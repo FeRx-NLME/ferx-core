@@ -431,6 +431,8 @@ mod tests {
             pk_idx_f64: vec![],
             sel_flat: vec![],
             ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
             referenced_covariates: vec!["CR".into()],
             gradient_method: GradientMethod::Fd,

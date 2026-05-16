@@ -633,9 +633,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .get("individual_parameters")
         .ok_or("Missing [individual_parameters] block")?;
 
-    let theta_names: Vec<String> = thetas.iter().map(|t| t.name.clone()).collect();
+    // theta_names is extended below after diffusion thetas are appended
+    let mut theta_names: Vec<String> = thetas.iter().map(|t| t.name.clone()).collect();
     let sigma_names: Vec<String> = sigmas.iter().map(|s| s.name.clone()).collect();
-    let n_theta = theta_names.len();
+    let mut n_theta = theta_names.len(); // updated below after diffusion thetas
     let n_eta = eta_names_bsv.len(); // BSV-only count
     let n_kappa = kappa_info.names_ordered.len();
     let n_epsilon = sigma_names.len();
@@ -679,27 +680,84 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .iter()
         .any(|l| l.starts_with("ode(") || l.starts_with("ode "));
 
-    let (pk_model, pk_param_map, ode_spec) = if is_ode {
+    let (pk_model, pk_param_map, ode_spec, diffusion_theta_names, diffusion_theta_inits, diffusion_theta_fixed, diffusion_state_indices) = if is_ode {
         let (state_names, obs_cmt_name) = parse_ode_structural(struct_lines)?;
         let ode_lines = blocks
             .get("odes")
             .ok_or("ODE model requires [odes] block")?;
-        let ode_spec = build_ode_spec(ode_lines, &state_names, &obs_cmt_name, &indiv_var_names)?;
+        let mut ode_spec = build_ode_spec(ode_lines, &state_names, &obs_cmt_name, &indiv_var_names)?;
+
+        // Parse optional [diffusion] block
+        let (diff_var, diff_names, diff_fixed, diff_state_idx) =
+            if let Some(diff_lines) = blocks.get("diffusion") {
+                let (variances, names, fixed) =
+                    parse_diffusion_block(diff_lines, &state_names)?;
+                // Collect indices of states that actually have diffusion
+                let state_idx: Vec<usize> = names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, n)| n.as_ref().map(|_| i))
+                    .collect();
+                (variances, names, fixed, state_idx)
+            } else {
+                (vec![0.0; state_names.len()], vec![None; state_names.len()], vec![false; state_names.len()], Vec::new())
+            };
+
+        // Store initial diffusion variances in the ODE spec (non-zero states only)
+        if !diff_state_idx.is_empty() {
+            ode_spec.diffusion_var = diff_var.clone();
+        }
+
+        // Collect diffusion parameters that will become thetas (non-zero, non-fixed)
+        let diff_theta_names: Vec<String> = diff_names
+            .iter()
+            .filter_map(|n| n.clone())
+            .collect();
+        let diff_theta_inits: Vec<f64> = diff_state_idx
+            .iter()
+            .map(|&i| diff_var[i])
+            .collect();
+        let diff_theta_fixed_vec: Vec<bool> = diff_state_idx
+            .iter()
+            .map(|&i| diff_fixed[i])
+            .collect();
         // PK model not used for ODE, but we need a placeholder + empty param map
-        (PkModel::OneCptOral, HashMap::new(), Some(ode_spec))
+        (PkModel::OneCptOral, HashMap::new(), Some(ode_spec),
+         diff_theta_names, diff_theta_inits, diff_theta_fixed_vec, diff_state_idx)
     } else {
+        // [diffusion] outside an ODE model is an error
+        if blocks.contains_key("diffusion") {
+            return Err(
+                "[diffusion] block requires an ODE model (use `ode(...)` in [structural_model] \
+                 and define [odes]). Analytical PK models do not support SDE diffusion."
+                    .to_string(),
+            );
+        }
         let (pk_model, pk_param_map) = parse_structural_model(struct_lines)?;
-        (pk_model, pk_param_map, None)
+        (pk_model, pk_param_map, None, Vec::new(), Vec::new(), Vec::new(), Vec::new())
     };
 
     // Build pk_param_fn with the extended eta context (BSV + kappa names).
     let (pk_param_fn, referenced_covariates) =
         build_pk_param_fn(indiv_stmts.clone(), &pk_param_map, &indiv_var_names)?;
 
-    let theta_values: Vec<f64> = thetas.iter().map(|t| t.init).collect();
-    let theta_lower: Vec<f64> = thetas.iter().map(|t| t.lower).collect();
-    let theta_upper: Vec<f64> = thetas.iter().map(|t| t.upper).collect();
-    let theta_fixed: Vec<bool> = thetas.iter().map(|t| t.fixed).collect();
+    // Append diffusion parameters to the theta list. They are treated as
+    // positive variance parameters: log-transformed during optimisation,
+    // lower-bounded at 0, no upper bound. They appear last in the theta vector
+    // so existing theta indices are unaffected.
+    let diff_theta_start = thetas.len(); // index of first diffusion theta
+    let mut theta_values: Vec<f64> = thetas.iter().map(|t| t.init).collect();
+    let mut theta_lower: Vec<f64> = thetas.iter().map(|t| t.lower).collect();
+    let mut theta_upper: Vec<f64> = thetas.iter().map(|t| t.upper).collect();
+    let mut theta_fixed: Vec<bool> = thetas.iter().map(|t| t.fixed).collect();
+    for (i, &init) in diffusion_theta_inits.iter().enumerate() {
+        theta_values.push(init.max(1e-10)); // ensure positive initial value
+        theta_names.push(diffusion_theta_names[i].clone());
+        theta_lower.push(0.0);
+        theta_upper.push(f64::INFINITY);
+        theta_fixed.push(diffusion_theta_fixed[i]);
+    }
+    n_theta = theta_names.len();
     // BSV omega is built from the BSV-only eta names (no kappas)
     let omega = build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?;
     let omega_fixed = build_omega_fixed(&omegas, &block_omegas, &eta_names_bsv)?;
@@ -896,6 +954,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         pk_idx_f64,
         sel_flat,
         ode_spec,
+        diffusion_theta_start: if diffusion_state_indices.is_empty() {
+            None
+        } else {
+            Some(diff_theta_start)
+        },
+        diffusion_state_indices,
         bloq_method: BloqMethod::Drop,
         mu_refs,
         kappa_mu_refs,
@@ -1298,6 +1362,71 @@ fn parse_ode_structural(lines: &[String]) -> Result<(Vec<String>, String), Strin
 
 // ── [odes] block → OdeSpec ──────────────────────────────────────────────────
 
+/// Parse a `[diffusion]` block into per-state initial variance values.
+///
+/// Expected syntax (one line per state):
+///   `STATE_NAME ~ value`         — variance value, estimated
+///   `STATE_NAME ~ value FIX`     — fixed variance
+///
+/// Returns `(diffusion_var, diffusion_names, diffusion_fixed)` where each vec
+/// is aligned to `state_names` order (zero for states not mentioned).
+/// States not listed default to 0 (no diffusion).
+///
+/// Also validates that all named states exist in `state_names`.
+fn parse_diffusion_block(
+    lines: &[String],
+    state_names: &[String],
+) -> Result<(Vec<f64>, Vec<Option<String>>, Vec<bool>), String> {
+    let n = state_names.len();
+    let mut variances = vec![0.0f64; n];
+    let mut names: Vec<Option<String>> = vec![None; n];
+    let mut fixed = vec![false; n];
+
+    let re = Regex::new(r"(?i)^(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?").unwrap();
+
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let caps = re.captures(line).ok_or_else(|| {
+            format!(
+                "[diffusion] invalid line (expected `STATE ~ value` or `STATE ~ value FIX`): `{}`",
+                line
+            )
+        })?;
+        let state = caps[1].to_string();
+        let value: f64 = caps[2]
+            .parse()
+            .map_err(|_| format!("[diffusion] bad variance value in: `{}`", line))?;
+        let is_fixed = caps.get(3).is_some();
+
+        let idx = state_names
+            .iter()
+            .position(|s| s.eq_ignore_ascii_case(&state))
+            .ok_or_else(|| {
+                format!(
+                    "[diffusion] state `{}` not defined in [odes] block. \
+                     Known states: {}",
+                    state,
+                    state_names.join(", ")
+                )
+            })?;
+
+        if value < 0.0 {
+            return Err(format!(
+                "[diffusion] variance for `{}` must be >= 0, got {}",
+                state, value
+            ));
+        }
+        variances[idx] = value;
+        names[idx] = Some(format!("DIFF_{}", state.to_uppercase()));
+        fixed[idx] = is_fixed;
+    }
+
+    Ok((variances, names, fixed))
+}
+
 fn build_ode_spec(
     lines: &[String],
     state_names: &[String],
@@ -1463,6 +1592,7 @@ fn build_ode_spec(
         n_states,
         state_names: state_names.to_vec(),
         obs_cmt_idx,
+        diffusion_var: Vec::new(),
     })
 }
 
@@ -5366,6 +5496,113 @@ if (1 > 0) {
             pk.lagtime(),
             0.5,
             "LAGTIME must be routed to PK_IDX_LAGTIME for ODE models"
+        );
+    }
+
+    // ── [diffusion] block parsing ─────────────────────────────────────────
+
+    fn minimal_ode_model_with_diffusion(diffusion_lines: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[diffusion]
+{diffusion_lines}
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method = foce
+"#,
+            diffusion_lines = diffusion_lines
+        )
+    }
+
+    #[test]
+    fn test_diffusion_block_parsed_into_theta() {
+        let src = minimal_ode_model_with_diffusion("  central ~ 0.05");
+        let parsed = parse_full_model(&src).unwrap();
+        let m = &parsed.model;
+        // DIFF_CENTRAL should be appended as the last theta
+        assert!(
+            m.theta_names.iter().any(|n| n == "DIFF_CENTRAL"),
+            "expected DIFF_CENTRAL in theta_names, got {:?}",
+            m.theta_names
+        );
+        let idx = m.theta_names.iter().position(|n| n == "DIFF_CENTRAL").unwrap();
+        assert!(
+            (m.default_params.theta[idx] - 0.05).abs() < 1e-9,
+            "initial diffusion variance should be 0.05"
+        );
+    }
+
+    #[test]
+    fn test_diffusion_block_sets_diffusion_theta_start() {
+        let src = minimal_ode_model_with_diffusion("  central ~ 0.01");
+        let parsed = parse_full_model(&src).unwrap();
+        let m = &parsed.model;
+        assert!(m.diffusion_theta_start.is_some(), "diffusion_theta_start must be set");
+        assert_eq!(m.diffusion_state_indices.len(), 1);
+        assert!(m.is_sde());
+    }
+
+    #[test]
+    fn test_diffusion_block_fix_flag() {
+        let src = minimal_ode_model_with_diffusion("  central ~ 0.02 FIX");
+        let parsed = parse_full_model(&src).unwrap();
+        let m = &parsed.model;
+        let idx = m.theta_names.iter().position(|n| n == "DIFF_CENTRAL").unwrap();
+        assert!(
+            m.default_params.theta_fixed[idx],
+            "DIFF_CENTRAL should be FIX"
+        );
+    }
+
+    #[test]
+    fn test_diffusion_block_unknown_state_error() {
+        let src = minimal_ode_model_with_diffusion("  depot ~ 0.01");
+        assert!(
+            parse_full_model(&src).is_err(),
+            "unknown state in [diffusion] must be an error"
+        );
+    }
+
+    #[test]
+    fn test_diffusion_on_analytical_model_is_error() {
+        let src = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 0.1
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+[diffusion]
+  central ~ 0.01
+[error_model]
+  additive
+"#;
+        assert!(
+            parse_full_model(src).is_err(),
+            "[diffusion] on an analytical model must be an error"
         );
     }
 }

@@ -139,9 +139,17 @@ pub fn individual_nll_into_with_schedule(
     // for per-event PK params (only consumed on the TV-cov path; ignored
     // on the no-TV fast path).
     let preds = model_predictions_into_with_schedule(model, subject, theta, eta, scratch, schedule);
+    // For SDE models, compute per-observation EKF process-noise variance and
+    // add it to the residual variance to form V_total.
+    let p_obs = if model.is_sde() {
+        ekf_p_obs(model, subject, theta, eta, sigma_values)
+    } else {
+        Vec::new()
+    };
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        let v = residual_variance(model.error_model, f_pred, sigma_values);
+        let v_resid = residual_variance(model.error_model, f_pred, sigma_values);
+        let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if is_m3_bloq(model, subject, j) {
             // y carries LLOQ on CENS=1 rows.
             let z = (y - f_pred) / v.sqrt();
@@ -153,6 +161,53 @@ pub fn individual_nll_into_with_schedule(
     }
 
     0.5 * (eta_prior + log_det_omega + data_ll)
+}
+
+/// Compute per-observation EKF process-noise variance (p_obs) for an SDE model.
+///
+/// Returns an empty vec when `model.is_sde()` is false — callers should check
+/// `model.is_sde()` before calling this to avoid an unnecessary ODE pass.
+fn ekf_p_obs(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    sigma_values: &[f64],
+) -> Vec<f64> {
+    let (start, state_indices) = match model.diffusion_theta_start {
+        Some(s) => (s, &model.diffusion_state_indices),
+        None => return Vec::new(),
+    };
+    let ode = match model.ode_spec.as_ref() {
+        Some(o) => o,
+        None => return Vec::new(),
+    };
+
+    // Build current diffusion_var from the live theta slice — this is what
+    // changes each outer iteration as the optimizer updates diffusion thetas.
+    let mut diffusion_var = vec![0.0f64; ode.n_states];
+    for (k, &state_idx) in state_indices.iter().enumerate() {
+        let theta_idx = start + k;
+        if theta_idx < theta.len() && state_idx < ode.n_states {
+            diffusion_var[state_idx] = theta[theta_idx].max(0.0);
+        }
+    }
+
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let error_model = model.error_model;
+
+    // Temporarily shadow ode_spec with updated diffusion_var for this call.
+    // We cannot mutate model.ode_spec, so we pass diffusion_var separately
+    // via a local OdeSpec-like struct. Since solve_ekf takes rhs + n_states
+    // + obs_cmt_idx + diffusion_var as separate args, we call it directly.
+    let (_, p_obs) = crate::ode::ode_predictions_ekf_with_diffusion(
+        ode,
+        &pk.values,
+        subject,
+        &diffusion_var,
+        |f_pred| crate::stats::residual_error::residual_variance(error_model, f_pred, sigma_values),
+    );
+    p_obs
 }
 
 /// Log-determinant of Omega via Cholesky: log|Omega| = 2 * sum(log(L_ii))
@@ -195,6 +250,13 @@ pub fn foce_subject_nll(
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
     let ipreds = model_predictions(model, subject, theta, eta_hat.as_slice());
 
+    // For SDE models, inflate R with the EKF process-noise variance.
+    let p_obs = if model.is_sde() {
+        ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
+    } else {
+        Vec::new()
+    };
+
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
 
     if interaction || m3_active {
@@ -207,6 +269,7 @@ pub fn foce_subject_nll(
             sigma_values,
             model.error_model,
             model.bloq_method,
+            &p_obs,
         )
     } else {
         foce_subject_nll_standard(
@@ -218,6 +281,7 @@ pub fn foce_subject_nll(
             sigma_values,
             model.error_model,
             model.bloq_method,
+            &p_obs,
         )
     }
 }
@@ -235,6 +299,7 @@ pub fn foce_subject_nll_standard(
     sigma_values: &[f64],
     error_model: ErrorModel,
     _bloq_method: BloqMethod,
+    p_obs: &[f64],
 ) -> f64 {
     let n_obs = subject.observations.len();
 
@@ -246,8 +311,11 @@ pub fn foce_subject_nll_standard(
         .map(|(j, &ip)| ip - h_eta[j])
         .collect();
 
-    // R diagonal at f0
-    let r_diag = compute_r_diag(error_model, &f0, sigma_values);
+    // R diagonal at f0; inflate with EKF process-noise variance for SDE models.
+    let mut r_diag = compute_r_diag(error_model, &f0, sigma_values);
+    for (j, r) in r_diag.iter_mut().enumerate() {
+        *r += p_obs.get(j).copied().unwrap_or(0.0);
+    }
 
     // R_tilde = H * Omega * H' + diag(R)
     let r_tilde = compute_r_tilde(h_matrix, &omega.matrix, &r_diag);
@@ -306,6 +374,7 @@ pub fn foce_subject_nll_interaction(
     sigma_values: &[f64],
     error_model: ErrorModel,
     bloq_method: BloqMethod,
+    p_obs: &[f64],
 ) -> f64 {
     let n_obs = subject.observations.len();
 
@@ -329,8 +398,11 @@ pub fn foce_subject_nll_interaction(
     let h_quant = DMatrix::from_fn(n_quant, n_eta, |r, c| h_matrix[(quant_idx[r], c)]);
     let ipreds_quant: Vec<f64> = quant_idx.iter().map(|&j| ipreds[j]).collect();
 
-    // R diagonal at η̂/ipred (interaction).
-    let r_diag_quant = compute_r_diag(error_model, &ipreds_quant, sigma_values);
+    // R diagonal at η̂/ipred (interaction); inflate with EKF variance for SDE.
+    let mut r_diag_quant = compute_r_diag(error_model, &ipreds_quant, sigma_values);
+    for (qi, &orig_j) in quant_idx.iter().enumerate() {
+        r_diag_quant[qi] += p_obs.get(orig_j).copied().unwrap_or(0.0);
+    }
 
     // R̃ over quantified rows: H_q · Ω · H_qᵀ + diag(R_q(η̂))
     let r_tilde = compute_r_tilde(&h_quant, &omega.matrix, &r_diag_quant);
@@ -443,6 +515,11 @@ pub fn foce_subject_nll_iov(
     }
 
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
+    let p_obs_iov = if model.is_sde() {
+        ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
+    } else {
+        Vec::new()
+    };
     let foce_term = if interaction || m3_active {
         foce_subject_nll_interaction(
             subject,
@@ -453,6 +530,7 @@ pub fn foce_subject_nll_iov(
             sigma_values,
             model.error_model,
             model.bloq_method,
+            &p_obs_iov,
         )
     } else {
         foce_subject_nll_standard(
@@ -464,6 +542,7 @@ pub fn foce_subject_nll_iov(
             sigma_values,
             model.error_model,
             model.bloq_method,
+            &p_obs_iov,
         )
     };
 
@@ -801,6 +880,8 @@ mod tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
@@ -942,6 +1023,7 @@ mod tests {
             &sigma,
             ErrorModel::Additive,
             BloqMethod::Drop,
+            &[],
         );
         let focei = foce_subject_nll_interaction(
             &subj,
@@ -952,6 +1034,7 @@ mod tests {
             &sigma,
             ErrorModel::Additive,
             BloqMethod::Drop,
+            &[],
         );
 
         // For an η-independent residual variance, FOCEI is mathematically

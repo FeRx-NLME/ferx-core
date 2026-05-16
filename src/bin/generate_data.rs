@@ -204,6 +204,8 @@ fn build_warfarin_model() -> CompiledModel {
             v
         },
         ode_spec: None,
+        diffusion_theta_start: None,
+        diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
@@ -307,6 +309,8 @@ fn generate_two_cpt_iv() {
             v
         },
         ode_spec: None,
+        diffusion_theta_start: None,
+        diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
@@ -409,6 +413,8 @@ fn generate_two_cpt_oral_cov() {
             v
         },
         ode_spec: None,
+        diffusion_theta_start: None,
+        diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),
@@ -535,6 +541,7 @@ fn generate_mm_oral() {
         n_states: 2,
         state_names: vec!["depot".into(), "central".into()],
         obs_cmt_idx: 1,
+        diffusion_var: Vec::new(),
     };
     let model = CompiledModel {
         name: "mm_oral".into(),
@@ -562,6 +569,8 @@ fn generate_mm_oral() {
             v
         },
         ode_spec: Some(ode_spec),
+        diffusion_theta_start: None,
+        diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
         mu_refs: HashMap::new(),
         kappa_mu_refs: HashMap::new(),

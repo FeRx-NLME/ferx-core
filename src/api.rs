@@ -208,7 +208,12 @@ pub fn fit_from_files(
     let population = read_nonmem_csv(Path::new(data_path), covariate_columns, None)?;
     let opts = options.unwrap_or_default();
     model.bloq_method = opts.bloq_method;
-    model.gradient_method = opts.gradient_method;
+    // SDE models cannot use autodiff — force FD.
+    model.gradient_method = if model.is_sde() && opts.gradient_method != crate::types::GradientMethod::Fd {
+        crate::types::GradientMethod::Fd
+    } else {
+        opts.gradient_method
+    };
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
     // Hash inputs post-fit (same pattern as `run_model_with_data`). The
     // model and CSV were already read by `parse_model_file` and
@@ -341,6 +346,34 @@ fn fit_inner(
             "  {} thetas, {} etas, {} sigmas",
             model.n_theta, model.n_eta, model.n_epsilon
         );
+    }
+
+    // Guard: SDE ([diffusion] block) is incompatible with SAEM and with the
+    // autodiff gradient path. Fail/warn early so users get a clear message
+    // rather than a silent wrong result.
+    if model.is_sde() {
+        if chain.iter().any(|&m| m == EstimationMethod::Saem) {
+            return Err(
+                "method = saem is not compatible with a [diffusion] block. \
+                 SDE / EKF estimation requires FOCE or FOCEI. Use method = foce or method = focei."
+                    .to_string(),
+            );
+        }
+        if options.gradient_method == crate::types::GradientMethod::Ad {
+            return Err(
+                "gradient_method = ad is not compatible with a [diffusion] block. \
+                 Set gradient_method = fd (or leave it unset — fd is selected automatically)."
+                    .to_string(),
+            );
+        }
+        // Auto-mode: force FD silently (the inner loop detects this via
+        // model.gradient_method which the parser will have set to Fd; if
+        // somehow Auto slipped through, enforce it here).
+        if options.gradient_method == crate::types::GradientMethod::Auto {
+            // Nothing to do — the parser enforces Fd when diffusion is present.
+            // This comment is a reminder that Auto on SDE models is safe only
+            // because the ODE path already falls back to Fd in the inner loop.
+        }
     }
 
     // Guard: SAEM does not support IOV (kappas are not sampled in the SAEM
@@ -762,6 +795,7 @@ fn fit_inner(
         gradient_method_inner: grad_inner.as_str().to_string(),
         gradient_method_outer: grad_outer.as_str().to_string(),
         uses_ode_solver: model.is_ode_based(),
+        uses_sde: model.is_sde(),
         n_threads_used,
         nlopt_missing_algorithms: nlopt_missing,
         covariance_n_evals_estimated,
@@ -1629,6 +1663,8 @@ mod iov_integration {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
@@ -2345,6 +2381,8 @@ mod simulate_with_uncertainty_tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
@@ -2430,6 +2468,7 @@ mod simulate_with_uncertainty_tests {
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,
+            uses_sde: false,
             n_threads_used: 1,
             nlopt_missing_algorithms: vec![],
             covariance_n_evals_estimated: None,
@@ -2538,5 +2577,197 @@ mod simulate_with_uncertainty_tests {
         };
         let err = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap_err();
         assert!(err.contains("covariance"));
+    }
+}
+
+// ── SDE end-to-end integration ───────────────────────────────────────────────
+
+#[cfg(test)]
+mod sde_integration {
+    use super::fit;
+    use crate::parser::model_parser::parse_full_model;
+    use crate::types::*;
+    use std::collections::HashMap;
+
+    /// 1-cpt IV ODE model with a [diffusion] block on the central compartment.
+    /// Sigma (ADD) is fixed so that the diffusion parameter must absorb residual
+    /// variance. We verify:
+    ///   (a) uses_sde = true
+    ///   (b) DIFF_CENTRAL is estimated positive
+    ///   (c) OFV is finite and the fit converges
+    ///   (d) OFV with diffusion <= OFV without diffusion (diffusion can only help)
+    const SDE_MODEL_SRC: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 1.0 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[diffusion]
+  central ~ 0.5
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method = foce
+"#;
+
+    /// Same model without the [diffusion] block (for OFV comparison).
+    const BASE_MODEL_SRC: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 1.0 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method = foce
+"#;
+
+    fn make_sde_population() -> Population {
+        // 4 subjects, single IV bolus dose=100 at t=0, observations at 3 times.
+        // Concentrations from a 1-cpt model with CL=5, V=50 plus modest noise.
+        let obs_times = vec![1.0, 4.0, 8.0];
+        let dvs: &[(&str, Vec<f64>)] = &[
+            ("S1", vec![1.62, 0.92, 0.48]),
+            ("S2", vec![1.70, 0.97, 0.52]),
+            ("S3", vec![1.55, 0.88, 0.45]),
+            ("S4", vec![1.65, 0.94, 0.50]),
+        ];
+        let subjects = dvs
+            .iter()
+            .map(|(id, obs)| Subject {
+                id: id.to_string(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: obs_times.clone(),
+                observations: obs.clone(),
+                obs_cmts: vec![1; 3],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                cens: vec![0; 3],
+                occasions: vec![1u32; 3],
+                dose_occasions: vec![1u32],
+            })
+            .collect();
+        Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+        }
+    }
+
+    fn fast_foce_opts() -> FitOptions {
+        FitOptions {
+            method: EstimationMethod::Foce,
+            methods: Vec::new(),
+            outer_maxiter: 80,
+            outer_gtol: 1e-3,
+            inner_maxiter: 50,
+            inner_tol: 1e-4,
+            run_covariance_step: false,
+            interaction: false,
+            mu_referencing: false,
+            optimizer: Optimizer::Slsqp,
+            lbfgs_memory: 5,
+            verbose: false,
+            ..FitOptions::default()
+        }
+    }
+
+    #[test]
+    fn test_sde_fit_uses_sde_flag() {
+        let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
+        let pop = make_sde_population();
+        let opts = fast_foce_opts();
+        let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
+            .expect("SDE fit should succeed");
+        assert!(result.uses_sde, "uses_sde must be true");
+    }
+
+    #[test]
+    fn test_sde_fit_diff_central_positive() {
+        let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
+        let pop = make_sde_population();
+        let opts = fast_foce_opts();
+        let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
+            .expect("SDE fit should succeed");
+        let diff_idx = result
+            .theta_names
+            .iter()
+            .position(|n| n == "DIFF_CENTRAL")
+            .expect("DIFF_CENTRAL must be in theta_names");
+        let diff_val = result.theta[diff_idx];
+        assert!(
+            diff_val > 0.0,
+            "DIFF_CENTRAL must be positive, got {diff_val}"
+        );
+    }
+
+    #[test]
+    fn test_sde_fit_ofv_finite() {
+        let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
+        let pop = make_sde_population();
+        let opts = fast_foce_opts();
+        let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
+            .expect("SDE fit should succeed");
+        assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
+    }
+
+    #[test]
+    fn test_sde_ofv_le_base_ofv() {
+        let pop = make_sde_population();
+        let opts = fast_foce_opts();
+
+        let parsed_base = parse_full_model(BASE_MODEL_SRC).expect("base model should parse");
+        let base_result = fit(
+            &parsed_base.model,
+            &pop,
+            &parsed_base.model.default_params,
+            &opts,
+        )
+        .expect("base fit should succeed");
+
+        let parsed_sde = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
+        let sde_result = fit(
+            &parsed_sde.model,
+            &pop,
+            &parsed_sde.model.default_params,
+            &opts,
+        )
+        .expect("SDE fit should succeed");
+
+        assert!(
+            sde_result.ofv <= base_result.ofv + 1.0,
+            "SDE OFV ({}) should not be worse than base OFV ({}) by more than 1 unit",
+            sde_result.ofv,
+            base_result.ofv,
+        );
     }
 }

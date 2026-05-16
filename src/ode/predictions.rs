@@ -63,6 +63,12 @@ pub struct OdeSpec {
     pub state_names: Vec<String>,
     /// Index of the observable compartment (0-based) for DV
     pub obs_cmt_idx: usize,
+    /// Per-state diagonal process-noise variances (σ²_w,i) for SDE / EKF.
+    /// Length must equal `n_states` when non-empty; empty means standard ODE
+    /// (no diffusion). Declared via `[diffusion]` block as `state ~ variance`,
+    /// analogous to sigma/omega notation. Updated each outer iteration as
+    /// diffusion thetas are re-estimated.
+    pub diffusion_var: Vec<f64>,
 }
 
 /// Compute ODE-based predictions for a single subject.
@@ -357,6 +363,86 @@ pub fn ode_predictions_event_driven(
     predictions
 }
 
+/// EKF-based predictions with an explicit diffusion_var slice (bypasses
+/// `ode_spec.diffusion_var`). Used by the likelihood path to supply the
+/// current theta-derived diffusion variances without mutating the model.
+pub fn ode_predictions_ekf_with_diffusion(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    subject: &Subject,
+    diffusion_var: &[f64],
+    r_obs_fn: impl Fn(f64) -> f64,
+) -> (Vec<f64>, Vec<f64>) {
+    use crate::ode::ekf::solve_ekf;
+
+    let ipred_plain = ode_predictions(ode, pk_params_flat, subject);
+    let r_obs: f64 = {
+        let valid: Vec<f64> = ipred_plain.iter().map(|&f| r_obs_fn(f)).filter(|v| v.is_finite() && *v > 0.0).collect();
+        if valid.is_empty() { 1.0 } else { valid.iter().sum::<f64>() / valid.len() as f64 }
+    };
+
+    let pts = solve_ekf(
+        ode.rhs.as_ref(),
+        ode.n_states,
+        ode.obs_cmt_idx,
+        diffusion_var,
+        pk_params_flat,
+        &subject.doses,
+        &subject.obs_times,
+        r_obs,
+    );
+
+    let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
+    let p_obs: Vec<f64> = pts.iter().map(|p| p.p_obs).collect();
+    (ipreds, p_obs)
+}
+
+/// EKF-based predictions for a subject with an SDE model.
+///
+/// Wraps `solve_ekf`, handling the residual variance `r_obs` needed for the
+/// Kalman update step. Returns `(ipred, p_obs)` where `p_obs[j]` is the
+/// EKF state covariance at the observable compartment just before assimilating
+/// observation `j`. Callers add `p_obs[j]` to the residual variance to form
+/// `V_total = p_obs[j] + V_residual`.
+///
+/// `r_obs_fn` computes the scalar residual variance for each observation given
+/// the predicted value — this feeds the Kalman update, keeping the covariance
+/// estimate numerically stable. It does NOT affect the returned `p_obs` values
+/// (those are pre-update, i.e. the purely process-noise contribution).
+pub fn ode_predictions_ekf(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    subject: &Subject,
+    r_obs_fn: impl Fn(f64) -> f64,
+) -> (Vec<f64>, Vec<f64>) {
+    use crate::ode::ekf::solve_ekf;
+
+    // Compute a representative R for the Kalman update using a simple average
+    // of the predicted values from a standard ODE pass (no diffusion).
+    // This only affects numerical stability of the update step, not the
+    // returned p_obs values.
+    let ipred_plain = ode_predictions(ode, pk_params_flat, subject);
+    let r_obs: f64 = {
+        let valid: Vec<f64> = ipred_plain.iter().map(|&f| r_obs_fn(f)).filter(|v| v.is_finite() && *v > 0.0).collect();
+        if valid.is_empty() { 1.0 } else { valid.iter().sum::<f64>() / valid.len() as f64 }
+    };
+
+    let pts = solve_ekf(
+        ode.rhs.as_ref(),
+        ode.n_states,
+        ode.obs_cmt_idx,
+        &ode.diffusion_var,
+        pk_params_flat,
+        &subject.doses,
+        &subject.obs_times,
+        r_obs,
+    );
+
+    let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
+    let p_obs: Vec<f64> = pts.iter().map(|p| p.p_obs).collect();
+    (ipreds, p_obs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +461,7 @@ mod tests {
             n_states: 1,
             state_names: vec!["central".into()],
             obs_cmt_idx: 0,
+            diffusion_var: Vec::new(),
         }
     }
 
@@ -481,6 +568,7 @@ mod tests {
             n_states: 2,
             state_names: vec!["depot".into(), "central".into()],
             obs_cmt_idx: 1,
+            diffusion_var: Vec::new(),
         }
     }
 

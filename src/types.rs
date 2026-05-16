@@ -542,6 +542,16 @@ pub struct CompiledModel {
     /// analytical PK equations. The `pk_param_fn` output is flattened and passed
     /// to the ODE RHS function as the parameter vector.
     pub ode_spec: Option<crate::ode::OdeSpec>,
+    /// Index of the first diffusion theta in the theta vector, and the parallel
+    /// mapping from diffusion-theta index to ODE state index.
+    /// `None` when no `[diffusion]` block is present.
+    /// Used by `ekf_p_obs` to read current diffusion variances from `theta`
+    /// without requiring mutation of `ode_spec` during estimation.
+    pub diffusion_theta_start: Option<usize>,
+    /// For each diffusion theta (offset from `diffusion_theta_start`),
+    /// the index of the ODE state it applies to. Parallel to the diffusion
+    /// theta slice of `theta`. Empty when `diffusion_theta_start` is `None`.
+    pub diffusion_state_indices: Vec<usize>,
     /// Mirror of [`FitOptions::bloq_method`] so likelihood/AD paths can read
     /// it without threading the options struct through every call site.
     /// Set by [`fit_from_files`](crate::fit_from_files) automatically;
@@ -630,6 +640,11 @@ impl CompiledModel {
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
+    }
+
+    /// Returns true when the model has a `[diffusion]` block (SDE / EKF path).
+    pub fn is_sde(&self) -> bool {
+        self.ode_spec.as_ref().map_or(false, |s| !s.diffusion_var.is_empty())
     }
 
     /// Returns true when `[individual_parameters]` declares `LAGTIME` (or its
@@ -762,6 +777,8 @@ pub struct FitResult {
     pub gradient_method_outer: String,
     /// True when the model uses ODE integration; false for analytical PK.
     pub uses_ode_solver: bool,
+    /// True when the model has a `[diffusion]` block (SDE / EKF likelihood).
+    pub uses_sde: bool,
     /// Number of Rayon worker threads used during this fit.
     pub n_threads_used: usize,
     /// NLopt algorithms requested but not available in this platform build.
@@ -1270,12 +1287,15 @@ pub(crate) mod test_helpers {
             eta_map: vec![],
             pk_idx_f64: vec![],
             sel_flat: vec![],
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
             ode_spec: if with_ode {
                 Some(crate::ode::OdeSpec {
                     rhs: Box::new(|_y, _p, _t, _dy| {}),
                     n_states: 2,
                     state_names: vec!["depot".into(), "central".into()],
                     obs_cmt_idx: 0,
+                    diffusion_var: Vec::new(),
                 })
             } else {
                 None

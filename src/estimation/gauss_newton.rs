@@ -680,6 +680,7 @@ fn subject_nll_at(
             &params.sigma.values,
             model.error_model,
             model.bloq_method,
+            &[],
         )
     } else {
         foce_subject_nll_standard(
@@ -691,6 +692,7 @@ fn subject_nll_at(
             &params.sigma.values,
             model.error_model,
             model.bloq_method,
+            &[],
         )
     }
 }

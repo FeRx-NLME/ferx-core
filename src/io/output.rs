@@ -434,6 +434,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
         writeln!(f, "  method_chain: [{}]", chain.join(", ")).map_err(|e| e.to_string())?;
     }
+    writeln!(f, "  uses_ode_solver: {}", result.uses_ode_solver).map_err(|e| e.to_string())?;
+    writeln!(f, "  uses_sde: {}", result.uses_sde).map_err(|e| e.to_string())?;
 
     writeln!(f, "\nobjective_function:").map_err(|e| e.to_string())?;
     writeln!(f, "  ofv: {:.6}", result.ofv).map_err(|e| e.to_string())?;
@@ -805,6 +807,7 @@ mod tests {
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,
+            uses_sde: false,
             n_threads_used: 1,
             nlopt_missing_algorithms: Vec::new(),
             covariance_n_evals_estimated: None,

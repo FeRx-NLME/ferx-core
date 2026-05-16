@@ -679,6 +679,8 @@ mod tests {
                 v
             },
             ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),

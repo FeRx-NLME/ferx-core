@@ -370,6 +370,7 @@ mod tests {
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,
+            uses_sde: false,
             n_threads_used: 1,
             nlopt_missing_algorithms: vec![],
             covariance_n_evals_estimated: None,

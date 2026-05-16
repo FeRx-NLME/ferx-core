@@ -100,7 +100,15 @@ The solver automatically adapts step sizes based on local error estimates.
 - **Compartment indexing**: Compartments are 1-indexed in the data file (`CMT=1` corresponds to the first state in the `states` list)
 - **Multiple doses**: The ODE is integrated in segments between dose events, with state discontinuities at each bolus
 
+## Stochastic ODE Models (SDE)
+
+To model within-subject system noise that accumulates between observations, add
+a `[diffusion]` block to your ODE model.  See [Stochastic Differential
+Equations](diffusion.md) for a full description, worked example, and comparison
+with sigma and omega.
+
 ## Limitations
 
 - The observable compartment contains the amount (not concentration). Divide by volume in the ODE equations if needed
 - Steady-state (`SS=1`) is not directly supported for ODE models
+- SDE (`[diffusion]`) is not compatible with SAEM or the autodiff gradient path
