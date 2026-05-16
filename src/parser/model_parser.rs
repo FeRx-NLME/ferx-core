@@ -2,6 +2,10 @@ use crate::types::*;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
+
+static DIFFUSION_LINE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?").unwrap());
 
 // ── Mu-referencing pattern detection ────────────────────────────────────────
 
@@ -751,11 +755,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let mut theta_upper: Vec<f64> = thetas.iter().map(|t| t.upper).collect();
     let mut theta_fixed: Vec<bool> = thetas.iter().map(|t| t.fixed).collect();
     for (i, &init) in diffusion_theta_inits.iter().enumerate() {
-        theta_values.push(init.max(1e-10)); // ensure positive initial value
+        let is_fixed = diffusion_theta_fixed[i];
+        // Only clamp estimated params — a fixed 0.0 diffusion should stay 0.0
+        let clamped = if is_fixed { init } else { init.max(1e-10) };
+        theta_values.push(clamped);
         theta_names.push(diffusion_theta_names[i].clone());
         theta_lower.push(0.0);
         theta_upper.push(f64::INFINITY);
-        theta_fixed.push(diffusion_theta_fixed[i]);
+        theta_fixed.push(is_fixed);
     }
     n_theta = theta_names.len();
     // BSV omega is built from the BSV-only eta names (no kappas)
@@ -1382,14 +1389,12 @@ fn parse_diffusion_block(
     let mut names: Vec<Option<String>> = vec![None; n];
     let mut fixed = vec![false; n];
 
-    let re = Regex::new(r"(?i)^(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?").unwrap();
-
     for line in lines {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let caps = re.captures(line).ok_or_else(|| {
+        let caps = DIFFUSION_LINE_RE.captures(line).ok_or_else(|| {
             format!(
                 "[diffusion] invalid line (expected `STATE ~ value` or `STATE ~ value FIX`): `{}`",
                 line

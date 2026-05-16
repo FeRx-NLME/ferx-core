@@ -376,10 +376,13 @@ pub fn ode_predictions_ekf_with_diffusion(
     use crate::ode::ekf::solve_ekf;
 
     let ipred_plain = ode_predictions(ode, pk_params_flat, subject);
-    let r_obs: f64 = {
-        let valid: Vec<f64> = ipred_plain.iter().map(|&f| r_obs_fn(f)).filter(|v| v.is_finite() && *v > 0.0).collect();
-        if valid.is_empty() { 1.0 } else { valid.iter().sum::<f64>() / valid.len() as f64 }
-    };
+    let r_obs_vec: Vec<f64> = ipred_plain
+        .iter()
+        .map(|&f| {
+            let v = r_obs_fn(f);
+            if v.is_finite() && v > 0.0 { v } else { 1.0 }
+        })
+        .collect();
 
     let pts = solve_ekf(
         ode.rhs.as_ref(),
@@ -389,7 +392,7 @@ pub fn ode_predictions_ekf_with_diffusion(
         pk_params_flat,
         &subject.doses,
         &subject.obs_times,
-        r_obs,
+        &r_obs_vec,
     );
 
     let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
@@ -409,6 +412,9 @@ pub fn ode_predictions_ekf_with_diffusion(
 /// the predicted value — this feeds the Kalman update, keeping the covariance
 /// estimate numerically stable. It does NOT affect the returned `p_obs` values
 /// (those are pre-update, i.e. the purely process-noise contribution).
+// Not currently called from outside this module — superseded by
+// `ode_predictions_ekf_with_diffusion` which accepts an explicit diffusion_var.
+#[allow(dead_code)]
 pub fn ode_predictions_ekf(
     ode: &OdeSpec,
     pk_params_flat: &[f64],
@@ -417,15 +423,16 @@ pub fn ode_predictions_ekf(
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::ode::ekf::solve_ekf;
 
-    // Compute a representative R for the Kalman update using a simple average
-    // of the predicted values from a standard ODE pass (no diffusion).
-    // This only affects numerical stability of the update step, not the
-    // returned p_obs values.
+    // Compute per-observation R for the Kalman update from a standard ODE pass.
+    // Using per-observation R is correct for proportional and combined error models.
     let ipred_plain = ode_predictions(ode, pk_params_flat, subject);
-    let r_obs: f64 = {
-        let valid: Vec<f64> = ipred_plain.iter().map(|&f| r_obs_fn(f)).filter(|v| v.is_finite() && *v > 0.0).collect();
-        if valid.is_empty() { 1.0 } else { valid.iter().sum::<f64>() / valid.len() as f64 }
-    };
+    let r_obs_vec: Vec<f64> = ipred_plain
+        .iter()
+        .map(|&f| {
+            let v = r_obs_fn(f);
+            if v.is_finite() && v > 0.0 { v } else { 1.0 }
+        })
+        .collect();
 
     let pts = solve_ekf(
         ode.rhs.as_ref(),
@@ -435,7 +442,7 @@ pub fn ode_predictions_ekf(
         pk_params_flat,
         &subject.doses,
         &subject.obs_times,
-        r_obs,
+        &r_obs_vec,
     );
 
     let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();

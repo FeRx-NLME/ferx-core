@@ -128,10 +128,12 @@ pub struct EkfObsPoint {
 /// Propagate mean and covariance through a subject's dose+obs timeline.
 ///
 /// `rhs`, `n_states`, `obs_cmt_idx` mirror `OdeSpec`. `diffusion_var` is the
-/// diagonal of Q (length == n_states). `r_obs` is the scalar measurement
-/// variance R (the residual error variance at each observation point — passed
-/// in so the Kalman update is numerically stable; it does NOT inflate the
-/// returned `p_obs`, which is the pre-update EKF component only).
+/// diagonal of Q (length == n_states). `r_obs_vec` is the per-observation
+/// measurement variance R (one entry per element of `obs_times`, in the same
+/// order). Using per-observation R ensures the Kalman update is correct for
+/// proportional and combined error models where R depends on the predicted value.
+/// The returned `p_obs` values are the pre-update EKF covariance components and
+/// are not inflated by R.
 ///
 /// Dose events are handled identically to `ode_predictions`: boluses add to
 /// state; infusions inject a rate term into the wrapped RHS. Covariance is
@@ -144,7 +146,7 @@ pub fn solve_ekf(
     pk_params_flat: &[f64],
     doses: &[DoseEvent],
     obs_times: &[f64],
-    r_obs: f64,
+    r_obs_vec: &[f64],
 ) -> Vec<EkfObsPoint> {
     use std::collections::HashMap;
 
@@ -191,7 +193,8 @@ pub fn solve_ekf(
 
         // Record obs exactly at t_start (after dose application)
         if let Some(&obs_idx) = obs_map.get(&t_start.to_bits()) {
-            let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r_obs, n);
+            let r = r_obs_vec.get(obs_idx).copied().unwrap_or(1.0);
+            let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
             p_mat = p_new;
             let v = u[obs_cmt_idx];
             results[obs_idx] = EkfObsPoint {
@@ -273,7 +276,8 @@ pub fn solve_ekf(
             }
 
             if let Some(&obs_idx) = obs_map.get(&pt.t.to_bits()) {
-                let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r_obs, n);
+                let r = r_obs_vec.get(obs_idx).copied().unwrap_or(1.0);
+                let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
                 p_mat = p_new;
                 let v = pt.u[obs_cmt_idx];
                 results[obs_idx] = EkfObsPoint {
@@ -330,6 +334,7 @@ mod tests {
         let pk = make_pk(5.0, 80.0);
         let diffusion_var = vec![0.0]; // zero diffusion
 
+        let r_obs_vec: Vec<f64> = vec![0.01; obs_times.len()];
         let ekf_pts = solve_ekf(
             &one_cpt_rhs,
             1,
@@ -338,7 +343,7 @@ mod tests {
             &pk,
             &doses,
             &obs_times,
-            0.01,
+            &r_obs_vec,
         );
 
         let subj = Subject {
@@ -394,6 +399,7 @@ mod tests {
         // Use a large R so the Kalman update barely contracts P —
         // effectively "no assimilation", so P stays near the free-drift solution.
         let r_large = 1e8_f64;
+        let r_obs_vec: Vec<f64> = vec![r_large; obs_times.len()];
 
         let ekf_pts = solve_ekf(
             &one_cpt_rhs,
@@ -403,7 +409,7 @@ mod tests {
             &pk,
             &doses,
             &obs_times,
-            r_large,
+            &r_obs_vec,
         );
 
         for (i, &t) in obs_times.iter().enumerate() {
@@ -420,6 +426,7 @@ mod tests {
         let obs_times = vec![2.0, 6.0, 12.0];
         let pk = make_pk(5.0, 80.0);
 
+        let r_obs_vec: Vec<f64> = vec![0.05; obs_times.len()];
         let ekf_pts = solve_ekf(
             &one_cpt_rhs,
             1,
@@ -428,7 +435,7 @@ mod tests {
             &pk,
             &doses,
             &obs_times,
-            0.05,
+            &r_obs_vec,
         );
 
         for pt in &ekf_pts {

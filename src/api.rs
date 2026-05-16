@@ -359,6 +359,13 @@ fn fit_inner(
                     .to_string(),
             );
         }
+        if chain.iter().any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid)) {
+            return Err(
+                "SDE ([diffusion]) is not supported with method = gn or gn_hybrid. \
+                 Use method = foce or method = focei."
+                    .to_string(),
+            );
+        }
         if options.gradient_method == crate::types::GradientMethod::Ad {
             return Err(
                 "gradient_method = ad is not compatible with a [diffusion] block. \
@@ -2769,5 +2776,47 @@ mod sde_integration {
             sde_result.ofv,
             base_result.ofv,
         );
+    }
+
+    /// SDE + gn / gn_hybrid must fail with a clear error message.
+    #[test]
+    fn sde_gn_returns_error() {
+        use crate::types::EstimationMethod;
+
+        let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
+        let pop = {
+            // Minimal single-subject population (no data needed — error fires before fitting).
+            use crate::types::{DoseEvent, Population, Subject};
+            let subj = Subject {
+                id: "1".into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0],
+                observations: vec![1.0],
+                obs_cmts: vec![1],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                cens: vec![0],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+            };
+            Population { subjects: vec![subj], covariate_names: Vec::new(), dv_column: "DV".into() }
+        };
+
+        for method in [EstimationMethod::FoceGn, EstimationMethod::FoceGnHybrid] {
+            let opts = FitOptions {
+                method,
+                ..FitOptions::default()
+            };
+            let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts);
+            assert!(result.is_err(), "expected error for {:?} + SDE", method);
+            let msg = result.unwrap_err();
+            assert!(
+                msg.contains("gn") || msg.contains("gn_hybrid"),
+                "error message should mention gn: {msg}"
+            );
+        }
     }
 }

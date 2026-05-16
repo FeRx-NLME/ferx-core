@@ -200,6 +200,7 @@ fn ekf_p_obs(
     // We cannot mutate model.ode_spec, so we pass diffusion_var separately
     // via a local OdeSpec-like struct. Since solve_ekf takes rhs + n_states
     // + obs_cmt_idx + diffusion_var as separate args, we call it directly.
+    // TODO: unify EKF ipred with likelihood ipred to avoid double ODE evaluation
     let (_, p_obs) = crate::ode::ode_predictions_ekf_with_diffusion(
         ode,
         &pk.values,

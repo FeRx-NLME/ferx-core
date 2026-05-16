@@ -644,7 +644,7 @@ impl CompiledModel {
 
     /// Returns true when the model has a `[diffusion]` block (SDE / EKF path).
     pub fn is_sde(&self) -> bool {
-        self.ode_spec.as_ref().map_or(false, |s| !s.diffusion_var.is_empty())
+        self.diffusion_theta_start.is_some()
     }
 
     /// Returns true when `[individual_parameters]` declares `LAGTIME` (or its
