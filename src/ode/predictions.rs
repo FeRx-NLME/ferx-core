@@ -85,10 +85,7 @@ pub fn ode_predictions(ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject)
 
     // Lagtime shifts the effective start (and end) of every dose record.
     // Default 0.0 when not declared, so existing models behave identically.
-    let lagtime = pk_params_flat
-        .get(PK_IDX_LAGTIME)
-        .copied()
-        .unwrap_or(0.0);
+    let lagtime = pk_params_flat.get(PK_IDX_LAGTIME).copied().unwrap_or(0.0);
     // Per-dose lagtimes for `active_infusions` — uniform for the no-TV
     // path (lagtime is constant across doses).
     let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
@@ -380,7 +377,11 @@ pub fn ode_predictions_ekf_with_diffusion(
         .iter()
         .map(|&f| {
             let v = r_obs_fn(f);
-            if v.is_finite() && v > 0.0 { v } else { 1.0 }
+            if v.is_finite() && v > 0.0 {
+                v
+            } else {
+                1.0
+            }
         })
         .collect();
 
@@ -430,7 +431,11 @@ pub fn ode_predictions_ekf(
         .iter()
         .map(|&f| {
             let v = r_obs_fn(f);
-            if v.is_finite() && v > 0.0 { v } else { 1.0 }
+            if v.is_finite() && v > 0.0 {
+                v
+            } else {
+                1.0
+            }
         })
         .collect();
 

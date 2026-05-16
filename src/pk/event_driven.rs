@@ -94,11 +94,7 @@ impl EventSchedule {
     /// `dose_lagtimes` must be length `subject.doses.len()` (or empty,
     /// which is treated as all zeros for backward compatibility with the
     /// no-lagtime fast path).
-    pub fn for_subject(
-        subject: &Subject,
-        _pk_model: PkModel,
-        dose_lagtimes: &[f64],
-    ) -> Self {
+    pub fn for_subject(subject: &Subject, _pk_model: PkModel, dose_lagtimes: &[f64]) -> Self {
         assert!(
             dose_lagtimes.is_empty() || dose_lagtimes.len() == subject.doses.len(),
             "dose_lagtimes length {} does not match subject.doses.len() {}",

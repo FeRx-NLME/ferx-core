@@ -209,11 +209,12 @@ pub fn fit_from_files(
     let opts = options.unwrap_or_default();
     model.bloq_method = opts.bloq_method;
     // SDE models cannot use autodiff — force FD.
-    model.gradient_method = if model.is_sde() && opts.gradient_method != crate::types::GradientMethod::Fd {
-        crate::types::GradientMethod::Fd
-    } else {
-        opts.gradient_method
-    };
+    model.gradient_method =
+        if model.is_sde() && opts.gradient_method != crate::types::GradientMethod::Fd {
+            crate::types::GradientMethod::Fd
+        } else {
+            opts.gradient_method
+        };
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
     // Hash inputs post-fit (same pattern as `run_model_with_data`). The
     // model and CSV were already read by `parse_model_file` and
@@ -359,7 +360,10 @@ fn fit_inner(
                     .to_string(),
             );
         }
-        if chain.iter().any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid)) {
+        if chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
+        {
             return Err(
                 "SDE ([diffusion]) is not supported with method = gn or gn_hybrid. \
                  Use method = foce or method = focei."
@@ -465,11 +469,7 @@ fn fit_inner(
         // covariates). Cheap — one pk_param_fn call per population.
         if let Some(first_subj) = population.subjects.first() {
             let zero_eta = vec![0.0_f64; model.n_eta];
-            let pk = (model.pk_param_fn)(
-                &init_params.theta,
-                &zero_eta,
-                &first_subj.covariates,
-            );
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates);
             if pk.lagtime() < 0.0 {
                 accumulated_warnings.push(format!(
                     "Lagtime evaluates to {:.4} (< 0) at the initial typical-value \
@@ -2744,7 +2744,11 @@ mod sde_integration {
         let opts = fast_foce_opts();
         let result = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
             .expect("SDE fit should succeed");
-        assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
+        assert!(
+            result.ofv.is_finite(),
+            "OFV must be finite, got {}",
+            result.ofv
+        );
     }
 
     #[test]
@@ -2802,7 +2806,11 @@ mod sde_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
             };
-            Population { subjects: vec![subj], covariate_names: Vec::new(), dv_column: "DV".into() }
+            Population {
+                subjects: vec![subj],
+                covariate_names: Vec::new(),
+                dv_column: "DV".into(),
+            }
         };
 
         for method in [EstimationMethod::FoceGn, EstimationMethod::FoceGnHybrid] {

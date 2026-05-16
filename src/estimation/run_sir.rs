@@ -106,8 +106,7 @@ pub fn run_sir(
                     ));
                 }
             }
-            let parsed =
-                crate::parser::model_parser::parse_full_model_file(Path::new(path))?;
+            let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(path))?;
             iov_column_from_parse = parsed.fit_options.iov_column.clone();
             model_owned = Some(parsed.model);
             model_owned.as_ref().unwrap()
@@ -339,8 +338,8 @@ mod tests {
         data_path: &str,
         opts: FitOptions,
     ) -> Option<FitResult> {
-        let fit = fit_from_files(model_path, data_path, None, Some(opts))
-            .expect("fit must converge");
+        let fit =
+            fit_from_files(model_path, data_path, None, Some(opts)).expect("fit must converge");
         if fit.covariance_matrix.is_none() {
             eprintln!(
                 "[skip] covariance step did not produce a matrix (likely FD \
@@ -422,12 +421,15 @@ mod tests {
             return;
         };
 
-        let iov_model = crate::parser::model_parser::parse_full_model_file(
-            std::path::Path::new("examples/warfarin_iov.ferx"),
-        )
+        let iov_model = crate::parser::model_parser::parse_full_model_file(std::path::Path::new(
+            "examples/warfarin_iov.ferx",
+        ))
         .expect("parse warfarin_iov.ferx")
         .model;
-        assert!(iov_model.n_kappa > 0, "warfarin_iov.ferx must declare kappa");
+        assert!(
+            iov_model.n_kappa > 0,
+            "warfarin_iov.ferx must declare kappa"
+        );
 
         let err = run_sir(&fit, Some(&iov_model), None, &opts).unwrap_err();
         assert!(
@@ -492,10 +494,7 @@ mod tests {
 
         // Tamper with both files — would fail any disk-based hash check.
         for p in [&model_path, &data_path] {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(p)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
             writeln!(f, "# tampered").unwrap();
             drop(f);
         }

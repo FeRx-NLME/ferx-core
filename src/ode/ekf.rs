@@ -91,7 +91,12 @@ fn propagate_covariance(
 ///
 /// Returns `(P_updated, p_obs_cmt)` where `p_obs_cmt` is P[obs_cmt, obs_cmt]
 /// *before* the update — the component the caller adds to residual variance.
-fn kalman_update(p_mat: &DMatrix<f64>, obs_cmt: usize, r_obs: f64, n: usize) -> (DMatrix<f64>, f64) {
+fn kalman_update(
+    p_mat: &DMatrix<f64>,
+    obs_cmt: usize,
+    r_obs: f64,
+    n: usize,
+) -> (DMatrix<f64>, f64) {
     let p_cc = p_mat[(obs_cmt, obs_cmt)];
     let s = p_cc + r_obs; // innovation variance
     let p_obs = p_cc; // returned to caller before update
@@ -156,7 +161,13 @@ pub fn solve_ekf(
 
     let mut u = vec![0.0f64; n];
     let mut p_mat = DMatrix::zeros(n, n);
-    let mut results = vec![EkfObsPoint { ipred: 0.0, p_obs: 0.0 }; n_obs];
+    let mut results = vec![
+        EkfObsPoint {
+            ipred: 0.0,
+            p_obs: 0.0
+        };
+        n_obs
+    ];
 
     let obs_map: HashMap<u64, usize> = obs_times
         .iter()
@@ -183,7 +194,9 @@ pub fn solve_ekf(
 
         // Apply bolus doses at t_start
         for dose in doses {
-            if (dose.time - t_start).abs() < 1e-12 && !(dose.is_infusion() && dose.duration > 0.0 && dose.duration.is_finite()) {
+            if (dose.time - t_start).abs() < 1e-12
+                && !(dose.is_infusion() && dose.duration > 0.0 && dose.duration.is_finite())
+            {
                 let cmt_idx = dose.cmt.saturating_sub(1);
                 if cmt_idx < n {
                     u[cmt_idx] += dose.amt;
@@ -241,7 +254,14 @@ pub fn solve_ekf(
         };
 
         // Integrate mean state
-        let sol = solve_ode(&wrapped_rhs, &u, (t_start, t_end), pk_params_flat, &saveat, &opts);
+        let sol = solve_ode(
+            &wrapped_rhs,
+            &u,
+            (t_start, t_end),
+            pk_params_flat,
+            &saveat,
+            &opts,
+        );
 
         // Propagate covariance and update at obs times within this segment
         let mut t_prev = t_start;
@@ -258,7 +278,9 @@ pub fn solve_ekf(
                 for s in 0..n_steps {
                     // Linearly interpolate state across sub-step midpoint
                     let alpha_mid = (s as f64 + 0.5) / n_steps as f64;
-                    let u_mid: Vec<f64> = u_prev.iter().zip(&pt.u)
+                    let u_mid: Vec<f64> = u_prev
+                        .iter()
+                        .zip(&pt.u)
                         .map(|(&a, &b)| a + alpha_mid * (b - a))
                         .collect();
                     let t_mid = t_prev + alpha_mid * dt;
@@ -439,7 +461,11 @@ mod tests {
         );
 
         for pt in &ekf_pts {
-            assert!(pt.p_obs > 0.0, "expected p_obs > 0 with diffusion, got {}", pt.p_obs);
+            assert!(
+                pt.p_obs > 0.0,
+                "expected p_obs > 0 with diffusion, got {}",
+                pt.p_obs
+            );
         }
     }
 }
