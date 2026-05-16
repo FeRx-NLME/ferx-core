@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-f08615c6.js";
+            window.path_to_searchindex_js = "searchindex-33a6e33e.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-61c3128c.js"></script>
+        <script src="toc-e860d047.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1286,11 +1286,122 @@ of <code>0</code>.</p>
 <li><strong>Compartment indexing</strong>: Compartments are 1-indexed in the data file (<code>CMT=1</code> corresponds to the first state in the <code>states</code> list)</li>
 <li><strong>Multiple doses</strong>: The ODE is integrated in segments between dose events, with state discontinuities at each bolus</li>
 </ul>
+<h2 id="stochastic-ode-models-sde"><a class="header" href="#stochastic-ode-models-sde">Stochastic ODE Models (SDE)</a></h2>
+<p>To model within-subject system noise that accumulates between observations, add
+a <code>[diffusion]</code> block to your ODE model.  See <a href="#stochastic-differential-equations-sde--diffusion">Stochastic Differential
+Equations</a> for a full description, worked example, and comparison
+with sigma and omega.</p>
 <h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
 <ul>
 <li>The observable compartment contains the amount (not concentration). Divide by volume in the ODE equations if needed</li>
 <li>Steady-state (<code>SS=1</code>) is not directly supported for ODE models</li>
+<li>SDE (<code>[diffusion]</code>) is not compatible with SAEM or the autodiff gradient path</li>
 </ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="stochastic-differential-equations-sde--diffusion"><a class="header" href="#stochastic-differential-equations-sde--diffusion">Stochastic Differential Equations (SDE / Diffusion)</a></h1>
+<p>The <code>[diffusion]</code> block adds continuous stochastic noise to ODE state variables.
+This models <em>system noise</em> — structural uncertainty that accumulates between
+observations — as opposed to measurement noise (sigma) or inter-individual
+variability (omega).</p>
+<h2 id="what-is-system-noise"><a class="header" href="#what-is-system-noise">What is system noise?</a></h2>
+<p>In a standard ODE-based NLME model the trajectory of each subject is
+deterministic once the individual parameters are fixed.  In an SDE model the
+ODE is replaced by an Itô stochastic differential equation:</p>
+<pre><code>dX = f(X, t, θ) dt  +  diag(σ_w) dW
+</code></pre>
+<p>where <code>dW</code> is a vector of independent Wiener increments.  The diagonal entries
+<code>σ_w</code> are the <em>diffusion standard deviations</em>; their squares <code>σ²_w</code> are the
+<strong>diffusion variances</strong> declared in <code>[diffusion]</code>.</p>
+<p>FeRx estimates the diffusion variances with an Extended Kalman Filter (EKF):
+the state covariance matrix <code>P</code> is propagated alongside the ODE trajectory and
+updated at each observation.  The total observation variance is:</p>
+<pre><code>V_total = P_ekf[obs_cmt, obs_cmt]  +  V_residual
+</code></pre>
+<p>where <code>V_residual</code> is the variance from the <code>[error_model]</code> (sigma-based).</p>
+<h2 id="declaring-diffusion-variances"><a class="header" href="#declaring-diffusion-variances">Declaring diffusion variances</a></h2>
+<pre><code>[diffusion]
+  STATE_NAME ~ initial_value
+  STATE_NAME ~ initial_value FIX
+</code></pre>
+<ul>
+<li><code>STATE_NAME</code> must be one of the state names listed in <code>[structural_model]</code>.</li>
+<li>The value after <code>~</code> is the <strong>initial estimate of the variance</strong> σ²_w (≥ 0).</li>
+<li><code>FIX</code> pins the parameter at its initial value (not estimated).</li>
+<li>Each declared state gets a population parameter named <code>DIFF_&lt;STATE&gt;</code> (e.g.,
+<code>DIFF_CENTRAL</code>).  These appear in <code>theta_names</code> of the fit result alongside
+the regular structural parameters.</li>
+</ul>
+<h2 id="how-diffusion-differs-from-sigma-and-omega"><a class="header" href="#how-diffusion-differs-from-sigma-and-omega">How diffusion differs from sigma and omega</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th><strong>sigma</strong></th><th><strong>omega</strong></th><th><strong>diffusion</strong></th></tr>
+</thead>
+<tbody>
+<tr><td>What it is</td><td>Measurement noise (assay/residual error)</td><td>Between-subject variability</td><td>Within-subject system noise</td></tr>
+<tr><td>When it acts</td><td>At each observation time</td><td>At model initialisation (between subjects)</td><td>Continuously along the trajectory</td></tr>
+<tr><td>What it affects</td><td>Observation residuals only</td><td>Individual parameter values</td><td>State trajectories between doses</td></tr>
+<tr><td>NONMEM analogy</td><td><code>EPS</code> / <code>SIGMA</code></td><td><code>ETA</code> / <code>OMEGA</code></td><td>No direct analogy</td></tr>
+</tbody>
+</table>
+</div>
+<p>A large estimated <code>DIFF_CENTRAL</code> relative to sigma suggests that the ODE
+structure is missing an important mechanism (e.g., a compartment, a feedback
+loop, or a covariate effect).</p>
+<h2 id="when-to-use-sde-models"><a class="header" href="#when-to-use-sde-models">When to use SDE models</a></h2>
+<p>The primary signal is residual autocorrelation.  If the IWRES Durbin-Watson
+statistic is low (&lt; 1.5) in a fitted ODE model, adding a diffusion term on the
+slow-varying compartment often absorbs the systematic drift.</p>
+<h2 id="worked-example-1-cpt-iv-with-central-diffusion"><a class="header" href="#worked-example-1-cpt-iv-with-central-diffusion">Worked example: 1-cpt IV with central diffusion</a></h2>
+<pre><code>[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 1.0
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[diffusion]
+  central ~ 0.5       # initial estimate for DIFF_CENTRAL
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method = foce
+</code></pre>
+<p>The estimated <code>DIFF_CENTRAL</code> gives the variance of the stochastic driving noise
+on the central compartment amount per unit time.  A value near zero indicates
+the ODE alone explains the data; a large value suggests model misspecification.</p>
+<h2 id="constraints-and-incompatibilities"><a class="header" href="#constraints-and-incompatibilities">Constraints and incompatibilities</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Situation</th><th>Behaviour</th></tr>
+</thead>
+<tbody>
+<tr><td><code>[diffusion]</code> on an analytical PK model (<code>pk ...</code>)</td><td>Parse-time error</td></tr>
+<tr><td><code>method = saem</code> with <code>[diffusion]</code></td><td>Hard error at fit time</td></tr>
+<tr><td><code>gradient_method = ad</code> with <code>[diffusion]</code></td><td>Warning emitted; automatically switched to <code>fd</code></td></tr>
+<tr><td>State name not in <code>states = [...]</code></td><td>Parse-time error</td></tr>
+<tr><td>Negative initial value</td><td>Parse-time error</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="ferx-r-usage-note"><a class="header" href="#ferx-r-usage-note">ferx-r usage note</a></h2>
+<p>When using FeRx from R via the ferx-r package, the <code>[diffusion]</code> block is part
+of the <code>.ferx</code> model file and requires no special R-side argument.  The
+estimated diffusion variances appear in the returned fit object alongside other
+theta parameters.  See the ferx-r documentation (<code>?ferx_fit</code>) for details on
+accessing <code>theta_names</code> and interpreting <code>uses_sde</code> in the fit object.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="fit-options"><a class="header" href="#fit-options">Fit Options</a></h1>
 <p>The optional <code>[fit_options]</code> block configures the estimation method and optimizer settings.</p>

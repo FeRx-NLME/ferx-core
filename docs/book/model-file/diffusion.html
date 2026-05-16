@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Estimation Methods - FeRx-NLME Documentation</title>
+        <title>Stochastic Differential Equations - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,59 +177,120 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="estimation-methods"><a class="header" href="#estimation-methods">Estimation Methods</a></h1>
-<p>FeRx implements two families of estimation methods for nonlinear mixed effects models:</p>
+                        <h1 id="stochastic-differential-equations-sde--diffusion"><a class="header" href="#stochastic-differential-equations-sde--diffusion">Stochastic Differential Equations (SDE / Diffusion)</a></h1>
+<p>The <code>[diffusion]</code> block adds continuous stochastic noise to ODE state variables.
+This models <em>system noise</em> — structural uncertainty that accumulates between
+observations — as opposed to measurement noise (sigma) or inter-individual
+variability (omega).</p>
+<h2 id="what-is-system-noise"><a class="header" href="#what-is-system-noise">What is system noise?</a></h2>
+<p>In a standard ODE-based NLME model the trajectory of each subject is
+deterministic once the individual parameters are fixed.  In an SDE model the
+ODE is replaced by an Itô stochastic differential equation:</p>
+<pre><code>dX = f(X, t, θ) dt  +  diag(σ_w) dW
+</code></pre>
+<p>where <code>dW</code> is a vector of independent Wiener increments.  The diagonal entries
+<code>σ_w</code> are the <em>diffusion standard deviations</em>; their squares <code>σ²_w</code> are the
+<strong>diffusion variances</strong> declared in <code>[diffusion]</code>.</p>
+<p>FeRx estimates the diffusion variances with an Extended Kalman Filter (EKF):
+the state covariance matrix <code>P</code> is propagated alongside the ODE trajectory and
+updated at each observation.  The total observation variance is:</p>
+<pre><code>V_total = P_ekf[obs_cmt, obs_cmt]  +  V_residual
+</code></pre>
+<p>where <code>V_residual</code> is the variance from the <code>[error_model]</code> (sigma-based).</p>
+<h2 id="declaring-diffusion-variances"><a class="header" href="#declaring-diffusion-variances">Declaring diffusion variances</a></h2>
+<pre><code>[diffusion]
+  STATE_NAME ~ initial_value
+  STATE_NAME ~ initial_value FIX
+</code></pre>
 <ul>
-<li>
-<p><strong><a href="foce.html">FOCE / FOCEI</a></strong> – First-Order Conditional Estimation (with or without interaction). The workhorse of population PK, using nested optimization to find maximum likelihood estimates.</p>
-</li>
-<li>
-<p><strong><a href="gauss-newton.html">Gauss-Newton (BHHH)</a></strong> – A fast alternative that exploits the nonlinear-least-squares structure of the FOCE objective. Converges in 10-30 iterations using the outer product of per-subject gradients as an approximate Hessian. Available as pure GN or a GN+FOCEI hybrid.</p>
-</li>
-<li>
-<p><strong><a href="saem.html">SAEM</a></strong> – Stochastic Approximation Expectation-Maximization. Uses MCMC sampling for random effects, providing more robust convergence on complex models.</p>
-</li>
-<li>
-<p><strong><a href="sir.html">SIR</a></strong> – Sampling Importance Resampling. An optional post-estimation step that provides non-parametric parameter uncertainty estimates (95% CIs), more robust than the asymptotic covariance matrix.</p>
-</li>
+<li><code>STATE_NAME</code> must be one of the state names listed in <code>[structural_model]</code>.</li>
+<li>The value after <code>~</code> is the <strong>initial estimate of the variance</strong> σ²_w (≥ 0).</li>
+<li><code>FIX</code> pins the parameter at its initial value (not estimated).</li>
+<li>Each declared state gets a population parameter named <code>DIFF_&lt;STATE&gt;</code> (e.g.,
+<code>DIFF_CENTRAL</code>).  These appear in <code>theta_names</code> of the fit result alongside
+the regular structural parameters.</li>
 </ul>
-<h2 id="quick-comparison"><a class="header" href="#quick-comparison">Quick Comparison</a></h2>
+<h2 id="how-diffusion-differs-from-sigma-and-omega"><a class="header" href="#how-diffusion-differs-from-sigma-and-omega">How diffusion differs from sigma and omega</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Feature</th><th>FOCE/FOCEI</th><th>Gauss-Newton</th><th>SAEM</th></tr>
+<tr><th></th><th><strong>sigma</strong></th><th><strong>omega</strong></th><th><strong>diffusion</strong></th></tr>
 </thead>
 <tbody>
-<tr><td>Random effect estimation</td><td>MAP (optimization)</td><td>MAP (optimization)</td><td>MCMC (sampling)</td></tr>
-<tr><td>Convergence speed</td><td>Medium (~50-100 evals)</td><td>Fast (~10-30 iterations)</td><td>Slower (~400 iterations)</td></tr>
-<tr><td>Local minima robustness</td><td>Can get stuck</td><td>Can get stuck</td><td>More robust</td></tr>
-<tr><td>Gradient required</td><td>Yes (AD or FD)</td><td>Yes (FD, per-subject)</td><td>No (for E-step)</td></tr>
-<tr><td>Stochastic</td><td>No</td><td>No</td><td>Yes</td></tr>
-<tr><td>Best for</td><td>General use</td><td>Fast iteration, well-conditioned models</td><td>Complex models, many random effects</td></tr>
+<tr><td>What it is</td><td>Measurement noise (assay/residual error)</td><td>Between-subject variability</td><td>Within-subject system noise</td></tr>
+<tr><td>When it acts</td><td>At each observation time</td><td>At model initialisation (between subjects)</td><td>Continuously along the trajectory</td></tr>
+<tr><td>What it affects</td><td>Observation residuals only</td><td>Individual parameter values</td><td>State trajectories between doses</td></tr>
+<tr><td>NONMEM analogy</td><td><code>EPS</code> / <code>SIGMA</code></td><td><code>ETA</code> / <code>OMEGA</code></td><td>No direct analogy</td></tr>
 </tbody>
 </table>
 </div>
-<h2 id="choosing-a-method"><a class="header" href="#choosing-a-method">Choosing a Method</a></h2>
-<p><strong>Start with FOCE</strong> for standard 1- or 2-compartment models with 2-4 random effects. It is deterministic and well-understood.</p>
-<p><strong>Try Gauss-Newton (<code>gn</code> or <code>gn_hybrid</code>)</strong> when you want faster convergence during model development, or when FOCE is slow to converge.</p>
-<p><strong>Switch to SAEM</strong> when:</p>
-<ul>
-<li>FOCE fails to converge or produces implausible estimates</li>
-<li>The model has many random effects (&gt;4)</li>
-<li>You suspect the FOCE solution is a local minimum</li>
-<li>The model has complex nonlinear random effect structure</li>
-</ul>
-<p>All methods produce comparable results on well-behaved models. The final OFV from SAEM and GN is computed using the FOCE approximation, so AIC/BIC values are directly comparable.</p>
+<p>A large estimated <code>DIFF_CENTRAL</code> relative to sigma suggests that the ODE
+structure is missing an important mechanism (e.g., a compartment, a feedback
+loop, or a covariate effect).</p>
+<h2 id="when-to-use-sde-models"><a class="header" href="#when-to-use-sde-models">When to use SDE models</a></h2>
+<p>The primary signal is residual autocorrelation.  If the IWRES Durbin-Watson
+statistic is low (&lt; 1.5) in a fitted ODE model, adding a diffusion term on the
+slow-varying compartment often absorbs the systematic drift.</p>
+<h2 id="worked-example-1-cpt-iv-with-central-diffusion"><a class="header" href="#worked-example-1-cpt-iv-with-central-diffusion">Worked example: 1-cpt IV with central diffusion</a></h2>
+<pre><code>[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD ~ 1.0
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[diffusion]
+  central ~ 0.5       # initial estimate for DIFF_CENTRAL
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method = foce
+</code></pre>
+<p>The estimated <code>DIFF_CENTRAL</code> gives the variance of the stochastic driving noise
+on the central compartment amount per unit time.  A value near zero indicates
+the ODE alone explains the data; a large value suggests model misspecification.</p>
+<h2 id="constraints-and-incompatibilities"><a class="header" href="#constraints-and-incompatibilities">Constraints and incompatibilities</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Situation</th><th>Behaviour</th></tr>
+</thead>
+<tbody>
+<tr><td><code>[diffusion]</code> on an analytical PK model (<code>pk ...</code>)</td><td>Parse-time error</td></tr>
+<tr><td><code>method = saem</code> with <code>[diffusion]</code></td><td>Hard error at fit time</td></tr>
+<tr><td><code>gradient_method = ad</code> with <code>[diffusion]</code></td><td>Warning emitted; automatically switched to <code>fd</code></td></tr>
+<tr><td>State name not in <code>states = [...]</code></td><td>Parse-time error</td></tr>
+<tr><td>Negative initial value</td><td>Parse-time error</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="ferx-r-usage-note"><a class="header" href="#ferx-r-usage-note">ferx-r usage note</a></h2>
+<p>When using FeRx from R via the ferx-r package, the <code>[diffusion]</code> block is part
+of the <code>.ferx</code> model file and requires no special R-side argument.  The
+estimated diffusion variances appear in the returned fit object alongside other
+theta parameters.  See the ferx-r documentation (<code>?ferx_fit</code>) for details on
+accessing <code>theta_names</code> and interpreting <code>uses_sde</code> in the fit object.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../model-file/simulation.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../model-file/ode-models.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../estimation/foce.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../model-file/fit-options.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -239,11 +300,11 @@
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../model-file/simulation.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../model-file/ode-models.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../estimation/foce.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../model-file/fit-options.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
