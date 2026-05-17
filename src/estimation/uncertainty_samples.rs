@@ -381,6 +381,8 @@ mod tests {
             covariance_status: crate::types::CovarianceStatus::Computed,
             shrinkage_eta: vec![],
             shrinkage_eps: f64::NAN,
+            iwres_lag1_r: f64::NAN,
+            dw_statistic: f64::NAN,
             wall_time_secs: 0.0,
             model_name: String::new(),
             ferx_version: String::new(),

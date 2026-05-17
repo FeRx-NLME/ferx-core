@@ -6,7 +6,7 @@ use crate::pk;
 use crate::stats::likelihood::{
     compute_cwres, foce_subject_nll, foce_subject_nll_iov, split_obs_by_occasion,
 };
-use crate::stats::residual_error::compute_iwres;
+use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::path::Path;
@@ -725,6 +725,8 @@ fn fit_inner(
         warnings.push(w);
     }
 
+    let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
+
     // Covariance status
     let covariance_status = if !options.run_covariance_step {
         CovarianceStatus::NotRequested
@@ -785,6 +787,28 @@ fn fit_inner(
         )
     });
 
+    // DW autocorrelation warnings
+    if dw_statistic.is_finite() {
+        if dw_statistic < 1.5 {
+            let mut msg = format!(
+                "Positive IWRES autocorrelation detected (Durbin-Watson = {:.2}). \
+                Structural model may be missing dynamics. Consider a transit \
+                absorption model, additional compartment, or IOV on ka/F.",
+                dw_statistic
+            );
+            if model.ode_spec.is_some() {
+                msg.push_str(" For ODE models, SDE process noise may also help.");
+            }
+            warnings.push(msg);
+        } else if dw_statistic > 2.5 {
+            warnings.push(format!(
+                "Negative IWRES autocorrelation detected (Durbin-Watson = {:.2}). \
+                Possible over-parameterization or misspecified error model.",
+                dw_statistic
+            ));
+        }
+    }
+
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
@@ -839,6 +863,8 @@ fn fit_inner(
         covariance_status,
         shrinkage_eta,
         shrinkage_eps,
+        iwres_lag1_r,
+        dw_statistic,
         wall_time_secs,
         model_name: model.name.clone(),
         ferx_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2584,6 +2610,8 @@ mod simulate_with_uncertainty_tests {
             covariance_status: CovarianceStatus::Computed,
             shrinkage_eta: vec![],
             shrinkage_eps: f64::NAN,
+            iwres_lag1_r: f64::NAN,
+            dw_statistic: f64::NAN,
             wall_time_secs: 0.0,
             model_name: String::new(),
             ferx_version: String::new(),

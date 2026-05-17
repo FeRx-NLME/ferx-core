@@ -818,6 +818,8 @@ mod tests {
             covariance_status: CovarianceStatus::NotRequested,
             shrinkage_eta: Vec::new(),
             shrinkage_eps: f64::NAN,
+            iwres_lag1_r: f64::NAN,
+            dw_statistic: f64::NAN,
             wall_time_secs: 0.0,
             model_name: "test".to_string(),
             ferx_version: env!("CARGO_PKG_VERSION").to_string(),

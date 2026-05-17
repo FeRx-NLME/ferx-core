@@ -1,4 +1,4 @@
-use crate::types::ErrorModel;
+use crate::types::{ErrorModel, SubjectResult};
 
 const MIN_VARIANCE: f64 = 1e-12;
 
@@ -50,6 +50,64 @@ pub fn compute_iwres(
         .zip(ipreds.iter())
         .map(|(&y, &f)| iwres(y, f, error_model, sigma_values))
         .collect()
+}
+
+/// Compute pooled lag-1 autocorrelation diagnostics on IWRES across subjects.
+///
+/// Subjects with fewer than 2 finite IWRES values are skipped.
+/// Returns `(lag1_r, durbin_watson)` where DW = 2.0 indicates no autocorrelation.
+/// Returns `(f64::NAN, f64::NAN)` when no subject has enough observations.
+pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
+    // Accumulators for Durbin-Watson: Σ(eᵢ - eᵢ₋₁)², Σeᵢ²
+    let mut dw_num = 0.0_f64;
+    let mut dw_den = 0.0_f64;
+
+    // Accumulators for pooled lag-1 Pearson r
+    let mut sum_xy = 0.0_f64; // Σ e[t] * e[t+1]
+    let mut sum_x = 0.0_f64;  // Σ e[t]
+    let mut sum_y = 0.0_f64;  // Σ e[t+1]
+    let mut sum_x2 = 0.0_f64; // Σ e[t]²
+    let mut sum_y2 = 0.0_f64; // Σ e[t+1]²
+    let mut n_pairs: usize = 0;
+
+    for subj in subjects {
+        let valid: Vec<f64> = subj.iwres.iter().copied().filter(|v| v.is_finite()).collect();
+        if valid.len() < 2 {
+            continue;
+        }
+        // DW accumulation
+        dw_den += valid.iter().map(|e| e * e).sum::<f64>();
+        for w in valid.windows(2) {
+            let diff = w[1] - w[0];
+            dw_num += diff * diff;
+        }
+        // Lag-1 Pearson accumulation
+        for w in valid.windows(2) {
+            let x = w[0];
+            let y = w[1];
+            sum_x += x;
+            sum_y += y;
+            sum_x2 += x * x;
+            sum_y2 += y * y;
+            sum_xy += x * y;
+            n_pairs += 1;
+        }
+    }
+
+    if n_pairs == 0 {
+        return (f64::NAN, f64::NAN);
+    }
+
+    let n = n_pairs as f64;
+    let lag1_r = {
+        let num = n * sum_xy - sum_x * sum_y;
+        let den = ((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y)).sqrt();
+        if den == 0.0 { 0.0 } else { num / den }
+    };
+
+    let dw = if dw_den == 0.0 { f64::NAN } else { dw_num / dw_den };
+
+    (lag1_r, dw)
 }
 
 #[cfg(test)]
@@ -126,5 +184,71 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_relative_eq!(result[0], 2.0, epsilon = 1e-12);
         assert_relative_eq!(result[1], 2.0, epsilon = 1e-12);
+    }
+
+    fn make_subject(iwres: Vec<f64>) -> SubjectResult {
+        use nalgebra::DVector;
+        SubjectResult {
+            id: "1".to_string(),
+            eta: DVector::zeros(0),
+            ipred: vec![0.0; iwres.len()],
+            pred: vec![0.0; iwres.len()],
+            iwres,
+            cwres: vec![],
+            ofv_contribution: 0.0,
+            cens: vec![],
+            n_obs: 0,
+        }
+    }
+
+    #[test]
+    fn test_dw_monotone_positive_autocorrelation() {
+        // Monotonically increasing → strong positive autocorrelation → DW near 0
+        let subj = make_subject(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+        let (r, dw) = iwres_autocorrelation(&[subj]);
+        assert!(dw < 1.5, "expected DW < 1.5 for monotone sequence, got {dw}");
+        assert!(r > 0.5, "expected positive lag-1 r, got {r}");
+    }
+
+    #[test]
+    fn test_dw_alternating_negative_autocorrelation() {
+        // Alternating signs → strong negative autocorrelation → DW near 4
+        let subj = make_subject(vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0]);
+        let (_r, dw) = iwres_autocorrelation(&[subj]);
+        assert!(dw > 2.5, "expected DW > 2.5 for alternating sequence, got {dw}");
+    }
+
+    #[test]
+    fn test_dw_uncorrelated_near_two() {
+        // Residuals that cancel out → DW close to 2
+        let subj = make_subject(vec![1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0]);
+        let (_r, dw) = iwres_autocorrelation(&[subj]);
+        // Not a strict test — just check it's in a reasonable mid range
+        assert!(dw > 1.0 && dw < 3.5, "expected DW near 2 for mixed signs, got {dw}");
+    }
+
+    #[test]
+    fn test_nan_iwres_skipped() {
+        let subj = make_subject(vec![f64::NAN, 1.0, 2.0, f64::NAN, 3.0]);
+        let (_r, dw) = iwres_autocorrelation(&[subj]);
+        // Should not panic and should produce a finite result based on valid values
+        assert!(dw.is_finite(), "DW should be finite after skipping NaN entries");
+    }
+
+    #[test]
+    fn test_single_observation_subject_skipped() {
+        let single = make_subject(vec![1.0]);
+        let multi = make_subject(vec![1.0, 2.0, 3.0]);
+        let (r, dw) = iwres_autocorrelation(&[single, multi]);
+        assert!(dw.is_finite());
+        assert!(r.is_finite());
+    }
+
+    #[test]
+    fn test_no_valid_subjects_returns_nan() {
+        let subj = make_subject(vec![1.0]); // < 2 valid
+        let (r, dw) = iwres_autocorrelation(&[subj]);
+        assert!(r.is_nan());
+        assert!(dw.is_nan());
     }
 }

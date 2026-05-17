@@ -939,6 +939,13 @@ pub struct FitResult {
     pub shrinkage_eta: Vec<f64>,
     /// EPS shrinkage: `1 - SD(IWRES)`.  `NaN` when fewer than 2 valid residuals.
     pub shrinkage_eps: f64,
+    /// Pooled lag-1 Pearson correlation of IWRES across subjects.
+    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    pub iwres_lag1_r: f64,
+    /// Pooled Durbin-Watson statistic for IWRES within subjects.
+    /// 2.0 = no autocorrelation; < 1.5 = positive; > 2.5 = negative.
+    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    pub dw_statistic: f64,
     /// Wall-clock time for the complete fit in seconds.
     pub wall_time_secs: f64,
     /// Model name (from the `.ferx` file or "Unnamed").

@@ -173,6 +173,10 @@ struct FitWire {
     error_model: String,
     #[serde(with = "f64_nan_as_null")]
     shrinkage_eps: f64,
+    #[serde(default = "default_nan", with = "f64_nan_as_null")]
+    iwres_lag1_r: f64,
+    #[serde(default = "default_nan", with = "f64_nan_as_null")]
+    dw_statistic: f64,
     covariance_matrix: Option<MatrixWire>,
     cov_eigenvalues: Option<Vec<f64>>,
     #[serde(with = "opt_f64_nan_as_null")]
@@ -304,6 +308,10 @@ impl MatrixWire {
 // ---------------------------------------------------------------------------
 // Enum <-> string mappings (kept local so types.rs stays unchanged)
 // ---------------------------------------------------------------------------
+
+fn default_nan() -> f64 {
+    f64::NAN
+}
 
 fn method_to_str(m: EstimationMethod) -> &'static str {
     match m {
@@ -585,6 +593,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         },
         error_model: error_model_to_str(r.error_model).into(),
         shrinkage_eps: r.shrinkage_eps,
+        iwres_lag1_r: r.iwres_lag1_r,
+        dw_statistic: r.dw_statistic,
         covariance_matrix: r.covariance_matrix.as_ref().map(MatrixWire::from),
         cov_eigenvalues: r.cov_eigenvalues.clone(),
         cov_condition_number: r.cov_condition_number,
@@ -1326,6 +1336,8 @@ fn wire_to_fit_result(
         covariance_status: covariance_status_from_str(&w.covariance_status)?,
         shrinkage_eta: w.omega.shrinkage,
         shrinkage_eps: w.shrinkage_eps,
+        iwres_lag1_r: w.iwres_lag1_r,
+        dw_statistic: w.dw_statistic,
         wall_time_secs: w.wall_time_secs,
         model_name: w.model_name,
         ferx_version: w.ferx_version,
@@ -1477,6 +1489,8 @@ mod tests {
             covariance_status: CovarianceStatus::Computed,
             shrinkage_eta: vec![0.1, 0.15],
             shrinkage_eps: 0.05,
+            iwres_lag1_r: 0.12,
+            dw_statistic: 1.75,
             wall_time_secs: 1.234,
             model_name: "test_model".into(),
             ferx_version: "0.1.0".into(),
