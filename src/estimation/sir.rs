@@ -16,7 +16,7 @@ use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal, WeightedIndex};
+use rand_distr::{ChiSquared, Distribution, StandardNormal, WeightedIndex};
 use rayon::prelude::*;
 
 /// Results from the SIR procedure.
@@ -126,18 +126,37 @@ pub fn run_sir_core(
         );
     }
 
-    // Step 1: Pre-generate all samples (RNG is sequential)
-    let log_q_hat = -0.5 * (n_packed as f64 * (2.0 * std::f64::consts::PI).ln() + log_det_proposal);
+    // Step 1: Pre-generate all samples (RNG is sequential).
+    // Use a multivariate Student-t proposal with nu degrees of freedom.
+    // Sampling: draw z ~ N(0,I), chi2 ~ chi2(nu), then scale z by sqrt(nu/chi2).
+    // Heavier tails than MVN improve ESS for parameters near boundaries (e.g. omega variances).
+    let nu = options.sir_df;
+    let chi2_dist = ChiSquared::new(nu).map_err(|e| format!("sir_df invalid: {e}"))?;
+
+    // Log-normalisation constant for the multivariate Student-t density.
+    // log p_t(x_hat) = lgamma((nu+d)/2) - lgamma(nu/2) - d/2*log(nu*pi) - 0.5*log_det_proposal
+    // At the centre x_hat the quadratic form z^T z = 0, so:
+    let d = n_packed as f64;
+    let log_q_hat = lgamma((nu + d) / 2.0)
+        - lgamma(nu / 2.0)
+        - (d / 2.0) * (nu * std::f64::consts::PI).ln()
+        - 0.5 * log_det_proposal;
 
     let mut z_vectors: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
     let mut samples: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
     for _ in 0..n_samples {
         let z: Vec<f64> = (0..n_packed).map(|_| rng.sample(StandardNormal)).collect();
+        let chi2: f64 = chi2_dist.sample(&mut rng);
+        let scale = (nu / chi2).sqrt();
         let z_vec = DVector::from_column_slice(&z);
-        let delta = &proposal_chol * &z_vec;
+        let delta = &proposal_chol * &z_vec * scale;
         let x_k: Vec<f64> = x_hat.iter().zip(delta.iter()).map(|(a, b)| a + b).collect();
         samples.push(x_k);
-        z_vectors.push(z);
+        // Store the standardised z (before chi2 scaling) for density evaluation.
+        // For Student-t, the quadratic form uses the scaled residual L^{-1}(x_k - x_hat) = z*scale,
+        // so we store z and scale separately — but we can recompute scale from chi2.
+        // Simpler: store the actual scaled z = z * scale.
+        z_vectors.push(z.into_iter().map(|zi| zi * scale).collect());
     }
 
     // Step 2: Evaluate importance weights in parallel (warm-started inner loop)
@@ -211,12 +230,15 @@ pub fn run_sir_core(
 
             let dofv = ofv_k - ofv_hat;
 
-            // Log-proposal density: ||z||^2 is the quadratic form since x_k = x_hat + L*z
+            // Log Student-t proposal density at x_k.
+            // z holds the scaled standardised residual L^{-1}(x_k - x_hat), so
+            // the quadratic form is z^T z (already in the scaled space).
             let quad_form: f64 = z.iter().map(|zi| zi * zi).sum();
-            let log_q_k = -0.5
-                * (n_packed as f64 * (2.0 * std::f64::consts::PI).ln()
-                    + log_det_proposal
-                    + quad_form);
+            let log_q_k = lgamma((nu + d) / 2.0)
+                - lgamma(nu / 2.0)
+                - (d / 2.0) * (nu * std::f64::consts::PI).ln()
+                - 0.5 * log_det_proposal
+                - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
 
             // Importance weight: log w_k = -0.5 * dOFV_k - log_q_k + log_q_hat
             -0.5 * dofv - log_q_k + log_q_hat
@@ -302,6 +324,34 @@ pub fn run_sir_core(
     })
 }
 
+/// Log-gamma function via the Lanczos approximation (g=7, n=9 coefficients).
+/// Accurate to ~15 significant figures for x > 0.5.
+fn lgamma(x: f64) -> f64 {
+    // Lanczos coefficients (g=7)
+    const G: f64 = 7.0;
+    const C: [f64; 9] = [
+        0.999_999_999_999_809_93,
+        676.520_368_121_885_1,
+        -1259.139_216_722_402_8,
+        771.323_428_777_653_08,
+        -176.615_029_162_140_6,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    let xm1 = x - 1.0;
+    let mut sum = C[0];
+    for (i, &c) in C[1..].iter().enumerate() {
+        sum += c / (xm1 + (i + 1) as f64);
+    }
+    let t = xm1 + G + 0.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln()
+        + (xm1 + 0.5) * t.ln()
+        - t
+        + sum.ln()
+}
+
 /// Compute 2.5th and 97.5th percentiles from a sample.
 fn percentile_ci(values: &[f64]) -> (f64, f64) {
     if values.is_empty() {
@@ -341,5 +391,61 @@ mod tests {
         let (lo, hi) = percentile_ci(&[]);
         assert!(lo.is_nan());
         assert!(hi.is_nan());
+    }
+
+    #[test]
+    fn test_lgamma_known_values() {
+        // lgamma(1) = 0, lgamma(2) = 0, lgamma(0.5) = ln(sqrt(pi))
+        assert!((lgamma(1.0)).abs() < 1e-12);
+        assert!((lgamma(2.0)).abs() < 1e-12);
+        let expected_half = (std::f64::consts::PI.sqrt()).ln();
+        assert!((lgamma(0.5) - expected_half).abs() < 1e-10, "lgamma(0.5)={}", lgamma(0.5));
+        // lgamma(5) = ln(4!) = ln(24)
+        assert!((lgamma(5.0) - 24.0_f64.ln()).abs() < 1e-10);
+    }
+
+    /// Student-t log-density at the centre must equal log_q_hat (quadratic form = 0).
+    #[test]
+    fn test_student_t_density_at_centre() {
+        let nu = 5.0_f64;
+        let d = 3.0_f64;
+        let log_det = 0.0_f64; // identity covariance
+        let log_q_hat = lgamma((nu + d) / 2.0)
+            - lgamma(nu / 2.0)
+            - (d / 2.0) * (nu * std::f64::consts::PI).ln()
+            - 0.5 * log_det;
+        // At centre, quad_form = 0, so log_q_k should equal log_q_hat
+        let quad_form = 0.0_f64;
+        let log_q_k = lgamma((nu + d) / 2.0)
+            - lgamma(nu / 2.0)
+            - (d / 2.0) * (nu * std::f64::consts::PI).ln()
+            - 0.5 * log_det
+            - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
+        assert!((log_q_k - log_q_hat).abs() < 1e-12);
+    }
+
+    /// Large nu should recover near-normal proposal (lgamma ratio converges).
+    #[test]
+    fn test_large_nu_approaches_normal() {
+        // For nu=1000, d=2, the Student-t log-density should be very close
+        // to the MVN log-density at the same quadratic form.
+        let nu = 1000.0_f64;
+        let d = 2.0_f64;
+        let log_det = 0.5_f64;
+        let quad_form = 1.5_f64;
+
+        let log_t = lgamma((nu + d) / 2.0)
+            - lgamma(nu / 2.0)
+            - (d / 2.0) * (nu * std::f64::consts::PI).ln()
+            - 0.5 * log_det
+            - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
+
+        let log_mvn = -0.5 * (d * (2.0 * std::f64::consts::PI).ln() + log_det + quad_form);
+
+        assert!(
+            (log_t - log_mvn).abs() < 0.01,
+            "Student-t (nu=1000) vs MVN: diff = {:.4e}",
+            (log_t - log_mvn).abs()
+        );
     }
 }

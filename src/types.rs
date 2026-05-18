@@ -1042,6 +1042,11 @@ pub struct FitOptions {
     /// `simulate_with_uncertainty()`. Adds `n_resamples * n_packed * 8` bytes
     /// to the result; default `false`.
     pub sir_keep_samples: bool,
+    /// Degrees of freedom for the Student-t SIR proposal distribution.
+    /// Heavier tails than the normal improve ESS for parameters near boundaries
+    /// (omega variances, constrained thetas). Default 5.0 follows Dosne (2017).
+    /// Set to a large value (e.g. 100.0) to recover near-normal behaviour.
+    pub sir_df: f64,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -1134,6 +1139,7 @@ impl Default for FitOptions {
             sir_resamples: 250,
             sir_seed: None,
             sir_keep_samples: false,
+            sir_df: 5.0,
             bloq_method: BloqMethod::Drop,
             steihaug_max_iters: 50,
             mu_referencing: true,
@@ -1299,6 +1305,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "sir_resamples",
         "sir_seed",
         "sir_keep_samples",
+        "sir_df",
         "bloq_method",
         "bloq",
         "mu_referencing",

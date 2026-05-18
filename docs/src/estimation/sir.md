@@ -10,7 +10,7 @@ SIR is an optional post-estimation step that provides non-parametric parameter u
 
 SIR uses the maximum likelihood estimates and their covariance matrix as a proposal distribution, then reweights samples based on the actual likelihood:
 
-1. **Sample**: Draw M parameter vectors from a multivariate normal distribution centered on the ML estimates, using the estimation covariance matrix
+1. **Sample**: Draw M parameter vectors from a multivariate Student-t distribution (default ν=5) centered on the ML estimates, using the estimation covariance matrix as the scale
 2. **Importance weighting**: For each sample, compute the objective function value (OFV) and calculate an importance weight based on the ratio of the true likelihood to the proposal density
 3. **Resample**: Draw m vectors (with replacement) proportional to the importance weights
 
@@ -36,6 +36,7 @@ Add `sir = true` to the `[fit_options]` block. The covariance step must also be 
 | `sir_resamples` | `250` | Number of resampled vectors (m). Must be less than `sir_samples` |
 | `sir_seed` | `12345` | RNG seed for reproducibility |
 | `sir_keep_samples` | `false` | Retain the resampled parameter vectors on `FitResult.sir_resamples_packed`. Required for `simulate_with_uncertainty()` with `UncertaintyMethod::Sir`. Adds `n_resamples × n_packed × 8` bytes to the result |
+| `sir_df` | `5.0` | Degrees of freedom ν for the Student-t proposal. Heavier tails (small ν) improve ESS for parameters near boundaries such as omega variances. Set to a large value (e.g. 100) for near-normal behaviour. Dosne (2017) recommends ν=5. |
 
 ## Output
 

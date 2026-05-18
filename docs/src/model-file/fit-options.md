@@ -68,6 +68,7 @@ SIR provides non-parametric parameter uncertainty estimates as an optional post-
 | `sir_resamples` | `250` | Number of resampled vectors (m) |
 | `sir_seed` | `12345` | RNG seed for reproducibility |
 | `sir_keep_samples` | `false` | Retain resampled parameter vectors for `simulate_with_uncertainty()` |
+| `sir_df` | `5.0` | Degrees of freedom for the Student-t proposal; higher values approach a normal proposal |
 
 See [SIR documentation](../estimation/sir.md) for details.
 
