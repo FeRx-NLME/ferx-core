@@ -794,8 +794,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         theta_upper.push(f64::INFINITY);
         theta_fixed.push(is_fixed);
     }
-    n_theta = theta_names.len(); // set here after diffusion thetas are appended above
-                                 // BSV omega is built from the BSV-only eta names (no kappas)
+    // set here after diffusion thetas are appended above
+    n_theta = theta_names.len();
+    // BSV omega is built from the BSV-only eta names (no kappas)
     let omega = build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?;
     let omega_fixed = build_omega_fixed(&omegas, &block_omegas, &eta_names_bsv)?;
     let sigma_values: Vec<f64> = sigmas.iter().map(|s| s.value).collect();
