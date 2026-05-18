@@ -238,7 +238,12 @@ pub fn fit_from_files(
 /// log-packed theta by `exp(N(0, sigma))` and shift identity-packed thetas
 /// (negative lower bound) by `sigma * N(0,1)`. Omega and sigma are left
 /// unchanged — their starting values are typically less important than theta.
-fn perturb_init(params: &ModelParameters, start_idx: usize, sigma: f64, base_seed: u64) -> ModelParameters {
+fn perturb_init(
+    params: &ModelParameters,
+    start_idx: usize,
+    sigma: f64,
+    base_seed: u64,
+) -> ModelParameters {
     if start_idx == 0 {
         return params.clone();
     }
@@ -343,7 +348,8 @@ pub fn fit(
                     None => true,
                     Some((_, b)) => {
                         // Prefer converged over unconverged; then lower OFV
-                        (!b.converged && r.converged) || (b.converged == r.converged && r.ofv < b.ofv)
+                        (!b.converged && r.converged)
+                            || (b.converged == r.converged && r.ofv < b.ofv)
                     }
                 };
                 if better {
@@ -3071,7 +3077,11 @@ mod multi_start_tests {
     use crate::estimation::parameterization::theta_packs_log;
     use crate::types::{FitOptions, ModelParameters, OmegaMatrix, SigmaVector};
 
-    fn make_params(theta: Vec<f64>, theta_lower: Vec<f64>, theta_upper: Vec<f64>) -> ModelParameters {
+    fn make_params(
+        theta: Vec<f64>,
+        theta_lower: Vec<f64>,
+        theta_upper: Vec<f64>,
+    ) -> ModelParameters {
         let n = theta.len();
         ModelParameters {
             theta,
@@ -3081,7 +3091,10 @@ mod multi_start_tests {
             theta_fixed: vec![false; n],
             omega: OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]),
             omega_fixed: vec![false],
-            sigma: SigmaVector { values: vec![0.1], names: vec!["ERR".into()] },
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["ERR".into()],
+            },
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
@@ -3100,7 +3113,11 @@ mod multi_start_tests {
         let p = make_params(vec![5.0, 50.0], vec![0.1, 1.0], vec![100.0, 500.0]);
         let perturbed = perturb_init(&p, 1, 0.3, 42);
         // With sigma=0.3 and seed=43 (42+1), at least one theta should differ
-        let changed = perturbed.theta.iter().zip(p.theta.iter()).any(|(a, b)| (a - b).abs() > 1e-10);
+        let changed = perturbed
+            .theta
+            .iter()
+            .zip(p.theta.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-10);
         assert!(changed, "start 1 should perturb theta");
     }
 
@@ -3110,8 +3127,16 @@ mod multi_start_tests {
         for k in 1..=10 {
             let perturbed = perturb_init(&p, k, 2.0, 42); // large sigma to stress-test bounds
             for (i, &t) in perturbed.theta.iter().enumerate() {
-                assert!(t >= p.theta_lower[i], "start {k}: theta[{i}]={t} < lower={}", p.theta_lower[i]);
-                assert!(t <= p.theta_upper[i], "start {k}: theta[{i}]={t} > upper={}", p.theta_upper[i]);
+                assert!(
+                    t >= p.theta_lower[i],
+                    "start {k}: theta[{i}]={t} < lower={}",
+                    p.theta_lower[i]
+                );
+                assert!(
+                    t <= p.theta_upper[i],
+                    "start {k}: theta[{i}]={t} > upper={}",
+                    p.theta_upper[i]
+                );
             }
         }
     }
