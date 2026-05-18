@@ -1379,7 +1379,6 @@ fn parse_csv_row(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::*;
     use nalgebra::{DMatrix, DVector};
 
     fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResult {

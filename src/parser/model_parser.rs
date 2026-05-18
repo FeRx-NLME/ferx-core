@@ -640,7 +640,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // theta_names is extended below after diffusion thetas are appended
     let mut theta_names: Vec<String> = thetas.iter().map(|t| t.name.clone()).collect();
     let sigma_names: Vec<String> = sigmas.iter().map(|s| s.name.clone()).collect();
-    let mut n_theta = theta_names.len(); // updated below after diffusion thetas
+    let n_theta;
     let n_eta = eta_names_bsv.len(); // BSV-only count
     let n_kappa = kappa_info.names_ordered.len();
     let n_epsilon = sigma_names.len();
@@ -784,7 +784,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         theta_upper.push(f64::INFINITY);
         theta_fixed.push(is_fixed);
     }
-    n_theta = theta_names.len();
+    n_theta = theta_names.len(); // set here after diffusion thetas are appended above
     // BSV omega is built from the BSV-only eta names (no kappas)
     let omega = build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?;
     let omega_fixed = build_omega_fixed(&omegas, &block_omegas, &eta_names_bsv)?;
