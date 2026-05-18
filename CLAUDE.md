@@ -45,6 +45,16 @@ Inline `#[cfg(test)] mod tests` blocks at the bottom of each module (e.g. `src/p
 
 Prefer unit tests of the smallest helper that isolates the new behaviour (e.g. test `detect_mu_refs` directly, not just through a full `fit()` call) — end-to-end fits are too slow and flaky for the default test suite.
 
+**Any test that calls `fit()` and runs to convergence must be marked `#[ignore]`** to keep `cargo test --lib` fast. Add the attribute immediately after `#[test]`:
+
+```rust
+#[test]
+#[ignore = "slow: runs a full optimisation to convergence"]
+fn test_my_new_estimator() { ... }
+```
+
+Ignored tests still run in CI on a weekly schedule and can be triggered manually via `workflow_dispatch`. Fast-failing tests (those that call `fit()` but expect an immediate `Err` without running the optimiser) do not need `#[ignore]`.
+
 ## Documentation
 
 Docs live in `docs/` as an [mdBook](https://rust-lang.github.io/mdBook/):
