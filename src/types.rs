@@ -1065,6 +1065,20 @@ pub struct FitOptions {
     /// pool of `n` threads — so the setting is per-call, not process-wide,
     /// and different fits can use different thread counts.
     pub threads: Option<usize>,
+    /// Number of independent optimizations to run from perturbed starting values.
+    /// `1` (default) is a single run — no behaviour change. When `> 1`, runs are
+    /// launched in parallel via rayon; the result with the lowest OFV among
+    /// converged runs is returned. Start 0 always uses the exact user initials;
+    /// starts 1..n are log-space or additive perturbations of size `start_sigma`.
+    /// Useful for models with local minima (nonlinear elimination, full-block omega,
+    /// many covariates). Nested rayon parallelism (multi-start × per-subject) is
+    /// safe — rayon's work-stealing pool handles it without oversubscription.
+    pub n_starts: usize,
+    /// Log-space standard deviation of the perturbation applied to initial theta
+    /// values for starts 1..n_starts. Log-packed thetas are multiplied by
+    /// `exp(N(0, start_sigma))`; identity-packed thetas (negative lower bound)
+    /// are shifted by `start_sigma * N(0,1)`. Default `0.3` (≈ 30% CV).
+    pub start_sigma: f64,
     /// Name of the column in the dataset that identifies the occasion for each row.
     /// When `Some`, `read_nonmem_csv` populates `Subject::occasions` / `dose_occasions`
     /// and the inner loop estimates per-occasion kappas alongside the BSV etas.
@@ -1144,6 +1158,8 @@ impl Default for FitOptions {
             steihaug_max_iters: 50,
             mu_referencing: true,
             threads: None,
+            n_starts: 1,
+            start_sigma: 0.3,
             iov_column: None,
             cancel: None,
             user_set_keys: Vec::new(),
@@ -1310,6 +1326,8 @@ pub fn framework_keys() -> &'static [&'static str] {
         "bloq",
         "mu_referencing",
         "threads",
+        "n_starts",
+        "start_sigma",
         "gradient",
         "gradient_method",
         "iov_column",

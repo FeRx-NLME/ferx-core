@@ -1362,6 +1362,17 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             }
         }
+        "n_starts" => {
+            match value.parse::<usize>() {
+                Ok(n) if n >= 1 => opts.n_starts = n,
+                _ => {
+                    return Err(format!(
+                        "fit option `n_starts`: expected a positive integer, got `{value}`"
+                    ));
+                }
+            }
+        }
+        "start_sigma" => opts.start_sigma = parse_f64("start_sigma")?,
         "iov_column" => {
             opts.iov_column = if value.is_empty()
                 || value.eq_ignore_ascii_case("null")

@@ -1,4 +1,5 @@
 use crate::estimation::outer_optimizer::optimize_population;
+use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::io::datareader::read_nonmem_csv;
 use crate::io::output;
@@ -9,6 +10,9 @@ use crate::stats::likelihood::{
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+use rand::SeedableRng;
+use rand_distr::{Distribution, Normal};
+use rayon::prelude::*;
 use std::path::Path;
 use std::time::Instant;
 
@@ -228,6 +232,34 @@ pub fn fit_from_files(
     Ok(result)
 }
 
+/// Perturb initial parameters for multi-start optimisation.
+///
+/// Start 0 always returns the unmodified params. Starts 1..n multiply each
+/// log-packed theta by `exp(N(0, sigma))` and shift identity-packed thetas
+/// (negative lower bound) by `sigma * N(0,1)`. Omega and sigma are left
+/// unchanged — their starting values are typically less important than theta.
+fn perturb_init(params: &ModelParameters, start_idx: usize, sigma: f64, base_seed: u64) -> ModelParameters {
+    if start_idx == 0 {
+        return params.clone();
+    }
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(base_seed.wrapping_add(start_idx as u64));
+    let normal = Normal::new(0.0_f64, 1.0_f64).expect("normal dist");
+    let mut p = params.clone();
+    for (i, t) in p.theta.iter_mut().enumerate() {
+        let lower = p.theta_lower.get(i).copied().unwrap_or(0.0);
+        if theta_packs_log(lower) {
+            *t *= (sigma * normal.sample(&mut rng)).exp();
+        } else {
+            *t += sigma * normal.sample(&mut rng);
+        }
+        // Clamp to bounds to avoid starting outside the feasible region
+        let lo = p.theta_lower.get(i).copied().unwrap_or(f64::NEG_INFINITY);
+        let hi = p.theta_upper.get(i).copied().unwrap_or(f64::INFINITY);
+        *t = t.clamp(lo, hi);
+    }
+    p
+}
+
 /// Main fit entry point: CompiledModel + Population → FitResult.
 ///
 /// When `options.threads` is `Some(n)`, the fit runs inside a scoped rayon
@@ -263,15 +295,80 @@ pub fn fit(
         }
     };
     let pop_ref: &Population = &*pop_pruned;
-    match options.threads {
-        Some(n) if n > 0 => {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(n)
-                .build()
-                .map_err(|e| format!("failed to build rayon pool with {} threads: {}", n, e))?;
-            pool.install(|| fit_inner(model, pop_ref, init_params, options))
+
+    // Single-start fast path (default)
+    if options.n_starts <= 1 {
+        return match options.threads {
+            Some(n) if n > 0 => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build()
+                    .map_err(|e| format!("failed to build rayon pool with {} threads: {}", n, e))?;
+                pool.install(|| fit_inner(model, pop_ref, init_params, options))
+            }
+            _ => fit_inner(model, pop_ref, init_params, options),
+        };
+    }
+
+    // Multi-start: run n_starts fits in parallel, return the lowest-OFV converged result.
+    let base_seed: u64 = options.saem_seed.unwrap_or(42);
+    let n = options.n_starts;
+    let sigma = options.start_sigma;
+
+    let results: Vec<Result<FitResult, String>> = (0..n)
+        .into_par_iter()
+        .map(|k| {
+            let init_k = perturb_init(init_params, k, sigma, base_seed);
+            match options.threads {
+                Some(t) if t > 0 => {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(t)
+                        .build()
+                        .map_err(|e| {
+                            format!("failed to build rayon pool with {} threads: {}", t, e)
+                        })?;
+                    pool.install(|| fit_inner(model, pop_ref, &init_k, options))
+                }
+                _ => fit_inner(model, pop_ref, &init_k, options),
+            }
+        })
+        .collect();
+
+    // Pick best converged result; fall back to best unconverged if none converged.
+    let mut best: Option<(usize, FitResult)> = None;
+    for (k, res) in results.into_iter().enumerate() {
+        match res {
+            Ok(r) => {
+                let better = match &best {
+                    None => true,
+                    Some((_, b)) => {
+                        // Prefer converged over unconverged; then lower OFV
+                        (!b.converged && r.converged) || (b.converged == r.converged && r.ofv < b.ofv)
+                    }
+                };
+                if better {
+                    best = Some((k, r));
+                }
+            }
+            Err(_) => {} // ignore failed starts
         }
-        _ => fit_inner(model, pop_ref, init_params, options),
+    }
+
+    match best {
+        None => Err("All multi-start fits failed".to_string()),
+        Some((k, mut result)) => {
+            if !result.converged {
+                result.warnings.push(format!(
+                    "No multi-start run converged ({n} starts); returning best OFV from start {k}"
+                ));
+            } else if k > 0 {
+                result.warnings.push(format!(
+                    "Multi-start: best result from start {k}/{n} (OFV = {:.4})",
+                    result.ofv
+                ));
+            }
+            Ok(result)
+        }
     }
 }
 
@@ -2965,5 +3062,74 @@ mod sde_integration {
                 "error message should mention gn: {msg}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod multi_start_tests {
+    use super::perturb_init;
+    use crate::estimation::parameterization::theta_packs_log;
+    use crate::types::{FitOptions, ModelParameters, OmegaMatrix, SigmaVector};
+
+    fn make_params(theta: Vec<f64>, theta_lower: Vec<f64>, theta_upper: Vec<f64>) -> ModelParameters {
+        let n = theta.len();
+        ModelParameters {
+            theta,
+            theta_names: (0..n).map(|i| format!("T{i}")).collect(),
+            theta_lower,
+            theta_upper,
+            theta_fixed: vec![false; n],
+            omega: OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]),
+            omega_fixed: vec![false],
+            sigma: SigmaVector { values: vec![0.1], names: vec!["ERR".into()] },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_perturb_start0_is_identity() {
+        let p = make_params(vec![5.0, 50.0], vec![0.1, 1.0], vec![100.0, 500.0]);
+        let perturbed = perturb_init(&p, 0, 0.5, 42);
+        assert_eq!(perturbed.theta, p.theta);
+    }
+
+    #[test]
+    fn test_perturb_changes_theta() {
+        let p = make_params(vec![5.0, 50.0], vec![0.1, 1.0], vec![100.0, 500.0]);
+        let perturbed = perturb_init(&p, 1, 0.3, 42);
+        // With sigma=0.3 and seed=43 (42+1), at least one theta should differ
+        let changed = perturbed.theta.iter().zip(p.theta.iter()).any(|(a, b)| (a - b).abs() > 1e-10);
+        assert!(changed, "start 1 should perturb theta");
+    }
+
+    #[test]
+    fn test_perturb_stays_in_bounds() {
+        let p = make_params(vec![5.0, 50.0], vec![0.1, 1.0], vec![100.0, 500.0]);
+        for k in 1..=10 {
+            let perturbed = perturb_init(&p, k, 2.0, 42); // large sigma to stress-test bounds
+            for (i, &t) in perturbed.theta.iter().enumerate() {
+                assert!(t >= p.theta_lower[i], "start {k}: theta[{i}]={t} < lower={}", p.theta_lower[i]);
+                assert!(t <= p.theta_upper[i], "start {k}: theta[{i}]={t} > upper={}", p.theta_upper[i]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_perturb_identity_packed_theta() {
+        // theta_lower < 0 → identity packing → additive perturbation
+        let p = make_params(vec![0.5], vec![-5.0], vec![5.0]);
+        assert!(!theta_packs_log(p.theta_lower[0]));
+        let perturbed = perturb_init(&p, 1, 0.3, 99);
+        assert!(perturbed.theta[0] >= -5.0 && perturbed.theta[0] <= 5.0);
+    }
+
+    #[test]
+    fn test_n_starts_option_parsed() {
+        let mut opts = FitOptions::default();
+        assert_eq!(opts.n_starts, 1);
+        opts.n_starts = 4;
+        assert_eq!(opts.n_starts, 4);
     }
 }
