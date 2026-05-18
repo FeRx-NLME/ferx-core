@@ -542,53 +542,55 @@ fn build_gn_system(
 
         x_work[j] = xj_plus;
         let params_plus = unpack_params(&x_work, template);
-        let nll_plus: Vec<f64> = population
-            .subjects
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let kap_i = if i < kappas.len() {
-                    kappas[i].as_slice()
-                } else {
-                    &[]
-                };
-                subject_nll_at(
-                    model,
-                    population,
-                    i,
-                    &params_plus,
-                    &eta_hats[i],
-                    &h_matrices[i],
-                    kap_i,
-                    options,
-                )
-            })
-            .collect();
+        let nll_plus: Vec<f64> = {
+            use rayon::prelude::*;
+            (0..n_subj)
+                .into_par_iter()
+                .map(|i| {
+                    let kap_i = if i < kappas.len() {
+                        kappas[i].as_slice()
+                    } else {
+                        &[]
+                    };
+                    subject_nll_at(
+                        model,
+                        population,
+                        i,
+                        &params_plus,
+                        &eta_hats[i],
+                        &h_matrices[i],
+                        kap_i,
+                        options,
+                    )
+                })
+                .collect()
+        };
 
         x_work[j] = xj_minus;
         let params_minus = unpack_params(&x_work, template);
-        let nll_minus: Vec<f64> = population
-            .subjects
-            .iter()
-            .enumerate()
-            .map(|(i, _)| {
-                let kap_i = if i < kappas.len() {
-                    kappas[i].as_slice()
-                } else {
-                    &[]
-                };
-                subject_nll_at(
-                    model,
-                    population,
-                    i,
-                    &params_minus,
-                    &eta_hats[i],
-                    &h_matrices[i],
-                    kap_i,
-                    options,
-                )
-            })
-            .collect();
+        let nll_minus: Vec<f64> = {
+            use rayon::prelude::*;
+            (0..n_subj)
+                .into_par_iter()
+                .map(|i| {
+                    let kap_i = if i < kappas.len() {
+                        kappas[i].as_slice()
+                    } else {
+                        &[]
+                    };
+                    subject_nll_at(
+                        model,
+                        population,
+                        i,
+                        &params_minus,
+                        &eta_hats[i],
+                        &h_matrices[i],
+                        kap_i,
+                        options,
+                    )
+                })
+                .collect()
+        };
 
         x_work[j] = x[j];
 
