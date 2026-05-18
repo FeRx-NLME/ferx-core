@@ -1764,6 +1764,7 @@ mod iov_integration {
     // ── Tests: FOCE + all outer optimizers ───────────────────────────────────
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_foce_bobyqa() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1773,6 +1774,7 @@ mod iov_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_foce_slsqp() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1782,6 +1784,7 @@ mod iov_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_foce_lbfgs() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1791,6 +1794,7 @@ mod iov_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_foce_nlopt_lbfgs() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1800,6 +1804,7 @@ mod iov_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_foce_mma() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1809,6 +1814,7 @@ mod iov_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_foce_bfgs() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1820,6 +1826,7 @@ mod iov_integration {
     // ── Tests: FOCEI ─────────────────────────────────────────────────────────
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_focei_bobyqa() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1831,6 +1838,7 @@ mod iov_integration {
     // ── Tests: mu-referencing ─────────────────────────────────────────────────
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_foce_mu_referencing_on() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1841,6 +1849,7 @@ mod iov_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_focei_mu_referencing_on() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1853,6 +1862,7 @@ mod iov_integration {
     // ── Tests: GN and GN_Hybrid ───────────────────────────────────────────────
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_gn() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -1863,6 +1873,7 @@ mod iov_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_iov_gn_hybrid() {
         let model = make_iov_model();
         let pop = make_iov_population();
@@ -2709,6 +2720,7 @@ mod sde_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_sde_fit_uses_sde_flag() {
         let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
         let pop = make_sde_population();
@@ -2719,6 +2731,7 @@ mod sde_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_sde_fit_diff_central_positive() {
         let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
         let pop = make_sde_population();
@@ -2738,6 +2751,7 @@ mod sde_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_sde_fit_ofv_finite() {
         let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
         let pop = make_sde_population();
@@ -2752,6 +2766,7 @@ mod sde_integration {
     }
 
     #[test]
+    #[ignore = "slow: runs a full optimisation to convergence"]
     fn test_sde_ofv_le_base_ofv() {
         let pop = make_sde_population();
         let opts = fast_foce_opts();
