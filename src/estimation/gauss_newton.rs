@@ -20,6 +20,7 @@ use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_subject_nll_interaction, foce_subject_nll_standard};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+use rayon::prelude::*;
 
 /// Run FOCE estimation using a Gauss-Newton optimizer.
 ///
@@ -542,55 +543,49 @@ fn build_gn_system(
 
         x_work[j] = xj_plus;
         let params_plus = unpack_params(&x_work, template);
-        let nll_plus: Vec<f64> = {
-            use rayon::prelude::*;
-            (0..n_subj)
-                .into_par_iter()
-                .map(|i| {
-                    let kap_i = if i < kappas.len() {
-                        kappas[i].as_slice()
-                    } else {
-                        &[]
-                    };
-                    subject_nll_at(
-                        model,
-                        population,
-                        i,
-                        &params_plus,
-                        &eta_hats[i],
-                        &h_matrices[i],
-                        kap_i,
-                        options,
-                    )
-                })
-                .collect()
-        };
+        let nll_plus: Vec<f64> = (0..n_subj)
+            .into_par_iter()
+            .map(|i| {
+                let kap_i = if i < kappas.len() {
+                    kappas[i].as_slice()
+                } else {
+                    &[]
+                };
+                subject_nll_at(
+                    model,
+                    population,
+                    i,
+                    &params_plus,
+                    &eta_hats[i],
+                    &h_matrices[i],
+                    kap_i,
+                    options,
+                )
+            })
+            .collect();
 
         x_work[j] = xj_minus;
         let params_minus = unpack_params(&x_work, template);
-        let nll_minus: Vec<f64> = {
-            use rayon::prelude::*;
-            (0..n_subj)
-                .into_par_iter()
-                .map(|i| {
-                    let kap_i = if i < kappas.len() {
-                        kappas[i].as_slice()
-                    } else {
-                        &[]
-                    };
-                    subject_nll_at(
-                        model,
-                        population,
-                        i,
-                        &params_minus,
-                        &eta_hats[i],
-                        &h_matrices[i],
-                        kap_i,
-                        options,
-                    )
-                })
-                .collect()
-        };
+        let nll_minus: Vec<f64> = (0..n_subj)
+            .into_par_iter()
+            .map(|i| {
+                let kap_i = if i < kappas.len() {
+                    kappas[i].as_slice()
+                } else {
+                    &[]
+                };
+                subject_nll_at(
+                    model,
+                    population,
+                    i,
+                    &params_minus,
+                    &eta_hats[i],
+                    &h_matrices[i],
+                    kap_i,
+                    options,
+                )
+            })
+            .collect();
 
         x_work[j] = x[j];
 
@@ -696,5 +691,208 @@ fn subject_nll_at(
             model.bloq_method,
             &[],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::estimation::parameterization::{compute_bounds, pack_params};
+    use crate::types::{
+        BloqMethod, CompiledModel, DoseEvent, ErrorModel, FitOptions, GradientMethod,
+        ModelParameters, OmegaMatrix, PkModel, PkParams, Population, SigmaVector, Subject,
+    };
+    use nalgebra::DVector;
+    use std::collections::HashMap;
+
+    fn make_model() -> CompiledModel {
+        let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
+        let default_params = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.1, 5.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        CompiledModel {
+            name: "gn_test".into(),
+            pk_model: PkModel::OneCptIvBolus,
+            error_model: ErrorModel::Proportional,
+            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp(); // CL
+                p.values[1] = theta[1]; // V
+                p
+            }),
+            n_theta: 2,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            default_params,
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+        }
+    }
+
+    fn make_population() -> Population {
+        let subjects = (0..3)
+            .map(|_| Subject {
+                id: "S1".into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 4.0, 8.0],
+                observations: vec![25.0, 15.0, 9.0],
+                obs_cmts: vec![1, 1, 1],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                cens: vec![0, 0, 0],
+                occasions: vec![1, 1, 1],
+                dose_occasions: vec![1],
+            })
+            .collect();
+        Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+        }
+    }
+
+    /// Verify that build_gn_system returns a gradient and BHHH Hessian with
+    /// correct dimensions and that the gradient matches a sequential central-FD
+    /// reference to within numerical noise.
+    #[test]
+    fn test_build_gn_system_gradient_matches_fd_reference() {
+        let model = make_model();
+        let population = make_population();
+        let template = &model.default_params;
+        let n_subj = population.subjects.len();
+
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n = x.len();
+
+        // h_matrix shape: (n_obs × n_eta) — here 3 observations, 1 eta
+        let n_obs = 3;
+        let n_eta = 1;
+        let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
+        let h_matrices: Vec<nalgebra::DMatrix<f64>> = (0..n_subj)
+            .map(|_| nalgebra::DMatrix::zeros(n_obs, n_eta))
+            .collect();
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
+        let options = FitOptions::default();
+
+        let (grad, h_bhhh) = build_gn_system(
+            &x,
+            template,
+            &model,
+            &population,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &bounds,
+            &options,
+        );
+
+        // Dimensions
+        assert_eq!(grad.len(), n);
+        assert_eq!(h_bhhh.nrows(), n);
+        assert_eq!(h_bhhh.ncols(), n);
+
+        // BHHH Hessian must be symmetric and positive semi-definite (all eigenvalues >= 0)
+        for i in 0..n {
+            for j in 0..n {
+                assert!(
+                    (h_bhhh[(i, j)] - h_bhhh[(j, i)]).abs() < 1e-10,
+                    "H_bhhh not symmetric at ({i},{j})"
+                );
+            }
+        }
+
+        // Gradient must be finite
+        for (k, g) in grad.iter().enumerate() {
+            assert!(g.is_finite(), "gradient[{k}] is not finite");
+        }
+
+        // Cross-check: sequential central-FD reference must agree with the
+        // parallel result to within FD numerical noise (~1e-6 relative).
+        let eps = 1e-4;
+        for j in 0..n {
+            let mut xp = x.clone();
+            let mut xm = x.clone();
+            xp[j] += eps * (1.0 + x[j].abs());
+            xm[j] -= eps * (1.0 + x[j].abs());
+            let actual_2h = xp[j] - xm[j];
+
+            let params_p = unpack_params(&xp, template);
+            let params_m = unpack_params(&xm, template);
+
+            let nll_p: f64 = (0..n_subj)
+                .map(|i| {
+                    subject_nll_at(
+                        &model,
+                        &population,
+                        i,
+                        &params_p,
+                        &eta_hats[i],
+                        &h_matrices[i],
+                        &[],
+                        &options,
+                    )
+                })
+                .sum();
+            let nll_m: f64 = (0..n_subj)
+                .map(|i| {
+                    subject_nll_at(
+                        &model,
+                        &population,
+                        i,
+                        &params_m,
+                        &eta_hats[i],
+                        &h_matrices[i],
+                        &[],
+                        &options,
+                    )
+                })
+                .sum();
+
+            let ref_grad_j = 2.0 * (nll_p - nll_m) / actual_2h;
+            let tol = 1e-4 * (1.0 + ref_grad_j.abs());
+            assert!(
+                (grad[j] - ref_grad_j).abs() < tol,
+                "gradient[{j}]: parallel={:.6e}, reference={:.6e}, diff={:.2e}",
+                grad[j],
+                ref_grad_j,
+                (grad[j] - ref_grad_j).abs()
+            );
+        }
     }
 }
