@@ -346,10 +346,7 @@ fn lgamma(x: f64) -> f64 {
         sum += c / (xm1 + (i + 1) as f64);
     }
     let t = xm1 + G + 0.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln()
-        + (xm1 + 0.5) * t.ln()
-        - t
-        + sum.ln()
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (xm1 + 0.5) * t.ln() - t + sum.ln()
 }
 
 /// Compute 2.5th and 97.5th percentiles from a sample.
@@ -399,7 +396,11 @@ mod tests {
         assert!((lgamma(1.0)).abs() < 1e-12);
         assert!((lgamma(2.0)).abs() < 1e-12);
         let expected_half = (std::f64::consts::PI.sqrt()).ln();
-        assert!((lgamma(0.5) - expected_half).abs() < 1e-10, "lgamma(0.5)={}", lgamma(0.5));
+        assert!(
+            (lgamma(0.5) - expected_half).abs() < 1e-10,
+            "lgamma(0.5)={}",
+            lgamma(0.5)
+        );
         // lgamma(5) = ln(4!) = ln(24)
         assert!((lgamma(5.0) - 24.0_f64.ln()).abs() < 1e-10);
     }
