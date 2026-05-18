@@ -64,14 +64,19 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
 
     // Accumulators for pooled lag-1 Pearson r
     let mut sum_xy = 0.0_f64; // Σ e[t] * e[t+1]
-    let mut sum_x = 0.0_f64;  // Σ e[t]
-    let mut sum_y = 0.0_f64;  // Σ e[t+1]
+    let mut sum_x = 0.0_f64; // Σ e[t]
+    let mut sum_y = 0.0_f64; // Σ e[t+1]
     let mut sum_x2 = 0.0_f64; // Σ e[t]²
     let mut sum_y2 = 0.0_f64; // Σ e[t+1]²
     let mut n_pairs: usize = 0;
 
     for subj in subjects {
-        let valid: Vec<f64> = subj.iwres.iter().copied().filter(|v| v.is_finite()).collect();
+        let valid: Vec<f64> = subj
+            .iwres
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .collect();
         if valid.len() < 2 {
             continue;
         }
@@ -102,10 +107,18 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
     let lag1_r = {
         let num = n * sum_xy - sum_x * sum_y;
         let den = ((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y)).sqrt();
-        if den == 0.0 { 0.0 } else { num / den }
+        if den == 0.0 {
+            0.0
+        } else {
+            num / den
+        }
     };
 
-    let dw = if dw_den == 0.0 { f64::NAN } else { dw_num / dw_den };
+    let dw = if dw_den == 0.0 {
+        f64::NAN
+    } else {
+        dw_num / dw_den
+    };
 
     (lag1_r, dw)
 }
@@ -206,7 +219,10 @@ mod tests {
         // Monotonically increasing → strong positive autocorrelation → DW near 0
         let subj = make_subject(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         let (r, dw) = iwres_autocorrelation(&[subj]);
-        assert!(dw < 1.5, "expected DW < 1.5 for monotone sequence, got {dw}");
+        assert!(
+            dw < 1.5,
+            "expected DW < 1.5 for monotone sequence, got {dw}"
+        );
         assert!(r > 0.5, "expected positive lag-1 r, got {r}");
     }
 
@@ -215,7 +231,10 @@ mod tests {
         // Alternating signs → strong negative autocorrelation → DW near 4
         let subj = make_subject(vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0]);
         let (_r, dw) = iwres_autocorrelation(&[subj]);
-        assert!(dw > 2.5, "expected DW > 2.5 for alternating sequence, got {dw}");
+        assert!(
+            dw > 2.5,
+            "expected DW > 2.5 for alternating sequence, got {dw}"
+        );
     }
 
     #[test]
@@ -224,7 +243,10 @@ mod tests {
         let subj = make_subject(vec![1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0]);
         let (_r, dw) = iwres_autocorrelation(&[subj]);
         // Not a strict test — just check it's in a reasonable mid range
-        assert!(dw > 1.0 && dw < 3.5, "expected DW near 2 for mixed signs, got {dw}");
+        assert!(
+            dw > 1.0 && dw < 3.5,
+            "expected DW near 2 for mixed signs, got {dw}"
+        );
     }
 
     #[test]
@@ -232,7 +254,10 @@ mod tests {
         let subj = make_subject(vec![f64::NAN, 1.0, 2.0, f64::NAN, 3.0]);
         let (_r, dw) = iwres_autocorrelation(&[subj]);
         // Should not panic and should produce a finite result based on valid values
-        assert!(dw.is_finite(), "DW should be finite after skipping NaN entries");
+        assert!(
+            dw.is_finite(),
+            "DW should be finite after skipping NaN entries"
+        );
     }
 
     #[test]
