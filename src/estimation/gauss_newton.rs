@@ -494,31 +494,6 @@ fn build_gn_system(
     let n = x.len();
     let n_subj = population.subjects.len();
 
-    // Compute per-subject NLL at current point
-    let params = unpack_params(x, template);
-    let _nll_base: Vec<f64> = population
-        .subjects
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            let kap_i = if i < kappas.len() {
-                kappas[i].as_slice()
-            } else {
-                &[]
-            };
-            subject_nll_at(
-                model,
-                population,
-                i,
-                &params,
-                &eta_hats[i],
-                &h_matrices[i],
-                kap_i,
-                options,
-            )
-        })
-        .collect();
-
     // Compute per-subject gradient via central FD
     // g_i[j] = d(nll_i)/d(x_j) for each subject i, parameter j
     let eps = 1e-4;
