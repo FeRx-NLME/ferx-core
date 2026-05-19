@@ -334,6 +334,8 @@ mod tests {
         assert_eq!(adaptive_steihaug_budget(16), 5);
         // Larger model: 25 params → ceil(sqrt(25))=5.
         assert_eq!(adaptive_steihaug_budget(25), 5);
+        // Growth visible: 50 params → ceil(sqrt(50))=8.
+        assert_eq!(adaptive_steihaug_budget(50), 8);
         // Very large: 100 params → ceil(sqrt(100))=10.
         assert_eq!(adaptive_steihaug_budget(100), 10);
         // Budget never exceeds n_params.
