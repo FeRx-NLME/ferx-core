@@ -19,7 +19,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | `optimizer` | `slsqp`, `lbfgs`, `nlopt_lbfgs`, `mma`, `bfgs`, `bobyqa`, `trust_region` | `slsqp` | Optimization algorithm |
 | `inner_maxiter` | integer | `200` | Max iterations for the inner (per-subject EBE) optimizer |
 | `inner_tol` | float | `1e-4` | Gradient-norm convergence tolerance for the inner (per-subject EBE) optimizer. The default of `1e-4` matches the precision of typical NLME engines (NONMEM's default inner-loop SIGDIGITS is ~3, equivalent to ~`1e-3`). Tighter values (e.g. `1e-6`, `1e-8`) over-converge the EBE relative to the Sheiner–Beal linearisation error and can slow FOCEI fits by 10–15× without measurable change in the final OFV. Use a tighter value only if you're comparing post-hoc EBE values across runs at high precision. |
-| `steihaug_max_iters` | integer | `50` | Max CG iterations for the Steihaug subproblem (only used when `optimizer = trust_region`) |
+| `steihaug_max_iters` | integer | adaptive | Max CG iterations for the Steihaug subproblem (only used when `optimizer = trust_region`). Default (unset) uses `ceil(sqrt(n_params)).clamp(5, n_params)` — typically 5 for standard NLME models. Set explicitly (e.g. `steihaug_max_iters = 50`) to pin the budget. |
 | `global_search` | `true`, `false` | `false` | Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a gradient-free global pre-search before the local optimizer. CRS2-LM samples within the parameter bounds; the local optimizer (e.g. `bobyqa`, `slsqp`) starts from the best point found. Useful for poorly-identified models — when the local optimizer can land in a degenerate basin (collapsed ETA, V/Q swap, parameters at bounds) from a far-from-truth start, the global pre-search usually escapes it. Adds the pre-search budget on top of the local optimisation, but typically more efficient than running multiple full fits from scratch. Requires a full NLopt build (e.g. `brew install nlopt` or `apt install libnlopt-dev`); a clear warning is emitted if CRS2-LM is unavailable. |
 | `global_maxeval` | integer | `200 * (n_params + 1)` | Maximum evaluations of the FOCE objective during the global pre-search. Each eval is a full inner-loop pass over all subjects, so this is the dominant cost of `global_search = true`. The default (`0` → auto) is empirically enough to escape bad basins on 10–20 parameter PK models without dominating the wall time of the subsequent local refine. |
 | `bloq_method` | `drop`, `m3` | `drop` | How to handle rows with `CENS=1`. `m3` enables Beal's M3 likelihood (see [BLOQ example](../examples/bloq.md)). |
@@ -82,16 +82,18 @@ See [SIR documentation](../estimation/sir.md) for details.
 | `nlopt_lbfgs` | NLopt L-BFGS | Alternative L-BFGS |
 | `mma` | Method of Moving Asymptotes (NLopt) | Constrained problems |
 | `bobyqa` | NLopt BOBYQA — derivative-free quadratic interpolation | Noisy or non-smooth objectives where FD gradients are unreliable |
-| `trust_region` | Newton trust-region with Steihaug CG subproblem (argmin) | Well-conditioned problems where second-order curvature helps convergence; tune `steihaug_max_iters` |
+| `trust_region` | Newton trust-region with Steihaug CG subproblem (argmin) | Well-conditioned problems where second-order curvature helps convergence |
 
 Notes:
 - `bobyqa` does not use gradients, so it is robust to small discontinuities in
   the FOCE surface caused by EBE re-estimation, but it converges more slowly
   than gradient-based methods on smooth problems.
-- `trust_region` uses a finite-difference Hessian of the OFV-at-fixed-EBEs.
-  Each Hessian costs O(n²) OFV evaluations, so it is fastest when the number
-  of packed parameters is small. Increase `steihaug_max_iters` when the
-  parameter count exceeds the default of 50.
+- `trust_region` uses an AD-based gradient (same `subject_nll_pop_grad` as the
+  outer FOCE optimizer) and a BHHH approximate Hessian (`H ≈ 4 Σ gᵢgᵢᵀ`).
+  The BHHH matrix is always positive semi-definite, so the Steihaug subproblem
+  is well-conditioned even near constraints. The Steihaug CG budget defaults to
+  `ceil(sqrt(n_params))` — typically 5 for standard NLME models, which is far
+  cheaper than the previous FD-Hessian path (O(n²) OFV evaluations per Hessian).
 
 ## Parameter Scaling and EBE Convergence
 

@@ -1,13 +1,25 @@
 use argmin::core::{CostFunction, Error, Executor, Gradient, Hessian, State};
 use argmin::solver::trustregion::{Steihaug, TrustRegion};
 use nalgebra::{DMatrix, DVector};
+use rayon::prelude::*;
 
+use crate::estimation::gauss_newton::subject_nll_pop_grad;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{compute_covariance, pop_nll, OuterResult};
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params, PackedBounds,
 };
 use crate::types::{CompiledModel, FitOptions, ModelParameters, Population};
+
+/// Per-call cache for per-subject NLL gradients.
+/// Avoids recomputing the inner loop and AD gradients when `gradient()` and
+/// `hessian()` are called with the same parameter vector in the same TR iteration.
+struct GradCache {
+    x: Vec<f64>,
+    etas: Vec<DVector<f64>>,
+    h_mats: Vec<DMatrix<f64>>,
+    per_subj_grads: Vec<Vec<f64>>,
+}
 
 struct FoceiProblem<'a> {
     model: &'a CompiledModel,
@@ -16,6 +28,7 @@ struct FoceiProblem<'a> {
     init_params: &'a ModelParameters,
     bounds: PackedBounds,
     cached_etas: std::sync::Mutex<Vec<DVector<f64>>>,
+    grad_cache: std::sync::Mutex<Option<GradCache>>,
 }
 
 impl FoceiProblem<'_> {
@@ -61,31 +74,52 @@ impl FoceiProblem<'_> {
         }
     }
 
-    fn grad_fixed(&self, x: &[f64], etas: &[DVector<f64>], h_mats: &[DMatrix<f64>]) -> Vec<f64> {
-        let n = x.len();
-        let eps = 1e-5_f64;
-        let mut g = vec![0.0_f64; n];
-        let mut xw = x.to_vec();
-
-        for i in 0..n {
-            let h = eps * (1.0 + x[i].abs());
-            let xi_plus = (x[i] + h).min(self.bounds.upper[i]);
-            let xi_minus = (x[i] - h).max(self.bounds.lower[i]);
-            let dh = xi_plus - xi_minus;
-            if dh.abs() < 1e-16 {
-                continue;
-            }
-            xw[i] = xi_plus;
-            let fp = self.ofv_fixed(&xw, etas, h_mats);
-            xw[i] = xi_minus;
-            let fm = self.ofv_fixed(&xw, etas, h_mats);
-            xw[i] = x[i];
-            let gi = (fp - fm) / dh;
-            if gi.is_finite() {
-                g[i] = gi;
+    /// Compute per-subject NLL gradients via `subject_nll_pop_grad`, caching the
+    /// result so that `hessian()` can reuse it without a second inner-loop solve.
+    fn compute_ad_grads(
+        &self,
+        x: &[f64],
+    ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<f64>>) {
+        // Return cached result if x matches.
+        {
+            let cache = self.grad_cache.lock().unwrap();
+            if let Some(ref c) = *cache {
+                if c.x == x {
+                    return (c.etas.clone(), c.h_mats.clone(), c.per_subj_grads.clone());
+                }
             }
         }
-        g
+
+        let (etas, h_mats) = self.run_inner(x);
+        let n_subj = self.population.subjects.len();
+
+        let per_subj: Vec<Vec<f64>> = (0..n_subj)
+            .into_par_iter()
+            .map(|i| {
+                subject_nll_pop_grad(
+                    x,
+                    self.init_params,
+                    self.model,
+                    self.population,
+                    i,
+                    &etas[i],
+                    &h_mats[i],
+                    &[], // IOV not yet supported in trust_region path
+                    &self.bounds,
+                    self.options,
+                )
+                .1
+            })
+            .collect();
+
+        *self.grad_cache.lock().unwrap() = Some(GradCache {
+            x: x.to_vec(),
+            etas: etas.clone(),
+            h_mats: h_mats.clone(),
+            per_subj_grads: per_subj.clone(),
+        });
+
+        (etas, h_mats, per_subj)
     }
 }
 
@@ -107,8 +141,15 @@ impl Gradient for FoceiProblem<'_> {
     type Gradient = Vec<f64>;
 
     fn gradient(&self, p: &Vec<f64>) -> Result<Vec<f64>, Error> {
-        let (etas, h_mats) = self.run_inner(p);
-        Ok(self.grad_fixed(p, &etas, &h_mats))
+        let (_, _, per_subj) = self.compute_ad_grads(p);
+        let n = p.len();
+        let mut g = vec![0.0_f64; n];
+        for gi in &per_subj {
+            for k in 0..n {
+                g[k] += 2.0 * gi[k];
+            }
+        }
+        Ok(g)
     }
 }
 
@@ -117,37 +158,27 @@ impl Hessian for FoceiProblem<'_> {
     type Hessian = Vec<Vec<f64>>;
 
     fn hessian(&self, p: &Vec<f64>) -> Result<Vec<Vec<f64>>, Error> {
+        let (_, _, per_subj) = self.compute_ad_grads(p);
         let n = p.len();
-        let eps = 1e-4_f64;
-        let (etas, h_mats) = self.run_inner(p);
-        let g0 = self.grad_fixed(p, &etas, &h_mats);
-
-        let mut h_fwd = vec![vec![0.0_f64; n]; n];
-        let mut xp = p.clone();
-        for i in 0..n {
-            let hi = eps * (1.0 + p[i].abs());
-            let xi_plus = (p[i] + hi).min(self.bounds.upper[i]);
-            let actual_hi = xi_plus - p[i];
-            if actual_hi.abs() < 1e-16 {
-                continue;
-            }
-            xp[i] = xi_plus;
-            let g1 = self.grad_fixed(&xp, &etas, &h_mats);
-            xp[i] = p[i];
-            for j in 0..n {
-                h_fwd[i][j] = (g1[j] - g0[j]) / actual_hi;
+        // BHHH approximation: H ≈ 4 Σ gᵢgᵢᵀ  (factor 4 because OFV = 2*NLL,
+        // so grad(OFV) = 2*gᵢ and the outer product scales by 4).
+        let mut h = vec![vec![0.0_f64; n]; n];
+        for gi in &per_subj {
+            for i in 0..n {
+                for j in 0..n {
+                    h[i][j] += 4.0 * gi[i] * gi[j];
+                }
             }
         }
-
-        // Symmetrize: H_sym[i][j] = (H[i][j] + H[j][i]) / 2
-        let mut h_sym = vec![vec![0.0_f64; n]; n];
-        for i in 0..n {
-            for j in 0..n {
-                h_sym[i][j] = (h_fwd[i][j] + h_fwd[j][i]) / 2.0;
-            }
-        }
-        Ok(h_sym)
+        Ok(h)
     }
+}
+
+/// Size-adaptive Steihaug CG budget: `ceil(sqrt(n_params)).clamp(5, n_params)`.
+/// Avoids the fixed-50 default that wastes CG iterations when n_params ≤ 15.
+fn adaptive_steihaug_budget(n_params: usize) -> usize {
+    let base = (n_params as f64).sqrt().ceil() as usize;
+    base.clamp(5, n_params.max(5))
 }
 
 pub fn optimize_trust_region(
@@ -172,6 +203,7 @@ pub fn optimize_trust_region(
         init_params,
         bounds,
         cached_etas: std::sync::Mutex::new(vec![DVector::zeros(n_eta); n_subj]),
+        grad_cache: std::sync::Mutex::new(None),
     };
 
     if options.verbose {
@@ -181,7 +213,11 @@ pub fn optimize_trust_region(
         );
     }
 
-    let subproblem = Steihaug::new().with_max_iters(options.steihaug_max_iters as u64);
+    let cg_budget = options
+        .steihaug_max_iters
+        .unwrap_or_else(|| adaptive_steihaug_budget(x0.len()));
+
+    let subproblem = Steihaug::new().with_max_iters(cg_budget as u64);
     let solver = TrustRegion::new(subproblem)
         .with_radius(1.0)
         .expect("trust region radius must be positive")
@@ -283,5 +319,45 @@ pub fn optimize_trust_region(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_adaptive_steihaug_budget() {
+        // Typical NLME: 7 params → ceil(sqrt(7))=3, clamped to 5.
+        assert_eq!(adaptive_steihaug_budget(7), 5);
+        // Medium model: 16 params → ceil(sqrt(16))=4, clamped to 5.
+        assert_eq!(adaptive_steihaug_budget(16), 5);
+        // Larger model: 25 params → ceil(sqrt(25))=5.
+        assert_eq!(adaptive_steihaug_budget(25), 5);
+        // Very large: 100 params → ceil(sqrt(100))=10.
+        assert_eq!(adaptive_steihaug_budget(100), 10);
+        // Budget never exceeds n_params.
+        assert!(adaptive_steihaug_budget(4) <= 4.max(5));
+    }
+
+    #[test]
+    fn test_steihaug_budget_option_none_uses_adaptive() {
+        let options = FitOptions::default();
+        assert!(options.steihaug_max_iters.is_none());
+        // Simulate what optimize_trust_region does for n_params = 8.
+        let budget = options
+            .steihaug_max_iters
+            .unwrap_or_else(|| adaptive_steihaug_budget(8));
+        assert_eq!(budget, 5); // ceil(sqrt(8))=3, clamped to 5
+    }
+
+    #[test]
+    fn test_steihaug_budget_option_some_pins_value() {
+        let mut options = FitOptions::default();
+        options.steihaug_max_iters = Some(20);
+        let budget = options
+            .steihaug_max_iters
+            .unwrap_or_else(|| adaptive_steihaug_budget(8));
+        assert_eq!(budget, 20);
     }
 }

@@ -1052,8 +1052,10 @@ pub struct FitOptions {
     /// when the data has no CENS column).
     pub bloq_method: BloqMethod,
     /// Maximum CG iterations for the Steihaug subproblem solver (trust-region only).
-    /// Should be at least n_params; default 50 covers most population PK models.
-    pub steihaug_max_iters: usize,
+    /// `None` (default) uses a size-adaptive budget of `ceil(sqrt(n_params)).clamp(5, n_params)`,
+    /// which is 5 for typical NLME problems (n_params ≈ 7–15) and grows with model size.
+    /// `Some(n)` pins the budget to `n` — set to `50` to recover the previous fixed behaviour.
+    pub steihaug_max_iters: Option<usize>,
     /// If true (default), use automatically detected mu-referencing to centre
     /// ETA starting points on the current population mean at each outer step.
     /// Set to false to disable for comparison purposes.
@@ -1160,7 +1162,7 @@ impl Default for FitOptions {
             sir_keep_samples: false,
             sir_df: 5.0,
             bloq_method: BloqMethod::Drop,
-            steihaug_max_iters: 50,
+            steihaug_max_iters: None,
             mu_referencing: true,
             threads: None,
             n_starts: 1,

@@ -1303,7 +1303,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             };
         }
-        "steihaug_max_iters" => opts.steihaug_max_iters = parse_usize("steihaug_max_iters")?,
+        "steihaug_max_iters" => opts.steihaug_max_iters = Some(parse_usize("steihaug_max_iters")?),
         "global_search" => opts.global_search = parse_bool("global_search")?,
         "global_maxeval" => opts.global_maxeval = parse_usize("global_maxeval")?,
         "n_exploration" => opts.saem_n_exploration = parse_usize("n_exploration")?,
@@ -4663,15 +4663,15 @@ mod tests {
             minimal_model_with_fit_options("  optimizer = trust_region\n  steihaug_max_iters = 30");
         let parsed = parse_full_model(&content).unwrap();
         assert_eq!(parsed.fit_options.optimizer, Optimizer::TrustRegion);
-        assert_eq!(parsed.fit_options.steihaug_max_iters, 30);
+        assert_eq!(parsed.fit_options.steihaug_max_iters, Some(30));
     }
 
     #[test]
     fn test_steihaug_max_iters_default() {
-        // Default must match the documented value (50).
+        // Default is None (size-adaptive budget).
         let content = minimal_model_with_fit_options("  optimizer = trust_region");
         let parsed = parse_full_model(&content).unwrap();
-        assert_eq!(parsed.fit_options.steihaug_max_iters, 50);
+        assert_eq!(parsed.fit_options.steihaug_max_iters, None);
     }
 
     #[test]
@@ -4686,12 +4686,12 @@ mod tests {
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
         //   optimizer = slsqp, inner_maxiter = 200, inner_tol = 1e-4,
-        //   steihaug_max_iters = 50.
+        //   steihaug_max_iters = None (adaptive).
         let opts = FitOptions::default();
         assert_eq!(opts.optimizer, Optimizer::Slsqp);
         assert_eq!(opts.inner_maxiter, 200);
         assert!((opts.inner_tol - 1e-4).abs() < 1e-20);
-        assert_eq!(opts.steihaug_max_iters, 50);
+        assert_eq!(opts.steihaug_max_iters, None);
     }
 
     #[test]
@@ -4711,7 +4711,7 @@ mod tests {
         let content = include_str!("../../examples/warfarin_trust_region.ferx");
         let parsed = parse_full_model(content).unwrap();
         assert_eq!(parsed.fit_options.optimizer, Optimizer::TrustRegion);
-        assert_eq!(parsed.fit_options.steihaug_max_iters, 30);
+        assert_eq!(parsed.fit_options.steihaug_max_iters, Some(30));
     }
 
     // ── apply_fit_option: coverage of the newly-added optimizer keys.
@@ -4743,7 +4743,7 @@ mod tests {
             apply_fit_option(&mut opts, "steihaug_max_iters", "30"),
             Ok(true)
         );
-        assert_eq!(opts.steihaug_max_iters, 30);
+        assert_eq!(opts.steihaug_max_iters, Some(30));
         // Reject malformed (e.g. negative) value.
         assert!(apply_fit_option(&mut opts, "steihaug_max_iters", "-1").is_err());
     }

@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-d2ce75cd.js";
+            window.path_to_searchindex_js = "searchindex-aeadd51d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-7ca32c60.js"></script>
@@ -1568,7 +1568,7 @@ example.</p>
 <tr><td><code>optimizer</code></td><td><code>slsqp</code>, <code>lbfgs</code>, <code>nlopt_lbfgs</code>, <code>mma</code>, <code>bfgs</code>, <code>bobyqa</code>, <code>trust_region</code></td><td><code>slsqp</code></td><td>Optimization algorithm</td></tr>
 <tr><td><code>inner_maxiter</code></td><td>integer</td><td><code>200</code></td><td>Max iterations for the inner (per-subject EBE) optimizer</td></tr>
 <tr><td><code>inner_tol</code></td><td>float</td><td><code>1e-4</code></td><td>Gradient-norm convergence tolerance for the inner (per-subject EBE) optimizer. The default of <code>1e-4</code> matches the precision of typical NLME engines (NONMEM’s default inner-loop SIGDIGITS is ~3, equivalent to ~<code>1e-3</code>). Tighter values (e.g. <code>1e-6</code>, <code>1e-8</code>) over-converge the EBE relative to the Sheiner–Beal linearisation error and can slow FOCEI fits by 10–15× without measurable change in the final OFV. Use a tighter value only if you’re comparing post-hoc EBE values across runs at high precision.</td></tr>
-<tr><td><code>steihaug_max_iters</code></td><td>integer</td><td><code>50</code></td><td>Max CG iterations for the Steihaug subproblem (only used when <code>optimizer = trust_region</code>)</td></tr>
+<tr><td><code>steihaug_max_iters</code></td><td>integer</td><td>adaptive</td><td>Max CG iterations for the Steihaug subproblem (only used when <code>optimizer = trust_region</code>). Default (unset) uses <code>ceil(sqrt(n_params)).clamp(5, n_params)</code> — typically 5 for standard NLME models. Set explicitly (e.g. <code>steihaug_max_iters = 50</code>) to pin the budget.</td></tr>
 <tr><td><code>global_search</code></td><td><code>true</code>, <code>false</code></td><td><code>false</code></td><td>Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a gradient-free global pre-search before the local optimizer. CRS2-LM samples within the parameter bounds; the local optimizer (e.g. <code>bobyqa</code>, <code>slsqp</code>) starts from the best point found. Useful for poorly-identified models — when the local optimizer can land in a degenerate basin (collapsed ETA, V/Q swap, parameters at bounds) from a far-from-truth start, the global pre-search usually escapes it. Adds the pre-search budget on top of the local optimisation, but typically more efficient than running multiple full fits from scratch. Requires a full NLopt build (e.g. <code>brew install nlopt</code> or <code>apt install libnlopt-dev</code>); a clear warning is emitted if CRS2-LM is unavailable.</td></tr>
 <tr><td><code>global_maxeval</code></td><td>integer</td><td><code>200 * (n_params + 1)</code></td><td>Maximum evaluations of the FOCE objective during the global pre-search. Each eval is a full inner-loop pass over all subjects, so this is the dominant cost of <code>global_search = true</code>. The default (<code>0</code> → auto) is empirically enough to escape bad basins on 10–20 parameter PK models without dominating the wall time of the subsequent local refine.</td></tr>
 <tr><td><code>bloq_method</code></td><td><code>drop</code>, <code>m3</code></td><td><code>drop</code></td><td>How to handle rows with <code>CENS=1</code>. <code>m3</code> enables Beal’s M3 likelihood (see <a href="#bloq-m3-method">BLOQ example</a>).</td></tr>
@@ -1637,7 +1637,7 @@ example.</p>
 <tr><td><code>nlopt_lbfgs</code></td><td>NLopt L-BFGS</td><td>Alternative L-BFGS</td></tr>
 <tr><td><code>mma</code></td><td>Method of Moving Asymptotes (NLopt)</td><td>Constrained problems</td></tr>
 <tr><td><code>bobyqa</code></td><td>NLopt BOBYQA — derivative-free quadratic interpolation</td><td>Noisy or non-smooth objectives where FD gradients are unreliable</td></tr>
-<tr><td><code>trust_region</code></td><td>Newton trust-region with Steihaug CG subproblem (argmin)</td><td>Well-conditioned problems where second-order curvature helps convergence; tune <code>steihaug_max_iters</code></td></tr>
+<tr><td><code>trust_region</code></td><td>Newton trust-region with Steihaug CG subproblem (argmin)</td><td>Well-conditioned problems where second-order curvature helps convergence</td></tr>
 </tbody>
 </table>
 </div>
@@ -1646,10 +1646,12 @@ example.</p>
 <li><code>bobyqa</code> does not use gradients, so it is robust to small discontinuities in
 the FOCE surface caused by EBE re-estimation, but it converges more slowly
 than gradient-based methods on smooth problems.</li>
-<li><code>trust_region</code> uses a finite-difference Hessian of the OFV-at-fixed-EBEs.
-Each Hessian costs O(n²) OFV evaluations, so it is fastest when the number
-of packed parameters is small. Increase <code>steihaug_max_iters</code> when the
-parameter count exceeds the default of 50.</li>
+<li><code>trust_region</code> uses an AD-based gradient (same <code>subject_nll_pop_grad</code> as the
+outer FOCE optimizer) and a BHHH approximate Hessian (<code>H ≈ 4 Σ gᵢgᵢᵀ</code>).
+The BHHH matrix is always positive semi-definite, so the Steihaug subproblem
+is well-conditioned even near constraints. The Steihaug CG budget defaults to
+<code>ceil(sqrt(n_params))</code> — typically 5 for standard NLME models, which is far
+cheaper than the previous FD-Hessian path (O(n²) OFV evaluations per Hessian).</li>
 </ul>
 <h2 id="parameter-scaling-and-ebe-convergence"><a class="header" href="#parameter-scaling-and-ebe-convergence">Parameter Scaling and EBE Convergence</a></h2>
 <div class="table-wrapper">

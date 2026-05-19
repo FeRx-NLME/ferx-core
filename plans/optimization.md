@@ -637,7 +637,7 @@ so the gain is proportional to P (number of packed population parameters).
 
 ## Step 6 — Trust Region: AD Gradient + BHHH Hessian + Adaptive Steihaug-CG
 
-**Status: 🔶 PARTIAL**
+**Status: ✅ DONE — merged via PR #50.**
 
 **Requires: Steps 3 and 5 complete.**
 
