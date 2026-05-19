@@ -404,10 +404,13 @@ fn obs_nll_subject_grad(
         theta_p[i] += delta;
         let preds_p =
             crate::pk::compute_predictions_with_tv_into(model, subject, &theta_p, eta, pk_scratch);
+        // Difference on raw predictions — do NOT clip before differencing.
+        // Clipping both pp and pb at 1e-12 before subtracting would produce a
+        // zero difference whenever pb < 1e-12, silently zeroing the gradient.
         let d_obs_nll: f64 = d_nll_d_f
             .iter()
             .zip(preds_p.iter().zip(preds_base.iter()))
-            .map(|(&dl, (&pp, &pb))| dl * (pp.max(1e-12) - pb.max(1e-12)) / delta)
+            .map(|(&dl, (&pp, &pb))| dl * (pp - pb) / delta)
             .sum();
         grad[i] = if theta_packs_log_mask[i] {
             theta[i] * d_obs_nll
@@ -1423,7 +1426,7 @@ mod tests {
     /// non-pinned packed parameters (theta + sigma).
     #[test]
     fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
-        use crate::types::{DoseEvent, FitOptions, Population, SigmaVector};
+        use crate::types::{DoseEvent, Population};
         use std::collections::HashMap;
 
         let model = analytical_model(GradientMethod::Auto);
