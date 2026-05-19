@@ -135,9 +135,8 @@ pub fn run_sir_core(
 
     let d = n_packed as f64;
     // Cache lgamma terms that are constant across all samples.
-    let log_norm = lgamma((nu + d) / 2.0)
-        - lgamma(nu / 2.0)
-        - (d / 2.0) * (nu * std::f64::consts::PI).ln();
+    let log_norm =
+        lgamma((nu + d) / 2.0) - lgamma(nu / 2.0) - (d / 2.0) * (nu * std::f64::consts::PI).ln();
     // At the centre the quadratic form is 0, so log_q_hat = log_norm - 0.5*log_det.
     let log_q_hat = log_norm - 0.5 * log_det_proposal;
 
@@ -230,9 +229,8 @@ pub fn run_sir_core(
             // z holds the scaled standardised residual L^{-1}(x_k - x_hat), so
             // the quadratic form is z^T z (already in the scaled space).
             let quad_form: f64 = z.iter().map(|zi| zi * zi).sum();
-            let log_q_k = log_norm
-                - 0.5 * log_det_proposal
-                - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
+            let log_q_k =
+                log_norm - 0.5 * log_det_proposal - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
 
             // Importance weight: log w_k = -0.5 * dOFV_k - log_q_k + log_q_hat
             -0.5 * dofv - log_q_k + log_q_hat
