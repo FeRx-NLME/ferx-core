@@ -323,6 +323,7 @@ pub fn fit(
     // so we only honour `threads` when the global pool hasn't been entered yet (single-start
     // path above). Here we always use the global pool for the outer par_iter.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
+    let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
     let n = options.n_starts;
     let sigma = options.start_sigma;
 
@@ -330,7 +331,24 @@ pub fn fit(
         .into_par_iter()
         .map(|k| {
             let init_k = perturb_init(init_params, k, sigma, base_seed);
-            (k, fit_inner(model, pop_ref, &init_k, options))
+            // Per-start option overrides for k > 0:
+            // - saem_seed: derive from base so each start gets a different MH trajectory.
+            //   Start 0 keeps the user's seed for reproducibility of the unperturbed run.
+            // - global_search: CRS2-LM ignores the starting point and samples freely in
+            //   [lower, upper], so running it on starts 1..n overrides the perturbation
+            //   and makes multi-start a no-op for those starts. Only run it on start 0.
+            let opts_k;
+            let opts_ref = if k == 0 {
+                options
+            } else {
+                opts_k = FitOptions {
+                    saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
+                    global_search: false,
+                    ..options.clone()
+                };
+                &opts_k
+            };
+            (k, fit_inner(model, pop_ref, &init_k, opts_ref))
         })
         .collect();
 
