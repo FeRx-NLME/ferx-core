@@ -1407,6 +1407,8 @@ fn ad_population_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
+    debug_assert_eq!(ehs.len(), n_subj);
+    debug_assert_eq!(hms.len(), n_subj);
     debug_assert_eq!(kappas.len(), n_subj);
     let np = x.len();
     let per_subj: Vec<Vec<f64>> = (0..n_subj)
@@ -1789,8 +1791,10 @@ mod tests {
         let options = FitOptions::default();
 
         let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
+        // Use a non-zero H-matrix so r_tilde = R + H·Ω·Hᵀ depends on Ω and
+        // the omega/off-diagonal Cholesky gradients are non-trivially exercised.
         let h_matrices: Vec<nalgebra::DMatrix<f64>> = (0..n_subj)
-            .map(|_| nalgebra::DMatrix::zeros(n_obs, n_eta))
+            .map(|_| nalgebra::DMatrix::from_element(n_obs, n_eta, 0.1))
             .collect();
         let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
 
@@ -1921,16 +1925,19 @@ mod tests {
         check_gradient(&model, &make_population(3), 2);
     }
 
-    /// IOV path: non-empty kappas force the central-FD fallback in
-    /// subject_nll_pop_grad; the population-sum must still match the
+    /// Non-empty kappas force the central-FD fallback in subject_nll_pop_grad
+    /// (can_use_analytical = false); the population-sum must still match the
     /// population-level FD reference.
+    ///
+    /// Note: with omega_iov=None the IOV NLL formula is not exercised here —
+    /// this test covers the FD *code path*, not IOV NLL correctness.
     #[test]
-    fn test_outer_ad_gradient_iov_fallback() {
-        // `subject_nll_at` only enters the IOV branch when kappas is non-empty
-        // AND omega_iov is Some. With omega_iov=None and non-empty kappas the
-        // function falls through to standard FOCE — but subject_nll_pop_grad
-        // still takes the central-FD path whenever kappas.is_empty() is false,
-        // which is exactly the code path we want to exercise here.
+    fn test_outer_ad_gradient_fd_fallback_path() {
+        // `subject_nll_at` only enters the IOV NLL branch when kappas is
+        // non-empty AND omega_iov is Some. With omega_iov=None and non-empty
+        // kappas the function falls through to standard FOCE, but
+        // subject_nll_pop_grad still takes the per-subject central-FD path
+        // because kappas.is_empty() is false — the path we want to exercise.
         let model = make_model();
 
         let template = &model.default_params;

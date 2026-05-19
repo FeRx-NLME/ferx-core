@@ -893,7 +893,17 @@ pub(crate) fn subject_nll_pop_grad(
         x_work[j] = x[j];
 
         let deriv = (nll_plus - nll_minus) / actual_2h;
-        grad[j] = if deriv.is_finite() { deriv } else { 0.0 };
+        grad[j] = if deriv.is_finite() {
+            deriv
+        } else if nll_plus.is_finite() && nll_base.is_finite() {
+            // One-sided fallback: minus-side was non-finite.
+            (nll_plus - nll_base) / (xj_plus - x[j])
+        } else if nll_minus.is_finite() && nll_base.is_finite() {
+            // One-sided fallback: plus-side was non-finite.
+            (nll_base - nll_minus) / (x[j] - xj_minus)
+        } else {
+            0.0
+        };
     }
 
     (nll_base, grad)
