@@ -344,14 +344,17 @@ fn obs_nll_subject_grad(
                 let nll_p =
                     obs_nll_single_into(model, subject, &theta_p, sigma_values, eta, pk_scratch);
                 let raw = (nll_p - nll_base) / delta;
-                grad[i] = if theta_packs_log_mask[i] { theta[i] * raw } else { raw };
+                grad[i] = if theta_packs_log_mask[i] {
+                    theta[i] * raw
+                } else {
+                    raw
+                };
             } else {
                 let k = i - n_theta;
                 let mut sigma_p = sigma_values.to_vec();
                 let delta = h * (1.0 + sigma_values[k].abs());
                 sigma_p[k] += delta;
-                let nll_p =
-                    obs_nll_single_into(model, subject, theta, &sigma_p, eta, pk_scratch);
+                let nll_p = obs_nll_single_into(model, subject, theta, &sigma_p, eta, pk_scratch);
                 // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)
                 grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
             }
@@ -381,7 +384,9 @@ fn obs_nll_subject_grad(
         // d(obs_nll_j)/d(f_j) = -resid/V + 0.5 * (dV/df) * (1/V - resid²/V²)
         let dv_df = match model.error_model {
             ErrorModel::Additive => 0.0,
-            ErrorModel::Proportional | ErrorModel::Combined => 2.0 * f * sigma_values[0] * sigma_values[0],
+            ErrorModel::Proportional | ErrorModel::Combined => {
+                2.0 * f * sigma_values[0] * sigma_values[0]
+            }
         };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
@@ -397,15 +402,18 @@ fn obs_nll_subject_grad(
         let delta = h_fd * (1.0 + theta[i].abs());
         let mut theta_p = theta.to_vec();
         theta_p[i] += delta;
-        let preds_p = crate::pk::compute_predictions_with_tv_into(
-            model, subject, &theta_p, eta, pk_scratch,
-        );
+        let preds_p =
+            crate::pk::compute_predictions_with_tv_into(model, subject, &theta_p, eta, pk_scratch);
         let d_obs_nll: f64 = d_nll_d_f
             .iter()
             .zip(preds_p.iter().zip(preds_base.iter()))
             .map(|(&dl, (&pp, &pb))| dl * (pp.max(1e-12) - pb.max(1e-12)) / delta)
             .sum();
-        grad[i] = if theta_packs_log_mask[i] { theta[i] * d_obs_nll } else { d_obs_nll };
+        grad[i] = if theta_packs_log_mask[i] {
+            theta[i] * d_obs_nll
+        } else {
+            d_obs_nll
+        };
     }
 
     // Sigma gradient: analytical.
@@ -424,7 +432,7 @@ fn obs_nll_subject_grad(
                 let resid = residuals[j];
                 // ratio = sigma_k * dV/d(sigma_k)
                 let ratio = match model.error_model {
-                    ErrorModel::Additive => 2.0 * s * s, // = 2V
+                    ErrorModel::Additive => 2.0 * s * s,             // = 2V
                     ErrorModel::Proportional => 2.0 * s * s * f * f, // = 2V
                     ErrorModel::Combined => {
                         if k == 0 {
@@ -1437,7 +1445,11 @@ mod tests {
         };
 
         let population = Population {
-            subjects: vec![make_subj("1", 8.0), make_subj("2", 5.0), make_subj("3", 11.0)],
+            subjects: vec![
+                make_subj("1", 8.0),
+                make_subj("2", 5.0),
+                make_subj("3", 11.0),
+            ],
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
         };
@@ -1496,7 +1508,12 @@ mod tests {
             }
         }
 
-        assert!((total_nll - f0).abs() < 1e-10, "nll mismatch: {} vs {}", total_nll, f0);
+        assert!(
+            (total_nll - f0).abs() < 1e-10,
+            "nll mismatch: {} vs {}",
+            total_nll,
+            f0
+        );
 
         for j in 0..n {
             let rel = if ref_grad[j].abs() > 1e-10 {
