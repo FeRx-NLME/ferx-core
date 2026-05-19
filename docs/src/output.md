@@ -112,6 +112,25 @@ Both formulas use the **uncentered second moment with `n` divisor**, matching th
 
 Values of `NaN` indicate a zero-variance omega component (ETA) or fewer than two valid residuals (EPS).
 
+### IWRES Autocorrelation
+
+Two pooled autocorrelation diagnostics are reported after every fit:
+
+**`iwres_lag1_r`** — pooled lag-1 Pearson correlation of IWRES across subjects. Values near 0 indicate no serial dependence; values approaching ±1 indicate strong autocorrelation.
+
+**`dw_statistic`** — pooled Durbin-Watson statistic:
+\\[ \text{DW} = \frac{\sum_i \sum_t (e_{i,t} - e_{i,t-1})^2}{\sum_i \sum_t e_{i,t}^2} \\]
+
+| DW range | Interpretation |
+|----------|---------------|
+| ≈ 2.0 | No autocorrelation |
+| < 1.5 | Positive autocorrelation — structural model likely missing dynamics |
+| > 2.5 | Negative autocorrelation — possible over-parameterization or misspecified error model |
+
+Subjects with fewer than 2 finite IWRES values are excluded from both statistics. Both fields are `NaN` when no subject qualifies.
+
+When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption model, additional compartment, or IOV on ka/F (plus SDE process noise for ODE models). When `dw_statistic > 2.5`, the warning suggests over-parameterization or a misspecified error model.
+
 ### Covariance Status
 
 `covariance_status: CovarianceStatus` takes one of three values:

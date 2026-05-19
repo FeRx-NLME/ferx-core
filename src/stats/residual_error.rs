@@ -239,13 +239,12 @@ mod tests {
 
     #[test]
     fn test_dw_uncorrelated_near_two() {
-        // Residuals that cancel out → DW close to 2
-        let subj = make_subject(vec![1.0, -1.0, 1.0, 1.0, -1.0, 1.0, -1.0, -1.0]);
+        // White-noise-like residuals → DW near 2 (no autocorrelation)
+        let subj = make_subject(vec![0.5, -0.3, 0.8, -0.1, 0.2, -0.6, 0.4, -0.2]);
         let (_r, dw) = iwres_autocorrelation(&[subj]);
-        // Not a strict test — just check it's in a reasonable mid range
         assert!(
-            dw > 1.0 && dw < 3.5,
-            "expected DW near 2 for mixed signs, got {dw}"
+            dw > 1.5 && dw < 2.5,
+            "expected DW near 2 for white-noise sequence, got {dw}"
         );
     }
 

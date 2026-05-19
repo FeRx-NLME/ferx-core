@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-17b3bfda.js";
+            window.path_to_searchindex_js = "searchindex-ac2e6f7b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-6f2d6898.js"></script>
@@ -2696,6 +2696,25 @@ sigma:
 <p>Both formulas use the <strong>uncentered second moment with <code>n</code> divisor</strong>, matching the NONMEM / PsN / Monolix convention — the population model assumes <code>E[η]=0</code> and <code>E[IWRES²]=1</code>, so the natural estimator is <code>√(Σx²/n)</code> rather than the unbiased sample SD (which centers on the sample mean and divides by <code>n-1</code>). The unbiased form would inflate SD by <code>√(n/(n-1))</code> and routinely produce spurious negative shrinkage on small samples.</p>
 <p><strong>Negative <code>shrinkage_eps</code></strong> is mathematically possible and meaningful: it indicates <code>mean(IWRES²) &gt; 1</code>, i.e. the residual error model does not absorb the residuals seen at the final EBE etas. Common causes include SAEM converging to a local optimum with under-fit sigma (often resolved by polishing with <code>method = [saem, focei]</code> or trying a different start), model misspecification for a subset of subjects (check the IWRES distribution in the sdtab for outliers), or sigma at a bound. When <code>shrinkage_eps &lt; -5%</code>, ferx emits a warning to <code>FitResult.warnings</code>; the raw value is retained for parity with NONMEM/PsN.</p>
 <p>Values of <code>NaN</code> indicate a zero-variance omega component (ETA) or fewer than two valid residuals (EPS).</p>
+<h3 id="iwres-autocorrelation"><a class="header" href="#iwres-autocorrelation">IWRES Autocorrelation</a></h3>
+<p>Two pooled autocorrelation diagnostics are reported after every fit:</p>
+<p><strong><code>iwres_lag1_r</code></strong> — pooled lag-1 Pearson correlation of IWRES across subjects. Values near 0 indicate no serial dependence; values approaching ±1 indicate strong autocorrelation.</p>
+<p><strong><code>dw_statistic</code></strong> — pooled Durbin-Watson statistic:
+\[ \text{DW} = \frac{\sum_i \sum_t (e_{i,t} - e_{i,t-1})^2}{\sum_i \sum_t e_{i,t}^2} \]</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>DW range</th><th>Interpretation</th></tr>
+</thead>
+<tbody>
+<tr><td>≈ 2.0</td><td>No autocorrelation</td></tr>
+<tr><td>&lt; 1.5</td><td>Positive autocorrelation — structural model likely missing dynamics</td></tr>
+<tr><td>&gt; 2.5</td><td>Negative autocorrelation — possible over-parameterization or misspecified error model</td></tr>
+</tbody>
+</table>
+</div>
+<p>Subjects with fewer than 2 finite IWRES values are excluded from both statistics. Both fields are <code>NaN</code> when no subject qualifies.</p>
+<p>When <code>dw_statistic &lt; 1.5</code>, ferx emits a warning suggesting a transit absorption model, additional compartment, or IOV on ka/F (plus SDE process noise for ODE models). When <code>dw_statistic &gt; 2.5</code>, the warning suggests over-parameterization or a misspecified error model.</p>
 <h3 id="covariance-status"><a class="header" href="#covariance-status">Covariance Status</a></h3>
 <p><code>covariance_status: CovarianceStatus</code> takes one of three values:</p>
 <div class="table-wrapper">
