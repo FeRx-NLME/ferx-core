@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-3cd74007.js";
+            window.path_to_searchindex_js = "searchindex-789e20a1.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-6f2d6898.js"></script>
+        <script src="toc-e4ad03bd.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1820,6 +1820,160 @@ warnings.</p>
 <h2 id="covariates-in-simulation"><a class="header" href="#covariates-in-simulation">Covariates in Simulation</a></h2>
 <p>Covariates can be specified per subject in the <code>[simulation]</code> block. Currently, the simulated population uses default covariate values (covariates are not randomized).</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="importing-mrgsolve-models"><a class="header" href="#importing-mrgsolve-models">Importing mrgsolve Models</a></h1>
+<p>ferx can read <a href="https://mrgsolve.org">mrgsolve</a>-style <code>.cpp</code>/<code>.mod</code> model
+files directly. Two workflows are supported:</p>
+<pre><code class="language-bash"># Direct fit — ferx auto-detects the .cpp/.mod extension.
+ferx warfarin.mod --data warfarin.csv
+
+# Inspect-and-edit workflow — emit an equivalent .ferx file first.
+ferx translate warfarin.mod -o warfarin.ferx
+ferx warfarin.ferx --data warfarin.csv
+</code></pre>
+<p>Under the hood, the mrgsolve front-end translates the model into ferx’s
+<code>.ferx</code> DSL and feeds that through the existing parser. Translation is
+deterministic and side-effect-free — the same <code>.cpp</code> always produces the
+same <code>.ferx</code>.</p>
+<h2 id="supported-blocks"><a class="header" href="#supported-blocks">Supported blocks</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Block</th><th>Behaviour</th></tr>
+</thead>
+<tbody>
+<tr><td><code>$PROB</code></td><td>Model name (used in log output).</td></tr>
+<tr><td><code>$PARAM</code></td><td>Named thetas: <code>$PARAM TVCL=1, TVV=10</code>.</td></tr>
+<tr><td><code>$THETA</code></td><td>Positional thetas; auto-named <code>THETA1..THETAn</code>.</td></tr>
+<tr><td><code>$INPUT</code></td><td>Covariate names (defaults ignored — covariates come from data).</td></tr>
+<tr><td><code>$OMEGA</code></td><td>Diagonal or <code>@block</code>, with optional <code>@labels</code> for ETA names.</td></tr>
+<tr><td><code>$SIGMA</code></td><td>Same shape as <code>$OMEGA</code>, for residual error terms.</td></tr>
+<tr><td><code>$CMT</code> / <code>$INIT</code></td><td>Compartment names; <code>$INIT</code> allows <code>NAME = init_value</code>.</td></tr>
+<tr><td><code>$MAIN</code> / <code>$PK</code></td><td>Individual-parameter calculations (becomes <code>[individual_parameters]</code>).</td></tr>
+<tr><td><code>$ODE</code></td><td>Differential equations; <code>dxdt_X = ...</code> becomes <code>d/dt(X) = ...</code>.</td></tr>
+<tr><td><code>$TABLE</code> / <code>$ERROR</code></td><td>Residual-error definition (pattern-matched into one of ferx’s three error models).</td></tr>
+<tr><td><code>$CAPTURE</code></td><td>Recorded but not separately translated (every named variable is already exposed).</td></tr>
+<tr><td><code>$PKMODEL</code></td><td>Analytical model dispatch — <code>ncmt=1..3</code>, <code>depot=TRUE</code>/<code>FALSE</code>.</td></tr>
+<tr><td><code>$SET</code></td><td>Ignored (simulation options aren’t carried into the fit).</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="unsupported-hard-fail-blocks-and-constructs"><a class="header" href="#unsupported-hard-fail-blocks-and-constructs">Unsupported (hard-fail) blocks and constructs</a></h2>
+<p>The translator rejects these with a <code>file:line:</code> error pointing at the
+offending source line:</p>
+<ul>
+<li><code>$GLOBAL</code>, <code>$PREAMBLE</code>, <code>$INCLUDE</code> — arbitrary C++ scope can’t be safely
+embedded in <code>.ferx</code>.</li>
+<li><code>$PLUGIN</code> — pluggable extensions (<code>Rcpp</code>, <code>mrgx</code>, <code>nm-vars</code>, <code>autodec</code>) are
+not modelled.</li>
+<li><code>$NMXML</code>, <code>$NMEXT</code> — NONMEM result imports.</li>
+<li><code>$PRED</code>, <code>$EVENT</code> — alternative model entry points.</li>
+<li><code>for</code> / <code>while</code> loops, <code>return</code>, <code>?:</code> ternaries, C-style casts (<code>(int)x</code>).</li>
+<li><code>pow(a, b)</code> — rewrite as <code>a^b</code>.</li>
+<li>Preprocessor directives (<code>#include</code>, <code>#define</code>).</li>
+</ul>
+<h2 id="name-resolution-rules"><a class="header" href="#name-resolution-rules">Name resolution rules</a></h2>
+<p>Inside <code>$MAIN</code>/<code>$ODE</code>/<code>$TABLE</code> bodies:</p>
+<ul>
+<li><code>THETA(n)</code> resolves to the <em>n</em>th entry of <code>$PARAM</code> (1-indexed). If
+<code>$THETA</code> is also declared, <code>$THETA</code> takes precedence.</li>
+<li><code>ETA(n)</code> resolves to the <em>n</em>th label across all <code>$OMEGA</code> blocks. When a
+block has no <code>@labels</code>, etas are auto-named <code>ETA1..ETAn</code>.</li>
+<li><code>EPS(n)</code> resolves to the <em>n</em>th label across all <code>$SIGMA</code> blocks. Same
+auto-naming rule applies.</li>
+<li>Out-of-range indices produce a hard error.</li>
+</ul>
+<p>Named references (<code>TVCL</code>, <code>ETA_CL</code>, …) work identically to positional ones.
+The emitted <code>.ferx</code> source uses names exclusively — no <code>THETA(1)</code> survives
+translation.</p>
+<h2 id="supported-error-model-patterns"><a class="header" href="#supported-error-model-patterns">Supported error-model patterns</a></h2>
+<p>ferx represents residual error declaratively, so the <code>$TABLE</code> block must end
+in one of these structural shapes:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Pattern</th><th>Becomes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Y = IPRED * (1 + EPS(p))</code></td><td><code>DV ~ proportional(SIGMA_p)</code></td></tr>
+<tr><td><code>Y = IPRED + EPS(a)</code></td><td><code>DV ~ additive(SIGMA_a)</code></td></tr>
+<tr><td><code>Y = IPRED * (1 + EPS(p)) + EPS(a)</code></td><td><code>DV ~ combined(SIGMA_p, SIGMA_a)</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Any other shape (e.g. log-normal <code>Y = IPRED * exp(EPS(1))</code>, two
+proportional terms) is rejected with a hint listing the three supported
+forms.</p>
+<h2 id="default-fit-options"><a class="header" href="#default-fit-options">Default fit options</a></h2>
+<p>A translated model has no <code>[fit_options]</code> section in the source <code>.cpp</code>. The
+emitter inserts these defaults:</p>
+<pre><code>[fit_options]
+  method     = focei
+  maxiter    = 300
+  covariance = true
+</code></pre>
+<p>To customise them, run <code>ferx translate</code> to emit the <code>.ferx</code>, edit the
+<code>[fit_options]</code> block, and run <code>ferx &lt;model&gt;.ferx --data ...</code> against the
+edited file.</p>
+<h2 id="worked-example"><a class="header" href="#worked-example">Worked example</a></h2>
+<p>Source <code>examples/warfarin.mod</code>:</p>
+<pre><code class="language-cpp">$PROB warfarin one-cpt oral
+$PARAM TVCL = 0.2, TVV = 10.0, TVKA = 1.5
+$CMT GUT CENT
+$OMEGA @labels ETA_CL ETA_V ETA_KA
+0.09 0.04 0.30
+$SIGMA @labels PROP_ERR
+0.02
+$MAIN
+double CL = TVCL * exp(ETA_CL);
+double V  = TVV  * exp(ETA_V);
+double KA = TVKA * exp(ETA_KA);
+$PKMODEL ncmt=1, depot=TRUE
+$TABLE
+capture IPRED = CENT/V;
+capture Y     = IPRED * (1 + EPS(1));
+</code></pre>
+<p>Running <code>ferx translate examples/warfarin.mod</code> produces:</p>
+<pre><code># warfarin one-cpt oral
+# Translated from mrgsolve by `ferx translate`.
+
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10)
+  theta TVKA(1.5)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  omega ETA_KA ~ 0.3
+
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 300
+  covariance = true
+</code></pre>
+<p>This is functionally equivalent to the hand-written <code>examples/warfarin.ferx</code>.</p>
+<h2 id="cli-reference"><a class="header" href="#cli-reference">CLI reference</a></h2>
+<pre><code>ferx translate &lt;model.mod|model.cpp&gt; [-o out.ferx] [--check] [--force]
+</code></pre>
+<ul>
+<li><code>-o, --output PATH</code> — write <code>.ferx</code> to <code>PATH</code> instead of stdout.</li>
+<li><code>--check</code> — parse only; exit 0 on success, non-zero on error. No output
+is written.</li>
+<li><code>--force</code> — overwrite an existing <code>--output</code> target.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="estimation-methods-1"><a class="header" href="#estimation-methods-1">Estimation Methods</a></h1>
 <p>FeRx implements two families of estimation methods for nonlinear mixed effects models:</p>
 <ul>
@@ -2512,7 +2666,7 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <h2 id="column-name-case"><a class="header" href="#column-name-case">Column Name Case</a></h2>
 <p>Column names are case-insensitive. <code>ID</code>, <code>Id</code>, and <code>id</code> are all recognized. Covariate columns preserve their case as declared in the CSV header.</p>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="cli-reference"><a class="header" href="#cli-reference">CLI Reference</a></h1>
+<h1 id="cli-reference-1"><a class="header" href="#cli-reference-1">CLI Reference</a></h1>
 <p>The <code>ferx</code> command-line tool runs population PK estimation from model files and data.</p>
 <h2 id="usage-1"><a class="header" href="#usage-1">Usage</a></h2>
 <pre><code class="language-bash">ferx &lt;model.ferx&gt; --data &lt;data.csv&gt; [--output &lt;run.fitrx&gt;] [--include-data]

@@ -15,6 +15,7 @@
   - [Neural Networks (DCM / NODE)](model-file/neural-networks.md)
   - [Fit Options](model-file/fit-options.md)
   - [Simulation](model-file/simulation.md)
+  - [Importing mrgsolve Models](model-file/mrgsolve.md)
 - [Estimation Methods](estimation/README.md)
   - [FOCE / FOCEI](estimation/foce.md)
   - [Gauss-Newton (BHHH)](estimation/gauss-newton.md)

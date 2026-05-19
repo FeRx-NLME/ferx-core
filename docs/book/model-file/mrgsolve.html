@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>BLOQ (M3 method) - FeRx-NLME Documentation</title>
+        <title>Importing mrgsolve Models - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,37 +177,130 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="bloq-m3-method"><a class="header" href="#bloq-m3-method">BLOQ (M3 method)</a></h1>
-<p>This example shows how to fit a model to data that contains observations below
-the assay lower limit of quantification (BLOQ) using Beal’s <strong>M3 method</strong>.
-Instead of dropping BLOQ rows — which biases terminal-phase parameter estimates
-— each censored observation contributes
-<code>P(y &lt; LLOQ | θ, η) = Φ((LLOQ − f)/√V)</code> to the likelihood.</p>
-<h2 id="dataset-datawarfarin-bloqcsv"><a class="header" href="#dataset-datawarfarin-bloqcsv">Dataset (<code>data/warfarin-bloq.csv</code>)</a></h2>
-<p>This is the warfarin dataset with an added <code>CENS</code> column. Ten late-time
-observations that originally fell below an assay LLOQ of 2.0 µg/mL have been
-marked <code>CENS=1</code> and their <code>DV</code> cell set to the LLOQ value:</p>
-<pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,CENS
-1,0,.,1,100,1,0,1,0
-1,0.5,5.3653,0,.,1,0,0,0
-...
-1,96,2.5019,0,.,1,0,0,0
-1,120,2,0,.,1,0,0,1
+                        <h1 id="importing-mrgsolve-models"><a class="header" href="#importing-mrgsolve-models">Importing mrgsolve Models</a></h1>
+<p>ferx can read <a href="https://mrgsolve.org">mrgsolve</a>-style <code>.cpp</code>/<code>.mod</code> model
+files directly. Two workflows are supported:</p>
+<pre><code class="language-bash"># Direct fit — ferx auto-detects the .cpp/.mod extension.
+ferx warfarin.mod --data warfarin.csv
+
+# Inspect-and-edit workflow — emit an equivalent .ferx file first.
+ferx translate warfarin.mod -o warfarin.ferx
+ferx warfarin.ferx --data warfarin.csv
 </code></pre>
-<p><strong>NONMEM <code>CENS</code> convention</strong>: when <code>CENS=1</code>, the row is censored and <code>DV</code>
-carries the LLOQ value — not the true (unobserved) concentration. Rows with no
-<code>CENS</code> column, or <code>CENS=0</code>, are treated as ordinary quantified observations.</p>
-<h2 id="model-file-exampleswarfarin-bloqferx"><a class="header" href="#model-file-exampleswarfarin-bloqferx">Model File (<code>examples/warfarin-bloq.ferx</code>)</a></h2>
-<pre><code># One-compartment oral PK model (warfarin) with M3 BLOQ likelihood.
+<p>Under the hood, the mrgsolve front-end translates the model into ferx’s
+<code>.ferx</code> DSL and feeds that through the existing parser. Translation is
+deterministic and side-effect-free — the same <code>.cpp</code> always produces the
+same <code>.ferx</code>.</p>
+<h2 id="supported-blocks"><a class="header" href="#supported-blocks">Supported blocks</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Block</th><th>Behaviour</th></tr>
+</thead>
+<tbody>
+<tr><td><code>$PROB</code></td><td>Model name (used in log output).</td></tr>
+<tr><td><code>$PARAM</code></td><td>Named thetas: <code>$PARAM TVCL=1, TVV=10</code>.</td></tr>
+<tr><td><code>$THETA</code></td><td>Positional thetas; auto-named <code>THETA1..THETAn</code>.</td></tr>
+<tr><td><code>$INPUT</code></td><td>Covariate names (defaults ignored — covariates come from data).</td></tr>
+<tr><td><code>$OMEGA</code></td><td>Diagonal or <code>@block</code>, with optional <code>@labels</code> for ETA names.</td></tr>
+<tr><td><code>$SIGMA</code></td><td>Same shape as <code>$OMEGA</code>, for residual error terms.</td></tr>
+<tr><td><code>$CMT</code> / <code>$INIT</code></td><td>Compartment names; <code>$INIT</code> allows <code>NAME = init_value</code>.</td></tr>
+<tr><td><code>$MAIN</code> / <code>$PK</code></td><td>Individual-parameter calculations (becomes <code>[individual_parameters]</code>).</td></tr>
+<tr><td><code>$ODE</code></td><td>Differential equations; <code>dxdt_X = ...</code> becomes <code>d/dt(X) = ...</code>.</td></tr>
+<tr><td><code>$TABLE</code> / <code>$ERROR</code></td><td>Residual-error definition (pattern-matched into one of ferx’s three error models).</td></tr>
+<tr><td><code>$CAPTURE</code></td><td>Recorded but not separately translated (every named variable is already exposed).</td></tr>
+<tr><td><code>$PKMODEL</code></td><td>Analytical model dispatch — <code>ncmt=1..3</code>, <code>depot=TRUE</code>/<code>FALSE</code>.</td></tr>
+<tr><td><code>$SET</code></td><td>Ignored (simulation options aren’t carried into the fit).</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="unsupported-hard-fail-blocks-and-constructs"><a class="header" href="#unsupported-hard-fail-blocks-and-constructs">Unsupported (hard-fail) blocks and constructs</a></h2>
+<p>The translator rejects these with a <code>file:line:</code> error pointing at the
+offending source line:</p>
+<ul>
+<li><code>$GLOBAL</code>, <code>$PREAMBLE</code>, <code>$INCLUDE</code> — arbitrary C++ scope can’t be safely
+embedded in <code>.ferx</code>.</li>
+<li><code>$PLUGIN</code> — pluggable extensions (<code>Rcpp</code>, <code>mrgx</code>, <code>nm-vars</code>, <code>autodec</code>) are
+not modelled.</li>
+<li><code>$NMXML</code>, <code>$NMEXT</code> — NONMEM result imports.</li>
+<li><code>$PRED</code>, <code>$EVENT</code> — alternative model entry points.</li>
+<li><code>for</code> / <code>while</code> loops, <code>return</code>, <code>?:</code> ternaries, C-style casts (<code>(int)x</code>).</li>
+<li><code>pow(a, b)</code> — rewrite as <code>a^b</code>.</li>
+<li>Preprocessor directives (<code>#include</code>, <code>#define</code>).</li>
+</ul>
+<h2 id="name-resolution-rules"><a class="header" href="#name-resolution-rules">Name resolution rules</a></h2>
+<p>Inside <code>$MAIN</code>/<code>$ODE</code>/<code>$TABLE</code> bodies:</p>
+<ul>
+<li><code>THETA(n)</code> resolves to the <em>n</em>th entry of <code>$PARAM</code> (1-indexed). If
+<code>$THETA</code> is also declared, <code>$THETA</code> takes precedence.</li>
+<li><code>ETA(n)</code> resolves to the <em>n</em>th label across all <code>$OMEGA</code> blocks. When a
+block has no <code>@labels</code>, etas are auto-named <code>ETA1..ETAn</code>.</li>
+<li><code>EPS(n)</code> resolves to the <em>n</em>th label across all <code>$SIGMA</code> blocks. Same
+auto-naming rule applies.</li>
+<li>Out-of-range indices produce a hard error.</li>
+</ul>
+<p>Named references (<code>TVCL</code>, <code>ETA_CL</code>, …) work identically to positional ones.
+The emitted <code>.ferx</code> source uses names exclusively — no <code>THETA(1)</code> survives
+translation.</p>
+<h2 id="supported-error-model-patterns"><a class="header" href="#supported-error-model-patterns">Supported error-model patterns</a></h2>
+<p>ferx represents residual error declaratively, so the <code>$TABLE</code> block must end
+in one of these structural shapes:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Pattern</th><th>Becomes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Y = IPRED * (1 + EPS(p))</code></td><td><code>DV ~ proportional(SIGMA_p)</code></td></tr>
+<tr><td><code>Y = IPRED + EPS(a)</code></td><td><code>DV ~ additive(SIGMA_a)</code></td></tr>
+<tr><td><code>Y = IPRED * (1 + EPS(p)) + EPS(a)</code></td><td><code>DV ~ combined(SIGMA_p, SIGMA_a)</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Any other shape (e.g. log-normal <code>Y = IPRED * exp(EPS(1))</code>, two
+proportional terms) is rejected with a hint listing the three supported
+forms.</p>
+<h2 id="default-fit-options"><a class="header" href="#default-fit-options">Default fit options</a></h2>
+<p>A translated model has no <code>[fit_options]</code> section in the source <code>.cpp</code>. The
+emitter inserts these defaults:</p>
+<pre><code>[fit_options]
+  method     = focei
+  maxiter    = 300
+  covariance = true
+</code></pre>
+<p>To customise them, run <code>ferx translate</code> to emit the <code>.ferx</code>, edit the
+<code>[fit_options]</code> block, and run <code>ferx &lt;model&gt;.ferx --data ...</code> against the
+edited file.</p>
+<h2 id="worked-example"><a class="header" href="#worked-example">Worked example</a></h2>
+<p>Source <code>examples/warfarin.mod</code>:</p>
+<pre><code class="language-cpp">$PROB warfarin one-cpt oral
+$PARAM TVCL = 0.2, TVV = 10.0, TVKA = 1.5
+$CMT GUT CENT
+$OMEGA @labels ETA_CL ETA_V ETA_KA
+0.09 0.04 0.30
+$SIGMA @labels PROP_ERR
+0.02
+$MAIN
+double CL = TVCL * exp(ETA_CL);
+double V  = TVV  * exp(ETA_V);
+double KA = TVKA * exp(ETA_KA);
+$PKMODEL ncmt=1, depot=TRUE
+$TABLE
+capture IPRED = CENT/V;
+capture Y     = IPRED * (1 + EPS(1));
+</code></pre>
+<p>Running <code>ferx translate examples/warfarin.mod</code> produces:</p>
+<pre><code># warfarin one-cpt oral
+# Translated from mrgsolve by `ferx translate`.
 
 [parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
+  theta TVCL(0.2)
+  theta TVV(10)
+  theta TVKA(1.5)
 
   omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
+  omega ETA_V ~ 0.04
+  omega ETA_KA ~ 0.3
 
   sigma PROP_ERR ~ 0.02
 
@@ -223,65 +316,30 @@ carries the LLOQ value — not the true (unobserved) concentration. Rows with no
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method       = focei
-  maxiter      = 300
-  covariance   = true
-  bloq_method  = m3
+  method     = focei
+  maxiter    = 300
+  covariance = true
 </code></pre>
-<p>The only two lines that differ from a plain fit are <code>bloq_method = m3</code> in
-<code>[fit_options]</code> and the added <code>CENS</code> column in the CSV. Nothing else in the
-model changes.</p>
-<h2 id="running"><a class="header" href="#running">Running</a></h2>
-<pre><code class="language-bash">ferx examples/warfarin-bloq.ferx --data data/warfarin-bloq.csv
+<p>This is functionally equivalent to the hand-written <code>examples/warfarin.ferx</code>.</p>
+<h2 id="cli-reference"><a class="header" href="#cli-reference">CLI reference</a></h2>
+<pre><code>ferx translate &lt;model.mod|model.cpp&gt; [-o out.ferx] [--check] [--force]
 </code></pre>
-<h2 id="expected-results"><a class="header" href="#expected-results">Expected Results</a></h2>
-<pre><code>--- Objective Function ---
-OFV:  -213.9104
-
---- THETA Estimates ---
-TVCL                 0.126263
-TVV                  7.629401
-TVKA                 1.083302
-
---- OMEGA Estimates ---
-  OMEGA(1,1) = 0.031381  (CV% = 17.7)
-  OMEGA(2,2) = 0.009723  (CV% = 9.9)
-  OMEGA(3,3) = 0.419327  (CV% = 64.8)
-
---- SIGMA Estimates ---
-  SIGMA(1) = 0.010766
-</code></pre>
-<p>The diagnostic table (<code>warfarin-bloq-sdtab.csv</code>) gains a <code>CENS</code> column, and the
-<code>IWRES</code> / <code>CWRES</code> cells for censored rows are written as empty (a weighted
-Gaussian residual is undefined when the observed value is censored).</p>
-<h2 id="method-notes"><a class="header" href="#method-notes">Method Notes</a></h2>
 <ul>
-<li><strong>Activation requires both pieces</strong>: the <code>CENS</code> column in the data file <em>and</em>
-<code>bloq_method = m3</code> in <code>[fit_options]</code>. Without the option, <code>CENS=1</code> rows are
-treated as ordinary observations at the LLOQ value, which biases the fit.</li>
-<li><strong>FOCE is auto-promoted to FOCEI on affected subjects.</strong> Mixing linearized
-Gaussian residuals with non-linearized <code>log Φ</code> terms produces inconsistent
-OFVs near the LLOQ boundary, so when <code>method = foce</code> and a subject has any
-<code>CENS=1</code> row, that subject is evaluated with η-interaction. A notice is
-written to <code>FitResult.warnings</code>; set <code>method = focei</code> explicitly to silence
-it.</li>
-<li><strong>Gauss-Newton caveat.</strong> With <code>method = gn</code> or <code>gn_hybrid</code>, the BHHH
-information-matrix approximation degrades as the BLOQ fraction grows (each
-censored row carries less Fisher information than its Gaussian counterpart).
-A warning is emitted; for &gt;20% censoring prefer <code>focei</code>.</li>
-<li><strong>SAEM</strong> optimizes θ/σ with M3 in the M-step directly, so no special handling
-is required beyond setting <code>bloq_method = m3</code>.</li>
+<li><code>-o, --output PATH</code> — write <code>.ferx</code> to <code>PATH</code> instead of stdout.</li>
+<li><code>--check</code> — parse only; exit 0 on success, non-zero on error. No output
+is written.</li>
+<li><code>--force</code> — overwrite an existing <code>--output</code> target.</li>
 </ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../examples/ode-model.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../model-file/simulation.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../examples/iov.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../estimation/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -291,11 +349,11 @@ is required beyond setting <code>bloq_method = m3</code>.</li>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../examples/ode-model.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../model-file/simulation.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../examples/iov.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../estimation/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

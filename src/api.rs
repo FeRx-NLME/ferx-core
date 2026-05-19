@@ -21,15 +21,38 @@ fn model_preds(model: &CompiledModel, subject: &Subject, pk_params: &PkParams) -
     }
 }
 
+/// Parse a model file, dispatching on extension. `.ferx` → existing ferx
+/// parser; `.cpp`/`.mod` → mrgsolve front-end. Anything else falls through
+/// to the ferx parser so unrecognised extensions get the existing error
+/// rather than a surprising "unsupported extension" message.
+pub fn parse_any_model_file(path: &Path) -> Result<ParsedModel, String> {
+    use crate::parser::model_parser::parse_full_model_file;
+    use crate::parser::mrgsolve;
+
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("cpp") | Some("mod") => {
+            eprintln!(
+                "note: {} parsed as mrgsolve; using default fit options. \
+                 Run `ferx translate` to inspect/customise the .ferx output.",
+                path.display()
+            );
+            mrgsolve::parse_mrgsolve_file(path)
+        }
+        _ => parse_full_model_file(path),
+    }
+}
+
 /// Run a model file with a NONMEM-format CSV dataset.
 /// Returns (FitResult, Population) so caller can write sdtab.
 pub fn run_model_with_data(
     model_path: &str,
     data_path: &str,
 ) -> Result<(FitResult, Population), String> {
-    use crate::parser::model_parser::parse_full_model_file;
-
-    let mut parsed = parse_full_model_file(Path::new(model_path))?;
+    let mut parsed = parse_any_model_file(Path::new(model_path))?;
     set_model_name(&mut parsed.model, model_path);
 
     eprintln!("Model: {}", parsed.model.name);
@@ -64,10 +87,9 @@ pub fn run_model_with_data(
 /// Run a model file with simulated data (from [simulation] block).
 /// Returns (FitResult, Population) so caller can write sdtab.
 pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), String> {
-    use crate::parser::model_parser::parse_full_model_file;
     use std::collections::HashMap;
 
-    let mut parsed = parse_full_model_file(Path::new(model_path))?;
+    let mut parsed = parse_any_model_file(Path::new(model_path))?;
     let sim_spec = parsed
         .simulation
         .clone()

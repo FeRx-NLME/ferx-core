@@ -1,12 +1,21 @@
 use std::env;
+use std::path::Path;
 use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
+    // Subcommand dispatch — checked before the positional model-path logic
+    // so `ferx translate ...` doesn't collide with `ferx <model.ferx> ...`.
+    if args.get(1).map(String::as_str) == Some("translate") {
+        run_translate(&args[2..]);
+        return;
+    }
+
     if args.len() < 2 {
-        eprintln!("Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data]");
-        eprintln!("       ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]");
+        eprintln!("Usage: ferx <model.ferx|model.mod|model.cpp> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data]");
+        eprintln!("       ferx <model> --simulate                       [--threads N|auto] [--output <run.fitrx>]");
+        eprintln!("       ferx translate <model.mod|model.cpp>          [-o out.ferx] [--check]");
         eprintln!();
         eprintln!("Fits a NLME model and writes sdtab.csv with residuals.");
         eprintln!("Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)");
@@ -132,6 +141,61 @@ fn main() {
 
 /// Parse the optional `--output` flag. Returns `None` when absent; exits with
 /// an error message when present but missing its value, mirroring `--threads`.
+/// Handle `ferx translate <input.mod> [-o out.ferx] [--check] [--force]`.
+fn run_translate(args: &[String]) {
+    let input = match args.iter().find(|a| !a.starts_with('-')) {
+        Some(p) => p.clone(),
+        None => {
+            eprintln!("Usage: ferx translate <model.mod|model.cpp> [-o out.ferx] [--check] [--force]");
+            std::process::exit(1);
+        }
+    };
+    let output = parse_o_flag(args);
+    let check_only = args.iter().any(|a| a == "--check");
+    let force = args.iter().any(|a| a == "--force");
+
+    let path = Path::new(&input);
+    let result = ferx_core::translate_mrgsolve_file(path);
+    let ferx_text = match result {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("translate: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if check_only {
+        eprintln!("translate: {} parsed cleanly ({} bytes of .ferx)", path.display(), ferx_text.len());
+        return;
+    }
+
+    match output {
+        Some(out_path) => {
+            let out = Path::new(&out_path);
+            if out.exists() && !force {
+                eprintln!(
+                    "translate: refusing to overwrite existing {} (pass --force to override)",
+                    out.display()
+                );
+                std::process::exit(1);
+            }
+            if let Err(e) = std::fs::write(out, ferx_text) {
+                eprintln!("translate: failed to write {}: {}", out.display(), e);
+                std::process::exit(1);
+            }
+            eprintln!("translate: wrote {}", out.display());
+        }
+        None => print!("{}", ferx_text),
+    }
+}
+
+fn parse_o_flag(args: &[String]) -> Option<String> {
+    args.iter()
+        .position(|a| a == "-o" || a == "--output")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
 fn parse_output_flag(args: &[String]) -> Option<String> {
     let idx = args.iter().position(|a| a == "--output")?;
     match args.get(idx + 1) {

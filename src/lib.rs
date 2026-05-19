@@ -24,12 +24,17 @@ pub mod stats;
 pub mod types;
 
 pub use api::{
-    fit, fit_from_files, predict, run_from_file, run_model_simulate, run_model_with_data, simulate,
-    simulate_with_seed, simulate_with_uncertainty, SimulateUncertaintyOptions,
+    fit, fit_from_files, parse_any_model_file, predict, run_from_file, run_model_simulate,
+    run_model_with_data, simulate, simulate_with_seed, simulate_with_uncertainty,
+    SimulateUncertaintyOptions,
 };
 pub use cancel::CancelFlag;
 pub use estimation::run_sir::run_sir;
 pub use estimation::uncertainty_samples::UncertaintyMethod;
 pub use io::datareader::read_nonmem_csv;
 pub use parser::model_parser::{parse_full_model_file, parse_model_file, parse_model_string};
+pub use parser::mrgsolve::{
+    parse_mrgsolve_file, parse_mrgsolve_string, translate_mrgsolve_file,
+    translate_mrgsolve_string,
+};
 pub use types::*;
