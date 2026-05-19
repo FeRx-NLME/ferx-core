@@ -492,19 +492,27 @@ mod tests {
             return;
         };
 
-        // Tamper with both files — would fail any disk-based hash check.
-        for p in [&model_path, &data_path] {
-            let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+        // Tamper only the model file — changing its hash is sufficient to
+        // verify the hash-bypass behaviour. Appending to the CSV would add
+        // a fake subject (the CSV reader doesn't skip comment lines), which
+        // would make pop.subjects.len() != fit.eta_hats.len() and panic in
+        // run_inner_loop_warm; the data file hash is checked separately in
+        // run_sir_detects_modified_data_file.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&model_path)
+                .unwrap();
             writeln!(f, "# tampered").unwrap();
-            drop(f);
         }
 
-        // Build model + population in memory (from the tampered files —
-        // doesn't matter, this branch doesn't verify).
+        // Build model + population in memory (from the tampered/original files —
+        // the caller-supplied branch doesn't verify hashes).
         let parsed = crate::parser::model_parser::parse_full_model_file(&model_path)
             .expect("parse tampered model");
         let pop = crate::io::datareader::read_nonmem_csv(&data_path, None, None)
-            .expect("read tampered data");
+            .expect("read data");
 
         // Should succeed despite the on-disk tampering, because the
         // caller-supplied branch bypasses the hash check entirely.
