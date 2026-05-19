@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>SAEM - FeRx-NLME Documentation</title>
+        <title>Multi-Start (Michaelis-Menten) - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,109 +177,112 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="saem"><a class="header" href="#saem">SAEM</a></h1>
-<p>Stochastic Approximation Expectation-Maximization (SAEM) is an alternative estimation method that uses MCMC sampling for random effects instead of MAP optimization. It is more robust to local minima and can handle complex random effect structures.</p>
-<h2 id="algorithm-overview"><a class="header" href="#algorithm-overview">Algorithm Overview</a></h2>
-<p>SAEM replaces the deterministic inner loop of FOCE with stochastic sampling, following the Monolix convention with a two-phase step-size schedule.</p>
-<h3 id="references"><a class="header" href="#references">References</a></h3>
-<ul>
-<li>Delyon, Lavielle, Moulines (1999). <em>Convergence of a stochastic approximation version of the EM algorithm.</em> Annals of Statistics, 94–128.</li>
-<li>Kuhn &amp; Lavielle (2004). <em>Coupling a stochastic approximation version of EM with an MCMC procedure.</em> ESAIM: Probability and Statistics 8:115–131.</li>
-</ul>
-<h2 id="two-phase-schedule"><a class="header" href="#two-phase-schedule">Two-Phase Schedule</a></h2>
-<h3 id="phase-1-exploration-iterations-1-to-k1"><a class="header" href="#phase-1-exploration-iterations-1-to-k1">Phase 1: Exploration (iterations 1 to K1)</a></h3>
-<p>Step size \( \gamma_k = 1 \). The algorithm explores the parameter space rapidly, with the sufficient statistics being fully replaced each iteration. This allows fast movement toward the basin of the MLE.</p>
-<p>Default: 150 iterations.</p>
-<h3 id="phase-2-convergence-iterations-k11-to-k1k2"><a class="header" href="#phase-2-convergence-iterations-k11-to-k1k2">Phase 2: Convergence (iterations K1+1 to K1+K2)</a></h3>
-<p>Step size \( \gamma_k = 1/(k - K_1) \). The algorithm performs a decreasing-weight average, which guarantees almost-sure convergence to the MLE under regularity conditions.</p>
-<p>Default: 250 iterations.</p>
-<h2 id="per-iteration-steps"><a class="header" href="#per-iteration-steps">Per-Iteration Steps</a></h2>
-<p>Each SAEM iteration consists of:</p>
-<h3 id="1-e-step-metropolis-hastings-sampling"><a class="header" href="#1-e-step-metropolis-hastings-sampling">1. E-Step: Metropolis-Hastings Sampling</a></h3>
-<p>For each subject, run <code>n_mh_steps</code> Metropolis-Hastings iterations to sample from the conditional distribution of random effects:</p>
-<p>\[ p(\eta_i | y_i, \theta, \Omega, \sigma) \]</p>
-<p><strong>Proposal</strong>: symmetric random walk in deviation space, \( \eta_{\text{prop}} = \eta_{\text{current}} + \delta_i \cdot L \cdot z \), with \( z \sim N(0, I) \) and \( L = \text{chol}(\Omega) \). The schedule is identical across both phases — only the SA step size \( \gamma_k \) changes between exploration and convergence.</p>
-<p>The MH kernel is symmetric in \( \eta \), so the proposal density cancels and the acceptance log-ratio is the difference of <code>individual_nll</code> values, which encodes the prior \( N(0, \Omega) \) plus the observation likelihood.</p>
-<p><strong>Acceptance</strong>: Accept with probability \( \min(1, \exp(\text{NLL}<em>{\text{current}} - \text{NLL}</em>{\text{prop}})) \).</p>
-<p>The MH sampling is parallelized across subjects using Rayon.</p>
-<h3 id="2-stochastic-approximation-update"><a class="header" href="#2-stochastic-approximation-update">2. Stochastic Approximation Update</a></h3>
-<p>Update the sufficient statistic for \( \Omega \):</p>
-<p>\[ S_2 \leftarrow (1 - \gamma_k) \cdot S_2 + \gamma_k \cdot \frac{1}{N} \sum_{i=1}^{N} \eta_i \eta_i^T \]</p>
-<h3 id="3-m-step-for-omega-closed-form"><a class="header" href="#3-m-step-for-omega-closed-form">3. M-Step for Omega (Closed Form)</a></h3>
-<p>\[ \Omega_k = S_2 \]</p>
-<p>with structurally-zero entries (cross-block off-diagonals, standalone-vs-block off-diagonals, and all off-diagonals in a fully-diagonal Ω) zeroed out — the SA accumulator \( (1/N) \sum_i \eta_i \eta_i^T \) is dense by construction, but the model declares which entries are free parameters. Without this projection the chain feeds spurious sampling correlations into the next iteration’s MH proposal Cholesky and Ω drifts toward rank-deficiency.</p>
-<h3 id="4-m-step-for-theta-and-sigma-optimization"><a class="header" href="#4-m-step-for-theta-and-sigma-optimization">4. M-Step for Theta and Sigma (Optimization)</a></h3>
-<p>Minimize the conditional observation negative log-likelihood with ETAs held fixed:</p>
-<p>\[ \sum_{i=1}^{N} \sum_{j=1}^{n_i} \left[ \frac{1}{2} \log V_{ij} + \frac{1}{2} \frac{(y_{ij} - f_{ij})^2}{V_{ij}} \right] \]</p>
-<p>When <code>mu_referencing = true</code> (the default), ferx detects lognormal parameters from the <code>[individual_parameters]</code> block and applies the <strong>closed-form EM update</strong> for those thetas instead of running NLopt:</p>
-<p>\[ \log \theta_j \leftarrow \log \theta_j + \gamma_k \cdot \overline{\eta_j} \]</p>
-<p>where \( \overline{\eta_j} = (1/N) \sum_i \eta_{i,j} \) is the empirical mean of the post-MH random effects for the eta paired with \( \theta_j \). For a log-mu-referenced model where \( \log P_i = \log \theta + \eta_i \) with \( \eta_i \sim N(0, \omega^2) \), this is exactly the M-step that maximises the complete-data log-likelihood, scaled by the SA step size \( \gamma_k \). After the update the etas are re-centred by the same shift so they remain deviations from the new \( \log \theta_j \).</p>
-<p>NLopt still runs for any remaining thetas (non-mu-referenced) and for sigma — the closed-form-updated thetas are pinned at their new values for the NLopt call.</p>
-<p>When <code>mu_referencing = false</code>, the full NLopt M-step runs for all thetas as before.</p>
-<p>The number of NLopt evaluations saved is stored in <code>FitResult::saem_mu_ref_m_step_evals_saved</code>, accumulated across SAEM iterations as <code>2 × mstep_maxiter × n_mu_ref_pairs</code> per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at <code>mstep_maxiter</code> NLopt gradient requests). The field is <code>None</code> when mu-referencing is off or method ≠ SAEM.</p>
-<h3 id="5-adaptive-mh-step-sizes"><a class="header" href="#5-adaptive-mh-step-sizes">5. Adaptive MH Step Sizes</a></h3>
-<p>Every <code>adapt_interval</code> iterations, the per-subject step sizes \( \delta_i \) are adjusted:</p>
-<ul>
-<li>If acceptance rate &gt; 40%: increase \( \delta_i \) by 10% (up to 5.0)</li>
-<li>If acceptance rate &lt; 40%: decrease \( \delta_i \) by 10% (down to 0.01)</li>
-</ul>
-<p>This targets an acceptance rate around 40%, balancing exploration and mixing.</p>
-<h2 id="post-saem-finalization"><a class="header" href="#post-saem-finalization">Post-SAEM Finalization</a></h2>
-<p>After the SAEM iterations complete:</p>
-<ol>
-<li><strong>EBE Refinement</strong>: Run the standard FOCE inner loop (BFGS optimization) warm-started from the SAEM ETAs to obtain final empirical Bayes estimates</li>
-<li><strong>FOCE OFV</strong>: Compute the objective function using the FOCE/Laplace approximation, so AIC and BIC are directly comparable with FOCE results</li>
-<li><strong>Covariance Step</strong>: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)</li>
-<li><strong>Diagnostics</strong>: Compute PRED, IPRED, CWRES, IWRES for each subject</li>
-</ol>
-<h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
-<pre><code>[fit_options]
-  method        = saem
-  n_exploration = 150      # Phase 1 iterations
-  n_convergence = 250      # Phase 2 iterations
-  n_mh_steps    = 3        # MH steps per subject per iteration
-  adapt_interval = 50      # Step-size adaptation frequency
-  seed          = 12345    # RNG seed for reproducibility
-  covariance    = true     # Compute standard errors
+                        <h1 id="multi-start-michaelis-menten-elimination"><a class="header" href="#multi-start-michaelis-menten-elimination">Multi-Start: Michaelis-Menten Elimination</a></h1>
+<p>Michaelis-Menten (saturable) elimination is the canonical example of a local-minimum problem in NLME modelling. The Vmax/Km pair is only weakly identifiable from sparse PK data: many (Vmax, Km) combinations produce similar predicted concentrations, so the OFV surface contains a narrow ridge. A single-start FOCEI run is sensitive to the initial values — starting far from the true optimum, the optimizer often settles on an inflated Vmax/Km pair with a higher OFV than the true optimum.</p>
+<h2 id="the-problem"><a class="header" href="#the-problem">The problem</a></h2>
+<p>For the model below with true parameters Vmax ≈ 3.5 mg/h and Km ≈ 5.5 mg/L, starting with Vmax = 12 and Km = 20 (both roughly 3× too high) a single FOCEI run may converge to a local minimum rather than the global one. The two solutions predict similar concentration-time profiles on the observed time grid but differ in OFV by several units.</p>
+<h2 id="the-model-file"><a class="header" href="#the-model-file">The model file</a></h2>
+<pre><code class="language-ferx"># Michaelis-Menten elimination — multi-start demonstration
+#
+# The Vmax/Km parameter pair is only weakly identifiable from sparse PK data:
+# many (Vmax, Km) combinations produce similar predicted concentrations, and the
+# OFV surface contains a narrow ridge that makes single-start FOCEI sensitive to
+# the choice of initial values.  Starting from the values below, a single run
+# will often land on a local minimum with Vmax and Km both inflated relative to
+# the true values (Vmax ≈ 3.5 mg/h, Km ≈ 5.5 mg/L).
+#
+# n_starts = 8 runs 8 parallel fits from perturbed starting points (the same
+# wall-clock time as one run on an 8-core machine) and returns the converged
+# result with the lowest OFV.  Set multi_start_seed to reproduce a specific
+# set of perturbations.
+#
+# Data: data/mm_sparse.csv  (simulate with --simulate, or use the [simulation]
+# block below)
+
+[parameters]
+  # Initial values are intentionally high — a single run often stays here.
+  # Multi-start explores the neighbourhood and finds the true optimum.
+  theta TVVMAX(12.0, 0.1, 50.0)    # maximum elimination rate (mg/h); true ≈ 3.5
+  theta TVKM(20.0,  0.1, 100.0)    # Michaelis constant (mg/L);       true ≈ 5.5
+  theta TVV(11.0,   1.0, 200.0)    # volume of distribution (L);       true ≈ 11
+  theta TVKA(1.3,   0.05, 20.0)    # absorption rate constant (1/h);   true ≈ 1.3
+
+  omega ETA_VMAX ~ 0.25
+  omega ETA_V    ~ 0.20
+
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  VMAX = TVVMAX * exp(ETA_VMAX)
+  KM   = TVKM
+  V    = TVV * exp(ETA_V)
+  KA   = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method           = focei
+  maxiter          = 500
+  covariance       = true
+  n_starts         = 8
+  start_sigma      = 0.5    # wider perturbation for a ridge-shaped surface
+  multi_start_seed = 42
+
+[simulation]
+  n_subjects = 40
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  obs_times  = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]
+  seed       = 1
 </code></pre>
-<h2 id="tuning-guide"><a class="header" href="#tuning-guide">Tuning Guide</a></h2>
-<h3 id="not-converging"><a class="header" href="#not-converging">Not Converging</a></h3>
+<h2 id="what-multi-start-does"><a class="header" href="#what-multi-start-does">What multi-start does</a></h2>
+<p>With <code>n_starts = 8</code> and <code>start_sigma = 0.5</code>:</p>
 <ul>
-<li>Increase <code>n_exploration</code> (e.g., 300) to give more time for basin finding</li>
-<li>Increase <code>n_convergence</code> (e.g., 500) for a longer averaging window</li>
-<li>Increase <code>n_mh_steps</code> (e.g., 5-10) for better mixing in the E-step</li>
+<li><strong>Start 0</strong> uses the exact initial values from <code>[parameters]</code> (Vmax=12, Km=20).</li>
+<li><strong>Starts 1–7</strong> multiply each log-packed theta by <code>exp(N(0, 0.5))</code>, giving a spread of roughly ×0.6–×1.6 around the initial values. With <code>start_sigma = 0.5</code> this is wider than the default 0.3 — appropriate for a ridge-shaped surface.</li>
+<li>All 8 runs execute in parallel. On an 8-core machine wall-clock time equals a single run.</li>
+<li>The converged run with the lowest OFV is returned. If start 0 was already at the global optimum, nothing changes. If one of the perturbed starts found a better solution, a warning on <code>FitResult.warnings</code> reports which start won and its OFV.</li>
 </ul>
-<h3 id="slow-convergence"><a class="header" href="#slow-convergence">Slow Convergence</a></h3>
-<ul>
-<li>Decrease <code>n_exploration</code> and <code>n_convergence</code> if parameters stabilize early</li>
-<li>Use <code>adapt_interval = 25</code> for faster step-size adaptation</li>
-</ul>
-<h3 id="reproducibility"><a class="header" href="#reproducibility">Reproducibility</a></h3>
-<ul>
-<li>Always set <code>seed</code> for reproducible results</li>
-<li>Different seeds will produce slightly different estimates due to the stochastic nature of the algorithm</li>
-</ul>
-<h2 id="output"><a class="header" href="#output">Output</a></h2>
-<p>The SAEM iteration progress is printed to stderr:</p>
-<pre><code>SAEM: 10 subjects, 3 ETAs, 400 total iter (150 explore + 250 converge)
-  SAEM iter    1/400 [explore] gamma=1.000  condNLL=95.244
-  SAEM iter   50/400 [explore] gamma=1.000  condNLL=56.705
-  SAEM iter  150/400 [explore] gamma=1.000  condNLL=46.071
-  SAEM iter  200/400 [converge] gamma=0.020  condNLL=36.799
-  SAEM iter  400/400 [converge] gamma=0.004  condNLL=38.096
-SAEM iterations complete. Computing final EBEs and OFV...
+<h2 id="running-it"><a class="header" href="#running-it">Running it</a></h2>
+<pre><code class="language-bash"># Simulate data first
+cargo run --release -- examples/mm_multistart.ferx --simulate
+
+# Fit with multi-start
+cargo run --release -- examples/mm_multistart.ferx --data mm_multistart-sim.csv
 </code></pre>
-<p>The <code>condNLL</code> is the conditional observation negative log-likelihood (not the final OFV). It should generally decrease during the exploration phase and stabilize during convergence.</p>
+<h2 id="when-to-use-multi-start"><a class="header" href="#when-to-use-multi-start">When to use multi-start</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Model feature</th><th>Risk of local minima</th><th>Recommended n_starts</th></tr>
+</thead>
+<tbody>
+<tr><td>Linear 1-cpt / 2-cpt</td><td>Very low</td><td>1 (default)</td></tr>
+<tr><td>Michaelis-Menten elimination</td><td>High</td><td>4–8</td></tr>
+<tr><td>Full-block omega (≥ 3 etas)</td><td>Moderate</td><td>4</td></tr>
+<tr><td>Many correlated covariates</td><td>Moderate</td><td>4–8</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>start_sigma = 0.3</code> (the default, ≈ 30% CV) is appropriate for most models. For ridge-shaped surfaces like Vmax/Km, <code>start_sigma = 0.4–0.5</code> explores a wider neighbourhood.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../estimation/gauss-newton.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../examples/iov.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../estimation/sir.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../api/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -289,11 +292,11 @@ SAEM iterations complete. Computing final EBEs and OFV...
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../estimation/gauss-newton.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../examples/iov.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../estimation/sir.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../api/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

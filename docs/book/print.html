@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-ac2e6f7b.js";
+            window.path_to_searchindex_js = "searchindex-75f56fb1.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-6f2d6898.js"></script>
+        <script src="toc-7ca32c60.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1619,6 +1619,7 @@ example.</p>
 <tr><td><code>sir_resamples</code></td><td><code>250</code></td><td>Number of resampled vectors (m)</td></tr>
 <tr><td><code>sir_seed</code></td><td><code>12345</code></td><td>RNG seed for reproducibility</td></tr>
 <tr><td><code>sir_keep_samples</code></td><td><code>false</code></td><td>Retain resampled parameter vectors for <code>simulate_with_uncertainty()</code></td></tr>
+<tr><td><code>sir_df</code></td><td><code>5.0</code></td><td>Degrees of freedom for the Student-t proposal; higher values approach a normal proposal</td></tr>
 </tbody>
 </table>
 </div>
@@ -1672,6 +1673,20 @@ ignored — the fit still proceeds.</p>
 <p>For a chained fit (<code>method = [saem, focei]</code>), an option is kept if it applies
 to <em>any</em> stage in the chain, so SAEM and FOCEI keys can be mixed without
 warnings.</p>
+<h2 id="multi-start-optimization"><a class="header" href="#multi-start-optimization">Multi-Start Optimization</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>n_starts</code></td><td><code>1</code></td><td>Number of independent optimization runs. <code>1</code> disables multi-start (no behaviour change). When <code>&gt; 1</code>, all starts run in parallel via rayon; the converged run with the lowest OFV is returned. Start 0 always uses the exact initial values from the model file.</td></tr>
+<tr><td><code>start_sigma</code></td><td><code>0.3</code></td><td>Log-space perturbation applied to initial theta values for starts 1..n. Log-packed thetas are multiplied by <code>exp(N(0, start_sigma))</code>; thetas with negative lower bounds are shifted additively.</td></tr>
+<tr><td><code>multi_start_seed</code></td><td><code>42</code></td><td>RNG seed for the multi-start theta perturbations. Independent of <code>seed</code> (SAEM) so that changing the SAEM seed does not silently alter which perturbed starting points are used in FOCE multi-start runs.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Multi-start is most useful for models prone to local minima: nonlinear elimination (Michaelis-Menten), full-block omega, or many covariate parameters. On an 8-core machine <code>n_starts = 8</code> costs the same wall-clock time as a single run but has ~8× lower probability of a local minimum.</p>
 <h2 id="global-search"><a class="header" href="#global-search">Global Search</a></h2>
 <p>Setting <code>global_search = true</code> runs a gradient-free pre-search (NLopt CRS2-LM) before the local optimizer. This helps escape local minima on challenging datasets.</p>
 <p>The number of global evaluations is auto-scaled based on the number of parameters and observations, or can be set explicitly with <code>global_maxeval</code>.</p>
@@ -2141,7 +2156,7 @@ SAEM iterations complete. Computing final EBEs and OFV...
 <h2 id="how-it-works"><a class="header" href="#how-it-works">How It Works</a></h2>
 <p>SIR uses the maximum likelihood estimates and their covariance matrix as a proposal distribution, then reweights samples based on the actual likelihood:</p>
 <ol>
-<li><strong>Sample</strong>: Draw M parameter vectors from a multivariate normal distribution centered on the ML estimates, using the estimation covariance matrix</li>
+<li><strong>Sample</strong>: Draw M parameter vectors from a multivariate Student-t distribution (default ν=5) centered on the ML estimates, using the estimation covariance matrix as the scale</li>
 <li><strong>Importance weighting</strong>: For each sample, compute the objective function value (OFV) and calculate an importance weight based on the ratio of the true likelihood to the proposal density</li>
 <li><strong>Resample</strong>: Draw m vectors (with replacement) proportional to the importance weights</li>
 </ol>
@@ -2165,6 +2180,7 @@ SAEM iterations complete. Computing final EBEs and OFV...
 <tr><td><code>sir_resamples</code></td><td><code>250</code></td><td>Number of resampled vectors (m). Must be less than <code>sir_samples</code></td></tr>
 <tr><td><code>sir_seed</code></td><td><code>12345</code></td><td>RNG seed for reproducibility</td></tr>
 <tr><td><code>sir_keep_samples</code></td><td><code>false</code></td><td>Retain the resampled parameter vectors on <code>FitResult.sir_resamples_packed</code>. Required for <code>simulate_with_uncertainty()</code> with <code>UncertaintyMethod::Sir</code>. Adds <code>n_resamples × n_packed × 8</code> bytes to the result</td></tr>
+<tr><td><code>sir_df</code></td><td><code>5.0</code></td><td>Degrees of freedom ν for the Student-t proposal. Heavier tails (small ν) improve ESS for parameters near boundaries such as omega variances. Set to a large value (e.g. 100) for near-normal behaviour. Dosne (2017) recommends ν=5.</td></tr>
 </tbody>
 </table>
 </div>
@@ -3550,6 +3566,103 @@ println!("Omega IOV: {:?}", result.omega_iov);
 <li><strong>Use FOCEI for proportional errors</strong> — the interaction term matters more when individual predictions vary across occasions.</li>
 <li><strong>SAEM is not supported</strong> with IOV — use <code>foce</code> or <code>focei</code>.</li>
 </ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="multi-start-michaelis-menten-elimination"><a class="header" href="#multi-start-michaelis-menten-elimination">Multi-Start: Michaelis-Menten Elimination</a></h1>
+<p>Michaelis-Menten (saturable) elimination is the canonical example of a local-minimum problem in NLME modelling. The Vmax/Km pair is only weakly identifiable from sparse PK data: many (Vmax, Km) combinations produce similar predicted concentrations, so the OFV surface contains a narrow ridge. A single-start FOCEI run is sensitive to the initial values — starting far from the true optimum, the optimizer often settles on an inflated Vmax/Km pair with a higher OFV than the true optimum.</p>
+<h2 id="the-problem"><a class="header" href="#the-problem">The problem</a></h2>
+<p>For the model below with true parameters Vmax ≈ 3.5 mg/h and Km ≈ 5.5 mg/L, starting with Vmax = 12 and Km = 20 (both roughly 3× too high) a single FOCEI run may converge to a local minimum rather than the global one. The two solutions predict similar concentration-time profiles on the observed time grid but differ in OFV by several units.</p>
+<h2 id="the-model-file"><a class="header" href="#the-model-file">The model file</a></h2>
+<pre><code class="language-ferx"># Michaelis-Menten elimination — multi-start demonstration
+#
+# The Vmax/Km parameter pair is only weakly identifiable from sparse PK data:
+# many (Vmax, Km) combinations produce similar predicted concentrations, and the
+# OFV surface contains a narrow ridge that makes single-start FOCEI sensitive to
+# the choice of initial values.  Starting from the values below, a single run
+# will often land on a local minimum with Vmax and Km both inflated relative to
+# the true values (Vmax ≈ 3.5 mg/h, Km ≈ 5.5 mg/L).
+#
+# n_starts = 8 runs 8 parallel fits from perturbed starting points (the same
+# wall-clock time as one run on an 8-core machine) and returns the converged
+# result with the lowest OFV.  Set multi_start_seed to reproduce a specific
+# set of perturbations.
+#
+# Data: data/mm_sparse.csv  (simulate with --simulate, or use the [simulation]
+# block below)
+
+[parameters]
+  # Initial values are intentionally high — a single run often stays here.
+  # Multi-start explores the neighbourhood and finds the true optimum.
+  theta TVVMAX(12.0, 0.1, 50.0)    # maximum elimination rate (mg/h); true ≈ 3.5
+  theta TVKM(20.0,  0.1, 100.0)    # Michaelis constant (mg/L);       true ≈ 5.5
+  theta TVV(11.0,   1.0, 200.0)    # volume of distribution (L);       true ≈ 11
+  theta TVKA(1.3,   0.05, 20.0)    # absorption rate constant (1/h);   true ≈ 1.3
+
+  omega ETA_VMAX ~ 0.25
+  omega ETA_V    ~ 0.20
+
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  VMAX = TVVMAX * exp(ETA_VMAX)
+  KM   = TVKM
+  V    = TVV * exp(ETA_V)
+  KA   = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method           = focei
+  maxiter          = 500
+  covariance       = true
+  n_starts         = 8
+  start_sigma      = 0.5    # wider perturbation for a ridge-shaped surface
+  multi_start_seed = 42
+
+[simulation]
+  n_subjects = 40
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  obs_times  = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]
+  seed       = 1
+</code></pre>
+<h2 id="what-multi-start-does"><a class="header" href="#what-multi-start-does">What multi-start does</a></h2>
+<p>With <code>n_starts = 8</code> and <code>start_sigma = 0.5</code>:</p>
+<ul>
+<li><strong>Start 0</strong> uses the exact initial values from <code>[parameters]</code> (Vmax=12, Km=20).</li>
+<li><strong>Starts 1–7</strong> multiply each log-packed theta by <code>exp(N(0, 0.5))</code>, giving a spread of roughly ×0.6–×1.6 around the initial values. With <code>start_sigma = 0.5</code> this is wider than the default 0.3 — appropriate for a ridge-shaped surface.</li>
+<li>All 8 runs execute in parallel. On an 8-core machine wall-clock time equals a single run.</li>
+<li>The converged run with the lowest OFV is returned. If start 0 was already at the global optimum, nothing changes. If one of the perturbed starts found a better solution, a warning on <code>FitResult.warnings</code> reports which start won and its OFV.</li>
+</ul>
+<h2 id="running-it"><a class="header" href="#running-it">Running it</a></h2>
+<pre><code class="language-bash"># Simulate data first
+cargo run --release -- examples/mm_multistart.ferx --simulate
+
+# Fit with multi-start
+cargo run --release -- examples/mm_multistart.ferx --data mm_multistart-sim.csv
+</code></pre>
+<h2 id="when-to-use-multi-start"><a class="header" href="#when-to-use-multi-start">When to use multi-start</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Model feature</th><th>Risk of local minima</th><th>Recommended n_starts</th></tr>
+</thead>
+<tbody>
+<tr><td>Linear 1-cpt / 2-cpt</td><td>Very low</td><td>1 (default)</td></tr>
+<tr><td>Michaelis-Menten elimination</td><td>High</td><td>4–8</td></tr>
+<tr><td>Full-block omega (≥ 3 etas)</td><td>Moderate</td><td>4</td></tr>
+<tr><td>Many correlated covariates</td><td>Moderate</td><td>4–8</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>start_sigma = 0.3</code> (the default, ≈ 30% CV) is appropriate for most models. For ridge-shaped surfaces like Vmax/Km, <code>start_sigma = 0.4–0.5</code> explores a wider neighbourhood.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="rust-api"><a class="header" href="#rust-api">Rust API</a></h1>
 <p>FeRx-NLME can be used as a Rust library for embedding population PK estimation in your own applications.</p>

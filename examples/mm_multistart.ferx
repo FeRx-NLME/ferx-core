@@ -1,0 +1,60 @@
+# Michaelis-Menten elimination — multi-start demonstration
+#
+# The Vmax/Km parameter pair is only weakly identifiable from sparse PK data:
+# many (Vmax, Km) combinations produce similar predicted concentrations, and the
+# OFV surface contains a narrow ridge that makes single-start FOCEI sensitive to
+# the choice of initial values.  Starting from the values below, a single run
+# will often land on a local minimum with Vmax and Km both inflated relative to
+# the true values (Vmax ≈ 3.5 mg/h, Km ≈ 5.5 mg/L).
+#
+# n_starts = 8 runs 8 parallel fits from perturbed starting points (the same
+# wall-clock time as one run on an 8-core machine) and returns the converged
+# result with the lowest OFV.  Set multi_start_seed to reproduce a specific
+# set of perturbations.
+#
+# Data: data/mm_sparse.csv  (simulate with --simulate, or use the [simulation]
+# block below)
+
+[parameters]
+  # Initial values are intentionally high — a single run often stays here.
+  # Multi-start explores the neighbourhood and finds the true optimum.
+  theta TVVMAX(12.0, 0.1, 50.0)    # maximum elimination rate (mg/h); true ≈ 3.5
+  theta TVKM(20.0,  0.1, 100.0)    # Michaelis constant (mg/L);       true ≈ 5.5
+  theta TVV(11.0,   1.0, 200.0)    # volume of distribution (L);       true ≈ 11
+  theta TVKA(1.3,   0.05, 20.0)    # absorption rate constant (1/h);   true ≈ 1.3
+
+  omega ETA_VMAX ~ 0.25
+  omega ETA_V    ~ 0.20
+
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  VMAX = TVVMAX * exp(ETA_VMAX)
+  KM   = TVKM
+  V    = TVV * exp(ETA_V)
+  KA   = TVKA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method           = focei
+  maxiter          = 500
+  covariance       = true
+  n_starts         = 8
+  start_sigma      = 0.5    # wider perturbation for a ridge-shaped surface
+  multi_start_seed = 42
+
+[simulation]
+  n_subjects = 40
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  obs_times  = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]
+  seed       = 1

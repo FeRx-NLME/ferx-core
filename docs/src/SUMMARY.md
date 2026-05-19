@@ -32,6 +32,7 @@
   - [ODE Model](examples/ode-model.md)
   - [BLOQ (M3 method)](examples/bloq.md)
   - [Inter-Occasion Variability](examples/iov.md)
+  - [Multi-Start (Michaelis-Menten)](examples/multistart.md)
 - [Rust API](api/README.md)
   - [Core Types](api/types.md)
   - [Fitting Functions](api/fitting.md)

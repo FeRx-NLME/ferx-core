@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-ac2e6f7b.js";
+            window.path_to_searchindex_js = "../searchindex-75f56fb1.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-6f2d6898.js"></script>
+        <script src="../toc-7ca32c60.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -247,6 +247,7 @@
 <tr><td><code>sir_resamples</code></td><td><code>250</code></td><td>Number of resampled vectors (m)</td></tr>
 <tr><td><code>sir_seed</code></td><td><code>12345</code></td><td>RNG seed for reproducibility</td></tr>
 <tr><td><code>sir_keep_samples</code></td><td><code>false</code></td><td>Retain resampled parameter vectors for <code>simulate_with_uncertainty()</code></td></tr>
+<tr><td><code>sir_df</code></td><td><code>5.0</code></td><td>Degrees of freedom for the Student-t proposal; higher values approach a normal proposal</td></tr>
 </tbody>
 </table>
 </div>
@@ -300,6 +301,20 @@ ignored — the fit still proceeds.</p>
 <p>For a chained fit (<code>method = [saem, focei]</code>), an option is kept if it applies
 to <em>any</em> stage in the chain, so SAEM and FOCEI keys can be mixed without
 warnings.</p>
+<h2 id="multi-start-optimization"><a class="header" href="#multi-start-optimization">Multi-Start Optimization</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>n_starts</code></td><td><code>1</code></td><td>Number of independent optimization runs. <code>1</code> disables multi-start (no behaviour change). When <code>&gt; 1</code>, all starts run in parallel via rayon; the converged run with the lowest OFV is returned. Start 0 always uses the exact initial values from the model file.</td></tr>
+<tr><td><code>start_sigma</code></td><td><code>0.3</code></td><td>Log-space perturbation applied to initial theta values for starts 1..n. Log-packed thetas are multiplied by <code>exp(N(0, start_sigma))</code>; thetas with negative lower bounds are shifted additively.</td></tr>
+<tr><td><code>multi_start_seed</code></td><td><code>42</code></td><td>RNG seed for the multi-start theta perturbations. Independent of <code>seed</code> (SAEM) so that changing the SAEM seed does not silently alter which perturbed starting points are used in FOCE multi-start runs.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Multi-start is most useful for models prone to local minima: nonlinear elimination (Michaelis-Menten), full-block omega, or many covariate parameters. On an 8-core machine <code>n_starts = 8</code> costs the same wall-clock time as a single run but has ~8× lower probability of a local minimum.</p>
 <h2 id="global-search"><a class="header" href="#global-search">Global Search</a></h2>
 <p>Setting <code>global_search = true</code> runs a gradient-free pre-search (NLopt CRS2-LM) before the local optimizer. This helps escape local minima on challenging datasets.</p>
 <p>The number of global evaluations is auto-scaled based on the number of parameters and observations, or can be set explicitly with <code>global_maxeval</code>.</p>

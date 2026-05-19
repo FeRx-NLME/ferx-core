@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-ac2e6f7b.js";
+            window.path_to_searchindex_js = "../searchindex-75f56fb1.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-6f2d6898.js"></script>
+        <script src="../toc-7ca32c60.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -187,7 +187,7 @@
 <h2 id="how-it-works"><a class="header" href="#how-it-works">How It Works</a></h2>
 <p>SIR uses the maximum likelihood estimates and their covariance matrix as a proposal distribution, then reweights samples based on the actual likelihood:</p>
 <ol>
-<li><strong>Sample</strong>: Draw M parameter vectors from a multivariate normal distribution centered on the ML estimates, using the estimation covariance matrix</li>
+<li><strong>Sample</strong>: Draw M parameter vectors from a multivariate Student-t distribution (default ν=5) centered on the ML estimates, using the estimation covariance matrix as the scale</li>
 <li><strong>Importance weighting</strong>: For each sample, compute the objective function value (OFV) and calculate an importance weight based on the ratio of the true likelihood to the proposal density</li>
 <li><strong>Resample</strong>: Draw m vectors (with replacement) proportional to the importance weights</li>
 </ol>
@@ -211,6 +211,7 @@
 <tr><td><code>sir_resamples</code></td><td><code>250</code></td><td>Number of resampled vectors (m). Must be less than <code>sir_samples</code></td></tr>
 <tr><td><code>sir_seed</code></td><td><code>12345</code></td><td>RNG seed for reproducibility</td></tr>
 <tr><td><code>sir_keep_samples</code></td><td><code>false</code></td><td>Retain the resampled parameter vectors on <code>FitResult.sir_resamples_packed</code>. Required for <code>simulate_with_uncertainty()</code> with <code>UncertaintyMethod::Sir</code>. Adds <code>n_resamples × n_packed × 8</code> bytes to the result</td></tr>
+<tr><td><code>sir_df</code></td><td><code>5.0</code></td><td>Degrees of freedom ν for the Student-t proposal. Heavier tails (small ν) improve ESS for parameters near boundaries such as omega variances. Set to a large value (e.g. 100) for near-normal behaviour. Dosne (2017) recommends ν=5.</td></tr>
 </tbody>
 </table>
 </div>
