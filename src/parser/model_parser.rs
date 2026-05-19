@@ -1317,7 +1317,13 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "sir_resamples" => opts.sir_resamples = parse_usize("sir_resamples")?,
         "sir_seed" => opts.sir_seed = parse_u64_opt("sir_seed")?,
         "sir_keep_samples" => opts.sir_keep_samples = parse_bool("sir_keep_samples")?,
-        "sir_df" => opts.sir_df = parse_f64("sir_df")?,
+        "sir_df" => {
+            let v = parse_f64("sir_df")?;
+            if v < 1.0 {
+                return Err(format!("sir_df must be >= 1.0, got {v}"));
+            }
+            opts.sir_df = v;
+        }
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
             opts.bloq_method = match value.to_lowercase().as_str() {
@@ -3753,8 +3759,20 @@ mod tests {
         assert!(apply_fit_option(&mut opts, "optimizer", "does_not_exist").is_err());
         assert!(apply_fit_option(&mut opts, "bloq_method", "nope").is_err());
         assert!(apply_fit_option(&mut opts, "threads", "-1").is_err());
+        assert!(apply_fit_option(&mut opts, "sir_df", "0.0").is_err());
+        assert!(apply_fit_option(&mut opts, "sir_df", "0.5").is_err());
         // Failed apply must not mutate — default preserved.
         assert_eq!(opts.saem_n_exploration, 150);
+    }
+
+    #[test]
+    fn test_sir_df_valid_and_invalid() {
+        let mut opts = FitOptions::default();
+        assert!(apply_fit_option(&mut opts, "sir_df", "5.0").is_ok());
+        assert_eq!(opts.sir_df, 5.0);
+        assert!(apply_fit_option(&mut opts, "sir_df", "1.0").is_ok());
+        assert!(apply_fit_option(&mut opts, "sir_df", "0.9").is_err());
+        assert!(apply_fit_option(&mut opts, "sir_df", "0.0").is_err());
     }
 
     #[test]

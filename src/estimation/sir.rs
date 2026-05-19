@@ -133,14 +133,13 @@ pub fn run_sir_core(
     let nu = options.sir_df;
     let chi2_dist = ChiSquared::new(nu).map_err(|e| format!("sir_df invalid: {e}"))?;
 
-    // Log-normalisation constant for the multivariate Student-t density.
-    // log p_t(x_hat) = lgamma((nu+d)/2) - lgamma(nu/2) - d/2*log(nu*pi) - 0.5*log_det_proposal
-    // At the centre x_hat the quadratic form z^T z = 0, so:
     let d = n_packed as f64;
-    let log_q_hat = lgamma((nu + d) / 2.0)
+    // Cache lgamma terms that are constant across all samples.
+    let log_norm = lgamma((nu + d) / 2.0)
         - lgamma(nu / 2.0)
-        - (d / 2.0) * (nu * std::f64::consts::PI).ln()
-        - 0.5 * log_det_proposal;
+        - (d / 2.0) * (nu * std::f64::consts::PI).ln();
+    // At the centre the quadratic form is 0, so log_q_hat = log_norm - 0.5*log_det.
+    let log_q_hat = log_norm - 0.5 * log_det_proposal;
 
     let mut z_vectors: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
     let mut samples: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
@@ -152,10 +151,7 @@ pub fn run_sir_core(
         let delta = &proposal_chol * &z_vec * scale;
         let x_k: Vec<f64> = x_hat.iter().zip(delta.iter()).map(|(a, b)| a + b).collect();
         samples.push(x_k);
-        // Store the standardised z (before chi2 scaling) for density evaluation.
-        // For Student-t, the quadratic form uses the scaled residual L^{-1}(x_k - x_hat) = z*scale,
-        // so we store z and scale separately — but we can recompute scale from chi2.
-        // Simpler: store the actual scaled z = z * scale.
+        // store L⁻¹(x_k − x_hat) = z * scale for the quadratic form in log_q_k
         z_vectors.push(z.into_iter().map(|zi| zi * scale).collect());
     }
 
@@ -234,9 +230,7 @@ pub fn run_sir_core(
             // z holds the scaled standardised residual L^{-1}(x_k - x_hat), so
             // the quadratic form is z^T z (already in the scaled space).
             let quad_form: f64 = z.iter().map(|zi| zi * zi).sum();
-            let log_q_k = lgamma((nu + d) / 2.0)
-                - lgamma(nu / 2.0)
-                - (d / 2.0) * (nu * std::f64::consts::PI).ln()
+            let log_q_k = log_norm
                 - 0.5 * log_det_proposal
                 - ((nu + d) / 2.0) * (1.0 + quad_form / nu).ln();
 
