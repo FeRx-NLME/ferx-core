@@ -6,7 +6,7 @@ Instead of dropping BLOQ rows — which biases terminal-phase parameter estimate
 — each censored observation contributes
 `P(y < LLOQ | θ, η) = Φ((LLOQ − f)/√V)` to the likelihood.
 
-## Dataset (`data/warfarin-bloq.csv`)
+## Dataset (`data/warfarin_bloq.csv`)
 
 This is the warfarin dataset with an added `CENS` column. Ten late-time
 observations that originally fell below an assay LLOQ of 2.0 µg/mL have been
@@ -25,7 +25,7 @@ ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,CENS
 carries the LLOQ value — not the true (unobserved) concentration. Rows with no
 `CENS` column, or `CENS=0`, are treated as ordinary quantified observations.
 
-## Model File (`examples/warfarin-bloq.ferx`)
+## Model File (`examples/warfarin_bloq.ferx`)
 
 ```
 # One-compartment oral PK model (warfarin) with M3 BLOQ likelihood.
@@ -66,7 +66,7 @@ model changes.
 ## Running
 
 ```bash
-ferx examples/warfarin-bloq.ferx --data data/warfarin-bloq.csv
+ferx examples/warfarin_bloq.ferx --data data/warfarin_bloq.csv
 ```
 
 ## Expected Results
@@ -89,7 +89,7 @@ TVKA                 1.083302
   SIGMA(1) = 0.010766
 ```
 
-The diagnostic table (`warfarin-bloq-sdtab.csv`) gains a `CENS` column, and the
+The diagnostic table (`warfarin_bloq-sdtab.csv`) gains a `CENS` column, and the
 `IWRES` / `CWRES` cells for censored rows are written as empty (a weighted
 Gaussian residual is undefined when the observed value is censored).
 

@@ -29,5 +29,5 @@ ferx examples/mm_oral.ferx --data data/mm_oral.csv
 ferx examples/warfarin_saem.ferx --data data/warfarin.csv
 
 # BLOQ (M3 method)
-ferx examples/warfarin-bloq.ferx --data data/warfarin-bloq.csv
+ferx examples/warfarin_bloq.ferx --data data/warfarin_bloq.csv
 ```

@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-75f56fb1.js";
+            window.path_to_searchindex_js = "searchindex-d2ce75cd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-7ca32c60.js"></script>
@@ -3071,7 +3071,7 @@ ferx examples/mm_oral.ferx --data data/mm_oral.csv
 ferx examples/warfarin_saem.ferx --data data/warfarin.csv
 
 # BLOQ (M3 method)
-ferx examples/warfarin-bloq.ferx --data data/warfarin-bloq.csv
+ferx examples/warfarin_bloq.ferx --data data/warfarin_bloq.csv
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="one-compartment-oral-warfarin"><a class="header" href="#one-compartment-oral-warfarin">One-Compartment Oral (Warfarin)</a></h1>
@@ -3356,7 +3356,7 @@ the assay lower limit of quantification (BLOQ) using Beal’s <strong>M3 method<
 Instead of dropping BLOQ rows — which biases terminal-phase parameter estimates
 — each censored observation contributes
 <code>P(y &lt; LLOQ | θ, η) = Φ((LLOQ − f)/√V)</code> to the likelihood.</p>
-<h2 id="dataset-datawarfarin-bloqcsv"><a class="header" href="#dataset-datawarfarin-bloqcsv">Dataset (<code>data/warfarin-bloq.csv</code>)</a></h2>
+<h2 id="dataset-datawarfarin_bloqcsv"><a class="header" href="#dataset-datawarfarin_bloqcsv">Dataset (<code>data/warfarin_bloq.csv</code>)</a></h2>
 <p>This is the warfarin dataset with an added <code>CENS</code> column. Ten late-time
 observations that originally fell below an assay LLOQ of 2.0 µg/mL have been
 marked <code>CENS=1</code> and their <code>DV</code> cell set to the LLOQ value:</p>
@@ -3370,7 +3370,7 @@ marked <code>CENS=1</code> and their <code>DV</code> cell set to the LLOQ value:
 <p><strong>NONMEM <code>CENS</code> convention</strong>: when <code>CENS=1</code>, the row is censored and <code>DV</code>
 carries the LLOQ value — not the true (unobserved) concentration. Rows with no
 <code>CENS</code> column, or <code>CENS=0</code>, are treated as ordinary quantified observations.</p>
-<h2 id="model-file-exampleswarfarin-bloqferx"><a class="header" href="#model-file-exampleswarfarin-bloqferx">Model File (<code>examples/warfarin-bloq.ferx</code>)</a></h2>
+<h2 id="model-file-exampleswarfarin_bloqferx"><a class="header" href="#model-file-exampleswarfarin_bloqferx">Model File (<code>examples/warfarin_bloq.ferx</code>)</a></h2>
 <pre><code># One-compartment oral PK model (warfarin) with M3 BLOQ likelihood.
 
 [parameters]
@@ -3405,7 +3405,7 @@ carries the LLOQ value — not the true (unobserved) concentration. Rows with no
 <code>[fit_options]</code> and the added <code>CENS</code> column in the CSV. Nothing else in the
 model changes.</p>
 <h2 id="running-4"><a class="header" href="#running-4">Running</a></h2>
-<pre><code class="language-bash">ferx examples/warfarin-bloq.ferx --data data/warfarin-bloq.csv
+<pre><code class="language-bash">ferx examples/warfarin_bloq.ferx --data data/warfarin_bloq.csv
 </code></pre>
 <h2 id="expected-results-1"><a class="header" href="#expected-results-1">Expected Results</a></h2>
 <pre><code>--- Objective Function ---
@@ -3424,7 +3424,7 @@ TVKA                 1.083302
 --- SIGMA Estimates ---
   SIGMA(1) = 0.010766
 </code></pre>
-<p>The diagnostic table (<code>warfarin-bloq-sdtab.csv</code>) gains a <code>CENS</code> column, and the
+<p>The diagnostic table (<code>warfarin_bloq-sdtab.csv</code>) gains a <code>CENS</code> column, and the
 <code>IWRES</code> / <code>CWRES</code> cells for censored rows are written as empty (a weighted
 Gaussian residual is undefined when the observed value is censored).</p>
 <h2 id="method-notes"><a class="header" href="#method-notes">Method Notes</a></h2>
@@ -3630,7 +3630,7 @@ println!("Omega IOV: {:?}", result.omega_iov);
   n_subjects = 40
   dose_amt   = 100.0
   dose_cmt   = 1
-  obs_times  = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]
+  times      = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]
   seed       = 1
 </code></pre>
 <h2 id="what-multi-start-does"><a class="header" href="#what-multi-start-does">What multi-start does</a></h2>
