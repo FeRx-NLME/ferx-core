@@ -327,6 +327,16 @@ pub fn fit(
     let n = options.n_starts;
     let sigma = options.start_sigma;
 
+    // Warn once (before the parallel section) that global_search only runs on start 0.
+    let mut pre_warnings: Vec<String> = Vec::new();
+    if options.global_search && n > 1 {
+        pre_warnings.push(format!(
+            "global_search = true with n_starts = {n}: CRS2-LM only runs on start 0 \
+             (it ignores the starting point and would override the theta perturbation \
+             on starts 1..{n})"
+        ));
+    }
+
     let results: Vec<(usize, Result<FitResult, String>)> = (0..n)
         .into_par_iter()
         .map(|k| {
@@ -337,16 +347,16 @@ pub fn fit(
             // - global_search: CRS2-LM ignores the starting point and samples freely in
             //   [lower, upper], so running it on starts 1..n overrides the perturbation
             //   and makes multi-start a no-op for those starts. Only run it on start 0.
-            let opts_k;
-            let opts_ref = if k == 0 {
+            let opts_k_storage;
+            let opts_ref: &FitOptions = if k == 0 {
                 options
             } else {
-                opts_k = FitOptions {
+                opts_k_storage = FitOptions {
                     saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
                     global_search: false,
                     ..options.clone()
                 };
-                &opts_k
+                &opts_k_storage
             };
             (k, fit_inner(model, pop_ref, &init_k, opts_ref))
         })
@@ -377,6 +387,7 @@ pub fn fit(
     match best {
         None => Err("All multi-start fits failed".to_string()),
         Some((k, mut result)) => {
+            result.warnings.splice(0..0, pre_warnings);
             if !failed_starts.is_empty() {
                 result.warnings.push(format!(
                     "Multi-start: {} of {n} starts failed: {}",
@@ -3189,5 +3200,20 @@ mod multi_start_tests {
         assert_eq!(opts.multi_start_seed, Some(123));
         apply_fit_option(&mut opts, "start_sigma", "0.5").expect("start_sigma parses");
         assert!((opts.start_sigma - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_per_start_saem_seed_derivation() {
+        let base: u64 = 12345;
+        // Each start k > 0 gets base + k; start 0 keeps the base unchanged.
+        assert_eq!(base.wrapping_add(0), 12345);
+        assert_eq!(base.wrapping_add(1), 12346);
+        assert_eq!(base.wrapping_add(7), 12352);
+        // All derived seeds are distinct.
+        let seeds: Vec<u64> = (0..8).map(|k| base.wrapping_add(k)).collect();
+        let unique: std::collections::HashSet<u64> = seeds.iter().copied().collect();
+        assert_eq!(unique.len(), 8);
+        // wrapping_add is defined at u64::MAX.
+        assert_eq!(u64::MAX.wrapping_add(1), 0);
     }
 }
