@@ -180,53 +180,66 @@ fn theta_sigma_mstep_light(
 
     // Objective operating on the unscaled packed parameters.
     //
-    // Forward-difference gradient: `g[i] = (f(x + h·e_i) - f(x)) / h`.
-    // We keep the base `f(x)` from the value pass above so each gradient
-    // request costs `n_dim` extra `obs_nll_sum` calls, not `2·n_dim` for
-    // central FD. SAEM's stochastic-approximation framework absorbs the
-    // O(h) bias just like it absorbs MH noise; the central-FD precision
-    // was wasted work on this hot loop. Parallelises over the parameter
-    // dimension; rayon's nested par_iter with the obs_nll_sum's
-    // subject-level par_iter avoids oversubscription via work stealing.
+    // Gradient strategy: single rayon pass over subjects, each computing its
+    // own partial gradient via `obs_nll_subject_grad` (analytical sigma,
+    // FD-of-predictions for theta). This replaces the old per-parameter
+    // forward-FD of `obs_nll_sum` which launched `n_dim` rayon jobs
+    // sequentially. Key improvements:
+    //  • Sigma gradient is analytical — no extra predict calls per sigma dim.
+    //  • Single rayon launch instead of n_dim sequential launches.
+    //  • Better cache locality: one subject's data stays in cache while
+    //    iterating over all its theta perturbations.
+    //  • Pinned dims (lower == upper) are skipped per-subject, saving the
+    //    predict calls entirely (same as the old FD guard).
     let obj = |xv: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
-        let val = obs_nll_sum(model, population, &th, &sg, etas);
 
         if let Some(g) = grad {
             use rayon::prelude::*;
-            let h = 1e-5;
-            let f0 = val;
-            let g_vec: Vec<f64> = (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    // Pinned dims (lower == upper) cannot move; skip their FD
-                    // evaluations entirely. This is what makes the SAEM mu-ref
-                    // gradient step actually save NLopt OFV evaluations —
-                    // without it, NLopt's FD would still hit each pinned dim.
-                    if lower[i] == upper[i] {
-                        return 0.0;
-                    }
-                    let mut xp = xv.to_vec();
-                    xp[i] = xv[i] + h;
-                    let th_p: Vec<f64> = unpack_thetas(&xp[..n_theta]);
-                    let sg_p: Vec<f64> = xp[n_theta..].iter().map(|&v| v.exp()).collect();
-                    let fp = obs_nll_sum(model, population, &th_p, &sg_p, etas);
-                    let gi = (fp - f0) / h;
-                    if gi.is_finite() {
-                        gi
-                    } else {
-                        0.0
-                    }
+            let (val, grad_vec) = population
+                .subjects
+                .par_iter()
+                .zip(etas.par_iter())
+                .map_init(EventPkParams::default, |scratch, (subject, eta)| {
+                    obs_nll_subject_grad(
+                        model,
+                        subject,
+                        &th,
+                        &sg,
+                        eta,
+                        &theta_packs_log_mask,
+                        &lower,
+                        &upper,
+                        n_theta,
+                        n_sigma,
+                        scratch,
+                    )
                 })
-                .collect();
-            g.copy_from_slice(&g_vec);
-        }
-
-        if val.is_finite() {
-            val
+                .reduce(
+                    || (0.0, vec![0.0f64; n]),
+                    |(nll_a, mut ga), (nll_b, gb)| {
+                        for (a, b) in ga.iter_mut().zip(gb.iter()) {
+                            *a += b;
+                        }
+                        (nll_a + nll_b, ga)
+                    },
+                );
+            for (gi, &gv) in g.iter_mut().zip(grad_vec.iter()) {
+                *gi = if gv.is_finite() { gv } else { 0.0 };
+            }
+            if val.is_finite() {
+                val
+            } else {
+                1e20
+            }
         } else {
-            1e20
+            let val = obs_nll_sum(model, population, &th, &sg, etas);
+            if val.is_finite() {
+                val
+            } else {
+                1e20
+            }
         }
     };
 
@@ -280,6 +293,154 @@ fn theta_sigma_mstep_light(
     let log_theta_new = x_final[..n_theta].to_vec();
     let log_sigma_new = x_final[n_theta..].to_vec();
     (log_theta_new, log_sigma_new)
+}
+
+/// Gradient of `obs_nll` w.r.t. the SAEM packed parameter vector
+/// `[log_theta_0 … log_theta_{P-1} | log_sigma_0 … log_sigma_{Q-1}]`
+/// for a single subject with ETAs held fixed.
+///
+/// For non-M3 models:
+/// - Sigma: analytical from the residual-variance formula (no extra predict call).
+/// - Theta: forward-FD of `compute_predictions_with_tv_into` + chain rule through
+///   obs_nll (one extra predict call per non-pinned theta, not one full-subject
+///   NLL call).
+///
+/// For M3 models (complex Mills-ratio sigma gradient): forward-FD of
+/// `obs_nll_single_into` for all parameters.
+///
+/// `lower`/`upper` are the packed-space bounds used to detect pinned dimensions
+/// (`lower[i] == upper[i]`); pinned dimensions contribute 0 to the gradient and
+/// skip their FD call.
+#[allow(clippy::too_many_arguments)]
+fn obs_nll_subject_grad(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    theta_packs_log_mask: &[bool],
+    lower: &[f64],
+    upper: &[f64],
+    n_theta: usize,
+    n_sigma: usize,
+    pk_scratch: &mut EventPkParams,
+) -> (f64, Vec<f64>) {
+    let n = n_theta + n_sigma;
+    let m3 = matches!(model.bloq_method, BloqMethod::M3);
+
+    if m3 {
+        // M3 path: forward-FD of obs_nll_single_into for all parameters.
+        let nll_base = obs_nll_single_into(model, subject, theta, sigma_values, eta, pk_scratch);
+        let mut grad = vec![0.0f64; n];
+        let h = 1e-5;
+        for i in 0..n {
+            if lower[i] == upper[i] {
+                continue;
+            }
+            if i < n_theta {
+                let mut theta_p = theta.to_vec();
+                let delta = h * (1.0 + theta[i].abs());
+                theta_p[i] += delta;
+                let nll_p =
+                    obs_nll_single_into(model, subject, &theta_p, sigma_values, eta, pk_scratch);
+                let raw = (nll_p - nll_base) / delta;
+                grad[i] = if theta_packs_log_mask[i] { theta[i] * raw } else { raw };
+            } else {
+                let k = i - n_theta;
+                let mut sigma_p = sigma_values.to_vec();
+                let delta = h * (1.0 + sigma_values[k].abs());
+                sigma_p[k] += delta;
+                let nll_p =
+                    obs_nll_single_into(model, subject, theta, &sigma_p, eta, pk_scratch);
+                // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)
+                grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
+            }
+        }
+        return (nll_base, grad);
+    }
+
+    // Non-M3 path.
+    let preds_base =
+        crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+
+    let mut nll_base = 0.0f64;
+    let n_obs = subject.observations.len();
+
+    // per-obs residual, variance, d(obs_nll)/d(f_j)
+    let mut residuals = vec![0.0f64; n_obs];
+    let mut variances = vec![0.0f64; n_obs];
+    let mut d_nll_d_f = vec![0.0f64; n_obs];
+
+    for j in 0..n_obs {
+        let f = preds_base[j].max(1e-12);
+        let v = residual_variance(model.error_model, f, sigma_values).max(1e-12);
+        let resid = subject.observations[j] - f;
+        nll_base += 0.5 * (v.ln() + resid * resid / v);
+        residuals[j] = resid;
+        variances[j] = v;
+        // d(obs_nll_j)/d(f_j) = -resid/V + 0.5 * (dV/df) * (1/V - resid²/V²)
+        let dv_df = match model.error_model {
+            ErrorModel::Additive => 0.0,
+            ErrorModel::Proportional | ErrorModel::Combined => 2.0 * f * sigma_values[0] * sigma_values[0],
+        };
+        d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
+    }
+
+    let mut grad = vec![0.0f64; n];
+
+    // Theta gradient: forward-FD of predictions, chain rule through obs_nll.
+    let h_fd = 1e-5;
+    for i in 0..n_theta {
+        if lower[i] == upper[i] {
+            continue;
+        }
+        let delta = h_fd * (1.0 + theta[i].abs());
+        let mut theta_p = theta.to_vec();
+        theta_p[i] += delta;
+        let preds_p = crate::pk::compute_predictions_with_tv_into(
+            model, subject, &theta_p, eta, pk_scratch,
+        );
+        let d_obs_nll: f64 = d_nll_d_f
+            .iter()
+            .zip(preds_p.iter().zip(preds_base.iter()))
+            .map(|(&dl, (&pp, &pb))| dl * (pp.max(1e-12) - pb.max(1e-12)) / delta)
+            .sum();
+        grad[i] = if theta_packs_log_mask[i] { theta[i] * d_obs_nll } else { d_obs_nll };
+    }
+
+    // Sigma gradient: analytical.
+    // d(obs_nll)/d(log_sigma_k) = Σ_j 0.5 * ratio_jk * (1/V_j - resid_j²/V_j²)
+    // where ratio_jk = sigma_k * dV_j/d_sigma_k.
+    for k in 0..n_sigma {
+        let i = n_theta + k;
+        if lower[i] == upper[i] {
+            continue;
+        }
+        let s = sigma_values[k];
+        let g: f64 = (0..n_obs)
+            .map(|j| {
+                let f = preds_base[j].max(1e-12);
+                let v = variances[j];
+                let resid = residuals[j];
+                // ratio = sigma_k * dV/d(sigma_k)
+                let ratio = match model.error_model {
+                    ErrorModel::Additive => 2.0 * s * s, // = 2V
+                    ErrorModel::Proportional => 2.0 * s * s * f * f, // = 2V
+                    ErrorModel::Combined => {
+                        if k == 0 {
+                            2.0 * s * s * f * f
+                        } else {
+                            2.0 * s * s
+                        }
+                    }
+                };
+                0.5 * ratio * (1.0 / v - resid * resid / (v * v))
+            })
+            .sum();
+        grad[i] = g;
+    }
+
+    (nll_base, grad)
 }
 
 /// Observation NLL for a single subject with ETAs held fixed.
@@ -1247,5 +1408,109 @@ mod tests {
         // The identity-packed theta carries a negative value through —
         // pre-fix, this was clamped to 1e-10 by the log path.
         assert!(unpacked[2] < 0.0);
+    }
+
+    /// `obs_nll_subject_grad` summed over subjects must match the reference
+    /// forward-FD of `obs_nll_sum` to within 1e-4 relative tolerance for all
+    /// non-pinned packed parameters (theta + sigma).
+    #[test]
+    fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
+        use crate::types::{DoseEvent, FitOptions, Population, SigmaVector};
+        use std::collections::HashMap;
+
+        let model = analytical_model(GradientMethod::Auto);
+
+        let make_subj = |id: &str, obs: f64| Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 4.0, 8.0],
+            observations: vec![obs, obs * 0.6, obs * 0.3],
+            obs_cmts: vec![1, 1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            cens: vec![0, 0, 0],
+            occasions: vec![],
+            dose_occasions: vec![],
+        };
+
+        let population = Population {
+            subjects: vec![make_subj("1", 8.0), make_subj("2", 5.0), make_subj("3", 11.0)],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+        };
+
+        let theta = vec![1.5f64, 20.0]; // CL, V
+        let sigma_values = vec![0.2f64]; // proportional
+        let etas: Vec<Vec<f64>> = vec![vec![0.0], vec![0.1], vec![-0.1]];
+        let n_theta = 2;
+        let n_sigma = 1;
+        let n = n_theta + n_sigma;
+
+        // Compute reference gradient via forward-FD of obs_nll_sum.
+        let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas);
+        let h = 1e-5;
+        let mut ref_grad = vec![0.0f64; n];
+        // Theta perturbations (in natural scale).
+        for i in 0..n_theta {
+            let mut theta_p = theta.clone();
+            theta_p[i] += h;
+            let fp = obs_nll_sum(&model, &population, &theta_p, &sigma_values, &etas);
+            // FD in natural scale; convert to log-packed space (d/d_log = theta * d/d_theta)
+            ref_grad[i] = theta[i] * (fp - f0) / h;
+        }
+        // Sigma perturbation (in natural scale; convert to log-packed).
+        {
+            let mut sigma_p = sigma_values.clone();
+            sigma_p[0] += h;
+            let fp = obs_nll_sum(&model, &population, &theta, &sigma_p, &etas);
+            ref_grad[n_theta] = sigma_values[0] * (fp - f0) / h;
+        }
+
+        // Compute gradient via obs_nll_subject_grad summed over subjects.
+        let mask: Vec<bool> = theta.iter().map(|_| true).collect(); // all log-packed
+        let lo = vec![-1e30f64; n];
+        let hi = vec![1e30f64; n];
+        let mut total_nll = 0.0f64;
+        let mut total_grad = vec![0.0f64; n];
+        let mut scratch = EventPkParams::default();
+        for (i, subject) in population.subjects.iter().enumerate() {
+            let (nll_i, grad_i) = obs_nll_subject_grad(
+                &model,
+                subject,
+                &theta,
+                &sigma_values,
+                &etas[i],
+                &mask,
+                &lo,
+                &hi,
+                n_theta,
+                n_sigma,
+                &mut scratch,
+            );
+            total_nll += nll_i;
+            for (g, gi) in total_grad.iter_mut().zip(grad_i.iter()) {
+                *g += gi;
+            }
+        }
+
+        assert!((total_nll - f0).abs() < 1e-10, "nll mismatch: {} vs {}", total_nll, f0);
+
+        for j in 0..n {
+            let rel = if ref_grad[j].abs() > 1e-10 {
+                (total_grad[j] - ref_grad[j]).abs() / ref_grad[j].abs()
+            } else {
+                (total_grad[j] - ref_grad[j]).abs()
+            };
+            assert!(
+                rel < 1e-4,
+                "grad[{j}]: obs_nll_subject_grad={:.6e}, ref={:.6e}, rel={:.2e}",
+                total_grad[j],
+                ref_grad[j],
+                rel
+            );
+        }
     }
 }
