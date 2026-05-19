@@ -3173,4 +3173,3 @@ mod multi_start_tests {
         assert!((opts.start_sigma - 0.5).abs() < 1e-10);
     }
 }
-
