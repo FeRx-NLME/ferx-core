@@ -1079,6 +1079,11 @@ pub struct FitOptions {
     /// `exp(N(0, start_sigma))`; identity-packed thetas (negative lower bound)
     /// are shifted by `start_sigma * N(0,1)`. Default `0.3` (≈ 30% CV).
     pub start_sigma: f64,
+    /// RNG seed for the multi-start theta perturbations. Independent of
+    /// `saem_seed` so that changing the SAEM seed for SAEM convergence does
+    /// not silently alter which perturbed starts are tried for FOCE multi-start
+    /// runs. Default `None` falls back to `42`.
+    pub multi_start_seed: Option<u64>,
     /// Name of the column in the dataset that identifies the occasion for each row.
     /// When `Some`, `read_nonmem_csv` populates `Subject::occasions` / `dose_occasions`
     /// and the inner loop estimates per-occasion kappas alongside the BSV etas.
@@ -1160,6 +1165,7 @@ impl Default for FitOptions {
             threads: None,
             n_starts: 1,
             start_sigma: 0.3,
+            multi_start_seed: None,
             iov_column: None,
             cancel: None,
             user_set_keys: Vec::new(),
@@ -1328,6 +1334,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "threads",
         "n_starts",
         "start_sigma",
+        "multi_start_seed",
         "gradient",
         "gradient_method",
         "iov_column",

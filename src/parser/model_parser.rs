@@ -1371,6 +1371,14 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
         },
         "start_sigma" => opts.start_sigma = parse_f64("start_sigma")?,
+        "multi_start_seed" => match value.parse::<u64>() {
+            Ok(s) => opts.multi_start_seed = Some(s),
+            _ => {
+                return Err(format!(
+                    "fit option `multi_start_seed`: expected a non-negative integer, got `{value}`"
+                ));
+            }
+        },
         "iov_column" => {
             opts.iov_column = if value.is_empty()
                 || value.eq_ignore_ascii_case("null")

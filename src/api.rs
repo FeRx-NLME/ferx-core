@@ -316,32 +316,28 @@ pub fn fit(
     }
 
     // Multi-start: run n_starts fits in parallel, return the lowest-OFV converged result.
-    let base_seed: u64 = options.saem_seed.unwrap_or(42);
+    // `threads` controls per-subject parallelism inside each start; in multi-start mode
+    // we let the global rayon pool handle both levels (outer start × inner per-subject).
+    // Creating a new ThreadPool per start inside an outer into_par_iter() spawns n_starts
+    // independent pools that all compete on the same CPUs, causing oversubscription —
+    // so we only honour `threads` when the global pool hasn't been entered yet (single-start
+    // path above). Here we always use the global pool for the outer par_iter.
+    let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
     let n = options.n_starts;
     let sigma = options.start_sigma;
 
-    let results: Vec<Result<FitResult, String>> = (0..n)
+    let results: Vec<(usize, Result<FitResult, String>)> = (0..n)
         .into_par_iter()
         .map(|k| {
             let init_k = perturb_init(init_params, k, sigma, base_seed);
-            match options.threads {
-                Some(t) if t > 0 => {
-                    let pool = rayon::ThreadPoolBuilder::new()
-                        .num_threads(t)
-                        .build()
-                        .map_err(|e| {
-                            format!("failed to build rayon pool with {} threads: {}", t, e)
-                        })?;
-                    pool.install(|| fit_inner(model, pop_ref, &init_k, options))
-                }
-                _ => fit_inner(model, pop_ref, &init_k, options),
-            }
+            (k, fit_inner(model, pop_ref, &init_k, options))
         })
         .collect();
 
     // Pick best converged result; fall back to best unconverged if none converged.
     let mut best: Option<(usize, FitResult)> = None;
-    for (k, res) in results.into_iter().enumerate() {
+    let mut failed_starts: Vec<String> = Vec::new();
+    for (k, res) in results {
         match res {
             Ok(r) => {
                 let better = match &best {
@@ -356,13 +352,20 @@ pub fn fit(
                     best = Some((k, r));
                 }
             }
-            Err(_) => {} // ignore failed starts
+            Err(e) => failed_starts.push(format!("start {k}: {e}")),
         }
     }
 
     match best {
         None => Err("All multi-start fits failed".to_string()),
         Some((k, mut result)) => {
+            if !failed_starts.is_empty() {
+                result.warnings.push(format!(
+                    "Multi-start: {} of {n} starts failed: {}",
+                    failed_starts.len(),
+                    failed_starts.join("; ")
+                ));
+            }
             if !result.converged {
                 result.warnings.push(format!(
                     "No multi-start run converged ({n} starts); returning best OFV from start {k}"
@@ -3157,4 +3160,17 @@ mod multi_start_tests {
         opts.n_starts = 4;
         assert_eq!(opts.n_starts, 4);
     }
+
+    #[test]
+    fn test_n_starts_and_seed_via_parser() {
+        use crate::parser::model_parser::apply_fit_option;
+        let mut opts = FitOptions::default();
+        apply_fit_option(&mut opts, "n_starts", "4").expect("n_starts parses");
+        assert_eq!(opts.n_starts, 4);
+        apply_fit_option(&mut opts, "multi_start_seed", "123").expect("multi_start_seed parses");
+        assert_eq!(opts.multi_start_seed, Some(123));
+        apply_fit_option(&mut opts, "start_sigma", "0.5").expect("start_sigma parses");
+        assert!((opts.start_sigma - 0.5).abs() < 1e-10);
+    }
 }
+
