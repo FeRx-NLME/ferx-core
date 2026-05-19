@@ -737,17 +737,41 @@ fn subject_nll_pop_grad_analytical(
             continue;
         }
         if row == col {
-            // Diagonal: x[k] = log L_omega[i,i], d(omega_ii)/d(x[k]) = 2 * omega_ii
-            let omega_ii = params.omega.matrix[(row, row)];
-            let w = &h_cols_solved[row]; // C^{-1} h_i
-            let h_i_dot_a: f64 = h_matrix
+            // x[k] = log L_omega[i,i]; chain rule factor is L[i,i].
+            // ∂NLL/∂L[i,i] = (C⁻¹hᵢ)·(C⁻¹uᵢ) − (hᵢ·a)(uᵢ·a)
+            // where uᵢ = H·L[:,i].
+            //
+            // For diagonal omega L[:,i] = L[i,i]·eᵢ so uᵢ = L[i,i]·hᵢ and the
+            // expression collapses to Ω[i,i]·(w² − (hᵢ·a)²).  For block omega
+            // L[:,i] has sub-diagonal entries and we must use the full uᵢ.
+            let l_ii = l_omega[(row, row)];
+            let c_inv_w = &h_cols_solved[row]; // C⁻¹ hᵢ
+            let w_dot_a: f64 = h_matrix
                 .column(row)
                 .iter()
                 .zip(solved_a.iter())
                 .map(|(h, a)| h * a)
                 .sum();
-            let w_sq: f64 = w.iter().map(|&x| x * x).sum();
-            grad[k] = omega_ii * (w_sq - h_i_dot_a * h_i_dot_a);
+            if template.omega.diagonal {
+                // Fast path: uᵢ = L[i,i]·hᵢ, so C⁻¹uᵢ = L[i,i]·(C⁻¹hᵢ).
+                let w_sq: f64 = c_inv_w.iter().map(|&x| x * x).sum();
+                // ∂NLL/∂x[k] = L[i,i] · L[i,i] · (w² − (hᵢ·a)²) = Ω[i,i] · (...)
+                grad[k] = l_ii * l_ii * (w_sq - w_dot_a * w_dot_a);
+            } else {
+                // General path: compute uᵢ = H·L[:,i] using the full i-th column.
+                let l_col: Vec<f64> = (0..n_eta).map(|r| l_omega[(r, row)]).collect();
+                let u: Vec<f64> = (0..n_obs)
+                    .map(|obs_j| {
+                        (0..n_eta)
+                            .map(|eta_i| h_matrix[(obs_j, eta_i)] * l_col[eta_i])
+                            .sum::<f64>()
+                    })
+                    .collect();
+                let c_inv_u = fwd_solve(&chol_l, &u);
+                let u_dot_a: f64 = u.iter().zip(solved_a.iter()).map(|(ui, ai)| ui * ai).sum();
+                let trace_term: f64 = c_inv_w.iter().zip(c_inv_u.iter()).map(|(w, u)| w * u).sum();
+                grad[k] = l_ii * (trace_term - w_dot_a * u_dot_a);
+            }
         } else {
             // Off-diagonal: x[k] = L_omega[row, col] (identity-packed)
             // u = H * L_omega[:,col], w_vec = h_row = H[:,row]
