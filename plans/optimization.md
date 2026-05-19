@@ -555,6 +555,86 @@ wall-clock improvement for FOCE/FOCEI on ODE models.
 
 ---
 
+## Step 5b — Analytical Gradient for IOV Models in the Outer Optimizer
+
+**Status: 🔴 NOT STARTED**
+
+**Requires: Step 5 complete.**
+
+### Background
+
+Step 5 replaced population-level central FD with `subject_nll_pop_grad` summed
+in parallel over subjects. For non-IOV analytical PK models, `subject_nll_pop_grad`
+takes the analytical path (`subject_nll_pop_grad_analytical`): exact for ω/σ
+Cholesky elements, forward-FD of predictions only for θ. For IOV models,
+`can_use_analytical = false` because `!kappas.is_empty()`, so it falls back to
+per-subject central FD (cost = 2P subject NLL evals per outer gradient query).
+
+The analytical gradient *can* be extended to IOV — the FOCE NLL structure is
+identical, just with an expanded random-effects vector and a block-diagonal
+variance matrix.
+
+### What remains
+
+#### Math
+
+For a subject with occasions `1…K`, the IOV random effects are `[η; κ₁; …; κ_K]`
+and the combined variance block is:
+
+```
+Ω_combined = diag(Ω_bsv, Ω_iov, …, Ω_iov)   (K+1 blocks)
+```
+
+The FOCE linearisation gives:
+
+```
+r_tilde = R + H_combined · Ω_combined · H_combined^T
+```
+
+where `H_combined = [H_η | H_κ₁ | … | H_κ_K]` concatenates the Jacobians
+`∂ipred/∂η` and `∂ipred/∂κ_occ` for each occasion (most columns are zero
+outside their occasion's observations).
+
+The gradients follow the same formula as the non-IOV case:
+
+```
+∂NLL/∂L_bsv[i,j]  = ...  (same as non-IOV ∂NLL/∂L[i,j] for the bsv block)
+∂NLL/∂L_iov[i,j]  = Σ_occ [same formula applied to the κ_occ block]
+∂NLL/∂σ_k         = ...  (unchanged)
+∂NLL/∂θ           = forward-FD of ipred (unchanged)
+```
+
+#### Implementation
+
+1. Add `subject_nll_pop_grad_analytical_iov` in `src/estimation/gauss_newton.rs`
+   (or extend `subject_nll_pop_grad_analytical` with an IOV branch).
+2. In `subject_nll_pop_grad`, lift the `kappas.is_empty()` gate from
+   `can_use_analytical` for non-ODE, non-M3 models.
+3. The kappa H-matrices (`∂ipred/∂κ_occ`) must be available at the call site —
+   verify they are returned by `run_inner_loop_warm` or add their computation.
+
+### Files to touch
+- `src/estimation/gauss_newton.rs` (new IOV analytical gradient variant)
+- `src/estimation/outer_optimizer.rs` (lift `kappas.is_empty()` gate if needed)
+
+### Test
+
+Add a gradient test analogous to `test_outer_ad_gradient_block_omega` but with
+`omega_iov` set and multiple occasions per subject. Verify that the IOV
+analytical gradient matches population-level central FD to within `1e-4`.
+
+Also verify that `test_outer_ad_gradient_fd_fallback_path` is superseded (or
+update it to confirm the analytical path is now taken for non-ODE IOV).
+
+### Expected gain
+
+Same ratio as Step 5 for non-IOV: instead of 2P subject NLL evals per gradient
+query, the cost drops to 1 forward-FD pass of predictions per θ component.
+For IOV models with many occasions, the per-subject FD cost scales with P,
+so the gain is proportional to P (number of packed population parameters).
+
+---
+
 ## Step 6 — Trust Region: AD Gradient + BHHH Hessian + Adaptive Steihaug-CG
 
 **Status: 🔶 PARTIAL**
