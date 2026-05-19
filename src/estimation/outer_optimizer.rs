@@ -617,10 +617,22 @@ fn optimize_nlopt(
             let pop_grads: Vec<(f64, Vec<f64>)> = (0..n_subj)
                 .into_par_iter()
                 .map(|i| {
-                    let kap_i = if i < kappas.len() { kappas[i].as_slice() } else { &[] };
+                    let kap_i = if i < kappas.len() {
+                        kappas[i].as_slice()
+                    } else {
+                        &[]
+                    };
                     subject_nll_pop_grad(
-                        &x, init_params, model, population, i,
-                        &ehs[i], &hms[i], kap_i, &bounds, options,
+                        &x,
+                        init_params,
+                        model,
+                        population,
+                        i,
+                        &ehs[i],
+                        &hms[i],
+                        kap_i,
+                        &bounds,
+                        options,
                     )
                 })
                 .collect();
@@ -628,7 +640,11 @@ fn optimize_nlopt(
             for k in 0..g.len() {
                 // d(OFV)/d(x) = 2 * Σ_i d(NLL_i)/d(x); then scale for optimizer space.
                 let gi_sum: f64 = pop_grads.iter().map(|(_, gi)| gi[k]).sum::<f64>() * 2.0;
-                let gi = if gi_sum.is_finite() { gi_sum * scale[k] } else { 0.0 };
+                let gi = if gi_sum.is_finite() {
+                    gi_sum * scale[k]
+                } else {
+                    0.0
+                };
                 g[k] = gi;
                 sq += gi * gi;
             }
@@ -874,17 +890,33 @@ fn optimize_nlopt(
                 let pop_grads: Vec<(f64, Vec<f64>)> = (0..n_subj)
                     .into_par_iter()
                     .map(|i| {
-                        let kap_i = if i < kappas.len() { kappas[i].as_slice() } else { &[] };
+                        let kap_i = if i < kappas.len() {
+                            kappas[i].as_slice()
+                        } else {
+                            &[]
+                        };
                         subject_nll_pop_grad(
-                            &x, init_params, model, population, i,
-                            &ehs[i], &hms[i], kap_i, &bounds, options,
+                            &x,
+                            init_params,
+                            model,
+                            population,
+                            i,
+                            &ehs[i],
+                            &hms[i],
+                            kap_i,
+                            &bounds,
+                            options,
                         )
                     })
                     .collect();
                 let mut sq = 0.0_f64;
                 for k in 0..g.len() {
                     let gi_sum: f64 = pop_grads.iter().map(|(_, gi)| gi[k]).sum::<f64>() * 2.0;
-                    let gi = if gi_sum.is_finite() { gi_sum * scale[k] } else { 0.0 };
+                    let gi = if gi_sum.is_finite() {
+                        gi_sum * scale[k]
+                    } else {
+                        0.0
+                    };
                     g[k] = gi;
                     sq += gi * gi;
                 }
@@ -1154,10 +1186,22 @@ fn optimize_bfgs(
         let pop_grads: Vec<(f64, Vec<f64>)> = (0..n_subj)
             .into_par_iter()
             .map(|i| {
-                let kap_i = if i < kappas.len() { kappas[i].as_slice() } else { &[] };
+                let kap_i = if i < kappas.len() {
+                    kappas[i].as_slice()
+                } else {
+                    &[]
+                };
                 subject_nll_pop_grad(
-                    x, init_params, model, population, i,
-                    &ehs[i], &hms[i], kap_i, &bounds, options,
+                    x,
+                    init_params,
+                    model,
+                    population,
+                    i,
+                    &ehs[i],
+                    &hms[i],
+                    kap_i,
+                    &bounds,
+                    options,
                 )
             })
             .collect();
@@ -1754,8 +1798,16 @@ mod tests {
             .map(|i| {
                 let kap_i = kappas[i].as_slice();
                 subject_nll_pop_grad(
-                    &x, template, &model, &population, i,
-                    &eta_hats[i], &h_matrices[i], kap_i, &bounds, &options,
+                    &x,
+                    template,
+                    &model,
+                    &population,
+                    i,
+                    &eta_hats[i],
+                    &h_matrices[i],
+                    kap_i,
+                    &bounds,
+                    &options,
                 )
             })
             .collect();
@@ -1766,7 +1818,15 @@ mod tests {
         // Reference: population-level central-FD of OFV = 2 * pop_nll
         let ofv_at = |xp: &[f64]| -> f64 {
             let p = unpack_params(xp, template);
-            2.0 * pop_nll(&model, &population, &p, &eta_hats, &h_matrices, &kappas, options.interaction)
+            2.0 * pop_nll(
+                &model,
+                &population,
+                &p,
+                &eta_hats,
+                &h_matrices,
+                &kappas,
+                options.interaction,
+            )
         };
         let eps = 1e-4;
         let fd_grad: Vec<f64> = (0..n)
@@ -1785,7 +1845,8 @@ mod tests {
             assert!(
                 (ad_grad[j] - fd_grad[j]).abs() < tol,
                 "outer grad[{j}]: AD={:.6e}, FD={:.6e}",
-                ad_grad[j], fd_grad[j],
+                ad_grad[j],
+                fd_grad[j],
             );
         }
     }

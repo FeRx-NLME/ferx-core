@@ -511,8 +511,8 @@ mod tests {
         // the caller-supplied branch doesn't verify hashes).
         let parsed = crate::parser::model_parser::parse_full_model_file(&model_path)
             .expect("parse tampered model");
-        let pop = crate::io::datareader::read_nonmem_csv(&data_path, None, None)
-            .expect("read data");
+        let pop =
+            crate::io::datareader::read_nonmem_csv(&data_path, None, None).expect("read data");
 
         // Should succeed despite the on-disk tampering, because the
         // caller-supplied branch bypasses the hash check entirely.
