@@ -76,10 +76,7 @@ impl FoceiProblem<'_> {
 
     /// Compute per-subject NLL gradients via `subject_nll_pop_grad`, caching the
     /// result so that `hessian()` can reuse it without a second inner-loop solve.
-    fn compute_ad_grads(
-        &self,
-        x: &[f64],
-    ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<f64>>) {
+    fn compute_ad_grads(&self, x: &[f64]) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<f64>>) {
         // Return cached result if x matches.
         {
             let cache = self.grad_cache.lock().unwrap();
