@@ -33,16 +33,18 @@ Since 2026-05-19, the following non-optimization PRs landed:
 
 | Step | Requires | Status |
 |------|----------|--------|
-| **5b** — IOV analytical gradient in outer optimizer | Step 5 ✅ | ✅ DONE — PR [#70](https://github.com/FeRx-NLME/ferx-core/pull/70) merged |
+| **5b** — IOV analytical gradient in outer optimizer | Step 5 ✅ | ✅ DONE — PR [#71](https://github.com/FeRx-NLME/ferx-core/pull/71) merged |
 | **6b** — Eliminate double inner-solve in trust-region `cost()` | Step 6 ✅ | ✅ DONE — PR [#67](https://github.com/FeRx-NLME/ferx-core/pull/67) merged |
 | **7** — GN → trust-region subproblem (replace LM damping + line search) | Steps 6 ✅ + 6b ✅ | ✅ DONE — PRs [#68](https://github.com/FeRx-NLME/ferx-core/pull/68) + [#69](https://github.com/FeRx-NLME/ferx-core/pull/69) merged |
 | **8** — HMC proposals in SAEM E-step | Steps 3 ✅ + 4 ✅ + PR #66 merged | ❌ NOT STARTED |
+| **11** — IOV support for SAEM | Steps 4 ✅ + 5b, Step 8 recommended | ❌ NOT STARTED |
 
-**Recommended implementation order: 5b ✅ → 7 ✅ → 8.**
+**Recommended implementation order: 5b ✅ → 7 ✅ → 8 → 11 (IOV+SAEM, optional).**
 - 6b: ✅ done (PR #67 merged).
 - 7: ✅ done (PR #68 merged; missing `two_cpt_oral_cov` Tier 3 test added via PR #69).
-- 5b: ✅ done (PR #70 merged). Key Phase B deviation: kappa H-matrices are not needed — the IOV NLL uses BSV-only FOCE linearisation + a direct kappa prior; `∂P_κ/∂L_iov` derived via forward/backward solve through `L_iov` only. No changes to `run_inner_loop_warm` or call sites.
+- 5b: ✅ done (PR #71 merged). Key Phase B deviation: kappa H-matrices are not needed — the IOV NLL uses BSV-only FOCE linearisation + a direct kappa prior; `∂P_κ/∂L_iov` derived via forward/backward solve through `L_iov` only. No changes to `run_inner_loop_warm` or call sites.
 - 8 last: largest scope, requires PR #66 merged; `autodiff` feature dependency means CI validation needs extra care.
+- 11 (IOV+SAEM): optional, post-Step 8; see new step below.
 
 ---
 
@@ -586,7 +588,7 @@ wall-clock improvement for FOCE/FOCEI on ODE models.
 
 ## Step 5b — Analytical Gradient for IOV Models in the Outer Optimizer
 
-**Status: ❌ NOT STARTED**
+**Status: 🔶 IN REVIEW — PR [#71](https://github.com/FeRx-NLME/ferx-core/pull/71)**
 
 **Requires: Step 5 ✅**
 
@@ -1549,6 +1551,124 @@ On an 8-core machine, `n_starts = 8` takes the same wall-clock time as a single
 run but has ~8× lower probability of a local minimum. For models with nonlinear
 elimination, full-block OMEGA, or many covariates, local minima are the most
 common practical failure mode.
+
+---
+
+## Step 11 — IOV Support for SAEM
+
+**Status: ❌ NOT STARTED**
+
+**Requires: Steps 4 ✅, 5b ✅, and Step 8 (HMC E-step) recommended first**
+
+### Background
+
+SAEM currently rejects any model with `n_kappa > 0` at the API level (`api.rs:570-572`):
+
+```rust
+if model.n_kappa > 0 && chain.iter().any(|&m| m == EstimationMethod::Saem) {
+    return Err("method = saem does not support IOV (n_kappa > 0). ...")
+}
+```
+
+Supporting IOV in SAEM requires changes in three areas: the E-step (sampling kappas alongside etas), the M-step (including Ω_iov as an optimized parameter with its prior gradient), and removing the hard block.
+
+The fundamental difficulty is that SAEM's E-step currently samples a per-subject eta vector from a single MH/HMC chain. For IOV subjects, the per-occasion kappas are additional random effects with their own prior `N(0, Ω_iov)` — they must also be sampled and tracked in SAEM state.
+
+### Actual code state
+
+**E-step** (`saem.rs`): `mh_steps` / `hmc_step` (Step 8) samples a single `DVector<f64>` per subject. SAEM state holds `Vec<DVector<f64>>` (one eta per subject). No kappa state exists.
+
+**M-step** (`saem.rs`): The M-step NLopt closure calls `obs_nll_sum` (or `obs_nll_subject_into` post-PR #66), which evaluates the observation likelihood for fixed etas. Ω_iov is not included in the M-step optimizer's parameter vector; the kappa prior contributes nothing to the M-step objective.
+
+**Block**: `api.rs:570-572` — explicit `Err` return before any estimation begins.
+
+**Bobyqa + IOV**: already works. The FOCE outer optimizer routes `pop_nll` → `foce_population_nll_iov` correctly (`outer_optimizer.rs:136-149`). Only SAEM is blocked.
+
+### Sub-task 11a — SAEM state: add kappa samples
+
+In `src/estimation/saem.rs`, extend `SaemState` to hold per-subject per-occasion kappa samples:
+
+```rust
+pub(crate) struct SaemState {
+    pub etas: Vec<DVector<f64>>,
+    pub kappas: Vec<Vec<DVector<f64>>>,  // NEW: [subject][occasion]
+    pub step_scales: Vec<f64>,
+    // ... existing fields
+}
+```
+
+Initialize `kappas` from zeros (or the inner loop warm-start) at the start of SAEM. At the end of each SAEM iteration, the kappa samples feed into the M-step alongside etas.
+
+### Sub-task 11b — E-step: sample kappas per occasion
+
+For each subject in the E-step, after sampling eta, sample each kappa_k independently using a second MH (or HMC if Step 8 is done) chain:
+
+```
+For each occasion k:
+    κ_k_prop ~ q(κ_k_prop | κ_k_curr, step_scale_kappa)
+    log_alpha = individual_nll(eta, κ_k_prop) - individual_nll(eta, κ_k_curr)
+              + 0.5 * (κ_k_curr^T Ω_iov^{-1} κ_k_curr - κ_k_prop^T Ω_iov^{-1} κ_k_prop)
+    accept with probability min(1, exp(-log_alpha))
+```
+
+The NLL function used here must accept a combined `[eta, kappa_k]` vector per occasion — reuse `individual_nll` with the combined eta that `foce_subject_nll_iov` already constructs.
+
+Alternatively (more efficient): treat `[eta; κ_1; …; κ_K]` as a single augmented vector and sample jointly with one MH/HMC proposal. For HMC this is natural; for MH this requires a block proposal. The per-occasion Gibbs-style approach (option above) mixes better when K is large and eta/kappa are weakly correlated.
+
+Add `saem_kappa_step_scales: Vec<Vec<f64>>` to `SaemState` for adaptation, or reuse a single scale per subject (simpler first cut).
+
+### Sub-task 11c — M-step: include Ω_iov in parameter vector
+
+Currently the M-step packs `[theta | omega_bsv chol | sigma]` (no IOV). Extend the M-step NLopt parameter vector to include the IOV Cholesky entries (same log-packed diagonal, identity off-diagonal as in `pack_params`).
+
+The M-step objective for subject i with occasion k kappa samples is:
+
+```
+NLL_M(theta, Omega_bsv, Omega_iov, sigma) =
+    obs_nll_i(theta, eta_i, sigma)                    (observation likelihood)
+  + 0.5 * eta_i^T Omega_bsv^{-1} eta_i + 0.5 * log|Omega_bsv|   (BSV prior)
+  + 0.5 * Σ_k [κ_{i,k}^T Ω_iov^{-1} κ_{i,k} + log|Ω_iov|]     (IOV prior)
+```
+
+The kappa prior contribution is identical to `foce_subject_nll_iov`'s kappa prior — use the same formula. The gradient w.r.t. Ω_iov Cholesky is the same as computed in Step 5b (`subject_nll_pop_grad_analytical_iov`'s IOV section), and can be reused directly.
+
+**Files:** Add Ω_iov packing/unpacking to the M-step NLopt setup in `saem.rs` (search for where `pack_params` / `unpack_params` is called in the M-step). Thread the `omega_iov` gradient through `subject_nll_pop_grad` (already handles IOV after Step 5b).
+
+### Sub-task 11d — Remove the API block
+
+In `api.rs:570-572`, remove the IOV+SAEM error. Add a warning to `FitResult.warnings` instead if `n_kappa > 0 && chain contains Saem` — warn that convergence may be slower with many occasions (Gibbs sampling overhead).
+
+### Sub-task 11e — Ω_iov M-step update (analytic, optional)
+
+The SAEM M-step for Ω_bsv uses the standard analytic update `Ω = (1/N) Σ η_i η_i^T` when `mu_referencing` is active. An equivalent analytic update for Ω_iov is:
+
+```
+Ω_iov = (1 / Σ_i K_i) * Σ_i Σ_k κ_{i,k} κ_{i,k}^T
+```
+
+where K_i is the number of occasions for subject i. This replaces the NLopt sub-problem for Ω_iov when `mu_referencing = true`, eliminating one optimizer call per SAEM iteration. Implement alongside the existing Ω_bsv analytic update in the M-step.
+
+### Files to touch
+- `src/estimation/saem.rs` — add kappa state, E-step sampling, M-step parameter extension, analytic Ω_iov update
+- `src/api.rs` — remove hard block at lines 570-572; add soft warning
+- `src/types.rs` — add kappa step-scale fields to SAEM state if exposed
+
+### Tests
+
+**Tier 1 (unit, `src/estimation/saem.rs`):**
+- Test kappa MH acceptance/rejection logic on a synthetic 1-kappa 2-occasion subject
+- Test analytic Ω_iov update: known kappa samples, assert update matches manual formula
+
+**Tier 2 (integration, `tests/saem_iov.rs` — new file):**
+- `fit()` on `examples/warfarin_iov.ferx` with `method = saem` and `outer_maxiter = 5`; assert no panic, finite OFV, no error return
+
+**Tier 3 (slow, same file):**
+- Full warfarin_iov SAEM convergence; assert OFV within 0.5 of the FOCE/FOCEI result (SAEM and FOCE can differ slightly)
+- Assert acceptance rate for kappa proposals > 20% (not stuck)
+
+### Expected gain
+
+Enables population PK/PD models with between-occasion variability to use SAEM — currently the only supported IOV estimation path is FOCE/FoceI. SAEM+IOV is relevant for models with many occasions per subject where FOCE linearisation error accumulates. No wall-clock improvement over FOCE is expected; the gain is access to a different estimation algorithm where FOCE assumptions break down.
 
 ---
 
