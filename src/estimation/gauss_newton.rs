@@ -2177,7 +2177,10 @@ mod tests {
         let template = &model.default_params;
         let x = pack_params(template);
         let bounds = compute_bounds(template);
-        let options = FitOptions::default();
+        let options = FitOptions {
+            interaction: false,
+            ..FitOptions::default()
+        };
 
         // Fixed EBEs: small non-zero values to exercise all gradient paths.
         let eta_hat = DVector::from_vec(vec![0.1]);
@@ -2229,7 +2232,7 @@ mod tests {
                     h_matrix,
                     &p.omega,
                     &p.sigma.values,
-                    false,
+                    options.interaction,
                     &kappas,
                     iov,
                 )
@@ -2280,7 +2283,10 @@ mod tests {
         let template = &model.default_params;
         let x = pack_params(template);
         let bounds = compute_bounds(template);
-        let options = FitOptions::default();
+        let options = FitOptions {
+            interaction: false,
+            ..FitOptions::default()
+        };
 
         use crate::estimation::inner_optimizer::run_inner_loop_warm;
         let (eta_hats, h_mats, _, kappas_all) =
@@ -2318,7 +2324,7 @@ mod tests {
                     &h_mats[0],
                     &p.omega,
                     &p.sigma.values,
-                    false,
+                    options.interaction,
                     &kappas_all[0],
                     iov,
                 )

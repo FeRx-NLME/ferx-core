@@ -1,8 +1,9 @@
 //! Slow convergence tests for the IOV analytical gradient path.
 //!
-//! These run to convergence on a real IOV model and verify that the analytical
-//! gradient produces the same result as the central-FD fallback.  Gate them so
-//! they are skipped in the default PR job (only run nightly / on demand):
+//! These run two optimizers (SLSQP and trust-region) to convergence on a real
+//! IOV model and verify they reach the same OFV — both now use the analytical
+//! IOV gradient via subject_nll_pop_grad.  Gate them so they are skipped in the
+//! default PR job (only run nightly / on demand):
 //!
 //!   cargo test --features slow-tests --test iov_convergence
 
@@ -10,12 +11,9 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
 use std::path::Path;
 
-/// Full FOCEI fit on warfarin_iov must converge to the same OFV whether the
-/// analytical IOV gradient is used or not.
-///
-/// We verify this by comparing the analytical-gradient run (default, non-ODE
-/// model so the new path is taken) against a reference SLSQP run.  The two
-/// must agree within 0.01 OFV units.
+/// Full FOCEI fit on warfarin_iov: SLSQP and trust-region must converge to the
+/// same OFV (within 0.01 units), confirming that the analytical IOV gradient
+/// path is numerically consistent across optimizers.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -27,8 +25,7 @@ fn iov_analytical_gradient_converges_to_slsqp_baseline() {
     let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, None)
         .expect("warfarin_iov data must load");
 
-    // Reference: SLSQP FOCEI (uses the same analytical gradient internally,
-    // so this also exercises the full gradient path to convergence).
+    // Reference: SLSQP FOCEI (uses the analytical IOV gradient via subject_nll_pop_grad).
     let mut opts_ref = FitOptions::default();
     opts_ref.method = EstimationMethod::FoceI;
     opts_ref.optimizer = Optimizer::Slsqp;

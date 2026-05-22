@@ -2051,9 +2051,9 @@ mod tests {
         check_gradient(&model, &make_population(3), 2);
     }
 
-    /// Non-empty kappas force the central-FD fallback in subject_nll_pop_grad
-    /// (can_use_analytical = false); the population-sum must still match the
-    /// population-level FD reference.
+    /// With omega_iov=None but non-empty kappas, subject_nll_pop_grad falls
+    /// through to central FD (no analytical IOV path without omega_iov).
+    /// The population-sum must still match the population-level FD reference.
     ///
     /// Note: with omega_iov=None the IOV NLL formula is not exercised here —
     /// this test covers the FD *code path*, not IOV NLL correctness.
@@ -2061,9 +2061,9 @@ mod tests {
     fn test_outer_ad_gradient_fd_fallback_path() {
         // `subject_nll_at` only enters the IOV NLL branch when kappas is
         // non-empty AND omega_iov is Some. With omega_iov=None and non-empty
-        // kappas the function falls through to standard FOCE, but
-        // subject_nll_pop_grad still takes the per-subject central-FD path
-        // because kappas.is_empty() is false — the path we want to exercise.
+        // kappas the function falls through to standard FOCE; without
+        // omega_iov the dispatch in subject_nll_pop_grad also falls through to
+        // central FD — the code path this test exercises.
         let model = make_model();
 
         let template = &model.default_params;
