@@ -17,6 +17,7 @@ use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::{compute_covariance, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
+use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
 use crate::stats::likelihood::{
     chol_log_det, compute_r_tilde, foce_subject_nll_interaction, foce_subject_nll_standard,
 };
@@ -38,7 +39,8 @@ pub fn run_foce_gn(
     let _n_eta = model.n_eta;
     let verbose = options.verbose;
     let maxiter = options.outer_maxiter;
-    let mut lambda = options.gn_lambda; // LM damping factor
+    let mut trust_radius: f64 = 1.0; // TR initial radius (in scaled space)
+    let delta_max: f64 = 10.0; // TR maximum radius
 
     let bounds = compute_bounds(init_params);
     let mut x = pack_params(init_params);
@@ -73,7 +75,10 @@ pub fn run_foce_gn(
     if verbose {
         eprintln!("Starting FOCE Gauss-Newton estimation...");
         eprintln!("  {} subjects, {} observations", n_subj, population.n_obs());
-        eprintln!("  {} packed parameters, lambda={:.4}", n_packed, lambda);
+        eprintln!(
+            "  {} packed parameters, initial trust radius={:.4}",
+            n_packed, trust_radius
+        );
     }
 
     // Initial inner loop
@@ -159,123 +164,113 @@ pub fn run_foce_gn(
             }
         }
 
-        // ---- Levenberg-Marquardt damping (in scaled space) ----
-        let mut h_s_lm = h_s.clone();
-        for i in 0..n_packed {
-            h_s_lm[(i, i)] += lambda * h_s[(i, i)].max(1e-8);
+        // ---- Trust-region subproblem (Steihaug truncated CG) ----
+        let cg_budget = adaptive_steihaug_budget(n_packed);
+        let delta_s = solve_trust_region_subproblem(&grad_s, &h_s, trust_radius, cg_budget);
+
+        // Predicted decrease in the scaled quadratic model: -gᵀδ - ½ δᵀHδ
+        let h_s_delta_s = &h_s * &delta_s;
+        let pred_reduction = -grad_s.dot(&delta_s) - 0.5 * delta_s.dot(&h_s_delta_s);
+
+        if pred_reduction < 1e-10 {
+            // Gradient is effectively zero — already at a stationary point.
+            converged = true;
+            if verbose {
+                eprintln!(
+                    "  GN iter {:>3}: predicted reduction negligible, converged",
+                    iter
+                );
+            }
+            break;
         }
 
-        // ---- Solve for step: H_s_lm * delta_s = -grad_s ----
-        let neg_grad_s = -&grad_s;
-        let chol = h_s_lm.clone().cholesky();
-        let delta_s = match chol {
-            Some(c) => c.solve(&neg_grad_s),
-            None => {
-                // Fall back to regularized pseudo-inverse
-                if verbose {
-                    eprintln!("  GN iter {:>3}: Hessian singular, increasing lambda", iter);
-                }
-                lambda *= 10.0;
-                continue;
-            }
-        };
-        // Convert step back to real (unscaled) space
+        // Proposed new point (in unscaled parameter space)
         let delta =
             DVector::from_iterator(n_packed, (0..n_packed).map(|i| delta_s[i] * gn_scale[i]));
+        let mut x_try = x.clone();
+        for i in 0..n_packed {
+            x_try[i] = (x[i] + delta[i]).clamp(bounds.lower[i], bounds.upper[i]);
+        }
 
-        // ---- Line search with backtracking ----
-        let mut alpha = 1.0;
-        let mut x_new = x.clone();
-        let mut ofv_new = f64::INFINITY;
-        let mut eta_new = eta_hats.clone();
-        let mut h_new = h_matrices.clone();
-
-        for _ls in 0..15 {
-            // Take step
-            for i in 0..n_packed {
-                x_new[i] = (x[i] + alpha * delta[i]).clamp(bounds.lower[i], bounds.upper[i]);
-            }
-
-            let params_try = unpack_params(&x_new, init_params);
-
-            // Re-estimate EBEs at new parameters (warm-started)
-            let ls_mu_k = compute_mu_k(model, &params_try.theta, options.mu_referencing);
-            let (eh, hm, _, kap_new) = run_inner_loop_warm(
+        let params_try = unpack_params(&x_try, init_params);
+        let try_mu_k = compute_mu_k(model, &params_try.theta, options.mu_referencing);
+        let (eta_try, h_try, _, kap_try) = run_inner_loop_warm(
+            model,
+            population,
+            &params_try,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&eta_hats),
+            Some(&try_mu_k),
+            options.min_obs_for_convergence_check as usize,
+        );
+        let ofv_try = 2.0
+            * pop_nll(
                 model,
                 population,
                 &params_try,
-                options.inner_maxiter,
-                options.inner_tol,
-                Some(&eta_new),
-                Some(&ls_mu_k),
-                options.min_obs_for_convergence_check as usize,
+                &eta_try,
+                &h_try,
+                &kap_try,
+                options.interaction,
             );
 
-            let ofv_try = 2.0
-                * pop_nll(
-                    model,
-                    population,
-                    &params_try,
-                    &eh,
-                    &hm,
-                    &kap_new,
-                    options.interaction,
-                );
+        // TR ratio: actual OFV decrease vs quadratic model decrease.
+        // rho < 0 or non-finite OFV → reject.
+        let rho = if ofv_try.is_finite() {
+            (ofv - ofv_try) / pred_reduction
+        } else {
+            -1.0
+        };
 
-            if ofv_try.is_finite() && ofv_try < ofv {
-                ofv_new = ofv_try;
-                eta_new = eh;
-                h_new = hm;
-                kappas = kap_new;
-                break;
-            }
+        let (new_radius, accepted) = update_trust_radius(rho, trust_radius, delta_max);
+        trust_radius = new_radius;
 
-            alpha *= 0.5;
-        }
-
-        if ofv_new >= ofv {
-            // Step failed — increase damping and retry
-            lambda *= 10.0;
-
+        if !accepted {
             // Trace: rejected step
             if crate::estimation::trace::is_active() {
                 let (gn_method, gn_phase) = gn_trace_method_phase(options.method);
                 crate::estimation::trace::write_gn(
-                    iter, gn_method, gn_phase, ofv, lambda, 0.0, false, None, None,
+                    iter,
+                    gn_method,
+                    gn_phase,
+                    ofv,
+                    trust_radius,
+                    0.0,
+                    false,
+                    None,
+                    None,
                 );
             }
 
-            if lambda > 1e6 {
+            if trust_radius < 1e-10 {
                 if verbose {
-                    eprintln!("  GN iter {:>3}: lambda too large, stopping", iter);
+                    eprintln!("  GN iter {:>3}: trust radius collapsed, stopping", iter);
                 }
-                warnings.push("Gauss-Newton: lambda exceeded threshold".to_string());
+                warnings.push("Gauss-Newton: trust radius collapsed".to_string());
                 break;
             }
             if verbose {
                 eprintln!(
-                    "  GN iter {:>3}: step rejected, lambda -> {:.4}",
-                    iter, lambda
+                    "  GN iter {:>3}: step rejected (rho={:.3}), radius -> {:.4e}",
+                    iter, rho, trust_radius
                 );
             }
             continue;
         }
 
         // ---- Accept step ----
-        let ofv_change = (ofv - ofv_new).abs();
+        let ofv_change = (ofv - ofv_try).abs();
         let rel_change = ofv_change / ofv.abs().max(1.0);
 
-        x = x_new;
+        x = x_try;
         let prev_ofv = ofv;
-        ofv = ofv_new;
-        eta_hats = eta_new;
-        h_matrices = h_new;
-        // kappas already updated in the line-search block on accept
+        ofv = ofv_try;
+        eta_hats = eta_try;
+        h_matrices = h_try;
+        kappas = kap_try;
 
-        // Decrease damping on success
-        lambda = (lambda * 0.3).max(1e-6);
-
-        // Trace: accepted step
+        // Trace: accepted step (lm_lambda column carries trust_radius for GN-TR)
         if crate::estimation::trace::is_active() {
             let (gn_method, gn_phase) = gn_trace_method_phase(options.method);
             crate::estimation::trace::write_gn(
@@ -283,7 +278,7 @@ pub fn run_foce_gn(
                 gn_method,
                 gn_phase,
                 ofv,
-                lambda,
+                trust_radius,
                 ofv - prev_ofv,
                 true,
                 None,
@@ -293,8 +288,8 @@ pub fn run_foce_gn(
 
         if verbose {
             eprintln!(
-                "  GN iter {:>3}: OFV = {:.6}  (delta={:.2e}, lambda={:.4})",
-                iter, ofv, ofv_change, lambda
+                "  GN iter {:>3}: OFV = {:.6}  (delta={:.2e}, radius={:.4})",
+                iter, ofv, ofv_change, trust_radius
             );
         }
 
@@ -470,6 +465,22 @@ fn gn_trace_method_phase(method: EstimationMethod) -> (&'static str, &'static st
     match method {
         EstimationMethod::FoceGnHybrid => ("gn_hybrid", "gn"),
         _ => ("gn", ""),
+    }
+}
+
+/// Update the trust radius based on the TR ratio ρ = actual / predicted reduction.
+///
+/// Returns `(new_radius, accepted)`:
+/// - ρ > 0.75: expand radius (× 2, capped at delta_max), accept step.
+/// - 0.25 ≤ ρ ≤ 0.75: keep radius, accept step.
+/// - ρ < 0.25: shrink radius (÷ 4), reject step.
+fn update_trust_radius(rho: f64, current: f64, delta_max: f64) -> (f64, bool) {
+    if rho < 0.25 {
+        (current / 4.0, false)
+    } else if rho > 0.75 {
+        ((current * 2.0).min(delta_max), true)
+    } else {
+        (current, true)
     }
 }
 
@@ -1153,6 +1164,50 @@ mod tests {
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
         }
+    }
+
+    /// update_trust_radius: rho > 0.75 expands the radius (× 2) and accepts.
+    #[test]
+    fn test_update_trust_radius_expands_on_good_step() {
+        let (radius, accepted) = update_trust_radius(0.9, 1.0, 10.0);
+        assert!(accepted, "rho=0.9 must accept");
+        assert!(
+            (radius - 2.0).abs() < 1e-12,
+            "radius must double: got {radius}"
+        );
+    }
+
+    /// update_trust_radius: rho > 0.75 caps at delta_max.
+    #[test]
+    fn test_update_trust_radius_capped_at_delta_max() {
+        let (radius, accepted) = update_trust_radius(0.9, 6.0, 10.0);
+        assert!(accepted);
+        assert!(
+            (radius - 10.0).abs() < 1e-12,
+            "radius must be capped at 10: got {radius}"
+        );
+    }
+
+    /// update_trust_radius: rho < 0.25 shrinks (÷ 4) and rejects.
+    #[test]
+    fn test_update_trust_radius_shrinks_and_rejects_on_poor_step() {
+        let (radius, accepted) = update_trust_radius(0.1, 1.0, 10.0);
+        assert!(!accepted, "rho=0.1 must reject");
+        assert!(
+            (radius - 0.25).abs() < 1e-12,
+            "radius must quarter: got {radius}"
+        );
+    }
+
+    /// update_trust_radius: 0.25 ≤ rho ≤ 0.75 keeps radius and accepts.
+    #[test]
+    fn test_update_trust_radius_keeps_radius_on_moderate_step() {
+        let (radius, accepted) = update_trust_radius(0.5, 1.0, 10.0);
+        assert!(accepted, "rho=0.5 must accept");
+        assert!(
+            (radius - 1.0).abs() < 1e-12,
+            "radius must stay at 1.0: got {radius}"
+        );
     }
 
     /// Verify that build_gn_system returns a gradient and BHHH Hessian with

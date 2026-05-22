@@ -8,7 +8,7 @@
 //! while tolerating normal optimizer jitter.
 
 use ferx_core::parser::model_parser::parse_model_file;
-use ferx_core::{fit, read_nonmem_csv, FitOptions, Optimizer};
+use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
 use std::path::Path;
 
 fn data_and_model() -> (
@@ -254,6 +254,30 @@ fn final_ofv_no_worse_than_best_seen_during_trace() {
     );
 
     let _ = std::fs::remove_file(&trace_path);
+}
+
+/// Verify that the GN trust-region loop (replacing LM + backtracking) produces
+/// a finite, non-NaN result after a handful of outer iterations. This exercises
+/// the full `solve_trust_region_subproblem` → `run_inner` → TR-ratio path
+/// without waiting for convergence. Uses `outer_maxiter = 5` so it runs fast
+/// on every PR.
+#[test]
+fn gn_tr_warmstart_returns_finite_ofv() {
+    let (model, population) = data_and_model();
+    let mut opts = base_options();
+    opts.method = EstimationMethod::FoceGn;
+    opts.outer_maxiter = 5;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("GN trust-region must not panic");
+    assert!(
+        result.ofv.is_finite(),
+        "GN-TR OFV must be finite after 5 iters, got {}",
+        result.ofv
+    );
+    assert!(
+        !result.theta.iter().any(|x| x.is_nan()),
+        "GN-TR theta must not contain NaN"
+    );
 }
 
 /// Verify that the pre-warm cache change in `cost()` is transparent end-to-end:

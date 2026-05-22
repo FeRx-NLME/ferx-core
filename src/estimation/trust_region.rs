@@ -196,9 +196,94 @@ impl Hessian for FoceiProblem<'_> {
     }
 }
 
+/// Steihaug truncated-CG trust-region subproblem solver.
+///
+/// Finds an approximate minimiser of the quadratic model `½ δᵀ H δ + gᵀ δ`
+/// subject to `‖δ‖ ≤ trust_radius` (Nocedal & Wright, Algorithm 7.2).
+/// `H` must be symmetric; it works best when `H` is positive semi-definite
+/// (e.g. the BHHH approximation), but handles zero and negative curvature by
+/// terminating at the trust-region boundary.
+///
+/// Returns the step `δ` satisfying the trust constraint.
+pub fn solve_trust_region_subproblem(
+    g: &DVector<f64>,
+    h: &DMatrix<f64>,
+    trust_radius: f64,
+    max_iters: usize,
+) -> DVector<f64> {
+    let n = g.len();
+    let eps_rel = 1e-10;
+
+    let mut p = DVector::zeros(n);
+    let mut r = g.clone();
+    let mut d = -g.clone();
+    let r0_norm = r.norm();
+
+    if r0_norm < 1e-16 {
+        return p; // gradient is zero — no step needed
+    }
+
+    for _ in 0..max_iters {
+        let hd = h * &d;
+        let d_hd = d.dot(&hd);
+
+        if d_hd <= 0.0 {
+            // Zero or negative curvature along d: step to the TR boundary.
+            return boundary_step(&p, &d, trust_radius);
+        }
+
+        let r_sq = r.dot(&r);
+        let alpha = r_sq / d_hd;
+        let p_new = &p + alpha * &d;
+
+        if p_new.norm() >= trust_radius {
+            // Step would exit the trust region: clip to boundary.
+            return boundary_step(&p, &d, trust_radius);
+        }
+
+        let r_new = &r + alpha * &hd;
+
+        if r_new.norm() < eps_rel * r0_norm {
+            return p_new; // residual converged
+        }
+
+        let beta = r_new.dot(&r_new) / r_sq;
+        d = -&r_new + beta * &d;
+        p = p_new;
+        r = r_new;
+    }
+
+    p
+}
+
+/// Find τ ≥ 0 such that ‖p + τd‖ = delta, i.e. the boundary intersection
+/// along d from p (which must lie inside the ball).
+///
+/// Solves: ‖d‖² τ² + 2(p·d) τ + (‖p‖² − Δ²) = 0, taking the positive root.
+fn boundary_step(p: &DVector<f64>, d: &DVector<f64>, delta: f64) -> DVector<f64> {
+    let d_sq = d.dot(d);
+    let pd = p.dot(d);
+    let p_sq = p.dot(p);
+
+    if d_sq < 1e-30 {
+        // d is negligible — return p clamped to the boundary (or as-is if inside).
+        let p_norm = p_sq.sqrt();
+        return if p_norm > 1e-30 {
+            p * (delta / p_norm)
+        } else {
+            p.clone()
+        };
+    }
+
+    // disc = (p·d)² − ‖d‖²(‖p‖² − Δ²) ≥ 0 since p is inside the ball.
+    let disc = pd * pd - d_sq * (p_sq - delta * delta);
+    let tau = (-pd + disc.max(0.0).sqrt()) / d_sq;
+    p + tau * d
+}
+
 /// Size-adaptive Steihaug CG budget: `ceil(sqrt(n_params)).clamp(5, n_params)`.
 /// Avoids the fixed-50 default that wastes CG iterations when n_params ≤ 15.
-fn adaptive_steihaug_budget(n_params: usize) -> usize {
+pub(crate) fn adaptive_steihaug_budget(n_params: usize) -> usize {
     let base = (n_params as f64).sqrt().ceil() as usize;
     base.clamp(5, n_params.max(5))
 }
@@ -452,6 +537,50 @@ mod tests {
                 "miss path must produce a full entry without a preceding cost() call"
             );
         }
+    }
+
+    /// TR subproblem must respect the trust radius for a range of radii.
+    #[test]
+    fn test_solve_trust_region_subproblem_respects_radius() {
+        let g = DVector::from_vec(vec![1.0, -2.0]);
+        let h = DMatrix::from_row_slice(2, 2, &[4.0, 1.0, 1.0, 3.0]); // PD
+        for &delta in &[0.1_f64, 0.5, 1.0, 5.0] {
+            let step = solve_trust_region_subproblem(&g, &h, delta, 20);
+            assert!(
+                step.norm() <= delta * (1.0 + 1e-8),
+                "‖step‖ = {:.6} > Δ = {} (violation)",
+                step.norm(),
+                delta
+            );
+        }
+    }
+
+    /// The step must decrease the quadratic model q(δ) = ½ δᵀ H δ + gᵀ δ < 0.
+    #[test]
+    fn test_solve_trust_region_subproblem_improves_quadratic_model() {
+        let g = DVector::from_vec(vec![1.0, -2.0]);
+        let h = DMatrix::from_row_slice(2, 2, &[4.0, 1.0, 1.0, 3.0]);
+        let delta = solve_trust_region_subproblem(&g, &h, 1.0, 20);
+        let q = 0.5 * delta.dot(&(h * &delta)) + g.dot(&delta);
+        assert!(q < 0.0, "quadratic model must decrease: q = {:.6}", q);
+    }
+
+    /// With a Hessian that has a negative eigenvalue, the step must reach the
+    /// TR boundary (Steihaug terminates at the boundary on negative curvature).
+    #[test]
+    fn test_solve_trust_region_subproblem_negative_curvature() {
+        // H = diag(-1, 2) has a negative eigenvalue along e₁.
+        let g = DVector::from_vec(vec![0.0, 1.0]);
+        let h = DMatrix::from_row_slice(2, 2, &[-1.0, 0.0, 0.0, 2.0]);
+        let trust_radius = 1.0;
+        let step = solve_trust_region_subproblem(&g, &h, trust_radius, 20);
+        // Step must reach the boundary, not panic.
+        assert!(
+            (step.norm() - trust_radius).abs() < 1e-8,
+            "negative curvature: ‖step‖ = {:.8} should equal Δ = {}",
+            step.norm(),
+            trust_radius
+        );
     }
 
     #[test]
