@@ -173,15 +173,40 @@ pub fn run_foce_gn(
         let pred_reduction = -grad_s.dot(&delta_s) - 0.5 * delta_s.dot(&h_s_delta_s);
 
         if pred_reduction < 1e-10 {
-            // Gradient is effectively zero — already at a stationary point.
-            converged = true;
-            if verbose {
-                eprintln!(
-                    "  GN iter {:>3}: predicted reduction negligible, converged",
-                    iter
-                );
+            if grad_s.norm() < 1e-8 {
+                // Gradient is genuinely zero — true stationary point.
+                converged = true;
+                if verbose {
+                    eprintln!(
+                        "  GN iter {:>3}: predicted reduction negligible, converged",
+                        iter
+                    );
+                }
+                break;
+            } else {
+                // Degenerate BHHH: near-zero quadratic improvement despite a
+                // non-zero gradient. Shrink the trust radius and retry.
+                trust_radius /= 4.0;
+                if trust_radius < 1e-10 {
+                    if verbose {
+                        eprintln!(
+                            "  GN iter {:>3}: degenerate BHHH Hessian, trust radius collapsed",
+                            iter
+                        );
+                    }
+                    warnings.push(
+                        "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed".to_string(),
+                    );
+                    break;
+                }
+                if verbose {
+                    eprintln!(
+                        "  GN iter {:>3}: degenerate BHHH, shrinking radius to {:.4e}",
+                        iter, trust_radius
+                    );
+                }
+                continue;
             }
-            break;
         }
 
         // Proposed new point (in unscaled parameter space)
@@ -223,11 +248,14 @@ pub fn run_foce_gn(
             -1.0
         };
 
+        let radius_before = trust_radius;
         let (new_radius, accepted) = update_trust_radius(rho, trust_radius, delta_max);
         trust_radius = new_radius;
 
         if !accepted {
-            // Trace: rejected step
+            // Trace: rejected step — use radius_before so the column records
+            // the radius that was active when the step was attempted, consistent
+            // with accepted-step rows (which also log the post-accept radius).
             if crate::estimation::trace::is_active() {
                 let (gn_method, gn_phase) = gn_trace_method_phase(options.method);
                 crate::estimation::trace::write_gn(
@@ -235,7 +263,7 @@ pub fn run_foce_gn(
                     gn_method,
                     gn_phase,
                     ofv,
-                    trust_radius,
+                    radius_before,
                     0.0,
                     false,
                     None,
@@ -1207,6 +1235,30 @@ mod tests {
         assert!(
             (radius - 1.0).abs() < 1e-12,
             "radius must stay at 1.0: got {radius}"
+        );
+    }
+
+    /// update_trust_radius: rho = 0.25 exactly falls into the "keep, accept" branch
+    /// (boundary of the strict `< 0.25` shrink condition).
+    #[test]
+    fn test_update_trust_radius_boundary_rho_0_25() {
+        let (radius, accepted) = update_trust_radius(0.25, 1.0, 10.0);
+        assert!(accepted, "rho=0.25 must accept (boundary of shrink branch)");
+        assert!(
+            (radius - 1.0).abs() < 1e-12,
+            "radius must stay at 1.0 for rho=0.25: got {radius}"
+        );
+    }
+
+    /// update_trust_radius: rho = 0.75 exactly falls into the "keep, accept" branch
+    /// (boundary of the strict `> 0.75` expand condition).
+    #[test]
+    fn test_update_trust_radius_boundary_rho_0_75() {
+        let (radius, accepted) = update_trust_radius(0.75, 1.0, 10.0);
+        assert!(accepted, "rho=0.75 must accept (boundary of expand branch)");
+        assert!(
+            (radius - 1.0).abs() < 1e-12,
+            "radius must stay at 1.0 for rho=0.75: got {radius}"
         );
     }
 

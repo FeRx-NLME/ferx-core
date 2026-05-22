@@ -205,14 +205,13 @@ impl Hessian for FoceiProblem<'_> {
 /// terminating at the trust-region boundary.
 ///
 /// Returns the step `δ` satisfying the trust constraint.
-pub fn solve_trust_region_subproblem(
+pub(crate) fn solve_trust_region_subproblem(
     g: &DVector<f64>,
     h: &DMatrix<f64>,
     trust_radius: f64,
     max_iters: usize,
 ) -> DVector<f64> {
     let n = g.len();
-    let eps_rel = 1e-10;
 
     let mut p = DVector::zeros(n);
     let mut r = g.clone();
@@ -222,6 +221,11 @@ pub fn solve_trust_region_subproblem(
     if r0_norm < 1e-16 {
         return p; // gradient is zero — no step needed
     }
+
+    // N&W Algorithm 7.2 forcing sequence: ε = min(0.5, √‖r₀‖).
+    // At 1e-10 the criterion never fires within the small CG budget; this
+    // tighter value lets a raised budget benefit from early termination.
+    let eps_rel = r0_norm.sqrt().min(0.5);
 
     for _ in 0..max_iters {
         let hd = h * &d;
@@ -277,7 +281,8 @@ fn boundary_step(p: &DVector<f64>, d: &DVector<f64>, delta: f64) -> DVector<f64>
 
     // disc = (p·d)² − ‖d‖²(‖p‖² − Δ²) ≥ 0 since p is inside the ball.
     let disc = pd * pd - d_sq * (p_sq - delta * delta);
-    let tau = (-pd + disc.max(0.0).sqrt()) / d_sq;
+    let disc_clamped = if disc > 0.0 { disc } else { 0.0 };
+    let tau = (-pd + disc_clamped.sqrt()) / d_sq;
     p + tau * d
 }
 
@@ -582,6 +587,25 @@ mod tests {
             "negative curvature: ‖step‖ = {:.8} should equal Δ = {}",
             step.norm(),
             trust_radius
+        );
+    }
+
+    /// `boundary_step` with d ≈ 0: the function must return a point on the sphere
+    /// (‖result‖ = delta) rather than panicking or producing a degenerate step.
+    /// This edge case is unreachable from the normal Steihaug flow but the guard
+    /// (`d_sq < 1e-30`) is present and must be tested independently.
+    #[test]
+    fn test_boundary_step_near_zero_d() {
+        // p is inside the ball; d is effectively zero.
+        let p = DVector::from_vec(vec![0.3, 0.4]); // ‖p‖ = 0.5
+        let d = DVector::from_vec(vec![0.0, 0.0]);
+        let delta = 1.0;
+        let result = boundary_step(&p, &d, delta);
+        // With d ≈ 0 the function projects p onto the sphere.
+        let result_norm = result.norm();
+        assert!(
+            (result_norm - delta).abs() < 1e-10,
+            "boundary_step(d≈0): ‖result‖ = {result_norm:.8} should equal Δ = {delta}"
         );
     }
 
