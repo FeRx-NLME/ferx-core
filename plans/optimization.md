@@ -34,13 +34,13 @@ Since 2026-05-19, the following non-optimization PRs landed:
 | Step | Requires | Status |
 |------|----------|--------|
 | **5b** — IOV analytical gradient in outer optimizer | Step 5 ✅ | ❌ NOT STARTED |
-| **6b** — Eliminate double inner-solve in trust-region `cost()` | Step 6 ✅ | 🔶 IN PR [#67](https://github.com/FeRx-NLME/ferx-core/pull/67) |
-| **7** — GN → trust-region subproblem (replace LM damping + line search) | Steps 6 ✅ + 6b ✅ | ❌ NOT STARTED |
+| **6b** — Eliminate double inner-solve in trust-region `cost()` | Step 6 ✅ | ✅ DONE — PR [#67](https://github.com/FeRx-NLME/ferx-core/pull/67) merged |
+| **7** — GN → trust-region subproblem (replace LM damping + line search) | Steps 6 ✅ + 6b ✅ | 🔶 IN PR (branch `perf/gn-trust-region`) |
 | **8** — HMC proposals in SAEM E-step | Steps 3 ✅ + 4 ✅ + PR #66 merged | ❌ NOT STARTED |
 
 **Recommended implementation order: 6b → 7 → 5b → 8.**
-- 6b first: smallest scope, pure `trust_region.rs` change, immediately halves inner-solve cost per TR iteration, unblocks Step 7.
-- 7 second: requires 6b; reuses the TR subproblem machinery being introduced in 6b.
+- 6b: ✅ done (PR #67 merged).
+- 7: 🔶 in PR (branch `perf/gn-trust-region`). Reuses `solve_trust_region_subproblem` and `adaptive_steihaug_budget` from `trust_region.rs`.
 - 5b third: independent of 6b/7; larger scope (requires inner optimizer to expose kappa H-matrices).
 - 8 last: largest scope, requires PR #66 merged; `autodiff` feature dependency means CI validation needs extra care.
 
