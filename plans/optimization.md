@@ -29,19 +29,19 @@ Since 2026-05-19, the following non-optimization PRs landed:
 | **9** — Student-t SIR proposal | [#41](https://github.com/FeRx-NLME/ferx-core/pull/41) | Replace MVN proposal in SIR with multivariate Student-t (ν=5) | Normal proposal has thin tails; ESS collapses for parameters near boundaries (Ω variances, constrained θ) | Higher ESS without increasing `sir_samples`; more reliable 95% CIs for boundary-adjacent parameters |
 | **10** — Parallel multi-start | [#42](https://github.com/FeRx-NLME/ferx-core/pull/42) | Run N independent full optimizations from perturbed initials in parallel via rayon; return lowest OFV | Local minima are the most common practical failure mode for nonlinear elimination, full-block Ω, and covariate models | On an 8-core machine, `n_starts = 8` gives ~8× lower probability of a local minimum at the same wall-clock cost |
 
-**Remaining (4 steps):**
+**Remaining (1 step):**
 
 | Step | Requires | Status |
 |------|----------|--------|
-| **5b** — IOV analytical gradient in outer optimizer | Step 5 ✅ | ❌ NOT STARTED |
+| **5b** — IOV analytical gradient in outer optimizer | Step 5 ✅ | ✅ DONE — PR [#70](https://github.com/FeRx-NLME/ferx-core/pull/70) merged |
 | **6b** — Eliminate double inner-solve in trust-region `cost()` | Step 6 ✅ | ✅ DONE — PR [#67](https://github.com/FeRx-NLME/ferx-core/pull/67) merged |
-| **7** — GN → trust-region subproblem (replace LM damping + line search) | Steps 6 ✅ + 6b ✅ | 🔶 IN PR (branch `perf/gn-trust-region`) |
+| **7** — GN → trust-region subproblem (replace LM damping + line search) | Steps 6 ✅ + 6b ✅ | ✅ DONE — PRs [#68](https://github.com/FeRx-NLME/ferx-core/pull/68) + [#69](https://github.com/FeRx-NLME/ferx-core/pull/69) merged |
 | **8** — HMC proposals in SAEM E-step | Steps 3 ✅ + 4 ✅ + PR #66 merged | ❌ NOT STARTED |
 
-**Recommended implementation order: 6b → 7 → 5b → 8.**
+**Recommended implementation order: 5b ✅ → 7 ✅ → 8.**
 - 6b: ✅ done (PR #67 merged).
-- 7: 🔶 in PR (branch `perf/gn-trust-region`). Reuses `solve_trust_region_subproblem` and `adaptive_steihaug_budget` from `trust_region.rs`.
-- 5b third: independent of 6b/7; larger scope (requires inner optimizer to expose kappa H-matrices).
+- 7: ✅ done (PR #68 merged; missing `two_cpt_oral_cov` Tier 3 test added via PR #69).
+- 5b: ✅ done (PR #70 merged). Key Phase B deviation: kappa H-matrices are not needed — the IOV NLL uses BSV-only FOCE linearisation + a direct kappa prior; `∂P_κ/∂L_iov` derived via forward/backward solve through `L_iov` only. No changes to `run_inner_loop_warm` or call sites.
 - 8 last: largest scope, requires PR #66 merged; `autodiff` feature dependency means CI validation needs extra care.
 
 ---
