@@ -27,6 +27,8 @@ use std::autodiff::{autodiff_forward, autodiff_reverse};
     Const,
     Const,
     Const,
+    Const,
+    Const,
     Active
 )]
 pub fn individual_nll_ad(
@@ -39,6 +41,8 @@ pub fn individual_nll_ad(
     dose_amts: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
+    dose_ss: &[f64], // 1.0 when steady-state, else 0.0
+    dose_ii: &[f64], // dosing interval per dose (0 when not SS)
     obs_times: &[f64],
     observations: &[f64],
     cens_f64: &[f64],      // per-observation censoring flag; > 0.5 ⇒ BLOQ (M3)
@@ -99,6 +103,8 @@ pub fn individual_nll_ad(
                     dose_amts[d],
                     dose_rates[d],
                     dose_durations[d],
+                    dose_ss[d],
+                    dose_ii[d],
                     pk[PK_IDX_CL],
                     pk[PK_IDX_V],
                     pk[PK_IDX_Q],
@@ -181,6 +187,8 @@ fn log_normal_cdf_ad(z: f64) -> f64 {
     Const,
     Const,
     Const,
+    Const,
+    Const,
     Dual
 )]
 pub fn predict_all_ad(
@@ -190,6 +198,8 @@ pub fn predict_all_ad(
     dose_amts: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
+    dose_ss: &[f64],
+    dose_ii: &[f64],
     obs_times: &[f64],
     pk_idx_f64: &[f64], // PK parameter indices as f64 (cast to usize inside)
     sel_flat: &[f64],   // n_tv × n_eta row-major one-hot eta selector
@@ -230,6 +240,8 @@ pub fn predict_all_ad(
                     dose_amts[d],
                     dose_rates[d],
                     dose_durations[d],
+                    dose_ss[d],
+                    dose_ii[d],
                     pk[PK_IDX_CL],
                     pk[PK_IDX_V],
                     pk[PK_IDX_Q],
@@ -253,6 +265,8 @@ fn single_dose_ad(
     amt: f64,
     rate: f64,
     dur: f64,
+    ss: f64,
+    ii: f64,
     cl: f64,
     v: f64,
     q: f64,
@@ -266,17 +280,39 @@ fn single_dose_ad(
         return 0.0;
     }
 
+    // `is_ss` is data-dependent (constant per dose), not parameter-
+    // dependent, so branching on it doesn't poison Enzyme adjoints — same
+    // pattern as the existing `if dur <= 0.0` branches below.
+    let is_ss = ss > 0.5 && ii > 0.0;
+
     match pk_model_id {
         0 => {
             // OneCptIvBolus
             let k = cl / v;
-            (amt / v) * (-k * tau).exp()
+            if is_ss {
+                let denom = 1.0 - (-k * ii).exp();
+                (amt / v) * (-k * tau).exp() / denom
+            } else {
+                (amt / v) * (-k * tau).exp()
+            }
         }
         1 => {
             // OneCptOral
             let k = cl / v;
             let d = f_bio * amt;
-            if (ka - k).abs() < 1e-6 {
+            if is_ss {
+                if (ka - k).abs() < 1e-6 {
+                    let x = (-k * ii).exp();
+                    let one_minus_x = 1.0 - x;
+                    let s = tau / one_minus_x + ii * x / (one_minus_x * one_minus_x);
+                    (d * ka / v) * (-k * tau).exp() * s
+                } else {
+                    let denom_k = 1.0 - (-k * ii).exp();
+                    let denom_ka = 1.0 - (-ka * ii).exp();
+                    (d * ka / (v * (ka - k)))
+                        * ((-k * tau).exp() / denom_k - (-ka * tau).exp() / denom_ka)
+                }
+            } else if (ka - k).abs() < 1e-6 {
                 (d * ka / v) * tau * (-k * tau).exp()
             } else {
                 (d * ka / (v * (ka - k))) * ((-k * tau).exp() - (-ka * tau).exp())
@@ -286,7 +322,23 @@ fn single_dose_ad(
             // OneCptInfusion
             let k = cl / v;
             if dur <= 0.0 {
-                (amt / v) * (-k * tau).exp()
+                if is_ss {
+                    let denom = 1.0 - (-k * ii).exp();
+                    (amt / v) * (-k * tau).exp() / denom
+                } else {
+                    (amt / v) * (-k * tau).exp()
+                }
+            } else if is_ss && dur <= ii {
+                let denom = 1.0 - (-k * ii).exp();
+                let one_minus_e_kt_inf = 1.0 - (-k * dur).exp();
+                let past_pulses =
+                    (rate / cl) * one_minus_e_kt_inf * (-k * (tau - dur)).exp() * (-k * ii).exp()
+                        / denom;
+                if tau <= dur {
+                    (rate / cl) * (1.0 - (-k * tau).exp()) + past_pulses
+                } else {
+                    (rate / cl) * one_minus_e_kt_inf * (-k * (tau - dur)).exp() / denom
+                }
             } else if tau <= dur {
                 (rate / cl) * (1.0 - (-k * tau).exp())
             } else {
@@ -302,7 +354,13 @@ fn single_dose_ad(
             }
             let a = (amt / v) * (alpha - k21) / diff;
             let b = (amt / v) * (k21 - beta) / diff;
-            a * (-alpha * tau).exp() + b * (-beta * tau).exp()
+            if is_ss {
+                let denom_a = 1.0 - (-alpha * ii).exp();
+                let denom_b = 1.0 - (-beta * ii).exp();
+                a * (-alpha * tau).exp() / denom_a + b * (-beta * tau).exp() / denom_b
+            } else {
+                a * (-alpha * tau).exp() + b * (-beta * tau).exp()
+            }
         }
         4 => {
             // TwoCptOral
@@ -312,22 +370,55 @@ fn single_dose_ad(
                 return 0.0;
             }
             let coeff = f_bio * amt * ka / v;
-            let p = if (ka - alpha).abs() < 1e-6 {
-                coeff * (alpha - k21) / diff * tau * (-alpha * tau).exp()
+            if is_ss {
+                // SS bateman: Σ_n (τ + n·II) · exp(-λ·(τ + n·II)) when ka ≈ λ
+                // collapses to exp(-λ·τ) · [τ/(1-x) + II·x/(1-x)²], else the
+                // non-singular path scales each eigenvalue by 1/(1-exp(-λ·ii)).
+                let denom_alpha = 1.0 - (-alpha * ii).exp();
+                let denom_beta = 1.0 - (-beta * ii).exp();
+                let denom_ka = 1.0 - (-ka * ii).exp();
+                let p = if (ka - alpha).abs() < 1e-6 {
+                    let x = (-alpha * ii).exp();
+                    let one_minus_x = 1.0 - x;
+                    let s = tau / one_minus_x + ii * x / (one_minus_x * one_minus_x);
+                    coeff * (alpha - k21) / diff * (-alpha * tau).exp() * s
+                } else {
+                    coeff * (k21 - alpha) / ((ka - alpha) * (beta - alpha)) * (-alpha * tau).exp()
+                        / denom_alpha
+                };
+                let q_val = if (ka - beta).abs() < 1e-6 {
+                    let x = (-beta * ii).exp();
+                    let one_minus_x = 1.0 - x;
+                    let s = tau / one_minus_x + ii * x / (one_minus_x * one_minus_x);
+                    coeff * (k21 - beta) / diff * (-beta * tau).exp() * s
+                } else {
+                    coeff * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-beta * tau).exp()
+                        / denom_beta
+                };
+                let r = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 {
+                    0.0
+                } else {
+                    coeff * (k21 - ka) / ((alpha - ka) * (beta - ka)) * (-ka * tau).exp() / denom_ka
+                };
+                p + q_val + r
             } else {
-                coeff * (k21 - alpha) / ((ka - alpha) * (beta - alpha)) * (-alpha * tau).exp()
-            };
-            let q_val = if (ka - beta).abs() < 1e-6 {
-                coeff * (k21 - beta) / diff * tau * (-beta * tau).exp()
-            } else {
-                coeff * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-beta * tau).exp()
-            };
-            let r = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 {
-                0.0
-            } else {
-                coeff * (k21 - ka) / ((alpha - ka) * (beta - ka)) * (-ka * tau).exp()
-            };
-            p + q_val + r
+                let p = if (ka - alpha).abs() < 1e-6 {
+                    coeff * (alpha - k21) / diff * tau * (-alpha * tau).exp()
+                } else {
+                    coeff * (k21 - alpha) / ((ka - alpha) * (beta - alpha)) * (-alpha * tau).exp()
+                };
+                let q_val = if (ka - beta).abs() < 1e-6 {
+                    coeff * (k21 - beta) / diff * tau * (-beta * tau).exp()
+                } else {
+                    coeff * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-beta * tau).exp()
+                };
+                let r = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 {
+                    0.0
+                } else {
+                    coeff * (k21 - ka) / ((alpha - ka) * (beta - ka)) * (-ka * tau).exp()
+                };
+                p + q_val + r
+            }
         }
         5 => {
             // TwoCptInfusion
@@ -341,7 +432,38 @@ fn single_dose_ad(
             if dur <= 0.0 {
                 let a = (amt / v) * (alpha - k21) / diff;
                 let b = (amt / v) * (k21 - beta) / diff;
-                a * (-alpha * tau).exp() + b * (-beta * tau).exp()
+                if is_ss {
+                    let denom_a = 1.0 - (-alpha * ii).exp();
+                    let denom_b = 1.0 - (-beta * ii).exp();
+                    a * (-alpha * tau).exp() / denom_a + b * (-beta * tau).exp() / denom_b
+                } else {
+                    a * (-alpha * tau).exp() + b * (-beta * tau).exp()
+                }
+            } else if is_ss && dur <= ii {
+                let a_c = (rate / v) * (alpha - k21) / (diff * alpha);
+                let b_c = (rate / v) * (k21 - beta) / (diff * beta);
+                let denom_a = 1.0 - (-alpha * ii).exp();
+                let denom_b = 1.0 - (-beta * ii).exp();
+                let past_a = a_c
+                    * (1.0 - (-alpha * dur).exp())
+                    * (-alpha * (tau - dur)).exp()
+                    * (-alpha * ii).exp()
+                    / denom_a;
+                let past_b = b_c
+                    * (1.0 - (-beta * dur).exp())
+                    * (-beta * (tau - dur)).exp()
+                    * (-beta * ii).exp()
+                    / denom_b;
+                if tau <= dur {
+                    a_c * (1.0 - (-alpha * tau).exp())
+                        + b_c * (1.0 - (-beta * tau).exp())
+                        + past_a
+                        + past_b
+                } else {
+                    let dt = tau - dur;
+                    a_c * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() / denom_a
+                        + b_c * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp() / denom_b
+                }
             } else {
                 let a_c = (rate / v) * (alpha - k21) / (diff * alpha);
                 let b_c = (rate / v) * (k21 - beta) / (diff * beta);
@@ -367,7 +489,16 @@ fn single_dose_ad(
             let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
             let b = d * (beta - k21) * (beta - k31) / (-ab * bg);
             let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-            a * (-alpha * tau).exp() + b * (-beta * tau).exp() + g * (-gamma * tau).exp()
+            if is_ss {
+                let denom_a = 1.0 - (-alpha * ii).exp();
+                let denom_b = 1.0 - (-beta * ii).exp();
+                let denom_g = 1.0 - (-gamma * ii).exp();
+                a * (-alpha * tau).exp() / denom_a
+                    + b * (-beta * tau).exp() / denom_b
+                    + g * (-gamma * tau).exp() / denom_g
+            } else {
+                a * (-alpha * tau).exp() + b * (-beta * tau).exp() + g * (-gamma * tau).exp()
+            }
         }
         7 => {
             // ThreeCptOral
@@ -383,22 +514,58 @@ fn single_dose_ad(
             let b_c = (beta - k21) * (beta - k31) / (-ab * bg);
             let g_c = (gamma - k21) * (gamma - k31) / (ag * bg);
 
-            let bateman_a = if (ka - alpha).abs() < 1e-6 {
-                tau * (-alpha * tau).exp()
+            if is_ss {
+                // SS bateman per eigenvalue λ:
+                //   non-singular: [exp(-λ·τ)/(1-exp(-λ·ii)) - exp(-ka·τ)/(1-exp(-ka·ii))] / (ka - λ)
+                //   singular (ka ≈ λ): exp(-λ·τ) · [τ/(1-x) + ii·x/(1-x)²]  with x = exp(-λ·ii)
+                let denom_ka = 1.0 - (-ka * ii).exp();
+                let bateman_a_ss = if (ka - alpha).abs() < 1e-6 {
+                    let x = (-alpha * ii).exp();
+                    let one_minus_x = 1.0 - x;
+                    (-alpha * tau).exp()
+                        * (tau / one_minus_x + ii * x / (one_minus_x * one_minus_x))
+                } else {
+                    let denom_alpha = 1.0 - (-alpha * ii).exp();
+                    ((-alpha * tau).exp() / denom_alpha - (-ka * tau).exp() / denom_ka)
+                        / (ka - alpha)
+                };
+                let bateman_b_ss = if (ka - beta).abs() < 1e-6 {
+                    let x = (-beta * ii).exp();
+                    let one_minus_x = 1.0 - x;
+                    (-beta * tau).exp() * (tau / one_minus_x + ii * x / (one_minus_x * one_minus_x))
+                } else {
+                    let denom_beta = 1.0 - (-beta * ii).exp();
+                    ((-beta * tau).exp() / denom_beta - (-ka * tau).exp() / denom_ka) / (ka - beta)
+                };
+                let bateman_g_ss = if (ka - gamma).abs() < 1e-6 {
+                    let x = (-gamma * ii).exp();
+                    let one_minus_x = 1.0 - x;
+                    (-gamma * tau).exp()
+                        * (tau / one_minus_x + ii * x / (one_minus_x * one_minus_x))
+                } else {
+                    let denom_gamma = 1.0 - (-gamma * ii).exp();
+                    ((-gamma * tau).exp() / denom_gamma - (-ka * tau).exp() / denom_ka)
+                        / (ka - gamma)
+                };
+                coeff * (a_c * bateman_a_ss + b_c * bateman_b_ss + g_c * bateman_g_ss)
             } else {
-                ((-alpha * tau).exp() - (-ka * tau).exp()) / (ka - alpha)
-            };
-            let bateman_b = if (ka - beta).abs() < 1e-6 {
-                tau * (-beta * tau).exp()
-            } else {
-                ((-beta * tau).exp() - (-ka * tau).exp()) / (ka - beta)
-            };
-            let bateman_g = if (ka - gamma).abs() < 1e-6 {
-                tau * (-gamma * tau).exp()
-            } else {
-                ((-gamma * tau).exp() - (-ka * tau).exp()) / (ka - gamma)
-            };
-            coeff * (a_c * bateman_a + b_c * bateman_b + g_c * bateman_g)
+                let bateman_a = if (ka - alpha).abs() < 1e-6 {
+                    tau * (-alpha * tau).exp()
+                } else {
+                    ((-alpha * tau).exp() - (-ka * tau).exp()) / (ka - alpha)
+                };
+                let bateman_b = if (ka - beta).abs() < 1e-6 {
+                    tau * (-beta * tau).exp()
+                } else {
+                    ((-beta * tau).exp() - (-ka * tau).exp()) / (ka - beta)
+                };
+                let bateman_g = if (ka - gamma).abs() < 1e-6 {
+                    tau * (-gamma * tau).exp()
+                } else {
+                    ((-gamma * tau).exp() - (-ka * tau).exp()) / (ka - gamma)
+                };
+                coeff * (a_c * bateman_a + b_c * bateman_b + g_c * bateman_g)
+            }
         }
         8 => {
             // ThreeCptInfusion
@@ -420,7 +587,52 @@ fn single_dose_ad(
                 let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
                 let b = d * (beta - k21) * (beta - k31) / (-ab * bg);
                 let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-                a * (-alpha * tau).exp() + b * (-beta * tau).exp() + g * (-gamma * tau).exp()
+                if is_ss {
+                    let denom_a = 1.0 - (-alpha * ii).exp();
+                    let denom_b = 1.0 - (-beta * ii).exp();
+                    let denom_g = 1.0 - (-gamma * ii).exp();
+                    a * (-alpha * tau).exp() / denom_a
+                        + b * (-beta * tau).exp() / denom_b
+                        + g * (-gamma * tau).exp() / denom_g
+                } else {
+                    a * (-alpha * tau).exp() + b * (-beta * tau).exp() + g * (-gamma * tau).exp()
+                }
+            } else if is_ss && dur <= ii {
+                let rv = rate / v;
+                let a_c = rv * (alpha - k21) * (alpha - k31) / (ab * ag * alpha);
+                let b_c = rv * (beta - k21) * (beta - k31) / (-ab * bg * beta);
+                let g_c = rv * (gamma - k21) * (gamma - k31) / (ag * bg * gamma);
+                let denom_a = 1.0 - (-alpha * ii).exp();
+                let denom_b = 1.0 - (-beta * ii).exp();
+                let denom_g = 1.0 - (-gamma * ii).exp();
+                let past_a = a_c
+                    * (1.0 - (-alpha * dur).exp())
+                    * (-alpha * (tau - dur)).exp()
+                    * (-alpha * ii).exp()
+                    / denom_a;
+                let past_b = b_c
+                    * (1.0 - (-beta * dur).exp())
+                    * (-beta * (tau - dur)).exp()
+                    * (-beta * ii).exp()
+                    / denom_b;
+                let past_g = g_c
+                    * (1.0 - (-gamma * dur).exp())
+                    * (-gamma * (tau - dur)).exp()
+                    * (-gamma * ii).exp()
+                    / denom_g;
+                if tau <= dur {
+                    a_c * (1.0 - (-alpha * tau).exp())
+                        + b_c * (1.0 - (-beta * tau).exp())
+                        + g_c * (1.0 - (-gamma * tau).exp())
+                        + past_a
+                        + past_b
+                        + past_g
+                } else {
+                    let dt = tau - dur;
+                    a_c * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() / denom_a
+                        + b_c * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp() / denom_b
+                        + g_c * (1.0 - (-gamma * dur).exp()) * (-gamma * dt).exp() / denom_g
+                }
             } else {
                 let rv = rate / v;
                 let a_c = rv * (alpha - k21) * (alpha - k31) / (ab * ag * alpha);
@@ -580,6 +792,11 @@ pub struct FlatDoseData {
     pub amts: Vec<f64>,
     pub rates: Vec<f64>,
     pub durations: Vec<f64>,
+    /// `1.0` when `dose.ss == true`, else `0.0`. Stored as `f64` so the
+    /// flat arrays remain a uniform ABI for the AD-instrumented functions.
+    pub ss: Vec<f64>,
+    /// Dose interval (NONMEM `II`) per dose; `0.0` when not steady-state.
+    pub ii: Vec<f64>,
 }
 
 impl FlatDoseData {
@@ -589,6 +806,12 @@ impl FlatDoseData {
             amts: subject.doses.iter().map(|d| d.amt).collect(),
             rates: subject.doses.iter().map(|d| d.rate).collect(),
             durations: subject.doses.iter().map(|d| d.duration).collect(),
+            ss: subject
+                .doses
+                .iter()
+                .map(|d| if d.ss { 1.0 } else { 0.0 })
+                .collect(),
+            ii: subject.doses.iter().map(|d| d.ii).collect(),
         }
     }
 }
@@ -633,6 +856,8 @@ pub fn compute_nll_gradient_ad(
         &dose_data.amts,
         &dose_data.rates,
         &dose_data.durations,
+        &dose_data.ss,
+        &dose_data.ii,
         obs_times,
         observations,
         cens_f64,
@@ -675,6 +900,8 @@ pub fn compute_jacobian_ad(
             &dose_data.amts,
             &dose_data.rates,
             &dose_data.durations,
+            &dose_data.ss,
+            &dose_data.ii,
             obs_times,
             pk_idx_f64,
             sel_flat,

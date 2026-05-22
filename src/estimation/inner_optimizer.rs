@@ -65,24 +65,22 @@ fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGra
         if !want_ad {
             return InnerGradientMethod::Fd;
         }
-        // SS=1 doses in the AD paths would require threading `dose.ss` and
-        // `dose.ii` through the AD-instrumented propagators and adding
-        // closed-form SS branches inside them. Until that lands, fall back
-        // to FD whenever the subject has any SS dose — otherwise AD
-        // gradients (computed against the single-dose response) would not
-        // match the SS-aware predictions from `predict_concentration`.
-        if subject.has_ss_doses() {
-            return InnerGradientMethod::Fd;
-        }
         // Lagtime in the event-driven AD path would require threading
         // per-dose `lagtime` through the AD-instrumented propagators and
         // their infusion-window checks. The single-snapshot AD path
         // already handles lagtime (see `ad_gradients.rs::predict_all_ad`).
         // Until the event-driven AD path is updated, fall back to FD when
         // a TV-cov subject is paired with a lagtime-bearing model.
+        //
+        // SS=1 doses: the single-snapshot AD path now honours `dose.ss`/
+        // `dose.ii` (closed-form SS branches in `single_dose_ad`), so
+        // no-TV SS subjects use AD. The event-driven AD propagators don't
+        // yet honour SS, so SS+TV subjects still fall back to FD —
+        // tracked on issue #74.
         if subject.has_tv_covariates() {
             if crate::ad::event_driven_ad::supports_event_driven_ad(model.pk_model)
                 && !model.has_lagtime()
+                && !subject.has_ss_doses()
             {
                 InnerGradientMethod::AdEventDriven
             } else {
