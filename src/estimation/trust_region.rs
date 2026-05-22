@@ -570,7 +570,9 @@ mod tests {
     #[test]
     fn test_solve_trust_region_subproblem_negative_curvature() {
         // H = diag(-1, 2) has a negative eigenvalue along e₁.
-        let g = DVector::from_vec(vec![0.0, 1.0]);
+        // g must point along e₁ so the initial CG direction d = -g = [-1, 0]
+        // immediately encounters d·Hd = -1 < 0 and triggers the boundary step.
+        let g = DVector::from_vec(vec![1.0, 0.0]);
         let h = DMatrix::from_row_slice(2, 2, &[-1.0, 0.0, 0.0, 2.0]);
         let trust_radius = 1.0;
         let step = solve_trust_region_subproblem(&g, &h, trust_radius, 20);
