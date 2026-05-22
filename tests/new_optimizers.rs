@@ -318,3 +318,31 @@ fn steihaug_max_iters_is_respected_by_trust_region() {
         .expect("trust_region with tight CG budget must still return");
     assert!(result.ofv.is_finite());
 }
+
+/// IOV analytical gradient path: fit() on warfarin_iov with method=focei and
+/// outer_maxiter=5 must complete without panic and return a finite OFV.
+///
+/// This confirms the new IOV analytical gradient is wired through the outer
+/// optimizer without running to convergence (slow-test) — any panic or NaN
+/// means the IOV analytical path broke.
+#[test]
+fn iov_analytical_gradient_path_returns_finite_ofv() {
+    let model =
+        ferx_core::parser::model_parser::parse_model_file(Path::new("examples/warfarin_iov.ferx"))
+            .expect("warfarin_iov model must parse");
+    let population = ferx_core::read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, None)
+        .expect("warfarin_iov data must load");
+
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceI;
+    opts.outer_maxiter = 5;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("IOV fit must not error");
+    assert!(
+        result.ofv.is_finite(),
+        "IOV fit OFV must be finite, got {}",
+        result.ofv
+    );
+}

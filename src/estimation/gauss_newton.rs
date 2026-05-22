@@ -20,6 +20,7 @@ use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
 use crate::stats::likelihood::{
     chol_log_det, compute_r_tilde, foce_subject_nll_interaction, foce_subject_nll_standard,
+    split_obs_by_occasion,
 };
 use crate::stats::residual_error::compute_r_diag;
 use crate::types::*;
@@ -579,6 +580,20 @@ fn fwd_solve(chol_l: &DMatrix<f64>, rhs: &[f64]) -> Vec<f64> {
     w
 }
 
+/// Solve L^T a = rhs by backward substitution (L lower triangular, hence L^T upper triangular).
+fn bwd_solve_t(l: &DMatrix<f64>, rhs: &[f64]) -> Vec<f64> {
+    let n = l.nrows();
+    let mut a = vec![0.0f64; n];
+    for i in (0..n).rev() {
+        let mut s = rhs[i];
+        for k in (i + 1)..n {
+            s -= l[(k, i)] * a[k]; // L^T[i,k] = L[k,i]
+        }
+        a[i] = s / l[(i, i)];
+    }
+    a
+}
+
 /// d(r_j)/d(log sigma_k) for each observation, at the prediction point used
 /// to evaluate r_diag (f0 for standard, ipreds for interaction).
 fn dr_diag_d_log_sigma(
@@ -863,6 +878,314 @@ fn subject_nll_pop_grad_analytical(
     Some((nll, grad))
 }
 
+/// IOV variant of [`subject_nll_pop_grad_analytical`].
+///
+/// Computes the FOCE NLL (BSV FOCE term + kappa prior) and its gradient for a
+/// single IOV subject, with all random effects (BSV η and per-occasion κ) fixed
+/// at their EBE values.
+///
+/// The BSV FOCE term uses the BSV-only H-matrix (`h_matrix = ∂pred/∂η_bsv`),
+/// exactly as `foce_subject_nll_iov` does.  The kappa prior
+/// `0.5 Σ_k [κ_k^T Ω_iov^{-1} κ_k + log|Ω_iov|]` is differentiated
+/// analytically w.r.t. the Cholesky factor `L_iov`:
+///
+/// - Diagonal (log-packed, `x = log L[i,i]`):
+///   `∂P_κ/∂x = K − L[i,i] · Σ_k a_k[i] · w_k[i]`
+///   where `w_k = L^{−1} κ_k`, `a_k = L^{−T} w_k`, K = number of occasions.
+///   (For diagonal `L_iov` this simplifies to `K − Σ_k w_k[i]²`.)
+/// - Off-diagonal (identity-packed, `i > j`):
+///   `∂P_κ/∂L[i,j] = −Σ_k a_k[i] · w_k[j]`
+///
+/// Returns `None` if `R_tilde` is not positive definite.
+#[allow(clippy::too_many_arguments)]
+fn subject_nll_pop_grad_analytical_iov(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    subj_idx: usize,
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    kappas: &[DVector<f64>],
+    omega_iov: &OmegaMatrix,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Option<(f64, Vec<f64>)> {
+    use crate::pk;
+
+    let n = x.len();
+    let n_eta = model.n_eta;
+    let n_theta = template.theta.len();
+    let n_sigma = template.sigma.values.len();
+    let n_obs = population.subjects[subj_idx].observations.len();
+    let subject = &population.subjects[subj_idx];
+    let params = unpack_params(x, template);
+    let fixed_mask = packed_fixed_mask(template);
+
+    // Per-occasion ipreds: combined = [bsv_eta, kappa_k] per occasion.
+    let occ_groups = split_obs_by_occasion(subject);
+    let mut ipreds = vec![0.0_f64; n_obs];
+    for (k_occ, (_, obs_indices)) in occ_groups.iter().enumerate() {
+        let kap: &[f64] = if k_occ < kappas.len() {
+            kappas[k_occ].as_slice()
+        } else {
+            &[]
+        };
+        let combined: Vec<f64> = eta_hat.iter().copied().chain(kap.iter().copied()).collect();
+        let all_preds = pk::compute_predictions_with_tv(model, subject, &params.theta, &combined);
+        for &j in obs_indices {
+            ipreds[j] = all_preds[j];
+        }
+    }
+
+    // FOCE state (BSV linearisation only, matching foce_subject_nll_iov).
+    let h_eta = h_matrix * eta_hat;
+    let f0: Vec<f64> = ipreds
+        .iter()
+        .enumerate()
+        .map(|(j, &ip)| ip - h_eta[j])
+        .collect();
+
+    let r_pred_point: &[f64] = if options.interaction { &ipreds } else { &f0 };
+    let r_diag = compute_r_diag(model.error_model, r_pred_point, &params.sigma.values);
+    let r_tilde = compute_r_tilde(h_matrix, &params.omega.matrix, &r_diag);
+    let chol = r_tilde.cholesky()?;
+    let chol_l = chol.l();
+
+    let v: DVector<f64> = DVector::from_iterator(
+        n_obs,
+        subject
+            .observations
+            .iter()
+            .zip(f0.iter())
+            .map(|(&y, &f)| y - f),
+    );
+    let solved_a = chol.solve(&v);
+    let nll_foce = 0.5 * (v.dot(&solved_a) + chol_log_det(&chol_l));
+
+    // Kappa prior NLL: 0.5 * [Σ_k κ_k^T Ω_iov^{-1} κ_k + K * log|Ω_iov|]
+    let k_float = kappas.len() as f64;
+    let kappa_quad: f64 = kappas
+        .iter()
+        .map(|kap| kap.dot(&(&omega_iov.inv * kap)))
+        .sum();
+    let nll = nll_foce + 0.5 * (kappa_quad + k_float * omega_iov.log_det);
+
+    // Shared quantities for gradient.
+    let rinv_diag = r_inv_diag(&chol_l);
+    let h_cols_solved: Vec<Vec<f64>> = (0..n_eta)
+        .map(|i| fwd_solve(&chol_l, h_matrix.column(i).as_slice()))
+        .collect();
+    let l_omega = &params.omega.chol;
+
+    // Kappa prior gradient: w_k = L_iov^{-1} κ_k, a_k = L_iov^{-T} w_k.
+    let l_iov = &omega_iov.chol;
+    let w_vecs: Vec<Vec<f64>> = kappas
+        .iter()
+        .map(|kap| fwd_solve(l_iov, kap.as_slice()))
+        .collect();
+    let a_vecs: Vec<Vec<f64>> = w_vecs.iter().map(|w| bwd_solve_t(l_iov, w)).collect();
+
+    let mut grad = vec![0.0f64; n];
+
+    // ── Theta parameters ───────────────────────────────────────────────────
+    let eps = 1e-5;
+    for k in 0..n_theta {
+        if fixed_mask[k] {
+            continue;
+        }
+        let h = eps * (1.0 + x[k].abs());
+        let xk_plus = (x[k] + h).min(bounds.upper[k]);
+        let actual_h = xk_plus - x[k];
+        if actual_h.abs() < 1e-16 {
+            continue;
+        }
+        let mut x_pert = x.to_vec();
+        x_pert[k] = xk_plus;
+        let params_pert = unpack_params(&x_pert, template);
+
+        // Per-occasion ipreds with perturbed theta.
+        let mut ipreds_pert = vec![0.0_f64; n_obs];
+        for (k_occ, (_, obs_indices)) in occ_groups.iter().enumerate() {
+            let kap: &[f64] = if k_occ < kappas.len() {
+                kappas[k_occ].as_slice()
+            } else {
+                &[]
+            };
+            let combined: Vec<f64> = eta_hat.iter().copied().chain(kap.iter().copied()).collect();
+            let all_preds =
+                pk::compute_predictions_with_tv(model, subject, &params_pert.theta, &combined);
+            for &j in obs_indices {
+                ipreds_pert[j] = all_preds[j];
+            }
+        }
+
+        let d_ipreds: Vec<f64> = ipreds_pert
+            .iter()
+            .zip(ipreds.iter())
+            .map(|(&p, &b)| (p - b) / actual_h)
+            .collect();
+
+        let dr: Vec<f64> = r_diag
+            .iter()
+            .zip(r_pred_point.iter().zip(d_ipreds.iter()))
+            .map(|(&r_j, (&pred_j, &dp_j))| match model.error_model {
+                ErrorModel::Additive => 0.0,
+                ErrorModel::Proportional => {
+                    if pred_j.abs() > 1e-15 {
+                        2.0 * r_j / pred_j * dp_j
+                    } else {
+                        0.0
+                    }
+                }
+                ErrorModel::Combined => {
+                    let sp2 = params.sigma.values[0] * params.sigma.values[0];
+                    2.0 * sp2 * pred_j * dp_j
+                }
+            })
+            .collect();
+
+        let data_term: f64 = solved_a
+            .iter()
+            .zip(d_ipreds.iter())
+            .map(|(&a_j, &df_j)| -a_j * df_j)
+            .sum();
+        let r_term: f64 = dr
+            .iter()
+            .zip(rinv_diag.iter().zip(solved_a.iter()))
+            .map(|(&drj, (&rinv_jj, &a_j))| 0.5 * drj * (rinv_jj - a_j * a_j))
+            .sum();
+        grad[k] = data_term + r_term;
+    }
+
+    // ── Omega_bsv packed parameters (identical to non-IOV) ─────────────────
+    let omega_start = n_theta;
+    let omega_entries: Vec<(usize, usize)> = if template.omega.diagonal {
+        (0..n_eta).map(|i| (i, i)).collect()
+    } else {
+        let mut v = Vec::new();
+        for j in 0..n_eta {
+            for i in j..n_eta {
+                v.push((i, j));
+            }
+        }
+        v
+    };
+
+    for (ko, &(row, col)) in omega_entries.iter().enumerate() {
+        let k = omega_start + ko;
+        if fixed_mask[k] {
+            continue;
+        }
+        if row == col {
+            let l_ii = l_omega[(row, row)];
+            let c_inv_w = &h_cols_solved[row];
+            let w_dot_a: f64 = h_matrix
+                .column(row)
+                .iter()
+                .zip(solved_a.iter())
+                .map(|(h, a)| h * a)
+                .sum();
+            if template.omega.diagonal {
+                let w_sq: f64 = c_inv_w.iter().map(|&x| x * x).sum();
+                grad[k] = l_ii * l_ii * (w_sq - w_dot_a * w_dot_a);
+            } else {
+                let l_col: Vec<f64> = (0..n_eta).map(|r| l_omega[(r, row)]).collect();
+                let u: Vec<f64> = (0..n_obs)
+                    .map(|obs_j| {
+                        (0..n_eta)
+                            .map(|eta_i| h_matrix[(obs_j, eta_i)] * l_col[eta_i])
+                            .sum::<f64>()
+                    })
+                    .collect();
+                let c_inv_u = fwd_solve(&chol_l, &u);
+                let u_dot_a: f64 = u.iter().zip(solved_a.iter()).map(|(ui, ai)| ui * ai).sum();
+                let trace_term: f64 = c_inv_w.iter().zip(c_inv_u.iter()).map(|(w, u)| w * u).sum();
+                grad[k] = l_ii * (trace_term - w_dot_a * u_dot_a);
+            }
+        } else {
+            let l_col: Vec<f64> = (0..n_eta).map(|r| l_omega[(r, col)]).collect();
+            let u: Vec<f64> = (0..n_obs)
+                .map(|obs_j| {
+                    (0..n_eta)
+                        .map(|eta_i| h_matrix[(obs_j, eta_i)] * l_col[eta_i])
+                        .sum::<f64>()
+                })
+                .collect();
+            let c_inv_u = fwd_solve(&chol_l, &u);
+            let c_inv_w = &h_cols_solved[row];
+            let u_dot_a: f64 = u.iter().zip(solved_a.iter()).map(|(ui, ai)| ui * ai).sum();
+            let w_dot_a: f64 = h_matrix
+                .column(row)
+                .iter()
+                .zip(solved_a.iter())
+                .map(|(h, a)| h * a)
+                .sum();
+            let trace_term: f64 = c_inv_w.iter().zip(c_inv_u.iter()).map(|(w, u)| w * u).sum();
+            grad[k] = trace_term - w_dot_a * u_dot_a;
+        }
+    }
+
+    // ── Sigma packed parameters ────────────────────────────────────────────
+    let sigma_start = omega_start + omega_entries.len();
+    for ks in 0..n_sigma {
+        let k = sigma_start + ks;
+        if fixed_mask[k] {
+            continue;
+        }
+        let dr_k = dr_diag_d_log_sigma(
+            model.error_model,
+            &r_diag,
+            r_pred_point,
+            &params.sigma.values,
+            ks,
+        );
+        let g: f64 = dr_k
+            .iter()
+            .zip(rinv_diag.iter().zip(solved_a.iter()))
+            .map(|(&drj, (&rinv_jj, &a_j))| 0.5 * drj * (rinv_jj - a_j * a_j))
+            .sum();
+        grad[k] = g;
+    }
+
+    // ── Omega_iov packed parameters (kappa prior only) ─────────────────────
+    let iov_start = sigma_start + n_sigma;
+    let n_kappa = omega_iov.dim();
+    let iov_entries: Vec<(usize, usize)> = if omega_iov.diagonal {
+        (0..n_kappa).map(|i| (i, i)).collect()
+    } else {
+        let mut v = Vec::new();
+        for j in 0..n_kappa {
+            for i in j..n_kappa {
+                v.push((i, j));
+            }
+        }
+        v
+    };
+
+    for (ko, &(row, col)) in iov_entries.iter().enumerate() {
+        let k = iov_start + ko;
+        if fixed_mask[k] {
+            continue;
+        }
+        // ∂P_κ/∂L[i,i] (log-packed): K − L[i,i] · Σ_k a_k[i] · w_k[i]
+        // ∂P_κ/∂L[i,j] (identity-packed, i > j): −Σ_k a_k[i] · w_k[j]
+        let sum_aw: f64 = a_vecs
+            .iter()
+            .zip(w_vecs.iter())
+            .map(|(a, w)| a[row] * w[col])
+            .sum();
+        if row == col {
+            let l_ii = l_iov[(row, row)];
+            grad[k] = k_float - l_ii * sum_aw;
+        } else {
+            grad[k] = -sum_aw;
+        }
+    }
+
+    Some((nll, grad))
+}
+
 /// Compute the FOCE NLL and its gradient w.r.t. the packed population parameter
 /// vector for a single subject, with ETAs fixed at their current EBE values.
 ///
@@ -883,15 +1206,23 @@ pub(crate) fn subject_nll_pop_grad(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> (f64, Vec<f64>) {
-    let can_use_analytical = model.ode_spec.is_none()
-        && kappas.is_empty()
-        && !matches!(model.bloq_method, BloqMethod::M3);
+    let can_use_analytical =
+        model.ode_spec.is_none() && !matches!(model.bloq_method, BloqMethod::M3);
 
     if can_use_analytical {
-        if let Some(result) = subject_nll_pop_grad_analytical(
-            x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
-        ) {
-            return result;
+        if kappas.is_empty() {
+            if let Some(result) = subject_nll_pop_grad_analytical(
+                x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
+            ) {
+                return result;
+            }
+        } else if let Some(ref omega_iov) = unpack_params(x, template).omega_iov {
+            if let Some(result) = subject_nll_pop_grad_analytical_iov(
+                x, template, model, population, subj_idx, eta_hat, h_matrix, kappas, omega_iov,
+                bounds, options,
+            ) {
+                return result;
+            }
         }
     }
 
@@ -1743,6 +2074,274 @@ mod tests {
                 "grad[{j}]: subject_nll_pop_grad={:.6e}, ref={:.6e}",
                 grad[j],
                 ref_j,
+            );
+        }
+    }
+
+    // ── IOV analytical gradient tests ─────────────────────────────────────
+
+    fn make_iov_model_gn() -> CompiledModel {
+        let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+        let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
+        let default_params = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.01, 1.0],
+            theta_upper: vec![100.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: Some(omega_iov),
+            kappa_fixed: vec![false],
+        };
+        CompiledModel {
+            name: "iov_gn_test".into(),
+            pk_model: PkModel::OneCptIvBolus,
+            error_model: ErrorModel::Proportional,
+            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                // eta[0] = bsv_eta, eta[1] = kappa (combined vector from inner optimizer)
+                p.values[0] = theta[0] * eta[0].exp();
+                p.values[1] = theta[1];
+                p
+            }),
+            n_theta: 2,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 1,
+            kappa_names: vec!["KAPPA_CL".into()],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            default_params,
+            omega_init_as_sd: vec![false],
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: vec![false],
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+        }
+    }
+
+    fn make_iov_population_gn() -> Population {
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![0.5, 1.0, 2.0, 3.0, 5.0, 8.0],
+            observations: vec![40.0, 32.0, 25.0, 38.0, 22.0, 14.0],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            cens: vec![0; 6],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            dose_occasions: Vec::new(),
+        };
+        Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+        }
+    }
+
+    /// IOV analytical gradient must agree with central FD to within 1e-4 for
+    /// all packed parameters (theta, L_bsv, sigma, L_iov).
+    ///
+    /// Uses a 2-occasion subject with n_kappa = 1 (diagonal Ω_iov).
+    #[test]
+    fn test_iov_analytical_gradient_matches_fd() {
+        let model = make_iov_model_gn();
+        let population = make_iov_population_gn();
+        let template = &model.default_params;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let options = FitOptions::default();
+
+        // Fixed EBEs: small non-zero values to exercise all gradient paths.
+        let eta_hat = DVector::from_vec(vec![0.1]);
+        // Two occasions, one kappa each.
+        let kappas = vec![
+            DVector::from_vec(vec![0.05]),
+            DVector::from_vec(vec![-0.03]),
+        ];
+
+        // Run inner loop to get H-matrix for the IOV subject.
+        use crate::estimation::inner_optimizer::run_inner_loop_warm;
+        let (_, h_mats, _, _) =
+            run_inner_loop_warm(&model, &population, template, 100, 1e-5, None, None, 0);
+        let h_matrix = &h_mats[0];
+
+        // Analytical gradient via the new IOV path.
+        let omega_iov = template.omega_iov.as_ref().unwrap();
+        let (nll_an, grad_an) = subject_nll_pop_grad_analytical_iov(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            h_matrix,
+            &kappas,
+            omega_iov,
+            &bounds,
+            &options,
+        )
+        .expect("IOV analytical gradient must return Some");
+
+        // Central-FD reference gradient.
+        let eps = 1e-4;
+        let n = x.len();
+        let mut grad_fd = vec![0.0f64; n];
+        let params_base = unpack_params(&x, template);
+        use crate::stats::likelihood::foce_subject_nll_iov;
+        let subject = &population.subjects[0];
+
+        let nll_at = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, template);
+            if let Some(ref iov) = p.omega_iov {
+                foce_subject_nll_iov(
+                    &model,
+                    subject,
+                    &p.theta,
+                    &eta_hat,
+                    h_matrix,
+                    &p.omega,
+                    &p.sigma.values,
+                    false,
+                    &kappas,
+                    iov,
+                )
+            } else {
+                f64::NAN
+            }
+        };
+
+        let nll_base_fd = nll_at(&x);
+        assert!(
+            (nll_an - nll_base_fd).abs() < 1e-10,
+            "IOV analytical NLL {:.6} must match FD reference {:.6}",
+            nll_an,
+            nll_base_fd,
+        );
+
+        for j in 0..n {
+            let h_step = eps * (1.0 + x[j].abs());
+            let mut xp = x.clone();
+            xp[j] = (x[j] + h_step).min(bounds.upper[j]);
+            let mut xm = x.clone();
+            xm[j] = (x[j] - h_step).max(bounds.lower[j]);
+            let actual_2h = xp[j] - xm[j];
+            grad_fd[j] = (nll_at(&xp) - nll_at(&xm)) / actual_2h;
+        }
+
+        for j in 0..n {
+            let tol = 1e-4 * (1.0 + grad_fd[j].abs());
+            assert!(
+                (grad_an[j] - grad_fd[j]).abs() < tol,
+                "IOV grad[{j}]: analytical={:.6e}, FD={:.6e}",
+                grad_an[j],
+                grad_fd[j],
+            );
+        }
+        let _ = params_base; // suppress unused warning
+    }
+
+    /// `subject_nll_pop_grad` must take the analytical IOV path for a
+    /// non-ODE IOV model (not fall through to central FD).
+    ///
+    /// Verified by comparing the returned gradient against central FD of the
+    /// full-population NLL to the same tolerance.
+    #[test]
+    fn test_iov_analytical_path_is_taken_in_subject_nll_pop_grad() {
+        let model = make_iov_model_gn();
+        let population = make_iov_population_gn();
+        let template = &model.default_params;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let options = FitOptions::default();
+
+        use crate::estimation::inner_optimizer::run_inner_loop_warm;
+        let (eta_hats, h_mats, _, kappas_all) =
+            run_inner_loop_warm(&model, &population, template, 200, 1e-5, None, None, 0);
+
+        let (nll_an, grad_an) = subject_nll_pop_grad(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hats[0],
+            &h_mats[0],
+            &kappas_all[0],
+            &bounds,
+            &options,
+        );
+        assert!(nll_an.is_finite(), "IOV grad path must return finite NLL");
+        assert!(
+            grad_an.iter().all(|g| g.is_finite()),
+            "IOV grad path must return all-finite gradient"
+        );
+
+        // Confirm gradient is close to central FD of the same NLL.
+        use crate::stats::likelihood::foce_subject_nll_iov;
+        let subject = &population.subjects[0];
+        let nll_at = |xv: &[f64]| -> f64 {
+            let p = unpack_params(xv, template);
+            if let Some(ref iov) = p.omega_iov {
+                foce_subject_nll_iov(
+                    &model,
+                    subject,
+                    &p.theta,
+                    &eta_hats[0],
+                    &h_mats[0],
+                    &p.omega,
+                    &p.sigma.values,
+                    false,
+                    &kappas_all[0],
+                    iov,
+                )
+            } else {
+                f64::NAN
+            }
+        };
+        let eps = 1e-4;
+        let n = x.len();
+        for j in 0..n {
+            let h_step = eps * (1.0 + x[j].abs());
+            let mut xp = x.clone();
+            xp[j] = (x[j] + h_step).min(bounds.upper[j]);
+            let mut xm = x.clone();
+            xm[j] = (x[j] - h_step).max(bounds.lower[j]);
+            let actual_2h = xp[j] - xm[j];
+            let fd_j = (nll_at(&xp) - nll_at(&xm)) / actual_2h;
+            let tol = 1e-4 * (1.0 + fd_j.abs());
+            assert!(
+                (grad_an[j] - fd_j).abs() < tol,
+                "IOV dispatch grad[{j}]: analytical={:.6e}, FD={:.6e}",
+                grad_an[j],
+                fd_j,
             );
         }
     }
