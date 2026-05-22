@@ -107,3 +107,50 @@ fn gn_hybrid_tr_warfarin_ofv_matches_slsqp() {
         ref_result.ofv,
     );
 }
+
+/// GN trust-region on the covariate model must converge to an OFV within 1.0
+/// of SLSQP. This model has weakly-identified covariate exponents alongside
+/// well-identified PK parameters — the TR per-direction step scaling is
+/// intended to handle exactly this mixed-curvature case without regressing
+/// iteration count.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn gn_tr_two_cpt_oral_cov_ofv_matches_slsqp_baseline() {
+    let model = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx"))
+        .expect("two_cpt_oral_cov model must parse");
+    let population = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data must load");
+
+    let mut opts_ref = FitOptions::default();
+    opts_ref.method = EstimationMethod::Foce;
+    opts_ref.optimizer = Optimizer::Slsqp;
+    opts_ref.outer_maxiter = 500;
+    opts_ref.run_covariance_step = false;
+    opts_ref.verbose = false;
+    let ref_result = fit(&model, &population, &model.default_params, &opts_ref)
+        .expect("SLSQP reference fit must succeed");
+    assert!(ref_result.ofv.is_finite(), "SLSQP OFV must be finite");
+
+    let mut opts_gn = FitOptions::default();
+    opts_gn.method = EstimationMethod::FoceGn;
+    opts_gn.outer_maxiter = 300;
+    opts_gn.run_covariance_step = false;
+    opts_gn.verbose = false;
+    let gn_result = fit(&model, &population, &model.default_params, &opts_gn)
+        .expect("GN trust-region fit must succeed");
+
+    assert!(
+        gn_result.ofv.is_finite(),
+        "GN-TR OFV must be finite, got {}",
+        gn_result.ofv
+    );
+    assert!(
+        (gn_result.ofv - ref_result.ofv).abs() < 1.0,
+        "GN-TR OFV {:.4} deviates from SLSQP OFV {:.4} by more than 1.0 unit",
+        gn_result.ofv,
+        ref_result.ofv,
+    );
+}
