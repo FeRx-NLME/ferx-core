@@ -583,14 +583,6 @@ fn fit_inner(
         }
     }
 
-    // Guard: SAEM does not support IOV (kappas are not sampled in the SAEM
-    // stochastic approximation loop).  Fail early with a clear message.
-    if model.n_kappa > 0 && chain.iter().any(|&m| m == EstimationMethod::Saem) {
-        return Err("method = saem does not support IOV (n_kappa > 0). \
-             Use method = foce or method = focei for models with kappa declarations."
-            .to_string());
-    }
-
     // Guard: IMP is a likelihood evaluation, not an estimator. It must follow
     // a parameter-estimating stage (it consumes that stage's EBEs + Hessians),
     // may appear at most once, and must be the terminal stage. A non-terminal
@@ -2322,40 +2314,48 @@ mod iov_integration {
         assert_iov_fit_ok(&result);
     }
 
-    // ── Test: SAEM + IOV must return Err ──────────────────────────────────────
+    // ── Test: SAEM + IOV now supported (Step 11) ─────────────────────────────
 
     #[test]
-    fn test_iov_saem_returns_err() {
+    fn test_iov_saem_succeeds() {
         let model = make_iov_model();
         let pop = make_iov_population();
         let opts = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
         let result = fit(&model, &pop, &model.default_params, &opts);
-        assert!(result.is_err(), "SAEM with IOV must return an error");
-        let msg = result.unwrap_err();
         assert!(
-            msg.contains("saem") && msg.contains("IOV"),
-            "error message should mention saem and IOV, got: {msg}"
+            result.is_ok(),
+            "SAEM with IOV must succeed, got: {:?}",
+            result.err()
+        );
+        let fr = result.unwrap();
+        assert!(
+            fr.ofv.is_finite(),
+            "SAEM IOV OFV must be finite, got {}",
+            fr.ofv
+        );
+        assert!(
+            fr.omega_iov.is_some(),
+            "omega_iov must be present in result"
         );
     }
 
-    // ── Test: SAEM in a chained methods sequence + IOV must also Err ──────────
-    // The guard checks the full chain, not just `method`; this locks in that
-    // behaviour so a future refactor can't accidentally drop the chain check.
+    // ── Test: SAEM in a chained methods sequence + IOV succeeds ──────────────
     #[test]
-    fn test_iov_saem_in_methods_chain_returns_err() {
+    fn test_iov_saem_in_methods_chain_succeeds() {
         let model = make_iov_model();
         let pop = make_iov_population();
         let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         opts.methods = vec![EstimationMethod::Saem, EstimationMethod::Foce];
         let result = fit(&model, &pop, &model.default_params, &opts);
         assert!(
-            result.is_err(),
-            "SAEM in methods chain with IOV must return an error"
+            result.is_ok(),
+            "SAEM in methods chain with IOV must succeed, got: {:?}",
+            result.err()
         );
-        let msg = result.unwrap_err();
+        let fr = result.unwrap();
         assert!(
-            msg.contains("saem") && msg.contains("IOV"),
-            "error message should mention saem and IOV, got: {msg}"
+            fr.ofv.is_finite(),
+            "chained SAEM+FOCE IOV OFV must be finite"
         );
     }
 

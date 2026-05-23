@@ -10,7 +10,10 @@ use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{compute_covariance, pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::{individual_nll, individual_nll_into, obs_nll_subject_into};
+use crate::stats::likelihood::{
+    individual_nll, individual_nll_into, individual_nll_iov, obs_nll_subject_into,
+    split_obs_by_occasion,
+};
 use crate::stats::residual_error::residual_variance;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -26,22 +29,36 @@ use rand_distr::StandardNormal;
 struct SaemState {
     /// Per-subject current ETAs
     etas: Vec<Vec<f64>>,
-    /// Cached individual NLL at current ETAs
+    /// Per-subject per-occasion kappa samples. `kappas[i][k]` = kappas for
+    /// subject i, occasion k.  Empty outer vecs when `n_kappa == 0`.
+    kappas: Vec<Vec<Vec<f64>>>,
+    /// Cached individual NLL at current ETAs (and kappas for IOV models)
     nll_cache: Vec<f64>,
-    /// Per-subject MH step sizes
+    /// Per-subject MH step sizes (for eta)
     step_scales: Vec<f64>,
+    /// Per-subject kappa MH step sizes.  Empty when `n_kappa == 0`.
+    kappa_step_scales: Vec<f64>,
     /// Per-subject acceptance counts since last adaptation
     accept_counts: Vec<usize>,
     /// Per-subject proposal counts since last adaptation (1 for HMC, n_mh_steps for MH)
     proposal_counts: Vec<usize>,
+    /// Per-subject kappa acceptance counts since last adaptation.
+    kappa_accept_counts: Vec<usize>,
+    /// Per-subject kappa proposal counts since last adaptation.
+    kappa_proposal_counts: Vec<usize>,
     /// Steps since last adaptation
     steps_since_adapt: usize,
     /// SA sufficient statistic for Omega: running average of (1/N) Σ ηᵢηᵢᵀ
     s2: DMatrix<f64>,
+    /// SA sufficient statistic for Omega_iov: running average of (1/N_occ) Σᵢ Σₖ κᵢₖκᵢₖᵀ.
+    /// Zero-sized when `n_kappa == 0`.
+    s2_iov: DMatrix<f64>,
     /// Current theta
     theta: Vec<f64>,
     /// Current omega matrix
     omega_mat: DMatrix<f64>,
+    /// Current Omega_iov matrix (zero-sized when `n_kappa == 0`).
+    omega_iov_mat: DMatrix<f64>,
     /// Current sigma values
     sigma_vals: Vec<f64>,
 }
@@ -121,6 +138,286 @@ fn mh_steps(
 }
 
 // ---------------------------------------------------------------------------
+// Per-occasion kappa MH step for IOV models
+// ---------------------------------------------------------------------------
+
+/// Run one symmetric random-walk MH proposal for each occasion's kappa.
+///
+/// For each occasion k, proposes `κ_k_prop = κ_k + step_scale · L_iov · z` and
+/// accepts/rejects using the full IOV individual NLL (includes both the kappa
+/// prior and the observation likelihood).  The per-occasion Gibbs structure
+/// means proposals are low-dimensional (n_kappa typically 1–3), so the MH
+/// acceptance rate stays high even without HMC.
+///
+/// Returns `(n_accepted, n_proposed, updated_nll)`.
+#[allow(clippy::too_many_arguments)]
+fn mh_kappa_steps(
+    kappas: &mut Vec<Vec<f64>>,
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    eta: &[f64],
+    omega_bsv: &OmegaMatrix,
+    omega_iov: &OmegaMatrix,
+    sigma_values: &[f64],
+    step_scale: f64,
+    rng: &mut impl Rng,
+) -> (usize, usize, f64) {
+    let n_kappa = omega_iov.matrix.nrows();
+    let l = &omega_iov.chol;
+    let mut nll = nll_current;
+    let mut n_accepted = 0;
+    let n_occ = kappas.len();
+
+    for k in 0..n_occ {
+        let z: Vec<f64> = (0..n_kappa).map(|_| rng.sample(StandardNormal)).collect();
+        let z_vec = DVector::from_column_slice(&z);
+        let perturbation = l * z_vec;
+
+        let kap_prop: Vec<f64> = (0..n_kappa)
+            .map(|j| kappas[k][j] + step_scale * perturbation[j])
+            .collect();
+
+        // Temporarily substitute kappa_k with the proposal.
+        let old_kap = kappas[k].clone();
+        kappas[k] = kap_prop;
+
+        let nll_prop = individual_nll_iov(
+            model,
+            subject,
+            theta,
+            eta,
+            kappas,
+            omega_bsv,
+            Some(omega_iov),
+            sigma_values,
+        );
+
+        let log_u: f64 = rng.gen::<f64>().ln();
+        if log_u < nll - nll_prop {
+            // Accept
+            nll = nll_prop;
+            n_accepted += 1;
+        } else {
+            // Reject — restore old kappa
+            kappas[k] = old_kap;
+        }
+    }
+
+    (n_accepted, n_occ, nll)
+}
+
+// ---------------------------------------------------------------------------
+// IOV-aware observation NLL for M-step (no priors, per-occasion predictions)
+// ---------------------------------------------------------------------------
+
+/// Compute the observation-only NLL for an IOV subject in the SAEM M-step.
+///
+/// ETAs and kappas are held fixed (sampled values from the E-step).  For each
+/// occasion k the combined `[eta, kappa_k]` vector is used to compute predictions;
+/// only the observations belonging to that occasion are scored.  No eta or kappa
+/// prior terms are included — those are handled by the SA sufficient-statistic
+/// update for Ω_bsv and Ω_iov separately.
+fn obs_nll_subject_into_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    kappas: &[Vec<f64>],
+    pk_scratch: &mut crate::pk::EventPkParams,
+) -> f64 {
+    use crate::stats::special::log_normal_cdf;
+    let m3 = matches!(model.bloq_method, BloqMethod::M3);
+    let occ_groups = split_obs_by_occasion(subject);
+    let mut total_nll = 0.0_f64;
+    for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
+        let kap: &[f64] = kappas.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
+        let combined: Vec<f64> = eta.iter().chain(kap.iter()).copied().collect();
+        let preds = crate::pk::compute_predictions_with_tv_into(
+            model, subject, theta, &combined, pk_scratch,
+        );
+        for &j in obs_indices {
+            let f = preds[j].max(1e-12);
+            let v =
+                crate::stats::residual_error::residual_variance(model.error_model, f, sigma_values)
+                    .max(1e-12);
+            if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
+                let z = (subject.observations[j] - f) / v.sqrt();
+                total_nll += -log_normal_cdf(z);
+            } else {
+                total_nll += 0.5 * (v.ln() + (subject.observations[j] - f).powi(2) / v);
+            }
+        }
+    }
+    total_nll
+}
+
+/// Gradient of the IOV observation NLL w.r.t. the SAEM packed vector
+/// `[log_theta | log_sigma]` for one subject with ETAs and kappas fixed.
+///
+/// Sigma gradient is analytical (same formula as the non-IOV path but summed
+/// across all occasions' observations).  Theta gradient uses forward-FD of
+/// per-occasion predictions, chain-rule'd through the per-observation obs_nll.
+#[allow(clippy::too_many_arguments)]
+fn obs_nll_subject_grad_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+    kappas: &[Vec<f64>],
+    theta_packs_log_mask: &[bool],
+    lower: &[f64],
+    upper: &[f64],
+    n_theta: usize,
+    n_sigma: usize,
+    pk_scratch: &mut crate::pk::EventPkParams,
+) -> (f64, Vec<f64>) {
+    let n = n_theta + n_sigma;
+    let m3 = matches!(model.bloq_method, BloqMethod::M3);
+
+    if m3 {
+        // M3 path: forward-FD of obs_nll_subject_into_iov.
+        let nll_base =
+            obs_nll_subject_into_iov(model, subject, theta, sigma_values, eta, kappas, pk_scratch);
+        let mut grad = vec![0.0f64; n];
+        let h = 1e-5;
+        for i in 0..n {
+            if lower[i] == upper[i] {
+                continue;
+            }
+            if i < n_theta {
+                let mut theta_p = theta.to_vec();
+                let delta = h * (1.0 + theta[i].abs());
+                theta_p[i] += delta;
+                let nll_p = obs_nll_subject_into_iov(
+                    model,
+                    subject,
+                    &theta_p,
+                    sigma_values,
+                    eta,
+                    kappas,
+                    pk_scratch,
+                );
+                let raw = (nll_p - nll_base) / delta;
+                grad[i] = if theta_packs_log_mask[i] {
+                    theta[i] * raw
+                } else {
+                    raw
+                };
+            } else {
+                let k = i - n_theta;
+                let mut sigma_p = sigma_values.to_vec();
+                let delta = h * (1.0 + sigma_values[k].abs());
+                sigma_p[k] += delta;
+                let nll_p = obs_nll_subject_into_iov(
+                    model, subject, theta, &sigma_p, eta, kappas, pk_scratch,
+                );
+                grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
+            }
+        }
+        return (nll_base, grad);
+    }
+
+    // Non-M3 path: compute per-occasion base predictions and score.
+    let occ_groups = split_obs_by_occasion(subject);
+    let n_obs = subject.observations.len();
+    let mut nll_base = 0.0_f64;
+    let mut all_preds_base = vec![0.0f64; n_obs];
+    let mut residuals = vec![0.0f64; n_obs];
+    let mut variances = vec![0.0f64; n_obs];
+    let mut d_nll_d_f = vec![0.0f64; n_obs];
+
+    for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
+        let kap: &[f64] = kappas.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
+        let combined: Vec<f64> = eta.iter().chain(kap.iter()).copied().collect();
+        let preds = crate::pk::compute_predictions_with_tv_into(
+            model, subject, theta, &combined, pk_scratch,
+        );
+        for &j in obs_indices {
+            let f = preds[j].max(1e-12);
+            let v =
+                crate::stats::residual_error::residual_variance(model.error_model, f, sigma_values)
+                    .max(1e-12);
+            let resid = subject.observations[j] - f;
+            nll_base += 0.5 * (v.ln() + resid * resid / v);
+            all_preds_base[j] = f;
+            residuals[j] = resid;
+            variances[j] = v;
+            let dv_df = match model.error_model {
+                ErrorModel::Additive => 0.0,
+                ErrorModel::Proportional | ErrorModel::Combined => {
+                    2.0 * f * sigma_values[0] * sigma_values[0]
+                }
+            };
+            d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
+        }
+    }
+
+    let mut grad = vec![0.0f64; n];
+
+    // Theta gradient: forward-FD of per-occasion predictions.
+    let h_fd = 1e-5;
+    for i in 0..n_theta {
+        if lower[i] == upper[i] {
+            continue;
+        }
+        let delta = h_fd * (1.0 + theta[i].abs());
+        let mut theta_p = theta.to_vec();
+        theta_p[i] += delta;
+        let mut d_obs_nll = 0.0_f64;
+        for (k, (_, obs_indices)) in occ_groups.iter().enumerate() {
+            let kap: &[f64] = kappas.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
+            let combined: Vec<f64> = eta.iter().chain(kap.iter()).copied().collect();
+            let preds_p = crate::pk::compute_predictions_with_tv_into(
+                model, subject, &theta_p, &combined, pk_scratch,
+            );
+            for &j in obs_indices {
+                d_obs_nll += d_nll_d_f[j] * (preds_p[j] - all_preds_base[j]) / delta;
+            }
+        }
+        grad[i] = if theta_packs_log_mask[i] {
+            theta[i] * d_obs_nll
+        } else {
+            d_obs_nll
+        };
+    }
+
+    // Sigma gradient: analytical — same formula as non-IOV, summed over all obs.
+    for k in 0..n_sigma {
+        let i = n_theta + k;
+        if lower[i] == upper[i] {
+            continue;
+        }
+        let s = sigma_values[k];
+        let g: f64 = (0..n_obs)
+            .map(|j| {
+                let f = all_preds_base[j];
+                let v = variances[j];
+                let resid = residuals[j];
+                let ratio = match model.error_model {
+                    ErrorModel::Additive => 2.0 * s * s,
+                    ErrorModel::Proportional => 2.0 * s * s * f * f,
+                    ErrorModel::Combined => {
+                        if k == 0 {
+                            2.0 * s * s * f * f
+                        } else {
+                            2.0 * s * s
+                        }
+                    }
+                };
+                0.5 * ratio * (1.0 / v - resid * resid / (v * v))
+            })
+            .sum();
+        grad[i] = g;
+    }
+
+    (nll_base, grad)
+}
+
+// ---------------------------------------------------------------------------
 // Gradient of conditional observation NLL w.r.t. log(theta) and log(sigma)
 // ---------------------------------------------------------------------------
 
@@ -136,6 +433,7 @@ fn theta_sigma_mstep_light(
     model: &CompiledModel,
     population: &Population,
     etas: &[Vec<f64>],
+    kappas_opt: Option<&[Vec<Vec<f64>>]>,
     log_theta_init: &[f64],
     log_sigma_init: &[f64],
     log_theta_lower: &[f64],
@@ -198,34 +496,67 @@ fn theta_sigma_mstep_light(
 
         if let Some(g) = grad {
             use rayon::prelude::*;
-            let (val, grad_vec) = population
-                .subjects
-                .par_iter()
-                .zip(etas.par_iter())
-                .map_init(EventPkParams::default, |scratch, (subject, eta)| {
-                    obs_nll_subject_grad(
-                        model,
-                        subject,
-                        &th,
-                        &sg,
-                        eta,
-                        &theta_packs_log_mask,
-                        &lower,
-                        &upper,
-                        n_theta,
-                        n_sigma,
-                        scratch,
+            let (val, grad_vec) = if let Some(kappas) = kappas_opt {
+                population
+                    .subjects
+                    .par_iter()
+                    .zip(etas.par_iter())
+                    .zip(kappas.par_iter())
+                    .map_init(EventPkParams::default, |scratch, ((subject, eta), kaps)| {
+                        obs_nll_subject_grad_iov(
+                            model,
+                            subject,
+                            &th,
+                            &sg,
+                            eta,
+                            kaps,
+                            &theta_packs_log_mask,
+                            &lower,
+                            &upper,
+                            n_theta,
+                            n_sigma,
+                            scratch,
+                        )
+                    })
+                    .reduce(
+                        || (0.0, vec![0.0f64; n]),
+                        |(nll_a, mut ga), (nll_b, gb)| {
+                            for (a, b) in ga.iter_mut().zip(gb.iter()) {
+                                *a += b;
+                            }
+                            (nll_a + nll_b, ga)
+                        },
                     )
-                })
-                .reduce(
-                    || (0.0, vec![0.0f64; n]),
-                    |(nll_a, mut ga), (nll_b, gb)| {
-                        for (a, b) in ga.iter_mut().zip(gb.iter()) {
-                            *a += b;
-                        }
-                        (nll_a + nll_b, ga)
-                    },
-                );
+            } else {
+                population
+                    .subjects
+                    .par_iter()
+                    .zip(etas.par_iter())
+                    .map_init(EventPkParams::default, |scratch, (subject, eta)| {
+                        obs_nll_subject_grad(
+                            model,
+                            subject,
+                            &th,
+                            &sg,
+                            eta,
+                            &theta_packs_log_mask,
+                            &lower,
+                            &upper,
+                            n_theta,
+                            n_sigma,
+                            scratch,
+                        )
+                    })
+                    .reduce(
+                        || (0.0, vec![0.0f64; n]),
+                        |(nll_a, mut ga), (nll_b, gb)| {
+                            for (a, b) in ga.iter_mut().zip(gb.iter()) {
+                                *a += b;
+                            }
+                            (nll_a + nll_b, ga)
+                        },
+                    )
+            };
             for (gi, &gv) in g.iter_mut().zip(grad_vec.iter()) {
                 *gi = if gv.is_finite() { gv } else { 0.0 };
             }
@@ -235,7 +566,11 @@ fn theta_sigma_mstep_light(
                 1e20
             }
         } else {
-            let val = obs_nll_sum(model, population, &th, &sg, etas);
+            let val = if let Some(kappas) = kappas_opt {
+                obs_nll_sum_iov(model, population, &th, &sg, etas, kappas)
+            } else {
+                obs_nll_sum(model, population, &th, &sg, etas)
+            };
             if val.is_finite() {
                 val
             } else {
@@ -485,6 +820,34 @@ fn obs_nll_sum(
         .sum()
 }
 
+/// IOV variant of `obs_nll_sum`: per-occasion predictions using `[eta, kappa_k]`.
+fn obs_nll_sum_iov(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    sigma_values: &[f64],
+    etas: &[Vec<f64>],
+    kappas: &[Vec<Vec<f64>>],
+) -> f64 {
+    use rayon::prelude::*;
+    population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+            obs_nll_subject_into_iov(
+                model,
+                subject,
+                theta,
+                sigma_values,
+                &etas[i],
+                &kappas[i],
+                scratch,
+            )
+        })
+        .sum()
+}
+
 /// Build (theta_idx, eta_idx) pairs for log-transformed mu-references only.
 ///
 /// Only `log_transformed = true` mu-refs (patterns `THETA*exp(ETA)` and
@@ -525,6 +888,7 @@ pub fn run_saem(
 ) -> Result<OuterResult, String> {
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
+    let n_kappa = model.n_kappa;
     let k1 = options.saem_n_exploration;
     let k2 = options.saem_n_convergence;
     let n_iter = k1 + k2;
@@ -575,20 +939,67 @@ pub fn run_saem(
         .collect();
     let step_scales = vec![0.3; n_subjects];
 
-    // Initial NLL cache
+    // Initialize IOV kappa state
+    let (kappas_init, omega_iov_init, s2_iov_init): (
+        Vec<Vec<Vec<f64>>>,
+        DMatrix<f64>,
+        DMatrix<f64>,
+    ) = if n_kappa > 0 {
+        let kaps: Vec<Vec<Vec<f64>>> = population
+            .subjects
+            .iter()
+            .map(|s| {
+                let n_occ = split_obs_by_occasion(s).len();
+                vec![vec![0.0f64; n_kappa]; n_occ]
+            })
+            .collect();
+        let iov_mat = init_params
+            .omega_iov
+            .as_ref()
+            .map(|iov| iov.matrix.clone())
+            .unwrap_or_else(|| DMatrix::identity(n_kappa, n_kappa));
+        (kaps, iov_mat.clone(), iov_mat)
+    } else {
+        (
+            vec![vec![]; n_subjects],
+            DMatrix::zeros(0, 0),
+            DMatrix::zeros(0, 0),
+        )
+    };
+    let kappa_step_scales = vec![0.3; n_subjects];
+
+    // Initial NLL cache — use IOV-aware NLL when kappas are present
+    let omega_iov_init_om = if n_kappa > 0 {
+        init_params.omega_iov.clone()
+    } else {
+        None
+    };
     let nll_cache: Vec<f64> = population
         .subjects
         .iter()
         .enumerate()
         .map(|(i, subject)| {
-            individual_nll(
-                model,
-                subject,
-                &theta_cur,
-                &etas[i],
-                &init_params.omega,
-                &sigma_cur,
-            )
+            if n_kappa > 0 {
+                individual_nll_iov(
+                    model,
+                    subject,
+                    &theta_cur,
+                    &etas[i],
+                    &kappas_init[i],
+                    &init_params.omega,
+                    omega_iov_init_om.as_ref(),
+                    &sigma_cur,
+                )
+            } else {
+                individual_nll(
+                    model,
+                    subject,
+                    &theta_cur,
+                    &etas[i],
+                    &init_params.omega,
+                    &sigma_cur,
+                )
+            }
         })
         .collect();
 
@@ -663,14 +1074,20 @@ pub fn run_saem(
 
     let mut state = SaemState {
         etas,
+        kappas: kappas_init,
         nll_cache,
         step_scales,
+        kappa_step_scales,
         accept_counts: vec![0; n_subjects],
         proposal_counts: vec![0; n_subjects],
+        kappa_accept_counts: vec![0; n_subjects],
+        kappa_proposal_counts: vec![0; n_subjects],
         steps_since_adapt: 0,
         s2,
+        s2_iov: s2_iov_init,
         theta: theta_cur,
         omega_mat: omega_cur,
+        omega_iov_mat: omega_iov_init,
         sigma_vals: sigma_cur,
     };
 
@@ -717,6 +1134,7 @@ pub fn run_saem(
             let sigma_ref = &state.sigma_vals;
             let omega_ref = &omega_k;
 
+            // Returns (eta_new, nll_after_eta, n_acc_eta, n_prop_eta, used_hmc)
             let results: Vec<(Vec<f64>, f64, usize, usize, bool)> = state
                 .etas
                 .par_iter()
@@ -780,6 +1198,47 @@ pub fn run_saem(
                 hmc_subjects[i] |= used_hmc;
             }
         }
+
+        // ---- Step 1b: Per-occasion kappa MH (IOV models only) ----
+        // For each subject, propose one new kappa per occasion and accept/reject
+        // using the full IOV individual NLL (kappa prior + observation likelihood).
+        // This is a sequential per-subject loop (non-parallel) because the kappa
+        // MH is cheap (low-dimensional, analytical PK) and share-free.
+        if n_kappa > 0 {
+            if let Some(omega_iov_ref) = init_params.omega_iov.as_ref() {
+                let omega_iov_cur = OmegaMatrix::from_matrix(
+                    state.omega_iov_mat.clone(),
+                    omega_iov_ref.eta_names.clone(),
+                    omega_iov_ref.diagonal,
+                );
+                for i in 0..n_subjects {
+                    let subject = &population.subjects[i];
+                    let mut rng = StdRng::seed_from_u64(
+                        master_seed
+                            .wrapping_add(k as u64 * 100_000)
+                            .wrapping_add(i as u64)
+                            .wrapping_add(999_999),
+                    );
+                    let (n_acc, n_prop, nll_new) = mh_kappa_steps(
+                        &mut state.kappas[i],
+                        state.nll_cache[i],
+                        subject,
+                        model,
+                        &state.theta,
+                        &state.etas[i],
+                        &omega_k,
+                        &omega_iov_cur,
+                        &state.sigma_vals,
+                        state.kappa_step_scales[i],
+                        &mut rng,
+                    );
+                    state.nll_cache[i] = nll_new;
+                    state.kappa_accept_counts[i] += n_acc;
+                    state.kappa_proposal_counts[i] += n_prop;
+                }
+            }
+        }
+
         state.steps_since_adapt += 1;
 
         // ---- Step 2: SA update of sufficient statistic for Omega ----
@@ -792,7 +1251,25 @@ pub fn run_saem(
 
         state.s2 = (1.0 - gamma) * &state.s2 + gamma * &eta_outer;
 
-        // ---- Step 3: M-step Omega (closed form) ----
+        // ---- Step 2b: SA update for Omega_iov (IOV only) ----
+        // s2_iov = (1 - γ) s2_iov + γ · (1/N_occ) Σᵢ Σₖ κᵢₖ κᵢₖᵀ
+        if n_kappa > 0 {
+            let mut kappa_outer = DMatrix::zeros(n_kappa, n_kappa);
+            let mut n_total_occ = 0_usize;
+            for kappas_i in &state.kappas {
+                for kap in kappas_i {
+                    let kv = DVector::from_column_slice(kap);
+                    kappa_outer += &kv * kv.transpose();
+                    n_total_occ += 1;
+                }
+            }
+            if n_total_occ > 0 {
+                kappa_outer /= n_total_occ as f64;
+            }
+            state.s2_iov = (1.0 - gamma) * &state.s2_iov + gamma * &kappa_outer;
+        }
+
+        // ---- Step 3: M-step Omega_bsv (closed form) ----
         // Restore FIX-ed rows / columns from the template. An eta flagged FIX
         // keeps its initial variance AND its initial off-diagonal couplings
         // (zero for a diagonal declaration, block cov for a FIX-ed block).
@@ -825,9 +1302,47 @@ pub fn run_saem(
             }
         }
 
+        // ---- Step 3b: M-step Omega_iov (analytic, IOV only) ----
+        // Apply the SA sufficient statistic, zeroing structural off-diagonals
+        // and restoring FIX-ed kappa entries, mirroring the BSV omega treatment.
+        if n_kappa > 0 {
+            if let Some(omega_iov_ref) = init_params.omega_iov.as_ref() {
+                state.omega_iov_mat = state.s2_iov.clone();
+                // Zero structurally-absent off-diagonals.
+                for i in 0..n_kappa {
+                    for j in 0..n_kappa {
+                        if !omega_iov_ref.free_mask[(i, j)] {
+                            state.omega_iov_mat[(i, j)] = 0.0;
+                        }
+                    }
+                }
+                // Restore FIX-ed kappa rows/columns from the template.
+                for i in 0..n_kappa {
+                    for j in 0..n_kappa {
+                        let fi = init_params.kappa_fixed.get(i).copied().unwrap_or(false);
+                        let fj = init_params.kappa_fixed.get(j).copied().unwrap_or(false);
+                        if fi || fj {
+                            state.omega_iov_mat[(i, j)] = omega_iov_ref.matrix[(i, j)];
+                        }
+                    }
+                }
+                // Floor diagonal to stay positive-definite.
+                for i in 0..n_kappa {
+                    if state.omega_iov_mat[(i, i)] < 1e-8 {
+                        state.omega_iov_mat[(i, i)] = 1e-8;
+                    }
+                }
+            }
+        }
+
         // ---- Step 4: M-step theta, sigma (lightweight NLopt, warm-started) ----
         // Only run every few iterations during exploration to save time
         let run_mstep = k <= 5 || k % 3 == 0 || k > k1;
+        let kappas_for_mstep = if n_kappa > 0 {
+            Some(state.kappas.as_slice())
+        } else {
+            None
+        };
         if run_mstep {
             let mstep_maxiter = if k <= k1 { 3 } else { 5 }; // more precise in convergence phase
 
@@ -886,6 +1401,7 @@ pub fn run_saem(
                     model,
                     population,
                     &state.etas,
+                    kappas_for_mstep,
                     &log_theta,
                     &log_sigma,
                     &temp_theta_lower,
@@ -906,6 +1422,7 @@ pub fn run_saem(
                     model,
                     population,
                     &state.etas,
+                    kappas_for_mstep,
                     &log_theta,
                     &log_sigma,
                     &log_theta_lower,
@@ -934,7 +1451,31 @@ pub fn run_saem(
             init_params.omega.eta_names.clone(),
             init_params.omega.diagonal,
         );
-        {
+        if n_kappa > 0 {
+            // IOV: rebuild omega_iov_cur and use individual_nll_iov for the cache.
+            let omega_iov_upd = init_params.omega_iov.as_ref().map(|iov_ref| {
+                OmegaMatrix::from_matrix(
+                    state.omega_iov_mat.clone(),
+                    iov_ref.eta_names.clone(),
+                    iov_ref.diagonal,
+                )
+            });
+            let new_nlls: Vec<f64> = (0..n_subjects)
+                .map(|i| {
+                    individual_nll_iov(
+                        model,
+                        &population.subjects[i],
+                        &state.theta,
+                        &state.etas[i],
+                        &state.kappas[i],
+                        &omega_upd,
+                        omega_iov_upd.as_ref(),
+                        &state.sigma_vals,
+                    )
+                })
+                .collect();
+            state.nll_cache = new_nlls;
+        } else {
             use rayon::prelude::*;
             // map_init lets each rayon worker keep one `EventPkParams`
             // scratch alive across every subject it handles, the same
@@ -975,6 +1516,18 @@ pub fn run_saem(
                 }
                 state.accept_counts[i] = 0;
                 state.proposal_counts[i] = 0;
+                // Adapt kappa step sizes (target 40% for MH on kappas).
+                if n_kappa > 0 {
+                    let kappa_total = state.kappa_proposal_counts[i].max(1);
+                    let kappa_rate = state.kappa_accept_counts[i] as f64 / kappa_total as f64;
+                    if kappa_rate > 0.40 {
+                        state.kappa_step_scales[i] = (state.kappa_step_scales[i] * 1.1).min(5.0);
+                    } else {
+                        state.kappa_step_scales[i] = (state.kappa_step_scales[i] * 0.9).max(0.01);
+                    }
+                    state.kappa_accept_counts[i] = 0;
+                    state.kappa_proposal_counts[i] = 0;
+                }
             }
             state.steps_since_adapt = 0;
         }
@@ -1029,7 +1582,17 @@ pub fn run_saem(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
-        omega_iov: init_params.omega_iov.clone(),
+        omega_iov: if n_kappa > 0 {
+            init_params.omega_iov.as_ref().map(|iov_ref| {
+                OmegaMatrix::from_matrix(
+                    state.omega_iov_mat.clone(),
+                    iov_ref.eta_names.clone(),
+                    iov_ref.diagonal,
+                )
+            })
+        } else {
+            init_params.omega_iov.clone()
+        },
         kappa_fixed: init_params.kappa_fixed.clone(),
     };
 
@@ -1559,5 +2122,117 @@ mod tests {
                 rel
             );
         }
+    }
+
+    // ── IOV kappa MH: rejection restores kappa ─────────────────────────────
+
+    /// With `step_scale = 0` the proposal is always identical to the current
+    /// kappa, so ΔH = 0 and every step is accepted.  The kappa values must
+    /// not change (proposal == current).
+    #[test]
+    fn mh_kappa_zero_step_always_accepts_and_preserves_kappa() {
+        use crate::types::test_helpers::analytical_model;
+        use std::collections::HashMap;
+
+        let model = analytical_model(GradientMethod::Auto);
+
+        // One subject with 2 occasions (occasions = [1,1,2,2]).
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 3.0, 4.0],
+            observations: vec![50.0, 40.0, 35.0, 28.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1u32, 1, 2, 2],
+            dose_occasions: vec![1u32],
+        };
+
+        let omega_bsv = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+        let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
+        let theta = vec![5.0, 50.0];
+        let eta = vec![0.0];
+        let sigma = vec![0.1];
+        // Two occasions, each with one kappa.
+        let mut kappas = vec![vec![0.2_f64], vec![-0.1_f64]];
+        let kappas_before = kappas.clone();
+
+        let nll0 = individual_nll_iov(
+            &model,
+            &subject,
+            &theta,
+            &eta,
+            &kappas,
+            &omega_bsv,
+            Some(&omega_iov),
+            &sigma,
+        );
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let (n_acc, n_prop, nll_after) = mh_kappa_steps(
+            &mut kappas,
+            nll0,
+            &subject,
+            &model,
+            &theta,
+            &eta,
+            &omega_bsv,
+            &omega_iov,
+            &sigma,
+            0.0, // step_scale = 0 → proposal == current → always accepted
+            &mut rng,
+        );
+
+        // With step_scale=0 every occasion proposal is accepted (2 occasions).
+        assert_eq!(n_prop, 2, "expected 2 proposals (one per occasion)");
+        assert_eq!(n_acc, 2, "step_scale=0: all proposals must be accepted");
+        // Kappa values must be unchanged (proposal == current point).
+        assert_eq!(
+            kappas, kappas_before,
+            "kappas must not change with step_scale=0"
+        );
+        // NLL must not change either.
+        assert!(
+            (nll_after - nll0).abs() < 1e-10,
+            "NLL must not change with step_scale=0"
+        );
+    }
+
+    // ── IOV omega analytic update formula ──────────────────────────────────
+
+    /// The analytic update `(1/N_occ) Σᵢ Σₖ κᵢₖ κᵢₖᵀ` for a 1-dimensional
+    /// omega_iov with two subjects, two occasions each, and known kappas must
+    /// match the hand-computed value exactly.
+    #[test]
+    fn iov_omega_analytic_update_matches_hand_computation() {
+        // Subject 1: occ1 = [0.2], occ2 = [-0.1]
+        // Subject 2: occ1 = [0.3], occ2 = [-0.2]
+        // Hand sum = 0.2² + 0.1² + 0.3² + 0.2² = 0.04 + 0.01 + 0.09 + 0.04 = 0.18
+        // Divided by 4 occasions → 0.045
+        let kappas: Vec<Vec<Vec<f64>>> =
+            vec![vec![vec![0.2], vec![-0.1]], vec![vec![0.3], vec![-0.2]]];
+        let n_kappa = 1_usize;
+        let mut kappa_outer = DMatrix::zeros(n_kappa, n_kappa);
+        let mut n_total_occ = 0_usize;
+        for kappas_i in &kappas {
+            for kap in kappas_i {
+                let kv = DVector::from_column_slice(kap);
+                kappa_outer += &kv * kv.transpose();
+                n_total_occ += 1;
+            }
+        }
+        kappa_outer /= n_total_occ as f64;
+        let expected = (0.04 + 0.01 + 0.09 + 0.04) / 4.0;
+        assert!(
+            (kappa_outer[(0, 0)] - expected).abs() < 1e-12,
+            "IOV omega analytic update: got {:.6e}, expected {:.6e}",
+            kappa_outer[(0, 0)],
+            expected
+        );
     }
 }
