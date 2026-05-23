@@ -1,0 +1,47 @@
+# Form C: amount-based ODE with `[scaling] y = ...`.
+#
+# Compare to `examples/bioavailability_ode.ferx` — the same model written
+# with the concentration baked into `central` directly (`d/dt(central) =
+# F*KA*depot/V - CL/V*central`). Here the ODE keeps `central` as an
+# amount (no `/V` inside the derivative) and the conversion to
+# concentration lives in the [scaling] block.
+#
+# Both formulations produce identical observed predictions — see
+# `tests/scaling_block.rs::form_c_amount_ode_matches_concentration_ode`.
+
+[parameters]
+  theta TVCL(5.0,   0.1,  50.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVKA(1.5,  0.05,  20.0)
+  theta THETA_F(0.70, 0.001, 0.999)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_F  ~ 0.10
+
+  sigma PROP_ERR ~ 0.15 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = inv_logit(logit(THETA_F) + ETA_F)
+
+[structural_model]
+  ode(states=[depot, central])    # no obs_cmt — Form C provides it
+
+[odes]
+  # Both compartments hold amounts (mg). The conversion to mg/L lives
+  # in [scaling] below.
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = F * KA * depot - CL/V * central
+
+[scaling]
+  y = central / V                 # observable = concentration (mg/L)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true

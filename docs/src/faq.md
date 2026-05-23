@@ -129,3 +129,28 @@ Reach for a different optimizer when SLSQP misbehaves:
 
 See [Fit Options](model-file/fit-options.md#optimizer-choices) for the full
 list.
+
+## How do I scale predictions to match my data's units, like NONMEM's `S1`/`S2`?
+
+Use the `[scaling]` block. The convention is divisive
+(`pred_scaled = pred_raw / scale`), matching the natural reading of
+`obs_scale = V/1000`.
+
+```
+[scaling]
+  obs_scale = 1000          # mg/L → mg/mL
+```
+
+The block also supports expression-form scales (`obs_scale = WT / 70`)
+and an ODE-only Form C that replaces the state readout entirely:
+
+```
+[structural_model]
+  ode(states=[depot, central])
+
+[scaling]
+  y = central / V           # central holds amount; observe as concentration
+```
+
+See [Scaling](model-file/scaling.md) for the full reference, including
+how this compares to NONMEM's `S1`/`S2` and nlmixr2's `cmt(central); f = ...`.

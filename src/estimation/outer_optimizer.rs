@@ -1873,6 +1873,7 @@ mod tests {
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         }
     }
 
@@ -2047,6 +2048,7 @@ mod tests {
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         };
         check_gradient(&model, &make_population(3), 2);
     }

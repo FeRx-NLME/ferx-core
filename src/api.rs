@@ -37,13 +37,27 @@ use rayon::prelude::*;
 use std::path::Path;
 use std::time::Instant;
 
-/// Route predictions through analytical PK or ODE solver.
-fn model_preds(model: &CompiledModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
-    if let Some(ref ode_spec) = model.ode_spec {
+/// Route predictions through analytical PK or ODE solver, then apply
+/// `model.scaling` so simulate / predict / post-fit IPRED see the same
+/// scaled output as the estimation dispatcher in `pk::compute_predictions_with_tv_into_with_schedule`.
+///
+/// `theta` and `eta` are required so that `ScalingSpec::ExpressionScale`
+/// can evaluate its `scale_fn(theta, eta, covariates)`. Callers that don't
+/// have a separate eta vector (population predictions) pass an all-zero eta.
+fn model_preds(
+    model: &CompiledModel,
+    subject: &Subject,
+    pk_params: &PkParams,
+    theta: &[f64],
+    eta: &[f64],
+) -> Vec<f64> {
+    let mut preds = if let Some(ref ode_spec) = model.ode_spec {
         pk::compute_predictions_ode(ode_spec, subject, &pk_params.values)
     } else {
         pk::compute_predictions(model.pk_model, subject, pk_params)
-    }
+    };
+    pk::apply_scaling(&model.scaling, theta, eta, &subject.covariates, &mut preds);
+    preds
 }
 
 /// Run a model file with a NONMEM-format CSV dataset.
@@ -1357,7 +1371,7 @@ fn compute_subject_results(
                     let combined: Vec<f64> =
                         eta.iter().copied().chain(kap.iter().copied()).collect();
                     let pk = (model.pk_param_fn)(&params.theta, &combined, &subject.covariates);
-                    let all_preds = model_preds(model, subject, &pk);
+                    let all_preds = model_preds(model, subject, &pk, &params.theta, &combined);
                     for &j in obs_indices {
                         ipreds[j] = all_preds[j];
                     }
@@ -1366,13 +1380,19 @@ fn compute_subject_results(
             } else {
                 let pk_params_ind =
                     (model.pk_param_fn)(&params.theta, eta.as_slice(), &subject.covariates);
-                model_preds(model, subject, &pk_params_ind)
+                model_preds(
+                    model,
+                    subject,
+                    &pk_params_ind,
+                    &params.theta,
+                    eta.as_slice(),
+                )
             };
 
             // Population predictions: f(eta = 0, kappa = 0).
             let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
             let pk_params_pop = (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
-            let pred = model_preds(model, subject, &pk_params_pop);
+            let pred = model_preds(model, subject, &pk_params_pop, &params.theta, &zero_eta);
 
             // IWRES (NaN on BLOQ rows — see compute_cwres for CWRES handling).
             let mut iwres = compute_iwres(
@@ -1842,7 +1862,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
             let pk_params = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
 
             // Predict concentrations
-            let ipreds = model_preds(model, subject, &pk_params);
+            let ipreds = model_preds(model, subject, &pk_params, &params.theta, &eta_slice);
 
             // Add residual error
             for (j, &ipred) in ipreds.iter().enumerate() {
@@ -1963,7 +1983,7 @@ pub fn predict(
 
     for subject in &population.subjects {
         let pk_params = (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
-        let preds = model_preds(model, subject, &pk_params);
+        let preds = model_preds(model, subject, &pk_params, &params.theta, &zero_eta);
 
         for (j, &pred) in preds.iter().enumerate() {
             results.push(PredictionResult {
@@ -2062,6 +2082,7 @@ mod iov_integration {
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         }
     }
 
@@ -2797,6 +2818,7 @@ mod simulate_with_uncertainty_tests {
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         }
     }
 

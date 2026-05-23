@@ -404,6 +404,7 @@ pub fn find_ebe(
                         model.error_model,
                         &model.pk_idx_f64,
                         &model.sel_flat,
+                        model.scaling.scalar_for_ad(),
                     );
                     GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
                     g
@@ -430,6 +431,7 @@ pub fn find_ebe(
                         model.error_model,
                         &model.pk_idx_f64,
                         &model.sel_flat,
+                        model.scaling.scalar_for_ad(),
                     );
                     GRADIENT_TIMINGS.record_ad(t0.elapsed().as_nanos() as u64);
                     g
@@ -483,6 +485,7 @@ pub fn find_ebe(
                 model.pk_model,
                 &model.pk_idx_f64,
                 &model.sel_flat,
+                model.scaling.scalar_for_ad(),
             );
             GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
             j
@@ -503,6 +506,7 @@ pub fn find_ebe(
                 model.pk_model,
                 &model.pk_idx_f64,
                 &model.sel_flat,
+                model.scaling.scalar_for_ad(),
             );
             GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
             j
@@ -1267,6 +1271,7 @@ mod iov_tests {
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         }
     }
 
@@ -1371,6 +1376,7 @@ mod iov_tests {
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         };
         let subject = Subject {
             id: "1".into(),

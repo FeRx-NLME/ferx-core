@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>ODE Model - FeRx-NLME Documentation</title>
+        <title>Scaling - FeRx-NLME Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -177,90 +177,106 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="ode-model-michaelis-menten"><a class="header" href="#ode-model-michaelis-menten">ODE Model (Michaelis-Menten)</a></h1>
-<p>This example demonstrates a one-compartment oral model with saturable (Michaelis-Menten) elimination, solved using the ODE integrator.</p>
-<h2 id="model-file-mm_oralferx"><a class="header" href="#model-file-mm_oralferx">Model File (<code>mm_oral.ferx</code>)</a></h2>
-<pre><code># One-compartment oral model with Michaelis-Menten elimination
-
-[parameters]
-  theta TVVMAX(10.0, 0.1, 1000.0)
-  theta TVKM(2.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.0, 0.01, 50.0)
-
-  omega ETA_VMAX ~ 0.09
-  omega ETA_V    ~ 0.04
-
-  sigma PROP_ERR ~ 0.1
-
-[individual_parameters]
-  VMAX = TVVMAX * exp(ETA_VMAX)
-  KM   = TVKM
-  V    = TVV * exp(ETA_V)
-  KA   = TVKA
-
-[structural_model]
-  ode(obs_cmt=central, states=[depot, central])
+                        <h1 id="scaling"><a class="header" href="#scaling">Scaling</a></h1>
+<p>The optional <code>[scaling]</code> block declares how the structural model’s raw
+output maps to the observed <code>DV</code>. It exists so the user does not have to
+fold unit conversion or amount-to-concentration arithmetic into the
+structural model itself — keeping <code>[odes]</code> and <code>[structural_model]</code>
+readable, and making mixed-unit data (e.g. data in ng/mL when the model
+thinks in mg/L) straightforward.</p>
+<p>The convention is <strong>divisive</strong>: <code>pred_scaled = pred_raw / scale</code>. This
+matches the natural reading of <code>obs_scale = V/1000</code> as <em>“divide amount by
+V/1000 to get concentration in the user’s units.”</em></p>
+<p>Three forms are supported. Each is optional; omitting <code>[scaling]</code> keeps
+the historical “raw prediction equals DV” behaviour.</p>
+<h2 id="form-a--scalar-divisor"><a class="header" href="#form-a--scalar-divisor">Form A — scalar divisor</a></h2>
+<p>Use for fixed unit conversion (e.g. mg/L → mg/mL is a constant 1000).</p>
+<pre><code class="language-ferx">[scaling]
+  obs_scale = 1000
+</code></pre>
+<p>Applies to analytical PK models and ODE models alike: every prediction
+is divided by the constant before reaching the residual error model.</p>
+<h2 id="form-b--expression-divisor"><a class="header" href="#form-b--expression-divisor">Form B — expression divisor</a></h2>
+<p>Use when the scale depends on theta, eta, or a covariate.</p>
+<pre><code class="language-ferx">[scaling]
+  obs_scale = WT / 70
+</code></pre>
+<p>In Phase 1, expressions may reference:</p>
+<ul>
+<li>thetas (e.g. <code>TVV</code>),</li>
+<li>etas (e.g. <code>ETA_CL</code>),</li>
+<li>covariates (e.g. <code>WT</code>, <code>CR</code>).</li>
+</ul>
+<p>Phase 1 <strong>does not</strong> support references to individual parameters (e.g.
+<code>obs_scale = 1000 / V</code>) — the parser will reject these with a clear
+error. Use the underlying theta (<code>TVV</code>) for now, or switch to Form C if
+you need an individual-parameter-driven scale on an ODE model.</p>
+<p>The scale is evaluated <strong>once per subject</strong> with subject-level
+covariates (matching the no-TV path). Time-varying covariate support for
+expression scales is a Phase 1.5 follow-up.</p>
+<h2 id="form-c--explicit-output-expression-ode-only"><a class="header" href="#form-c--explicit-output-expression-ode-only">Form C — explicit output expression (ODE only)</a></h2>
+<p>Use when the ODE state is held as an amount and the observation is a
+concentration. Form C replaces the default <code>obs_cmt</code> readout entirely.</p>
+<pre><code class="language-ferx">[structural_model]
+  ode(states=[depot, central])     # no obs_cmt — Form C provides it
 
 [odes]
   d/dt(depot)   = -KA * depot
-  d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
+  d/dt(central) = KA * depot - CL/V * central   # central holds amount
 
-[error_model]
-  DV ~ proportional(PROP_ERR)
-
-[fit_options]
-  method     = focei
-  maxiter    = 500
-  covariance = true
+[scaling]
+  y = central / V
 </code></pre>
-<h2 id="model-description"><a class="header" href="#model-description">Model Description</a></h2>
-<h3 id="why-use-odes"><a class="header" href="#why-use-odes">Why Use ODEs</a></h3>
-<p>Michaelis-Menten (saturable) elimination cannot be described by a simple exponential function. At high concentrations, elimination approaches a maximum rate (VMAX), leading to nonlinear pharmacokinetics. This requires numerical ODE integration.</p>
-<h3 id="ode-system"><a class="header" href="#ode-system">ODE System</a></h3>
-<pre><code>d/dt(depot)   = -KA * depot
-d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
-</code></pre>
+<p>The right-hand side may reference state names (<code>depot</code>, <code>central</code>),
+individual parameters (<code>CL</code>, <code>V</code>, <code>KA</code>), and covariates. Thetas and
+etas are <strong>not</strong> directly in scope — they are folded into individual
+parameters by <code>[individual_parameters]</code> before <code>y</code> is evaluated.</p>
+<p>Form C is only valid for ODE models. The parser rejects <code>y = ...</code> on
+analytical models with a clear error.</p>
+<h2 id="comparison-with-nonmem-and-nlmixr2"><a class="header" href="#comparison-with-nonmem-and-nlmixr2">Comparison with NONMEM and nlmixr2</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Need</th><th>NONMEM</th><th>nlmixr2</th><th>ferx</th></tr>
+</thead>
+<tbody>
+<tr><td>Scalar unit conversion</td><td><code>S1 = 1000</code></td><td>(multiplier in <code>cmt</code>/<code>f</code>)</td><td><code>[scaling] obs_scale = 1000</code></td></tr>
+<tr><td>Amount-state ODE with concentration DV</td><td><code>S2 = V/1000</code> plus <code>Y = A(2)/S2</code></td><td><code>cmt(central); f = central/V/1000</code></td><td><code>[scaling] y = central / (V/1000)</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The ferx form is divisive by convention, so an <code>obs_scale = V/1000</code>
+reads as “divide raw by V/1000” — matching NONMEM’s <code>S2</code>.</p>
+<h2 id="interaction-with-gradients-ad-vs-fd"><a class="header" href="#interaction-with-gradients-ad-vs-fd">Interaction with gradients (AD vs FD)</a></h2>
 <ul>
-<li><strong>depot</strong>: Absorption compartment. First-order absorption at rate KA.</li>
-<li><strong>central</strong>: Central compartment. Drug enters from depot and is eliminated by Michaelis-Menten kinetics.</li>
+<li>Scalar <code>obs_scale = K</code> works with both <code>gradient = ad</code> and
+<code>gradient = fd</code>. The constant is threaded through the AD entry points
+as a <code>Const</code> argument.</li>
+<li>Expression <code>obs_scale = &lt;expr&gt;</code> is supported only with
+<code>gradient = fd</code> in Phase 1. The parser rejects the combination of
+expression scaling with AD gradients and prints the required flag.</li>
 </ul>
-<h3 id="parameters"><a class="header" href="#parameters">Parameters</a></h3>
-<ul>
-<li><strong>VMAX</strong>: Maximum elimination rate (amount/time)</li>
-<li><strong>KM</strong>: Michaelis-Menten constant (concentration at half-maximal rate)</li>
-<li><strong>V</strong>: Volume of distribution</li>
-<li><strong>KA</strong>: First-order absorption rate constant</li>
-</ul>
-<p>Note that only VMAX and V have random effects. KM and KA are treated as population parameters (no between-subject variability).</p>
-<h3 id="structural-model-declaration"><a class="header" href="#structural-model-declaration">Structural Model Declaration</a></h3>
-<pre><code>[structural_model]
-  ode(obs_cmt=central, states=[depot, central])
-</code></pre>
-<ul>
-<li><code>obs_cmt=central</code>: The <code>central</code> compartment is observed (matched to DV in the data)</li>
-<li><code>states=[depot, central]</code>: Two state variables (compartments)</li>
-</ul>
-<h2 id="running"><a class="header" href="#running">Running</a></h2>
-<pre><code class="language-bash">ferx examples/mm_oral.ferx --data data/mm_oral.csv
-</code></pre>
-<h2 id="notes"><a class="header" href="#notes">Notes</a></h2>
-<ul>
-<li>ODE models are slower than analytical models because each prediction requires numerical integration</li>
-<li>The ODE solver uses adaptive step-size control (Dormand-Prince RK45) for accuracy</li>
-<li>For standard first-order kinetics, use the analytical <code>one_cpt_oral</code> model instead – it is much faster</li>
-<li>The <code>central</code> compartment in this model contains the drug amount. If you want concentration as the observed variable, divide by V in the ODE equations (as done here with <code>KA * depot / V</code>)</li>
-</ul>
+<h2 id="interaction-with-sde--diffusion"><a class="header" href="#interaction-with-sde--diffusion">Interaction with SDE / <code>[diffusion]</code></a></h2>
+<p>The EKF / SDE path requires a single observable compartment index for
+the Kalman update. SDE models can use Forms A and B (post-multiplied at
+the end of the prediction path) but cannot use Form C — the parser
+rejects SDE models that omit <code>obs_cmt</code> from <code>[structural_model]</code>.</p>
+<h2 id="multi-analyte-forward-compatibility"><a class="header" href="#multi-analyte-forward-compatibility">Multi-analyte (forward compatibility)</a></h2>
+<p><code>[scaling]</code> is per-model in Phase 1. When ferx adds CMT-keyed scaling
+(NONMEM’s <code>if (CMT==2) Y = A2/V2</code>-style routing), the same block will
+grow <code>y[CMT=1] = &lt;expr&gt;</code> / <code>y[CMT=2] = &lt;expr&gt;</code> and
+<code>obs_scale[CMT=...]</code> variants. Existing single-form usage will continue
+to work unchanged.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../examples/covariates.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../model-file/ode-models.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../examples/bloq.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../model-file/diffusion.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -270,11 +286,11 @@ d/dt(central) = KA * depot / V - VMAX * central / (KM + central)
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../examples/covariates.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../model-file/ode-models.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../examples/bloq.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../model-file/diffusion.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

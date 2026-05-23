@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-5ecdcefc.js";
+            window.path_to_searchindex_js = "searchindex-38383e4d.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-eae77ecf.js"></script>
+        <script src="toc-f187808c.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1061,7 +1061,16 @@ PARAM = THETA + ETA                   # additive
 <pre><code>[structural_model]
   ode(obs_cmt=COMPARTMENT_NAME, states=[state1, state2, ...])
 </code></pre>
-<p>See <a href="#ode-models-1">ODE Models</a> for full ODE syntax.</p>
+<p>When the observable is a derived quantity (e.g. amount / V), use the
+amount-only ODE form and supply <code>[scaling] y = &lt;expr&gt;</code>:</p>
+<pre><code>[structural_model]
+  ode(states=[depot, central])
+
+[scaling]
+  y = central / V
+</code></pre>
+<p>See <a href="#ode-models-1">ODE Models</a> for full ODE syntax and
+<a href="#scaling">Scaling</a> for the <code>[scaling]</code> block.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="lagtime-1"><a class="header" href="#lagtime-1">Lagtime</a></h1>
 <p>A <code>lagtime</code> PK parameter shifts the effective start of every dose record by
@@ -1324,6 +1333,97 @@ with sigma and omega.</p>
 <li>Steady-state (<code>SS=1</code>) is not directly supported for ODE models</li>
 <li>SDE (<code>[diffusion]</code>) is not compatible with SAEM or the autodiff gradient path</li>
 </ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="scaling"><a class="header" href="#scaling">Scaling</a></h1>
+<p>The optional <code>[scaling]</code> block declares how the structural model’s raw
+output maps to the observed <code>DV</code>. It exists so the user does not have to
+fold unit conversion or amount-to-concentration arithmetic into the
+structural model itself — keeping <code>[odes]</code> and <code>[structural_model]</code>
+readable, and making mixed-unit data (e.g. data in ng/mL when the model
+thinks in mg/L) straightforward.</p>
+<p>The convention is <strong>divisive</strong>: <code>pred_scaled = pred_raw / scale</code>. This
+matches the natural reading of <code>obs_scale = V/1000</code> as <em>“divide amount by
+V/1000 to get concentration in the user’s units.”</em></p>
+<p>Three forms are supported. Each is optional; omitting <code>[scaling]</code> keeps
+the historical “raw prediction equals DV” behaviour.</p>
+<h2 id="form-a--scalar-divisor"><a class="header" href="#form-a--scalar-divisor">Form A — scalar divisor</a></h2>
+<p>Use for fixed unit conversion (e.g. mg/L → mg/mL is a constant 1000).</p>
+<pre><code class="language-ferx">[scaling]
+  obs_scale = 1000
+</code></pre>
+<p>Applies to analytical PK models and ODE models alike: every prediction
+is divided by the constant before reaching the residual error model.</p>
+<h2 id="form-b--expression-divisor"><a class="header" href="#form-b--expression-divisor">Form B — expression divisor</a></h2>
+<p>Use when the scale depends on theta, eta, or a covariate.</p>
+<pre><code class="language-ferx">[scaling]
+  obs_scale = WT / 70
+</code></pre>
+<p>In Phase 1, expressions may reference:</p>
+<ul>
+<li>thetas (e.g. <code>TVV</code>),</li>
+<li>etas (e.g. <code>ETA_CL</code>),</li>
+<li>covariates (e.g. <code>WT</code>, <code>CR</code>).</li>
+</ul>
+<p>Phase 1 <strong>does not</strong> support references to individual parameters (e.g.
+<code>obs_scale = 1000 / V</code>) — the parser will reject these with a clear
+error. Use the underlying theta (<code>TVV</code>) for now, or switch to Form C if
+you need an individual-parameter-driven scale on an ODE model.</p>
+<p>The scale is evaluated <strong>once per subject</strong> with subject-level
+covariates (matching the no-TV path). Time-varying covariate support for
+expression scales is a Phase 1.5 follow-up.</p>
+<h2 id="form-c--explicit-output-expression-ode-only"><a class="header" href="#form-c--explicit-output-expression-ode-only">Form C — explicit output expression (ODE only)</a></h2>
+<p>Use when the ODE state is held as an amount and the observation is a
+concentration. Form C replaces the default <code>obs_cmt</code> readout entirely.</p>
+<pre><code class="language-ferx">[structural_model]
+  ode(states=[depot, central])     # no obs_cmt — Form C provides it
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central   # central holds amount
+
+[scaling]
+  y = central / V
+</code></pre>
+<p>The right-hand side may reference state names (<code>depot</code>, <code>central</code>),
+individual parameters (<code>CL</code>, <code>V</code>, <code>KA</code>), and covariates. Thetas and
+etas are <strong>not</strong> directly in scope — they are folded into individual
+parameters by <code>[individual_parameters]</code> before <code>y</code> is evaluated.</p>
+<p>Form C is only valid for ODE models. The parser rejects <code>y = ...</code> on
+analytical models with a clear error.</p>
+<h2 id="comparison-with-nonmem-and-nlmixr2"><a class="header" href="#comparison-with-nonmem-and-nlmixr2">Comparison with NONMEM and nlmixr2</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Need</th><th>NONMEM</th><th>nlmixr2</th><th>ferx</th></tr>
+</thead>
+<tbody>
+<tr><td>Scalar unit conversion</td><td><code>S1 = 1000</code></td><td>(multiplier in <code>cmt</code>/<code>f</code>)</td><td><code>[scaling] obs_scale = 1000</code></td></tr>
+<tr><td>Amount-state ODE with concentration DV</td><td><code>S2 = V/1000</code> plus <code>Y = A(2)/S2</code></td><td><code>cmt(central); f = central/V/1000</code></td><td><code>[scaling] y = central / (V/1000)</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The ferx form is divisive by convention, so an <code>obs_scale = V/1000</code>
+reads as “divide raw by V/1000” — matching NONMEM’s <code>S2</code>.</p>
+<h2 id="interaction-with-gradients-ad-vs-fd"><a class="header" href="#interaction-with-gradients-ad-vs-fd">Interaction with gradients (AD vs FD)</a></h2>
+<ul>
+<li>Scalar <code>obs_scale = K</code> works with both <code>gradient = ad</code> and
+<code>gradient = fd</code>. The constant is threaded through the AD entry points
+as a <code>Const</code> argument.</li>
+<li>Expression <code>obs_scale = &lt;expr&gt;</code> is supported only with
+<code>gradient = fd</code> in Phase 1. The parser rejects the combination of
+expression scaling with AD gradients and prints the required flag.</li>
+</ul>
+<h2 id="interaction-with-sde--diffusion"><a class="header" href="#interaction-with-sde--diffusion">Interaction with SDE / <code>[diffusion]</code></a></h2>
+<p>The EKF / SDE path requires a single observable compartment index for
+the Kalman update. SDE models can use Forms A and B (post-multiplied at
+the end of the prediction path) but cannot use Form C — the parser
+rejects SDE models that omit <code>obs_cmt</code> from <code>[structural_model]</code>.</p>
+<h2 id="multi-analyte-forward-compatibility"><a class="header" href="#multi-analyte-forward-compatibility">Multi-analyte (forward compatibility)</a></h2>
+<p><code>[scaling]</code> is per-model in Phase 1. When ferx adds CMT-keyed scaling
+(NONMEM’s <code>if (CMT==2) Y = A2/V2</code>-style routing), the same block will
+grow <code>y[CMT=1] = &lt;expr&gt;</code> / <code>y[CMT=2] = &lt;expr&gt;</code> and
+<code>obs_scale[CMT=...]</code> variants. Existing single-form usage will continue
+to work unchanged.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="stochastic-differential-equations-sde--diffusion"><a class="header" href="#stochastic-differential-equations-sde--diffusion">Stochastic Differential Equations (SDE / Diffusion)</a></h1>
 <p>The <code>[diffusion]</code> block adds continuous stochastic noise to ODE state variables.
@@ -4738,6 +4838,23 @@ parameters.</li>
 </ul>
 <p>See <a href="#optimizer-choices">Fit Options</a> for the full
 list.</p>
+<h2 id="how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2"><a class="header" href="#how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2">How do I scale predictions to match my data’s units, like NONMEM’s <code>S1</code>/<code>S2</code>?</a></h2>
+<p>Use the <code>[scaling]</code> block. The convention is divisive
+(<code>pred_scaled = pred_raw / scale</code>), matching the natural reading of
+<code>obs_scale = V/1000</code>.</p>
+<pre><code>[scaling]
+  obs_scale = 1000          # mg/L → mg/mL
+</code></pre>
+<p>The block also supports expression-form scales (<code>obs_scale = WT / 70</code>)
+and an ODE-only Form C that replaces the state readout entirely:</p>
+<pre><code>[structural_model]
+  ode(states=[depot, central])
+
+[scaling]
+  y = central / V           # central holds amount; observe as concentration
+</code></pre>
+<p>See <a href="#scaling">Scaling</a> for the full reference, including
+how this compares to NONMEM’s <code>S1</code>/<code>S2</code> and nlmixr2’s <code>cmt(central); f = ...</code>.</p>
 
                     </main>
 

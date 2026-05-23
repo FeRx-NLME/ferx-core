@@ -1,0 +1,36 @@
+# Form A: scalar `obs_scale` — unit conversion (mg/L → mg/mL).
+#
+# Same warfarin model as `examples/warfarin.ferx` plus an [scaling] block
+# that divides every prediction by 1000. Demonstrates that omitting the
+# block reproduces the historical behaviour and adding it shifts the
+# predictions by exactly the chosen factor.
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[scaling]
+  obs_scale = 1000              # raw mg/L predictions → mg/mL DV
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 300
+  covariance = true

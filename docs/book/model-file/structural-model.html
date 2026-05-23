@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-5ecdcefc.js";
+            window.path_to_searchindex_js = "../searchindex-38383e4d.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-eae77ecf.js"></script>
+        <script src="../toc-f187808c.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -235,7 +235,16 @@
 <pre><code>[structural_model]
   ode(obs_cmt=COMPARTMENT_NAME, states=[state1, state2, ...])
 </code></pre>
-<p>See <a href="ode-models.html">ODE Models</a> for full ODE syntax.</p>
+<p>When the observable is a derived quantity (e.g. amount / V), use the
+amount-only ODE form and supply <code>[scaling] y = &lt;expr&gt;</code>:</p>
+<pre><code>[structural_model]
+  ode(states=[depot, central])
+
+[scaling]
+  y = central / V
+</code></pre>
+<p>See <a href="ode-models.html">ODE Models</a> for full ODE syntax and
+<a href="scaling.html">Scaling</a> for the <code>[scaling]</code> block.</p>
 
                     </main>
 

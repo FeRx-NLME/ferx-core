@@ -38,6 +38,7 @@ use std::autodiff::autodiff_forward;
     Const,      // pk_idx_f64
     Const,      // sel_flat
     Const,      // pk_model_id_f64
+    Const,      // obs_scale
     Dual        // out
 )]
 pub fn predict_all_event_driven_ad(
@@ -54,6 +55,7 @@ pub fn predict_all_event_driven_ad(
     pk_idx_f64: &[f64],
     sel_flat: &[f64],
     pk_model_id_f64: f64,
+    obs_scale: f64,
     out: &mut [f64],
 ) {
     let n_eta = eta.len();
@@ -161,7 +163,8 @@ pub fn predict_all_event_driven_ad(
 
         let v_safe = ev_v.abs() + 1e-30;
         let conc_raw = central_amt / v_safe;
-        let conc = (conc_raw + conc_raw.abs()) * 0.5;
+        let conc_clamped = (conc_raw + conc_raw.abs()) * 0.5;
+        let conc = conc_clamped / obs_scale;
 
         // Unconditional write: every Dual output slot must be written
         // exactly once for forward-mode pointer tracking. Non-obs slots
@@ -729,6 +732,7 @@ fn propagate_three_cpt_oral_jac(
 /// `predict_all_event_driven_ad_tangent` once per η-column, scattering
 /// the obs-only tangents into the matrix via the `event_kinds` /
 /// `event_orig_idx_f64` back-pointers.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_jacobian_event_driven_ad(
     eta: &[f64],
     tv_per_event: &FlatEventTv,
@@ -737,6 +741,7 @@ pub fn compute_jacobian_event_driven_ad(
     pk_model: PkModel,
     pk_idx_f64: &[f64],
     sel_flat: &[f64],
+    obs_scale: f64,
 ) -> nalgebra::DMatrix<f64> {
     let n_eta = eta.len();
     let pk_id = crate::ad::ad_gradients::pk_model_to_id(pk_model) as f64;
@@ -793,6 +798,7 @@ pub fn compute_jacobian_event_driven_ad(
             pk_idx_f64,
             sel_flat,
             pk_id,
+            obs_scale,
             &mut out,
             &mut d_out,
         );

@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-5ecdcefc.js";
+            window.path_to_searchindex_js = "searchindex-38383e4d.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-eae77ecf.js"></script>
+        <script src="toc-f187808c.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -271,6 +271,23 @@ parameters.</li>
 </ul>
 <p>See <a href="model-file/fit-options.html#optimizer-choices">Fit Options</a> for the full
 list.</p>
+<h2 id="how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2"><a class="header" href="#how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2">How do I scale predictions to match my data’s units, like NONMEM’s <code>S1</code>/<code>S2</code>?</a></h2>
+<p>Use the <code>[scaling]</code> block. The convention is divisive
+(<code>pred_scaled = pred_raw / scale</code>), matching the natural reading of
+<code>obs_scale = V/1000</code>.</p>
+<pre><code>[scaling]
+  obs_scale = 1000          # mg/L → mg/mL
+</code></pre>
+<p>The block also supports expression-form scales (<code>obs_scale = WT / 70</code>)
+and an ODE-only Form C that replaces the state readout entirely:</p>
+<pre><code>[structural_model]
+  ode(states=[depot, central])
+
+[scaling]
+  y = central / V           # central holds amount; observe as concentration
+</code></pre>
+<p>See <a href="model-file/scaling.html">Scaling</a> for the full reference, including
+how this compares to NONMEM’s <code>S1</code>/<code>S2</code> and nlmixr2’s <code>cmt(central); f = ...</code>.</p>
 
                     </main>
 

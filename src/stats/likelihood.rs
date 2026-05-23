@@ -937,6 +937,7 @@ mod tests {
             indiv_param_names: vec!["CL".into(), "V".into()],
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         }
     }
 

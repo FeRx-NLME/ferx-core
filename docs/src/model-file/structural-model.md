@@ -72,4 +72,16 @@ For non-standard kinetics (e.g., saturable elimination), use the ODE specificati
   ode(obs_cmt=COMPARTMENT_NAME, states=[state1, state2, ...])
 ```
 
-See [ODE Models](ode-models.md) for full ODE syntax.
+When the observable is a derived quantity (e.g. amount / V), use the
+amount-only ODE form and supply `[scaling] y = <expr>`:
+
+```
+[structural_model]
+  ode(states=[depot, central])
+
+[scaling]
+  y = central / V
+```
+
+See [ODE Models](ode-models.md) for full ODE syntax and
+[Scaling](scaling.md) for the `[scaling]` block.

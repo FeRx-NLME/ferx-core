@@ -708,6 +708,7 @@ mod tests {
 
     use crate::types::{
         BloqMethod, CompiledModel, ErrorModel, GradientMethod, MuRef, PkModel, PkParams,
+        ScalingSpec,
     };
     use std::collections::HashMap;
 
@@ -789,6 +790,7 @@ mod tests {
             kappa_names: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         }
     }
 

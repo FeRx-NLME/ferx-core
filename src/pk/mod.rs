@@ -3,11 +3,45 @@ pub mod one_compartment;
 pub mod three_compartment;
 pub mod two_compartment;
 
-use crate::types::{CompiledModel, DoseEvent, PkModel, PkParams, Subject};
+use crate::types::{CompiledModel, DoseEvent, PkModel, PkParams, ScalingSpec, Subject};
 
 pub use one_compartment::*;
 pub use three_compartment::*;
 pub use two_compartment::*;
+
+/// Divide each prediction in-place by the scale derived from
+/// `model.scaling`. The convention is **divisive** so that
+/// `[scaling] obs_scale = 1000` maps mg/L → mg/mL (i.e. the user's number
+/// reads as "raw / scale").
+///
+/// `ScalingSpec::None` is a no-op so every existing call path keeps its
+/// historical behaviour.
+///
+/// Form C (ODE `y = <expr>`) does *not* go through here — it replaces the
+/// per-observation state readout inside the ODE timeline loop via
+/// `OdeSpec::output_fn`, so the prediction returned to this function is
+/// already in observation units.
+#[inline]
+pub fn apply_scaling(
+    scaling: &ScalingSpec,
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &std::collections::HashMap<String, f64>,
+    preds: &mut [f64],
+) {
+    match scaling {
+        ScalingSpec::None => {}
+        ScalingSpec::ScalarScale(k) => {
+            let inv = 1.0 / k;
+            preds.iter_mut().for_each(|p| *p *= inv);
+        }
+        ScalingSpec::ExpressionScale { scale_fn } => {
+            let s = scale_fn(theta, eta, covariates);
+            let inv = 1.0 / s;
+            preds.iter_mut().for_each(|p| *p *= inv);
+        }
+    }
+}
 
 /// Per-event PK parameter snapshots for one subject.
 ///
@@ -266,46 +300,53 @@ pub fn compute_predictions_with_tv_into_with_schedule(
 ) -> Vec<f64> {
     let has_tv = subject.has_tv_covariates();
 
-    // ODE path.
-    if let Some(ref ode) = model.ode_spec {
+    let mut preds = if let Some(ref ode) = model.ode_spec {
+        // ODE path.
         if has_tv {
             compute_event_pk_params_into(model, subject, theta, eta, scratch);
-            return crate::ode::ode_predictions_event_driven(
+            crate::ode::ode_predictions_event_driven(
                 ode,
                 subject,
                 &scratch.dose,
                 &scratch.obs,
                 &scratch.pk_only,
-            );
+            )
+        } else {
+            let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+            crate::ode::ode_predictions(ode, &pk.values, subject)
         }
-        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-        return crate::ode::ode_predictions(ode, &pk.values, subject);
-    }
-
-    if has_tv && event_driven::supports_event_driven(model.pk_model) {
+    } else if has_tv && event_driven::supports_event_driven(model.pk_model) {
         compute_event_pk_params_into(model, subject, theta, eta, scratch);
         if let Some(sched) = schedule {
-            return event_driven::event_driven_predictions_with_schedule(
+            event_driven::event_driven_predictions_with_schedule(
                 model.pk_model,
                 subject,
                 sched,
                 &scratch.dose,
                 &scratch.obs,
                 &scratch.pk_only,
-            );
+            )
+        } else {
+            event_driven::event_driven_predictions(
+                model.pk_model,
+                subject,
+                &scratch.dose,
+                &scratch.obs,
+                &scratch.pk_only,
+            )
         }
-        return event_driven::event_driven_predictions(
-            model.pk_model,
-            subject,
-            &scratch.dose,
-            &scratch.obs,
-            &scratch.pk_only,
-        );
-    }
+    } else {
+        // No-TV fast path (or TV with unsupported model — see docstring).
+        let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+        compute_predictions(model.pk_model, subject, &pk)
+    };
 
-    // No-TV fast path (or TV with unsupported model — see docstring).
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-    compute_predictions(model.pk_model, subject, &pk)
+    // `[scaling]` post-multiply. Single insertion point covers FOCE/FOCEI,
+    // GN, trust-region, SAEM, and IOV — they all route through here.
+    // Form C (ODE `y = <expr>`) is already applied inside `ode_predictions*`
+    // via `OdeSpec::output_fn`, so `model.scaling` is `None` for those.
+    apply_scaling(&model.scaling, theta, eta, &subject.covariates, &mut preds);
+    preds
 }
 
 #[cfg(test)]
@@ -387,7 +428,7 @@ mod tests {
     fn cl_from_cr_model() -> crate::types::CompiledModel {
         use crate::types::{
             BloqMethod, CompiledModel, ErrorModel, GradientMethod, ModelParameters, OmegaMatrix,
-            PkModel, SigmaVector,
+            PkModel, ScalingSpec, SigmaVector,
         };
         CompiledModel {
             name: "cl_from_cr".into(),
@@ -445,6 +486,7 @@ mod tests {
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         }
     }
 
@@ -600,5 +642,58 @@ mod tests {
             &pk_nolag,
         );
         assert_relative_eq!(c_post, c_post_nolag, epsilon = 1e-10);
+    }
+
+    // ── apply_scaling ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_apply_scaling_none_is_noop() {
+        let mut preds = vec![10.0, 20.0, 30.0];
+        let theta = vec![];
+        let eta = vec![];
+        let cov = HashMap::new();
+        apply_scaling(&ScalingSpec::None, &theta, &eta, &cov, &mut preds);
+        assert_eq!(preds, vec![10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn test_apply_scaling_scalar_divides_in_place() {
+        let mut preds = vec![1000.0, 2000.0, 3000.0];
+        let theta = vec![];
+        let eta = vec![];
+        let cov = HashMap::new();
+        apply_scaling(
+            &ScalingSpec::ScalarScale(1000.0),
+            &theta,
+            &eta,
+            &cov,
+            &mut preds,
+        );
+        for (got, exp) in preds.iter().zip([1.0, 2.0, 3.0].iter()) {
+            assert_relative_eq!(got, exp, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_apply_scaling_expression_uses_covariate() {
+        // scale_fn = WT / 70 — divisive convention so preds / (WT/70).
+        let scale_fn: crate::types::ScaleFn =
+            Box::new(|_theta, _eta, cov: &HashMap<String, f64>| {
+                cov.get("WT").copied().unwrap_or(70.0) / 70.0
+            });
+        let mut preds = vec![12.0, 24.0];
+        let theta = vec![];
+        let eta = vec![];
+        let mut cov = HashMap::new();
+        cov.insert("WT".to_string(), 84.0); // scale = 84/70 = 1.2
+        apply_scaling(
+            &ScalingSpec::ExpressionScale { scale_fn },
+            &theta,
+            &eta,
+            &cov,
+            &mut preds,
+        );
+        assert_relative_eq!(preds[0], 10.0, epsilon = 1e-12); // 12 / 1.2
+        assert_relative_eq!(preds[1], 20.0, epsilon = 1e-12); // 24 / 1.2
     }
 }

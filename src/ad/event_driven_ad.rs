@@ -207,6 +207,7 @@ impl FlatEventTv {
     Const,      // pk_idx_f64
     Const,      // sel_flat
     Const,      // pk_and_err_model
+    Const,      // obs_scale
     Active      // return
 )]
 pub fn individual_nll_event_driven_ad(
@@ -228,6 +229,7 @@ pub fn individual_nll_event_driven_ad(
     pk_idx_f64: &[f64],
     sel_flat: &[f64],
     pk_and_err_model: f64,
+    obs_scale: f64, // `[scaling] obs_scale = K` → conc /= K (1.0 = no-op)
 ) -> f64 {
     let n_eta = eta.len();
     let n_tv = pk_idx_f64.len();
@@ -382,7 +384,8 @@ pub fn individual_nll_event_driven_ad(
         // line-search trial steps.
         let v_safe = ev_v.abs() + 1e-30;
         let conc_raw = central_amt / v_safe;
-        let conc = (conc_raw + conc_raw.abs()) * 0.5;
+        let conc_clamped = (conc_raw + conc_raw.abs()) * 0.5;
+        let conc = conc_clamped / obs_scale;
 
         let v_resid = residual_variance_ad(error_model_id, conc, sigma_values);
         let cens_active = if cens_f64[obs_idx] > 0.5 { 1.0 } else { 0.0 };
@@ -1161,6 +1164,7 @@ pub fn compute_nll_gradient_event_driven_ad(
     error_model: ErrorModel,
     pk_idx_f64: &[f64],
     sel_flat: &[f64],
+    obs_scale: f64,
 ) -> (f64, Vec<f64>) {
     let n_eta = eta.len();
     let mut d_eta = vec![0.0_f64; n_eta];
@@ -1227,6 +1231,7 @@ pub fn compute_nll_gradient_event_driven_ad(
         pk_idx_f64,
         sel_flat,
         pk_and_err,
+        obs_scale,
         1.0,
     );
 

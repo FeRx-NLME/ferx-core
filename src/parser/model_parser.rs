@@ -838,8 +838,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         let ode_lines = blocks
             .get("odes")
             .ok_or("ODE model requires [odes] block")?;
-        let mut ode_spec =
-            build_ode_spec(ode_lines, &state_names, &obs_cmt_name, &indiv_var_names)?;
+        let mut ode_spec = build_ode_spec(
+            ode_lines,
+            &state_names,
+            obs_cmt_name.as_deref(),
+            &indiv_var_names,
+        )?;
 
         // Parse optional [diffusion] block
         let (diff_var, diff_names, diff_fixed, diff_state_idx) =
@@ -1247,6 +1251,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         parse_warnings: Vec::new(), // populated below
         eta_param_info,
         theta_transform,
+        scaling: ScalingSpec::None,
     };
 
     // ── Optional blocks ──
@@ -1264,6 +1269,87 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // functions can branch without threading bloq_method through every call.
     let mut model = model;
     model.bloq_method = fit_options.bloq_method;
+
+    // ── [scaling] block ──
+    // Parsed after `parse_fit_options` so we can validate the
+    // `ExpressionScale + gradient = ad` combination (which is rejected for
+    // Phase 1 — AD's `obs_scale` Const input is only wired to ScalarScale).
+    if let Some(scaling_lines) = blocks.get("scaling") {
+        let theta_names_for_scaling = model.theta_names.clone();
+        let eta_names_for_scaling = model.eta_names.clone();
+        let indiv_var_names_for_scaling = model.indiv_param_names.clone();
+        let state_names_for_scaling = model
+            .ode_spec
+            .as_ref()
+            .map(|s| s.state_names.clone())
+            .unwrap_or_default();
+        let is_ode_model = model.ode_spec.is_some();
+
+        let (scaling, output_fn) = parse_scaling_block(
+            scaling_lines,
+            &theta_names_for_scaling,
+            &eta_names_for_scaling,
+            &indiv_var_names_for_scaling,
+            &state_names_for_scaling,
+            is_ode_model,
+        )?;
+
+        // Form B + AD is rejected: the analytical AD path threads a single
+        // f64 scale into `individual_nll_ad` as a `Const`, which can't
+        // evaluate an expression that touches theta/eta. (gradient_method
+        // resolution happens at fit time when `Auto` defaults to AD if
+        // `tv_fn.is_some()`, so we conservatively reject both `Ad` and
+        // `Auto` here when ExpressionScale is in play.)
+        let ad_explicit = fit_options.gradient_method == GradientMethod::Ad;
+        let ad_auto_likely = fit_options.gradient_method == GradientMethod::Auto
+            && model.tv_fn.is_some()
+            && cfg!(feature = "autodiff");
+        if matches!(scaling, ScalingSpec::ExpressionScale { .. }) && (ad_explicit || ad_auto_likely)
+        {
+            return Err(
+                "[scaling]: expression-form `obs_scale = <expr>` is not yet supported with AD \
+                 gradients. Add `gradient = fd` to [fit_options], or rewrite as a scalar \
+                 `obs_scale = <number>`."
+                    .into(),
+            );
+        }
+
+        // Form C wiring: store the output_fn on the ODE spec and clear
+        // `obs_cmt_idx` so the readout dispatches through `output_fn`.
+        if let Some(of) = output_fn {
+            // `is_ode_model` guarantees `model.ode_spec.is_some()` here,
+            // and parse_scaling_block already rejects Form C for analytical models.
+            let ode_spec = model.ode_spec.as_mut().expect("guarded by is_ode_model");
+            ode_spec.output_fn = Some(of);
+            ode_spec.obs_cmt_idx = None;
+        }
+
+        model.scaling = scaling;
+    }
+
+    // ODE validation: exactly one of obs_cmt / output_fn must be set on
+    // any compiled ODE model. `parse_ode_structural` accepts both forms;
+    // the only invalid path is omitting obs_cmt without supplying
+    // [scaling] y = <expr>.
+    if let Some(ref ode_spec) = model.ode_spec {
+        if ode_spec.obs_cmt_idx.is_none() && ode_spec.output_fn.is_none() {
+            return Err(
+                "ODE model omitted `obs_cmt=...` in [structural_model] but no \
+                 [scaling] y = <expr> was provided. Either add `obs_cmt=NAME` or supply Form C."
+                    .into(),
+            );
+        }
+        // SDE + Form C is rejected: EKF requires a single observable
+        // compartment index for the Kalman update.
+        if ode_spec.obs_cmt_idx.is_none() && model.diffusion_theta_start.is_some() {
+            return Err(
+                "[scaling] y = <expr> (Form C) is not supported on SDE models — the \
+                 [diffusion] / EKF path requires a single observable compartment index. \
+                 Use `obs_cmt=NAME` in [structural_model] and (optionally) `obs_scale = K`."
+                    .into(),
+            );
+        }
+    }
 
     // Warn when eta-referencing individual parameters are assigned inside
     // if-blocks and therefore excluded from mu-referencing. Users should
@@ -1671,21 +1757,223 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
     Ok(true)
 }
 
+// ── [scaling] block parser ──────────────────────────────────────────────────
+
+/// Parse a single scalar expression from `value` using the existing
+/// recursive-descent expression parser. Used by `parse_scaling_block` for
+/// `obs_scale = <expr>` and `y = <expr>` lines.
+fn parse_scalar_expression(value: &str, ctx: ParseCtx<'_>) -> Result<Expression, String> {
+    let toks = tokenize(value)?;
+    let toks = strip_newlines_in_groups(toks);
+    let pos = skip_newlines(&toks, 0);
+    let (expr, p) = parse_add_sub(&toks, pos, ctx)?;
+    let p = skip_newlines(&toks, p);
+    if p != toks.len() {
+        return Err(format!("trailing tokens after expression: `{}`", value));
+    }
+    Ok(expr)
+}
+
+/// Walk an expression tree and reject any `Variable` reference. Used to
+/// enforce the Phase-1 restriction that `obs_scale = <expr>` (Form B) cannot
+/// reference individual parameters — only theta/eta/covariates.
+fn reject_variable_refs(expr: &Expression, where_msg: &str) -> Result<(), String> {
+    match expr {
+        Expression::Variable(name) => Err(format!(
+            "[scaling]: `{}` references individual parameter `{}`. \
+             Form B (obs_scale = <expr>) supports thetas, etas, and covariates only \
+             in Phase 1; refer to the underlying theta (e.g. `TVV`) or use Form C \
+             (`y = <expr>` on an ODE model) for individual-parameter access.",
+            where_msg, name
+        )),
+        Expression::BinOp(l, _, r) => {
+            reject_variable_refs(l, where_msg)?;
+            reject_variable_refs(r, where_msg)
+        }
+        Expression::UnaryFn(_, a) => reject_variable_refs(a, where_msg),
+        Expression::Power(b, e) => {
+            reject_variable_refs(b, where_msg)?;
+            reject_variable_refs(e, where_msg)
+        }
+        Expression::Conditional(_, t, e) => {
+            reject_variable_refs(t, where_msg)?;
+            reject_variable_refs(e, where_msg)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Parsed contents of a `[scaling]` block.
+///
+/// Returns `(ScalingSpec, Option<OdeOutputFn>)`:
+/// - `ScalingSpec` populates `CompiledModel.scaling` (Forms A/B post-multiply).
+/// - `OdeOutputFn` populates `OdeSpec.output_fn` for Form C (`y = <expr>`),
+///   replacing the default state-index readout inside the ODE timeline loop.
+///
+/// `is_ode = true` enables Form C and lets expressions reference state names.
+/// Validation:
+/// - Unknown keys are rejected.
+/// - `y = ...` on an analytical model is rejected.
+/// - Form B (expression `obs_scale`) cannot reference individual parameters
+///   in Phase 1 — see `reject_variable_refs`.
+#[allow(clippy::too_many_arguments)]
+fn parse_scaling_block(
+    lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    state_names: &[String],
+    is_ode: bool,
+) -> Result<(ScalingSpec, Option<crate::ode::OdeOutputFn>), String> {
+    let mut scaling = ScalingSpec::None;
+    let mut output_fn: Option<crate::ode::OdeOutputFn> = None;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(2, '=').map(|s| s.trim()).collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "[scaling]: expected `key = value`, got: `{}`",
+                trimmed
+            ));
+        }
+        let (key, value) = (parts[0], parts[1]);
+
+        match key {
+            "obs_scale" => {
+                if !matches!(scaling, ScalingSpec::None) {
+                    return Err("[scaling]: duplicate `obs_scale` key".into());
+                }
+                // Try scalar first (Form A). Otherwise parse as expression (Form B).
+                if let Ok(k) = value.parse::<f64>() {
+                    if k == 0.0 || !k.is_finite() {
+                        return Err(format!(
+                            "[scaling]: obs_scale must be a non-zero finite value, got `{}`",
+                            value
+                        ));
+                    }
+                    scaling = ScalingSpec::ScalarScale(k);
+                } else {
+                    let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+                    let expr = parse_scalar_expression(value, ctx)
+                        .map_err(|e| format!("[scaling] obs_scale: {}", e))?;
+                    // Phase 1 restriction: no individual-parameter refs in
+                    // Form B — the closure has no path to evaluate them
+                    // without re-running the pk_param_fn (deferred to phase 2).
+                    reject_variable_refs(&expr, "obs_scale")?;
+                    let scale_fn: ScaleFn = Box::new(
+                        move |theta: &[f64],
+                              eta: &[f64],
+                              covariates: &HashMap<String, f64>|
+                              -> f64 {
+                            let empty_vars: HashMap<String, f64> = HashMap::new();
+                            let empty_nn: Vec<Vec<f64>> = Vec::new();
+                            eval_expression(&expr, theta, eta, covariates, &empty_vars, &empty_nn)
+                        },
+                    );
+                    scaling = ScalingSpec::ExpressionScale { scale_fn };
+                }
+            }
+            "y" => {
+                if !is_ode {
+                    return Err("[scaling]: `y = <expr>` (Form C) requires an ODE model — \
+                         use `obs_scale = <expr>` for analytical PK"
+                        .into());
+                }
+                if output_fn.is_some() {
+                    return Err("[scaling]: duplicate `y` key".into());
+                }
+                // Form C: expression references state names + individual parameter
+                // names. Thetas/etas are NOT in scope (they're folded into pk via
+                // pk_param_fn before output_fn is called).
+                let mut defined: Vec<String> = state_names.to_vec();
+                for n in indiv_var_names {
+                    if !defined.iter().any(|d| d == n) {
+                        defined.push(n.clone());
+                    }
+                }
+                let ctx = ParseCtx::ode(&defined);
+                let expr = parse_scalar_expression(value, ctx)
+                    .map_err(|e| format!("[scaling] y: {}", e))?;
+                // Pre-resolve state names → state indices and individual-param
+                // names → positional pk_params_flat slots (ODE writes indiv
+                // params sequentially starting at slot 0; see build_pk_param_fn).
+                let state_idx: HashMap<String, usize> = state_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.clone(), i))
+                    .collect();
+                let indiv_idx: HashMap<String, usize> = indiv_var_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.clone(), i))
+                    .collect();
+                let out_fn: crate::ode::OdeOutputFn = Box::new(
+                    move |state: &[f64],
+                          pk_params_flat: &[f64],
+                          covariates: &HashMap<String, f64>|
+                          -> f64 {
+                        let mut vars: HashMap<String, f64> =
+                            HashMap::with_capacity(state_idx.len() + indiv_idx.len());
+                        for (name, &i) in &state_idx {
+                            if i < state.len() {
+                                vars.insert(name.clone(), state[i]);
+                            }
+                        }
+                        for (name, &i) in &indiv_idx {
+                            if i < pk_params_flat.len() {
+                                vars.insert(name.clone(), pk_params_flat[i]);
+                            }
+                        }
+                        let empty_nn: Vec<Vec<f64>> = Vec::new();
+                        let empty_theta: [f64; 0] = [];
+                        let empty_eta: [f64; 0] = [];
+                        eval_expression(
+                            &expr,
+                            &empty_theta,
+                            &empty_eta,
+                            covariates,
+                            &vars,
+                            &empty_nn,
+                        )
+                    },
+                );
+                output_fn = Some(out_fn);
+            }
+            _ => {
+                return Err(format!("[scaling]: unknown key `{}`", key));
+            }
+        }
+    }
+
+    Ok((scaling, output_fn))
+}
+
 // ── [structural_model] ODE variant parser ───────────────────────────────────
 
-fn parse_ode_structural(lines: &[String]) -> Result<(Vec<String>, String), String> {
-    // ode(obs_cmt=central, states=[depot, central])
-    let re =
+fn parse_ode_structural(lines: &[String]) -> Result<(Vec<String>, Option<String>), String> {
+    // ode(obs_cmt=central, states=[depot, central])   — classic form
+    // ode(states=[depot, central])                    — Form C: requires [scaling] y = ...
+    let with_obs =
         Regex::new(r"ode\(\s*obs_cmt\s*=\s*(\w+)\s*,\s*states\s*=\s*\[([^\]]+)\]\s*\)").unwrap();
+    let without_obs = Regex::new(r"ode\(\s*states\s*=\s*\[([^\]]+)\]\s*\)").unwrap();
     for line in lines {
-        if let Some(caps) = re.captures(line) {
+        if let Some(caps) = with_obs.captures(line) {
             let obs_cmt = caps[1].to_string();
             let states: Vec<String> = caps[2].split(',').map(|s| s.trim().to_string()).collect();
-            return Ok((states, obs_cmt));
+            return Ok((states, Some(obs_cmt)));
+        }
+        if let Some(caps) = without_obs.captures(line) {
+            let states: Vec<String> = caps[1].split(',').map(|s| s.trim().to_string()).collect();
+            return Ok((states, None));
         }
     }
     Err(
-        "Could not parse ODE structural model. Expected: ode(obs_cmt=NAME, states=[...])"
+        "Could not parse ODE structural model. Expected: ode(obs_cmt=NAME, states=[...]) or \
+         ode(states=[...]) with [scaling] y = <expr>"
             .to_string(),
     )
 }
@@ -1967,19 +2255,22 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
 fn build_ode_spec(
     lines: &[String],
     state_names: &[String],
-    obs_cmt_name: &str,
+    obs_cmt_name: Option<&str>,
     indiv_param_names: &[String],
 ) -> Result<crate::ode::OdeSpec, String> {
     let n_states = state_names.len();
-    let obs_cmt_idx = state_names
-        .iter()
-        .position(|s| s == obs_cmt_name)
-        .ok_or_else(|| {
+    // `obs_cmt_idx = None` when the user omitted `obs_cmt` in the ODE form
+    // and supplied a `[scaling] y = <expr>` (Form C) instead — wired in
+    // `parse_full_model` after the scaling block parses.
+    let obs_cmt_idx = match obs_cmt_name {
+        Some(name) => Some(state_names.iter().position(|s| s == name).ok_or_else(|| {
             format!(
                 "Observable compartment '{}' not in states {:?}",
-                obs_cmt_name, state_names
+                name, state_names
             )
-        })?;
+        })?),
+        None => None,
+    };
 
     // For ODE RHS expressions, states + individual params get injected into the
     // `vars` map at eval time, so every bare identifier should resolve to a
@@ -2135,6 +2426,7 @@ fn build_ode_spec(
         n_states,
         state_names: state_names.to_vec(),
         obs_cmt_idx,
+        output_fn: None,
         diffusion_var: Vec::new(),
     })
 }
@@ -6507,7 +6799,7 @@ if (1 > 0) {
             "}".into(),
         ];
         let state_names = vec!["central".to_string()];
-        let result = build_ode_spec(&ode_lines, &state_names, "central", &[]);
+        let result = build_ode_spec(&ode_lines, &state_names, Some("central"), &[]);
         assert!(
             result.is_ok(),
             "same state in different branches must be allowed"
@@ -7525,5 +7817,248 @@ if (1 > 0) {
         );
         // KA = TVKA (plain theta path, unchanged).
         assert!((tvs[2] - theta[0]).abs() < 1e-12);
+    }
+
+    // ── [scaling] block parser tests ────────────────────────────────────────
+
+    /// Analytical 1-cpt IV bolus model template — small enough to compose
+    /// scaling-block variants on top.
+    fn analytical_model_with_scaling(scaling_block: Option<&str>) -> String {
+        let mut s = String::from(
+            "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv_bolus(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 10
+  gradient = fd
+",
+        );
+        if let Some(block) = scaling_block {
+            s.push_str("\n[scaling]\n");
+            s.push_str(block);
+        }
+        s
+    }
+
+    /// ODE 1-cpt oral template — small enough to compose Form C variants.
+    fn ode_model_with_scaling(struct_line: &str, scaling_block: Option<&str>) -> String {
+        let mut s = format!(
+            "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  {struct_line}
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 10
+  gradient = fd
+",
+            struct_line = struct_line
+        );
+        if let Some(block) = scaling_block {
+            s.push_str("\n[scaling]\n");
+            s.push_str(block);
+        }
+        s
+    }
+
+    #[test]
+    fn test_parse_scaling_none() {
+        let src = analytical_model_with_scaling(None);
+        let model = parse_model_string(&src).expect("base model parses");
+        assert!(matches!(model.scaling, ScalingSpec::None));
+    }
+
+    #[test]
+    fn test_parse_scaling_scalar() {
+        let src = analytical_model_with_scaling(Some("  obs_scale = 1000\n"));
+        let model = parse_model_string(&src).expect("scalar scaling parses");
+        match model.scaling {
+            ScalingSpec::ScalarScale(k) => assert!((k - 1000.0).abs() < 1e-12),
+            other => panic!("expected ScalarScale, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_scaling_scalar_rejects_zero() {
+        let src = analytical_model_with_scaling(Some("  obs_scale = 0\n"));
+        let err = parse_model_string(&src).expect_err("obs_scale = 0 must be rejected");
+        assert!(
+            err.to_lowercase().contains("non-zero"),
+            "expected non-zero-divisor error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_expression_with_theta_evaluates() {
+        // `obs_scale = TVV / 10` — references a theta, not an indiv param.
+        let src = analytical_model_with_scaling(Some("  obs_scale = TVV / 10\n"));
+        let model = parse_model_string(&src).expect("expression scaling parses");
+        match model.scaling {
+            ScalingSpec::ExpressionScale { ref scale_fn } => {
+                // TVV = 50 (the parsed default), so scale = 50/10 = 5.
+                let theta = vec![1.0, 50.0]; // [TVCL, TVV]
+                let eta = vec![0.0];
+                let cov = HashMap::new();
+                let s = scale_fn(&theta, &eta, &cov);
+                assert!((s - 5.0).abs() < 1e-12, "expected 5.0, got {}", s);
+            }
+            other => panic!("expected ExpressionScale, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_scaling_expression_uses_covariate() {
+        let src = analytical_model_with_scaling(Some("  obs_scale = WT / 70\n"));
+        let model = parse_model_string(&src).expect("covariate scaling parses");
+        match model.scaling {
+            ScalingSpec::ExpressionScale { ref scale_fn } => {
+                let theta = vec![1.0, 50.0];
+                let eta = vec![0.0];
+                let mut cov = HashMap::new();
+                cov.insert("WT".to_string(), 84.0);
+                let s = scale_fn(&theta, &eta, &cov);
+                assert!((s - 1.2).abs() < 1e-12, "expected 1.2, got {}", s);
+            }
+            other => panic!("expected ExpressionScale, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_scaling_expression_rejects_indiv_param_ref() {
+        // Phase 1 restriction: `V` is an individual parameter — must be rejected
+        // in Form B because the closure has no path to materialize it without
+        // re-running pk_param_fn.
+        let src = analytical_model_with_scaling(Some("  obs_scale = 1000 / V\n"));
+        let err =
+            parse_model_string(&src).expect_err("indiv param ref in obs_scale must be rejected");
+        assert!(
+            err.contains("individual parameter") && err.contains('V'),
+            "expected indiv-param rejection error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_y_on_analytical_errors() {
+        let src = analytical_model_with_scaling(Some("  y = 1000\n"));
+        let err = parse_model_string(&src).expect_err("y on analytical must be rejected");
+        assert!(
+            err.contains("Form C") || err.contains("ODE model"),
+            "expected Form-C-requires-ODE error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_unknown_key_errors() {
+        let src = analytical_model_with_scaling(Some("  foo = 1000\n"));
+        let err = parse_model_string(&src).expect_err("unknown scaling key must be rejected");
+        assert!(
+            err.contains("unknown key") && err.contains("foo"),
+            "expected unknown-key error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_y_form_c_on_ode() {
+        // ODE form C: ode(states=...) without obs_cmt, and `y = central / V`
+        // replaces the readout. Verifies the parse path completes and
+        // output_fn evaluates correctly.
+        let src =
+            ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V\n"));
+        let model = parse_model_string(&src).expect("Form C parses");
+        let ode = model.ode_spec.as_ref().expect("ODE spec present");
+        assert!(ode.obs_cmt_idx.is_none(), "Form C clears obs_cmt_idx");
+        let out_fn = ode.output_fn.as_ref().expect("Form C sets output_fn");
+
+        // ODE writes indiv params sequentially into pk_params_flat[0..n] in
+        // declaration order: [CL, V, KA] -> pk[0..3]. State order: [depot,
+        // central] -> state[0..2]. So y = central / V = state[1] / pk[1].
+        let state = vec![0.0, 100.0]; // depot=0, central=100
+        let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+        pk[0] = 1.0; // CL
+        pk[1] = 50.0; // V
+        pk[2] = 1.0; // KA
+        let cov = HashMap::new();
+        let y = out_fn(&state, &pk, &cov);
+        assert!((y - 2.0).abs() < 1e-12, "expected 100/50 = 2, got {}", y);
+    }
+
+    #[test]
+    fn test_parse_scaling_y_requires_scaling_block_for_missing_obs_cmt() {
+        // ODE without obs_cmt and no [scaling] y = ... must error.
+        let src = ode_model_with_scaling("ode(states=[depot, central])", None);
+        let err = parse_model_string(&src)
+            .expect_err("ODE without obs_cmt and without Form C must error");
+        assert!(
+            err.contains("obs_cmt") || err.contains("Form C"),
+            "expected validation error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_scalar_on_ode_keeps_obs_cmt() {
+        // Form A on an ODE model should preserve obs_cmt and apply post-multiply.
+        let src = ode_model_with_scaling(
+            "ode(obs_cmt=central, states=[depot, central])",
+            Some("  obs_scale = 1000\n"),
+        );
+        let model = parse_model_string(&src).expect("Form A on ODE parses");
+        let ode = model.ode_spec.as_ref().expect("ODE spec present");
+        assert_eq!(ode.obs_cmt_idx, Some(1));
+        assert!(ode.output_fn.is_none());
+        assert!(matches!(model.scaling, ScalingSpec::ScalarScale(k) if (k - 1000.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn test_parse_scaling_expression_rejects_ad_gradient() {
+        // Form B + gradient = ad must error with clear message.
+        let base = analytical_model_with_scaling(Some("  obs_scale = TVV / 10\n"));
+        // Replace `gradient = fd` with `gradient = ad`.
+        let src = base.replace("gradient = fd", "gradient = ad");
+        let err =
+            parse_model_string(&src).expect_err("ExpressionScale + gradient = ad must be rejected");
+        assert!(
+            err.to_lowercase().contains("expression") && err.contains("gradient = fd"),
+            "expected gradient=fd hint, got: {}",
+            err
+        );
     }
 }

@@ -587,6 +587,73 @@ pub struct EtaParamInfo {
 /// PK parameter function: maps (theta, eta, covariates) -> PkParams
 pub type PkParamFn = Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> PkParams + Send + Sync>;
 
+/// Closure signature for `[scaling] obs_scale = <expr>` (Form B). Receives
+/// `(theta, eta, covariates)` and returns the per-subject scale factor used
+/// to divide the raw prediction. Mirrors the surface of `PkParamFn` so the
+/// parser can build it with the same machinery.
+pub type ScaleFn = Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
+
+/// How the structural model's raw output is mapped to the observed `DV`.
+///
+/// Set by the `[scaling]` block in `.ferx` model files. The convention is
+/// **divisive**: `pred_scaled = pred_raw / scale`. This matches the natural
+/// reading of `obs_scale = V/1000` as "divide amount by V/1000 to get
+/// concentration in the user's units."
+///
+/// Forms A/B (this enum) post-multiply analytical and ODE predictions
+/// uniformly at the end of the prediction dispatcher. Form C (ODE-only
+/// `y = <expr>`) is handled inside the ODE timeline loop via
+/// `OdeSpec::output_fn` instead — it replaces the state readout entirely,
+/// so it doesn't share the post-multiply path.
+pub enum ScalingSpec {
+    /// No scaling: prediction is returned as-is.
+    None,
+    /// Constant divisor applied to every prediction.
+    ScalarScale(f64),
+    /// Per-subject divisor evaluated from `(theta, eta, covariates)`.
+    /// Used for expressions like `obs_scale = 1000 / V`.
+    ExpressionScale { scale_fn: ScaleFn },
+}
+
+impl Default for ScalingSpec {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl ScalingSpec {
+    /// Returns the per-subject scalar divisor for the AD path.
+    /// `None` → 1.0 (no-op). `ScalarScale(k)` → `k`. `ExpressionScale` is
+    /// rejected at parse time when the model resolves `gradient_method == Ad`,
+    /// so the AD path never sees it — returns `1.0` with a debug assertion
+    /// rather than evaluating the closure (which would need theta/eta and
+    /// defeat the AD entry-point signature anyway).
+    #[inline]
+    pub fn scalar_for_ad(&self) -> f64 {
+        match self {
+            Self::None => 1.0,
+            Self::ScalarScale(k) => *k,
+            Self::ExpressionScale { .. } => {
+                debug_assert!(
+                    false,
+                    "ExpressionScale with AD must be rejected at parse time"
+                );
+                1.0
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for ScalingSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "ScalingSpec::None"),
+            Self::ScalarScale(k) => write!(f, "ScalingSpec::ScalarScale({})", k),
+            Self::ExpressionScale { .. } => write!(f, "ScalingSpec::ExpressionScale {{ .. }}"),
+        }
+    }
+}
+
 /// Associates an ETA with its mu-referencing anchor theta.
 #[derive(Debug, Clone)]
 pub struct MuRef {
@@ -740,6 +807,11 @@ pub struct CompiledModel {
     /// the optimizer vector like any other theta.
     #[cfg(feature = "nn")]
     pub covariate_nns: Vec<crate::nn::CovariateNn>,
+    /// How the structural model's raw output is mapped to the observed `DV`.
+    /// Default `ScalingSpec::None` preserves the historical behaviour where
+    /// the prediction is returned unchanged. Forms A/B from the `[scaling]`
+    /// block populate this field; Form C lives on `ode_spec.output_fn`.
+    pub scaling: ScalingSpec,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -1648,7 +1720,8 @@ pub(crate) mod test_helpers {
                     rhs: Box::new(|_y, _p, _t, _dy| {}),
                     n_states: 2,
                     state_names: vec!["depot".into(), "central".into()],
-                    obs_cmt_idx: 0,
+                    obs_cmt_idx: Some(0),
+                    output_fn: None,
                     diffusion_var: Vec::new(),
                 })
             } else {
@@ -1662,6 +1735,7 @@ pub(crate) mod test_helpers {
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
             covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
         }
     }
 }
