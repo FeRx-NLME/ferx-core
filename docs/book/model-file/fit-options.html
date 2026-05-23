@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-25ae7740.js";
+            window.path_to_searchindex_js = "../searchindex-45bc66c5.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-e4fdb3a6.js"></script>
@@ -228,8 +228,8 @@
 <tbody>
 <tr><td><code>n_exploration</code></td><td><code>150</code></td><td>Phase 1 iterations (step size = 1)</td></tr>
 <tr><td><code>n_convergence</code></td><td><code>250</code></td><td>Phase 2 iterations (step size = 1/k)</td></tr>
-<tr><td><code>n_mh_steps</code></td><td><code>3</code></td><td>Metropolis-Hastings steps per subject per iteration</td></tr>
-<tr><td><code>n_leapfrog</code></td><td><code>0</code></td><td>Leapfrog steps per HMC proposal (0 = use MH; see below)</td></tr>
+<tr><td><code>n_mh_steps</code></td><td><code>3</code></td><td>Metropolis-Hastings steps per subject per iteration. When <code>n_leapfrog &gt; 0</code>, this applies to subjects that fall back to MH (see below); HMC subjects use one proposal per iteration regardless.</td></tr>
+<tr><td><code>n_leapfrog</code></td><td><code>0</code></td><td>Leapfrog steps per HMC proposal (0 = use MH; see below). When &gt; 0, subjects for which HMC is unavailable (ODE model, missing analytical PK path, non-finite Ω, unsupported TV-cov path) fall back to MH using <code>n_mh_steps</code> proposals.</td></tr>
 <tr><td><code>adapt_interval</code></td><td><code>50</code></td><td>Iterations between step-size adaptation</td></tr>
 <tr><td><code>seed</code></td><td><code>12345</code></td><td>RNG seed for reproducibility</td></tr>
 </tbody>
@@ -404,7 +404,7 @@ warnings.</p>
 <tr><td><code>step_accepted</code></td><td>GN</td><td>Whether the GN step was accepted</td></tr>
 <tr><td><code>cond_nll</code></td><td>SAEM</td><td>Conditional observation NLL</td></tr>
 <tr><td><code>gamma</code></td><td>SAEM</td><td>SAEM step-size (1 in exploration, 1/k in convergence)</td></tr>
-<tr><td><code>mh_accept_rate</code></td><td>SAEM</td><td>Mean Metropolis-Hastings acceptance rate across subjects</td></tr>
+<tr><td><code>mh_accept_rate</code></td><td>SAEM</td><td>Mean acceptance rate across all subjects (MH or HMC). In mixed HMC/MH runs (<code>n_leapfrog &gt; 0</code> with some MH-fallback subjects) this is an aggregate across both samplers.</td></tr>
 <tr><td><code>n_ebe_unconverged</code></td><td>FOCE/FOCEI</td><td>Subjects whose inner optimizer did not converge</td></tr>
 <tr><td><code>n_ebe_fallback</code></td><td>FOCE/FOCEI</td><td>Subjects that fell back to Nelder-Mead</td></tr>
 </tbody>

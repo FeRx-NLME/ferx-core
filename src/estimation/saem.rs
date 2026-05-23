@@ -32,6 +32,8 @@ struct SaemState {
     step_scales: Vec<f64>,
     /// Per-subject acceptance counts since last adaptation
     accept_counts: Vec<usize>,
+    /// Per-subject proposal counts since last adaptation (1 for HMC, n_mh_steps for MH)
+    proposal_counts: Vec<usize>,
     /// Steps since last adaptation
     steps_since_adapt: usize,
     /// SA sufficient statistic for Omega: running average of (1/N) Σ ηᵢηᵢᵀ
@@ -560,7 +562,6 @@ pub fn run_saem(
                 .to_string(),
         );
     }
-    let n_proposals_per_iter = if using_hmc { 1_usize } else { n_mh_steps };
     let target_accept_rate = if using_hmc { 0.65_f64 } else { 0.40_f64 };
 
     // Initialize state
@@ -665,6 +666,7 @@ pub fn run_saem(
         nll_cache,
         step_scales,
         accept_counts: vec![0; n_subjects],
+        proposal_counts: vec![0; n_subjects],
         steps_since_adapt: 0,
         s2,
         theta: theta_cur,
@@ -711,7 +713,7 @@ pub fn run_saem(
             let sigma_ref = &state.sigma_vals;
             let omega_ref = &omega_k;
 
-            let results: Vec<(Vec<f64>, f64, usize)> = state
+            let results: Vec<(Vec<f64>, f64, usize, usize)> = state
                 .etas
                 .par_iter()
                 .zip(state.nll_cache.par_iter())
@@ -744,7 +746,7 @@ pub fn run_saem(
                                     sigma_ref, scale, n_leapfrog, &mut rng,
                                 )
                             {
-                                return (new_eta, new_nll, accepted as usize);
+                                return (new_eta, new_nll, accepted as usize, 1_usize);
                             }
                         }
                         let (n_acc, nll_new) = mh_steps(
@@ -760,15 +762,16 @@ pub fn run_saem(
                             n_mh_steps,
                             pk_scratch,
                         );
-                        (eta_work, nll_new, n_acc)
+                        (eta_work, nll_new, n_acc, n_mh_steps)
                     },
                 )
                 .collect();
 
-            for (i, (eta_new, nll_new, n_acc)) in results.into_iter().enumerate() {
+            for (i, (eta_new, nll_new, n_acc, n_prop)) in results.into_iter().enumerate() {
                 state.etas[i] = eta_new;
                 state.nll_cache[i] = nll_new;
                 state.accept_counts[i] += n_acc;
+                state.proposal_counts[i] += n_prop;
             }
         }
         state.steps_since_adapt += 1;
@@ -954,14 +957,18 @@ pub fn run_saem(
         // ---- Adapt MH step sizes ----
         if state.steps_since_adapt >= adapt_interval {
             for i in 0..n_subjects {
-                let rate =
-                    state.accept_counts[i] as f64 / (n_proposals_per_iter * adapt_interval) as f64;
+                // Use the actual per-subject proposal count as the denominator so
+                // that MH-fallback subjects in HMC mode (which run n_mh_steps
+                // proposals) are not scaled by the HMC denominator of 1.
+                let total_proposals = state.proposal_counts[i].max(1);
+                let rate = state.accept_counts[i] as f64 / total_proposals as f64;
                 if rate > target_accept_rate {
                     state.step_scales[i] = (state.step_scales[i] * 1.1).min(5.0);
                 } else {
                     state.step_scales[i] = (state.step_scales[i] * 0.9).max(0.01);
                 }
                 state.accept_counts[i] = 0;
+                state.proposal_counts[i] = 0;
             }
             state.steps_since_adapt = 0;
         }
@@ -970,10 +977,11 @@ pub fn run_saem(
         {
             let phase = if k <= k1 { "explore" } else { "converge" };
             let cond_nll: f64 = state.nll_cache.iter().sum();
-            // Rolling MH accept rate since the last adapt reset.
-            let steps_so_far = state.steps_since_adapt.max(1);
-            let mh_accept_rate: f64 = state.accept_counts.iter().sum::<usize>() as f64
-                / (n_subjects * n_proposals_per_iter * steps_so_far) as f64;
+            // Rolling accept rate since the last adapt reset (per-subject proposal counts
+            // as denominator so mixed HMC/MH runs report a meaningful rate).
+            let total_proposals: usize = state.proposal_counts.iter().sum();
+            let mh_accept_rate: f64 =
+                state.accept_counts.iter().sum::<usize>() as f64 / total_proposals.max(1) as f64;
 
             if verbose && (k == 1 || k % 50 == 0 || k == n_iter) {
                 eprintln!(

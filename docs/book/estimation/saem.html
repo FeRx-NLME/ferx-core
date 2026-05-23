@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-25ae7740.js";
+            window.path_to_searchindex_js = "../searchindex-45bc66c5.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-e4fdb3a6.js"></script>
@@ -208,7 +208,15 @@
 <p>When <code>n_leapfrog</code> is set to a positive integer (e.g. <code>3</code>), one HMC proposal replaces the <code>n_mh_steps</code> MH proposals per subject per iteration. HMC uses the gradient of the individual NLL to make longer, more directed moves through the posterior:</p>
 <p>\[ H(\eta, p) = \text{NLL}(\eta) + \tfrac{1}{2} |p|^2 \]</p>
 <p>with momentum \( p \sim N(0, I) \) and a standard velocity Störmer-Verlet (leapfrog) integrator. Acceptance is on \( \Delta H \), targeting ~65% acceptance.</p>
-<p><strong>Requirements</strong>: <code>autodiff</code> feature enabled (default) and an analytical PK model (no ODE). Falls back silently to MH for any subject where HMC is unavailable. A warning is emitted if <code>n_leapfrog &gt; 0</code> but the <code>autodiff</code> feature is absent.</p>
+<p><strong>Requirements</strong>: <code>autodiff</code> feature enabled (default) and an analytical PK model (no ODE). A warning is emitted if <code>n_leapfrog &gt; 0</code> but the <code>autodiff</code> feature is absent.</p>
+<p><strong>Per-subject fallback to MH</strong>: <code>hmc_step</code> silently falls back to MH for a subject when any of the following conditions hold:</p>
+<ul>
+<li>The model uses an ODE (<code>[odes]</code> block present)</li>
+<li>The model has no analytical PK path (no <code>tv_fn</code> — pure ODE-only models)</li>
+<li>The Ω matrix has a non-finite log-determinant (degenerate variance)</li>
+<li>The subject has time-varying covariates and either the PK model does not support the event-driven AD path or the model has a lag time</li>
+</ul>
+<p>In a single run with <code>n_leapfrog &gt; 0</code>, different subjects can therefore use different samplers. The acceptance rate reported in verbose output and the optimizer trace is an aggregate across all subjects; in mixed HMC/MH runs the target (65% for HMC, 40% for MH) may not be meaningful for the aggregate. The <code>n_mh_steps</code> option governs the number of proposals for MH-fallback subjects even when <code>n_leapfrog &gt; 0</code>.</p>
 <p>The E-step sampling is parallelized across subjects using Rayon.</p>
 <h3 id="2-stochastic-approximation-update"><a class="header" href="#2-stochastic-approximation-update">2. Stochastic Approximation Update</a></h3>
 <p>Update the sufficient statistic for \( \Omega \):</p>

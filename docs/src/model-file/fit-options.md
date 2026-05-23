@@ -53,8 +53,8 @@ Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP op
 |-----|---------|-------------|
 | `n_exploration` | `150` | Phase 1 iterations (step size = 1) |
 | `n_convergence` | `250` | Phase 2 iterations (step size = 1/k) |
-| `n_mh_steps` | `3` | Metropolis-Hastings steps per subject per iteration |
-| `n_leapfrog` | `0` | Leapfrog steps per HMC proposal (0 = use MH; see below) |
+| `n_mh_steps` | `3` | Metropolis-Hastings steps per subject per iteration. When `n_leapfrog > 0`, this applies to subjects that fall back to MH (see below); HMC subjects use one proposal per iteration regardless. |
+| `n_leapfrog` | `0` | Leapfrog steps per HMC proposal (0 = use MH; see below). When > 0, subjects for which HMC is unavailable (ODE model, missing analytical PK path, non-finite Ω, unsupported TV-cov path) fall back to MH using `n_mh_steps` proposals. |
 | `adapt_interval` | `50` | Iterations between step-size adaptation |
 | `seed` | `12345` | RNG seed for reproducibility |
 
@@ -255,7 +255,7 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | `step_accepted` | GN | Whether the GN step was accepted |
 | `cond_nll` | SAEM | Conditional observation NLL |
 | `gamma` | SAEM | SAEM step-size (1 in exploration, 1/k in convergence) |
-| `mh_accept_rate` | SAEM | Mean Metropolis-Hastings acceptance rate across subjects |
+| `mh_accept_rate` | SAEM | Mean acceptance rate across all subjects (MH or HMC). In mixed HMC/MH runs (`n_leapfrog > 0` with some MH-fallback subjects) this is an aggregate across both samplers. |
 | `n_ebe_unconverged` | FOCE/FOCEI | Subjects whose inner optimizer did not converge |
 | `n_ebe_fallback` | FOCE/FOCEI | Subjects that fell back to Nelder-Mead |
 

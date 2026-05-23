@@ -55,7 +55,15 @@ When `n_leapfrog` is set to a positive integer (e.g. `3`), one HMC proposal repl
 
 with momentum \\( p \sim N(0, I) \\) and a standard velocity Störmer-Verlet (leapfrog) integrator. Acceptance is on \\( \Delta H \\), targeting ~65% acceptance.
 
-**Requirements**: `autodiff` feature enabled (default) and an analytical PK model (no ODE). Falls back silently to MH for any subject where HMC is unavailable. A warning is emitted if `n_leapfrog > 0` but the `autodiff` feature is absent.
+**Requirements**: `autodiff` feature enabled (default) and an analytical PK model (no ODE). A warning is emitted if `n_leapfrog > 0` but the `autodiff` feature is absent.
+
+**Per-subject fallback to MH**: `hmc_step` silently falls back to MH for a subject when any of the following conditions hold:
+- The model uses an ODE (`[odes]` block present)
+- The model has no analytical PK path (no `tv_fn` — pure ODE-only models)
+- The Ω matrix has a non-finite log-determinant (degenerate variance)
+- The subject has time-varying covariates and either the PK model does not support the event-driven AD path or the model has a lag time
+
+In a single run with `n_leapfrog > 0`, different subjects can therefore use different samplers. The acceptance rate reported in verbose output and the optimizer trace is an aggregate across all subjects; in mixed HMC/MH runs the target (65% for HMC, 40% for MH) may not be meaningful for the aggregate. The `n_mh_steps` option governs the number of proposals for MH-fallback subjects even when `n_leapfrog > 0`.
 
 The E-step sampling is parallelized across subjects using Rayon.
 

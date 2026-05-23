@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-25ae7740.js";
+            window.path_to_searchindex_js = "searchindex-45bc66c5.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-e4fdb3a6.js"></script>
@@ -1775,8 +1775,8 @@ for comparison.</li>
 <tbody>
 <tr><td><code>n_exploration</code></td><td><code>150</code></td><td>Phase 1 iterations (step size = 1)</td></tr>
 <tr><td><code>n_convergence</code></td><td><code>250</code></td><td>Phase 2 iterations (step size = 1/k)</td></tr>
-<tr><td><code>n_mh_steps</code></td><td><code>3</code></td><td>Metropolis-Hastings steps per subject per iteration</td></tr>
-<tr><td><code>n_leapfrog</code></td><td><code>0</code></td><td>Leapfrog steps per HMC proposal (0 = use MH; see below)</td></tr>
+<tr><td><code>n_mh_steps</code></td><td><code>3</code></td><td>Metropolis-Hastings steps per subject per iteration. When <code>n_leapfrog &gt; 0</code>, this applies to subjects that fall back to MH (see below); HMC subjects use one proposal per iteration regardless.</td></tr>
+<tr><td><code>n_leapfrog</code></td><td><code>0</code></td><td>Leapfrog steps per HMC proposal (0 = use MH; see below). When &gt; 0, subjects for which HMC is unavailable (ODE model, missing analytical PK path, non-finite Ω, unsupported TV-cov path) fall back to MH using <code>n_mh_steps</code> proposals.</td></tr>
 <tr><td><code>adapt_interval</code></td><td><code>50</code></td><td>Iterations between step-size adaptation</td></tr>
 <tr><td><code>seed</code></td><td><code>12345</code></td><td>RNG seed for reproducibility</td></tr>
 </tbody>
@@ -1951,7 +1951,7 @@ warnings.</p>
 <tr><td><code>step_accepted</code></td><td>GN</td><td>Whether the GN step was accepted</td></tr>
 <tr><td><code>cond_nll</code></td><td>SAEM</td><td>Conditional observation NLL</td></tr>
 <tr><td><code>gamma</code></td><td>SAEM</td><td>SAEM step-size (1 in exploration, 1/k in convergence)</td></tr>
-<tr><td><code>mh_accept_rate</code></td><td>SAEM</td><td>Mean Metropolis-Hastings acceptance rate across subjects</td></tr>
+<tr><td><code>mh_accept_rate</code></td><td>SAEM</td><td>Mean acceptance rate across all subjects (MH or HMC). In mixed HMC/MH runs (<code>n_leapfrog &gt; 0</code> with some MH-fallback subjects) this is an aggregate across both samplers.</td></tr>
 <tr><td><code>n_ebe_unconverged</code></td><td>FOCE/FOCEI</td><td>Subjects whose inner optimizer did not converge</td></tr>
 <tr><td><code>n_ebe_fallback</code></td><td>FOCE/FOCEI</td><td>Subjects that fell back to Nelder-Mead</td></tr>
 </tbody>
@@ -2262,7 +2262,15 @@ warnings.</p>
 <p>When <code>n_leapfrog</code> is set to a positive integer (e.g. <code>3</code>), one HMC proposal replaces the <code>n_mh_steps</code> MH proposals per subject per iteration. HMC uses the gradient of the individual NLL to make longer, more directed moves through the posterior:</p>
 <p>\[ H(\eta, p) = \text{NLL}(\eta) + \tfrac{1}{2} |p|^2 \]</p>
 <p>with momentum \( p \sim N(0, I) \) and a standard velocity Störmer-Verlet (leapfrog) integrator. Acceptance is on \( \Delta H \), targeting ~65% acceptance.</p>
-<p><strong>Requirements</strong>: <code>autodiff</code> feature enabled (default) and an analytical PK model (no ODE). Falls back silently to MH for any subject where HMC is unavailable. A warning is emitted if <code>n_leapfrog &gt; 0</code> but the <code>autodiff</code> feature is absent.</p>
+<p><strong>Requirements</strong>: <code>autodiff</code> feature enabled (default) and an analytical PK model (no ODE). A warning is emitted if <code>n_leapfrog &gt; 0</code> but the <code>autodiff</code> feature is absent.</p>
+<p><strong>Per-subject fallback to MH</strong>: <code>hmc_step</code> silently falls back to MH for a subject when any of the following conditions hold:</p>
+<ul>
+<li>The model uses an ODE (<code>[odes]</code> block present)</li>
+<li>The model has no analytical PK path (no <code>tv_fn</code> — pure ODE-only models)</li>
+<li>The Ω matrix has a non-finite log-determinant (degenerate variance)</li>
+<li>The subject has time-varying covariates and either the PK model does not support the event-driven AD path or the model has a lag time</li>
+</ul>
+<p>In a single run with <code>n_leapfrog &gt; 0</code>, different subjects can therefore use different samplers. The acceptance rate reported in verbose output and the optimizer trace is an aggregate across all subjects; in mixed HMC/MH runs the target (65% for HMC, 40% for MH) may not be meaningful for the aggregate. The <code>n_mh_steps</code> option governs the number of proposals for MH-fallback subjects even when <code>n_leapfrog &gt; 0</code>.</p>
 <p>The E-step sampling is parallelized across subjects using Rayon.</p>
 <h3 id="2-stochastic-approximation-update"><a class="header" href="#2-stochastic-approximation-update">2. Stochastic Approximation Update</a></h3>
 <p>Update the sufficient statistic for \( \Omega \):</p>

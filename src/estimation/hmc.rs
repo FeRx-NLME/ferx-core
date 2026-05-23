@@ -151,7 +151,7 @@ pub fn hmc_step(
 
     // Build the gradient closure for leapfrog.  Two paths depending on whether
     // the subject has time-varying covariates.
-    let (eta_prop, p_prop, nll_prop) = if subject.has_tv_covariates() {
+    let (p_init, eta_prop, p_prop, nll_prop) = if subject.has_tv_covariates() {
         // Event-driven AD path — required for TV-covariate subjects.
         if !event_driven_ad::supports_event_driven_ad(model.pk_model) || model.has_lagtime() {
             return None;
@@ -219,13 +219,13 @@ pub fn hmc_step(
 
     // Metropolis accept/reject on ΔH = H_curr − H_prop.
     // H = NLL(η) + ½‖p‖²  (identity mass matrix).
-    let kinetic_curr = 0.5 * eta_prop.iter().map(|&p| p * p).sum::<f64>();
-    let kinetic_prop = 0.5 * p_prop.iter().map(|&p| p * p).sum::<f64>();
+    let kinetic_curr = 0.5 * p_init.iter().map(|&x| x * x).sum::<f64>();
+    let kinetic_prop = 0.5 * p_prop.iter().map(|&x| x * x).sum::<f64>();
     let delta_h = nll_current + kinetic_curr - nll_prop - kinetic_prop;
 
     let log_u: f64 = rng.gen::<f64>().ln();
     if log_u < delta_h {
-        Some((p_prop, nll_prop, true)) // accepted: advance to proposal
+        Some((eta_prop, nll_prop, true)) // accepted: advance to proposal
     } else {
         Some((eta.to_vec(), nll_current, false)) // rejected: stay put
     }
@@ -241,9 +241,9 @@ mod tests {
 
     /// 1-D harmonic oscillator: NLL(q) = ½q², grad = q.
     /// H(q, p) = ½q² + ½p² is analytically conserved.
-    /// Verlet discretisation error is O(ε² L), so with ε = 0.1, L = 10:
-    /// expected |ΔH| < (0.1)² × 10 × max(H) ≈ 0.1 × H, well below 0.01
-    /// for the chosen initial condition (H₀ ≈ 0.5).
+    /// Symplectic integrators have O(ε²) *bounded* global energy error —
+    /// it does not grow with L.  With ε = 0.1 and H₀ ≈ 0.5 the expected
+    /// |ΔH| is well below 0.01.
     #[test]
     fn test_leapfrog_energy_conservation() {
         let grad_fn = |q: &[f64]| vec![q[0]]; // ∂(½q²)/∂q = q
