@@ -1,4 +1,5 @@
 pub mod gauss_newton;
+pub(crate) mod hmc;
 pub mod importance_sampling;
 pub mod inner_optimizer;
 pub mod outer_optimizer;

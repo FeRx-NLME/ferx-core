@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-b02da9c0.js";
+            window.path_to_searchindex_js = "../searchindex-25ae7740.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3a934816.js"></script>
+        <script src="../toc-e4fdb3a6.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -238,7 +238,7 @@
 <tr><th>Algorithm</th><th>Key</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td>Trust region</td><td><code>trust_region</code></td><td>Newton trust-region with Steihaug conjugate-gradient subproblem. Uses the AD-based outer gradient (<code>subject_nll_pop_grad</code>) and a BHHH approximate Hessian <code>H ≈ 4 Σ gᵢgᵢᵀ</code> — always positive semi-definite, so the Steihaug subproblem stays well-conditioned. The CG budget defaults to <code>ceil(sqrt(n_params)).clamp(5, n_params)</code> (typically 5 for standard NLME models); pin it explicitly with <code>steihaug_max_iters</code>.</td></tr>
+<tr><td>Trust region</td><td><code>trust_region</code></td><td>Newton trust-region with Steihaug conjugate-gradient subproblem. Uses a finite-difference Hessian of the OFV-at-fixed-EBEs. Tune the CG budget with <code>steihaug_max_iters</code> (default 50).</td></tr>
 </tbody>
 </table>
 </div>
@@ -264,7 +264,7 @@
 <li>The maximum number of iterations (<code>maxiter</code>) is reached</li>
 <li>The optimizer reports convergence (NLopt <code>XtolReached</code> or <code>FtolReached</code>)</li>
 </ul>
-<p>The inner loop terminates when the gradient norm falls below <code>inner_tol</code> (default <code>1e-4</code>, matching NONMEM’s ~3 SIGDIGITS inner-loop precision — see <a href="../model-file/fit-options.html#general-options"><code>fit-options.md</code></a> for tuning guidance) or <code>inner_maxiter</code> (default 200) iterations are reached.</p>
+<p>The inner loop terminates when the gradient norm falls below <code>inner_tol</code> (default 1e-8) or <code>inner_maxiter</code> (default 200) iterations are reached.</p>
 <h2 id="warm-starting"><a class="header" href="#warm-starting">Warm Starting</a></h2>
 <p>The inner loop warm-starts EBE estimation from the previous outer iteration’s EBEs. This significantly reduces computation time, especially in later iterations when parameters change slowly.</p>
 <h2 id="configuration-example"><a class="header" href="#configuration-example">Configuration Example</a></h2>

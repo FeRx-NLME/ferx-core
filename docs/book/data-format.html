@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-b02da9c0.js";
+            window.path_to_searchindex_js = "searchindex-25ae7740.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-3a934816.js"></script>
+        <script src="toc-e4fdb3a6.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -302,12 +302,6 @@
 1,0.5,25.3,0,.,.,.,.,0
 </code></pre>
 <p>This assumes the subject has reached steady state with 100 units every 12 hours before the observation at TIME=0.5.</p>
-<p>SS=1 is supported on every prediction path: analytical (1-/2-/3-cpt with
-or without time-varying covariates) and ODE. SS=1 also composes with
-<code>LAGTIME</code> — the lagged SS curve at time <code>t</code> equals the un-lagged curve
-at <code>t - lagtime</code>. See <a href="model-file/steady-state.html">Steady-State Doses</a>
-for the full reference, including the data-validation warnings emitted
-for malformed rows (missing <code>II</code>, overlapping infusions).</p>
 <h2 id="multiple-doses"><a class="header" href="#multiple-doses">Multiple Doses</a></h2>
 <p>Multiple doses are supported as separate rows:</p>
 <pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,MDV

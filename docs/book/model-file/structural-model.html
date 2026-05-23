@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-b02da9c0.js";
+            window.path_to_searchindex_js = "../searchindex-25ae7740.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3a934816.js"></script>
+        <script src="../toc-e4fdb3a6.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -196,13 +196,9 @@
 <tr><td><code>two_cpt_iv_bolus</code></td><td>2</td><td>IV bolus</td><td><code>cl</code>, <code>v1</code>, <code>q</code>, <code>v2</code></td></tr>
 <tr><td><code>two_cpt_oral</code></td><td>2</td><td>Oral</td><td><code>cl</code>, <code>v1</code>, <code>q</code>, <code>v2</code>, <code>ka</code></td></tr>
 <tr><td><code>two_cpt_infusion</code></td><td>2</td><td>IV infusion</td><td><code>cl</code>, <code>v1</code>, <code>q</code>, <code>v2</code></td></tr>
-<tr><td><code>three_cpt_iv_bolus</code></td><td>3</td><td>IV bolus</td><td><code>cl</code>, <code>v1</code>, <code>q2</code>, <code>v2</code>, <code>q3</code>, <code>v3</code></td></tr>
-<tr><td><code>three_cpt_oral</code></td><td>3</td><td>Oral</td><td><code>cl</code>, <code>v1</code>, <code>q2</code>, <code>v2</code>, <code>q3</code>, <code>v3</code>, <code>ka</code></td></tr>
-<tr><td><code>three_cpt_infusion</code></td><td>3</td><td>IV infusion</td><td><code>cl</code>, <code>v1</code>, <code>q2</code>, <code>v2</code>, <code>q3</code>, <code>v3</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>Each model has a <code>three_compartment_*</code> long-form alias (e.g. <code>three_compartment_iv_bolus</code>); the short and long names are interchangeable.</p>
 <h3 id="examples"><a class="header" href="#examples">Examples</a></h3>
 <p>One-compartment oral:</p>
 <pre><code>[structural_model]
@@ -215,10 +211,6 @@
 <p>Two-compartment oral:</p>
 <pre><code>[structural_model]
   pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
-</code></pre>
-<p>Three-compartment IV bolus (note that <code>q2</code>/<code>q3</code> and <code>v2</code>/<code>v3</code> distinguish the two peripheral compartments):</p>
-<pre><code>[structural_model]
-  pk three_cpt_iv_bolus(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
 </code></pre>
 <h3 id="bioavailability"><a class="header" href="#bioavailability">Bioavailability</a></h3>
 <p>For oral models, bioavailability (F) defaults to 1.0. To estimate it, define an <code>F</code> parameter in <code>[individual_parameters]</code> – it will be automatically used by the oral PK functions.</p>
@@ -243,16 +235,7 @@
 <pre><code>[structural_model]
   ode(obs_cmt=COMPARTMENT_NAME, states=[state1, state2, ...])
 </code></pre>
-<p>When the observable is a derived quantity (e.g. amount / V), use the
-amount-only ODE form and supply <code>[scaling] y = &lt;expr&gt;</code>:</p>
-<pre><code>[structural_model]
-  ode(states=[depot, central])
-
-[scaling]
-  y = central / V
-</code></pre>
-<p>See <a href="ode-models.html">ODE Models</a> for full ODE syntax and
-<a href="scaling.html">Scaling</a> for the <code>[scaling]</code> block.</p>
+<p>See <a href="ode-models.html">ODE Models</a> for full ODE syntax.</p>
 
                     </main>
 

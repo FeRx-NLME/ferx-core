@@ -36,10 +36,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-b02da9c0.js";
+            window.path_to_searchindex_js = "searchindex-25ae7740.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-3a934816.js"></script>
+        <script src="toc-e4fdb3a6.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -1022,13 +1022,9 @@ PARAM = THETA + ETA                   # additive
 <tr><td><code>two_cpt_iv_bolus</code></td><td>2</td><td>IV bolus</td><td><code>cl</code>, <code>v1</code>, <code>q</code>, <code>v2</code></td></tr>
 <tr><td><code>two_cpt_oral</code></td><td>2</td><td>Oral</td><td><code>cl</code>, <code>v1</code>, <code>q</code>, <code>v2</code>, <code>ka</code></td></tr>
 <tr><td><code>two_cpt_infusion</code></td><td>2</td><td>IV infusion</td><td><code>cl</code>, <code>v1</code>, <code>q</code>, <code>v2</code></td></tr>
-<tr><td><code>three_cpt_iv_bolus</code></td><td>3</td><td>IV bolus</td><td><code>cl</code>, <code>v1</code>, <code>q2</code>, <code>v2</code>, <code>q3</code>, <code>v3</code></td></tr>
-<tr><td><code>three_cpt_oral</code></td><td>3</td><td>Oral</td><td><code>cl</code>, <code>v1</code>, <code>q2</code>, <code>v2</code>, <code>q3</code>, <code>v3</code>, <code>ka</code></td></tr>
-<tr><td><code>three_cpt_infusion</code></td><td>3</td><td>IV infusion</td><td><code>cl</code>, <code>v1</code>, <code>q2</code>, <code>v2</code>, <code>q3</code>, <code>v3</code></td></tr>
 </tbody>
 </table>
 </div>
-<p>Each model has a <code>three_compartment_*</code> long-form alias (e.g. <code>three_compartment_iv_bolus</code>); the short and long names are interchangeable.</p>
 <h3 id="examples"><a class="header" href="#examples">Examples</a></h3>
 <p>One-compartment oral:</p>
 <pre><code>[structural_model]
@@ -1041,10 +1037,6 @@ PARAM = THETA + ETA                   # additive
 <p>Two-compartment oral:</p>
 <pre><code>[structural_model]
   pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
-</code></pre>
-<p>Three-compartment IV bolus (note that <code>q2</code>/<code>q3</code> and <code>v2</code>/<code>v3</code> distinguish the two peripheral compartments):</p>
-<pre><code>[structural_model]
-  pk three_cpt_iv_bolus(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
 </code></pre>
 <h3 id="bioavailability"><a class="header" href="#bioavailability">Bioavailability</a></h3>
 <p>For oral models, bioavailability (F) defaults to 1.0. To estimate it, define an <code>F</code> parameter in <code>[individual_parameters]</code> – it will be automatically used by the oral PK functions.</p>
@@ -1069,16 +1061,7 @@ PARAM = THETA + ETA                   # additive
 <pre><code>[structural_model]
   ode(obs_cmt=COMPARTMENT_NAME, states=[state1, state2, ...])
 </code></pre>
-<p>When the observable is a derived quantity (e.g. amount / V), use the
-amount-only ODE form and supply <code>[scaling] y = &lt;expr&gt;</code>:</p>
-<pre><code>[structural_model]
-  ode(states=[depot, central])
-
-[scaling]
-  y = central / V
-</code></pre>
-<p>See <a href="#ode-models-1">ODE Models</a> for full ODE syntax and
-<a href="#scaling">Scaling</a> for the <code>[scaling]</code> block.</p>
+<p>See <a href="#ode-models-1">ODE Models</a> for full ODE syntax.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="lagtime-1"><a class="header" href="#lagtime-1">Lagtime</a></h1>
 <p>A <code>lagtime</code> PK parameter shifts the effective start of every dose record by
@@ -1151,227 +1134,13 @@ yields a negative value, predictions will treat the dose as effective
 before its record time. Prefer a log-link (<code>exp(...)</code>) or any other
 parameterisation that keeps <code>lagtime ≥ 0</code>. ferx emits a warning in
 <code>FitResult.warnings</code> when the initial typical-value lagtime is negative.</li>
-<li>Steady-state doses (<code>SS=1</code>) combined with non-zero <code>lagtime</code> are
-fully supported. Under linear superposition the lagged SS curve at
-time <code>t</code> equals the un-lagged SS curve evaluated at <code>t - lagtime</code>,
-i.e. <code>C_ss(t, L) = C_ss(t - L, 0)</code>. See
-<a href="#steady-state-doses-ss1">Steady-State Doses</a> for the full SS=1 reference.</li>
+<li>Steady-state doses (<code>SS=1</code>) combined with non-zero <code>lagtime</code> are not
+currently supported; the SS train is treated as unshifted, with only
+the post-SS continuation lagged. ferx emits a warning in
+<code>FitResult.warnings</code> when any subject has both an <code>SS=1</code> dose record
+and a model with declared <code>LAGTIME</code>. Tracked as a follow-up.</li>
 </ul>
 <p>See <code>examples/oral_with_lagtime.ferx</code> for a runnable model.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="steady-state-doses-ss1"><a class="header" href="#steady-state-doses-ss1">Steady-State Doses (SS=1)</a></h1>
-<p>A dose record with <code>SS=1</code> and <code>II &gt; 0</code> tells ferx-core that, at the time
-of the record, the compartmental state is at steady state under repeated
-dosing of that amount/rate every <code>II</code> time units. The record itself is
-treated as one of the pulses in the train.</p>
-<p>This matches the NONMEM <code>SS=1</code> semantic: the compartments are initialised
-to the value that would arise from an infinite-past pulse train at
-interval <code>II</code>. Subsequent observations decay from that loaded state under
-the model’s normal dynamics; the SS train is <strong>not</strong> implicitly continued
-past the SS dose record. To continue dosing forward in time, add explicit
-dose records (the typical clinical pattern is one <code>SS=1</code> “loading” row
-followed by any number of probe observations).</p>
-<h2 id="dataset-columns"><a class="header" href="#dataset-columns">Dataset columns</a></h2>
-<p>A steady-state row uses two NONMEM-format columns: <code>SS</code> and <code>II</code>.</p>
-<pre><code>ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS
-1,0,.,1,100,1,0,1,24,1     # SS=1: at SS under q24h dosing of AMT=100
-1,1,4.18,0,.,1,0,0,.,.
-1,4,3.86,0,.,1,0,0,.,.
-1,12,1.78,0,.,1,0,0,.,.
-1,23,0.59,0,.,1,0,0,.,.
-</code></pre>
-<p><code>II</code> is the dosing interval. For a bolus row (<code>RATE=0</code>) and an
-infusion row (<code>RATE&gt;0</code>), <code>SS=1</code> works the same way — the steady-state
-state is computed from the corresponding single-dose response repeated
-every <code>II</code>.</p>
-<h2 id="supported-prediction-paths"><a class="header" href="#supported-prediction-paths">Supported prediction paths</a></h2>
-<p>Every prediction path in ferx-core honours <code>SS=1</code>:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Path</th><th>Where</th><th>How</th></tr>
-</thead>
-<tbody>
-<tr><td>Analytical (1-/2-/3-cpt, no TV covariates)</td><td><code>predict_concentration</code> in <code>src/pk/mod.rs</code></td><td>Closed-form geometric-series</td></tr>
-<tr><td>Analytical (1-/2-/3-cpt, time-varying covariates)</td><td><code>event_driven_predictions_with_schedule</code> in <code>src/pk/event_driven.rs</code></td><td>Numerical pulse expansion via the propagator</td></tr>
-<tr><td>ODE (<code>[odes]</code>-block models)</td><td><code>ode_predictions</code> / <code>ode_predictions_event_driven</code> in <code>src/ode/predictions.rs</code></td><td>Numerical pulse expansion via the RK45 solver</td></tr>
-</tbody>
-</table>
-</div>
-<p>Both kinds of paths start from the same underlying identity — the
-choice between them is a question of whether the geometric series has
-a closed form for the model in question.</p>
-<h3 id="analytical-path-closed-form-geometric-series"><a class="header" href="#analytical-path-closed-form-geometric-series">Analytical path: closed-form geometric series</a></h3>
-<p>For linear analytical PK (1-/2-/3-cpt), the single-dose response is a
-sum of exponentials with known eigenvalues. The steady-state series</p>
-<pre><code>C_ss(τ) = Σ_{n=0}^∞ C_single(τ + n·II)
-</code></pre>
-<p>collapses per eigenvalue: every exponential <code>A·exp(-λ·t)</code> in the
-single-dose response contributes a steady-state amplitude
-<code>A·exp(-λ·τ) / (1 - exp(-λ·II))</code>. ferx evaluates this exactly — no
-iteration, single-pass cost equivalent to evaluating the single-dose
-formula plus one extra division per eigenvalue. For oral models when
-<code>KA ≈ λ</code> the closed form needs the L’Hopital limit; ferx handles that
-case automatically.</p>
-<h3 id="ode-path-brute-force-pulse-expansion"><a class="header" href="#ode-path-brute-force-pulse-expansion">ODE path: brute-force pulse expansion</a></h3>
-<p>An <code>[odes]</code>-block model is an arbitrary user-defined RHS. There is no
-general eigenstructure to exploit — <code>dy/dt = f(y, p, t)</code> can be
-non-linear (Michaelis-Menten elimination), time-varying, or both, so
-no closed form exists for the steady-state state in general.</p>
-<p>Instead, ferx evaluates the geometric series <em>numerically</em> before the
-SS dose is applied. The algorithm in <code>equilibrate_ss_state</code> is exactly
-what its name says — brute-force pulse expansion:</p>
-<ol>
-<li><strong>Reset</strong> the compartment state to zero. NONMEM <code>SS=1</code> semantics
-say prior dynamics are discarded at the SS dose, so anything that
-happened earlier in the timeline is overwritten here.</li>
-<li><strong>Loop <code>N = 50</code> cycles</strong>:
-<ul>
-<li><strong>Apply the dose</strong> for one cycle:
-<ul>
-<li>For a bolus, add <code>AMT</code> (with bioavailability <code>F1</code> applied) to
-the dose’s compartment.</li>
-<li>For an infusion, integrate for <code>T_inf = AMT/RATE</code> with a
-wrapped RHS that adds <code>+RATE</code> to the dose’s compartment.</li>
-</ul>
-</li>
-<li><strong>Propagate</strong> the ODE forward by the remainder of the cycle (<code>II</code>
-for boluses, <code>II - T_inf</code> for infusions). Same RK45 solver as the
-normal timeline, same tolerances, same wrapped-infusion mechanics.</li>
-</ul>
-</li>
-<li>After the loop, the compartment state equals the “just-before-the-
-next-pulse” steady-state amount.</li>
-<li>Normal-timeline handling resumes — the SS dose’s own pulse is
-applied through the standard bolus/infusion code path, taking the
-state from pre-pulse to at-pulse SS.</li>
-</ol>
-<p>The result is mathematically equivalent to the analytical closed form
-in the linear case (and is unit-tested against it — see
-<code>ode_ss_iv_bolus_matches_analytical_ss</code> in <code>src/ode/predictions.rs</code>
-for the 1-cpt cross-check). For non-linear PK, the same scheme still
-produces a self-consistent steady-state state under the model’s own
-dynamics; just be aware that for systems that <em>don’t</em> have a true
-periodic steady state (e.g. zero-order elimination at saturation),
-the iteration may not converge to anything meaningful and SS=1 isn’t
-really applicable.</p>
-<h3 id="why-n--50"><a class="header" href="#why-n--50">Why <code>N = 50</code>?</a></h3>
-<p>The truncation tail after <code>N</code> cycles is bounded by <code>exp(-N·λ·II)</code> for
-each disposition rate <code>λ</code>. For typical PK
-(<code>λ·II ≈ 2</code>, i.e. ~3 half-lives per dosing interval),
-<code>exp(-100) ≈ 4e-44</code> — well below any meaningful precision. For very
-slow PK (<code>λ·II = 0.1</code>, ~14 half-lives total over the 50 cycles),
-<code>exp(-5) ≈ 7e-3</code> — the slowest realistic case. ferx uses fixed
-<code>N = 50</code> rather than adaptive convergence checking because (a) the
-bound is conservative and (b) skipping the convergence check keeps
-the hot path branch-free for AD compatibility.</p>
-<p>If you need tighter accuracy for an unusually slow PK, the constant
-lives at <code>SS_EQUILIBRATION_CYCLES</code> in <code>src/ode/predictions.rs</code> and
-<code>EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES</code> in <code>src/pk/event_driven.rs</code>.</p>
-<h3 id="cost-comparison"><a class="header" href="#cost-comparison">Cost comparison</a></h3>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Path</th><th>Per SS-dose cost</th><th>Notes</th></tr>
-</thead>
-<tbody>
-<tr><td>Analytical closed</td><td>~1 single-dose evaluation</td><td>Effectively free</td></tr>
-<tr><td>Event-driven pulse</td><td>~50× analytical propagator calls</td><td>Still cheap; analytical propagator is fast</td></tr>
-<tr><td>ODE pulse</td><td>~50× RK45 segment integrations</td><td>Real cost — RK45 is the dominant per-prediction cost for ODE models, so SS doses cost ~50× more than non-SS doses</td></tr>
-</tbody>
-</table>
-</div>
-<p>SS doses are typically rare (one per subject at the start of a
-maintenance regimen), so the absolute overhead per fit iteration is
-modest even for ODE models. If a benchmark shows SS equilibration as
-a hot spot, an adaptive <code>N</code> (loop until <code>||state - prev|| / ||state|| &lt; tol</code>) is the obvious follow-up — it would early-exit on fast PK.</p>
-<h2 id="dsl-example-1"><a class="header" href="#dsl-example-1">DSL example</a></h2>
-<p>No new DSL syntax is required — the model file is identical to a
-single-dose model. SS is a property of the <strong>dataset</strong>:</p>
-<pre><code>[parameters]
-  theta TVCL(2.5, 0.01, 50.0)
-  theta TVV(15.0, 0.5, 200.0)
-  theta TVKA(1.0, 0.05, 20.0)
-
-  omega ETA_CL ~ 0.05
-  omega ETA_V  ~ 0.05
-  omega ETA_KA ~ 0.1
-
-  sigma PROP_ERR ~ 0.02 (sd)
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-
-[fit_options]
-  method  = foce
-  maxiter = 100
-</code></pre>
-<p>Combine with the SS=1 dataset above and run:</p>
-<pre><code>cargo run --release -- examples/ss_oral_q24.ferx --data data/ss_oral_q24.csv
-</code></pre>
-<p>A runnable example pair ships in the repository at
-<code>examples/ss_oral_q24.ferx</code> + <code>data/ss_oral_q24.csv</code>.</p>
-<h2 id="combining-with-lagtime"><a class="header" href="#combining-with-lagtime">Combining with <code>LAGTIME</code></a></h2>
-<p><code>LAGTIME</code> shifts each pulse in the SS train, including the SS pulse
-itself. Under linear superposition this satisfies the identity</p>
-<pre><code>C_ss(τ, L) = C_ss(τ - L, 0)   for τ &gt; L
-</code></pre>
-<p>i.e. the lagged SS curve is just the un-lagged SS curve shifted in time.
-ferx-core enforces this exactly — declaring <code>LAGTIME</code> on a steady-state
-model is fully supported across all paths.</p>
-<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
-<p>For the following malformed configurations, ferx-core skips the SS
-pre-equilibration (treating the dose as a single, non-SS bolus or
-infusion) and emits a warning in <code>FitResult.warnings</code>. The predictions
-in these cases are <em>not</em> zero — the dose is still applied through the
-normal flow — but the system isn’t actually at steady state at the
-dose time, so don’t interpret the fit as a steady-state fit.</p>
-<ul>
-<li><strong><code>SS=1</code> with <code>II ≤ 0</code></strong> — interval is required for SS predictions.
-The SS branch is gated on <code>dose.ii &gt; 0</code>, so the dose falls through
-to the single-dose path. Set <code>II</code> in the dataset or remove the
-<code>SS=1</code> flag.</li>
-<li><strong><code>SS=1</code> infusion with <code>T_inf &gt; II</code></strong> (overlapping pulses) — no
-closed-form solution or pulse-expansion scheme covers this. The SS
-pre-equilibration returns a zero preload and the dose is then
-applied as a single infusion. Use a shorter infusion (<code>T_inf ≤ II</code>)
-or model overlapping infusions with an <code>[odes]</code> block and explicit
-periodic dose records (without <code>SS=1</code>).</li>
-</ul>
-<h3 id="ss2"><a class="header" href="#ss2"><code>SS=2</code></a></h3>
-<p>NONMEM’s <code>SS=2</code> semantic (“add to the existing train without
-re-equilibrating”) is <strong>not implemented</strong>. The CSV reader accepts any
-positive integer in the <code>SS</code> column and treats it as a boolean: an
-<code>SS=2</code> row is parsed identically to <code>SS=1</code> and goes through the
-re-equilibration path described above. This is not bit-for-bit
-NONMEM-compatible for datasets that distinguish <code>SS=1</code> and <code>SS=2</code>
-records — convert <code>SS=2</code> rows to explicit dose records if the
-no-re-equilibration semantic is required.</p>
-<h2 id="nonmem-equivalence-1"><a class="header" href="#nonmem-equivalence-1">NONMEM equivalence</a></h2>
-<ul>
-<li><code>SS=1</code>, <code>II=24</code>, <code>AMT=100</code>, <code>RATE=0</code> → matches NONMEM SS=1 bolus.</li>
-<li><code>SS=1</code>, <code>II=24</code>, <code>AMT=100</code>, <code>RATE=25</code> → matches NONMEM SS=1 infusion
-of duration <code>4</code> (= <code>AMT/RATE</code>), repeated every 24 time units.</li>
-<li>The SS state is computed assuming the same <code>CL</code>, <code>V</code>, etc. as the
-current PK record — i.e. ferx uses the <strong>current</strong> subject’s
-parameters, not a separate “SS parameters” set. This matches
-NONMEM’s <code>$PK</code> evaluation convention.</li>
-</ul>
-<h2 id="validation"><a class="header" href="#validation">Validation</a></h2>
-<p>Closed-form SS expressions are unit-tested against 200- to 400-term
-numerical pulse sums at 1e-9 relative tolerance (see
-<code>src/pk/one_compartment.rs::tests::test_ss_*</code>, similarly for 2-cpt and
-3-cpt). The ODE and event-driven paths are cross-checked against the
-analytical closed forms in their own test modules. The end-to-end fit
-path is covered by <code>tests/ss_fit_smoke.rs</code>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="error-model"><a class="header" href="#error-model">Error Model</a></h1>
 <p>The <code>[error_model]</code> block defines the residual error structure, specifying how observed data (DV) relates to model predictions.</p>
@@ -1549,151 +1318,12 @@ of <code>0</code>.</p>
 a <code>[diffusion]</code> block to your ODE model.  See <a href="#stochastic-differential-equations-sde--diffusion">Stochastic Differential
 Equations</a> for a full description, worked example, and comparison
 with sigma and omega.</p>
-<h2 id="limitations-1"><a class="header" href="#limitations-1">Limitations</a></h2>
+<h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
 <ul>
 <li>The observable compartment contains the amount (not concentration). Divide by volume in the ODE equations if needed</li>
+<li>Steady-state (<code>SS=1</code>) is not directly supported for ODE models</li>
 <li>SDE (<code>[diffusion]</code>) is not compatible with SAEM or the autodiff gradient path</li>
 </ul>
-<p>Steady-state (<code>SS=1</code>) is supported for ODE models via numerical
-pulse-expansion equilibration — see <a href="#steady-state-doses-ss1">Steady-State Doses</a>
-for the mechanism and how it differs from the analytical closed forms.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="scaling"><a class="header" href="#scaling">Scaling</a></h1>
-<p>The optional <code>[scaling]</code> block declares how the structural model’s raw
-output maps to the observed <code>DV</code>. It exists so the user does not have to
-fold unit conversion or amount-to-concentration arithmetic into the
-structural model itself — keeping <code>[odes]</code> and <code>[structural_model]</code>
-readable, and making mixed-unit data (e.g. data in ng/mL when the model
-thinks in mg/L) straightforward.</p>
-<p>The convention is <strong>divisive</strong>: <code>pred_scaled = pred_raw / scale</code>. This
-matches the natural reading of <code>obs_scale = V/1000</code> as <em>“divide amount by
-V/1000 to get concentration in the user’s units.”</em></p>
-<p>Three forms are supported. Each is optional; omitting <code>[scaling]</code> keeps
-the historical “raw prediction equals DV” behaviour.</p>
-<h2 id="form-a--scalar-divisor"><a class="header" href="#form-a--scalar-divisor">Form A — scalar divisor</a></h2>
-<p>Use for fixed unit conversion (e.g. mg/L → mg/mL is a constant 1000).</p>
-<pre><code class="language-ferx">[scaling]
-  obs_scale = 1000
-</code></pre>
-<p>Applies to analytical PK models and ODE models alike: every prediction
-is divided by the constant before reaching the residual error model.</p>
-<h2 id="form-b--expression-divisor"><a class="header" href="#form-b--expression-divisor">Form B — expression divisor</a></h2>
-<p>Use when the scale depends on theta, eta, or a covariate.</p>
-<pre><code class="language-ferx">[scaling]
-  obs_scale = WT / 70
-</code></pre>
-<p>Expressions may reference:</p>
-<ul>
-<li>thetas (e.g. <code>TVV</code>),</li>
-<li>etas (e.g. <code>ETA_CL</code>),</li>
-<li>covariates (e.g. <code>WT</code>, <code>CR</code>),</li>
-<li>individual parameters declared in <code>[individual_parameters]</code> (e.g.
-<code>V</code>, <code>CL</code>) — these are resolved from a subject-static evaluation of
-<code>pk_param_fn</code> at scale-evaluation time, so <code>obs_scale = 1000 / V</code>
-uses the per-subject V (typical value times the EBE eta).</li>
-</ul>
-<p>The scale is evaluated <strong>once per subject</strong> with subject-level
-covariates (matching the no-TV path). Time-varying covariate support for
-expression scales is a Phase 1.5 follow-up.</p>
-<h2 id="form-c--explicit-output-expression-ode-only"><a class="header" href="#form-c--explicit-output-expression-ode-only">Form C — explicit output expression (ODE only)</a></h2>
-<p>Use when the ODE state is held as an amount and the observation is a
-concentration. Form C replaces the default <code>obs_cmt</code> readout entirely.</p>
-<pre><code class="language-ferx">[structural_model]
-  ode(states=[depot, central])     # no obs_cmt — Form C provides it
-
-[odes]
-  d/dt(depot)   = -KA * depot
-  d/dt(central) = KA * depot - CL/V * central   # central holds amount
-
-[scaling]
-  y = central / V
-</code></pre>
-<p>The right-hand side may reference state names (<code>depot</code>, <code>central</code>),
-individual parameters (<code>CL</code>, <code>V</code>, <code>KA</code>), thetas (<code>TVCL</code>), etas
-(<code>ETA_CL</code>), and covariates (<code>WT</code>). All five name classes are looked up
-at evaluation time — states from the ODE solver, individual parameters
-from the subject-static <code>pk_param_fn</code>, and thetas/etas/covariates from
-the values supplied by the caller.</p>
-<p>Form C is only valid for ODE models. The parser rejects <code>y = ...</code> on
-analytical models with a clear error.</p>
-<h2 id="runtime-behaviour-on-bad-scales"><a class="header" href="#runtime-behaviour-on-bad-scales">Runtime behaviour on bad scales</a></h2>
-<p>If an expression scale (Form B or C) evaluates to a non-positive or
-non-finite value at runtime — for example <code>WT / 70</code> when <code>WT</code> is missing
-(reads 0) or <code>1 / (TVV - x)</code> near a singularity — every prediction for
-that subject is set to <code>NaN</code>. The outer NLL then evaluates to <code>NaN</code> and
-the optimizer rejects the step. This matches established NLM convention
-(NONMEM’s <code>OBJFN = NaN</code> → step rejection) and surfaces bad scales in
-the per-subject diagnostics rather than silently producing a mis-scaled
-fit.</p>
-<h2 id="comparison-with-nonmem-and-nlmixr2"><a class="header" href="#comparison-with-nonmem-and-nlmixr2">Comparison with NONMEM and nlmixr2</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Need</th><th>NONMEM</th><th>nlmixr2</th><th>ferx</th></tr>
-</thead>
-<tbody>
-<tr><td>Scalar unit conversion</td><td><code>S1 = 1000</code></td><td>(multiplier in <code>cmt</code>/<code>f</code>)</td><td><code>[scaling] obs_scale = 1000</code></td></tr>
-<tr><td>Amount-state ODE with concentration DV</td><td><code>S2 = V/1000</code> plus <code>Y = A(2)/S2</code></td><td><code>cmt(central); f = central/V/1000</code></td><td><code>[scaling] y = central / (V/1000)</code></td></tr>
-</tbody>
-</table>
-</div>
-<p>The ferx form is divisive by convention, so an <code>obs_scale = V/1000</code>
-reads as “divide raw by V/1000” — matching NONMEM’s <code>S2</code>.</p>
-<h2 id="interaction-with-gradients-ad-vs-fd"><a class="header" href="#interaction-with-gradients-ad-vs-fd">Interaction with gradients (AD vs FD)</a></h2>
-<ul>
-<li>Scalar <code>obs_scale = K</code> works with both <code>gradient = ad</code> and
-<code>gradient = fd</code>. The constant is threaded through the AD entry points
-as a <code>Const</code> argument.</li>
-<li>Expression <code>obs_scale = &lt;expr&gt;</code> is supported only with
-<code>gradient = fd</code> in Phase 1. The parser rejects the combination of
-expression scaling with AD gradients and prints the required flag.</li>
-</ul>
-<h2 id="interaction-with-sde--diffusion"><a class="header" href="#interaction-with-sde--diffusion">Interaction with SDE / <code>[diffusion]</code></a></h2>
-<p>In Phase 1, <code>[scaling]</code> is <strong>not supported</strong> on SDE models. The EKF /
-Kalman update computes both the predicted mean and the prediction
-covariance <code>p_obs</code> in the observation space, and the per-observation
-<code>r_obs</code> callback evaluates the residual variance from that predicted
-mean. Forms A/B post-multiply only the mean, so the EKF variance would
-remain in the unscaled space — producing mis-scaled OFVs.</p>
-<p>A correct SDE+scaling integration needs the scale factor threaded into
-both the EKF <code>p_obs</code> propagation (scales by <code>1/K²</code>) and the residual
-variance callback. That’s a wider change deferred to Phase 1.5. Until
-then, the parser rejects any <code>[scaling]</code> block on a model with a
-<code>[diffusion]</code> block (Forms A, B, and C alike).</p>
-<h2 id="multi-analyte--per-cmt-scaling"><a class="header" href="#multi-analyte--per-cmt-scaling">Multi-analyte / per-CMT scaling</a></h2>
-<p>For models that observe multiple compartments (parent + metabolite,
-sum-of-moieties, free vs. total, …), specify a separate scale per
-observed CMT using the <code>obs_scale[CMT=N]</code> (Forms A/B) or <code>y[CMT=N]</code>
-(Form C) syntax. <code>N</code> is the 1-based CMT index from the data file’s
-<code>CMT</code> column.</p>
-<pre><code class="language-ferx">[scaling]
-  obs_scale[CMT=1] = 1000    # parent in mg/L → mg/mL
-  obs_scale[CMT=2] = 1       # metabolite already in target units
-</code></pre>
-<p>Form C (ODE) per-CMT:</p>
-<pre><code class="language-ferx">[structural_model]
-  ode(states=[depot, parent, metab])
-
-[scaling]
-  y[CMT=1] = parent / V_parent
-  y[CMT=2] = metab  / V_metab
-</code></pre>
-<p><strong>Coverage rule</strong> — every CMT that has at least one observation in the
-data must have a matching <code>[CMT=N]</code> entry. The parser only checks
-syntax; the fit-time validation (run automatically at the top of
-<code>fit()</code>) errors with a list of the missing CMTs:</p>
-<pre><code>[scaling]: per-CMT scaling is missing entries for observed CMTs [2, 3].
-Every observed CMT must have an `obs_scale[CMT=N]` (or `y[CMT=N]` for ODE) entry.
-</code></pre>
-<p><strong>Mixing rule</strong> — the uniform form (<code>obs_scale = K</code>) and the per-CMT
-form (<code>obs_scale[CMT=N] = K</code>) are mutually exclusive within the same
-group. The parser rejects mixing them so the user is explicit about
-intent. The same rule applies to <code>y</code> and <code>y[CMT=N]</code>.</p>
-<p><strong>Gradients</strong> — per-CMT scaling forces <code>gradient = fd</code>. The AD path
-takes a single <code>Const</code> scale factor per subject; supporting per-CMT
-scales under AD requires threading per-observation scale arrays through
-the AD entry points and is deferred to a future PR. Parser rejects
-<code>PerCmt + gradient = ad</code> with a <code>gradient = fd</code> hint.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="stochastic-differential-equations-sde--diffusion"><a class="header" href="#stochastic-differential-equations-sde--diffusion">Stochastic Differential Equations (SDE / Diffusion)</a></h1>
 <p>The <code>[diffusion]</code> block adds continuous stochastic noise to ODE state variables.
@@ -2107,7 +1737,7 @@ for comparison.</li>
 <tr><th>Key</th><th>Values</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>method</code></td><td><code>foce</code>, <code>focei</code>, <code>saem</code>, <code>imp</code> (only as final chain stage)</td><td><code>focei</code></td><td>Estimation method (or single-stage method in a chain). See <a href="#chained-fits">chained fits</a>.</td></tr>
+<tr><td><code>method</code></td><td><code>foce</code>, <code>focei</code>, <code>saem</code></td><td><code>focei</code></td><td>Estimation method</td></tr>
 <tr><td><code>maxiter</code></td><td>integer</td><td><code>500</code></td><td>Maximum outer loop iterations</td></tr>
 <tr><td><code>covariance</code></td><td><code>true</code>, <code>false</code></td><td><code>true</code></td><td>Compute covariance matrix and standard errors</td></tr>
 <tr><td><code>optimizer</code></td><td><code>slsqp</code>, <code>lbfgs</code>, <code>nlopt_lbfgs</code>, <code>mma</code>, <code>bfgs</code>, <code>bobyqa</code>, <code>trust_region</code></td><td><code>slsqp</code></td><td>Optimization algorithm</td></tr>
@@ -2146,7 +1776,8 @@ for comparison.</li>
 <tr><td><code>n_exploration</code></td><td><code>150</code></td><td>Phase 1 iterations (step size = 1)</td></tr>
 <tr><td><code>n_convergence</code></td><td><code>250</code></td><td>Phase 2 iterations (step size = 1/k)</td></tr>
 <tr><td><code>n_mh_steps</code></td><td><code>3</code></td><td>Metropolis-Hastings steps per subject per iteration</td></tr>
-<tr><td><code>adapt_interval</code></td><td><code>50</code></td><td>Iterations between MH step-size adaptation</td></tr>
+<tr><td><code>n_leapfrog</code></td><td><code>0</code></td><td>Leapfrog steps per HMC proposal (0 = use MH; see below)</td></tr>
+<tr><td><code>adapt_interval</code></td><td><code>50</code></td><td>Iterations between step-size adaptation</td></tr>
 <tr><td><code>seed</code></td><td><code>12345</code></td><td>RNG seed for reproducibility</td></tr>
 </tbody>
 </table>
@@ -2169,32 +1800,6 @@ for comparison.</li>
 </table>
 </div>
 <p>See <a href="#sampling-importance-resampling-sir">SIR documentation</a> for details.</p>
-<h2 id="importance-sampling-imp"><a class="header" href="#importance-sampling-imp">Importance Sampling (IMP)</a></h2>
-<p>The <code>imp</code> stage estimates the marginal log-likelihood by Monte-Carlo
-importance sampling, giving a lower-bias <code>−2 log L</code> than the FOCE/Laplace
-OFV when subject posteriors of η are non-Gaussian (e.g. sparsely-sampled
-PK). Use it as a final chain stage:</p>
-<pre><code>[fit_options]
-  method        = [focei, imp]
-  is_samples    = 1000
-  is_proposal_df = 5
-  is_seed       = 12345
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Key</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>is_samples</code></td><td><code>1000</code></td><td>Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE.</td></tr>
-<tr><td><code>is_proposal_df</code></td><td><code>5.0</code></td><td>Student-t proposal degrees of freedom (≥ 1). Lower = heavier tails.</td></tr>
-<tr><td><code>is_seed</code></td><td><code>42</code></td><td>RNG seed. Same seed → identical <code>−2 log L</code>.</td></tr>
-<tr><td><code>is_low_ess_threshold</code></td><td><code>0.1</code></td><td>Subjects with normalized ESS below this fraction get flagged in the result. Set <code>0</code> to silence.</td></tr>
-</tbody>
-</table>
-</div>
-<p>See <a href="#importance-sampling-imp-1">Importance Sampling documentation</a>
-for the algorithm, IOV caveats, and tuning guidance.</p>
 <h2 id="optimizer-choices"><a class="header" href="#optimizer-choices">Optimizer Choices</a></h2>
 <div class="table-wrapper">
 <table>
@@ -2514,7 +2119,7 @@ warnings.</p>
 <tr><th>Algorithm</th><th>Key</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td>Trust region</td><td><code>trust_region</code></td><td>Newton trust-region with Steihaug conjugate-gradient subproblem. Uses the AD-based outer gradient (<code>subject_nll_pop_grad</code>) and a BHHH approximate Hessian <code>H ≈ 4 Σ gᵢgᵢᵀ</code> — always positive semi-definite, so the Steihaug subproblem stays well-conditioned. The CG budget defaults to <code>ceil(sqrt(n_params)).clamp(5, n_params)</code> (typically 5 for standard NLME models); pin it explicitly with <code>steihaug_max_iters</code>.</td></tr>
+<tr><td>Trust region</td><td><code>trust_region</code></td><td>Newton trust-region with Steihaug conjugate-gradient subproblem. Uses a finite-difference Hessian of the OFV-at-fixed-EBEs. Tune the CG budget with <code>steihaug_max_iters</code> (default 50).</td></tr>
 </tbody>
 </table>
 </div>
@@ -2540,7 +2145,7 @@ warnings.</p>
 <li>The maximum number of iterations (<code>maxiter</code>) is reached</li>
 <li>The optimizer reports convergence (NLopt <code>XtolReached</code> or <code>FtolReached</code>)</li>
 </ul>
-<p>The inner loop terminates when the gradient norm falls below <code>inner_tol</code> (default <code>1e-4</code>, matching NONMEM’s ~3 SIGDIGITS inner-loop precision — see <a href="#general-options"><code>fit-options.md</code></a> for tuning guidance) or <code>inner_maxiter</code> (default 200) iterations are reached.</p>
+<p>The inner loop terminates when the gradient norm falls below <code>inner_tol</code> (default 1e-8) or <code>inner_maxiter</code> (default 200) iterations are reached.</p>
 <h2 id="warm-starting"><a class="header" href="#warm-starting">Warm Starting</a></h2>
 <p>The inner loop warm-starts EBE estimation from the previous outer iteration’s EBEs. This significantly reduces computation time, especially in later iterations when parameters change slowly.</p>
 <h2 id="configuration-example"><a class="header" href="#configuration-example">Configuration Example</a></h2>
@@ -2644,13 +2249,21 @@ warnings.</p>
 <p>Default: 250 iterations.</p>
 <h2 id="per-iteration-steps"><a class="header" href="#per-iteration-steps">Per-Iteration Steps</a></h2>
 <p>Each SAEM iteration consists of:</p>
-<h3 id="1-e-step-metropolis-hastings-sampling"><a class="header" href="#1-e-step-metropolis-hastings-sampling">1. E-Step: Metropolis-Hastings Sampling</a></h3>
-<p>For each subject, run <code>n_mh_steps</code> Metropolis-Hastings iterations to sample from the conditional distribution of random effects:</p>
+<h3 id="1-e-step-sampling"><a class="header" href="#1-e-step-sampling">1. E-Step: Sampling</a></h3>
+<p>For each subject, sample from the conditional distribution of random effects:</p>
 <p>\[ p(\eta_i | y_i, \theta, \Omega, \sigma) \]</p>
-<p><strong>Proposal</strong>: symmetric random walk in deviation space, \( \eta_{\text{prop}} = \eta_{\text{current}} + \delta_i \cdot L \cdot z \), with \( z \sim N(0, I) \) and \( L = \text{chol}(\Omega) \). The schedule is identical across both phases — only the SA step size \( \gamma_k \) changes between exploration and convergence.</p>
+<p>Two samplers are available:</p>
+<h4 id="metropolis-hastings-default-n_leapfrog--0"><a class="header" href="#metropolis-hastings-default-n_leapfrog--0">Metropolis-Hastings (default, <code>n_leapfrog = 0</code>)</a></h4>
+<p>Run <code>n_mh_steps</code> symmetric random-walk MH iterations per subject per SAEM iteration.</p>
+<p><strong>Proposal</strong>: \( \eta_{\text{prop}} = \eta_{\text{current}} + \delta_i \cdot L \cdot z \), with \( z \sim N(0, I) \) and \( L = \text{chol}(\Omega) \). The schedule is identical across both phases — only the SA step size \( \gamma_k \) changes between exploration and convergence.</p>
 <p>The MH kernel is symmetric in \( \eta \), so the proposal density cancels and the acceptance log-ratio is the difference of <code>individual_nll</code> values, which encodes the prior \( N(0, \Omega) \) plus the observation likelihood.</p>
-<p><strong>Acceptance</strong>: Accept with probability \( \min(1, \exp(\text{NLL}<em>{\text{current}} - \text{NLL}</em>{\text{prop}})) \).</p>
-<p>The MH sampling is parallelized across subjects using Rayon.</p>
+<p><strong>Acceptance</strong>: \( \min(1, \exp(\text{NLL}<em>{\text{current}} - \text{NLL}</em>{\text{prop}})) \). Target acceptance rate: 40%.</p>
+<h4 id="hmc-hamiltonian-monte-carlo-n_leapfrog--0"><a class="header" href="#hmc-hamiltonian-monte-carlo-n_leapfrog--0">HMC (Hamiltonian Monte Carlo, <code>n_leapfrog &gt; 0</code>)</a></h4>
+<p>When <code>n_leapfrog</code> is set to a positive integer (e.g. <code>3</code>), one HMC proposal replaces the <code>n_mh_steps</code> MH proposals per subject per iteration. HMC uses the gradient of the individual NLL to make longer, more directed moves through the posterior:</p>
+<p>\[ H(\eta, p) = \text{NLL}(\eta) + \tfrac{1}{2} |p|^2 \]</p>
+<p>with momentum \( p \sim N(0, I) \) and a standard velocity Störmer-Verlet (leapfrog) integrator. Acceptance is on \( \Delta H \), targeting ~65% acceptance.</p>
+<p><strong>Requirements</strong>: <code>autodiff</code> feature enabled (default) and an analytical PK model (no ODE). Falls back silently to MH for any subject where HMC is unavailable. A warning is emitted if <code>n_leapfrog &gt; 0</code> but the <code>autodiff</code> feature is absent.</p>
+<p>The E-step sampling is parallelized across subjects using Rayon.</p>
 <h3 id="2-stochastic-approximation-update"><a class="header" href="#2-stochastic-approximation-update">2. Stochastic Approximation Update</a></h3>
 <p>Update the sufficient statistic for \( \Omega \):</p>
 <p>\[ S_2 \leftarrow (1 - \gamma_k) \cdot S_2 + \gamma_k \cdot \frac{1}{N} \sum_{i=1}^{N} \eta_i \eta_i^T \]</p>
@@ -2666,13 +2279,13 @@ warnings.</p>
 <p>NLopt still runs for any remaining thetas (non-mu-referenced) and for sigma — the closed-form-updated thetas are pinned at their new values for the NLopt call.</p>
 <p>When <code>mu_referencing = false</code>, the full NLopt M-step runs for all thetas as before.</p>
 <p>The number of NLopt evaluations saved is stored in <code>FitResult::saem_mu_ref_m_step_evals_saved</code>, accumulated across SAEM iterations as <code>2 × mstep_maxiter × n_mu_ref_pairs</code> per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at <code>mstep_maxiter</code> NLopt gradient requests). The field is <code>None</code> when mu-referencing is off or method ≠ SAEM.</p>
-<h3 id="5-adaptive-mh-step-sizes"><a class="header" href="#5-adaptive-mh-step-sizes">5. Adaptive MH Step Sizes</a></h3>
-<p>Every <code>adapt_interval</code> iterations, the per-subject step sizes \( \delta_i \) are adjusted:</p>
+<h3 id="5-adaptive-step-sizes"><a class="header" href="#5-adaptive-step-sizes">5. Adaptive Step Sizes</a></h3>
+<p>Every <code>adapt_interval</code> iterations, the per-subject step sizes \( \delta_i \) (MH) or leapfrog step sizes (HMC) are adjusted based on acceptance rate:</p>
 <ul>
-<li>If acceptance rate &gt; 40%: increase \( \delta_i \) by 10% (up to 5.0)</li>
-<li>If acceptance rate &lt; 40%: decrease \( \delta_i \) by 10% (down to 0.01)</li>
+<li>If acceptance rate exceeds the target: increase \( \delta_i \) by 10% (up to 5.0)</li>
+<li>If acceptance rate falls below the target: decrease \( \delta_i \) by 10% (down to 0.01)</li>
 </ul>
-<p>This targets an acceptance rate around 40%, balancing exploration and mixing.</p>
+<p>Target acceptance rates: 40% for MH, 65% for HMC.</p>
 <h2 id="post-saem-finalization"><a class="header" href="#post-saem-finalization">Post-SAEM Finalization</a></h2>
 <p>After the SAEM iterations complete:</p>
 <ol>
@@ -2681,18 +2294,13 @@ warnings.</p>
 <li><strong>Covariance Step</strong>: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)</li>
 <li><strong>Diagnostics</strong>: Compute PRED, IPRED, CWRES, IWRES for each subject</li>
 </ol>
-<p>For sparsely-sampled data where the Laplace OFV is biased, you can
-append an importance-sampling stage that estimates <code>−2 log L</code> by Monte
-Carlo:</p>
-<pre><code>method = [saem, imp]
-</code></pre>
-<p>See <a href="#importance-sampling-imp-1">Importance Sampling (IMP)</a>.</p>
 <h2 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h2>
 <pre><code>[fit_options]
   method        = saem
   n_exploration = 150      # Phase 1 iterations
   n_convergence = 250      # Phase 2 iterations
-  n_mh_steps    = 3        # MH steps per subject per iteration
+  n_mh_steps    = 3        # MH steps per subject per iteration (ignored when n_leapfrog &gt; 0)
+  n_leapfrog    = 0        # Set &gt; 0 (e.g. 3) to use HMC instead of MH
   adapt_interval = 50      # Step-size adaptation frequency
   seed          = 12345    # RNG seed for reproducibility
   covariance    = true     # Compute standard errors
@@ -2830,197 +2438,6 @@ let fit_with_sir = run_sir(&amp;fit, None, None, &amp;opts)?;
 <h2 id="reference"><a class="header" href="#reference">Reference</a></h2>
 <p>Dosne A-G, Bergstrand M, Karlsson MO. “Improving the estimation of parameter uncertainty distributions in nonlinear mixed effects models using sampling importance resampling.” <em>J Pharmacokinet Pharmacodyn</em>. 2017;44(6):539-562. doi:10.1007/s10928-017-9542-0</p>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="importance-sampling-imp-1"><a class="header" href="#importance-sampling-imp-1">Importance Sampling (IMP)</a></h1>
-<p>The <code>imp</code> stage estimates the marginal log-likelihood</p>
-<p>\[
--2 \log L(\theta) \;=\; -2 \sum_i \log p(y_i \mid \theta)
-\;=\; -2 \sum_i \log \int p(y_i \mid \eta, \theta)\, p(\eta \mid \theta)\, d\eta
-\]</p>
-<p>by Monte-Carlo importance sampling. The IS Monte-Carlo estimator of
-<code>p(yᵢ|θ)</code> is unbiased; the reported <code>−2 log L</code> carries a small Jensen
-bias from the <code>log(·)</code> transform that vanishes as <code>K → ∞</code> and is
-typically dominated by the much larger Laplace-approximation bias of
-<code>ofv</code> in the sparse-data / strongly-nonlinear regime IMP targets.
-Analogous to NONMEM’s <code>$EST METHOD=IMP EONLY=1</code> and Monolix’s
-“Importance Sampling” likelihood method.</p>
-<h2 id="when-to-use-it"><a class="header" href="#when-to-use-it">When to use it</a></h2>
-<p>The Laplace approximation that produces the FOCE/FOCEI OFV assumes each
-subject’s posterior of η is Gaussian-shaped. That assumption is fine for
-<strong>well-sampled</strong> PK (≥ 5–6 obs per subject across the elimination phase)
-but breaks down for:</p>
-<ul>
-<li><strong>Sparse data</strong> — e.g. routine TDM with 1–3 troughs per patient.</li>
-<li><strong>Strong nonlinearity</strong> — Michaelis–Menten elimination,
-target-mediated drug disposition, transit-compartment absorption.</li>
-<li><strong>PD with categorical / binary endpoints</strong> (likelihood
-surface non-quadratic in η).</li>
-</ul>
-<p>In those regimes the FOCE OFV is biased — typically <em>under</em>-stated, so
-naïve AIC/BIC comparisons favour over-parameterised models. IMP gives a
-much-lower-bias estimate at extra MC cost.</p>
-<h2 id="how-it-runs"><a class="header" href="#how-it-runs">How it runs</a></h2>
-<p><code>imp</code> is a chain stage, not a standalone method:</p>
-<pre><code>[fit_options]
-  method        = [focei, imp]
-  is_samples    = 2000     # K, samples per subject
-  is_proposal_df = 5       # ν, Student-t tail weight
-  is_seed       = 12345
-</code></pre>
-<p>Rules:</p>
-<ul>
-<li><strong>Must follow another stage.</strong> <code>methods = [imp]</code> and
-<code>methods = [imp, focei]</code> are rejected — IMP needs the previous stage’s
-EBEs and per-subject Jacobian as the proposal centre/scale.</li>
-<li><strong>Must appear at most once.</strong></li>
-<li><strong>Should be terminal.</strong> A non-terminal <code>imp</code> produces a warning — the
-next stage updates parameters and the IS result becomes meaningless.</li>
-</ul>
-<p>When IMP runs, <code>FitResult.method</code> still reports the previous estimating
-stage (e.g. <code>FOCEI</code>), and <code>FitResult.method_chain</code> preserves the full
-chain (<code>[FoceI, Imp]</code>). The IS-LL itself lands on
-<code>FitResult.importance_sampling</code>.</p>
-<h2 id="algorithm"><a class="header" href="#algorithm">Algorithm</a></h2>
-<p>For each subject <em>i</em> with EBE η̂ᵢ and inner-loop Jacobian Jᵢ = ∂f/∂η at η̂ᵢ:</p>
-<ol>
-<li>
-<p><strong>Build proposal scale Σᵢ:</strong></p>
-<ul>
-<li>Compute Sheiner–Beal posterior Hessian
-\(H_i = J_i^\top R_i^{-1} J_i + \Omega^{-1}\) at η̂ᵢ
-(\(R_i\) = diagonal residual variance at the EBE).</li>
-<li>Add a small ridge \(\lambda I\) for numerical safety
-(λ = max(10⁻⁶ · trace(H)/d, 10⁻¹⁰)).</li>
-<li>Cholesky-factor; on failure fall back to Σᵢ = Ω (broad prior-scale
-proposal — gives a valid but noisy LL estimate).</li>
-</ul>
-</li>
-<li>
-<p><strong>Draw K samples</strong> \(\eta_{ik} \sim t_\nu(\hat\eta_i, \Sigma_i)\)
-(multivariate Student-t).</p>
-</li>
-<li>
-<p><strong>Compute log importance weights:</strong>
-\[
-\log w_{ik} = \log p(y_i \mid \eta_{ik}, \theta)
-+ \log p(\eta_{ik} \mid \theta)
-- \log q(\eta_{ik}).
-\]</p>
-</li>
-<li>
-<p><strong>Subject marginal LL</strong> via log-sum-exp:
-\[
-\log \hat p(y_i \mid \theta)
-\;=\; \operatorname{lse}<em>k \log w</em>{ik} - \log K.
-\]</p>
-</li>
-<li>
-<p><strong>Per-subject effective sample size:</strong>
-\(\mathrm{ESS}<em>i = 1 / \sum_k \tilde w</em>{ik}^2\) (normalised weights).
-The result reports the across-subject min and median of ESS/K, plus
-any subjects below <code>is_low_ess_threshold</code> (default 10%).</p>
-</li>
-<li>
-<p><strong>Monte-Carlo standard error.</strong> For a self-normalised IS estimator the
-asymptotic per-subject variance (Geweke 1989) is
-\[
-\operatorname{Var}\bigl(\log \hat p(y_i \mid \theta)\bigr)
-\;\approx\; \frac{1}{K}\left(\frac{1}{\mathrm{ESS}<em>i / K} - 1\right).
-\]
-Aggregating across subjects (LL is a sum of independent per-subject
-log-marginals) and converting to the <code>−2 log L</code> scale,
-\[
-\operatorname{SE}(-2 \log L</em>{IS})
-\;=\; 2 \sqrt{\sum_i \operatorname{Var}\bigl(\log \hat p(y_i \mid \theta)\bigr)}.
-\]
-Subjects with degenerate ESS (\(\mathrm{ESS}_i / K = 0\) — complete
-proposal collapse) fall back to a per-subject variance of <code>1.0</code>, which
-produces a <em>finite</em> but inflated SE rather than a NaN. A separate
-warning is emitted on <code>FitResult.warnings</code> listing the collapsed
-subjects; the IS-LL itself remains usable as a point estimate.</p>
-</li>
-<li>
-<p><strong>Population −2 log L</strong> = <code>−2 · Σᵢ log p̂(yᵢ | θ)</code>, reported on
-<code>FitResult.importance_sampling.minus2_log_likelihood</code> together with
-<code>mc_standard_error</code>.</p>
-</li>
-</ol>
-<h2 id="tuning"><a class="header" href="#tuning">Tuning</a></h2>
-<ul>
-<li><strong>K = <code>is_samples</code></strong> controls accuracy. The MC SE scales as
-\(1/\sqrt{K}\); halve it by quadrupling K.
-Default 1000 is fine for a smoke test; bump to 2000–5000 for any
-reported LL.</li>
-<li><strong>ν = <code>is_proposal_df</code></strong> controls the proposal tails. The default of 5
-is robust to mild proposal misspecification (Geweke 1989); raise
-toward 30+ to recover a near-Gaussian proposal when the posterior is
-known to be light-tailed.</li>
-<li><strong>Low-ESS subjects</strong> signal a proposal that doesn’t match the
-posterior well — usually a sign the EBE didn’t converge or the
-Hessian was near-singular. The IS estimate is still unbiased, just
-noisier. Investigate by re-running with a tighter <code>inner_tol</code> or
-inspecting the <code>FitResult.subjects[i]</code> diagnostics.</li>
-<li><strong>Reproducibility.</strong> <code>is_seed</code> defaults to <code>42</code> when unset (so two
-fits with the same <code>is_samples</code> and <code>is_proposal_df</code> produce identical
-<code>−2 log L</code>). Set it explicitly to vary the RNG stream. The full set of
-<code>is_*</code> defaults is listed in the
-<a href="#importance-sampling-imp"><code>[fit_options]</code> reference</a>.</li>
-</ul>
-<h2 id="sde--diffusion-models-not-supported"><a class="header" href="#sde--diffusion-models-not-supported">SDE / [diffusion] models (not supported)</a></h2>
-<p>IMP refuses to run on models with a <code>[diffusion]</code> block. The EKF
-process-noise variance that inflates the residual variance for SDE
-models is not yet threaded through the IS observation-likelihood path,
-so the marginal would be silently biased. Use FOCE / FOCEI for the
-Laplace OFV on SDE models; IMP for SDE is tracked as a follow-up.</p>
-<h2 id="iov-current-limitation"><a class="header" href="#iov-current-limitation">IOV (current limitation)</a></h2>
-<p>For models with <code>kappa</code> declarations, IMP samples η only — per-occasion
-κ is held fixed at its EBE κ̂. The reported <code>−2 log L</code> is therefore a
-<strong>partial marginal</strong> that does not integrate over κ uncertainty. It
-underestimates the true marginal variance and is <em>not</em> directly
-comparable to NONMEM <code>$EST METHOD=IMP LAPLACIAN=1</code> on κ.</p>
-<p>The result struct flags this via <code>kappa_treatment = "fixed_at_mode"</code>
-(YAML) and the CLI prints a notice. Joint (η, κ) sampling is planned;
-see the <code>TODO(imp-iov-v2)</code> marker in
-<code>src/estimation/importance_sampling.rs</code>.</p>
-<h2 id="cost"><a class="header" href="#cost">Cost</a></h2>
-<p>K × n_subjects predict calls per IMP run. For warfarin (32 subjects)
-with K=2000 this is ≈ 64k predicts — seconds to a minute on a typical
-laptop. The cost is linear in K and trivially parallel over subjects
-(uses the same Rayon worker pool as the inner loop).</p>
-<h2 id="output-2"><a class="header" href="#output-2">Output</a></h2>
-<p>In the CLI:</p>
-<pre><code>--- Importance Sampling (marginal log-likelihood) ---
-  -2 log L (IS): 1284.52  (MC SE = 0.41, K = 2000, ν = 5)
-  ESS / K: min = 0.18, median = 0.62
-  Low-ESS subjects (3): 12=0.18, 27=0.21, 34=0.22
-</code></pre>
-<p>In the fit YAML:</p>
-<pre><code class="language-yaml">importance_sampling:
-  minus2_log_likelihood: 1284.524300
-  mc_standard_error: 0.412700
-  n_samples: 2000
-  proposal_df: 5.0000
-  ess_min: 0.1800
-  ess_median: 0.6200
-  kappa_treatment: not_applicable
-  low_ess_subjects:
-    - id: "12"
-      ess_fraction: 0.1800
-    - id: "27"
-      ess_fraction: 0.2100
-    - id: "34"
-      ess_fraction: 0.2200
-</code></pre>
-<p>The Rust <code>FitResult.importance_sampling</code> field carries the same data
-typed as <code>Option&lt;ImportanceSamplingResult&gt;</code>.</p>
-<h2 id="see-also-1"><a class="header" href="#see-also-1">See also</a></h2>
-<ul>
-<li><a href="#saem-1">SAEM</a> — common upstream stage for <code>methods = [saem, imp]</code>.</li>
-<li><a href="#sampling-importance-resampling-sir">SIR</a> — a different importance-sampling-flavoured procedure
-that targets <em>parameter uncertainty</em> (CIs on θ/Ω/σ), not the marginal
-likelihood. The name overlap is unfortunate; the two methods are
-unrelated in goal and implementation.</li>
-</ul>
-<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="inter-occasion-variability-iov"><a class="header" href="#inter-occasion-variability-iov">Inter-Occasion Variability (IOV)</a></h1>
 <p>Inter-Occasion Variability (IOV) models the fact that a subject’s PK parameters may shift between occasions (treatment periods, study visits, dosing intervals). Unlike between-subject variability (BSV), which is fixed for a subject across the whole study, IOV is a random effect that is re-drawn for each occasion.</p>
 <h2 id="concepts"><a class="header" href="#concepts">Concepts</a></h2>
@@ -3118,7 +2535,7 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <p>The H-matrix (Jacobian ∂f/∂η) covers BSV etas only — kappa columns are not included in the FOCE linearization.</p>
 <h3 id="covariance-step-1"><a class="header" href="#covariance-step-1">Covariance step</a></h3>
 <p>When <code>covariance = true</code>, standard errors for the IOV omega diagonal (or its Cholesky elements) are computed via the finite-difference Hessian at convergence, using the same procedure as for BSV omega.</p>
-<h2 id="output-3"><a class="header" href="#output-3">Output</a></h2>
+<h2 id="output-2"><a class="header" href="#output-2">Output</a></h2>
 <p>The following IOV-related fields are populated on <code>FitResult</code> and printed by <code>print_results()</code>. The fit YAML gains an <code>omega_iov:</code> section listing the kappa variances and (for Option B) the off-diagonal covariances/correlations.</p>
 <div class="table-wrapper">
 <table>
@@ -3138,7 +2555,7 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 <blockquote>
 <p><strong>Note</strong>: <code>shrinkage_kappa</code> exists as a placeholder field on <code>FitResult</code> but is not yet computed — it is always returned as an empty <code>Vec</code>. Use <code>ebe_kappas</code> directly if you need a manual shrinkage diagnostic.</p>
 </blockquote>
-<h2 id="limitations-2"><a class="header" href="#limitations-2">Limitations</a></h2>
+<h2 id="limitations-1"><a class="header" href="#limitations-1">Limitations</a></h2>
 <ul>
 <li><strong>SAEM is not supported</strong> with IOV models — an error is returned directing you to use <code>foce</code> or <code>focei</code>.</li>
 <li><strong>Automatic differentiation (AD) is not used</strong> for IOV inner-loop gradients; finite differences are used instead. For large models this is slower than the AD path used for BSV-only models.</li>
@@ -3286,12 +2703,6 @@ x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Ome
 1,0.5,25.3,0,.,.,.,.,0
 </code></pre>
 <p>This assumes the subject has reached steady state with 100 units every 12 hours before the observation at TIME=0.5.</p>
-<p>SS=1 is supported on every prediction path: analytical (1-/2-/3-cpt with
-or without time-varying covariates) and ODE. SS=1 also composes with
-<code>LAGTIME</code> — the lagged SS curve at time <code>t</code> equals the un-lagged curve
-at <code>t - lagtime</code>. See <a href="#steady-state-doses-ss1">Steady-State Doses</a>
-for the full reference, including the data-validation warnings emitted
-for malformed rows (missing <code>II</code>, overlapping infusions).</p>
 <h2 id="multiple-doses"><a class="header" href="#multiple-doses">Multiple Doses</a></h2>
 <p>Multiple doses are supported as separate rows:</p>
 <pre><code class="language-csv">ID,TIME,DV,EVID,AMT,CMT,MDV
@@ -3578,7 +2989,7 @@ support for zip, JSON, and CSV — Rust, R, Python, Julia.</p>
 unzip -p run1.fitrx manifest.json
 unzip -p run1.fitrx fit.json | jq .theta
 </code></pre>
-<h2 id="when-to-use-it-1"><a class="header" href="#when-to-use-it-1">When to use it</a></h2>
+<h2 id="when-to-use-it"><a class="header" href="#when-to-use-it">When to use it</a></h2>
 <p>Use <code>--output run1.fitrx</code> (CLI) or <code>save_fit()</code> (Rust API) when you want a
 single artifact that can be shipped between machines and languages — for
 example, fitting in Rust and post-processing in R/Python. The legacy
@@ -5106,43 +4517,14 @@ scale that ferx uses internally.</p>
 <li><strong><code>bobyqa</code></strong> — derivative-free, good when FOCE’s FD gradients are noisy and
 SLSQP stalls or oscillates. Slower per iteration on smooth problems, but
 often converges when gradient-based methods give up.</li>
-<li><strong><code>trust_region</code></strong> — second-order Newton trust-region with an AD-based
-gradient and BHHH approximate Hessian. Can be faster near convergence
-because it uses curvature information; the CG budget defaults to
-<code>ceil(sqrt(n_params))</code> (~5 for standard NLME models), but you can pin
-it with <code>steihaug_max_iters</code> if you have many packed parameters and
-want more aggressive sub-problem solves.</li>
+<li><strong><code>trust_region</code></strong> — second-order Newton trust-region. Can be faster near
+convergence because it uses curvature information; tune the CG budget with
+<code>steihaug_max_iters</code> (default 50) if you have more than ~50 packed
+parameters.</li>
 <li><strong><code>lbfgs</code> / <code>bfgs</code></strong> — fall back to these only when NLopt is unavailable.</li>
 </ul>
 <p>See <a href="#optimizer-choices">Fit Options</a> for the full
 list.</p>
-<h2 id="how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2"><a class="header" href="#how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2">How do I scale predictions to match my data’s units, like NONMEM’s <code>S1</code>/<code>S2</code>?</a></h2>
-<p>Use the <code>[scaling]</code> block. The convention is divisive
-(<code>pred_scaled = pred_raw / scale</code>), matching the natural reading of
-<code>obs_scale = V/1000</code>.</p>
-<pre><code>[scaling]
-  obs_scale = 1000          # mg/L → mg/mL
-</code></pre>
-<p>The block also supports expression-form scales (<code>obs_scale = WT / 70</code>)
-and an ODE-only Form C that replaces the state readout entirely:</p>
-<pre><code>[structural_model]
-  ode(states=[depot, central])
-
-[scaling]
-  y = central / V           # central holds amount; observe as concentration
-</code></pre>
-<p>For models with multiple observed compartments (parent + metabolite,
-sum-of-moieties, free vs. total), specify a scale per CMT:</p>
-<pre><code>[scaling]
-  obs_scale[CMT=1] = 1000
-  obs_scale[CMT=2] = 1
-  y[CMT=1] = parent / V
-  y[CMT=2] = metab  / VM
-</code></pre>
-<p>Every observed CMT must have a matching <code>[CMT=N]</code> entry — <code>fit()</code>
-errors at startup with the list of missing CMTs.</p>
-<p>See <a href="#scaling">Scaling</a> for the full reference, including
-how this compares to NONMEM’s <code>S1</code>/<code>S2</code> and nlmixr2’s <code>cmt(central); f = ...</code>.</p>
 
                     </main>
 

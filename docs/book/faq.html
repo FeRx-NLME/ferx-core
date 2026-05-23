@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-b02da9c0.js";
+            window.path_to_searchindex_js = "searchindex-25ae7740.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-3a934816.js"></script>
+        <script src="toc-e4fdb3a6.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -263,43 +263,14 @@ scale that ferx uses internally.</p>
 <li><strong><code>bobyqa</code></strong> — derivative-free, good when FOCE’s FD gradients are noisy and
 SLSQP stalls or oscillates. Slower per iteration on smooth problems, but
 often converges when gradient-based methods give up.</li>
-<li><strong><code>trust_region</code></strong> — second-order Newton trust-region with an AD-based
-gradient and BHHH approximate Hessian. Can be faster near convergence
-because it uses curvature information; the CG budget defaults to
-<code>ceil(sqrt(n_params))</code> (~5 for standard NLME models), but you can pin
-it with <code>steihaug_max_iters</code> if you have many packed parameters and
-want more aggressive sub-problem solves.</li>
+<li><strong><code>trust_region</code></strong> — second-order Newton trust-region. Can be faster near
+convergence because it uses curvature information; tune the CG budget with
+<code>steihaug_max_iters</code> (default 50) if you have more than ~50 packed
+parameters.</li>
 <li><strong><code>lbfgs</code> / <code>bfgs</code></strong> — fall back to these only when NLopt is unavailable.</li>
 </ul>
 <p>See <a href="model-file/fit-options.html#optimizer-choices">Fit Options</a> for the full
 list.</p>
-<h2 id="how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2"><a class="header" href="#how-do-i-scale-predictions-to-match-my-datas-units-like-nonmems-s1s2">How do I scale predictions to match my data’s units, like NONMEM’s <code>S1</code>/<code>S2</code>?</a></h2>
-<p>Use the <code>[scaling]</code> block. The convention is divisive
-(<code>pred_scaled = pred_raw / scale</code>), matching the natural reading of
-<code>obs_scale = V/1000</code>.</p>
-<pre><code>[scaling]
-  obs_scale = 1000          # mg/L → mg/mL
-</code></pre>
-<p>The block also supports expression-form scales (<code>obs_scale = WT / 70</code>)
-and an ODE-only Form C that replaces the state readout entirely:</p>
-<pre><code>[structural_model]
-  ode(states=[depot, central])
-
-[scaling]
-  y = central / V           # central holds amount; observe as concentration
-</code></pre>
-<p>For models with multiple observed compartments (parent + metabolite,
-sum-of-moieties, free vs. total), specify a scale per CMT:</p>
-<pre><code>[scaling]
-  obs_scale[CMT=1] = 1000
-  obs_scale[CMT=2] = 1
-  y[CMT=1] = parent / V
-  y[CMT=2] = metab  / VM
-</code></pre>
-<p>Every observed CMT must have a matching <code>[CMT=N]</code> entry — <code>fit()</code>
-errors at startup with the list of missing CMTs.</p>
-<p>See <a href="model-file/scaling.html">Scaling</a> for the full reference, including
-how this compares to NONMEM’s <code>S1</code>/<code>S2</code> and nlmixr2’s <code>cmt(central); f = ...</code>.</p>
 
                     </main>
 

@@ -529,6 +529,15 @@ pub fn run_saem(
     let n_mh_steps = options.saem_n_mh_steps;
     let adapt_interval = options.saem_adapt_interval;
     let verbose = options.verbose;
+    let n_leapfrog = options.saem_n_leapfrog;
+    let using_hmc: bool = {
+        #[cfg(feature = "autodiff")]
+        {
+            n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some()
+        }
+        #[cfg(not(feature = "autodiff"))]
+        false
+    };
 
     let n_theta = init_params.theta.len();
     let n_sigma = init_params.sigma.values.len();
@@ -542,6 +551,17 @@ pub fn run_saem(
             n_subjects, n_eta, n_iter, k1, k2
         );
     }
+
+    let mut warnings = Vec::new();
+    if n_leapfrog > 0 && !using_hmc {
+        warnings.push(
+            "saem_n_leapfrog > 0 but HMC is unavailable (requires `autodiff` feature and \
+             analytical PK model); falling back to Metropolis-Hastings"
+                .to_string(),
+        );
+    }
+    let n_proposals_per_iter = if using_hmc { 1_usize } else { n_mh_steps };
+    let target_accept_rate = if using_hmc { 0.65_f64 } else { 0.40_f64 };
 
     // Initialize state
     let theta_cur = init_params.theta.clone();
@@ -713,6 +733,20 @@ pub fn run_saem(
                                 .wrapping_add(i as u64),
                         );
                         let mut eta_work = eta.clone();
+                        // HMC path: one gradient-guided proposal per SAEM iteration.
+                        // Returns None if HMC is unavailable for this subject (e.g.
+                        // TV-cov subject with unsupported PK model); fall through to MH.
+                        #[cfg(feature = "autodiff")]
+                        if using_hmc {
+                            if let Some((new_eta, new_nll, accepted)) =
+                                crate::estimation::hmc::hmc_step(
+                                    subject, &eta_work, nll, model, theta_ref, omega_ref,
+                                    sigma_ref, scale, n_leapfrog, &mut rng,
+                                )
+                            {
+                                return (new_eta, new_nll, accepted as usize);
+                            }
+                        }
                         let (n_acc, nll_new) = mh_steps(
                             &mut eta_work,
                             nll,
@@ -920,8 +954,9 @@ pub fn run_saem(
         // ---- Adapt MH step sizes ----
         if state.steps_since_adapt >= adapt_interval {
             for i in 0..n_subjects {
-                let rate = state.accept_counts[i] as f64 / (n_mh_steps * adapt_interval) as f64;
-                if rate > 0.4 {
+                let rate =
+                    state.accept_counts[i] as f64 / (n_proposals_per_iter * adapt_interval) as f64;
+                if rate > target_accept_rate {
                     state.step_scales[i] = (state.step_scales[i] * 1.1).min(5.0);
                 } else {
                     state.step_scales[i] = (state.step_scales[i] * 0.9).max(0.01);
@@ -938,7 +973,7 @@ pub fn run_saem(
             // Rolling MH accept rate since the last adapt reset.
             let steps_so_far = state.steps_since_adapt.max(1);
             let mh_accept_rate: f64 = state.accept_counts.iter().sum::<usize>() as f64
-                / (n_subjects * n_mh_steps * steps_so_far) as f64;
+                / (n_subjects * n_proposals_per_iter * steps_so_far) as f64;
 
             if verbose && (k == 1 || k % 50 == 0 || k == n_iter) {
                 eprintln!(
@@ -1015,7 +1050,6 @@ pub fn run_saem(
         );
 
     // ---- Covariance step ----
-    let mut warnings = Vec::new();
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if verbose {

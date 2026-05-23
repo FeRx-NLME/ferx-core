@@ -54,7 +54,8 @@ Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP op
 | `n_exploration` | `150` | Phase 1 iterations (step size = 1) |
 | `n_convergence` | `250` | Phase 2 iterations (step size = 1/k) |
 | `n_mh_steps` | `3` | Metropolis-Hastings steps per subject per iteration |
-| `adapt_interval` | `50` | Iterations between MH step-size adaptation |
+| `n_leapfrog` | `0` | Leapfrog steps per HMC proposal (0 = use MH; see below) |
+| `adapt_interval` | `50` | Iterations between step-size adaptation |
 | `seed` | `12345` | RNG seed for reproducibility |
 
 ## SIR (Sampling Importance Resampling)

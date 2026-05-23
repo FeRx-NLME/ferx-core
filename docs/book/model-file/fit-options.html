@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-b02da9c0.js";
+            window.path_to_searchindex_js = "../searchindex-25ae7740.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3a934816.js"></script>
+        <script src="../toc-e4fdb3a6.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -190,7 +190,7 @@
 <tr><th>Key</th><th>Values</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>method</code></td><td><code>foce</code>, <code>focei</code>, <code>saem</code>, <code>imp</code> (only as final chain stage)</td><td><code>focei</code></td><td>Estimation method (or single-stage method in a chain). See <a href="#chained-fits">chained fits</a>.</td></tr>
+<tr><td><code>method</code></td><td><code>foce</code>, <code>focei</code>, <code>saem</code></td><td><code>focei</code></td><td>Estimation method</td></tr>
 <tr><td><code>maxiter</code></td><td>integer</td><td><code>500</code></td><td>Maximum outer loop iterations</td></tr>
 <tr><td><code>covariance</code></td><td><code>true</code>, <code>false</code></td><td><code>true</code></td><td>Compute covariance matrix and standard errors</td></tr>
 <tr><td><code>optimizer</code></td><td><code>slsqp</code>, <code>lbfgs</code>, <code>nlopt_lbfgs</code>, <code>mma</code>, <code>bfgs</code>, <code>bobyqa</code>, <code>trust_region</code></td><td><code>slsqp</code></td><td>Optimization algorithm</td></tr>
@@ -229,7 +229,8 @@
 <tr><td><code>n_exploration</code></td><td><code>150</code></td><td>Phase 1 iterations (step size = 1)</td></tr>
 <tr><td><code>n_convergence</code></td><td><code>250</code></td><td>Phase 2 iterations (step size = 1/k)</td></tr>
 <tr><td><code>n_mh_steps</code></td><td><code>3</code></td><td>Metropolis-Hastings steps per subject per iteration</td></tr>
-<tr><td><code>adapt_interval</code></td><td><code>50</code></td><td>Iterations between MH step-size adaptation</td></tr>
+<tr><td><code>n_leapfrog</code></td><td><code>0</code></td><td>Leapfrog steps per HMC proposal (0 = use MH; see below)</td></tr>
+<tr><td><code>adapt_interval</code></td><td><code>50</code></td><td>Iterations between step-size adaptation</td></tr>
 <tr><td><code>seed</code></td><td><code>12345</code></td><td>RNG seed for reproducibility</td></tr>
 </tbody>
 </table>
@@ -252,32 +253,6 @@
 </table>
 </div>
 <p>See <a href="../estimation/sir.html">SIR documentation</a> for details.</p>
-<h2 id="importance-sampling-imp"><a class="header" href="#importance-sampling-imp">Importance Sampling (IMP)</a></h2>
-<p>The <code>imp</code> stage estimates the marginal log-likelihood by Monte-Carlo
-importance sampling, giving a lower-bias <code>−2 log L</code> than the FOCE/Laplace
-OFV when subject posteriors of η are non-Gaussian (e.g. sparsely-sampled
-PK). Use it as a final chain stage:</p>
-<pre><code>[fit_options]
-  method        = [focei, imp]
-  is_samples    = 1000
-  is_proposal_df = 5
-  is_seed       = 12345
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Key</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>is_samples</code></td><td><code>1000</code></td><td>Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE.</td></tr>
-<tr><td><code>is_proposal_df</code></td><td><code>5.0</code></td><td>Student-t proposal degrees of freedom (≥ 1). Lower = heavier tails.</td></tr>
-<tr><td><code>is_seed</code></td><td><code>42</code></td><td>RNG seed. Same seed → identical <code>−2 log L</code>.</td></tr>
-<tr><td><code>is_low_ess_threshold</code></td><td><code>0.1</code></td><td>Subjects with normalized ESS below this fraction get flagged in the result. Set <code>0</code> to silence.</td></tr>
-</tbody>
-</table>
-</div>
-<p>See <a href="../estimation/importance-sampling.html">Importance Sampling documentation</a>
-for the algorithm, IOV caveats, and tuning guidance.</p>
 <h2 id="optimizer-choices"><a class="header" href="#optimizer-choices">Optimizer Choices</a></h2>
 <div class="table-wrapper">
 <table>

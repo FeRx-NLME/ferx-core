@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-b02da9c0.js";
+            window.path_to_searchindex_js = "../searchindex-25ae7740.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-3a934816.js"></script>
+        <script src="../toc-e4fdb3a6.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -195,13 +195,21 @@
 <p>Default: 250 iterations.</p>
 <h2 id="per-iteration-steps"><a class="header" href="#per-iteration-steps">Per-Iteration Steps</a></h2>
 <p>Each SAEM iteration consists of:</p>
-<h3 id="1-e-step-metropolis-hastings-sampling"><a class="header" href="#1-e-step-metropolis-hastings-sampling">1. E-Step: Metropolis-Hastings Sampling</a></h3>
-<p>For each subject, run <code>n_mh_steps</code> Metropolis-Hastings iterations to sample from the conditional distribution of random effects:</p>
+<h3 id="1-e-step-sampling"><a class="header" href="#1-e-step-sampling">1. E-Step: Sampling</a></h3>
+<p>For each subject, sample from the conditional distribution of random effects:</p>
 <p>\[ p(\eta_i | y_i, \theta, \Omega, \sigma) \]</p>
-<p><strong>Proposal</strong>: symmetric random walk in deviation space, \( \eta_{\text{prop}} = \eta_{\text{current}} + \delta_i \cdot L \cdot z \), with \( z \sim N(0, I) \) and \( L = \text{chol}(\Omega) \). The schedule is identical across both phases — only the SA step size \( \gamma_k \) changes between exploration and convergence.</p>
+<p>Two samplers are available:</p>
+<h4 id="metropolis-hastings-default-n_leapfrog--0"><a class="header" href="#metropolis-hastings-default-n_leapfrog--0">Metropolis-Hastings (default, <code>n_leapfrog = 0</code>)</a></h4>
+<p>Run <code>n_mh_steps</code> symmetric random-walk MH iterations per subject per SAEM iteration.</p>
+<p><strong>Proposal</strong>: \( \eta_{\text{prop}} = \eta_{\text{current}} + \delta_i \cdot L \cdot z \), with \( z \sim N(0, I) \) and \( L = \text{chol}(\Omega) \). The schedule is identical across both phases — only the SA step size \( \gamma_k \) changes between exploration and convergence.</p>
 <p>The MH kernel is symmetric in \( \eta \), so the proposal density cancels and the acceptance log-ratio is the difference of <code>individual_nll</code> values, which encodes the prior \( N(0, \Omega) \) plus the observation likelihood.</p>
-<p><strong>Acceptance</strong>: Accept with probability \( \min(1, \exp(\text{NLL}<em>{\text{current}} - \text{NLL}</em>{\text{prop}})) \).</p>
-<p>The MH sampling is parallelized across subjects using Rayon.</p>
+<p><strong>Acceptance</strong>: \( \min(1, \exp(\text{NLL}<em>{\text{current}} - \text{NLL}</em>{\text{prop}})) \). Target acceptance rate: 40%.</p>
+<h4 id="hmc-hamiltonian-monte-carlo-n_leapfrog--0"><a class="header" href="#hmc-hamiltonian-monte-carlo-n_leapfrog--0">HMC (Hamiltonian Monte Carlo, <code>n_leapfrog &gt; 0</code>)</a></h4>
+<p>When <code>n_leapfrog</code> is set to a positive integer (e.g. <code>3</code>), one HMC proposal replaces the <code>n_mh_steps</code> MH proposals per subject per iteration. HMC uses the gradient of the individual NLL to make longer, more directed moves through the posterior:</p>
+<p>\[ H(\eta, p) = \text{NLL}(\eta) + \tfrac{1}{2} |p|^2 \]</p>
+<p>with momentum \( p \sim N(0, I) \) and a standard velocity Störmer-Verlet (leapfrog) integrator. Acceptance is on \( \Delta H \), targeting ~65% acceptance.</p>
+<p><strong>Requirements</strong>: <code>autodiff</code> feature enabled (default) and an analytical PK model (no ODE). Falls back silently to MH for any subject where HMC is unavailable. A warning is emitted if <code>n_leapfrog &gt; 0</code> but the <code>autodiff</code> feature is absent.</p>
+<p>The E-step sampling is parallelized across subjects using Rayon.</p>
 <h3 id="2-stochastic-approximation-update"><a class="header" href="#2-stochastic-approximation-update">2. Stochastic Approximation Update</a></h3>
 <p>Update the sufficient statistic for \( \Omega \):</p>
 <p>\[ S_2 \leftarrow (1 - \gamma_k) \cdot S_2 + \gamma_k \cdot \frac{1}{N} \sum_{i=1}^{N} \eta_i \eta_i^T \]</p>
@@ -217,13 +225,13 @@
 <p>NLopt still runs for any remaining thetas (non-mu-referenced) and for sigma — the closed-form-updated thetas are pinned at their new values for the NLopt call.</p>
 <p>When <code>mu_referencing = false</code>, the full NLopt M-step runs for all thetas as before.</p>
 <p>The number of NLopt evaluations saved is stored in <code>FitResult::saem_mu_ref_m_step_evals_saved</code>, accumulated across SAEM iterations as <code>2 × mstep_maxiter × n_mu_ref_pairs</code> per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at <code>mstep_maxiter</code> NLopt gradient requests). The field is <code>None</code> when mu-referencing is off or method ≠ SAEM.</p>
-<h3 id="5-adaptive-mh-step-sizes"><a class="header" href="#5-adaptive-mh-step-sizes">5. Adaptive MH Step Sizes</a></h3>
-<p>Every <code>adapt_interval</code> iterations, the per-subject step sizes \( \delta_i \) are adjusted:</p>
+<h3 id="5-adaptive-step-sizes"><a class="header" href="#5-adaptive-step-sizes">5. Adaptive Step Sizes</a></h3>
+<p>Every <code>adapt_interval</code> iterations, the per-subject step sizes \( \delta_i \) (MH) or leapfrog step sizes (HMC) are adjusted based on acceptance rate:</p>
 <ul>
-<li>If acceptance rate &gt; 40%: increase \( \delta_i \) by 10% (up to 5.0)</li>
-<li>If acceptance rate &lt; 40%: decrease \( \delta_i \) by 10% (down to 0.01)</li>
+<li>If acceptance rate exceeds the target: increase \( \delta_i \) by 10% (up to 5.0)</li>
+<li>If acceptance rate falls below the target: decrease \( \delta_i \) by 10% (down to 0.01)</li>
 </ul>
-<p>This targets an acceptance rate around 40%, balancing exploration and mixing.</p>
+<p>Target acceptance rates: 40% for MH, 65% for HMC.</p>
 <h2 id="post-saem-finalization"><a class="header" href="#post-saem-finalization">Post-SAEM Finalization</a></h2>
 <p>After the SAEM iterations complete:</p>
 <ol>
@@ -232,18 +240,13 @@
 <li><strong>Covariance Step</strong>: Optionally compute standard errors via finite-difference Hessian (same method as FOCE)</li>
 <li><strong>Diagnostics</strong>: Compute PRED, IPRED, CWRES, IWRES for each subject</li>
 </ol>
-<p>For sparsely-sampled data where the Laplace OFV is biased, you can
-append an importance-sampling stage that estimates <code>−2 log L</code> by Monte
-Carlo:</p>
-<pre><code>method = [saem, imp]
-</code></pre>
-<p>See <a href="importance-sampling.html">Importance Sampling (IMP)</a>.</p>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
 <pre><code>[fit_options]
   method        = saem
   n_exploration = 150      # Phase 1 iterations
   n_convergence = 250      # Phase 2 iterations
-  n_mh_steps    = 3        # MH steps per subject per iteration
+  n_mh_steps    = 3        # MH steps per subject per iteration (ignored when n_leapfrog &gt; 0)
+  n_leapfrog    = 0        # Set &gt; 0 (e.g. 3) to use HMC instead of MH
   adapt_interval = 50      # Step-size adaptation frequency
   seed          = 12345    # RNG seed for reproducibility
   covariance    = true     # Compute standard errors
