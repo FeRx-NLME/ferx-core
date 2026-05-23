@@ -174,6 +174,7 @@ pub fn hmc_step(
                 model.error_model,
                 &model.pk_idx_f64,
                 &model.sel_flat,
+                model.scaling.scalar_for_ad(),
             );
             last_nll.set(nll);
             g
@@ -206,6 +207,7 @@ pub fn hmc_step(
                 model.error_model,
                 &model.pk_idx_f64,
                 &model.sel_flat,
+                model.scaling.scalar_for_ad(),
             );
             last_nll.set(nll);
             g
