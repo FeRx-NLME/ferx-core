@@ -888,6 +888,7 @@ mod tests {
                 &pk_idx_f64,
                 &sel_flat,
                 pk_model_id,
+                1.0,
                 &mut out,
             );
             // Drop the dose slot (kind=0) — only obs slots carry preds.
@@ -955,6 +956,7 @@ mod tests {
                 &pk_idx_f64,
                 &sel_flat,
                 pk_model_id,
+                1.0,
                 &mut out,
             );
             event_kinds
