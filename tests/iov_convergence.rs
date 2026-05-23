@@ -22,7 +22,7 @@ use std::path::Path;
 fn iov_analytical_gradient_converges_to_slsqp_baseline() {
     let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
         .expect("warfarin_iov model must parse");
-    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, None)
+    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
         .expect("warfarin_iov data must load");
 
     // Reference: SLSQP FOCEI (uses the analytical IOV gradient via subject_nll_pop_grad).
