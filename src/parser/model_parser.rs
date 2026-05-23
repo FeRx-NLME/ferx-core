@@ -1339,15 +1339,31 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     .into(),
             );
         }
-        // SDE + Form C is rejected: EKF requires a single observable
-        // compartment index for the Kalman update.
-        if ode_spec.obs_cmt_idx.is_none() && model.diffusion_theta_start.is_some() {
-            return Err(
-                "[scaling] y = <expr> (Form C) is not supported on SDE models — the \
-                 [diffusion] / EKF path requires a single observable compartment index. \
-                 Use `obs_cmt=NAME` in [structural_model] and (optionally) `obs_scale = K`."
-                    .into(),
-            );
+        // SDE + scaling is rejected entirely in Phase 1:
+        //   - Form C needs the obs_cmt index for the Kalman update.
+        //   - Forms A/B post-multiply only the mean prediction; the EKF
+        //     `p_obs` variance and the `r_obs` callback both run in the
+        //     unscaled observation space. Correct EKF scaling needs to
+        //     thread the factor into both (p_obs scales by 1/K^2; the
+        //     residual_variance closure must see the scaled prediction).
+        //     That's a wider change than Phase 1 covers — flag and defer.
+        let sde_active = model.diffusion_theta_start.is_some();
+        if sde_active {
+            if ode_spec.obs_cmt_idx.is_none() {
+                return Err(
+                    "[scaling] y = <expr> (Form C) is not supported on SDE models — the \
+                     [diffusion] / EKF path requires a single observable compartment index."
+                        .into(),
+                );
+            }
+            if !matches!(model.scaling, ScalingSpec::None) {
+                return Err(
+                    "[scaling] is not yet supported on SDE / [diffusion] models — the EKF \
+                     variance and `r_obs` paths run in the unscaled observation space and \
+                     would need separate threading of the scale factor (Phase 1.5)."
+                        .into(),
+                );
+            }
         }
     }
 
@@ -1849,9 +1865,12 @@ fn parse_scaling_block(
                 }
                 // Try scalar first (Form A). Otherwise parse as expression (Form B).
                 if let Ok(k) = value.parse::<f64>() {
-                    if k == 0.0 || !k.is_finite() {
+                    // Divisor — strictly positive. A negative scale would flip
+                    // every prediction sign and bypass the upstream
+                    // non-negativity clamps in the analytical / ODE paths.
+                    if !(k > 0.0 && k.is_finite()) {
                         return Err(format!(
-                            "[scaling]: obs_scale must be a non-zero finite value, got `{}`",
+                            "[scaling]: obs_scale must be a strictly positive finite value, got `{}`",
                             value
                         ));
                     }
@@ -1895,7 +1914,14 @@ fn parse_scaling_block(
                         defined.push(n.clone());
                     }
                 }
-                let ctx = ParseCtx::ode(&defined);
+                // Use `ParseCtx::new` (fallback_covariate = true) rather than
+                // `ParseCtx::ode` so unknown identifiers like `WT` resolve as
+                // `Covariate(WT)` and are looked up in the covariate map at
+                // eval time. With `ParseCtx::ode` they would silently parse
+                // as `Variable(WT)` and read 0.0 from `vars` since the output_fn
+                // vars map only carries states + indiv params.
+                const EMPTY: &[String] = &[];
+                let ctx = ParseCtx::new(EMPTY, EMPTY, &defined);
                 let expr = parse_scalar_expression(value, ctx)
                     .map_err(|e| format!("[scaling] y: {}", e))?;
                 // Pre-resolve state names → state indices and individual-param
@@ -7917,8 +7943,19 @@ if (1 > 0) {
         let src = analytical_model_with_scaling(Some("  obs_scale = 0\n"));
         let err = parse_model_string(&src).expect_err("obs_scale = 0 must be rejected");
         assert!(
-            err.to_lowercase().contains("non-zero"),
-            "expected non-zero-divisor error, got: {}",
+            err.to_lowercase().contains("strictly positive"),
+            "expected strictly-positive error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_scalar_rejects_negative() {
+        let src = analytical_model_with_scaling(Some("  obs_scale = -1000\n"));
+        let err = parse_model_string(&src).expect_err("negative obs_scale must be rejected");
+        assert!(
+            err.to_lowercase().contains("strictly positive"),
+            "expected strictly-positive error, got: {}",
             err
         );
     }
@@ -8045,6 +8082,85 @@ if (1 > 0) {
         assert_eq!(ode.obs_cmt_idx, Some(1));
         assert!(ode.output_fn.is_none());
         assert!(matches!(model.scaling, ScalingSpec::ScalarScale(k) if (k - 1000.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn test_parse_scaling_y_form_c_resolves_covariates() {
+        // Regression for Copilot review: Form C parsed with ParseCtx::ode
+        // silently turned `WT` into a `Variable` and returned 0.0. With the
+        // fix (ParseCtx::new), unknown identifiers resolve as Covariate and
+        // get looked up in the per-call covariate map.
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            Some("  y = central / V * WT\n"),
+        );
+        let model = parse_model_string(&src).expect("Form C with covariate parses");
+        let ode = model.ode_spec.as_ref().unwrap();
+        let out_fn = ode.output_fn.as_ref().unwrap();
+
+        let state = vec![0.0, 50.0]; // depot=0, central=50
+        let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+        pk[0] = 1.0; // CL
+        pk[1] = 50.0; // V
+        pk[2] = 1.0; // KA
+        let mut cov = HashMap::new();
+        cov.insert("WT".to_string(), 70.0);
+        let y = out_fn(&state, &pk, &cov);
+        // central/V * WT = 50/50 * 70 = 70. With the bug, WT was treated as
+        // a Variable and read 0 from the empty vars map → y = 0.
+        assert!(
+            (y - 70.0).abs() < 1e-12,
+            "expected 70.0 (covariate WT must resolve), got {}",
+            y
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_rejected_on_sde_model() {
+        // Regression for Copilot review: EKF p_obs / r_obs run in unscaled
+        // observation space, so Forms A/B Phase 1 scaling on SDE models
+        // would produce mis-scaled variance. Parser must reject the
+        // combination entirely (Form C was already rejected).
+        let src = format!(
+            "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[diffusion]
+  central ~ 0.01
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[scaling]
+  obs_scale = 1000
+
+[fit_options]
+  method  = focei
+  maxiter = 5
+  gradient = fd
+"
+        );
+        let err =
+            parse_model_string(&src).expect_err("SDE + [scaling] must be rejected in Phase 1");
+        assert!(
+            err.to_lowercase().contains("sde") || err.contains("[diffusion]"),
+            "expected SDE rejection error, got: {}",
+            err
+        );
     }
 
     #[test]

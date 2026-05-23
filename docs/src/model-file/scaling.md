@@ -96,10 +96,18 @@ reads as "divide raw by V/1000" — matching NONMEM's `S2`.
 
 ## Interaction with SDE / `[diffusion]`
 
-The EKF / SDE path requires a single observable compartment index for
-the Kalman update. SDE models can use Forms A and B (post-multiplied at
-the end of the prediction path) but cannot use Form C — the parser
-rejects SDE models that omit `obs_cmt` from `[structural_model]`.
+In Phase 1, `[scaling]` is **not supported** on SDE models. The EKF /
+Kalman update computes both the predicted mean and the prediction
+covariance `p_obs` in the observation space, and the per-observation
+`r_obs` callback evaluates the residual variance from that predicted
+mean. Forms A/B post-multiply only the mean, so the EKF variance would
+remain in the unscaled space — producing mis-scaled OFVs.
+
+A correct SDE+scaling integration needs the scale factor threaded into
+both the EKF `p_obs` propagation (scales by `1/K²`) and the residual
+variance callback. That's a wider change deferred to Phase 1.5. Until
+then, the parser rejects any `[scaling]` block on a model with a
+`[diffusion]` block (Forms A, B, and C alike).
 
 ## Multi-analyte (forward compatibility)
 

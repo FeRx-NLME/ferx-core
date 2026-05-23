@@ -32,13 +32,27 @@ pub fn apply_scaling(
     match scaling {
         ScalingSpec::None => {}
         ScalingSpec::ScalarScale(k) => {
-            let inv = 1.0 / k;
-            preds.iter_mut().for_each(|p| *p *= inv);
+            // Parser enforces `k > 0 && finite`; defensive guard kept so
+            // hand-constructed CompiledModels can't introduce inf/NaN.
+            if *k > 0.0 && k.is_finite() {
+                let inv = 1.0 / k;
+                preds.iter_mut().for_each(|p| *p *= inv);
+            }
         }
         ScalingSpec::ExpressionScale { scale_fn } => {
             let s = scale_fn(theta, eta, covariates);
-            let inv = 1.0 / s;
-            preds.iter_mut().for_each(|p| *p *= inv);
+            // Expression scales can evaluate to 0 / NaN / inf at runtime
+            // (e.g. covariate-driven `WT / 70` when WT = 0 due to missing
+            // data, or `1 / (TVV - x)` near a singularity). Dividing
+            // would produce inf/NaN predictions that then contaminate
+            // residual variance and likelihood. Skip the divide and
+            // leave preds untouched when the scale is not a positive
+            // finite value — the resulting OFV will reflect the
+            // mis-scaled fit rather than blowing up.
+            if s > 0.0 && s.is_finite() {
+                let inv = 1.0 / s;
+                preds.iter_mut().for_each(|p| *p *= inv);
+            }
         }
     }
 }
@@ -671,6 +685,38 @@ mod tests {
         );
         for (got, exp) in preds.iter().zip([1.0, 2.0, 3.0].iter()) {
             assert_relative_eq!(got, exp, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_apply_scaling_skips_invalid_scale() {
+        // Regression for Copilot review: an ExpressionScale whose closure
+        // returns 0 / NaN / inf must not produce inf/NaN predictions.
+        // Phase 1 policy: leave preds unchanged.
+        let cases: [Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>; 3] = [
+            Box::new(|_, _, _| 0.0),
+            Box::new(|_, _, _| f64::NAN),
+            Box::new(|_, _, _| f64::INFINITY),
+        ];
+        let theta = vec![];
+        let eta = vec![];
+        let cov = HashMap::new();
+        for scale_fn in cases {
+            let mut preds = vec![1.0, 2.0, 3.0];
+            apply_scaling(
+                &ScalingSpec::ExpressionScale { scale_fn },
+                &theta,
+                &eta,
+                &cov,
+                &mut preds,
+            );
+            for p in &preds {
+                assert!(
+                    p.is_finite(),
+                    "invalid scale must not contaminate predictions"
+                );
+            }
+            assert_eq!(preds, vec![1.0, 2.0, 3.0]);
         }
     }
 

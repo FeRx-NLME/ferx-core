@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "../searchindex-38383e4d.js";
+            window.path_to_searchindex_js = "../searchindex-10b3e3bf.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-f187808c.js"></script>
@@ -257,10 +257,17 @@ as a <code>Const</code> argument.</li>
 expression scaling with AD gradients and prints the required flag.</li>
 </ul>
 <h2 id="interaction-with-sde--diffusion"><a class="header" href="#interaction-with-sde--diffusion">Interaction with SDE / <code>[diffusion]</code></a></h2>
-<p>The EKF / SDE path requires a single observable compartment index for
-the Kalman update. SDE models can use Forms A and B (post-multiplied at
-the end of the prediction path) but cannot use Form C — the parser
-rejects SDE models that omit <code>obs_cmt</code> from <code>[structural_model]</code>.</p>
+<p>In Phase 1, <code>[scaling]</code> is <strong>not supported</strong> on SDE models. The EKF /
+Kalman update computes both the predicted mean and the prediction
+covariance <code>p_obs</code> in the observation space, and the per-observation
+<code>r_obs</code> callback evaluates the residual variance from that predicted
+mean. Forms A/B post-multiply only the mean, so the EKF variance would
+remain in the unscaled space — producing mis-scaled OFVs.</p>
+<p>A correct SDE+scaling integration needs the scale factor threaded into
+both the EKF <code>p_obs</code> propagation (scales by <code>1/K²</code>) and the residual
+variance callback. That’s a wider change deferred to Phase 1.5. Until
+then, the parser rejects any <code>[scaling]</code> block on a model with a
+<code>[diffusion]</code> block (Forms A, B, and C alike).</p>
 <h2 id="multi-analyte-forward-compatibility"><a class="header" href="#multi-analyte-forward-compatibility">Multi-analyte (forward compatibility)</a></h2>
 <p><code>[scaling]</code> is per-model in Phase 1. When ferx adds CMT-keyed scaling
 (NONMEM’s <code>if (CMT==2) Y = A2/V2</code>-style routing), the same block will
