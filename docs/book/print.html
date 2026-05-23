@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "ayu";
-            window.path_to_searchindex_js = "searchindex-45bc66c5.js";
+            window.path_to_searchindex_js = "searchindex-229bf832.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-e4fdb3a6.js"></script>
@@ -2287,6 +2287,7 @@ warnings.</p>
 <p>NLopt still runs for any remaining thetas (non-mu-referenced) and for sigma — the closed-form-updated thetas are pinned at their new values for the NLopt call.</p>
 <p>When <code>mu_referencing = false</code>, the full NLopt M-step runs for all thetas as before.</p>
 <p>The number of NLopt evaluations saved is stored in <code>FitResult::saem_mu_ref_m_step_evals_saved</code>, accumulated across SAEM iterations as <code>2 × mstep_maxiter × n_mu_ref_pairs</code> per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at <code>mstep_maxiter</code> NLopt gradient requests). The field is <code>None</code> when mu-referencing is off or method ≠ SAEM.</p>
+<p>When <code>n_leapfrog &gt; 0</code>, <code>FitResult::saem_n_subjects_hmc</code> records how many subjects used HMC at least once during the E-step (the remainder used MH fallback). The field is <code>None</code> for MH-only runs. The fit YAML also emits <code>saem_n_subjects_hmc</code> and <code>saem_n_subjects_mh</code> when the field is <code>Some</code>.</p>
 <h3 id="5-adaptive-step-sizes"><a class="header" href="#5-adaptive-step-sizes">5. Adaptive Step Sizes</a></h3>
 <p>Every <code>adapt_interval</code> iterations, the per-subject step sizes \( \delta_i \) (MH) or leapfrog step sizes (HMC) are adjusted based on acceptance rate:</p>
 <ul>

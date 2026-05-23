@@ -686,6 +686,10 @@ pub fn run_saem(
     // the value we add per M-step that takes the closed-form branch.
     let mut mstep_grad_step_evals_saved: u64 = 0;
 
+    // Per-subject flag: did this subject successfully use HMC at least once?
+    // Only meaningful when `using_hmc = true`; stays all-false otherwise.
+    let mut hmc_subjects = vec![false; n_subjects];
+
     // Main loop
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -713,7 +717,7 @@ pub fn run_saem(
             let sigma_ref = &state.sigma_vals;
             let omega_ref = &omega_k;
 
-            let results: Vec<(Vec<f64>, f64, usize, usize)> = state
+            let results: Vec<(Vec<f64>, f64, usize, usize, bool)> = state
                 .etas
                 .par_iter()
                 .zip(state.nll_cache.par_iter())
@@ -746,7 +750,7 @@ pub fn run_saem(
                                     sigma_ref, scale, n_leapfrog, &mut rng,
                                 )
                             {
-                                return (new_eta, new_nll, accepted as usize, 1_usize);
+                                return (new_eta, new_nll, accepted as usize, 1_usize, true);
                             }
                         }
                         let (n_acc, nll_new) = mh_steps(
@@ -762,16 +766,18 @@ pub fn run_saem(
                             n_mh_steps,
                             pk_scratch,
                         );
-                        (eta_work, nll_new, n_acc, n_mh_steps)
+                        (eta_work, nll_new, n_acc, n_mh_steps, false)
                     },
                 )
                 .collect();
 
-            for (i, (eta_new, nll_new, n_acc, n_prop)) in results.into_iter().enumerate() {
+            for (i, (eta_new, nll_new, n_acc, n_prop, used_hmc)) in results.into_iter().enumerate()
+            {
                 state.etas[i] = eta_new;
                 state.nll_cache[i] = nll_new;
                 state.accept_counts[i] += n_acc;
                 state.proposal_counts[i] += n_prop;
+                hmc_subjects[i] |= used_hmc;
             }
         }
         state.steps_since_adapt += 1;
@@ -1092,6 +1098,12 @@ pub fn run_saem(
         None
     };
 
+    let saem_n_subjects_hmc = if using_hmc {
+        Some(hmc_subjects.iter().filter(|&&b| b).count())
+    } else {
+        None
+    };
+
     Ok(OuterResult {
         params: final_params,
         ofv,
@@ -1103,6 +1115,7 @@ pub fn run_saem(
         covariance_matrix,
         warnings,
         saem_mu_ref_m_step_evals_saved,
+        saem_n_subjects_hmc,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,

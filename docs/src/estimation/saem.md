@@ -97,6 +97,8 @@ When `mu_referencing = false`, the full NLopt M-step runs for all thetas as befo
 
 The number of NLopt evaluations saved is stored in `FitResult::saem_mu_ref_m_step_evals_saved`, accumulated across SAEM iterations as `2 × mstep_maxiter × n_mu_ref_pairs` per outer step (one finite-difference probe pair per pinned mu-ref dimension, capped at `mstep_maxiter` NLopt gradient requests). The field is `None` when mu-referencing is off or method ≠ SAEM.
 
+When `n_leapfrog > 0`, `FitResult::saem_n_subjects_hmc` records how many subjects used HMC at least once during the E-step (the remainder used MH fallback). The field is `None` for MH-only runs. The fit YAML also emits `saem_n_subjects_hmc` and `saem_n_subjects_mh` when the field is `Some`.
+
 ### 5. Adaptive Step Sizes
 
 Every `adapt_interval` iterations, the per-subject step sizes \\( \delta_i \\) (MH) or leapfrog step sizes (HMC) are adjusted based on acceptance rate:

@@ -371,6 +371,7 @@ mod tests {
             shrinkage_kappa: vec![],
             ebe_kappas: vec![],
             saem_mu_ref_m_step_evals_saved: None,
+            saem_n_subjects_hmc: None,
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,

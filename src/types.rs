@@ -1123,6 +1123,9 @@ pub struct FitResult {
     /// Estimated OFV evaluations saved by the SAEM mu-ref gradient step M-step.
     /// Non-None only when method=saem and mu_referencing=true.
     pub saem_mu_ref_m_step_evals_saved: Option<u64>,
+    /// Number of subjects that used HMC at least once during the SAEM E-step.
+    /// `None` when `n_leapfrog = 0` (MH-only) or for non-SAEM methods.
+    pub saem_n_subjects_hmc: Option<usize>,
     /// Gradient method used in the inner (per-subject EBE) BFGS loop.
     pub gradient_method_inner: String,
     /// Gradient method used in the outer (population parameter) optimizer.

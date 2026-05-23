@@ -166,6 +166,8 @@ struct FitWire {
     total_ebe_fallbacks: u32,
     warnings: Vec<String>,
     saem_mu_ref_m_step_evals_saved: Option<u64>,
+    #[serde(default)]
+    saem_n_subjects_hmc: Option<usize>,
 
     theta: ThetaWire,
     omega: OmegaWire,
@@ -581,6 +583,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         total_ebe_fallbacks: r.total_ebe_fallbacks,
         warnings: r.warnings.clone(),
         saem_mu_ref_m_step_evals_saved: r.saem_mu_ref_m_step_evals_saved,
+        saem_n_subjects_hmc: r.saem_n_subjects_hmc,
         theta: ThetaWire {
             names: r.theta_names.clone(),
             estimates: r.theta.clone(),
@@ -1433,6 +1436,7 @@ fn wire_to_fit_result(
         shrinkage_kappa,
         ebe_kappas,
         saem_mu_ref_m_step_evals_saved: w.saem_mu_ref_m_step_evals_saved,
+        saem_n_subjects_hmc: w.saem_n_subjects_hmc,
         gradient_method_inner: w.gradient_method_inner,
         gradient_method_outer: w.gradient_method_outer,
         uses_ode_solver: w.uses_ode_solver,
@@ -1592,6 +1596,7 @@ mod tests {
             shrinkage_kappa: vec![],
             ebe_kappas: vec![],
             saem_mu_ref_m_step_evals_saved: None,
+            saem_n_subjects_hmc: None,
             gradient_method_inner: "autodiff".into(),
             gradient_method_outer: "autodiff".into(),
             uses_ode_solver: false,

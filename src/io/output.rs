@@ -542,6 +542,11 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     }
     writeln!(f, "  uses_ode_solver: {}", result.uses_ode_solver).map_err(|e| e.to_string())?;
     writeln!(f, "  uses_sde: {}", result.uses_sde).map_err(|e| e.to_string())?;
+    if let Some(n_hmc) = result.saem_n_subjects_hmc {
+        let n_mh = result.n_subjects.saturating_sub(n_hmc);
+        writeln!(f, "  saem_n_subjects_hmc: {n_hmc}").map_err(|e| e.to_string())?;
+        writeln!(f, "  saem_n_subjects_mh: {n_mh}").map_err(|e| e.to_string())?;
+    }
 
     writeln!(f, "\nobjective_function:").map_err(|e| e.to_string())?;
     writeln!(f, "  ofv: {:.6}", result.ofv).map_err(|e| e.to_string())?;
@@ -1002,6 +1007,7 @@ mod tests {
             shrinkage_kappa: Vec::new(),
             ebe_kappas: Vec::new(),
             saem_mu_ref_m_step_evals_saved: None,
+            saem_n_subjects_hmc: None,
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,
