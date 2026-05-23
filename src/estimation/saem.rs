@@ -93,6 +93,10 @@ fn mh_steps(
     rng: &mut impl Rng,
     n_steps: usize,
     pk_scratch: &mut EventPkParams,
+    // When Some, eta proposals are evaluated with IOV-aware NLL (kappas held fixed).
+    // This is required for Gibbs correctness in IOV models: the acceptance ratio
+    // must target p(η | κ, θ, data), which includes the per-occasion kappa terms.
+    kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
 ) -> (usize, f64) {
     let n_eta = eta.len();
     let l = &omega.chol;
@@ -108,20 +112,33 @@ fn mh_steps(
             .map(|j| eta[j] + step_scale * perturbation[j])
             .collect();
 
-        // Reuses `pk_scratch` across all n_steps proposals (and across
-        // outer SAEM iterations when the caller hoists allocation
-        // further). On TV-cov subjects this eliminates the per-call
-        // allocate/discard of three `Vec<PkParams>` per evaluation —
-        // the dominant allocator pressure on the SAEM hot loop.
-        let nll_prop = individual_nll_into(
-            model,
-            subject,
-            theta,
-            &eta_prop,
-            omega,
-            sigma_values,
-            pk_scratch,
-        );
+        // For non-IOV models: reuse pk_scratch to avoid per-call allocation
+        // (dominant allocator pressure on the SAEM hot loop for TV-cov subjects).
+        // For IOV models: individual_nll_iov allocates its own scratch; correctness
+        // of the Gibbs conditional p(η | κ, θ, data) requires the per-occasion
+        // [eta_prop, kappa_k] predictions, which individual_nll_into does not compute.
+        let nll_prop = if let Some((kappas, omega_iov)) = kappas_opt {
+            individual_nll_iov(
+                model,
+                subject,
+                theta,
+                &eta_prop,
+                kappas,
+                omega,
+                Some(omega_iov),
+                sigma_values,
+            )
+        } else {
+            individual_nll_into(
+                model,
+                subject,
+                theta,
+                &eta_prop,
+                omega,
+                sigma_values,
+                pk_scratch,
+            )
+        };
 
         // Symmetric proposal q(η_prop|η) = q(η|η_prop) cancels in the ratio,
         // so the prior+likelihood difference encoded in `individual_nll` is
@@ -152,7 +169,7 @@ fn mh_steps(
 /// Returns `(n_accepted, n_proposed, updated_nll)`.
 #[allow(clippy::too_many_arguments)]
 fn mh_kappa_steps(
-    kappas: &mut Vec<Vec<f64>>,
+    kappas: &mut [Vec<f64>],
     nll_current: f64,
     subject: &Subject,
     model: &CompiledModel,
@@ -239,6 +256,9 @@ fn obs_nll_subject_into_iov(
             model, subject, theta, &combined, pk_scratch,
         );
         for &j in obs_indices {
+            // Floors protect log(0) in the M-step objective.  individual_nll_iov
+            // (the E-step evaluator) does not floor — see obs_nll_subject_grad_iov
+            // for why the asymmetry is intentional.
             let f = preds[j].max(1e-12);
             let v =
                 crate::stats::residual_error::residual_variance(model.error_model, f, sigma_values)
@@ -384,6 +404,18 @@ fn obs_nll_subject_grad_iov(
             d_obs_nll
         };
     }
+
+    // split_obs_by_occasion partitions every index in 0..n_obs (one entry per
+    // observation in subject.occasions).  The sigma gradient below sums over
+    // all_preds_base/residuals/variances which are only populated for indices
+    // that appear in occ_groups.  Assert the partition is complete so an
+    // occasion-code gap would surface as a debug-mode failure rather than a
+    // silent wrong gradient.
+    debug_assert_eq!(
+        occ_groups.iter().map(|(_, v)| v.len()).sum::<usize>(),
+        n_obs,
+        "split_obs_by_occasion must partition every observation index"
+    );
 
     // Sigma gradient: analytical — same formula as non-IOV, summed over all obs.
     for k in 0..n_sigma {
@@ -1124,6 +1156,24 @@ pub fn run_saem(
             init_params.omega.diagonal,
         );
 
+        // Rebuild omega_iov for this iteration.  Using from_matrix_with_mask
+        // (not from_matrix) preserves the structural free_mask so that an
+        // off-diagonal entry that converges to zero is not mistakenly treated
+        // as a structural zero in the Cholesky proposal distribution.
+        // Used in both the eta MH (Bug 2 fix) and the kappa MH (Step 1b).
+        let omega_iov_cur_opt: Option<OmegaMatrix> = if n_kappa > 0 {
+            init_params.omega_iov.as_ref().map(|iov_ref| {
+                OmegaMatrix::from_matrix_with_mask(
+                    state.omega_iov_mat.clone(),
+                    iov_ref.eta_names.clone(),
+                    iov_ref.diagonal,
+                    iov_ref.free_mask.clone(),
+                )
+            })
+        } else {
+            None
+        };
+
         // ---- Step 1: MH simulation (parallelized) ----
         // Symmetric random-walk MH in eta_true space, identical schedule
         // throughout exploration and convergence — the only thing that
@@ -1133,6 +1183,11 @@ pub fn run_saem(
             let theta_ref = &state.theta;
             let sigma_ref = &state.sigma_vals;
             let omega_ref = &omega_k;
+            // For IOV models, eta proposals must target p(η | κ, θ, data):
+            // the per-occasion [eta_prop, kappa_k] predictions determine
+            // which etas are accepted.  Pass omega_iov to mh_steps so it
+            // can call individual_nll_iov with kappas held fixed.
+            let omega_iov_for_eta_mh: Option<&OmegaMatrix> = omega_iov_cur_opt.as_ref();
 
             // Returns (eta_new, nll_after_eta, n_acc_eta, n_prop_eta, used_hmc)
             let results: Vec<(Vec<f64>, f64, usize, usize, bool)> = state
@@ -1140,6 +1195,7 @@ pub fn run_saem(
                 .par_iter()
                 .zip(state.nll_cache.par_iter())
                 .zip(state.step_scales.par_iter())
+                .zip(state.kappas.par_iter())
                 .enumerate()
                 // Per-rayon-worker `EventPkParams` scratch: allocated
                 // once per worker per outer iteration, reused across
@@ -1149,7 +1205,7 @@ pub fn run_saem(
                 // with it, n_workers × N_iter ≈ 10 × N_iter.
                 .map_init(
                     EventPkParams::default,
-                    |pk_scratch, (i, ((eta, &nll), &scale))| {
+                    |pk_scratch, (i, (((eta, &nll), &scale), kappas_i))| {
                         let subject = &population.subjects[i];
                         let mut rng = StdRng::seed_from_u64(
                             master_seed
@@ -1171,6 +1227,8 @@ pub fn run_saem(
                                 return (new_eta, new_nll, accepted as usize, 1_usize, true);
                             }
                         }
+                        let kappas_mh_opt =
+                            omega_iov_for_eta_mh.map(|iov| (kappas_i.as_slice(), iov));
                         let (n_acc, nll_new) = mh_steps(
                             &mut eta_work,
                             nll,
@@ -1183,6 +1241,7 @@ pub fn run_saem(
                             &mut rng,
                             n_mh_steps,
                             pk_scratch,
+                            kappas_mh_opt,
                         );
                         (eta_work, nll_new, n_acc, n_mh_steps, false)
                     },
@@ -1205,12 +1264,7 @@ pub fn run_saem(
         // This is a sequential per-subject loop (non-parallel) because the kappa
         // MH is cheap (low-dimensional, analytical PK) and share-free.
         if n_kappa > 0 {
-            if let Some(omega_iov_ref) = init_params.omega_iov.as_ref() {
-                let omega_iov_cur = OmegaMatrix::from_matrix(
-                    state.omega_iov_mat.clone(),
-                    omega_iov_ref.eta_names.clone(),
-                    omega_iov_ref.diagonal,
-                );
+            if let Some(omega_iov_cur) = omega_iov_cur_opt.as_ref() {
                 for i in 0..n_subjects {
                     let subject = &population.subjects[i];
                     let mut rng = StdRng::seed_from_u64(
@@ -1219,15 +1273,33 @@ pub fn run_saem(
                             .wrapping_add(i as u64)
                             .wrapping_add(999_999),
                     );
+                    // Recompute NLL under the IOV-consistent function before
+                    // proposing kappa.  After the eta MH block, nll_cache[i]
+                    // may have been set by mh_steps via individual_nll_iov
+                    // (with kappas fixed) — but to be safe we always recompute
+                    // with the current kappas so detailed balance is guaranteed:
+                    // both nll_kappa_ref and nll_prop are evaluated by the same
+                    // individual_nll_iov, giving the correct acceptance ratio for
+                    // p(κ | η, θ, data).
+                    let nll_kappa_ref = individual_nll_iov(
+                        model,
+                        subject,
+                        &state.theta,
+                        &state.etas[i],
+                        &state.kappas[i],
+                        &omega_k,
+                        Some(omega_iov_cur),
+                        &state.sigma_vals,
+                    );
                     let (n_acc, n_prop, nll_new) = mh_kappa_steps(
                         &mut state.kappas[i],
-                        state.nll_cache[i],
+                        nll_kappa_ref,
                         subject,
                         model,
                         &state.theta,
                         &state.etas[i],
                         &omega_k,
-                        &omega_iov_cur,
+                        omega_iov_cur,
                         &state.sigma_vals,
                         state.kappa_step_scales[i],
                         &mut rng,
@@ -1452,12 +1524,16 @@ pub fn run_saem(
             init_params.omega.diagonal,
         );
         if n_kappa > 0 {
-            // IOV: rebuild omega_iov_cur and use individual_nll_iov for the cache.
+            // IOV NLL cache refresh — sequential rather than rayon-parallel.
+            // individual_nll_iov is cheap (analytical PK, few occasions) and
+            // the sequential loop avoids a second rayon scatter/gather.
+            // Parallelise here if profiling shows a bottleneck.
             let omega_iov_upd = init_params.omega_iov.as_ref().map(|iov_ref| {
-                OmegaMatrix::from_matrix(
+                OmegaMatrix::from_matrix_with_mask(
                     state.omega_iov_mat.clone(),
                     iov_ref.eta_names.clone(),
                     iov_ref.diagonal,
+                    iov_ref.free_mask.clone(),
                 )
             });
             let new_nlls: Vec<f64> = (0..n_subjects)
@@ -1860,6 +1936,7 @@ mod tests {
             &mut rng,
             100,
             &mut pk_scratch,
+            None,
         );
 
         // Random walk with step=0: every proposal == current eta, accepted as

@@ -185,6 +185,7 @@ fn iov_saem_converges_within_tolerance_of_focei() {
         "omega_iov must be present in SAEM IOV result"
     );
     // SAEM and FOCEI are different approximations; allow 2.0 OFV units of slack.
+    // TODO: tighten after nightly baseline is established.
     assert!(
         (saem_result.ofv - focei_result.ofv).abs() < 2.0,
         "SAEM IOV OFV {:.4} differs from FOCEI OFV {:.4} by more than 2.0 units",

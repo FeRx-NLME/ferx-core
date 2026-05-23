@@ -1,6 +1,6 @@
 # SAEM
 
-Stochastic Approximation Expectation-Maximization (SAEM) is an alternative estimation method that uses MCMC sampling for random effects instead of MAP optimization. It is more robust to local minima and can handle complex random effect structures.
+Stochastic Approximation Expectation-Maximization (SAEM) is an alternative estimation method that uses MCMC sampling for random effects instead of MAP optimization. It is more robust to local minima and can handle complex random effect structures, including models with **inter-occasion variability (IOV)**.
 
 ## Algorithm Overview
 
@@ -125,6 +125,16 @@ method = [saem, imp]
 ```
 
 See [Importance Sampling (IMP)](importance-sampling.md).
+
+## Inter-Occasion Variability (IOV)
+
+`method = saem` supports models with `kappa` declarations (`n_kappa > 0`). IOV is handled with a per-occasion Gibbs Metropolis-Hastings step interleaved with the standard eta MH:
+
+- **E-step**: After sampling \\( \eta \\), one MH proposal is made for each occasion's \\( \kappa_k \\). Both the eta and kappa samplers target the correct conditional distributions: \\( p(\eta | \kappa, \theta, \text{data}) \\) and \\( p(\kappa_k | \eta, \theta, \text{data}) \\) respectively.
+- **SA update**: \\( S_2^{\text{iov}} \leftarrow (1 - \gamma_k) S_2^{\text{iov}} + \gamma_k \cdot \frac{1}{N_{\text{occ}}} \sum_i \sum_k \kappa_{ik} \kappa_{ik}^T \\)
+- **M-step**: \\( \Omega_{\text{iov}} = S_2^{\text{iov}} \\) (analytic update, same structure as the BSV omega M-step).
+
+No additional configuration is required; `method = saem` works for both BSV-only and IOV models.
 
 ## Configuration
 
