@@ -2357,6 +2357,10 @@ mod iov_integration {
             fr.ofv.is_finite(),
             "chained SAEM+FOCE IOV OFV must be finite"
         );
+        assert!(
+            fr.omega_iov.is_some(),
+            "omega_iov must survive the FOCE polishing step in a chained run"
+        );
     }
 
     // ── Test: trust-region optimizer + IOV must return Err ────────────────────

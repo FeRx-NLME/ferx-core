@@ -971,6 +971,13 @@ pub fn run_saem(
         .collect();
     let step_scales = vec![0.3; n_subjects];
 
+    // Guard: the parser must guarantee omega_iov is present whenever kappas
+    // are declared; if this fires, the caller wired up a broken ModelParameters.
+    debug_assert!(
+        n_kappa == 0 || init_params.omega_iov.is_some(),
+        "n_kappa > 0 but init_params.omega_iov is None — model is misconfigured"
+    );
+
     // Initialize IOV kappa state
     let (kappas_init, omega_iov_init, s2_iov_init): (
         Vec<Vec<Vec<f64>>>,
@@ -1659,11 +1666,17 @@ pub fn run_saem(
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
         omega_iov: if n_kappa > 0 {
+            // Use from_matrix_with_mask so structural free_mask is preserved
+            // when this OuterResult is handed to a chained estimator (e.g.
+            // [saem, foce]); from_matrix would infer the mask from nonzeros
+            // and could mark a legitimately-zero off-diagonal as structurally
+            // fixed, corrupting the next estimator's parameterisation.
             init_params.omega_iov.as_ref().map(|iov_ref| {
-                OmegaMatrix::from_matrix(
+                OmegaMatrix::from_matrix_with_mask(
                     state.omega_iov_mat.clone(),
                     iov_ref.eta_names.clone(),
                     iov_ref.diagonal,
+                    iov_ref.free_mask.clone(),
                 )
             })
         } else {
