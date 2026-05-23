@@ -330,8 +330,9 @@ fn iov_analytical_gradient_path_returns_finite_ofv() {
     let model =
         ferx_core::parser::model_parser::parse_model_file(Path::new("examples/warfarin_iov.ferx"))
             .expect("warfarin_iov model must parse");
-    let population = ferx_core::read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, None)
-        .expect("warfarin_iov data must load");
+    let population =
+        ferx_core::read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+            .expect("warfarin_iov data must load");
 
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;
