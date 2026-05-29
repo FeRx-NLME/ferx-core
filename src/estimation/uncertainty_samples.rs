@@ -357,6 +357,7 @@ mod tests {
             n_iterations: 0,
             interaction: true,
             warnings: vec![],
+            warnings_structured: vec![],
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,

@@ -1500,6 +1500,14 @@ fn fit_inner(
         }
     }
 
+    // Build structured warnings from the final accumulated message list.
+    // Classification (severity/category) lives entirely in core so the R
+    // wrapper consumes the structure directly and never re-parses message text.
+    let warnings_structured_entries: Vec<crate::types::WarningEntry> = warnings
+        .iter()
+        .map(|w| crate::types::classify_warning(w))
+        .collect();
+
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
@@ -1530,6 +1538,7 @@ fn fit_inner(
         n_iterations: result.n_iterations,
         interaction: options.interaction,
         warnings,
+        warnings_structured: warnings_structured_entries,
         sir_ci_theta: sir_result.as_ref().map(|s| s.ci_theta.clone()),
         sir_ci_omega: sir_result.as_ref().map(|s| s.ci_omega.clone()),
         sir_ci_sigma: sir_result.as_ref().map(|s| s.ci_sigma.clone()),
@@ -3367,6 +3376,7 @@ mod simulate_with_uncertainty_tests {
             n_iterations: 0,
             interaction: true,
             warnings: vec![],
+            warnings_structured: vec![],
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,

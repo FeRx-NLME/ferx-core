@@ -1419,6 +1419,11 @@ fn wire_to_fit_result(
         n_parameters: w.n_parameters,
         n_iterations: w.n_iterations,
         interaction: w.interaction,
+        warnings_structured: w
+            .warnings
+            .iter()
+            .map(|s| crate::types::classify_warning(s))
+            .collect(),
         warnings: w.warnings,
         sir_ci_theta,
         sir_ci_omega,
@@ -1583,6 +1588,7 @@ mod tests {
             n_iterations: 10,
             interaction: true,
             warnings: vec!["watch out".into()],
+            warnings_structured: vec![],
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,

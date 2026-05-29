@@ -993,6 +993,7 @@ mod tests {
             n_iterations: 0,
             interaction: false,
             warnings: Vec::new(),
+            warnings_structured: Vec::new(),
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,
