@@ -496,7 +496,17 @@ pub fn find_ebe(
         ad_tv_adjusted,
         ad_event_data,
         ad_tv_per_event,
-    ) = if grad_method != InnerGradientMethod::Fd {
+    ) = if matches!(
+        grad_method,
+        InnerGradientMethod::AdSingleSnapshot | InnerGradientMethod::AdEventDriven
+    ) {
+        // AD-helper precompute is exclusive to the AD inner-gradient
+        // variants. Sens has its own Ω⁻¹ precompute earlier
+        // (`omega_inv_for_sens`) and doesn't need `tv_fn`-derived
+        // helpers, which is critical because Sens-eligible models
+        // (ODE) don't carry a `tv_fn`. Without this narrower gate
+        // the `tv_fn.expect(...)` below panicked under
+        // `--features autodiff` whenever the Sens path resolved.
         let dose_data = FlatDoseData::from_subject(subject);
         let omega_inv = params
             .omega
@@ -561,7 +571,12 @@ pub fn find_ebe(
                     &params.theta,
                 )),
             ),
-            InnerGradientMethod::Fd => (None, None, None),
+            // Sens and Fd both skip the AD-helper precompute; the Sens
+            // path doesn't use these scratch buffers and the Fd path
+            // never enters this conditional in the first place (gated by
+            // the outer `if grad_method != Fd { ... }`). Either way the
+            // arm produces `(None, None, None)`.
+            InnerGradientMethod::Fd | InnerGradientMethod::Sens => (None, None, None),
         };
         (
             Some(dose_data),
@@ -580,9 +595,25 @@ pub fn find_ebe(
     //
     // Resolved before the AD/FD branches. The `Sens` route doesn't need
     // `tv_fn` (which is analytical-only), so it kicks in for the ODE+Form-C
-    // models the Tier 4a work was designed for. Builds a psi-space
-    // gradient closure that converts `psi` → `eta_true` and dispatches to
-    // `gradient_sens` (one augmented integration per gradient call).
+    // models the Tier 4a work was designed for.
+    //
+    // Routes both `obj` AND `grad` through `predict_ode_with_sens` so the
+    // BFGS line search sees the SAME prediction surface that the gradient
+    // was computed on. Originally `obj` used `ode_predictions` (plain) and
+    // `grad` used `predict_ode_with_sens` (augmented); at the default
+    // solver tolerance the two integrations produce subtly different
+    // state trajectories (~1e-5 absolute), which is enough that the
+    // analytical gradient is the gradient of a slightly *different* NLL
+    // surface than the one Armijo's line search evaluates. The line search
+    // then backtracks ~27 times per BFGS step on the experiment Emax
+    // PK/PD fit (alpha → 7.5e-9, tiny steps, no progress) and the run is
+    // 10× slower than FD. Sharing predictions makes BFGS line search
+    // succeed normally; the residual perf gap vs FD comes from the
+    // augmented integration's ~3.4× per-call cost (n_states · (1 + n_eta)
+    // states, with default tolerance) — which is competitive with FD's
+    // `2 · n_eta` plain integrations only for `n_eta ≥ 4` or so. For the
+    // experiment's `n_eta = 2` Emax PK/PD model, Sens lands at roughly
+    // ~3× slower than FD even with consistent obj/grad.
     let omega_inv_for_sens = if grad_method == InnerGradientMethod::Sens {
         Some(
             params
@@ -597,13 +628,30 @@ pub fn find_ebe(
         None
     };
 
-    // Try BFGS — Sens or AD gradient when resolved, FD otherwise. The AD
-    // and Sens gradients of individual_nll w.r.t. psi equal the gradient
-    // w.r.t. eta_true (chain rule: d/dpsi = d/d(eta_true), since psi =
-    // eta_true + mu).
     let result_sens = if grad_method == InnerGradientMethod::Sens {
         let omega_inv = omega_inv_for_sens.as_ref().expect("just initialised");
         let mu_sens = mu.clone();
+        let mu_sens_obj = mu.clone();
+        // Sens-aware obj: same NLL formula as `individual_nll_into_with_schedule`
+        // but computes predictions via `predict_ode_with_sens`'s primary
+        // output (sens is unused here; the BFGS gradient closure below
+        // recomputes a fresh `predict_ode_with_sens` to get the sens
+        // tensor when it needs the gradient).
+        let obj_sens = |p: &[f64]| -> f64 {
+            let eta_t: Vec<f64> = p
+                .iter()
+                .zip(mu_sens_obj.iter())
+                .map(|(pi, mi)| pi - mi)
+                .collect();
+            sens_individual_nll(
+                model,
+                subject,
+                &params.theta,
+                &eta_t,
+                &params.omega,
+                &params.sigma.values,
+            )
+        };
         let grad_fn = |p: &[f64]| -> Vec<f64> {
             let eta_t: Vec<f64> = p
                 .iter()
@@ -620,7 +668,7 @@ pub fn find_ebe(
             )
         };
         Some(bfgs_minimize_with_grad(
-            &obj, &grad_fn, &mut psi, n_eta, max_iter, tol,
+            &obj_sens, &grad_fn, &mut psi, n_eta, max_iter, tol,
         ))
     } else {
         None
@@ -629,7 +677,13 @@ pub fn find_ebe(
     #[cfg(feature = "autodiff")]
     let result = if let Some(r) = result_sens {
         r
-    } else if grad_method != InnerGradientMethod::Fd {
+    } else if matches!(
+        grad_method,
+        InnerGradientMethod::AdSingleSnapshot | InnerGradientMethod::AdEventDriven
+    ) {
+        // Same narrower gate as the precompute block above — Sens
+        // is dispatched via `result_sens`, AD via this branch, FD
+        // via the trailing `else`.
         let dose_data = ad_dose_data.as_ref().unwrap();
         let omega_inv_flat = ad_omega_inv_flat.as_ref().unwrap();
         let log_det_omega = ad_log_det_omega.unwrap();
@@ -788,7 +842,13 @@ pub fn find_ebe(
             GRADIENT_TIMINGS.record_jac_ad(t0.elapsed().as_nanos() as u64);
             j
         }
-        InnerGradientMethod::Fd => {
+        InnerGradientMethod::Fd | InnerGradientMethod::Sens => {
+            // Sens shares the FD Jacobian here in MVP — the post-
+            // convergence H matrix is used for the SE / shrinkage path,
+            // not the BFGS gradient itself. Switching this to an
+            // analytical sens-based Jacobian is a follow-up; the FD
+            // version is correct, just one extra `2·n_eta` integrations
+            // per subject per outer iteration.
             let mut scratch = pk_scratch_cell.borrow_mut();
             let t0 = std::time::Instant::now();
             let j = compute_jacobian_fd(
@@ -1283,6 +1343,66 @@ fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
     }
     GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
     g
+}
+
+/// NLL evaluator that uses `predict_ode_with_sens`'s primary output
+/// instead of `ode_predictions`. Same formula as
+/// `individual_nll_into_with_schedule` but routes predictions through
+/// the augmented integrator so the BFGS line search sees an NLL surface
+/// consistent with the analytical gradient — see the long comment in
+/// `find_ebe`'s Sens branch for why this matters.
+fn sens_individual_nll(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    omega: &crate::types::OmegaMatrix,
+    sigma_values: &[f64],
+) -> f64 {
+    if !omega.log_det.is_finite() {
+        return 1e20;
+    }
+    let eta_vec = nalgebra::DVector::from_row_slice(eta);
+    let eta_prior = eta_vec.dot(&(&omega.inv * &eta_vec));
+
+    let ode = model
+        .ode_spec
+        .as_ref()
+        .expect("sens_individual_nll: ode_spec required");
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let (predictions, _sens) =
+        match crate::ode::predict_ode_with_sens(ode, &pk.values, theta, eta, subject) {
+            Some(out) => out,
+            None => return 1e20,
+        };
+
+    let mut data_ll = 0.0;
+    let error_spec = &model.error_spec;
+    for (j, (&y, &f)) in subject
+        .observations
+        .iter()
+        .zip(predictions.iter())
+        .enumerate()
+    {
+        if !f.is_finite() {
+            return 1e20;
+        }
+        let cmt = subject.obs_cmts.get(j).copied().unwrap_or(0);
+        let v = error_spec.variance_at(cmt, f, sigma_values);
+        if !v.is_finite() || v <= 0.0 {
+            return 1e20;
+        }
+        // MVP: BLOQ obs use the Gaussian formula here too — matches
+        // `gradient_sens`'s data-LL chain (and shares its limitation).
+        let resid = y - f;
+        data_ll += resid * resid / v + v.ln();
+    }
+    let nll = 0.5 * (eta_prior + omega.log_det + data_ll);
+    if nll.is_finite() {
+        nll
+    } else {
+        1e20
+    }
 }
 
 /// Analytical η-gradient via the Tier 4a sensitivity path. Computes

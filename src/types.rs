@@ -1299,23 +1299,56 @@ pub enum GradientMethod {
     Ad,
     Fd,
     /// Analytical sensitivity gradient via the Tier 4a augmented ODE +
-    /// Form C readout sensitivities (milestones 1-5, this PR being the
-    /// estimator-wiring step).
+    /// Form C readout sensitivities (milestones 1-5).
     ///
     /// Available when:
     /// - The model is ODE-based (`model.ode_spec.is_some()`), AND
     /// - `OdeSpec.rhs_augmented.is_some()` (milestone 3 codegen ran), AND
     /// - The readout is either `ObsCmt(_)` (direct sens-state read) OR
     ///   has matching `OdeSpec.readout_sensitivity` (milestone 4 closure
-    ///   available for Form C).
+    ///   for Form C), AND
+    /// - The subject has no SS doses, no system resets, and the model
+    ///   has no lagtime (MVP scope — augmented dose-event handling is a
+    ///   follow-up).
     ///
-    /// Falls back to `Fd` automatically when any of those conditions
-    /// fails — see `inner_optimizer::resolve_gradient_method`. Cost per
-    /// gradient call: one augmented ODE integration (n_states · (1 + n_eta)
-    /// states) versus FD's `2 · n_eta` plain integrations. For analytical
-    /// (non-ODE) PK models, `Sens` falls back to `Auto` (i.e. AD if
-    /// available, else FD) — the analytical-PK gradient already has an
-    /// efficient closed-form path that doesn't benefit from this work.
+    /// Falls back to `Fd` automatically when any condition fails — see
+    /// `inner_optimizer::resolve_gradient_method`. For analytical (non-
+    /// ODE) PK models `Sens` falls through to `Auto`'s AD/FD chain.
+    ///
+    /// # Performance characteristic
+    ///
+    /// **Sens is currently NOT a wall-time win for the typical
+    /// `n_eta ≤ 3` PK/PD model.** Measured on the experiment Emax PK/PD
+    /// fit (n_eta = 2, 100 subjects, 30 outer iterations):
+    ///
+    /// | Path | Wall time | Per-call cost |
+    /// |------|-----------|---------------|
+    /// | `Fd`   | 53 s    | 24 µs / `ode_predictions` call |
+    /// | `Sens` | 509 s   | 60 µs / `predict_ode_with_sens` call |
+    ///
+    /// Two reasons it doesn't win at low `n_eta`:
+    ///
+    /// 1. **Augmented integration is ~2.5× more expensive per call** —
+    ///    `n_states · (1 + n_eta)` states with default solver tolerance.
+    ///    FD only pays this 2× per η axis (perturbing each η in turn);
+    ///    Sens pays it on EVERY obj evaluation because the BFGS line
+    ///    search calls obj through the same augmented integrator (the
+    ///    only way to keep obj's prediction surface consistent with the
+    ///    analytical gradient — without this, Armijo's line search
+    ///    backtracks ~27× per BFGS step and the fit stalls).
+    /// 2. **Break-even is around `n_eta ≈ 21`** under the current
+    ///    per-call ratio. For typical PK/PD problems (n_eta ≤ 5) FD
+    ///    wins.
+    ///
+    /// The infrastructure (milestones 1-4) is correct and the analytical
+    /// gradient matches FD to ~1e-5 absolute. Productive use cases this
+    /// route enables today:
+    /// - Benchmark / cross-validation against FD on high-n_eta models.
+    /// - Future work on either (a) `n_eta`-scaling models (covariate-NN,
+    ///   hierarchical), or (b) a solver-level change that decouples
+    ///   sens-state error control from original-state step size — which
+    ///   would bring the per-call ratio toward 1× and shift break-even
+    ///   to `n_eta ≈ 3`.
     Sens,
 }
 

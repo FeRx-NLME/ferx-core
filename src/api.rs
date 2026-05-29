@@ -116,6 +116,22 @@ pub fn run_model_with_data_inits(
         data_path
     );
 
+    // Mirror `fit_from_files`'s `gradient_method` sync — the CLI path
+    // parses `gradient = sens` (or `ad`/`fd`) from the `[fit_options]`
+    // block into `parsed.fit_options.gradient_method`, but the inner-
+    // loop dispatcher reads `model.gradient_method`. Without this
+    // sync the requested method is silently ignored and the resolver
+    // falls back through the default `Auto` chain — confusingly,
+    // `gradient_route_summary` still prints `requested: Sens` because
+    // it sees the FitOptions field, but the per-subject resolver sees
+    // the un-synced `model.gradient_method` and demotes to FD.
+    parsed.model.gradient_method = if parsed.model.is_sde()
+        && parsed.fit_options.gradient_method != crate::types::GradientMethod::Fd
+    {
+        crate::types::GradientMethod::Fd
+    } else {
+        parsed.fit_options.gradient_method
+    };
     let init_params = build_init_params(&parsed);
     let mut result = fit(
         &parsed.model,
@@ -217,6 +233,17 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         population.n_obs()
     );
 
+    // Mirror `fit_from_files`'s `gradient_method` sync — see the
+    // matching block in `run_model_with_data_inits` above for the
+    // detailed rationale. Same one-liner here so `--simulate` mode
+    // honours `gradient = sens` in `[fit_options]` too.
+    parsed.model.gradient_method = if parsed.model.is_sde()
+        && parsed.fit_options.gradient_method != crate::types::GradientMethod::Fd
+    {
+        crate::types::GradientMethod::Fd
+    } else {
+        parsed.fit_options.gradient_method
+    };
     let init_params = build_init_params(&parsed);
     let mut result = fit(
         &parsed.model,

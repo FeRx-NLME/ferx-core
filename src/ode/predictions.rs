@@ -760,17 +760,20 @@ pub fn predict_ode_with_sens(
     let total_aug = n_states * (1 + n_eta);
     let n_obs = subject.obs_times.len();
 
-    // Tighter solver tolerance than the default — augmented integration
-    // has ~4× more states and the local-error estimator's coupling
-    // between original-state and sens-state error budgets degrades
-    // gradient accuracy with the default reltol=1e-4. 1e-8/1e-8 is the
-    // floor we've tested at; tighter risks runaway step-shrink with no
-    // meaningful gradient improvement.
-    let opts = OdeSolverOptions {
-        abstol: 1e-8,
-        reltol: 1e-8,
-        ..OdeSolverOptions::default()
-    };
+    // Solver tolerance matches the plain `ode_predictions` defaults
+    // (`reltol=1e-4`, `abstol=1e-6`). Tighter (1e-8/1e-8) was needed
+    // only for the milestone-3/4 end-to-end tests that compare an
+    // augmented integration against FD on a standalone integration;
+    // at fit time the gradient only needs to be more accurate than the
+    // inner-loop BFGS line-search tolerance (~1e-4) and the FD noise
+    // floor (~1e-6), so the default reltol gives us margin while
+    // keeping per-call cost in line with FD. Forcing 1e-8 here caused
+    // an ~8× slowdown vs FD on the experiment Emax PK/PD fit by
+    // step-shrinking the adaptive integrator on every RK45 stage of
+    // the 12-state augmented system, with no meaningful gradient
+    // improvement (sens-vs-FD already agreed to ~1e-5 absolute on
+    // that model at the default tolerance, well below FD's noise).
+    let opts = OdeSolverOptions::default();
 
     // Augmented initial state: original `init(state) = …` results in the
     // first n_states slots; sens-states init to 0 (no η dependence in the
