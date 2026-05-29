@@ -776,6 +776,31 @@ impl ErrorSpec {
             },
         }
     }
+
+    /// `∂V/∂f` partial for the milestone-5 analytical η-gradient. Same
+    /// per-CMT dispatch as `variance_at`; falls back to `NaN` on a
+    /// hand-constructed model with an uncovered CMT (matching the
+    /// defensive behaviour of `variance_at`).
+    pub fn dv_df_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
+        use crate::stats::residual_error::residual_variance_dv_df;
+        match self {
+            ErrorSpec::Single(em) => residual_variance_dv_df(*em, f_pred, sigma),
+            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
+                Some(ep) => {
+                    let n = ep.error_model.n_sigma();
+                    let mut buf = [0.0f64; 2];
+                    for k in 0..n.min(2) {
+                        match ep.sigma_idx.get(k).and_then(|&i| sigma.get(i)) {
+                            Some(&v) => buf[k] = v,
+                            None => return f64::NAN,
+                        }
+                    }
+                    residual_variance_dv_df(ep.error_model, f_pred, &buf[..n.min(2)])
+                }
+                None => f64::NAN,
+            },
+        }
+    }
 }
 
 /// One endpoint of a multi-endpoint (`ErrorSpec::PerCmt`) residual error model.
@@ -1273,6 +1298,25 @@ pub enum GradientMethod {
     Auto,
     Ad,
     Fd,
+    /// Analytical sensitivity gradient via the Tier 4a augmented ODE +
+    /// Form C readout sensitivities (milestones 1-5, this PR being the
+    /// estimator-wiring step).
+    ///
+    /// Available when:
+    /// - The model is ODE-based (`model.ode_spec.is_some()`), AND
+    /// - `OdeSpec.rhs_augmented.is_some()` (milestone 3 codegen ran), AND
+    /// - The readout is either `ObsCmt(_)` (direct sens-state read) OR
+    ///   has matching `OdeSpec.readout_sensitivity` (milestone 4 closure
+    ///   available for Form C).
+    ///
+    /// Falls back to `Fd` automatically when any of those conditions
+    /// fails — see `inner_optimizer::resolve_gradient_method`. Cost per
+    /// gradient call: one augmented ODE integration (n_states · (1 + n_eta)
+    /// states) versus FD's `2 · n_eta` plain integrations. For analytical
+    /// (non-ODE) PK models, `Sens` falls back to `Auto` (i.e. AD if
+    /// available, else FD) — the analytical-PK gradient already has an
+    /// efficient closed-form path that doesn't benefit from this work.
+    Sens,
 }
 
 impl Default for GradientMethod {

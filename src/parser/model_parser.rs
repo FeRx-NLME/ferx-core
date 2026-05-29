@@ -1994,9 +1994,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 "auto" => GradientMethod::Auto,
                 "ad" | "autodiff" => GradientMethod::Ad,
                 "fd" | "finite" | "finite_difference" | "finite-difference" => GradientMethod::Fd,
+                "sens" | "sensitivity" => GradientMethod::Sens,
                 other => {
                     return Err(format!(
-                        "fit option `gradient`: unknown value `{other}` — expected 'auto', 'ad', or 'fd'"
+                        "fit option `gradient`: unknown value `{other}` — expected 'auto', 'ad', 'fd', or 'sens'"
                     ));
                 }
             };
@@ -8044,6 +8045,8 @@ mod tests {
             ("gradient = fd", GradientMethod::Fd),
             ("gradient = finite", GradientMethod::Fd),
             ("gradient_method = ad", GradientMethod::Ad),
+            ("gradient = sens", GradientMethod::Sens),
+            ("gradient = sensitivity", GradientMethod::Sens),
         ] {
             let opts = parse_fit_options(&[input.to_string()]).unwrap();
             assert_eq!(opts.gradient_method, expected, "input: {input}");

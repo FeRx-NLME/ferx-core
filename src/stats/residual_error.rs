@@ -24,6 +24,31 @@ pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f
     v.max(MIN_VARIANCE)
 }
 
+/// Partial derivative `∂V/∂f` of the residual variance w.r.t. the
+/// prediction, mirroring [`residual_variance`]'s branches. Used by the
+/// milestone-5 analytical η-gradient (`gradient_sens`) for the
+/// chain-rule term that propagates predicted-value sensitivity into
+/// `∂NLL/∂η`. The `MIN_VARIANCE` clamp in `residual_variance` is NOT
+/// reflected here — the clamp is below f64 ULP for any realistic
+/// `f_pred`, and the gradient is unspecified in the clamped regime
+/// anyway.
+pub fn residual_variance_dv_df(error_model: ErrorModel, f_pred: f64, sigma_values: &[f64]) -> f64 {
+    match error_model {
+        // V = σ₁² → ∂V/∂f = 0
+        ErrorModel::Additive => 0.0,
+        // V = (f·σ₁)² → ∂V/∂f = 2 · f · σ₁²
+        ErrorModel::Proportional => {
+            let s = sigma_values[0];
+            2.0 * f_pred * s * s
+        }
+        // V = (f·σ₁)² + σ₂² → ∂V/∂f = 2 · f · σ₁²
+        ErrorModel::Combined => {
+            let s1 = sigma_values[0];
+            2.0 * f_pred * s1 * s1
+        }
+    }
+}
+
 /// Compute the R diagonal (vector of residual variances for all observations),
 /// dispatching the error model per observation by compartment. `obs_cmts` is
 /// parallel to `ipreds` (`subject.obs_cmts`); for single-endpoint models the

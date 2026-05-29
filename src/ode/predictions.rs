@@ -661,6 +661,267 @@ pub fn ode_predictions(
     predictions
 }
 
+/// Read both the primary observable AND its η-sensitivities at observation
+/// `obs_cmt`. Writes `∂y/∂η_k for k in 0..n_eta` into `sens_out`.
+///
+/// Dispatch mirrors `read_observable`:
+/// - `ObsCmt(idx)`: primary = `u_aug[idx]`; sens = direct read from the
+///   integrated sens-state at `u_aug[n_states + k·n_states + idx]`.
+/// - `Single` / `PerCmt`: primary via the primary closure; sens via the
+///   matching `OdeReadoutSens` closure (milestone 4). Mismatched shapes
+///   (Single readout + PerCmt sens, or PerCmt with no entry for `obs_cmt`)
+///   write NaN to `sens_out` — a parser-pipeline bug.
+#[inline]
+fn read_observable_and_sens(
+    ode: &OdeSpec,
+    u_aug: &[f64],
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    covariates: &HashMap<String, f64>,
+    obs_cmt: usize,
+    sens_out: &mut [f64],
+) -> f64 {
+    let n_states = ode.n_states;
+    debug_assert_eq!(sens_out.len(), ode.n_eta_for_sens);
+    let primary = match &ode.readout {
+        OdeReadout::ObsCmt(idx) => u_aug[*idx],
+        OdeReadout::Single(out_fn) => {
+            out_fn(&u_aug[..n_states], pk_params_flat, theta, eta, covariates)
+        }
+        OdeReadout::PerCmt(map) => match map.get(&obs_cmt) {
+            Some(out_fn) => out_fn(&u_aug[..n_states], pk_params_flat, theta, eta, covariates),
+            None => f64::NAN,
+        },
+    };
+    match (&ode.readout, &ode.readout_sensitivity) {
+        (OdeReadout::ObsCmt(idx), _) => {
+            // ObsCmt sensitivity is a direct sens-state read — no closure.
+            for k in 0..ode.n_eta_for_sens {
+                sens_out[k] = u_aug[n_states + k * n_states + *idx];
+            }
+        }
+        (OdeReadout::Single(_), Some(OdeReadoutSens::Single(sens_fn))) => {
+            sens_fn(u_aug, pk_params_flat, theta, eta, covariates, sens_out);
+        }
+        (OdeReadout::PerCmt(_), Some(OdeReadoutSens::PerCmt(map))) => match map.get(&obs_cmt) {
+            Some(sens_fn) => sens_fn(u_aug, pk_params_flat, theta, eta, covariates, sens_out),
+            None => {
+                for s in sens_out.iter_mut() {
+                    *s = f64::NAN;
+                }
+            }
+        },
+        // Shape mismatch — parser bug. NaN propagates.
+        _ => {
+            for s in sens_out.iter_mut() {
+                *s = f64::NAN;
+            }
+        }
+    };
+    primary
+}
+
+/// ODE predictions WITH per-observation η sensitivities. Integrates the
+/// augmented system from milestone 3 — state vector of length
+/// `n_states · (1 + n_eta_for_sens)` — and returns both the standard
+/// predictions Vec AND a per-obs `∂y/∂η_k` matrix.
+///
+/// Returns `None` when sensitivity codegen wasn't available (no
+/// `OdeSpec.rhs_augmented`, or `n_eta_for_sens == 0`). The caller falls
+/// back to plain `ode_predictions` + FD in that case.
+///
+/// Scope limits (milestone 5 MVP, same as the milestone 3 PR called out):
+/// - **Bolus doses with F=1** — η-dependence of F is not accounted for at
+///   the dose event. Models with η-dependent bioavailability or lagtime
+///   produce off-by-(dose perturbation) sens at dose times.
+/// - **Infusions (rate > 0)** integrate without their η-dependence on rate
+///   for sens slots. Tolerated for typical (η-independent) infusions; the
+///   resolve-gradient-method check should reject sens for SS or
+///   η-dependent infusion in a follow-up.
+/// - **System resets (EVID=3/4)** are not routed through this path; the
+///   inner-loop dispatcher demotes such subjects to FD.
+///
+/// Same n_obs Vec layout as `ode_predictions` for `predictions`; `sens`
+/// has shape `[n_obs][n_eta_for_sens]`.
+pub fn predict_ode_with_sens(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
+    let aug_rhs = ode.rhs_augmented.as_ref()?;
+    let n_eta = ode.n_eta_for_sens;
+    if n_eta == 0 {
+        return None;
+    }
+    let n_states = ode.n_states;
+    let total_aug = n_states * (1 + n_eta);
+    let n_obs = subject.obs_times.len();
+
+    // Tighter solver tolerance than the default — augmented integration
+    // has ~4× more states and the local-error estimator's coupling
+    // between original-state and sens-state error budgets degrades
+    // gradient accuracy with the default reltol=1e-4. 1e-8/1e-8 is the
+    // floor we've tested at; tighter risks runaway step-shrink with no
+    // meaningful gradient improvement.
+    let opts = OdeSolverOptions {
+        abstol: 1e-8,
+        reltol: 1e-8,
+        ..OdeSolverOptions::default()
+    };
+
+    // Augmented initial state: original `init(state) = …` results in the
+    // first n_states slots; sens-states init to 0 (no η dependence in the
+    // initial condition in MVP). When the user later adds an
+    // η-dependent init_fn we differentiate it the same way as the RHS.
+    let init_compact = ode.initial_state(pk_params_flat);
+    let mut u = vec![0.0_f64; total_aug];
+    u[..init_compact.len().min(n_states)]
+        .copy_from_slice(&init_compact[..init_compact.len().min(n_states)]);
+
+    let mut predictions = vec![f64::NAN; n_obs];
+    let mut sens = vec![vec![f64::NAN; n_eta]; n_obs];
+
+    let lagtime = pk_params_flat.get(PK_IDX_LAGTIME).copied().unwrap_or(0.0);
+    let dose_lagtimes: Vec<f64> = vec![lagtime; subject.doses.len()];
+    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
+    let dose_f_bio: Vec<f64> = vec![f_bio; subject.doses.len()];
+
+    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, &t) in subject.obs_times.iter().enumerate() {
+        obs_map.entry(t.to_bits()).or_default().push(i);
+    }
+
+    let t_last = subject.obs_times.iter().cloned().fold(0.0f64, f64::max);
+    let mut break_times: Vec<f64> = vec![0.0];
+    for dose in &subject.doses {
+        break_times.push(dose.time + lagtime);
+        if is_real_infusion(dose) {
+            break_times.push(dose.time + lagtime + dose.duration);
+        }
+    }
+    break_times.push(t_last);
+    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+
+    for k in 0..(break_times.len() - 1) {
+        let t_start = break_times[k];
+        let t_end = break_times[k + 1];
+
+        // Bolus jumps: original state gets `f_bio * dose.amt`. Sens states
+        // stay zero — MVP assumes F is η-independent. When that changes
+        // we add `(∂F/∂η_k) * dose.amt` to the matching sens slot here.
+        for dose in &subject.doses {
+            if (dose.time + lagtime - t_start).abs() >= 1e-12 {
+                continue;
+            }
+            if !is_real_infusion(dose) {
+                let cmt_idx = dose.cmt - 1;
+                if cmt_idx < n_states {
+                    u[cmt_idx] += f_bio * dose.amt;
+                }
+            }
+        }
+
+        // Record obs at exactly t_start (after dose).
+        if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
+            for &obs_idx in obs_idxs {
+                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                predictions[obs_idx] = read_observable_and_sens(
+                    ode,
+                    &u,
+                    pk_params_flat,
+                    theta,
+                    eta,
+                    &subject.covariates,
+                    cmt,
+                    &mut sens[obs_idx],
+                );
+            }
+        }
+
+        let mut saveat: Vec<f64> = subject
+            .obs_times
+            .iter()
+            .filter(|&&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+            .cloned()
+            .collect();
+        if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
+            saveat.push(t_end);
+        }
+        saveat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+
+        if (t_end - t_start).abs() < 1e-15 {
+            continue;
+        }
+
+        let active = active_infusions(
+            &subject.doses,
+            t_start,
+            t_end,
+            &dose_lagtimes,
+            &dose_f_bio,
+            f64::NEG_INFINITY,
+        );
+        // Wrap the 6-arg augmented closure: capture theta/eta into a 4-arg
+        // closure compatible with `solve_ode`. Same wrapper pattern as
+        // milestone-3's integration test.
+        let theta_local = theta.to_vec();
+        let eta_local = eta.to_vec();
+        let wrapped_aug = move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
+            (aug_rhs)(y, &theta_local, &eta_local, p, t, dy);
+            // Infusion contribution to the original states only — sens
+            // states get nothing in MVP (η-independent rate). When that
+            // changes, add `(∂rate/∂η_k)` here too.
+            for &(cmt_idx, rate) in &active {
+                if cmt_idx < dy.len() {
+                    dy[cmt_idx] += rate;
+                }
+            }
+        };
+        let sol = solve_ode(
+            &wrapped_aug,
+            &u,
+            (t_start, t_end),
+            pk_params_flat,
+            &saveat,
+            &opts,
+        );
+
+        for pt in &sol {
+            if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
+                for &obs_idx in obs_idxs {
+                    let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                    predictions[obs_idx] = read_observable_and_sens(
+                        ode,
+                        &pt.u,
+                        pk_params_flat,
+                        theta,
+                        eta,
+                        &subject.covariates,
+                        cmt,
+                        &mut sens[obs_idx],
+                    );
+                }
+            }
+        }
+
+        if let Some(last) = sol.last() {
+            u.copy_from_slice(&last.u);
+        }
+    }
+
+    for p in predictions.iter_mut() {
+        if *p < 0.0 {
+            *p = 0.0;
+        }
+    }
+    Some((predictions, sens))
+}
+
 /// ODE-based predictions with per-event PK parameters (time-varying-covariate
 /// aware). Walks the merged dose+obs+pk-only timeline, integrating each
 /// segment `[cur_t, t_event]` with the PK params evaluated at `t_event` —
