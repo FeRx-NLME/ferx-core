@@ -1417,13 +1417,18 @@ pub enum WarningSeverity {
 /// `bloq_method`, `sir`, `importance_sampling`, `data_quality`,
 /// `omega_structure`, `ebe_convergence`, `gradient_fallback`,
 /// `mu_referencing`, `optimizer_config`, `multi_start`, `cancelled`,
-/// `threads`, `condition_number`, `eta_normality`.
+/// `threads`, `condition_number`, `eta_normality`, `general` (fallback for
+/// unrecognised messages).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WarningEntry {
     pub severity: WarningSeverity,
     /// Fixed lowercase category string (see type-level docs).
     pub category: String,
-    /// Human-readable message (same text as the parallel `warnings` entry).
+    /// Human-readable message. For messages that carry a multi-stage chain
+    /// prefix such as `[FOCEI] ...`, only the body after the prefix is stored
+    /// here; the method tag is moved into `source_method`. For unprefixed
+    /// messages this is identical to the corresponding entry in
+    /// `FitResult.warnings`.
     pub message: String,
     /// For multi-stage chains, the method that produced this warning.
     pub source_method: Option<String>,
