@@ -333,16 +333,21 @@ mod tests {
     use super::*;
     use crate::io::datareader::read_nonmem_csv;
     use crate::parser::model_parser::parse_model_file;
-    use crate::types::{PK_IDX_CL, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2};
+    use crate::types::{PK_IDX_CL, PK_IDX_Q, PK_IDX_V, PK_IDX_V2};
     use std::path::Path;
 
     // ── helpers ─────────────────────────────────────────────────────────────
 
+    /// Parse the warfarin (1-cpt oral) model only — for tests that synthesise
+    /// their own `Population` (e.g. the empty-observations rRMSE branch).
+    fn warfarin_model() -> CompiledModel {
+        parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse")
+    }
+
     /// Load the warfarin (1-cpt oral) fixture used by the suite's other tests.
     /// Small (~30 subjects) and analytical so each sweep iteration is fast.
     fn warfarin() -> (CompiledModel, Population) {
-        let model = parse_model_file(Path::new("examples/warfarin.ferx"))
-            .expect("warfarin model must parse");
+        let model = warfarin_model();
         let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
             .expect("warfarin data must load");
         (model, population)
@@ -371,7 +376,7 @@ mod tests {
     /// observations over an empty one.
     #[test]
     fn test_rrmse_no_observations_returns_infinity() {
-        let (model, _real_pop) = warfarin();
+        let model = warfarin_model();
         let empty_pop = Population {
             subjects: vec![],
             covariate_names: vec![],
