@@ -1417,8 +1417,8 @@ pub enum WarningSeverity {
 /// `bloq_method`, `sir`, `importance_sampling`, `data_quality`,
 /// `omega_structure`, `ebe_convergence`, `gradient_fallback`,
 /// `mu_referencing`, `optimizer_config`, `multi_start`, `cancelled`,
-/// `threads`, `condition_number`, `eta_normality`, `general` (fallback for
-/// unrecognised messages).
+/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`, `general`
+/// (fallback for unrecognised messages).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WarningEntry {
     pub severity: WarningSeverity,
@@ -1432,26 +1432,6 @@ pub struct WarningEntry {
     pub message: String,
     /// For multi-stage chains, the method that produced this warning.
     pub source_method: Option<String>,
-}
-
-impl WarningEntry {
-    pub fn new(
-        severity: WarningSeverity,
-        category: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            severity,
-            category: category.into(),
-            message: message.into(),
-            source_method: None,
-        }
-    }
-
-    pub fn with_source(mut self, method: impl Into<String>) -> Self {
-        self.source_method = Some(method.into());
-        self
-    }
 }
 
 /// Classify a free-text warning message into a structured `WarningEntry`.
@@ -1485,11 +1465,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("no multi-start run converged")
     {
         (WarningSeverity::Critical, "convergence")
-    } else if lower.contains("covariance step failed")
-        || lower.contains("covariance failed")
-        || lower.contains("ses not available")
-        || lower.contains("se not available")
-    {
+    } else if lower.contains("covariance step failed") || lower.contains("covariance failed") {
+        // "ses not available" and "se not available" intentionally omitted:
+        // the only emitter ("Covariance step failed — SEs not available") already
+        // hits "covariance step failed" above, and bare "se not available" is too
+        // broad to safely match future messages.
         (WarningSeverity::Critical, "covariance_step")
     } else if lower.contains("ill-conditioned") || lower.contains("condition number") {
         (WarningSeverity::Critical, "condition_number")
@@ -1505,16 +1485,27 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, "sir")
     } else if lower.contains("ess = 0") || lower.contains("proposal collapse") {
         (WarningSeverity::Warning, "importance_sampling")
-    } else if lower.contains("ltbs") || lower.contains("non-positive dv") {
+    } else if lower.contains("eps shrinkage") {
+        (WarningSeverity::Warning, "eps_shrinkage")
+    } else if lower.contains("ltbs")
+        || lower.contains("non-positive dv")
+        || lower.contains("ss=1 dose")
+        || lower.contains("ss=1 infusion")
+        || lower.contains("evid=3/4")
+        || lower.contains("lagtime evaluates")
+    {
         (WarningSeverity::Warning, "data_quality")
     } else if lower.contains("mixed lognormal") || lower.contains("mixed log-normal") {
         (WarningSeverity::Warning, "omega_structure")
-    } else if lower.contains("ebe") && lower.contains("unconverged") {
-        (WarningSeverity::Warning, "ebe_convergence")
-    } else if lower.contains("hmc is unavailable") || lower.contains("falls back to") {
+    } else if lower.contains("hmc is unavailable") {
+        // "falls back to" intentionally removed: no emitted message uses that exact
+        // phrase. The SAEM HMC message is fully covered by "hmc is unavailable".
         (WarningSeverity::Info, "gradient_fallback")
     } else if lower.contains("mu-ref") || lower.contains("mu-referencing") {
         (WarningSeverity::Info, "mu_referencing")
+    } else if lower.contains("global_search disabled") {
+        // Runtime failure: CRS2-LM init failed — the optimiser ran without global search.
+        (WarningSeverity::Warning, "optimizer_config")
     } else if lower.contains("global_search") {
         (WarningSeverity::Info, "optimizer_config")
     } else if lower.contains("multi-start") {
