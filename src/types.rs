@@ -1525,7 +1525,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Info, "threads")
     } else if lower.contains("n\u{00b2} ofv")
         || lower.contains("n^2 ofv")
-        || lower.contains("parameters") && lower.contains("covariance step:")
+        || (lower.contains("parameters") && lower.contains("covariance step:"))
     {
         (WarningSeverity::Info, "covariance_step")
     } else {

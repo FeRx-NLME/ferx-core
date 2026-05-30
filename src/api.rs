@@ -833,6 +833,7 @@ pub fn fit(
         };
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
+            rebuild_warnings_structured(&mut result);
             result
         });
     }
@@ -927,9 +928,22 @@ pub fn fit(
                     result.ofv
                 ));
             }
+            rebuild_warnings_structured(&mut result);
             Ok(result)
         }
     }
+}
+
+/// Rebuild `warnings_structured` from the current `warnings` vec.
+///
+/// Called after all late-injected warnings (LTBS splice, multi-start metadata)
+/// have been appended so the structured field is always in sync with the flat list.
+fn rebuild_warnings_structured(result: &mut FitResult) {
+    result.warnings_structured = result
+        .warnings
+        .iter()
+        .map(|w| crate::types::classify_warning(w))
+        .collect();
 }
 
 /// Probe whether NLopt CRS2-LM (used for global_search) is available.
@@ -1500,14 +1514,6 @@ fn fit_inner(
         }
     }
 
-    // Build structured warnings from the final accumulated message list.
-    // Classification (severity/category) lives entirely in core so the R
-    // wrapper consumes the structure directly and never re-parses message text.
-    let warnings_structured_entries: Vec<crate::types::WarningEntry> = warnings
-        .iter()
-        .map(|w| crate::types::classify_warning(w))
-        .collect();
-
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
@@ -1538,7 +1544,7 @@ fn fit_inner(
         n_iterations: result.n_iterations,
         interaction: options.interaction,
         warnings,
-        warnings_structured: warnings_structured_entries,
+        warnings_structured: vec![],
         sir_ci_theta: sir_result.as_ref().map(|s| s.ci_theta.clone()),
         sir_ci_omega: sir_result.as_ref().map(|s| s.ci_omega.clone()),
         sir_ci_sigma: sir_result.as_ref().map(|s| s.ci_sigma.clone()),

@@ -1588,7 +1588,7 @@ mod tests {
             n_iterations: 10,
             interaction: true,
             warnings: vec!["watch out".into()],
-            warnings_structured: vec![],
+            warnings_structured: vec![crate::types::classify_warning("watch out")],
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,
