@@ -203,7 +203,7 @@ fn covariate_table_built_from_declarations() {
         },
     ];
     let (pop, table) =
-        read_nonmem_csv_with_covariates(Path::new("data/two_cpt_oral_cov.csv"), &decls, None)
+        read_nonmem_csv_with_covariates(Path::new("data/two_cpt_oral_cov.csv"), &decls, &[], None)
             .unwrap();
     assert_eq!(table.names, vec!["WT", "CRCL"]);
     // One row per input record — strictly more than the observation count
@@ -229,10 +229,10 @@ fn declared_covariate_absent_from_data_is_reported() {
     let _ = std::fs::remove_file(&model);
 }
 
-/// A covariate used in the model but not declared in `[covariates]` is a parse
-/// error (the block is authoritative when present).
+/// A covariate used in the model but not declared in `[covariates]` is allowed
+/// (still usable) — the parser warns rather than erroring.
 #[test]
-fn undeclared_referenced_covariate_is_parse_error() {
+fn undeclared_referenced_covariate_warns_not_errors() {
     let model = temp_model(
         "cov_undeclared",
         "\
@@ -256,11 +256,24 @@ fn undeclared_referenced_covariate_is_parse_error() {
   DV ~ proportional(PROP_ERR)
 ",
     );
+    // The model parses successfully (no parse error)...
+    let parsed = parse_full_model_file(&model).expect("model should parse");
+    assert!(
+        parsed
+            .model
+            .parse_warnings
+            .iter()
+            .any(|w| w.contains("WT") && w.contains("not declared")),
+        "expected an undeclared-covariate warning, got: {:?}",
+        parsed.model.parse_warnings
+    );
+    // ...and `ferx check` (no data) reports no errors.
     let report = validate_model_file(model.to_str().unwrap(), None);
-    assert!(!report.valid);
-    assert!(report.diagnostics.iter().any(|d| d.code == "E_PARSE"
-        && d.message.contains("WT")
-        && d.message.contains("not declared")));
+    assert!(
+        report.valid,
+        "unexpected diagnostics: {:?}",
+        report.diagnostics
+    );
     let _ = std::fs::remove_file(&model);
 }
 

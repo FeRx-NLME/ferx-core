@@ -108,13 +108,15 @@ pub fn run_model_with_data_inits(
     eprintln!("Model: {}", parsed.model.name);
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
-    // When the model declares a `[covariates]` block, it is authoritative: read
+    // When the model declares a `[covariates]` block, read declared covariates
     // through the strict path (validates presence + numeric coding) and capture
-    // the covariate table to attach to the result below.
+    // the covariate table. Referenced-but-undeclared covariates are passed as
+    // `extra` so they're still read (leniently); the parser already warned.
     let (population, covariate_table) = match &parsed.covariate_decls {
         Some(decls) => {
+            let extra = undeclared_referenced(&parsed.model, decls);
             let (pop, table) =
-                read_nonmem_csv_with_covariates(Path::new(data_path), decls, iov_col)?;
+                read_nonmem_csv_with_covariates(Path::new(data_path), decls, &extra, iov_col)?;
             (pop, Some(table))
         }
         None => (read_nonmem_csv(Path::new(data_path), None, iov_col)?, None),
@@ -295,6 +297,18 @@ fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagn
         ),
     )
     .with_suggestion(format!("available covariate columns: {}", available))]
+}
+
+/// Covariates referenced by the model but missing from the `[covariates]`
+/// declaration. These are still read (leniently) so the model works; the parser
+/// has already warned that they ought to be declared.
+fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<String> {
+    model
+        .referenced_covariates
+        .iter()
+        .filter(|c| !decls.iter().any(|d| &d.name == *c))
+        .cloned()
+        .collect()
 }
 
 /// When a `[covariates]` block is present, every declared covariate column must
@@ -725,7 +739,9 @@ pub fn fit_from_files(
     // legacy auto-detect when both are absent).
     let (population, covariate_table) = match &parsed.covariate_decls {
         Some(decls) => {
-            let (pop, table) = read_nonmem_csv_with_covariates(Path::new(data_path), decls, None)?;
+            let extra = undeclared_referenced(&model, decls);
+            let (pop, table) =
+                read_nonmem_csv_with_covariates(Path::new(data_path), decls, &extra, None)?;
             (pop, Some(table))
         }
         None => (

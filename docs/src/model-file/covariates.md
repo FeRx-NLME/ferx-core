@@ -36,12 +36,15 @@ Covariate names are **case-sensitive** and must match the CSV header exactly.
 
 - **Optional & backward-compatible.** When the block is absent, behaviour is
   unchanged: every non-standard CSV column is auto-detected as a covariate.
-- **Authoritative when present.** Only the listed columns are treated as
-  covariates; any other non-standard column (e.g. `STUDY`, `DATE`) is ignored.
-- **Every referenced covariate must be declared.** A covariate used in
-  `[individual_parameters]` but missing from `[covariates]` is a parse error.
-  Declaring a covariate the model does *not* use is fine — that is the point.
-- **Validation against the data.** A declared column that is absent from the
+- **Authoritative for the table and typing.** Only the listed columns appear in
+  the covariate table and carry a declared type; other non-standard columns
+  (e.g. `STUDY`, `DATE`) are not tabled.
+- **Undeclared-but-used is a warning, not an error.** A covariate used in
+  `[individual_parameters]` but missing from `[covariates]` is still usable —
+  ferx reads it (leniently) and emits a warning recommending you declare it so
+  its type is recorded and it appears in the table. Declaring a covariate the
+  model does *not* use is also fine — that is the point.
+- **Validation against the data.** A *declared* column that is absent from the
   dataset is an error (`E_MISSING_COVARIATE`).
 
 ## Categorical covariates must be numerically coded

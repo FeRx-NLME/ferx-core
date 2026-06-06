@@ -1548,8 +1548,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     }
 
     // ── Optional [covariates] block ──
-    // When present it is authoritative: only the listed columns are covariates,
-    // and every covariate the model actually references must be declared here.
+    // When present it is authoritative for the covariate *table* and typing:
+    // only listed columns are tabled, and declared columns are read strictly.
+    // A covariate used in [individual_parameters] but not declared is still
+    // usable (it is read leniently, like the auto-detect path) — we just warn
+    // that it ought to be declared so its type is known.
     let covariate_decls = if let Some(lines) = blocks.get("covariates") {
         let decls = parse_covariates_block(lines)?;
         let declared: std::collections::HashSet<&str> =
@@ -1561,10 +1564,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .map(|s| s.as_str())
             .collect();
         if !undeclared.is_empty() {
-            return Err(format!(
-                "[covariates]: covariate(s) used in [individual_parameters] but not declared in \
-                 [covariates]: {}. The [covariates] block is authoritative when present, so every \
-                 covariate the model references must be listed in it.",
+            model.parse_warnings.push(format!(
+                "Covariate(s) used in [individual_parameters] but not declared in [covariates]: \
+                 {}. They are still usable, but declaring them (with `continuous`/`categorical`) \
+                 lets ferx record their type and include them in the covariate table.",
                 undeclared.join(", ")
             ));
         }
@@ -8446,13 +8449,25 @@ mod tests {
     }
 
     #[test]
-    fn test_covariates_referenced_must_be_declared() {
-        // CL uses WT, but only SEX is declared → authoritative block rejects it.
-        let err = parse_full_model(&model_with_covariates(Some("SEX categorical"), true))
-            .err()
-            .unwrap();
-        assert!(err.contains("not declared in"), "got: {err}");
-        assert!(err.contains("WT"), "got: {err}");
+    fn test_covariates_referenced_but_undeclared_warns_not_errors() {
+        // CL uses WT, but only SEX is declared. This is allowed (WT is still
+        // usable) — the parser warns rather than erroring.
+        let parsed =
+            parse_full_model(&model_with_covariates(Some("SEX categorical"), true)).unwrap();
+        // WT is still declared as known? No — only SEX is. But the parse succeeds.
+        let decls = parsed.covariate_decls.expect("declared");
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "SEX");
+        // A warning names the undeclared covariate.
+        assert!(
+            parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("WT") && w.contains("not declared")),
+            "expected a warning about undeclared WT, got: {:?}",
+            parsed.model.parse_warnings
+        );
     }
 
     #[test]
