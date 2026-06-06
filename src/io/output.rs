@@ -526,6 +526,46 @@ pub fn write_sdtab_csv(
     Ok(())
 }
 
+/// Write the covariate table (from a `[covariates]` block) as a CSV file.
+///
+/// Columns: `ID, TIME, EVID, <declared covariates...>`, one row per input
+/// dataset record. Missing values (`f64::NAN`) are written as empty cells so
+/// downstream tools read them as missing.
+pub fn write_covtab_csv(table: &crate::types::CovariateTable, path: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut f =
+        std::fs::File::create(path).map_err(|e| format!("Failed to create {}: {}", path, e))?;
+
+    // Header
+    let mut header = String::from("ID,TIME,EVID");
+    for name in &table.names {
+        header.push(',');
+        header.push_str(name);
+    }
+    writeln!(f, "{}", header).map_err(|e| e.to_string())?;
+
+    for row in &table.rows {
+        let mut line = format!("{},{},{}", row.id, fmt_num(row.time), row.evid);
+        for &v in &row.values {
+            line.push(',');
+            line.push_str(&fmt_num(v));
+        }
+        writeln!(f, "{}", line).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+/// Format a numeric cell for CSV output: NaN → empty (missing), else 6 dp.
+fn fmt_num(v: f64) -> String {
+    if v.is_nan() {
+        String::new()
+    } else {
+        format!("{:.6}", v)
+    }
+}
+
 /// Write parameter estimates and uncertainty as YAML
 pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String> {
     use std::io::Write;
@@ -1041,6 +1081,7 @@ mod tests {
             data_hash: None,
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
+            covariate_table: None,
         }
     }
 

@@ -101,6 +101,15 @@ fn main() {
                 Err(e) => eprintln!("Warning: failed to write sdtab: {}", e),
             }
 
+            // Covariate table — only when the model declared a [covariates] block.
+            if let Some(table) = &fit_result.covariate_table {
+                let covtab_path = format!("{}-covtab.csv", model_name);
+                match ferx_core::io::output::write_covtab_csv(table, &covtab_path) {
+                    Ok(()) => eprintln!("Covariates written to {}", covtab_path),
+                    Err(e) => eprintln!("Warning: failed to write covtab: {}", e),
+                }
+            }
+
             let yaml_path = format!("{}-fit.yaml", model_name);
             match ferx_core::io::output::write_estimates_yaml(&fit_result, &yaml_path) {
                 Ok(()) => eprintln!("Estimates written to {}", yaml_path),

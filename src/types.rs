@@ -339,6 +339,66 @@ impl Population {
     }
 }
 
+/// Whether a declared covariate is continuous or categorical.
+///
+/// Both kinds are carried as `f64` in the data path (categoricals must be
+/// numerically coded — see [`CovariateDecl`]). The distinction is metadata for
+/// downstream consumers (R-side summary statistics, covariate-search
+/// algorithms) that treat the two differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CovariateKind {
+    Continuous,
+    Categorical,
+}
+
+impl CovariateKind {
+    /// Lowercase label used in the `[covariates]` block and in output.
+    pub fn label(&self) -> &'static str {
+        match self {
+            CovariateKind::Continuous => "continuous",
+            CovariateKind::Categorical => "categorical",
+        }
+    }
+}
+
+/// One entry from the optional `[covariates]` DSL block: a dataset column the
+/// modeller declares as a covariate, tagged continuous or categorical. This is
+/// a declaration of *availability* — it does not imply the covariate is used in
+/// the structural model.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CovariateDecl {
+    /// Column name, case-sensitive, matching the CSV header.
+    pub name: String,
+    pub kind: CovariateKind,
+}
+
+/// A single row of the [`CovariateTable`], echoing one input dataset record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CovariateRow {
+    pub id: String,
+    pub time: f64,
+    /// EVID of the source row (0=obs, 1=dose, 2=other, 3=reset, 4=reset+dose).
+    pub evid: u32,
+    /// Covariate values, parallel to [`CovariateTable::names`]. A missing value
+    /// (blank / `.` / `NA` in the source) is encoded as `f64::NAN`.
+    pub values: Vec<f64>,
+}
+
+/// Echo of the declared covariate columns from the input dataset, one row per
+/// input record (including dose / EVID rows — unlike the observation-only
+/// sdtab). Produced at data-read time when a `[covariates]` block is present,
+/// and attached to [`FitResult::covariate_table`]. Missing values are
+/// `f64::NAN`. Restricted to declared columns to bound memory.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CovariateTable {
+    /// Declared covariate names, in declaration order. Parallel to each row's
+    /// `values` and to `kinds`.
+    pub names: Vec<String>,
+    /// Continuous/categorical tag per covariate, parallel to `names`.
+    pub kinds: Vec<CovariateKind>,
+    pub rows: Vec<CovariateRow>,
+}
+
 /// Between-subject variability matrix (Omega)
 #[derive(Debug, Clone)]
 pub struct OmegaMatrix {
@@ -1592,6 +1652,13 @@ pub struct FitResult {
     /// `plans/dcm-and-low-dim-node.md` "Option E".
     #[cfg(feature = "nn")]
     pub neural_networks: Vec<NeuralNetworkInfo>,
+    /// Echo of the declared covariate columns from the input dataset (ID, TIME,
+    /// EVID + one column per declared covariate, one row per input record).
+    /// `Some` only when the model has a `[covariates]` block AND the fit was
+    /// launched from a data file; `None` for the in-memory [`fit`] entry point
+    /// (which has no raw rows) or when no `[covariates]` block is declared.
+    /// Missing values are `f64::NAN`. See [`CovariateTable`].
+    pub covariate_table: Option<CovariateTable>,
 }
 
 /// Minimal per-NN metadata carried on `FitResult` so output writers can
@@ -2150,6 +2217,13 @@ pub struct ParsedModel {
     pub model: CompiledModel,
     pub simulation: Option<SimulationSpec>,
     pub fit_options: FitOptions,
+    /// Declarations from the optional `[covariates]` block. `None` when the
+    /// block is absent (legacy auto-detect: every non-standard CSV column is a
+    /// covariate). `Some` (possibly empty) when present, in which case it is
+    /// authoritative — only listed columns are covariates, and each must exist
+    /// in the data and be numerically coded. Drives the file-based readers and
+    /// the [`FitResult::covariate_table`].
+    pub covariate_decls: Option<Vec<CovariateDecl>>,
     /// 1-based source line of each unnamed `[block]` header, keyed by the
     /// lowercased block type (e.g. `"individual_parameters" -> 7`). Used by
     /// `ferx check` to attach a block-level location to diagnostics. Empty when

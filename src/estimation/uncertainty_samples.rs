@@ -405,6 +405,7 @@ mod tests {
             data_hash: None,
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
+            covariate_table: None,
         }
     }
 

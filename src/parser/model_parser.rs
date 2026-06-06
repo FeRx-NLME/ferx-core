@@ -1547,12 +1547,139 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
+    // ── Optional [covariates] block ──
+    // When present it is authoritative: only the listed columns are covariates,
+    // and every covariate the model actually references must be declared here.
+    let covariate_decls = if let Some(lines) = blocks.get("covariates") {
+        let decls = parse_covariates_block(lines)?;
+        let declared: std::collections::HashSet<&str> =
+            decls.iter().map(|d| d.name.as_str()).collect();
+        let undeclared: Vec<&str> = model
+            .referenced_covariates
+            .iter()
+            .filter(|c| !declared.contains(c.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        if !undeclared.is_empty() {
+            return Err(format!(
+                "[covariates]: covariate(s) used in [individual_parameters] but not declared in \
+                 [covariates]: {}. The [covariates] block is authoritative when present, so every \
+                 covariate the model references must be listed in it.",
+                undeclared.join(", ")
+            ));
+        }
+        Some(decls)
+    } else {
+        None
+    };
+
     Ok(ParsedModel {
         model,
         simulation,
         fit_options,
+        covariate_decls,
         block_lines: extracted.block_lines.clone(),
     })
+}
+
+/// Map a `[covariates]` type token to a [`CovariateKind`]. Accepts the full
+/// words and the `cont`/`cat` shorthands, case-insensitively.
+fn parse_covariate_kind(token: &str) -> Option<CovariateKind> {
+    match token.trim().to_lowercase().as_str() {
+        "continuous" | "cont" => Some(CovariateKind::Continuous),
+        "categorical" | "cat" => Some(CovariateKind::Categorical),
+        _ => None,
+    }
+}
+
+fn push_covariate_decl(
+    decls: &mut Vec<CovariateDecl>,
+    seen: &mut std::collections::HashSet<String>,
+    name: &str,
+    kind: CovariateKind,
+) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("[covariates]: empty covariate name".to_string());
+    }
+    // Names are case-sensitive (matching the data reader's covariate lookup).
+    if !seen.insert(name.to_string()) {
+        return Err(format!(
+            "[covariates]: covariate '{}' is declared more than once",
+            name
+        ));
+    }
+    decls.push(CovariateDecl {
+        name: name.to_string(),
+        kind,
+    });
+    Ok(())
+}
+
+/// Parse the optional `[covariates]` block into ordered declarations.
+///
+/// Two line forms are accepted and may be mixed:
+///   - `NAME TYPE`              e.g. `WT continuous`
+///   - `TYPE: NAME, NAME, ...`  e.g. `continuous: WT, HT, CRCL`
+///
+/// where TYPE is `continuous`/`cont` or `categorical`/`cat` (case-insensitive).
+/// Declaration order is preserved. Duplicate names and unknown types are errors.
+fn parse_covariates_block(lines: &[String]) -> Result<Vec<CovariateDecl>, String> {
+    let mut decls: Vec<CovariateDecl> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(colon) = line.find(':') {
+            // `TYPE: NAME, NAME, ...`
+            let (ty_str, rest) = line.split_at(colon);
+            let kind = parse_covariate_kind(ty_str).ok_or_else(|| {
+                format!(
+                    "[covariates]: unknown covariate type '{}' (expected continuous/cont or \
+                     categorical/cat)",
+                    ty_str.trim()
+                )
+            })?;
+            let names = &rest[1..]; // skip the ':'
+            let mut any = false;
+            for name in names.split(',') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    push_covariate_decl(&mut decls, &mut seen, name, kind)?;
+                    any = true;
+                }
+            }
+            if !any {
+                return Err(format!(
+                    "[covariates]: type '{}' declared with no covariate names",
+                    ty_str.trim()
+                ));
+            }
+        } else {
+            // `NAME TYPE`
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() != 2 {
+                return Err(format!(
+                    "[covariates]: expected `NAME TYPE` (e.g. `WT continuous`) or \
+                     `TYPE: NAME, ...`, got '{}'",
+                    line
+                ));
+            }
+            let kind = parse_covariate_kind(parts[1]).ok_or_else(|| {
+                format!(
+                    "[covariates]: unknown covariate type '{}' for '{}' (expected continuous/cont \
+                     or categorical/cat)",
+                    parts[1], parts[0]
+                )
+            })?;
+            push_covariate_decl(&mut decls, &mut seen, parts[0], kind)?;
+        }
+    }
+
+    Ok(decls)
 }
 
 // ── [simulation] block parser ───────────────────────────────────────────────
@@ -8215,6 +8342,126 @@ mod tests {
         assert_eq!(p.omega_fixed, vec![false, true, false]);
         assert_eq!(p.sigma_fixed, vec![true]);
         assert!(p.has_any_fixed());
+    }
+
+    /// Build a minimal one-cpt model, optionally with a `[covariates]` block and
+    /// an optional covariate reference in the CL expression.
+    fn model_with_covariates(cov_block: Option<&str>, cl_uses_wt: bool) -> String {
+        let cl_expr = if cl_uses_wt {
+            "CL = TVCL * (WT / 70.0) * exp(ETA_CL)"
+        } else {
+            "CL = TVCL * exp(ETA_CL)"
+        };
+        let cov = cov_block
+            .map(|b| format!("\n[covariates]\n{}\n", b))
+            .unwrap_or_default();
+        format!(
+            r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+{cov}
+[individual_parameters]
+  {cl_expr}
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        )
+    }
+
+    #[test]
+    fn test_covariates_absent_is_none() {
+        let parsed = parse_full_model(&model_with_covariates(None, false)).unwrap();
+        assert!(parsed.covariate_decls.is_none());
+    }
+
+    #[test]
+    fn test_covariates_per_line_form() {
+        let parsed = parse_full_model(&model_with_covariates(
+            Some("WT continuous\nSEX categorical"),
+            true,
+        ))
+        .unwrap();
+        let decls = parsed.covariate_decls.expect("declared");
+        assert_eq!(decls.len(), 2);
+        assert_eq!(decls[0].name, "WT");
+        assert_eq!(decls[0].kind, CovariateKind::Continuous);
+        assert_eq!(decls[1].name, "SEX");
+        assert_eq!(decls[1].kind, CovariateKind::Categorical);
+    }
+
+    #[test]
+    fn test_covariates_colon_form_and_order() {
+        let parsed = parse_full_model(&model_with_covariates(
+            Some("continuous: WT, HT, CRCL\ncategorical: SEX"),
+            true,
+        ))
+        .unwrap();
+        let decls = parsed.covariate_decls.expect("declared");
+        let names: Vec<&str> = decls.iter().map(|d| d.name.as_str()).collect();
+        // Declaration order preserved across the two lines.
+        assert_eq!(names, vec!["WT", "HT", "CRCL", "SEX"]);
+        assert_eq!(decls[3].kind, CovariateKind::Categorical);
+    }
+
+    #[test]
+    fn test_covariates_type_aliases() {
+        let parsed = parse_full_model(&model_with_covariates(
+            Some("WT cont\nSEX cat\ncont: HT"),
+            true,
+        ))
+        .unwrap();
+        let decls = parsed.covariate_decls.expect("declared");
+        assert_eq!(decls[0].kind, CovariateKind::Continuous);
+        assert_eq!(decls[1].kind, CovariateKind::Categorical);
+        assert_eq!(decls[2].kind, CovariateKind::Continuous);
+    }
+
+    #[test]
+    fn test_covariates_duplicate_errors() {
+        let err = parse_full_model(&model_with_covariates(
+            Some("WT continuous\nWT categorical"),
+            true,
+        ))
+        .err()
+        .unwrap();
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn test_covariates_unknown_type_errors() {
+        let err = parse_full_model(&model_with_covariates(Some("WT numeric"), true))
+            .err()
+            .unwrap();
+        assert!(err.contains("unknown covariate type"), "got: {err}");
+    }
+
+    #[test]
+    fn test_covariates_referenced_must_be_declared() {
+        // CL uses WT, but only SEX is declared → authoritative block rejects it.
+        let err = parse_full_model(&model_with_covariates(Some("SEX categorical"), true))
+            .err()
+            .unwrap();
+        assert!(err.contains("not declared in"), "got: {err}");
+        assert!(err.contains("WT"), "got: {err}");
+    }
+
+    #[test]
+    fn test_covariates_declared_unreferenced_is_ok() {
+        // Declaring a covariate the model doesn't use is the whole point
+        // ("potentially available") — must not error.
+        let parsed =
+            parse_full_model(&model_with_covariates(Some("WT continuous"), false)).unwrap();
+        assert_eq!(parsed.covariate_decls.expect("declared").len(), 1);
     }
 
     #[test]

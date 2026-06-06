@@ -27,6 +27,13 @@
 [structural_model]
   pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
 
+# Declares which dataset columns are covariates and their type. Optional, but
+# when present it is authoritative: every covariate used above must be listed,
+# and each must exist in the data and be numerically coded.
+[covariates]
+  WT   continuous
+  CRCL continuous
+
 [error_model]
   DV ~ proportional(PROP_ERR)
 

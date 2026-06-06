@@ -1,6 +1,15 @@
-use crate::types::{DoseEvent, Population, Subject};
+use crate::types::{
+    CovariateDecl, CovariateKind, CovariateRow, CovariateTable, DoseEvent, Population, Subject,
+};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// True when a CSV cell represents a missing value (blank / `.` / `NA` / `NaN`).
+/// NONMEM convention uses `.` for missing.
+fn is_missing_cell(s: &str) -> bool {
+    let t = s.trim();
+    t.is_empty() || t == "." || t.eq_ignore_ascii_case("na") || t.eq_ignore_ascii_case("nan")
+}
 
 /// Read a NONMEM-format CSV file into a Population.
 ///
@@ -20,6 +29,47 @@ pub fn read_nonmem_csv(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
 ) -> Result<Population, String> {
+    read_nonmem_csv_impl(path, covariate_columns, iov_column, false, None).map(|(pop, _)| pop)
+}
+
+/// Read a NONMEM-format CSV with an authoritative `[covariates]` declaration.
+///
+/// Unlike [`read_nonmem_csv`], this enforces the declaration: every declared
+/// covariate must exist as a column, and every non-missing value in a declared
+/// covariate must be numeric (categoricals must be numerically coded) — a
+/// violation is a hard error rather than a silent coercion to `0.0`.
+///
+/// Returns the [`Population`] plus a [`CovariateTable`] echoing the declared
+/// covariate columns: one row per input record (including dose / EVID rows),
+/// with `f64::NAN` for missing values.
+pub fn read_nonmem_csv_with_covariates(
+    path: &Path,
+    decls: &[CovariateDecl],
+    iov_column: Option<&str>,
+) -> Result<(Population, CovariateTable), String> {
+    let names: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let kinds: Vec<CovariateKind> = decls.iter().map(|d| d.kind).collect();
+    let (pop, table) =
+        read_nonmem_csv_impl(path, Some(&name_refs), iov_column, true, Some(&kinds))?;
+    Ok((
+        pop,
+        table.expect("covariate table is built whenever table_kinds is Some"),
+    ))
+}
+
+/// Shared CSV reader. `strict_numeric` makes non-numeric / missing declared
+/// covariate columns fatal; `table_kinds`, when `Some`, requests building a
+/// [`CovariateTable`] over the (declared) covariate columns, tagged with those
+/// kinds. The two flags are set together by [`read_nonmem_csv_with_covariates`]
+/// and both off for the legacy auto-detect [`read_nonmem_csv`] path.
+fn read_nonmem_csv_impl(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    strict_numeric: bool,
+    table_kinds: Option<&[CovariateKind]>,
+) -> Result<(Population, Option<CovariateTable>), String> {
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
         .has_headers(true)
@@ -78,10 +128,36 @@ pub fn read_nonmem_csv(
             .cloned()
             .collect(),
     };
+    // Under an authoritative `[covariates]` declaration every declared column
+    // must exist — otherwise it would silently vanish from `cov_indices` below
+    // and quietly evaluate to nothing. Fail loudly instead.
+    if strict_numeric {
+        if let Some(cols) = covariate_columns {
+            let missing: Vec<&str> = cols
+                .iter()
+                .copied()
+                .filter(|c| col_idx_cs(c).is_none())
+                .collect();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "[covariates]: declared covariate column(s) not found in data \
+                     (case-sensitive): {}. Available columns: {}.",
+                    missing.join(", "),
+                    headers.join(", ")
+                ));
+            }
+        }
+    }
+
     let cov_indices: Vec<(String, usize)> = cov_names
         .iter()
         .filter_map(|name| col_idx_cs(name).map(|idx| (name.clone(), idx)))
         .collect();
+
+    // Optional covariate table: one row per input record, in file order. Only
+    // built when requested (authoritative `[covariates]` path).
+    let build_table = table_kinds.is_some();
+    let mut table_rows: Vec<CovariateRow> = Vec::new();
 
     // Parse rows grouped by ID
     let mut rows_by_id: Vec<(String, Vec<Vec<String>>)> = Vec::new();
@@ -92,6 +168,46 @@ pub fn read_nonmem_csv(
         let fields: Vec<String> = record.iter().map(|f| f.trim().to_string()).collect();
 
         let id = fields.get(id_col).cloned().unwrap_or_default();
+
+        if build_table {
+            let time = parse_f64(fields.get(time_col).map(|s| s.as_str()).unwrap_or("0"));
+            // Mirror `parse_subject`'s EVID computation so the table's EVID
+            // agrees with how each row was classified.
+            let evid = evid_col
+                .and_then(|c| fields.get(c))
+                .map(|s| parse_usize(s))
+                .unwrap_or(0) as u32;
+            let mut values = Vec::with_capacity(cov_indices.len());
+            for (name, idx) in &cov_indices {
+                let cell = fields.get(*idx).map(|s| s.as_str()).unwrap_or("");
+                if is_missing_cell(cell) {
+                    values.push(f64::NAN);
+                } else {
+                    match cell.trim().parse::<f64>() {
+                        Ok(v) => values.push(v),
+                        Err(_) if strict_numeric => {
+                            return Err(format!(
+                                "[covariates]: non-numeric value '{}' for covariate '{}' \
+                                 (ID {}, TIME {}). Covariates must be numerically coded — \
+                                 encode categoricals as integer levels.",
+                                cell.trim(),
+                                name,
+                                id,
+                                time
+                            ));
+                        }
+                        Err(_) => values.push(f64::NAN),
+                    }
+                }
+            }
+            table_rows.push(CovariateRow {
+                id: id.clone(),
+                time,
+                evid,
+                values,
+            });
+        }
+
         if id != current_id {
             current_id = id.clone();
             rows_by_id.push((id, Vec::new()));
@@ -137,11 +253,27 @@ pub fn read_nonmem_csv(
         }
     }
 
-    Ok(Population {
-        subjects,
-        covariate_names: cov_names,
-        dv_column: "dv".to_string(),
-    })
+    let table = if build_table {
+        Some(CovariateTable {
+            // `cov_names` is the declared order; `cov_indices` (and hence each
+            // row's `values`) is the same order, since strict mode has already
+            // verified every declared column exists.
+            names: cov_names.clone(),
+            kinds: table_kinds.unwrap().to_vec(),
+            rows: table_rows,
+        })
+    } else {
+        None
+    };
+
+    Ok((
+        Population {
+            subjects,
+            covariate_names: cov_names,
+            dv_column: "dv".to_string(),
+        },
+        table,
+    ))
 }
 
 fn parse_f64(s: &str) -> f64 {
@@ -670,6 +802,98 @@ mod tests {
         assert!(!subj.has_tv_covariates());
         assert!(subj.pk_only_times.is_empty());
         assert!(subj.pk_only_covariates.is_empty());
+    }
+
+    fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
+        CovariateDecl {
+            name: name.to_string(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn test_covariate_table_one_row_per_input_record() {
+        // 1 dose + 2 obs = 3 input rows → 3 table rows, including the dose row.
+        let csv = "ID,TIME,DV,EVID,AMT,WT,SEX\n\
+                   1,0,.,1,100,70,1\n\
+                   1,1,5.0,0,.,70,1\n\
+                   1,2,3.0,0,.,70,1\n";
+        let f = write_csv(csv);
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        let (_pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, None).unwrap();
+        assert_eq!(table.names, vec!["WT", "SEX"]);
+        assert_eq!(
+            table.kinds,
+            vec![CovariateKind::Continuous, CovariateKind::Categorical]
+        );
+        assert_eq!(table.rows.len(), 3);
+        // Dose row preserved with EVID=1.
+        assert_eq!(table.rows[0].evid, 1);
+        assert_eq!(table.rows[0].time, 0.0);
+        assert_eq!(table.rows[0].values, vec![70.0, 1.0]);
+        assert_eq!(table.rows[1].evid, 0);
+        assert_eq!(table.rows[2].time, 2.0);
+    }
+
+    #[test]
+    fn test_covariate_table_missing_value_is_nan() {
+        let csv = "ID,TIME,DV,EVID,AMT,WT,SEX\n\
+                   1,0,.,1,100,70,.\n\
+                   1,1,5.0,0,.,,1\n";
+        let f = write_csv(csv);
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        let (_pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, None).unwrap();
+        // Row 0: SEX is "." → NaN. Row 1: WT is blank → NaN.
+        assert!(table.rows[0].values[1].is_nan());
+        assert!(table.rows[1].values[0].is_nan());
+        assert_eq!(table.rows[0].values[0], 70.0);
+    }
+
+    #[test]
+    fn test_covariate_strict_numeric_errors_on_non_numeric() {
+        let csv = "ID,TIME,DV,EVID,AMT,WT,SEX\n\
+                   1,0,.,1,100,70,M\n\
+                   1,1,5.0,0,.,70,M\n";
+        let f = write_csv(csv);
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        let err = read_nonmem_csv_with_covariates(f.path(), &decls, None).unwrap_err();
+        assert!(err.contains("non-numeric"), "got: {err}");
+        assert!(err.contains("SEX"), "got: {err}");
+    }
+
+    #[test]
+    fn test_covariate_declared_column_missing_errors() {
+        let csv = "ID,TIME,DV,EVID,AMT,WT\n\
+                   1,0,.,1,100,70\n";
+        let f = write_csv(csv);
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("CRCL", CovariateKind::Continuous),
+        ];
+        let err = read_nonmem_csv_with_covariates(f.path(), &decls, None).unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+        assert!(err.contains("CRCL"), "got: {err}");
+    }
+
+    #[test]
+    fn test_legacy_read_still_succeeds_with_non_numeric_covariate() {
+        // The legacy auto-detect path must remain unchanged (no strict numeric
+        // check): a non-numeric covariate column loads without erroring.
+        let csv = "ID,TIME,DV,EVID,AMT,SEX\n\
+                   1,0,.,1,100,M\n\
+                   1,1,5.0,0,.,M\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.covariate_names.contains(&"SEX".to_string()));
     }
 
     #[test]

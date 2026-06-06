@@ -8,6 +8,7 @@
   - [Parameters](model-file/parameters.md)
   - [Inter-Occasion Variability (IOV)](model-file/iov.md)
   - [Individual Parameters](model-file/individual-parameters.md)
+  - [Covariates](model-file/covariates.md)
   - [Structural Model](model-file/structural-model.md)
   - [Lagtime](model-file/lagtime.md)
   - [Steady-State Doses](model-file/steady-state.md)
