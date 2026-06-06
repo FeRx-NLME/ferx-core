@@ -49,12 +49,12 @@ See [IOV documentation](model-file/iov.md) for full details.
 
 ## Covariate Columns
 
-Any column not in the standard set above is automatically treated as a covariate. Covariate values are:
+By default, any column not in the standard set above is automatically treated as a covariate. Alternatively, declare covariates explicitly with a [`[covariates]`](model-file/covariates.md) block in the model file; when present it is authoritative (only listed columns are covariates) and enables type tagging, validation, and the covariate output table. Covariate values are:
 
 - **Time-constant**: The first non-missing value for each subject is used
 - **Time-varying**: If values change over time for a subject, Last Observation Carried Forward (LOCF) is applied per event (NONMEM-equivalent: `[individual_parameters]` is re-evaluated at each dose and observation row using that row's covariate values)
 
-Covariate names in the data file are matched case-insensitively to names used in `[individual_parameters]` expressions.
+Covariate names are **case-sensitive**: a column name in the data file must match the name used in `[individual_parameters]` expressions (and in a `[covariates]` block) exactly. (Standard NONMEM columns like `ID`/`TIME` are matched case-insensitively; covariate columns are not.)
 
 ### Time-varying covariate scope
 

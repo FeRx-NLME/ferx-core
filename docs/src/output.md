@@ -1,6 +1,7 @@
 # Output Files
 
-Each model run produces three output files.
+Each model run produces three output files (plus a fourth, `{model}-covtab.csv`,
+when the model declares a [`[covariates]`](model-file/covariates.md) block).
 
 ## sdtab CSV (`{model}-sdtab.csv`)
 
@@ -37,6 +38,32 @@ where \\( f_0 = f(\hat{\eta}) - H\hat{\eta} \\) is the linearized population pre
 ID,TIME,DV,PRED,IPRED,CWRES,IWRES,ETA1,ETA2,ETA3
 1,0.5,9.49,10.12,9.55,-0.23,-0.06,0.15,-0.08,0.32
 1,1.0,14.42,14.87,14.35,0.18,0.05,0.15,-0.08,0.32
+```
+
+## covtab CSV (`{model}-covtab.csv`)
+
+Written only when the model declares a [`[covariates]`](model-file/covariates.md)
+block. Unlike sdtab (observation rows only), it echoes the declared covariate
+columns with **one row per input dataset record**, including dose and other-event
+rows. Missing values are written as empty cells. It is also available
+programmatically as `FitResult::covariate_table`.
+
+### Columns
+
+| Column | Description |
+|--------|-------------|
+| `ID` | Subject identifier |
+| `TIME` | Record time |
+| `EVID` | Event ID of the source row (0=obs, 1=dose, 2=other, 3=reset, 4=reset+dose) |
+| *declared covariates* | One column per covariate in the `[covariates]` block, in declaration order |
+
+### Example
+
+```csv
+ID,TIME,EVID,WT,CRCL
+1,0.000000,1,70.600000,73.700000
+1,0.500000,0,70.600000,73.700000
+1,1.000000,0,70.600000,73.700000
 ```
 
 ## Fit YAML (`{model}-fit.yaml`)

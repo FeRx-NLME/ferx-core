@@ -34,6 +34,10 @@ This example demonstrates a two-compartment oral model with body weight (WT) and
 [structural_model]
   pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
 
+[covariates]
+  WT   continuous
+  CRCL continuous
+
 [error_model]
   DV ~ proportional(PROP_ERR)
 
@@ -42,6 +46,11 @@ This example demonstrates a two-compartment oral model with body weight (WT) and
   maxiter    = 500
   covariance = true
 ```
+
+The optional [`[covariates]`](../model-file/covariates.md) block declares which
+dataset columns are covariates and their type. It is not required, but when
+present it is authoritative and lets ferx validate the columns and emit a
+covariate table — see below.
 
 ## Covariate Effects
 
@@ -65,13 +74,20 @@ ID,TIME,DV,EVID,AMT,CMT,MDV,WT,CRCL
 1,1.0,18.7,0,.,.,0,72.5,105
 ```
 
-Covariate columns are automatically detected -- any column not in the standard NONMEM set is treated as a covariate. The names in the data file must match those used in `[individual_parameters]` (case-insensitive).
+By default, covariate columns are automatically detected -- any column not in the standard NONMEM set is treated as a covariate. Covariate names are **case-sensitive** and must match the names used in `[individual_parameters]` exactly.
+
+Adding a [`[covariates]`](../model-file/covariates.md) block makes this explicit and authoritative: only the listed columns are treated as covariates, each declared column must exist in the data and be numerically coded (categoricals must be integer-coded), and a covariate used in the model but not declared produces a warning recommending it be declared.
 
 ## Running
 
 ```bash
 ferx examples/two_cpt_oral_cov.ferx --data data/two_cpt_oral_cov.csv
 ```
+
+When the model declares a `[covariates]` block, ferx also writes
+`two_cpt_oral_cov-covtab.csv` alongside the usual `-sdtab.csv` and `-fit.yaml`:
+one row per input record (`ID,TIME,EVID` plus the declared covariate columns),
+which the R package and covariate-diagnostic tooling consume.
 
 ## Notes
 
