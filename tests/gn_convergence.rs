@@ -93,18 +93,22 @@ fn gn_tr_warfarin_ofv_matches_slsqp_baseline() {
 /// GN-hybrid trust-region on warfarin: the GN phase followed by FOCEI polish
 /// must reach the known-good minimum.
 ///
-/// Baseline -279.1243: the FOCEI polish improves on pure GN-TR by ~0.01 OFV.
-/// SLSQP reaches -278.7336 (gap ~0.39 OFV).  Tolerance of 0.25 keeps the
-/// pass threshold strictly better than SLSQP, so a regression in the
-/// polish stage to SLSQP-level performance fails the assert.  See the
-/// module-level "Baseline history" comment for the Almquist Laplace
-/// shift from the pre-#130 SB baseline.
+/// Baseline -279.1243: the FOCEI polish (run with the default `bobyqa`
+/// optimizer since #155 — see `FitOptions::default`) improves on pure GN-TR by
+/// ~0.01 OFV.  SLSQP-driven polish only reaches -278.7336 (gap ~0.39 OFV),
+/// so the pass threshold `KNOWN_GOOD_OFV + TOLERANCE` = -278.8743 is
+/// hardcoded below the SLSQP reference: any polish stage that regresses to
+/// SLSQP-level performance fails the assert.  Name says "beats_slsqp"
+/// because of that threshold placement, not because of any direct
+/// `ofv < slsqp_ofv` comparison in the code.  See the module-level
+/// "Baseline history" comment for the Almquist Laplace shift from the
+/// pre-#130 SB baseline.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
     ignore = "slow: opt in with --features slow-tests"
 )]
-fn gn_hybrid_tr_warfarin_ofv_matches_slsqp() {
+fn gn_hybrid_tr_warfarin_ofv_beats_slsqp_baseline() {
     const KNOWN_GOOD_OFV: f64 = -279.1243;
     const TOLERANCE: f64 = 0.25;
 

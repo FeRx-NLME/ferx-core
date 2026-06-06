@@ -46,12 +46,34 @@ fn collect_mul_anchors(expr: &Expression, out: &mut Vec<MuRefAnchor>) {
     }
 }
 
-/// Walk a Mul-chain and find the first `exp(Eta(j))`, returning the eta index.
+/// Walk a Mul-chain and find the first `exp(Eta(j))` or `exp(Eta(a) + Eta(b))`,
+/// returning the eta index. For the two-eta case (IIV+IOV combined pattern)
+/// returns the **minimum** index; BSV etas are numbered `0..n_eta` and kappa etas
+/// `n_eta..`, so min always selects the BSV eta regardless of expression order.
 fn find_exp_eta_in_mul(expr: &Expression) -> Option<usize> {
     match expr {
         Expression::UnaryFn(name, arg) if name == "exp" => {
             if let Expression::Eta(j) = arg.as_ref() {
                 return Some(*j);
+            }
+            // exp(ETA1 + ETA2) — IIV+IOV combined pattern.
+            if let Expression::BinOp(l, BinOp::Add, r) = arg.as_ref() {
+                let li = if let Expression::Eta(j) = l.as_ref() {
+                    Some(*j)
+                } else {
+                    None
+                };
+                let ri = if let Expression::Eta(j) = r.as_ref() {
+                    Some(*j)
+                } else {
+                    None
+                };
+                return match (li, ri) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    // One operand is not a bare Eta (e.g. exp(ETA + constant));
+                    // return whichever index was found.
+                    (a, b) => a.or(b),
+                };
             }
             None
         }
@@ -59,6 +81,21 @@ fn find_exp_eta_in_mul(expr: &Expression) -> Option<usize> {
             find_exp_eta_in_mul(l).or_else(|| find_exp_eta_in_mul(r))
         }
         _ => None,
+    }
+}
+
+/// Returns `true` when `expr` contains an `Eta` node that is NOT shielded
+/// inside an `exp(...)` call. Used to guard the log-normal product fallback
+/// classifier: if all etas are inside exp(), the expression is log-normal.
+fn has_bare_eta(expr: &Expression) -> bool {
+    match expr {
+        Expression::Eta(_) => true,
+        // Etas inside exp() enter multiplicatively — they are not "bare".
+        Expression::UnaryFn(name, _) if name == "exp" => false,
+        Expression::BinOp(l, _, r) => has_bare_eta(l) || has_bare_eta(r),
+        Expression::UnaryFn(_, arg) => has_bare_eta(arg),
+        Expression::Power(b, e) => has_bare_eta(b) || has_bare_eta(e),
+        _ => false,
     }
 }
 
@@ -451,10 +488,37 @@ fn classify_expr(expr: &Expression, n_theta: usize) -> Option<ExprClass> {
             } else {
                 EtaParamType::Additive
             };
+            // Populate theta_idx so apply_class can set linked_theta in
+            // EtaParamInfo. theta_transform stays None — the product/additive
+            // pattern does not change how the theta is packed by the optimizer
+            // (that is driven by theta_lower bounds, not by classification).
+            let theta_idx = match anchor {
+                MuRefAnchor::Theta(ti) if ti < n_theta => Some(ti),
+                _ => None,
+            };
+            return Some(ExprClass {
+                eta_idx: ei,
+                theta_idx,
+                param_type: pt,
+                theta_transform: None,
+            });
+        }
+    }
+
+    // Fallback: BASE * exp(ETA[+KAPPA]) where BASE contains no bare eta
+    // references. Handles derived intermediates like `KTR * exp(ETA_KA)`
+    // where KTR is a variable defined earlier in [individual_parameters] and
+    // collect_mul_anchors therefore finds no direct Theta anchor.
+    // Only reached when detect_pattern returned None above.
+    // detect_pattern already handles the Theta-anchored case, so this
+    // only fires when anchors.len() != 1 but the expression is still
+    // structurally log-normal.
+    if let Some(ei) = find_exp_eta_in_mul(expr) {
+        if !has_bare_eta(expr) {
             return Some(ExprClass {
                 eta_idx: ei,
                 theta_idx: None,
-                param_type: pt,
+                param_type: EtaParamType::LogNormal,
                 theta_transform: None,
             });
         }
@@ -1073,6 +1137,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // For per-CMT (multi-endpoint) models this maps each endpoint's sigma
     // names to indices into this flat vector and enforces the ODE-only
     // restriction.
+    // Capture referenced sigma names before `parsed_error_model` is consumed.
+    let used_sigmas_in_error = used_sigma_names(&parsed_error_model);
     let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
     let sigma = SigmaVector {
         values: sigma_values,
@@ -1302,8 +1368,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         n_kappa,
         n_epsilon,
         theta_names,
-        eta_names: eta_names_bsv,
-        kappa_names,
+        eta_names: eta_names_bsv.clone(),
+        kappa_names: kappa_names.clone(),
         indiv_param_names: indiv_var_names.clone(),
         indiv_param_partials,
         default_params,
@@ -1546,6 +1612,21 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             ));
         }
     }
+
+    // Warn about declared-but-unused parameters. These are not errors because a
+    // user may intentionally comment out expressions (e.g. during model
+    // development), but the warning makes clear that such parameters have no
+    // effect on predictions and will not be meaningfully estimated.
+    let unused_warnings = check_unused_parameters(
+        &thetas,
+        &eta_names_bsv,
+        &kappa_names,
+        n_eta,
+        &model.default_params.sigma.names,
+        &indiv_stmts,
+        &used_sigmas_in_error,
+    );
+    model.parse_warnings.extend(unused_warnings);
 
     // ── Optional [covariates] block ──
     // When present it is authoritative for the covariate *table* and typing:
@@ -3552,20 +3633,37 @@ fn parse_parameters(
     // The `FIX` keyword is case-insensitive and must be the exact token —
     // the trailing `\b` rejects prefix matches like `FIXED`, which would
     // otherwise silently mark the parameter as fixed.
+    // Accept FIX in any of these positions:
+    //   theta NAME(init, FIX)                   — comma before FIX, inside parens
+    //   theta NAME(init FIX)                    — no comma, inside parens
+    //   theta NAME(init) FIX                    — after closing paren
+    //   theta NAME(init, lower, FIX)            — lower only, FIX inside
+    //   theta NAME(init, lower) FIX             — lower only, FIX outside
+    //   theta NAME(init, lower, upper, FIX)
+    //   theta NAME(init, lower, upper) FIX
+    // Bounds: lower (group 3) is optional; upper (group 4) is optional within
+    // the bounds sub-group, defaulting to 1e9 when absent.
+    // Group 5 captures FIX inside the parens; group 6 captures FIX outside.
+    // `fixed` is true when either group is present.
     let theta_re = Regex::new(
-        r"(?i)theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)\s*,\s*([0-9eE.+-]+))?\s*(?:,\s*(FIX)\b)?\s*\)",
+        r"(?i)theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)\s*(?:,\s*([0-9eE.+-]+)(?:\s*,\s*([0-9eE.+-]+))?)?\s*(?:,?\s*(FIX)\b)?\s*\)(?:\s+(FIX)\b)?",
     )
     .unwrap();
 
-    // omega NAME ~ value [(sd|variance|var)] [FIX]
+    // omega NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
     // Initial value defaults to the variance scale (matching how the optimizer
     // stores omega internally). Append `(sd)` to declare the value on the
     // standard-deviation scale — the parser squares it before storing. The
     // `(variance)` / `(var)` annotation is accepted as an explicit no-op for
     // symmetry with sigma.
+    // FIX may appear before or after the scale annotation (group 3 = FIX
+    // before annotation, group 4 = annotation, group 5 = FIX after).
+    // Note: the first FIX group requires \s+ (at least one space) so that
+    // `value(sd)` without a space between value and annotation still matches
+    // correctly — the annotation group uses \s* (zero or more) intentionally.
     let omega_re = Regex::new(
-        r"(?i)omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?",
+        r"(?i)omega\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?",
     )
     .unwrap();
 
@@ -3576,20 +3674,23 @@ fn parse_parameters(
     let block_omega_re =
         Regex::new(r"(?i)block_omega\s*\(([^)]+)\)\s*=\s*\[([^\]]+)\](?:\s+(FIX)\b)?").unwrap();
 
-    // sigma NAME ~ value [(sd|variance|var)] [FIX]
+    // sigma NAME ~ value [FIX] [(sd|variance|var)] [FIX]
     //
     // As of issue #56, sigma defaults to the variance scale (matching omega).
     // `(sd)` opts back into specifying a standard deviation directly. The
     // parser converts variance → internal SD via `sqrt` so the residual-error
     // and likelihood code (which work in SD) need no changes.
+    // FIX may appear before or after the scale annotation (same group layout
+    // as omega_re: group 3 = FIX before, group 4 = annotation, group 5 = FIX after).
     let sigma_re = Regex::new(
-        r"(?i)sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?",
+        r"(?i)sigma\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?",
     )
     .unwrap();
 
-    // kappa NAME ~ value [(sd|variance|var)] [FIX]  (IOV diagonal variance)
+    // kappa NAME ~ value [FIX] [(sd|variance|var)] [FIX]  (IOV diagonal variance)
+    // Same group layout as omega_re.
     let kappa_re = Regex::new(
-        r"(?i)kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?",
+        r"(?i)kappa\s+(\w+)\s*~\s*([0-9eE.+-]+)(?:\s+(FIX)\b)?(?:\s*\((sd|variance|var)\))?(?:\s+(FIX)\b)?",
     )
     .unwrap();
 
@@ -3613,7 +3714,7 @@ fn parse_parameters(
                 .get(4)
                 .map(|m| m.as_str().parse().unwrap_or(1e9))
                 .unwrap_or(1e9);
-            let fixed = caps.get(5).is_some();
+            let fixed = caps.get(5).is_some() || caps.get(6).is_some();
             thetas.push(ThetaSpec {
                 name,
                 init,
@@ -3686,8 +3787,9 @@ fn parse_parameters(
             let raw: f64 = caps[2]
                 .parse()
                 .map_err(|_| format!("Bad omega: {}", line))?;
+            // Group 4 = scale annotation; groups 3 and 5 = FIX (before/after).
             let init_as_sd = caps
-                .get(3)
+                .get(4)
                 .map(|m| m.as_str().eq_ignore_ascii_case("sd"))
                 .unwrap_or(false);
             // Negative values are nonsensical on either scale: variance ≥ 0
@@ -3701,7 +3803,7 @@ fn parse_parameters(
                 ));
             }
             let variance = if init_as_sd { raw * raw } else { raw };
-            let fixed = caps.get(4).is_some();
+            let fixed = caps.get(3).is_some() || caps.get(5).is_some();
             eta_names_ordered.push(name.clone());
             omegas.push(OmegaSpec {
                 name,
@@ -3714,8 +3816,9 @@ fn parse_parameters(
             let raw: f64 = caps[2]
                 .parse()
                 .map_err(|_| format!("Bad sigma: {}", line))?;
+            // Group 4 = scale annotation; groups 3 and 5 = FIX (before/after).
             let init_as_sd = caps
-                .get(3)
+                .get(4)
                 .map(|m| m.as_str().eq_ignore_ascii_case("sd"))
                 .unwrap_or(false);
             // Reject negatives on both scales. On the default (variance)
@@ -3730,7 +3833,7 @@ fn parse_parameters(
                 ));
             }
             let value = if init_as_sd { raw } else { raw.sqrt() };
-            let fixed = caps.get(4).is_some();
+            let fixed = caps.get(3).is_some() || caps.get(5).is_some();
             sigmas.push(SigmaSpec {
                 name,
                 value,
@@ -3742,8 +3845,9 @@ fn parse_parameters(
             let raw: f64 = caps[2]
                 .parse()
                 .map_err(|_| format!("Bad kappa: {}", line))?;
+            // Group 4 = scale annotation; groups 3 and 5 = FIX (before/after).
             let init_as_sd = caps
-                .get(3)
+                .get(4)
                 .map(|m| m.as_str().eq_ignore_ascii_case("sd"))
                 .unwrap_or(false);
             if raw < 0.0 {
@@ -3753,7 +3857,7 @@ fn parse_parameters(
                 ));
             }
             let variance = if init_as_sd { raw * raw } else { raw };
-            let fixed = caps.get(4).is_some();
+            let fixed = caps.get(3).is_some() || caps.get(5).is_some();
             kappa_names_ordered.push(name.clone());
             kappas.push(KappaSpec {
                 name,
@@ -3924,15 +4028,43 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
         if let Some(caps) = pk_re.captures(line) {
             let model_name = &caps[1];
             let pk_model = match model_name {
-                "one_cpt_iv_bolus" | "one_compartment_iv_bolus" => PkModel::OneCptIvBolus,
+                "one_cpt_iv" | "one_compartment_iv" => PkModel::OneCptIv,
                 "one_cpt_oral" | "one_compartment_oral" => PkModel::OneCptOral,
-                "one_cpt_infusion" | "one_compartment_infusion" => PkModel::OneCptInfusion,
-                "two_cpt_iv_bolus" | "two_compartment_iv_bolus" => PkModel::TwoCptIvBolus,
+                "two_cpt_iv" | "two_compartment_iv" => PkModel::TwoCptIv,
                 "two_cpt_oral" | "two_compartment_oral" => PkModel::TwoCptOral,
-                "two_cpt_infusion" | "two_compartment_infusion" => PkModel::TwoCptInfusion,
-                "three_cpt_iv_bolus" | "three_compartment_iv_bolus" => PkModel::ThreeCptIvBolus,
+                "three_cpt_iv" | "three_compartment_iv" => PkModel::ThreeCptIv,
                 "three_cpt_oral" | "three_compartment_oral" => PkModel::ThreeCptOral,
-                "three_cpt_infusion" | "three_compartment_infusion" => PkModel::ThreeCptInfusion,
+                // Retired names (issue #176): bolus and infusion are no longer
+                // separate model variants — the route is read per-dose from the
+                // RATE column. Emit a migration error so users update their
+                // model files explicitly rather than relying on a silent alias.
+                retired @ ("one_cpt_iv_bolus"
+                | "one_compartment_iv_bolus"
+                | "one_cpt_infusion"
+                | "one_compartment_infusion"
+                | "two_cpt_iv_bolus"
+                | "two_compartment_iv_bolus"
+                | "two_cpt_infusion"
+                | "two_compartment_infusion"
+                | "three_cpt_iv_bolus"
+                | "three_compartment_iv_bolus"
+                | "three_cpt_infusion"
+                | "three_compartment_infusion") => {
+                    let n = if retired.starts_with("one") {
+                        "one"
+                    } else if retired.starts_with("two") {
+                        "two"
+                    } else {
+                        "three"
+                    };
+                    return Err(format!(
+                        "`{retired}` was removed in #176; use `{n}_cpt_iv` instead. \
+                         Bolus and infusion administration are now driven by the \
+                         RATE column in the dataset (RATE=0 for bolus, RATE>0 for \
+                         infusion), so a single `{n}_cpt_iv` model handles either \
+                         or a mix of both within the same subject."
+                    ));
+                }
                 other => return Err(format!("Unknown PK model: {}", other)),
             };
 
@@ -4589,6 +4721,172 @@ fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::
             }
         }
     }
+}
+
+fn collect_theta_eta(
+    expr: &Expression,
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    match expr {
+        Expression::Theta(i) => {
+            thetas.insert(*i);
+        }
+        Expression::Eta(i) => {
+            etas.insert(*i);
+        }
+        Expression::BinOp(lhs, _, rhs) => {
+            collect_theta_eta(lhs, thetas, etas);
+            collect_theta_eta(rhs, thetas, etas);
+        }
+        Expression::UnaryFn(_, arg) => collect_theta_eta(arg, thetas, etas),
+        Expression::Power(base, exp) => {
+            collect_theta_eta(base, thetas, etas);
+            collect_theta_eta(exp, thetas, etas);
+        }
+        Expression::Conditional(cond, t, e) => {
+            collect_theta_eta_in_condition(cond, thetas, etas);
+            collect_theta_eta(t, thetas, etas);
+            collect_theta_eta(e, thetas, etas);
+        }
+        _ => {}
+    }
+}
+
+fn collect_theta_eta_in_condition(
+    cond: &Condition,
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            collect_theta_eta(l, thetas, etas);
+            collect_theta_eta(r, thetas, etas);
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            collect_theta_eta_in_condition(l, thetas, etas);
+            collect_theta_eta_in_condition(r, thetas, etas);
+        }
+        Condition::Not(c) => collect_theta_eta_in_condition(c, thetas, etas),
+    }
+}
+
+fn collect_theta_eta_in_stmts(
+    stmts: &[Statement],
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    for s in stmts {
+        match s {
+            Statement::Assign(_, e)
+            | Statement::AssignIdx(_, e)
+            | Statement::DiffEq(_, e)
+            | Statement::DiffEqIdx(_, e) => collect_theta_eta(e, thetas, etas),
+            Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {}
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (cond, body) in branches {
+                    collect_theta_eta_in_condition(cond, thetas, etas);
+                    collect_theta_eta_in_stmts(body, thetas, etas);
+                }
+                if let Some(eb) = else_body {
+                    collect_theta_eta_in_stmts(eb, thetas, etas);
+                }
+            }
+        }
+    }
+}
+
+/// Collect the sigma names referenced in a `ParsedErrorModel` (before index resolution).
+fn used_sigma_names(parsed: &ParsedErrorModel) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    match parsed {
+        ParsedErrorModel::Single(_, names) => {
+            for n in names {
+                out.insert(n.clone());
+            }
+        }
+        ParsedErrorModel::PerCmt(entries) => {
+            for (_, _, names) in entries {
+                for n in names {
+                    out.insert(n.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Warn about parameters declared in `[parameters]` that are not referenced in
+/// any expression. Returns one warning string per unused parameter; the caller
+/// appends these to `CompiledModel.parse_warnings`.
+///
+/// Only user-declared thetas (indices `0..n_theta_user`) are checked; thetas
+/// added automatically (NN weights, diffusion) are excluded.
+///
+/// Scanning `indiv_stmts` is sufficient for ODE models too: `build_ode_spec`
+/// uses `ParseCtx::ode` which sets `theta_names = []`, so raw theta/eta names
+/// cannot appear in `[odes]` RHS expressions — they must be routed through
+/// `[individual_parameters]` first.
+fn check_unused_parameters(
+    thetas: &[ThetaSpec],
+    eta_names_bsv: &[String],
+    kappa_names: &[String],
+    n_eta: usize,
+    sigma_names: &[String],
+    indiv_stmts: &[Statement],
+    used_sigmas: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut used_thetas = std::collections::HashSet::new();
+    let mut used_etas = std::collections::HashSet::new();
+    collect_theta_eta_in_stmts(indiv_stmts, &mut used_thetas, &mut used_etas);
+
+    let mut warnings = Vec::new();
+
+    for (i, t) in thetas.iter().enumerate() {
+        if !used_thetas.contains(&i) {
+            warnings.push(format!(
+                "theta '{}' is declared in [parameters] but not referenced in \
+                 [individual_parameters] — it will not affect predictions or be \
+                 meaningfully estimated",
+                t.name
+            ));
+        }
+    }
+    for (i, name) in eta_names_bsv.iter().enumerate() {
+        if !used_etas.contains(&i) {
+            warnings.push(format!(
+                "omega '{}' is declared in [parameters] but not referenced in \
+                 [individual_parameters] — it will not affect predictions or be \
+                 meaningfully estimated",
+                name
+            ));
+        }
+    }
+    for (i, name) in kappa_names.iter().enumerate() {
+        if !used_etas.contains(&(n_eta + i)) {
+            warnings.push(format!(
+                "kappa '{}' is declared in [parameters] but not referenced in \
+                 [individual_parameters] — it will not affect predictions or be \
+                 meaningfully estimated",
+                name
+            ));
+        }
+    }
+    for name in sigma_names {
+        if !used_sigmas.contains(name) {
+            warnings.push(format!(
+                "sigma '{}' is declared in [parameters] but not referenced in \
+                 [error_model] — it will not affect predictions or be \
+                 meaningfully estimated",
+                name
+            ));
+        }
+    }
+
+    warnings
 }
 
 fn eval_expression(
@@ -6999,6 +7297,49 @@ fn parse_if_statement(
 mod tests {
     use super::*;
 
+    // Issue #176 retired the split `*_iv_bolus` / `*_infusion` model names
+    // in favour of a single `*_iv` per compartment count. The parser must
+    // reject the old names with a migration message rather than silently
+    // accept or emit a generic "unknown model" error.
+    #[test]
+    fn test_retired_iv_bolus_and_infusion_names_emit_migration_error() {
+        let retired = [
+            ("one_cpt_iv_bolus", "one"),
+            ("one_compartment_iv_bolus", "one"),
+            ("one_cpt_infusion", "one"),
+            ("two_cpt_iv_bolus", "two"),
+            ("two_compartment_infusion", "two"),
+            ("three_cpt_iv_bolus", "three"),
+            ("three_cpt_infusion", "three"),
+        ];
+        for (name, n) in retired {
+            let lines = vec![format!("pk {}(cl=CL, v=V)", name)];
+            let err = parse_structural_model(&lines)
+                .expect_err(&format!("expected retired name `{name}` to error"));
+            assert!(
+                err.contains("#176") && err.contains(&format!("{n}_cpt_iv")),
+                "missing migration hint for `{name}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unified_iv_names_parse_to_iv_variant() {
+        // The new spelling must compile to the unified IV variant.
+        let cases = [
+            ("one_cpt_iv", PkModel::OneCptIv),
+            ("one_compartment_iv", PkModel::OneCptIv),
+            ("two_cpt_iv", PkModel::TwoCptIv),
+            ("three_cpt_iv", PkModel::ThreeCptIv),
+        ];
+        for (name, expected) in cases {
+            let lines = vec![format!("pk {}(cl=CL, v=V, q=Q, v2=V2, q2=Q2, v3=V3)", name)];
+            let (pk_model, _) = parse_structural_model(&lines)
+                .unwrap_or_else(|e| panic!("`{name}` failed to parse: {e}"));
+            assert_eq!(pk_model, expected, "wrong variant for `{name}`");
+        }
+    }
+
     #[test]
     fn test_parse_method_single() {
         let opts = parse_fit_options(&["method = focei".to_string()]).unwrap();
@@ -7692,13 +8033,17 @@ mod tests {
 
     #[test]
     fn test_detect_mu_ref_rejects_compound_eta_expression() {
-        // exp(ETA_CL + ETA_OCC) is not a bare exp(Eta) — rejected.
+        // exp(ETA_CL + ETA_OCC) — IIV+IOV combined pattern. Since Fix 1,
+        // find_exp_eta_in_mul recognises this and returns the min-index eta
+        // (ETA_CL, index 0), so a mu-ref IS detected for ETA_CL → TVCL.
         let m = detect_one(
             "CL = TVCL * exp(ETA_CL + ETA_OCC)",
             &["TVCL"],
             &["ETA_CL", "ETA_OCC"],
         );
-        assert!(m.is_none());
+        let m = m.expect("IIV+IOV combined pattern should detect mu-ref for ETA_CL");
+        assert_eq!(m.theta_name, "TVCL");
+        assert!(m.log_transformed);
     }
 
     #[test]
@@ -7746,7 +8091,7 @@ mod tests {
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -7983,6 +8328,72 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_theta_fix_no_comma_inside_parens() {
+        // theta NAME(init FIX) — no comma before FIX
+        let lines = vec!["theta TVCL(0.75 FIX)".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(thetas[0].fixed);
+        assert!((thetas[0].init - 0.75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_theta_fix_after_paren() {
+        // theta NAME(init) FIX — FIX outside closing paren
+        let lines = vec!["theta TVCL(0.75) FIX".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(thetas[0].fixed);
+        assert!((thetas[0].init - 0.75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_theta_fix_after_paren_with_bounds() {
+        // theta NAME(init, lower, upper) FIX — bounds + FIX outside paren
+        let lines = vec!["theta TVKA(1.0, 0.01, 10.0) FIX".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(thetas[0].fixed);
+        assert!((thetas[0].init - 1.0).abs() < 1e-12);
+        assert!((thetas[0].lower - 0.01).abs() < 1e-12);
+        assert!((thetas[0].upper - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_parse_theta_lower_bound_only() {
+        // theta NAME(init, lower) — upper defaults to 1e9
+        let lines = vec!["theta TVCL(1.0, 0.01)".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(!thetas[0].fixed);
+        assert!((thetas[0].init - 1.0).abs() < 1e-12);
+        assert!((thetas[0].lower - 0.01).abs() < 1e-12);
+        assert!((thetas[0].upper - 1e9).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_parse_theta_lower_bound_fix_inside() {
+        // theta NAME(init, lower, FIX) — lower only + FIX inside parens
+        let lines = vec!["theta TVCL(1.0, 0.01, FIX)".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(thetas[0].fixed);
+        assert!((thetas[0].lower - 0.01).abs() < 1e-12);
+        assert!((thetas[0].upper - 1e9).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_parse_theta_lower_bound_fix_outside() {
+        // theta NAME(init, lower) FIX — lower only + FIX after paren
+        let lines = vec!["theta TVCL(1.0, 0.01) FIX".to_string()];
+        let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert_eq!(thetas.len(), 1);
+        assert!(thetas[0].fixed);
+        assert!((thetas[0].lower - 0.01).abs() < 1e-12);
+        assert!((thetas[0].upper - 1e9).abs() < 1.0);
+    }
+
+    #[test]
     fn test_parse_theta_unfixed_by_default() {
         let lines = vec!["theta TVCL(0.1, 0.01, 1.0)".to_string()];
         let (thetas, _, _, _, _, _) = parse_parameters(&lines).unwrap();
@@ -8017,6 +8428,30 @@ mod tests {
         let lines = vec!["omega ETA_CL ~ 0.09 FIX".to_string()];
         let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
         assert!(omegas[0].fixed);
+    }
+
+    #[test]
+    fn test_omega_unfixed_no_annotation() {
+        // Baseline: plain omega with no FIX and no annotation — confirms the
+        // group-numbering shift (annotation moved 3→4) didn't regress the
+        // common case.
+        let lines = vec!["omega ETA_CL ~ 0.09".to_string()];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert!(!omegas[0].fixed);
+        assert!(!omegas[0].init_as_sd);
+        assert!((omegas[0].variance - 0.09).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_omega_double_fix_is_harmless() {
+        // `FIX (sd) FIX` — both FIX groups fire; result must still be fixed
+        // with SD squaring applied.
+        let lines = vec!["omega ETA_CL ~ 0.30 FIX (sd) FIX".to_string()];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let expected = 0.30 * 0.30;
+        assert!((omegas[0].variance - expected).abs() < 1e-12);
+        assert!(omegas[0].fixed);
+        assert!(omegas[0].init_as_sd);
     }
 
     #[test]
@@ -8090,6 +8525,58 @@ mod tests {
         assert!((omegas[0].variance - expected).abs() < 1e-12);
         assert!(omegas[0].fixed);
         assert!(omegas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_omega_fix_before_sd_annotation() {
+        // `FIX (sd)` — FIX before the scale annotation.
+        let lines = vec!["omega ETA_CL ~ 0.30 FIX (sd)".to_string()];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        let expected = 0.30 * 0.30;
+        assert!((omegas[0].variance - expected).abs() < 1e-12);
+        assert!(omegas[0].fixed);
+        assert!(omegas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_omega_fix_before_annotation_no_sd() {
+        // `FIX` before a no-op annotation — fixed and variance-scale.
+        let lines = vec!["omega ETA_CL ~ 0.09 FIX (variance)".to_string()];
+        let (_, omegas, _, _, _, _) = parse_parameters(&lines).unwrap();
+        assert!((omegas[0].variance - 0.09).abs() < 1e-12);
+        assert!(omegas[0].fixed);
+        assert!(!omegas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_sigma_fix_before_sd_annotation() {
+        // `FIX (sd)` — FIX before the scale annotation for sigma.
+        let lines = vec!["sigma PROP ~ 0.30 FIX (sd)".to_string()];
+        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        assert!(sigmas[0].fixed);
+        assert!(sigmas[0].init_as_sd);
+        assert!((sigmas[0].value - 0.30).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_sigma_fix_after_sd_annotation() {
+        // `(sd) FIX` — existing form still works.
+        let lines = vec!["sigma PROP ~ 0.30 (sd) FIX".to_string()];
+        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        assert!(sigmas[0].fixed);
+        assert!(sigmas[0].init_as_sd);
+    }
+
+    #[test]
+    fn test_sigma_unfixed_no_annotation() {
+        // Baseline: plain sigma with no FIX and no annotation — confirms the
+        // group-numbering shift didn't regress the common case.
+        let lines = vec!["sigma PROP ~ 0.04".to_string()];
+        let (_, _, _, sigmas, _, _) = parse_parameters(&lines).unwrap();
+        assert!(!sigmas[0].fixed);
+        assert!(!sigmas[0].init_as_sd);
+        // Stored as SD internally: sqrt(0.04) = 0.2
+        assert!((sigmas[0].value - 0.2).abs() < 1e-12);
     }
 
     #[test]
@@ -8819,6 +9306,28 @@ mod tests {
     }
 
     #[test]
+    fn test_kappa_unfixed_no_annotation() {
+        // Baseline: plain kappa with no FIX and no annotation — confirms the
+        // group-numbering shift didn't regress the common case.
+        let lines = vec!["kappa KAPPA_V ~ 0.05".to_string()];
+        let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+        assert!(!ki.diagonal[0].fixed);
+        assert!(!ki.diagonal[0].init_as_sd);
+        assert!((ki.diagonal[0].variance - 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_kappa_fix_before_sd_annotation() {
+        // `FIX (sd)` — FIX before the scale annotation for kappa.
+        let lines = vec!["kappa KAPPA_V ~ 0.30 FIX (sd)".to_string()];
+        let (_, _, _, _, _, ki) = parse_parameters(&lines).unwrap();
+        let expected = 0.30 * 0.30;
+        assert!((ki.diagonal[0].variance - expected).abs() < 1e-12);
+        assert!(ki.diagonal[0].fixed);
+        assert!(ki.diagonal[0].init_as_sd);
+    }
+
+    #[test]
     fn test_kappa_appended_after_bsv_etas() {
         // kappa names must NOT appear in the BSV eta_names list returned
         // as the 5th element; they only appear in the 6th (kappas) element.
@@ -8848,7 +9357,7 @@ mod tests {
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -8939,7 +9448,7 @@ mod tests {
   V  = TVV  * exp(ETA_V + KAPPA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9153,7 +9662,7 @@ if (X < 10) {
   V = TVV * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9187,7 +9696,7 @@ if (X < 10) {
   V = TVV * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9222,7 +9731,7 @@ if (X < 10) {
   V = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9320,7 +9829,7 @@ if (X < 10) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -9579,7 +10088,7 @@ if (1 > 0) {
 {}
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(EPS)
@@ -9600,7 +10109,7 @@ if (1 > 0) {
   F = inv_logit(THETA_F + ETA_F)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=1, v=1)
+  pk one_cpt_iv(cl=1, v=1)
 
 [error_model]
   DV ~ proportional(EPS)
@@ -9632,10 +10141,104 @@ if (1 > 0) {
             .find(|i| i.eta_name == "ETA_CL")
             .unwrap();
         assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
-        // TVCL * exp(ETA) pattern: theta is not on log scale (theta IS TVCL)
-        assert!(cl_info.linked_theta.is_none());
-        // theta_transform for TVCL (theta index 0) stays Identity
+        // Anchor is the theta TVCL — linked_theta is now populated.
+        assert_eq!(cl_info.linked_theta, Some("TVCL".to_string()));
+        // theta_transform for TVCL (theta index 0) stays Identity — the
+        // product pattern does not imply the theta is on the log scale.
         assert_eq!(model.theta_transform[0], ThetaTransform::Identity);
+    }
+
+    /// `TVCL * exp(ETA_CL + KAPPA_CL)` — IIV and IOV on the same parameter.
+    /// ETA_CL (BSV) should be LogNormal with linked_theta TVCL.
+    /// Also verifies that detect_mu_refs sets mu_ref for ETA_CL → TVCL.
+    #[test]
+    fn test_classify_iov_combined() {
+        use crate::types::EtaParamType;
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma EPS ~ 0.01
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+[fit_options]
+  iov_column = OCC
+";
+        let model = super::parse_full_model(src).unwrap().model;
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .expect("ETA_CL must be classified");
+        assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
+        assert_eq!(cl_info.linked_theta, Some("TVCL".to_string()));
+        // mu_ref must be detected so SAEM can initialise ETA_CL at ln(TVCL).
+        let mu = model.mu_refs.get("ETA_CL").expect("mu_ref for ETA_CL");
+        assert_eq!(mu.theta_name, "TVCL");
+        assert!(mu.log_transformed);
+    }
+
+    /// `KTR = 4.0 / TVMTT; KA = KTR * exp(ETA_KA)` — the base is a derived
+    /// intermediate, not a raw theta. ETA_KA should still be LogNormal (CV%
+    /// can be computed from the omega). linked_theta is None because no direct
+    /// theta anchor is visible in the KA expression.
+    #[test]
+    fn test_classify_lognormal_derived_base() {
+        use crate::types::EtaParamType;
+        // Reuse minimal_model_with_indiv which has TVCL and TVV as thetas.
+        let model = minimal_model_with_indiv(
+            "  KTR = 4.0 / TVCL\n  V = TVV * exp(ETA_V)\n  CL = KTR * exp(ETA_CL)",
+        );
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .expect("ETA_CL must be classified");
+        assert_eq!(
+            cl_info.param_type,
+            EtaParamType::LogNormal,
+            "derived base should still yield LogNormal, not Custom"
+        );
+        // No direct theta is visible in `KTR * exp(ETA_CL)`, so linked_theta is None.
+        assert!(cl_info.linked_theta.is_none());
+    }
+
+    /// Confirms that the covariate-product form `TVCL * (WT/70)^0.75 * exp(ETA_CL)`
+    /// (ferx-r #54) is already classified as LogNormal with linked_theta = TVCL.
+    #[test]
+    fn test_classify_covariate_product() {
+        use crate::types::EtaParamType;
+        let src = r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma EPS ~ 0.01
+[individual_parameters]
+  CL = TVCL * (WT / 70)^0.75 * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let model = super::parse_full_model(src).unwrap().model;
+        let cl_info = model
+            .eta_param_info
+            .iter()
+            .find(|i| i.eta_name == "ETA_CL")
+            .expect("ETA_CL must be classified");
+        assert_eq!(cl_info.param_type, EtaParamType::LogNormal);
+        assert_eq!(cl_info.linked_theta, Some("TVCL".to_string()));
     }
 
     #[test]
@@ -9696,7 +10299,7 @@ if (1 > 0) {
   F = inv_logit(logit(THETA_F) + ETA_F)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=1, v=1)
+  pk one_cpt_iv(cl=1, v=1)
 
 [error_model]
   DV ~ proportional(EPS)
@@ -9725,7 +10328,7 @@ if (1 > 0) {
   F = inv_logit(logit(THETA_F) + ETA_F)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=1, v=1)
+  pk one_cpt_iv(cl=1, v=1)
 
 [error_model]
   DV ~ proportional(EPS)
@@ -9940,7 +10543,7 @@ if (1 > 0) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(NO_SUCH_SIGMA)
@@ -9964,7 +10567,7 @@ if (1 > 0) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   CMT=1: DV ~ proportional(PROP_ERR_PK)
@@ -10493,7 +11096,7 @@ if (1 > 0) {
   CL = TVCL * exp(ETA_CL)
   V  = TVV
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 [diffusion]
   central ~ 0.01
 [error_model]
@@ -10527,7 +11130,7 @@ if (1 > 0) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ additive(ADD)
@@ -10961,7 +11564,7 @@ if (1 > 0) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -11443,7 +12046,7 @@ if (1 > 0) {
     #[test]
     fn test_parse_scaling_per_cmt_scalar() {
         // Use the analytical template but layer a per-CMT scaling block on
-        // top. Even though one_cpt_iv_bolus only emits CMT=1 observations,
+        // top. Even though one_cpt_iv only emits CMT=1 observations,
         // the parser doesn't validate coverage (that happens at fit time),
         // so this exercises the parse path cleanly.
         let mut src = String::from(
@@ -11459,7 +12062,7 @@ if (1 > 0) {
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -12545,6 +13148,367 @@ if (1 > 0) {
         assert!(
             (sym - expected).abs() < 1e-12 * expected.abs().max(1.0),
             "∂KA/∂TVKAM: sym={sym}, expected={expected}",
+        );
+    }
+
+    // ── unused-parameter warning tests ──────────────────────────────────────
+
+    fn minimal_model(parameters: &str, individual_parameters: &str, error_model: &str) -> String {
+        format!(
+            r#"
+[parameters]
+{parameters}
+
+[individual_parameters]
+{individual_parameters}
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+DV ~ proportional({error_model})
+
+[fit_options]
+method = foce
+"#
+        )
+    }
+
+    #[test]
+    fn test_all_used_no_warnings() {
+        let src = minimal_model(
+            "theta TVCL(0.1)\nomega ETA_CL ~ 0.09\nsigma PROP ~ 0.01",
+            "CL = TVCL * exp(ETA_CL)\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(
+            parsed.model.parse_warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            parsed.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_unused_theta_warns() {
+        let src = minimal_model(
+            "theta TVCL(0.1)\ntheta UNUSED(0.5)\nomega ETA_CL ~ 0.09\nsigma PROP ~ 0.01",
+            "CL = TVCL * exp(ETA_CL)\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("UNUSED"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected exactly one warning for UNUSED theta"
+        );
+        assert!(warns[0].contains("theta"), "warning should mention 'theta'");
+    }
+
+    #[test]
+    fn test_unused_omega_warns() {
+        let src = minimal_model(
+            "theta TVCL(0.1)\nomega ETA_CL ~ 0.09\nomega ETA_UNUSED ~ 0.04\nsigma PROP ~ 0.01",
+            "CL = TVCL * exp(ETA_CL)\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("ETA_UNUSED"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected exactly one warning for ETA_UNUSED omega"
+        );
+        assert!(warns[0].contains("omega"), "warning should mention 'omega'");
+    }
+
+    #[test]
+    fn test_unused_sigma_warns() {
+        let src = minimal_model(
+            "theta TVCL(0.1)\nomega ETA_CL ~ 0.09\nsigma PROP ~ 0.01\nsigma ADD_UNUSED ~ 0.01",
+            "CL = TVCL * exp(ETA_CL)\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("ADD_UNUSED"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected exactly one warning for ADD_UNUSED sigma"
+        );
+        assert!(warns[0].contains("sigma"), "warning should mention 'sigma'");
+    }
+
+    #[test]
+    fn test_commented_out_usage_warns() {
+        // Simulates: CL = TVCL #* exp(ETA_CL) — ETA_CL is commented away
+        let src = minimal_model(
+            "theta TVCL(0.1)\nomega ETA_CL ~ 0.09\nsigma PROP ~ 0.01",
+            "CL = TVCL\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("ETA_CL"))
+            .collect();
+        assert_eq!(warns.len(), 1, "ETA_CL not used → should warn");
+    }
+
+    #[test]
+    fn test_multiple_unused_all_reported() {
+        let src = minimal_model(
+            "theta TVCL(0.1)\ntheta TH_UNUSED(0.5)\nomega ETA_CL ~ 0.09\nomega ETA_UNUSED ~ 0.04\nsigma PROP ~ 0.01\nsigma SIG_UNUSED ~ 0.01",
+            "CL = TVCL * exp(ETA_CL)\nV = 10.0\nKA = 1.0",
+            "PROP",
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let unused: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("UNUSED"))
+            .collect();
+        assert_eq!(
+            unused.len(),
+            3,
+            "expected warnings for TH_UNUSED, ETA_UNUSED, SIG_UNUSED; got: {:?}",
+            unused
+        );
+    }
+
+    #[test]
+    fn test_unused_kappa_warns() {
+        // KAPPA_CL declared but not used in any expression (index arithmetic:
+        // Eta(n_eta + i), distinct from BSV etas).
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(0.1)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = 10.0
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = foce
+  iov_column = OCC
+"#
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("KAPPA_CL"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "expected one warning for unused KAPPA_CL; got: {:?}",
+            warns
+        );
+        assert!(warns[0].contains("kappa"), "warning should mention 'kappa'");
+    }
+
+    #[test]
+    fn test_derived_variable_no_false_positive() {
+        // ke = CL / V is a derived variable — no theta/eta directly.
+        // But CL = TVCL * exp(ETA_CL) and V = TVV * exp(ETA_V) ARE in
+        // indiv_stmts and ARE walked, so TVCL/ETA_CL/TVV/ETA_V are found
+        // through those statements. No spurious "unused" warnings expected.
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(0.1)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.04
+  sigma PROP ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  ke = CL / V
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = foce
+"#
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(
+            parsed.model.parse_warnings.is_empty(),
+            "derived variable ke=CL/V must not trigger false positives; \
+             got: {:?}",
+            parsed.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_theta_used_only_in_conditional_branch_no_warn() {
+        // WT_POW is only referenced inside an if-branch — it must still be
+        // found because collect_theta_eta_in_stmts recurses into if-bodies.
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(0.1)
+  theta WT_POW(0.75)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01
+
+[individual_parameters]
+  if (WT > 0) {{
+    CL = TVCL * (WT / 70)^WT_POW * exp(ETA_CL)
+  }} else {{
+    CL = TVCL * exp(ETA_CL)
+  }}
+  V  = 10.0
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = foce
+"#
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        // The conditional model legitimately triggers a mu-referencing warning
+        // for CL — that is unrelated to our check. Assert only that no
+        // unused-parameter warning is emitted for WT_POW or any other parameter.
+        let unused: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("declared in [parameters] but not referenced"))
+            .collect();
+        assert!(
+            unused.is_empty(),
+            "WT_POW used inside if-branch must not trigger unused-param warning; got: {:?}",
+            unused
+        );
+    }
+
+    #[test]
+    fn test_block_omega_one_unused_warns() {
+        // block_omega declares ETA_CL and ETA_V together; only ETA_CL is used.
+        // ETA_V should produce a warning even though it's part of a block.
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(0.1)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]
+  sigma PROP ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = 10.0
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = foce
+"#
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        let warns: Vec<_> = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("ETA_V"))
+            .collect();
+        assert_eq!(
+            warns.len(),
+            1,
+            "ETA_V unused in block_omega should warn; got: {:?}",
+            warns
+        );
+        assert!(warns[0].contains("omega"), "warning should mention 'omega'");
+        // ETA_CL IS used — must not appear in warnings
+        assert!(
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("ETA_CL")),
+            "ETA_CL is used and must not warn"
+        );
+    }
+
+    #[test]
+    fn test_block_omega_all_used_no_warn() {
+        // Both etas in a block_omega are used — no warnings expected.
+        let src = format!(
+            r#"
+[parameters]
+  theta TVCL(0.1)
+  theta TVV(10.0)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.01, 0.04]
+  sigma PROP ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method = foce
+"#
+        );
+        let parsed = parse_full_model(&src).expect("parse ok");
+        assert!(
+            parsed.model.parse_warnings.is_empty(),
+            "all block_omega etas used — no warnings expected; got: {:?}",
+            parsed.model.parse_warnings
         );
     }
 }

@@ -748,7 +748,7 @@ mod tests {
         };
         CompiledModel {
             name: "test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|_, _, _| PkParams::default()),

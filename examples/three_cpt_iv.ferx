@@ -1,4 +1,4 @@
-# Three-compartment IV bolus PK model
+# Three-compartment IV PK model — RATE column drives bolus vs infusion per dose.
 
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
@@ -26,7 +26,7 @@
   V3 = TVV3 * exp(ETA_V3)
 
 [structural_model]
-  pk three_cpt_iv_bolus(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
+  pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
 
 [error_model]
   DV ~ proportional(PROP_ERR)

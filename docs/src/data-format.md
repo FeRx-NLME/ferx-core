@@ -60,14 +60,11 @@ Covariate names are **case-sensitive**: a column name in the data file must matc
 
 Time-varying covariates are supported for **all** analytical structural models and ODE-defined models:
 
-- 1-compartment IV bolus (`one_cpt_iv_bolus`)
-- 1-compartment infusion (`one_cpt_infusion`)
+- 1-compartment IV (`one_cpt_iv`) — bolus and/or infusion per dose
 - 1-compartment oral (`one_cpt_oral`)
-- 2-compartment IV bolus (`two_cpt_iv_bolus`)
-- 2-compartment infusion (`two_cpt_infusion`)
+- 2-compartment IV (`two_cpt_iv`) — bolus and/or infusion per dose
 - 2-compartment oral (`two_cpt_oral`)
-- 3-compartment IV bolus (`three_cpt_iv_bolus`)
-- 3-compartment infusion (`three_cpt_infusion`)
+- 3-compartment IV (`three_cpt_iv`) — bolus and/or infusion per dose
 - 3-compartment oral (`three_cpt_oral`)
 - All ODE-defined models (via `[odes]`)
 

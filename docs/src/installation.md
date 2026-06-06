@@ -136,6 +136,8 @@ rustc +enzyme -Zautodiff=Enable -Clto=fat -Copt-level=2 /tmp/ad_check.rs -o /tmp
 
 Expected: the compile finishes **in a few seconds** and prints `autodiff OK: f=22.3355, df/dx=43.1711`. If `rustc` instead **hangs** (pins a core at 100% CPU and never returns), your toolchain has the LLVM/Enzyme mismatch described in the warning at the top — rebuild from source with `--set llvm.download-ci-llvm=false`.
 
+> **The ferx R package runs this check for you.** Installing [ferx-r](https://github.com/FeRx-NLME/ferx-r) on the autodiff path runs the same compile-and-run self-test automatically (under a timeout) before the long fat-LTO build, and aborts with a pointer back here if the toolchain hangs — so a broken toolchain fails fast instead of wedging `rustc`. You only need to run the check above by hand when setting the toolchain up outside the R package (e.g. for the `ferx` CLI). Set `FERX_AD_PREFLIGHT_SKIP=1` to skip it once verified.
+
 ### Make the toolchain permanent
 
 The clone lives in `/tmp/rust-src`, and `rustup toolchain link enzyme build/host/stage1` points the `enzyme` toolchain *into* that tree. macOS periodically purges `/tmp`, which would silently break the toolchain. Relocate the stage-1 build (~640 MB once pruned) to a permanent path and re-link:

@@ -440,6 +440,7 @@ pub fn optimize_trust_region(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        final_gradient: None,
     }
 }
 

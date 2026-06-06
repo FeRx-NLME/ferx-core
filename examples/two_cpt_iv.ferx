@@ -1,4 +1,4 @@
-# Two-compartment IV bolus PK model
+# Two-compartment IV PK model — RATE column drives bolus vs infusion per dose.
 
 [parameters]
   theta TVCL(4.0, 0.1, 100.0)
@@ -20,7 +20,7 @@
   V2 = TVV2 * exp(ETA_V2)
 
 [structural_model]
-  pk two_cpt_iv_bolus(cl=CL, v1=V1, q=Q, v2=V2)
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
 
 [error_model]
   DV ~ proportional(PROP_ERR)

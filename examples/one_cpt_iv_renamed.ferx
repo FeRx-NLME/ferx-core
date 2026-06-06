@@ -1,4 +1,4 @@
-# 1-cpt IV bolus model with non-standard theta names.
+# 1-cpt IV model with non-standard theta names.
 #
 # Tests that suggest_start is independent of how the user names their TV
 # thetas: the slot lookup proceeds through mu_refs (ETA_CL → CLEARANCE,
@@ -18,7 +18,7 @@
   V  = DISTRIB   * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)

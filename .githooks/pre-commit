@@ -5,4 +5,4 @@
 # Skip the check when no .rs files are staged (e.g. docs-only commits).
 git diff --cached --name-only | grep -q '\.rs$' || exit 0
 
-cargo fmt --check
+cargo +nightly fmt --check

@@ -46,4 +46,9 @@ jobs:
         # `--lib` is intentionally omitted so integration tests in `tests/`
         # are compiled and run here. Gated slow tests (the `slow-tests` feature
         # removes their `#[ignore]`) and ungated integration tests both execute.
-        run: cargo test --no-default-features --features ci,slow-tests --release
+        #
+        # `--no-fail-fast` keeps cargo running every test binary even after one
+        # fails. Without it, cargo aborts at the first failed binary and the
+        # remaining ~15 integration-test binaries (alphabetically after the
+        # failing one) silently never run, masking concurrent regressions.
+        run: cargo test --no-default-features --features ci,slow-tests --release --no-fail-fast

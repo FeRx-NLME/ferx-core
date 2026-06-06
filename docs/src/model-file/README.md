@@ -29,7 +29,7 @@ ferx-core models are defined in `.ferx` files using a declarative DSL. Each file
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ additive(ADD_ERR)

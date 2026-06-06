@@ -400,6 +400,43 @@ pub fn print_results(result: &FitResult) {
             eprintln!("  EPS shrinkage:  {:.1}%", result.shrinkage_eps * 100.0);
         }
     }
+    if !result.shrinkage_kappa.is_empty() {
+        eprintln!("\n--- Kappa Shrinkage (pooled) ---");
+        for (k, &sh) in result.shrinkage_kappa.iter().enumerate() {
+            let name = result
+                .kappa_names
+                .get(k)
+                .map(|s| s.as_str())
+                .unwrap_or("KAPPA");
+            if sh.is_finite() {
+                eprintln!("  {} shrinkage: {:.1}%", name, sh * 100.0);
+            } else {
+                eprintln!("  {} shrinkage: NaN", name);
+            }
+        }
+        if !result.shrinkage_kappa_by_occ.is_empty() {
+            eprintln!("  Per-occasion:");
+            for (occ_idx, occ_sh) in result.shrinkage_kappa_by_occ.iter().enumerate() {
+                let parts: Vec<String> = occ_sh
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &sh)| {
+                        let name = result
+                            .kappa_names
+                            .get(k)
+                            .map(|s| s.as_str())
+                            .unwrap_or("KAPPA");
+                        if sh.is_finite() {
+                            format!("{} {:.1}%", name, sh * 100.0)
+                        } else {
+                            format!("{} NaN", name)
+                        }
+                    })
+                    .collect();
+                eprintln!("    Occasion slot {}: {}", occ_idx + 1, parts.join(", "));
+            }
+        }
+    }
 
     // Run info
     eprintln!("\n--- Run Info ---");
@@ -432,12 +469,17 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .iter()
         .any(|s| s.cens.iter().any(|&c| c != 0));
     let any_occ = population.subjects.iter().any(|s| !s.occasions.is_empty());
+    let any_multicmt = population
+        .subjects
+        .iter()
+        .any(|s| s.obs_cmts.iter().any(|&c| c != 1));
 
     let mut ids = Vec::with_capacity(n_total);
     let mut times = Vec::with_capacity(n_total);
     let mut dvs = Vec::with_capacity(n_total);
     let mut cens_col = Vec::with_capacity(n_total);
     let mut occ_col = Vec::with_capacity(n_total);
+    let mut cmt_col = Vec::with_capacity(n_total);
     let mut preds = Vec::with_capacity(n_total);
     let mut ipreds = Vec::with_capacity(n_total);
     let mut cwres_vec = Vec::with_capacity(n_total);
@@ -448,11 +490,12 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     for (si, sr) in result.subjects.iter().enumerate() {
         let subj = &population.subjects[si];
         for j in 0..sr.ipred.len() {
-            ids.push(si as f64 + 1.0);
+            ids.push(sr.id.parse::<f64>().unwrap_or(si as f64 + 1.0));
             times.push(subj.obs_times[j]);
             dvs.push(subj.observations[j]);
             cens_col.push(sr.cens.get(j).copied().unwrap_or(0) as f64);
             occ_col.push(subj.occasions.get(j).copied().unwrap_or(0) as f64);
+            cmt_col.push(subj.obs_cmts.get(j).copied().unwrap_or(1) as f64);
             preds.push(sr.pred[j]);
             ipreds.push(sr.ipred[j]);
             cwres_vec.push(sr.cwres[j]);
@@ -472,6 +515,9 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     }
     if any_occ {
         cols.push(("OCC".to_string(), occ_col));
+    }
+    if any_multicmt {
+        cols.push(("CMT".to_string(), cmt_col));
     }
     cols.extend([
         ("PRED".to_string(), preds),
@@ -1024,6 +1070,7 @@ mod tests {
             n_iterations: 0,
             interaction: false,
             warnings: Vec::new(),
+            warnings_structured: Vec::new(),
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,
@@ -1036,6 +1083,7 @@ mod tests {
             kappa_init_as_sd: Vec::new(),
             se_kappa: None,
             shrinkage_kappa: Vec::new(),
+            shrinkage_kappa_by_occ: Vec::new(),
             ebe_kappas: Vec::new(),
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
@@ -1070,6 +1118,24 @@ mod tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            model_text: None,
+            theta_init: Vec::new(),
+            omega_init: DMatrix::zeros(0, 0),
+            sigma_init: Vec::new(),
+            obs_time_range: None,
+            final_gradient: None,
+            optimizer: "bobyqa".to_string(),
+            n_starts: 1,
+            multi_start_seed: None,
+            saem_seed: None,
+            sir_seed: None,
+            is_seed: None,
+            bloq_method: "drop".to_string(),
+            outer_maxiter: 0,
+            outer_gtol: 0.0,
+            inits_from_nca: None,
+            covariate_names: Vec::new(),
+            input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
             covariate_table: None,
@@ -1254,6 +1320,260 @@ mod tests {
             1,
             "yaml=\n{}",
             yaml
+        );
+    }
+
+    // ── sdtab helpers ────────────────────────────────────────────────────────
+
+    fn sdtab_subject_result(id: &str, n_obs: usize) -> SubjectResult {
+        SubjectResult {
+            id: id.to_string(),
+            eta: nalgebra::DVector::zeros(0),
+            ipred: vec![1.0; n_obs],
+            pred: vec![1.0; n_obs],
+            iwres: vec![0.0; n_obs],
+            cwres: vec![0.0; n_obs],
+            ofv_contribution: 0.0,
+            cens: vec![0; n_obs],
+            n_obs,
+        }
+    }
+
+    fn sdtab_subject(id: &str, n_obs: usize, obs_cmts: Vec<usize>) -> Subject {
+        use std::collections::HashMap;
+        Subject {
+            id: id.to_string(),
+            doses: vec![],
+            obs_times: (0..n_obs).map(|j| j as f64 + 1.0).collect(),
+            observations: vec![1.0; n_obs],
+            obs_cmts,
+            covariates: HashMap::new(),
+            dose_covariates: vec![],
+            obs_covariates: vec![],
+            pk_only_times: vec![],
+            pk_only_covariates: vec![],
+            reset_times: vec![],
+            cens: vec![0; n_obs],
+            occasions: vec![],
+            dose_occasions: vec![],
+        }
+    }
+
+    fn minimal_sdtab_result(subjects: Vec<SubjectResult>) -> FitResult {
+        let sigma_types = ErrorModel::Proportional.sigma_types();
+        FitResult {
+            method: EstimationMethod::Foce,
+            method_chain: vec![EstimationMethod::Foce],
+            converged: true,
+            ofv: 0.0,
+            aic: 0.0,
+            bic: 0.0,
+            theta: Vec::new(),
+            theta_names: Vec::new(),
+            eta_names: Vec::new(),
+            omega: DMatrix::zeros(0, 0),
+            sigma: vec![0.1],
+            sigma_names: vec!["eps".to_string()],
+            error_model: ErrorModel::Proportional,
+            covariance_matrix: None,
+            se_theta: None,
+            se_omega: None,
+            se_sigma: None,
+            theta_fixed: Vec::new(),
+            omega_fixed: Vec::new(),
+            sigma_fixed: vec![false],
+            omega_init_as_sd: Vec::new(),
+            sigma_init_as_sd: vec![false],
+            subjects,
+            n_obs: 0,
+            n_subjects: 0,
+            n_parameters: 0,
+            n_iterations: 0,
+            interaction: false,
+            warnings: Vec::new(),
+            warnings_structured: Vec::new(),
+            sir_ci_theta: None,
+            sir_ci_omega: None,
+            sir_ci_sigma: None,
+            sir_ess: None,
+            sir_resamples_packed: None,
+            importance_sampling: None,
+            omega_iov: None,
+            kappa_names: Vec::new(),
+            kappa_fixed: Vec::new(),
+            kappa_init_as_sd: Vec::new(),
+            se_kappa: None,
+            shrinkage_kappa: Vec::new(),
+            shrinkage_kappa_by_occ: Vec::new(),
+            ebe_kappas: Vec::new(),
+            saem_mu_ref_m_step_evals_saved: None,
+            saem_n_subjects_hmc: None,
+            gradient_method_inner: String::new(),
+            gradient_method_outer: String::new(),
+            uses_ode_solver: false,
+            uses_sde: false,
+            n_threads_used: 1,
+            nlopt_missing_algorithms: Vec::new(),
+            covariance_n_evals_estimated: None,
+            trace_path: None,
+            ebe_convergence_warnings: 0,
+            max_unconverged_subjects: 0,
+            total_ebe_fallbacks: 0,
+            covariance_status: CovarianceStatus::NotRequested,
+            shrinkage_eta: Vec::new(),
+            shrinkage_eps: f64::NAN,
+            iwres_lag1_r: f64::NAN,
+            dw_statistic: f64::NAN,
+            wall_time_secs: 0.0,
+            model_name: "test".to_string(),
+            ferx_version: env!("CARGO_PKG_VERSION").to_string(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            sigma_types,
+            cov_eigenvalues: None,
+            cov_condition_number: None,
+            eta_log_transformed: Vec::new(),
+            omega_param_corr: None,
+            omega_iov_param_corr: None,
+            model_path: None,
+            data_path: None,
+            model_hash: None,
+            data_hash: None,
+            model_text: None,
+            theta_init: Vec::new(),
+            omega_init: DMatrix::zeros(0, 0),
+            sigma_init: Vec::new(),
+            obs_time_range: None,
+            final_gradient: None,
+            optimizer: "bobyqa".to_string(),
+            n_starts: 1,
+            multi_start_seed: None,
+            saem_seed: None,
+            sir_seed: None,
+            is_seed: None,
+            bloq_method: "drop".to_string(),
+            outer_maxiter: 0,
+            outer_gtol: 0.0,
+            inits_from_nca: None,
+            covariate_names: Vec::new(),
+            input_columns: vec![],
+            #[cfg(feature = "nn")]
+            neural_networks: Vec::new(),
+            covariate_table: None,
+        }
+    }
+
+    // ── Step 1: sdtab ID column uses the subject's original numeric ID ────────
+
+    #[test]
+    fn sdtab_id_column_uses_subject_id_not_loop_index() {
+        // Subjects with non-consecutive IDs — the classic clinical-data case.
+        let result = minimal_sdtab_result(vec![
+            sdtab_subject_result("101", 1),
+            sdtab_subject_result("202", 1),
+            sdtab_subject_result("303", 1),
+        ]);
+        let population = Population {
+            subjects: vec![
+                sdtab_subject("101", 1, vec![1]),
+                sdtab_subject("202", 1, vec![1]),
+                sdtab_subject("303", 1, vec![1]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        let id_col = cols
+            .iter()
+            .find(|(name, _)| name == "ID")
+            .map(|(_, v)| v.clone())
+            .expect("ID column missing");
+
+        assert_eq!(
+            id_col,
+            vec![101.0, 202.0, 303.0],
+            "expected original subject IDs, got {:?}",
+            id_col
+        );
+    }
+
+    // ── Step 2: sdtab CMT column appears only for multi-endpoint datasets ─────
+
+    #[test]
+    fn sdtab_cmt_column_present_for_multi_cmt() {
+        let result = minimal_sdtab_result(vec![sdtab_subject_result("1", 2)]);
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 2, vec![1, 2])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        let cmt_col = cols
+            .iter()
+            .find(|(name, _)| name == "CMT")
+            .map(|(_, v)| v.clone())
+            .expect("CMT column should be present for multi-endpoint data");
+
+        assert_eq!(cmt_col, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn sdtab_cmt_column_absent_for_single_cmt() {
+        let result = minimal_sdtab_result(vec![sdtab_subject_result("1", 2)]);
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        assert!(
+            cols.iter().all(|(name, _)| name != "CMT"),
+            "CMT column should be absent when all obs_cmts == 1"
+        );
+    }
+
+    // ── Fix 4: non-numeric subject IDs fall back to 1-based loop index ───────
+
+    /// When a subject ID cannot be parsed as f64 the sdtab ID column falls
+    /// back to the 1-based loop index rather than panicking or silently
+    /// emitting 0.  This test pins the fallback behavior; a separate warning
+    /// is issued by fit_inner() for callers that go through the estimation
+    /// path.
+    #[test]
+    fn sdtab_id_column_falls_back_for_non_numeric_ids() {
+        let result = minimal_sdtab_result(vec![
+            sdtab_subject_result("PT-001", 1),
+            sdtab_subject_result("PT-002", 1),
+        ]);
+        let population = Population {
+            subjects: vec![
+                sdtab_subject("PT-001", 1, vec![1]),
+                sdtab_subject("PT-002", 1, vec![1]),
+            ],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        let id_col = cols
+            .iter()
+            .find(|(name, _)| name == "ID")
+            .map(|(_, v)| v.clone())
+            .expect("ID column missing");
+
+        // Fallback: 1-based loop indices (1.0, 2.0), not NaN or 0.
+        assert_eq!(
+            id_col,
+            vec![1.0, 2.0],
+            "non-numeric IDs should fall back to 1-based index, got {:?}",
+            id_col
         );
     }
 }

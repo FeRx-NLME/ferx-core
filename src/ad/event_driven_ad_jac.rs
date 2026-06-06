@@ -15,6 +15,10 @@
 //! Enzyme issue is fixed they should be merged back; until then,
 //! changes to one MUST be mirrored in the other.
 
+use crate::ad::ad_gradients::{
+    PK_ID_ONE_CPT_IV, PK_ID_ONE_CPT_ORAL, PK_ID_THREE_CPT_IV, PK_ID_THREE_CPT_ORAL,
+    PK_ID_TWO_CPT_IV, PK_ID_TWO_CPT_ORAL,
+};
 use crate::ad::event_driven_ad::{FlatEventData, FlatEventTv};
 use crate::types::*;
 use std::autodiff::autodiff_forward;
@@ -165,7 +169,13 @@ pub fn predict_all_event_driven_ad(
         };
         state0 += is_dose * is_bolus * dose_amts[dose_idx] * ev_f;
 
-        let central_amt = if pk_model_id == 1 || pk_model_id == 4 || pk_model_id == 7 {
+        // Central-compartment slot: oral models put depot in state0 and
+        // central in state1; IV models put central in state0. See the
+        // matching dispatch in `event_driven_ad.rs`.
+        let central_amt = if pk_model_id == PK_ID_ONE_CPT_ORAL
+            || pk_model_id == PK_ID_TWO_CPT_ORAL
+            || pk_model_id == PK_ID_THREE_CPT_ORAL
+        {
             state1
         } else {
             state0
@@ -228,7 +238,10 @@ fn propagate_state_jac(
     dose_cmts_f64: &[f64],
     n_doses: usize,
 ) -> (f64, f64, f64, f64) {
-    if pk_model_id == 0 || pk_model_id == 2 {
+    // ID dispatch — mirrors `event_driven_ad.rs::propagate_state_ad`. Per
+    // issue #176, IV bolus and infusion share a single ID; the route is
+    // chosen per dose inside the propagator from RATE.
+    if pk_model_id == PK_ID_ONE_CPT_IV {
         let s0 = propagate_one_cpt_jac(
             state0,
             t_from,
@@ -242,10 +255,10 @@ fn propagate_state_jac(
             n_doses,
         );
         (s0, state1, state2, state3)
-    } else if pk_model_id == 1 {
+    } else if pk_model_id == PK_ID_ONE_CPT_ORAL {
         let (s0, s1) = propagate_one_cpt_oral_jac(state0, state1, t_from, t_to, cl, v, ka);
         (s0, s1, state2, state3)
-    } else if pk_model_id == 3 || pk_model_id == 5 {
+    } else if pk_model_id == PK_ID_TWO_CPT_IV {
         let (s0, s1) = propagate_two_cpt_jac(
             state0,
             state1,
@@ -263,11 +276,11 @@ fn propagate_state_jac(
             n_doses,
         );
         (s0, s1, state2, state3)
-    } else if pk_model_id == 4 {
+    } else if pk_model_id == PK_ID_TWO_CPT_ORAL {
         let (s0, s1, s2) =
             propagate_two_cpt_oral_jac(state0, state1, state2, t_from, t_to, cl, v, q, v2, ka);
         (s0, s1, s2, state3)
-    } else if pk_model_id == 6 || pk_model_id == 8 {
+    } else if pk_model_id == PK_ID_THREE_CPT_IV {
         let (s0, s1, s2) = propagate_three_cpt_jac(
             state0,
             state1,
@@ -288,7 +301,7 @@ fn propagate_state_jac(
             n_doses,
         );
         (s0, s1, s2, state3)
-    } else if pk_model_id == 7 {
+    } else if pk_model_id == PK_ID_THREE_CPT_ORAL {
         propagate_three_cpt_oral_jac(
             state0, state1, state2, state3, t_from, t_to, cl, v, q, v2, q3, v3, ka,
         )
@@ -948,7 +961,7 @@ mod tests {
         // 1-cpt IV infusion: dose split across a finite duration so the
         // propagator's per-dose `f_bio * dose_rates[d]` path runs (not the
         // main loop's bolus step).
-        let pk_model_id = pk_model_to_id(PkModel::OneCptInfusion) as f64;
+        let pk_model_id = pk_model_to_id(PkModel::OneCptIv) as f64;
         let event_times = vec![0.0_f64, 0.5, 1.0, 2.0, 4.0, 8.0];
         let event_kinds = vec![0.0_f64, 1.0, 1.0, 1.0, 1.0, 1.0];
         let event_orig = vec![0.0_f64, 0.0, 1.0, 2.0, 3.0, 4.0];

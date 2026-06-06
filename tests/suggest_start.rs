@@ -118,6 +118,7 @@ fn test_suggest_start_empty_population() {
         subjects: vec![],
         covariate_names: vec![],
         dv_column: "DV".into(),
+        input_columns: vec![],
     };
     let result = inits_from_nca(&model, &empty, NcaInit::Nca);
     assert!(!result.warnings.is_empty(), "must warn on empty population");
@@ -145,11 +146,23 @@ fn test_nca_sweep_two_cpt_iv_within_bounds() {
 
 /// nca_sweep should move unwritten thetas away from model default.
 ///
-/// For 2-cpt IV, CL/V1 are written by NCA; Q/V2 start at model default.
-/// After the sweep, Q and/or V2 should have changed (rRMSE found a better value).
+/// For 3-cpt IV, biexponential peeling estimates CL/V1/Q/V2 from the
+/// terminal-pooled curve but cannot reach the third distribution phase
+/// (Q3/V3), which therefore start at their model defaults. After the
+/// sweep, Q3 and/or V3 should have changed (rRMSE found a better value).
+///
+/// The 2-cpt IV fixture used by the other tests in this file is *not*
+/// suitable here: biexponential peeling for 2-cpt writes all four thetas,
+/// so the sweep's `remaining` set is empty and it is — correctly — a
+/// no-op. The 3-cpt fixture is the smallest case where `nca_sweep` and
+/// `nca_only` legitimately produce different theta vectors.
 #[test]
 fn test_nca_sweep_moves_unwritten_thetas() {
-    let (model, population) = two_cpt_iv();
+    let model = parse_model_file(Path::new("examples/three_cpt_iv.ferx"))
+        .expect("three_cpt_iv model must parse");
+    let population = read_nonmem_csv(Path::new("data/three_cpt_iv.csv"), None, None)
+        .expect("three_cpt_iv data must load");
+
     let fast = inits_from_nca(&model, &population, NcaInit::Nca);
     let thorough = inits_from_nca(&model, &population, NcaInit::Sweep);
 
@@ -163,7 +176,8 @@ fn test_nca_sweep_moves_unwritten_thetas() {
 
     assert!(
         any_changed,
-        "nca_sweep should change at least one theta vs nca-only"
+        "nca_sweep should change at least one theta vs nca-only \
+         (3-cpt Q3/V3 left at default by peeling should be filled in by sweep)"
     );
 }
 

@@ -14,17 +14,18 @@ pk MODEL_NAME(param=VALUE, param=VALUE, ...)
 
 | Model Function | Compartments | Route | Required Parameters |
 |---------------|--------------|-------|---------------------|
-| `one_cpt_iv_bolus` | 1 | IV bolus | `cl`, `v` |
+| `one_cpt_iv` | 1 | IV (bolus and/or infusion) | `cl`, `v` |
 | `one_cpt_oral` | 1 | Oral | `cl`, `v`, `ka` |
-| `one_cpt_infusion` | 1 | IV infusion | `cl`, `v` |
-| `two_cpt_iv_bolus` | 2 | IV bolus | `cl`, `v1`, `q`, `v2` |
+| `two_cpt_iv` | 2 | IV (bolus and/or infusion) | `cl`, `v1`, `q`, `v2` |
 | `two_cpt_oral` | 2 | Oral | `cl`, `v1`, `q`, `v2`, `ka` |
-| `two_cpt_infusion` | 2 | IV infusion | `cl`, `v1`, `q`, `v2` |
-| `three_cpt_iv_bolus` | 3 | IV bolus | `cl`, `v1`, `q2`, `v2`, `q3`, `v3` |
+| `three_cpt_iv` | 3 | IV (bolus and/or infusion) | `cl`, `v1`, `q2`, `v2`, `q3`, `v3` |
 | `three_cpt_oral` | 3 | Oral | `cl`, `v1`, `q2`, `v2`, `q3`, `v3`, `ka` |
-| `three_cpt_infusion` | 3 | IV infusion | `cl`, `v1`, `q2`, `v2`, `q3`, `v3` |
 
-Each model has a `three_compartment_*` long-form alias (e.g. `three_compartment_iv_bolus`); the short and long names are interchangeable.
+Each model has a `*_compartment_*` long-form alias (e.g. `three_compartment_iv`); the short and long names are interchangeable.
+
+There is no separate bolus or infusion variant: every IV model selects the closed form per dose from the `RATE` column (`RATE=0` ⇒ bolus, `RATE>0` ⇒ infusion). A single subject can mix the two. This matches NONMEM, nlmixr2, and Monolix.
+
+The earlier `*_iv_bolus` and `*_infusion` model names were retired in #176. The parser now rejects them with a migration message pointing at the unified `*_iv` name.
 
 ### Examples
 
@@ -34,10 +35,10 @@ One-compartment oral:
   pk one_cpt_oral(cl=CL, v=V, ka=KA)
 ```
 
-Two-compartment IV bolus:
+Two-compartment IV (bolus, infusion, or a mix — driven by RATE):
 ```
 [structural_model]
-  pk two_cpt_iv_bolus(cl=CL, v1=V1, q=Q, v2=V2)
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
 ```
 
 Two-compartment oral:
@@ -46,10 +47,10 @@ Two-compartment oral:
   pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
 ```
 
-Three-compartment IV bolus (note that `q2`/`q3` and `v2`/`v3` distinguish the two peripheral compartments):
+Three-compartment IV (note that `q2`/`q3` and `v2`/`v3` distinguish the two peripheral compartments):
 ```
 [structural_model]
-  pk three_cpt_iv_bolus(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
+  pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
 ```
 
 ### Bioavailability
@@ -64,9 +65,10 @@ All `pk` models accept an optional `lagtime=` parameter (or its NONMEM-style ali
 
 ### Dose Handling
 
-Analytical models support:
-- **Bolus doses**: Instantaneous input (default when `RATE=0` in data)
+Analytical IV models support:
+- **Bolus doses**: Instantaneous input (when `RATE=0` in data)
 - **Infusions**: Zero-order input (when `RATE>0` in data)
+- **Mixed**: A single subject may receive both bolus and infusion doses; the route is read per event from `RATE`
 - **Steady-state**: Pre-computed steady-state concentrations (when `SS=1` and `II>0` in data)
 - **Dose superposition**: Multiple doses are handled by summing contributions from each dose event
 

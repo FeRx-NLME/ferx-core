@@ -27,6 +27,10 @@
 //!     Const branches get constant-folded by LLVM and don't poison the
 //!     reverse-mode adjoint.
 
+use crate::ad::ad_gradients::{
+    PK_ID_ONE_CPT_IV, PK_ID_ONE_CPT_ORAL, PK_ID_THREE_CPT_IV, PK_ID_THREE_CPT_ORAL,
+    PK_ID_TWO_CPT_IV, PK_ID_TWO_CPT_ORAL,
+};
 use crate::types::*;
 use std::autodiff::autodiff_reverse;
 
@@ -54,7 +58,7 @@ pub struct FlatEventData {
     pub dose_amts: Vec<f64>,
     pub dose_rates: Vec<f64>,
     pub dose_durations: Vec<f64>,
-    /// Per-dose compartment number as f64 (1-based, matches NONMEM).
+    /// Per-dose compartment number (1-based, matches NONMEM).
     /// Used by the 2-/3-cpt AD propagators to route an infusion's
     /// steady-state contribution to the correct channel (central vs
     /// periph1 vs periph2). Const through the AD macros.
@@ -72,7 +76,7 @@ impl FlatEventData {
         // (time, kind_order, orig_idx). Tie-break order at the same time:
         //   dose (0) < pk-only (1) < obs (2)
         // — see analytical `event_driven::event_driven_predictions` for
-        // the rationale. Stored kind is encoded as f64 for the AD macros:
+        // the rationale. Stored kind is encoded for the AD macros:
         //   0.0 = dose, 1.0 = obs, 2.0 = pk-only. The kind_order used for
         // sorting is computed from these.
         for (k, d) in subject.doses.iter().enumerate() {
@@ -385,7 +389,10 @@ pub fn individual_nll_event_driven_ad(
         //   IV models (1- 2- 3-cpt): central = state0
         //   Oral models (1- 2- 3-cpt): central = state1 (state0 is depot)
         // Const branch on pk_model_id constant-folds.
-        let central_amt = if pk_model_id == 1 || pk_model_id == 4 || pk_model_id == 7 {
+        let central_amt = if pk_model_id == PK_ID_ONE_CPT_ORAL
+            || pk_model_id == PK_ID_TWO_CPT_ORAL
+            || pk_model_id == PK_ID_THREE_CPT_ORAL
+        {
             state1
         } else {
             state0
@@ -488,8 +495,11 @@ fn propagate_state_ad(
     // (mirrors `pk::event_driven::propagate_with_bounds`). Oral
     // propagators take no doses internally — bolus into depot is
     // handled in the main event loop with `f_bio` applied there.
-    if pk_model_id == 0 || pk_model_id == 2 {
-        // 1-cpt IV bolus / infusion: state = [central].
+    // Per issue #176, IV bolus and infusion share one model ID (the bolus
+    // vs infusion route is picked per dose inside the propagator from
+    // RATE), so each IV branch below matches a single ID.
+    if pk_model_id == PK_ID_ONE_CPT_IV {
+        // 1-cpt IV (bolus and/or infusion): state = [central].
         let s0 = propagate_one_cpt_ad(
             state0,
             t_from,
@@ -503,12 +513,12 @@ fn propagate_state_ad(
             n_doses,
         );
         (s0, state1, state2, state3)
-    } else if pk_model_id == 1 {
+    } else if pk_model_id == PK_ID_ONE_CPT_ORAL {
         // 1-cpt oral: state = [depot, central]. No infusion support.
         let (s0, s1) = propagate_one_cpt_oral_ad(state0, state1, t_from, t_to, cl, v, ka);
         (s0, s1, state2, state3)
-    } else if pk_model_id == 3 || pk_model_id == 5 {
-        // 2-cpt IV bolus / infusion: state = [central, periph].
+    } else if pk_model_id == PK_ID_TWO_CPT_IV {
+        // 2-cpt IV (bolus and/or infusion): state = [central, periph].
         let (s0, s1) = propagate_two_cpt_ad(
             state0,
             state1,
@@ -526,13 +536,13 @@ fn propagate_state_ad(
             n_doses,
         );
         (s0, s1, state2, state3)
-    } else if pk_model_id == 4 {
+    } else if pk_model_id == PK_ID_TWO_CPT_ORAL {
         // 2-cpt oral: state = [depot, central, periph].
         let (s0, s1, s2) =
             propagate_two_cpt_oral_ad(state0, state1, state2, t_from, t_to, cl, v, q, v2, ka);
         (s0, s1, s2, state3)
-    } else if pk_model_id == 6 || pk_model_id == 8 {
-        // 3-cpt IV bolus / infusion: state = [central, periph1, periph2].
+    } else if pk_model_id == PK_ID_THREE_CPT_IV {
+        // 3-cpt IV (bolus and/or infusion): state = [central, periph1, periph2].
         let (s0, s1, s2) = propagate_three_cpt_ad(
             state0,
             state1,
@@ -553,7 +563,7 @@ fn propagate_state_ad(
             n_doses,
         );
         (s0, s1, s2, state3)
-    } else if pk_model_id == 7 {
+    } else if pk_model_id == PK_ID_THREE_CPT_ORAL {
         // 3-cpt oral: state = [depot, central, periph1, periph2].
         propagate_three_cpt_oral_ad(
             state0, state1, state2, state3, t_from, t_to, cl, v, q, v2, q3, v3, ka,
@@ -1153,14 +1163,11 @@ pub fn supports_event_driven_ad(pk_model: PkModel) -> bool {
     // dispatch.
     matches!(
         pk_model,
-        PkModel::OneCptIvBolus
-            | PkModel::OneCptInfusion
+        PkModel::OneCptIv
             | PkModel::OneCptOral
-            | PkModel::TwoCptIvBolus
-            | PkModel::TwoCptInfusion
+            | PkModel::TwoCptIv
             | PkModel::TwoCptOral
-            | PkModel::ThreeCptIvBolus
-            | PkModel::ThreeCptInfusion
+            | PkModel::ThreeCptIv
             | PkModel::ThreeCptOral
     )
 }

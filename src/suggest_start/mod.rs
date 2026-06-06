@@ -379,12 +379,9 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
             .map(nca_one_cpt_oral)
             .collect(),
 
-        PkModel::OneCptIvBolus
-        | PkModel::TwoCptIvBolus
-        | PkModel::ThreeCptIvBolus
-        | PkModel::OneCptInfusion
-        | PkModel::TwoCptInfusion
-        | PkModel::ThreeCptInfusion => population.subjects.par_iter().map(nca_one_cpt_iv).collect(),
+        PkModel::OneCptIv | PkModel::TwoCptIv | PkModel::ThreeCptIv => {
+            population.subjects.par_iter().map(nca_one_cpt_iv).collect()
+        }
     };
 
     // Count how many subjects had valid CL estimates.
@@ -400,10 +397,10 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
     // For 2-cpt/3-cpt models, attempt biexponential peeling on the pooled curve.
     let mut pop = pool_nca(&per_subject);
     match model.pk_model {
-        PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion | PkModel::TwoCptOral => {
+        PkModel::TwoCptIv | PkModel::TwoCptOral => {
             try_biexp_peel(model, population, &mut pop, &mut warnings);
         }
-        PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => {
+        PkModel::ThreeCptIv => {
             try_biexp_peel(model, population, &mut pop, &mut warnings);
             warnings.push(
                 "inits_from_nca: 3-cpt distribution parameters from biexponential peeling are unreliable; consider the nca_sweep method".into(),
@@ -808,6 +805,7 @@ mod tests {
             subjects: vec![],
             covariate_names: vec![],
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
         let result = inits_from_nca(&model, &empty_pop, NcaInit::Nca);
         // Must not panic and should warn.

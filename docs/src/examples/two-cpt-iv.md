@@ -27,7 +27,7 @@ This example fits a two-compartment IV bolus model with four random effects.
   V2 = TVV2 * exp(ETA_V2)
 
 [structural_model]
-  pk two_cpt_iv_bolus(cl=CL, v1=V1, q=Q, v2=V2)
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
 
 [error_model]
   DV ~ proportional(PROP_ERR)

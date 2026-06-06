@@ -232,14 +232,11 @@ fn compute_propagation_bounds(
 pub fn supports_event_driven(pk_model: PkModel) -> bool {
     matches!(
         pk_model,
-        PkModel::OneCptIvBolus
-            | PkModel::OneCptInfusion
+        PkModel::OneCptIv
             | PkModel::OneCptOral
-            | PkModel::TwoCptIvBolus
-            | PkModel::TwoCptInfusion
+            | PkModel::TwoCptIv
             | PkModel::TwoCptOral
-            | PkModel::ThreeCptIvBolus
-            | PkModel::ThreeCptInfusion
+            | PkModel::ThreeCptIv
             | PkModel::ThreeCptOral
     )
 }
@@ -248,11 +245,11 @@ pub fn supports_event_driven(pk_model: PkModel) -> bool {
 /// pk_model. Central is where the observation read-out reads from.
 fn state_layout(pk_model: PkModel) -> (usize, usize) {
     match pk_model {
-        PkModel::OneCptIvBolus | PkModel::OneCptInfusion => (1, 0),
+        PkModel::OneCptIv => (1, 0),
         PkModel::OneCptOral => (2, 1), // [depot, central]
-        PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion => (2, 0),
+        PkModel::TwoCptIv => (2, 0),
         PkModel::TwoCptOral => (3, 1), // [depot, central, periph]
-        PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => (3, 0),
+        PkModel::ThreeCptIv => (3, 0),
         PkModel::ThreeCptOral => (4, 1), // [depot, central, periph1, periph2]
     }
 }
@@ -664,14 +661,14 @@ fn propagate_with_bounds(
             if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
                 let r = f_bio * d.rate;
                 match (pk_model, d.cmt) {
-                    (PkModel::OneCptIvBolus | PkModel::OneCptInfusion, 1) => rate_central += r,
+                    (PkModel::OneCptIv, 1) => rate_central += r,
                     (PkModel::OneCptOral, 2) => rate_central += r,
-                    (PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion, 1) => rate_central += r,
-                    (PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion, 2) => rate_periph1 += r,
+                    (PkModel::TwoCptIv, 1) => rate_central += r,
+                    (PkModel::TwoCptIv, 2) => rate_periph1 += r,
                     (PkModel::TwoCptOral, 2) => rate_central += r,
-                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 1) => rate_central += r,
-                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 2) => rate_periph1 += r,
-                    (PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion, 3) => rate_periph2 += r,
+                    (PkModel::ThreeCptIv, 1) => rate_central += r,
+                    (PkModel::ThreeCptIv, 2) => rate_periph1 += r,
+                    (PkModel::ThreeCptIv, 3) => rate_periph2 += r,
                     (PkModel::ThreeCptOral, 2) => rate_central += r,
                     _ => panic!(
                         "event-driven PK: infusion into compartment {} not supported \
@@ -685,19 +682,19 @@ fn propagate_with_bounds(
         }
 
         match pk_model {
-            PkModel::OneCptIvBolus | PkModel::OneCptInfusion => {
+            PkModel::OneCptIv => {
                 propagate_one_cpt(state, dt, pk, rate_central);
             }
             PkModel::OneCptOral => {
                 propagate_one_cpt_oral(state, dt, pk);
             }
-            PkModel::TwoCptIvBolus | PkModel::TwoCptInfusion => {
+            PkModel::TwoCptIv => {
                 propagate_two_cpt(state, dt, pk, rate_central, rate_periph1);
             }
             PkModel::TwoCptOral => {
                 propagate_two_cpt_oral(state, dt, pk);
             }
-            PkModel::ThreeCptIvBolus | PkModel::ThreeCptInfusion => {
+            PkModel::ThreeCptIv => {
                 propagate_three_cpt(state, dt, pk, rate_central, rate_periph1, rate_periph2);
             }
             PkModel::ThreeCptOral => {
@@ -1195,7 +1192,7 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
         assert!(preds[0] > 0.0, "pre-reset obs should be positive");
         assert_relative_eq!(preds[1], 0.0, epsilon = 1e-12);
         assert_relative_eq!(preds[2], 0.0, epsilon = 1e-12);
@@ -1217,11 +1214,11 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
 
         let fresh = vec![DoseEvent::new(10.0, 500.0, 1, 0.0, false, 0.0)];
         for (i, &t) in obs_times.iter().enumerate() {
-            let expected = crate::pk::predict_concentration(PkModel::OneCptIvBolus, &fresh, t, &pk);
+            let expected = crate::pk::predict_concentration(PkModel::OneCptIv, &fresh, t, &pk);
             assert_relative_eq!(preds[i], expected, epsilon = 1e-10, max_relative = 1e-10);
         }
     }
@@ -1238,8 +1235,7 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds =
-            event_driven_predictions(PkModel::OneCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
         assert!(
             preds[0] > 0.0,
             "mid-infusion pre-reset obs should be positive"
@@ -1290,10 +1286,10 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::TwoCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::TwoCptIv, &subj, &pk_dose, &pk_obs, &[]);
         let fresh = vec![DoseEvent::new(20.0, 1000.0, 1, 0.0, false, 0.0)];
         for (i, &t) in obs_times.iter().enumerate() {
-            let expected = crate::pk::predict_concentration(PkModel::TwoCptIvBolus, &fresh, t, &pk);
+            let expected = crate::pk::predict_concentration(PkModel::TwoCptIv, &fresh, t, &pk);
             assert_relative_eq!(preds[i], expected, epsilon = 1e-9, max_relative = 1e-9);
         }
     }
@@ -1309,10 +1305,10 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
-            .map(|&t| crate::pk::predict_concentration(PkModel::OneCptIvBolus, &subj.doses, t, &pk))
+            .map(|&t| crate::pk::predict_concentration(PkModel::OneCptIv, &subj.doses, t, &pk))
             .collect();
         for (a, e) in preds.iter().zip(expected.iter()) {
             assert_relative_eq!(*a, *e, epsilon = 1e-10);
@@ -1332,10 +1328,10 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
-            .map(|&t| crate::pk::predict_concentration(PkModel::OneCptIvBolus, &subj.doses, t, &pk))
+            .map(|&t| crate::pk::predict_concentration(PkModel::OneCptIv, &subj.doses, t, &pk))
             .collect();
         for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
             assert_relative_eq!(*a, *e, epsilon = 1e-10, max_relative = 1e-10);
@@ -1354,13 +1350,10 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds =
-            event_driven_predictions(PkModel::OneCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
-            .map(|&t| {
-                crate::pk::predict_concentration(PkModel::OneCptInfusion, &subj.doses, t, &pk)
-            })
+            .map(|&t| crate::pk::predict_concentration(PkModel::OneCptIv, &subj.doses, t, &pk))
             .collect();
         for (a, e) in preds.iter().zip(expected.iter()) {
             assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-9);
@@ -1379,10 +1372,10 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::TwoCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::TwoCptIv, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
-            .map(|&t| crate::pk::predict_concentration(PkModel::TwoCptIvBolus, &subj.doses, t, &pk))
+            .map(|&t| crate::pk::predict_concentration(PkModel::TwoCptIv, &subj.doses, t, &pk))
             .collect();
         for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
             assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-9,);
@@ -1403,13 +1396,10 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds =
-            event_driven_predictions(PkModel::TwoCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::TwoCptIv, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
-            .map(|&t| {
-                crate::pk::predict_concentration(PkModel::TwoCptInfusion, &subj.doses, t, &pk)
-            })
+            .map(|&t| crate::pk::predict_concentration(PkModel::TwoCptIv, &subj.doses, t, &pk))
             .collect();
         for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
             assert_relative_eq!(*a, *e, epsilon = 1e-8, max_relative = 1e-8,);
@@ -1438,7 +1428,7 @@ mod tests {
         let pk_dose = vec![pk_low];
         let pk_obs = vec![pk_low, pk_high]; // pk changes at obs2
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
 
         // [0, 1] uses pk_low (= pk at obs1):
         //   A1(1) = 1000 * exp(-0.05) ≈ 951.23
@@ -1475,7 +1465,7 @@ mod tests {
         let pk_dose = vec![pk_low, pk_high];
         let pk_obs = vec![pk_low, pk_high];
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
 
         // [0, 5] uses pk_low (pk at obs1):
         //   A1(5) = 1000 * exp(-0.05*5) = 778.80, C = 7.788
@@ -1498,14 +1488,11 @@ mod tests {
     #[test]
     fn supports_event_driven_gates_supported_models_only() {
         // Now covers all analytical PK models.
-        assert!(supports_event_driven(PkModel::OneCptIvBolus));
-        assert!(supports_event_driven(PkModel::OneCptInfusion));
+        assert!(supports_event_driven(PkModel::OneCptIv));
         assert!(supports_event_driven(PkModel::OneCptOral));
-        assert!(supports_event_driven(PkModel::TwoCptIvBolus));
-        assert!(supports_event_driven(PkModel::TwoCptInfusion));
+        assert!(supports_event_driven(PkModel::TwoCptIv));
         assert!(supports_event_driven(PkModel::TwoCptOral));
-        assert!(supports_event_driven(PkModel::ThreeCptIvBolus));
-        assert!(supports_event_driven(PkModel::ThreeCptInfusion));
+        assert!(supports_event_driven(PkModel::ThreeCptIv));
         assert!(supports_event_driven(PkModel::ThreeCptOral));
     }
 
@@ -1675,18 +1662,11 @@ mod tests {
         pk.values[crate::types::PK_IDX_F] = 1.0;
         let pk_dose_unit = vec![pk; 1];
         let pk_obs_unit = vec![pk; obs_times.len()];
-        let preds_unit = event_driven_predictions(
-            PkModel::OneCptInfusion,
-            &subj,
-            &pk_dose_unit,
-            &pk_obs_unit,
-            &[],
-        );
+        let preds_unit =
+            event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose_unit, &pk_obs_unit, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
-            .map(|&t| {
-                crate::pk::predict_concentration(PkModel::OneCptInfusion, &subj.doses, t, &pk)
-            })
+            .map(|&t| crate::pk::predict_concentration(PkModel::OneCptIv, &subj.doses, t, &pk))
             .collect();
         for (i, (a, e)) in preds_unit.iter().zip(expected.iter()).enumerate() {
             assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-8);
@@ -1698,7 +1678,7 @@ mod tests {
         let pk_dose_f = vec![pk_f; 1];
         let pk_obs_f = vec![pk_f; obs_times.len()];
         let preds_f =
-            event_driven_predictions(PkModel::OneCptInfusion, &subj, &pk_dose_f, &pk_obs_f, &[]);
+            event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose_f, &pk_obs_f, &[]);
         for (a_f, a_1) in preds_f.iter().zip(preds_unit.iter()) {
             assert_relative_eq!(*a_f, 0.4 * *a_1, epsilon = 1e-9, max_relative = 1e-9);
         }
@@ -1738,13 +1718,10 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds =
-            event_driven_predictions(PkModel::ThreeCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::ThreeCptIv, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
-            .map(|&t| {
-                crate::pk::predict_concentration(PkModel::ThreeCptIvBolus, &subj.doses, t, &pk)
-            })
+            .map(|&t| crate::pk::predict_concentration(PkModel::ThreeCptIv, &subj.doses, t, &pk))
             .collect();
         for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
             assert_relative_eq!(*a, *e, epsilon = 1e-9, max_relative = 1e-8);
@@ -1765,13 +1742,10 @@ mod tests {
         let pk_dose = vec![pk; subj.doses.len()];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds =
-            event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::ThreeCptIv, &subj, &pk_dose, &pk_obs, &[]);
         let expected: Vec<f64> = obs_times
             .iter()
-            .map(|&t| {
-                crate::pk::predict_concentration(PkModel::ThreeCptInfusion, &subj.doses, t, &pk)
-            })
+            .map(|&t| crate::pk::predict_concentration(PkModel::ThreeCptIv, &subj.doses, t, &pk))
             .collect();
         for (i, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
             assert_relative_eq!(*a, *e, epsilon = 1e-7, max_relative = 1e-7);
@@ -1792,8 +1766,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds =
-            event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::ThreeCptIv, &subj, &pk_dose, &pk_obs, &[]);
 
         for (i, &p) in preds.iter().enumerate() {
             assert!(p.is_finite(), "obs {} should be finite, got {}", i, p);
@@ -1819,8 +1792,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds =
-            event_driven_predictions(PkModel::ThreeCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::ThreeCptIv, &subj, &pk_dose, &pk_obs, &[]);
         for &p in &preds {
             assert!(p.is_finite() && p >= 0.0, "got {}", p);
         }
@@ -1874,8 +1846,7 @@ mod tests {
         let pk_obs = vec![pk_high];
         let pk_only = vec![pk_high];
 
-        let preds =
-            event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &pk_only);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &pk_only);
 
         //   A(5⁻) = 1000 * exp(-0.10*5) = 606.53   (uses pk_high — end-of-interval)
         //   A(10) = A(5⁻) * exp(-0.10*5) = 367.88
@@ -1950,7 +1921,7 @@ mod tests {
         let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
         let obs_times = vec![0.0, 1.0]; // first obs at t=0, same as dose
         let subj = make_subject(doses, obs_times);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIvBolus, &[]);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &[]);
 
         assert_eq!(schedule.events.len(), 3);
         assert!(matches!(schedule.events[0].kind, EventKind::Dose));
@@ -1967,7 +1938,7 @@ mod tests {
         let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 2.0)];
         let obs_times = vec![10.0];
         let subj = make_subject(doses, obs_times);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptInfusion, &[]);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &[]);
 
         // Two events (dose at 0, obs at 10) → one interval (0, 10).
         assert_eq!(schedule.bounds_per_interval.len(), 1);
@@ -2005,11 +1976,10 @@ mod tests {
             pk_obs.push(pk_two(5.0 + 0.1 * i as f64, 50.0, 2.0, 100.0));
         }
 
-        let direct =
-            event_driven_predictions(PkModel::TwoCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::TwoCptInfusion, &[]);
+        let direct = event_driven_predictions(PkModel::TwoCptIv, &subj, &pk_dose, &pk_obs, &[]);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::TwoCptIv, &[]);
         let with_sched = event_driven_predictions_with_schedule(
-            PkModel::TwoCptInfusion,
+            PkModel::TwoCptIv,
             &subj,
             &schedule,
             &pk_dose,
@@ -2043,7 +2013,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
         for (j, &t) in obs_times.iter().enumerate() {
             let expected = one_cpt_iv_bolus_ss(&dose, t, cl, v);
             assert_relative_eq!(preds[j], expected, epsilon = 1e-9, max_relative = 1e-7);
@@ -2065,8 +2035,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds =
-            event_driven_predictions(PkModel::OneCptInfusion, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
         for (j, &t) in obs_times.iter().enumerate() {
             let expected = one_cpt_infusion_ss(&dose, t, cl, v);
             assert_relative_eq!(preds[j], expected, epsilon = 1e-9, max_relative = 1e-7);
@@ -2130,7 +2099,7 @@ mod tests {
         let pk_dose = vec![pk; 1];
         let pk_obs = vec![pk; obs_times.len()];
 
-        let preds = event_driven_predictions(PkModel::OneCptIvBolus, &subj, &pk_dose, &pk_obs, &[]);
+        let preds = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
         for (j, &(_t, pred)) in nonmem.iter().enumerate() {
             assert_relative_eq!(preds[j], pred, max_relative = 1e-4);
         }

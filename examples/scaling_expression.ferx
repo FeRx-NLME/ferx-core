@@ -26,7 +26,7 @@
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [scaling]
   obs_scale = V                 # per-subject volume-normalised DV scale

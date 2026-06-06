@@ -335,6 +335,21 @@ pub fn run_foce_gn(
         warnings.push("Gauss-Newton: max iterations reached without convergence".to_string());
     }
 
+    // Recompute gradient at the final accepted x so the stored value is always
+    // at the converged point (mid-loop capture would be off by one step).
+    let (grad_final, _) = build_gn_system(
+        &x,
+        init_params,
+        model,
+        population,
+        &eta_hats,
+        &h_matrices,
+        &kappas,
+        &bounds,
+        options,
+    );
+    let mut final_gradient: Option<Vec<f64>> = Some(grad_final.as_slice().to_vec());
+
     let gn_ofv = ofv;
     let do_polish = matches!(options.method, EstimationMethod::FoceGnHybrid);
 
@@ -396,6 +411,7 @@ pub fn run_foce_gn(
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
+            final_gradient,
         };
     }
 
@@ -438,6 +454,7 @@ pub fn run_foce_gn(
         final_h_mats = polish_result.h_matrices;
         final_kappas = polish_result.kappas;
         converged = polish_result.converged || converged;
+        final_gradient = polish_result.final_gradient.or(final_gradient);
     } else {
         if verbose {
             eprintln!("  FOCEI polish did not improve (GN result kept)");
@@ -499,6 +516,7 @@ pub fn run_foce_gn(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        final_gradient,
     }
 }
 
@@ -1580,7 +1598,7 @@ mod tests {
         };
         CompiledModel {
             name: "gn_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -1649,6 +1667,7 @@ mod tests {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 
@@ -2481,7 +2500,7 @@ mod tests {
         };
         let model = CompiledModel {
             name: "gn_block_omega_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -2753,7 +2772,7 @@ mod tests {
         };
         CompiledModel {
             name: "iov_gn_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -2821,6 +2840,7 @@ mod tests {
             subjects: vec![subject],
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 

@@ -1811,6 +1811,7 @@ pub fn run_saem(
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
+        final_gradient: None,
     })
 }
 
@@ -2178,6 +2179,7 @@ mod tests {
             subjects: vec![subj],
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
 
         let flag = CancelFlag::new();
@@ -2274,6 +2276,7 @@ mod tests {
             ],
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
 
         let theta = vec![1.5f64, 20.0]; // CL, V
@@ -2425,6 +2428,7 @@ mod tests {
             subjects: vec![make_subj("1", 1.0), make_subj("2", 1.1)],
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
 
         let theta = vec![1.0f64, 10.0, 0.5];

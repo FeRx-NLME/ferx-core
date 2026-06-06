@@ -96,7 +96,18 @@ jobs:
         # `slow-tests` un-ignores the gated tests, so `--include-ignored`
         # isn't needed; left off so a stray plain `#[ignore]` test elsewhere
         # in the suite doesn't silently inflate coverage measurements here.
-        run: cargo llvm-cov --lib --no-default-features --features ci,slow-tests --release --lcov --output-path lcov.info
+        #
+        # `--tests` (i.e. NOT `--lib`) so the integration tests in `tests/`
+        # contribute to coverage — they exercise public-API entry points
+        # (e.g. `inits_from_nca`, the full sweep paths in
+        # `src/suggest_start/sweep.rs`) that no inline `#[cfg(test)]` test
+        # reaches. Lib-only coverage misrepresented sweep.rs as ~8% covered
+        # when its public functions were in fact extensively exercised.
+        #
+        # `--no-fail-fast` so a single test-binary failure doesn't abort
+        # cargo's run and silently drop coverage from every later binary
+        # (mirrors the same flag in slow-tests.yml).
+        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,slow-tests --release --lcov --output-path lcov.info
 
       - name: Upload to Codecov
         uses: codecov/codecov-action@v5

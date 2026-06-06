@@ -113,6 +113,7 @@ fn simulate_subjects(
         subjects: subjects.clone(),
         covariate_names: vec![],
         dv_column: "dv".into(),
+        input_columns: vec![],
     };
 
     let sim = simulate_with_seed(model, &pop, params, 1, seed);
@@ -293,7 +294,7 @@ fn generate_two_cpt_iv() {
         });
     let model = CompiledModel {
         name: "two_cpt_iv".into(),
-        pk_model: PkModel::TwoCptIvBolus,
+        pk_model: PkModel::TwoCptIv,
         error_model: ErrorModel::Proportional,
         error_spec: ferx_core::types::ErrorSpec::Single(ErrorModel::Proportional),
         pk_param_fn,
@@ -505,6 +506,7 @@ fn generate_two_cpt_oral_cov() {
         subjects,
         covariate_names: vec!["wt".into(), "crcl".into()],
         dv_column: "dv".into(),
+        input_columns: vec![],
     };
     let sim = simulate_with_seed(&model, &pop, &params, 1, 456);
 

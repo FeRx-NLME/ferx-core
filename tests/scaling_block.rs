@@ -22,6 +22,7 @@ fn one_subject_pop() -> Population {
     Population {
         covariate_names: Vec::new(),
         dv_column: "DV".to_string(),
+        input_columns: vec![],
         subjects: vec![Subject {
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -53,7 +54,7 @@ const ANALYTICAL_BASE: &str = "\
   V  = TVV
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)
@@ -259,6 +260,7 @@ fn two_cmt_pop() -> Population {
     Population {
         covariate_names: Vec::new(),
         dv_column: "DV".to_string(),
+        input_columns: vec![],
         subjects: vec![mk_subject("1"), mk_subject("2")],
     }
 }

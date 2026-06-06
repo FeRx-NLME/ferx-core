@@ -331,6 +331,29 @@ pub fn sweep_unwritten_thetas_ebe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::datareader::read_nonmem_csv;
+    use crate::parser::model_parser::parse_model_file;
+    use crate::types::{PK_IDX_CL, PK_IDX_Q, PK_IDX_V, PK_IDX_V2};
+    use std::path::Path;
+
+    // ── helpers ─────────────────────────────────────────────────────────────
+
+    /// Parse the warfarin (1-cpt oral) model only — for tests that synthesise
+    /// their own `Population` (e.g. the empty-observations rRMSE branch).
+    fn warfarin_model() -> CompiledModel {
+        parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse")
+    }
+
+    /// Load the warfarin (1-cpt oral) fixture used by the suite's other tests.
+    /// Small (~30 subjects) and analytical so each sweep iteration is fast.
+    fn warfarin() -> (CompiledModel, Population) {
+        let model = warfarin_model();
+        let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data must load");
+        (model, population)
+    }
+
+    // ── log_grid ────────────────────────────────────────────────────────────
 
     #[test]
     fn test_log_grid_endpoints() {
@@ -344,5 +367,204 @@ mod tests {
     fn test_log_grid_single_point() {
         let grid = log_grid(5.0, 10.0, 1);
         assert_eq!(grid, vec![5.0]);
+    }
+
+    // ── rrmse ───────────────────────────────────────────────────────────────
+
+    /// rRMSE on a population with no observations must return INFINITY rather
+    /// than divide by zero — the sweep then prefers any grid point with valid
+    /// observations over an empty one.
+    #[test]
+    fn test_rrmse_no_observations_returns_infinity() {
+        let model = warfarin_model();
+        let empty_pop = Population {
+            subjects: vec![],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+        };
+        let r = rrmse(&model, &empty_pop, &model.default_params);
+        assert!(
+            r.is_infinite() && r > 0.0,
+            "empty population must give +∞ rRMSE, got {r}"
+        );
+    }
+
+    // ── sweep_slots (etas=0) ────────────────────────────────────────────────
+
+    /// `sweep_slots` with a PK slot the model doesn't have must skip cleanly
+    /// (returns the base params unchanged) and emit one warning identifying
+    /// the missing slot. Warfarin is 1-cpt so `PK_IDX_Q` is absent.
+    #[test]
+    fn test_sweep_slots_warns_when_slot_missing() {
+        let (model, population) = warfarin();
+        let base = model.default_params.clone();
+        let (out, warnings) = sweep_slots(
+            &model,
+            &population,
+            &base,
+            PK_IDX_CL,
+            PK_IDX_Q, // absent from warfarin (1-cpt model)
+            9,
+            10.0,
+            "CL/Q (synthetic)",
+        );
+        assert_eq!(
+            out.theta, base.theta,
+            "missing slot must leave base unchanged"
+        );
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly one slot-missing warning expected"
+        );
+        assert!(
+            warnings[0].contains("could not locate theta indices"),
+            "warning text must mention missing-slot reason, got: {}",
+            warnings[0]
+        );
+    }
+
+    // ── sweep_unwritten_thetas (etas=0) ─────────────────────────────────────
+
+    /// Empty `targets` must short-circuit to a clone of base with no warnings.
+    #[test]
+    fn test_sweep_unwritten_thetas_empty_targets_noop() {
+        let (model, population) = warfarin();
+        let base = model.default_params.clone();
+        let (out, warnings) = sweep_unwritten_thetas(&model, &population, &base, &[], 9, 10.0);
+        assert_eq!(out.theta, base.theta);
+        assert!(warnings.is_empty());
+    }
+
+    /// A non-positive theta value (e.g. 0.0) can't be log-grid-swept; the
+    /// function must skip it with a warning and continue with the rest.
+    #[test]
+    fn test_sweep_unwritten_thetas_skips_non_positive() {
+        let (model, population) = warfarin();
+        let mut base = model.default_params.clone();
+        base.theta[0] = 0.0; // force a non-positive theta in slot 0
+        let (out, warnings) = sweep_unwritten_thetas(&model, &population, &base, &[0], 9, 10.0);
+        assert_eq!(out.theta[0], 0.0, "non-positive theta must not be touched");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("non-positive"),
+            "warning must mention non-positive cause, got: {}",
+            warnings[0]
+        );
+    }
+
+    // ── sweep_slots_ebe (etas≠0) ────────────────────────────────────────────
+
+    /// EBE-variant equivalent of `test_sweep_slots_warns_when_slot_missing`.
+    /// `PK_IDX_V2` is absent from the warfarin (1-cpt) model.
+    #[test]
+    fn test_sweep_slots_ebe_warns_when_slot_missing() {
+        let (model, population) = warfarin();
+        let base = model.default_params.clone();
+        let (out, warnings) = sweep_slots_ebe(
+            &model,
+            &population,
+            &base,
+            PK_IDX_Q,
+            PK_IDX_V2, // absent from warfarin
+            3,
+            5.0,
+            "Q/V2 (synthetic)",
+        );
+        assert_eq!(out.theta, base.theta);
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("could not locate theta indices"),
+            "warning text must identify the missing-slot cause, got: {}",
+            warnings[0]
+        );
+    }
+
+    /// `sweep_slots_ebe` happy path: 2D grid sweep on CL/V (both present in
+    /// warfarin) with a small grid so the inner-loop warm-starts complete
+    /// quickly. Asserts the function runs end-to-end and returns valid output;
+    /// the no-call-coverage on `sweep_slots_ebe` is the gap this closes (no
+    /// existing fixture exercises the 2D EBE pair sweep because peeling fills
+    /// CL/V in `nca_with_ebe` upstream).
+    #[test]
+    fn test_sweep_slots_ebe_runs_2d_grid() {
+        let (model, population) = warfarin();
+        let base = model.default_params.clone();
+        // 3×3 grid keeps the test fast (~1 s for warfarin's 30 subjects).
+        let (out, warnings) = sweep_slots_ebe(
+            &model,
+            &population,
+            &base,
+            PK_IDX_CL,
+            PK_IDX_V,
+            3,
+            3.0,
+            "CL/V",
+        );
+        assert!(
+            warnings.is_empty(),
+            "happy path must not warn, got: {warnings:?}"
+        );
+        // Theta bounds must be respected.
+        for (i, &t) in out.theta.iter().enumerate() {
+            assert!(
+                t >= out.theta_lower[i] && t <= out.theta_upper[i],
+                "swept theta[{i}] = {t} outside bounds [{}, {}]",
+                out.theta_lower[i],
+                out.theta_upper[i]
+            );
+        }
+    }
+
+    // ── sweep_unwritten_thetas_ebe (etas≠0) ─────────────────────────────────
+
+    /// EBE-variant equivalent of `test_sweep_unwritten_thetas_empty_targets_noop`.
+    #[test]
+    fn test_sweep_unwritten_thetas_ebe_empty_targets_noop() {
+        let (model, population) = warfarin();
+        let base = model.default_params.clone();
+        let (out, warnings) = sweep_unwritten_thetas_ebe(&model, &population, &base, &[], 9, 10.0);
+        assert_eq!(out.theta, base.theta);
+        assert!(warnings.is_empty());
+    }
+
+    /// EBE-variant equivalent of `test_sweep_unwritten_thetas_skips_non_positive`.
+    /// Uses a tiny 1-pt grid so even with the warm-started inner loop the test
+    /// stays fast — the skip happens before any inner-loop work anyway.
+    #[test]
+    fn test_sweep_unwritten_thetas_ebe_skips_non_positive() {
+        let (model, population) = warfarin();
+        let mut base = model.default_params.clone();
+        base.theta[0] = -1.0; // negative value triggers the centre <= 0 branch
+        let (out, warnings) = sweep_unwritten_thetas_ebe(&model, &population, &base, &[0], 1, 5.0);
+        assert_eq!(out.theta[0], -1.0, "non-positive theta must not be touched");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("non-positive"),
+            "warning must mention non-positive cause, got: {}",
+            warnings[0]
+        );
+    }
+
+    /// `sweep_unwritten_thetas` with all-FIX upstream (PK_IDX_Q3 absent from
+    /// warfarin) — confirms the path that finds *no* slot among targets after
+    /// the upstream filter still returns cleanly. Targets pre-filtered to be
+    /// empty would short-circuit via `test_*_empty_targets_noop`; here the
+    /// non-positive guard catches a single target that has been zeroed and
+    /// also confirms `theta_names` lookup for the warning interpolation.
+    #[test]
+    fn test_sweep_unwritten_thetas_zero_theta_uses_theta_name() {
+        let (model, population) = warfarin();
+        let mut base = model.default_params.clone();
+        let theta_idx = 0;
+        base.theta[theta_idx] = 0.0;
+        let theta_name = base.theta_names[theta_idx].clone();
+        let (_, warnings) =
+            sweep_unwritten_thetas(&model, &population, &base, &[theta_idx], 5, 5.0);
+        assert!(
+            warnings.iter().any(|w| w.contains(&theta_name)),
+            "warning must interpolate the theta name '{theta_name}', got: {warnings:?}"
+        );
     }
 }

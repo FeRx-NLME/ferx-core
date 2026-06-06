@@ -76,6 +76,42 @@ mod vec_f64_nan_as_null {
     }
 }
 
+mod vec_vec_f64_nan_as_null {
+    use serde::{de::Deserialize, ser::SerializeSeq, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Vec<Vec<f64>>, ser: S) -> Result<S::Ok, S::Error> {
+        let mut outer = ser.serialize_seq(Some(value.len()))?;
+        for inner in value {
+            // Delegate each inner Vec<f64> to the same NaN-as-null logic.
+            struct NanSafeSlice<'a>(&'a [f64]);
+            impl serde::Serialize for NanSafeSlice<'_> {
+                fn serialize<S2: Serializer>(&self, s: S2) -> Result<S2::Ok, S2::Error> {
+                    use serde::ser::SerializeSeq as _;
+                    let mut seq = s.serialize_seq(Some(self.0.len()))?;
+                    for v in self.0 {
+                        if v.is_finite() {
+                            seq.serialize_element(v)?;
+                        } else {
+                            seq.serialize_element(&Option::<f64>::None)?;
+                        }
+                    }
+                    seq.end()
+                }
+            }
+            outer.serialize_element(&NanSafeSlice(inner))?;
+        }
+        outer.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<Vec<f64>>, D::Error> {
+        let outer: Vec<Vec<Option<f64>>> = Vec::deserialize(de)?;
+        Ok(outer
+            .into_iter()
+            .map(|inner| inner.into_iter().map(|o| o.unwrap_or(f64::NAN)).collect())
+            .collect())
+    }
+}
+
 mod opt_f64_nan_as_null {
     use serde::{de::Deserialize, Deserializer, Serializer};
 
@@ -200,6 +236,43 @@ struct FitWire {
     model_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_text: Option<String>,
+    #[serde(default)]
+    theta_init: Vec<f64>,
+    #[serde(default)]
+    omega_init: Option<MatrixWire>,
+    #[serde(default)]
+    sigma_init: Vec<f64>,
+    #[serde(default)]
+    obs_time_range: Option<(f64, f64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    final_gradient: Option<Vec<f64>>,
+    // ── Run settings ─────────────────────────────────────────────────────────
+    #[serde(default)]
+    optimizer: String,
+    #[serde(default = "default_one")]
+    n_starts: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    multi_start_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saem_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sir_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    is_seed: Option<u64>,
+    #[serde(default)]
+    bloq_method: String,
+    #[serde(default)]
+    outer_maxiter: usize,
+    #[serde(default)]
+    outer_gtol: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inits_from_nca: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    covariate_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    input_columns: Vec<String>,
     /// `[covariate_nn]` block metadata. Absent (None) on bundles produced
     /// before this field existed or when ferx-core was built without
     /// `--features nn`. Loaders gracefully default to an empty Vec.
@@ -265,6 +338,10 @@ struct IovWire {
     se_kappa: Option<Vec<f64>>,
     #[serde(with = "vec_f64_nan_as_null")]
     shrinkage_kappa: Vec<f64>,
+    /// Per-occasion kappa shrinkage: `[occ_idx][kappa_idx]`.
+    /// Defaulted for backward compatibility with older .fitrx files.
+    #[serde(default, with = "vec_vec_f64_nan_as_null")]
+    shrinkage_kappa_by_occ: Vec<Vec<f64>>,
     omega_iov: MatrixWire,
     omega_iov_param_corr: Option<MatrixWire>,
     /// Per-kappa SD-init flag. Defaulted for backward compatibility with
@@ -332,6 +409,10 @@ impl MatrixWire {
 
 fn default_nan() -> f64 {
     f64::NAN
+}
+
+fn default_one() -> usize {
+    1
 }
 
 fn method_to_str(m: EstimationMethod) -> &'static str {
@@ -509,8 +590,9 @@ pub fn save_fit(
     entries.push("predictions.csv".into());
 
     // --- model.ferx --------------------------------------------------------
+    let effective_source = result.model_text.as_deref().unwrap_or(model_source);
     zip.start_file("model.ferx", zopts)?;
-    zip.write_all(model_source.as_bytes())?;
+    zip.write_all(effective_source.as_bytes())?;
     entries.push("model.ferx".into());
 
     // --- warnings.txt ------------------------------------------------------
@@ -641,6 +723,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             kappa_fixed: r.kappa_fixed.clone(),
             se_kappa: r.se_kappa.clone(),
             shrinkage_kappa: r.shrinkage_kappa.clone(),
+            shrinkage_kappa_by_occ: r.shrinkage_kappa_by_occ.clone(),
             omega_iov: MatrixWire::from(m),
             omega_iov_param_corr: r.omega_iov_param_corr.as_ref().map(MatrixWire::from),
             kappa_init_as_sd: r.kappa_init_as_sd.clone(),
@@ -661,6 +744,24 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         data_path: r.data_path.clone(),
         model_hash: r.model_hash.clone(),
         data_hash: r.data_hash.clone(),
+        model_text: r.model_text.clone(),
+        theta_init: r.theta_init.clone(),
+        omega_init: Some(MatrixWire::from(&r.omega_init)),
+        sigma_init: r.sigma_init.clone(),
+        obs_time_range: r.obs_time_range,
+        final_gradient: r.final_gradient.clone(),
+        optimizer: r.optimizer.clone(),
+        n_starts: r.n_starts,
+        multi_start_seed: r.multi_start_seed,
+        saem_seed: r.saem_seed,
+        sir_seed: r.sir_seed,
+        is_seed: r.is_seed,
+        bloq_method: r.bloq_method.clone(),
+        outer_maxiter: r.outer_maxiter,
+        outer_gtol: r.outer_gtol,
+        inits_from_nca: r.inits_from_nca.clone(),
+        covariate_names: r.covariate_names.clone(),
+        input_columns: r.input_columns.clone(),
         #[cfg(feature = "nn")]
         neural_networks: if r.neural_networks.is_empty() {
             None
@@ -871,7 +972,8 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
         Vec::new()
     };
 
-    let fit = wire_to_fit_result(wire, subjects, ebe_kappas)?;
+    let mut fit = wire_to_fit_result(wire, subjects, ebe_kappas)?;
+    fit.model_text = Some(model_source.clone());
 
     Ok(LoadedFit {
         fit,
@@ -1316,6 +1418,15 @@ fn wire_to_fit_result(
 
     let omega = w.omega.matrix.into_dmatrix()?;
     let omega_param_corr = w.omega.param_corr.map(|m| m.into_dmatrix()).transpose()?;
+    let omega_init = {
+        match w.omega_init {
+            Some(m) => m.into_dmatrix()?,
+            // Pre-PR bundles lack omega_init.  Fall back to the converged
+            // omega rather than a zero matrix — zeros are not positive-definite
+            // and would break any Cholesky-based consumer.
+            None => omega.clone(),
+        }
+    };
     let covariance_matrix = w.covariance_matrix.map(|m| m.into_dmatrix()).transpose()?;
 
     let (
@@ -1325,6 +1436,7 @@ fn wire_to_fit_result(
         kappa_init_as_sd,
         se_kappa,
         shrinkage_kappa,
+        shrinkage_kappa_by_occ,
         omega_iov_param_corr,
     ) = match w.iov {
         Some(iov) => {
@@ -1345,6 +1457,7 @@ fn wire_to_fit_result(
                 init_as_sd,
                 iov.se_kappa,
                 iov.shrinkage_kappa,
+                iov.shrinkage_kappa_by_occ,
                 iov.omega_iov_param_corr
                     .map(|m| m.into_dmatrix())
                     .transpose()?,
@@ -1356,6 +1469,7 @@ fn wire_to_fit_result(
             Vec::new(),
             Vec::new(),
             None,
+            Vec::new(),
             Vec::new(),
             None,
         ),
@@ -1419,6 +1533,11 @@ fn wire_to_fit_result(
         n_parameters: w.n_parameters,
         n_iterations: w.n_iterations,
         interaction: w.interaction,
+        warnings_structured: w
+            .warnings
+            .iter()
+            .map(|s| crate::types::classify_warning(s))
+            .collect(),
         warnings: w.warnings,
         sir_ci_theta,
         sir_ci_omega,
@@ -1434,6 +1553,7 @@ fn wire_to_fit_result(
         kappa_init_as_sd,
         se_kappa,
         shrinkage_kappa,
+        shrinkage_kappa_by_occ,
         ebe_kappas,
         saem_mu_ref_m_step_evals_saved: w.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: w.saem_n_subjects_hmc,
@@ -1468,6 +1588,24 @@ fn wire_to_fit_result(
         data_path: w.data_path,
         model_hash: w.model_hash,
         data_hash: w.data_hash,
+        model_text: w.model_text,
+        theta_init: w.theta_init,
+        omega_init,
+        sigma_init: w.sigma_init,
+        obs_time_range: w.obs_time_range,
+        final_gradient: w.final_gradient,
+        optimizer: w.optimizer,
+        n_starts: w.n_starts,
+        multi_start_seed: w.multi_start_seed,
+        saem_seed: w.saem_seed,
+        sir_seed: w.sir_seed,
+        is_seed: w.is_seed,
+        bloq_method: w.bloq_method,
+        outer_maxiter: w.outer_maxiter,
+        outer_gtol: w.outer_gtol,
+        inits_from_nca: w.inits_from_nca,
+        covariate_names: w.covariate_names,
+        input_columns: w.input_columns,
         #[cfg(feature = "nn")]
         neural_networks: w.neural_networks.unwrap_or_default(),
         // The covariate table is not persisted in the .fitrx bundle (yet); a
@@ -1551,6 +1689,7 @@ mod tests {
             subjects,
             covariate_names: vec![],
             dv_column: "DV".into(),
+            input_columns: vec![],
         }
     }
 
@@ -1586,6 +1725,7 @@ mod tests {
             n_iterations: 10,
             interaction: true,
             warnings: vec!["watch out".into()],
+            warnings_structured: vec![crate::types::classify_warning("watch out")],
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,
@@ -1598,6 +1738,7 @@ mod tests {
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],
+            shrinkage_kappa_by_occ: vec![],
             ebe_kappas: vec![],
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
@@ -1649,6 +1790,24 @@ mod tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            model_text: None,
+            theta_init: vec![1.0, 2.0, 0.5],
+            omega_init: DMatrix::from_row_slice(2, 2, &[0.1, 0.0, 0.0, 0.2]),
+            sigma_init: vec![0.05],
+            obs_time_range: Some((0.25, 24.0)),
+            final_gradient: None,
+            optimizer: "slsqp".to_string(),
+            n_starts: 1,
+            multi_start_seed: None,
+            saem_seed: None,
+            sir_seed: None,
+            is_seed: None,
+            bloq_method: "drop".to_string(),
+            outer_maxiter: 300,
+            outer_gtol: 1e-4,
+            inits_from_nca: None,
+            covariate_names: vec!["WT".into(), "AGE".into()],
+            input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
             covariate_table: None,
@@ -1952,5 +2111,92 @@ mod tests {
             FitrxError::Corrupt(msg) => assert!(msg.contains("1-based"), "msg = {}", msg),
             other => panic!("expected Corrupt, got {:?}", other),
         }
+    }
+
+    // ── Fix 3: omega_init backward-compat fallback ───────────────────────────
+
+    /// Loading a .fitrx bundle that pre-dates the omega_init field should fall
+    /// back to the converged omega, not to a zero matrix.  A zero matrix is not
+    /// positive-definite and would break any Cholesky-based consumer.
+    #[test]
+    fn omega_init_fallback_uses_omega_not_zeros() {
+        use std::io::{Read as _, Write as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-omega-init.fitrx");
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        // Strip omega_init from fit.json to simulate a pre-PR bundle.
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            if name == "fit.json" {
+                let mut v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+                v.as_object_mut().unwrap().remove("omega_init");
+                buf = serde_json::to_vec_pretty(&v).unwrap();
+            }
+            entries.push((name, buf));
+        }
+        let patched = dir.path().join("no-omega-init-patched.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&patched).unwrap());
+        for (name, body) in entries {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap();
+
+        let loaded = load_fit(&patched).unwrap();
+        let omega_init = &loaded.fit.omega_init;
+        let omega = &loaded.fit.omega;
+
+        // Should match the converged omega, not be an all-zero matrix.
+        assert_eq!(
+            omega_init, omega,
+            "omega_init should fall back to converged omega, got {:?}",
+            omega_init
+        );
+        assert!(
+            omega_init.iter().any(|&v| v != 0.0),
+            "omega_init must not be all zeros"
+        );
+    }
+
+    #[test]
+    fn covariate_names_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cov-roundtrip.fitrx");
+        let r = minimal_fit_result(); // has covariate_names: ["WT", "AGE"]
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(
+            loaded.fit.covariate_names,
+            vec!["WT".to_string(), "AGE".to_string()]
+        );
+    }
+
+    #[test]
+    fn input_columns_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ic-roundtrip.fitrx");
+        let mut r = minimal_fit_result();
+        r.input_columns = vec![
+            "ID".into(),
+            "TIME".into(),
+            "DV".into(),
+            "AMT".into(),
+            "WT".into(),
+        ];
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+        let loaded = load_fit(&path).unwrap();
+        assert_eq!(loaded.fit.input_columns, r.input_columns);
     }
 }

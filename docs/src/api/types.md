@@ -162,11 +162,14 @@ pub struct SubjectResult {
 
 ```rust
 pub enum EstimationMethod { Foce, FoceI, Saem }
-pub enum PkModel { OneCptIvBolus, OneCptOral, OneCptInfusion,
-                   TwoCptIvBolus, TwoCptOral, TwoCptInfusion }
+pub enum PkModel { OneCptIv, OneCptOral,
+                   TwoCptIv, TwoCptOral,
+                   ThreeCptIv, ThreeCptOral }
 pub enum ErrorModel { Additive, Proportional, Combined }
 pub enum Optimizer { Bfgs, Lbfgs, Slsqp, NloptLbfgs, Mma }
 ```
+
+The IV variants cover both bolus and infusion administration — the route is chosen per dose from the data's `RATE` column (`RATE=0` ⇒ bolus, `RATE>0` ⇒ infusion), so one model handles either or a mix within a single subject.
 
 ## DoseEvent
 

@@ -1,4 +1,7 @@
-# One-compartment IV bolus PK model (analytical)
+# One-compartment IV PK model (analytical).
+#
+# The bolus-vs-infusion choice is per dose (RATE column): RATE=0 ⇒
+# bolus, RATE>0 ⇒ infusion. A subject may mix the two.
 #
 # True parameters: CL=5 L/h, V=50 L
 
@@ -16,7 +19,7 @@
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_iv_bolus(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)

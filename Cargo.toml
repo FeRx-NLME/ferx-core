@@ -1,6 +1,6 @@
 [package]
 name = "ferx-core"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 description = "Nonlinear Mixed Effects modeling engine with FOCE/FOCEI estimation"
 license = "MIT"

@@ -4,9 +4,20 @@
 [![Slow tests](https://github.com/FeRx-NLME/ferx-core/actions/workflows/slow-tests.yml/badge.svg)](https://github.com/FeRx-NLME/ferx-core/actions/workflows/slow-tests.yml)
 [![Docs](https://github.com/FeRx-NLME/ferx-core/actions/workflows/docs.yml/badge.svg)](https://github.com/FeRx-NLME/ferx-core/actions/workflows/docs.yml)
 [![codecov](https://codecov.io/gh/FeRx-NLME/ferx-core/branch/main/graph/badge.svg)](https://codecov.io/gh/FeRx-NLME/ferx-core)
+[![CodeFactor](https://www.codefactor.io/repository/github/ferx-nlme/ferx-core/badge)](https://www.codefactor.io/repository/github/ferx-nlme/ferx-core)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A high-performance Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics, written in Rust. Implements FOCE/FOCEI estimation with analytical PK solutions and an optional ODE solver, similar to NONMEM.
+A high-performance Nonlinear Mixed Effects (NLME) modeling engine for population pharmacokinetics, written in Rust. Implements FOCEI and SAEM estimation with analytical PK solutions and ODE solvers.
+
+Additional features:
+- PK-PD and multi-analyte modeling
+- BLQ likelihood modeling
+- Importance Sampling & SIR
+- Deep Compartmental Models & Neural ODEs
+- Stochastic differential equations
+- Simulation with uncertainty
+- Various optimizers
+- ... and more
 
 ## Quick Start
 
@@ -60,13 +71,15 @@ Models are defined in a simple DSL. Here is a one-compartment oral PK model for 
 
 | Model | Syntax |
 |-------|--------|
-| 1-compartment IV bolus | `pk one_cpt_iv_bolus(cl=CL, v=V)` |
+| 1-compartment IV (bolus and/or infusion) | `pk one_cpt_iv(cl=CL, v=V)` |
 | 1-compartment oral | `pk one_cpt_oral(cl=CL, v=V, ka=KA)` |
-| 1-compartment infusion | `pk one_cpt_infusion(cl=CL, v=V)` |
-| 2-compartment IV bolus | `pk two_cpt_iv_bolus(cl=CL, v1=V1, q=Q, v2=V2)` |
+| 2-compartment IV (bolus and/or infusion) | `pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)` |
 | 2-compartment oral | `pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)` |
-| 2-compartment infusion | `pk two_cpt_infusion(cl=CL, v1=V1, q=Q, v2=V2)` |
+| 3-compartment IV (bolus and/or infusion) | `pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)` |
+| 3-compartment oral | `pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA)` |
 | ODE-based | Define equations in an `[odes]` block |
+
+For IV models, the closed form (bolus vs infusion) is chosen per dose event from the `RATE` column — a subject can mix bolus and infusion records.
 
 ## Estimation Methods
 

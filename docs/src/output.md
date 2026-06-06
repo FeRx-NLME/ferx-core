@@ -139,6 +139,20 @@ Both formulas use the **uncentered second moment with `n` divisor**, matching th
 
 Values of `NaN` indicate a zero-variance omega component (ETA) or fewer than two valid residuals (EPS).
 
+**Kappa shrinkage** (IOV models only — `shrinkage_kappa: Vec<f64>` and `shrinkage_kappa_by_occ: Vec<Vec<f64>>`):
+
+When the model contains `kappa` or `block_kappa` declarations, two additional shrinkage metrics are computed using the same uncentered-moment convention.
+
+*Pooled* — one value per kappa parameter `j`, averaged over all `N_\text{pairs}` (subject, occasion) pairs:
+\\[ \text{shrinkage}_{\kappa,j} = 1 - \frac{\sqrt{\frac{1}{N_{\text{pairs}}}\sum_i \sum_{q} \hat{\kappa}_{iqj}^2}}{\sqrt{\omega_{\text{iov},jj}}} \\]
+where `q` indexes occasions and `N_\text{pairs} = \sum_i K_i` (total subject-occasion pairs; equals `N_\text{subj} \cdot K` only for balanced designs).
+
+*Per-occasion slot* — the same formula restricted to occasion slot `occ_idx`, stored in `shrinkage_kappa_by_occ[occ_idx][kappa_idx]`. Only reported when two or more occasions are present. Useful for identifying sparse occasions (high shrinkage in one slot suggests that occasion has little information on kappa).
+
+> **Note on unbalanced designs:** `occ_idx` is the 0-based position within each subject's own occasion list (order of first appearance in that subject's rows), *not* the raw `OCC` column value. When subjects have different `OCC` sequences (e.g., a late-entry subject whose data begins at OCC 2), a given slot may pool kappas from different occasions across subjects. In that case, use the pooled `shrinkage_kappa` and interpret per-slot values with caution.
+
+Both metrics are `NaN` when `omega_iov` diagonal is zero or fewer than two subject-occasion observations are available for that slot.
+
 ### IWRES Autocorrelation
 
 Two pooled autocorrelation diagnostics are reported after every fit:

@@ -1411,6 +1411,7 @@ mod iov_tests {
             subjects: vec![make_iov_subject()],
             covariate_names: Vec::new(),
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
         // `requested` is the user's FitOptions value, passed independently of
         // model.gradient_method (which compatibility rules may have mutated).
@@ -1455,7 +1456,7 @@ mod iov_tests {
         };
         CompiledModel {
             name: "iov_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -1566,7 +1567,7 @@ mod iov_tests {
         };
         let model = CompiledModel {
             name: "no_iov".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {

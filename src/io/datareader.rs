@@ -296,6 +296,7 @@ fn read_nonmem_csv_impl(
             subjects,
             covariate_names: existing_cov_names,
             dv_column: "dv".to_string(),
+            input_columns: headers,
         },
         table,
     ))
@@ -995,5 +996,23 @@ mod tests {
         assert_eq!(subj.obs_covariates[1]["CR"], 2.0);
         // Obs 2 (t=3, CR missing) → LOCF → 2.0.
         assert_eq!(subj.obs_covariates[2]["CR"], 2.0);
+    }
+
+    #[test]
+    fn test_input_columns_preserves_full_header_order() {
+        // input_columns must carry every column in original order and case,
+        // including standard columns (ID, TIME, DV, …) that are excluded from
+        // covariate_names, and IOV columns.
+        let csv = "ID,TIME,DV,EVID,AMT,OCC,WT\n\
+                   1,0,.,1,100,1,70\n\
+                   1,1,5.0,0,.,1,70\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap();
+        assert_eq!(
+            pop.input_columns,
+            vec!["ID", "TIME", "DV", "EVID", "AMT", "OCC", "WT"]
+        );
+        // Standard and IOV columns must not appear in covariate_names.
+        assert_eq!(pop.covariate_names, vec!["WT"]);
     }
 }

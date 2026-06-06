@@ -1,6 +1,8 @@
-# One-compartment IV infusion PK model (analytical).
+# One-compartment IV PK model (analytical) — dataset uses infusion doses.
 #
-# Drug is administered as a constant-rate infusion (RATE column in data).
+# Drug is administered as a constant-rate infusion (RATE>0 in the data).
+# The same `one_cpt_iv` model also handles bolus doses (RATE=0) and can
+# mix the two within a single subject; the route is read per-event.
 # CL/F → CL for IV; F is fixed at 1.
 
 [parameters]
@@ -17,7 +19,7 @@
   V  = TVV  * exp(ETA_V)
 
 [structural_model]
-  pk one_cpt_infusion(cl=CL, v=V)
+  pk one_cpt_iv(cl=CL, v=V)
 
 [error_model]
   DV ~ proportional(PROP_ERR)

@@ -140,6 +140,7 @@ pub fn run_model_with_data_inits(
     result.data_path = Some(data_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    result.model_text = std::fs::read_to_string(model_path).ok();
     Ok((result, population))
 }
 
@@ -188,6 +189,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         subjects,
         covariate_names: vec![],
         dv_column: "dv".into(),
+        input_columns: vec![],
     };
 
     // Simulate
@@ -238,6 +240,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // non-fatal and just disable the integrity check in `run_sir`.
     result.model_path = Some(model_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
+    result.model_text = std::fs::read_to_string(model_path).ok();
     Ok((result, population))
 }
 
@@ -403,12 +406,37 @@ fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> 
 /// a dataset, collected into one diagnostic list. Shared by `fit()` (which
 /// stops at the first error via [`first_error`]) and `ferx check` (which
 /// reports every finding). Check order matches the historical inline order in
-/// `fit()` so the first error is unchanged: covariates, scaling, error model.
+/// `fit()` so the first error is unchanged: covariates, scaling, error model,
+/// iov occasions.
 pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     let mut diags = check_covariates(model, population);
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
+    diags.extend(check_iov_occasions(model, population));
     diags
+}
+
+/// IOV models require occasion labels in the dataset. When `n_kappa > 0` but
+/// every subject has an empty `occasions` vector the kappa random effects are
+/// silently ignored — catch this early instead.
+fn check_iov_occasions(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    if model.n_kappa == 0 {
+        return Vec::new();
+    }
+    // `all()` on an empty iterator is vacuously true; an empty population is not
+    // a missing-OCC problem so skip the check when there are no subjects.
+    let all_empty = !population.subjects.is_empty()
+        && population.subjects.iter().all(|s| s.occasions.is_empty());
+    if !all_empty {
+        return Vec::new();
+    }
+    vec![Diagnostic::error(
+        "E_IOV_MISSING_OCC",
+        "Model declares kappa (IOV) parameters but no occasion labels were found in the \
+         dataset. Set `iov_column = \"OCC\"` (or the relevant column name) in \
+         [fit_options] so that per-occasion kappas can be estimated.",
+    )
+    .with_block("fit_options")]
 }
 
 /// Model + estimation-option *compatibility* checks that don't depend on data:
@@ -690,7 +718,20 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
 
     let mut diags: Vec<Diagnostic> = Vec::new();
 
-    // 2. Model / estimation-option compatibility (data-independent): catches
+    // 2a. Parse-time warnings collected during parsing (unused parameters,
+    //     mu-referencing diagnostics, etc.). Each warning embeds its own block
+    //     context in the message text; we use W_PARSE as the generic code here
+    //     rather than a narrower code that would mislabel unrelated warnings.
+    for w in &parsed.model.parse_warnings {
+        let code = if w.contains("declared in [parameters] but not referenced") {
+            "W_UNUSED_PARAM"
+        } else {
+            "W_PARSE"
+        };
+        diags.push(Diagnostic::warning(code, w.clone()));
+    }
+
+    // 2b. Model / estimation-option compatibility (data-independent): catches
     //    method/model combinations that `fit()` rejects before fitting, so a
     //    clean check and a fit agree. Uses the parsed `[fit_options]`, mirroring
     //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.
@@ -775,6 +816,7 @@ pub fn fit_from_files(
     result.data_path = Some(data_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
+    result.model_text = std::fs::read_to_string(model_path).ok();
     Ok(result)
 }
 
@@ -916,6 +958,7 @@ pub fn fit(
         };
         return res.map(|mut result| {
             result.warnings.splice(0..0, ltbs_warnings);
+            rebuild_warnings_structured(&mut result);
             result
         });
     }
@@ -1010,9 +1053,22 @@ pub fn fit(
                     result.ofv
                 ));
             }
+            rebuild_warnings_structured(&mut result);
             Ok(result)
         }
     }
+}
+
+/// Rebuild `warnings_structured` from the current `warnings` vec.
+///
+/// Called after all late-injected warnings (LTBS splice, multi-start metadata)
+/// have been appended so the structured field is always in sync with the flat list.
+fn rebuild_warnings_structured(result: &mut FitResult) {
+    result.warnings_structured = result
+        .warnings
+        .iter()
+        .map(|w| crate::types::classify_warning(w))
+        .collect();
 }
 
 /// Probe whether NLopt CRS2-LM (used for global_search) is available.
@@ -1174,6 +1230,27 @@ fn fit_inner(
         None
     };
 
+    // Compute observation time range from the population.
+    let obs_time_range: Option<(f64, f64)> = {
+        let mut mn = f64::INFINITY;
+        let mut mx = f64::NEG_INFINITY;
+        for s in &population.subjects {
+            for &t in &s.obs_times {
+                if t < mn {
+                    mn = t;
+                }
+                if t > mx {
+                    mx = t;
+                }
+            }
+        }
+        if mn.is_finite() {
+            Some((mn, mx))
+        } else {
+            None
+        }
+    };
+
     // Run each stage in sequence, feeding params forward.
     let n_stages = chain.len();
     let mut stage_params: ModelParameters = init_params.clone();
@@ -1218,6 +1295,36 @@ fn fit_inner(
         stage_params = suggested.params;
         accumulated_warnings.extend(suggested.warnings);
     }
+
+    // Warn if any subject has a non-numeric ID.  sdtab() parses subject IDs
+    // as f64 and falls back to a 1-based loop index when parsing fails; the
+    // fallback produces a misleading ID column that breaks downstream joins.
+    // NONMEM data always uses numeric IDs, so this fires only for malformed
+    // input.
+    let non_numeric_ids: Vec<&str> = population
+        .subjects
+        .iter()
+        .filter(|s| s.id.parse::<f64>().is_err())
+        .map(|s| s.id.as_str())
+        .collect();
+    if !non_numeric_ids.is_empty() {
+        accumulated_warnings.push(format!(
+            "Non-numeric subject IDs detected ({} subject(s), e.g. {:?}). \
+             The sdtab ID column will fall back to a 1-based loop index for \
+             these subjects, which will break any downstream join by ID.",
+            non_numeric_ids.len(),
+            non_numeric_ids.first().unwrap_or(&""),
+        ));
+    }
+
+    // Capture initial parameter values after NCA override so the stored
+    // values reflect what the optimizer actually started from.  Placed here
+    // rather than at the top of the function so that inits_from_nca-derived
+    // values are captured correctly (init_params is never mutated; only
+    // stage_params is updated by the NCA block above).
+    let theta_init = stage_params.theta.clone();
+    let omega_init = stage_params.omega.matrix.clone();
+    let sigma_init = stage_params.sigma.values.clone();
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
@@ -1494,6 +1601,15 @@ fn fit_inner(
     // Shrinkage
     let shrinkage_eta = compute_eta_shrinkage(&subjects, &result.params.omega.matrix);
     let shrinkage_eps = compute_eps_shrinkage(&subjects);
+    let (shrinkage_kappa, shrinkage_kappa_by_occ) =
+        if let Some(ref omega_iov) = result.params.omega_iov {
+            (
+                compute_kappa_shrinkage(&result.kappas, &omega_iov.matrix),
+                compute_kappa_shrinkage_by_occ(&result.kappas, &omega_iov.matrix),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
     if let Some(w) = eps_shrinkage_warning(shrinkage_eps) {
         warnings.push(w);
@@ -1613,6 +1729,7 @@ fn fit_inner(
         n_iterations: result.n_iterations,
         interaction: options.interaction,
         warnings,
+        warnings_structured: vec![],
         sir_ci_theta: sir_result.as_ref().map(|s| s.ci_theta.clone()),
         sir_ci_omega: sir_result.as_ref().map(|s| s.ci_omega.clone()),
         sir_ci_sigma: sir_result.as_ref().map(|s| s.ci_sigma.clone()),
@@ -1624,7 +1741,8 @@ fn fit_inner(
         kappa_fixed: result.params.kappa_fixed.clone(),
         kappa_init_as_sd: model.kappa_init_as_sd.clone(),
         se_kappa,
-        shrinkage_kappa: Vec::new(),
+        shrinkage_kappa,
+        shrinkage_kappa_by_occ,
         ebe_kappas: result.kappas.clone(),
         saem_mu_ref_m_step_evals_saved: result.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: result.saem_n_subjects_hmc,
@@ -1664,6 +1782,38 @@ fn fit_inner(
         data_path: None,
         model_hash: None,
         data_hash: None,
+        model_text: None,
+        theta_init,
+        omega_init,
+        sigma_init,
+        obs_time_range,
+        final_gradient: result.final_gradient.clone(),
+        optimizer: match final_method {
+            EstimationMethod::Saem => "saem",
+            EstimationMethod::FoceGn => "gn",
+            EstimationMethod::FoceGnHybrid => "gn",
+            _ => options.optimizer.label(),
+        }
+        .to_string(),
+        n_starts: options.n_starts,
+        multi_start_seed: options.multi_start_seed,
+        saem_seed: options.saem_seed,
+        sir_seed: options.sir_seed,
+        is_seed: options.is_seed,
+        bloq_method: model.bloq_method.label().to_string(),
+        outer_maxiter: options.outer_maxiter,
+        outer_gtol: options.outer_gtol,
+        inits_from_nca: options.inits_from_nca.map(|m| {
+            use crate::suggest_start::NcaInit;
+            match m {
+                NcaInit::Nca => "nca",
+                NcaInit::Sweep => "nca_sweep",
+                NcaInit::Ebe => "nca_ebe",
+            }
+            .to_string()
+        }),
+        covariate_names: population.covariate_names.clone(),
+        input_columns: population.input_columns.clone(),
         #[cfg(feature = "nn")]
         neural_networks: build_neural_network_infos(model),
         // Populated by the file-based entry points (`fit_from_files`,
@@ -1963,6 +2113,97 @@ fn compute_subject_results(
         .collect()
 }
 
+/// Kappa shrinkage pooled across all subject-occasion pairs.
+///
+/// `1 - sqrt(mean(κ̂²)) / sqrt(omega_iov_kk)` for each kappa k, where the mean
+/// runs over every (subject, occasion) pair.  Returns NaN for a given kappa when
+/// the corresponding diagonal of `omega_iov` is non-positive or when fewer than
+/// two (subject, occasion) observations are available.
+pub(crate) fn compute_kappa_shrinkage(
+    kappas_per_subject: &[Vec<DVector<f64>>],
+    omega_iov: &DMatrix<f64>,
+) -> Vec<f64> {
+    let n_kappa = omega_iov.nrows();
+    if n_kappa == 0 {
+        return vec![];
+    }
+    // Flatten all per-subject per-occasion kappa vectors into one iterator.
+    let all_kappas: Vec<&DVector<f64>> = kappas_per_subject
+        .iter()
+        .flat_map(|occ_kappas| occ_kappas.iter())
+        .collect();
+    let n = all_kappas.len();
+    if n < 2 {
+        return vec![f64::NAN; n_kappa];
+    }
+    (0..n_kappa)
+        .map(|k| {
+            let var = omega_iov[(k, k)];
+            if var <= 0.0 {
+                return f64::NAN;
+            }
+            let ms = all_kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
+            1.0 - ms.sqrt() / var.sqrt()
+        })
+        .collect()
+}
+
+/// Kappa shrinkage broken out by occasion index.
+///
+/// Returns `shrinkage_by_occ[occ_idx][kappa_idx]` where `occ_idx` is the
+/// **0-based position within each subject's own occasion list** — i.e. the
+/// order in which distinct OCC values were first encountered in that subject's
+/// rows (matching `split_obs_by_occasion`).
+///
+/// **Important limitation for unbalanced designs:** `occ_idx` is a position
+/// index, *not* the raw OCC column value.  When subjects have different OCC
+/// sequences (e.g., a late-entry subject whose data begins at OCC 2), their
+/// position 0 maps to OCC 2 while other subjects' position 0 maps to OCC 1.
+/// Pooling across position 0 then mixes kappas from different occasions.
+/// For unbalanced designs use the pooled `shrinkage_kappa` instead, and
+/// interpret per-occasion values only when the OCC column is aligned across
+/// all subjects.
+///
+/// Returns an empty outer vec when fewer than two distinct occasions are present
+/// or no kappa parameters exist.
+pub(crate) fn compute_kappa_shrinkage_by_occ(
+    kappas_per_subject: &[Vec<DVector<f64>>],
+    omega_iov: &DMatrix<f64>,
+) -> Vec<Vec<f64>> {
+    let n_kappa = omega_iov.nrows();
+    if n_kappa == 0 {
+        return vec![];
+    }
+    // Determine max number of occasions across subjects.
+    let n_occ = kappas_per_subject
+        .iter()
+        .map(|v| v.len())
+        .max()
+        .unwrap_or(0);
+    if n_occ < 2 {
+        return vec![];
+    }
+    (0..n_occ)
+        .map(|occ_idx| {
+            let occ_kappas: Vec<&DVector<f64>> = kappas_per_subject
+                .iter()
+                .filter_map(|occ_vecs| occ_vecs.get(occ_idx))
+                .collect();
+            let n = occ_kappas.len();
+            (0..n_kappa)
+                .map(|k| {
+                    let var = omega_iov[(k, k)];
+                    if var <= 0.0 || n < 2 {
+                        return f64::NAN;
+                    }
+                    let ms = occ_kappas.iter().map(|kv| kv[k].powi(2)).sum::<f64>() / n as f64;
+                    1.0 - ms.sqrt() / var.sqrt()
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// ETA shrinkage: `1 - sqrt(mean(eta_hat_k^2)) / sqrt(omega_kk)` for each random effect k.
 ///
 /// Uses the uncentered second moment with `n` divisor (NONMEM / PsN / Monolix
@@ -2173,6 +2414,112 @@ mod tests {
         assert!(eps_shrinkage_warning(-0.05).is_none());
         // NaN — no warning.
         assert!(eps_shrinkage_warning(f64::NAN).is_none());
+    }
+
+    // ── kappa shrinkage ──────────────────────────────────────────────────────
+
+    fn make_kappas(vals: Vec<Vec<f64>>) -> Vec<Vec<DVector<f64>>> {
+        // vals[subj_idx][occ_idx] = single-kappa value
+        vals.into_iter()
+            .map(|occ_vals| {
+                occ_vals
+                    .into_iter()
+                    .map(|v| DVector::from_vec(vec![v]))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_pooled_zero_when_rms_matches_omega_sd() {
+        // omega_iov = 1.0; kappas = [+1, -1] across 2 subjects × 1 occasion
+        // mean(κ²) = 1 → shrinkage = 0
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+        let kappas = make_kappas(vec![vec![1.0], vec![-1.0]]);
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert_eq!(sh.len(), 1);
+        assert!((sh[0]).abs() < 1e-10, "expected ~0, got {}", sh[0]);
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_pooled_positive_when_shrunk() {
+        // kappas near zero → shrinkage > 0
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+        let kappas = make_kappas(vec![
+            vec![0.01, 0.02],
+            vec![-0.01, -0.02],
+            vec![0.01, 0.02],
+            vec![-0.01, -0.02],
+        ]);
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert!(sh[0] > 0.9, "expected high shrinkage, got {}", sh[0]);
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_pooled_nan_when_omega_zero() {
+        let omega = DMatrix::zeros(1, 1);
+        let kappas = make_kappas(vec![vec![0.1], vec![-0.1]]);
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert!(sh[0].is_nan());
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_pooled_nan_when_fewer_than_2_obs() {
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+        let kappas = make_kappas(vec![vec![0.5]]);
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert!(sh[0].is_nan());
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_by_occ_returns_empty_for_single_occasion() {
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+        let kappas = make_kappas(vec![vec![0.5], vec![-0.5]]);
+        let sh = compute_kappa_shrinkage_by_occ(&kappas, &omega);
+        assert!(sh.is_empty(), "expected empty for 1 occasion, got {:?}", sh);
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_by_occ_values() {
+        // 4 subjects, 2 occasions.
+        // OCC 1: kappas = [+1, -1, +1, -1] → mean(κ²) = 1 → shrinkage = 0 with omega=1
+        // OCC 2: kappas = [0.1, -0.1, 0.1, -0.1] → mean(κ²) = 0.01 → high shrinkage
+        let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
+        let kappas = make_kappas(vec![
+            vec![1.0, 0.1],
+            vec![-1.0, -0.1],
+            vec![1.0, 0.1],
+            vec![-1.0, -0.1],
+        ]);
+        let sh = compute_kappa_shrinkage_by_occ(&kappas, &omega);
+        assert_eq!(sh.len(), 2, "expected 2 occasions");
+        assert!(
+            (sh[0][0]).abs() < 1e-10,
+            "occ 1 shrinkage ~0, got {}",
+            sh[0][0]
+        );
+        assert!(sh[1][0] > 0.8, "occ 2 shrinkage high, got {}", sh[1][0]);
+    }
+
+    #[test]
+    fn test_kappa_shrinkage_two_kappas_independent() {
+        // n_kappa = 2: each kappa parameter should be computed independently.
+        // kappa 0: RMS = 1.0 → shrinkage = 0 with omega_00 = 1.0
+        // kappa 1: RMS = 0.1 → shrinkage = 1 - 0.1/1.0 = 0.9 with omega_11 = 1.0
+        let omega = DMatrix::from_diagonal(&DVector::from_vec(vec![1.0, 1.0]));
+        // Each subject has 1 occasion; kappa vector is [k0_val, k1_val].
+        let kappas: Vec<Vec<DVector<f64>>> = vec![
+            vec![DVector::from_vec(vec![1.0, 0.1])],
+            vec![DVector::from_vec(vec![-1.0, -0.1])],
+        ];
+        let sh = compute_kappa_shrinkage(&kappas, &omega);
+        assert_eq!(sh.len(), 2);
+        assert!((sh[0]).abs() < 1e-10, "kappa 0 shrinkage ~0, got {}", sh[0]);
+        assert!(
+            (sh[1] - 0.9).abs() < 1e-10,
+            "kappa 1 shrinkage ~0.9, got {}",
+            sh[1]
+        );
     }
 
     #[test]
@@ -2538,7 +2885,7 @@ mod iov_integration {
         };
         CompiledModel {
             name: "iov_test".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             // pk_param_fn: eta[0]=BSV for CL, eta[1]=KAPPA_CL (appended by IOV path)
@@ -2626,6 +2973,7 @@ mod iov_integration {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 
@@ -2858,6 +3206,48 @@ mod iov_integration {
             msg.contains("trust_region") && msg.contains("IOV"),
             "error message should mention trust_region and IOV, got: {msg}"
         );
+    }
+
+    // When a model has kappa declarations but the dataset carries no occasion
+    // labels, `fit()` must return an error and `check_model_data` must surface
+    // E_IOV_MISSING_OCC — rather than silently ignoring the kappas.
+    #[test]
+    fn test_iov_missing_occ_returns_err() {
+        let model = make_iov_model();
+        // Population built without occasion labels (empty `occasions` vectors).
+        let mut pop = make_iov_population();
+        for subj in &mut pop.subjects {
+            subj.occasions.clear();
+        }
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        let result = fit(&model, &pop, &model.default_params, &opts);
+        assert!(
+            result.is_err(),
+            "IOV model without occasion labels must error"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("iov_column") || msg.contains("OCC") || msg.contains("occasion"),
+            "error message should mention the missing occasion column, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_check_model_data_flags_missing_occ() {
+        use crate::diagnostics::Severity;
+        let model = make_iov_model();
+        let mut pop = make_iov_population();
+        for subj in &mut pop.subjects {
+            subj.occasions.clear();
+        }
+        let diags = super::check_model_data(&model, &pop);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_IOV_MISSING_OCC")
+            .expect("expected E_IOV_MISSING_OCC diagnostic");
+        assert_eq!(d.severity, Severity::Error);
+        assert!(d.message.contains("iov_column") || d.message.contains("kappa"));
+        assert_eq!(d.block.as_deref(), Some("fit_options"));
     }
 
     // `ferx check` must surface the same trust_region+IOV incompatibility that
@@ -3344,7 +3734,7 @@ mod simulate_with_uncertainty_tests {
         };
         CompiledModel {
             name: "uncertainty_smoke".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
@@ -3414,6 +3804,7 @@ mod simulate_with_uncertainty_tests {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 
@@ -3454,6 +3845,7 @@ mod simulate_with_uncertainty_tests {
             n_iterations: 0,
             interaction: true,
             warnings: vec![],
+            warnings_structured: vec![],
             sir_ci_theta: None,
             sir_ci_omega: None,
             sir_ci_sigma: None,
@@ -3466,6 +3858,7 @@ mod simulate_with_uncertainty_tests {
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],
+            shrinkage_kappa_by_occ: vec![],
             ebe_kappas: vec![],
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
@@ -3500,6 +3893,24 @@ mod simulate_with_uncertainty_tests {
             data_path: None,
             model_hash: None,
             data_hash: None,
+            model_text: None,
+            theta_init: template.theta.clone(),
+            omega_init: template.omega.matrix.clone(),
+            sigma_init: template.sigma.values.clone(),
+            obs_time_range: None,
+            final_gradient: None,
+            optimizer: "bobyqa".to_string(),
+            n_starts: 1,
+            multi_start_seed: None,
+            saem_seed: None,
+            sir_seed: None,
+            is_seed: None,
+            bloq_method: "drop".to_string(),
+            outer_maxiter: 0,
+            outer_gtol: 0.0,
+            inits_from_nca: None,
+            covariate_names: Vec::new(),
+            input_columns: vec![],
             #[cfg(feature = "nn")]
             neural_networks: Vec::new(),
             covariate_table: None,
@@ -3721,6 +4132,7 @@ mod sde_integration {
             subjects,
             covariate_names: Vec::new(),
             dv_column: "DV".to_string(),
+            input_columns: vec![],
         }
     }
 
@@ -3844,6 +4256,7 @@ mod sde_integration {
                 subjects: vec![subj],
                 covariate_names: Vec::new(),
                 dv_column: "DV".into(),
+                input_columns: vec![],
             }
         };
 
@@ -4030,7 +4443,7 @@ mod tests_sdtab_tv_cov {
         };
         let model = CompiledModel {
             name: "tv_cov_sdtab_regression".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             // CL = TVCL · exp(η_CL) · (WT/70) — reads WT from the covariate map
@@ -4124,6 +4537,7 @@ mod tests_sdtab_tv_cov {
             subjects: vec![subject.clone()],
             covariate_names: vec!["WT".into()],
             dv_column: "DV".into(),
+            input_columns: vec![],
         };
 
         // Fixed EBE at η = 0; H matrix is irrelevant for the IPRED check but

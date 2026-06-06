@@ -462,35 +462,48 @@ pub fn predict_concentration(
 
 /// Concentration contribution from a single dose at elapsed time tau.
 ///
+/// For IV variants the bolus-vs-infusion closed form is chosen per dose
+/// from `dose.is_infusion()` (RATE>0 ⇒ infusion). This lets a single
+/// subject mix bolus and infusion doses without changing the model
+/// declaration (issue #176). Oral routes always go through the oral
+/// closed form regardless of RATE.
+///
 /// When `dose.ss` is true and `dose.ii > 0`, the SS closed-form variant
-/// is dispatched for every analytical PK model (1-/2-/3-cpt IV bolus,
-/// oral, and infusion). The malformed SS configurations that the
-/// closed forms don't handle — `ii <= 0` and `T_inf > ii` for infusion —
-/// fall through to the single-dose formula and are flagged by the
-/// data-validation warning in `api.rs`.
+/// is dispatched. The malformed SS configurations the closed forms
+/// don't handle — `ii <= 0` and `T_inf > ii` for infusion — fall through
+/// to the single-dose formula and are flagged by the data-validation
+/// warning in `api.rs`.
 fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams) -> f64 {
     let cl = p.cl();
     let v = p.v();
+    let infusion = dose.is_infusion();
 
     if dose.ss && dose.ii > 0.0 {
         match pk_model {
-            PkModel::OneCptIvBolus => return one_cpt_iv_bolus_ss(dose, tau, cl, v),
-            PkModel::OneCptInfusion => return one_cpt_infusion_ss(dose, tau, cl, v),
-            PkModel::OneCptOral => return one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio()),
-            PkModel::TwoCptIvBolus => {
-                return two_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2());
+            PkModel::OneCptIv => {
+                return if infusion {
+                    one_cpt_infusion_ss(dose, tau, cl, v)
+                } else {
+                    one_cpt_iv_bolus_ss(dose, tau, cl, v)
+                };
             }
-            PkModel::TwoCptInfusion => {
-                return two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2());
+            PkModel::OneCptOral => return one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio()),
+            PkModel::TwoCptIv => {
+                return if infusion {
+                    two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2())
+                } else {
+                    two_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2())
+                };
             }
             PkModel::TwoCptOral => {
                 return two_cpt_oral_f_ss(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
             }
-            PkModel::ThreeCptIvBolus => {
-                return three_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-            }
-            PkModel::ThreeCptInfusion => {
-                return three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+            PkModel::ThreeCptIv => {
+                return if infusion {
+                    three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                } else {
+                    three_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                };
             }
             PkModel::ThreeCptOral => {
                 return three_cpt_oral_f_ss(
@@ -510,17 +523,28 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
     }
 
     match pk_model {
-        PkModel::OneCptIvBolus => one_cpt_iv_bolus(dose, tau, cl, v),
-        PkModel::OneCptInfusion => one_cpt_infusion(dose, tau, cl, v),
-        PkModel::OneCptOral => one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio()),
-        PkModel::TwoCptIvBolus => two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2()),
-        PkModel::TwoCptInfusion => two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2()),
-        PkModel::TwoCptOral => two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio()),
-        PkModel::ThreeCptIvBolus => {
-            three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+        PkModel::OneCptIv => {
+            if infusion {
+                one_cpt_infusion(dose, tau, cl, v)
+            } else {
+                one_cpt_iv_bolus(dose, tau, cl, v)
+            }
         }
-        PkModel::ThreeCptInfusion => {
-            three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+        PkModel::OneCptOral => one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio()),
+        PkModel::TwoCptIv => {
+            if infusion {
+                two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
+            } else {
+                two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2())
+            }
+        }
+        PkModel::TwoCptOral => two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio()),
+        PkModel::ThreeCptIv => {
+            if infusion {
+                three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+            } else {
+                three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+            }
         }
         PkModel::ThreeCptOral => three_cpt_oral_f(
             dose,
@@ -749,7 +773,7 @@ mod tests {
     fn test_superposition_single_dose() {
         let doses = vec![bolus_dose(0.0, 1000.0)];
         let pk = make_pk_params(10.0, 100.0);
-        let c = predict_concentration(PkModel::OneCptIvBolus, &doses, 0.0, &pk);
+        let c = predict_concentration(PkModel::OneCptIv, &doses, 0.0, &pk);
         assert_relative_eq!(c, 10.0, epsilon = 1e-10);
     }
 
@@ -760,7 +784,7 @@ mod tests {
         let k: f64 = 10.0 / 100.0;
 
         // At t=10, first dose has decayed, second dose just given
-        let c = predict_concentration(PkModel::OneCptIvBolus, &doses, 10.0, &pk);
+        let c = predict_concentration(PkModel::OneCptIv, &doses, 10.0, &pk);
         let expected = (1000.0_f64 / 100.0) * (-k * 10.0).exp() + 1000.0 / 100.0;
         assert_relative_eq!(c, expected, epsilon = 1e-10);
     }
@@ -772,8 +796,8 @@ mod tests {
 
         // At t=5, second dose hasn't happened yet
         let c_single =
-            predict_concentration(PkModel::OneCptIvBolus, &[bolus_dose(0.0, 1000.0)], 5.0, &pk);
-        let c_two = predict_concentration(PkModel::OneCptIvBolus, &doses, 5.0, &pk);
+            predict_concentration(PkModel::OneCptIv, &[bolus_dose(0.0, 1000.0)], 5.0, &pk);
+        let c_two = predict_concentration(PkModel::OneCptIv, &doses, 5.0, &pk);
         assert_relative_eq!(c_single, c_two, epsilon = 1e-12);
     }
 
@@ -799,7 +823,7 @@ mod tests {
             dose_occasions: Vec::new(),
         };
         let pk = make_pk_params(10.0, 100.0);
-        let preds = compute_predictions(PkModel::OneCptIvBolus, &subj, &pk);
+        let preds = compute_predictions(PkModel::OneCptIv, &subj, &pk);
         assert!(preds[0] > 0.0);
         assert_relative_eq!(preds[1], 0.0, epsilon = 1e-12);
     }
@@ -839,7 +863,7 @@ mod tests {
         };
         CompiledModel {
             name: "cl_from_cr".into(),
-            pk_model: PkModel::OneCptIvBolus,
+            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Additive),
             pk_param_fn: Box::new(|theta, _eta, cov| {
@@ -956,7 +980,7 @@ mod tests {
             dose_occasions: Vec::new(),
         };
         let pk = make_pk_params(10.0, 100.0);
-        let preds = compute_predictions(PkModel::OneCptIvBolus, &subject, &pk);
+        let preds = compute_predictions(PkModel::OneCptIv, &subject, &pk);
         assert_eq!(preds.len(), 4);
         // Predictions should be monotonically decreasing for IV bolus
         for i in 1..preds.len() {
@@ -1029,15 +1053,15 @@ mod tests {
         pk.values[crate::types::PK_IDX_LAGTIME] = 0.5;
 
         // (a) Before lagged start: still zero.
-        let c_pre = predict_concentration(PkModel::OneCptInfusion, &doses, 0.6, &pk);
+        let c_pre = predict_concentration(PkModel::OneCptIv, &doses, 0.6, &pk);
         assert_eq!(c_pre, 0.0);
 
         // (b) Mid-infusion (lagged): pre-lag conc at tau = t - (dose.time + lag) = t - 2.5.
         // Compare against unlagged infusion at tau via the same formula.
         let pk_nolag = make_pk_params(10.0, 100.0);
-        let c_lag = predict_concentration(PkModel::OneCptInfusion, &doses, 2.6, &pk);
+        let c_lag = predict_concentration(PkModel::OneCptIv, &doses, 2.6, &pk);
         let c_no = predict_concentration(
-            PkModel::OneCptInfusion,
+            PkModel::OneCptIv,
             &[DoseEvent::new(0.1, 100.0, 1, 100.0, false, 0.0)],
             0.2,
             &pk_nolag,
@@ -1046,9 +1070,9 @@ mod tests {
         assert_relative_eq!(c_lag, c_no, epsilon = 1e-10);
 
         // (c) Post-infusion (lagged window ends at 3.5).
-        let c_post = predict_concentration(PkModel::OneCptInfusion, &doses, 3.6, &pk);
+        let c_post = predict_concentration(PkModel::OneCptIv, &doses, 3.6, &pk);
         let c_post_nolag = predict_concentration(
-            PkModel::OneCptInfusion,
+            PkModel::OneCptIv,
             &[DoseEvent::new(0.0, 100.0, 1, 100.0, false, 0.0)],
             1.1,
             &pk_nolag,
@@ -1067,7 +1091,7 @@ mod tests {
         let pk = make_pk_params(10.0, 100.0);
         let k = 10.0_f64 / 100.0;
         for &t in &[0.0, 3.0, 11.9, 24.0] {
-            let c = predict_concentration(PkModel::OneCptIvBolus, &doses, t, &pk);
+            let c = predict_concentration(PkModel::OneCptIv, &doses, t, &pk);
             let expected = (1000.0 / 100.0) * (-k * t).exp() / (1.0 - (-k * ii).exp());
             assert_relative_eq!(c, expected, epsilon = 1e-10);
         }
@@ -1088,9 +1112,8 @@ mod tests {
 
         // Sample several t > lagtime so both curves are defined.
         for &t in &[2.0, 5.0, 11.0, 13.5] {
-            let c_lag = predict_concentration(PkModel::OneCptIvBolus, &doses, t, &pk_lag);
-            let c_no =
-                predict_concentration(PkModel::OneCptIvBolus, &doses, t - lagtime, &pk_nolag);
+            let c_lag = predict_concentration(PkModel::OneCptIv, &doses, t, &pk_lag);
+            let c_no = predict_concentration(PkModel::OneCptIv, &doses, t - lagtime, &pk_nolag);
             assert_relative_eq!(c_lag, c_no, epsilon = 1e-12);
         }
     }
@@ -1509,5 +1532,96 @@ mod tests {
         assert_eq!(arr[0], 1000.0);
         assert!(arr[1].is_nan());
         assert_eq!(arr[2], 1000.0);
+    }
+
+    // ── Mixed bolus + infusion within a single subject (issue #176) ─────────
+    //
+    // Regression guard for the silent-wrong-answer bug on the superposition
+    // path: before #176, `single_dose_concentration` branched on the model
+    // enum (`OneCptIvBolus` vs `OneCptInfusion`), so an infusion event under
+    // an IV-bolus model was treated as an instantaneous bolus of `AMT`,
+    // ignoring the duration entirely. After #176 the dispatch picks per
+    // dose from `dose.is_infusion()`, so both routes coexist in one record.
+
+    #[test]
+    fn test_mixed_bolus_and_infusion_in_single_subject_superposition() {
+        // Same `OneCptIv` model, two doses with different administration:
+        //   t=0:  bolus     AMT=100, RATE=0
+        //   t=4:  infusion  AMT=500, RATE=50 → duration=10
+        // The superposition prediction must equal the sum of the two
+        // single-dose closed forms (one bolus, one infusion).
+        let bolus = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let infusion = DoseEvent::new(4.0, 500.0, 1, 50.0, false, 0.0);
+        debug_assert!(!bolus.is_infusion() && infusion.is_infusion());
+        debug_assert!((infusion.duration - 10.0).abs() < 1e-12);
+        let doses = vec![bolus.clone(), infusion.clone()];
+        let pk = make_pk_params(10.0, 100.0);
+
+        // Probe times that fall in three regimes:
+        //   t = 2.0  → only the bolus has been given
+        //   t = 8.0  → both active, infusion still running
+        //   t = 20.0 → infusion has ended, post-infusion decay
+        for &t in &[2.0, 8.0, 20.0] {
+            let combined = predict_concentration(PkModel::OneCptIv, &doses, t, &pk);
+            let from_bolus = predict_concentration(PkModel::OneCptIv, &[bolus.clone()], t, &pk);
+            let from_infusion =
+                predict_concentration(PkModel::OneCptIv, &[infusion.clone()], t, &pk);
+            assert_relative_eq!(combined, from_bolus + from_infusion, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_mixed_dose_superposition_matches_event_driven_path() {
+        // Cross-check: the analytical superposition path and the
+        // event-driven analytical path must agree to roundoff on a
+        // mixed-administration record. Before #176 the superposition path
+        // was silently wrong (bolus formula applied to the infusion dose),
+        // while the event-driven path was already correct — so these two
+        // would have disagreed materially.
+        use crate::pk::event_driven::event_driven_predictions;
+        use crate::types::Subject;
+
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), // bolus
+            DoseEvent::new(4.0, 500.0, 1, 50.0, false, 0.0), // infusion (dur=10)
+        ];
+        let obs_times = vec![1.0_f64, 3.0, 6.0, 10.0, 14.0, 20.0];
+        let pk = make_pk_params(10.0, 100.0);
+
+        let analytical: Vec<f64> = obs_times
+            .iter()
+            .map(|&t| predict_concentration(PkModel::OneCptIv, &doses, t, &pk))
+            .collect();
+
+        let n_obs = obs_times.len();
+        let subject = Subject {
+            id: "mixed".into(),
+            doses: doses.clone(),
+            obs_times: obs_times.clone(),
+            observations: vec![0.0; n_obs],
+            obs_cmts: vec![1; n_obs],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n_obs],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+        };
+        let pk_dose: Vec<PkParams> = vec![pk.clone(); doses.len()];
+        let pk_obs: Vec<PkParams> = vec![pk.clone(); obs_times.len()];
+        let event_driven =
+            event_driven_predictions(PkModel::OneCptIv, &subject, &pk_dose, &pk_obs, &[]);
+
+        for (i, (&a, &e)) in analytical.iter().zip(event_driven.iter()).enumerate() {
+            let diff = (a - e).abs();
+            assert!(
+                diff < 1e-10,
+                "mismatch at obs[{i}] t={}: superposition {a} vs event-driven {e} (|Δ|={diff})",
+                obs_times[i]
+            );
+        }
     }
 }

@@ -279,6 +279,10 @@ pub struct Population {
     pub subjects: Vec<Subject>,
     pub covariate_names: Vec<String>,
     pub dv_column: String,
+    /// All column headers from the data CSV in original order (ID, TIME, DV, AMT, ...,
+    /// covariates). Preserved verbatim so downstream consumers can echo a NONMEM-style
+    /// `$INPUT` line. Empty for in-memory `Population` values that were not read from a file.
+    pub input_columns: Vec<String>,
 }
 
 impl Population {
@@ -604,18 +608,23 @@ impl ModelParameters {
     }
 }
 
-/// Supported PK structural models
+/// Supported PK structural models.
+///
+/// IV (bolus and/or infusion) administration is represented by a single
+/// variant per compartment count; the bolus-vs-infusion choice is made
+/// per dose event from the dataset's RATE column (see
+/// `DoseEvent::is_infusion`). This mirrors NONMEM, nlmixr2, and Monolix
+/// and lets a subject mix bolus and infusion doses in one record.
+/// Oral routes remain a separate variant because they have a distinct
+/// model structure (absorption rate constant KA, bioavailability F).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PkModel {
-    OneCptIvBolus,
+    OneCptIv,
     OneCptOral,
-    OneCptInfusion,
-    TwoCptIvBolus,
+    TwoCptIv,
     TwoCptOral,
-    TwoCptInfusion,
-    ThreeCptIvBolus,
+    ThreeCptIv,
     ThreeCptOral,
-    ThreeCptInfusion,
 }
 
 /// Supported residual error models
@@ -1461,6 +1470,136 @@ pub enum CovarianceStatus {
     Failed,
 }
 
+/// Severity level for a structured warning entry.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum WarningSeverity {
+    Critical,
+    Warning,
+    Info,
+}
+
+/// A structured warning with severity, category, and message.
+///
+/// Populated in parallel with `FitResult.warnings` (which remains for
+/// backward compatibility). The `category` is a fixed lowercase vocabulary:
+/// `convergence`, `covariance_step`, `optimizer_health`, `dw_autocorrelation`,
+/// `bloq_method`, `sir`, `importance_sampling`, `data_quality`,
+/// `omega_structure`, `ebe_convergence`, `gradient_fallback`,
+/// `mu_referencing`, `optimizer_config`, `multi_start`, `cancelled`,
+/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`, `general`
+/// (fallback for unrecognised messages).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WarningEntry {
+    pub severity: WarningSeverity,
+    /// Fixed lowercase category string (see type-level docs).
+    pub category: String,
+    /// Human-readable message. For messages that carry a multi-stage chain
+    /// prefix such as `[FOCEI] ...`, only the body after the prefix is stored
+    /// here; the method tag is moved into `source_method`. For unprefixed
+    /// messages this is identical to the corresponding entry in
+    /// `FitResult.warnings`.
+    pub message: String,
+    /// For multi-stage chains, the method that produced this warning.
+    pub source_method: Option<String>,
+}
+
+/// Classify a free-text warning message into a structured `WarningEntry`.
+///
+/// This is the single source of truth for warning severity/category in
+/// ferx-core. The R wrapper consumes the structured output directly and never
+/// re-classifies message text. Multi-stage chain prefixes (`[FOCEI] ...`) are
+/// stripped into `source_method`; the remaining message is matched against the
+/// fixed category vocabulary. Unrecognised messages fall back to
+/// `Warning`/`general`.
+pub fn classify_warning(raw: &str) -> WarningEntry {
+    // Strip a leading "[METHOD] " chain prefix into source_method.
+    let (source_method, msg) = if let Some(rest) = raw.strip_prefix('[') {
+        if let Some(idx) = rest.find(']') {
+            let tag = &rest[..idx];
+            let body = rest[idx + 1..].trim_start();
+            (Some(tag.to_string()), body.to_string())
+        } else {
+            (None, raw.to_string())
+        }
+    } else {
+        (None, raw.to_string())
+    };
+
+    let lower = msg.to_lowercase();
+
+    // (severity, category) keyed off distinctive substrings. Order matters:
+    // more specific patterns first.
+    let (severity, category) = if lower.contains("did not converge")
+        || lower.contains("without convergence")
+        || lower.contains("no multi-start run converged")
+    {
+        (WarningSeverity::Critical, "convergence")
+    } else if lower.contains("covariance step failed") || lower.contains("covariance failed") {
+        // "ses not available" and "se not available" intentionally omitted:
+        // the only emitter ("Covariance step failed — SEs not available") already
+        // hits "covariance step failed" above, and bare "se not available" is too
+        // broad to safely match future messages.
+        (WarningSeverity::Critical, "covariance_step")
+    } else if lower.contains("ill-conditioned") || lower.contains("condition number") {
+        (WarningSeverity::Critical, "condition_number")
+    } else if lower.contains("trust radius") || lower.contains("degenerate") {
+        (WarningSeverity::Warning, "optimizer_health")
+    } else if lower.contains("autocorrelation") || lower.contains("durbin") {
+        (WarningSeverity::Warning, "dw_autocorrelation")
+    } else if lower.contains("shapiro") || lower.contains("non-normal") {
+        (WarningSeverity::Warning, "eta_normality")
+    } else if lower.contains("m3 bloq") || lower.contains("bloq handling") {
+        (WarningSeverity::Warning, "bloq_method")
+    } else if lower.contains("sir failed") || lower.contains("sir requested") {
+        (WarningSeverity::Warning, "sir")
+    } else if lower.contains("ess = 0") || lower.contains("proposal collapse") {
+        (WarningSeverity::Warning, "importance_sampling")
+    } else if lower.contains("eps shrinkage") {
+        (WarningSeverity::Warning, "eps_shrinkage")
+    } else if lower.contains("ltbs")
+        || lower.contains("non-positive dv")
+        || lower.contains("ss=1 dose")
+        || lower.contains("ss=1 infusion")
+        || lower.contains("evid=3/4")
+        || lower.contains("lagtime evaluates")
+    {
+        (WarningSeverity::Warning, "data_quality")
+    } else if lower.contains("mixed lognormal") || lower.contains("mixed log-normal") {
+        (WarningSeverity::Warning, "omega_structure")
+    } else if lower.contains("hmc is unavailable") {
+        // "falls back to" intentionally removed: no emitted message uses that exact
+        // phrase. The SAEM HMC message is fully covered by "hmc is unavailable".
+        (WarningSeverity::Info, "gradient_fallback")
+    } else if lower.contains("mu-ref") || lower.contains("mu-referencing") {
+        (WarningSeverity::Info, "mu_referencing")
+    } else if lower.contains("global_search disabled") {
+        // Runtime failure: CRS2-LM init failed — the optimiser ran without global search.
+        (WarningSeverity::Warning, "optimizer_config")
+    } else if lower.contains("global_search") {
+        (WarningSeverity::Info, "optimizer_config")
+    } else if lower.contains("multi-start") {
+        (WarningSeverity::Info, "multi_start")
+    } else if lower.contains("cancelled by user") {
+        (WarningSeverity::Info, "cancelled")
+    } else if lower.contains("threads configured") || lower.contains("threads than subjects") {
+        (WarningSeverity::Info, "threads")
+    } else if lower.contains("n\u{00b2} ofv")
+        || lower.contains("n^2 ofv")
+        || (lower.contains("parameters") && lower.contains("covariance step:"))
+    {
+        (WarningSeverity::Info, "covariance_step")
+    } else {
+        (WarningSeverity::Warning, "general")
+    };
+
+    WarningEntry {
+        severity,
+        category: category.to_string(),
+        message: msg,
+        source_method,
+    }
+}
+
 /// Full fit result
 #[derive(Debug, Clone)]
 pub struct FitResult {
@@ -1514,6 +1653,8 @@ pub struct FitResult {
     pub n_iterations: usize,
     pub interaction: bool,
     pub warnings: Vec<String>,
+    /// Structured counterpart to `warnings` — same entries with severity and category metadata.
+    pub warnings_structured: Vec<WarningEntry>,
     // SIR results (optional)
     pub sir_ci_theta: Option<Vec<(f64, f64)>>,
     pub sir_ci_omega: Option<Vec<(f64, f64)>>,
@@ -1541,7 +1682,17 @@ pub struct FitResult {
     /// `kappa NAME ~ X (sd)`. Always `false` for block_kappa entries.
     pub kappa_init_as_sd: Vec<bool>,
     pub se_kappa: Option<Vec<f64>>,
+    /// Pooled kappa shrinkage: one value per kappa parameter, averaged over all
+    /// subject-occasion pairs.  Empty when `n_kappa == 0`.
     pub shrinkage_kappa: Vec<f64>,
+    /// Per-occasion kappa shrinkage: `shrinkage_kappa_by_occ[occ_idx][kappa_idx]`.
+    /// `occ_idx` is the 0-based position within each subject's own occasion list
+    /// (order in which distinct OCC values first appear in that subject's rows),
+    /// **not** the raw OCC column value.  For unbalanced designs where subjects
+    /// have different OCC sequences, a given `occ_idx` may map to different OCC
+    /// values across subjects — use `shrinkage_kappa` (pooled) in that case.
+    /// Empty when `n_kappa == 0` or only one occasion is present.
+    pub shrinkage_kappa_by_occ: Vec<Vec<f64>>,
     /// Per-subject, per-occasion kappa EBEs.
     /// `ebe_kappas[i][k]` is the kappa vector for subject i, occasion k.
     /// Outer vec is empty when `n_kappa == 0`.
@@ -1643,6 +1794,68 @@ pub struct FitResult {
     /// SHA-256 hex digest of the data file bytes at fit time. Same semantics
     /// as `model_hash`.
     pub data_hash: Option<String>,
+    /// Verbatim content of the `.ferx` model file. `Some` when the fit was
+    /// launched via `fit_from_files` / CLI or loaded from a `.fitrx` bundle;
+    /// `None` for in-memory `fit()` callers who never had a file path.
+    pub model_text: Option<String>,
+    /// Initial theta values as supplied to the optimizer, parallel to `theta`
+    /// and `theta_names`.
+    pub theta_init: Vec<f64>,
+    /// Initial omega matrix (variance scale), same layout as `omega`.
+    pub omega_init: DMatrix<f64>,
+    /// Initial sigma values, parallel to `sigma` and `sigma_names`.
+    pub sigma_init: Vec<f64>,
+    /// `(min_time, max_time)` across all observation records. `None` only when
+    /// there are no observations at all.
+    pub obs_time_range: Option<(f64, f64)>,
+    /// Gradient of the objective function at the best-OFV parameter point,
+    /// in the packed parameter space (log-theta, Cholesky-omega, log-sigma).
+    /// `Some` only for NLopt gradient-based runs (SLSQP, L-BFGS, MMA) when at
+    /// least one gradient-requesting iteration improved the OFV; `None` for
+    /// BOBYQA (derivative-free), built-in BFGS, GN, and SAEM.
+    pub final_gradient: Option<Vec<f64>>,
+    // ── Run settings (for runlog / reproducibility) ──────────────────────────
+    /// Outer optimizer used for this fit, as a short lowercase label
+    /// ("bobyqa", "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs",
+    /// "trust_region").  Always populated; the label is the same regardless of
+    /// method chain length.
+    pub optimizer: String,
+    /// Number of random multi-starts attempted. 1 means a single fit from
+    /// the model-file initial values (no multi-start).
+    pub n_starts: usize,
+    /// Seed used to perturb initial values across multi-starts.  `None` when
+    /// `n_starts == 1` (no perturbation applied) or when no seed was set and
+    /// the run used a random seed derived from the system clock.
+    pub multi_start_seed: Option<u64>,
+    /// Seed used for the SAEM MCMC E-step.  `None` for non-SAEM methods or
+    /// when no explicit seed was set in `[fit_options]`.
+    pub saem_seed: Option<u64>,
+    /// Seed used for the SIR resampling step.  `None` when SIR was not run or
+    /// no explicit seed was set.
+    pub sir_seed: Option<u64>,
+    /// Seed used for the importance-sampling Monte Carlo step.  `None` when IS
+    /// was not run or no explicit seed was set.
+    pub is_seed: Option<u64>,
+    /// BLOQ handling method: "drop" (observations below LOQ are excluded) or
+    /// "m3" (M3 likelihood for censored observations).
+    pub bloq_method: String,
+    /// Maximum number of outer optimizer iterations allowed.
+    pub outer_maxiter: usize,
+    /// Gradient-norm convergence tolerance for the outer optimizer.
+    pub outer_gtol: f64,
+    /// NCA initialisation method used to derive starting values, if any.
+    /// One of "nca", "nca_sweep", "nca_ebe", or `None` when the model-file
+    /// initial values were used directly.
+    pub inits_from_nca: Option<String>,
+    /// Names of covariate columns present in the dataset, in the order they
+    /// appear in the data file's header.  Mirrors the NONMEM `$INPUT` echo —
+    /// lets `ferx_runlog()` report which covariates were available without
+    /// requiring the caller to re-read the CSV.  Empty for in-memory `fit()`
+    /// calls that never touch a file.
+    pub covariate_names: Vec<String>,
+    /// All column headers from the data CSV in original order (ID, TIME, DV, AMT, ...,
+    /// covariates), analogous to NONMEM `$INPUT`. Empty for in-memory `fit()` calls.
+    pub input_columns: Vec<String>,
     /// One entry per `[covariate_nn NAME]` block in the model, populated by
     /// `fit()` from `CompiledModel.covariate_nns`. Empty when the `nn`
     /// feature is off or no block is declared. Output writers
@@ -1988,26 +2201,58 @@ pub enum BloqMethod {
     M3,
 }
 
+impl BloqMethod {
+    pub fn label(self) -> &'static str {
+        match self {
+            BloqMethod::Drop => "drop",
+            BloqMethod::M3 => "m3",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Optimizer {
     Bfgs,
     Lbfgs,
-    /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based,
-    /// default outer optimizer. Robust on the FOCE/FOCEI objective surface in
-    /// practice: FD-gradient noise from EBE re-estimation is small relative
-    /// to the OFV moves the optimizer cares about.
+    /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based;
+    /// fast per iteration on smooth, well-conditioned analytical PK models where
+    /// the fixed-EBE finite-difference gradient is a faithful proxy for the true
+    /// gradient. On ill-conditioned fits (ODE/PD models, sparse data, Hill-ridge
+    /// identifiability) the fixed-EBE bias can drive SLSQP to declare convergence
+    /// hundreds of OFV units above the true minimum — pair with
+    /// `reconverge_gradient_interval = 1` if it stalls, or switch to `Bobyqa`
+    /// (the default; see `FitOptions::default`).
     Slsqp,
     /// NLopt LD_LBFGS
     NloptLbfgs,
     /// NLopt LD_MMA — Method of Moving Asymptotes
     Mma,
-    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation. Useful when
-    /// FD gradients are unreliable (e.g. small datasets where EBE-loop noise
-    /// dominates per-eval signal). Needs more outer evaluations than SLSQP
-    /// because it must triangulate a quadratic from scratch.
+    /// NLopt LN_BOBYQA — derivative-free quadratic interpolation, default outer
+    /// optimizer. Re-evaluates the FOCE objective (and the inner EBE loop) at
+    /// every trial point, so it never sees the fixed-EBE gradient bias that can
+    /// stall gradient-based optimizers; consistently reaches a lower OFV than
+    /// SLSQP on ODE/PD models, sparse data, and Hill-ridge problems. Needs more
+    /// outer evaluations than SLSQP to triangulate a quadratic from scratch, but
+    /// each evaluation is cheap (no FD gradient sweep). See
+    /// `docs/src/estimation/optimizers.md` for the cefepime and Emax PKPD
+    /// validations behind the default choice.
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,
+}
+
+impl Optimizer {
+    pub fn label(self) -> &'static str {
+        match self {
+            Optimizer::Bfgs => "bfgs",
+            Optimizer::Lbfgs => "lbfgs",
+            Optimizer::Slsqp => "slsqp",
+            Optimizer::NloptLbfgs => "nlopt_lbfgs",
+            Optimizer::Mma => "mma",
+            Optimizer::Bobyqa => "bobyqa",
+            Optimizer::TrustRegion => "trust_region",
+        }
+    }
 }
 
 /// Estimation method
@@ -2328,6 +2573,211 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_warning_convergence_is_critical() {
+        let w = classify_warning("Outer optimization did not converge");
+        assert_eq!(w.severity, WarningSeverity::Critical);
+        assert_eq!(w.category, "convergence");
+        assert!(w.source_method.is_none());
+    }
+
+    #[test]
+    fn classify_warning_covariance_is_critical() {
+        let w = classify_warning("Covariance step failed");
+        assert_eq!(w.severity, WarningSeverity::Critical);
+        assert_eq!(w.category, "covariance_step");
+    }
+
+    #[test]
+    fn classify_warning_dw_is_warning() {
+        let w = classify_warning("Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).");
+        assert_eq!(w.severity, WarningSeverity::Warning);
+        assert_eq!(w.category, "dw_autocorrelation");
+    }
+
+    #[test]
+    fn classify_warning_mu_ref_is_info() {
+        let w = classify_warning("mu-ref: CL, V");
+        assert_eq!(w.severity, WarningSeverity::Info);
+        assert_eq!(w.category, "mu_referencing");
+    }
+
+    #[test]
+    fn classify_warning_strips_chain_prefix() {
+        let w = classify_warning("[FOCEI] Covariance step failed");
+        assert_eq!(w.source_method.as_deref(), Some("FOCEI"));
+        assert_eq!(w.message, "Covariance step failed");
+        assert_eq!(w.severity, WarningSeverity::Critical);
+        assert_eq!(w.category, "covariance_step");
+    }
+
+    #[test]
+    fn classify_warning_unknown_falls_back_to_general() {
+        let w = classify_warning("some entirely novel message");
+        assert_eq!(w.severity, WarningSeverity::Warning);
+        assert_eq!(w.category, "general");
+    }
+
+    /// Round-trip table covering every literal warning message emitted by the
+    /// engine, with the (severity, category) it should classify to.
+    ///
+    /// This protects the classifier contract from quiet regressions when a
+    /// message gets a typo fix or a wording change. If you edit a message
+    /// string in `outer_optimizer.rs`, `saem.rs`, `gauss_newton.rs`,
+    /// `trust_region.rs`, or `api.rs`, mirror the edit here so the test
+    /// keeps reflecting the engine's actual output.
+    ///
+    /// Messages built by `format!(..)` are exercised with a representative
+    /// instantiation: the substrings the classifier matches on must remain
+    /// present after interpolation.
+    #[test]
+    fn classify_warning_roundtrips_every_engine_message() {
+        use WarningSeverity::*;
+        let table: &[(&str, WarningSeverity, &str)] = &[
+            // -- outer_optimizer.rs ----------------------------------------
+            (
+                "Outer optimization did not converge",
+                Critical,
+                "convergence",
+            ),
+            ("Covariance step failed", Critical, "covariance_step"),
+            // global_search has two arms: explicit "disabled" is a runtime
+            // failure (Warning); a bare mention without "disabled" is
+            // informational.
+            (
+                "global_search disabled: bad seed",
+                Warning,
+                "optimizer_config",
+            ),
+            ("global_search reached eval cap", Info, "optimizer_config"),
+            ("cancelled by user", Info, "cancelled"),
+            // -- gauss_newton.rs -------------------------------------------
+            (
+                "Gauss-Newton: trust radius collapsed",
+                Warning,
+                "optimizer_health",
+            ),
+            (
+                "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed",
+                Warning,
+                "optimizer_health",
+            ),
+            (
+                "Gauss-Newton: max iterations reached without convergence",
+                Critical,
+                "convergence",
+            ),
+            // -- saem.rs ---------------------------------------------------
+            (
+                "Covariance step failed \u{2014} SEs not available",
+                Critical,
+                "covariance_step",
+            ),
+            (
+                "saem_n_leapfrog > 0 but HMC is unavailable (requires `autodiff` feature)",
+                Info,
+                "gradient_fallback",
+            ),
+            // -- trust_region.rs ------------------------------------------
+            (
+                "Trust-region did not converge: line search stalled",
+                Critical,
+                "convergence",
+            ),
+            // -- api.rs ----------------------------------------------------
+            (
+                "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).",
+                Warning,
+                "dw_autocorrelation",
+            ),
+            (
+                "Negative IWRES autocorrelation detected (Durbin-Watson = 2.80).",
+                Warning,
+                "dw_autocorrelation",
+            ),
+            (
+                "M3 BLOQ handling requires FOCEI semantics",
+                Warning,
+                "bloq_method",
+            ),
+            (
+                "SIR failed: covariance not positive definite",
+                Warning,
+                "sir",
+            ),
+            (
+                "SIR requested but covariance matrix is not available",
+                Warning,
+                "sir",
+            ),
+            (
+                "IMP: 2 subject(s) had ESS = 0 (proposal collapse)",
+                Warning,
+                "importance_sampling",
+            ),
+            (
+                "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
+                Warning,
+                "data_quality",
+            ),
+            (
+                "block omega: ETA_CL x ETA_V have mixed lognormal / additive parameterisations",
+                Warning,
+                "omega_structure",
+            ),
+            ("mu-ref: CL, V, KA", Info, "mu_referencing"),
+            (
+                "Multi-start: best result from start 3/8",
+                Info,
+                "multi_start",
+            ),
+            (
+                "12 threads configured but only 10 subject(s)",
+                Info,
+                "threads",
+            ),
+            ("SAEM with more threads than subjects/2", Info, "threads"),
+            (
+                "Covariance step: 35 parameters \u{2192} n\u{00b2} OFV evaluations",
+                Info,
+                "covariance_step",
+            ),
+            (
+                "Covariance step: 35 parameters -> n^2 OFV evaluations",
+                Info,
+                "covariance_step",
+            ),
+            // -- chain-prefixed (multi-stage) -----------------------------
+            (
+                "[FOCEI] Covariance step failed",
+                Critical,
+                "covariance_step",
+            ),
+            ("[SAEM] mu-ref: CL", Info, "mu_referencing"),
+            (
+                "[FOCEI] Outer optimization did not converge",
+                Critical,
+                "convergence",
+            ),
+        ];
+
+        let mut failures: Vec<String> = Vec::new();
+        for (msg, want_sev, want_cat) in table {
+            let got = classify_warning(msg);
+            if got.severity != *want_sev || got.category != *want_cat {
+                failures.push(format!(
+                    "  {msg:?} -> expected ({:?}, {:?}), got ({:?}, {:?})",
+                    want_sev, want_cat, got.severity, got.category
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "classify_warning round-trip failures:\n{}",
+            failures.join("\n")
+        );
+    }
 
     #[test]
     fn is_ode_based_false_for_analytical() {
