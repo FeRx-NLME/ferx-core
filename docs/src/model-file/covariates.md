@@ -54,7 +54,8 @@ covariates must be encoded as integer levels in the data (e.g. `SEX` as `0`/`1`,
 not `"M"`/`"F"`). Under a `[covariates]` block this is enforced: a non-numeric
 value in a declared covariate is a hard error rather than a silent coercion to
 `0.0`. (In the legacy auto-detect path — no `[covariates]` block — a non-numeric
-covariate is still silently treated as missing, preserving prior behaviour.)
+covariate value fails to parse, is dropped, and the covariate evaluates to `0.0`
+in the model, preserving prior behaviour.)
 
 Missing values (blank, `.`, `NA`) are permitted and recorded as missing.
 
@@ -90,4 +91,6 @@ See `examples/two_cpt_oral_cov.ferx`, which declares:
 ```
 
 Both `WT` and `CRCL` are used in `[individual_parameters]` to scale `CL` and
-`V1`, so they must appear in the block.
+`V1`, so they are declared here. A covariate used in the model but left out of
+the block still works, but the parser emits a warning recommending it be
+declared (so its type is recorded and it appears in the covariate table).

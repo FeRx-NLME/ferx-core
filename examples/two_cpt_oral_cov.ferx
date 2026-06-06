@@ -27,9 +27,11 @@
 [structural_model]
   pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
 
-# Declares which dataset columns are covariates and their type. Optional, but
-# when present it is authoritative: every covariate used above must be listed,
-# and each must exist in the data and be numerically coded.
+# Declares which dataset columns are covariates and their type. Optional. When
+# present, declared columns are validated (must exist in the data and be
+# numerically coded) and echoed in the covariate table. A covariate used above
+# but not declared here still works, but emits a warning recommending you
+# declare it so its type is recorded.
 [covariates]
   WT   continuous
   CRCL continuous
