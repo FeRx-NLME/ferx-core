@@ -2,6 +2,14 @@ use crate::types::{CovariateDecl, CovariateRow, CovariateTable, DoseEvent, Popul
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Leading text of the "declared covariate column absent from data" error.
+/// Shared so the `ferx check` layer can classify the reader's error into the
+/// right diagnostic code without matching on the full (formatted) message.
+pub(crate) const ERR_COV_MISSING_COLUMNS: &str =
+    "[covariates]: declared covariate column(s) not found in data";
+/// Leading text of the "declared covariate value is not numeric" error.
+pub(crate) const ERR_COV_NON_NUMERIC: &str = "[covariates]: non-numeric value";
+
 /// True when a CSV cell represents a missing value (blank / `.` / `NA` / `NaN`).
 /// NONMEM convention uses `.` for missing.
 fn is_missing_cell(s: &str) -> bool {
@@ -151,8 +159,7 @@ fn read_nonmem_csv_impl(
             .collect();
         if !missing.is_empty() {
             return Err(format!(
-                "[covariates]: declared covariate column(s) not found in data \
-                 (case-sensitive): {}. Available columns: {}.",
+                "{ERR_COV_MISSING_COLUMNS} (case-sensitive): {}. Available columns: {}.",
                 missing.join(", "),
                 headers.join(", ")
             ));
@@ -186,8 +193,8 @@ fn read_nonmem_csv_impl(
             // agrees with how each row was classified.
             let evid = evid_col
                 .and_then(|c| fields.get(c))
-                .map(|s| parse_usize(s))
-                .unwrap_or(0) as u32;
+                .map(|s| parse_evid(s))
+                .unwrap_or(0);
             let mut values = Vec::with_capacity(table_indices.len());
             for (name, idx) in &table_indices {
                 let cell = fields.get(*idx).map(|s| s.as_str()).unwrap_or("");
@@ -198,9 +205,9 @@ fn read_nonmem_csv_impl(
                         Ok(v) => values.push(v),
                         Err(_) => {
                             return Err(format!(
-                                "[covariates]: non-numeric value '{}' for covariate '{}' \
-                                 (ID {}, TIME {}). Covariates must be numerically coded — \
-                                 encode categoricals as integer levels.",
+                                "{ERR_COV_NON_NUMERIC} '{}' for covariate '{}' (ID {}, TIME {}). \
+                                 Covariates must be numerically coded — encode categoricals as \
+                                 integer levels.",
                                 cell.trim(),
                                 name,
                                 id,
@@ -275,10 +282,19 @@ fn read_nonmem_csv_impl(
         None
     };
 
+    // `covariate_names` reports only columns that actually exist in the data
+    // (derived from `cov_indices`). A requested column that isn't in the CSV —
+    // e.g. a referenced-but-undeclared covariate passed in the union that turns
+    // out to be absent — must NOT appear here, otherwise `check_covariates`
+    // would treat it as present and let the fit run with that covariate at 0.0
+    // instead of failing with E_MISSING_COVARIATE. (For the auto-detect path
+    // `cov_names` is already existing-only, so this is a no-op there.)
+    let existing_cov_names: Vec<String> = cov_indices.iter().map(|(n, _)| n.clone()).collect();
+
     Ok((
         Population {
             subjects,
-            covariate_names: cov_names,
+            covariate_names: existing_cov_names,
             dv_column: "dv".to_string(),
         },
         table,
@@ -293,12 +309,23 @@ fn parse_usize(s: &str) -> usize {
     s.parse::<usize>().unwrap_or(1)
 }
 
+/// Parse an EVID cell. A missing / blank / unparseable value maps to 0
+/// (observation) — NONMEM's documented default. (`parse_usize` defaults to 1,
+/// which would mislabel a blank-EVID observation row as a dose.)
+fn parse_evid(s: &str) -> u32 {
+    let t = s.trim();
+    if is_missing_cell(t) {
+        return 0;
+    }
+    t.parse::<u32>().unwrap_or(0)
+}
+
 /// Parse an occasion-column cell. Returns `None` for blank / `.` / NA / non-integer
 /// values so the caller can warn about silently dropped rows. NONMEM convention
 /// uses `.` for missing.
 fn parse_occ(s: &str) -> Option<u32> {
     let t = s.trim();
-    if t.is_empty() || t == "." || t.eq_ignore_ascii_case("na") || t.eq_ignore_ascii_case("nan") {
+    if is_missing_cell(t) {
         return None;
     }
     t.parse::<u32>().ok()
@@ -415,7 +442,7 @@ fn parse_subject(
         let time = parse_f64(row.get(time_col).map(|s| s.as_str()).unwrap_or("0"));
         let evid = evid_col
             .and_then(|c| row.get(c))
-            .map(|s| parse_usize(s))
+            .map(|s| parse_evid(s))
             .unwrap_or(0);
         let mdv = mdv_col
             .and_then(|c| row.get(c))
@@ -892,6 +919,51 @@ mod tests {
         let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
         assert!(err.contains("CRCL"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_evid_defaults_to_observation() {
+        // parse_usize defaults to 1; parse_evid must default to 0 (observation)
+        // for blank / missing / unparseable cells.
+        assert_eq!(parse_evid("1"), 1);
+        assert_eq!(parse_evid("0"), 0);
+        assert_eq!(parse_evid(""), 0);
+        assert_eq!(parse_evid("."), 0);
+        assert_eq!(parse_evid("NA"), 0);
+        assert_eq!(parse_evid("x"), 0);
+    }
+
+    #[test]
+    fn test_covtab_blank_evid_is_observation_not_dose() {
+        // A blank EVID cell on an observation row must be EVID=0 in the covtab,
+        // not 1 (which parse_usize would have produced).
+        let csv = "ID,TIME,DV,EVID,AMT,WT\n\
+                   1,0,.,1,100,70\n\
+                   1,1,5.0,,.,70\n";
+        let f = write_csv(csv);
+        let decls = vec![decl("WT", CovariateKind::Continuous)];
+        let (_pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap();
+        assert_eq!(table.rows[0].evid, 1); // explicit dose row
+        assert_eq!(table.rows[1].evid, 0); // blank EVID → observation
+    }
+
+    #[test]
+    fn test_absent_extra_covariate_excluded_from_covariate_names() {
+        // A referenced-but-undeclared covariate passed in `extra` that is NOT a
+        // real column must not appear in covariate_names — otherwise the fit's
+        // E_MISSING_COVARIATE guard would be masked and it would silently read
+        // as 0.0. (Regression test for the masking bug.)
+        let csv = "ID,TIME,DV,EVID,AMT,WT,CRCL\n\
+                   1,0,.,1,100,70,80\n\
+                   1,1,5.0,0,.,70,80\n";
+        let f = write_csv(csv);
+        let decls = vec![decl("WT", CovariateKind::Continuous)];
+        let extra = vec!["GHOST".to_string()]; // not a column in the CSV
+        let (pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, &extra, None).unwrap();
+        assert!(!pop.covariate_names.contains(&"GHOST".to_string()));
+        assert!(pop.covariate_names.contains(&"WT".to_string()));
+        // The table still reflects only declared columns.
+        assert_eq!(table.names, vec!["WT"]);
     }
 
     #[test]

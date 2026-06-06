@@ -511,14 +511,7 @@ pub fn write_sdtab_csv(
     for row in 0..n_rows {
         let vals: Vec<String> = cols
             .iter()
-            .map(|(_, values)| {
-                let v = values[row];
-                if v.is_nan() {
-                    String::new()
-                } else {
-                    format!("{:.6}", v)
-                }
-            })
+            .map(|(_, values)| fmt_num(values[row]))
             .collect();
         writeln!(f, "{}", vals.join(",")).map_err(|e| e.to_string())?;
     }
@@ -530,30 +523,28 @@ pub fn write_sdtab_csv(
 ///
 /// Columns: `ID, TIME, EVID, <declared covariates...>`, one row per input
 /// dataset record. Missing values (`f64::NAN`) are written as empty cells so
-/// downstream tools read them as missing.
+/// downstream tools read them as missing. Uses the `csv` writer so a subject ID
+/// (a free-form string) containing a comma or quote is properly escaped rather
+/// than corrupting column alignment.
 pub fn write_covtab_csv(table: &crate::types::CovariateTable, path: &str) -> Result<(), String> {
-    use std::io::Write;
+    let mut wtr = csv::WriterBuilder::new()
+        .from_path(path)
+        .map_err(|e| format!("Failed to create {}: {}", path, e))?;
 
-    let mut f =
-        std::fs::File::create(path).map_err(|e| format!("Failed to create {}: {}", path, e))?;
-
-    // Header
-    let mut header = String::from("ID,TIME,EVID");
-    for name in &table.names {
-        header.push(',');
-        header.push_str(name);
-    }
-    writeln!(f, "{}", header).map_err(|e| e.to_string())?;
+    let mut header: Vec<String> = vec!["ID".into(), "TIME".into(), "EVID".into()];
+    header.extend(table.names.iter().cloned());
+    wtr.write_record(&header).map_err(|e| e.to_string())?;
 
     for row in &table.rows {
-        let mut line = format!("{},{},{}", row.id, fmt_num(row.time), row.evid);
-        for &v in &row.values {
-            line.push(',');
-            line.push_str(&fmt_num(v));
-        }
-        writeln!(f, "{}", line).map_err(|e| e.to_string())?;
+        let mut rec: Vec<String> = Vec::with_capacity(3 + row.values.len());
+        rec.push(row.id.clone());
+        rec.push(fmt_num(row.time));
+        rec.push(row.evid.to_string());
+        rec.extend(row.values.iter().map(|&v| fmt_num(v)));
+        wtr.write_record(&rec).map_err(|e| e.to_string())?;
     }
 
+    wtr.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
 

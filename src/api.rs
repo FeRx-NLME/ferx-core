@@ -2,7 +2,9 @@ use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
-use crate::io::datareader::{read_nonmem_csv, read_nonmem_csv_with_covariates};
+use crate::io::datareader::{
+    read_nonmem_csv, read_nonmem_csv_with_covariates, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
+};
 use crate::pk;
 use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
@@ -108,19 +110,13 @@ pub fn run_model_with_data_inits(
     eprintln!("Model: {}", parsed.model.name);
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
-    // When the model declares a `[covariates]` block, read declared covariates
-    // through the strict path (validates presence + numeric coding) and capture
-    // the covariate table. Referenced-but-undeclared covariates are passed as
-    // `extra` so they're still read (leniently); the parser already warned.
-    let (population, covariate_table) = match &parsed.covariate_decls {
-        Some(decls) => {
-            let extra = undeclared_referenced(&parsed.model, decls);
-            let (pop, table) =
-                read_nonmem_csv_with_covariates(Path::new(data_path), decls, &extra, iov_col)?;
-            (pop, Some(table))
-        }
-        None => (read_nonmem_csv(Path::new(data_path), None, iov_col)?, None),
-    };
+    let (population, covariate_table) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        data_path,
+        None,
+        iov_col,
+    )?;
     eprintln!(
         "Data:  {} subjects, {} observations from {}",
         population.subjects.len(),
@@ -311,34 +307,51 @@ fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<
         .collect()
 }
 
-/// When a `[covariates]` block is present, every declared covariate column must
-/// exist in the dataset. Reuses `E_MISSING_COVARIATE` so `ferx check` reports a
-/// declared-but-absent column the same way `fit()` (via the strict reader) does.
-/// Case-sensitive, matching the reader's covariate lookup.
-fn check_covariate_decls(decls: &[CovariateDecl], population: &Population) -> Vec<Diagnostic> {
-    let missing: Vec<&str> = decls
-        .iter()
-        .filter(|d| !population.covariate_names.iter().any(|n| n == &d.name))
-        .map(|d| d.name.as_str())
-        .collect();
-    if missing.is_empty() {
-        return Vec::new();
+/// Single covariate-aware reader used by every file-based entry point (`fit`
+/// wrappers and `ferx check`), so they all apply identical covariate validation.
+///
+/// When the model declares a `[covariates]` block this routes through the strict
+/// reader (validates declared columns exist + are numeric, builds the table, and
+/// reads referenced-but-undeclared covariates leniently as `extra`). Otherwise
+/// it falls back to the lenient reader with `fallback_columns` (the legacy
+/// `covariate_columns` argument, or `None` for auto-detect).
+fn read_population_for(
+    model: &CompiledModel,
+    covariate_decls: &Option<Vec<CovariateDecl>>,
+    data_path: &str,
+    fallback_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+) -> Result<(Population, Option<CovariateTable>), String> {
+    match covariate_decls {
+        Some(decls) => {
+            let extra = undeclared_referenced(model, decls);
+            let (pop, table) =
+                read_nonmem_csv_with_covariates(Path::new(data_path), decls, &extra, iov_column)?;
+            Ok((pop, Some(table)))
+        }
+        None => Ok((
+            read_nonmem_csv(Path::new(data_path), fallback_columns, iov_column)?,
+            None,
+        )),
     }
-    let available = if population.covariate_names.is_empty() {
-        "(none)".to_string()
+}
+
+/// Map an error string from [`read_population_for`] onto a `ferx check`
+/// diagnostic, so the covariate-validation failures the strict reader raises at
+/// fit time surface with the same code/block in `ferx check` (rather than as a
+/// generic `E_DATA`). Classification keys off the reader's stable message
+/// prefixes ([`ERR_COV_MISSING_COLUMNS`] / [`ERR_COV_NON_NUMERIC`]).
+fn covariate_read_diagnostic(err: &str, path: &str) -> Diagnostic {
+    if err.starts_with(ERR_COV_MISSING_COLUMNS) {
+        Diagnostic::error("E_MISSING_COVARIATE", err.to_string()).with_block("covariates")
+    } else if err.starts_with(ERR_COV_NON_NUMERIC) {
+        Diagnostic::error("E_COVARIATE_NOT_NUMERIC", err.to_string()).with_block("covariates")
     } else {
-        population.covariate_names.join(", ")
-    };
-    vec![Diagnostic::error(
-        "E_MISSING_COVARIATE",
-        format!(
-            "[covariates] declares column(s) not found in data (case-sensitive): {}. \
-             Available columns: {}.",
-            missing.join(", "),
-            available
-        ),
-    )
-    .with_block("covariates")]
+        Diagnostic::error(
+            "E_DATA",
+            format!("Failed to read data file '{}': {}", path, err),
+        )
+    }
 }
 
 /// Per-CMT scaling needs every observed CMT to have an entry in the
@@ -683,15 +696,16 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.
     diags.extend(check_model_options(&parsed.model, &parsed.fit_options));
 
-    // 3. Data-dependent checks (only when a dataset is supplied).
+    // 3. Data-dependent checks (only when a dataset is supplied). Read through
+    //    the same covariate-aware chokepoint the fit uses, so `ferx check` and
+    //    `fit()` apply identical covariate validation (declared columns present
+    //    + numeric). A covariate-validation failure surfaces as the matching
+    //    diagnostic rather than a generic read error.
     if let Some(path) = data_path {
         let iov_col = parsed.fit_options.iov_column.as_deref();
-        match read_nonmem_csv(Path::new(path), None, iov_col) {
-            Ok(population) => {
+        match read_population_for(&parsed.model, &parsed.covariate_decls, path, None, iov_col) {
+            Ok((population, _table)) => {
                 diags.extend(check_model_data(&parsed.model, &population));
-                if let Some(decls) = &parsed.covariate_decls {
-                    diags.extend(check_covariate_decls(decls, &population));
-                }
                 let init_params = parsed.model.default_params.clone();
                 diags.extend(check_model_data_warnings(
                     &parsed.model,
@@ -700,10 +714,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                 ));
             }
             Err(e) => {
-                diags.push(Diagnostic::error(
-                    "E_DATA",
-                    format!("Failed to read data file '{}': {}", path, e),
-                ));
+                diags.push(covariate_read_diagnostic(&e, path));
             }
         }
     }
@@ -737,18 +748,13 @@ pub fn fit_from_files(
     // A `[covariates]` declaration takes precedence over the explicit
     // `covariate_columns` argument; otherwise fall back to the argument (or
     // legacy auto-detect when both are absent).
-    let (population, covariate_table) = match &parsed.covariate_decls {
-        Some(decls) => {
-            let extra = undeclared_referenced(&model, decls);
-            let (pop, table) =
-                read_nonmem_csv_with_covariates(Path::new(data_path), decls, &extra, None)?;
-            (pop, Some(table))
-        }
-        None => (
-            read_nonmem_csv(Path::new(data_path), covariate_columns, None)?,
-            None,
-        ),
-    };
+    let (population, covariate_table) = read_population_for(
+        &model,
+        &parsed.covariate_decls,
+        data_path,
+        covariate_columns,
+        None,
+    )?;
     let opts = options.unwrap_or_default();
     model.bloq_method = opts.bloq_method;
     // SDE models cannot use autodiff — force FD.

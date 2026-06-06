@@ -58,6 +58,11 @@ covariate is still silently treated as missing, preserving prior behaviour.)
 
 Missing values (blank, `.`, `NA`) are permitted and recorded as missing.
 
+`ferx check` reads through the same covariate-aware path the fit uses, so a
+declared column that is absent (`E_MISSING_COVARIATE`) or non-numeric
+(`E_COVARIATE_NOT_NUMERIC`), or a referenced covariate missing from the data, is
+reported at check time rather than only failing once the fit starts.
+
 ## Covariate table
 
 When a `[covariates]` block is present and the fit is launched from a data file,

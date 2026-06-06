@@ -277,6 +277,117 @@ fn undeclared_referenced_covariate_warns_not_errors() {
     let _ = std::fs::remove_file(&model);
 }
 
+/// Write `content` to a uniquely-named temp `.csv` file and return its path.
+fn temp_data(tag: &str, content: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "ferx_check_{}_{}_{}.csv",
+        tag,
+        std::process::id(),
+        n
+    ));
+    std::fs::write(&path, content).expect("write temp data");
+    path
+}
+
+/// `ferx check` now reads through the same strict reader the fit uses, so a
+/// non-numeric value in a declared covariate is caught at check time (parity
+/// with fit) instead of passing check and then failing the fit.
+#[test]
+fn check_reports_non_numeric_declared_covariate() {
+    let model = temp_model(
+        "cov_nonnumeric",
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[covariates]
+  WT  continuous
+  SEX categorical
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * (WT / 70.0)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=1.0)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    );
+    // SEX is declared categorical but coded as strings — must be rejected.
+    let data = temp_data(
+        "cov_nonnumeric",
+        "ID,TIME,DV,EVID,AMT,WT,SEX\n1,0,.,1,100,70,M\n1,1,5.0,0,.,70,M\n",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(!report.valid);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_COVARIATE_NOT_NUMERIC" && d.message.contains("SEX")),
+        "expected E_COVARIATE_NOT_NUMERIC for SEX, got: {:?}",
+        report.diagnostics
+    );
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}
+
+/// Regression: a covariate referenced by the model but absent from the data is
+/// still caught (E_MISSING_COVARIATE) even when a [covariates] block is present
+/// — the block must not mask the missing-covariate guard.
+#[test]
+fn referenced_absent_covariate_errors_even_with_block() {
+    let model = temp_model(
+        "cov_masking",
+        "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVAGE(0.1, 0.001, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[covariates]
+  WT continuous
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL) * (WT / 70.0) * (AGE / 40.0)^TVAGE
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=1.0)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    );
+    // WT present (declared, numeric) but AGE (referenced, undeclared) is absent.
+    let data = temp_data(
+        "cov_masking",
+        "ID,TIME,DV,EVID,AMT,WT\n1,0,.,1,100,70\n1,1,5.0,0,.,70\n",
+    );
+    let report = validate_model_file(model.to_str().unwrap(), Some(data.to_str().unwrap()));
+    assert!(!report.valid);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_MISSING_COVARIATE" && d.message.contains("AGE")),
+        "expected E_MISSING_COVARIATE for AGE, got: {:?}",
+        report.diagnostics
+    );
+    let _ = std::fs::remove_file(&model);
+    let _ = std::fs::remove_file(&data);
+}
+
 /// The report serializes to JSON with the documented shape.
 #[test]
 fn report_serializes_to_json() {
