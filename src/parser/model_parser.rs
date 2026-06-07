@@ -1206,6 +1206,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         sigma_fixed,
         omega_iov,
         kappa_fixed,
+        vine_dist: None,
     };
 
     // Auto-generate tv_fn: evaluate individual parameters with eta=0

@@ -626,6 +626,10 @@ pub struct ModelParameters {
     pub omega_iov: Option<OmegaMatrix>,
     /// Per-kappa FIX flags (parallel to `omega_iov` diagonal).
     pub kappa_fixed: Vec<bool>,
+    /// Fitted vine-copula distribution for the random effects. Populated after a
+    /// successful `omega_dist = vine_copula` SAEM fit; `None` for Gaussian fits.
+    /// Used by `simulate` to draw ETAs from the vine rather than N(0, Omega).
+    pub vine_dist: Option<std::sync::Arc<crate::stats::vine_copula::VineCopulaOmega>>,
 }
 
 impl ModelParameters {
@@ -1951,6 +1955,10 @@ pub struct FitResult {
     /// quantify the advantage of the vine model.
     /// `None` for non-vine fits or when the correction is non-finite.
     pub vine_corrected_ofv: Option<f64>,
+    /// Fitted vine-copula distribution (reference-counted). Use with
+    /// `ModelParameters::vine_dist` to draw ETAs from the vine in `simulate`.
+    /// `None` for non-vine fits.
+    pub vine_dist: Option<std::sync::Arc<crate::stats::vine_copula::VineCopulaOmega>>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a short lowercase label
     /// ("bobyqa", "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs",
@@ -2702,6 +2710,7 @@ pub(crate) mod test_helpers {
                 sigma_fixed: vec![false],
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
+                vine_dist: None,
             },
             omega_init_as_sd: vec![false],
             sigma_init_as_sd: vec![false],

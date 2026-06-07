@@ -103,6 +103,7 @@ pub(crate) fn dvine_log_density(u: &[f64], pair_copulas: &[Vec<CopulaFamily>]) -
 ///
 /// Constructed once at the start of `run_saem_vine` from the initial model
 /// parameters; updated in-place by each `mstep_update` call.
+#[derive(Clone, Debug)]
 pub struct VineCopulaOmega {
     /// Number of ETAs (= d).
     pub d: usize,
@@ -542,6 +543,73 @@ impl VineCopulaOmega {
 
         VineFitParams { marginals, trees }
     }
+
+    /// Draw one d-dimensional ETA sample from this D-vine distribution.
+    ///
+    /// Uses the inverse Rosenblatt transform (Aas et al. 2009): independent
+    /// uniforms w[0..d] are sequentially mapped through h-inverse functions from
+    /// the outermost tree inward, then inverted through Gaussian marginals.
+    pub fn draw_eta<R: rand::Rng>(&self, rng: &mut R) -> Vec<f64> {
+        use crate::stats::special::normal_quantile;
+        use rand_distr::Open01;
+
+        let d = self.d;
+        if d == 0 {
+            return vec![];
+        }
+        let w: Vec<f64> = (0..d).map(|_| rng.sample(Open01)).collect();
+        if d == 1 {
+            let z = normal_quantile(w[0].clamp(1e-12, 1.0 - 1e-12));
+            return vec![self.marginal_means[0] + self.marginal_stds[0] * z];
+        }
+
+        // V-table: vt[j][k] = v_{j,k} for 0 ≤ j ≤ k < d (0-indexed).
+        // v_{j,j} = u[j] (the copula-uniform for variable j).
+        // v_{j,k} = h(v_{j,k-1} | v_{j+1,k}; pair_copulas[k-j-1][j]).
+        //
+        // During simulation, vt grows column by column as each variable is
+        // generated. Only the columns up to the current index are read/written.
+        let mut vt = vec![vec![0.0_f64; d]; d];
+
+        // Generate u[0] (first variable, no conditioning).
+        let u0 = w[0].clamp(1e-12, 1.0 - 1e-12);
+        vt[0][0] = u0;
+
+        for i in 1..d {
+            // Apply h_inv from the outermost tree (level i-1) down to tree 0.
+            // j=0 → tree_level = i-1 (outermost), j=i-1 → tree_level = 0 (innermost).
+            let mut tmp = w[i].clamp(1e-12, 1.0 - 1e-12);
+            for j in 0..i {
+                let tree_level = i - 1 - j;
+                let pair_idx = j;
+                let cond = vt[j][i - 1].clamp(1e-12, 1.0 - 1e-12);
+                tmp = self.pair_copulas[tree_level][pair_idx]
+                    .h_inv(tmp.clamp(1e-12, 1.0 - 1e-12), cond)
+                    .clamp(1e-12, 1.0 - 1e-12);
+            }
+            vt[i][i] = tmp;
+
+            // Update V-table for future iterations.
+            // j goes from i-1 down to 0 so that vt[j+1][i] is ready before vt[j][i].
+            for j in (0..i).rev() {
+                let tree_level = i - j - 1;
+                let pair_idx = j;
+                let l = vt[j][i - 1].clamp(1e-12, 1.0 - 1e-12);
+                let r = vt[j + 1][i].clamp(1e-12, 1.0 - 1e-12);
+                vt[j][i] = self.pair_copulas[tree_level][pair_idx]
+                    .h(l, r)
+                    .clamp(1e-12, 1.0 - 1e-12);
+            }
+        }
+
+        // Invert Gaussian marginals: u[k] → η[k] = μ[k] + σ[k] * Φ⁻¹(u[k]).
+        (0..d)
+            .map(|k| {
+                let z = normal_quantile(vt[k][k]);
+                self.marginal_means[k] + self.marginal_stds[k] * z
+            })
+            .collect()
+    }
 }
 
 fn pair_copula_summary(cop: &CopulaFamily) -> PairCopulaSummary {
@@ -741,5 +809,40 @@ mod tests {
         let lp1 = dist.log_prior(&eta);
         let lp2 = dist.log_prior(&eta);
         assert_eq!(lp1, lp2);
+    }
+
+    /// `draw_eta` marginals should match the configured means and variances.
+    ///
+    /// With 4 000 draws and initial marginals σ² ≈ 0.09 (from the standard
+    /// warfarin model), sample mean should be within 0.03 and sample variance
+    /// within 20 % of the true value with overwhelming probability.
+    #[test]
+    fn draw_eta_marginals_match_configured() {
+        use rand::SeedableRng;
+        let dist = make_dist();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1234);
+        let n = 4_000;
+        let mut sums = vec![0.0_f64; dist.d];
+        let mut sumsq = vec![0.0_f64; dist.d];
+        for _ in 0..n {
+            let eta = dist.draw_eta(&mut rng);
+            for (k, &v) in eta.iter().enumerate() {
+                sums[k] += v;
+                sumsq[k] += v * v;
+            }
+        }
+        for k in 0..dist.d {
+            let mean = sums[k] / n as f64;
+            let var = sumsq[k] / n as f64 - mean * mean;
+            let true_var = dist.marginal_stds[k] * dist.marginal_stds[k];
+            assert!(
+                mean.abs() < 0.05,
+                "dimension {k}: sample mean {mean:.4} too far from 0"
+            );
+            assert!(
+                (var - true_var).abs() / true_var < 0.25,
+                "dimension {k}: sample var {var:.4} more than 25% from true {true_var:.4}"
+            );
+        }
     }
 }

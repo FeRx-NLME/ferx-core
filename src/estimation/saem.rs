@@ -1349,6 +1349,7 @@ fn run_saem_vine(
         sigma_fixed: init_params.sigma_fixed.clone(),
         omega_iov: init_params.omega_iov.clone(),
         kappa_fixed: init_params.kappa_fixed.clone(),
+        vine_dist: Some(std::sync::Arc::new(dist.clone())),
     };
 
     // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
@@ -2281,6 +2282,7 @@ pub fn run_saem(
             init_params.omega_iov.clone()
         },
         kappa_fixed: init_params.kappa_fixed.clone(),
+        vine_dist: None,
     };
 
     // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----

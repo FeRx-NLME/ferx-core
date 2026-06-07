@@ -2374,6 +2374,7 @@ fn fit_inner(
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
+        vine_dist: result.params.vine_dist.clone(),
         kappa_init_as_sd: model.kappa_init_as_sd.clone(),
         se_kappa,
         shrinkage_kappa,
@@ -3343,11 +3344,16 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     for sim_idx in 0..n_sim {
         for subject in &population.subjects {
-            // Sample eta from N(0, Omega); append zero kappas for IOV models.
-            let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-            let z_vec = DVector::from_column_slice(&z);
-            let eta = &params.omega.chol * z_vec;
-            let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+            // Sample eta from the fitted distribution (vine copula if available,
+            // otherwise N(0, Omega)) and append zero kappas for IOV models.
+            let eta_vec = if let Some(ref vine) = params.vine_dist {
+                vine.draw_eta(rng)
+            } else {
+                let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                let z_vec = DVector::from_column_slice(&z);
+                (&params.omega.chol * z_vec).iter().copied().collect()
+            };
+            let mut eta_slice: Vec<f64> = eta_vec;
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
             // Compute individual parameters
@@ -3532,6 +3538,7 @@ mod iov_integration {
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
+            vine_dist: None,
         };
         CompiledModel {
             name: "iov_test".into(),
@@ -4015,6 +4022,7 @@ mod extract_se_tests {
             sigma_fixed: vec![false],
             omega_iov,
             kappa_fixed,
+            vine_dist: None,
         }
     }
 
@@ -4050,6 +4058,7 @@ mod extract_se_tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: vec![],
+            vine_dist: None,
         };
         // Packed layout: theta(1) + omega_block(6) + sigma(1) = 8.
         // Within the omega block (start = 1): L[0,0] at idx 1, L[1,1] at idx 4,
@@ -4090,6 +4099,7 @@ mod extract_se_tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: vec![],
+            vine_dist: None,
         };
         // Packed layout: theta(1) + omega_diag(2) + sigma(1) = 4. Identity cov.
         let cov = Some(DMatrix::<f64>::identity(4, 4));
@@ -4418,6 +4428,7 @@ mod simulate_with_uncertainty_tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         CompiledModel {
             name: "uncertainty_smoke".into(),
@@ -4546,6 +4557,7 @@ mod simulate_with_uncertainty_tests {
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],
+            vine_dist: None,
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],
@@ -5001,6 +5013,7 @@ mod multi_start_tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         }
     }
 
@@ -5138,6 +5151,7 @@ mod tests_sdtab_tv_cov {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         let model = CompiledModel {
             name: "tv_cov_sdtab_regression".into(),

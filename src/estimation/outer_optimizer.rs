@@ -2498,6 +2498,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         CompiledModel {
             name: "outer_test".into(),
@@ -2689,6 +2690,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         let model = CompiledModel {
             name: "block_test".into(),
