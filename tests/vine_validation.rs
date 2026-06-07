@@ -324,6 +324,85 @@ fn vine_copula_recovers_clayton_dependence() {
     );
     eprintln!("  Vine family selected: {vine_family}  (expected: clayton)");
     eprintln!("  Gaussian Pearson r  = {pearson:.4}  (no tail dependence captured)");
+
+    // ── Vine-corrected OFV (Clayton families only) ───────────────────────────
+    //
+    // The FOCE OFV uses pop_nll() which evaluates BOTH models with the same
+    // Gaussian Laplace approximation — the vine copula density is never
+    // computed in the final OFV. The "vine-corrected OFV" replaces the
+    // Gaussian prior term with the actual vine (Clayton) prior at the vine EBEs:
+    //
+    //   vine_corrected = vine_FOCE_OFV + 2×(Σ vine_prior_nll − Σ gauss_prior_nll)
+    //
+    // Both priors use fully normalised NLLs (same constant convention).
+    // Only computed when the vine selected a Clayton family (theta is a valid
+    // Clayton parameter); printed as "n/a" for other families.
+    eprintln!("\n{}", "─".repeat(70));
+    eprintln!("Vine-corrected OFV (replacing Gaussian prior with Clayton prior)");
+    if vine_family == "clayton" {
+        let vp = vine.vine_params.as_ref().unwrap();
+        let mean_cl = vp.marginals[0].1;
+        let sd_cl = vp.marginals[0].2;
+        let mean_v = vp.marginals[1].1;
+        let sd_v = vp.marginals[1].2;
+        let theta_vine = vp.trees[0].pairs[0].copula.params[0].1;
+
+        let o11 = vine.omega[(0, 0)];
+        let o12 = vine.omega[(0, 1)];
+        let o22 = vine.omega[(1, 1)];
+        let det = o11 * o22 - o12 * o12;
+        let log_det = det.ln();
+        let two_pi = 2.0 * std::f64::consts::PI;
+
+        let (vine_prior_sum, gauss_prior_sum) =
+            vine.subjects
+                .iter()
+                .fold((0.0_f64, 0.0_f64), |(va, ga), subj| {
+                    let eta1 = subj.eta[0];
+                    let eta2 = subj.eta[1];
+
+                    // Vine prior NLL: −log[c_Clayton(u1,u2;θ) · φ₁(z1)/σ₁ · φ₂(z2)/σ₂]
+                    let z1 = (eta1 - mean_cl) / sd_cl;
+                    let z2 = (eta2 - mean_v) / sd_v;
+                    let u1 = normal_cdf(z1).clamp(1e-12, 1.0 - 1e-12);
+                    let u2 = normal_cdf(z2).clamp(1e-12, 1.0 - 1e-12);
+                    let log_c = (1.0 + theta_vine).ln()
+                        - (1.0 + theta_vine) * (u1.ln() + u2.ln())
+                        - (2.0 + 1.0 / theta_vine)
+                            * (u1.powf(-theta_vine) + u2.powf(-theta_vine) - 1.0).ln();
+                    let log_m1 = -0.5 * z1 * z1 - 0.5 * two_pi.ln() - sd_cl.ln();
+                    let log_m2 = -0.5 * z2 * z2 - 0.5 * two_pi.ln() - sd_v.ln();
+                    let vine_nll = -(log_c + log_m1 + log_m2);
+
+                    // Gaussian prior NLL (fully normalised, d=2):
+                    //   0.5 × (η'Ω⁻¹η + log|Ω| + 2·log(2π))
+                    let quad =
+                        (o22 * eta1 * eta1 - 2.0 * o12 * eta1 * eta2 + o11 * eta2 * eta2) / det;
+                    let gauss_nll = 0.5 * (quad + log_det + 2.0 * two_pi.ln());
+
+                    (va + vine_nll, ga + gauss_nll)
+                });
+
+        let vine_corrected_ofv = vine.ofv + 2.0 * (vine_prior_sum - gauss_prior_sum);
+        let improvement = gauss.ofv - vine_corrected_ofv;
+
+        eprintln!("  Σ vine_prior_NLL    = {vine_prior_sum:.2}   (Clayton density at vine EBEs)");
+        eprintln!("  Σ gauss_prior_NLL   = {gauss_prior_sum:.2}   (MVN density at vine EBEs)");
+        eprintln!(
+            "  Prior Δ per subject = {:.3}  [negative ⇒ Clayton better describes the ETAs]",
+            (vine_prior_sum - gauss_prior_sum) / N_SUBJECTS as f64
+        );
+        eprintln!("  vine_FOCE_OFV       = {:.3}", vine.ofv);
+        eprintln!("  vine_corrected_OFV  = {vine_corrected_ofv:.3}");
+        eprintln!("  gauss_FOCE_OFV      = {:.3}", gauss.ofv);
+        eprintln!("  Δ(gauss − corrected)= {improvement:.2}  [vine proper advantage]");
+    } else {
+        eprintln!(
+            "  (skipped — vine selected '{vine_family}'; correction formula is Clayton-specific)"
+        );
+        eprintln!("  vine_FOCE_OFV  = {:.3}", vine.ofv);
+        eprintln!("  gauss_FOCE_OFV = {:.3}", gauss.ofv);
+    }
     eprintln!("{bar}\n");
 
     // ── Assertions ────────────────────────────────────────────────────────────
