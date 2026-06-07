@@ -1084,6 +1084,86 @@ fn mh_steps_with_dist(
     (n_accepted, nll)
 }
 
+/// Componentwise (single-coordinate) Metropolis-within-Gibbs sweep for the
+/// vine-copula E-step — the dist-aware analogue of [`mh_steps_componentwise`].
+///
+/// Each sweep proposes `η'_j = η_j + step_scale · cw_sd[j] · z` for one
+/// coordinate at a time, holding the others fixed, and accepts/rejects with the
+/// full conditional NLL `obs_nll + dist.log_prior(η)` (which carries the copula
+/// dependence, so detailed balance for p(η | data) is preserved). Returns
+/// `(n_accepted, n_proposed, updated_nll)` with `n_proposed = n_sweeps · n_eta`.
+///
+/// Why this kernel exists: the block kernel [`mh_steps_with_dist`] proposes along
+/// `chol(omega_equiv)·z`, so once the vine's Gaussian-equivalent Ω drifts toward
+/// high correlation the proposal can only move η along that near-degenerate
+/// direction. The M-step then re-fits both `omega_equiv` and the pair-copulas
+/// from those collinear draws and feeds the inflated dependence back into the
+/// next proposal — the same runaway collapse the Gaussian arm hit (see PR #191
+/// and the `saem-block-omega-rank1-collapse` investigation), but in vine
+/// parameter space. A per-coordinate proposal can always move a single η
+/// independently of the off-diagonal structure, so the sampled draws are not
+/// forced collinear and the sufficient statistics recover the true dependence.
+#[allow(clippy::too_many_arguments)]
+fn mh_steps_componentwise_dist(
+    eta: &mut [f64],
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    dist: &crate::stats::vine_copula::VineCopulaOmega,
+    sigma_values: &[f64],
+    step_scale: f64,
+    // Per-coordinate proposal SD = vine marginal SD (already floored to
+    // MARGINAL_STD_FLOOR), shared across subjects. Indexed `[0, n_eta)`.
+    cw_sd: &[f64],
+    rng: &mut impl Rng,
+    n_sweeps: usize,
+    pk_scratch: &mut EventPkParams,
+    kappas_iov_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
+) -> (usize, usize, f64) {
+    let n_eta = eta.len();
+    let mut nll = nll_current;
+    let mut n_accepted = 0;
+
+    for _ in 0..n_sweeps {
+        for j in 0..n_eta {
+            let z: f64 = rng.sample(StandardNormal);
+            let old_j = eta[j];
+            eta[j] = old_j + step_scale * cw_sd[j] * z;
+
+            let obs_nll_prop = if let Some((kappas, _)) = kappas_iov_opt {
+                obs_nll_subject_into_iov(
+                    model,
+                    subject,
+                    theta,
+                    sigma_values,
+                    eta,
+                    kappas,
+                    pk_scratch,
+                )
+            } else {
+                obs_nll_subject_into(model, subject, theta, sigma_values, eta, pk_scratch)
+            };
+            // Kappa prior is constant (kappas fixed during eta MH) → cancels in
+            // the ratio, but include it so `nll` stays on the cache scale.
+            let kap_prior = kappas_iov_opt
+                .map(|(kaps, iov)| kappa_prior_nll(kaps, iov))
+                .unwrap_or(0.0);
+            let nll_prop = obs_nll_prop + dist.log_prior(eta) + kap_prior;
+
+            // Symmetric scalar proposal cancels, same as the block kernel.
+            if rng.gen::<f64>().ln() < nll - nll_prop {
+                nll = nll_prop;
+                n_accepted += 1;
+            } else {
+                eta[j] = old_j; // reject — restore
+            }
+        }
+    }
+
+    (n_accepted, n_eta * n_sweeps, nll)
+}
+
 // ---------------------------------------------------------------------------
 // SAEM loop with vine-copula random-effect distribution
 // ---------------------------------------------------------------------------
@@ -1195,6 +1275,14 @@ fn run_saem_vine(
     let n_iter = k1 + k2;
     let omega_burnin = options.saem_omega_burnin.min(k1);
     let n_mh_steps = options.saem_n_mh_steps;
+    // Componentwise sweeps per iteration (Kuhn-Lavielle kernel 2), sized like
+    // the Gaussian arm. Skipped for single-η models, where there is no
+    // off-diagonal/copula to decorrelate and the kernel duplicates the block move.
+    let n_cw_sweeps = if n_eta >= 2 {
+        (n_mh_steps / n_eta).max(2)
+    } else {
+        0
+    };
     let adapt_interval = options.saem_adapt_interval;
     let verbose = options.verbose;
     let master_seed = options.saem_seed.unwrap_or(12345);
@@ -1299,6 +1387,10 @@ fn run_saem_vine(
     let mut step_scales = vec![0.3f64; n_subjects];
     let mut accept_counts = vec![0usize; n_subjects];
     let mut proposal_counts = vec![0usize; n_subjects];
+    // Componentwise (decorrelating) kernel state — mirrors the Gaussian arm.
+    let mut cw_step_scales = vec![1.0f64; n_subjects];
+    let mut cw_accept_counts = vec![0usize; n_subjects];
+    let mut cw_proposal_counts = vec![0usize; n_subjects];
     let mut steps_since_adapt: usize = 0;
 
     let mut theta_cur: Vec<f64> = init_params.theta.clone();
@@ -1388,6 +1480,20 @@ fn run_saem_vine(
             break;
         }
         let gamma = if k <= k1 { 1.0 } else { 1.0 / (k - k1) as f64 };
+        // Damped SA step for the vine's Gaussian-equivalent Ω during exploration
+        // only (cf. the Gaussian arm). With the full γ=1 used for θ, an undamped
+        // omega_equiv would be overwritten each exploration iteration by a single
+        // warm-started, not-yet-equilibrated MCMC draw; for a correlated block
+        // that snapshot is biased toward the chain's current correlation and the
+        // bias feeds back through chol(omega_equiv) into the next block proposal —
+        // a runaway toward a near rank-1 Ω. Capping the Ω learning rate averages
+        // those draws (Robbins-Monro) and breaks the feedback, while θ keeps
+        // moving at full γ. In convergence (k > k1) the cap is lifted.
+        let gamma_omega = if k <= k1 {
+            gamma.min(OMEGA_SA_MAX_STEP)
+        } else {
+            gamma
+        };
 
         // Rebuild omega_iov for this iteration (IOV models only).
         let omega_iov_cur_opt: Option<OmegaMatrix> = if n_kappa > 0 {
@@ -1408,8 +1514,18 @@ fn run_saem_vine(
             let theta_ref = &theta_cur;
             let sigma_ref = &sigma_cur;
             let dist_ref: &VineCopulaOmega = &dist;
+            let cw_scales = &cw_step_scales;
+            // Per-coordinate componentwise proposal SDs — the vine's marginal SDs
+            // (shared across subjects, already floored). Computed once here.
+            let cw_sd: Vec<f64> = dist
+                .marginal_stds
+                .iter()
+                .map(|&s| s.max(SAEM_OMEGA_DIAG_FLOOR.sqrt()))
+                .collect();
+            let cw_sd_ref = &cw_sd;
 
-            let results: Vec<(Vec<f64>, f64, usize, usize)> = etas
+            // Returns (eta_new, nll_after, n_acc, n_prop, n_acc_cw, n_prop_cw).
+            let results: Vec<(Vec<f64>, f64, usize, usize, usize, usize)> = etas
                 .par_iter()
                 .zip(nll_cache.par_iter())
                 .zip(step_scales.par_iter())
@@ -1428,6 +1544,8 @@ fn run_saem_vine(
                         let kappas_mh_opt = omega_iov_cur_opt
                             .as_ref()
                             .map(|iov| (kappas_i.as_slice(), iov));
+
+                        // ---- Kernel 1: primary block move ----
                         let (n_acc, nll_new) = mh_steps_with_dist(
                             &mut eta_work,
                             nll,
@@ -1442,16 +1560,42 @@ fn run_saem_vine(
                             pk_scratch,
                             kappas_mh_opt,
                         );
-                        (eta_work, nll_new, n_acc, n_mh_steps)
+
+                        // ---- Kernel 2: componentwise decorrelating sweep ----
+                        let (n_acc_cw, n_prop_cw, nll_cw) = if n_cw_sweeps > 0 {
+                            mh_steps_componentwise_dist(
+                                &mut eta_work,
+                                nll_new,
+                                subject,
+                                model,
+                                theta_ref,
+                                dist_ref,
+                                sigma_ref,
+                                cw_scales[i],
+                                cw_sd_ref,
+                                &mut rng,
+                                n_cw_sweeps,
+                                pk_scratch,
+                                kappas_mh_opt,
+                            )
+                        } else {
+                            (0, 0, nll_new)
+                        };
+
+                        (eta_work, nll_cw, n_acc, n_mh_steps, n_acc_cw, n_prop_cw)
                     },
                 )
                 .collect();
 
-            for (i, (eta_new, nll_new, n_acc, n_prop)) in results.into_iter().enumerate() {
+            for (i, (eta_new, nll_new, n_acc, n_prop, n_acc_cw, n_prop_cw)) in
+                results.into_iter().enumerate()
+            {
                 etas[i] = eta_new;
                 nll_cache[i] = nll_new;
                 accept_counts[i] += n_acc;
                 proposal_counts[i] += n_prop;
+                cw_accept_counts[i] += n_acc_cw;
+                cw_proposal_counts[i] += n_prop_cw;
             }
         }
 
@@ -1490,8 +1634,14 @@ fn run_saem_vine(
         steps_since_adapt += 1;
 
         // ---- Step 2: M-step for vine Ω (gated by omega_burnin) ----
+        // `gamma_omega` damps the two dependence drivers during exploration —
+        // the Gaussian-equivalent Ω (which builds the block proposal's Cholesky)
+        // and the pair-copula parameters (which enter `log_prior`) — to break the
+        // correlation-collapse feedback. The marginal refit inside `mstep_update`
+        // is a per-coordinate scale, not a dependence driver, and keeps learning
+        // at full rate (cf. θ in the Gaussian arm).
         if k > omega_burnin {
-            dist.mstep_update(&etas, gamma);
+            dist.mstep_update(&etas, gamma_omega);
         }
 
         // ---- Step 2b: SA update for Omega_iov sufficient statistic (IOV only) ----
@@ -1684,6 +1834,20 @@ fn run_saem_vine(
                 }
                 accept_counts[i] = 0;
                 proposal_counts[i] = 0;
+                // Adapt the componentwise kernel scale toward the 1-D optimum
+                // (~0.44 acceptance, Roberts & Rosenthal 2001), independent of
+                // the block scale above.
+                if n_cw_sweeps > 0 {
+                    let cw_total = cw_proposal_counts[i].max(1);
+                    let cw_rate = cw_accept_counts[i] as f64 / cw_total as f64;
+                    if cw_rate > CW_TARGET_ACCEPT {
+                        cw_step_scales[i] = (cw_step_scales[i] * 1.1).min(5.0);
+                    } else {
+                        cw_step_scales[i] = (cw_step_scales[i] * 0.9).max(0.01);
+                    }
+                    cw_accept_counts[i] = 0;
+                    cw_proposal_counts[i] = 0;
+                }
                 if n_kappa > 0 {
                     let kappa_total = kappa_proposal_counts[i].max(1);
                     let kappa_rate = kappa_accept_counts[i] as f64 / kappa_total as f64;

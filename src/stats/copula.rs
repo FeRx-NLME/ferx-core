@@ -900,6 +900,49 @@ impl CopulaFamily {
         }
     }
 
+    /// Refit the parameter from `(u, v)` but damp the move toward the fitted
+    /// value by a Robbins-Monro step `gamma` on the native parameter scale,
+    /// keeping the family fixed: `param_new = (1 − γ)·param_old + γ·param_fit`.
+    ///
+    /// This is the vine analogue of the damped Ω SA step in the Gaussian SAEM
+    /// arm. During the γ=1 exploration phase a single warm-started, not-yet-
+    /// equilibrated MCMC snapshot can be collinear (especially for weakly
+    /// identified components); an undamped MLE then locks the pair-copula at
+    /// extreme dependence, and `log_prior` feeds that back into the next E-step
+    /// — a runaway toward a degenerate vine. Capping the per-iteration move
+    /// averages the draws and breaks the feedback. `gamma >= 1.0` reproduces
+    /// [`refit`]; a family change (which only happens at the first, undamped
+    /// selection) takes the fitted copula as-is.
+    pub fn damped_refit(&self, u: &[f64], v: &[f64], gamma: f64) -> Self {
+        let fitted = self.refit(u, v);
+        if gamma >= 1.0 {
+            return fitted;
+        }
+        let blend = |old: f64, new: f64| (1.0 - gamma) * old + gamma * new;
+        match (self, &fitted) {
+            (CopulaFamily::Gaussian(a), CopulaFamily::Gaussian(b)) => CopulaFamily::Gaussian(
+                GaussianCopula::new(blend(a.rho, b.rho).clamp(-0.999, 0.999)),
+            ),
+            (CopulaFamily::StudentT(a), CopulaFamily::StudentT(b)) => CopulaFamily::StudentT(
+                // ν is a tail-shape nuisance parameter, not a dependence scale;
+                // damp ρ only and keep the freshly fitted ν.
+                StudentTCopula::new(blend(a.rho, b.rho).clamp(-0.999, 0.999), b.nu),
+            ),
+            (CopulaFamily::Clayton(a), CopulaFamily::Clayton(b)) => {
+                CopulaFamily::Clayton(ClaytonCopula::new(blend(a.theta, b.theta).max(1e-6)))
+            }
+            (CopulaFamily::Gumbel(a), CopulaFamily::Gumbel(b)) => {
+                CopulaFamily::Gumbel(GumbelCopula::new(blend(a.theta, b.theta).max(1.0)))
+            }
+            (CopulaFamily::Frank(a), CopulaFamily::Frank(b)) => {
+                let t = blend(a.theta, b.theta);
+                CopulaFamily::Frank(FrankCopula::new(if t.abs() < 1e-6 { 1e-6 } else { t }))
+            }
+            // Family mismatch (only at the first, undamped selection) — adopt fit.
+            _ => fitted,
+        }
+    }
+
     /// Select the best family for (u, v) by AIC. Starts from a fitted Gaussian
     /// and accepts a competing family only when its AIC is strictly lower.
     pub fn select(u: &[f64], v: &[f64]) -> Result<Self, String> {

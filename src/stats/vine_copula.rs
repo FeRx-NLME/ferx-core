@@ -254,10 +254,13 @@ impl VineCopulaOmega {
 
     /// Fit (or re-fit) all pair-copulas from the pseudo-observation matrix.
     ///
-    /// When `select_families == true` the best family is chosen by AIC.
-    /// When false, the existing family label is kept and only the parameter
-    /// is updated. On fitting failure the current copula is left unchanged.
-    fn fit_vine(&mut self, pseudo_obs: &[Vec<f64>], select_families: bool) {
+    /// When `select_families == true` the best family is chosen by AIC (the
+    /// first, undamped M-step). When false, the existing family label is kept
+    /// and only the parameter is updated, damped toward the fresh fit by `gamma`
+    /// (the SAEM step size) to break the dependence-collapse feedback during
+    /// exploration — the vine analogue of the damped Ω SA step. On fitting
+    /// failure the current copula is left unchanged.
+    fn fit_vine(&mut self, pseudo_obs: &[Vec<f64>], select_families: bool, gamma: f64) {
         let d = self.d;
         if d <= 1 {
             return;
@@ -298,7 +301,8 @@ impl VineCopulaOmega {
                         self.pair_copulas[k][j] = cop;
                     }
                 } else {
-                    self.pair_copulas[k][j] = self.pair_copulas[k][j].refit(lefts, rights);
+                    self.pair_copulas[k][j] =
+                        self.pair_copulas[k][j].damped_refit(lefts, rights, gamma);
                 }
 
                 // Compute h-transforms for the next vine level.
@@ -360,7 +364,7 @@ impl RandomEffectDistribution for VineCopulaOmega {
         self.update_sample_cov(sampled_etas, gamma);
         let pseudo_obs = self.pit_from_samples(sampled_etas);
         let select = !self.families_selected;
-        self.fit_vine(&pseudo_obs, select);
+        self.fit_vine(&pseudo_obs, select, gamma);
         if select {
             self.families_selected = true;
         }
