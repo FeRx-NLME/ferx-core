@@ -1,6 +1,6 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Phase 1 wiring merged (PR #191) — Tier 3 convergence + NONMEM comparison pending  
+**Status:** Phase 1 wiring PR open (#192, under review) — 3 blocking bugs to fix before merge  
 **Scope:** Active implementation — code changes underway  
 **Revised:** 2026-06-07 (deep research edition — NONMEM/nlmixr2/Monolix docs, tutorial papers, methods improvements, adjacent fields)
 
@@ -2083,9 +2083,11 @@ treated as bugs:
 **Scope:** Exponential, Weibull, and Gompertz; fixed and random hazard parameters; FOCEI
 Laplace; right-censored, interval-censored, and **left-truncated (delayed entry)**; no PK.
 
-**Status: wiring merged (PR #191).** PR #190 (v0.1.6) merged the infrastructure
-scaffold; PR #191 merged the wiring layer. Remaining: Tier 3 convergence tests and
-NONMEM/nlmixr2 reference comparison.
+**Status: wiring PR open (#192, under review).** PR #190 (v0.1.6) merged the
+infrastructure scaffold. The wiring layer is in PR #192 (branch `feat/tte-wiring`,
+rebased onto main 2026-06-07 after PR #191 landed a SAEM block-Ω fix). A code review
+found 3 blocking bugs (see below); fix, re-review, then merge. After merge: Tier 3
+convergence tests and NONMEM/nlmixr2 reference comparison.
 
 #### Done — PR #190 (infrastructure scaffold)
 
@@ -2110,7 +2112,7 @@ NONMEM/nlmixr2 reference comparison.
 `model.endpoints` which is always empty until the `[event_model]` parser lands. It will
 silently produce no output until then — not a stub, just wired to an empty map.
 
-#### Done — PR #191 (wiring layer)
+#### Done — PR #192 (wiring layer, open)
 
 - ✅ `[event_model]` block parsing in `src/parser/model_parser.rs` — populates
   `model.endpoints[cmt]` with `EndpointLikelihood::Tte { hazard }` using a `param_fn`
@@ -2132,7 +2134,31 @@ silently produce no output until then — not a stub, just wired to an empty map
   duplicate-CMT parse error.
 - ✅ `docs/src/estimation/tte.md` + `docs/src/model-file/event-model.md` + `docs/src/SUMMARY.md`
 
-#### Remaining — follow-up PR(s)
+#### Before PR #192 merges — blocking bugs (found in code review)
+
+- ❌ **`loghr` silently ignored** (`src/parser/model_parser.rs`): the `loghr` expression is
+  parsed and stored but the `param_fn` closure never applies it to the hazard. Fix: multiply
+  `lambda` (Exponential/Gompertz rate, Weibull `(shape/scale)*(t/scale)^(shape-1)`) by
+  `loghr_val.exp()` inside `hazard_and_cum_hazard` — or pass `loghr` as an extra parameter
+  that the caller multiplies onto `h` and adds to `log h`. Either way, a Tier 2 test must
+  verify that a nonzero `loghr` changes the OFV.
+- ❌ **Family-incompatible keys not validated** (`src/parser/model_parser.rs`): a `shape` key
+  in an Exponential `[event_model]` block is silently accepted and then dropped. Add a parse
+  error: if `family = exponential` (or `gompertz`) and `shape` is present, return
+  `Err("shape is not valid for exponential family")`. Extend the duplicate-CMT test to also
+  cover this path.
+- ❌ **CMT collision guard misses `ErrorSpec::Single`** (`src/parser/model_parser.rs`): the
+  guard that prevents a CMT from being declared as both Gaussian and TTE checks
+  `ErrorSpec::PerCmt` but not `ErrorSpec::Single`. Fix: also check the single-CMT arm and
+  error if the error model's sole CMT matches a TTE CMT.
+
+#### Also in PR #192 (this session)
+
+- ✅ **CI break fixed**: `tests/saem_block_omega_collapse.rs` (added to main by PR #191)
+  used the old `s.dv_sim` field. Replaced with `s.outcome.continuous_value()` and pushed
+  to the branch after rebasing onto new main (commit `3b45481`, 2026-06-07).
+
+#### Remaining — follow-up PR(s) after #192 merges
 
 - ❌ SAEM analytic σ M-step skip for TTE subjects (`src/estimation/saem.rs`) — needed
   before SAEM estimation on TTE data (FOCEI already works)
