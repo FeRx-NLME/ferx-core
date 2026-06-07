@@ -127,6 +127,10 @@ pub struct VineCopulaOmega {
     omega_fixed: Vec<bool>,
     /// Initial omega matrix values (for restoring fixed entries after SA).
     initial_matrix: DMatrix<f64>,
+    /// Per-pair pseudo-observations from the last `fit_vine` call.
+    /// `per_pair_pseudo_obs[k][j]` = (lefts, rights) for tree k+1, pair j.
+    /// Used to compute approximate SEs via observed-information Hessian.
+    per_pair_pseudo_obs: Vec<Vec<(Vec<f64>, Vec<f64>)>>,
 }
 
 impl VineCopulaOmega {
@@ -168,6 +172,7 @@ impl VineCopulaOmega {
             initial_omega,
             omega_fixed,
             initial_matrix,
+            per_pair_pseudo_obs: Vec::new(),
         }
     }
 
@@ -272,6 +277,8 @@ impl VineCopulaOmega {
             })
             .collect();
 
+        let mut new_pair_pseudo = vec![Vec::new(); d.saturating_sub(1)];
+
         for k in 0..d - 1 {
             let n_pairs = d - k - 1;
             // Store left/right h-transforms for the next level.
@@ -281,6 +288,9 @@ impl VineCopulaOmega {
             for j in 0..n_pairs {
                 let lefts: &[f64] = &u_cols[j];
                 let rights: &[f64] = &u_cols[j + 1];
+
+                // Store per-pair pseudo-observations for SE computation.
+                new_pair_pseudo[k].push((lefts.to_vec(), rights.to_vec()));
 
                 // Fit or re-fit the pair-copula.
                 if select_families {
@@ -308,6 +318,7 @@ impl VineCopulaOmega {
             next_u.push(new_right_cols[n_pairs - 1].clone());
             u_cols = next_u;
         }
+        self.per_pair_pseudo_obs = new_pair_pseudo;
     }
 }
 
@@ -389,9 +400,15 @@ impl RandomEffectDistribution for VineCopulaOmega {
 pub struct PairCopulaSummary {
     /// Family name: "gaussian", "student_t", "clayton", "gumbel", or "frank".
     pub family: String,
-    /// Copula parameter(s). For Gaussian/Student-t: [(\"rho\", ρ)], plus for
-    /// Student-t [(\"nu\", ν)]. For Clayton/Gumbel/Frank: [(\"theta\", θ)].
+    /// Copula parameter(s). For Gaussian/Student-t: [("rho", ρ)], plus for
+    /// Student-t [("nu", ν)]. For Clayton/Gumbel/Frank: [("theta", θ)].
     pub params: Vec<(String, f64)>,
+    /// Approximate standard errors for each parameter (same ordering as `params`).
+    /// Computed via observed-information Hessian on the transformed scale with
+    /// delta-method back to the natural scale. Labeled "approximate" because
+    /// pseudo-observations are treated as fixed (IFM approximation).
+    #[serde(default)]
+    pub se: Vec<(String, f64)>,
     /// Kendall's rank correlation τ derived from the fitted parameters.
     pub kendall_tau: f64,
     /// Lower tail dependence λ_L = lim_{u→0} P(V ≤ u | U ≤ u).
@@ -531,7 +548,15 @@ impl VineCopulaOmega {
                 };
 
                 let cop = &self.pair_copulas[k][j];
-                let summary = pair_copula_summary(cop);
+                let mut summary = pair_copula_summary(cop);
+                // Attach approximate SEs if pseudo-observations are available.
+                if let Some(pair_pseudo) = self
+                    .per_pair_pseudo_obs
+                    .get(k)
+                    .and_then(|level| level.get(j))
+                {
+                    summary.se = pair_copula_se(cop, &pair_pseudo.0, &pair_pseudo.1);
+                }
                 pairs.push(VinePairEntry {
                     label,
                     copula: summary,
@@ -619,6 +644,7 @@ fn pair_copula_summary(cop: &CopulaFamily) -> PairCopulaSummary {
             PairCopulaSummary {
                 family: "gaussian".into(),
                 params: vec![("rho".into(), rho)],
+                se: vec![],
                 kendall_tau: kendall_tau_gaussian(rho),
                 tail_dep_lower: 0.0,
                 tail_dep_upper: 0.0,
@@ -630,6 +656,7 @@ fn pair_copula_summary(cop: &CopulaFamily) -> PairCopulaSummary {
             PairCopulaSummary {
                 family: "student_t".into(),
                 params: vec![("rho".into(), rho), ("nu".into(), nu)],
+                se: vec![],
                 kendall_tau: kendall_tau_student_t(rho),
                 tail_dep_lower: td,
                 tail_dep_upper: td,
@@ -640,6 +667,7 @@ fn pair_copula_summary(cop: &CopulaFamily) -> PairCopulaSummary {
             PairCopulaSummary {
                 family: "clayton".into(),
                 params: vec![("theta".into(), theta)],
+                se: vec![],
                 kendall_tau: kendall_tau_clayton(theta),
                 tail_dep_lower: (2.0f64).powf(-1.0 / theta),
                 tail_dep_upper: 0.0,
@@ -650,6 +678,7 @@ fn pair_copula_summary(cop: &CopulaFamily) -> PairCopulaSummary {
             PairCopulaSummary {
                 family: "gumbel".into(),
                 params: vec![("theta".into(), theta)],
+                se: vec![],
                 kendall_tau: kendall_tau_gumbel(theta),
                 tail_dep_lower: 0.0,
                 tail_dep_upper: 2.0 - (2.0f64).powf(1.0 / theta),
@@ -660,10 +689,164 @@ fn pair_copula_summary(cop: &CopulaFamily) -> PairCopulaSummary {
             PairCopulaSummary {
                 family: "frank".into(),
                 params: vec![("theta".into(), theta)],
+                se: vec![],
                 kendall_tau: kendall_tau_frank(theta),
                 tail_dep_lower: 0.0,
                 tail_dep_upper: 0.0,
             }
+        }
+    }
+}
+
+/// Approximate SE for each parameter of a fitted pair-copula.
+///
+/// Uses the observed-information Hessian on a transformed scale:
+/// - Gaussian/Student-t ρ: Fisher-z transform `ψ = arctanh(ρ)`
+/// - Student-t ν: log transform `ψ = ln(ν)`
+/// - Clayton/Gumbel θ > 1: log-shift `ψ = ln(θ − 1)` for Gumbel, log `ψ = ln(θ)` for Clayton
+/// - Frank θ: identity
+///
+/// FD step size: `h = 1e-5`. SE = 1/√max(|H|, 1e-12). Delta-method maps SE_ψ → SE_θ.
+/// Returns `Vec<(name, se)>` with the same ordering as `PairCopulaSummary::params`.
+fn pair_copula_se(cop: &CopulaFamily, u: &[f64], v: &[f64]) -> Vec<(String, f64)> {
+    use crate::stats::copula::BivariateCopula;
+
+    if u.len() < 4 {
+        return match cop {
+            CopulaFamily::StudentT(_) => {
+                vec![("rho".into(), f64::NAN), ("nu".into(), f64::NAN)]
+            }
+            _ => vec![("theta_or_rho".into(), f64::NAN)],
+        };
+    }
+
+    let log_lik = |cop_eval: &CopulaFamily| -> f64 {
+        u.iter()
+            .zip(v.iter())
+            .map(|(&ui, &vi)| cop_eval.log_density(ui, vi))
+            .sum::<f64>()
+    };
+
+    let fd_hessian_diag = |ll_center: f64, ll_plus: f64, ll_minus: f64, h: f64| -> f64 {
+        -(ll_plus - 2.0 * ll_center + ll_minus) / (h * h)
+    };
+
+    let h = 1e-5_f64;
+
+    match cop {
+        CopulaFamily::Gaussian(c) => {
+            let rho = c.rho;
+            let psi = rho.atanh(); // Fisher-z
+            let make = |dpsi: f64| -> CopulaFamily {
+                CopulaFamily::Gaussian(crate::stats::copula::GaussianCopula {
+                    rho: (psi + dpsi).tanh().clamp(-0.9999, 0.9999),
+                })
+            };
+            let ll0 = log_lik(cop);
+            let ll_p = log_lik(&make(h));
+            let ll_m = log_lik(&make(-h));
+            let info = fd_hessian_diag(ll0, ll_p, ll_m, h).max(0.0);
+            let se_psi = if info > 1e-12 {
+                1.0 / info.sqrt()
+            } else {
+                f64::NAN
+            };
+            let d_rho_d_psi = 1.0 - rho * rho; // sech²(ψ)
+            vec![("rho".into(), (d_rho_d_psi * se_psi).abs())]
+        }
+        CopulaFamily::StudentT(c) => {
+            let (rho, nu) = (c.rho, c.nu);
+            let psi_rho = rho.atanh();
+            let psi_nu = nu.ln();
+            // ρ diagonal
+            let make_rho = |dp: f64| -> CopulaFamily {
+                CopulaFamily::StudentT(crate::stats::copula::StudentTCopula {
+                    rho: (psi_rho + dp).tanh().clamp(-0.9999, 0.9999),
+                    nu,
+                })
+            };
+            let ll0 = log_lik(cop);
+            let ll_p = log_lik(&make_rho(h));
+            let ll_m = log_lik(&make_rho(-h));
+            let info_rho = fd_hessian_diag(ll0, ll_p, ll_m, h).max(0.0);
+            let se_psi_rho = if info_rho > 1e-12 {
+                1.0 / info_rho.sqrt()
+            } else {
+                f64::NAN
+            };
+            let d_rho = (1.0 - rho * rho) * se_psi_rho;
+            // ν diagonal
+            let make_nu = |dp: f64| -> CopulaFamily {
+                CopulaFamily::StudentT(crate::stats::copula::StudentTCopula {
+                    rho,
+                    nu: (psi_nu + dp).exp().max(2.001),
+                })
+            };
+            let ll_p2 = log_lik(&make_nu(h));
+            let ll_m2 = log_lik(&make_nu(-h));
+            let info_nu = fd_hessian_diag(ll0, ll_p2, ll_m2, h).max(0.0);
+            let se_psi_nu = if info_nu > 1e-12 {
+                1.0 / info_nu.sqrt()
+            } else {
+                f64::NAN
+            };
+            let d_nu = nu * se_psi_nu;
+            vec![("rho".into(), d_rho.abs()), ("nu".into(), d_nu.abs())]
+        }
+        CopulaFamily::Clayton(c) => {
+            let theta = c.theta;
+            let psi = theta.max(1e-8).ln();
+            let make = |dp: f64| -> CopulaFamily {
+                CopulaFamily::Clayton(crate::stats::copula::ClaytonCopula {
+                    theta: (psi + dp).exp().max(1e-6),
+                })
+            };
+            let ll0 = log_lik(cop);
+            let ll_p = log_lik(&make(h));
+            let ll_m = log_lik(&make(-h));
+            let info = fd_hessian_diag(ll0, ll_p, ll_m, h).max(0.0);
+            let se_psi = if info > 1e-12 {
+                1.0 / info.sqrt()
+            } else {
+                f64::NAN
+            };
+            vec![("theta".into(), (theta * se_psi).abs())]
+        }
+        CopulaFamily::Gumbel(c) => {
+            let theta = c.theta;
+            let psi = (theta - 1.0).max(1e-8).ln();
+            let make = |dp: f64| -> CopulaFamily {
+                CopulaFamily::Gumbel(crate::stats::copula::GumbelCopula {
+                    theta: 1.0 + (psi + dp).exp(),
+                })
+            };
+            let ll0 = log_lik(cop);
+            let ll_p = log_lik(&make(h));
+            let ll_m = log_lik(&make(-h));
+            let info = fd_hessian_diag(ll0, ll_p, ll_m, h).max(0.0);
+            let se_psi = if info > 1e-12 {
+                1.0 / info.sqrt()
+            } else {
+                f64::NAN
+            };
+            let d_theta = (theta - 1.0) * se_psi; // ∂θ/∂ψ = exp(ψ) = θ − 1
+            vec![("theta".into(), d_theta.abs())]
+        }
+        CopulaFamily::Frank(c) => {
+            let theta = c.theta;
+            let make = |dp: f64| -> CopulaFamily {
+                CopulaFamily::Frank(crate::stats::copula::FrankCopula { theta: theta + dp })
+            };
+            let ll0 = log_lik(cop);
+            let ll_p = log_lik(&make(h));
+            let ll_m = log_lik(&make(-h));
+            let info = fd_hessian_diag(ll0, ll_p, ll_m, h).max(0.0);
+            let se = if info > 1e-12 {
+                1.0 / info.sqrt()
+            } else {
+                f64::NAN
+            };
+            vec![("theta".into(), se.abs())]
         }
     }
 }
@@ -817,6 +1000,39 @@ mod tests {
     /// warfarin model), sample mean should be within 0.03 and sample variance
     /// within 20 % of the true value with overwhelming probability.
     #[test]
+    /// `pair_copula_se` returns a finite positive SE for a Gaussian copula with
+    /// 50 paired pseudo-observations drawn from the copula's own distribution.
+    #[test]
+    fn pair_copula_se_gaussian_is_finite_positive() {
+        use crate::stats::copula::{BivariateCopula, GaussianCopula};
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let rho_true = 0.6;
+        let cop = CopulaFamily::Gaussian(GaussianCopula::new(rho_true));
+        // Draw n=50 (u,v) pairs from a Gaussian copula using the Gaussian copula
+        // CDF: u ~ Uniform, v = h_inv(w | u) for w ~ Uniform.
+        let n = 50usize;
+        let mut u_data = vec![0.0f64; n];
+        let mut v_data = vec![0.0f64; n];
+        for i in 0..n {
+            let u: f64 = rng.gen_range(0.01..0.99);
+            let w: f64 = rng.gen_range(0.01..0.99);
+            let v = cop.h_inv(w, u).clamp(0.01, 0.99);
+            u_data[i] = u;
+            v_data[i] = v;
+        }
+        let ses = pair_copula_se(&cop, &u_data, &v_data);
+        assert_eq!(ses.len(), 1);
+        assert_eq!(ses[0].0, "rho");
+        let se = ses[0].1;
+        assert!(
+            se.is_finite() && se > 0.0,
+            "SE should be finite positive, got {se}"
+        );
+        // SE for rho from n=50 should be in a reasonable range (rough bound: SE < 0.5)
+        assert!(se < 0.5, "SE seems implausibly large: {se}");
+    }
+
     fn draw_eta_marginals_match_configured() {
         use rand::SeedableRng;
         let dist = make_dist();

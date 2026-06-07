@@ -490,7 +490,22 @@ pub fn print_results(result: &FitResult) {
                     .copula
                     .params
                     .iter()
-                    .map(|(k, v)| format!("{}={:.4}", k, v))
+                    .map(|(pname, pval)| {
+                        let se_str = entry
+                            .copula
+                            .se
+                            .iter()
+                            .find(|(k, _)| k == pname)
+                            .map(|(_, se)| {
+                                if se.is_nan() {
+                                    " (SE=NA)".into()
+                                } else {
+                                    format!(" (SE≈{:.4})", se)
+                                }
+                            })
+                            .unwrap_or_default();
+                        format!("{}={:.4}{}", pname, pval, se_str)
+                    })
                     .collect();
                 let mut line = format!(
                     "    {}  [{}  {}  τ={:.3}",
@@ -1195,6 +1210,15 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     for (pname, pval) in &entry.copula.params {
                         writeln!(f, "          {}: {:.6}", pname, pval)
                             .map_err(|e| e.to_string())?;
+                        if let Some((_, se)) = entry.copula.se.iter().find(|(k, _)| k == pname) {
+                            if se.is_nan() {
+                                writeln!(f, "          {}_se: NA", pname)
+                                    .map_err(|e| e.to_string())?;
+                            } else {
+                                writeln!(f, "          {}_se: {:.6}", pname, se)
+                                    .map_err(|e| e.to_string())?;
+                            }
+                        }
                     }
                     writeln!(f, "          kendall_tau: {:.6}", entry.copula.kendall_tau)
                         .map_err(|e| e.to_string())?;
