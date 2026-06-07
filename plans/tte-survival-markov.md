@@ -1,6 +1,6 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Phase 1 in progress — infrastructure scaffold merged (PR #190, v0.1.6)  
+**Status:** Phase 1 wiring merged (PR #191) — Tier 3 convergence + NONMEM comparison pending  
 **Scope:** Active implementation — code changes underway  
 **Revised:** 2026-06-07 (deep research edition — NONMEM/nlmixr2/Monolix docs, tutorial papers, methods improvements, adjacent fields)
 
@@ -2083,8 +2083,9 @@ treated as bugs:
 **Scope:** Exponential, Weibull, and Gompertz; fixed and random hazard parameters; FOCEI
 Laplace; right-censored, interval-censored, and **left-truncated (delayed entry)**; no PK.
 
-**Status: in progress.** PR #190 (v0.1.6) merged the infrastructure scaffold. The
-remaining work is the wiring: parser, datareader, likelihood dispatch, tests, and docs.
+**Status: wiring merged (PR #191).** PR #190 (v0.1.6) merged the infrastructure
+scaffold; PR #191 merged the wiring layer. Remaining: Tier 3 convergence tests and
+NONMEM/nlmixr2 reference comparison.
 
 #### Done — PR #190 (infrastructure scaffold)
 
@@ -2109,27 +2110,37 @@ remaining work is the wiring: parser, datareader, likelihood dispatch, tests, an
 `model.endpoints` which is always empty until the `[event_model]` parser lands. It will
 silently produce no output until then — not a stub, just wired to an empty map.
 
-#### Remaining — next Phase 1 PR
+#### Done — PR #191 (wiring layer)
 
-- ❌ `[event_model]` block parsing in `src/parser/model_parser.rs` — populates
+- ✅ `[event_model]` block parsing in `src/parser/model_parser.rs` — populates
   `model.endpoints[cmt]` with `EndpointLikelihood::Tte { hazard }` using a `param_fn`
   closure. Keys: `cmt`, `family` (exponential|weibull|gompertz), `shape`, `scale`/`rate`,
-  `loghr` (optional PH covariate term).
-- ❌ Datareader TTE row routing in `src/io/datareader.rs` — detect `TENTRY` column;
-  for EVID=0 rows where `cmt ∈ tte_cmts`: parse DV as censoring code (0=right-censored,
-  1=exact, 2=interval bound) and push to `subject.obs_records` instead of the Gaussian Vecs
-- ❌ `individual_nll` dispatch for TTE data term (`src/stats/likelihood.rs`)
-- ❌ `foce_subject_nll_interaction` dispatch: FD Hessian + `½ log|det H_total|` for TTE CMTs
+  `loghr` (optional PH covariate term). Named blocks for multiple endpoints. Duplicate-CMT guard.
+- ✅ Datareader TTE row routing in `src/io/datareader.rs` — `TENTRY` column detection;
+  DV=0/1/2 routing into `subject.obs_records`; deferred-flush pattern for interval-censored
+  pairs; end-of-subject flush; two new `read_nonmem_csv_*_tte` helpers.
+- ✅ `individual_nll` dispatch for TTE data term (`src/stats/likelihood.rs`) — 2× scaling
+  to match the Gaussian `data_ll` halving convention.
+- ✅ `foce_subject_nll_interaction_with_tte`: FD Hessian + `½ log|det H_total|` for TTE CMTs
   (`src/stats/likelihood.rs`)
-- ❌ SAEM analytic σ M-step skip for TTE subjects (`src/estimation/saem.rs`)
-- ❌ `predict_survival` in `src/api.rs`: returns `Prediction::Survival { s, cum_hazard,
-  hazard }` on a time grid; median survival + E[T]
-- ❌ Example files: `examples/tte_exponential.ferx`, `examples/tte_weibull.ferx`,
-  `examples/tte_gompertz.ferx` + `data/tte_exponential.csv` (run simulate.R)
-- ❌ Tier 2 smoke tests (`tests/tte_smoke.rs`): `fit()` in ≤5 outer iterations; fixed-effects
-  `n_eta=0` Weibull PH (validates empty-Ω path, §16 D7)
-- ❌ Tier 3 convergence + SSE tests (`tests/tte_convergence.rs`, gated `slow-tests`)
-- ❌ `docs/src/estimation/tte.md` + entry in `docs/src/SUMMARY.md`; NONMEM comparison table
+- ✅ `predict_survival` in `src/api.rs`: `SurvivalPredictionResult` returning S(t), H(t), h(t)
+  on a time grid; median survival; mean survival from numerical integration.
+- ✅ API: `read_population_for` dispatches to TTE-aware reader when `model.endpoints` has TTE CMTs.
+- ✅ Example files: `examples/tte_exponential.ferx` + `data/tte_exponential.csv`
+  (30-subject simulated exponential TTE dataset).
+- ✅ Tier 2 smoke tests (`tests/tte_smoke.rs`): parse test, fit 3 iter, n_eta=0 path,
+  duplicate-CMT parse error.
+- ✅ `docs/src/estimation/tte.md` + `docs/src/model-file/event-model.md` + `docs/src/SUMMARY.md`
+
+#### Remaining — follow-up PR(s)
+
+- ❌ SAEM analytic σ M-step skip for TTE subjects (`src/estimation/saem.rs`) — needed
+  before SAEM estimation on TTE data (FOCEI already works)
+- ❌ Tier 3 convergence tests (`tests/tte_convergence.rs`, gated `slow-tests`)
+- ❌ NONMEM/nlmixr2 reference comparison (run `tests/reference/tte_exponential/` scripts;
+  fill the comparison table in `docs/src/estimation/tte.md`)
+- ❌ Allow absent `[structural_model]` / `[error_model]` when `[event_model]` is present
+  (currently requires dummy structural/error blocks for TTE-only models)
 
 ### Phase 1b — Competing risks (cause-specific hazard)
 
