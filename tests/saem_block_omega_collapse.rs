@@ -143,7 +143,7 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
         let dv: Vec<f64> = sim
             .iter()
             .filter(|s| s.id == subj.id)
-            .map(|s| s.dv_sim.max(1e-6))
+            .map(|s| s.outcome.continuous_value().max(1e-6))
             .collect();
         subj.observations = dv;
     }
