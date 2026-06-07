@@ -938,6 +938,7 @@ fn mh_steps_with_dist(
     rng: &mut impl Rng,
     n_steps: usize,
     pk_scratch: &mut EventPkParams,
+    kappas_iov_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
 ) -> (usize, f64) {
     let n_eta = eta.len();
     let l = dist.proposal_chol();
@@ -951,9 +952,25 @@ fn mh_steps_with_dist(
             .map(|j| eta[j] + step_scale * perturbation[j])
             .collect();
 
-        let obs_nll_prop =
-            obs_nll_subject_into(model, subject, theta, sigma_values, &eta_prop, pk_scratch);
-        let nll_prop = obs_nll_prop + dist.log_prior(&eta_prop);
+        let obs_nll_prop = if let Some((kappas, _)) = kappas_iov_opt {
+            obs_nll_subject_into_iov(
+                model,
+                subject,
+                theta,
+                sigma_values,
+                &eta_prop,
+                kappas,
+                pk_scratch,
+            )
+        } else {
+            obs_nll_subject_into(model, subject, theta, sigma_values, &eta_prop, pk_scratch)
+        };
+        // Kappa prior is constant (kappas fixed during eta MH) → cancels in ratio,
+        // but include it so the returned NLL stays on the same scale as the cache.
+        let kap_prior = kappas_iov_opt
+            .map(|(kaps, iov)| kappa_prior_nll(kaps, iov))
+            .unwrap_or(0.0);
+        let nll_prop = obs_nll_prop + dist.log_prior(&eta_prop) + kap_prior;
 
         if rng.gen::<f64>().ln() < nll - nll_prop {
             eta.copy_from_slice(&eta_prop);
@@ -968,14 +985,95 @@ fn mh_steps_with_dist(
 // SAEM loop with vine-copula random-effect distribution
 // ---------------------------------------------------------------------------
 
+/// Gaussian prior NLL for a set of kappa vectors: 0.5 * (Σ_k κ_k'Ω_iov⁻¹κ_k + K·log|Ω_iov|).
+fn kappa_prior_nll(kappas: &[Vec<f64>], omega_iov: &OmegaMatrix) -> f64 {
+    let n = omega_iov.matrix.nrows();
+    if n == 0 || kappas.is_empty() {
+        return 0.0;
+    }
+    let log_det: f64 = (0..n)
+        .map(|i| omega_iov.chol[(i, i)].abs().ln())
+        .sum::<f64>()
+        * 2.0;
+    let omega_inv = match omega_iov.matrix.clone().cholesky() {
+        Some(ch) => ch.inverse(),
+        None => return 1e20,
+    };
+    let quad: f64 = kappas
+        .iter()
+        .map(|kap| {
+            let kv = DVector::from_column_slice(kap);
+            kv.dot(&(&omega_inv * &kv))
+        })
+        .sum();
+    0.5 * (quad + kappas.len() as f64 * log_det)
+}
+
+/// Metropolis-Hastings kappa step for vine+IOV models.
+///
+/// Mirrors `mh_kappa_steps` but uses the vine prior for eta rather than a
+/// Gaussian, so that `nll_current` and the proposal NLL are on the same scale:
+///   nll = obs_nll_iov + vine_prior(η) + gaussian_kappa_prior(κ, Ω_iov)
+/// The vine_prior(η) term is constant (η fixed) and cancels in the ratio.
+fn mh_kappa_steps_vine(
+    kappas: &mut [Vec<f64>],
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    eta: &[f64],
+    dist: &crate::stats::vine_copula::VineCopulaOmega,
+    omega_iov: &OmegaMatrix,
+    sigma_values: &[f64],
+    step_scale: f64,
+    rng: &mut impl Rng,
+) -> (usize, usize, f64) {
+    let n_kappa = omega_iov.matrix.nrows();
+    let l = &omega_iov.chol;
+    let mut nll = nll_current;
+    let mut n_accepted = 0;
+    let n_occ = kappas.len();
+    let vine_prior = dist.log_prior(eta); // constant — eta is fixed
+
+    for k in 0..n_occ {
+        let z: Vec<f64> = (0..n_kappa).map(|_| rng.sample(StandardNormal)).collect();
+        let perturbation = l * DVector::from_column_slice(&z);
+        let kap_prop: Vec<f64> = (0..n_kappa)
+            .map(|j| kappas[k][j] + step_scale * perturbation[j])
+            .collect();
+
+        let old_kap = kappas[k].clone();
+        kappas[k] = kap_prop;
+
+        let mut scratch = EventPkParams::default();
+        let obs_prop = obs_nll_subject_into_iov(
+            model,
+            subject,
+            theta,
+            sigma_values,
+            eta,
+            kappas,
+            &mut scratch,
+        );
+        let kap_prior_prop = kappa_prior_nll(kappas, omega_iov);
+        let nll_prop = obs_prop + vine_prior + kap_prior_prop;
+
+        if rng.gen::<f64>().ln() < nll - nll_prop {
+            nll = nll_prop;
+            n_accepted += 1;
+        } else {
+            kappas[k] = old_kap;
+        }
+    }
+    (n_accepted, n_occ, nll)
+}
+
 /// Run the full SAEM loop using a [`VineCopulaOmega`] distribution for the
 /// E-step prior and M-step Ω update. Called from [`run_saem`] when
 /// `options.saem_omega_dist == OmegaDist::VineCopula`.
 ///
-/// Limitations vs the Gaussian arm:
-/// - IOV models (`n_kappa > 0`) are not supported — returns `Err`.
-/// - HMC is not supported (vine `log_prior_grad` is not yet implemented);
-///   a warning is emitted and the run falls back to MH.
+/// HMC is not supported (vine `log_prior_grad` is not yet implemented);
+/// a warning is emitted and the run falls back to MH.
 fn run_saem_vine(
     model: &CompiledModel,
     population: &Population,
@@ -986,13 +1084,6 @@ fn run_saem_vine(
     use rayon::prelude::*;
 
     let n_kappa = model.n_kappa;
-    if n_kappa > 0 {
-        return Err(
-            "omega_dist = vine is not supported with IOV models (n_kappa > 0); \
-             set omega_dist = gaussian or remove the kappa declarations"
-                .into(),
-        );
-    }
 
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
@@ -1110,21 +1201,78 @@ fn run_saem_vine(
     let mut theta_cur: Vec<f64> = init_params.theta.clone();
     let mut sigma_cur: Vec<f64> = init_params.sigma.values.clone();
 
-    // Initial NLL cache: obs_nll + vine prior.
+    // IOV kappa state — mirrors the Gaussian arm.
+    debug_assert!(
+        n_kappa == 0 || init_params.omega_iov.is_some(),
+        "n_kappa > 0 but init_params.omega_iov is None — model is misconfigured"
+    );
+    let (mut kappas, mut omega_iov_mat, mut s2_iov): (
+        Vec<Vec<Vec<f64>>>,
+        DMatrix<f64>,
+        DMatrix<f64>,
+    ) = if n_kappa > 0 {
+        let kaps: Vec<Vec<Vec<f64>>> = population
+            .subjects
+            .iter()
+            .map(|s| {
+                let n_occ = split_obs_by_occasion(s).len();
+                vec![vec![0.0f64; n_kappa]; n_occ]
+            })
+            .collect();
+        let iov_mat = init_params
+            .omega_iov
+            .as_ref()
+            .map(|iov| iov.matrix.clone())
+            .unwrap_or_else(|| DMatrix::identity(n_kappa, n_kappa));
+        (kaps, iov_mat.clone(), iov_mat)
+    } else {
+        (
+            vec![vec![]; n_subjects],
+            DMatrix::zeros(0, 0),
+            DMatrix::zeros(0, 0),
+        )
+    };
+    let mut kappa_step_scales = vec![0.3f64; n_subjects];
+    let mut kappa_accept_counts = vec![0usize; n_subjects];
+    let mut kappa_proposal_counts = vec![0usize; n_subjects];
+
+    // Initial NLL cache: obs_nll (+ IOV if present) + vine prior (+ kappa prior if IOV).
+    let omega_iov_init_om: Option<OmegaMatrix> = if n_kappa > 0 {
+        init_params.omega_iov.clone()
+    } else {
+        None
+    };
     let mut nll_cache: Vec<f64> = population
         .subjects
         .iter()
         .enumerate()
         .map(|(i, subject)| {
             let mut scratch = EventPkParams::default();
-            obs_nll_subject_into(
-                model,
-                subject,
-                &theta_cur,
-                &sigma_cur,
-                &etas[i],
-                &mut scratch,
-            ) + dist.log_prior(&etas[i])
+            let obs = if n_kappa > 0 {
+                obs_nll_subject_into_iov(
+                    model,
+                    subject,
+                    &theta_cur,
+                    &sigma_cur,
+                    &etas[i],
+                    &kappas[i],
+                    &mut scratch,
+                )
+            } else {
+                obs_nll_subject_into(
+                    model,
+                    subject,
+                    &theta_cur,
+                    &sigma_cur,
+                    &etas[i],
+                    &mut scratch,
+                )
+            };
+            let kap_prior = omega_iov_init_om
+                .as_ref()
+                .map(|iov| kappa_prior_nll(&kappas[i], iov))
+                .unwrap_or(0.0);
+            obs + dist.log_prior(&etas[i]) + kap_prior
         })
         .collect();
 
@@ -1138,6 +1286,20 @@ fn run_saem_vine(
         }
         let gamma = if k <= k1 { 1.0 } else { 1.0 / (k - k1) as f64 };
 
+        // Rebuild omega_iov for this iteration (IOV models only).
+        let omega_iov_cur_opt: Option<OmegaMatrix> = if n_kappa > 0 {
+            init_params.omega_iov.as_ref().map(|iov_ref| {
+                OmegaMatrix::from_matrix_with_mask(
+                    omega_iov_mat.clone(),
+                    iov_ref.eta_names.clone(),
+                    iov_ref.diagonal,
+                    iov_ref.free_mask.clone(),
+                )
+            })
+        } else {
+            None
+        };
+
         // ---- Step 1: MH E-step (parallelized) ----
         {
             let theta_ref = &theta_cur;
@@ -1148,10 +1310,11 @@ fn run_saem_vine(
                 .par_iter()
                 .zip(nll_cache.par_iter())
                 .zip(step_scales.par_iter())
+                .zip(kappas.par_iter())
                 .enumerate()
                 .map_init(
                     EventPkParams::default,
-                    |pk_scratch, (i, ((eta, &nll), &scale))| {
+                    |pk_scratch, (i, (((eta, &nll), &scale), kappas_i))| {
                         let subject = &population.subjects[i];
                         let mut rng = StdRng::seed_from_u64(
                             master_seed
@@ -1159,6 +1322,9 @@ fn run_saem_vine(
                                 .wrapping_add(i as u64),
                         );
                         let mut eta_work = eta.clone();
+                        let kappas_mh_opt = omega_iov_cur_opt
+                            .as_ref()
+                            .map(|iov| (kappas_i.as_slice(), iov));
                         let (n_acc, nll_new) = mh_steps_with_dist(
                             &mut eta_work,
                             nll,
@@ -1171,6 +1337,7 @@ fn run_saem_vine(
                             &mut rng,
                             n_mh_steps,
                             pk_scratch,
+                            kappas_mh_opt,
                         );
                         (eta_work, nll_new, n_acc, n_mh_steps)
                     },
@@ -1185,6 +1352,38 @@ fn run_saem_vine(
             }
         }
 
+        // ---- Step 1b: Per-occasion kappa MH (IOV models only) ----
+        if n_kappa > 0 {
+            if let Some(omega_iov_cur) = omega_iov_cur_opt.as_ref() {
+                for i in 0..n_subjects {
+                    let subject = &population.subjects[i];
+                    let mut rng = StdRng::seed_from_u64(
+                        master_seed
+                            .wrapping_add(k as u64 * 100_000)
+                            .wrapping_add(i as u64)
+                            .wrapping_add(999_999),
+                    );
+                    let nll_kappa_ref = nll_cache[i];
+                    let (n_acc, n_prop, nll_new) = mh_kappa_steps_vine(
+                        &mut kappas[i],
+                        nll_kappa_ref,
+                        subject,
+                        model,
+                        &theta_cur,
+                        &etas[i],
+                        &dist,
+                        omega_iov_cur,
+                        &sigma_cur,
+                        kappa_step_scales[i],
+                        &mut rng,
+                    );
+                    nll_cache[i] = nll_new;
+                    kappa_accept_counts[i] += n_acc;
+                    kappa_proposal_counts[i] += n_prop;
+                }
+            }
+        }
+
         steps_since_adapt += 1;
 
         // ---- Step 2: M-step for vine Ω (gated by omega_burnin) ----
@@ -1192,8 +1391,30 @@ fn run_saem_vine(
             dist.mstep_update(&etas, gamma);
         }
 
+        // ---- Step 2b: SA update for Omega_iov sufficient statistic (IOV only) ----
+        if n_kappa > 0 {
+            let mut kappa_outer = DMatrix::zeros(n_kappa, n_kappa);
+            let mut n_total_occ = 0_usize;
+            for kappas_i in &kappas {
+                for kap in kappas_i {
+                    let kv = DVector::from_column_slice(kap);
+                    kappa_outer += &kv * kv.transpose();
+                    n_total_occ += 1;
+                }
+            }
+            if n_total_occ > 0 {
+                kappa_outer /= n_total_occ as f64;
+            }
+            s2_iov = (1.0 - gamma) * &s2_iov + gamma * &kappa_outer;
+        }
+
         // ---- Step 3: M-step theta, sigma (NLopt, warm-started) ----
         let run_mstep = k <= 5 || k % 3 == 0 || k > k1;
+        let kappas_for_mstep: Option<&[Vec<Vec<f64>>]> = if n_kappa > 0 {
+            Some(kappas.as_slice())
+        } else {
+            None
+        };
         if run_mstep {
             let mstep_maxiter = if k <= k1 { 3 } else { 5 };
 
@@ -1228,7 +1449,7 @@ fn run_saem_vine(
                     model,
                     population,
                     &etas,
-                    None,
+                    kappas_for_mstep,
                     &log_theta,
                     &log_sigma,
                     &temp_theta_lower,
@@ -1248,7 +1469,7 @@ fn run_saem_vine(
                     model,
                     population,
                     &etas,
-                    None,
+                    kappas_for_mstep,
                     &log_theta,
                     &log_sigma,
                     &log_theta_lower,
@@ -1271,8 +1492,65 @@ fn run_saem_vine(
             sigma_cur = log_sigma.iter().map(|&v| v.exp()).collect();
         }
 
-        // ---- Refresh NLL cache (vine prior + updated theta/sigma) ----
-        {
+        // ---- Step 3b: M-step Omega_iov (IOV only, gated by omega_burnin) ----
+        if n_kappa > 0 && k > omega_burnin {
+            if let Some(omega_iov_ref) = init_params.omega_iov.as_ref() {
+                omega_iov_mat = s2_iov.clone();
+                for i in 0..n_kappa {
+                    for j in 0..n_kappa {
+                        if !omega_iov_ref.free_mask[(i, j)] {
+                            omega_iov_mat[(i, j)] = 0.0;
+                        }
+                    }
+                }
+                for i in 0..n_kappa {
+                    for j in 0..n_kappa {
+                        let fi = init_params.kappa_fixed.get(i).copied().unwrap_or(false);
+                        let fj = init_params.kappa_fixed.get(j).copied().unwrap_or(false);
+                        if fi || fj {
+                            omega_iov_mat[(i, j)] = omega_iov_ref.matrix[(i, j)];
+                        }
+                    }
+                }
+                for i in 0..n_kappa {
+                    if omega_iov_mat[(i, i)] < 1e-8 {
+                        omega_iov_mat[(i, i)] = 1e-8;
+                    }
+                }
+            }
+        }
+
+        // ---- Refresh NLL cache (vine prior + kappa prior + updated theta/sigma) ----
+        if n_kappa > 0 {
+            // Sequential for IOV (same rationale as Gaussian arm)
+            let omega_iov_upd = init_params.omega_iov.as_ref().map(|iov_ref| {
+                OmegaMatrix::from_matrix_with_mask(
+                    omega_iov_mat.clone(),
+                    iov_ref.eta_names.clone(),
+                    iov_ref.diagonal,
+                    iov_ref.free_mask.clone(),
+                )
+            });
+            nll_cache = (0..n_subjects)
+                .map(|i| {
+                    let mut scratch = EventPkParams::default();
+                    let obs = obs_nll_subject_into_iov(
+                        model,
+                        &population.subjects[i],
+                        &theta_cur,
+                        &sigma_cur,
+                        &etas[i],
+                        &kappas[i],
+                        &mut scratch,
+                    );
+                    let kap_prior = omega_iov_upd
+                        .as_ref()
+                        .map(|iov| kappa_prior_nll(&kappas[i], iov))
+                        .unwrap_or(0.0);
+                    obs + dist.log_prior(&etas[i]) + kap_prior
+                })
+                .collect();
+        } else {
             let dist_ref: &VineCopulaOmega = &dist;
             let new_nlls: Vec<f64> = etas
                 .par_iter()
@@ -1303,6 +1581,17 @@ fn run_saem_vine(
                 }
                 accept_counts[i] = 0;
                 proposal_counts[i] = 0;
+                if n_kappa > 0 {
+                    let kappa_total = kappa_proposal_counts[i].max(1);
+                    let kappa_rate = kappa_accept_counts[i] as f64 / kappa_total as f64;
+                    if kappa_rate > 0.40 {
+                        kappa_step_scales[i] = (kappa_step_scales[i] * 1.1).min(5.0);
+                    } else {
+                        kappa_step_scales[i] = (kappa_step_scales[i] * 0.9).max(0.01);
+                    }
+                    kappa_accept_counts[i] = 0;
+                    kappa_proposal_counts[i] = 0;
+                }
             }
             steps_since_adapt = 0;
         }
@@ -1347,7 +1636,18 @@ fn run_saem_vine(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
-        omega_iov: init_params.omega_iov.clone(),
+        omega_iov: if n_kappa > 0 {
+            init_params.omega_iov.as_ref().map(|iov_ref| {
+                OmegaMatrix::from_matrix_with_mask(
+                    omega_iov_mat.clone(),
+                    iov_ref.eta_names.clone(),
+                    iov_ref.diagonal,
+                    iov_ref.free_mask.clone(),
+                )
+            })
+        } else {
+            init_params.omega_iov.clone()
+        },
         kappa_fixed: init_params.kappa_fixed.clone(),
         vine_dist: Some(std::sync::Arc::new(dist.clone())),
     };
@@ -2832,20 +3132,83 @@ mod tests {
         );
     }
 
-    /// vine SAEM with IOV model returns an informative Err.
+    /// vine SAEM with an IOV model completes without error.
     ///
-    /// IOV support for the vine path is deferred; the guard in `run_saem_vine`
-    /// ensures it fails with a clear message rather than producing wrong results.
-    /// A full parse+fit IOV regression lives in tests/saem_vine_iov.rs.
+    /// Minimal smoke test: one subject, two occasions, one BSV eta, one IOV kappa.
+    /// Verifies the vine + Gaussian IOV path runs and returns a finite OFV.
     #[test]
-    fn vine_omega_dist_iov_returns_error() {
-        // run_saem_vine is called from run_saem on the VineCopula arm.
-        // The analytical_model has n_kappa = 0, so IOV cannot be triggered
-        // from that model. The guard is proven correct by code inspection:
-        // run_saem_vine's first check is `if n_kappa > 0 { return Err(...) }`.
-        // This test is a compilation-only placeholder that documents the
-        // requirement; the behavioural assertion lives in the integration suite.
-        let _ = ();
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
+    fn vine_omega_dist_with_iov_runs() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{DoseEvent, FitOptions, OmegaDist, Population};
+        let model_str = r#"
+[parameters]
+theta CL = 1.0 lower=0
+theta V  = 10.0 lower=0
+omega ETA_CL ~ 0.1
+kappa KAPPA_CL ~ 0.1
+
+[individual_parameters]
+CL = theta(CL) * exp(eta(ETA_CL) + kappa(KAPPA_CL))
+V  = theta(V)
+
+[structural_model]
+pk = one_cpt_iv(CL, V)
+
+[error_model]
+proportional sigma = 0.1
+
+[fit_options]
+method = saem
+omega_dist = vine
+"#;
+        let model = parse_model_string(model_str).expect("parse");
+        let subj = Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 4.0, 8.0, 13.0, 16.0, 20.0],
+            observations: vec![6.0, 4.0, 2.0, 5.5, 3.5, 1.8],
+            obs_cmts: vec![1; 6],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 6],
+            occasions: vec![0, 0, 0, 1, 1, 1],
+            dose_occasions: vec![0, 1],
+        };
+        let pop = Population {
+            subjects: vec![subj],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let init = model.default_params.clone();
+        let opts = FitOptions {
+            method: crate::types::EstimationMethod::Saem,
+            saem_omega_dist: OmegaDist::VineCopula,
+            saem_n_exploration: 5,
+            saem_n_convergence: 5,
+            saem_n_mh_steps: 2,
+            verbose: false,
+            ..Default::default()
+        };
+        let result = run_saem(&model, &pop, &init, &opts).expect("vine+IOV saem should succeed");
+        assert!(result.ofv.is_finite(), "OFV must be finite");
+        assert!(
+            result.params.omega_iov.is_some(),
+            "omega_iov must be populated"
+        );
     }
 
     /// Per-theta packing must round-trip values identically for both log-packed
