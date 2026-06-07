@@ -2134,11 +2134,27 @@ fn fit_inner(
     }
 
     let n_obs = population.n_obs();
-    let n_params = n_params_pre;
+
+    // For vine fits: use vine_corrected_ofv as the base (replaces Gaussian prior
+    // with the vine prior at the final EBEs) and add the pair-copula parameter count.
+    // The vine marginal means/stds are subsumed by omega_equiv and not re-counted.
+    let (ofv_for_ic, n_copula_params) = if let Some(ref vine) = result.params.vine_dist {
+        let copula_k: usize = vine
+            .pair_copulas
+            .iter()
+            .flat_map(|level| level.iter())
+            .map(|cop| cop.n_params())
+            .sum();
+        let base = result.vine_corrected_ofv.unwrap_or(result.ofv);
+        (base, copula_k)
+    } else {
+        (result.ofv, 0)
+    };
+    let n_params = n_params_pre + n_copula_params;
 
     let ofv = result.ofv;
-    let aic = ofv + 2.0 * n_params as f64;
-    let bic = ofv + n_params as f64 * (n_obs as f64).ln();
+    let aic = ofv_for_ic + 2.0 * n_params as f64;
+    let bic = ofv_for_ic + n_params as f64 * (n_obs as f64).ln();
 
     // Extract SEs from covariance matrix using converged parameter values
     let (se_theta, se_omega, se_sigma, se_kappa) =

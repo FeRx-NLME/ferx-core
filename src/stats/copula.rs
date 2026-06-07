@@ -852,6 +852,15 @@ pub enum CopulaFamily {
 }
 
 impl CopulaFamily {
+    /// Number of free scalar parameters in this family.
+    /// Used for AIC/BIC penalty when the copula is part of a vine model.
+    pub fn n_params(&self) -> usize {
+        match self {
+            CopulaFamily::StudentT(_) => 2, // ρ and ν
+            _ => 1,
+        }
+    }
+
     /// AIC = −2 log L + 2 k, where k is the number of parameters.
     pub fn aic(&self, u: &[f64], v: &[f64]) -> f64 {
         let k = match self {
@@ -1165,5 +1174,50 @@ mod tests {
         let u: Vec<f64> = (0..100).map(|_| rng.gen::<f64>()).collect();
         let v: Vec<f64> = (0..100).map(|_| rng.gen::<f64>()).collect();
         CopulaFamily::select(&u, &v).expect("select must not error on valid pseudo-obs");
+    }
+
+    /// `n_params` returns 1 for all single-parameter families and 2 for Student-t.
+    /// This drives the AIC/BIC correction for vine copula fits: each pair-copula
+    /// contributes `n_params()` to the effective parameter count.
+    #[test]
+    fn n_params_matches_family_arity() {
+        assert_eq!(
+            CopulaFamily::Gaussian(GaussianCopula::new(0.3)).n_params(),
+            1,
+            "Gaussian has 1 parameter (rho)"
+        );
+        assert_eq!(
+            CopulaFamily::StudentT(StudentTCopula::new(0.3, 5.0)).n_params(),
+            2,
+            "Student-t has 2 parameters (rho, nu)"
+        );
+        assert_eq!(
+            CopulaFamily::Clayton(ClaytonCopula { theta: 1.5 }).n_params(),
+            1,
+            "Clayton has 1 parameter (theta)"
+        );
+        assert_eq!(
+            CopulaFamily::Gumbel(GumbelCopula { theta: 1.5 }).n_params(),
+            1,
+            "Gumbel has 1 parameter (theta)"
+        );
+        assert_eq!(
+            CopulaFamily::Frank(FrankCopula { theta: 2.0 }).n_params(),
+            1,
+            "Frank has 1 parameter (theta)"
+        );
+    }
+
+    /// Mixed vine with one Gaussian and one Student-t pair-copula: total copula
+    /// parameter count should be 3 (1 + 2), matching the AIC/BIC formula in api.rs.
+    #[test]
+    fn vine_copula_param_count_sums_across_pairs() {
+        let pairs: Vec<CopulaFamily> = vec![
+            CopulaFamily::Gaussian(GaussianCopula::new(0.4)),
+            CopulaFamily::StudentT(StudentTCopula::new(0.3, 6.0)),
+            CopulaFamily::Clayton(ClaytonCopula { theta: 1.2 }),
+        ];
+        let total: usize = pairs.iter().map(|c| c.n_params()).sum();
+        assert_eq!(total, 4, "Gaussian(1) + StudentT(2) + Clayton(1) = 4");
     }
 }
