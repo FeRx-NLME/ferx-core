@@ -222,6 +222,11 @@ pub struct Subject {
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
+    /// Non-Gaussian observation records (TTE events, discrete states, counts).
+    /// Empty for all-Gaussian subjects. Populated by the data reader when the
+    /// model declares a non-Gaussian endpoint for the row's CMT.
+    #[cfg(feature = "survival")]
+    pub obs_records: Vec<ObsRecord>,
 }
 
 impl Subject {
@@ -1130,6 +1135,131 @@ pub struct MuRef {
     pub log_transformed: bool,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Non-Gaussian endpoint types  (Phase 1: TTE / survival)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "survival")]
+/// Censoring type for a TTE event record.
+#[derive(Debug, Clone)]
+pub enum EventType {
+    Exact,
+    RightCensored,
+    /// Event occurred in the half-open interval (left, right].
+    IntervalCensored {
+        left: f64,
+        right: f64,
+    },
+}
+
+#[cfg(feature = "survival")]
+/// A single non-Gaussian observation record on a subject.
+#[derive(Debug, Clone)]
+pub enum ObsRecord {
+    Event {
+        time: f64,
+        event_type: EventType,
+        /// Left truncation / delayed entry time (0.0 when none).
+        /// The likelihood conditions on survival past entry_time:
+        ///   H_eff(T) = H(T) − H(entry_time)
+        entry_time: f64,
+        cmt: usize,
+    },
+    // DiscreteState and Count variants deferred to Phase 4/5
+}
+
+#[cfg(feature = "survival")]
+/// Analytic parametric hazard families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HazardFamily {
+    Exponential,
+    Weibull,
+    Gompertz,
+}
+
+#[cfg(feature = "survival")]
+/// Closure type for computing hazard parameters from (theta, eta, covariates).
+///
+/// Return layout by family:
+///   Exponential: `[lambda]`
+///   Weibull:     `[scale, shape]`
+///   Gompertz:    `[alpha, gamma, loghr_term]`  (loghr_term cumulates log-hazard
+///                 contributions from covariates; 0.0 when no covariates)
+pub type HazardParamFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> Vec<f64> + Send + Sync>;
+
+#[cfg(feature = "survival")]
+/// Hazard specification for a TTE endpoint.
+pub enum HazardSpec {
+    Analytic {
+        family: HazardFamily,
+        param_fn: HazardParamFn,
+    },
+    // OdeAccumulated deferred to Phase 2
+}
+
+#[cfg(feature = "survival")]
+impl std::fmt::Debug for HazardSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HazardSpec::Analytic { family, .. } => {
+                write!(f, "HazardSpec::Analytic({family:?})")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "survival")]
+/// Per-CMT endpoint likelihood specification.
+pub enum EndpointLikelihood {
+    Gaussian(EndpointError),
+    Tte { hazard: HazardSpec },
+    // Binary, Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
+}
+
+#[cfg(feature = "survival")]
+impl std::fmt::Debug for EndpointLikelihood {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EndpointLikelihood::Gaussian(e) => write!(f, "Gaussian({e:?})"),
+            EndpointLikelihood::Tte { hazard } => write!(f, "Tte({hazard:?})"),
+        }
+    }
+}
+
+/// Outcome of a single simulated observation — replaces the previous `dv_sim: f64` field.
+///
+/// `Continuous` preserves the existing Gaussian path unchanged.
+/// `Event` carries TTE-specific outputs (gated behind `survival` feature).
+#[derive(Debug, Clone)]
+pub enum SimOutcome {
+    /// Gaussian continuous prediction + residual noise (the only variant before Phase 1).
+    Continuous { value: f64 },
+    /// TTE event: simulated event time and whether it occurred before the censoring horizon.
+    #[cfg(feature = "survival")]
+    Event { time: f64, observed: bool },
+}
+
+impl SimOutcome {
+    /// Extract the continuous value for Gaussian outcomes; NAN for all others.
+    ///
+    /// Calling this on a TTE `Event` row is a logic error; a `debug_assert` fires
+    /// in debug builds to catch misuse early.
+    pub fn continuous_value(&self) -> f64 {
+        match self {
+            SimOutcome::Continuous { value } => *value,
+            #[cfg(feature = "survival")]
+            SimOutcome::Event { .. } => {
+                debug_assert!(
+                    false,
+                    "continuous_value() called on a TTE Event row — filter by CMT type first"
+                );
+                f64::NAN
+            }
+        }
+    }
+}
+
 /// A compiled model ready for estimation
 pub struct CompiledModel {
     pub name: String,
@@ -1325,6 +1455,11 @@ pub struct CompiledModel {
     pub derived_exprs: Vec<DerivedExprSpec>,
     /// Column names from [output] block. Validated at fit time.
     pub output_columns: Vec<String>,
+    /// Per-CMT non-Gaussian endpoint specifications.
+    /// Empty for models with only Gaussian observations.
+    /// Keyed by the CMT value declared in `[event_model]` / future blocks.
+    #[cfg(feature = "survival")]
+    pub endpoints: HashMap<usize, EndpointLikelihood>,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -2076,14 +2211,18 @@ pub struct FitOptions {
     // SAEM-specific options
     pub saem_n_exploration: usize,
     pub saem_n_convergence: usize,
-    /// Number of MH proposals per subject per SAEM outer iteration.
-    /// The default 10 mixes well enough for hard cold-start surfaces
-    /// (e.g. Emax PKPD with stressful initial values, where chains
-    /// at 3 proposals can lock the M-step into a degenerate basin
-    /// with the PD-curve thetas at boundary values). Reduce to 3 for
-    /// the older behaviour on simpler PK-only models; raise (20-50)
-    /// only when the diagnostic shows the M-step is still tracking
-    /// correlated samples.
+    /// Number of block-kernel MH proposals per subject per SAEM outer
+    /// iteration. The default 20 mixes well on hard cold-start surfaces
+    /// (e.g. Emax PKPD with stressful initial values, where chains at 3
+    /// proposals can lock the M-step into a degenerate basin with the
+    /// PD-curve thetas at boundary values) and, together with the
+    /// componentwise kernel (run automatically for multi-η models), keeps a
+    /// block Ω from collapsing to a near rank-1 correlation matrix. The
+    /// componentwise sweep count `max(2, n_mh_steps / n_eta)` is derived from
+    /// this value (the kernel is skipped entirely for single-η models).
+    /// Reduce to 3-10 for the older/faster behaviour on simpler
+    /// well-identified models; raise (30-50) only when the diagnostic shows
+    /// the M-step is still tracking correlated samples.
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
     /// Number of initial exploration iterations during which the BSV/IOV Ω
@@ -2315,7 +2454,7 @@ impl Default for FitOptions {
             global_maxeval: 0,
             saem_n_exploration: 150,
             saem_n_convergence: 250,
-            saem_n_mh_steps: 10,
+            saem_n_mh_steps: 20,
             saem_adapt_interval: 50,
             saem_omega_burnin: 20,
             saem_seed: None,
@@ -2754,6 +2893,8 @@ pub(crate) mod test_helpers {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: HashMap::new(),
         }
     }
 }
@@ -3165,25 +3306,30 @@ mod tests {
         assert_eq!(p_alias.lagtime(), 2.0);
     }
 
-    /// Guard the SAEM MH-step default. The previous value (3) was too low
-    /// for hard cold-start surfaces — the chain didn't decorrelate between
-    /// SAEM outer iterations, so the single-draw stochastic M-step received
-    /// sticky correlated ETAs and locked the population-θ M-step into a
-    /// degenerate basin (observed on Emax PKPD: PD-curve thetas pinned to
-    /// boundary, ~150 OFV units worse than the correct basin). The current
-    /// default (10) escapes that trap reliably across seeds at ~20% extra
-    /// wall on the affected model and ~0% on simpler PK-only models.
+    /// Guard the SAEM MH-step default. An early value (3) was too low for hard
+    /// cold-start surfaces — the chain didn't decorrelate between SAEM outer
+    /// iterations, so the single-draw stochastic M-step received sticky
+    /// correlated ETAs and locked the population-θ M-step into a degenerate
+    /// basin (observed on Emax PKPD: PD-curve thetas pinned to boundary, ~150
+    /// OFV units worse than the correct basin). The default was raised to 10,
+    /// then to 20 alongside the componentwise eta kernel and the damped Ω
+    /// stochastic-approximation step — both added to stop a block (correlated)
+    /// Ω collapsing to a near rank-1 correlation matrix (UVM 2-cpt: every
+    /// off-diagonal correlation → ~0.99, one variance → 0). The larger default
+    /// also sizes the componentwise sweep count (`max(2, n_mh_steps / n_eta)`).
     ///
-    /// If a future change drops the default below ~5, re-run the Emax PKPD
-    /// regression in the experiment repo before merging — the basin trap
-    /// returns silently (OFV looks fine; PD parameters wrong).
+    /// If a future change drops the default below ~5, re-run both the Emax PKPD
+    /// basin regression and the UVM block-Ω collapse regression in the
+    /// experiment repo before merging — both fail silently (OFV looks fine;
+    /// parameters wrong).
     #[test]
-    fn saem_n_mh_steps_default_is_10() {
+    fn saem_n_mh_steps_default_is_20() {
         let opts = FitOptions::default();
         assert_eq!(
-            opts.saem_n_mh_steps, 10,
+            opts.saem_n_mh_steps, 20,
             "saem_n_mh_steps default changed — see comment above this test \
-             for the basin-trap regression rationale before adjusting."
+             for the basin-trap and block-Ω-collapse regression rationale \
+             before adjusting."
         );
     }
 }

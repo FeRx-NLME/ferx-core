@@ -363,7 +363,18 @@ exclusions:
 
 ## ferx-r changes
 
-### `ferx_selection()` (new, `R/exclude.R`)
+> **Status note (2026-06-06):** the ferx-core side shipped and merged to `main`
+> in PR #187 (merge `e572dde`). The public Rust surface the R side builds on is:
+> `SelectionFilter::from_opts(ignore, accept, ignore_subjects)`,
+> `read_nonmem_csv_filtered(path, cov_cols, iov, &filter)` and
+> `read_nonmem_csv_with_covariates_filtered(...)`, and
+> `ExclusionSummary { excluded_subject_ids, n_obs_excluded, n_dose_excluded,
+> n_other_excluded, n_records_total, fired_ignore, fired_accept }` on both
+> `Population` and `FitResult`. Parser keys are `ignore` / `accept` /
+> `ignore_subjects`; dedup helper is `push_unique_expr`. The sections below are
+> updated to match what actually shipped.
+
+### `ferx_selection()` (new, `R/selection.R`)
 
 ```r
 ferx_selection <- function(data, ignore = NULL, accept = NULL, ignore_ids = NULL)
@@ -387,11 +398,13 @@ ferx_selection <- function(data, ignore = NULL, accept = NULL, ignore_ids = NULL
    - `"ignore_ids"` — the ID vector
 
 `ferx_fit()` accepts `ferx_data` objects as its `data` argument. When a `ferx_data`
-is received, the exclusion expressions stored in its attributes are injected into the
-Rust `settings` vectors (`ignore`/`accept`/`ignore_subjects` keys), and the filtered
-data is written to a temp CSV that is passed to Rust. The Rust side re-evaluates
-(so the canonical filtering is always in Rust), but the R preview lets users inspect
-what will be excluded before committing to a fit.
+is received, the exclusion expressions stored in its attributes are forwarded to
+Rust as the `ignore`/`accept`/`ignore_subjects` selection rules and the **original
+source CSV path** is passed through unchanged — **no temp CSV is written**. Rust
+does the canonical filtering at read time (see the Rust-glue section), so the R
+preview is purely informational (it lets users inspect what will be excluded
+before committing to a fit). If `data` is an in-memory data.frame with no source
+path, write it to a temp CSV once and pass that path.
 
 ### `ferx_selection_excluded(fit_or_data)` (new)
 
@@ -415,8 +428,13 @@ Add an exclusion block after the Data line, drawn from `fit$exclusions`:
   ignore: "DV < 0.001"    →  20 obs excluded
   ignore: IDs [3]         →  subject 3 excluded (8 obs, 2 doses)
   accept: "BW >= 30"      →  0 records excluded
+  Excluded: 20 obs, 2 doses, 0 other (of 251 records)
   Included: 31 subjects, 221 observations / 32 subjects, 251 total
 ```
+
+The counts come straight from `fit$exclusions` (mirroring `ExclusionSummary`):
+`n_obs_excluded`, `n_dose_excluded`, `n_other_excluded` (EVID 2/3 and missing-DV
+rows), `n_records_total`, `excluded_subject_ids`, `fired_ignore`, `fired_accept`.
 
 Block is omitted when `fit$exclusions` is NULL (no selection applied).
 
@@ -429,14 +447,31 @@ Block is omitted when `fit$exclusions` is NULL (no selection applied).
   settings). These are merged (OR'd / AND'd) with any `[data_selection]` block in
   the `.ferx` file — not overriding it.
 
-### Rust glue (`src/rust/src/lib.rs`)
+### Rust glue (`src/rust/src/lib.rs`) — **read-ordering fix is the crux**
 
-- `ignore` / `accept` / `ignore_subjects` are **not** on the RESERVED list (they
-  go through `apply_fit_option` like other settings).
-- Repeated `ignore` keys in the settings vectors append to `ignore_exprs` using
-  `push_unique` — exact-string deduplication prevents the same condition appearing
-  twice when both the `.ferx` file and the R call specify it.
-- Expose `fit$exclusions` as a named list mirroring `ExclusionSummary`.
+⚠️ **The glue currently bypasses the filter.** `ferx_rust_fit` reads the data with
+`ferx_core::read_nonmem_csv(path, None, iov)` *before* the settings loop, then calls
+`ferx_core::fit()` separately. It does **not** go through ferx-core's file-based
+entry points, so populating `opts.ignore_exprs` via settings alone changes nothing —
+`fit()` never re-filters. The fix:
+
+1. Parse the model and clone `opts` as today.
+2. Run the settings loop first, so `ignore`/`accept`/`ignore_subjects` land in
+   `opts.ignore_exprs` / `accept_exprs` / `ignore_subjects` (they are **not** on the
+   RESERVED list; they flow through `apply_fit_option` like other settings, and
+   `push_unique_expr` dedups exact-string repeats across the `.ferx` file and the R
+   call).
+3. **Then** read the data, building a filter when any rule is set:
+   `let filter = SelectionFilter::from_opts(&opts.ignore_exprs, &opts.accept_exprs, &opts.ignore_subjects)?;`
+   and call `read_nonmem_csv_filtered(path, None, iov, &filter)` instead of
+   `read_nonmem_csv`. (Use `read_nonmem_csv_with_covariates_filtered` if/when the
+   glue grows a `[covariates]` path; today it passes `None`.)
+4. After the fit, expose `result.exclusions` as `fit$exclusions` — a named list
+   mirroring `ExclusionSummary` (include `n_other_excluded`).
+
+The dedicated `ferx_fit(ignore=, accept=, ignore_ids=)` args are merged into the
+same `settings` vectors R-side before the call (same pattern as `optimizer_trace` /
+`inits_from_nca`), so a single Rust pathway handles `.ferx`-file and R-call rules.
 
 ---
 

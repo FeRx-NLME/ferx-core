@@ -1,0 +1,54 @@
+# One-compartment oral PK model (warfarin) with SDE process noise
+#
+# Identical to the standard warfarin model but written as an ODE so that a
+# [diffusion] block can be added.  The DIFF_CENTRAL parameter captures
+# within-subject system noise on the central compartment — useful when
+# IWRES shows autocorrelation that cannot be absorbed by the residual error
+# alone (structural misspecification, unmodelled absorption variability, etc.).
+#
+# The EKF inflates the residual variance at each observation by the
+# integrated covariance: V_total = P[central] + sigma^2(PRED).
+# DIFF_CENTRAL is estimated on the variance scale (not SD).
+#
+# Note: SDE is incompatible with Enzyme autodiff — gradient_method = fd is
+# required and set below.  The Enzyme toolchain is recommended for speed;
+# without it each ODE+EKF evaluation uses finite differences, which is
+# significantly slower than an equivalent analytical PK model.
+
+[parameters]
+  theta TVCL(0.134, 0.001, 10.0)
+  theta TVV(8.1, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.07
+  omega ETA_V  ~ 0.02
+  omega ETA_KA ~ 0.40
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  # `central` is concentration (mg/L): the absorption term carries `/V` so the
+  # ODE state matches the concentration-scale DV column. See the existing
+  # `examples/bioavailability_ode.ferx` in ferx-core for the same convention.
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL / V) * central
+
+[diffusion]
+  central ~ 0.01
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method          = foce
+  maxiter         = 300
+  covariance      = true
+  gradient_method = fd

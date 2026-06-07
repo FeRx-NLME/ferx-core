@@ -27,9 +27,10 @@ where `name` becomes a new sdtab column and `expression` is evaluated for every 
 | Eta names (`ETA_CL`, …) | Subject EBE |
 | Covariate names (`WT`, `AGE`, …) | Subject covariate |
 | `IPRED` | Individual prediction at the row's time point |
+| `PRED` | Population prediction (eta = 0) at the row's time point |
 | `DV` | Observed value |
 | `TAFD` | Time after first dose |
-| `TAD` | Time after most recent dose |
+| `TAD` | Time after most recent dose (SS-aware) |
 | `TIME` | Nominal time |
 
 ## Operators and functions
@@ -47,8 +48,12 @@ Standard arithmetic (`+`, `-`, `*`, `/`), comparison (`<`, `>`, `<=`, `>=`, `==`
 | `max(expr)` | Subject-level maximum of `expr` over all observations |
 | `min(expr)` | Subject-level minimum |
 | `tmax(expr)` | Time at which `expr` is maximised |
-| `integral(expr, from=t0, to=t1)` | AUC from `t0` to `t1` using the trapezoidal rule |
-| `integral(expr, from=t0, to=t1, step=dt)` | Grid-based integral with step `dt` (IPRED-based only; ignored for DV) |
+| `integral(expr, from=t0, to=t1)` | AUC from `t0` to `t1`; obs times for DV, fine grid (500 pts) for IPRED |
+| `integral(expr, from=t0, to=t1, step=dt)` | As above with grid step `dt` hours (IPRED only; `step=` is ignored for DV) |
+| `integral(expr, cond, from=t0, to=t1)` | As above, only time points where `cond` is true contribute |
+| `integral(expr, window=P)` | Periodic AUC: one value per dosing window of length `P` hours |
+| `integral(expr, window=P, anchor=A)` | Periodic AUC with windows starting at `A` (default 0) |
+| `integral(expr, cond, window=P, step=dt)` | Periodic AUC, filtered by `cond`, with grid step `dt` |
 
 The constant `MACHEPS` (machine epsilon, ≈ 2.22 × 10⁻¹⁶) is also available.
 
@@ -104,7 +109,7 @@ AUC24_grid = integral(IPRED, from=0, to=24, step=0.5)
 
 A `[derived]` name must **not** clash with:
 
-- Built-in sdtab columns: `ID`, `TIME`, `DV`, `IPRED`, `CWRES`, `IWRES`, `ETA1`, `ETA2`, …, `TAFD`, `TAD`
+- Built-in sdtab columns: `ID`, `TIME`, `DV`, `PRED`, `IPRED`, `CWRES`, `IWRES`, `EBE_OFV`, `N_OBS`, `TAFD`, `TAD`, `CENS`, `OCC`, `CMT`
 - Any theta, eta, or individual-parameter name in the model
 
 Shadowing a **covariate** name is permitted (the covariate column is replaced) but will emit a `W_DERIVED_COVARIATE_SHADOW` warning.

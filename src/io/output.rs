@@ -1645,6 +1645,8 @@ mod tests {
             cens: vec![0; n_obs],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         }
     }
 

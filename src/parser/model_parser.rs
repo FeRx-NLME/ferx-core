@@ -1404,6 +1404,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         dv_pre_logged: ltbs_flags.dv_pre_logged,
         derived_exprs: vec![],
         output_columns: vec![],
+        #[cfg(feature = "survival")]
+        endpoints: std::collections::HashMap::new(),
     };
 
     // ── Optional blocks ──

@@ -28,7 +28,7 @@ Occasion 1 = first period, occasion 2 = second period. Dose records and observat
 
 ## Model File (Option A — diagonal IOV)
 
-This is the contents of [`examples/warfarin_iov.ferx`](https://github.com/ferx-core-NLME/ferx-core/blob/main/examples/warfarin_iov.ferx):
+This is the contents of [`examples/warfarin_iov.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/warfarin_iov.ferx):
 
 ```
 model warfarin_iov

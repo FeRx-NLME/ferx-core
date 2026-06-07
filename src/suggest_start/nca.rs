@@ -699,6 +699,8 @@ mod tests {
             obs_cmts: vec![1; 7],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
             covariates: HashMap::new(),
             dose_covariates: vec![],
             obs_covariates: vec![],

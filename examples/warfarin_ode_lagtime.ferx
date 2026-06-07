@@ -1,0 +1,60 @@
+# Warfarin ODE with absorption lag time (LAGTIME keyword)
+#
+# Demonstrates the LAGTIME keyword in [individual_parameters] for ODE models.
+# Assigning to the reserved name LAGTIME tells the event handler to delay
+# every dose event for that subject by the individual lag time; no change to
+# the ODE equations is needed.
+#
+# This is the ODE-model equivalent of passing lagtime= to an analytical solver:
+#
+#   analytical:  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=TLAG)
+#   ODE:         LAGTIME = TVLAG * exp(ETA_LAG)   # in [individual_parameters]
+#
+# IIV on LAGTIME is log-normal. The individual LAGTIME is recovered per
+# subject in fit$individual_estimates alongside CL, V, and KA.
+#
+# States (CMT numbers):
+#   1  depot   — oral dose lands here (amount, mg)
+#   2  central — drug in central compartment (amount, mg)
+#
+# Dataset: data/warfarin.csv (100 mg single oral dose, 32 subjects × 7 obs)
+#
+# True simulation parameters match warfarin.ferx:
+#   TVCL=0.134, TVV=8.1, TVKA=1.0, TVLAG=0.5
+
+[parameters]
+  theta TVCL(0.134, 0.001, 10.0)    # typical clearance (L/h)
+  theta TVV(8.1,    0.1,  500.0)    # typical volume (L)
+  theta TVKA(1.0,   0.01,  50.0)    # typical absorption rate constant (/h)
+  theta TVLAG(0.5,  0.01,   5.0)    # typical absorption lag time (h)
+
+  omega ETA_CL  ~ 0.07              # BSV on CL  (log-normal, ~26% CV)
+  omega ETA_V   ~ 0.02              # BSV on V   (log-normal, ~14% CV)
+  omega ETA_KA  ~ 0.40              # BSV on KA  (log-normal, ~63% CV)
+  omega ETA_LAG ~ 0.09              # BSV on LAGTIME (log-normal, ~30% CV)
+
+  sigma PROP_ERR ~ 0.01 (sd)        # proportional residual error (~10% CV)
+
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV  * exp(ETA_V)
+  KA      = TVKA * exp(ETA_KA)
+  LAGTIME = TVLAG * exp(ETA_LAG)    # dose event delayed by this many hours
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - CL/V * central
+
+[scaling]
+  obs_scale = V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true

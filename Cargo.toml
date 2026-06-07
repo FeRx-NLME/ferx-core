@@ -1,6 +1,6 @@
 [package]
 name = "ferx-core"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Nonlinear Mixed Effects modeling engine with FOCE/FOCEI estimation"
 license = "MIT"
@@ -20,6 +20,10 @@ ci = []  # Allows building without autodiff for CI (nightly, no Enzyme)
 # dynamics (low-dim NODE). See `plans/dcm-and-low-dim-node.md`. No new
 # runtime deps — the MLP runs on top of `nalgebra`.
 nn = []
+# TTE/survival/categorical non-Gaussian endpoint support.
+# Default-off while Phase 1 is in development; promoted to default-on after
+# nlmixr2/NONMEM validation (see plans/tte-survival-markov.md Phase 1).
+survival = []
 # Heavy fit-based tests (5–60 min wall each on a 2-core CI runner).
 # Default `cargo test` `#[ignore]`s them; a nightly/manual job opts in.
 slow-tests = []

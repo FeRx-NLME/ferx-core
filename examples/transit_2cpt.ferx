@@ -1,0 +1,56 @@
+# Two-compartment model with transit absorption (ODE)
+#
+# Absorption: 3 transit compartments feeding a 2-cpt disposition system.
+# KTR = (n+1)/MTT = 4/MTT (n = 3 transit comps)
+#
+# Allometric scaling on CL, V1, V2 (reference WT = 70 kg).
+# Absorption delay is provided by the transit chain via MTT.
+#
+# States (CMT numbers):
+#   1  transit1   -- oral dose lands here (amount, mg)
+#   2  transit2   -- (amount, mg)
+#   3  transit3   -- (amount, mg)
+#   4  central    -- concentration (mg/L)
+#   5  peripheral -- concentration (mg/L)
+#
+# IIV: CL, V1, KA (~30% CV each)
+# Residual: proportional, ~30% CV
+
+[parameters]
+  theta TVCL(5.0,    0.1,  100.0)   # typical clearance (L/h)
+  theta TVV1(50.0,   5.0,  500.0)   # typical central volume (L)
+  theta TVQ(10.0,    0.1,  200.0)   # typical intercompartmental CL (L/h)
+  theta TVV2(100.0,  5.0, 1000.0)   # typical peripheral volume (L)
+  theta TVMTT(1.0,   0.1,   10.0)   # mean transit time (h); KTR = 4/MTT
+
+  omega ETA_CL ~ 0.09               # IIV on CL (~30% CV)
+  omega ETA_V1 ~ 0.09               # IIV on V1 (~30% CV)
+  omega ETA_KA ~ 0.09               # IIV on KA (~30% CV)
+
+  sigma PROP_ERR ~ 0.30 (sd)        # proportional residual error (~30% CV)
+
+[individual_parameters]
+  CL     = TVCL * (WT / 70)^0.75 * exp(ETA_CL)
+  V1     = TVV1 * (WT / 70)^1.00 * exp(ETA_V1)
+  Q      = TVQ
+  V2     = TVV2 * (WT / 70)^1.00
+  KTR    = 4.0 / TVMTT              # transit rate constant
+  KA     = KTR * exp(ETA_KA)        # KA equals KTR at typical, IIV shifts individual rate
+
+[structural_model]
+  ode(obs_cmt=central, states=[transit1, transit2, transit3, central, peripheral])
+
+[odes]
+  d/dt(transit1)   = -KTR * transit1
+  d/dt(transit2)   =  KTR * transit1 - KTR * transit2
+  d/dt(transit3)   =  KTR * transit2 - KTR * transit3
+  d/dt(central)    =  KA  * transit3 / V1 - (CL / V1 + Q / V1) * central + Q / V2 * peripheral
+  d/dt(peripheral) =  Q   * central  / V1 - Q / V2 * peripheral
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true

@@ -395,6 +395,8 @@ mod tests {
             cens: vec![0; obs_times.len()],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         let ode_spec = OdeSpec {
             rhs: Box::new(one_cpt_rhs),

@@ -1,0 +1,42 @@
+# One-compartment oral PK model (warfarin) with [scaling] block (Form A)
+#
+# Demonstrates obs_scale for unit conversion.
+#
+# The dataset records AMT in micrograms (100 mg = 100000 ug) while DV is
+# in mg/L.  Without [scaling] the model would predict in ug/L, a factor-1000
+# mismatch.  obs_scale = 1000 divides every prediction by 1000 before the
+# residual is computed, so the sigma is expressed on the mg/L (DV) scale.
+#
+# PK parameter values are identical to the standard warfarin example; the
+# fit should converge to the same estimates.
+
+[parameters]
+  theta TVCL(0.134, 0.001, 10.0)
+  theta TVV(8.1, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.07
+  omega ETA_V  ~ 0.02
+  omega ETA_KA ~ 0.40
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[scaling]
+  obs_scale = 1000
+
+[fit_options]
+  method     = foce
+  maxiter    = 300
+  covariance = true
+  gradient   = ad

@@ -1,0 +1,37 @@
+# One-compartment oral PK model demonstrating steady-state dosing (SS column)
+#
+# The dataset (warfarin_ss.csv) records once-daily dosing at steady state.
+# The dose row has SS=1 and II=24 (24-hour interval).
+# The engine computes steady-state initial conditions analytically from the
+# dose, interval, and current individual parameters -- no model changes needed.
+#
+# At steady state with tau=24 h and half-life~42 h (ke=CL/V=0.0165/h) there
+# is ~3-fold accumulation over a single dose; DV values are in the 15-35 mg/L
+# range vs 5-14 mg/L for the single-dose warfarin example.
+
+[parameters]
+  theta TVCL(0.134, 0.001, 10.0)
+  theta TVV(8.1, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.07
+  omega ETA_V  ~ 0.02
+  omega ETA_KA ~ 0.40
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 300
+  covariance = true

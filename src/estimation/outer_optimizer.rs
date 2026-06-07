@@ -2567,6 +2567,8 @@ mod tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
             })
             .collect();
         Population {

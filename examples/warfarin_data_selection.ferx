@@ -1,0 +1,36 @@
+# One-compartment oral PK model (warfarin) with data-selection filtering
+#
+# Demonstrates [data_selection]: excludes observations below a surrogate LLOQ
+# (DV < 1.0 mg/L) at read time without modifying the CSV.
+# Equivalent to NONMEM $DATA IGNORE=.
+
+[parameters]
+  theta TVCL(0.134, 0.001, 10.0)
+  theta TVV(8.1, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.07
+  omega ETA_V  ~ 0.02
+  omega ETA_KA ~ 0.40
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[data_selection]
+  # Drop observations below a surrogate LLOQ of 1.0 mg/L.
+  ignore = DV < 1.0
+
+[fit_options]
+  method   = foce
+  maxiter  = 300
+  gradient = fd

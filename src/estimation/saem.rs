@@ -47,6 +47,19 @@ pub(crate) const MSTEP_NLOPT_ALGORITHM: nlopt::Algorithm = nlopt::Algorithm::Bob
 /// being far below any plausible estimated variance.
 const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
 
+/// Target acceptance rate for the componentwise (1-D) eta kernel. The optimal
+/// scaling result for single-coordinate random-walk Metropolis is ≈0.44
+/// (Roberts & Rosenthal 2001), higher than the block kernel's 0.40 target.
+const CW_TARGET_ACCEPT: f64 = 0.44;
+
+/// Maximum per-iteration stochastic-approximation step for the Ω sufficient
+/// statistic *during the exploration phase*. The θ/σ M-step uses the full γ
+/// (1.0 in exploration), but Ω is averaged at no more than this rate so a single
+/// un-equilibrated MCMC draw cannot overwrite a correlated Ω and trigger the
+/// rank-1 collapse feedback. In the convergence phase the cap is lifted and Ω
+/// uses the full decaying γ = 1/(k−k1), the same Robbins-Monro schedule as θ.
+const OMEGA_SA_MAX_STEP: f64 = 0.1;
+
 /// Raise every *free* diagonal entry of the BSV Ω that has fallen below `floor`
 /// up to `floor`. FIX-ed diagonals (`omega_fixed[i] == true`) are left untouched
 /// — they carry the user's declared variance and must not be perturbed.
@@ -67,14 +80,22 @@ struct SaemState {
     kappas: Vec<Vec<Vec<f64>>>,
     /// Cached individual NLL at current ETAs (and kappas for IOV models)
     nll_cache: Vec<f64>,
-    /// Per-subject MH step sizes (for eta)
+    /// Per-subject MH step sizes (for the block eta kernel)
     step_scales: Vec<f64>,
+    /// Per-subject step sizes for the componentwise eta kernel (Kuhn-Lavielle
+    /// kernel 2). Adapted separately from `step_scales` because the optimal
+    /// 1-D scaling differs from the d-dimensional block scaling.
+    cw_step_scales: Vec<f64>,
     /// Per-subject kappa MH step sizes.  Empty when `n_kappa == 0`.
     kappa_step_scales: Vec<f64>,
     /// Per-subject acceptance counts since last adaptation
     accept_counts: Vec<usize>,
     /// Per-subject proposal counts since last adaptation (1 for HMC, n_mh_steps for MH)
     proposal_counts: Vec<usize>,
+    /// Per-subject componentwise-kernel acceptance counts since last adaptation.
+    cw_accept_counts: Vec<usize>,
+    /// Per-subject componentwise-kernel proposal counts since last adaptation.
+    cw_proposal_counts: Vec<usize>,
     /// Per-subject kappa acceptance counts since last adaptation.
     kappa_accept_counts: Vec<usize>,
     /// Per-subject kappa proposal counts since last adaptation.
@@ -185,6 +206,84 @@ fn mh_steps(
     }
 
     (n_accepted, nll)
+}
+
+/// Componentwise (single-coordinate) Metropolis-within-Gibbs sweep for one
+/// subject — the second kernel of the Kuhn & Lavielle (2004) mixture.
+///
+/// Each sweep proposes a perturbation to one η coordinate at a time,
+/// `η'_j = η_j + step_scale · √Ω_jj · z`, holding the other coordinates fixed,
+/// and accepts/rejects with the full conditional NLL (which carries the
+/// correlated prior, so detailed balance for p(η | data) is preserved). Returns
+/// `(n_accepted, n_proposed, updated_nll)` with `n_proposed = n_sweeps · n_eta`.
+///
+/// Why this kernel exists: the block kernel `mh_steps` proposes along
+/// `chol(Ω)·z`, so once Ω drifts toward a high correlation the proposal can only
+/// move η along that near-degenerate direction. The single-draw Ω M-step then
+/// feeds the induced correlation back into Ω, and during the γ=1 exploration
+/// phase (no SA averaging) this compounds into a runaway collapse toward a
+/// rank-1 Ω (every off-diagonal correlation → ±1, one variance → 0). A
+/// per-coordinate proposal can always move a single η independently of Ω's
+/// off-diagonals, so the sampled draws are not forced collinear and the
+/// sufficient statistic recovers the true correlation. See the
+/// `saem-block-omega-rank1-collapse` investigation.
+#[allow(clippy::too_many_arguments)]
+fn mh_steps_componentwise(
+    eta: &mut [f64],
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    step_scale: f64,
+    // Per-coordinate proposal SD = √(marginal variance), precomputed once per
+    // iteration from Ω's diagonal (it is identical across subjects) and floored
+    // to match the Ω diagonal floor so a collapsing diagonal can't shrink the
+    // decorrelating step to zero. Indexed `[0, n_eta)`.
+    cw_sd: &[f64],
+    rng: &mut impl Rng,
+    n_sweeps: usize,
+    pk_scratch: &mut EventPkParams,
+    kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
+) -> (usize, usize, f64) {
+    let n_eta = eta.len();
+    let mut nll = nll_current;
+    let mut n_accepted = 0;
+
+    for _ in 0..n_sweeps {
+        for j in 0..n_eta {
+            let z: f64 = rng.sample(StandardNormal);
+            let old_j = eta[j];
+            eta[j] = old_j + step_scale * cw_sd[j] * z;
+
+            let nll_prop = if let Some((kappas, omega_iov)) = kappas_opt {
+                individual_nll_iov(
+                    model,
+                    subject,
+                    theta,
+                    eta,
+                    kappas,
+                    omega,
+                    Some(omega_iov),
+                    sigma_values,
+                )
+            } else {
+                individual_nll_into(model, subject, theta, eta, omega, sigma_values, pk_scratch)
+            };
+
+            // Symmetric scalar proposal cancels, same as the block kernel.
+            let log_u: f64 = rng.gen::<f64>().ln();
+            if log_u < nll - nll_prop {
+                nll = nll_prop;
+                n_accepted += 1;
+            } else {
+                eta[j] = old_j; // reject — restore
+            }
+        }
+    }
+
+    (n_accepted, n_eta * n_sweeps, nll)
 }
 
 // ---------------------------------------------------------------------------
@@ -897,8 +996,12 @@ fn get_mu_ref_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
 /// mirrors that condition so the banner reflects what will actually run.
 pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) -> String {
     let n_leapfrog = options.saem_n_leapfrog;
+    // HMC is BSV-only (`hmc_step` and the AD NLL/gradient are kappa-unaware), so
+    // it is disabled for IOV models (`n_kappa > 0`); those subjects use the MH
+    // kernels, whose acceptance targets the IOV conditional p(η | κ, θ, data).
     #[cfg(feature = "autodiff")]
-    let using_hmc = n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some();
+    let using_hmc =
+        n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && model.n_kappa == 0;
     #[cfg(not(feature = "autodiff"))]
     let using_hmc = {
         let _ = model;
@@ -1802,13 +1905,29 @@ pub fn run_saem(
     // freeze Ω into the convergence phase. See `FitOptions::saem_omega_burnin`.
     let omega_burnin = options.saem_omega_burnin.min(k1);
     let n_mh_steps = options.saem_n_mh_steps;
+    // Componentwise sweeps per iteration (Kuhn-Lavielle kernel 2). Each sweep is
+    // `n_eta` single-coordinate proposals, so sizing it `n_mh_steps / n_eta`
+    // keeps the kernel's NLL-eval cost roughly on par with the block kernel.
+    // Skipped entirely for single-η models, where there is no off-diagonal to
+    // decorrelate and the kernel would duplicate the block move.
+    let n_cw_sweeps = if n_eta >= 2 {
+        (n_mh_steps / n_eta).max(2)
+    } else {
+        0
+    };
     let adapt_interval = options.saem_adapt_interval;
     let verbose = options.verbose;
     let n_leapfrog = options.saem_n_leapfrog;
+    // HMC is BSV-only (kappa-unaware); disable it for IOV models so eta sampling
+    // uses the MH kernels that target the IOV conditional p(η | κ, θ, data).
+    // Without this guard, an IOV model with an analytical PK path and
+    // `n_leapfrog > 0` would propose eta against the kappa-free posterior and
+    // hand a BSV-only NLL to the componentwise kernel as its (mismatched)
+    // acceptance baseline.
     let using_hmc: bool = {
         #[cfg(feature = "autodiff")]
         {
-            n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some()
+            n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && n_kappa == 0
         }
         #[cfg(not(feature = "autodiff"))]
         false
@@ -1829,11 +1948,16 @@ pub fn run_saem(
 
     let mut warnings = Vec::new();
     if n_leapfrog > 0 && !using_hmc {
-        warnings.push(
-            "saem_n_leapfrog > 0 but HMC is unavailable (requires `autodiff` feature and \
-             analytical PK model); falling back to Metropolis-Hastings"
-                .to_string(),
-        );
+        // Keep the substring "HMC is unavailable" in both arms — `classify_warning`
+        // keys on it to tag this as an Info/gradient_fallback warning.
+        let reason = if n_kappa > 0 {
+            "HMC is unavailable for IOV models (it is kappa-unaware)"
+        } else {
+            "HMC is unavailable (requires `autodiff` feature and analytical PK model)"
+        };
+        warnings.push(format!(
+            "saem_n_leapfrog > 0 but {reason}; falling back to Metropolis-Hastings"
+        ));
     }
     let target_accept_rate = if using_hmc { 0.65_f64 } else { 0.40_f64 };
 
@@ -1847,6 +1971,10 @@ pub fn run_saem(
         .map(|_| get_eta_init(n_eta, None, None))
         .collect();
     let step_scales = vec![0.3; n_subjects];
+    // Componentwise kernel scales η'_j by √Ω_jj (a marginal SD), so a multiplier
+    // near 1 is already a sensible 1-D step; start higher than the block kernel
+    // and let adaptation climb toward the ~2.4 optimum.
+    let cw_step_scales = vec![1.0; n_subjects];
 
     // Guard: the parser must guarantee omega_iov is present whenever kappas
     // are declared; if this fires, the caller wired up a broken ModelParameters.
@@ -1993,9 +2121,12 @@ pub fn run_saem(
         kappas: kappas_init,
         nll_cache,
         step_scales,
+        cw_step_scales,
         kappa_step_scales,
         accept_counts: vec![0; n_subjects],
         proposal_counts: vec![0; n_subjects],
+        cw_accept_counts: vec![0; n_subjects],
+        cw_proposal_counts: vec![0; n_subjects],
         kappa_accept_counts: vec![0; n_subjects],
         kappa_proposal_counts: vec![0; n_subjects],
         steps_since_adapt: 0,
@@ -2032,6 +2163,23 @@ pub fn run_saem(
             break;
         }
         let gamma = if k <= k1 { 1.0 } else { 1.0 / (k - k1) as f64 };
+        // Damped SA step for the Ω sufficient statistic during exploration only.
+        // With the full γ=1 used for θ, an undamped Ω would be overwritten each
+        // exploration iteration by a single (warm-started, not-yet-equilibrated)
+        // MCMC draw; for a correlated block that snapshot is biased toward the
+        // chain's current correlation, and the bias feeds back through chol(Ω)
+        // into the next proposal — a runaway toward a near rank-1 Ω. Capping the
+        // Ω learning rate during exploration averages those draws (Robbins-Monro)
+        // and breaks the feedback, while θ keeps moving at full γ. In the
+        // convergence phase the cap is lifted: Ω uses the full decaying
+        // γ = 1/(k−k1), the same schedule as θ, so the SA estimate settles
+        // correctly (the chain is equilibrated by then, so the single-draw
+        // overwrite risk that motivated the cap no longer applies).
+        let gamma_omega = if k <= k1 {
+            gamma.min(OMEGA_SA_MAX_STEP)
+        } else {
+            gamma
+        };
 
         // Rebuild omega for this iteration
         let omega_k = OmegaMatrix::from_matrix(
@@ -2062,19 +2210,35 @@ pub fn run_saem(
         // Symmetric random-walk MH in eta_true space, identical schedule
         // throughout exploration and convergence — the only thing that
         // changes between phases is the SA step size `gamma`.
+        //
+        // Two kernels run per subject per iteration (Kuhn & Lavielle 2004
+        // mixture): (1) the primary block kernel — HMC when available, else a
+        // `chol(Ω)`-preconditioned block RW; then (2) a componentwise sweep
+        // (`mh_steps_componentwise`) that perturbs one η at a time. Kernel (2)
+        // is what keeps a block Ω from collapsing to rank-1 — see that fn's
+        // docstring.
         {
             use rayon::prelude::*;
             let theta_ref = &state.theta;
             let sigma_ref = &state.sigma_vals;
             let omega_ref = &omega_k;
+            let cw_scales = &state.cw_step_scales;
+            // Per-coordinate componentwise proposal SDs — computed once here (Ω's
+            // diagonal is shared across subjects) rather than per subject inside
+            // the parallel kernel. Floored to match the Ω diagonal floor.
+            let cw_sd: Vec<f64> = (0..n_eta)
+                .map(|j| omega_k.matrix[(j, j)].max(SAEM_OMEGA_DIAG_FLOOR).sqrt())
+                .collect();
+            let cw_sd_ref = &cw_sd;
             // For IOV models, eta proposals must target p(η | κ, θ, data):
             // the per-occasion [eta_prop, kappa_k] predictions determine
             // which etas are accepted.  Pass omega_iov to mh_steps so it
             // can call individual_nll_iov with kappas held fixed.
             let omega_iov_for_eta_mh: Option<&OmegaMatrix> = omega_iov_cur_opt.as_ref();
 
-            // Returns (eta_new, nll_after_eta, n_acc_eta, n_prop_eta, used_hmc)
-            let results: Vec<(Vec<f64>, f64, usize, usize, bool)> = state
+            // Returns (eta_new, nll_after, n_acc_primary, n_prop_primary,
+            //          n_acc_cw, n_prop_cw, used_hmc)
+            let results: Vec<(Vec<f64>, f64, usize, usize, usize, usize, bool)> = state
                 .etas
                 .par_iter()
                 .zip(state.nll_cache.par_iter())
@@ -2096,48 +2260,100 @@ pub fn run_saem(
                                 .wrapping_add(k as u64 * 100_000)
                                 .wrapping_add(i as u64),
                         );
+                        let kappas_mh_opt =
+                            omega_iov_for_eta_mh.map(|iov| (kappas_i.as_slice(), iov));
                         let mut eta_work = eta.clone();
+
+                        // ---- Kernel 1: primary block move ----
+                        let mut nll_cur = nll;
+                        let mut n_acc_primary = 0_usize;
+                        let mut n_prop_primary = 0_usize;
                         // HMC path: one gradient-guided proposal per SAEM iteration.
-                        // Returns None if HMC is unavailable for this subject (e.g.
-                        // TV-cov subject with unsupported PK model); fall through to MH.
+                        // hmc_step returns None if HMC is unavailable for this subject
+                        // (e.g. TV-cov subject with unsupported PK model); fall through
+                        // to the block MH kernel. `did_hmc` doubles as the `used_hmc`
+                        // flag reported back for diagnostics.
                         #[cfg(feature = "autodiff")]
-                        if using_hmc {
+                        let did_hmc = if using_hmc {
                             if let Some((new_eta, new_nll, accepted)) =
                                 crate::estimation::hmc::hmc_step(
                                     subject, &eta_work, nll, model, theta_ref, omega_ref,
                                     sigma_ref, scale, n_leapfrog, &mut rng,
                                 )
                             {
-                                return (new_eta, new_nll, accepted as usize, 1_usize, true);
+                                eta_work = new_eta;
+                                nll_cur = new_nll;
+                                n_acc_primary = accepted as usize;
+                                n_prop_primary = 1;
+                                true
+                            } else {
+                                false
                             }
+                        } else {
+                            false
+                        };
+                        #[cfg(not(feature = "autodiff"))]
+                        let did_hmc = false;
+
+                        if !did_hmc {
+                            let (n_acc, nll_new) = mh_steps(
+                                &mut eta_work,
+                                nll_cur,
+                                subject,
+                                model,
+                                theta_ref,
+                                omega_ref,
+                                sigma_ref,
+                                scale,
+                                &mut rng,
+                                n_mh_steps,
+                                pk_scratch,
+                                kappas_mh_opt,
+                            );
+                            nll_cur = nll_new;
+                            n_acc_primary = n_acc;
+                            n_prop_primary = n_mh_steps;
                         }
-                        let kappas_mh_opt =
-                            omega_iov_for_eta_mh.map(|iov| (kappas_i.as_slice(), iov));
-                        let (n_acc, nll_new) = mh_steps(
+
+                        // ---- Kernel 2: componentwise decorrelating sweep ----
+                        let (n_acc_cw, n_prop_cw, nll_cw) = mh_steps_componentwise(
                             &mut eta_work,
-                            nll,
+                            nll_cur,
                             subject,
                             model,
                             theta_ref,
                             omega_ref,
                             sigma_ref,
-                            scale,
+                            cw_scales[i],
+                            cw_sd_ref,
                             &mut rng,
-                            n_mh_steps,
+                            n_cw_sweeps,
                             pk_scratch,
                             kappas_mh_opt,
                         );
-                        (eta_work, nll_new, n_acc, n_mh_steps, false)
+
+                        (
+                            eta_work,
+                            nll_cw,
+                            n_acc_primary,
+                            n_prop_primary,
+                            n_acc_cw,
+                            n_prop_cw,
+                            did_hmc,
+                        )
                     },
                 )
                 .collect();
 
-            for (i, (eta_new, nll_new, n_acc, n_prop, used_hmc)) in results.into_iter().enumerate()
+            for (i, (eta_new, nll_new, n_acc, n_prop, n_acc_cw, n_prop_cw, used_hmc)) in
+                results.into_iter().enumerate()
             {
                 state.etas[i] = eta_new;
                 state.nll_cache[i] = nll_new;
                 state.accept_counts[i] += n_acc;
                 state.proposal_counts[i] += n_prop;
+                state.cw_accept_counts[i] += n_acc_cw;
+                state.cw_proposal_counts[i] += n_prop_cw;
                 hmc_subjects[i] |= used_hmc;
             }
         }
@@ -2205,7 +2421,7 @@ pub fn run_saem(
         }
         eta_outer /= n_subjects as f64;
 
-        state.s2 = (1.0 - gamma) * &state.s2 + gamma * &eta_outer;
+        state.s2 = (1.0 - gamma_omega) * &state.s2 + gamma_omega * &eta_outer;
 
         // ---- Step 2b: SA update for Omega_iov (IOV only) ----
         // s2_iov = (1 - γ) s2_iov + γ · (1/N_occ) Σᵢ Σₖ κᵢₖ κᵢₖᵀ
@@ -2222,17 +2438,17 @@ pub fn run_saem(
             if n_total_occ > 0 {
                 kappa_outer /= n_total_occ as f64;
             }
-            state.s2_iov = (1.0 - gamma) * &state.s2_iov + gamma * &kappa_outer;
+            state.s2_iov = (1.0 - gamma_omega) * &state.s2_iov + gamma_omega * &kappa_outer;
         }
 
         // ---- Step 3: M-step Omega (BSV + IOV) ----
         // Gated by the burn-in: while `k <= omega_burnin` Ω (and Ω_iov) are held
         // at their initial values so the MH chain can warm up before any
         // variance component is estimated. Step 2 still refreshes the SA
-        // statistic `s2` each burn-in iteration (during exploration γ=1, so it
-        // tracks the current chain spread rather than averaging), so the first
-        // Ω update after burn-in reflects the warmed-up chain, not the
-        // cold-start spread.
+        // statistic `s2` each burn-in iteration (damped at `gamma_omega`, so it
+        // is a running average of the warming chain rather than the latest
+        // snapshot), so the first Ω update after burn-in reflects the warmed-up
+        // chain, not the cold-start spread.
         if k > omega_burnin {
             // ---- Step 3a: Omega_bsv (closed form) ----
             // Restore FIX-ed rows / columns from the template. An eta flagged FIX
@@ -2498,6 +2714,20 @@ pub fn run_saem(
                 }
                 state.accept_counts[i] = 0;
                 state.proposal_counts[i] = 0;
+                // Adapt the componentwise kernel scale toward the 1-D optimum
+                // (~0.44 acceptance, Roberts & Rosenthal 2001). Independent of
+                // the block scale above.
+                if n_cw_sweeps > 0 {
+                    let cw_total = state.cw_proposal_counts[i].max(1);
+                    let cw_rate = state.cw_accept_counts[i] as f64 / cw_total as f64;
+                    if cw_rate > CW_TARGET_ACCEPT {
+                        state.cw_step_scales[i] = (state.cw_step_scales[i] * 1.1).min(5.0);
+                    } else {
+                        state.cw_step_scales[i] = (state.cw_step_scales[i] * 0.9).max(0.01);
+                    }
+                    state.cw_accept_counts[i] = 0;
+                    state.cw_proposal_counts[i] = 0;
+                }
                 // Adapt kappa step sizes (target 40% for MH on kappas).
                 if n_kappa > 0 {
                     let kappa_total = state.kappa_proposal_counts[i].max(1);
@@ -2932,6 +3162,8 @@ mod tests {
             cens: vec![0],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
         let sigma = SigmaVector {
@@ -3043,6 +3275,8 @@ mod tests {
             cens: vec![0, 0],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         let population = Population {
             subjects: vec![subj],
@@ -3278,6 +3512,8 @@ omega_dist = vine
             cens: vec![0, 0, 0],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
 
         let population = Population {
@@ -3437,6 +3673,8 @@ omega_dist = vine
             cens: vec![0; 6],
             occasions: vec![],
             dose_occasions: vec![],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         let population = Population {
             subjects: vec![make_subj("1", 1.0), make_subj("2", 1.1)],
@@ -3546,6 +3784,8 @@ omega_dist = vine
             cens: vec![0; 4],
             occasions: vec![1u32, 1, 2, 2],
             dose_occasions: vec![1u32],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
 
         let omega_bsv = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);

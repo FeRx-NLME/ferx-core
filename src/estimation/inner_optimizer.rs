@@ -1524,6 +1524,8 @@ mod iov_tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         }
     }
 
@@ -1634,6 +1636,8 @@ mod iov_tests {
             cens: vec![0; 3],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         };
         let params = model.default_params.clone();
         let result = find_ebe(&model, &subject, &params, 200, 1e-5, None, None);

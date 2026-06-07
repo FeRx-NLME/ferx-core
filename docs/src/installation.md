@@ -1,6 +1,6 @@
 # Installation
 
-ferx-core requires a nightly Rust toolchain with Enzyme for automatic differentiation. The **supported way to get one is to build `rustc` from source with Enzyme enabled**, so that `rustc`, LLVM, and Enzyme are all compiled from the same tree and are guaranteed version-compatible. This is also how the [ferx-r Docker image](https://github.com/ferx-core-NLME/ferx-r) builds its toolchain.
+ferx-core requires a nightly Rust toolchain with Enzyme for automatic differentiation. The **supported way to get one is to build `rustc` from source with Enzyme enabled**, so that `rustc`, LLVM, and Enzyme are all compiled from the same tree and are guaranteed version-compatible. This is also how the [ferx-r Docker image](https://github.com/FeRx-NLME/ferx-r) builds its toolchain.
 
 > ## ⚠️ Do not build a standalone Enzyme *plugin* against a separately-installed LLVM
 >
@@ -207,7 +207,7 @@ Once upstream Enzyme integration is distributed via rustup (tracked at [rust-lan
 Once your Enzyme toolchain is set up and **verified**:
 
 ```bash
-git clone https://github.com/ferx-core-NLME/ferx-core
+git clone https://github.com/FeRx-NLME/ferx-core
 cd ferx-core
 
 RUSTFLAGS="-Z autodiff=Enable" cargo build --release --features autodiff
@@ -284,8 +284,11 @@ Should print a successful model fit with parameter estimates.
 The R package handles all of the above automatically — you do **not** set `RUSTFLAGS` yourself. Just:
 
 ```r
-devtools::install_github("ferx-core-NLME/ferx-r")
+pak::pak("FeRx-NLME/ferx-r")
+# or: devtools::install_github("FeRx-NLME/ferx-r")
 ```
+
+> **The autodiff final link spikes memory.** At the very end of the fat-LTO build all linked objects are optimised together in a single pass. On a machine with 16 GB RAM, close other applications first — if `rustc` is OOM-killed the install silently fails mid-link and must be re-run.
 
 The package's build is driven by its `src/Makevars`, which:
 
@@ -302,7 +305,7 @@ To confirm which path your installed package took, call `ferx:::ferx_rust_autodi
 
 This is why a committed `.cargo/config.toml` is discouraged for the core repo: the R package's `Makevars` already manages the flag conditionally per machine, generating the config only when Enzyme is actually available. A committed flag in `ferx-core` would conflict with that logic and break the no-Enzyme install.
 
-See the [ferx R package README](https://github.com/ferx-core-NLME/ferx-r) for API usage.
+See the [ferx R package README](https://github.com/FeRx-NLME/ferx-r) for API usage.
 
 ### Cancelling a running fit (Ctrl-C)
 

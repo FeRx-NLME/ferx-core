@@ -965,6 +965,8 @@ fn parse_subject(
             cens,
             occasions,
             dose_occasions: sorted_dose_occ,
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
         },
         occ_parse_failures,
         SubjectExclusion {

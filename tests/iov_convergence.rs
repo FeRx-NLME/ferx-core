@@ -129,19 +129,20 @@ fn iov_chain_improves_on_saem_and_reaches_reference() {
         chain.ofv,
         IOV_FOCEI_OFV
     );
-    // ...and meaningfully improves on SAEM alone (would NOT, with a fixed-EBE
-    // gradient that can't move the variance components). Under the Almquist
-    // Laplace FOCEI form the SAEM and FOCEI minima are very close — observed
-    // chain 307.84 vs SAEM 309.24 (gap ≈ 1.4) on both macOS arm64 and Linux
-    // x86_64 — so the floor is 0.5 OFV units, well above the FD-noise scale
-    // (~1e-3) while accommodating the genuinely small Almquist-Laplace gap.
-    // The pre-fix bug would have produced gap ≈ 0 (chain pinned at SAEM's
-    // point), so 0.5 still catches the original regression cleanly. The
-    // strict-minimum assertion above (`chain.ofv ≈ IOV_FOCEI_OFV`) does the
-    // heavy lifting on "did FOCEI polish reach the right place".
+    // ...and still improves on SAEM alone (would NOT, with a fixed-EBE gradient
+    // that can't move the variance components). The improvement margin used to
+    // be ~1.4 OFV units, but the SAEM multi-kernel + damped-Ω fixes
+    // (`saem_block_omega_collapse`) make SAEM land much closer to the FOCEI
+    // minimum on this IOV model — observed chain 307.84 vs SAEM 308.02
+    // (gap ≈ 0.18). The floor is therefore 0.05 OFV units: well above the
+    // FD-noise scale (~1e-3) and still cleanly above the pre-fix bug's gap ≈ 0
+    // (chain pinned at SAEM's point), while accommodating the now-smaller
+    // genuine gap. The strict-minimum assertion above (`chain.ofv ≈
+    // IOV_FOCEI_OFV`) does the heavy lifting on "did FOCEI polish reach the
+    // right place".
     assert!(
-        chain.ofv < saem.ofv - 0.5,
-        "FOCEI polish must improve on SAEM by >0.5 OFV units: chain {:.4} vs SAEM {:.4}",
+        chain.ofv < saem.ofv - 0.05,
+        "FOCEI polish must improve on SAEM by >0.05 OFV units: chain {:.4} vs SAEM {:.4}",
         chain.ofv,
         saem.ofv
     );

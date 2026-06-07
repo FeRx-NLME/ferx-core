@@ -15,7 +15,7 @@ The optional `[output]` block lists additional columns to include in the sdtab b
 | Covariates | `WT`, `AGE`, `SEX` | Written as-is from the data |
 | Individual parameters | `CL`, `V` | EBE-derived per-subject value |
 | Derived column names | `AUC`, `Cmax` | Defined in the `[derived]` block |
-| Eta names | `ETA_CL`, `ETA_V` | Already in the mandatory minimum; emits `W_OUTPUT_DUPLICATE` |
+| Eta names | `ETA_CL`, `ETA_V` | ETAs are not sdtab columns; declaration is ignored with `W_OUTPUT_DUPLICATE` |
 
 ### Mandatory minimum (always present)
 

@@ -74,7 +74,7 @@ Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP op
 |-----|---------|-------------|
 | `n_exploration` | `150` | Phase 1 iterations (step size = 1) |
 | `n_convergence` | `250` | Phase 2 iterations (step size = 1/k) |
-| `n_mh_steps` | `3` | Metropolis-Hastings steps per subject per iteration. When `n_leapfrog > 0`, this applies to subjects that fall back to MH (see below); HMC subjects use one proposal per iteration regardless. |
+| `n_mh_steps` | `20` | Block Metropolis-Hastings steps per subject per iteration. Also sizes the componentwise decorrelating kernel that prevents block-Ω collapse (`max(2, n_mh_steps / n_eta)` sweeps; multi-η models only — skipped when `n_eta < 2`). When `n_leapfrog > 0`, this applies to subjects that fall back to MH (see below); HMC subjects use one proposal per iteration regardless. |
 | `n_leapfrog` | `0` | Leapfrog steps per HMC proposal (0 = use MH; see below). When > 0, subjects for which HMC is unavailable (ODE model, missing analytical PK path, non-finite Ω, unsupported TV-cov path) fall back to MH using `n_mh_steps` proposals. |
 | `adapt_interval` | `50` | Iterations between step-size adaptation |
 | `omega_burnin` | `20` | Initial exploration iterations during which Ω (and Ω<sub>IOV</sub>) are held at their starting values while the MH chain warms up. Clamped to `n_exploration`; set `0` to disable. Prevents the Ω collapse described in the SAEM page. |
