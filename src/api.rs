@@ -2424,6 +2424,7 @@ fn fit_inner(
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
         vine_params: result.vine_params.clone(),
+        vine_corrected_ofv: result.vine_corrected_ofv,
         optimizer: match final_method {
             EstimationMethod::Saem => "saem",
             EstimationMethod::FoceGn => "gn",
@@ -4590,6 +4591,7 @@ mod simulate_with_uncertainty_tests {
             obs_time_range: None,
             final_gradient: None,
             vine_params: None,
+            vine_corrected_ofv: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,

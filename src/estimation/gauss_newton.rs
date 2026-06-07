@@ -413,6 +413,7 @@ pub fn run_foce_gn(
             total_ebe_fallbacks: 0,
             final_gradient,
             vine_params: None,
+            vine_corrected_ofv: None,
         };
     }
 
@@ -519,6 +520,7 @@ pub fn run_foce_gn(
         total_ebe_fallbacks: 0,
         final_gradient,
         vine_params: None,
+        vine_corrected_ofv: None,
     }
 }
 

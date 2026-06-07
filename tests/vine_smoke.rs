@@ -102,4 +102,14 @@ fn vine_omega_dist_fit_returns_ok() {
         !vp.trees.is_empty(),
         "vine_params.trees should be non-empty"
     );
+
+    // vine_corrected_ofv should be computed and finite.
+    assert!(
+        result.vine_corrected_ofv.is_some(),
+        "vine_corrected_ofv should be Some after omega_dist = vine fit"
+    );
+    assert!(
+        result.vine_corrected_ofv.unwrap().is_finite(),
+        "vine_corrected_ofv should be finite"
+    );
 }

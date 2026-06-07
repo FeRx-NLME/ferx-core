@@ -1377,6 +1377,35 @@ fn run_saem_vine(
             options.interaction,
         );
 
+    // ---- Vine-corrected OFV ----
+    // pop_nll always uses the Gaussian Laplace approximation. Replace the
+    // Gaussian prior term with the vine (copula) prior at the final EBEs so
+    // the result is directly comparable to a Gaussian FOCE OFV on the same data.
+    //
+    // Both priors use FOCE convention (no (d/2)log(2π) constant); the scale
+    // matches a standard Gaussian FOCE OFV exactly.
+    let vine_corrected_ofv = {
+        let d = final_params.omega.dim() as f64;
+        let half_d_log_2pi = (d / 2.0) * (2.0 * std::f64::consts::PI).ln();
+        let delta: f64 = eta_hats
+            .iter()
+            .map(|eta| {
+                // vine prior in FOCE convention (strip the marginal normalisation constant)
+                let vine_nll = dist.log_prior(eta.as_slice()) - half_d_log_2pi;
+                // Gaussian FOCE prior: 0.5 × (η'Ω⁻¹η + log|Ω|)
+                let q = eta.dot(&(&final_params.omega.inv * eta));
+                let gauss_nll = 0.5 * (q + final_params.omega.log_det);
+                vine_nll - gauss_nll
+            })
+            .sum();
+        let corrected = ofv + 2.0 * delta;
+        if corrected.is_finite() {
+            Some(corrected)
+        } else {
+            None
+        }
+    };
+
     // ---- Covariance step ----
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
@@ -1436,6 +1465,7 @@ fn run_saem_vine(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         vine_params: Some(dist.to_fit_params(&init_params.omega.eta_names)),
+        vine_corrected_ofv,
     })
 }
 
@@ -2348,6 +2378,7 @@ pub fn run_saem(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         vine_params: None,
+        vine_corrected_ofv: None,
     })
 }
 

@@ -36,6 +36,10 @@ pub struct OuterResult {
     pub final_gradient: Option<Vec<f64>>,
     /// Fitted vine-copula parameters. `Some` only when `omega_dist = vine`.
     pub vine_params: Option<crate::stats::vine_copula::VineFitParams>,
+    /// Vine-corrected OFV: the Gaussian FOCE OFV with the Gaussian prior term
+    /// replaced by the vine (copula) prior at the final EBEs. Directly comparable
+    /// to a Gaussian FOCE OFV on the same dataset; `None` for non-vine fits.
+    pub vine_corrected_ofv: Option<f64>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1269,6 +1273,7 @@ fn optimize_nlopt(
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
         final_gradient,
         vine_params: None,
+        vine_corrected_ofv: None,
     }
 }
 
@@ -1597,6 +1602,7 @@ fn optimize_bfgs(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         vine_params: None,
+        vine_corrected_ofv: None,
     }
 }
 

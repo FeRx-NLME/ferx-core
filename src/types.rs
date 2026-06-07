@@ -1945,6 +1945,12 @@ pub struct FitResult {
     /// Kendall's τ, and tail-dependence for each tree level.
     /// `Some` only when `omega_dist = vine` was requested and the run succeeded.
     pub vine_params: Option<crate::stats::vine_copula::VineFitParams>,
+    /// Vine-corrected OFV: the FOCE OFV with the Gaussian prior replaced by the
+    /// vine (copula) prior at the final EBEs. Directly comparable to a Gaussian
+    /// FOCE OFV on the same dataset; use `gauss_ofv - vine_corrected_ofv` to
+    /// quantify the advantage of the vine model.
+    /// `None` for non-vine fits or when the correction is non-finite.
+    pub vine_corrected_ofv: Option<f64>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a short lowercase label
     /// ("bobyqa", "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs",

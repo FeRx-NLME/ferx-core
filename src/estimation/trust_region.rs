@@ -442,6 +442,7 @@ pub fn optimize_trust_region(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         vine_params: None,
+        vine_corrected_ofv: None,
     }
 }
 

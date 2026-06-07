@@ -509,6 +509,18 @@ pub fn print_results(result: &FitResult) {
                 eprintln!("{}", line);
             }
         }
+        // Vine-corrected OFV: shows the true model advantage versus a Gaussian Ω.
+        // The reported OFV uses the Gaussian FOCE formula for both methods; the
+        // corrected value replaces the Gaussian prior with the vine prior at the
+        // final EBEs and is on the same scale as a Gaussian FOCE OFV.
+        if let Some(corr) = result.vine_corrected_ofv {
+            eprintln!("  OFV (FOCE/Gaussian prior):  {:.3}", result.ofv);
+            eprintln!("  OFV (vine-corrected prior): {:.3}", corr);
+            eprintln!(
+                "  ΔOFV (Gaussian − corrected): {:.3}  [vine model advantage]",
+                result.ofv - corr
+            );
+        }
     }
 
     // Warnings
@@ -1205,6 +1217,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 }
             }
         }
+        if let Some(corr) = result.vine_corrected_ofv {
+            writeln!(f, "  ofv_foce_gaussian_prior: {:.6}", result.ofv)
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "  ofv_vine_corrected: {:.6}", corr).map_err(|e| e.to_string())?;
+            writeln!(f, "  delta_ofv_vine_advantage: {:.6}", result.ofv - corr)
+                .map_err(|e| e.to_string())?;
+        }
     }
 
     if !result.warnings.is_empty() {
@@ -1365,6 +1384,7 @@ mod tests {
             obs_time_range: None,
             final_gradient: None,
             vine_params: None,
+            vine_corrected_ofv: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
@@ -1690,6 +1710,7 @@ mod tests {
             obs_time_range: None,
             final_gradient: None,
             vine_params: None,
+            vine_corrected_ofv: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
