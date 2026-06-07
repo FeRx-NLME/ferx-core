@@ -2064,9 +2064,10 @@ pub struct FitOptions {
     /// proposals can lock the M-step into a degenerate basin with the
     /// PD-curve thetas at boundary values) and, together with the
     /// componentwise kernel (run automatically for multi-η models), keeps a
-    /// block Ω from collapsing to a near rank-1 correlation matrix. A
-    /// componentwise sweep count of `n_mh_steps / n_eta` is derived from this
-    /// value. Reduce to 3-10 for the older/faster behaviour on simpler
+    /// block Ω from collapsing to a near rank-1 correlation matrix. The
+    /// componentwise sweep count `max(2, n_mh_steps / n_eta)` is derived from
+    /// this value (the kernel is skipped entirely for single-η models).
+    /// Reduce to 3-10 for the older/faster behaviour on simpler
     /// well-identified models; raise (30-50) only when the diagnostic shows
     /// the M-step is still tracking correlated samples.
     pub saem_n_mh_steps: usize,
@@ -3137,7 +3138,7 @@ mod tests {
     /// stochastic-approximation step — both added to stop a block (correlated)
     /// Ω collapsing to a near rank-1 correlation matrix (UVM 2-cpt: every
     /// off-diagonal correlation → ~0.99, one variance → 0). The larger default
-    /// also sizes the componentwise sweep count (`n_mh_steps / n_eta`).
+    /// also sizes the componentwise sweep count (`max(2, n_mh_steps / n_eta)`).
     ///
     /// If a future change drops the default below ~5, re-run both the Emax PKPD
     /// basin regression and the UVM block-Ω collapse regression in the

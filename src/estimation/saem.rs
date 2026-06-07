@@ -52,10 +52,11 @@ const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
 const CW_TARGET_ACCEPT: f64 = 0.44;
 
 /// Maximum per-iteration stochastic-approximation step for the Ω sufficient
-/// statistic. The θ/σ M-step still uses the full γ (1.0 in exploration), but Ω
-/// is averaged at no more than this rate so a single un-equilibrated MCMC draw
-/// cannot overwrite a correlated Ω and trigger the rank-1 collapse feedback.
-/// Inactive once the convergence-phase γ = 1/(k−k1) decays below it.
+/// statistic *during the exploration phase*. The θ/σ M-step uses the full γ
+/// (1.0 in exploration), but Ω is averaged at no more than this rate so a single
+/// un-equilibrated MCMC draw cannot overwrite a correlated Ω and trigger the
+/// rank-1 collapse feedback. In the convergence phase the cap is lifted and Ω
+/// uses the full decaying γ = 1/(k−k1), the same Robbins-Monro schedule as θ.
 const OMEGA_SA_MAX_STEP: f64 = 0.1;
 
 /// Raise every *free* diagonal entry of the BSV Ω that has fallen below `floor`
@@ -1296,16 +1297,23 @@ pub fn run_saem(
             break;
         }
         let gamma = if k <= k1 { 1.0 } else { 1.0 / (k - k1) as f64 };
-        // Damped SA step for the Ω sufficient statistic. With the full γ=1 used
-        // for θ during exploration, Ω would be overwritten each iteration by a
-        // single (warm-started, not-yet-equilibrated) MCMC draw; for a
-        // correlated block that snapshot is biased toward the chain's current
-        // correlation, and the bias feeds back through chol(Ω) into the next
-        // proposal — a runaway toward a near rank-1 Ω. Capping the Ω learning
-        // rate averages those draws (Robbins-Monro from the start) and breaks
-        // the feedback, while θ keeps moving at full γ. In the convergence phase
-        // the cap is inactive (γ already decays below it).
-        let gamma_omega = gamma.min(OMEGA_SA_MAX_STEP);
+        // Damped SA step for the Ω sufficient statistic during exploration only.
+        // With the full γ=1 used for θ, an undamped Ω would be overwritten each
+        // exploration iteration by a single (warm-started, not-yet-equilibrated)
+        // MCMC draw; for a correlated block that snapshot is biased toward the
+        // chain's current correlation, and the bias feeds back through chol(Ω)
+        // into the next proposal — a runaway toward a near rank-1 Ω. Capping the
+        // Ω learning rate during exploration averages those draws (Robbins-Monro)
+        // and breaks the feedback, while θ keeps moving at full γ. In the
+        // convergence phase the cap is lifted: Ω uses the full decaying
+        // γ = 1/(k−k1), the same schedule as θ, so the SA estimate settles
+        // correctly (the chain is equilibrated by then, so the single-draw
+        // overwrite risk that motivated the cap no longer applies).
+        let gamma_omega = if k <= k1 {
+            gamma.min(OMEGA_SA_MAX_STEP)
+        } else {
+            gamma
+        };
 
         // Rebuild omega for this iteration
         let omega_k = OmegaMatrix::from_matrix(
