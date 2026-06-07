@@ -2423,6 +2423,7 @@ fn fit_inner(
         sigma_init,
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
+        vine_params: result.vine_params.clone(),
         optimizer: match final_method {
             EstimationMethod::Saem => "saem",
             EstimationMethod::FoceGn => "gn",
@@ -4588,6 +4589,7 @@ mod simulate_with_uncertainty_tests {
             sigma_init: template.sigma.values.clone(),
             obs_time_range: None,
             final_gradient: None,
+            vine_params: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,

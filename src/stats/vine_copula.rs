@@ -380,6 +380,227 @@ impl RandomEffectDistribution for VineCopulaOmega {
 }
 
 // ---------------------------------------------------------------------------
+// VineFitParams — extracted summary for reporting
+// ---------------------------------------------------------------------------
+
+/// Summary of one fitted bivariate pair-copula.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PairCopulaSummary {
+    /// Family name: "gaussian", "student_t", "clayton", "gumbel", or "frank".
+    pub family: String,
+    /// Copula parameter(s). For Gaussian/Student-t: [(\"rho\", ρ)], plus for
+    /// Student-t [(\"nu\", ν)]. For Clayton/Gumbel/Frank: [(\"theta\", θ)].
+    pub params: Vec<(String, f64)>,
+    /// Kendall's rank correlation τ derived from the fitted parameters.
+    pub kendall_tau: f64,
+    /// Lower tail dependence λ_L = lim_{u→0} P(V ≤ u | U ≤ u).
+    /// 0 for Gaussian, Frank; 2^{−1/θ} for Clayton; 0 for Gumbel.
+    /// For Student-t: 2 · t_{ν+1}(−√((ν+1)(1−ρ)/(1+ρ))).
+    pub tail_dep_lower: f64,
+    /// Upper tail dependence λ_U = lim_{u→1} P(V > u | U > u).
+    /// 0 for Gaussian, Frank, Clayton; 2 − 2^{1/θ} for Gumbel.
+    /// For Student-t: same formula as lower (symmetric).
+    pub tail_dep_upper: f64,
+}
+
+/// One vine tree level: all pair-copulas at this level together with their
+/// variable labels.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VineTreeSummary {
+    /// Tree level (1 = unconditional, 2 = conditioned on one variable, …).
+    pub tree: usize,
+    /// Per-pair summaries. Entry j describes the pair at position j in the
+    /// D-vine ordering at this tree level.
+    pub pairs: Vec<VinePairEntry>,
+}
+
+/// One pair within a vine tree.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VinePairEntry {
+    /// Human-readable pair label, e.g. "ETA_CL ~ ETA_V | ETA_KA".
+    pub label: String,
+    pub copula: PairCopulaSummary,
+}
+
+/// Complete vine-copula fit summary attached to `FitResult` and written to
+/// the YAML / console output.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VineFitParams {
+    /// Fitted marginal Gaussian: (name, mean, sd) per ETA dimension.
+    pub marginals: Vec<(String, f64, f64)>,
+    /// Vine tree summaries, one entry per tree level (length d−1 for d ETAs).
+    pub trees: Vec<VineTreeSummary>,
+}
+
+// ---------------------------------------------------------------------------
+// Closed-form Kendall's τ and tail-dependence coefficients
+// ---------------------------------------------------------------------------
+
+fn kendall_tau_gaussian(rho: f64) -> f64 {
+    (2.0 / std::f64::consts::PI) * rho.asin()
+}
+
+fn kendall_tau_student_t(rho: f64) -> f64 {
+    (2.0 / std::f64::consts::PI) * rho.asin()
+}
+
+fn kendall_tau_clayton(theta: f64) -> f64 {
+    theta / (theta + 2.0)
+}
+
+fn kendall_tau_gumbel(theta: f64) -> f64 {
+    1.0 - 1.0 / theta
+}
+
+/// Kendall's τ for the Frank copula via the Debye D₁ function.
+/// D₁(θ) = (1/θ) ∫₀^θ t/(e^t − 1) dt, computed with 200-point quadrature.
+fn kendall_tau_frank(theta: f64) -> f64 {
+    if theta.abs() < 1e-8 {
+        return 0.0;
+    }
+    let n = 200usize;
+    let dt = theta / n as f64;
+    // Trapezoidal rule: integrand = t / (exp(t) - 1)
+    let integrand = |t: f64| -> f64 {
+        if t.abs() < 1e-10 {
+            return 1.0; // lim_{t→0} t/(e^t-1) = 1
+        }
+        t / (t.exp() - 1.0)
+    };
+    let mut integral = 0.5 * (integrand(0.0) + integrand(theta));
+    for i in 1..n {
+        integral += integrand(i as f64 * dt);
+    }
+    integral *= dt;
+    let d1 = integral / theta; // Debye function D₁(θ)
+    1.0 - 4.0 * (1.0 - d1) / theta
+}
+
+fn tail_dep_student_t(rho: f64, nu: f64) -> f64 {
+    if rho <= -1.0 + 1e-8 {
+        return 0.0;
+    }
+    let x = -((nu + 1.0) * (1.0 - rho) / (1.0 + rho)).sqrt();
+    2.0 * crate::stats::copula::student_t_cdf(x, nu + 1.0)
+}
+
+// ---------------------------------------------------------------------------
+// VineCopulaOmega → VineFitParams extraction
+// ---------------------------------------------------------------------------
+
+impl VineCopulaOmega {
+    /// Extract a human-readable summary of the fitted vine for reporting.
+    ///
+    /// `eta_names` should be `init_params.omega.eta_names` (the ETA labels from
+    /// the model file). Falls back to "ETA_1", "ETA_2", … if None.
+    pub fn to_fit_params(&self, eta_names: &[String]) -> VineFitParams {
+        let d = self.d;
+        let name = |i: usize| -> String {
+            eta_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("ETA_{}", i + 1))
+        };
+
+        // Marginals.
+        let marginals: Vec<(String, f64, f64)> = (0..d)
+            .map(|i| (name(i), self.marginal_means[i], self.marginal_stds[i]))
+            .collect();
+
+        // Tree summaries.
+        let mut trees: Vec<VineTreeSummary> = Vec::new();
+        for k in 0..d.saturating_sub(1) {
+            let n_pairs = d - k - 1;
+            let mut pairs: Vec<VinePairEntry> = Vec::new();
+
+            for j in 0..n_pairs {
+                let left_var = j;
+                let right_var = j + k + 1;
+                let cond_set: Vec<String> = (j + 1..=j + k).map(|c| name(c)).collect();
+
+                let label = if cond_set.is_empty() {
+                    format!("{} ~ {}", name(left_var), name(right_var))
+                } else {
+                    format!(
+                        "{} ~ {} | {}",
+                        name(left_var),
+                        name(right_var),
+                        cond_set.join(", ")
+                    )
+                };
+
+                let cop = &self.pair_copulas[k][j];
+                let summary = pair_copula_summary(cop);
+                pairs.push(VinePairEntry {
+                    label,
+                    copula: summary,
+                });
+            }
+
+            trees.push(VineTreeSummary { tree: k + 1, pairs });
+        }
+
+        VineFitParams { marginals, trees }
+    }
+}
+
+fn pair_copula_summary(cop: &CopulaFamily) -> PairCopulaSummary {
+    match cop {
+        CopulaFamily::Gaussian(c) => {
+            let rho = c.rho;
+            PairCopulaSummary {
+                family: "gaussian".into(),
+                params: vec![("rho".into(), rho)],
+                kendall_tau: kendall_tau_gaussian(rho),
+                tail_dep_lower: 0.0,
+                tail_dep_upper: 0.0,
+            }
+        }
+        CopulaFamily::StudentT(c) => {
+            let (rho, nu) = (c.rho, c.nu);
+            let td = tail_dep_student_t(rho, nu);
+            PairCopulaSummary {
+                family: "student_t".into(),
+                params: vec![("rho".into(), rho), ("nu".into(), nu)],
+                kendall_tau: kendall_tau_student_t(rho),
+                tail_dep_lower: td,
+                tail_dep_upper: td,
+            }
+        }
+        CopulaFamily::Clayton(c) => {
+            let theta = c.theta;
+            PairCopulaSummary {
+                family: "clayton".into(),
+                params: vec![("theta".into(), theta)],
+                kendall_tau: kendall_tau_clayton(theta),
+                tail_dep_lower: (2.0f64).powf(-1.0 / theta),
+                tail_dep_upper: 0.0,
+            }
+        }
+        CopulaFamily::Gumbel(c) => {
+            let theta = c.theta;
+            PairCopulaSummary {
+                family: "gumbel".into(),
+                params: vec![("theta".into(), theta)],
+                kendall_tau: kendall_tau_gumbel(theta),
+                tail_dep_lower: 0.0,
+                tail_dep_upper: 2.0 - (2.0f64).powf(1.0 / theta),
+            }
+        }
+        CopulaFamily::Frank(c) => {
+            let theta = c.theta;
+            PairCopulaSummary {
+                family: "frank".into(),
+                params: vec![("theta".into(), theta)],
+                kendall_tau: kendall_tau_frank(theta),
+                tail_dep_lower: 0.0,
+                tail_dep_upper: 0.0,
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -411,6 +411,7 @@ mod tests {
             sigma_init: template.sigma.values.clone(),
             obs_time_range: None,
             final_gradient: None,
+            vine_params: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,

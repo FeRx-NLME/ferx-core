@@ -412,6 +412,7 @@ pub fn run_foce_gn(
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             final_gradient,
+            vine_params: None,
         };
     }
 
@@ -517,6 +518,7 @@ pub fn run_foce_gn(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient,
+        vine_params: None,
     }
 }
 

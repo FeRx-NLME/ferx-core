@@ -476,6 +476,41 @@ pub fn print_results(result: &FitResult) {
         }
     }
 
+    // Vine-copula summary
+    if let Some(ref vp) = result.vine_params {
+        eprintln!("\n--- Vine Copula (omega_dist = vine) ---");
+        eprintln!("  Marginal Gaussians:");
+        for (name, mean, sd) in &vp.marginals {
+            eprintln!("    {:12}  mean={:+.4}  sd={:.4}", name, mean, sd);
+        }
+        for tree in &vp.trees {
+            eprintln!("  Tree {}:", tree.tree);
+            for entry in &tree.pairs {
+                let params: Vec<String> = entry
+                    .copula
+                    .params
+                    .iter()
+                    .map(|(k, v)| format!("{}={:.4}", k, v))
+                    .collect();
+                let mut line = format!(
+                    "    {}  [{}  {}  τ={:.3}",
+                    entry.label,
+                    entry.copula.family,
+                    params.join(" "),
+                    entry.copula.kendall_tau
+                );
+                if entry.copula.tail_dep_lower > 1e-10 {
+                    line.push_str(&format!("  λL={:.3}", entry.copula.tail_dep_lower));
+                }
+                if entry.copula.tail_dep_upper > 1e-10 {
+                    line.push_str(&format!("  λU={:.3}", entry.copula.tail_dep_upper));
+                }
+                line.push(']');
+                eprintln!("{}", line);
+            }
+        }
+    }
+
     // Warnings
     if !result.warnings.is_empty() {
         eprintln!("\n--- Warnings ---");
@@ -1125,6 +1160,53 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    if let Some(ref vp) = result.vine_params {
+        writeln!(f, "\nvine_copula:").map_err(|e| e.to_string())?;
+        writeln!(f, "  marginals:").map_err(|e| e.to_string())?;
+        for (name, mean, sd) in &vp.marginals {
+            writeln!(f, "    {}:", name).map_err(|e| e.to_string())?;
+            writeln!(f, "      mean: {:.6}", mean).map_err(|e| e.to_string())?;
+            writeln!(f, "      sd: {:.6}", sd).map_err(|e| e.to_string())?;
+        }
+        writeln!(f, "  trees:").map_err(|e| e.to_string())?;
+        for tree in &vp.trees {
+            writeln!(f, "    - tree: {}", tree.tree).map_err(|e| e.to_string())?;
+            if tree.pairs.is_empty() {
+                writeln!(f, "      pairs: []").map_err(|e| e.to_string())?;
+            } else {
+                writeln!(f, "      pairs:").map_err(|e| e.to_string())?;
+                for entry in &tree.pairs {
+                    writeln!(f, "        - label: \"{}\"", entry.label)
+                        .map_err(|e| e.to_string())?;
+                    writeln!(f, "          family: {}", entry.copula.family)
+                        .map_err(|e| e.to_string())?;
+                    for (pname, pval) in &entry.copula.params {
+                        writeln!(f, "          {}: {:.6}", pname, pval)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    writeln!(f, "          kendall_tau: {:.6}", entry.copula.kendall_tau)
+                        .map_err(|e| e.to_string())?;
+                    if entry.copula.tail_dep_lower > 1e-10 {
+                        writeln!(
+                            f,
+                            "          tail_dep_lower: {:.6}",
+                            entry.copula.tail_dep_lower
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    if entry.copula.tail_dep_upper > 1e-10 {
+                        writeln!(
+                            f,
+                            "          tail_dep_upper: {:.6}",
+                            entry.copula.tail_dep_upper
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
+    }
+
     if !result.warnings.is_empty() {
         writeln!(f, "\nwarnings:").map_err(|e| e.to_string())?;
         for w in &result.warnings {
@@ -1282,6 +1364,7 @@ mod tests {
             sigma_init: Vec::new(),
             obs_time_range: None,
             final_gradient: None,
+            vine_params: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
@@ -1606,6 +1689,7 @@ mod tests {
             sigma_init: Vec::new(),
             obs_time_range: None,
             final_gradient: None,
+            vine_params: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,

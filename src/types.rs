@@ -1941,6 +1941,10 @@ pub struct FitResult {
     /// least one gradient-requesting iteration improved the OFV; `None` for
     /// BOBYQA (derivative-free), built-in BFGS, GN, and SAEM.
     pub final_gradient: Option<Vec<f64>>,
+    /// Vine-copula fit summary: marginal Gaussians, pair-copula families,
+    /// Kendall's τ, and tail-dependence for each tree level.
+    /// `Some` only when `omega_dist = vine` was requested and the run succeeded.
+    pub vine_params: Option<crate::stats::vine_copula::VineFitParams>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a short lowercase label
     /// ("bobyqa", "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs",

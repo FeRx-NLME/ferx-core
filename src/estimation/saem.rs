@@ -1435,6 +1435,7 @@ fn run_saem_vine(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        vine_params: Some(dist.to_fit_params(&init_params.omega.eta_names)),
     })
 }
 
@@ -2346,6 +2347,7 @@ pub fn run_saem(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        vine_params: None,
     })
 }
 

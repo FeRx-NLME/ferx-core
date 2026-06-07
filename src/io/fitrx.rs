@@ -248,6 +248,8 @@ struct FitWire {
     obs_time_range: Option<(f64, f64)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_gradient: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vine_params: Option<crate::stats::vine_copula::VineFitParams>,
     // ── Run settings ─────────────────────────────────────────────────────────
     #[serde(default)]
     optimizer: String,
@@ -750,6 +752,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         sigma_init: r.sigma_init.clone(),
         obs_time_range: r.obs_time_range,
         final_gradient: r.final_gradient.clone(),
+        vine_params: r.vine_params.clone(),
         optimizer: r.optimizer.clone(),
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
@@ -1596,6 +1599,7 @@ fn wire_to_fit_result(
         sigma_init: w.sigma_init,
         obs_time_range: w.obs_time_range,
         final_gradient: w.final_gradient,
+        vine_params: w.vine_params,
         optimizer: w.optimizer,
         n_starts: w.n_starts,
         multi_start_seed: w.multi_start_seed,
@@ -1803,6 +1807,7 @@ mod tests {
             sigma_init: vec![0.05],
             obs_time_range: Some((0.25, 24.0)),
             final_gradient: None,
+            vine_params: None,
             optimizer: "slsqp".to_string(),
             n_starts: 1,
             multi_start_seed: None,
