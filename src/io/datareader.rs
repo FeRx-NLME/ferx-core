@@ -2,7 +2,7 @@ use crate::io::filter_expr::{FilterClause, RowContext};
 use crate::types::{
     CovariateDecl, CovariateRow, CovariateTable, DoseEvent, ExclusionSummary, Population, Subject,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Compiled data-selection filter built from `FitOptions` ignore/accept fields.
@@ -132,7 +132,8 @@ pub fn read_nonmem_csv(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(path, covariate_columns, iov_column, None, None).map(|(pop, _)| pop)
+    read_nonmem_csv_impl(path, covariate_columns, iov_column, None, None, &HashSet::new())
+        .map(|(pop, _)| pop)
 }
 
 /// Read a NONMEM-format CSV with a `[covariates]` declaration.
@@ -164,7 +165,7 @@ pub fn read_nonmem_csv_with_covariates(
     }
     let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
     let (pop, table) =
-        read_nonmem_csv_impl(path, Some(&union_refs), iov_column, Some(decls), None)?;
+        read_nonmem_csv_impl(path, Some(&union_refs), iov_column, Some(decls), None, &HashSet::new())?;
     Ok((
         pop,
         table.expect("covariate table is built whenever table_decls is Some"),
@@ -196,7 +197,7 @@ pub fn read_nonmem_csv_filtered(
     let cols_ref: Option<Vec<&str>> = augmented
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
-    read_nonmem_csv_impl(path, cols_ref.as_deref(), iov_column, None, Some(filter))
+    read_nonmem_csv_impl(path, cols_ref.as_deref(), iov_column, None, Some(filter), &HashSet::new())
         .map(|(pop, _)| pop)
 }
 
@@ -232,6 +233,76 @@ pub fn read_nonmem_csv_with_covariates_filtered(
         iov_column,
         Some(decls),
         Some(filter),
+        &HashSet::new(),
+    )?;
+    Ok((
+        pop,
+        table.expect("covariate table is built whenever table_decls is Some"),
+    ))
+}
+
+// ── TTE-aware readers (pub(crate) — used by api::read_population_for) ────────
+
+/// Like [`read_nonmem_csv_filtered`] but routes EVID=0 rows on `tte_cmts` to
+/// `Subject::obs_records` instead of the Gaussian parallel Vecs.
+///
+/// Used by `api::read_population_for` when the model has one or more TTE endpoints.
+pub(crate) fn read_nonmem_csv_filtered_tte(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    tte_cmts: &HashSet<usize>,
+) -> Result<Population, String> {
+    let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
+        let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
+        if let Some(f) = filter {
+            for c in f.referenced_covariate_columns() {
+                if !v.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
+                    v.push(c);
+                }
+            }
+        }
+        v
+    });
+    let cols_ref: Option<Vec<&str>> = augmented
+        .as_ref()
+        .map(|v| v.iter().map(|s| s.as_str()).collect());
+    read_nonmem_csv_impl(path, cols_ref.as_deref(), iov_column, None, filter, tte_cmts)
+        .map(|(pop, _)| pop)
+}
+
+/// Like [`read_nonmem_csv_with_covariates_filtered`] but routes EVID=0 rows on
+/// `tte_cmts` to `Subject::obs_records`.
+pub(crate) fn read_nonmem_csv_with_covariates_tte(
+    path: &Path,
+    decls: &[CovariateDecl],
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    filter: Option<&SelectionFilter>,
+    tte_cmts: &HashSet<usize>,
+) -> Result<(Population, CovariateTable), String> {
+    let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
+    for c in extra_columns {
+        if !union.iter().any(|n| n == c) {
+            union.push(c.clone());
+        }
+    }
+    if let Some(f) = filter {
+        for c in f.referenced_covariate_columns() {
+            if !union.iter().any(|n| n.eq_ignore_ascii_case(&c)) {
+                union.push(c);
+            }
+        }
+    }
+    let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
+    let (pop, table) = read_nonmem_csv_impl(
+        path,
+        Some(&union_refs),
+        iov_column,
+        Some(decls),
+        filter,
+        tte_cmts,
     )?;
     Ok((
         pop,
@@ -245,12 +316,16 @@ pub fn read_nonmem_csv_with_covariates_filtered(
 /// columns in `covariate_columns` (a superset, including referenced-but-
 /// undeclared covariates) are read into the [`Population`] leniently. `None` on
 /// both is the legacy auto-detect [`read_nonmem_csv`] path.
+///
+/// `tte_cmts`: CMTs whose EVID=0 rows should be routed to `Subject::obs_records`
+/// (TTE endpoint) instead of the Gaussian parallel Vecs. Empty for all-Gaussian models.
 fn read_nonmem_csv_impl(
     path: &Path,
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
     table_decls: Option<&[CovariateDecl]>,
     filter: Option<&SelectionFilter>,
+    tte_cmts: &HashSet<usize>,
 ) -> Result<(Population, Option<CovariateTable>), String> {
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
@@ -284,6 +359,9 @@ fn read_nonmem_csv_impl(
     let ss_col = col_idx_ci("ss");
     let cens_col = col_idx_ci("cens");
     let addl_col = col_idx_ci("addl");
+    // TENTRY column: left-truncation / delayed-entry time for TTE rows.
+    // Absent in Gaussian-only datasets; only used when tte_cmts is non-empty.
+    let tentry_col = col_idx_ci("tentry");
 
     // IOV occasion column (case-insensitive lookup of user-specified name)
     let occ_col: Option<usize> = iov_column.and_then(|name| col_idx_ci(name));
@@ -296,6 +374,7 @@ fn read_nonmem_csv_impl(
 
     const STANDARD_COLS: &[&str] = &[
         "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl",
+        "tentry",
     ];
     let is_standard = |h: &str| {
         STANDARD_COLS.iter().any(|s| h.eq_ignore_ascii_case(s))
@@ -435,6 +514,8 @@ fn read_nonmem_csv_impl(
             addl_col,
             &cov_indices,
             filter,
+            tte_cmts,
+            tentry_col,
         )?;
         total_occ_failures += occ_failures;
         population_warnings.extend(subj_warnings);
@@ -607,6 +688,12 @@ fn parse_subject(
     addl_col: Option<usize>,
     cov_indices: &[(String, usize)],
     filter: Option<&SelectionFilter>,
+    // CMTs to route to `obs_records` instead of the Gaussian parallel Vecs.
+    // Empty for Gaussian-only models. Always available; feature-gated routing
+    // runs inside `#[cfg(feature = "survival")]` blocks.
+    tte_cmts: &HashSet<usize>,
+    // Column index of the TENTRY (left-truncation time) column, if present.
+    tentry_col: Option<usize>,
 ) -> Result<(Subject, usize, SubjectExclusion, Vec<String>), String> {
     let mut doses = Vec::new();
     let mut obs_times = Vec::new();
@@ -622,6 +709,16 @@ fn parse_subject(
     let mut excl_fired: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
+
+    // TTE state — only meaningful when tte_cmts is non-empty.
+    // obs_records: finalised TTE observation records for this subject.
+    // tte_pending_left: per-CMT pending DV=0 row (may be a left-bound for an interval
+    //   or a right-censored event, depending on whether the next row is DV=2).
+    //   Map value is (time, entry_time).
+    #[cfg(feature = "survival")]
+    let mut tte_obs_records: Vec<crate::types::ObsRecord> = Vec::new();
+    #[cfg(feature = "survival")]
+    let mut tte_pending_left: HashMap<usize, (f64, f64)> = HashMap::new();
 
     // Time-constant covariates: first non-missing value across all rows.
     // Used as the subject-static fallback (and for the AD fast path, which
@@ -894,19 +991,118 @@ fn parse_subject(
                     }
                 })
                 .unwrap_or(1);
-            let cens_flag = cens_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
-                .unwrap_or(0);
-            obs_times.push(time);
-            observations.push(dv);
-            obs_cmts.push(cmt);
-            cens.push(if cens_flag > 0 { 1u8 } else { 0u8 });
-            if occ_col.is_some() {
-                occasions.push(occ);
-            }
-            if any_tv {
-                obs_covariates.push(locf_state.clone());
+
+            // TTE row routing: when this CMT belongs to a TTE endpoint, route to
+            // obs_records instead of the Gaussian parallel Vecs.
+            // The `tte_cmts.contains` check is always compiled (HashSet is not
+            // feature-gated); the inner ObsRecord construction is cfg-gated.
+            if tte_cmts.contains(&cmt) {
+                #[cfg(feature = "survival")]
+                {
+                    use crate::types::{EventType, ObsRecord};
+                    let entry_time = tentry_col
+                        .and_then(|c| row.get(c))
+                        .map(|s| parse_f64(s))
+                        .unwrap_or(0.0)
+                        .max(0.0);
+                    let dv_code = dv as i64;
+                    match dv_code {
+                        0 => {
+                            // DV=0: tentatively a right-censored event, or left-bound of
+                            // interval-censored pair. Save as pending; flush on next row.
+                            // Flush any existing pending for this CMT first.
+                            if let Some((t_left, e_left)) = tte_pending_left.remove(&cmt) {
+                                tte_obs_records.push(ObsRecord::Event {
+                                    time: t_left,
+                                    event_type: EventType::RightCensored,
+                                    entry_time: e_left,
+                                    cmt,
+                                });
+                            }
+                            tte_pending_left.insert(cmt, (time, entry_time));
+                        }
+                        1 => {
+                            // DV=1: exact event. Flush any pending left for this CMT.
+                            if let Some((t_left, e_left)) = tte_pending_left.remove(&cmt) {
+                                tte_obs_records.push(ObsRecord::Event {
+                                    time: t_left,
+                                    event_type: EventType::RightCensored,
+                                    entry_time: e_left,
+                                    cmt,
+                                });
+                            }
+                            tte_obs_records.push(ObsRecord::Event {
+                                time,
+                                event_type: EventType::Exact,
+                                entry_time,
+                                cmt,
+                            });
+                        }
+                        2 => {
+                            // DV=2: interval-censored right-bound. Must follow a DV=0.
+                            let left = tte_pending_left.remove(&cmt).ok_or_else(|| {
+                                format!(
+                                    "Subject {id}: DV=2 row at TIME={time} on CMT={cmt} \
+                                     not preceded by a DV=0 row on the same CMT — \
+                                     DV=2 marks the right bound of an interval-censored event"
+                                )
+                            })?;
+                            let (t_left, e_left) = left;
+                            tte_obs_records.push(ObsRecord::Event {
+                                time,
+                                event_type: EventType::IntervalCensored {
+                                    left: t_left,
+                                    right: time,
+                                },
+                                entry_time: e_left,
+                                cmt,
+                            });
+                        }
+                        other => {
+                            return Err(format!(
+                                "Subject {id}: TTE endpoint CMT={cmt} has DV={other} \
+                                 at TIME={time}; valid DV codes are 0 (right-censored), \
+                                 1 (exact event), 2 (interval-censored right bound)"
+                            ));
+                        }
+                    }
+                }
+                // When survival feature is off, fall through to Gaussian path (shouldn't
+                // happen with a consistently compiled model, but avoids a dead branch).
+                #[cfg(not(feature = "survival"))]
+                {
+                    let _ = tentry_col;
+                    let cens_flag = cens_col
+                        .and_then(|c| row.get(c))
+                        .map(|s| parse_usize(s))
+                        .unwrap_or(0);
+                    obs_times.push(time);
+                    observations.push(dv);
+                    obs_cmts.push(cmt);
+                    cens.push(if cens_flag > 0 { 1u8 } else { 0u8 });
+                    if occ_col.is_some() {
+                        occasions.push(occ);
+                    }
+                    if any_tv {
+                        obs_covariates.push(locf_state.clone());
+                    }
+                }
+            } else {
+                // Gaussian path (unchanged)
+                let cens_flag = cens_col
+                    .and_then(|c| row.get(c))
+                    .map(|s| parse_usize(s))
+                    .unwrap_or(0);
+                obs_times.push(time);
+                observations.push(dv);
+                obs_cmts.push(cmt);
+                cens.push(if cens_flag > 0 { 1u8 } else { 0u8 });
+                if occ_col.is_some() {
+                    occasions.push(occ);
+                }
+                if any_tv {
+                    obs_covariates.push(locf_state.clone());
+                }
             }
         } else if evid == 2 && any_tv {
             // EVID=2 "other event" — typically a covariate-change marker.
@@ -949,6 +1145,19 @@ fn parse_subject(
     // sort defensively so the event-driven propagators see them in order.
     reset_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Flush any remaining pending TTE left-bounds as right-censored events.
+    // This handles the common case: final row is a right-censored DV=0 with no
+    // following DV=2 — the subject was censored at its last observation time.
+    #[cfg(feature = "survival")]
+    for (cmt, (t_left, e_left)) in tte_pending_left {
+        tte_obs_records.push(crate::types::ObsRecord::Event {
+            time: t_left,
+            event_type: crate::types::EventType::RightCensored,
+            entry_time: e_left,
+            cmt,
+        });
+    }
+
     Ok((
         Subject {
             id: id.to_string(),
@@ -966,7 +1175,7 @@ fn parse_subject(
             occasions,
             dose_occasions: sorted_dose_occ,
             #[cfg(feature = "survival")]
-            obs_records: vec![],
+            obs_records: tte_obs_records,
         },
         occ_parse_failures,
         SubjectExclusion {

@@ -392,8 +392,8 @@ mod tests {
         let nll = tte_data_term(&records, &hazard, &[0.1], &[0.0], &HashMap::new());
         // NLL must be finite and positive; exact value verified via log-domain formula.
         assert!(nll.is_finite() && nll > 0.0, "nll = {nll}");
-        let delta = 0.1 * 0.0001; // H(right) - H(left)
-        let a = 0.1 * 10.0; // H(left) - H(entry)
+        let delta = 0.1_f64 * 0.0001; // H(right) - H(left)
+        let a = 0.1_f64 * 10.0; // H(left) - H(entry)
         let expected = a - ((-delta).exp_m1().abs().ln());
         assert_abs_diff_eq!(nll, expected, epsilon = 1e-8);
     }

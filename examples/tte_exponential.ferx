@@ -1,0 +1,49 @@
+# Standalone TTE model with exponential hazard (Phase 1 TTE).
+#
+# Event time for CMT 2 follows Exp(LAMBDA) where
+#   LAMBDA = TVLAMBDA * exp(ETA_LAMBDA).
+#
+# Data format (DV coding for TTE rows with EVID=0):
+#   DV=0  right-censored
+#   DV=1  exact event
+#
+# Reference (simulated): TVLAMBDA = 0.05 h^-1, omega(ETA_LAMBDA) = 0.09.
+# Administrative censoring at t = 30 h.
+#
+# Note: the [structural_model] and [error_model] blocks are syntactically
+# required by the parser; they are inert here because no Gaussian (CMT-1)
+# observations exist in the dataset. sigma and the dummy CL/V carry zero
+# gradient signal and stay at their initial values.
+
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+
+  # Dummy PK parameters, never used (no CMT-1 rows in dataset).
+  theta DUMMY_CL(1.0, FIX)
+  theta DUMMY_V(1.0, FIX)
+
+  omega ETA_LAMBDA ~ 0.09
+
+  # Placeholder sigma — unused when dataset has no Gaussian observations.
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  LAMBDA = TVLAMBDA * exp(ETA_LAMBDA)
+  CL     = DUMMY_CL
+  V      = DUMMY_V
+
+[structural_model]
+  # Dummy 1-cpt IV; never invoked for TTE-only subjects (no CMT-1 obs).
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = LAMBDA
+
+[fit_options]
+  method  = focei
+  maxiter = 300

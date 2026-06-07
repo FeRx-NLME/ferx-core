@@ -163,6 +163,44 @@ pub fn individual_nll_into_with_schedule(
         }
     }
 
+    // TTE data term: add −log p(events | η, θ) for each TTE endpoint.
+    // Only compiled and executed when the `survival` feature is enabled and
+    // the subject has non-Gaussian obs_records.
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        use crate::survival::tte_data_term;
+        use crate::types::EndpointLikelihood;
+        // Group records by CMT to call tte_data_term once per TTE endpoint.
+        // Clone records to satisfy tte_data_term's &[ObsRecord] signature.
+        // Subjects typically have 1–10 obs_records so this is negligible.
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for record in &subject.obs_records {
+            let crate::types::ObsRecord::Event { cmt, .. } = record;
+            if seen.insert(*cmt) {
+                if let Some(EndpointLikelihood::Tte { hazard }) = model.endpoints.get(cmt) {
+                    let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                        .obs_records
+                        .iter()
+                        .filter(|r| {
+                            matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt)
+                        })
+                        .cloned()
+                        .collect();
+                    // tte_data_term returns a raw NLL; multiply by 2 to match the
+                    // Gaussian data_ll convention (everything is halved at the end).
+                    data_ll += 2.0
+                        * tte_data_term(
+                            &records_for_cmt,
+                            hazard,
+                            theta,
+                            eta,
+                            &subject.covariates,
+                        );
+                }
+            }
+        }
+    }
+
     let nll = 0.5 * (eta_prior + log_det_omega + data_ll);
     // Guard a non-finite prediction the same way we guard a non-finite Ω above:
     // an ODE integration can blow up to NaN/inf when the EBE search pushes eta
@@ -314,6 +352,63 @@ pub fn foce_subject_nll(
     };
 
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
+
+    // TTE Laplace correction: when the subject has TTE obs_records, we compute
+    // the FD Hessian of the TTE data term w.r.t. η and add it to hrh inside
+    // the interaction path so log|H̃| includes both Gaussian and TTE curvature.
+    // For pure-TTE subjects (no Gaussian obs), the interaction path still runs
+    // but h_matrix is empty and hrh comes entirely from the TTE Hessian.
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        use crate::survival::{data_term_hessian_fd, shi_step_sizes, tte_data_term};
+        use crate::types::EndpointLikelihood;
+
+        // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
+        let n_eta = eta_hat.len();
+        let mut tte_nll_at_mode = 0.0_f64;
+        let mut tte_h = DMatrix::<f64>::zeros(n_eta, n_eta);
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+        for record in &subject.obs_records {
+            let crate::types::ObsRecord::Event { cmt, .. } = record;
+            if seen.insert(*cmt) {
+                if let Some(EndpointLikelihood::Tte { hazard }) = model.endpoints.get(cmt) {
+                    let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                        .obs_records
+                        .iter()
+                        .filter(|r| {
+                            matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt)
+                        })
+                        .cloned()
+                        .collect();
+                    // Closure that evaluates the TTE NLL at a given eta vector.
+                    let covariates = &subject.covariates;
+                    let tte_fn = |eta_eval: &[f64]| -> f64 {
+                        tte_data_term(&records_for_cmt, hazard, theta, eta_eval, covariates)
+                    };
+                    tte_nll_at_mode += tte_fn(eta_hat.as_slice());
+                    if n_eta > 0 {
+                        let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
+                        tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
+                    }
+                }
+            }
+        }
+
+        return foce_subject_nll_interaction_with_tte(
+            subject,
+            &ipreds,
+            eta_hat,
+            h_matrix,
+            omega,
+            sigma_values,
+            &model.error_spec,
+            model.bloq_method,
+            &p_obs,
+            tte_nll_at_mode,
+            tte_h,
+        );
+    }
 
     if interaction || m3_active {
         foce_subject_nll_interaction(
@@ -514,6 +609,86 @@ pub fn foce_subject_nll_interaction(
     };
 
     // BLOQ contributions: −2·log Φ((lloq − f)/√V) at η̂ (ipred-based variance).
+    let mut bloq_term = 0.0;
+    for &j in &bloq_idx {
+        let lloq = subject.observations[j];
+        let f = ipreds[j];
+        let v = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
+        let z = (lloq - f) / v.sqrt();
+        bloq_term += -2.0 * log_normal_cdf(z);
+    }
+
+    0.5 * (data_ll + eta_prior + log_det_omega + log_det_htilde + bloq_term)
+}
+
+/// FOCEI NLL with both Gaussian interaction terms and a TTE Laplace correction.
+///
+/// Adds the TTE data-term at η̂ to `data_ll` and the FD Hessian of the TTE
+/// data term to `hrh` before computing log|H̃|.  The Gaussian path is unchanged.
+///
+/// `tte_data_nll`  — the pre-computed TTE NLL at η̂ (sum over all TTE endpoints).
+///   Scaled by 2 to match the convention that data_ll is halved at the end.
+/// `tte_hessian`  — FD Hessian of the *raw* TTE NLL w.r.t. η (un-halved).
+///   Added to `hrh` before the `log|H̃|` computation.
+#[cfg(feature = "survival")]
+fn foce_subject_nll_interaction_with_tte(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    bloq_method: BloqMethod,
+    p_obs: &[f64],
+    tte_data_nll: f64,      // sum of raw TTE NLLs at η̂ (one per TTE CMT)
+    tte_hessian: DMatrix<f64>, // FD Hessian of the raw TTE NLL w.r.t. η
+) -> f64 {
+    let n_obs = subject.observations.len();
+    let n_eta = eta_hat.len();
+
+    let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
+        !(matches!(bloq_method, BloqMethod::M3) && subject.cens.get(j).copied().unwrap_or(0) != 0)
+    });
+
+    let mut data_ll = 2.0 * tte_data_nll; // scale by 2 to match Gaussian convention
+    let mut hrh = tte_hessian; // start with TTE Hessian; Gaussian Jacobian terms added below
+    let mut ctc = DMatrix::<f64>::zeros(n_eta, n_eta);
+    for &j in &quant_idx {
+        let f = ipreds[j];
+        let v_resid = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
+        let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
+        if !(v.is_finite() && v > 0.0) {
+            return 1e20;
+        }
+        let r = subject.observations[j] - f;
+        data_ll += r * r / v + v.ln();
+
+        let aj = h_matrix.row(j);
+        let dvar_df = error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values);
+        let c_scale = dvar_df / v;
+        let inv_v = 1.0 / v;
+        let cs2 = c_scale * c_scale;
+        for a in 0..n_eta {
+            let aa = aj[a];
+            for b in 0..n_eta {
+                let ab = aj[b];
+                let outer = aa * ab;
+                hrh[(a, b)] += outer * inv_v;
+                ctc[(a, b)] += outer * cs2;
+            }
+        }
+    }
+
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    let log_det_omega = omega.log_det;
+
+    let htilde = hrh + 0.5 * ctc + &omega.inv;
+    let log_det_htilde = match htilde.cholesky() {
+        Some(c) => chol_log_det(&c.l()),
+        None => return 1e20,
+    };
+
     let mut bloq_term = 0.0;
     for &j in &bloq_idx {
         let lloq = subject.observations[j];
@@ -1047,6 +1222,8 @@ mod tests {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
         }
     }
 
