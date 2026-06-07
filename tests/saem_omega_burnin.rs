@@ -19,11 +19,24 @@
 //! under-identified per subject so per-subject recovery is slow and the failure
 //! is visible within a bounded iteration budget). No proprietary data is used.
 //!
-//! The test runs the *same* fit twice — once with the burn-in disabled
-//! (`omega_burnin = 0`, the pre-fix behaviour) and once with it enabled — and
-//! asserts the burn-in recovers the total between-subject variance while the
-//! no-burn-in run collapses well below it. The recovery assertion alone would
-//! fail on the pre-fix code.
+//! The test runs the *same* fit twice — with the burn-in disabled
+//! (`omega_burnin = 0`) and enabled — and asserts both recover the total
+//! between-subject variance.
+//!
+//! ## Note on the burn-in vs the damped Ω SA step
+//!
+//! This test originally also asserted that *without* burn-in Ω collapses (the
+//! no-burn-in run recovering far less variance than the burn-in run). That
+//! contrast no longer holds: the damped Robbins-Monro step for the Ω sufficient
+//! statistic (`OMEGA_SA_MAX_STEP` in `saem.rs`, added with the block-Ω rank-1
+//! collapse fix) caps how fast a single cold/un-equilibrated draw can move Ω, so
+//! Ω is no longer overwritten by the iteration-1 cold-start spread even with the
+//! burn-in off. The damped step is a strict generalisation of the burn-in's
+//! protection — it guards the same cold-start failure continuously rather than
+//! only for the first `omega_burnin` iterations. The burn-in is retained as a
+//! complementary guard; this test now checks that both configurations recover Ω.
+//! The block-Ω collapse mechanism itself is guarded by the
+//! `saem_block_omega_collapse` test.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, OmegaMatrix, Population, Subject};
@@ -114,14 +127,11 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
 
 /// Run SAEM with the given burn-in and return the recovered trace(Ω).
 ///
-/// `saem_n_mh_steps` is pinned at 3 (the pre-PR #148 default) so the
-/// cold-start collapse this test guards against is reproducible.  The new
-/// default of 10 MH steps mixes the chain well enough on its own that the
-/// no-burn-in run no longer collapses Ω substantially below the burn-in
-/// run — so the new default masks the burn-in fix without removing the
-/// underlying problem.  Anchoring to the pre-#148 default keeps the test
-/// guarding the burn-in mechanism rather than the (orthogonal) MH-step
-/// improvement.
+/// `saem_n_mh_steps` is pinned at 3 (the pre-PR #148 default) so the chain is
+/// deliberately under-mixed.  The current default (20) mixes the chain well
+/// enough on its own to keep Ω from collapsing, which would mask the effect
+/// being exercised here; pinning to 3 keeps the recovery driven by the burn-in
+/// and the damped Ω SA step rather than by raw mixing.
 fn fit_trace(
     model: &ferx_core::types::CompiledModel,
     population: &Population,
@@ -161,21 +171,15 @@ fn saem_burnin_recovers_omega_on_sparse_data() {
         "trace(Ω): truth={TRUE_TRACE:.3}  burnin={trace_burnin:.4}  no_burnin={trace_no_burnin:.4}"
     );
 
-    // 1. With the burn-in (default), the recovered total BSV variance is in the
-    //    right neighbourhood of the truth. The window is wide because the
-    //    ω_CL/ω_V split is only weakly identified by one observation per
-    //    subject — the *total* variance is the robust quantity. This assertion
-    //    fails on the pre-fix code, where Ω collapses.
-    assert!(
-        trace_burnin > 0.5 * TRUE_TRACE && trace_burnin < 1.6 * TRUE_TRACE,
-        "burn-in run did not recover trace(Ω): got {trace_burnin:.4}, truth {TRUE_TRACE:.3}"
-    );
-
-    // 2. Disabling the burn-in collapses Ω: it recovers substantially less
-    //    variance than the burn-in run. This is the contrast the burn-in fixes.
-    assert!(
-        trace_no_burnin < 0.6 * trace_burnin,
-        "expected no-burn-in run to collapse Ω relative to burn-in run: \
-         no_burnin={trace_no_burnin:.4}, burnin={trace_burnin:.4}"
-    );
+    // Both configurations recover the total BSV variance in the right
+    // neighbourhood of the truth. The window is wide because the ω_CL/ω_V split
+    // is only weakly identified by one observation per subject — the *total*
+    // variance is the robust quantity. Both assertions fail on the pre-fix code
+    // (no burn-in, no damped Ω SA step), where Ω collapses into residual error.
+    for (label, trace) in [("burn-in", trace_burnin), ("no-burn-in", trace_no_burnin)] {
+        assert!(
+            trace > 0.5 * TRUE_TRACE && trace < 1.6 * TRUE_TRACE,
+            "{label} run did not recover trace(Ω): got {trace:.4}, truth {TRUE_TRACE:.3}"
+        );
+    }
 }

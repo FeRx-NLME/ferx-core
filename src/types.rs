@@ -2058,14 +2058,17 @@ pub struct FitOptions {
     // SAEM-specific options
     pub saem_n_exploration: usize,
     pub saem_n_convergence: usize,
-    /// Number of MH proposals per subject per SAEM outer iteration.
-    /// The default 10 mixes well enough for hard cold-start surfaces
-    /// (e.g. Emax PKPD with stressful initial values, where chains
-    /// at 3 proposals can lock the M-step into a degenerate basin
-    /// with the PD-curve thetas at boundary values). Reduce to 3 for
-    /// the older behaviour on simpler PK-only models; raise (20-50)
-    /// only when the diagnostic shows the M-step is still tracking
-    /// correlated samples.
+    /// Number of block-kernel MH proposals per subject per SAEM outer
+    /// iteration. The default 20 mixes well on hard cold-start surfaces
+    /// (e.g. Emax PKPD with stressful initial values, where chains at 3
+    /// proposals can lock the M-step into a degenerate basin with the
+    /// PD-curve thetas at boundary values) and, together with the
+    /// componentwise kernel (run automatically for multi-η models), keeps a
+    /// block Ω from collapsing to a near rank-1 correlation matrix. A
+    /// componentwise sweep count of `n_mh_steps / n_eta` is derived from this
+    /// value. Reduce to 3-10 for the older/faster behaviour on simpler
+    /// well-identified models; raise (30-50) only when the diagnostic shows
+    /// the M-step is still tracking correlated samples.
     pub saem_n_mh_steps: usize,
     pub saem_adapt_interval: usize,
     /// Number of initial exploration iterations during which the BSV/IOV Ω
@@ -2290,7 +2293,7 @@ impl Default for FitOptions {
             global_maxeval: 0,
             saem_n_exploration: 150,
             saem_n_convergence: 250,
-            saem_n_mh_steps: 10,
+            saem_n_mh_steps: 20,
             saem_adapt_interval: 50,
             saem_omega_burnin: 20,
             saem_seed: None,
@@ -3124,25 +3127,30 @@ mod tests {
         assert_eq!(p_alias.lagtime(), 2.0);
     }
 
-    /// Guard the SAEM MH-step default. The previous value (3) was too low
-    /// for hard cold-start surfaces — the chain didn't decorrelate between
-    /// SAEM outer iterations, so the single-draw stochastic M-step received
-    /// sticky correlated ETAs and locked the population-θ M-step into a
-    /// degenerate basin (observed on Emax PKPD: PD-curve thetas pinned to
-    /// boundary, ~150 OFV units worse than the correct basin). The current
-    /// default (10) escapes that trap reliably across seeds at ~20% extra
-    /// wall on the affected model and ~0% on simpler PK-only models.
+    /// Guard the SAEM MH-step default. An early value (3) was too low for hard
+    /// cold-start surfaces — the chain didn't decorrelate between SAEM outer
+    /// iterations, so the single-draw stochastic M-step received sticky
+    /// correlated ETAs and locked the population-θ M-step into a degenerate
+    /// basin (observed on Emax PKPD: PD-curve thetas pinned to boundary, ~150
+    /// OFV units worse than the correct basin). The default was raised to 10,
+    /// then to 20 alongside the componentwise eta kernel and the damped Ω
+    /// stochastic-approximation step — both added to stop a block (correlated)
+    /// Ω collapsing to a near rank-1 correlation matrix (UVM 2-cpt: every
+    /// off-diagonal correlation → ~0.99, one variance → 0). The larger default
+    /// also sizes the componentwise sweep count (`n_mh_steps / n_eta`).
     ///
-    /// If a future change drops the default below ~5, re-run the Emax PKPD
-    /// regression in the experiment repo before merging — the basin trap
-    /// returns silently (OFV looks fine; PD parameters wrong).
+    /// If a future change drops the default below ~5, re-run both the Emax PKPD
+    /// basin regression and the UVM block-Ω collapse regression in the
+    /// experiment repo before merging — both fail silently (OFV looks fine;
+    /// parameters wrong).
     #[test]
-    fn saem_n_mh_steps_default_is_10() {
+    fn saem_n_mh_steps_default_is_20() {
         let opts = FitOptions::default();
         assert_eq!(
-            opts.saem_n_mh_steps, 10,
+            opts.saem_n_mh_steps, 20,
             "saem_n_mh_steps default changed — see comment above this test \
-             for the basin-trap regression rationale before adjusting."
+             for the basin-trap and block-Ω-collapse regression rationale \
+             before adjusting."
         );
     }
 }
