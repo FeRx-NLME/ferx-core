@@ -132,8 +132,15 @@ pub fn read_nonmem_csv(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(path, covariate_columns, iov_column, None, None, &HashSet::new())
-        .map(|(pop, _)| pop)
+    read_nonmem_csv_impl(
+        path,
+        covariate_columns,
+        iov_column,
+        None,
+        None,
+        &HashSet::new(),
+    )
+    .map(|(pop, _)| pop)
 }
 
 /// Read a NONMEM-format CSV with a `[covariates]` declaration.
@@ -164,8 +171,14 @@ pub fn read_nonmem_csv_with_covariates(
         }
     }
     let union_refs: Vec<&str> = union.iter().map(|s| s.as_str()).collect();
-    let (pop, table) =
-        read_nonmem_csv_impl(path, Some(&union_refs), iov_column, Some(decls), None, &HashSet::new())?;
+    let (pop, table) = read_nonmem_csv_impl(
+        path,
+        Some(&union_refs),
+        iov_column,
+        Some(decls),
+        None,
+        &HashSet::new(),
+    )?;
     Ok((
         pop,
         table.expect("covariate table is built whenever table_decls is Some"),
@@ -197,8 +210,15 @@ pub fn read_nonmem_csv_filtered(
     let cols_ref: Option<Vec<&str>> = augmented
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
-    read_nonmem_csv_impl(path, cols_ref.as_deref(), iov_column, None, Some(filter), &HashSet::new())
-        .map(|(pop, _)| pop)
+    read_nonmem_csv_impl(
+        path,
+        cols_ref.as_deref(),
+        iov_column,
+        None,
+        Some(filter),
+        &HashSet::new(),
+    )
+    .map(|(pop, _)| pop)
 }
 
 /// Like [`read_nonmem_csv_with_covariates`] but applies `[data_selection]` filtering.
@@ -268,8 +288,15 @@ pub(crate) fn read_nonmem_csv_filtered_tte(
     let cols_ref: Option<Vec<&str>> = augmented
         .as_ref()
         .map(|v| v.iter().map(|s| s.as_str()).collect());
-    read_nonmem_csv_impl(path, cols_ref.as_deref(), iov_column, None, filter, tte_cmts)
-        .map(|(pop, _)| pop)
+    read_nonmem_csv_impl(
+        path,
+        cols_ref.as_deref(),
+        iov_column,
+        None,
+        filter,
+        tte_cmts,
+    )
+    .map(|(pop, _)| pop)
 }
 
 /// Like [`read_nonmem_csv_with_covariates_filtered`] but routes EVID=0 rows on

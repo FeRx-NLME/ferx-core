@@ -1732,9 +1732,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             let (cmt, endpoint) =
                 parse_event_model_block(lines, &theta_names, &eta_names, &model.error_spec)?;
             if model.endpoints.contains_key(&cmt) {
-                return Err(format!(
-                    "[event_model]: CMT={cmt} declared more than once"
-                ));
+                return Err(format!("[event_model]: CMT={cmt} declared more than once"));
             }
             model.endpoints.insert(cmt, endpoint);
         }
@@ -2411,9 +2409,7 @@ fn parse_event_model_block(
         match key {
             "cmt" => {
                 cmt_opt = Some(value.parse::<usize>().map_err(|_| {
-                    format!(
-                        "[event_model]: invalid cmt `{value}` — expected a positive integer"
-                    )
+                    format!("[event_model]: invalid cmt `{value}` — expected a positive integer")
                 })?);
             }
             "family" => {
@@ -2485,10 +2481,8 @@ fn parse_event_model_block(
             let shape = shape_expr.ok_or("[event_model] family=weibull requires `shape`")?;
             Box::new(
                 move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-                    let s =
-                        eval_expression(&scale, theta, eta, covariates, &HashMap::new(), &[]);
-                    let p =
-                        eval_expression(&shape, theta, eta, covariates, &HashMap::new(), &[]);
+                    let s = eval_expression(&scale, theta, eta, covariates, &HashMap::new(), &[]);
+                    let p = eval_expression(&shape, theta, eta, covariates, &HashMap::new(), &[]);
                     vec![s, p]
                 },
             )
@@ -2498,10 +2492,8 @@ fn parse_event_model_block(
             let gamma = gamma_expr.ok_or("[event_model] family=gompertz requires `gamma`")?;
             Box::new(
                 move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-                    let a =
-                        eval_expression(&alpha, theta, eta, covariates, &HashMap::new(), &[]);
-                    let g =
-                        eval_expression(&gamma, theta, eta, covariates, &HashMap::new(), &[]);
+                    let a = eval_expression(&alpha, theta, eta, covariates, &HashMap::new(), &[]);
+                    let g = eval_expression(&gamma, theta, eta, covariates, &HashMap::new(), &[]);
                     let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
                         eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
                     });

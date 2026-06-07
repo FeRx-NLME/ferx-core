@@ -440,12 +440,7 @@ fn read_population_for(
                 Ok((pop, Some(table)))
             }
             (None, Some(sel)) => Ok((
-                read_nonmem_csv_filtered(
-                    Path::new(data_path),
-                    fallback_columns,
-                    iov_column,
-                    sel,
-                )?,
+                read_nonmem_csv_filtered(Path::new(data_path), fallback_columns, iov_column, sel)?,
                 None,
             )),
             (None, None) => Ok((
@@ -3604,7 +3599,9 @@ pub fn predict_survival(
 
     for subject in &population.subjects {
         for (&cmt, endpoint) in &model.endpoints {
-            let EndpointLikelihood::Tte { hazard } = endpoint else { continue };
+            let EndpointLikelihood::Tte { hazard } = endpoint else {
+                continue;
+            };
             let crate::types::HazardSpec::Analytic { family, param_fn } = hazard;
             let params_vec = param_fn(&params.theta, &zero_eta, &subject.covariates);
 

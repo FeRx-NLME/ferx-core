@@ -189,13 +189,7 @@ pub fn individual_nll_into_with_schedule(
                     // tte_data_term returns a raw NLL; multiply by 2 to match the
                     // Gaussian data_ll convention (everything is halved at the end).
                     data_ll += 2.0
-                        * tte_data_term(
-                            &records_for_cmt,
-                            hazard,
-                            theta,
-                            eta,
-                            &subject.covariates,
-                        );
+                        * tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
                 }
             }
         }
@@ -641,7 +635,7 @@ fn foce_subject_nll_interaction_with_tte(
     error_spec: &ErrorSpec,
     bloq_method: BloqMethod,
     p_obs: &[f64],
-    tte_data_nll: f64,      // sum of raw TTE NLLs at η̂ (one per TTE CMT)
+    tte_data_nll: f64,         // sum of raw TTE NLLs at η̂ (one per TTE CMT)
     tte_hessian: DMatrix<f64>, // FD Hessian of the raw TTE NLL w.r.t. η
 ) -> f64 {
     let n_obs = subject.observations.len();
