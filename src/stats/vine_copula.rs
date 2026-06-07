@@ -1,0 +1,524 @@
+/// D-vine copula distribution over per-subject random effects η.
+///
+/// Implements [`RandomEffectDistribution`] by decomposing the joint η density
+/// into Gaussian marginals + a D-vine of bivariate pair-copulas. The vine
+/// captures non-Gaussian and asymmetric tail dependence that a purely Gaussian
+/// Ω cannot represent.
+///
+/// # Conventions
+///
+/// - **Marginals**: per-dimension Gaussian (`μ_i`, `σ_i`) fit by MLE from the
+///   pooled SAEM η samples each M-step.
+/// - **D-vine ordering**: fixed 0, 1, …, d−1. Variable permutation / R-vine
+///   structure selection is deferred to a later phase.
+/// - **Pair families**: AIC-selected on the first M-step call and frozen
+///   thereafter; only the scalar parameters are updated in subsequent M-steps.
+///   Mid-SAEM family switching would introduce discontinuities in `log_prior`
+///   and destabilise the Markov chain.
+/// - **Pseudo-observations**: Φ-PIT using the fitted marginal, not rank-based.
+///
+/// # References
+/// - Aas, K., Czado, C., Frigessi, A., Bakken, H. (2009). Pair-copula
+///   constructions of multiple dependence. Insurance: Mathematics and
+///   Economics 44:182–198.
+use crate::stats::copula::{BivariateCopula, CopulaFamily};
+use crate::stats::random_effects::RandomEffectDistribution;
+use crate::types::{ModelParameters, OmegaMatrix};
+use nalgebra::{DMatrix, DVector};
+use rand::Rng;
+use rand_distr::StandardNormal;
+
+/// Minimum standard deviation allowed for a marginal Gaussian.
+/// Keeps Φ-PIT well-defined and mirrors `SAEM_OMEGA_DIAG_FLOOR`.
+const MARGINAL_STD_FLOOR: f64 = 1e-3;
+
+// ---------------------------------------------------------------------------
+// D-vine density evaluation
+// ---------------------------------------------------------------------------
+
+/// Evaluate the log-density of a D-vine copula at `u ∈ (0,1)^d`.
+///
+/// `pair_copulas[k][j]` is the pair-copula at tree level k+1, pair j.
+/// Level k has `d − k − 1` entries. For d == 1 returns 0 (no pairs).
+///
+/// All inputs are clamped to (1e-12, 1−1e-12) before use; NaN/Inf inputs
+/// return 1e20 (treated as an extremely unlikely state).
+pub(crate) fn dvine_log_density(u: &[f64], pair_copulas: &[Vec<CopulaFamily>]) -> f64 {
+    let d = u.len();
+    if d <= 1 {
+        return 0.0;
+    }
+
+    // `left[j]` and `right[j]` are the conditional pseudo-observations fed
+    // into each vine level. Initially they are just u.
+    //
+    // After processing level k, pair j:
+    //   new_left[j]  = h(left[j]  | right[j+1]; copula[k][j])  ← h(left|right)
+    //   new_right[j] = h(right[j+1] | left[j]; copula[k][j])   ← h(right|left)
+    //
+    // For all five families (Gaussian, Student-t, Clayton, Gumbel, Frank) the
+    // copula is symmetric C(u,v)=C(v,u), so ∂C(u,v)/∂u = h(v,u) — i.e.
+    // h(right|left) can be evaluated by calling h(right, left) with the same
+    // formula.
+    let clamp01 = |x: f64| -> f64 {
+        if !x.is_finite() {
+            return 0.5;
+        }
+        x.clamp(1e-12, 1.0 - 1e-12)
+    };
+
+    let mut left: Vec<f64> = u.iter().map(|&x| clamp01(x)).collect();
+    let mut right: Vec<f64> = left.clone();
+
+    let mut log_dens = 0.0;
+    for k in 0..d - 1 {
+        let n_pairs = d - k - 1;
+        let mut new_left = vec![0.0f64; n_pairs];
+        let mut new_right = vec![0.0f64; n_pairs];
+        let cop_level = &pair_copulas[k];
+
+        for j in 0..n_pairs {
+            let l = left[j];
+            let r = right[j + 1];
+            let cop = &cop_level[j];
+            log_dens += cop.log_density(l, r);
+            new_left[j] = clamp01(cop.h(l, r));
+            new_right[j] = clamp01(cop.h(r, l));
+        }
+        left = new_left;
+        right = new_right;
+    }
+
+    if !log_dens.is_finite() {
+        return -1e20;
+    }
+    log_dens
+}
+
+// ---------------------------------------------------------------------------
+// VineCopulaOmega
+// ---------------------------------------------------------------------------
+
+/// Random-effect distribution using Gaussian marginals + D-vine pair-copulas.
+///
+/// Constructed once at the start of `run_saem_vine` from the initial model
+/// parameters; updated in-place by each `mstep_update` call.
+pub struct VineCopulaOmega {
+    /// Number of ETAs (= d).
+    pub d: usize,
+    /// Per-dimension marginal means (updated each M-step).
+    pub marginal_means: Vec<f64>,
+    /// Per-dimension marginal standard deviations (updated each M-step).
+    pub marginal_stds: Vec<f64>,
+    /// D-vine pair-copula families. `pair_copulas[k][j]` is at tree k+1, pair j.
+    /// After the first M-step the family types are frozen; only parameters change.
+    pub pair_copulas: Vec<Vec<CopulaFamily>>,
+    /// Whether AIC-based family selection has run at least once.
+    families_selected: bool,
+    /// SA sufficient statistic (1/N) Σ ηᵢηᵢᵀ — updated with step size γ.
+    sample_s2: DMatrix<f64>,
+    /// Gaussian-equivalent OmegaMatrix derived from `sample_s2`.
+    /// Reported as the OMEGA output and used for the MH proposal scale.
+    omega_equiv: OmegaMatrix,
+    /// Initial omega — reference for eta_names, diagonal flag, free_mask.
+    initial_omega: OmegaMatrix,
+    /// Per-eta fixed flags.
+    omega_fixed: Vec<bool>,
+    /// Initial omega matrix values (for restoring fixed entries after SA).
+    initial_matrix: DMatrix<f64>,
+}
+
+impl VineCopulaOmega {
+    /// Construct from the initial model parameters.
+    pub fn from_init_params(init_params: &ModelParameters) -> Self {
+        let omega = init_params.omega.clone();
+        let d = omega.dim();
+        let marginal_means = vec![0.0f64; d];
+        let marginal_stds: Vec<f64> = (0..d)
+            .map(|i| {
+                let v = omega.matrix[(i, i)];
+                v.max(MARGINAL_STD_FLOOR * MARGINAL_STD_FLOOR).sqrt()
+            })
+            .collect();
+
+        // Default: independent Gaussian copulas (ρ=0) before the first M-step.
+        let pair_copulas: Vec<Vec<CopulaFamily>> = (0..d.saturating_sub(1))
+            .map(|k| {
+                (0..d - k - 1)
+                    .map(|_| CopulaFamily::Gaussian(crate::stats::copula::GaussianCopula::new(0.0)))
+                    .collect()
+            })
+            .collect();
+
+        let sample_s2 = omega.matrix.clone();
+        let initial_matrix = omega.matrix.clone();
+        let initial_omega = omega.clone();
+        let omega_equiv = omega.clone();
+        let omega_fixed = init_params.omega_fixed.clone();
+
+        Self {
+            d,
+            marginal_means,
+            marginal_stds,
+            pair_copulas,
+            families_selected: false,
+            sample_s2,
+            omega_equiv,
+            initial_omega,
+            omega_fixed,
+            initial_matrix,
+        }
+    }
+
+    /// Compute pseudo-observations from η samples using the current marginals.
+    ///
+    /// Returns `u[j][i] = Φ((η[j][i] − μ_i) / σ_i)` clamped to (1e-8, 1−1e-8).
+    pub(crate) fn pit_from_samples(&self, sampled_etas: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        sampled_etas
+            .iter()
+            .map(|eta| {
+                (0..self.d)
+                    .map(|i| {
+                        let z = (eta[i] - self.marginal_means[i]) / self.marginal_stds[i];
+                        crate::stats::special::normal_cdf(z).clamp(1e-8, 1.0 - 1e-8)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Update marginal means and std devs from the current η samples (MLE).
+    fn update_marginals(&mut self, sampled_etas: &[Vec<f64>]) {
+        let n = sampled_etas.len() as f64;
+        for i in 0..self.d {
+            let mean = sampled_etas.iter().map(|e| e[i]).sum::<f64>() / n;
+            let var = sampled_etas
+                .iter()
+                .map(|e| (e[i] - mean) * (e[i] - mean))
+                .sum::<f64>()
+                / n;
+            self.marginal_means[i] = mean;
+            self.marginal_stds[i] = var.sqrt().max(MARGINAL_STD_FLOOR);
+        }
+    }
+
+    /// SA update for `sample_s2` and re-build `omega_equiv` with structural
+    /// constraints applied (free_mask, fixed entries, diagonal floor).
+    fn update_sample_cov(&mut self, sampled_etas: &[Vec<f64>], gamma: f64) {
+        let d = self.d;
+        let n = sampled_etas.len() as f64;
+        let mut eta_outer = DMatrix::zeros(d, d);
+        for eta in sampled_etas {
+            let ev = DVector::from_column_slice(eta);
+            eta_outer += &ev * ev.transpose();
+        }
+        eta_outer /= n;
+
+        self.sample_s2 = (1.0 - gamma) * &self.sample_s2 + gamma * &eta_outer;
+
+        let mut new_mat = self.sample_s2.clone();
+        for i in 0..d {
+            for j in 0..d {
+                if !self.initial_omega.free_mask[(i, j)] {
+                    new_mat[(i, j)] = 0.0;
+                }
+            }
+        }
+        for i in 0..d {
+            for j in 0..d {
+                let fi = self.omega_fixed.get(i).copied().unwrap_or(false);
+                let fj = self.omega_fixed.get(j).copied().unwrap_or(false);
+                if fi || fj {
+                    new_mat[(i, j)] = self.initial_matrix[(i, j)];
+                }
+            }
+        }
+        for i in 0..d {
+            if !self.omega_fixed.get(i).copied().unwrap_or(false) && new_mat[(i, i)] < 1e-6 {
+                new_mat[(i, i)] = 1e-6;
+            }
+        }
+
+        self.omega_equiv = OmegaMatrix::from_matrix(
+            new_mat,
+            self.initial_omega.eta_names.clone(),
+            self.initial_omega.diagonal,
+        );
+    }
+
+    /// Fit (or re-fit) all pair-copulas from the pseudo-observation matrix.
+    ///
+    /// When `select_families == true` the best family is chosen by AIC.
+    /// When false, the existing family label is kept and only the parameter
+    /// is updated. On fitting failure the current copula is left unchanged.
+    fn fit_vine(&mut self, pseudo_obs: &[Vec<f64>], select_families: bool) {
+        let d = self.d;
+        if d <= 1 {
+            return;
+        }
+        let n = pseudo_obs.len();
+        if n < 4 {
+            return; // too few samples to fit reliably
+        }
+
+        // u_cols[i] = all n samples of dimension i (column vector of PIT values).
+        let mut u_cols: Vec<Vec<f64>> = (0..d)
+            .map(|i| {
+                pseudo_obs
+                    .iter()
+                    .map(|row| row[i].clamp(1e-8, 1.0 - 1e-8))
+                    .collect()
+            })
+            .collect();
+
+        for k in 0..d - 1 {
+            let n_pairs = d - k - 1;
+            // Store left/right h-transforms for the next level.
+            let mut new_left_cols: Vec<Vec<f64>> = vec![vec![0.0f64; n]; n_pairs];
+            let mut new_right_cols: Vec<Vec<f64>> = vec![vec![0.0f64; n]; n_pairs];
+
+            for j in 0..n_pairs {
+                let lefts: &[f64] = &u_cols[j];
+                let rights: &[f64] = &u_cols[j + 1];
+
+                // Fit or re-fit the pair-copula.
+                if select_families {
+                    if let Ok(cop) = CopulaFamily::select(lefts, rights) {
+                        self.pair_copulas[k][j] = cop;
+                    }
+                } else {
+                    self.pair_copulas[k][j] = self.pair_copulas[k][j].refit(lefts, rights);
+                }
+
+                // Compute h-transforms for the next vine level.
+                let cop = &self.pair_copulas[k][j];
+                for s in 0..n {
+                    let l = lefts[s];
+                    let r = rights[s];
+                    new_left_cols[j][s] = cop.h(l, r).clamp(1e-8, 1.0 - 1e-8);
+                    new_right_cols[j][s] = cop.h(r, l).clamp(1e-8, 1.0 - 1e-8);
+                }
+            }
+
+            // For the next level: u_cols has n_pairs+1 entries.
+            // u_cols[j] = new_left_cols[j] for j=0..n_pairs-1.
+            // u_cols[n_pairs] = new_right_cols[n_pairs-1] (the last right h-transform).
+            let mut next_u: Vec<Vec<f64>> = new_left_cols;
+            next_u.push(new_right_cols[n_pairs - 1].clone());
+            u_cols = next_u;
+        }
+    }
+}
+
+impl RandomEffectDistribution for VineCopulaOmega {
+    fn log_prior(&self, eta: &[f64]) -> f64 {
+        // Negative log joint density = −log p(η) = −log[∏ f_i(η_i) × c(u_1,…,u_d)]
+        //   = Σ_i [−log f_i(η_i)] − log c(u_1,…,u_d)
+        // For Gaussian marginals:
+        //   −log f_i(η_i) = 0.5 z_i² + 0.5 log(2π) + log σ_i
+        // where z_i = (η_i − μ_i) / σ_i and u_i = Φ(z_i).
+        let mut log_prior = 0.0;
+        let mut u = vec![0.0f64; self.d];
+        for i in 0..self.d {
+            let z = (eta[i] - self.marginal_means[i]) / self.marginal_stds[i];
+            // Negative log marginal density.
+            log_prior +=
+                0.5 * z * z + 0.5 * (2.0 * std::f64::consts::PI).ln() + self.marginal_stds[i].ln();
+            u[i] = crate::stats::special::normal_cdf(z).clamp(1e-12, 1.0 - 1e-12);
+        }
+
+        // Subtract vine log-density (vine density > 1 lowers prior, < 1 raises it).
+        if self.d > 1 {
+            let vine_ld = dvine_log_density(&u, &self.pair_copulas);
+            log_prior -= vine_ld;
+        }
+
+        if !log_prior.is_finite() {
+            1e20
+        } else {
+            log_prior
+        }
+    }
+
+    fn mstep_update(&mut self, sampled_etas: &[Vec<f64>], gamma: f64) {
+        if sampled_etas.is_empty() {
+            return;
+        }
+        self.update_marginals(sampled_etas);
+        self.update_sample_cov(sampled_etas, gamma);
+        let pseudo_obs = self.pit_from_samples(sampled_etas);
+        let select = !self.families_selected;
+        self.fit_vine(&pseudo_obs, select);
+        if select {
+            self.families_selected = true;
+        }
+    }
+
+    fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
+        // Phase 4: sample from the Gaussian-equivalent Ω for reporting purposes.
+        // Proper vine inverse-Rosenblatt sampling is deferred to Phase 5.
+        let d = self.d;
+        let l = &self.omega_equiv.chol;
+        (0..n)
+            .map(|_| {
+                let z: Vec<f64> = (0..d).map(|_| rng.sample(StandardNormal)).collect();
+                (l * DVector::from_column_slice(&z))
+                    .iter()
+                    .copied()
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn proposal_chol(&self) -> &DMatrix<f64> {
+        &self.omega_equiv.chol
+    }
+
+    fn to_omega_matrix(&self) -> &OmegaMatrix {
+        &self.omega_equiv
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stats::copula::GaussianCopula;
+    use crate::types::test_helpers::analytical_model;
+    use crate::types::GradientMethod;
+    use rand::SeedableRng;
+    use rand_distr::StandardNormal;
+
+    fn make_dist() -> VineCopulaOmega {
+        let model = analytical_model(GradientMethod::Auto);
+        VineCopulaOmega::from_init_params(&model.default_params)
+    }
+
+    /// D-vine log density for d=1 is always 0 (no pairs).
+    #[test]
+    fn dvine_log_density_d1_is_zero() {
+        let cop: Vec<Vec<CopulaFamily>> = vec![];
+        assert_eq!(dvine_log_density(&[0.5], &cop), 0.0);
+    }
+
+    /// D-vine with all Gaussian(ρ=0) copulas (independence) has log density 0.
+    #[test]
+    fn dvine_independence_density_is_zero() {
+        let d = 3;
+        let pair_copulas: Vec<Vec<CopulaFamily>> = (0..d - 1)
+            .map(|k| {
+                (0..d - k - 1)
+                    .map(|_| CopulaFamily::Gaussian(GaussianCopula::new(0.0)))
+                    .collect()
+            })
+            .collect();
+        let u = vec![0.2, 0.5, 0.8];
+        let ld = dvine_log_density(&u, &pair_copulas);
+        assert!(
+            ld.abs() < 1e-10,
+            "independence vine log density should be 0, got {ld}"
+        );
+    }
+
+    /// from_init_params constructs with correct dimensions and positive stds.
+    #[test]
+    fn vine_omega_construction() {
+        let dist = make_dist();
+        assert_eq!(dist.marginal_means.len(), dist.d);
+        assert_eq!(dist.marginal_stds.len(), dist.d);
+        assert_eq!(dist.pair_copulas.len(), dist.d.saturating_sub(1));
+        for &s in &dist.marginal_stds {
+            assert!(s > 0.0);
+        }
+    }
+
+    /// log_prior is finite and positive for a typical η.
+    #[test]
+    fn vine_log_prior_finite_and_positive() {
+        let dist = make_dist();
+        let eta = vec![0.3_f64; dist.d];
+        let lp = dist.log_prior(&eta);
+        assert!(lp.is_finite(), "log_prior should be finite, got {lp}");
+        assert!(
+            lp > 0.0,
+            "log_prior (neg log density) should be positive near zero"
+        );
+    }
+
+    /// At η=0 with ρ=0 vine, log_prior equals the Gaussian marginal sum.
+    #[test]
+    fn vine_log_prior_zero_eta_equals_gaussian_marginal_sum() {
+        let dist = make_dist();
+        let d = dist.d;
+        let eta = vec![0.0_f64; d];
+
+        // Gaussian marginal neg-log-density at z=0: 0.5*log(2π) + log(σ).
+        // Vine (ρ=0) adds 0.
+        let expected: f64 = (0..d)
+            .map(|i| 0.5 * (2.0 * std::f64::consts::PI).ln() + dist.marginal_stds[i].ln())
+            .sum();
+        let actual = dist.log_prior(&eta);
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "log_prior(0) = {actual:.6e}, expected {expected:.6e}"
+        );
+    }
+
+    /// mstep_update runs without panicking, updates marginals, and selects families.
+    #[test]
+    fn vine_mstep_updates_marginals_and_selects_families() {
+        let mut dist = make_dist();
+        let d = dist.d;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let etas: Vec<Vec<f64>> = (0..30)
+            .map(|_| {
+                (0..d)
+                    .map(|_| 0.5 + 0.2 * rng.sample::<f64, _>(StandardNormal))
+                    .collect()
+            })
+            .collect();
+
+        let mean_before = dist.marginal_means[0];
+        dist.mstep_update(&etas, 1.0);
+
+        // Mean should move toward 0.5.
+        let mean_after = dist.marginal_means[0];
+        assert!(
+            (mean_after - 0.5).abs() < (mean_before - 0.5).abs() + 0.2,
+            "mean should move toward 0.5: before={mean_before:.3}, after={mean_after:.3}"
+        );
+        assert!(
+            dist.families_selected,
+            "families should be selected after first mstep"
+        );
+    }
+
+    /// proposal_chol is square with positive diagonal.
+    #[test]
+    fn vine_proposal_chol_valid() {
+        let dist = make_dist();
+        let l = dist.proposal_chol();
+        let d = dist.d;
+        assert_eq!(l.nrows(), d);
+        assert_eq!(l.ncols(), d);
+        for i in 0..d {
+            assert!(
+                l[(i, i)] > 0.0,
+                "Cholesky diagonal [{i},{i}] should be positive"
+            );
+        }
+    }
+
+    /// log_prior is consistent across two calls with the same η.
+    #[test]
+    fn vine_log_prior_deterministic() {
+        let dist = make_dist();
+        let eta = vec![0.1_f64; dist.d];
+        let lp1 = dist.log_prior(&eta);
+        let lp2 = dist.log_prior(&eta);
+        assert_eq!(lp1, lp2);
+    }
+}

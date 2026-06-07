@@ -866,6 +866,31 @@ impl CopulaFamily {
         -2.0 * log_l + 2.0 * k
     }
 
+    /// Re-fit the same family type to new data, keeping the family label fixed.
+    ///
+    /// Used in the vine copula M-step after the first iteration: the family
+    /// assignments are frozen after AIC selection, and only the parameters are
+    /// updated. Errors fall back to the current value unchanged.
+    pub fn refit(&self, u: &[f64], v: &[f64]) -> Self {
+        match self {
+            CopulaFamily::Gaussian(_) => GaussianCopula::fit(u, v)
+                .map(CopulaFamily::Gaussian)
+                .unwrap_or_else(|_| self.clone()),
+            CopulaFamily::StudentT(_) => StudentTCopula::fit(u, v)
+                .map(CopulaFamily::StudentT)
+                .unwrap_or_else(|_| self.clone()),
+            CopulaFamily::Clayton(_) => ClaytonCopula::fit(u, v)
+                .map(CopulaFamily::Clayton)
+                .unwrap_or_else(|_| self.clone()),
+            CopulaFamily::Gumbel(_) => GumbelCopula::fit(u, v)
+                .map(CopulaFamily::Gumbel)
+                .unwrap_or_else(|_| self.clone()),
+            CopulaFamily::Frank(_) => FrankCopula::fit(u, v)
+                .map(CopulaFamily::Frank)
+                .unwrap_or_else(|_| self.clone()),
+        }
+    }
+
     /// Select the best family for (u, v) by AIC. Starts from a fitted Gaussian
     /// and accepts a competing family only when its AIC is strictly lower.
     pub fn select(u: &[f64], v: &[f64]) -> Result<Self, String> {
@@ -960,13 +985,6 @@ mod tests {
                 assert_relative_eq!(p2, p, max_relative = 1e-6, epsilon = 1e-9);
             }
         }
-    }
-
-    // ── Helper: finite-difference log-density gradient check ────────────────
-
-    fn fd_log_density_du(c: &impl BivariateCopula, u: f64, v: f64) -> f64 {
-        let h = 1e-7;
-        (c.log_density(u + h, v) - c.log_density(u - h, v)) / (2.0 * h)
     }
 
     // ── h-function is the inverse of h_inv ──────────────────────────────────

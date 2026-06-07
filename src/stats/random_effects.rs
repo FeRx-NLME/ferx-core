@@ -42,7 +42,13 @@ pub trait RandomEffectDistribution: Send + Sync {
     fn mstep_update(&mut self, sampled_etas: &[Vec<f64>], gamma: f64);
 
     /// Draw `n` joint η samples — used for simulation and reporting.
-    fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<f64>>;
+    ///
+    /// `where Self: Sized` excludes this method from dyn dispatch, keeping
+    /// the rest of the trait dyn-compatible while preserving the generic `Rng`
+    /// argument for concrete callers.
+    fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<f64>>
+    where
+        Self: Sized;
 
     /// Working-proposal Cholesky used to scale MH perturbations.
     ///
