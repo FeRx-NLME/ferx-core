@@ -328,8 +328,8 @@ All standard output (theta, omega, sigma, AIC, BIC, sdtab, EBEs) is unchanged. A
 
 - **Variable ordering**: the D-vine ordering is currently fixed as declared in `[parameters]`. Optimal ordering or R-vine structure selection is not yet implemented.
 - **Copula SEs**: approximate only (IFM assumption). Godambe sandwich SEs are a planned improvement.
-- **HMC E-step**: gradient of the vine log-prior is not yet implemented; the vine path always uses Metropolis-Hastings even when `saem_n_leapfrog > 0` is set.
-- **Autodiff**: the vine path is not compatible with the `autodiff` feature flag (which is only used for ODE-based models).
+- **HMC E-step**: the vine path always uses Metropolis-Hastings, regardless of `saem_n_leapfrog`. The gradient of the vine log-prior is not yet implemented, so HMC is silently ignored for vine fits (a warning is emitted). HMC (via the `autodiff` feature) is only available for Gaussian SAEM with analytical PK models.
+- **ODE structural models**: fully supported — `[odes]`-based models work with `omega_dist = vine`. The MH E-step evaluates the ODE solver inside each proposal exactly as in Gaussian SAEM.
 
 ---
 
