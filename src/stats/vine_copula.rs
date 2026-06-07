@@ -569,6 +569,121 @@ impl VineCopulaOmega {
         VineFitParams { marginals, trees }
     }
 
+    /// Reconstruct a vine distribution from a fitted summary (`VineFitParams`).
+    ///
+    /// Inverse of [`to_fit_params`](Self::to_fit_params): rebuilds the Gaussian
+    /// marginals and the D-vine pair-copulas (families + parameters) so the
+    /// result can [`draw_eta`](Self::draw_eta) and evaluate
+    /// [`density`](Self::density). The fitting-only state (sufficient
+    /// statistics, pseudo-observations) is set to neutral defaults — this is for
+    /// *using* an already-fitted vine (simulation, density), not resuming a fit.
+    ///
+    /// Pair-copula parameters are read by name: Gaussian `rho`; Student-t `rho`
+    /// and `nu`; Clayton/Gumbel/Frank `theta`. An unrecognised family or a
+    /// missing parameter falls back to an independence (ρ=0 Gaussian) copula.
+    pub fn from_fit_params(params: &VineFitParams) -> Self {
+        use crate::stats::copula::{
+            ClaytonCopula, FrankCopula, GaussianCopula, GumbelCopula, StudentTCopula,
+        };
+
+        let d = params.marginals.len();
+        let eta_names: Vec<String> = params.marginals.iter().map(|(n, _, _)| n.clone()).collect();
+        let marginal_means: Vec<f64> = params.marginals.iter().map(|(_, m, _)| *m).collect();
+        let marginal_stds: Vec<f64> = params
+            .marginals
+            .iter()
+            .map(|(_, _, s)| {
+                if *s > MARGINAL_STD_FLOOR {
+                    *s
+                } else {
+                    MARGINAL_STD_FLOOR
+                }
+            })
+            .collect();
+
+        let get = |ps: &[(String, f64)], key: &str| -> Option<f64> {
+            ps.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+        };
+        let independence = || CopulaFamily::Gaussian(GaussianCopula::new(0.0));
+
+        // params.trees[k] is tree level k+1; entry j is pair j at that level,
+        // in the same order `to_fit_params` emitted them (the D-vine order).
+        let mut pair_copulas: Vec<Vec<CopulaFamily>> = Vec::with_capacity(d.saturating_sub(1));
+        for tree in &params.trees {
+            let level: Vec<CopulaFamily> = tree
+                .pairs
+                .iter()
+                .map(|p| {
+                    let ps = &p.copula.params;
+                    match p.copula.family.as_str() {
+                        "gaussian" => get(ps, "rho")
+                            .map(|rho| CopulaFamily::Gaussian(GaussianCopula::new(rho)))
+                            .unwrap_or_else(independence),
+                        "student_t" => match (get(ps, "rho"), get(ps, "nu")) {
+                            (Some(rho), Some(nu)) => {
+                                CopulaFamily::StudentT(StudentTCopula::new(rho, nu))
+                            }
+                            _ => independence(),
+                        },
+                        "clayton" => get(ps, "theta")
+                            .map(|t| CopulaFamily::Clayton(ClaytonCopula::new(t)))
+                            .unwrap_or_else(independence),
+                        "gumbel" => get(ps, "theta")
+                            .map(|t| CopulaFamily::Gumbel(GumbelCopula::new(t)))
+                            .unwrap_or_else(independence),
+                        "frank" => get(ps, "theta")
+                            .map(|t| CopulaFamily::Frank(FrankCopula::new(t)))
+                            .unwrap_or_else(independence),
+                        _ => independence(),
+                    }
+                })
+                .collect();
+            pair_copulas.push(level);
+        }
+        // Defensive: if the summary was malformed (e.g. no trees for d ≥ 2),
+        // fall back to an all-independence vine of the right shape.
+        if pair_copulas.len() != d.saturating_sub(1) {
+            pair_copulas = (0..d.saturating_sub(1))
+                .map(|k| (0..d - k - 1).map(|_| independence()).collect())
+                .collect();
+        }
+
+        // Neutral fitting-only state. A diagonal Omega from the marginal
+        // variances keeps `omega_equiv` / `initial_*` self-consistent; none of
+        // these fields are read by `draw_eta` / `log_prior`.
+        let mut diag = DMatrix::<f64>::zeros(d, d);
+        for i in 0..d {
+            diag[(i, i)] = marginal_stds[i] * marginal_stds[i];
+        }
+        let omega = OmegaMatrix::from_matrix(diag.clone(), eta_names, true);
+
+        Self {
+            d,
+            marginal_means,
+            marginal_stds,
+            pair_copulas,
+            families_selected: true,
+            sample_s2: diag.clone(),
+            omega_equiv: omega.clone(),
+            initial_omega: omega,
+            omega_fixed: vec![false; d],
+            initial_matrix: diag,
+            per_pair_pseudo_obs: Vec::new(),
+        }
+    }
+
+    /// Joint log-density `log p(η)` of the fitted vine at `eta` (natural log).
+    /// Equal to `−log_prior(eta)`; exposed for simulation / visualisation
+    /// consumers that want the density rather than the SAEM prior penalty.
+    pub fn log_density(&self, eta: &[f64]) -> f64 {
+        -self.log_prior(eta)
+    }
+
+    /// Joint density `p(η)` of the fitted vine at `eta`.
+    pub fn density(&self, eta: &[f64]) -> f64 {
+        self.log_density(eta).exp()
+    }
+
     /// Draw one d-dimensional ETA sample from this D-vine distribution.
     ///
     /// Uses the inverse Rosenblatt transform (Aas et al. 2009): independent
@@ -904,6 +1019,68 @@ mod tests {
         assert_eq!(dist.pair_copulas.len(), dist.d.saturating_sub(1));
         for &s in &dist.marginal_stds {
             assert!(s > 0.0);
+        }
+    }
+
+    /// from_fit_params rebuilds a usable vine from a summary: families and
+    /// parameters are restored, and density / draw_eta work on the result.
+    #[test]
+    fn vine_from_fit_params_rebuilds_clayton() {
+        let summary = VineFitParams {
+            marginals: vec![
+                ("ETA_CL".to_string(), 0.0, 0.39),
+                ("ETA_V".to_string(), 0.0, 0.30),
+            ],
+            trees: vec![VineTreeSummary {
+                tree: 1,
+                pairs: vec![VinePairEntry {
+                    label: "ETA_CL ~ ETA_V".to_string(),
+                    copula: PairCopulaSummary {
+                        family: "clayton".to_string(),
+                        params: vec![("theta".to_string(), 2.0)],
+                        se: vec![],
+                        kendall_tau: 0.5,
+                        tail_dep_lower: 0.707,
+                        tail_dep_upper: 0.0,
+                    },
+                }],
+            }],
+        };
+
+        let dist = VineCopulaOmega::from_fit_params(&summary);
+        assert_eq!(dist.d, 2);
+        assert_eq!(dist.pair_copulas.len(), 1);
+        assert_eq!(dist.pair_copulas[0].len(), 1);
+        match &dist.pair_copulas[0][0] {
+            CopulaFamily::Clayton(c) => assert!((c.theta - 2.0).abs() < 1e-12),
+            other => panic!("expected Clayton, got {other:?}"),
+        }
+        assert!((dist.marginal_stds[0] - 0.39).abs() < 1e-12);
+
+        // Density is finite & positive; the dependence raises it on the diagonal.
+        let p = dist.density(&[0.1, 0.1]);
+        assert!(
+            p.is_finite() && p > 0.0,
+            "density should be positive, got {p}"
+        );
+
+        // draw_eta produces a finite 2-vector.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let eta = dist.draw_eta(&mut rng);
+        assert_eq!(eta.len(), 2);
+        assert!(eta.iter().all(|x| x.is_finite()));
+    }
+
+    /// to_fit_params → from_fit_params preserves the marginals and vine shape.
+    #[test]
+    fn vine_fit_params_round_trip_shape() {
+        let dist = make_dist();
+        let summary = dist.to_fit_params(&[]);
+        let rebuilt = VineCopulaOmega::from_fit_params(&summary);
+        assert_eq!(rebuilt.d, dist.d);
+        assert_eq!(rebuilt.pair_copulas.len(), dist.pair_copulas.len());
+        for i in 0..dist.d {
+            assert!((rebuilt.marginal_stds[i] - dist.marginal_stds[i]).abs() < 1e-9);
         }
     }
 
