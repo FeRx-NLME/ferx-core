@@ -79,6 +79,7 @@ Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP op
 | `adapt_interval` | `50` | Iterations between step-size adaptation |
 | `omega_burnin` | `20` | Initial exploration iterations during which Ω (and Ω<sub>IOV</sub>) are held at their starting values while the MH chain warms up. Clamped to `n_exploration`; set `0` to disable. Prevents the Ω collapse described in the SAEM page. |
 | `seed` | `12345` | RNG seed for reproducibility |
+| `omega_dist` | `gaussian` | Random-effect (η) distribution. `gaussian` (default) uses the multivariate-normal Ω, unchanged. `vine` selects the opt-in vine-copula variant (non-Gaussian marginals and tail dependence) — _under development; currently rejected at run time until the implementation lands._ SAEM only; incompatible with a `saem → focei` chain (rejected at check/fit time). |
 
 ## SIR (Sampling Importance Resampling)
 

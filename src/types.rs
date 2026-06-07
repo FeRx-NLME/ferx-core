@@ -2081,6 +2081,13 @@ pub struct FitOptions {
     /// A positive value (e.g. `3`) enables HMC; requires the `autodiff`
     /// feature and an analytical PK model — falls back to MH otherwise.
     pub saem_n_leapfrog: usize,
+    /// Random-effect (eta) distribution for the SAEM estimator.
+    ///
+    /// `Gaussian` (default) uses the existing multivariate-normal path,
+    /// unchanged. `VineCopula` activates the opt-in SAEM-copula variant
+    /// (set with `omega_dist = vine`). Incompatible with a `saem → focei`
+    /// chain; consumed only by SAEM.
+    pub saem_omega_dist: OmegaDist,
     /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
     pub gn_lambda: f64,
     // SIR options
@@ -2295,6 +2302,7 @@ impl Default for FitOptions {
             saem_omega_burnin: 20,
             saem_seed: None,
             saem_n_leapfrog: 0,
+            saem_omega_dist: OmegaDist::Gaussian,
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -2427,6 +2435,20 @@ impl EstimationMethod {
             EstimationMethod::Imp => "IMP",
         }
     }
+}
+
+/// Random-effect (eta) distribution used by the SAEM estimator.
+///
+/// Selected via the `omega_dist` key in `[fit_options]`. Only SAEM consults
+/// this field; FOCE/FOCEI, Gauss-Newton, and importance sampling are always
+/// Gaussian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OmegaDist {
+    /// Multivariate normal (default). Existing SAEM code path, unchanged.
+    #[default]
+    Gaussian,
+    /// Vine copula with flexible marginals. The opt-in SAEM-copula variant.
+    VineCopula,
 }
 
 impl FitOptions {

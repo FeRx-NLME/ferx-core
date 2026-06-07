@@ -2529,6 +2529,17 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "n_leapfrog" | "saem_n_leapfrog" => opts.saem_n_leapfrog = parse_usize("n_leapfrog")?,
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
+        "omega_dist" => {
+            opts.saem_omega_dist = match value {
+                "gaussian" => OmegaDist::Gaussian,
+                "vine" => OmegaDist::VineCopula,
+                other => {
+                    return Err(format!(
+                        "unknown omega_dist value `{other}`; expected `gaussian` or `vine`"
+                    ))
+                }
+            };
+        }
         "seed" | "saem_seed" => opts.saem_seed = parse_u64_opt("seed")?,
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         "sir" => opts.sir = parse_bool("sir")?,
@@ -8250,6 +8261,30 @@ mod tests {
 
         assert_eq!(apply_fit_option(&mut opts, "omega_burnin", "30"), Ok(true));
         assert_eq!(opts.saem_omega_burnin, 30);
+    }
+
+    #[test]
+    fn test_omega_dist_parses() {
+        // Default is Gaussian; explicit gaussian/vine both apply.
+        let opts = FitOptions::default();
+        assert_eq!(opts.saem_omega_dist, OmegaDist::Gaussian);
+
+        let opts =
+            parse_fit_options(&["method = saem".to_string(), "omega_dist = vine".to_string()])
+                .expect("parse must succeed");
+        assert_eq!(opts.saem_omega_dist, OmegaDist::VineCopula);
+
+        let opts =
+            parse_fit_options(&["omega_dist = gaussian".to_string()]).expect("parse must succeed");
+        assert_eq!(opts.saem_omega_dist, OmegaDist::Gaussian);
+    }
+
+    #[test]
+    fn test_omega_dist_unknown_value_errors() {
+        let mut opts = FitOptions::default();
+        assert!(apply_fit_option(&mut opts, "omega_dist", "copula").is_err());
+        // Failed apply must not mutate — default preserved.
+        assert_eq!(opts.saem_omega_dist, OmegaDist::Gaussian);
     }
 
     #[test]

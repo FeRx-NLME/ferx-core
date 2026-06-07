@@ -924,6 +924,16 @@ pub fn run_saem(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
+    // SAEM eta-distribution branch. The Gaussian arm below is the frozen
+    // production path; the vine-copula arm is delivered in a later phase and
+    // currently rejects rather than silently running the Gaussian path.
+    match options.saem_omega_dist {
+        OmegaDist::Gaussian => {}
+        OmegaDist::VineCopula => {
+            return Err("omega_dist = vine (vine-copula SAEM) is not yet implemented".into())
+        }
+    }
+
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -2198,6 +2208,53 @@ mod tests {
                 "unexpected error message: {msg}"
             ),
             Ok(_) => panic!("pre-cancelled SAEM must return Err, not Ok"),
+        }
+    }
+
+    /// Rung 0 regression anchor: the vine-copula eta-distribution arm is not
+    /// yet implemented, so `run_saem` must reject it up front rather than
+    /// silently running the Gaussian path. The Gaussian default still runs.
+    #[test]
+    fn vine_omega_dist_returns_not_implemented() {
+        use crate::types::{DoseEvent, FitOptions, OmegaDist, Population};
+        use std::collections::HashMap;
+
+        let model = analytical_model(GradientMethod::Auto);
+        let subj = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0],
+            observations: vec![1.0, 0.5],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![],
+            dose_occasions: vec![],
+        };
+        let population = Population {
+            subjects: vec![subj],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+        opts.saem_omega_dist = OmegaDist::VineCopula;
+
+        match run_saem(&model, &population, &model.default_params, &opts) {
+            Err(msg) => assert!(
+                msg.contains("not yet implemented") && msg.contains("vine"),
+                "unexpected error message: {msg}"
+            ),
+            Ok(_) => panic!("vine omega_dist must return Err until implemented"),
         }
     }
 

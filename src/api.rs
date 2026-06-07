@@ -635,6 +635,23 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
+    // The vine-copula SAEM variant carries a non-Gaussian eta prior. FOCEI's
+    // inner objective is the Gaussian quadratic-form prior, so a `saem → focei`
+    // chain cannot host the vine prior — refuse it rather than silently running
+    // FOCEI against a Gaussian Ω that contradicts the fitted copula.
+    if options.saem_omega_dist == OmegaDist::VineCopula
+        && chain.iter().any(|&m| m == EstimationMethod::FoceI)
+    {
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_CHAIN",
+                "omega_dist = vine is incompatible with the focei chain step; \
+                 use saem alone or set omega_dist = gaussian",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
     // The trust-region outer optimizer does not thread kappas through its OFV.
     if model.n_kappa > 0 && options.optimizer == Optimizer::TrustRegion {
         diags.push(
@@ -3903,6 +3920,39 @@ mod iov_integration {
         // A compatible optimizer produces no compatibility diagnostics.
         let ok_opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
+    }
+
+    // `omega_dist = vine` carries a non-Gaussian eta prior FOCEI cannot host;
+    // a `saem → focei` chain combined with it must be rejected by the shared
+    // guard rather than silently running FOCEI against a contradictory Ω.
+    #[test]
+    fn test_check_model_options_flags_vine_focei_chain() {
+        let model = make_iov_model();
+
+        let mut bad = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        bad.methods = vec![EstimationMethod::Saem, EstimationMethod::FoceI];
+        bad.saem_omega_dist = OmegaDist::VineCopula;
+        let diags = super::check_model_options(&model, &bad);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_OMEGA_DIST_CHAIN")
+            .expect("expected E_OMEGA_DIST_CHAIN diagnostic");
+        assert!(d.is_error());
+        assert!(d.message.contains("omega_dist = vine") && d.message.contains("focei"));
+
+        // saem alone with the vine path is allowed (no chain step).
+        let mut ok = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        ok.saem_omega_dist = OmegaDist::VineCopula;
+        assert!(!super::check_model_options(&model, &ok)
+            .iter()
+            .any(|d| d.code == "E_OMEGA_DIST_CHAIN"));
+
+        // The default Gaussian path never trips the guard, even with focei.
+        let mut gauss = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        gauss.methods = vec![EstimationMethod::Saem, EstimationMethod::FoceI];
+        assert!(!super::check_model_options(&model, &gauss)
+            .iter()
+            .any(|d| d.code == "E_OMEGA_DIST_CHAIN"));
     }
 
     // On a build without the `autodiff` feature, explicitly requesting AD must
