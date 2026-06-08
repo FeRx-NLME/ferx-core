@@ -400,6 +400,7 @@ pub fn foce_subject_nll(
             &p_obs,
             tte_nll_at_mode,
             tte_h,
+            interaction,
         );
     }
 
@@ -623,6 +624,11 @@ pub fn foce_subject_nll_interaction(
 ///   Scaled by 2 to match the convention that data_ll is halved at the end.
 /// `tte_hessian`  — FD Hessian of the *raw* TTE NLL w.r.t. η (un-halved).
 ///   Added to `hrh` before the `log|H̃|` computation.
+/// `interaction`  — when `false` (plain FOCE) the η-dependence of the residual
+///   variance is ignored: the `½·CᵀC` interaction term is dropped from `H̃`,
+///   matching `foce_subject_nll_interaction`'s FOCEI-only use. For pure-TTE
+///   subjects there are no Gaussian rows, so `CᵀC` is empty and this is a no-op;
+///   the guard only matters for mixed PK+TTE models run under FOCE.
 #[cfg(feature = "survival")]
 fn foce_subject_nll_interaction_with_tte(
     subject: &Subject,
@@ -636,6 +642,7 @@ fn foce_subject_nll_interaction_with_tte(
     p_obs: &[f64],
     tte_data_nll: f64,         // sum of raw TTE NLLs at η̂ (one per TTE CMT)
     tte_hessian: DMatrix<f64>, // FD Hessian of the raw TTE NLL w.r.t. η
+    interaction: bool,         // include the ½·CᵀC interaction term (FOCEI) or not (FOCE)
 ) -> f64 {
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
@@ -676,7 +683,13 @@ fn foce_subject_nll_interaction_with_tte(
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
     let log_det_omega = omega.log_det;
 
-    let htilde = hrh + 0.5 * ctc + &omega.inv;
+    // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it. (CᵀC is
+    // all-zero for pure-TTE subjects, so this only bites mixed PK+TTE under FOCE.)
+    let htilde = if interaction {
+        hrh + 0.5 * ctc + &omega.inv
+    } else {
+        hrh + &omega.inv
+    };
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
         None => return 1e20,

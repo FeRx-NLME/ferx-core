@@ -322,12 +322,48 @@ mod survival_smoke {
 
     /// A nonzero `loghr` must actually change the OFV — i.e. the parser must wire it
     /// into the param_fn so it reaches the likelihood computation.
+    ///
+    /// IMPORTANT: `TVLAMBDA` is **FIXed** in both models. A constant `loghr` offset is
+    /// otherwise non-identifiable against a free exponential rate — the optimizer simply
+    /// rescales `TVLAMBDA` by `exp(-loghr)` and both fits converge to the *same* OFV
+    /// (verified: diff ≈ 2.6e-5 when `TVLAMBDA` is free). Fixing the rate makes the
+    /// `exp(0.5)` hazard multiplier identifiable, so a non-wired `loghr` (the bug this
+    /// test guards against) is the only way the two OFVs can coincide.
     #[test]
     fn tte_loghr_nonzero_changes_ofv() {
-        // Model B: hard-coded loghr = 0.5 (fixed offset on the log-hazard scale).
+        // Baseline: FIXed rate, no loghr.
+        let src_no_lhr = r"
+[parameters]
+  theta TVLAMBDA(0.05, FIX)
+  theta DUMMY_CL(1.0, FIX)
+  theta DUMMY_V(1.0, FIX)
+  omega ETA_LAMBDA ~ 0.09
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  LAMBDA = TVLAMBDA * exp(ETA_LAMBDA)
+  CL     = DUMMY_CL
+  V      = DUMMY_V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+        // Model B: identical, but with a hard-coded loghr = 0.5.
         let src_with_lhr = r"
 [parameters]
-  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta TVLAMBDA(0.05, FIX)
   theta DUMMY_CL(1.0, FIX)
   theta DUMMY_V(1.0, FIX)
   omega ETA_LAMBDA ~ 0.09
@@ -354,7 +390,7 @@ mod survival_smoke {
   method  = focei
   maxiter = 3
 ";
-        let model_no_lhr = parse_model_string(EXP_TTE_MODEL).expect("EXP_TTE_MODEL must parse");
+        let model_no_lhr = parse_model_string(src_no_lhr).expect("baseline model must parse");
         let model_with_lhr = parse_model_string(src_with_lhr).expect("model with loghr must parse");
 
         let pop = tte_population(TTE_DATA);
@@ -372,11 +408,10 @@ mod survival_smoke {
             r0.ofv,
             r1.ofv
         );
-        // loghr=0.5 multiplies the hazard by exp(0.5) ≈ 1.65 for all subjects.
-        // Analytically, the OFV shift at the initial theta is ~6 units for this
-        // 20-subject dataset.  After 3 outer iterations the models diverge further.
-        // A threshold of 1.0 is conservative but rules out the silent-zero bug where
-        // loghr is not wired through and both models return identical OFVs.
+        // With the rate FIXed, loghr=0.5 multiplies the hazard by exp(0.5) ≈ 1.65 for
+        // every subject and the offset cannot be absorbed by the rate. The OFV gap is
+        // several units; a threshold of 1.0 rules out the silent-zero bug where loghr
+        // is not wired through and both models return identical OFVs.
         assert!(
             (r0.ofv - r1.ofv).abs() > 1.0,
             "loghr=0.5 must change the OFV by > 1.0 — no_loghr_OFV={} loghr_OFV={}; diff={:.6}",

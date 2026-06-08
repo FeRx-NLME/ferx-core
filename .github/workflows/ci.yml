@@ -52,6 +52,25 @@ jobs:
       - name: cargo test
         run: cargo test --lib --no-default-features --features ci --release
 
+  survival:
+    name: Survival (TTE)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-survival
+      # All TTE/survival code is behind `#[cfg(feature = "survival")]`, so the
+      # default `ci` jobs above neither compile nor exercise it. Build and run
+      # the feature explicitly here so a break can't land with CI green. The
+      # `tte_smoke` integration tests are Tier-2 (a handful of outer iterations),
+      # so `--tests` stays fast.
+      - name: cargo test (survival)
+        run: cargo test --tests --no-default-features --features ci,survival --release
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
