@@ -13,11 +13,18 @@ including data format, hazard families, and comparison with nlmixr2 / NONMEM.
 [event_model]
   cmt    = <integer>    # CMT column value in the data file
   family = exponential  # exponential | weibull | gompertz
-  scale  = <expression> # theta/eta/covariate expression for scale parameter
-  shape  = <expression> # Weibull only (required for weibull; error if present for exponential)
-  alpha  = <expression> # Gompertz only: baseline hazard
-  gamma  = <expression> # Gompertz only: growth rate
+  scale  = <expression> # theta/eta/covariate expression — Exponential (rate λ) and Weibull
+  rate   = <expression> # alias for scale (Exponential only)
+  shape  = <expression> # Weibull only (required; error if present for exponential/gompertz)
+  alpha  = <expression> # Gompertz only: baseline hazard at t=0
+  gamma  = <expression> # Gompertz only: hazard growth rate
+  loghr  = <expression> # optional (all families): proportional-hazards covariate term;
+                        #   multiplies the full hazard by exp(loghr)
 ```
+
+> **Expression namespace:** all expressions are evaluated in the theta / eta / covariate
+> namespace. Names from `[individual_parameters]` are **not** in scope — write the full
+> theta/eta expression directly (e.g. `TVLAMBDA * exp(ETA_LAMBDA)`, not `LAMBDA`).
 
 Named blocks allow multiple TTE endpoints:
 
@@ -25,13 +32,13 @@ Named blocks allow multiple TTE endpoints:
 [event_model DROPOUT]
   cmt    = 2
   family = exponential
-  scale  = LAMBDA
+  scale  = TVLAMBDA_DROPOUT * exp(ETA_LAMBDA)
 
 [event_model DEATH]
   cmt    = 3
   family = weibull
-  scale  = SCALE_DEATH
-  shape  = SHAPE_DEATH
+  scale  = TVSCALE_DEATH
+  shape  = TVSHAPE_DEATH
 ```
 
 ## DV coding

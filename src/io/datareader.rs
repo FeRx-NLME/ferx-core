@@ -1101,12 +1101,33 @@ fn parse_subject(
                 #[cfg(feature = "survival")]
                 {
                     use crate::types::{EventType, ObsRecord};
-                    let entry_time = tentry_col
+                    let raw_entry = tentry_col
                         .and_then(|c| row.get(c))
                         .map(|s| parse_f64(s))
                         .unwrap_or(0.0)
                         .max(0.0);
-                    let dv_code = dv as i64;
+                    if raw_entry > time + 1e-12 {
+                        parse_warnings.push(format!(
+                            "Subject {id}: TENTRY={raw_entry} > TIME={time} on CMT={cmt} \
+                             — entry time after the event/censoring time yields a negative \
+                             effective cumulative hazard; row skipped"
+                        ));
+                        // Skip this malformed row rather than producing an invalid NLL.
+                        continue;
+                    }
+                    let entry_time = raw_entry;
+                    // DV must be an integer code (0/1/2).  Reject fractional values
+                    // explicitly: a DV of 1.9 would silently truncate to 1 (Exact event),
+                    // misclassifying a censored observation.
+                    let dv_rounded = dv.round();
+                    if (dv - dv_rounded).abs() > 1e-9 {
+                        return Err(format!(
+                            "Subject {id}: TTE endpoint CMT={cmt} has non-integer DV={dv} \
+                             at TIME={time}; DV must be 0 (right-censored), \
+                             1 (exact event), or 2 (interval-censored right bound)"
+                        ));
+                    }
+                    let dv_code = dv_rounded as i64;
                     match dv_code {
                         0 => {
                             // DV=0: tentatively a right-censored event, or left-bound of

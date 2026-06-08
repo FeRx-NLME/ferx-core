@@ -284,9 +284,14 @@ mod survival_smoke {
             r0.ofv,
             r1.ofv
         );
+        // loghr=0.5 multiplies the hazard by exp(0.5) ≈ 1.65 for all subjects.
+        // Analytically, the OFV shift at the initial theta is ~6 units for this
+        // 20-subject dataset.  After 3 outer iterations the models diverge further.
+        // A threshold of 1.0 is conservative but rules out the silent-zero bug where
+        // loghr is not wired through and both models return identical OFVs.
         assert!(
-            (r0.ofv - r1.ofv).abs() > 1e-6,
-            "loghr=0.5 must change the OFV — no_loghr_OFV={} loghr_OFV={}; diff={:.6}",
+            (r0.ofv - r1.ofv).abs() > 1.0,
+            "loghr=0.5 must change the OFV by > 1.0 — no_loghr_OFV={} loghr_OFV={}; diff={:.6}",
             r0.ofv,
             r1.ofv,
             (r0.ofv - r1.ofv).abs()

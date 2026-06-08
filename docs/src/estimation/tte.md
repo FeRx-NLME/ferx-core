@@ -25,10 +25,16 @@ Add one `[event_model]` block per TTE endpoint.
 
 ```
 [event_model]
-  cmt    = 2            # data-file CMT value that carries TTE rows
-  family = exponential  # exponential | weibull | gompertz
-  scale  = LAMBDA       # expression using theta/eta/covariate names
+  cmt    = 2                        # data-file CMT value that carries TTE rows
+  family = exponential              # exponential | weibull | gompertz
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)  # theta/eta/covariate expression
 ```
+
+> **Note:** `[event_model]` parameter expressions are evaluated in the
+> theta / eta / covariate namespace. Names defined in `[individual_parameters]`
+> (e.g. `LAMBDA`) are **not** available here — write the full expression in
+> terms of `theta` and `eta` names directly. This restriction will be lifted
+> in a future release.
 
 For Weibull, a `shape` parameter is also required:
 
@@ -56,13 +62,13 @@ Multiple TTE endpoints are supported by repeating the block with unique names:
 [event_model DROPOUT]
   cmt    = 2
   family = exponential
-  scale  = LAMBDA_DROPOUT
+  scale  = TVLAMBDA_DROPOUT * exp(ETA_LAMBDA)
 
 [event_model DEATH]
   cmt    = 3
   family = weibull
-  scale  = SCALE_DEATH
-  shape  = SHAPE_DEATH
+  scale  = TVSCALE_DEATH
+  shape  = TVSHAPE_DEATH
 ```
 
 ### `[structural_model]` and `[error_model]` requirement
@@ -92,7 +98,7 @@ dummy 1-cpt block with fixed parameters:
 [event_model]
   cmt    = 2
   family = exponential
-  scale  = LAMBDA
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)  # must use theta/eta names directly
 ```
 
 This restriction will be lifted in a future release.
@@ -138,16 +144,29 @@ ID,TIME,DV,EVID,CMT,TENTRY
 
 | Family | Parameters | h(t) | H(t) |
 |--------|-----------|------|------|
-| `exponential` | `scale` = λ | λ | λ·t |
-| `weibull` | `scale` = α, `shape` = γ | (γ/α)(t/α)^(γ−1) | (t/α)^γ |
-| `gompertz` | `alpha` = α, `gamma` = γ | α·exp(γ·t) | (α/γ)(exp(γ·t) − 1) |
+| `exponential` | `scale` = λ | λ · exp(loghr) | λ · exp(loghr) · t |
+| `weibull` | `scale` = α, `shape` = γ | (γ/α)(t/α)^(γ−1) · exp(loghr) | (t/α)^γ · exp(loghr) |
+| `gompertz` | `alpha` = α, `gamma` = γ | α · exp(γ·t) · exp(loghr) | (α/γ)(exp(γ·t) − 1) · exp(loghr) |
 
-All parameters are positive. Covariates (proportional-hazard terms) can be
-incorporated via the `scale` expression:
+All parameters must be positive. The optional `loghr` key adds a proportional-hazards
+covariate term: the entire hazard (and cumulative hazard) is multiplied by `exp(loghr)`.
+When `loghr` is omitted it defaults to 0 (no effect).
 
 ```
-# Weibull PH with weight covariate
-scale  = TVSCALE * exp(BETA_WT * WT + ETA_SCALE)
+# Exponential with PH covariate on sex (SEX=1 reference):
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+  loghr  = BETA_SEX * SEX
+
+# Weibull with PH covariate on weight:
+[event_model]
+  cmt    = 2
+  family = weibull
+  scale  = TVSCALE * exp(ETA_SCALE)
+  shape  = TVSHAPE
+  loghr  = BETA_WT * WT
 ```
 
 ## Estimation

@@ -2084,10 +2084,9 @@ treated as bugs:
 Laplace; right-censored, interval-censored, and **left-truncated (delayed entry)**; no PK.
 
 **Status: wiring PR open (#192, under review).** PR #190 (v0.1.6) merged the
-infrastructure scaffold. The wiring layer is in PR #192 (branch `feat/tte-wiring`,
-rebased onto main 2026-06-07 after PR #191 landed a SAEM block-Ω fix). A code review
-found 3 blocking bugs (see below); fix, re-review, then merge. After merge: Tier 3
-convergence tests and NONMEM/nlmixr2 reference comparison.
+infrastructure scaffold. The wiring layer is in PR #192 (branch `feat/tte-wiring`).
+All blocking review bugs are fixed; PR is ready for final review and merge.
+After merge: Tier 3 convergence tests and NONMEM/nlmixr2 reference comparison.
 
 #### Done — PR #190 (infrastructure scaffold)
 
@@ -2126,7 +2125,8 @@ silently produce no output until then — not a stub, just wired to an empty map
 - ✅ `foce_subject_nll_interaction_with_tte`: FD Hessian + `½ log|det H_total|` for TTE CMTs
   (`src/stats/likelihood.rs`)
 - ✅ `predict_survival` in `src/api.rs`: `SurvivalPredictionResult` returning S(t), H(t), h(t)
-  on a time grid; median survival; mean survival from numerical integration.
+  on a time grid. Note: median survival and mean survival fields are **not yet implemented**
+  despite early PR description; deferred to follow-up (see Remaining below).
 - ✅ API: `read_population_for` dispatches to TTE-aware reader when `model.endpoints` has TTE CMTs.
 - ✅ Example files: `examples/tte_exponential.ferx` + `data/tte_exponential.csv`
   (30-subject simulated exponential TTE dataset).
@@ -2134,39 +2134,63 @@ silently produce no output until then — not a stub, just wired to an empty map
   duplicate-CMT parse error.
 - ✅ `docs/src/estimation/tte.md` + `docs/src/model-file/event-model.md` + `docs/src/SUMMARY.md`
 
-#### Before PR #192 merges — blocking bugs (found in code review)
+#### Also in PR #192
 
-- ❌ **`loghr` silently ignored** (`src/parser/model_parser.rs`): the `loghr` expression is
-  parsed and stored but the `param_fn` closure never applies it to the hazard. Fix: multiply
-  `lambda` (Exponential/Gompertz rate, Weibull `(shape/scale)*(t/scale)^(shape-1)`) by
-  `loghr_val.exp()` inside `hazard_and_cum_hazard` — or pass `loghr` as an extra parameter
-  that the caller multiplies onto `h` and adds to `log h`. Either way, a Tier 2 test must
-  verify that a nonzero `loghr` changes the OFV.
-- ❌ **Family-incompatible keys not validated** (`src/parser/model_parser.rs`): a `shape` key
-  in an Exponential `[event_model]` block is silently accepted and then dropped. Add a parse
-  error: if `family = exponential` (or `gompertz`) and `shape` is present, return
-  `Err("shape is not valid for exponential family")`. Extend the duplicate-CMT test to also
-  cover this path.
-- ❌ **CMT collision guard misses `ErrorSpec::Single`** (`src/parser/model_parser.rs`): the
-  guard that prevents a CMT from being declared as both Gaussian and TTE checks
-  `ErrorSpec::PerCmt` but not `ErrorSpec::Single`. Fix: also check the single-CMT arm and
-  error if the error model's sole CMT matches a TTE CMT.
-
-#### Also in PR #192 (this session)
-
-- ✅ **CI break fixed**: `tests/saem_block_omega_collapse.rs` (added to main by PR #191)
-  used the old `s.dv_sim` field. Replaced with `s.outcome.continuous_value()` and pushed
-  to the branch after rebasing onto new main (commit `3b45481`, 2026-06-07).
+- ✅ **CI break fixed**: `tests/saem_block_omega_collapse.rs` used old `s.dv_sim` field
+  (commit `3b45481`).
+- ✅ **`loghr` silently ignored** — fixed in `src/survival/parametric.rs` and
+  `src/parser/model_parser.rs` (commit `7a5534a`); Tier 2 test `tte_loghr_nonzero_changes_ofv`
+  asserts OFV shift > 1.0 with loghr=0.5.
+- ✅ **Family-incompatible keys not validated** — parse errors added for e.g. `shape` in
+  `exponential` block (commit `7a5534a`); Tier 2 tests cover Exponential+shape and
+  Gompertz+scale.
+- ✅ **CMT collision guard missing `ErrorSpec::Single` arm** — explicit arm added with doc
+  comment explaining the architectural limitation (commit `7a5534a`).
+- ✅ **`n_eta=0` parse failure** — `build_omega_matrix` now returns 0×0 Omega for TTE models
+  with no BSV etas (commit `4e9bac9` by Ron Keizer).
+- ✅ **`scale = LAMBDA` in tests/examples** — tests updated to use raw theta/eta expressions;
+  example `examples/tte_exponential.ferx` fixed; docs updated with limitation note (commit
+  `56ed247` by Copilot; example/docs fixed 2026-06-08).
+- ✅ **TTE DV integer validation** — non-integer DV values on TTE CMTs now return a parse error
+  rather than silently truncating (e.g. DV=1.9 → 1).
+- ✅ **`TENTRY > TIME` validation** — rows with entry time after the event time now emit a
+  parse warning and are skipped rather than producing a negative effective cumulative hazard.
 
 #### Remaining — follow-up PR(s) after #192 merges
 
+**Estimation / correctness:**
 - ❌ SAEM analytic σ M-step skip for TTE subjects (`src/estimation/saem.rs`) — needed
   before SAEM estimation on TTE data (FOCEI already works)
 - ❌ Tier 3 convergence tests (`tests/tte_convergence.rs`, gated `slow-tests`)
 - ❌ NONMEM/nlmixr2 reference comparison (run `tests/reference/tte_exponential/` scripts;
   fill the comparison table in `docs/src/estimation/tte.md`)
+
+**Parser / DSL:**
+- ❌ **`[event_model]` expressions cannot reference `[individual_parameters]` names** — the
+  `param_fn` closure evaluates in the theta/eta/covariate namespace only. Users must write
+  `scale = TVLAMBDA * exp(ETA_LAMBDA)` rather than `scale = LAMBDA`. Fixing this requires
+  threading the individual_parameters expression evaluator into `parse_event_model_block`.
 - ❌ Allow absent `[structural_model]` / `[error_model]` when `[event_model]` is present
   (currently requires dummy structural/error blocks for TTE-only models)
+- ❌ `[event_model]` covariate names not added to `model.referenced_covariates` — hazard
+  covariates in `loghr` expressions (e.g. `BETA_WT * WT`) won't be auto-validated by the
+  strict covariate reader unless also declared in `[covariates]`
+
+**API / output:**
+- ❌ `predict_survival` and `SurvivalPredictionResult` not re-exported at crate root
+  (`src/lib.rs`) — accessible as `ferx_core::api::predict_survival` but inconsistent with
+  `fit`, `predict`, `simulate`
+- ❌ `SurvivalPredictionResult` missing `median_survival` and `mean_survival` fields
+  (analytically cheap for Exp/Weibull: solve H(T)=log 2; integrate S(t) numerically)
+
+**Code quality:**
+- ❌ `foce_subject_nll_interaction_with_tte` duplicates the Gaussian interaction loop —
+  any future fix to the Gaussian path (IOV, LTBS, BLoQ M3) must be replicated. Refactor
+  to accept optional `(tte_nll: f64, tte_hessian: DMatrix<f64>)` seed parameters.
+
+**ferx-r (separate repo PR):**
+- ❌ `ferx-r/src/rust/src/lib.rs:971` still uses `r.dv_sim` which was removed in PR #190;
+  fix: `r.outcome.continuous_value()`
 
 ### Phase 1b — Competing risks (cause-specific hazard)
 

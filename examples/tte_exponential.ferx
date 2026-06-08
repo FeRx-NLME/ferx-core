@@ -42,7 +42,10 @@
 [event_model]
   cmt    = 2
   family = exponential
-  scale  = LAMBDA
+  # Note: [event_model] expressions are evaluated in the theta/eta/covariate
+  # namespace — not in the [individual_parameters] namespace.  Write the full
+  # theta/eta expression here rather than referencing LAMBDA directly.
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
 
 [fit_options]
   method  = focei
