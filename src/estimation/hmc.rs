@@ -97,8 +97,9 @@ pub fn leapfrog(
 ///   - the model uses an ODE (`model.ode_spec.is_some()`)
 ///   - the model has no analytical PK path (`model.tv_fn.is_none()`)
 ///   - `omega.log_det` is non-finite (degenerate variance matrix)
-///   - [`inner_optimizer::resolve_gradient_method`] resolves the subject to
-///     `Fd` (no AD path consistent with the analytical objective): SS doses,
+///   - [`crate::estimation::inner_optimizer::resolve_gradient_method`] resolves
+///     the subject to `Fd` (no AD path consistent with the analytical
+///     objective): SS doses,
 ///     an oral model with a zero-order infusion dose, eta-dependent lagtime, or
 ///     a TV-covariate / reset subject on a PK model the event-driven AD path
 ///     doesn't support.
