@@ -395,13 +395,19 @@ fn build_selection_filter_merged(
     SelectionFilter::from_opts(&ignore, &accept, &subjects).map(Some)
 }
 
+/// Read a [`Population`] from `data_path` using the correct reader for `model`.
 ///
 /// When the model declares a `[covariates]` block this routes through the strict
 /// reader (validates declared columns exist + are numeric, builds the table, and
 /// reads referenced-but-undeclared covariates leniently as `extra`). Otherwise
 /// it falls back to the lenient reader with `fallback_columns` (the legacy
 /// `covariate_columns` argument, or `None` for auto-detect).
-fn read_population_for(
+///
+/// When the model contains `[event_model]` blocks (TTE endpoints), TTE rows are
+/// automatically routed to `subject.obs_records` instead of the Gaussian parallel
+/// vectors. Library consumers (e.g. the R glue) should call this instead of the
+/// individual `read_nonmem_csv*` functions so that TTE routing is applied.
+pub fn read_population_for(
     model: &CompiledModel,
     covariate_decls: &Option<Vec<CovariateDecl>>,
     data_path: &str,

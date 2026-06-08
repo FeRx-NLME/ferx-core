@@ -1,6 +1,6 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Phase 1 wiring PR open (#192, under review) — 3 blocking bugs to fix before merge  
+**Status:** Phase 1 wiring PR open (#192) — all blocking bugs fixed; `read_population_for` promoted to `pub`; ready to merge  
 **Scope:** Active implementation — code changes underway  
 **Revised:** 2026-06-07 (deep research edition — NONMEM/nlmixr2/Monolix docs, tutorial papers, methods improvements, adjacent fields)
 
@@ -2191,6 +2191,15 @@ silently produce no output until then — not a stub, just wired to an empty map
 **ferx-r:**
 - ✅ `r.dv_sim` → `r.outcome.continuous_value()` migration — fixed in ferx-r PR #132
   (commit `c222327`); ferx-r main is in sync with ferx-core's `SimulationResult` redesign.
+- ❌ **TTE datareader routing not wired in ferx-r** — `ferx_rust_fit()` calls
+  `read_nonmem_csv` / `read_nonmem_csv_filtered` / `read_nonmem_csv_with_covariates` directly
+  rather than `read_population_for`, so TTE rows are silently routed into the Gaussian parallel
+  vectors instead of `subject.obs_records`. TTE models through `ferx_fit()` will produce
+  incorrect (Gaussian-path) results.
+  **Fix:** make `read_population_for` `pub` in ferx-core (done in PR #192, commit below) then
+  update ferx-r's 4-way reader dispatch to a single `ferx_core::api::read_population_for(...)`
+  call. This simultaneously fixes the data_selection + covariates combined-reader gap.
+  **Blocked on:** ferx-core PR #192 merge.
 
 ### Phase 1b — Competing risks (cause-specific hazard)
 
