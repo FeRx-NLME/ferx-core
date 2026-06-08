@@ -182,10 +182,13 @@ pub struct Subject {
     /// Original (unshifted) observation times from the data file's TIME column,
     /// parallel to `obs_times`. For subjects with stacked reset occasions whose
     /// TIME restarts (see `io/datareader`), `obs_times` carries the internal
-    /// monotonic timeline while this keeps the raw value for diagnostics
-    /// (sdtab TIME, `[derived]` absolute windows). Empty when no shifting was
-    /// applied — consumers then fall back to `obs_times`, so the two are
-    /// interchangeable for the common (single-occasion) case.
+    /// monotonic timeline while this keeps the raw value for the user-clock
+    /// diagnostics: sdtab/covtab TIME and `predict()`/`simulate()` TIME.
+    /// (`[derived]` absolute windows still evaluate on the internal `obs_times`
+    /// — see the known limitation in `docs/src/data-format.md`.) Populated for
+    /// every observation read from a CSV (equal to `obs_times` when no shift
+    /// occurred); empty only for in-memory subjects, where consumers fall back
+    /// to `obs_times`.
     pub obs_raw_times: Vec<f64>,
     pub observations: Vec<f64>,
     pub obs_cmts: Vec<usize>,
@@ -275,7 +278,11 @@ impl Subject {
     /// very first occasion across the shifted timeline (issue #195 review).
     /// `obs_time` is on the same (internal, possibly shifted) clock as
     /// `doses[*].time` and `reset_times`, so the result is correct regardless
-    /// of any occasion shift. Returns `f64::INFINITY` when there are no doses.
+    /// of any occasion shift. Returns `f64::INFINITY` when the occasion
+    /// containing `obs_time` has no dose at or after its reset — which includes
+    /// the no-doses-at-all case and a pure-reset (EVID=3) occasion with no
+    /// subsequent dose; callers treat a non-finite result as an undefined TAFD
+    /// (NaN).
     pub fn occasion_first_dose_time(&self, obs_time: f64) -> f64 {
         let seg_start = self
             .reset_times

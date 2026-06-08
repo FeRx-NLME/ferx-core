@@ -824,9 +824,9 @@ fn parse_subject(
         }
 
         // Raw (unshifted) TIME for this row, preserved before the occasion
-        // shift below so diagnostics (sdtab TIME, `[derived]` absolute windows)
-        // can report the value the user wrote, while the engine uses the
-        // shifted monotonic `time`.
+        // shift below so the user-clock diagnostics (sdtab/covtab TIME and
+        // predict/simulate TIME) report the value the user wrote, while the
+        // engine uses the shifted monotonic `time`.
         let raw_time = time;
 
         // Reset-delimited occasion segmentation (see `time_offset` above).
