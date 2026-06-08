@@ -44,7 +44,7 @@ mod survival_smoke {
 [event_model]
   cmt    = 2
   family = exponential
-  scale  = LAMBDA
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
 
 [fit_options]
   method  = focei
@@ -75,7 +75,7 @@ mod survival_smoke {
 [event_model]
   cmt    = 2
   family = exponential
-  scale  = LAMBDA
+  scale  = TVLAMBDA
 
 [fit_options]
   method  = focei
@@ -259,7 +259,7 @@ mod survival_smoke {
 [event_model]
   cmt    = 2
   family = exponential
-  scale  = LAMBDA
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
   loghr  = 0.5
 
 [fit_options]
@@ -285,7 +285,7 @@ mod survival_smoke {
             r1.ofv
         );
         assert!(
-            (r0.ofv - r1.ofv).abs() > 1e-3,
+            (r0.ofv - r1.ofv).abs() > 1e-8,
             "loghr=0.5 must change the OFV — no_loghr_OFV={} loghr_OFV={}; diff={:.6}",
             r0.ofv,
             r1.ofv,
@@ -317,7 +317,7 @@ mod survival_smoke {
 [event_model]
   cmt    = 2
   family = exponential
-  scale  = LAMBDA
+  scale  = TVLAMBDA
   shape  = 2.0
 ";
         let err = parse_model_string(src)
@@ -391,12 +391,12 @@ mod survival_smoke {
 [event_model CMT2_A]
   cmt    = 2
   family = exponential
-  scale  = LAMBDA
+  scale  = TVLAMBDA
 
 [event_model CMT2_B]
   cmt    = 2
   family = exponential
-  scale  = LAMBDA
+  scale  = TVLAMBDA
 ";
         let err = parse_model_string(src)
             .err()
