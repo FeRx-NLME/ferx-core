@@ -1189,27 +1189,9 @@ fn parse_subject(
                         }
                     }
                 }
-                // When survival feature is off, fall through to Gaussian path (shouldn't
-                // happen with a consistently compiled model, but avoids a dead branch).
-                #[cfg(not(feature = "survival"))]
-                {
-                    let _ = tentry_col;
-                    let cens_flag = cens_col
-                        .and_then(|c| row.get(c))
-                        .map(|s| parse_usize(s))
-                        .unwrap_or(0);
-                    obs_times.push(time);
-                    obs_raw_times.push(raw_time);
-                    observations.push(dv);
-                    obs_cmts.push(cmt);
-                    cens.push(if cens_flag > 0 { 1u8 } else { 0u8 });
-                    if occ_col.is_some() {
-                        occasions.push(occ);
-                    }
-                    if any_tv {
-                        obs_covariates.push(locf_state.clone());
-                    }
-                }
+                // Note: no fallback needed here. `tte_cmts` is always empty when the
+                // `survival` feature is off (callers pass `&HashSet::new()`), so this
+                // branch is never entered in that build. The dead cfg block was removed.
             } else {
                 // Gaussian path (unchanged)
                 let cens_flag = cens_col

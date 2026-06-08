@@ -170,27 +170,25 @@ pub fn individual_nll_into_with_schedule(
     if !subject.obs_records.is_empty() {
         use crate::survival::tte_data_term;
         use crate::types::EndpointLikelihood;
-        // Group records by CMT to call tte_data_term once per TTE endpoint.
-        // Clone records to satisfy tte_data_term's &[ObsRecord] signature.
-        // Subjects typically have 1–10 obs_records so this is negligible.
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        for record in &subject.obs_records {
-            let crate::types::ObsRecord::Event { cmt, .. } = record;
-            if seen.insert(*cmt) {
-                if let Some(EndpointLikelihood::Tte { hazard }) = model.endpoints.get(cmt) {
-                    let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                        .obs_records
-                        .iter()
-                        .filter(|r| {
-                            matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt)
-                        })
-                        .cloned()
-                        .collect();
-                    // tte_data_term returns a raw NLL; multiply by 2 to match the
-                    // Gaussian data_ll convention (everything is halved at the end).
-                    data_ll += 2.0
-                        * tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+        // Iterate model.endpoints (typically 1–3 entries) rather than scanning
+        // obs_records for unique CMTs — avoids the HashSet and one pass over records.
+        for (cmt, endpoint) in &model.endpoints {
+            if let EndpointLikelihood::Tte { hazard } = endpoint {
+                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned()
+                    .collect();
+                if records_for_cmt.is_empty() {
+                    continue; // subject has no records for this TTE CMT
                 }
+                // tte_data_term returns a raw NLL; multiply by 2 to match the
+                // Gaussian data_ll convention (everything is halved at the end).
+                data_ll +=
+                    2.0 * tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
             }
         }
     }
@@ -358,33 +356,34 @@ pub fn foce_subject_nll(
         use crate::types::EndpointLikelihood;
 
         // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
+        // Iterate model.endpoints (typically 1–3 entries) rather than scanning
+        // obs_records for unique CMTs — avoids the HashSet and one pass over records.
         let n_eta = eta_hat.len();
         let mut tte_nll_at_mode = 0.0_f64;
         let mut tte_h = DMatrix::<f64>::zeros(n_eta, n_eta);
-        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-        for record in &subject.obs_records {
-            let crate::types::ObsRecord::Event { cmt, .. } = record;
-            if seen.insert(*cmt) {
-                if let Some(EndpointLikelihood::Tte { hazard }) = model.endpoints.get(cmt) {
-                    let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                        .obs_records
-                        .iter()
-                        .filter(|r| {
-                            matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt)
-                        })
-                        .cloned()
-                        .collect();
-                    // Closure that evaluates the TTE NLL at a given eta vector.
-                    let covariates = &subject.covariates;
-                    let tte_fn = |eta_eval: &[f64]| -> f64 {
-                        tte_data_term(&records_for_cmt, hazard, theta, eta_eval, covariates)
-                    };
-                    tte_nll_at_mode += tte_fn(eta_hat.as_slice());
-                    if n_eta > 0 {
-                        let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
-                        tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
-                    }
+        for (cmt, endpoint) in &model.endpoints {
+            if let EndpointLikelihood::Tte { hazard } = endpoint {
+                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned()
+                    .collect();
+                if records_for_cmt.is_empty() {
+                    continue; // subject has no records for this TTE CMT
+                }
+                // Closure that evaluates the TTE NLL at a given eta vector.
+                let covariates = &subject.covariates;
+                let tte_fn = |eta_eval: &[f64]| -> f64 {
+                    tte_data_term(&records_for_cmt, hazard, theta, eta_eval, covariates)
+                };
+                tte_nll_at_mode += tte_fn(eta_hat.as_slice());
+                if n_eta > 0 {
+                    let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
+                    tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
                 }
             }
         }

@@ -180,6 +180,94 @@ mod survival_smoke {
         assert_eq!(model.n_eta, 1, "n_eta should be 1");
     }
 
+    /// Parser must recognise [event_model] with family=weibull (scale + shape).
+    #[test]
+    fn tte_weibull_model_parses() {
+        let src = r"
+[parameters]
+  theta TVSCALE(10.0, 0.1, 1000.0)
+  theta TVSHAPE(1.5,  0.1, 10.0)
+  theta DUMMY_CL(1.0, FIX)
+  theta DUMMY_V(1.0, FIX)
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  SCALE = TVSCALE
+  SHAPE = TVSHAPE
+  CL    = DUMMY_CL
+  V     = DUMMY_V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = weibull
+  scale  = TVSCALE
+  shape  = TVSHAPE
+";
+        let model = parse_model_string(src).expect("Weibull TTE model must parse");
+        assert!(
+            model.endpoints.contains_key(&2),
+            "endpoints must contain CMT=2 for Weibull model"
+        );
+        match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte { hazard: _ }) => {}
+            other => panic!("expected Tte endpoint for CMT=2 (Weibull), got: {other:?}"),
+        }
+        assert_eq!(
+            model.n_theta, 4,
+            "n_theta should be 4 (TVSCALE, TVSHAPE, CL, V)"
+        );
+    }
+
+    /// Parser must recognise [event_model] with family=gompertz (alpha + gamma).
+    #[test]
+    fn tte_gompertz_model_parses() {
+        let src = r"
+[parameters]
+  theta TVALPHA(0.05, 0.001, 10.0)
+  theta TVGAMMA(0.05, 0.001, 5.0)
+  theta DUMMY_CL(1.0, FIX)
+  theta DUMMY_V(1.0, FIX)
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  ALPHA = TVALPHA
+  GAMMA = TVGAMMA
+  CL    = DUMMY_CL
+  V     = DUMMY_V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = gompertz
+  alpha  = TVALPHA
+  gamma  = TVGAMMA
+";
+        let model = parse_model_string(src).expect("Gompertz TTE model must parse");
+        assert!(
+            model.endpoints.contains_key(&2),
+            "endpoints must contain CMT=2 for Gompertz model"
+        );
+        match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte { hazard: _ }) => {}
+            other => panic!("expected Tte endpoint for CMT=2 (Gompertz), got: {other:?}"),
+        }
+        assert_eq!(
+            model.n_theta, 4,
+            "n_theta should be 4 (TVALPHA, TVGAMMA, CL, V)"
+        );
+    }
+
     /// Fixed-effects (no omega) model with CMT 2 TTE endpoint must parse.
     #[test]
     fn tte_fixed_effects_model_parses() {
