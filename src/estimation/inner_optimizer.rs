@@ -101,7 +101,7 @@ pub(crate) fn build_event_scale_array_for_ad(
 /// the single-snapshot AD path can't honour per-event covariate values or
 /// resets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InnerGradientMethod {
+pub(crate) enum InnerGradientMethod {
     /// Finite differences. Used when AD is unavailable/disabled, when the
     /// model has no `tv_fn`, on a structural model the event-driven AD path
     /// doesn't support (`supports_event_driven_ad` == false, e.g. ODE models),
@@ -159,7 +159,10 @@ fn lagtime_depends_on_eta(model: &CompiledModel) -> bool {
         })
 }
 
-fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGradientMethod {
+pub(crate) fn resolve_gradient_method(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> InnerGradientMethod {
     #[cfg(not(feature = "autodiff"))]
     {
         let _ = model;
@@ -1775,6 +1778,27 @@ mod iov_tests {
         assert!(
             !lagtime_depends_on_eta(&model),
             "eta-independent lag -> false"
+        );
+    }
+
+    #[cfg(feature = "autodiff")]
+    #[test]
+    fn reset_only_subject_routes_to_event_driven() {
+        // A subject with a system reset but no TV covariates must take the
+        // reset-aware event-driven AD path (not single-snapshot, which can't
+        // express resets). Both find_ebe and hmc_step dispatch on this.
+        let mut model = make_iov_model();
+        model.tv_fn = Some(Box::new(
+            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
+        ));
+        model.pk_model = PkModel::OneCptIv; // supports event-driven AD
+        let mut subj = make_iov_subject();
+        assert!(!subj.has_tv_covariates(), "fixture has no TV covariates");
+        subj.reset_times = vec![3.5];
+        assert_eq!(
+            resolve_gradient_method(&model, &subj),
+            InnerGradientMethod::AdEventDriven,
+            "reset-only subject must take the event-driven AD path"
         );
     }
 
