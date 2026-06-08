@@ -105,6 +105,7 @@ fn template_population(n: usize) -> Population {
                 // amt=1000, rate=500 → a 2 h infusion into the central compartment.
                 doses: vec![DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0)],
                 obs_times: times,
+                obs_raw_times: Vec::new(),
                 observations: vec![0.0; n_obs],
                 obs_cmts: vec![1; n_obs],
                 covariates: HashMap::new(),

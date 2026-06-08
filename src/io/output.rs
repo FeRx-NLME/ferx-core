@@ -518,7 +518,16 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         let subj = &population.subjects[si];
         for j in 0..sr.ipred.len() {
             ids.push(sr.id.parse::<f64>().unwrap_or(si as f64 + 1.0));
-            times.push(subj.obs_times[j]);
+            // Report the raw data TIME (so sdtab joins back to the input CSV and
+            // to covtab, which is also raw); `obs_times` may be the internal
+            // shifted timeline for stacked reset occasions. Falls back to
+            // `obs_times` when no raw vector was recorded (in-memory subjects).
+            times.push(
+                subj.obs_raw_times
+                    .get(j)
+                    .copied()
+                    .unwrap_or(subj.obs_times[j]),
+            );
             dvs.push(subj.observations[j]);
             cens_col.push(sr.cens.get(j).copied().unwrap_or(0) as f64);
             occ_col.push(subj.occasions.get(j).copied().unwrap_or(0) as f64);
@@ -560,19 +569,18 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     // per-observation diagnostic data (see tests/map_estimates_outputs.rs::
     // sdtab_omits_eta_columns_after_fit).
 
-    // TAFD — mandatory, computed from dose records.
+    // TAFD — mandatory, computed from dose records. Measured per reset-occasion
+    // (`occasion_first_dose_time`) so stacked occasions each restart their TAFD;
+    // `obs_times` is the internal clock, so the difference is offset-invariant
+    // and equals the raw time-after-first-dose.
     {
         let vals: Vec<f64> = result
             .subjects
             .iter()
             .zip(population.subjects.iter())
             .flat_map(|(_sr, subj)| {
-                let first_dose = subj
-                    .doses
-                    .iter()
-                    .map(|d| d.time)
-                    .fold(f64::INFINITY, f64::min);
                 subj.obs_times.iter().map(move |&t| {
+                    let first_dose = subj.occasion_first_dose_time(t);
                     if first_dose.is_finite() {
                         t - first_dose
                     } else {
@@ -1506,6 +1514,7 @@ mod tests {
             id: id.to_string(),
             doses: vec![],
             obs_times: (0..n_obs).map(|j| j as f64 + 1.0).collect(),
+            obs_raw_times: Vec::new(),
             observations: vec![1.0; n_obs],
             obs_cmts,
             covariates: HashMap::new(),

@@ -48,11 +48,21 @@ const LTBS_FLOOR_AD: f64 = 1e-12;
 pub struct FlatEventData {
     /// Sorted merged event times.
     pub event_times: Vec<f64>,
-    /// 0.0 for dose, 1.0 for observation.
+    /// Event kind tag: 0.0 = dose, 1.0 = obs, 2.0 = pk-only, 3.0 = reset
+    /// (EVID=3/4). Reset events sort first at a given time so they zero the
+    /// state before a same-time dose lands (EVID=4).
     pub event_kinds: Vec<f64>,
     /// Original index back into `subject.doses` (when kind=0) or
-    /// `subject.obs_times` (when kind=1).
+    /// `subject.obs_times` (when kind=1). Unused for reset (kind=3) events.
     pub event_orig_idx_f64: Vec<f64>,
+    /// Per-event reset floor: the time of the most recent system reset
+    /// strictly *before* this event, or `f64::NEG_INFINITY` when none.
+    /// Applied to the propagation interval ending at this event — infusions
+    /// whose start is `< event_reset_floor[i]` are turned off (a reset stops
+    /// ongoing infusions, just as it zeros the compartments). Mirrors the
+    /// scalar `reset_floor` in `pk::event_driven::event_driven_predictions`.
+    /// Const w.r.t. eta, so it threads through the AD kernels untouched.
+    pub event_reset_floor: Vec<f64>,
     /// Dose-level arrays (parallel to `subject.doses`).
     pub dose_times: Vec<f64>,
     pub dose_amts: Vec<f64>,
@@ -65,45 +75,90 @@ pub struct FlatEventData {
     pub dose_cmts_f64: Vec<f64>,
 }
 
-impl FlatEventData {
-    pub fn from_subject(subject: &Subject) -> Self {
-        let n_obs = subject.obs_times.len();
-        let n_dose = subject.doses.len();
-        let n_pk_only = subject.pk_only_times.len();
-        let n_events = n_obs + n_dose + n_pk_only;
+/// Same-time tie-break ordinal: `reset (0) < dose (1) < pk-only (2) < obs (3)`.
+/// A reset must sort before a same-time dose so an EVID=4 zeros the state before
+/// its own dose lands — matching `pk::event_driven::event_driven_predictions`.
+/// `kind_tag` is the encoded event kind (0.0=dose, 1.0=obs, 2.0=pk-only,
+/// 3.0=reset).
+fn event_kind_order(kind_tag: f64) -> u8 {
+    if kind_tag > 2.5 {
+        0 // reset
+    } else if kind_tag < 0.5 {
+        1 // dose
+    } else if kind_tag > 1.5 {
+        2 // pk-only
+    } else {
+        3 // obs
+    }
+}
 
-        let mut events: Vec<(f64, f64, f64)> = Vec::with_capacity(n_events);
-        // (time, kind_order, orig_idx). Tie-break order at the same time:
-        //   dose (0) < pk-only (1) < obs (2)
-        // — see analytical `event_driven::event_driven_predictions` for
-        // the rationale. Stored kind is encoded for the AD macros:
-        //   0.0 = dose, 1.0 = obs, 2.0 = pk-only. The kind_order used for
-        // sorting is computed from these.
-        for (k, d) in subject.doses.iter().enumerate() {
-            events.push((d.time, 0.0, k as f64));
-        }
-        for (j, &t) in subject.obs_times.iter().enumerate() {
-            events.push((t, 1.0, j as f64));
-        }
-        for (m, &t) in subject.pk_only_times.iter().enumerate() {
-            events.push((t, 2.0, m as f64));
-        }
-        // Sort: by time, then by tie-break order (dose=0 < pk-only=2-mapped
-        // to 1 < obs=1-mapped to 2). Encode the tie-break ordinal directly.
-        let kind_order = |k: f64| -> u8 {
-            if k < 0.5 {
-                0 // dose
-            } else if k > 1.5 {
-                1 // pk-only
-            } else {
-                2 // obs
-            }
-        };
-        events.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
-        });
+/// Merged, sorted event timeline shared by [`FlatEventData`] and [`FlatEventTv`]
+/// so the two are guaranteed to order events identically (a single source for
+/// the reset insertion, lag shift, and tie-break). Returns one
+/// `(time, kind_tag, orig_idx)` per event, where `kind_tag` is 0.0=dose,
+/// 1.0=obs, 2.0=pk-only, 3.0=reset and dose events carry the per-dose lag
+/// (`doses[k].time + lag(k)`; a lagged dose may re-sort past a later obs —
+/// correct, it genuinely happens later). Resets/obs/pk-only keep their record
+/// times.
+///
+/// Panics if `dose_lagtimes` is non-empty and not length `subject.doses.len()`
+/// (hard assert, matching `pk::event_driven::EventSchedule::for_subject`).
+fn build_sorted_events(subject: &Subject, dose_lagtimes: &[f64]) -> Vec<(f64, f64, usize)> {
+    assert!(
+        dose_lagtimes.is_empty() || dose_lagtimes.len() == subject.doses.len(),
+        "dose_lagtimes length {} != n_dose {}",
+        dose_lagtimes.len(),
+        subject.doses.len()
+    );
+    let lag = |k: usize| -> f64 { dose_lagtimes.get(k).copied().unwrap_or(0.0) };
+
+    let mut events: Vec<(f64, f64, usize)> = Vec::with_capacity(
+        subject.doses.len()
+            + subject.obs_times.len()
+            + subject.pk_only_times.len()
+            + subject.reset_times.len(),
+    );
+    for (k, d) in subject.doses.iter().enumerate() {
+        events.push((d.time + lag(k), 0.0, k));
+    }
+    for (j, &t) in subject.obs_times.iter().enumerate() {
+        events.push((t, 1.0, j));
+    }
+    for (m, &t) in subject.pk_only_times.iter().enumerate() {
+        events.push((t, 2.0, m));
+    }
+    for (r, &t) in subject.reset_times.iter().enumerate() {
+        events.push((t, 3.0, r));
+    }
+    events.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| event_kind_order(a.1).cmp(&event_kind_order(b.1)))
+    });
+    events
+}
+
+impl FlatEventData {
+    /// Build the flat event timeline for `subject`.
+    ///
+    /// `dose_lagtimes` (length `subject.doses.len()`, or empty for no lag)
+    /// shifts each dose's effective start to `doses[k].time + lag[k]` — for
+    /// both its merged-timeline event (where the bolus injects and the
+    /// propagation boundary lands) and the `dose_times` array the propagators
+    /// use for infusion-window overlap. Resets/obs/pk-only keep their record
+    /// times. Mirrors `pk::event_driven::EventSchedule::for_subject`.
+    ///
+    /// The lags are treated as Const w.r.t. eta in the AD kernels: exact for
+    /// the usual eta-independent lagtime (a `THETA`, optionally covariate-
+    /// scaled), and a documented approximation (drops `∂lag/∂η`) for the rare
+    /// eta-dependent case — the marginal NLL value itself is still computed by
+    /// the exact analytical path, so only the inner-loop gradient / FOCE `|H|`
+    /// see the frozen lag. (The FOCEI inner loop routes eta-dependent lagtime
+    /// to FD instead — see `inner_optimizer::resolve_gradient_method`.)
+    pub fn from_subject(subject: &Subject, dose_lagtimes: &[f64]) -> Self {
+        let events = build_sorted_events(subject, dose_lagtimes);
+        let n_events = events.len();
+        let lag = |k: usize| -> f64 { dose_lagtimes.get(k).copied().unwrap_or(0.0) };
 
         let mut event_times = Vec::with_capacity(n_events);
         let mut event_kinds = Vec::with_capacity(n_events);
@@ -111,14 +166,37 @@ impl FlatEventData {
         for (t, k, idx) in events {
             event_times.push(t);
             event_kinds.push(k);
-            event_orig_idx_f64.push(idx);
+            event_orig_idx_f64.push(idx as f64);
+        }
+
+        // Per-event reset floor. Walk the sorted events tracking the most
+        // recent reset time; each event records the floor in effect *before*
+        // it (resets at strictly earlier positions). The reset event's own
+        // interval still uses the previous floor — its infusions are turned
+        // off only from the next interval on, exactly as the non-AD path
+        // `continue`s past a reset after setting `reset_floor = ev.time`.
+        let mut event_reset_floor = Vec::with_capacity(n_events);
+        let mut running_floor = f64::NEG_INFINITY;
+        for i in 0..n_events {
+            event_reset_floor.push(running_floor);
+            if event_kinds[i] > 2.5 {
+                running_floor = event_times[i];
+            }
         }
 
         Self {
             event_times,
             event_kinds,
             event_orig_idx_f64,
-            dose_times: subject.doses.iter().map(|d| d.time).collect(),
+            event_reset_floor,
+            // Lagged start times — the propagators' infusion-window overlap
+            // must use the same `time + lag` as the merged-timeline events.
+            dose_times: subject
+                .doses
+                .iter()
+                .enumerate()
+                .map(|(k, d)| d.time + lag(k))
+                .collect(),
             dose_amts: subject.doses.iter().map(|d| d.amt).collect(),
             dose_rates: subject.doses.iter().map(|d| d.rate).collect(),
             dose_durations: subject.doses.iter().map(|d| d.duration).collect(),
@@ -137,50 +215,42 @@ pub struct FlatEventTv {
 }
 
 impl FlatEventTv {
-    pub fn from_subject(model: &CompiledModel, subject: &Subject, theta: &[f64]) -> Self {
+    /// `dose_lagtimes` must match the slice passed to
+    /// [`FlatEventData::from_subject`] so the two timelines sort identically
+    /// (a lagged dose may re-order relative to obs).
+    pub fn from_subject(
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        dose_lagtimes: &[f64],
+    ) -> Self {
         let tv_fn = model
             .tv_fn
             .as_ref()
             .expect("FlatEventTv::from_subject: model.tv_fn required for AD path");
 
-        // Re-derive the same event order used by FlatEventData::from_subject.
-        // Triplet kind tags: 0 = dose, 1 = obs, 2 = pk-only (EVID=2).
-        let mut events: Vec<(f64, f64, usize, u8)> = Vec::with_capacity(
-            subject.doses.len() + subject.obs_times.len() + subject.pk_only_times.len(),
-        );
-        for (k, d) in subject.doses.iter().enumerate() {
-            events.push((d.time, 0.0, k, 0));
-        }
-        for (j, &t) in subject.obs_times.iter().enumerate() {
-            events.push((t, 1.0, j, 1));
-        }
-        for (m, &t) in subject.pk_only_times.iter().enumerate() {
-            events.push((t, 2.0, m, 2));
-        }
-        let kind_order = |k: f64| -> u8 {
-            if k < 0.5 {
-                0
-            } else if k > 1.5 {
-                1
-            } else {
-                2
-            }
-        };
-        events.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
-        });
-
+        // Same sorted timeline FlatEventData walks — built by the shared helper
+        // so the per-event tv rows stay aligned with the event_* arrays.
+        let events = build_sorted_events(subject, dose_lagtimes);
         let n_events = events.len();
         let n_tv = model.pk_idx_f64.len();
 
         let mut tv = Vec::with_capacity(n_events * n_tv);
-        for (_, _, orig, kind_tag) in &events {
-            let cov = match kind_tag {
-                0 => subject.dose_cov(*orig),
-                1 => subject.obs_cov(*orig),
-                _ => subject.pk_only_cov(*orig),
+        for (_, kind_tag, orig) in &events {
+            // Covariate snapshot per event kind (0=dose, 1=obs, 2=pk-only).
+            // Reset events (3) carry no per-record snapshot — use the
+            // subject-static map (LOCF-correct for time-constant covariates).
+            // Their PK params only drive the propagation into the reset, whose
+            // result is immediately zeroed, so the exact value never reaches a
+            // prediction; a valid (finite, positive) row just avoids NaN.
+            let cov = if *kind_tag < 0.5 {
+                subject.dose_cov(*orig)
+            } else if *kind_tag < 1.5 {
+                subject.obs_cov(*orig)
+            } else if *kind_tag < 2.5 {
+                subject.pk_only_cov(*orig)
+            } else {
+                &subject.covariates
             };
             let row = tv_fn(theta, cov);
             assert_eq!(row.len(), n_tv, "tv_fn returned wrong length");
@@ -205,6 +275,7 @@ impl FlatEventTv {
     Const,      // event_times
     Const,      // event_kinds
     Const,      // event_orig_idx_f64
+    Const,      // event_reset_floor
     Const,      // dose_times
     Const,      // dose_amts
     Const,      // dose_rates
@@ -225,8 +296,12 @@ pub fn individual_nll_event_driven_ad(
     log_det_omega: f64,
     sigma_values: &[f64],
     event_times: &[f64],
-    event_kinds: &[f64], // 0=dose, 1=obs
+    event_kinds: &[f64], // 0=dose, 1=obs, 2=pk-only, 3=reset
     event_orig_idx_f64: &[f64],
+    // Per-event reset floor (length n_events): time of the most recent reset
+    // strictly before each event, else NEG_INFINITY. Infusions starting before
+    // it are masked off in the propagators. Const w.r.t. eta.
+    event_reset_floor: &[f64],
     dose_times: &[f64],
     dose_amts: &[f64],
     dose_rates: &[f64],
@@ -351,6 +426,7 @@ pub fn individual_nll_event_driven_ad(
             dose_durations,
             dose_cmts_f64,
             n_doses,
+            event_reset_floor[ev_idx],
         );
         state0 = s0_new;
         state1 = s1_new;
@@ -359,6 +435,18 @@ pub fn individual_nll_event_driven_ad(
 
         let kind = event_kinds[ev_idx];
         let orig = event_orig_idx_f64[ev_idx] as usize;
+
+        // ── Reset branch (EVID=3/4, kind=3.0). Zero every compartment after
+        // propagating into the reset time — the interval's drug is discarded,
+        // matching `pk::event_driven`'s reset that zeros state and `continue`s.
+        // `keep` is a Const mask (0 at a reset, 1 elsewhere) so the multiply is
+        // phi-free and Enzyme-safe. is_dose / is_obs are both 0 for a reset
+        // (kind=3.0), so the dose and obs branches below skip it naturally.
+        let keep = if kind > 2.5 { 0.0 } else { 1.0 };
+        state0 *= keep;
+        state1 *= keep;
+        state2 *= keep;
+        state3 *= keep;
         // `orig` is an index into doses (kind=0), obs (kind=1), or
         // pk_only events (kind=2). For each side-array access we
         // clamp to a safe fallback index when the event isn't of
@@ -488,6 +576,10 @@ fn propagate_state_ad(
     dose_durations: &[f64],
     dose_cmts_f64: &[f64],
     n_doses: usize,
+    // Most-recent reset time strictly before this interval (or NEG_INFINITY).
+    // Infusions whose start is `< reset_floor` are masked off inside the IV
+    // propagators. Const w.r.t. eta; oral propagators ignore it (bolus only).
+    reset_floor: f64,
 ) -> (f64, f64, f64, f64) {
     // Const-only branch on pk_model_id — constant-folds under LLVM. Only
     // the relevant arm contains real adjoint flow per build. `f_bio`
@@ -511,6 +603,7 @@ fn propagate_state_ad(
             dose_rates,
             dose_durations,
             n_doses,
+            reset_floor,
         );
         (s0, state1, state2, state3)
     } else if pk_model_id == PK_ID_ONE_CPT_ORAL {
@@ -534,6 +627,7 @@ fn propagate_state_ad(
             dose_durations,
             dose_cmts_f64,
             n_doses,
+            reset_floor,
         );
         (s0, s1, state2, state3)
     } else if pk_model_id == PK_ID_TWO_CPT_ORAL {
@@ -561,6 +655,7 @@ fn propagate_state_ad(
             dose_durations,
             dose_cmts_f64,
             n_doses,
+            reset_floor,
         );
         (s0, s1, s2, state3)
     } else if pk_model_id == PK_ID_THREE_CPT_ORAL {
@@ -591,6 +686,7 @@ fn propagate_one_cpt_ad(
     dose_rates: &[f64],
     dose_durations: &[f64],
     n_doses: usize,
+    reset_floor: f64,
 ) -> f64 {
     let v_safe = v.abs() + 1e-30;
     let cl_safe = cl.abs() + 1e-30;
@@ -611,8 +707,13 @@ fn propagate_one_cpt_ad(
         let diff = tau_total_raw - tau_to;
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
         let r = f_bio * dose_rates[d];
+        // Infusions that started before the most recent reset are off
+        // (Const mask on dose_times[d], mirrors `reset_floor` in the non-AD
+        // path). `s_i < reset_floor` strictly so an infusion starting *at*
+        // the reset time (e.g. an EVID=4's own infusion) stays active.
+        let active = if s_i < reset_floor { 0.0 } else { 1.0 };
         let contribution = (r / ke) * ((-ke * tau_to).exp() - (-ke * tau_total).exp());
-        s0 += contribution;
+        s0 += active * contribution;
     }
     s0
 }
@@ -638,6 +739,7 @@ fn propagate_two_cpt_ad(
     dose_durations: &[f64],
     dose_cmts_f64: &[f64],
     n_doses: usize,
+    reset_floor: f64,
 ) -> (f64, f64) {
     let v1_safe = v1.abs() + 1e-30;
     let cl_safe = cl.abs() + 1e-30;
@@ -685,6 +787,8 @@ fn propagate_two_cpt_ad(
         // convention as the bolus injection step in the event loop.
         let cmt = dose_cmts_f64[d] as i32;
         let r = f_bio * dose_rates[d];
+        // Infusions started before the most recent reset are off (Const mask).
+        let active = if s_i < reset_floor { 0.0 } else { 1.0 };
         let (a_ss_1, a_ss_2) = if cmt == 2 {
             (
                 r * v1_safe / cl_safe,
@@ -707,8 +811,8 @@ fn propagate_two_cpt_ad(
             c1_ss * (k21 - alpha) * (e_a_to - e_a_tot) + c2_ss * (k21 - beta) * (e_b_to - e_b_tot);
         let a2_contrib = k12 * (c1_ss * (e_a_to - e_a_tot) + c2_ss * (e_b_to - e_b_tot));
 
-        s0 += a1_contrib;
-        s1 += a2_contrib;
+        s0 += active * a1_contrib;
+        s1 += active * a2_contrib;
     }
     (s0, s1)
 }
@@ -943,6 +1047,7 @@ fn propagate_three_cpt_ad(
     dose_durations: &[f64],
     dose_cmts_f64: &[f64],
     n_doses: usize,
+    reset_floor: f64,
 ) -> (f64, f64, f64) {
     let v1_safe = v1.abs() + 1e-30;
     let cl_safe = cl.abs() + 1e-30;
@@ -985,6 +1090,8 @@ fn propagate_three_cpt_ad(
         // rate so dur→0 limits to a bolus of amount F·AMT.
         let cmt = dose_cmts_f64[d] as i32;
         let r = f_bio * dose_rates[d];
+        // Infusions started before the most recent reset are off (Const mask).
+        let active = if s_i < reset_floor { 0.0 } else { 1.0 };
         let (a_ss_c, a_ss_p1, a_ss_p2) = if cmt == 2 {
             // Channel 2 (periph1).
             (
@@ -1025,9 +1132,9 @@ fn propagate_three_cpt_ad(
             gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total,
         );
 
-        s0 += (ca_to - ca_tot) + (cb_to - cb_tot) + (cg_to - cg_tot);
-        s1 += (p1a_to - p1a_tot) + (p1b_to - p1b_tot) + (p1g_to - p1g_tot);
-        s2 += (p2a_to - p2a_tot) + (p2b_to - p2b_tot) + (p2g_to - p2g_tot);
+        s0 += active * ((ca_to - ca_tot) + (cb_to - cb_tot) + (cg_to - cg_tot));
+        s1 += active * ((p1a_to - p1a_tot) + (p1b_to - p1b_tot) + (p1g_to - p1g_tot));
+        s2 += active * ((p2a_to - p2a_tot) + (p2b_to - p2b_tot) + (p2g_to - p2g_tot));
     }
     (s0, s1, s2)
 }
@@ -1259,6 +1366,7 @@ pub fn compute_nll_gradient_event_driven_ad(
         &event_data.event_times,
         &event_data.event_kinds,
         &event_data.event_orig_idx_f64,
+        &event_data.event_reset_floor,
         dose_times_padded,
         dose_amts_padded,
         dose_rates_padded,

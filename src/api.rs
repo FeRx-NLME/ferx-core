@@ -131,6 +131,16 @@ pub fn run_model_with_data_inits(
     );
 
     let init_params = build_init_params(&parsed);
+    // Sync the resolved gradient method from fit_options onto the model so
+    // `resolve_gradient_method` (which reads `model.gradient_method`) honours
+    // the file's `gradient = ...` key. Mirrors `fit_from_files` (SDE forces FD).
+    parsed.model.gradient_method = if parsed.model.is_sde()
+        && parsed.fit_options.gradient_method != crate::types::GradientMethod::Fd
+    {
+        crate::types::GradientMethod::Fd
+    } else {
+        parsed.fit_options.gradient_method
+    };
     let mut result = fit(
         &parsed.model,
         &population,
@@ -178,6 +188,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                 0.0,
             )],
             obs_times: sim_spec.obs_times.clone(),
+            obs_raw_times: Vec::new(),
             observations: vec![0.0; sim_spec.obs_times.len()],
             obs_cmts: vec![1; sim_spec.obs_times.len()],
             covariates: HashMap::new(),
@@ -1337,11 +1348,7 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
 pub fn tafd_tad_for_subject(subject: &Subject, obs_idx: usize, lagtime: f64) -> (f64, f64) {
     let obs_time = subject.obs_times[obs_idx];
 
-    let first_dose_time = subject
-        .doses
-        .iter()
-        .map(|d| d.time)
-        .fold(f64::INFINITY, f64::min);
+    let first_dose_time = subject.occasion_first_dose_time(obs_time);
     let tafd = if first_dose_time.is_finite() {
         obs_time - first_dose_time
     } else {
@@ -1637,15 +1644,13 @@ pub(crate) fn compute_extra_output_columns(
                         let pts: Vec<(f64, f64)> = (0..n_steps)
                             .filter_map(|k| {
                                 let t = from + k as f64 * dt;
-                                let tafd_k = if subject.doses.is_empty() {
-                                    f64::NAN
-                                } else {
-                                    let fd = subject
-                                        .doses
-                                        .iter()
-                                        .map(|d| d.time)
-                                        .fold(f64::INFINITY, f64::min);
-                                    t - fd
+                                let tafd_k = {
+                                    let fd = subject.occasion_first_dose_time(t);
+                                    if fd.is_finite() {
+                                        t - fd
+                                    } else {
+                                        f64::NAN
+                                    }
                                 };
                                 let tad_k = {
                                     let last_dose_eff = subject
@@ -3402,7 +3407,13 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     draw,
                     sim: sim_idx + 1,
                     id: subject.id.clone(),
-                    time: subject.obs_times[j],
+                    // Raw data TIME (matches sdtab / input); `obs_times` may be
+                    // the internal shifted clock for stacked reset occasions.
+                    time: subject
+                        .obs_raw_times
+                        .get(j)
+                        .copied()
+                        .unwrap_or(subject.obs_times[j]),
                     cmt: subject.obs_cmts[j],
                     ipred,
                     outcome: SimOutcome::Continuous { value },
@@ -3540,7 +3551,13 @@ pub fn predict(
         for (j, &pred) in preds.iter().enumerate() {
             results.push(PredictionResult {
                 id: subject.id.clone(),
-                time: subject.obs_times[j],
+                // Raw data TIME (matches sdtab / input); `obs_times` may be the
+                // internal shifted clock for stacked reset occasions.
+                time: subject
+                    .obs_raw_times
+                    .get(j)
+                    .copied()
+                    .unwrap_or(subject.obs_times[j]),
                 pred,
             });
         }
@@ -3735,6 +3752,7 @@ mod iov_integration {
                     DoseEvent::new(3.5, 100.0, 1, 0.0, false, 0.0),
                 ],
                 obs_times: obs_times.clone(),
+                obs_raw_times: Vec::new(),
                 observations: obs.clone(),
                 obs_cmts: vec![1; 6],
                 covariates: HashMap::new(),
@@ -4574,6 +4592,7 @@ mod simulate_with_uncertainty_tests {
                 id: format!("S{}", i + 1),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: obs_times.clone(),
+                obs_raw_times: Vec::new(),
                 observations: vec![30.0, 22.0, 16.0],
                 obs_cmts: vec![1, 1, 1],
                 covariates: HashMap::new(),
@@ -4907,6 +4926,7 @@ mod sde_integration {
                 id: id.to_string(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: obs_times.clone(),
+                obs_raw_times: Vec::new(),
                 observations: obs.clone(),
                 obs_cmts: vec![1; 3],
                 covariates: HashMap::new(),
@@ -5036,6 +5056,7 @@ mod sde_integration {
                 id: "1".into(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0],
+                obs_raw_times: Vec::new(),
                 observations: vec![1.0],
                 obs_cmts: vec![1],
                 covariates: HashMap::new(),
@@ -5318,6 +5339,7 @@ mod tests_sdtab_tv_cov {
             id: "TVS".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0],
+            obs_raw_times: Vec::new(),
             observations: vec![10.0, 5.0, 2.5], // placeholders; values don't matter for the IPRED check
             obs_cmts: vec![1, 1, 1],
             covariates: subj_cov,

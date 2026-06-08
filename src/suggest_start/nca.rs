@@ -694,6 +694,7 @@ mod tests {
                 },
             ],
             obs_times: times_all.clone(),
+            obs_raw_times: Vec::new(),
             observations: concs_all.clone(),
             cens: vec![0; 7],
             obs_cmts: vec![1; 7],

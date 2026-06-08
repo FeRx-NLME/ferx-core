@@ -93,28 +93,76 @@ pub(crate) fn build_event_scale_array_for_ad(
 /// (b) the model to have `tv_fn` populated (analytical PK path only).
 /// ODE models have no AD path, so `Auto` resolves to FD there.
 ///
-/// For subjects with time-varying covariates, the *event-driven* AD path
-/// is used when the structural model is in
-/// [`crate::ad::event_driven_ad::supports_event_driven_ad`] (currently
-/// 1- and 2-cpt IV bolus + infusion). Other models with TV covariates
-/// fall back to FD — the single-snapshot AD path can't honour per-event
-/// covariate values.
+/// For subjects with time-varying covariates *or* system resets (EVID=3/4),
+/// the *event-driven* AD path is used when the structural model is in
+/// [`crate::ad::event_driven_ad::supports_event_driven_ad`] (all six
+/// analytical PK models). Lagtime is handled there too (a Const per-dose lag
+/// baked into the event timeline). Models outside that set fall back to FD —
+/// the single-snapshot AD path can't honour per-event covariate values or
+/// resets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InnerGradientMethod {
-    /// Finite differences. Used when AD is unavailable/disabled, when
-    /// the model has no `tv_fn`, or when the subject has TV covariates
-    /// on a model the event-driven AD path doesn't support yet.
+pub(crate) enum InnerGradientMethod {
+    /// Finite differences. Used when AD is unavailable/disabled, when the
+    /// model has no `tv_fn`, on a structural model the event-driven AD path
+    /// doesn't support (`supports_event_driven_ad` == false, e.g. ODE models),
+    /// or when AD would be inconsistent with the analytical objective:
+    /// SS doses, an oral model with a zero-order (infusion) dose (the AD oral
+    /// propagators are bolus-only), or eta-dependent lagtime (the AD paths
+    /// freeze lag w.r.t. eta).
     Fd,
     /// Reverse-mode AD with a single per-subject `tv_adjusted` vector
     /// — the legacy fast path. Correct only when the subject has no
-    /// time-varying covariates.
+    /// time-varying covariates and no system resets.
     AdSingleSnapshot,
     /// Reverse-mode AD with per-event `tv` arrays — required for
-    /// time-varying covariates to be reflected in gradients.
+    /// time-varying covariates and/or system resets (EVID=3/4) to be
+    /// reflected in gradients.
     AdEventDriven,
 }
 
-fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGradientMethod {
+/// True for the extravascular (oral / first-order absorption) analytical PK
+/// models, whose AD propagators are bolus-only (see the oral-infusion guard in
+/// [`resolve_gradient_method`]).
+#[cfg(feature = "autodiff")]
+fn is_oral_model(pk_model: PkModel) -> bool {
+    matches!(
+        pk_model,
+        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+    )
+}
+
+/// True when any BSV eta acts on the lagtime parameter, i.e. the model declares
+/// `lagtime`/`ALAG` with between-subject variability. Detected from the one-hot
+/// eta selector `sel_flat` (row-major `n_tv × n_eta`, parallel to `pk_indices`):
+/// a nonzero entry on the `PK_IDX_LAGTIME` row means eta moves the lag.
+///
+/// The AD paths freeze lagtime w.r.t. eta, so an eta-dependent lag makes the AD
+/// gradient inconsistent with the analytical objective — those subjects route
+/// to FD (see [`resolve_gradient_method`]).
+#[cfg(feature = "autodiff")]
+fn lagtime_depends_on_eta(model: &CompiledModel) -> bool {
+    let n_eta = model.n_eta;
+    if n_eta == 0 {
+        return false;
+    }
+    model
+        .pk_indices
+        .iter()
+        .enumerate()
+        .filter(|(_, &pk_idx)| pk_idx == crate::types::PK_IDX_LAGTIME)
+        .any(|(row, _)| {
+            let base = row * n_eta;
+            model
+                .sel_flat
+                .get(base..base + n_eta)
+                .is_some_and(|r| r.iter().any(|&c| c != 0.0))
+        })
+}
+
+pub(crate) fn resolve_gradient_method(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> InnerGradientMethod {
     #[cfg(not(feature = "autodiff"))]
     {
         let _ = model;
@@ -143,25 +191,35 @@ fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGra
         if subject.has_ss_doses() {
             return InnerGradientMethod::Fd;
         }
-        // System resets (EVID=3/4) zero the compartment state mid-record.
-        // The AD-instrumented propagators have no reset event, so their
-        // gradients wouldn't match the reset-aware predictions from the
-        // event-driven path. Fall back to FD until the AD path learns
-        // resets — the FD path routes through the reset-aware analytical
-        // propagator (see `pk::compute_predictions`).
-        if subject.has_resets() {
+        // Oral models with a zero-order (infusion, RATE>0) dose: every AD oral
+        // propagator — both the single-snapshot superposition (`ad_gradients`)
+        // and the event-driven (`event_driven_ad`) path — is bolus-only. They
+        // inject `amt` into the depot and ignore the infusion rate, whereas the
+        // analytical value path (`event_driven::propagate_with_bounds`) applies
+        // the zero-order input. Differentiating that mismatch yields a gradient
+        // inconsistent with the objective, so route these subjects to FD.
+        if is_oral_model(model.pk_model) && subject.doses.iter().any(|d| d.rate > 0.0) {
             return InnerGradientMethod::Fd;
         }
-        // Lagtime in the event-driven AD path would require threading
-        // per-dose `lagtime` through the AD-instrumented propagators and
-        // their infusion-window checks. The single-snapshot AD path
-        // already handles lagtime (see `ad_gradients.rs::predict_all_ad`).
-        // Until the event-driven AD path is updated, fall back to FD when
-        // a TV-cov subject is paired with a lagtime-bearing model.
-        if subject.has_tv_covariates() {
-            if crate::ad::event_driven_ad::supports_event_driven_ad(model.pk_model)
-                && !model.has_lagtime()
-            {
+        // Eta-dependent lagtime: the AD paths treat lagtime as Const w.r.t. eta
+        // (the event-driven path bakes a per-dose lag frozen at eta=0 into the
+        // timeline; the single-snapshot path reads it `volatile`), so `∂lag/∂η`
+        // is dropped and the AD gradient disagrees with the analytical
+        // (current-eta) objective the inner loop minimizes. Exact only when no
+        // eta acts on lagtime — fall back to FD when one does.
+        if lagtime_depends_on_eta(model) {
+            return InnerGradientMethod::Fd;
+        }
+        // System resets (EVID=3/4) and time-varying covariates both need the
+        // event-driven AD path: a reset zeros the compartment state mid-record
+        // (and turns off ongoing infusions), neither of which the
+        // single-snapshot superposition path in `ad_gradients.rs` can express.
+        // The event-driven AD kernel handles resets via a per-event reset-floor
+        // mask (mirrors `pk::event_driven`'s `reset_floor`) and lagtime via a
+        // Const per-dose lag baked into the event timeline (see
+        // `FlatEventData::from_subject`).
+        if subject.has_resets() || subject.has_tv_covariates() {
+            if crate::ad::event_driven_ad::supports_event_driven_ad(model.pk_model) {
                 InnerGradientMethod::AdEventDriven
             } else {
                 InnerGradientMethod::Fd
@@ -497,17 +555,37 @@ pub fn find_ebe(
             InnerGradientMethod::AdSingleSnapshot => {
                 (Some(tv_fn(&params.theta, &subject.covariates)), None, None)
             }
-            InnerGradientMethod::AdEventDriven => (
-                None,
-                Some(crate::ad::event_driven_ad::FlatEventData::from_subject(
-                    subject,
-                )),
-                Some(crate::ad::event_driven_ad::FlatEventTv::from_subject(
-                    model,
-                    subject,
-                    &params.theta,
-                )),
-            ),
+            InnerGradientMethod::AdEventDriven => {
+                // Per-dose lagtimes for the lagged event timeline, evaluated at
+                // (theta, covariate) with eta = 0 so they're Const w.r.t. the
+                // gradient. Exact for the usual eta-independent lagtime; the
+                // rare eta-dependent case drops ∂lag/∂η (documented in
+                // `FlatEventData::from_subject`). Empty when the model declares
+                // no lagtime — `from_subject` then applies zero shift.
+                let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
+                    let zeros = vec![0.0; n_eta];
+                    crate::pk::compute_event_pk_params(model, subject, &params.theta, &zeros)
+                        .dose
+                        .iter()
+                        .map(|p| p.lagtime())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (
+                    None,
+                    Some(crate::ad::event_driven_ad::FlatEventData::from_subject(
+                        subject,
+                        &dose_lagtimes,
+                    )),
+                    Some(crate::ad::event_driven_ad::FlatEventTv::from_subject(
+                        model,
+                        subject,
+                        &params.theta,
+                        &dose_lagtimes,
+                    )),
+                )
+            }
             InnerGradientMethod::Fd => (None, None, None),
         };
         (
@@ -1514,6 +1592,7 @@ mod iov_tests {
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            obs_raw_times: Vec::new(),
             observations: vec![40.0, 32.0, 25.0, 38.0, 30.0, 22.0],
             obs_cmts: vec![1; 6],
             covariates: HashMap::new(),
@@ -1627,6 +1706,7 @@ mod iov_tests {
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
+            obs_raw_times: Vec::new(),
             observations: vec![40.0, 32.0, 20.0],
             obs_cmts: vec![1; 3],
             covariates: HashMap::new(),
@@ -1671,6 +1751,89 @@ mod iov_tests {
             "mu shift not applied: r1.eta={}, r2.eta={}",
             r1.eta[0],
             r2.eta[0],
+        );
+    }
+
+    #[cfg(feature = "autodiff")]
+    #[test]
+    fn is_oral_model_classifies_extravascular_models() {
+        assert!(is_oral_model(PkModel::OneCptOral));
+        assert!(is_oral_model(PkModel::TwoCptOral));
+        assert!(is_oral_model(PkModel::ThreeCptOral));
+        assert!(!is_oral_model(PkModel::OneCptIv));
+        assert!(!is_oral_model(PkModel::TwoCptIv));
+        assert!(!is_oral_model(PkModel::ThreeCptIv));
+    }
+
+    #[cfg(feature = "autodiff")]
+    #[test]
+    fn lagtime_depends_on_eta_detects_bsv_on_lag() {
+        // Base model has no lagtime row (pk_indices = [CL, V]).
+        let mut model = make_iov_model();
+        assert!(!lagtime_depends_on_eta(&model), "no lag row -> false");
+
+        // Add a lagtime tv-row carrying eta (nonzero sel entry).
+        model.pk_indices = vec![0, 1, crate::types::PK_IDX_LAGTIME];
+        model.sel_flat = vec![1.0, 0.0, 1.0]; // 3 rows x n_eta=1; lag row has eta
+        assert!(lagtime_depends_on_eta(&model), "lag row with eta -> true");
+
+        // Same lagtime row but eta-independent (zero sel) -> false.
+        model.sel_flat = vec![1.0, 0.0, 0.0];
+        assert!(
+            !lagtime_depends_on_eta(&model),
+            "eta-independent lag -> false"
+        );
+    }
+
+    #[cfg(feature = "autodiff")]
+    #[test]
+    fn reset_only_subject_routes_to_event_driven() {
+        // A subject with a system reset but no TV covariates must take the
+        // reset-aware event-driven AD path (not single-snapshot, which can't
+        // express resets). Both find_ebe and hmc_step dispatch on this.
+        let mut model = make_iov_model();
+        model.tv_fn = Some(Box::new(
+            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
+        ));
+        model.pk_model = PkModel::OneCptIv; // supports event-driven AD
+        let mut subj = make_iov_subject();
+        assert!(!subj.has_tv_covariates(), "fixture has no TV covariates");
+        subj.reset_times = vec![3.5];
+        assert_eq!(
+            resolve_gradient_method(&model, &subj),
+            InnerGradientMethod::AdEventDriven,
+            "reset-only subject must take the event-driven AD path"
+        );
+    }
+
+    #[cfg(feature = "autodiff")]
+    #[test]
+    fn oral_infusion_subject_routes_to_fd() {
+        // tv_fn = Some so the AD branches are reachable; pk_model oral.
+        let mut model = make_iov_model();
+        model.tv_fn = Some(Box::new(
+            |_t: &[f64], _c: &std::collections::HashMap<String, f64>| vec![0.0, 0.0],
+        ));
+        model.pk_model = PkModel::OneCptOral;
+
+        // Oral *bolus* subject (RATE=0): AD is fine -> not FD.
+        let bolus = make_iov_subject();
+        assert!(bolus.doses.iter().all(|d| d.rate == 0.0));
+        assert_ne!(
+            resolve_gradient_method(&model, &bolus),
+            InnerGradientMethod::Fd,
+            "oral bolus should still take an AD route"
+        );
+
+        // Add a zero-order (infusion) dose -> guard routes to FD.
+        let mut infusion = make_iov_subject();
+        infusion
+            .doses
+            .push(DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)); // RATE>0
+        assert_eq!(
+            resolve_gradient_method(&model, &infusion),
+            InnerGradientMethod::Fd,
+            "oral + infusion must route to FD (AD oral propagators are bolus-only)"
         );
     }
 }

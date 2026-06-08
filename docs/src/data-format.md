@@ -101,6 +101,42 @@ ID,TIME,DV,EVID,AMT,CMT,MDV
 1,25,9.4,0,.,.,0
 ```
 
+### Stacked occasions with a restarting clock
+
+A common NONMEM idiom is to stack several independent dosing episodes under one
+subject ID, each opened by an `EVID=4` record whose `TIME` **restarts at 0** (so
+the records are not globally time-ordered):
+
+```csv
+ID,TIME,DV,EVID,AMT,RATE,MDV
+1,0,.,4,100,100,1
+1,1,9.4,0,.,.,0
+1,8,2.1,0,.,.,0
+1,0,.,4,100,100,1
+1,1,9.6,0,.,.,0
+1,8,2.0,0,.,.,0
+```
+
+NONMEM processes records sequentially, so the second `EVID=4` begins a fresh
+occasion that re-uses the first occasion's wall-clock. ferx-core reproduces this:
+each restarting occasion is shifted onto a single monotonic internal timeline
+(the reset zeros every compartment at the boundary, so no drug carries across),
+and the subject keeps **one shared set of random effects** across the occasions —
+exactly matching NONMEM's `EVID=4` semantics. The two occasions are *not* merged
+or double-dosed.
+
+Diagnostics are reported on the **raw** data clock: the `TIME` column of
+`{model}-sdtab.csv` (and `{model}-covtab.csv`) echoes the value you wrote, and
+`TAFD` / `TAD` reset per occasion (time after that occasion's first / most
+recent dose). The monotonic shift is purely internal to the prediction engine.
+
+> **Known limitation.** A `[derived]` integral column with an *absolute* window
+> (`[from, to]` or a periodic `anchor`) is evaluated on the internal linearised
+> timeline, so its boundaries do not align with the raw per-occasion `TIME` for
+> subjects with stacked reset occasions. Integrals over the subject's own
+> observation span are unaffected; absolute windows combined with stacked resets
+> are not yet supported per-occasion.
+
 Notes:
 
 - Resets force the [event-driven analytical / ODE prediction path](../estimation/foce.md) — dose superposition cannot express a mid-record reset — so any analytical or ODE model supports them with no configuration.
