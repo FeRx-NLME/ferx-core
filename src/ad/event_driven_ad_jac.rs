@@ -38,6 +38,7 @@ const LTBS_FLOOR_AD: f64 = 1e-12;
     Const,      // event_times
     Const,      // event_kinds
     Const,      // event_orig_idx_f64
+    Const,      // event_reset_floor
     Const,      // dose_times
     Const,      // dose_amts
     Const,      // dose_rates
@@ -55,6 +56,8 @@ pub fn predict_all_event_driven_ad(
     event_times: &[f64],
     event_kinds: &[f64],
     event_orig_idx_f64: &[f64],
+    // Per-event reset floor (length n_events); see sibling `event_driven_ad.rs`.
+    event_reset_floor: &[f64],
     dose_times: &[f64],
     dose_amts: &[f64],
     dose_rates: &[f64],
@@ -148,6 +151,7 @@ pub fn predict_all_event_driven_ad(
             dose_durations,
             dose_cmts_f64,
             n_doses,
+            event_reset_floor[ev_idx],
         );
         state0 = s0_new;
         state1 = s1_new;
@@ -157,6 +161,15 @@ pub fn predict_all_event_driven_ad(
         let kind = event_kinds[ev_idx];
         let orig = event_orig_idx_f64[ev_idx] as usize;
         let dose_idx = if kind < 0.5 { orig } else { 0 };
+
+        // Reset branch (kind=3.0): zero every compartment after propagating
+        // into the reset time. `keep` is a Const mask (0 at a reset). Mirrors
+        // the reverse-mode kernel in `event_driven_ad.rs`.
+        let keep = if kind > 2.5 { 0.0 } else { 1.0 };
+        state0 *= keep;
+        state1 *= keep;
+        state2 *= keep;
+        state3 *= keep;
 
         // is_dose=0 for obs (kind=1) and pk-only (kind=2), so their
         // state0 is unchanged regardless of dose_*[dose_idx]. `ev_f`
@@ -237,6 +250,7 @@ fn propagate_state_jac(
     dose_durations: &[f64],
     dose_cmts_f64: &[f64],
     n_doses: usize,
+    reset_floor: f64,
 ) -> (f64, f64, f64, f64) {
     // ID dispatch — mirrors `event_driven_ad.rs::propagate_state_ad`. Per
     // issue #176, IV bolus and infusion share a single ID; the route is
@@ -253,6 +267,7 @@ fn propagate_state_jac(
             dose_rates,
             dose_durations,
             n_doses,
+            reset_floor,
         );
         (s0, state1, state2, state3)
     } else if pk_model_id == PK_ID_ONE_CPT_ORAL {
@@ -274,6 +289,7 @@ fn propagate_state_jac(
             dose_durations,
             dose_cmts_f64,
             n_doses,
+            reset_floor,
         );
         (s0, s1, state2, state3)
     } else if pk_model_id == PK_ID_TWO_CPT_ORAL {
@@ -299,6 +315,7 @@ fn propagate_state_jac(
             dose_durations,
             dose_cmts_f64,
             n_doses,
+            reset_floor,
         );
         (s0, s1, s2, state3)
     } else if pk_model_id == PK_ID_THREE_CPT_ORAL {
@@ -322,6 +339,7 @@ fn propagate_one_cpt_jac(
     dose_rates: &[f64],
     dose_durations: &[f64],
     n_doses: usize,
+    reset_floor: f64,
 ) -> f64 {
     let v_safe = v.abs() + 1e-30;
     let cl_safe = cl.abs() + 1e-30;
@@ -342,8 +360,10 @@ fn propagate_one_cpt_jac(
         let diff = tau_total_raw - tau_to;
         let tau_total = tau_to + (diff + diff.abs()) * 0.5;
         let r = f_bio * dose_rates[d];
+        // Infusions started before the most recent reset are off (Const mask).
+        let active = if s_i < reset_floor { 0.0 } else { 1.0 };
         let contribution = (r / ke) * ((-ke * tau_to).exp() - (-ke * tau_total).exp());
-        s0 += contribution;
+        s0 += active * contribution;
     }
     s0
 }
@@ -364,6 +384,7 @@ fn propagate_two_cpt_jac(
     dose_durations: &[f64],
     dose_cmts_f64: &[f64],
     n_doses: usize,
+    reset_floor: f64,
 ) -> (f64, f64) {
     let v1_safe = v1.abs() + 1e-30;
     let cl_safe = cl.abs() + 1e-30;
@@ -405,6 +426,8 @@ fn propagate_two_cpt_jac(
 
         let cmt = dose_cmts_f64[d] as i32;
         let r = f_bio * dose_rates[d];
+        // Infusions started before the most recent reset are off (Const mask).
+        let active = if s_i < reset_floor { 0.0 } else { 1.0 };
         let (a_ss_1, a_ss_2) = if cmt == 2 {
             (
                 r * v1_safe / cl_safe,
@@ -426,8 +449,8 @@ fn propagate_two_cpt_jac(
             c1_ss * (k21 - alpha) * (e_a_to - e_a_tot) + c2_ss * (k21 - beta) * (e_b_to - e_b_tot);
         let a2_contrib = k12 * (c1_ss * (e_a_to - e_a_tot) + c2_ss * (e_b_to - e_b_tot));
 
-        s0 += a1_contrib;
-        s1 += a2_contrib;
+        s0 += active * a1_contrib;
+        s1 += active * a2_contrib;
     }
     (s0, s1)
 }
@@ -626,6 +649,7 @@ fn propagate_three_cpt_jac(
     dose_durations: &[f64],
     dose_cmts_f64: &[f64],
     n_doses: usize,
+    reset_floor: f64,
 ) -> (f64, f64, f64) {
     let v1_safe = v1.abs() + 1e-30;
     let cl_safe = cl.abs() + 1e-30;
@@ -660,6 +684,8 @@ fn propagate_three_cpt_jac(
 
         let cmt = dose_cmts_f64[d] as i32;
         let r = f_bio * dose_rates[d];
+        // Infusions started before the most recent reset are off (Const mask).
+        let active = if s_i < reset_floor { 0.0 } else { 1.0 };
         let (a_ss_c, a_ss_p1, a_ss_p2) = if cmt == 2 {
             (
                 r * v1_safe / cl_safe,
@@ -696,9 +722,9 @@ fn propagate_three_cpt_jac(
             gamma, a_ss_c, a_ss_p1, a_ss_p2, k12, k13, k21, k31, tau_total,
         );
 
-        s0 += (ca_to - ca_tot) + (cb_to - cb_tot) + (cg_to - cg_tot);
-        s1 += (p1a_to - p1a_tot) + (p1b_to - p1b_tot) + (p1g_to - p1g_tot);
-        s2 += (p2a_to - p2a_tot) + (p2b_to - p2b_tot) + (p2g_to - p2g_tot);
+        s0 += active * ((ca_to - ca_tot) + (cb_to - cb_tot) + (cg_to - cg_tot));
+        s1 += active * ((p1a_to - p1a_tot) + (p1b_to - p1b_tot) + (p1g_to - p1g_tot));
+        s2 += active * ((p2a_to - p2a_tot) + (p2b_to - p2b_tot) + (p2g_to - p2g_tot));
     }
     (s0, s1, s2)
 }
@@ -831,6 +857,7 @@ pub fn compute_jacobian_event_driven_ad(
             &event_data.event_times,
             &event_data.event_kinds,
             &event_data.event_orig_idx_f64,
+            &event_data.event_reset_floor,
             dose_times_padded,
             dose_amts_padded,
             dose_rates_padded,
@@ -862,7 +889,234 @@ pub fn compute_jacobian_event_driven_ad(
 mod tests {
     use super::*;
     use crate::ad::ad_gradients::pk_model_to_id;
+    use crate::ad::event_driven_ad::FlatEventData;
+    use crate::pk::event_driven::event_driven_predictions;
     use approx::assert_relative_eq;
+    use std::collections::HashMap;
+
+    // ── Reset (EVID=3/4) AD-vs-analytical regression ───────────────────
+    //
+    // The event-driven AD forward kernel must reproduce the reset-aware
+    // analytical path (`pk::event_driven::event_driven_predictions`) for
+    // subjects carrying system resets: state zeroed at the reset and any
+    // infusion that started before the reset turned off. We drive the REAL
+    // `FlatEventData::from_subject` timeline (so the reset-event insertion,
+    // tie-break ordering, and `event_reset_floor` computation are all under
+    // test) and feed constant PK params per event (no covariates), then
+    // compare obs-slot predictions to the analytical reference.
+
+    fn subject_with_resets(
+        doses: Vec<DoseEvent>,
+        obs_times: Vec<f64>,
+        reset_times: Vec<f64>,
+    ) -> Subject {
+        let n_obs = obs_times.len();
+        Subject {
+            id: "1".into(),
+            doses,
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n_obs],
+            obs_cmts: vec![1; n_obs],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times,
+            cens: vec![0; n_obs],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    /// Run the event-driven AD forward kernel for `subject` with constant
+    /// PK params `values` (covering `pk_idx`), returning per-observation
+    /// predictions in obs order. Uses the production `FlatEventData`.
+    fn ad_event_driven_preds(
+        pk_model: PkModel,
+        subject: &Subject,
+        pk_idx: &[usize],
+        values: &[f64],
+        dose_lagtimes: &[f64],
+    ) -> Vec<f64> {
+        let ed = FlatEventData::from_subject(subject, dose_lagtimes);
+        let n_events = ed.event_times.len();
+        let n_obs = subject.obs_times.len();
+
+        let pk_idx_f64: Vec<f64> = pk_idx.iter().map(|&i| i as f64).collect();
+        let n_tv = pk_idx.len();
+        let eta = vec![0.0_f64]; // single eta, zero effect
+        let sel_flat = vec![0.0_f64; n_tv]; // n_tv * n_eta (n_eta = 1), all zero
+        let tv = build_tv_constant(pk_idx, values, n_events);
+        let obs_scale = vec![1.0_f64; n_events]; // readout = central / V
+        let pk_model_id = pk_model_to_id(pk_model) as f64;
+
+        let mut out = vec![0.0_f64; n_events];
+        predict_all_event_driven_ad(
+            &eta,
+            &tv,
+            &ed.event_times,
+            &ed.event_kinds,
+            &ed.event_orig_idx_f64,
+            &ed.event_reset_floor,
+            &ed.dose_times,
+            &ed.dose_amts,
+            &ed.dose_rates,
+            &ed.dose_durations,
+            &ed.dose_cmts_f64,
+            &pk_idx_f64,
+            &sel_flat,
+            pk_model_id,
+            &obs_scale,
+            &mut out,
+        );
+
+        let mut preds = vec![0.0_f64; n_obs];
+        for ev in 0..n_events {
+            let k = ed.event_kinds[ev];
+            if k > 0.5 && k < 1.5 {
+                let oi = ed.event_orig_idx_f64[ev] as usize;
+                preds[oi] = out[ev];
+            }
+        }
+        preds
+    }
+
+    fn pk_one_iv(cl: f64, v: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[PK_IDX_CL] = cl;
+        p.values[PK_IDX_V] = v;
+        p
+    }
+
+    fn pk_three_iv(cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[PK_IDX_CL] = cl;
+        p.values[PK_IDX_V] = v1;
+        p.values[PK_IDX_Q] = q2;
+        p.values[PK_IDX_V2] = v2;
+        p.values[PK_IDX_Q3] = q3;
+        p.values[PK_IDX_V3] = v3;
+        p
+    }
+
+    #[test]
+    fn ad_reset_turns_off_ongoing_infusion_matches_analytical() {
+        // 1-cpt IV: infusion 0–8 h (rate 125), reset at t=4 mid-infusion.
+        // Obs at t=3 (pre-reset, > 0) and t=6 (post-reset). The reset zeros
+        // the state AND turns the infusion off, so t=6 must read ~0.
+        let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 125.0, false, 0.0)];
+        let obs_times = vec![3.0, 6.0];
+        let subj = subject_with_resets(doses, obs_times.clone(), vec![4.0]);
+        let pk = pk_one_iv(10.0, 100.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let reference = event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose, &pk_obs, &[]);
+        let ad = ad_event_driven_preds(
+            PkModel::OneCptIv,
+            &subj,
+            &[PK_IDX_CL, PK_IDX_V],
+            &[10.0, 100.0],
+            &[],
+        );
+
+        assert!(reference[0] > 0.0 && ad[0] > 0.0, "pre-reset obs positive");
+        assert_relative_eq!(ad[1], 0.0, epsilon = 1e-9);
+        for (a, r) in ad.iter().zip(reference.iter()) {
+            assert_relative_eq!(*a, *r, epsilon = 1e-9, max_relative = 1e-9);
+        }
+    }
+
+    #[test]
+    fn ad_three_cpt_two_occasion_reset_matches_analytical() {
+        // Propofol-shaped: two infusion occasions separated by an EVID=4
+        // reset on a 3-cpt IV model. Occasion 1: infusion at t=0 (rate 343,
+        // dur 0.27 ≈ a 92.6 mg bolus-like push) + a maintenance infusion at
+        // t=60. Reset at t=120 zeros the system; occasion 2 repeats. Every
+        // obs prediction must match the reset-aware analytical path.
+        let doses = vec![
+            DoseEvent::new(0.0, 92.6, 1, 343.0, false, 0.0),
+            DoseEvent::new(60.0, 89.4, 1, 1.49, false, 0.0),
+            DoseEvent::new(120.0, 92.6, 1, 343.0, false, 0.0),
+            DoseEvent::new(180.0, 89.4, 1, 1.49, false, 0.0),
+        ];
+        let obs_times = vec![2.0, 8.0, 30.0, 90.0, 122.0, 128.0, 150.0, 210.0];
+        let subj = subject_with_resets(doses, obs_times.clone(), vec![120.0]);
+        let pk = pk_three_iv(2.0, 6.0, 1.0, 25.0, 0.5, 250.0);
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        let reference =
+            event_driven_predictions(PkModel::ThreeCptIv, &subj, &pk_dose, &pk_obs, &[]);
+        let ad = ad_event_driven_preds(
+            PkModel::ThreeCptIv,
+            &subj,
+            &[
+                PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_Q3, PK_IDX_V3,
+            ],
+            &[2.0, 6.0, 1.0, 25.0, 0.5, 250.0],
+            &[],
+        );
+
+        // Occasion-2 obs (t≥120) must be positive — the reset+redose rebuilds
+        // the profile — and the early occasion-2 point must NOT carry residual
+        // occasion-1 drug (that's the reset/infusion-off invariant).
+        assert!(ad[4] > 0.0, "post-reset redose obs positive");
+        for (a, r) in ad.iter().zip(reference.iter()) {
+            assert_relative_eq!(*a, *r, epsilon = 1e-7, max_relative = 1e-7);
+        }
+    }
+
+    #[test]
+    fn ad_reset_plus_lagtime_matches_analytical() {
+        // Lagtime + reset on the same subject (the route that previously fell
+        // back to FD). 2-cpt IV: bolus at t=0 with ALAG=1.5 h (so drug enters
+        // at t=1.5), a long infusion at t=5 (ALAG shifts its window to
+        // [6.5, 16.5], so it is still running when the reset hits), and a reset
+        // at t=12 that must zero the state AND turn that infusion off. The
+        // lagged dose timeline + reset/infusion-off must all match the
+        // analytical path, which lags via `EventSchedule`.
+        let doses = vec![
+            DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), // bolus, lagged to 1.5
+            DoseEvent::new(5.0, 600.0, 1, 60.0, false, 0.0), // 10-h infusion → [6.5, 16.5]
+            DoseEvent::new(12.0, 800.0, 1, 0.0, false, 0.0), // post-reset bolus, lagged to 13.5
+        ];
+        let obs_times = vec![1.0, 3.0, 8.0, 11.0, 13.0, 16.0, 24.0];
+        let subj = subject_with_resets(doses, obs_times.clone(), vec![12.0]);
+
+        let lag = 1.5_f64;
+        let mut pk = PkParams::default();
+        pk.values[PK_IDX_CL] = 4.0;
+        pk.values[PK_IDX_V] = 30.0;
+        pk.values[PK_IDX_Q] = 2.0;
+        pk.values[PK_IDX_V2] = 40.0;
+        pk.values[PK_IDX_LAGTIME] = lag;
+        let pk_dose = vec![pk; subj.doses.len()];
+        let pk_obs = vec![pk; obs_times.len()];
+
+        // Analytical reference lags internally from `pk.lagtime()`.
+        let reference = event_driven_predictions(PkModel::TwoCptIv, &subj, &pk_dose, &pk_obs, &[]);
+        // AD path takes the lags explicitly (Const per-dose).
+        let dose_lagtimes = vec![lag; subj.doses.len()];
+        let ad = ad_event_driven_preds(
+            PkModel::TwoCptIv,
+            &subj,
+            &[PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
+            &[4.0, 30.0, 2.0, 40.0],
+            &dose_lagtimes,
+        );
+
+        // Obs at t=1.0 is before the lagged bolus entry (t=1.5) → ~0.
+        assert_relative_eq!(ad[0], 0.0, epsilon = 1e-9);
+        assert!(ad[1] > 0.0, "obs after lagged bolus entry positive");
+        for (a, r) in ad.iter().zip(reference.iter()) {
+            assert_relative_eq!(*a, *r, epsilon = 1e-7, max_relative = 1e-7);
+        }
+    }
 
     // Helper: build the minimum tv_per_event row layout the kernel needs.
     // `pk_idx_f64` declares which PK indices the row covers (and in what
@@ -916,12 +1170,15 @@ mod tests {
             let tv = build_tv_constant(&pk_idx, &[cl, v, ka, f], event_times.len());
             let mut out = vec![0.0_f64; event_times.len()];
             let obs_scale = vec![1.0_f64; event_times.len()];
+            // No resets in these fixtures — floor is NEG_INFINITY everywhere.
+            let event_reset_floor = vec![f64::NEG_INFINITY; event_times.len()];
             predict_all_event_driven_ad(
                 &eta,
                 &tv,
                 &event_times,
                 &event_kinds,
                 &event_orig,
+                &event_reset_floor,
                 &dose_times,
                 &dose_amts,
                 &dose_rates,
@@ -985,12 +1242,15 @@ mod tests {
             let tv = build_tv_constant(&pk_idx, &[cl, v, f], event_times.len());
             let mut out = vec![0.0_f64; event_times.len()];
             let obs_scale = vec![1.0_f64; event_times.len()];
+            // No resets in these fixtures — floor is NEG_INFINITY everywhere.
+            let event_reset_floor = vec![f64::NEG_INFINITY; event_times.len()];
             predict_all_event_driven_ad(
                 &eta,
                 &tv,
                 &event_times,
                 &event_kinds,
                 &event_orig,
+                &event_reset_floor,
                 &dose_times,
                 &dose_amts,
                 &dose_rates,
