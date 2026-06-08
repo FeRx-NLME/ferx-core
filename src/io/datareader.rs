@@ -889,12 +889,19 @@ fn parse_subject(
             if any_tv {
                 dose_covariates.push(locf_state.clone());
             }
-            // Advance the occasion watermark past this dose's *end* (infusion
-            // duration), not just its start. A later reset-restarting occasion
-            // is shifted past `max_eff_time`; if a dose here ends after the last
-            // observation, the watermark must reflect that so the next occasion
-            // doesn't land inside this one's dosing window.
-            let dose_end = time + if rate > 0.0 { amt / rate } else { 0.0 };
+            // Advance the occasion watermark past this dose's *end* (start +
+            // infusion duration), not just its start. A later reset-restarting
+            // occasion is shifted past `max_eff_time`; if a dose here ends after
+            // the last observation, the watermark must reflect that so the next
+            // occasion doesn't land inside this one's dosing window. Reuses the
+            // duration `DoseEvent::new` already computed (single source of truth).
+            // NOTE: dose lagtime (ALAG) is a model parameter unknown at parse
+            // time, so the watermark uses unlagged times; a heavily-lagged dose
+            // whose effective start crosses an occasion boundary is not covered.
+            let dose_end = {
+                let d = doses.last().unwrap();
+                d.time + d.duration
+            };
             if dose_end > max_eff_time {
                 max_eff_time = dose_end;
             }
@@ -933,7 +940,11 @@ fn parse_subject(
                         // whole ADDL train (issue #195 review): ADDL bolus doses
                         // landing after the next occasion's reset would otherwise
                         // fire onto it, since boluses aren't gated by reset_floor.
-                        let addl_end = addl_time + if rate > 0.0 { amt / rate } else { 0.0 };
+                        // Reuses the just-pushed dose's stored duration.
+                        let addl_end = {
+                            let d = doses.last().unwrap();
+                            d.time + d.duration
+                        };
                         if addl_end > max_eff_time {
                             max_eff_time = addl_end;
                         }
