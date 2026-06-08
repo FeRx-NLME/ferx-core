@@ -6,36 +6,40 @@
 //! (`data/warfarin_iov.csv`, 2 occasions/subject): 1-cpt oral, proportional
 //! error, IOV on CL. Model: `examples/warfarin_iov.ferx`.
 //!
-//! ## What this characterizes
+//! ## What this guards
 //!
-//! `iov_objective_characterizes_nonmem_gap` — ferx's FOCEI objective, evaluated
-//! at NONMEM's final MLE (all parameters FIXed), compared to NONMEM's
-//! OFV-without-constant. With the continuous per-occasion-aware prediction
-//! (issue #104, `pk::predict_iov`) ferx lands at ≈292 vs NONMEM's 308.83 — a
-//! ≈17-unit gap, down from ≈37 under the old Option-A superposition.
+//! `iov_objective_matches_nonmem` — ferx's FOCEI objective, evaluated at
+//! NONMEM's final MLE (all parameters FIXed), compared to NONMEM's
+//! OFV-without-constant. ferx lands at ≈308.2 vs NONMEM's 308.83 — a **~0.6-unit
+//! match**.
 //!
-//! **The prediction is now exact.** ferx's population PRED (η=κ=0) matches
-//! NONMEM's PRED to 5 significant figures on every row of the dataset,
-//! *including the occasion-2 carryover rows* (e.g. t=120.5: 6.1882; t=124:
-//! 11.761). So the carryover fix is fully validated, and the residual gap is
-//! NOT a prediction difference.
+//! ### History (issues #101 / #104 / #109)
+//!
+//! This started as a ≈37-unit gap under the old Option-A superposition, fell to
+//! ≈17 once the continuous per-occasion-aware prediction (issue #104,
+//! `pk::predict_iov`) made the prediction exact, and finally **closed to ~0.6**
+//! when the FOCEI INTER marginal switched from the augmented Sheiner–Beal
+//! linearised form to the Almquist 2015 Laplace form (commit `2de0bea`), which
+//! aligned ferx's marginal with NONMEM's Laplace FOCEI. That closure resolved
+//! issue #109, whose residual was diagnosed as exactly this Sheiner–Beal-vs-Laplace
+//! cross-engine difference.
+//!
+//! The remaining ~0.6 is well within what NONMEM's own non-clean convergence on
+//! this dataset can explain — it terminated on ROUNDING ERRORS (ERROR=134),
+//! though OFV and estimates were stable across the last iterations.
+//!
+//! **The prediction is exact.** ferx's population PRED (η=κ=0) matches NONMEM's
+//! PRED to 5 significant figures on every row of the dataset, *including the
+//! occasion-2 carryover rows* (e.g. t=120.5: 6.1882; t=124: 11.761).
 //!
 //! The simultaneous cross-occasion event ordering (occasion-1 obs and
-//! occasion-2 dose both at t=120) was investigated as a candidate: making the
-//! event sort occasion-aware there changes the OFV by only ~0.3 units, so it is
-//! not the residual and was not pursued (an occasion-aware tie-break would also
+//! occasion-2 dose both at t=120) was investigated as a candidate for the old
+//! residual: making the event sort occasion-aware there changes the OFV by only
+//! ~0.3 units, so it was not pursued (an occasion-aware tie-break would also
 //! need per-event occasion data for EVID=2 records to stay correct — see #107).
 //!
-//! The **residual ≈17 units (~1.7/subject)** is therefore in the FOCE marginal /
-//! EBE machinery: a cross-engine FOCEI difference for this weakly-identified
-//! multi-random-effect IOV model (ferx's augmented Sheiner–Beal marginal vs
-//! NONMEM's Laplace), plausibly inherent and amplified by NONMEM's own
-//! non-clean convergence here (it terminated on ROUNDING ERRORS). ferx SAEM
-//! (302.9) and FOCEI (288.8) bracket below NONMEM (308.8), consistent with a
-//! genuine approximation spread rather than a bug. Non-IOV NONMEM cross-checks
-//! (`multi_endpoint`, `ss_lagtime`) match tightly, so this is IOV-specific.
-//!
-//! This test is `#[ignore]`d: it characterizes and bounds the residual gap.
+//! This test is `#[ignore]`d (it needs the NONMEM-anchored fixture) and now
+//! guards that the IOV marginal stays in agreement with NONMEM.
 //!
 //! ## Reproducing the NONMEM reference
 //!
@@ -85,8 +89,8 @@ const NM_SIGMA_PROP_SD: f64 = 0.188116; // sqrt(0.0353877)
 const NM_OFV_NO_CONST: f64 = 308.8305;
 
 #[test]
-#[ignore = "issue #101: ferx Option-A IOV carryover differs from NONMEM's continuous integration on this washout-free design (~37 OFV units); characterization only"]
-fn iov_objective_characterizes_nonmem_gap() {
+#[ignore = "NONMEM-anchored IOV cross-check (issues #101/#104/#109): asserts ferx's FOCEI IOV marginal matches NONMEM to ~0.6 OFV units; needs the fixed-MLE fixture"]
+fn iov_objective_matches_nonmem() {
     // examples/warfarin_iov.ferx structural model, parameters FIXed at NONMEM's
     // MLE. omega/kappa are variances; sigma is the SD ferx reports.
     let fixed = format!(
@@ -133,17 +137,16 @@ fn iov_objective_characterizes_nonmem_gap() {
     let result = fit(&model, &pop, &model.default_params, &opts)
         .expect("fixed-param IOV objective evaluation must run");
 
-    // Characterize the residual gap (~17 units) after the continuous-prediction
-    // fix (issue #104). The prediction is exact (ferx PRED == NONMEM PRED to
-    // 5 s.f.), so this residual is the FOCE marginal / EBE cross-engine
-    // difference, not prediction. ferx sits BELOW NONMEM. If this band is broken,
-    // something changed — a closer FOCE-marginal match (gap → ~0, tighten/retire)
-    // or a regression (gap grew back toward the old ≈37 carryover gap, or blew up).
-    let diff = NM_OFV_NO_CONST - result.ofv; // expected ≈ +17
+    // After the Almquist 2015 Laplace marginal switch (commit 2de0bea, closing
+    // issue #109), ferx's FOCEI IOV objective matches NONMEM to ~0.6 units. The
+    // prediction is exact (ferx PRED == NONMEM PRED to 5 s.f.); the remaining gap
+    // is within NONMEM's own non-clean convergence on this dataset. If this band
+    // breaks, the IOV marginal moved away from NONMEM — a regression to investigate.
+    let diff = (NM_OFV_NO_CONST - result.ofv).abs(); // expected ≈ 0.6
     assert!(
-        result.ofv.is_finite() && (8.0..28.0).contains(&diff),
-        "ferx FOCEI at NONMEM's MLE = {:.4}; NONMEM = {:.4}; gap {:.4} outside the \
-         documented residual band [8, 28]",
+        result.ofv.is_finite() && diff < 3.0,
+        "ferx FOCEI at NONMEM's MLE = {:.4}; NONMEM = {:.4}; |gap| {:.4} exceeds the \
+         expected agreement tolerance (3.0 units)",
         result.ofv,
         NM_OFV_NO_CONST,
         diff
