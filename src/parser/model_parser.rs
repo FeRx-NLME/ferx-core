@@ -1114,8 +1114,26 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     }
     // set here after diffusion thetas are appended above
     n_theta = theta_names.len();
+    // A `[event_model]` (TTE) endpoint makes a fixed-effects model legitimate:
+    // the hazard parameters can be pure theta/covariate, so n_eta = 0 (an empty
+    // BSV Omega) is valid — even though `build_omega_matrix` rejects an empty
+    // Omega for ordinary PK models. Detect the block from the raw parse so the
+    // same `.ferx` parses identically with or without the `survival` feature
+    // compiled in (the actual TTE endpoints are only built under `survival`).
+    let has_event_model = blocks.get("event_model").is_some()
+        || extracted
+            .named
+            .get("event_model")
+            .is_some_and(|m| !m.is_empty());
     // BSV omega is built from the BSV-only eta names (no kappas)
-    let omega = build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?;
+    let omega = if eta_names_bsv.is_empty() && has_event_model {
+        // 0×0 Omega — `from_matrix` handles the empty matrix (cholesky of a
+        // 0-dim matrix is trivial, log|Ω| = 0); `build_omega_fixed` below
+        // already returns an empty `Vec` for an empty eta list.
+        OmegaMatrix::from_diagonal(&[], Vec::new())
+    } else {
+        build_omega_matrix(&omegas, &block_omegas, &eta_names_bsv)?
+    };
     let omega_fixed = build_omega_fixed(&omegas, &block_omegas, &eta_names_bsv)?;
     // Per-eta SD-init flags, parallel to `eta_names_bsv`. Diagonal omega
     // declarations carry their `(sd)` flag from the parser; block-omega etas
