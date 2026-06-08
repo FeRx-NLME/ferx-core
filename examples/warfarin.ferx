@@ -26,3 +26,10 @@
   method     = foce
   maxiter    = 300
   covariance = true
+
+[simulation]
+  n_subjects = 10
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0, 96.0, 120.0]
+  seed       = 1

@@ -272,10 +272,12 @@ The `ci` feature is the right choice for development on machines without the ful
 ### Verify the build
 
 ```bash
-RUSTFLAGS="-Z autodiff=Enable" cargo run --release --features autodiff --bin ferx -- examples/warfarin.ferx --simulate
+RUSTFLAGS="-Z autodiff=Enable" cargo run --release --features autodiff --bin ferx -- examples/warfarin.ferx --data data/warfarin.csv
 ```
 
-Should print a successful model fit with parameter estimates.
+Should print a successful model fit with parameter estimates. Fitting against
+the bundled `data/warfarin.csv` exercises the autodiff gradient path, so it
+also confirms Enzyme is working end-to-end (not just that the binary links).
 
 ---
 
