@@ -93,24 +93,27 @@ pub(crate) fn build_event_scale_array_for_ad(
 /// (b) the model to have `tv_fn` populated (analytical PK path only).
 /// ODE models have no AD path, so `Auto` resolves to FD there.
 ///
-/// For subjects with time-varying covariates, the *event-driven* AD path
-/// is used when the structural model is in
-/// [`crate::ad::event_driven_ad::supports_event_driven_ad`] (currently
-/// 1- and 2-cpt IV bolus + infusion). Other models with TV covariates
-/// fall back to FD — the single-snapshot AD path can't honour per-event
-/// covariate values.
+/// For subjects with time-varying covariates *or* system resets (EVID=3/4),
+/// the *event-driven* AD path is used when the structural model is in
+/// [`crate::ad::event_driven_ad::supports_event_driven_ad`] (all six
+/// analytical PK models). Lagtime is handled there too (a Const per-dose lag
+/// baked into the event timeline). Models outside that set fall back to FD —
+/// the single-snapshot AD path can't honour per-event covariate values or
+/// resets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InnerGradientMethod {
-    /// Finite differences. Used when AD is unavailable/disabled, when
-    /// the model has no `tv_fn`, or when the subject has TV covariates
-    /// on a model the event-driven AD path doesn't support yet.
+    /// Finite differences. Used when AD is unavailable/disabled, when the
+    /// model has no `tv_fn`, or when a TV-covariate / reset subject is on a
+    /// structural model the event-driven AD path doesn't support
+    /// (`supports_event_driven_ad` == false, e.g. ODE models).
     Fd,
     /// Reverse-mode AD with a single per-subject `tv_adjusted` vector
     /// — the legacy fast path. Correct only when the subject has no
-    /// time-varying covariates.
+    /// time-varying covariates and no system resets.
     AdSingleSnapshot,
     /// Reverse-mode AD with per-event `tv` arrays — required for
-    /// time-varying covariates to be reflected in gradients.
+    /// time-varying covariates and/or system resets (EVID=3/4) to be
+    /// reflected in gradients.
     AdEventDriven,
 }
 
@@ -143,25 +146,16 @@ fn resolve_gradient_method(model: &CompiledModel, subject: &Subject) -> InnerGra
         if subject.has_ss_doses() {
             return InnerGradientMethod::Fd;
         }
-        // System resets (EVID=3/4) zero the compartment state mid-record.
-        // The AD-instrumented propagators have no reset event, so their
-        // gradients wouldn't match the reset-aware predictions from the
-        // event-driven path. Fall back to FD until the AD path learns
-        // resets — the FD path routes through the reset-aware analytical
-        // propagator (see `pk::compute_predictions`).
-        if subject.has_resets() {
-            return InnerGradientMethod::Fd;
-        }
-        // Lagtime in the event-driven AD path would require threading
-        // per-dose `lagtime` through the AD-instrumented propagators and
-        // their infusion-window checks. The single-snapshot AD path
-        // already handles lagtime (see `ad_gradients.rs::predict_all_ad`).
-        // Until the event-driven AD path is updated, fall back to FD when
-        // a TV-cov subject is paired with a lagtime-bearing model.
-        if subject.has_tv_covariates() {
-            if crate::ad::event_driven_ad::supports_event_driven_ad(model.pk_model)
-                && !model.has_lagtime()
-            {
+        // System resets (EVID=3/4) and time-varying covariates both need the
+        // event-driven AD path: a reset zeros the compartment state mid-record
+        // (and turns off ongoing infusions), neither of which the
+        // single-snapshot superposition path in `ad_gradients.rs` can express.
+        // The event-driven AD kernel handles resets via a per-event reset-floor
+        // mask (mirrors `pk::event_driven`'s `reset_floor`) and lagtime via a
+        // Const per-dose lag baked into the event timeline (see
+        // `FlatEventData::from_subject`).
+        if subject.has_resets() || subject.has_tv_covariates() {
+            if crate::ad::event_driven_ad::supports_event_driven_ad(model.pk_model) {
                 InnerGradientMethod::AdEventDriven
             } else {
                 InnerGradientMethod::Fd
@@ -497,17 +491,37 @@ pub fn find_ebe(
             InnerGradientMethod::AdSingleSnapshot => {
                 (Some(tv_fn(&params.theta, &subject.covariates)), None, None)
             }
-            InnerGradientMethod::AdEventDriven => (
-                None,
-                Some(crate::ad::event_driven_ad::FlatEventData::from_subject(
-                    subject,
-                )),
-                Some(crate::ad::event_driven_ad::FlatEventTv::from_subject(
-                    model,
-                    subject,
-                    &params.theta,
-                )),
-            ),
+            InnerGradientMethod::AdEventDriven => {
+                // Per-dose lagtimes for the lagged event timeline, evaluated at
+                // (theta, covariate) with eta = 0 so they're Const w.r.t. the
+                // gradient. Exact for the usual eta-independent lagtime; the
+                // rare eta-dependent case drops ∂lag/∂η (documented in
+                // `FlatEventData::from_subject`). Empty when the model declares
+                // no lagtime — `from_subject` then applies zero shift.
+                let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
+                    let zeros = vec![0.0; n_eta];
+                    crate::pk::compute_event_pk_params(model, subject, &params.theta, &zeros)
+                        .dose
+                        .iter()
+                        .map(|p| p.lagtime())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                (
+                    None,
+                    Some(crate::ad::event_driven_ad::FlatEventData::from_subject(
+                        subject,
+                        &dose_lagtimes,
+                    )),
+                    Some(crate::ad::event_driven_ad::FlatEventTv::from_subject(
+                        model,
+                        subject,
+                        &params.theta,
+                        &dose_lagtimes,
+                    )),
+                )
+            }
             InnerGradientMethod::Fd => (None, None, None),
         };
         (

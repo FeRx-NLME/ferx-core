@@ -156,8 +156,10 @@ pub fn hmc_step(
         if !event_driven_ad::supports_event_driven_ad(model.pk_model) || model.has_lagtime() {
             return None;
         }
-        let event_data = event_driven_ad::FlatEventData::from_subject(subject);
-        let tv_per_event = event_driven_ad::FlatEventTv::from_subject(model, subject, theta);
+        // No lag: the `has_lagtime()` guard above already excluded lagtime
+        // models from the HMC event-driven path.
+        let event_data = event_driven_ad::FlatEventData::from_subject(subject, &[]);
+        let tv_per_event = event_driven_ad::FlatEventTv::from_subject(model, subject, theta, &[]);
         let obs = subject.observations.clone();
 
         let grad_fn = |q: &[f64]| -> Vec<f64> {

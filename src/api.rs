@@ -130,6 +130,16 @@ pub fn run_model_with_data_inits(
     );
 
     let init_params = build_init_params(&parsed);
+    // Sync the resolved gradient method from fit_options onto the model so
+    // `resolve_gradient_method` (which reads `model.gradient_method`) honours
+    // the file's `gradient = ...` key. Mirrors `fit_from_files` (SDE forces FD).
+    parsed.model.gradient_method = if parsed.model.is_sde()
+        && parsed.fit_options.gradient_method != crate::types::GradientMethod::Fd
+    {
+        crate::types::GradientMethod::Fd
+    } else {
+        parsed.fit_options.gradient_method
+    };
     let mut result = fit(
         &parsed.model,
         &population,
