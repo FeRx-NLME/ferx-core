@@ -1,12 +1,20 @@
 // Analytic hazard functions for Phase 1 parametric TTE families.
 //
 // Parameter layout by family (all in natural scale, not log):
-//   Exponential: [lambda]
-//   Weibull:     [scale, shape]   — scale parameterization: H=(t/scale)^shape
-//   Gompertz:    [alpha, gamma, loghr_term]
-//                alpha     = baseline hazard at t=0
-//                gamma     = hazard growth rate (> 0)
+//   Exponential: [lambda, loghr_term]
+//                lambda     = constant hazard rate (h = lambda * exp(loghr))
 //                loghr_term = Σ(β·covariate) added on the log-hazard scale; 0.0 when none
+//   Weibull:     [scale, shape, loghr_term]   — scale parameterization: H=(t/scale)^shape
+//                scale      = scale parameter (a time; larger = slower events)
+//                shape      = shape parameter (> 0; 1 = Exponential, > 1 = increasing hazard)
+//                loghr_term = same as above; multiplies entire hazard (PH form)
+//   Gompertz:    [alpha, gamma, loghr_term]
+//                alpha      = baseline hazard at t=0
+//                gamma      = hazard growth rate (> 0)
+//                loghr_term = same as above
+//
+// The loghr_term is always at the last index for each family and defaults to 0.0
+// when not provided (i.e. params.get(index) returns None).
 //
 // All functions guard against t ≤ 0 to avoid log/pow domain errors.
 
@@ -22,15 +30,21 @@ pub fn hazard_and_cum_hazard(family: HazardFamily, t: f64, params: &[f64]) -> (f
     match family {
         HazardFamily::Exponential => {
             let lambda = params[0];
-            (lambda, lambda * t)
+            let loghr = params.get(1).copied().unwrap_or(0.0);
+            // h(t) = lambda * exp(loghr);  H(t) = lambda * exp(loghr) * t
+            let eff_lambda = lambda * loghr.exp();
+            (eff_lambda, eff_lambda * t)
         }
         HazardFamily::Weibull => {
             let scale = params[0];
             let shape = params[1];
-            // H(t) = (t/scale)^shape;  h(t) = dH/dt = (shape/scale)*(t/scale)^(shape-1)
+            let loghr = params.get(2).copied().unwrap_or(0.0);
+            let exp_lhr = loghr.exp();
+            // PH form: h(t) = (shape/scale)*(t/scale)^(shape-1) * exp(loghr)
+            //          H(t) = (t/scale)^shape * exp(loghr)
             let t_scaled = t / scale;
-            let h_val = (shape / scale) * t_scaled.powf(shape - 1.0);
-            let cum_h = t_scaled.powf(shape);
+            let h_val = (shape / scale) * t_scaled.powf(shape - 1.0) * exp_lhr;
+            let cum_h = t_scaled.powf(shape) * exp_lhr;
             (h_val, cum_h)
         }
         HazardFamily::Gompertz => {
@@ -66,12 +80,17 @@ pub fn sample_event_time(family: HazardFamily, params: &[f64], u: f64) -> f64 {
     let t = match family {
         HazardFamily::Exponential => {
             let lambda = params[0];
-            neg_log_u / lambda
+            let loghr = params.get(1).copied().unwrap_or(0.0);
+            // H(T) = lambda*exp(loghr)*T = -log U  →  T = -log(U) / (lambda*exp(loghr))
+            neg_log_u / (lambda * loghr.exp())
         }
         HazardFamily::Weibull => {
             let scale = params[0];
             let shape = params[1];
-            scale * neg_log_u.powf(1.0 / shape)
+            let loghr = params.get(2).copied().unwrap_or(0.0);
+            // H(T) = (T/scale)^shape * exp(loghr) = -log U
+            // T = scale * (-log U / exp(loghr))^(1/shape)
+            scale * (neg_log_u / loghr.exp()).powf(1.0 / shape)
         }
         HazardFamily::Gompertz => {
             let alpha = params[0];
@@ -109,15 +128,21 @@ pub fn sample_conditional_event_time(
     let neg_log_u = -u.ln();
     let t = match family {
         HazardFamily::Exponential => {
-            // Memoryless: shift by entry_time
-            entry_time + neg_log_u / params[0]
+            let loghr = params.get(1).copied().unwrap_or(0.0);
+            let eff_lambda = params[0] * loghr.exp();
+            // Memoryless with PH: effective rate is lambda*exp(loghr); shift by entry_time.
+            entry_time + neg_log_u / eff_lambda
         }
         HazardFamily::Weibull => {
             let scale = params[0];
             let shape = params[1];
-            // H(T) = (T/scale)^shape = (entry/scale)^shape + neg_log_u
+            let loghr = params.get(2).copied().unwrap_or(0.0);
+            let exp_lhr = loghr.exp();
+            // H(T) - H(entry) = -log U
+            // (T/scale)^shape * exp_lhr - (entry/scale)^shape * exp_lhr = neg_log_u
+            // (T/scale)^shape = (entry/scale)^shape + neg_log_u / exp_lhr
             let h_entry = (entry_time / scale).powf(shape);
-            let h_target = h_entry + neg_log_u;
+            let h_target = h_entry + neg_log_u / exp_lhr;
             scale * h_target.powf(1.0 / shape)
         }
         HazardFamily::Gompertz => {
@@ -243,6 +268,98 @@ mod tests {
             assert!(
                 (h_t - h_entry - expected).abs() < 1e-8,
                 "{family:?}: H(T)-H(entry)={}, expected {}",
+                h_t - h_entry,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn exponential_loghr_doubles_hazard() {
+        // loghr = ln(2) should double both h and H compared to no loghr.
+        let loghr = 2.0_f64.ln();
+        let params_base = [0.1_f64];
+        let params_lhr = [0.1_f64, loghr];
+        let (h0, cum0) = hazard_and_cum_hazard(HazardFamily::Exponential, 3.0, &params_base);
+        let (h1, cum1) = hazard_and_cum_hazard(HazardFamily::Exponential, 3.0, &params_lhr);
+        assert!((h1 / h0 - 2.0).abs() < 1e-12, "h ratio = {}", h1 / h0);
+        assert!(
+            (cum1 / cum0 - 2.0).abs() < 1e-12,
+            "H ratio = {}",
+            cum1 / cum0
+        );
+    }
+
+    #[test]
+    fn exponential_loghr_inverse_cdf_roundtrip() {
+        // With loghr, H(T) = lambda*exp(loghr)*T; sample must satisfy H(T) = -log U.
+        let u = 0.4_f64;
+        let params = [0.1_f64, 0.5_f64]; // loghr = 0.5
+        let t = sample_event_time(HazardFamily::Exponential, &params, u);
+        let (_, cum) = hazard_and_cum_hazard(HazardFamily::Exponential, t, &params);
+        let expected = -u.ln();
+        assert!(
+            (cum - expected).abs() < 1e-10,
+            "H = {cum}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn weibull_loghr_doubles_hazard() {
+        // loghr = ln(2) doubles h and H for Weibull (PH form).
+        let loghr = 2.0_f64.ln();
+        let params_base = [20.0_f64, 2.0_f64];
+        let params_lhr = [20.0_f64, 2.0_f64, loghr];
+        let (h0, cum0) = hazard_and_cum_hazard(HazardFamily::Weibull, 5.0, &params_base);
+        let (h1, cum1) = hazard_and_cum_hazard(HazardFamily::Weibull, 5.0, &params_lhr);
+        assert!((h1 / h0 - 2.0).abs() < 1e-12, "h ratio = {}", h1 / h0);
+        assert!(
+            (cum1 / cum0 - 2.0).abs() < 1e-12,
+            "H ratio = {}",
+            cum1 / cum0
+        );
+    }
+
+    #[test]
+    fn weibull_loghr_inverse_cdf_roundtrip() {
+        // Sample T with loghr, confirm H(T) = -log U.
+        let u = 0.6_f64;
+        let params = [20.0_f64, 2.0_f64, 0.3_f64]; // loghr = 0.3
+        let t = sample_event_time(HazardFamily::Weibull, &params, u);
+        let (_, cum) = hazard_and_cum_hazard(HazardFamily::Weibull, t, &params);
+        let expected = -u.ln();
+        assert!(
+            (cum - expected).abs() < 1e-9,
+            "H = {cum}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn left_truncation_regression_with_loghr() {
+        // H(T) - H(entry) = -log U must hold even with nonzero loghr.
+        let u = 0.3_f64;
+        let entry = 5.0;
+        let cases: &[(&str, HazardFamily, Vec<f64>)] = &[
+            (
+                "Exponential+loghr",
+                HazardFamily::Exponential,
+                vec![0.1, 0.5],
+            ),
+            ("Weibull+loghr", HazardFamily::Weibull, vec![20.0, 2.0, 0.3]),
+            (
+                "Gompertz+loghr",
+                HazardFamily::Gompertz,
+                vec![0.002, 0.005, 0.4],
+            ),
+        ];
+        for (label, family, params) in cases {
+            let t = sample_conditional_event_time(*family, params, entry, u);
+            let h_t = cum_hazard(*family, t, params);
+            let h_entry = cum_hazard(*family, entry, params);
+            let expected = -u.ln();
+            assert!(
+                (h_t - h_entry - expected).abs() < 1e-8,
+                "{label}: H(T)-H(entry)={}, expected {}",
                 h_t - h_entry,
                 expected
             );

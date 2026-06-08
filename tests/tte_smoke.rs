@@ -231,6 +231,141 @@ mod survival_smoke {
         }
     }
 
+    /// A nonzero `loghr` must actually change the OFV — i.e. the parser must wire it
+    /// into the param_fn so it reaches the likelihood computation.
+    #[test]
+    fn tte_loghr_nonzero_changes_ofv() {
+        // Model B: hard-coded loghr = 0.5 (fixed offset on the log-hazard scale).
+        let src_with_lhr = r"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta DUMMY_CL(1.0, FIX)
+  theta DUMMY_V(1.0, FIX)
+  omega ETA_LAMBDA ~ 0.09
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  LAMBDA = TVLAMBDA * exp(ETA_LAMBDA)
+  CL     = DUMMY_CL
+  V      = DUMMY_V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = LAMBDA
+  loghr  = 0.5
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+        let model_no_lhr = parse_model_string(EXP_TTE_MODEL).expect("EXP_TTE_MODEL must parse");
+        let model_with_lhr = parse_model_string(src_with_lhr).expect("model with loghr must parse");
+
+        let pop = tte_population(TTE_DATA);
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+
+        let r0 = fit(&model_no_lhr, &pop, &model_no_lhr.default_params, &opts)
+            .expect("baseline fit must succeed");
+        let r1 = fit(&model_with_lhr, &pop, &model_with_lhr.default_params, &opts)
+            .expect("loghr fit must succeed");
+
+        assert!(
+            r0.ofv.is_finite() && r1.ofv.is_finite(),
+            "both OFVs must be finite; got {} and {}",
+            r0.ofv,
+            r1.ofv
+        );
+        assert!(
+            (r0.ofv - r1.ofv).abs() > 1e-3,
+            "loghr=0.5 must change the OFV — no_loghr_OFV={} loghr_OFV={}; diff={:.6}",
+            r0.ofv,
+            r1.ofv,
+            (r0.ofv - r1.ofv).abs()
+        );
+    }
+
+    /// `family=exponential` with a `shape` key must be rejected at parse time.
+    #[test]
+    fn tte_incompatible_key_exponential_shape_errors() {
+        let src = r"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta DUMMY_CL(1.0, FIX)
+  theta DUMMY_V(1.0, FIX)
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  LAMBDA = TVLAMBDA
+  CL     = DUMMY_CL
+  V      = DUMMY_V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = LAMBDA
+  shape  = 2.0
+";
+        let err = parse_model_string(src)
+            .err()
+            .expect("shape with exponential must be rejected");
+        assert!(
+            err.contains("shape") || err.contains("exponential"),
+            "error must mention the incompatible key: {err}"
+        );
+    }
+
+    /// `family=gompertz` with a `scale` key must be rejected at parse time.
+    #[test]
+    fn tte_incompatible_key_gompertz_scale_errors() {
+        let src = r"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta TVGAMMA(0.005, 0.0001, 1.0)
+  theta DUMMY_CL(1.0, FIX)
+  theta DUMMY_V(1.0, FIX)
+  sigma SIGMA_DV ~ 0.01 FIX
+
+[individual_parameters]
+  ALPHA = TVLAMBDA
+  GAMMA = TVGAMMA
+  CL    = DUMMY_CL
+  V     = DUMMY_V
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_DV)
+
+[event_model]
+  cmt    = 2
+  family = gompertz
+  scale  = TVLAMBDA
+  gamma  = GAMMA
+";
+        let err = parse_model_string(src)
+            .err()
+            .expect("scale with gompertz must be rejected");
+        assert!(
+            err.contains("scale") || err.contains("gompertz"),
+            "error must mention the incompatible key: {err}"
+        );
+    }
+
     /// Duplicate CMT in two [event_model] blocks must be rejected at parse time.
     #[test]
     fn tte_duplicate_cmt_parse_error() {

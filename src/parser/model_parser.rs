@@ -2453,17 +2453,71 @@ fn parse_event_model_block(
     let family = family_opt.ok_or("[event_model]: missing required key `family`")?;
 
     // Guard: same CMT can't be both Gaussian and TTE.
-    if let ErrorSpec::PerCmt(cmt_map) = error_spec {
-        if cmt_map.contains_key(&cmt) {
-            return Err(format!(
-                "[event_model]: CMT={cmt} is already declared as a Gaussian endpoint \
-                 in [error_model] — the same CMT cannot be both Gaussian and TTE"
-            ));
+    match error_spec {
+        ErrorSpec::PerCmt(cmt_map) => {
+            if cmt_map.contains_key(&cmt) {
+                return Err(format!(
+                    "[event_model]: CMT={cmt} is already declared as a Gaussian endpoint \
+                     in [error_model] — the same CMT cannot be both Gaussian and TTE"
+                ));
+            }
+        }
+        ErrorSpec::Single(_) => {
+            // A Single error model has no CMT restriction — it applies to every Gaussian
+            // observation regardless of the CMT column value.  We cannot detect a collision
+            // at parse time because the error model carries no CMT information.  If the user
+            // places both Gaussian and TTE observations on the same CMT value in their dataset,
+            // the data reader's two-path routing (Gaussian → obs_times, TTE → obs_records)
+            // prevents actual double-counting in the NLL; however, the Gaussian path would
+            // silently consume those rows via the Single error model, which is almost certainly
+            // unintended.  Use a per-CMT error model (`DV[CMT=N] ~ ...`) to get unambiguous
+            // parse-time validation.
+        }
+    }
+
+    // Validate family-specific keys: reject keys that do not belong to the chosen family.
+    // Accepting and silently dropping them would mislead users into thinking they had an effect.
+    match family {
+        HazardFamily::Exponential => {
+            if shape_expr.is_some() {
+                return Err("[event_model] family=exponential does not accept `shape` \
+                     — remove it or switch to `family = weibull`"
+                    .into());
+            }
+            if alpha_expr.is_some() || gamma_expr.is_some() {
+                return Err(
+                    "[event_model] family=exponential does not accept `alpha` or `gamma` \
+                     — use `family = gompertz` for the Gompertz family"
+                        .into(),
+                );
+            }
+        }
+        HazardFamily::Weibull => {
+            if alpha_expr.is_some() || gamma_expr.is_some() {
+                return Err(
+                    "[event_model] family=weibull does not accept `alpha` or `gamma` \
+                     — use `family = gompertz` for the Gompertz family"
+                        .into(),
+                );
+            }
+        }
+        HazardFamily::Gompertz => {
+            if scale_expr.is_some() {
+                return Err("[event_model] family=gompertz does not accept `scale` \
+                     — use `alpha` (baseline hazard at t=0) and `gamma` (growth rate) instead"
+                    .into());
+            }
+            if shape_expr.is_some() {
+                return Err("[event_model] family=gompertz does not accept `shape` \
+                     — use `family = weibull` for the Weibull family"
+                    .into());
+            }
         }
     }
 
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
+    // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
     let param_fn: crate::types::HazardParamFn = match family {
         HazardFamily::Exponential => {
             let scale = scale_expr
@@ -2472,7 +2526,10 @@ fn parse_event_model_block(
                 move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
                     let lambda =
                         eval_expression(&scale, theta, eta, covariates, &HashMap::new(), &[]);
-                    vec![lambda]
+                    let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
+                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                    });
+                    vec![lambda, lhr]
                 },
             )
         }
@@ -2483,7 +2540,10 @@ fn parse_event_model_block(
                 move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
                     let s = eval_expression(&scale, theta, eta, covariates, &HashMap::new(), &[]);
                     let p = eval_expression(&shape, theta, eta, covariates, &HashMap::new(), &[]);
-                    vec![s, p]
+                    let lhr = loghr_expr.as_ref().map_or(0.0, |e| {
+                        eval_expression(e, theta, eta, covariates, &HashMap::new(), &[])
+                    });
+                    vec![s, p, lhr]
                 },
             )
         }
