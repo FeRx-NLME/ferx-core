@@ -964,6 +964,7 @@ mod tests {
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            obs_raw_times: Vec::new(),
             observations: vec![50.0, 40.0, 30.0, 45.0, 35.0, 25.0],
             obs_cmts: vec![1; 6],
             covariates: HashMap::new(),

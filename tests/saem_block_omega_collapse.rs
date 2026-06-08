@@ -105,6 +105,7 @@ fn template_population(n: usize) -> Population {
                 // amt=1000, rate=500 → a 2 h infusion into the central compartment.
                 doses: vec![DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0)],
                 obs_times: times,
+                obs_raw_times: Vec::new(),
                 observations: vec![0.0; n_obs],
                 obs_cmts: vec![1; n_obs],
                 covariates: HashMap::new(),
@@ -143,7 +144,7 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
         let dv: Vec<f64> = sim
             .iter()
             .filter(|s| s.id == subj.id)
-            .map(|s| s.dv_sim.max(1e-6))
+            .map(|s| s.outcome.continuous_value().max(1e-6))
             .collect();
         subj.observations = dv;
     }

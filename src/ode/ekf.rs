@@ -384,6 +384,7 @@ mod tests {
             id: "1".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
+            obs_raw_times: Vec::new(),
             observations: vec![0.0; obs_times.len()],
             obs_cmts: vec![1; obs_times.len()],
             covariates: HashMap::new(),

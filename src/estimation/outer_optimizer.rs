@@ -2545,6 +2545,7 @@ mod tests {
                 id: "S1".into(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 4.0, 8.0],
+                obs_raw_times: Vec::new(),
                 observations: vec![25.0, 15.0, 9.0],
                 obs_cmts: vec![1, 1, 1],
                 covariates: HashMap::new(),

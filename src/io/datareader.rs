@@ -107,6 +107,15 @@ pub(crate) const ERR_COV_MISSING_COLUMNS: &str =
 /// Leading text of the "declared covariate value is not numeric" error.
 pub(crate) const ERR_COV_NON_NUMERIC: &str = "[covariates]: non-numeric value";
 
+/// Wall-clock gap inserted between reset-delimited occasion segments when a
+/// subject's TIME column restarts (see the segmentation logic in
+/// `parse_subject`). The reset zeros every compartment at the boundary, so no
+/// drug carries across the gap and its magnitude is numerically irrelevant
+/// (it cancels in every dose/observation time difference within a segment); a
+/// small positive value simply keeps the two occasions from colliding on the
+/// sorted absolute timeline.
+const RESET_SEGMENT_GAP: f64 = 1.0;
+
 /// True when a CSV cell represents a missing value (blank / `.` / `NA` / `NaN`).
 /// NONMEM convention uses `.` for missing.
 fn is_missing_cell(s: &str) -> bool {
@@ -610,6 +619,7 @@ fn parse_subject(
 ) -> Result<(Subject, usize, SubjectExclusion, Vec<String>), String> {
     let mut doses = Vec::new();
     let mut obs_times = Vec::new();
+    let mut obs_raw_times = Vec::new();
     let mut observations = Vec::new();
     let mut obs_cmts = Vec::new();
     let mut cens = Vec::new();
@@ -688,6 +698,23 @@ fn parse_subject(
     // compartment amount at `time`; EVID=4 additionally records a dose
     // (handled in the `evid == 1 || evid == 4` arm below).
     let mut reset_times: Vec<f64> = Vec::new();
+
+    // Reset-delimited occasion segmentation. NONMEM processes records
+    // sequentially, so an EVID=3/4 reset whose TIME restarts at/below the
+    // running timeline begins a fresh occasion that reuses the previous
+    // occasion's wall-clock (e.g. two infusion occasions both timed from 0,
+    // stacked under one ID). Our event engine sorts events by absolute time,
+    // which would interleave such occasions and double the administered dose.
+    // We instead shift each restarting segment — and every event after it,
+    // until the next restart — past the prior segment onto a single monotonic
+    // timeline. The reset zeros all compartments at the boundary, so the
+    // inserted gap carries no drug: predictions are identical to integrating
+    // each occasion independently, while the subject keeps one shared set of
+    // random effects (matching NONMEM's EVID=4 semantics). `time_offset` is
+    // the running shift; `max_eff_time` is the largest effective (shifted)
+    // event time emitted so far.
+    let mut time_offset = 0.0f64;
+    let mut max_eff_time = f64::NEG_INFINITY;
 
     for row in rows {
         // Update LOCF state from this row's TV-covariate values *before*
@@ -796,6 +823,26 @@ fn parse_subject(
             }
         }
 
+        // Raw (unshifted) TIME for this row, preserved before the occasion
+        // shift below so diagnostics (sdtab TIME, `[derived]` absolute windows)
+        // can report the value the user wrote, while the engine uses the
+        // shifted monotonic `time`.
+        let raw_time = time;
+
+        // Reset-delimited occasion segmentation (see `time_offset` above).
+        // When an EVID=3/4 reset's TIME would land at or before the running
+        // timeline, start a new segment by shifting it (and the rest of this
+        // occasion) just past the latest event seen so far. `time` is then the
+        // effective, monotonic event time used everywhere downstream; `raw_time`
+        // keeps the original column value for the diagnostic outputs.
+        if (evid == 3 || evid == 4) && time + time_offset <= max_eff_time {
+            time_offset = max_eff_time + RESET_SEGMENT_GAP - time;
+        }
+        let time = time + time_offset;
+        if time > max_eff_time {
+            max_eff_time = time;
+        }
+
         // EVID=3 (reset) and EVID=4 (reset + dose) both zero the compartment
         // state at this time. Record the reset before the dose arm runs so
         // EVID=4 captures both the reset and its dose.
@@ -842,6 +889,15 @@ fn parse_subject(
             if any_tv {
                 dose_covariates.push(locf_state.clone());
             }
+            // Advance the occasion watermark past this dose's *end* (infusion
+            // duration), not just its start. A later reset-restarting occasion
+            // is shifted past `max_eff_time`; if a dose here ends after the last
+            // observation, the watermark must reflect that so the next occasion
+            // doesn't land inside this one's dosing window.
+            let dose_end = time + if rate > 0.0 { amt / rate } else { 0.0 };
+            if dose_end > max_eff_time {
+                max_eff_time = dose_end;
+            }
 
             // ADDL expansion: add additional doses at time + k*II for k=1..=addl.
             let addl = addl_col
@@ -860,11 +916,9 @@ fn parse_subject(
                     }
                 } else {
                     for k in 1..=(addl as u32) {
+                        let addl_time = time + (k as f64) * ii;
                         doses.push(DoseEvent::new(
-                            time + (k as f64) * ii,
-                            amt,
-                            cmt,
-                            rate,
+                            addl_time, amt, cmt, rate,
                             false, // expanded doses are never SS themselves
                             ii,
                         ));
@@ -873,6 +927,15 @@ fn parse_subject(
                         }
                         if any_tv {
                             dose_covariates.push(locf_state.clone());
+                        }
+                        // Fold each expanded dose's end into the watermark so a
+                        // following reset-restarting occasion is shifted past the
+                        // whole ADDL train (issue #195 review): ADDL bolus doses
+                        // landing after the next occasion's reset would otherwise
+                        // fire onto it, since boluses aren't gated by reset_floor.
+                        let addl_end = addl_time + if rate > 0.0 { amt / rate } else { 0.0 };
+                        if addl_end > max_eff_time {
+                            max_eff_time = addl_end;
                         }
                     }
                 }
@@ -899,6 +962,7 @@ fn parse_subject(
                 .map(|s| parse_usize(s))
                 .unwrap_or(0);
             obs_times.push(time);
+            obs_raw_times.push(raw_time);
             observations.push(dv);
             obs_cmts.push(cmt);
             cens.push(if cens_flag > 0 { 1u8 } else { 0u8 });
@@ -954,6 +1018,7 @@ fn parse_subject(
             id: id.to_string(),
             doses: sorted_doses,
             obs_times,
+            obs_raw_times,
             observations,
             obs_cmts,
             covariates,
@@ -1032,10 +1097,16 @@ mod tests {
         let f = write_csv(csv);
         let pop = read_nonmem_csv(f.path(), None, None).unwrap();
         let subj = &pop.subjects[0];
+        // Also the no-shift guard for a *forward* reset (TIME=5 advances past
+        // the prior obs at TIME=1): the occasion-segmentation shift must only
+        // fire on a restarting clock, so reset_times and obs_times keep their
+        // raw values here (a spurious shift would push the reset past 5 and
+        // move the t=6 obs).
         assert_eq!(subj.reset_times, vec![5.0]);
         assert!(subj.has_resets());
         // One dose (t=0), two observations (t=1, t=6) — the reset row is neither.
         assert_eq!(subj.doses.len(), 1);
+        assert_eq!(subj.doses[0].time, 0.0);
         assert_eq!(subj.obs_times, vec![1.0, 6.0]);
     }
 
@@ -1126,6 +1197,95 @@ mod tests {
         let pop = read_nonmem_csv(f.path(), None, None).unwrap();
         assert!(pop.subjects[0].reset_times.is_empty());
         assert!(!pop.subjects[0].has_resets());
+    }
+
+    #[test]
+    fn test_evid4_restart_shifts_second_occasion_onto_monotonic_timeline() {
+        // Two dosing occasions stacked under one ID, each opened by an EVID=4
+        // reset whose TIME column restarts at 0 (NONMEM processes records
+        // sequentially, so this is a fresh occasion sharing the first's clock).
+        // The reader must shift the second occasion past the first so the two
+        // don't collide on the sorted absolute timeline — otherwise both doses
+        // land at t=0 and the subject is double-dosed (issue #195).
+        let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,4,100\n\
+                   1,2,5.0,0,.\n\
+                   1,8,2.0,0,.\n\
+                   1,0,.,4,100\n\
+                   1,2,4.0,0,.\n\
+                   1,8,1.5,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        // Two distinct reset times (the second shifted past the first occasion).
+        assert_eq!(subj.reset_times.len(), 2);
+        assert_eq!(subj.reset_times[0], 0.0);
+        assert!(
+            subj.reset_times[1] > 8.0,
+            "second reset must be shifted past the first occasion's last event (t=8), got {}",
+            subj.reset_times[1]
+        );
+
+        // Two doses, no longer colliding at t=0.
+        assert_eq!(subj.doses.len(), 2);
+        assert_eq!(subj.doses[0].time, 0.0);
+        assert_eq!(subj.doses[1].time, subj.reset_times[1]);
+
+        // Observation times are strictly increasing across the occasion
+        // boundary (the second occasion's relative spacing is preserved).
+        assert_eq!(subj.obs_times.len(), 4);
+        for w in subj.obs_times.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "obs times must be monotonic: {:?}",
+                subj.obs_times
+            );
+        }
+        // Within-occasion spacing is unchanged: second occasion's two obs are
+        // still 6 time units apart (raw t=2 and t=8).
+        let gap2 = subj.obs_times[3] - subj.obs_times[2];
+        assert!(
+            (gap2 - 6.0).abs() < 1e-9,
+            "second occasion spacing preserved"
+        );
+    }
+
+    #[test]
+    fn test_addl_train_advances_occasion_watermark() {
+        // Regression for the issue #195 review: occasion 1 carries an ADDL dose
+        // train (II=10, ADDL=3 → boluses at 0,10,20,30) but its only observation
+        // is at t=5. A following EVID=4 occasion restarts at TIME=0. The
+        // occasion shift must place the new reset past the *whole* ADDL train,
+        // not just past the last observation — otherwise the later ADDL boluses
+        // (which a reset does not cancel) would land after the reset and
+        // contaminate occasion 2.
+        let csv = "ID,TIME,DV,EVID,AMT,II,ADDL\n\
+                   1,0,.,1,100,10,3\n\
+                   1,5,5.0,0,.,.,.\n\
+                   1,0,.,4,100,0,0\n\
+                   1,5,4.0,0,.,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        // Occasion 1 doses: 0,10,20,30 (raw). The single reset (occasion 2)
+        // must be shifted strictly past the last ADDL dose at t=30.
+        assert_eq!(subj.reset_times.len(), 1);
+        let reset = subj.reset_times[0];
+        assert!(
+            reset > 30.0,
+            "occasion-2 reset must be shifted past the ADDL train (last dose t=30), got {reset}"
+        );
+        // No occasion-1 dose lands at or after the reset (which would inject it
+        // into occasion 2). Exactly one dose — occasion 2's own — is >= reset.
+        let after_reset = subj.doses.iter().filter(|d| d.time >= reset - 1e-9).count();
+        assert_eq!(
+            after_reset,
+            1,
+            "only occasion 2's own dose may sit at/after its reset; doses={:?}",
+            subj.doses.iter().map(|d| d.time).collect::<Vec<_>>()
+        );
     }
 
     #[test]

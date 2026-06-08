@@ -179,6 +179,14 @@ pub struct Subject {
     pub id: String,
     pub doses: Vec<DoseEvent>,
     pub obs_times: Vec<f64>,
+    /// Original (unshifted) observation times from the data file's TIME column,
+    /// parallel to `obs_times`. For subjects with stacked reset occasions whose
+    /// TIME restarts (see `io/datareader`), `obs_times` carries the internal
+    /// monotonic timeline while this keeps the raw value for diagnostics
+    /// (sdtab TIME, `[derived]` absolute windows). Empty when no shifting was
+    /// applied — consumers then fall back to `obs_times`, so the two are
+    /// interchangeable for the common (single-occasion) case.
+    pub obs_raw_times: Vec<f64>,
     pub observations: Vec<f64>,
     pub obs_cmts: Vec<usize>,
     /// Subject-representative covariate values (first non-missing value per
@@ -257,6 +265,29 @@ impl Subject {
     /// SS warning in `api.rs`.
     pub fn has_ss_doses(&self) -> bool {
         self.doses.iter().any(|d| d.ss)
+    }
+
+    /// Time of the first dose of the reset-occasion containing `obs_time`,
+    /// used as the TAFD (time-after-first-dose) reference. For a subject with
+    /// no resets this is just the earliest dose (the conventional TAFD origin);
+    /// for stacked reset occasions it is the first dose at or after the most
+    /// recent reset, so TAFD resets per occasion instead of measuring from the
+    /// very first occasion across the shifted timeline (issue #195 review).
+    /// `obs_time` is on the same (internal, possibly shifted) clock as
+    /// `doses[*].time` and `reset_times`, so the result is correct regardless
+    /// of any occasion shift. Returns `f64::INFINITY` when there are no doses.
+    pub fn occasion_first_dose_time(&self, obs_time: f64) -> f64 {
+        let seg_start = self
+            .reset_times
+            .iter()
+            .copied()
+            .filter(|&r| r <= obs_time + 1e-9)
+            .fold(f64::NEG_INFINITY, f64::max);
+        self.doses
+            .iter()
+            .map(|d| d.time)
+            .filter(|&t| t >= seg_start - 1e-9)
+            .fold(f64::INFINITY, f64::min)
     }
 
     /// Covariate snapshot at observation index `j`. Falls back to the
