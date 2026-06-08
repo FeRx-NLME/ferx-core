@@ -75,6 +75,69 @@ pub struct FlatEventData {
     pub dose_cmts_f64: Vec<f64>,
 }
 
+/// Same-time tie-break ordinal: `reset (0) < dose (1) < pk-only (2) < obs (3)`.
+/// A reset must sort before a same-time dose so an EVID=4 zeros the state before
+/// its own dose lands — matching `pk::event_driven::event_driven_predictions`.
+/// `kind_tag` is the encoded event kind (0.0=dose, 1.0=obs, 2.0=pk-only,
+/// 3.0=reset).
+fn event_kind_order(kind_tag: f64) -> u8 {
+    if kind_tag > 2.5 {
+        0 // reset
+    } else if kind_tag < 0.5 {
+        1 // dose
+    } else if kind_tag > 1.5 {
+        2 // pk-only
+    } else {
+        3 // obs
+    }
+}
+
+/// Merged, sorted event timeline shared by [`FlatEventData`] and [`FlatEventTv`]
+/// so the two are guaranteed to order events identically (a single source for
+/// the reset insertion, lag shift, and tie-break). Returns one
+/// `(time, kind_tag, orig_idx)` per event, where `kind_tag` is 0.0=dose,
+/// 1.0=obs, 2.0=pk-only, 3.0=reset and dose events carry the per-dose lag
+/// (`doses[k].time + lag(k)`; a lagged dose may re-sort past a later obs —
+/// correct, it genuinely happens later). Resets/obs/pk-only keep their record
+/// times.
+///
+/// Panics if `dose_lagtimes` is non-empty and not length `subject.doses.len()`
+/// (hard assert, matching `pk::event_driven::EventSchedule::for_subject`).
+fn build_sorted_events(subject: &Subject, dose_lagtimes: &[f64]) -> Vec<(f64, f64, usize)> {
+    assert!(
+        dose_lagtimes.is_empty() || dose_lagtimes.len() == subject.doses.len(),
+        "dose_lagtimes length {} != n_dose {}",
+        dose_lagtimes.len(),
+        subject.doses.len()
+    );
+    let lag = |k: usize| -> f64 { dose_lagtimes.get(k).copied().unwrap_or(0.0) };
+
+    let mut events: Vec<(f64, f64, usize)> = Vec::with_capacity(
+        subject.doses.len()
+            + subject.obs_times.len()
+            + subject.pk_only_times.len()
+            + subject.reset_times.len(),
+    );
+    for (k, d) in subject.doses.iter().enumerate() {
+        events.push((d.time + lag(k), 0.0, k));
+    }
+    for (j, &t) in subject.obs_times.iter().enumerate() {
+        events.push((t, 1.0, j));
+    }
+    for (m, &t) in subject.pk_only_times.iter().enumerate() {
+        events.push((t, 2.0, m));
+    }
+    for (r, &t) in subject.reset_times.iter().enumerate() {
+        events.push((t, 3.0, r));
+    }
+    events.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| event_kind_order(a.1).cmp(&event_kind_order(b.1)))
+    });
+    events
+}
+
 impl FlatEventData {
     /// Build the flat event timeline for `subject`.
     ///
@@ -90,63 +153,12 @@ impl FlatEventData {
     /// scaled), and a documented approximation (drops `∂lag/∂η`) for the rare
     /// eta-dependent case — the marginal NLL value itself is still computed by
     /// the exact analytical path, so only the inner-loop gradient / FOCE `|H|`
-    /// see the frozen lag.
+    /// see the frozen lag. (The FOCEI inner loop routes eta-dependent lagtime
+    /// to FD instead — see `inner_optimizer::resolve_gradient_method`.)
     pub fn from_subject(subject: &Subject, dose_lagtimes: &[f64]) -> Self {
-        let n_obs = subject.obs_times.len();
-        let n_dose = subject.doses.len();
-        let n_pk_only = subject.pk_only_times.len();
-        let n_reset = subject.reset_times.len();
-        let n_events = n_obs + n_dose + n_pk_only + n_reset;
-
-        debug_assert!(
-            dose_lagtimes.is_empty() || dose_lagtimes.len() == n_dose,
-            "dose_lagtimes length {} != n_dose {}",
-            dose_lagtimes.len(),
-            n_dose
-        );
+        let events = build_sorted_events(subject, dose_lagtimes);
+        let n_events = events.len();
         let lag = |k: usize| -> f64 { dose_lagtimes.get(k).copied().unwrap_or(0.0) };
-
-        let mut events: Vec<(f64, f64, f64)> = Vec::with_capacity(n_events);
-        // (time, kind_tag, orig_idx). Tie-break order at the same time:
-        //   reset (3) < dose (0) < pk-only (2) < obs (1)
-        // — a reset zeros the state before a same-time dose lands (EVID=4),
-        // matching `event_driven::event_driven_predictions`. Stored kind tag
-        // is encoded for the AD macros:
-        //   0.0 = dose, 1.0 = obs, 2.0 = pk-only, 3.0 = reset. The sort
-        // ordinal is computed from these by `kind_order`.
-        // Dose events use the *lagged* time so the bolus injects and the
-        // infusion window opens at `time + lag` (a lagged dose may re-sort
-        // after later obs — correct, it genuinely happens later).
-        for (k, d) in subject.doses.iter().enumerate() {
-            events.push((d.time + lag(k), 0.0, k as f64));
-        }
-        for (j, &t) in subject.obs_times.iter().enumerate() {
-            events.push((t, 1.0, j as f64));
-        }
-        for (m, &t) in subject.pk_only_times.iter().enumerate() {
-            events.push((t, 2.0, m as f64));
-        }
-        for (r, &t) in subject.reset_times.iter().enumerate() {
-            events.push((t, 3.0, r as f64));
-        }
-        // Sort: by time, then by tie-break ordinal (reset first so an EVID=4
-        // zeros the state before its same-time dose; then dose < pk-only < obs).
-        let kind_order = |k: f64| -> u8 {
-            if k > 2.5 {
-                0 // reset
-            } else if k < 0.5 {
-                1 // dose
-            } else if k > 1.5 {
-                2 // pk-only
-            } else {
-                3 // obs
-            }
-        };
-        events.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
-        });
 
         let mut event_times = Vec::with_capacity(n_events);
         let mut event_kinds = Vec::with_capacity(n_events);
@@ -154,7 +166,7 @@ impl FlatEventData {
         for (t, k, idx) in events {
             event_times.push(t);
             event_kinds.push(k);
-            event_orig_idx_f64.push(idx);
+            event_orig_idx_f64.push(idx as f64);
         }
 
         // Per-event reset floor. Walk the sorted events tracking the most
@@ -216,61 +228,29 @@ impl FlatEventTv {
             .tv_fn
             .as_ref()
             .expect("FlatEventTv::from_subject: model.tv_fn required for AD path");
-        let lag = |k: usize| -> f64 { dose_lagtimes.get(k).copied().unwrap_or(0.0) };
 
-        // Re-derive the same event order used by FlatEventData::from_subject.
-        // Kind tags: 0 = dose, 1 = obs, 2 = pk-only (EVID=2), 3 = reset.
-        let mut events: Vec<(f64, f64, usize, u8)> = Vec::with_capacity(
-            subject.doses.len()
-                + subject.obs_times.len()
-                + subject.pk_only_times.len()
-                + subject.reset_times.len(),
-        );
-        for (k, d) in subject.doses.iter().enumerate() {
-            events.push((d.time + lag(k), 0.0, k, 0));
-        }
-        for (j, &t) in subject.obs_times.iter().enumerate() {
-            events.push((t, 1.0, j, 1));
-        }
-        for (m, &t) in subject.pk_only_times.iter().enumerate() {
-            events.push((t, 2.0, m, 2));
-        }
-        for (r, &t) in subject.reset_times.iter().enumerate() {
-            events.push((t, 3.0, r, 3));
-        }
-        // Must match FlatEventData::from_subject exactly (reset first).
-        let kind_order = |k: f64| -> u8 {
-            if k > 2.5 {
-                0
-            } else if k < 0.5 {
-                1
-            } else if k > 1.5 {
-                2
-            } else {
-                3
-            }
-        };
-        events.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
-        });
-
+        // Same sorted timeline FlatEventData walks — built by the shared helper
+        // so the per-event tv rows stay aligned with the event_* arrays.
+        let events = build_sorted_events(subject, dose_lagtimes);
         let n_events = events.len();
         let n_tv = model.pk_idx_f64.len();
 
         let mut tv = Vec::with_capacity(n_events * n_tv);
-        for (_, _, orig, kind_tag) in &events {
-            // Reset events carry no per-record covariate snapshot — use the
+        for (_, kind_tag, orig) in &events {
+            // Covariate snapshot per event kind (0=dose, 1=obs, 2=pk-only).
+            // Reset events (3) carry no per-record snapshot — use the
             // subject-static map (LOCF-correct for time-constant covariates).
             // Their PK params only drive the propagation into the reset, whose
             // result is immediately zeroed, so the exact value never reaches a
             // prediction; a valid (finite, positive) row just avoids NaN.
-            let cov = match kind_tag {
-                0 => subject.dose_cov(*orig),
-                1 => subject.obs_cov(*orig),
-                2 => subject.pk_only_cov(*orig),
-                _ => &subject.covariates,
+            let cov = if *kind_tag < 0.5 {
+                subject.dose_cov(*orig)
+            } else if *kind_tag < 1.5 {
+                subject.obs_cov(*orig)
+            } else if *kind_tag < 2.5 {
+                subject.pk_only_cov(*orig)
+            } else {
+                &subject.covariates
             };
             let row = tv_fn(theta, cov);
             assert_eq!(row.len(), n_tv, "tv_fn returned wrong length");
