@@ -2188,9 +2188,9 @@ silently produce no output until then — not a stub, just wired to an empty map
   any future fix to the Gaussian path (IOV, LTBS, BLoQ M3) must be replicated. Refactor
   to accept optional `(tte_nll: f64, tte_hessian: DMatrix<f64>)` seed parameters.
 
-**ferx-r (separate repo PR):**
-- ❌ `ferx-r/src/rust/src/lib.rs:971` still uses `r.dv_sim` which was removed in PR #190;
-  fix: `r.outcome.continuous_value()`
+**ferx-r:**
+- ✅ `r.dv_sim` → `r.outcome.continuous_value()` migration — fixed in ferx-r PR #132
+  (commit `c222327`); ferx-r main is in sync with ferx-core's `SimulationResult` redesign.
 
 ### Phase 1b — Competing risks (cause-specific hazard)
 
