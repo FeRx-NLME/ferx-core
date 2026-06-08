@@ -285,7 +285,7 @@ mod survival_smoke {
             r1.ofv
         );
         assert!(
-            (r0.ofv - r1.ofv).abs() > 1e-8,
+            (r0.ofv - r1.ofv).abs() > 1e-6,
             "loghr=0.5 must change the OFV — no_loghr_OFV={} loghr_OFV={}; diff={:.6}",
             r0.ofv,
             r1.ofv,
