@@ -668,6 +668,10 @@ pub struct ModelParameters {
     pub omega_iov: Option<OmegaMatrix>,
     /// Per-kappa FIX flags (parallel to `omega_iov` diagonal).
     pub kappa_fixed: Vec<bool>,
+    /// Fitted vine-copula distribution for the random effects. Populated after a
+    /// successful `omega_dist = vine_copula` SAEM fit; `None` for Gaussian fits.
+    /// Used by `simulate` to draw ETAs from the vine rather than N(0, Omega).
+    pub vine_dist: Option<std::sync::Arc<crate::stats::vine_copula::VineCopulaOmega>>,
 }
 
 impl ModelParameters {
@@ -2113,6 +2117,20 @@ pub struct FitResult {
     /// least one gradient-requesting iteration improved the OFV; `None` for
     /// BOBYQA (derivative-free), built-in BFGS, GN, and SAEM.
     pub final_gradient: Option<Vec<f64>>,
+    /// Vine-copula fit summary: marginal Gaussians, pair-copula families,
+    /// Kendall's τ, and tail-dependence for each tree level.
+    /// `Some` only when `omega_dist = vine` was requested and the run succeeded.
+    pub vine_params: Option<crate::stats::vine_copula::VineFitParams>,
+    /// Vine-corrected OFV: the FOCE OFV with the Gaussian prior replaced by the
+    /// vine (copula) prior at the final EBEs. Directly comparable to a Gaussian
+    /// FOCE OFV on the same dataset; use `gauss_ofv - vine_corrected_ofv` to
+    /// quantify the advantage of the vine model.
+    /// `None` for non-vine fits or when the correction is non-finite.
+    pub vine_corrected_ofv: Option<f64>,
+    /// Fitted vine-copula distribution (reference-counted). Use with
+    /// `ModelParameters::vine_dist` to draw ETAs from the vine in `simulate`.
+    /// `None` for non-vine fits.
+    pub vine_dist: Option<std::sync::Arc<crate::stats::vine_copula::VineCopulaOmega>>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a short lowercase label
     /// ("bobyqa", "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs",
@@ -2257,6 +2275,13 @@ pub struct FitOptions {
     /// A positive value (e.g. `3`) enables HMC; requires the `autodiff`
     /// feature and an analytical PK model — falls back to MH otherwise.
     pub saem_n_leapfrog: usize,
+    /// Random-effect (eta) distribution for the SAEM estimator.
+    ///
+    /// `Gaussian` (default) uses the existing multivariate-normal path,
+    /// unchanged. `VineCopula` activates the opt-in SAEM-copula variant
+    /// (set with `omega_dist = vine`). Incompatible with a `saem → focei`
+    /// chain; consumed only by SAEM.
+    pub saem_omega_dist: OmegaDist,
     /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
     pub gn_lambda: f64,
     // SIR options
@@ -2471,6 +2496,7 @@ impl Default for FitOptions {
             saem_omega_burnin: 20,
             saem_seed: None,
             saem_n_leapfrog: 0,
+            saem_omega_dist: OmegaDist::Gaussian,
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -2603,6 +2629,20 @@ impl EstimationMethod {
             EstimationMethod::Imp => "IMP",
         }
     }
+}
+
+/// Random-effect (eta) distribution used by the SAEM estimator.
+///
+/// Selected via the `omega_dist` key in `[fit_options]`. Only SAEM consults
+/// this field; FOCE/FOCEI, Gauss-Newton, and importance sampling are always
+/// Gaussian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OmegaDist {
+    /// Multivariate normal (default). Existing SAEM code path, unchanged.
+    #[default]
+    Gaussian,
+    /// Vine copula with flexible marginals. The opt-in SAEM-copula variant.
+    VineCopula,
 }
 
 impl FitOptions {
@@ -2846,6 +2886,7 @@ pub(crate) mod test_helpers {
                 sigma_fixed: vec![false],
                 omega_iov: None,
                 kappa_fixed: Vec::new(),
+                vine_dist: None,
             },
             omega_init_as_sd: vec![false],
             sigma_init_as_sd: vec![false],

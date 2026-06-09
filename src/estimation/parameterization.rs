@@ -208,6 +208,7 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
         sigma_fixed: template.sigma_fixed.clone(),
         omega_iov,
         kappa_fixed: template.kappa_fixed.clone(),
+        vine_dist: None,
     }
 }
 
@@ -478,6 +479,7 @@ mod tests {
             sigma_fixed: vec![false; 1],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         }
     }
 
@@ -562,6 +564,7 @@ mod tests {
             sigma_fixed: vec![false; 1],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         let packed = pack_params(&template);
         // theta[0] is sign-constrained (lower=0.1) → log-packed.
@@ -652,6 +655,7 @@ mod tests {
             sigma_fixed: vec![false; 1],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         }
     }
 
@@ -745,6 +749,7 @@ mod tests {
             sigma_fixed: vec![false; 1],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         CompiledModel {
             name: "test".into(),
@@ -1028,6 +1033,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
+            vine_dist: None,
         }
     }
 
@@ -1129,6 +1135,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false, false],
+            vine_dist: None,
         }
     }
 

@@ -441,6 +441,8 @@ pub fn optimize_trust_region(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        vine_params: None,
+        vine_corrected_ofv: None,
     }
 }
 

@@ -81,6 +81,7 @@ pub fn fitted_params_from_result(
         sigma_fixed: fit_result.sigma_fixed.clone(),
         omega_iov,
         kappa_fixed: fit_result.kappa_fixed.clone(),
+        vine_dist: None,
     }
 }
 
@@ -320,6 +321,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         }
     }
 
@@ -367,6 +369,7 @@ mod tests {
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],
+            vine_dist: None,
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],
@@ -411,6 +414,8 @@ mod tests {
             sigma_init: template.sigma.values.clone(),
             obs_time_range: None,
             final_gradient: None,
+            vine_params: None,
+            vine_corrected_ofv: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,

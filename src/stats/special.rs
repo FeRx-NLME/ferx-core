@@ -43,6 +43,14 @@ pub fn normal_cdf(z: f64) -> f64 {
     0.5 * (1.0 + erf(z * INV_SQRT_2))
 }
 
+/// Standard normal quantile Φ⁻¹(p) — Peter Acklam's rational approximation.
+///
+/// Accurate to ~1.15×10⁻⁹ for p ∈ (10⁻³⁰⁸, 1−10⁻¹⁶). Returns ±∞ outside
+/// (0, 1). Delegates to the identical implementation in `copula.rs`.
+pub fn normal_quantile(p: f64) -> f64 {
+    crate::stats::copula::normal_cdf_inv(p)
+}
+
 /// Numerically stable log Φ(z).
 ///
 /// For z > -5 we use `ln(max(Φ(z), MIN_PROB))` directly. For very negative z the

@@ -29,6 +29,7 @@
   - [FOCE / FOCEI](estimation/foce.md)
   - [Gauss-Newton (BHHH)](estimation/gauss-newton.md)
   - [SAEM](estimation/saem.md)
+  - [Vine-Copula SAEM](estimation/saem-copula.md)
   - [SIR](estimation/sir.md)
   - [Importance Sampling (IMP)](estimation/importance-sampling.md)
   - [Outer Optimizers](estimation/optimizers.md)

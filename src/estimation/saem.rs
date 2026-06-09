@@ -14,6 +14,7 @@ use crate::stats::likelihood::{
     individual_nll, individual_nll_into, individual_nll_iov, obs_nll_subject_into,
     split_obs_by_occasion,
 };
+use crate::stats::random_effects::RandomEffectDistribution as _;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::prelude::*;
@@ -1018,6 +1019,1025 @@ pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) 
 }
 
 // ---------------------------------------------------------------------------
+// MH step using a generic random-effect distribution (vine-copula E-step)
+// ---------------------------------------------------------------------------
+
+/// Like [`mh_steps`] but uses a [`RandomEffectDistribution`] for the prior
+/// instead of a Gaussian `OmegaMatrix`. Called from [`run_saem_vine`].
+///
+/// The acceptance ratio is `exp(nll_current − nll_prop)` where each NLL is
+/// `obs_nll_subject_into + dist.log_prior(η)`. The symmetric proposal cancels
+/// exactly as in the Gaussian case.
+#[allow(clippy::too_many_arguments)]
+fn mh_steps_with_dist(
+    eta: &mut [f64],
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    dist: &crate::stats::vine_copula::VineCopulaOmega,
+    sigma_values: &[f64],
+    step_scale: f64,
+    rng: &mut impl Rng,
+    n_steps: usize,
+    pk_scratch: &mut EventPkParams,
+    kappas_iov_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
+) -> (usize, f64) {
+    let n_eta = eta.len();
+    let l = dist.proposal_chol();
+    let mut nll = nll_current;
+    let mut n_accepted = 0;
+
+    for _ in 0..n_steps {
+        let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(StandardNormal)).collect();
+        let perturbation = l * DVector::from_column_slice(&z);
+        let eta_prop: Vec<f64> = (0..n_eta)
+            .map(|j| eta[j] + step_scale * perturbation[j])
+            .collect();
+
+        let obs_nll_prop = if let Some((kappas, _)) = kappas_iov_opt {
+            obs_nll_subject_into_iov(
+                model,
+                subject,
+                theta,
+                sigma_values,
+                &eta_prop,
+                kappas,
+                pk_scratch,
+            )
+        } else {
+            obs_nll_subject_into(model, subject, theta, sigma_values, &eta_prop, pk_scratch)
+        };
+        // Kappa prior is constant (kappas fixed during eta MH) → cancels in ratio,
+        // but include it so the returned NLL stays on the same scale as the cache.
+        let kap_prior = kappas_iov_opt
+            .map(|(kaps, iov)| kappa_prior_nll(kaps, iov))
+            .unwrap_or(0.0);
+        let nll_prop = obs_nll_prop + dist.log_prior(&eta_prop) + kap_prior;
+
+        if rng.gen::<f64>().ln() < nll - nll_prop {
+            eta.copy_from_slice(&eta_prop);
+            nll = nll_prop;
+            n_accepted += 1;
+        }
+    }
+    (n_accepted, nll)
+}
+
+/// Componentwise (single-coordinate) Metropolis-within-Gibbs sweep for the
+/// vine-copula E-step — the dist-aware analogue of [`mh_steps_componentwise`].
+///
+/// Each sweep proposes `η'_j = η_j + step_scale · cw_sd[j] · z` for one
+/// coordinate at a time, holding the others fixed, and accepts/rejects with the
+/// full conditional NLL `obs_nll + dist.log_prior(η)` (which carries the copula
+/// dependence, so detailed balance for p(η | data) is preserved). Returns
+/// `(n_accepted, n_proposed, updated_nll)` with `n_proposed = n_sweeps · n_eta`.
+///
+/// Why this kernel exists: the block kernel [`mh_steps_with_dist`] proposes along
+/// `chol(omega_equiv)·z`, so once the vine's Gaussian-equivalent Ω drifts toward
+/// high correlation the proposal can only move η along that near-degenerate
+/// direction. The M-step then re-fits both `omega_equiv` and the pair-copulas
+/// from those collinear draws and feeds the inflated dependence back into the
+/// next proposal — the same runaway collapse the Gaussian arm hit (see PR #191
+/// and the `saem-block-omega-rank1-collapse` investigation), but in vine
+/// parameter space. A per-coordinate proposal can always move a single η
+/// independently of the off-diagonal structure, so the sampled draws are not
+/// forced collinear and the sufficient statistics recover the true dependence.
+#[allow(clippy::too_many_arguments)]
+fn mh_steps_componentwise_dist(
+    eta: &mut [f64],
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    dist: &crate::stats::vine_copula::VineCopulaOmega,
+    sigma_values: &[f64],
+    step_scale: f64,
+    // Per-coordinate proposal SD = vine marginal SD (already floored to
+    // MARGINAL_STD_FLOOR), shared across subjects. Indexed `[0, n_eta)`.
+    cw_sd: &[f64],
+    rng: &mut impl Rng,
+    n_sweeps: usize,
+    pk_scratch: &mut EventPkParams,
+    kappas_iov_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
+) -> (usize, usize, f64) {
+    let n_eta = eta.len();
+    let mut nll = nll_current;
+    let mut n_accepted = 0;
+
+    for _ in 0..n_sweeps {
+        for j in 0..n_eta {
+            let z: f64 = rng.sample(StandardNormal);
+            let old_j = eta[j];
+            eta[j] = old_j + step_scale * cw_sd[j] * z;
+
+            let obs_nll_prop = if let Some((kappas, _)) = kappas_iov_opt {
+                obs_nll_subject_into_iov(
+                    model,
+                    subject,
+                    theta,
+                    sigma_values,
+                    eta,
+                    kappas,
+                    pk_scratch,
+                )
+            } else {
+                obs_nll_subject_into(model, subject, theta, sigma_values, eta, pk_scratch)
+            };
+            // Kappa prior is constant (kappas fixed during eta MH) → cancels in
+            // the ratio, but include it so `nll` stays on the cache scale.
+            let kap_prior = kappas_iov_opt
+                .map(|(kaps, iov)| kappa_prior_nll(kaps, iov))
+                .unwrap_or(0.0);
+            let nll_prop = obs_nll_prop + dist.log_prior(eta) + kap_prior;
+
+            // Symmetric scalar proposal cancels, same as the block kernel.
+            if rng.gen::<f64>().ln() < nll - nll_prop {
+                nll = nll_prop;
+                n_accepted += 1;
+            } else {
+                eta[j] = old_j; // reject — restore
+            }
+        }
+    }
+
+    (n_accepted, n_eta * n_sweeps, nll)
+}
+
+// ---------------------------------------------------------------------------
+// SAEM loop with vine-copula random-effect distribution
+// ---------------------------------------------------------------------------
+
+/// Gaussian prior NLL for a set of kappa vectors: 0.5 * (Σ_k κ_k'Ω_iov⁻¹κ_k + K·log|Ω_iov|).
+fn kappa_prior_nll(kappas: &[Vec<f64>], omega_iov: &OmegaMatrix) -> f64 {
+    let n = omega_iov.matrix.nrows();
+    if n == 0 || kappas.is_empty() {
+        return 0.0;
+    }
+    let log_det: f64 = (0..n)
+        .map(|i| omega_iov.chol[(i, i)].abs().ln())
+        .sum::<f64>()
+        * 2.0;
+    let omega_inv = match omega_iov.matrix.clone().cholesky() {
+        Some(ch) => ch.inverse(),
+        None => return 1e20,
+    };
+    let quad: f64 = kappas
+        .iter()
+        .map(|kap| {
+            let kv = DVector::from_column_slice(kap);
+            kv.dot(&(&omega_inv * &kv))
+        })
+        .sum();
+    0.5 * (quad + kappas.len() as f64 * log_det)
+}
+
+/// Metropolis-Hastings kappa step for vine+IOV models.
+///
+/// Mirrors `mh_kappa_steps` but uses the vine prior for eta rather than a
+/// Gaussian, so that `nll_current` and the proposal NLL are on the same scale:
+///   nll = obs_nll_iov + vine_prior(η) + gaussian_kappa_prior(κ, Ω_iov)
+/// The vine_prior(η) term is constant (η fixed) and cancels in the ratio.
+fn mh_kappa_steps_vine(
+    kappas: &mut [Vec<f64>],
+    nll_current: f64,
+    subject: &Subject,
+    model: &CompiledModel,
+    theta: &[f64],
+    eta: &[f64],
+    dist: &crate::stats::vine_copula::VineCopulaOmega,
+    omega_iov: &OmegaMatrix,
+    sigma_values: &[f64],
+    step_scale: f64,
+    rng: &mut impl Rng,
+) -> (usize, usize, f64) {
+    let n_kappa = omega_iov.matrix.nrows();
+    let l = &omega_iov.chol;
+    let mut nll = nll_current;
+    let mut n_accepted = 0;
+    let n_occ = kappas.len();
+    let vine_prior = dist.log_prior(eta); // constant — eta is fixed
+
+    for k in 0..n_occ {
+        let z: Vec<f64> = (0..n_kappa).map(|_| rng.sample(StandardNormal)).collect();
+        let perturbation = l * DVector::from_column_slice(&z);
+        let kap_prop: Vec<f64> = (0..n_kappa)
+            .map(|j| kappas[k][j] + step_scale * perturbation[j])
+            .collect();
+
+        let old_kap = kappas[k].clone();
+        kappas[k] = kap_prop;
+
+        let mut scratch = EventPkParams::default();
+        let obs_prop = obs_nll_subject_into_iov(
+            model,
+            subject,
+            theta,
+            sigma_values,
+            eta,
+            kappas,
+            &mut scratch,
+        );
+        let kap_prior_prop = kappa_prior_nll(kappas, omega_iov);
+        let nll_prop = obs_prop + vine_prior + kap_prior_prop;
+
+        if rng.gen::<f64>().ln() < nll - nll_prop {
+            nll = nll_prop;
+            n_accepted += 1;
+        } else {
+            kappas[k] = old_kap;
+        }
+    }
+    (n_accepted, n_occ, nll)
+}
+
+/// Run the full SAEM loop using a [`VineCopulaOmega`] distribution for the
+/// E-step prior and M-step Ω update. Called from [`run_saem`] when
+/// `options.saem_omega_dist == OmegaDist::VineCopula`.
+///
+/// HMC is not supported (vine `log_prior_grad` is not yet implemented);
+/// a warning is emitted and the run falls back to MH.
+fn run_saem_vine(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Result<crate::estimation::outer_optimizer::OuterResult, String> {
+    use crate::stats::vine_copula::VineCopulaOmega;
+    use rayon::prelude::*;
+
+    let n_kappa = model.n_kappa;
+
+    let n_subjects = population.subjects.len();
+    let n_eta = model.n_eta;
+    let k1 = options.saem_n_exploration;
+    let k2 = options.saem_n_convergence;
+    let n_iter = k1 + k2;
+    let omega_burnin = options.saem_omega_burnin.min(k1);
+    let n_mh_steps = options.saem_n_mh_steps;
+    // Componentwise sweeps per iteration (Kuhn-Lavielle kernel 2), sized like
+    // the Gaussian arm. Skipped for single-η models, where there is no
+    // off-diagonal/copula to decorrelate and the kernel duplicates the block move.
+    let n_cw_sweeps = if n_eta >= 2 {
+        (n_mh_steps / n_eta).max(2)
+    } else {
+        0
+    };
+    let adapt_interval = options.saem_adapt_interval;
+    let verbose = options.verbose;
+    let master_seed = options.saem_seed.unwrap_or(12345);
+
+    let n_theta = init_params.theta.len();
+    let n_sigma = init_params.sigma.values.len();
+
+    if verbose {
+        eprintln!(
+            "SAEM (vine): {} subjects, {} ETAs, {} total iter ({} explore + {} converge)",
+            n_subjects, n_eta, n_iter, k1, k2
+        );
+    }
+
+    let mut warnings = Vec::new();
+    if options.saem_n_leapfrog > 0 {
+        warnings.push(
+            "saem_n_leapfrog > 0 but vine-copula SAEM uses Metropolis-Hastings; \
+             log_prior_grad for the vine is not yet implemented (Phase 5)"
+                .to_string(),
+        );
+    }
+
+    // Initialize the vine distribution.
+    let mut dist = VineCopulaOmega::from_init_params(init_params);
+
+    // Pack / unpack helpers (identical to the Gaussian arm).
+    let theta_packs_log_mask: Vec<bool> = init_params
+        .theta_lower
+        .iter()
+        .map(|&lo| crate::estimation::parameterization::theta_packs_log(lo))
+        .collect();
+    let pack_theta = |i: usize, t: f64| -> f64 {
+        if theta_packs_log_mask[i] {
+            t.max(1e-10).ln()
+        } else {
+            t
+        }
+    };
+    let unpack_theta = |i: usize, packed: f64| -> f64 {
+        if theta_packs_log_mask[i] {
+            packed.exp()
+        } else {
+            packed
+        }
+    };
+
+    let mut log_theta: Vec<f64> = (0..n_theta)
+        .map(|i| pack_theta(i, init_params.theta[i]))
+        .collect();
+    let mut log_sigma: Vec<f64> = init_params
+        .sigma
+        .values
+        .iter()
+        .map(|&s| s.max(1e-10).ln())
+        .collect();
+
+    let mut log_theta_lower: Vec<f64> = (0..n_theta)
+        .map(|i| {
+            if theta_packs_log_mask[i] {
+                init_params.theta_lower[i].max(1e-10).ln()
+            } else {
+                init_params.theta_lower[i]
+            }
+        })
+        .collect();
+    let mut log_theta_upper: Vec<f64> = (0..n_theta)
+        .map(|i| {
+            if theta_packs_log_mask[i] {
+                init_params.theta_upper[i].min(1e9).ln()
+            } else {
+                init_params.theta_upper[i]
+            }
+        })
+        .collect();
+    let log_sigma_lower = vec![-8.0f64; n_sigma];
+    let log_sigma_upper = vec![5.0f64; n_sigma];
+
+    for i in 0..n_theta {
+        if init_params.theta_fixed.get(i).copied().unwrap_or(false) {
+            log_theta_lower[i] = log_theta[i];
+            log_theta_upper[i] = log_theta[i];
+        }
+    }
+    let mut log_sigma_lower_mut = log_sigma_lower.clone();
+    let mut log_sigma_upper_mut = log_sigma_upper.clone();
+    for i in 0..n_sigma {
+        if init_params.sigma_fixed.get(i).copied().unwrap_or(false) {
+            log_sigma_lower_mut[i] = log_sigma[i];
+            log_sigma_upper_mut[i] = log_sigma[i];
+        }
+    }
+
+    let mu_ref_pairs: Vec<(usize, usize)> = get_mu_ref_pairs(model);
+    let use_closed_form_mstep = options.mu_referencing && !mu_ref_pairs.is_empty();
+    let mut mstep_grad_step_evals_saved: u64 = 0;
+
+    // Initial eta state: all zeros.
+    let mut etas: Vec<Vec<f64>> = (0..n_subjects)
+        .map(|_| get_eta_init(n_eta, None, None))
+        .collect();
+    let mut step_scales = vec![0.3f64; n_subjects];
+    let mut accept_counts = vec![0usize; n_subjects];
+    let mut proposal_counts = vec![0usize; n_subjects];
+    // Componentwise (decorrelating) kernel state — mirrors the Gaussian arm.
+    let mut cw_step_scales = vec![1.0f64; n_subjects];
+    let mut cw_accept_counts = vec![0usize; n_subjects];
+    let mut cw_proposal_counts = vec![0usize; n_subjects];
+    let mut steps_since_adapt: usize = 0;
+
+    let mut theta_cur: Vec<f64> = init_params.theta.clone();
+    let mut sigma_cur: Vec<f64> = init_params.sigma.values.clone();
+
+    // IOV kappa state — mirrors the Gaussian arm.
+    debug_assert!(
+        n_kappa == 0 || init_params.omega_iov.is_some(),
+        "n_kappa > 0 but init_params.omega_iov is None — model is misconfigured"
+    );
+    let (mut kappas, mut omega_iov_mat, mut s2_iov): (
+        Vec<Vec<Vec<f64>>>,
+        DMatrix<f64>,
+        DMatrix<f64>,
+    ) = if n_kappa > 0 {
+        let kaps: Vec<Vec<Vec<f64>>> = population
+            .subjects
+            .iter()
+            .map(|s| {
+                let n_occ = split_obs_by_occasion(s).len();
+                vec![vec![0.0f64; n_kappa]; n_occ]
+            })
+            .collect();
+        let iov_mat = init_params
+            .omega_iov
+            .as_ref()
+            .map(|iov| iov.matrix.clone())
+            .unwrap_or_else(|| DMatrix::identity(n_kappa, n_kappa));
+        (kaps, iov_mat.clone(), iov_mat)
+    } else {
+        (
+            vec![vec![]; n_subjects],
+            DMatrix::zeros(0, 0),
+            DMatrix::zeros(0, 0),
+        )
+    };
+    let mut kappa_step_scales = vec![0.3f64; n_subjects];
+    let mut kappa_accept_counts = vec![0usize; n_subjects];
+    let mut kappa_proposal_counts = vec![0usize; n_subjects];
+
+    // Initial NLL cache: obs_nll (+ IOV if present) + vine prior (+ kappa prior if IOV).
+    let omega_iov_init_om: Option<OmegaMatrix> = if n_kappa > 0 {
+        init_params.omega_iov.clone()
+    } else {
+        None
+    };
+    let mut nll_cache: Vec<f64> = population
+        .subjects
+        .iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let mut scratch = EventPkParams::default();
+            let obs = if n_kappa > 0 {
+                obs_nll_subject_into_iov(
+                    model,
+                    subject,
+                    &theta_cur,
+                    &sigma_cur,
+                    &etas[i],
+                    &kappas[i],
+                    &mut scratch,
+                )
+            } else {
+                obs_nll_subject_into(
+                    model,
+                    subject,
+                    &theta_cur,
+                    &sigma_cur,
+                    &etas[i],
+                    &mut scratch,
+                )
+            };
+            let kap_prior = omega_iov_init_om
+                .as_ref()
+                .map(|iov| kappa_prior_nll(&kappas[i], iov))
+                .unwrap_or(0.0);
+            obs + dist.log_prior(&etas[i]) + kap_prior
+        })
+        .collect();
+
+    // ---- Main SAEM loop ----
+    for k in 1..=n_iter {
+        if crate::cancel::is_cancelled(&options.cancel) {
+            if verbose {
+                eprintln!("SAEM (vine): cancelled at iteration {}", k);
+            }
+            break;
+        }
+        let gamma = if k <= k1 { 1.0 } else { 1.0 / (k - k1) as f64 };
+        // Damped SA step for the vine's Gaussian-equivalent Ω during exploration
+        // only (cf. the Gaussian arm). With the full γ=1 used for θ, an undamped
+        // omega_equiv would be overwritten each exploration iteration by a single
+        // warm-started, not-yet-equilibrated MCMC draw; for a correlated block
+        // that snapshot is biased toward the chain's current correlation and the
+        // bias feeds back through chol(omega_equiv) into the next block proposal —
+        // a runaway toward a near rank-1 Ω. Capping the Ω learning rate averages
+        // those draws (Robbins-Monro) and breaks the feedback, while θ keeps
+        // moving at full γ. In convergence (k > k1) the cap is lifted.
+        let gamma_omega = if k <= k1 {
+            gamma.min(OMEGA_SA_MAX_STEP)
+        } else {
+            gamma
+        };
+
+        // Rebuild omega_iov for this iteration (IOV models only).
+        let omega_iov_cur_opt: Option<OmegaMatrix> = if n_kappa > 0 {
+            init_params.omega_iov.as_ref().map(|iov_ref| {
+                OmegaMatrix::from_matrix_with_mask(
+                    omega_iov_mat.clone(),
+                    iov_ref.eta_names.clone(),
+                    iov_ref.diagonal,
+                    iov_ref.free_mask.clone(),
+                )
+            })
+        } else {
+            None
+        };
+
+        // ---- Step 1: MH E-step (parallelized) ----
+        {
+            let theta_ref = &theta_cur;
+            let sigma_ref = &sigma_cur;
+            let dist_ref: &VineCopulaOmega = &dist;
+            let cw_scales = &cw_step_scales;
+            // Per-coordinate componentwise proposal SDs — the vine's marginal SDs
+            // (shared across subjects, already floored). Computed once here.
+            let cw_sd: Vec<f64> = dist
+                .marginal_stds
+                .iter()
+                .map(|&s| s.max(SAEM_OMEGA_DIAG_FLOOR.sqrt()))
+                .collect();
+            let cw_sd_ref = &cw_sd;
+
+            // Returns (eta_new, nll_after, n_acc, n_prop, n_acc_cw, n_prop_cw).
+            let results: Vec<(Vec<f64>, f64, usize, usize, usize, usize)> = etas
+                .par_iter()
+                .zip(nll_cache.par_iter())
+                .zip(step_scales.par_iter())
+                .zip(kappas.par_iter())
+                .enumerate()
+                .map_init(
+                    EventPkParams::default,
+                    |pk_scratch, (i, (((eta, &nll), &scale), kappas_i))| {
+                        let subject = &population.subjects[i];
+                        let mut rng = StdRng::seed_from_u64(
+                            master_seed
+                                .wrapping_add(k as u64 * 100_000)
+                                .wrapping_add(i as u64),
+                        );
+                        let mut eta_work = eta.clone();
+                        let kappas_mh_opt = omega_iov_cur_opt
+                            .as_ref()
+                            .map(|iov| (kappas_i.as_slice(), iov));
+
+                        // ---- Kernel 1: primary block move ----
+                        let (n_acc, nll_new) = mh_steps_with_dist(
+                            &mut eta_work,
+                            nll,
+                            subject,
+                            model,
+                            theta_ref,
+                            dist_ref,
+                            sigma_ref,
+                            scale,
+                            &mut rng,
+                            n_mh_steps,
+                            pk_scratch,
+                            kappas_mh_opt,
+                        );
+
+                        // ---- Kernel 2: componentwise decorrelating sweep ----
+                        let (n_acc_cw, n_prop_cw, nll_cw) = if n_cw_sweeps > 0 {
+                            mh_steps_componentwise_dist(
+                                &mut eta_work,
+                                nll_new,
+                                subject,
+                                model,
+                                theta_ref,
+                                dist_ref,
+                                sigma_ref,
+                                cw_scales[i],
+                                cw_sd_ref,
+                                &mut rng,
+                                n_cw_sweeps,
+                                pk_scratch,
+                                kappas_mh_opt,
+                            )
+                        } else {
+                            (0, 0, nll_new)
+                        };
+
+                        (eta_work, nll_cw, n_acc, n_mh_steps, n_acc_cw, n_prop_cw)
+                    },
+                )
+                .collect();
+
+            for (i, (eta_new, nll_new, n_acc, n_prop, n_acc_cw, n_prop_cw)) in
+                results.into_iter().enumerate()
+            {
+                etas[i] = eta_new;
+                nll_cache[i] = nll_new;
+                accept_counts[i] += n_acc;
+                proposal_counts[i] += n_prop;
+                cw_accept_counts[i] += n_acc_cw;
+                cw_proposal_counts[i] += n_prop_cw;
+            }
+        }
+
+        // ---- Step 1b: Per-occasion kappa MH (IOV models only) ----
+        if n_kappa > 0 {
+            if let Some(omega_iov_cur) = omega_iov_cur_opt.as_ref() {
+                for i in 0..n_subjects {
+                    let subject = &population.subjects[i];
+                    let mut rng = StdRng::seed_from_u64(
+                        master_seed
+                            .wrapping_add(k as u64 * 100_000)
+                            .wrapping_add(i as u64)
+                            .wrapping_add(999_999),
+                    );
+                    let nll_kappa_ref = nll_cache[i];
+                    let (n_acc, n_prop, nll_new) = mh_kappa_steps_vine(
+                        &mut kappas[i],
+                        nll_kappa_ref,
+                        subject,
+                        model,
+                        &theta_cur,
+                        &etas[i],
+                        &dist,
+                        omega_iov_cur,
+                        &sigma_cur,
+                        kappa_step_scales[i],
+                        &mut rng,
+                    );
+                    nll_cache[i] = nll_new;
+                    kappa_accept_counts[i] += n_acc;
+                    kappa_proposal_counts[i] += n_prop;
+                }
+            }
+        }
+
+        steps_since_adapt += 1;
+
+        // ---- Step 2: M-step for vine Ω (gated by omega_burnin) ----
+        // `gamma_omega` damps the two dependence drivers during exploration —
+        // the Gaussian-equivalent Ω (which builds the block proposal's Cholesky)
+        // and the pair-copula parameters (which enter `log_prior`) — to break the
+        // correlation-collapse feedback. The marginal refit inside `mstep_update`
+        // is a per-coordinate scale, not a dependence driver, and keeps learning
+        // at full rate (cf. θ in the Gaussian arm).
+        if k > omega_burnin {
+            dist.mstep_update(&etas, gamma_omega);
+        }
+
+        // ---- Step 2b: SA update for Omega_iov sufficient statistic (IOV only) ----
+        if n_kappa > 0 {
+            let mut kappa_outer = DMatrix::zeros(n_kappa, n_kappa);
+            let mut n_total_occ = 0_usize;
+            for kappas_i in &kappas {
+                for kap in kappas_i {
+                    let kv = DVector::from_column_slice(kap);
+                    kappa_outer += &kv * kv.transpose();
+                    n_total_occ += 1;
+                }
+            }
+            if n_total_occ > 0 {
+                kappa_outer /= n_total_occ as f64;
+            }
+            s2_iov = (1.0 - gamma) * &s2_iov + gamma * &kappa_outer;
+        }
+
+        // ---- Step 3: M-step theta, sigma (NLopt, warm-started) ----
+        let run_mstep = k <= 5 || k % 3 == 0 || k > k1;
+        let kappas_for_mstep: Option<&[Vec<Vec<f64>>]> = if n_kappa > 0 {
+            Some(kappas.as_slice())
+        } else {
+            None
+        };
+        if run_mstep {
+            let mstep_maxiter = if k <= k1 { 3 } else { 5 };
+
+            if use_closed_form_mstep {
+                let n_subj = etas.len() as f64;
+                let mut temp_theta_lower = log_theta_lower.clone();
+                let mut temp_theta_upper = log_theta_upper.clone();
+                let mut n_pinned: u64 = 0;
+                for &(theta_idx, eta_idx) in &mu_ref_pairs {
+                    if init_params
+                        .theta_fixed
+                        .get(theta_idx)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let mean_eta: f64 = etas.iter().map(|e| e[eta_idx]).sum::<f64>() / n_subj;
+                    let log_theta_before = log_theta[theta_idx];
+                    log_theta[theta_idx] = (log_theta_before + gamma * mean_eta)
+                        .clamp(log_theta_lower[theta_idx], log_theta_upper[theta_idx]);
+                    let delta = log_theta[theta_idx] - log_theta_before;
+                    for e in etas.iter_mut() {
+                        e[eta_idx] -= delta;
+                    }
+                    temp_theta_lower[theta_idx] = log_theta[theta_idx];
+                    temp_theta_upper[theta_idx] = log_theta[theta_idx];
+                    n_pinned += 1;
+                }
+                mstep_grad_step_evals_saved += 2 * mstep_maxiter as u64 * n_pinned;
+                let (theta_new, sigma_new) = theta_sigma_mstep_light(
+                    model,
+                    population,
+                    &etas,
+                    kappas_for_mstep,
+                    &log_theta,
+                    &log_sigma,
+                    &temp_theta_lower,
+                    &temp_theta_upper,
+                    &log_sigma_lower_mut,
+                    &log_sigma_upper_mut,
+                    n_theta,
+                    n_sigma,
+                    mstep_maxiter,
+                    options.scale_params,
+                    &theta_packs_log_mask,
+                );
+                log_theta = theta_new;
+                log_sigma = sigma_new;
+            } else {
+                let (theta_new, sigma_new) = theta_sigma_mstep_light(
+                    model,
+                    population,
+                    &etas,
+                    kappas_for_mstep,
+                    &log_theta,
+                    &log_sigma,
+                    &log_theta_lower,
+                    &log_theta_upper,
+                    &log_sigma_lower_mut,
+                    &log_sigma_upper_mut,
+                    n_theta,
+                    n_sigma,
+                    mstep_maxiter,
+                    options.scale_params,
+                    &theta_packs_log_mask,
+                );
+                log_theta = theta_new;
+                log_sigma = sigma_new;
+            }
+
+            theta_cur = (0..n_theta)
+                .map(|i| unpack_theta(i, log_theta[i]))
+                .collect();
+            sigma_cur = log_sigma.iter().map(|&v| v.exp()).collect();
+        }
+
+        // ---- Step 3b: M-step Omega_iov (IOV only, gated by omega_burnin) ----
+        if n_kappa > 0 && k > omega_burnin {
+            if let Some(omega_iov_ref) = init_params.omega_iov.as_ref() {
+                omega_iov_mat = s2_iov.clone();
+                for i in 0..n_kappa {
+                    for j in 0..n_kappa {
+                        if !omega_iov_ref.free_mask[(i, j)] {
+                            omega_iov_mat[(i, j)] = 0.0;
+                        }
+                    }
+                }
+                for i in 0..n_kappa {
+                    for j in 0..n_kappa {
+                        let fi = init_params.kappa_fixed.get(i).copied().unwrap_or(false);
+                        let fj = init_params.kappa_fixed.get(j).copied().unwrap_or(false);
+                        if fi || fj {
+                            omega_iov_mat[(i, j)] = omega_iov_ref.matrix[(i, j)];
+                        }
+                    }
+                }
+                for i in 0..n_kappa {
+                    if omega_iov_mat[(i, i)] < 1e-8 {
+                        omega_iov_mat[(i, i)] = 1e-8;
+                    }
+                }
+            }
+        }
+
+        // ---- Refresh NLL cache (vine prior + kappa prior + updated theta/sigma) ----
+        if n_kappa > 0 {
+            // Sequential for IOV (same rationale as Gaussian arm)
+            let omega_iov_upd = init_params.omega_iov.as_ref().map(|iov_ref| {
+                OmegaMatrix::from_matrix_with_mask(
+                    omega_iov_mat.clone(),
+                    iov_ref.eta_names.clone(),
+                    iov_ref.diagonal,
+                    iov_ref.free_mask.clone(),
+                )
+            });
+            nll_cache = (0..n_subjects)
+                .map(|i| {
+                    let mut scratch = EventPkParams::default();
+                    let obs = obs_nll_subject_into_iov(
+                        model,
+                        &population.subjects[i],
+                        &theta_cur,
+                        &sigma_cur,
+                        &etas[i],
+                        &kappas[i],
+                        &mut scratch,
+                    );
+                    let kap_prior = omega_iov_upd
+                        .as_ref()
+                        .map(|iov| kappa_prior_nll(&kappas[i], iov))
+                        .unwrap_or(0.0);
+                    obs + dist.log_prior(&etas[i]) + kap_prior
+                })
+                .collect();
+        } else {
+            let dist_ref: &VineCopulaOmega = &dist;
+            let new_nlls: Vec<f64> = etas
+                .par_iter()
+                .enumerate()
+                .map_init(EventPkParams::default, |scratch, (i, eta)| {
+                    obs_nll_subject_into(
+                        model,
+                        &population.subjects[i],
+                        &theta_cur,
+                        &sigma_cur,
+                        eta,
+                        scratch,
+                    ) + dist_ref.log_prior(eta)
+                })
+                .collect();
+            nll_cache = new_nlls;
+        }
+
+        // ---- Adapt MH step sizes ----
+        if steps_since_adapt >= adapt_interval {
+            for i in 0..n_subjects {
+                let total = proposal_counts[i].max(1);
+                let rate = accept_counts[i] as f64 / total as f64;
+                if rate > 0.40 {
+                    step_scales[i] = (step_scales[i] * 1.1).min(5.0);
+                } else {
+                    step_scales[i] = (step_scales[i] * 0.9).max(0.01);
+                }
+                accept_counts[i] = 0;
+                proposal_counts[i] = 0;
+                // Adapt the componentwise kernel scale toward the 1-D optimum
+                // (~0.44 acceptance, Roberts & Rosenthal 2001), independent of
+                // the block scale above.
+                if n_cw_sweeps > 0 {
+                    let cw_total = cw_proposal_counts[i].max(1);
+                    let cw_rate = cw_accept_counts[i] as f64 / cw_total as f64;
+                    if cw_rate > CW_TARGET_ACCEPT {
+                        cw_step_scales[i] = (cw_step_scales[i] * 1.1).min(5.0);
+                    } else {
+                        cw_step_scales[i] = (cw_step_scales[i] * 0.9).max(0.01);
+                    }
+                    cw_accept_counts[i] = 0;
+                    cw_proposal_counts[i] = 0;
+                }
+                if n_kappa > 0 {
+                    let kappa_total = kappa_proposal_counts[i].max(1);
+                    let kappa_rate = kappa_accept_counts[i] as f64 / kappa_total as f64;
+                    if kappa_rate > 0.40 {
+                        kappa_step_scales[i] = (kappa_step_scales[i] * 1.1).min(5.0);
+                    } else {
+                        kappa_step_scales[i] = (kappa_step_scales[i] * 0.9).max(0.01);
+                    }
+                    kappa_accept_counts[i] = 0;
+                    kappa_proposal_counts[i] = 0;
+                }
+            }
+            steps_since_adapt = 0;
+        }
+
+        // ---- Verbose output ----
+        if verbose {
+            let phase = if k <= k1 { "explore" } else { "converge" };
+            let cond_nll: f64 = nll_cache.iter().sum();
+            let total_proposals: usize = proposal_counts.iter().sum();
+            let mh_accept_rate =
+                accept_counts.iter().sum::<usize>() as f64 / total_proposals.max(1) as f64;
+            if k == 1 || k % 50 == 0 || k == n_iter {
+                eprintln!(
+                    "  SAEM(vine) iter {:>4}/{} [{}] γ={:.3}  condNLL={:.3}  MH={:.2}",
+                    k, n_iter, phase, gamma, cond_nll, mh_accept_rate
+                );
+            }
+            crate::estimation::trace::write_saem(k, phase, cond_nll, gamma, mh_accept_rate);
+        }
+    }
+
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return Err("cancelled by user".to_string());
+    }
+
+    if verbose {
+        eprintln!("SAEM (vine) iterations complete. Computing final EBEs and OFV...");
+    }
+
+    // ---- Build final parameters using vine Gaussian-equivalent OMEGA ----
+    let final_omega = dist.to_omega_matrix().clone();
+    let final_params = ModelParameters {
+        theta: theta_cur.clone(),
+        theta_names: init_params.theta_names.clone(),
+        theta_lower: init_params.theta_lower.clone(),
+        theta_upper: init_params.theta_upper.clone(),
+        theta_fixed: init_params.theta_fixed.clone(),
+        omega: final_omega,
+        omega_fixed: init_params.omega_fixed.clone(),
+        sigma: crate::types::SigmaVector {
+            values: sigma_cur.clone(),
+            names: init_params.sigma.names.clone(),
+        },
+        sigma_fixed: init_params.sigma_fixed.clone(),
+        omega_iov: if n_kappa > 0 {
+            init_params.omega_iov.as_ref().map(|iov_ref| {
+                OmegaMatrix::from_matrix_with_mask(
+                    omega_iov_mat.clone(),
+                    iov_ref.eta_names.clone(),
+                    iov_ref.diagonal,
+                    iov_ref.free_mask.clone(),
+                )
+            })
+        } else {
+            init_params.omega_iov.clone()
+        },
+        kappa_fixed: init_params.kappa_fixed.clone(),
+        vine_dist: Some(std::sync::Arc::new(dist.clone())),
+    };
+
+    // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
+    let warm_etas: Vec<DVector<f64>> = etas.iter().map(|e| DVector::from_column_slice(e)).collect();
+    let saem_final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
+    let (eta_hats, h_matrices, _, final_kappas) = run_inner_loop_warm(
+        model,
+        population,
+        &final_params,
+        options.inner_maxiter,
+        options.inner_tol,
+        Some(&warm_etas),
+        Some(&saem_final_mu_k),
+        0,
+    );
+
+    // ---- Final OFV via FOCE approximation ----
+    let ofv = 2.0
+        * pop_nll(
+            model,
+            population,
+            &final_params,
+            &eta_hats,
+            &h_matrices,
+            &final_kappas,
+            options.interaction,
+        );
+
+    // ---- Vine-corrected OFV ----
+    // pop_nll always uses the Gaussian Laplace approximation. Replace the
+    // Gaussian prior term with the vine (copula) prior at the final EBEs so
+    // the result is directly comparable to a Gaussian FOCE OFV on the same data.
+    //
+    // Both priors use FOCE convention (no (d/2)log(2π) constant); the scale
+    // matches a standard Gaussian FOCE OFV exactly.
+    let vine_corrected_ofv = {
+        let d = final_params.omega.dim() as f64;
+        let half_d_log_2pi = (d / 2.0) * (2.0 * std::f64::consts::PI).ln();
+        let delta: f64 = eta_hats
+            .iter()
+            .map(|eta| {
+                // vine prior in FOCE convention (strip the marginal normalisation constant)
+                let vine_nll = dist.log_prior(eta.as_slice()) - half_d_log_2pi;
+                // Gaussian FOCE prior: 0.5 × (η'Ω⁻¹η + log|Ω|)
+                let q = eta.dot(&(&final_params.omega.inv * eta));
+                let gauss_nll = 0.5 * (q + final_params.omega.log_det);
+                vine_nll - gauss_nll
+            })
+            .sum();
+        let corrected = ofv + 2.0 * delta;
+        if corrected.is_finite() {
+            Some(corrected)
+        } else {
+            None
+        }
+    };
+
+    // ---- Covariance step ----
+    let covariance_matrix =
+        if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
+            if verbose {
+                eprintln!("Running covariance step...");
+            }
+            let packed = pack_params(&final_params);
+            match compute_covariance(
+                &packed,
+                &final_params,
+                model,
+                population,
+                &eta_hats,
+                &h_matrices,
+                &final_kappas,
+                options,
+            ) {
+                Some(out) => {
+                    if let Some(w) = out.warning {
+                        warnings.push(w);
+                    }
+                    Some(out.matrix)
+                }
+                None => {
+                    warnings.push("Covariance step failed — SEs not available".to_string());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    if verbose {
+        eprintln!("SAEM (vine) completed. Final OFV = {:.4}", ofv);
+    }
+
+    let saem_mu_ref_m_step_evals_saved = if use_closed_form_mstep {
+        Some(mstep_grad_step_evals_saved)
+    } else {
+        None
+    };
+
+    Ok(crate::estimation::outer_optimizer::OuterResult {
+        params: final_params,
+        ofv,
+        converged: ofv.is_finite(),
+        n_iterations: n_iter,
+        eta_hats,
+        h_matrices,
+        kappas: final_kappas,
+        covariance_matrix,
+        warnings,
+        saem_mu_ref_m_step_evals_saved,
+        saem_n_subjects_hmc: None,
+        ebe_convergence_warnings: 0,
+        max_unconverged_subjects: 0,
+        total_ebe_fallbacks: 0,
+        final_gradient: None,
+        vine_params: Some(dist.to_fit_params(&init_params.omega.eta_names)),
+        vine_corrected_ofv,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Main SAEM loop
 // ---------------------------------------------------------------------------
 
@@ -1027,6 +2047,16 @@ pub fn run_saem(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
+    // SAEM eta-distribution branch. The Gaussian arm below is the frozen
+    // production path; the vine-copula arm is delivered in a later phase and
+    // currently rejects rather than silently running the Gaussian path.
+    match options.saem_omega_dist {
+        OmegaDist::Gaussian => {}
+        OmegaDist::VineCopula => {
+            return run_saem_vine(model, population, init_params, options);
+        }
+    }
+
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -1946,6 +2976,7 @@ pub fn run_saem(
             init_params.omega_iov.clone()
         },
         kappa_fixed: init_params.kappa_fixed.clone(),
+        vine_dist: None,
     };
 
     // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
@@ -2042,6 +3073,8 @@ pub fn run_saem(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        vine_params: None,
+        vine_corrected_ofv: None,
     })
 }
 
@@ -2435,6 +3468,147 @@ mod tests {
             ),
             Ok(_) => panic!("pre-cancelled SAEM must return Err, not Ok"),
         }
+    }
+
+    /// Rung 0 regression anchor: the vine-copula eta-distribution arm is not
+    /// vine SAEM runs without panicking on a minimal non-IOV model.
+    ///
+    /// Uses 2+2 iterations so the test finishes quickly while exercising the
+    /// full vine code path: MH E-step, IFM M-step, NLL cache refresh, and
+    /// final EBE/OFV computation.
+    #[test]
+    fn vine_omega_dist_runs_on_simple_model() {
+        use crate::types::{DoseEvent, FitOptions, OmegaDist, Population};
+        use std::collections::HashMap;
+
+        let model = analytical_model(GradientMethod::Auto);
+        let make_subj = |id: &str, obs: Vec<f64>| Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 4.0, 8.0],
+            observations: obs,
+            obs_cmts: vec![1, 1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0],
+            occasions: vec![],
+            dose_occasions: vec![],
+        };
+        let population = Population {
+            subjects: vec![
+                make_subj("1", vec![2.5, 1.8, 0.9]),
+                make_subj("2", vec![3.0, 2.0, 1.1]),
+                make_subj("3", vec![2.0, 1.5, 0.8]),
+            ],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+        opts.saem_omega_dist = OmegaDist::VineCopula;
+        opts.saem_n_exploration = 2;
+        opts.saem_n_convergence = 2;
+        opts.run_covariance_step = false;
+
+        let result = run_saem(&model, &population, &model.default_params, &opts);
+        assert!(
+            result.is_ok(),
+            "vine SAEM should return Ok, got: {:?}",
+            result.err()
+        );
+        let res = result.unwrap();
+        assert!(
+            res.ofv.is_finite(),
+            "vine OFV should be finite, got {}",
+            res.ofv
+        );
+    }
+
+    /// vine SAEM with an IOV model completes without error.
+    ///
+    /// Minimal smoke test: one subject, two occasions, one BSV eta, one IOV kappa.
+    /// Verifies the vine + Gaussian IOV path runs and returns a finite OFV.
+    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
+    fn vine_omega_dist_with_iov_runs() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{DoseEvent, FitOptions, OmegaDist, Population};
+        let model_str = r#"
+[parameters]
+theta CL = 1.0 lower=0
+theta V  = 10.0 lower=0
+omega ETA_CL ~ 0.1
+kappa KAPPA_CL ~ 0.1
+
+[individual_parameters]
+CL = theta(CL) * exp(eta(ETA_CL) + kappa(KAPPA_CL))
+V  = theta(V)
+
+[structural_model]
+pk = one_cpt_iv(CL, V)
+
+[error_model]
+proportional sigma = 0.1
+
+[fit_options]
+method = saem
+omega_dist = vine
+"#;
+        let model = parse_model_string(model_str).expect("parse");
+        let subj = Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 4.0, 8.0, 13.0, 16.0, 20.0],
+            observations: vec![6.0, 4.0, 2.0, 5.5, 3.5, 1.8],
+            obs_cmts: vec![1; 6],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 6],
+            occasions: vec![0, 0, 0, 1, 1, 1],
+            dose_occasions: vec![0, 1],
+        };
+        let pop = Population {
+            subjects: vec![subj],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let init = model.default_params.clone();
+        let opts = FitOptions {
+            method: crate::types::EstimationMethod::Saem,
+            saem_omega_dist: OmegaDist::VineCopula,
+            saem_n_exploration: 5,
+            saem_n_convergence: 5,
+            saem_n_mh_steps: 2,
+            verbose: false,
+            ..Default::default()
+        };
+        let result = run_saem(&model, &pop, &init, &opts).expect("vine+IOV saem should succeed");
+        assert!(result.ofv.is_finite(), "OFV must be finite");
+        assert!(
+            result.params.omega_iov.is_some(),
+            "omega_iov must be populated"
+        );
     }
 
     /// Per-theta packing must round-trip values identically for both log-packed

@@ -476,6 +476,68 @@ pub fn print_results(result: &FitResult) {
         }
     }
 
+    // Vine-copula summary
+    if let Some(ref vp) = result.vine_params {
+        eprintln!("\n--- Vine Copula (omega_dist = vine) ---");
+        eprintln!("  Marginal Gaussians:");
+        for (name, mean, sd) in &vp.marginals {
+            eprintln!("    {:12}  mean={:+.4}  sd={:.4}", name, mean, sd);
+        }
+        for tree in &vp.trees {
+            eprintln!("  Tree {}:", tree.tree);
+            for entry in &tree.pairs {
+                let params: Vec<String> = entry
+                    .copula
+                    .params
+                    .iter()
+                    .map(|(pname, pval)| {
+                        let se_str = entry
+                            .copula
+                            .se
+                            .iter()
+                            .find(|(k, _)| k == pname)
+                            .map(|(_, se)| {
+                                if se.is_nan() {
+                                    " (SE=NA)".into()
+                                } else {
+                                    format!(" (SE≈{:.4})", se)
+                                }
+                            })
+                            .unwrap_or_default();
+                        format!("{}={:.4}{}", pname, pval, se_str)
+                    })
+                    .collect();
+                let mut line = format!(
+                    "    {}  [{}  {}  τ={:.3}",
+                    entry.label,
+                    entry.copula.family,
+                    params.join(" "),
+                    entry.copula.kendall_tau
+                );
+                if entry.copula.tail_dep_lower > 1e-10 {
+                    line.push_str(&format!("  λL={:.3}", entry.copula.tail_dep_lower));
+                }
+                if entry.copula.tail_dep_upper > 1e-10 {
+                    line.push_str(&format!("  λU={:.3}", entry.copula.tail_dep_upper));
+                }
+                line.push(']');
+                eprintln!("{}", line);
+            }
+        }
+        // Vine-corrected OFV: shows the true model advantage versus a Gaussian Ω.
+        // The reported OFV uses the Gaussian FOCE formula for both methods; the
+        // corrected value replaces the Gaussian prior with the vine prior at the
+        // final EBEs and is on the same scale as a Gaussian FOCE OFV.
+        if let Some(corr) = result.vine_corrected_ofv {
+            eprintln!("  OFV (FOCE/Gaussian prior):  {:.3}", result.ofv);
+            eprintln!("  OFV (vine-corrected prior): {:.3}", corr);
+            eprintln!(
+                "  ΔOFV (Gaussian − corrected): {:.3}  [vine model advantage]",
+                result.ofv - corr
+            );
+        }
+    }
+
     // Warnings
     if !result.warnings.is_empty() {
         eprintln!("\n--- Warnings ---");
@@ -1133,6 +1195,69 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    if let Some(ref vp) = result.vine_params {
+        writeln!(f, "\nvine_copula:").map_err(|e| e.to_string())?;
+        writeln!(f, "  marginals:").map_err(|e| e.to_string())?;
+        for (name, mean, sd) in &vp.marginals {
+            writeln!(f, "    {}:", name).map_err(|e| e.to_string())?;
+            writeln!(f, "      mean: {:.6}", mean).map_err(|e| e.to_string())?;
+            writeln!(f, "      sd: {:.6}", sd).map_err(|e| e.to_string())?;
+        }
+        writeln!(f, "  trees:").map_err(|e| e.to_string())?;
+        for tree in &vp.trees {
+            writeln!(f, "    - tree: {}", tree.tree).map_err(|e| e.to_string())?;
+            if tree.pairs.is_empty() {
+                writeln!(f, "      pairs: []").map_err(|e| e.to_string())?;
+            } else {
+                writeln!(f, "      pairs:").map_err(|e| e.to_string())?;
+                for entry in &tree.pairs {
+                    writeln!(f, "        - label: \"{}\"", entry.label)
+                        .map_err(|e| e.to_string())?;
+                    writeln!(f, "          family: {}", entry.copula.family)
+                        .map_err(|e| e.to_string())?;
+                    for (pname, pval) in &entry.copula.params {
+                        writeln!(f, "          {}: {:.6}", pname, pval)
+                            .map_err(|e| e.to_string())?;
+                        if let Some((_, se)) = entry.copula.se.iter().find(|(k, _)| k == pname) {
+                            if se.is_nan() {
+                                writeln!(f, "          {}_se: NA", pname)
+                                    .map_err(|e| e.to_string())?;
+                            } else {
+                                writeln!(f, "          {}_se: {:.6}", pname, se)
+                                    .map_err(|e| e.to_string())?;
+                            }
+                        }
+                    }
+                    writeln!(f, "          kendall_tau: {:.6}", entry.copula.kendall_tau)
+                        .map_err(|e| e.to_string())?;
+                    if entry.copula.tail_dep_lower > 1e-10 {
+                        writeln!(
+                            f,
+                            "          tail_dep_lower: {:.6}",
+                            entry.copula.tail_dep_lower
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                    if entry.copula.tail_dep_upper > 1e-10 {
+                        writeln!(
+                            f,
+                            "          tail_dep_upper: {:.6}",
+                            entry.copula.tail_dep_upper
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
+        if let Some(corr) = result.vine_corrected_ofv {
+            writeln!(f, "  ofv_foce_gaussian_prior: {:.6}", result.ofv)
+                .map_err(|e| e.to_string())?;
+            writeln!(f, "  ofv_vine_corrected: {:.6}", corr).map_err(|e| e.to_string())?;
+            writeln!(f, "  delta_ofv_vine_advantage: {:.6}", result.ofv - corr)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
     if !result.warnings.is_empty() {
         writeln!(f, "\nwarnings:").map_err(|e| e.to_string())?;
         for w in &result.warnings {
@@ -1290,6 +1415,9 @@ mod tests {
             sigma_init: Vec::new(),
             obs_time_range: None,
             final_gradient: None,
+            vine_params: None,
+            vine_corrected_ofv: None,
+            vine_dist: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
@@ -1617,6 +1745,9 @@ mod tests {
             sigma_init: Vec::new(),
             obs_time_range: None,
             final_gradient: None,
+            vine_params: None,
+            vine_corrected_ofv: None,
+            vine_dist: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,

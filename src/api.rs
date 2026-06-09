@@ -706,6 +706,23 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         }
     }
 
+    // The vine-copula SAEM variant carries a non-Gaussian eta prior. FOCEI's
+    // inner objective is the Gaussian quadratic-form prior, so a `saem → focei`
+    // chain cannot host the vine prior — refuse it rather than silently running
+    // FOCEI against a Gaussian Ω that contradicts the fitted copula.
+    if options.saem_omega_dist == OmegaDist::VineCopula
+        && chain.iter().any(|&m| m == EstimationMethod::FoceI)
+    {
+        diags.push(
+            Diagnostic::error(
+                "E_OMEGA_DIST_CHAIN",
+                "omega_dist = vine is incompatible with the focei chain step; \
+                 use saem alone or set omega_dist = gaussian",
+            )
+            .with_block("fit_options"),
+        );
+    }
+
     // The trust-region outer optimizer does not thread kappas through its OFV.
     if model.n_kappa > 0 && options.optimizer == Optimizer::TrustRegion {
         diags.push(
@@ -2329,11 +2346,27 @@ fn fit_inner(
     }
 
     let n_obs = population.n_obs();
-    let n_params = n_params_pre;
+
+    // For vine fits: use vine_corrected_ofv as the base (replaces Gaussian prior
+    // with the vine prior at the final EBEs) and add the pair-copula parameter count.
+    // The vine marginal means/stds are subsumed by omega_equiv and not re-counted.
+    let (ofv_for_ic, n_copula_params) = if let Some(ref vine) = result.params.vine_dist {
+        let copula_k: usize = vine
+            .pair_copulas
+            .iter()
+            .flat_map(|level| level.iter())
+            .map(|cop| cop.n_params())
+            .sum();
+        let base = result.vine_corrected_ofv.unwrap_or(result.ofv);
+        (base, copula_k)
+    } else {
+        (result.ofv, 0)
+    };
+    let n_params = n_params_pre + n_copula_params;
 
     let ofv = result.ofv;
-    let aic = ofv + 2.0 * n_params as f64;
-    let bic = ofv + n_params as f64 * (n_obs as f64).ln();
+    let aic = ofv_for_ic + 2.0 * n_params as f64;
+    let bic = ofv_for_ic + n_params as f64 * (n_obs as f64).ln();
 
     // Extract SEs from covariance matrix using converged parameter values
     let (se_theta, se_omega, se_sigma, se_kappa) =
@@ -2569,6 +2602,7 @@ fn fit_inner(
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
+        vine_dist: result.params.vine_dist.clone(),
         kappa_init_as_sd: model.kappa_init_as_sd.clone(),
         se_kappa,
         shrinkage_kappa,
@@ -2618,6 +2652,8 @@ fn fit_inner(
         sigma_init,
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
+        vine_params: result.vine_params.clone(),
+        vine_corrected_ofv: result.vine_corrected_ofv,
         optimizer: match final_method {
             EstimationMethod::Saem => "saem",
             EstimationMethod::FoceGn => "gn",
@@ -3536,11 +3572,16 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     for sim_idx in 0..n_sim {
         for subject in &population.subjects {
-            // Sample eta from N(0, Omega); append zero kappas for IOV models.
-            let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-            let z_vec = DVector::from_column_slice(&z);
-            let eta = &params.omega.chol * z_vec;
-            let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+            // Sample eta from the fitted distribution (vine copula if available,
+            // otherwise N(0, Omega)) and append zero kappas for IOV models.
+            let eta_vec = if let Some(ref vine) = params.vine_dist {
+                vine.draw_eta(rng)
+            } else {
+                let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                let z_vec = DVector::from_column_slice(&z);
+                (&params.omega.chol * z_vec).iter().copied().collect()
+            };
+            let mut eta_slice: Vec<f64> = eta_vec;
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
             // Compute individual parameters
@@ -3827,6 +3868,7 @@ mod iov_integration {
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
+            vine_dist: None,
         };
         CompiledModel {
             name: "iov_test".into(),
@@ -4224,6 +4266,39 @@ mod iov_integration {
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 
+    // `omega_dist = vine` carries a non-Gaussian eta prior FOCEI cannot host;
+    // a `saem → focei` chain combined with it must be rejected by the shared
+    // guard rather than silently running FOCEI against a contradictory Ω.
+    #[test]
+    fn test_check_model_options_flags_vine_focei_chain() {
+        let model = make_iov_model();
+
+        let mut bad = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        bad.methods = vec![EstimationMethod::Saem, EstimationMethod::FoceI];
+        bad.saem_omega_dist = OmegaDist::VineCopula;
+        let diags = super::check_model_options(&model, &bad);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_OMEGA_DIST_CHAIN")
+            .expect("expected E_OMEGA_DIST_CHAIN diagnostic");
+        assert!(d.is_error());
+        assert!(d.message.contains("omega_dist = vine") && d.message.contains("focei"));
+
+        // saem alone with the vine path is allowed (no chain step).
+        let mut ok = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        ok.saem_omega_dist = OmegaDist::VineCopula;
+        assert!(!super::check_model_options(&model, &ok)
+            .iter()
+            .any(|d| d.code == "E_OMEGA_DIST_CHAIN"));
+
+        // The default Gaussian path never trips the guard, even with focei.
+        let mut gauss = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        gauss.methods = vec![EstimationMethod::Saem, EstimationMethod::FoceI];
+        assert!(!super::check_model_options(&model, &gauss)
+            .iter()
+            .any(|d| d.code == "E_OMEGA_DIST_CHAIN"));
+    }
+
     // On a build without the `autodiff` feature, explicitly requesting AD must
     // error rather than silently running FD. `auto`/`fd` must still pass.
     #[cfg(not(feature = "autodiff"))]
@@ -4282,6 +4357,7 @@ mod extract_se_tests {
             sigma_fixed: vec![false],
             omega_iov,
             kappa_fixed,
+            vine_dist: None,
         }
     }
 
@@ -4317,6 +4393,7 @@ mod extract_se_tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: vec![],
+            vine_dist: None,
         };
         // Packed layout: theta(1) + omega_block(6) + sigma(1) = 8.
         // Within the omega block (start = 1): L[0,0] at idx 1, L[1,1] at idx 4,
@@ -4357,6 +4434,7 @@ mod extract_se_tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: vec![],
+            vine_dist: None,
         };
         // Packed layout: theta(1) + omega_diag(2) + sigma(1) = 4. Identity cov.
         let cov = Some(DMatrix::<f64>::identity(4, 4));
@@ -4685,6 +4763,7 @@ mod simulate_with_uncertainty_tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         CompiledModel {
             name: "uncertainty_smoke".into(),
@@ -4818,6 +4897,7 @@ mod simulate_with_uncertainty_tests {
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],
+            vine_dist: None,
             kappa_init_as_sd: vec![],
             se_kappa: None,
             shrinkage_kappa: vec![],
@@ -4862,6 +4942,8 @@ mod simulate_with_uncertainty_tests {
             sigma_init: template.sigma.values.clone(),
             obs_time_range: None,
             final_gradient: None,
+            vine_params: None,
+            vine_corrected_ofv: None,
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
@@ -5277,6 +5359,7 @@ mod multi_start_tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         }
     }
 
@@ -5414,6 +5497,7 @@ mod tests_sdtab_tv_cov {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         let model = CompiledModel {
             name: "tv_cov_sdtab_regression".into(),

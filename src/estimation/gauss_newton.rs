@@ -412,6 +412,8 @@ pub fn run_foce_gn(
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
             final_gradient,
+            vine_params: None,
+            vine_corrected_ofv: None,
         };
     }
 
@@ -517,6 +519,8 @@ pub fn run_foce_gn(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient,
+        vine_params: None,
+        vine_corrected_ofv: None,
     }
 }
 
@@ -1595,6 +1599,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         CompiledModel {
             name: "gn_test".into(),
@@ -2506,6 +2511,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         let model = CompiledModel {
             name: "gn_block_omega_test".into(),
@@ -2782,6 +2788,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
+            vine_dist: None,
         };
         CompiledModel {
             name: "iov_gn_test".into(),

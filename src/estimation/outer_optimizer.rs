@@ -34,6 +34,12 @@ pub struct OuterResult {
     /// (SLSQP, L-BFGS, MMA) when at least one gradient-requesting iteration
     /// improved the OFV; `None` for BOBYQA, built-in BFGS, GN, and SAEM.
     pub final_gradient: Option<Vec<f64>>,
+    /// Fitted vine-copula parameters. `Some` only when `omega_dist = vine`.
+    pub vine_params: Option<crate::stats::vine_copula::VineFitParams>,
+    /// Vine-corrected OFV: the Gaussian FOCE OFV with the Gaussian prior term
+    /// replaced by the vine (copula) prior at the final EBEs. Directly comparable
+    /// to a Gaussian FOCE OFV on the same dataset; `None` for non-vine fits.
+    pub vine_corrected_ofv: Option<f64>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1266,6 +1272,8 @@ fn optimize_nlopt(
         max_unconverged_subjects: ebe_final.max_unconverged as u32,
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
         final_gradient,
+        vine_params: None,
+        vine_corrected_ofv: None,
     }
 }
 
@@ -1593,6 +1601,8 @@ fn optimize_bfgs(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        vine_params: None,
+        vine_corrected_ofv: None,
     }
 }
 
@@ -2488,6 +2498,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         CompiledModel {
             name: "outer_test".into(),
@@ -2684,6 +2695,7 @@ mod tests {
             sigma_fixed: vec![false],
             omega_iov: None,
             kappa_fixed: Vec::new(),
+            vine_dist: None,
         };
         let model = CompiledModel {
             name: "block_test".into(),
