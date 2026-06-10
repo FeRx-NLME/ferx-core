@@ -399,6 +399,9 @@ fn read_nonmem_csv_impl(
     // Absent in Gaussian-only datasets; only used when tte_cmts is non-empty.
     let tentry_col = col_idx_ci("tentry");
 
+    // FREMTYPE column (case-insensitive)
+    let fremtype_col: Option<usize> = col_idx_ci("fremtype");
+
     // IOV occasion column (case-insensitive lookup of user-specified name)
     let occ_col: Option<usize> = iov_column.and_then(|name| col_idx_ci(name));
     if iov_column.is_some() && occ_col.is_none() {
@@ -410,7 +413,7 @@ fn read_nonmem_csv_impl(
 
     const STANDARD_COLS: &[&str] = &[
         "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl",
-        "tentry",
+        "tentry", "fremtype",
     ];
     let is_standard = |h: &str| {
         STANDARD_COLS.iter().any(|s| h.eq_ignore_ascii_case(s))
@@ -548,6 +551,7 @@ fn read_nonmem_csv_impl(
             cens_col,
             occ_col,
             addl_col,
+            fremtype_col,
             &cov_indices,
             filter,
             tte_cmts,
@@ -722,6 +726,7 @@ fn parse_subject(
     cens_col: Option<usize>,
     occ_col: Option<usize>,
     addl_col: Option<usize>,
+    fremtype_col: Option<usize>,
     cov_indices: &[(String, usize)],
     filter: Option<&SelectionFilter>,
     // CMTs to route to `obs_records` instead of the Gaussian parallel Vecs.
@@ -739,6 +744,7 @@ fn parse_subject(
     let mut cens = Vec::new();
     let mut occasions: Vec<u32> = Vec::new();
     let mut dose_occasions: Vec<u32> = Vec::new();
+    let mut fremtype: Vec<u16> = Vec::new();
     let mut occ_parse_failures: usize = 0;
     let mut excl_n_obs: usize = 0;
     let mut excl_n_dose: usize = 0;
@@ -1206,6 +1212,13 @@ fn parse_subject(
                 if occ_col.is_some() {
                     occasions.push(occ);
                 }
+                if fremtype_col.is_some() {
+                    let ft = fremtype_col
+                        .and_then(|c| row.get(c))
+                        .and_then(|s| s.parse::<u16>().ok())
+                        .unwrap_or(0);
+                    fremtype.push(ft);
+                }
                 if any_tv {
                     obs_covariates.push(locf_state.clone());
                 }
@@ -1281,6 +1294,7 @@ fn parse_subject(
             cens,
             occasions,
             dose_occasions: sorted_dose_occ,
+            fremtype,
             #[cfg(feature = "survival")]
             obs_records: tte_obs_records,
         },

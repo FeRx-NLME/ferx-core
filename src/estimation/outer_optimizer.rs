@@ -2538,6 +2538,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -2559,6 +2560,7 @@ mod tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
@@ -2734,6 +2736,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         };
         check_gradient(&model, &make_population(3), 2);
     }

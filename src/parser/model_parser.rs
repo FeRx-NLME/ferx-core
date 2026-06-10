@@ -1423,6 +1423,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         output_columns: vec![],
         #[cfg(feature = "survival")]
         endpoints: std::collections::HashMap::new(),
+        frem_config: None,
     };
 
     // ── Optional blocks ──
@@ -1464,6 +1465,81 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // functions can branch without threading bloq_method through every call.
     let mut model = model;
     model.bloq_method = fit_options.bloq_method;
+
+    // Build FremConfig from fit options when frem_predictions is present.
+    // Format: "THETA_NAME/ETA_NAME:FREMTYPE, ..."
+    // Example: "TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"
+    if let Some(ref preds_str) = fit_options.frem_predictions {
+        let mut fremtype_to_indices = std::collections::HashMap::new();
+        for pair in preds_str.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = pair.split(':').collect();
+            if parts.len() != 2 {
+                return Err(format!(
+                    "frem_predictions: expected 'THETA/ETA:FREMTYPE', got '{}'",
+                    pair
+                ));
+            }
+            let names_part = parts[0].trim();
+            let ft_value: u16 = parts[1].trim().parse().map_err(|_| {
+                format!(
+                    "frem_predictions: expected integer FREMTYPE value, got '{}'",
+                    parts[1].trim()
+                )
+            })?;
+            let name_parts: Vec<&str> = names_part.split('/').collect();
+            if name_parts.len() != 2 {
+                return Err(format!(
+                    "frem_predictions: expected 'THETA/ETA:FREMTYPE', got '{}'",
+                    pair
+                ));
+            }
+            let theta_name = name_parts[0].trim();
+            let eta_name = name_parts[1].trim();
+            let theta_idx = model
+                .theta_names
+                .iter()
+                .position(|n| n == theta_name)
+                .ok_or_else(|| {
+                    format!(
+                        "frem_predictions: theta '{}' not found (available: {:?})",
+                        theta_name, model.theta_names
+                    )
+                })?;
+            let eta_idx = model
+                .eta_names
+                .iter()
+                .position(|n| n == eta_name)
+                .ok_or_else(|| {
+                    format!(
+                        "frem_predictions: eta '{}' not found (available: {:?})",
+                        eta_name, model.eta_names
+                    )
+                })?;
+            fremtype_to_indices.insert(ft_value, (theta_idx, eta_idx));
+        }
+        // Find covariate sigma index.
+        let sigma_name = fit_options.frem_sigma.as_deref().unwrap_or("EPSCOV");
+        let covariate_sigma_index = model
+            .default_params
+            .sigma
+            .names
+            .iter()
+            .position(|n| n == sigma_name)
+            .ok_or_else(|| {
+                format!(
+                    "frem_sigma: sigma parameter '{}' not found (available: {:?})",
+                    sigma_name, model.default_params.sigma.names
+                )
+            })?;
+        model.frem_config = Some(crate::types::FremConfig {
+            fremtype_to_indices,
+            covariate_sigma_index,
+        });
+    }
 
     // ── [scaling] block ──
     // Parsed after `parse_fit_options` so we can validate the
@@ -2963,6 +3039,27 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 push_unique_expr(&mut opts.ignore_subjects, bare);
             }
             return Ok(true);
+        }
+        "frem_column" => {
+            opts.frem_column = if value.is_empty() || value.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        "frem_predictions" => {
+            opts.frem_predictions = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        "frem_sigma" => {
+            opts.frem_sigma = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
         }
         _ => return Ok(false),
     }
@@ -14951,5 +15048,45 @@ CL V KA WT
         } else {
             panic!("expected PerRow derived kind");
         }
+    }
+
+    #[test]
+    fn test_apply_fit_option_frem_predictions() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(
+                &mut opts,
+                "frem_predictions",
+                "TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            opts.frem_predictions.as_deref(),
+            Some("TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200")
+        );
+    }
+
+    #[test]
+    fn test_apply_fit_option_frem_sigma() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(&mut opts, "frem_sigma", "EPSCOV"),
+            Ok(true)
+        );
+        assert_eq!(opts.frem_sigma.as_deref(), Some("EPSCOV"));
+    }
+
+    #[test]
+    fn test_apply_fit_option_frem_column() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(&mut opts, "frem_column", "FREMTYPE"),
+            Ok(true)
+        );
+        assert_eq!(opts.frem_column.as_deref(), Some("FREMTYPE"));
+        // "none" clears it
+        assert_eq!(apply_fit_option(&mut opts, "frem_column", "none"), Ok(true));
+        assert_eq!(opts.frem_column, None);
     }
 }

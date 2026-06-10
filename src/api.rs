@@ -200,6 +200,7 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             cens: vec![0; sim_spec.obs_times.len()],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         })
@@ -3879,6 +3880,7 @@ mod iov_integration {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -3917,6 +3919,7 @@ mod iov_integration {
                 cens: vec![0; 6],
                 occasions: occasions.clone(),
                 dose_occasions: dose_occ.clone(),
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
@@ -4735,6 +4738,7 @@ mod simulate_with_uncertainty_tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -4757,6 +4761,7 @@ mod simulate_with_uncertainty_tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
@@ -5091,6 +5096,7 @@ mod sde_integration {
                 cens: vec![0; 3],
                 occasions: vec![1u32; 3],
                 dose_occasions: vec![1u32],
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
@@ -5221,6 +5227,7 @@ mod sde_integration {
                 cens: vec![0],
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             };
@@ -5470,6 +5477,7 @@ mod tests_sdtab_tv_cov {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -5504,6 +5512,7 @@ mod tests_sdtab_tv_cov {
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -5675,6 +5684,7 @@ mod tests_derived_session_clock {
             output_columns: Vec::new(),
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -5703,6 +5713,7 @@ mod tests_derived_session_clock {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -5930,6 +5941,7 @@ mod tests_derived_session_clock {
             cens: vec![0; 3],
             occasions: vec![1, 1, 1],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };

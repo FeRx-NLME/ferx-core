@@ -19,7 +19,8 @@ use crate::estimation::outer_optimizer::{compute_covariance, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
 use crate::stats::likelihood::{
-    chol_log_det, compute_r_tilde, foce_subject_nll_interaction, foce_subject_nll_standard,
+    build_frem_r_override, chol_log_det, compute_r_tilde, foce_subject_nll_interaction,
+    foce_subject_nll_standard,
 };
 use crate::stats::residual_error::compute_r_diag;
 use crate::types::*;
@@ -1540,6 +1541,13 @@ fn subject_nll_at(
 
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
 
+    // FREM R-diagonal override for covariate pseudo-observations.
+    let frem_r_override = build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        &params.sigma.values,
+    );
+
     if options.interaction || m3_active {
         foce_subject_nll_interaction(
             subject,
@@ -1551,6 +1559,7 @@ fn subject_nll_at(
             &model.error_spec,
             model.bloq_method,
             &[],
+            frem_r_override.as_deref(),
         )
     } else {
         foce_subject_nll_standard(
@@ -1563,6 +1572,7 @@ fn subject_nll_at(
             &model.error_spec,
             model.bloq_method,
             &[],
+            frem_r_override.as_deref(),
         )
     }
 }
@@ -1645,6 +1655,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -1666,6 +1677,7 @@ mod tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
@@ -2556,6 +2568,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         };
 
         let template = &model.default_params;
@@ -2833,6 +2846,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -2853,6 +2867,7 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };

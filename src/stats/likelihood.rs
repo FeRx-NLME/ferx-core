@@ -151,6 +151,21 @@ pub fn individual_nll_into_with_schedule(
     };
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
+        // FREM dispatch: covariate pseudo-observations use theta+eta as
+        // prediction and a near-zero additive sigma.
+        let fremtype_val = subject.fremtype.get(j).copied().unwrap_or(0);
+        if fremtype_val > 0 {
+            if let Some(ref fc) = model.frem_config {
+                if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&fremtype_val) {
+                    let frem_pred = theta[theta_idx] + eta[eta_idx];
+                    let frem_sigma = sigma_values[fc.covariate_sigma_index];
+                    let frem_v = (frem_sigma * frem_sigma).max(1e-12);
+                    let resid = y - frem_pred;
+                    data_ll += resid * resid / frem_v + frem_v.ln();
+                    continue;
+                }
+            }
+        }
         let v_resid = model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values);
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if is_m3_bloq(model, subject, j) {
@@ -343,6 +358,12 @@ pub fn foce_subject_nll(
         Vec::new()
     };
 
+    // FREM R-diagonal override: for FREMTYPE > 0, use covariate sigma^2 instead
+    // of the PK error model variance. Built once and passed through; None when
+    // no FREM config is active.
+    let frem_r_override =
+        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
+
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
 
     // TTE Laplace correction: when the subject has TTE obs_records, we compute
@@ -415,6 +436,7 @@ pub fn foce_subject_nll(
             &model.error_spec,
             model.bloq_method,
             &p_obs,
+            frem_r_override.as_deref(),
         )
     } else {
         foce_subject_nll_standard(
@@ -427,12 +449,39 @@ pub fn foce_subject_nll(
             &model.error_spec,
             model.bloq_method,
             &p_obs,
+            frem_r_override.as_deref(),
         )
     }
 }
 
 /// Standard FOCE (no interaction). When any CENS rows are present AND
 /// `bloq_method == M3`, the dispatcher has already routed to the interaction
+/// Build per-observation R-diagonal overrides for FREM covariate pseudo-observations.
+/// Returns `None` when FREM is inactive (no config or empty fremtype).
+pub fn build_frem_r_override(
+    frem_config: Option<&FremConfig>,
+    fremtype: &[u16],
+    sigma_values: &[f64],
+) -> Option<Vec<Option<f64>>> {
+    let fc = frem_config?;
+    if fremtype.is_empty() {
+        return None;
+    }
+    Some(
+        fremtype
+            .iter()
+            .map(|&ft| {
+                if ft > 0 {
+                    let s = sigma_values[fc.covariate_sigma_index];
+                    Some(if s * s > 1e-12 { s * s } else { 1e-12 })
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
 /// path — so inside this function the only case we need to handle is
 /// `bloq_method == Drop` (treat CENS rows as ordinary obs) or no CENS at all.
 pub fn foce_subject_nll_standard(
@@ -445,6 +494,7 @@ pub fn foce_subject_nll_standard(
     error_spec: &ErrorSpec,
     _bloq_method: BloqMethod,
     p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
 ) -> f64 {
     let n_obs = subject.observations.len();
 
@@ -456,8 +506,17 @@ pub fn foce_subject_nll_standard(
         .map(|(j, &ip)| ip - h_eta[j])
         .collect();
 
-    // R diagonal at f0; inflate with EKF process-noise variance for SDE models.
+    // R diagonal at f0, with FREM overrides for covariate observations.
     let mut r_diag = compute_r_diag(error_spec, &f0, &subject.obs_cmts, sigma_values);
+    if let Some(overrides) = frem_r_override {
+        for (j, ov) in overrides.iter().enumerate() {
+            if let Some(v) = ov {
+                if j < r_diag.len() {
+                    r_diag[j] = *v;
+                }
+            }
+        }
+    }
     for (j, r) in r_diag.iter_mut().enumerate() {
         *r += p_obs.get(j).copied().unwrap_or(0.0);
     }
@@ -543,6 +602,7 @@ pub fn foce_subject_nll_interaction(
     error_spec: &ErrorSpec,
     bloq_method: BloqMethod,
     p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
 ) -> f64 {
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
@@ -562,7 +622,13 @@ pub fn foce_subject_nll_interaction(
     let mut ctc = DMatrix::<f64>::zeros(n_eta, n_eta);
     for &j in &quant_idx {
         let f = ipreds[j];
-        let v_resid = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
+        // FREM override: use covariate sigma^2 for FREMTYPE > 0 observations.
+        let frem_ov = frem_r_override.and_then(|o| o.get(j)).and_then(|v| *v);
+        let v_resid = if let Some(v) = frem_ov {
+            v
+        } else {
+            error_spec.variance_at(subject.obs_cmts[j], f, sigma_values)
+        };
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if !(v.is_finite() && v > 0.0) {
             return 1e20;
@@ -572,7 +638,12 @@ pub fn foce_subject_nll_interaction(
 
         // a_j = row j of H (∂f_j/∂η). c̃_j = (∂R_j/∂f_j) · a_j / R_j.
         let aj = h_matrix.row(j);
-        let dvar_df = error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values);
+        // For FREM observations, dvar/df = 0 (additive near-zero sigma).
+        let dvar_df = if frem_ov.is_some() {
+            0.0
+        } else {
+            error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values)
+        };
         let c_scale = dvar_df / v; // c̃_j = c_scale · a_j
 
         // hrh += a_j' · a_j / v;  ctc += c̃_j' · c̃_j = c_scale² · a_j' · a_j.
@@ -871,6 +942,7 @@ pub fn foce_subject_nll_iov(
     } else {
         Vec::new()
     };
+    // IOV path does not support FREM (no FREM R-override).
     if interaction || m3_active {
         foce_subject_nll_interaction(
             subject,
@@ -882,6 +954,7 @@ pub fn foce_subject_nll_iov(
             &model.error_spec,
             model.bloq_method,
             &p_obs_iov,
+            None,
         )
     } else {
         foce_subject_nll_standard(
@@ -894,6 +967,7 @@ pub fn foce_subject_nll_iov(
             &model.error_spec,
             model.bloq_method,
             &p_obs_iov,
+            None,
         )
     }
 }
@@ -1157,6 +1231,7 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -1231,6 +1306,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -1525,6 +1601,7 @@ mod tests {
             &espec,
             BloqMethod::Drop,
             &[],
+            None,
         );
 
         // Hand-compute the Laplace value with c̃ ≡ 0 (additive R).
@@ -1602,6 +1679,7 @@ mod tests {
             &espec_combined,
             BloqMethod::Drop,
             &[],
+            None,
         );
         let focei_additive = foce_subject_nll_interaction(
             &subj,
@@ -1613,6 +1691,7 @@ mod tests {
             &espec_additive,
             BloqMethod::Drop,
             &[],
+            None,
         );
         let gap = focei_combined - focei_additive;
         assert!(

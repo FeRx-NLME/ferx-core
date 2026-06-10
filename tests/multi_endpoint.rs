@@ -81,6 +81,7 @@ fn pkpd_pop() -> Population {
             cens: vec![0; n],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }],

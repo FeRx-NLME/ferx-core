@@ -232,6 +232,10 @@ pub struct Subject {
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
+    /// FREM observation type per observation (parallel to `obs_times`).
+    /// 0 = PK observation, 100/200/300/... = covariate observation.
+    /// Empty when FREMTYPE column is absent from the data.
+    pub fremtype: Vec<u16>,
     /// Non-Gaussian observation records (TTE events, discrete states, counts).
     /// Empty for all-Gaussian subjects. Populated by the data reader when the
     /// model declares a non-Gaussian endpoint for the row's CMT.
@@ -1493,6 +1497,25 @@ pub struct CompiledModel {
     /// Keyed by the CMT value declared in `[event_model]` / future blocks.
     #[cfg(feature = "survival")]
     pub endpoints: HashMap<usize, EndpointLikelihood>,
+    /// FREM configuration. When `Some`, the model uses FREMTYPE-based
+    /// observation dispatch: covariate pseudo-observations use individual
+    /// parameter values as predictions and a near-zero additive sigma.
+    pub frem_config: Option<FremConfig>,
+}
+
+/// FREM (Full Random Effects Model) configuration.
+///
+/// Maps FREMTYPE observation-type values to (theta_index, eta_index) pairs
+/// so the likelihood can compute covariate pseudo-observation predictions
+/// as `theta[theta_idx] + eta[eta_idx]` and use a near-zero additive sigma.
+#[derive(Debug, Clone)]
+pub struct FremConfig {
+    /// Maps FREMTYPE value (100, 200, ...) → (theta_index, eta_index).
+    /// For FREMTYPE observations, the prediction is
+    /// `theta[theta_idx] + eta[eta_idx]`.
+    pub fremtype_to_indices: HashMap<u16, (usize, usize)>,
+    /// Index into `sigma_values` for the covariate error sigma (EPSCOV).
+    pub covariate_sigma_index: usize,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -2428,6 +2451,15 @@ pub struct FitOptions {
     /// Subject IDs to exclude wholesale (syntactic sugar for `ignore = ID == X`).
     /// Compared as strings against `Subject::id`.
     pub ignore_subjects: Vec<String>,
+    /// FREM observation-type column name (default: "FREMTYPE").
+    /// When set, observations with this column > 0 are treated as covariate
+    /// pseudo-observations dispatched via `FremConfig`.
+    pub frem_column: Option<String>,
+    /// FREM prediction map: `"TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"`.
+    /// Maps theta/eta pairs to FREMTYPE values.
+    pub frem_predictions: Option<String>,
+    /// FREM covariate sigma name (e.g. "EPSCOV").
+    pub frem_sigma: Option<String>,
 }
 
 impl Default for FitOptions {
@@ -2503,6 +2535,9 @@ impl Default for FitOptions {
             ignore_exprs: Vec::new(),
             accept_exprs: Vec::new(),
             ignore_subjects: Vec::new(),
+            frem_column: None,
+            frem_predictions: None,
+            frem_sigma: None,
         }
     }
 }
@@ -2891,6 +2926,7 @@ pub(crate) mod test_helpers {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
+            frem_config: None,
         }
     }
 }

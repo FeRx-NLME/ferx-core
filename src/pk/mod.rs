@@ -743,6 +743,20 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         compute_predictions(model.pk_model, subject, &pk)
     };
 
+    // FREM override: replace predictions for FREMTYPE > 0 observations
+    // with theta[k] + eta[m] (covariate pseudo-observation predictions).
+    if let Some(ref fc) = model.frem_config {
+        for (j, ft) in subject.fremtype.iter().enumerate() {
+            if *ft > 0 {
+                if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(ft) {
+                    if j < preds.len() {
+                        preds[j] = theta[theta_idx] + eta[eta_idx];
+                    }
+                }
+            }
+        }
+    }
+
     // `[scaling]` post-multiply. Single insertion point covers FOCE/FOCEI,
     // GN, trust-region, SAEM, and IOV — they all route through here.
     // Form C (ODE `y = <expr>`) is already applied inside `ode_predictions*`
@@ -822,6 +836,7 @@ mod tests {
             cens: vec![0; 2],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -854,6 +869,7 @@ mod tests {
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -932,6 +948,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -989,6 +1006,7 @@ mod tests {
             cens: vec![0; 4],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -1623,6 +1641,7 @@ mod tests {
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };

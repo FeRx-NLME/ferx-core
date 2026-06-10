@@ -117,6 +117,7 @@ fn template_population(n: usize) -> Population {
                 cens: vec![0; n_obs],
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             }
