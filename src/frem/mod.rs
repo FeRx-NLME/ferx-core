@@ -113,7 +113,7 @@ pub fn transform_dataset_for_frem(
         .collect();
 
     // Build augmented CSV.
-    // Header: ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,FREMTYPE,<original_covariates>
+    // Header: ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS,CENS,FREMTYPE,<original_covariates>
     let mut csv = String::new();
     let mut header_parts = vec![
         "ID".to_string(),
@@ -124,6 +124,9 @@ pub fn transform_dataset_for_frem(
         "CMT".to_string(),
         "RATE".to_string(),
         "MDV".to_string(),
+        "II".to_string(),
+        "SS".to_string(),
+        "CENS".to_string(),
         "FREMTYPE".to_string(),
     ];
     for cov_name in &population.covariate_names {
