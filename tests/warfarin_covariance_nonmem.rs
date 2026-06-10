@@ -13,12 +13,15 @@
 //!      the observed information (without the factor of two every SE is 1/√2 too
 //!      small).
 //!
-//! Two cases run the same warfarin model through the two covariance-OFV paths:
-//!   - **FOCEI** (`interaction = true`): the per-subject marginal already carries
-//!     `ηᵀΩ⁻¹η + log|Ω|`, so the covariance OFV is just `2·pop_nll`.
-//!   - **FOCE** (`interaction = false`): `pop_nll` (Sheiner–Beal) omits that prior,
-//!     so `compute_covariance` adds it back analytically via `omega_prior_gradient`.
-//!     This is the only end-to-end guard for that FOCE-specific gradient branch.
+//! Both methods take the covariance OFV as `2·pop_nll` (no separate omega-prior
+//! add-back):
+//!   - **FOCEI** (`interaction = true`): the Almquist–Laplace marginal carries
+//!     `ηᵀΩ⁻¹η + log|Ω|` explicitly.
+//!   - **FOCE** (`interaction = false`): the Sheiner–Beal marginal carries the Ω
+//!     penalty via `R̃ = HΩHᵀ + R` (equivalent by Woodbury to the conditional form
+//!     with `ηᵀΩ⁻¹η + log|Ω|`). An earlier covariance step added that prior again
+//!     for FOCE, double-counting Ω and under-stating the FOCE omega SEs ~31%;
+//!     removing the add-back is the fix in issue #243.
 //!
 //! ## NONMEM reference
 //!
@@ -35,13 +38,11 @@
 //! indefinite-Hessian blow-up (orders of magnitude), loose enough to tolerate the
 //! AD-vs-FD-Jacobian build difference and the FD-step truncation.
 //!
-//! The omega-block band is method-dependent. FOCEI matches NONMEM tightly (20%),
-//! but FOCE runs the Sheiner–Beal objective, whose omega-block curvature differs
-//! from NONMEM's FOCE: on this model ferx's FOCE omega SEs sit ~25–36% below
-//! NONMEM (the theta/sigma SEs still match within ~3%, and the omega *estimates*
-//! agree within ~6%). That is the SB-vs-NONMEM approximation gap, not a fault in
-//! the covariance machinery — so the FOCE omega band is widened to 45%. Tightening
-//! it is tracked with the planned FOCE Sheiner–Beal → Almquist–Laplace switch.
+//! The omega-block band is 20% for both methods. ferx's FOCE estimates already
+//! matched NONMEM FOCE (`METHOD=1`, no INTER): OFV −280.17 vs −280.36, θ within
+//! ~1%. The only defect was the FOCE omega SEs sitting ~31% below NONMEM — a
+//! covariance double-count of Ω (see above), not an objective gap. After the
+//! issue #243 fix the FOCE omega SEs match NONMEM to ~3%, same as FOCEI.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
@@ -81,7 +82,7 @@ struct SeRef {
 
 const TIGHT: f64 = 0.20; // theta + residual-error: NONMEM-anchored
 const OMEGA_FOCEI: f64 = 0.20; // FOCEI omega matches NONMEM tightly
-const OMEGA_FOCE: f64 = 0.45; // FOCE omega: Sheiner–Beal gap (see module docs)
+const OMEGA_FOCE: f64 = 0.20; // FOCE omega matches NONMEM after #243 cov fix
 
 /// NONMEM 7.5.1 `$COVARIANCE MATRIX=R` SEs (.ext, ITER=-1000000001), in the
 /// order [TVCL, TVV, TVKA, PROP_SD, ωCL, ωV, ωKA].
@@ -228,10 +229,9 @@ fn covariance_se_matches_nonmem() {
     assert_covariance_se_matches_nonmem(EstimationMethod::FoceI, true);
 }
 
-/// FOCE (non-interaction) covariance: exercises the Sheiner–Beal path where
-/// `compute_covariance` adds the Ω-prior gradient (`omega_prior_gradient`) that
-/// FOCEI gets for free from the marginal — the only end-to-end guard for that
-/// branch (the unit test `test_covariance_gradient_foce_matches_fd_ofv_fixed`
+/// FOCE (non-interaction) covariance: regression guard for issue #243 — the
+/// FOCE omega SEs now match NONMEM to ~3% after removing the Ω double-count in
+/// the covariance step (the unit test `test_covariance_gradient_foce_matches_fd_ofv_fixed`
 /// checks the gradient in isolation).
 #[test]
 #[cfg_attr(

@@ -128,9 +128,11 @@ The covariance is `2·H⁻¹`, where `H` is the finite-difference Hessian of the
 
 The factor of two is because the objective is `−2·logL`: its Hessian is twice the observed information, so the covariance needs `2·H⁻¹` to be on the right scale.
 
+The covariance objective is `2·pop_nll` for **both** FOCE and FOCEI — the Ω penalty is already inside each per-subject marginal and must not be added again. FOCEI's Almquist–Laplace marginal carries `η̂ᵀΩ⁻¹η̂ + log|Ω|` explicitly; FOCE's Sheiner–Beal marginal carries it through `R̃ = HΩHᵀ + R` (equivalent by the Woodbury identity). An earlier version added the Ω prior a second time on the FOCE path, double-counting Ω and under-stating the FOCE omega SEs by ~31% — fixed in issue [#243](https://github.com/FeRx-NLME/ferx-core/issues/243).
+
 ### NONMEM cross-check
 
-FOCEI on `data/warfarin.csv` (10 subjects, 1-cpt oral, proportional error) against NONMEM 7.5.1 `$COVARIANCE MATRIX=R`:
+On `data/warfarin.csv` (10 subjects, 1-cpt oral, proportional error) against NONMEM 7.5.1 `$COVARIANCE MATRIX=R`, **FOCEI** (`$EST METHOD=1 INTER`):
 
 | Parameter | ferx SE | NONMEM SE | rel. diff |
 |-----------|---------|-----------|-----------|
@@ -142,7 +144,19 @@ FOCEI on `data/warfarin.csv` (10 subjects, 1-cpt oral, proportional error) again
 | ω²(V)     | 0.00403 | 0.00431   | −6.4% |
 | ω²(KA)    | 0.1530  | 0.1504    | +1.8% |
 
-(autodiff build; the FD-Jacobian build agrees to within ~10% on the ω block.) The regression guard is `tests/warfarin_covariance_nonmem.rs`.
+and **FOCE** (`$EST METHOD=1`, no `INTER`), where ferx's OFV/estimates already match NONMEM (OFV −280.17 vs −280.36) and, after the #243 covariance fix, the omega SEs do too:
+
+| Parameter | ferx SE | NONMEM SE | rel. diff |
+|-----------|---------|-----------|-----------|
+| TVCL      | 0.00661 | 0.00663   | −0.3% |
+| TVV       | 0.2375  | 0.2340    | +1.5% |
+| TVKA      | 0.1209  | 0.1245    | −2.8% |
+| PROP_ERR (SD) | 0.000922 | 0.000941 | −2.0% |
+| ω²(CL)    | 0.01312 | 0.01280   | +2.5% |
+| ω²(V)     | 0.00454 | 0.00430   | +5.7% |
+| ω²(KA)    | 0.1510  | 0.1607    | −6.1% |
+
+(autodiff build; the FD-Jacobian build agrees to within ~10% on the ω block.) Both methods are guarded by `tests/warfarin_covariance_nonmem.rs` within a 20% band.
 
 ### Hessian regularization
 

@@ -29,6 +29,12 @@ section of the SDLC for the versioning policy).
   (SDLC) page and a Contributing page in the book.
 
 ### Fixed
+- FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
+  `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
+  covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the
+  Sheiner–Beal marginal, which already carries Ω through `R̃ = HΩHᵀ + R` —
+  double-counting Ω and flattening the omega-block curvature. FOCE estimates were
+  already correct; only the SEs were affected (#243).
 - Covariance standard errors now match NONMEM `$COVARIANCE MATRIX=R` (within ~2%
   on warfarin). The covariance step reconverges the inner EBE loop at every
   finite-difference point — holding the EBEs fixed gave an indefinite Hessian

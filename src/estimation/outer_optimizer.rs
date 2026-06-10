@@ -1853,74 +1853,14 @@ fn backtracking_line_search_warm(
     0.0
 }
 
-/// Gradient of the Ω-prior terms `Σᵢ [ηᵢᵀ Ω⁻¹ ηᵢ + log|Ω|]` w.r.t. the packed
-/// omega Cholesky entries (the omega block of the packed parameter vector).
+/// Gradient of the covariance-step objective `2·pop_nll` w.r.t. the packed
+/// parameter vector, with ETAs and H-matrices held fixed.
 ///
-/// Used only on the **FOCE standard path** (`interaction = false`). The
-/// standard `pop_nll` excludes the omega prior, so the covariance-step
-/// objective adds it explicitly and this function provides its gradient.
-/// For FOCEI/Laplace (`interaction = true`) the prior is already inside
-/// `pop_nll`, so adding this again would double-count it.
-///
-/// Chain rule through the packed Cholesky parameterisation:
-/// - Diagonal entries are log-packed: xₖ = log L[i,i], so chain rule × L[i,i]
-/// - Off-diagonal entries are identity-packed: xₖ = L[i,j], chain rule × 1
-fn omega_prior_gradient(eta_hats: &[DVector<f64>], params: &ModelParameters) -> Vec<f64> {
-    let n_eta = params.omega.dim();
-    let n_subj = eta_hats.len() as f64;
-    let n_packed = if params.omega.diagonal {
-        n_eta
-    } else {
-        n_eta * (n_eta + 1) / 2
-    };
-
-    let omega_inv = match params.omega.matrix.clone().cholesky() {
-        Some(c) => c.inverse(),
-        None => return vec![0.0; n_packed],
-    };
-
-    // S = Σᵢ ηᵢ ηᵢᵀ (ETA scatter matrix, fixed at EBE values)
-    let mut s = DMatrix::zeros(n_eta, n_eta);
-    for eta in eta_hats {
-        s += eta * eta.transpose();
-    }
-
-    // M = Ω⁻¹ S Ω⁻¹ L — appears in d(tr(S Ω⁻¹))/dL = −2 M (lower-tri)
-    let l = &params.omega.chol;
-    let m = &omega_inv * &s * &omega_inv * l;
-
-    let mut grad = Vec::with_capacity(n_packed);
-    if params.omega.diagonal {
-        for i in 0..n_eta {
-            // d/d(log L[i,i]) = (−2 M[i,i] + 2 n_subj/L[i,i]) · L[i,i]
-            //                 = −2 M[i,i] · L[i,i] + 2 n_subj
-            grad.push(-2.0 * m[(i, i)] * l[(i, i)] + 2.0 * n_subj);
-        }
-    } else {
-        for j in 0..n_eta {
-            for i in j..n_eta {
-                if i == j {
-                    grad.push(-2.0 * m[(i, i)] * l[(i, i)] + 2.0 * n_subj);
-                } else {
-                    // d/d(L[i,j]) = −2 M[i,j]  (identity packing)
-                    grad.push(-2.0 * m[(i, j)]);
-                }
-            }
-        }
-    }
-    grad
-}
-
-/// Gradient of the covariance-step objective w.r.t. the packed parameter
-/// vector, with ETAs and H-matrices held fixed.
-///
-/// The objective differs by path:
-/// - **FOCE** (`interaction = false`): `2·pop_nll + Σᵢ [ηᵢᵀ Ω⁻¹ ηᵢ + log|Ω|]`.
-///   `pop_nll` here is the standard (SB) path, which does NOT include the
-///   omega prior per subject, so it must be added analytically.
-/// - **FOCEI / Laplace** (`interaction = true`): `2·pop_nll`.
-///   `pop_nll` is the Almquist-Laplace path, which already includes
-///   `ηᵀΩ⁻¹η + log|Ω|` inside each subject NLL — no extra omega term needed.
+/// Both methods carry the Ω dependence inside `pop_nll` already — FOCE through
+/// `R̃ = HΩHᵀ + R` in the Sheiner–Beal marginal (equivalent by Woodbury to the
+/// conditional form with `η̂ᵀΩ⁻¹η̂ + log|Ω|`), FOCEI through the explicit prior in
+/// the Almquist–Laplace marginal — so the gradient is just `ad_population_gradient`
+/// with no separate omega-prior term (issue #243).
 #[allow(clippy::too_many_arguments)]
 fn covariance_gradient(
     x: &[f64],
@@ -1934,22 +1874,13 @@ fn covariance_gradient(
     options: &FitOptions,
 ) -> Vec<f64> {
     let n_subj = population.subjects.len();
-    let mut grad = ad_population_gradient(
+    // Gradient of `2·pop_nll` for both methods — no omega-prior add-back. The SB
+    // (FOCE) and Almquist–Laplace (FOCEI) marginals both already carry the Ω
+    // dependence (R̃ for SB, the explicit prior for Laplace); adding it again
+    // double-counted Ω and under-stated the FOCE omega SEs (issue #243).
+    ad_population_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
-    );
-    // FOCE standard path: pop_nll does not include the omega prior — add it.
-    // FOCEI/Laplace: pop_nll already includes ηᵀΩ⁻¹η + log|Ω| per subject.
-    if !options.interaction {
-        let params = unpack_params(x, template);
-        let n_theta = template.theta.len();
-        for (k, g) in omega_prior_gradient(eta_hats, &params)
-            .into_iter()
-            .enumerate()
-        {
-            grad[n_theta + k] += g;
-        }
-    }
-    grad
+    )
 }
 
 /// Outcome of the FD covariance step. `matrix` is the n×n covariance with FIX
@@ -2175,35 +2106,23 @@ pub(crate) fn compute_covariance(
             &kaps,
             options.interaction,
         );
-        if options.interaction {
-            return 2.0 * foce_nll;
-        }
-        let n_eta = if !ehs.is_empty() { ehs[0].len() } else { 0 };
-        let omega_inv = match params.omega.matrix.clone().cholesky() {
-            Some(c) => c.inverse(),
-            None => return 1e20,
-        };
-        let mut ld = 0.0;
-        for i in 0..n_eta {
-            let lii = params.omega.chol[(i, i)];
-            if lii > 0.0 {
-                ld += lii.ln();
-            } else {
-                return 1e20;
-            }
-        }
-        let log_det_omega = 2.0 * ld;
-        let mut omega_terms = 0.0;
-        for eta in &ehs {
-            omega_terms += eta.dot(&(&omega_inv * eta)) + log_det_omega;
-        }
-        2.0 * foce_nll + omega_terms
+        // Covariance OFV = −2·logL = 2·pop_nll for both FOCE and FOCEI.
+        //
+        // FOCE uses the Sheiner–Beal linearised marginal `(y−f₀)ᵀR̃⁻¹(y−f₀) +
+        // log|R̃|` with R̃ = HΩHᵀ + R. By Woodbury that marginal *already* carries
+        // the Ω penalty (it equals the conditional form including η̂ᵀΩ⁻¹η̂ +
+        // log|Ω|), so its Ω-curvature is complete. An earlier version added the
+        // η̂ᵀΩ⁻¹η̂ + log|Ω| prior here for the FOCE branch, which double-counted Ω
+        // and flattened the Ω-block curvature — the source of the ~31%-low FOCE
+        // omega SEs (issue #243). FOCEI's Almquist–Laplace marginal likewise
+        // carries the prior internally. So neither method needs an add-back.
+        2.0 * foce_nll
     };
 
     // Gradient of the covariance OFV at a reconverged point. Uses the analytical
     // population gradient — issue #196's H-column shortcut makes the θ part exact
-    // for mu-referenced parameters — and `covariance_gradient` adds the FOCE
-    // omega-prior gradient so it is consistent with `ofv` above.
+    // for mu-referenced parameters — which is exactly the gradient of `2·pop_nll`
+    // (= `ofv` above) for both FOCE and FOCEI; no omega-prior add-back (#243).
     let grad = |xv: &[f64]| -> Vec<f64> {
         let (_, ehs, hms, kaps) = reconverge(xv);
         covariance_gradient(
@@ -3492,72 +3411,13 @@ mod tests {
         }
     }
 
-    // ── omega_prior_gradient / covariance_gradient (issue #209) ─────────────
-
-    /// `omega_prior_gradient` must match the numerical gradient of the Ω-prior
-    /// objective `Σᵢ [ηᵢᵀ Ω⁻¹ ηᵢ + log|Ω|]` w.r.t. the packed omega entries.
-    #[test]
-    fn test_omega_prior_gradient_diagonal_matches_fd() {
-        let omega =
-            OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["eta_cl".into(), "eta_v".into()]);
-        let params = ModelParameters {
-            theta: vec![5.0],
-            theta_names: vec!["CL".into()],
-            theta_lower: vec![0.1],
-            theta_upper: vec![100.0],
-            theta_fixed: vec![false],
-            omega,
-            omega_fixed: vec![false, false],
-            sigma: SigmaVector {
-                values: vec![0.1],
-                names: vec!["s".into()],
-            },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-        };
-        let eta_hats = vec![
-            DVector::from_column_slice(&[0.1, -0.2_f64]),
-            DVector::from_column_slice(&[-0.3, 0.15_f64]),
-            DVector::from_column_slice(&[0.2, 0.05_f64]),
-        ];
-
-        let omega_terms_at = |p: &ModelParameters| -> f64 {
-            let omega_inv = p.omega.matrix.clone().cholesky().unwrap().inverse();
-            let n_e = p.omega.dim();
-            let log_det = 2.0 * (0..n_e).map(|i| p.omega.chol[(i, i)].ln()).sum::<f64>();
-            eta_hats
-                .iter()
-                .map(|eta| eta.dot(&(&omega_inv * eta)) + log_det)
-                .sum()
-        };
-
-        let grad = omega_prior_gradient(&eta_hats, &params);
-        assert_eq!(grad.len(), 2);
-
-        let packed = pack_params(&params);
-        let n_theta = 1usize;
-        let eps = 1e-5;
-        for k in 0..2 {
-            let mut xp = packed.clone();
-            let mut xm = packed.clone();
-            xp[n_theta + k] += eps;
-            xm[n_theta + k] -= eps;
-            let fd = (omega_terms_at(&unpack_params(&xp, &params))
-                - omega_terms_at(&unpack_params(&xm, &params)))
-                / (2.0 * eps);
-            let tol = 1e-5 * (1.0 + fd.abs());
-            assert!(
-                (grad[k] - fd).abs() < tol,
-                "omega_prior_gradient[{k}]: analytical={:.6e}, FD={:.6e}",
-                grad[k],
-                fd,
-            );
-        }
-    }
+    // ── covariance_gradient (issue #209 / #243) ─────────────────────────────
 
     /// `covariance_gradient` (FOCE path, interaction=false) must match FD of
-    /// `ofv_fixed = 2·pop_nll + Σᵢ[ηᵀΩ⁻¹η + log|Ω|]`.
+    /// `ofv_fixed = 2·pop_nll`. The Sheiner–Beal marginal already carries the Ω
+    /// penalty via R̃ = HΩHᵀ + R, so there is no separate omega-prior add-back
+    /// (issue #243 — adding one double-counted Ω and under-stated the FOCE
+    /// omega SEs).
     #[test]
     fn test_covariance_gradient_foce_matches_fd_ofv_fixed() {
         let model = make_model();
@@ -3571,7 +3431,7 @@ mod tests {
         let bounds = compute_bounds(template);
         let n = x.len();
         let mut options = FitOptions::default();
-        options.interaction = false; // FOCE: omega prior added separately
+        options.interaction = false; // FOCE: Sheiner–Beal marginal
 
         let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
         let h_matrices: Vec<nalgebra::DMatrix<f64>> = (0..n_subj)
@@ -3579,10 +3439,10 @@ mod tests {
             .collect();
         let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
 
-        // FOCE ofv_fixed = 2·pop_nll + Σᵢ[ηᵀΩ⁻¹η + log|Ω|]
+        // FOCE ofv_fixed = 2·pop_nll (Ω penalty already inside the SB marginal).
         let ofv_fixed = |xv: &[f64]| -> f64 {
             let p = unpack_params(xv, template);
-            let foce = pop_nll(
+            2.0 * pop_nll(
                 &model,
                 &population,
                 &p,
@@ -3590,15 +3450,7 @@ mod tests {
                 &h_matrices,
                 &kappas,
                 false, // FOCE
-            );
-            let omega_inv = p.omega.matrix.clone().cholesky().unwrap().inverse();
-            let n_e = p.omega.dim();
-            let log_det = 2.0 * (0..n_e).map(|i| p.omega.chol[(i, i)].ln()).sum::<f64>();
-            let omega_terms: f64 = eta_hats
-                .iter()
-                .map(|eta| eta.dot(&(&omega_inv * eta)) + log_det)
-                .sum();
-            2.0 * foce + omega_terms
+            )
         };
 
         let grad = covariance_gradient(
