@@ -2531,10 +2531,6 @@ pub struct FitOptions {
     /// Subject IDs to exclude wholesale (syntactic sugar for `ignore = ID == X`).
     /// Compared as strings against `Subject::id`.
     pub ignore_subjects: Vec<String>,
-    /// FREM observation-type column name (default: "FREMTYPE").
-    /// When set, observations with this column > 0 are treated as covariate
-    /// pseudo-observations dispatched via `FremConfig`.
-    pub frem_column: Option<String>,
     /// FREM prediction map: `"TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"`.
     /// Maps theta/eta pairs to FREMTYPE values.
     pub frem_predictions: Option<String>,
@@ -2616,7 +2612,6 @@ impl Default for FitOptions {
             ignore_exprs: Vec::new(),
             accept_exprs: Vec::new(),
             ignore_subjects: Vec::new(),
-            frem_column: None,
             frem_predictions: None,
             frem_sigma: None,
         }
@@ -3551,6 +3546,7 @@ mod tests {
             cens: Vec::new(),
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         }

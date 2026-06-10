@@ -501,7 +501,7 @@ pub fn build_frem_r_override(
         fremtype
             .iter()
             .map(|&ft| {
-                if ft > 0 {
+                if ft > 0 && fc.fremtype_to_indices.contains_key(&ft) {
                     let s = sigma_values[fc.covariate_sigma_index];
                     Some(if s * s > 1e-12 { s * s } else { 1e-12 })
                 } else {
@@ -644,62 +644,10 @@ pub fn foce_subject_nll_interaction(
         bloq_method,
         p_obs,
         n_eta,
+        frem_r_override,
     ) else {
         return 1e20;
     };
-
-    // Partition observation indices into quantified vs BLOQ (M3 only).
-    let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
-        !(matches!(bloq_method, BloqMethod::M3) && subject.cens.get(j).copied().unwrap_or(0) != 0)
-    });
-
-    // Accumulate data_ll at η̂ and the conditional Hessian pieces over the
-    // quantified rows. For SDE the EKF process-noise variance `p_obs` inflates
-    // R additively, treated as η-independent here (its η-dependence enters
-    // via the same a path; EKF-vs-FOCEI cross terms are dropped under
-    // Almquist's first-order convention).
-    let mut data_ll = 0.0_f64;
-    let mut hrh = DMatrix::<f64>::zeros(n_eta, n_eta);
-    let mut ctc = DMatrix::<f64>::zeros(n_eta, n_eta);
-    for &j in &quant_idx {
-        let f = ipreds[j];
-        // FREM override: use covariate sigma^2 for FREMTYPE > 0 observations.
-        let frem_ov = frem_r_override.and_then(|o| o.get(j)).and_then(|v| *v);
-        let v_resid = if let Some(v) = frem_ov {
-            v
-        } else {
-            error_spec.variance_at(subject.obs_cmts[j], f, sigma_values)
-        };
-        let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
-        if !(v.is_finite() && v > 0.0) {
-            return 1e20;
-        }
-        let r = subject.observations[j] - f;
-        data_ll += r * r / v + v.ln();
-
-        // a_j = row j of H (∂f_j/∂η). c̃_j = (∂R_j/∂f_j) · a_j / R_j.
-        let aj = h_matrix.row(j);
-        // For FREM observations, dvar/df = 0 (additive near-zero sigma).
-        let dvar_df = if frem_ov.is_some() {
-            0.0
-        } else {
-            error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values)
-        };
-        let c_scale = dvar_df / v; // c̃_j = c_scale · a_j
-
-        // hrh += a_j' · a_j / v;  ctc += c̃_j' · c̃_j = c_scale² · a_j' · a_j.
-        let inv_v = 1.0 / v;
-        let cs2 = c_scale * c_scale;
-        for a in 0..n_eta {
-            let aa = aj[a];
-            for b in 0..n_eta {
-                let ab = aj[b];
-                let outer = aa * ab;
-                hrh[(a, b)] += outer * inv_v;
-                ctc[(a, b)] += outer * cs2;
-            }
-        }
-    }
 
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
@@ -751,6 +699,7 @@ fn foce_subject_nll_interaction_with_tte(
         bloq_method,
         p_obs,
         n_eta,
+        None, // TTE path does not support FREM R-override
     ) else {
         return 1e20;
     };
@@ -806,6 +755,7 @@ fn gaussian_foce_accum(
     bloq_method: BloqMethod,
     p_obs: &[f64],
     n_eta: usize,
+    frem_r_override: Option<&[Option<f64>]>,
 ) -> Option<GaussianFoceTerms> {
     let n_obs = subject.observations.len();
 
@@ -823,7 +773,13 @@ fn gaussian_foce_accum(
     let mut ctc = DMatrix::<f64>::zeros(n_eta, n_eta);
     for &j in &quant_idx {
         let f = ipreds[j];
-        let v_resid = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
+        // FREM override: use covariate sigma^2 for FREMTYPE > 0 observations.
+        let frem_ov = frem_r_override.and_then(|o| o.get(j)).and_then(|v| *v);
+        let v_resid = if let Some(v) = frem_ov {
+            v
+        } else {
+            error_spec.variance_at(subject.obs_cmts[j], f, sigma_values)
+        };
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if !(v.is_finite() && v > 0.0) {
             return None;
@@ -833,7 +789,12 @@ fn gaussian_foce_accum(
 
         // a_j = row j of H (∂f_j/∂η); c̃_j = (∂R_j/∂f_j)·a_j / R_j.
         let aj = h_matrix.row(j);
-        let dvar_df = error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values);
+        // For FREM observations, dvar/df = 0 (additive near-zero sigma).
+        let dvar_df = if frem_ov.is_some() {
+            0.0
+        } else {
+            error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values)
+        };
         let c_scale = dvar_df / v;
         let inv_v = 1.0 / v;
         let cs2 = c_scale * c_scale;
@@ -1033,7 +994,12 @@ pub fn foce_subject_nll_iov(
     } else {
         Vec::new()
     };
-    // IOV path does not support FREM (no FREM R-override).
+    // IOV + FREM is unsupported: the augmented b̂ vector and block-diagonal
+    // Σ_b are not set up for FREM R-overrides.  Return a sentinel NLL so the
+    // optimizer steers away from this region rather than silently ignoring FREM.
+    if model.frem_config.is_some() && subject.fremtype.iter().any(|&ft| ft > 0) {
+        return 1e18;
+    }
     if interaction || m3_active {
         foce_subject_nll_interaction(
             subject,

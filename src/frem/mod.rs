@@ -144,15 +144,22 @@ pub fn transform_dataset_for_frem(
                 subject.id.clone(),
                 format!("{}", dose.time),
                 ".".to_string(),
-                if dose.ss {
-                    "4".to_string()
-                } else {
-                    "1".to_string()
-                },
+                "1".to_string(), // EVID
                 format!("{}", dose.amt),
                 format!("{}", dose.cmt),
                 format!("{}", dose.rate),
                 "1".to_string(), // MDV
+                if dose.ii > 0.0 {
+                    format!("{}", dose.ii)
+                } else {
+                    "0".to_string()
+                }, // II
+                if dose.ss {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }, // SS
+                "0".to_string(), // CENS
                 "0".to_string(), // FREMTYPE
             ];
             for cov_name in &population.covariate_names {
@@ -185,6 +192,9 @@ pub fn transform_dataset_for_frem(
                 "1".to_string(), // CMT (will be overridden by FREMTYPE dispatch)
                 "0".to_string(), // RATE
                 "0".to_string(), // MDV
+                "0".to_string(), // II
+                "0".to_string(), // SS
+                "0".to_string(), // CENS
                 format!("{}", ft),
             ];
             for cn in &population.covariate_names {
@@ -208,8 +218,7 @@ pub fn transform_dataset_for_frem(
             .enumerate()
         {
             let cmt = subject.obs_cmts.get(j).copied().unwrap_or(1);
-            let _cens_flag = subject.cens.get(j).copied().unwrap_or(0);
-            // CENS column handling deferred
+            let cens_flag = subject.cens.get(j).copied().unwrap_or(0);
             let mut row = vec![
                 subject.id.clone(),
                 format!("{}", time),
@@ -217,9 +226,12 @@ pub fn transform_dataset_for_frem(
                 "0".to_string(), // EVID
                 "0".to_string(), // AMT
                 format!("{}", cmt),
-                "0".to_string(), // RATE
-                "0".to_string(), // MDV
-                "0".to_string(), // FREMTYPE (PK observation)
+                "0".to_string(),          // RATE
+                "0".to_string(),          // MDV
+                "0".to_string(),          // II
+                "0".to_string(),          // SS
+                format!("{}", cens_flag), // CENS
+                "0".to_string(),          // FREMTYPE (PK observation)
             ];
             for cov_name in &population.covariate_names {
                 row.push(
@@ -398,7 +410,7 @@ pub fn generate_frem_model(
 
     // ── [fit_options] block ──
     model.push_str("[fit_options]\n");
-    // Copy base fit options (except method, which we'll override).
+    // Copy base fit options; preserve the user's method if present, default to focei.
     let mut has_method = false;
     if let Some(fit_lines) = blocks.get("fit_options") {
         for line in fit_lines {
@@ -419,7 +431,7 @@ pub fn generate_frem_model(
     }
 
     // Add FREM-specific fit options.
-    model.push_str("  frem_column = FREMTYPE\n");
+    // FREMTYPE column is auto-detected by datareader; no fit_option needed.
     let mut frem_preds: Vec<String> = Vec::new();
     for cov_name in &frem_info.covariate_names {
         let upper = cov_name.to_uppercase();

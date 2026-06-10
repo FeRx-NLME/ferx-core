@@ -2715,6 +2715,7 @@ mod tests {
             output_columns: Vec::new(),
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
+            frem_config: None,
         };
 
         // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.
@@ -2737,6 +2738,7 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         };

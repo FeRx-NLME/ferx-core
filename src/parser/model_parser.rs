@@ -3276,13 +3276,6 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             return Ok(true);
         }
-        "frem_column" => {
-            opts.frem_column = if value.is_empty() || value.eq_ignore_ascii_case("none") {
-                None
-            } else {
-                Some(value.to_string())
-            };
-        }
         "frem_predictions" => {
             opts.frem_predictions = if value.is_empty() {
                 None
@@ -15437,18 +15430,5 @@ CL V KA WT
             Ok(true)
         );
         assert_eq!(opts.frem_sigma.as_deref(), Some("EPSCOV"));
-    }
-
-    #[test]
-    fn test_apply_fit_option_frem_column() {
-        let mut opts = FitOptions::default();
-        assert_eq!(
-            apply_fit_option(&mut opts, "frem_column", "FREMTYPE"),
-            Ok(true)
-        );
-        assert_eq!(opts.frem_column.as_deref(), Some("FREMTYPE"));
-        // "none" clears it
-        assert_eq!(apply_fit_option(&mut opts, "frem_column", "none"), Ok(true));
-        assert_eq!(opts.frem_column, None);
     }
 }
