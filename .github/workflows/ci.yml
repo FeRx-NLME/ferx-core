@@ -129,7 +129,7 @@ jobs:
         run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,slow-tests --release --lcov --output-path lcov.info
 
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           fail_ci_if_error: true
