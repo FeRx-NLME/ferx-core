@@ -651,6 +651,21 @@ fn dr_diag_d_log_sigma(
         .collect()
 }
 
+/// Returns the index into `model.eta_names` of the ETA log-mu-referenced to
+/// theta `k`, or `None` if no such pairing exists.
+///
+/// Only log-transformed pairs (`MuRef::log_transformed == true`) qualify.
+/// Additive pairs (`PARAM = THETA + ETA`) do not: ferx packs all thetas as
+/// `x_k = log(THETA)`, so ∂f/∂x_k = THETA · ∂f/∂η ≠ H[:,j] there.
+fn mu_ref_eta_index(model: &CompiledModel, template: &ModelParameters, k: usize) -> Option<usize> {
+    let theta_name = template.theta_names.get(k)?;
+    let (eta_name, _) = model
+        .mu_refs
+        .iter()
+        .find(|(_, mu_ref)| mu_ref.log_transformed && mu_ref.theta_name == *theta_name)?;
+    model.eta_names.iter().position(|n| n == eta_name)
+}
+
 /// Analytical per-subject FOCE NLL gradient for non-IOV, non-ODE, non-M3 models.
 ///
 /// Returns `None` if the Cholesky of R_tilde fails (degenerate parameters) so
@@ -754,29 +769,34 @@ fn subject_nll_pop_grad_analytical(
 
     // ── Theta parameters (indices 0..n_theta) ──────────────────────────────
     let eps = 1e-5;
-    for k in 0..n_theta {
+    'theta: for k in 0..n_theta {
         if fixed_mask[k] {
             continue;
         }
-        let h = eps * (1.0 + x[k].abs());
-        let xk_plus = (x[k] + h).min(bounds.upper[k]);
-        let actual_h = xk_plus - x[k];
-        if actual_h.abs() < 1e-16 {
-            continue;
-        }
 
-        let mut x_pert = x.to_vec();
-        x_pert[k] = xk_plus;
-        let params_pert = unpack_params(&x_pert, template);
-        let ipreds_pert =
-            pk::compute_predictions_with_tv(model, subject, &params_pert.theta, eta_hat.as_slice());
-
-        // d(ipreds)/dx[k] via forward FD
-        let d_ipreds: Vec<f64> = ipreds_pert
-            .iter()
-            .zip(ipreds.iter())
-            .map(|(&p, &b)| (p - b) / actual_h)
-            .collect();
+        // d(ipreds)/dx_k: mu-ref shortcut reads H[:,j] (already computed);
+        // FD fallback perturbs theta and re-evaluates predictions.
+        let d_ipreds: Vec<f64> = 'fd: {
+            if options.mu_referencing {
+                if let Some(j) = mu_ref_eta_index(model, template, k) {
+                    break 'fd h_matrix.column(j).iter().copied().collect();
+                }
+            }
+            let h = eps * (1.0 + x[k].abs());
+            let xk_plus = (x[k] + h).min(bounds.upper[k]);
+            let actual_h = xk_plus - x[k];
+            if actual_h.abs() < 1e-16 {
+                continue 'theta;
+            }
+            let mut x_pert = x.to_vec();
+            x_pert[k] = xk_plus;
+            let params_pert = unpack_params(&x_pert, template);
+            pk::compute_predictions_with_tv(model, subject, &params_pert.theta, eta_hat.as_slice())
+                .iter()
+                .zip(ipreds.iter())
+                .map(|(&p, &b)| (p - b) / actual_h)
+                .collect()
+        };
 
         // d(f0) = d(ipreds); d(v) = -d(f0)
         // For sigma-dependent r: d(r_j)/d(x[k]) via chain rule through r(f0 or ipreds)
@@ -1120,6 +1140,17 @@ fn subject_nll_pop_grad_analytical_laplace(
         if fixed_mask[k] {
             continue;
         }
+        // mu-ref shortcut: d(ipreds)/dx_k == H[:,j] for a paired theta/eta.
+        if options.mu_referencing {
+            if let Some(j) = mu_ref_eta_index(model, template, k) {
+                let s: f64 = (0..n_obs)
+                    .map(|obs| theta_per_j[obs] * h_matrix[(obs, j)])
+                    .sum();
+                grad[k] = 0.5 * s;
+                continue;
+            }
+        }
+        // FD fallback for non-mu-referenced thetas.
         let h = eps * (1.0 + x[k].abs());
         let xk_plus = (x[k] + h).min(bounds.upper[k]);
         let actual_h = xk_plus - x[k];
@@ -1872,7 +1903,9 @@ mod tests {
         let n_eta = 1;
         let eta_hat = DVector::zeros(n_eta);
         let h_matrix = nalgebra::DMatrix::zeros(n_obs, n_eta);
-        let options = FitOptions::default();
+        // SB path requires non-interaction; default FitOptions has interaction=true.
+        let mut options = FitOptions::default();
+        options.interaction = false;
 
         // Analytical path (called directly)
         let (nll_an, grad_an) = subject_nll_pop_grad_analytical(
@@ -2941,6 +2974,452 @@ mod tests {
                 "IOV dispatch grad[{j}]: analytical={:.6e}, FD={:.6e}",
                 grad_an[j],
                 fd_j,
+            );
+        }
+    }
+
+    /// Microbenchmark: mu-ref shortcut vs forward-FD, both SB and Laplace paths.
+    ///
+    /// Run with:
+    ///   cargo test --lib --no-default-features --features ci --release \
+    ///     bench_mu_ref_gradient_throughput -- --nocapture --ignored
+    ///
+    /// Prints ns/call and speedup. Not a correctness test — always passes.
+    #[test]
+    #[ignore = "benchmark: run explicitly with --nocapture --ignored"]
+    fn bench_mu_ref_gradient_throughput() {
+        use crate::types::MuRef;
+        use std::time::Instant;
+
+        const N_SUBJ: usize = 32;
+        const N_ITER: u32 = 5_000;
+        const N_OBS: usize = 11;
+        const N_ETA: usize = 3;
+
+        // Build a 3-theta fully mu-referenced warfarin-like model.
+        fn make_bench_model(with_mu_refs: bool) -> CompiledModel {
+            let omega = OmegaMatrix::from_diagonal(
+                &[0.09, 0.04, 0.30],
+                vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
+            );
+            let default_params = ModelParameters {
+                theta: vec![0.2, 10.0, 1.5],
+                theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
+                theta_lower: vec![0.001, 0.1, 0.01],
+                theta_upper: vec![10.0, 500.0, 50.0],
+                theta_fixed: vec![false; 3],
+                omega,
+                omega_fixed: vec![false; 3],
+                sigma: SigmaVector {
+                    values: vec![0.02],
+                    names: vec!["PROP_ERR".into()],
+                },
+                sigma_fixed: vec![false],
+                omega_iov: None,
+                kappa_fixed: Vec::new(),
+            };
+            let mu_refs = if with_mu_refs {
+                let mut m = HashMap::new();
+                m.insert(
+                    "ETA_CL".into(),
+                    MuRef {
+                        theta_name: "TVCL".into(),
+                        log_transformed: true,
+                    },
+                );
+                m.insert(
+                    "ETA_V".into(),
+                    MuRef {
+                        theta_name: "TVV".into(),
+                        log_transformed: true,
+                    },
+                );
+                m.insert(
+                    "ETA_KA".into(),
+                    MuRef {
+                        theta_name: "TVKA".into(),
+                        log_transformed: true,
+                    },
+                );
+                m
+            } else {
+                HashMap::new()
+            };
+            CompiledModel {
+                name: "bench".into(),
+                pk_model: PkModel::OneCptOral,
+                error_model: ErrorModel::Proportional,
+                error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
+                pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+                    let mut p = PkParams::default();
+                    p.values[0] = theta[0] * eta[0].exp();
+                    p.values[1] = theta[1] * eta[1].exp();
+                    p.values[4] = theta[2] * eta[2].exp();
+                    p
+                }),
+                n_theta: 3,
+                n_eta: N_ETA,
+                n_epsilon: 1,
+                n_kappa: 0,
+                kappa_names: Vec::new(),
+                theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
+                eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
+                indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
+                indiv_param_partials: crate::types::IndivParamPartials::empty(),
+                default_params,
+                omega_init_as_sd: vec![false; 3],
+                sigma_init_as_sd: vec![false],
+                kappa_init_as_sd: Vec::new(),
+                mu_refs,
+                kappa_mu_refs: HashMap::new(),
+                tv_fn: None,
+                pk_indices: vec![0, 1, 4],
+                eta_map: vec![0, 1, 2],
+                pk_idx_f64: vec![0.0, 1.0, 4.0],
+                sel_flat: vec![1.0, 0.0, 0.0],
+                ode_spec: None,
+                diffusion_theta_start: None,
+                diffusion_state_indices: Vec::new(),
+                bloq_method: BloqMethod::Drop,
+                referenced_covariates: Vec::new(),
+                gradient_method: GradientMethod::Fd,
+                parse_warnings: Vec::new(),
+                eta_param_info: Vec::new(),
+                theta_transform: Vec::new(),
+                #[cfg(feature = "nn")]
+                covariate_nns: Vec::new(),
+                scaling: crate::types::ScalingSpec::None,
+                log_transform: false,
+                dv_pre_logged: false,
+                derived_exprs: vec![],
+                output_columns: vec![],
+                #[cfg(feature = "survival")]
+                endpoints: std::collections::HashMap::new(),
+            }
+        }
+
+        let population = {
+            let subjects = (0..N_SUBJ)
+                .map(|_| Subject {
+                    id: "S1".into(),
+                    doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                    obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0, 96.0, 120.0],
+                    obs_raw_times: Vec::new(),
+                    observations: vec![25.0, 20.0, 15.0, 10.0, 7.0, 5.0, 3.0, 1.5, 0.8, 0.4, 0.2],
+                    obs_cmts: vec![1; N_OBS],
+                    covariates: HashMap::new(),
+                    dose_covariates: Vec::new(),
+                    obs_covariates: Vec::new(),
+                    pk_only_times: Vec::new(),
+                    pk_only_covariates: Vec::new(),
+                    reset_times: Vec::new(),
+                    cens: vec![0; N_OBS],
+                    occasions: vec![1; N_OBS],
+                    dose_occasions: vec![1],
+                    #[cfg(feature = "survival")]
+                    obs_records: vec![],
+                })
+                .collect();
+            Population {
+                subjects,
+                covariate_names: Vec::new(),
+                dv_column: "DV".to_string(),
+                input_columns: vec![],
+                exclusions: None,
+                warnings: vec![],
+            }
+        };
+
+        let model_fd = make_bench_model(false);
+        let model_mu = make_bench_model(true);
+        let template = &model_fd.default_params;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let eta_hat = DVector::zeros(N_ETA);
+        let kappas: Vec<DVector<f64>> = vec![];
+        let h_vals: Vec<f64> = (0..N_OBS * N_ETA).map(|i| (i as f64 + 1.0) * 0.1).collect();
+        let h_matrix = nalgebra::DMatrix::from_vec(N_OBS, N_ETA, h_vals);
+
+        let run = |model: &CompiledModel, interaction: bool, mu_on: bool| -> f64 {
+            let mut opts = FitOptions::default();
+            opts.interaction = interaction;
+            opts.mu_referencing = mu_on;
+            let t0 = Instant::now();
+            for _ in 0..N_ITER {
+                for si in 0..N_SUBJ {
+                    let _ = subject_nll_pop_grad(
+                        &x,
+                        template,
+                        model,
+                        &population,
+                        si,
+                        &eta_hat,
+                        &h_matrix,
+                        &kappas,
+                        &bounds,
+                        &opts,
+                    );
+                }
+            }
+            t0.elapsed().as_nanos() as f64 / (N_ITER as f64 * N_SUBJ as f64)
+        };
+
+        // Cost of a single prediction solve (reference)
+        let ns_pred = {
+            let params = unpack_params(&x, template);
+            let eta = [0.0f64; 3];
+            let t0 = Instant::now();
+            for _ in 0..100_000 {
+                let _ = crate::pk::compute_predictions_with_tv(
+                    &model_fd,
+                    &population.subjects[0],
+                    &params.theta,
+                    &eta,
+                );
+            }
+            t0.elapsed().as_nanos() as f64 / 100_000.0
+        };
+
+        let ns_sb_fd = run(&model_fd, false, false);
+        let ns_sb_mu = run(&model_mu, false, true);
+        let ns_lp_fd = run(&model_fd, true, false);
+        let ns_lp_mu = run(&model_mu, true, true);
+
+        println!("\nMu-ref gradient shortcut — {N_SUBJ} subjects, {N_OBS} obs, 3 mu-ref thetas, {N_ITER} iters");
+        println!("  1 prediction solve = {ns_pred:.0} ns");
+        println!("  FD solves saved per call = 3 (all thetas mu-referenced)");
+        println!();
+        println!("  Path             FD (ns/call)   mu-ref (ns/call)   speedup");
+        println!("  {}", "-".repeat(60));
+        println!(
+            "  FOCE  (SB)       {ns_sb_fd:>9.0}        {ns_sb_mu:>9.0}       {:.2}x",
+            ns_sb_fd / ns_sb_mu
+        );
+        println!(
+            "  FOCEI (Laplace)  {ns_lp_fd:>9.0}        {ns_lp_mu:>9.0}       {:.2}x",
+            ns_lp_fd / ns_lp_mu
+        );
+        println!();
+        println!(
+            "  Expected saving/call from skipping 3 FD solves: ~{:.0} ns  ({:.0}% of FD cost)",
+            3.0 * ns_pred,
+            100.0 * 3.0 * ns_pred / ns_sb_fd.max(1.0)
+        );
+    }
+
+    /// Verify that the mu-ref gradient shortcut (H-column read) gives the same
+    /// theta gradient as forward FD for both the SB and Laplace paths.
+    ///
+    /// The test model has CL = TVCL * exp(ETA_CL) — a log mu-referenced pair.
+    /// H[:,0] is computed numerically from the eta Jacobian; mathematically it
+    /// equals ∂f/∂(log TVCL) exactly, so the shortcut and FD should agree to
+    /// within FD error (~1e-5 relative).
+    #[test]
+    fn test_mu_ref_gradient_shortcut() {
+        use crate::types::MuRef;
+
+        let mut model = make_model();
+        // Register the mu-referencing: ETA_CL is paired with TVCL (log-transformed).
+        model.mu_refs.insert(
+            "ETA_CL".into(),
+            MuRef {
+                theta_name: "TVCL".into(),
+                log_transformed: true,
+            },
+        );
+
+        let population = make_population();
+        let template = &model.default_params;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+
+        let n_obs = 3;
+        let n_eta = 1;
+        let eta_hat = DVector::from_vec(vec![0.05]);
+
+        // Compute H numerically: ∂f/∂η_0 via forward FD on eta.
+        let params = crate::estimation::parameterization::unpack_params(&x, template);
+        let ipreds_base = crate::pk::compute_predictions_with_tv(
+            &model,
+            &population.subjects[0],
+            &params.theta,
+            eta_hat.as_slice(),
+        );
+        let h_step = 1e-6;
+        let eta_pert = DVector::from_vec(vec![eta_hat[0] + h_step]);
+        let ipreds_pert_eta = crate::pk::compute_predictions_with_tv(
+            &model,
+            &population.subjects[0],
+            &params.theta,
+            eta_pert.as_slice(),
+        );
+        let h_col: Vec<f64> = ipreds_pert_eta
+            .iter()
+            .zip(ipreds_base.iter())
+            .map(|(&p, &b)| (p - b) / h_step)
+            .collect();
+        let h_matrix = nalgebra::DMatrix::from_column_slice(n_obs, n_eta, &h_col);
+
+        // SB path (interaction = false)
+        let mut opts_sb = FitOptions::default();
+        opts_sb.interaction = false;
+
+        opts_sb.mu_referencing = true;
+        let (_, grad_muref_sb) = subject_nll_pop_grad_analytical(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &opts_sb,
+        )
+        .expect("mu-ref SB path should succeed");
+
+        opts_sb.mu_referencing = false;
+        let (_, grad_fd_sb) = subject_nll_pop_grad_analytical(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &opts_sb,
+        )
+        .expect("FD SB path should succeed");
+
+        let n = x.len();
+        for j in 0..n {
+            let tol = 1e-4 * (1.0 + grad_fd_sb[j].abs());
+            assert!(
+                (grad_muref_sb[j] - grad_fd_sb[j]).abs() < tol,
+                "SB grad[{j}]: mu-ref={:.6e}, FD={:.6e}, diff={:.2e}",
+                grad_muref_sb[j],
+                grad_fd_sb[j],
+                (grad_muref_sb[j] - grad_fd_sb[j]).abs()
+            );
+        }
+
+        // Laplace path (interaction = true)
+        let mut opts_lap = FitOptions::default();
+        opts_lap.interaction = true;
+
+        opts_lap.mu_referencing = true;
+        let (_, grad_muref_lap) = subject_nll_pop_grad_analytical_laplace(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &opts_lap,
+        )
+        .expect("mu-ref Laplace path should succeed");
+
+        opts_lap.mu_referencing = false;
+        let (_, grad_fd_lap) = subject_nll_pop_grad_analytical_laplace(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &opts_lap,
+        )
+        .expect("FD Laplace path should succeed");
+
+        for j in 0..n {
+            let tol = 1e-4 * (1.0 + grad_fd_lap[j].abs());
+            assert!(
+                (grad_muref_lap[j] - grad_fd_lap[j]).abs() < tol,
+                "Laplace grad[{j}]: mu-ref={:.6e}, FD={:.6e}, diff={:.2e}",
+                grad_muref_lap[j],
+                grad_fd_lap[j],
+                (grad_muref_lap[j] - grad_fd_lap[j]).abs()
+            );
+        }
+    }
+
+    /// Additive mu-refs (log_transformed: false) must NOT use the H-column
+    /// shortcut. Ferx packs all thetas as log(THETA), so for an additive pair
+    /// PARAM = THETA + ETA the identity ∂f/∂x_k = H[:,j] does not hold:
+    ///   ∂f/∂x_k = ∂f/∂(log THETA) = THETA · ∂f/∂PARAM
+    ///   ∂f/∂η   =                         1 · ∂f/∂PARAM   (≠ above unless THETA=1)
+    ///
+    /// This test registers an additive mu-ref and verifies that the gradient
+    /// with mu_referencing=true still equals the FD gradient (i.e. the shortcut
+    /// was skipped and FD was used as the fallback).
+    #[test]
+    fn test_mu_ref_additive_skipped() {
+        use crate::types::MuRef;
+
+        let mut model = make_model();
+        // Register an additive (non-log) mu-ref for TVCL.
+        model.mu_refs.insert(
+            "ETA_CL".into(),
+            MuRef {
+                theta_name: "TVCL".into(),
+                log_transformed: false,
+            },
+        );
+
+        let population = make_population();
+        let template = &model.default_params;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let n_obs = 3;
+        let n_eta = 1;
+        let eta_hat = DVector::from_vec(vec![0.05]);
+        let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![2.0, 1.5, 0.8]);
+
+        let mut opts = FitOptions::default();
+        opts.interaction = false;
+
+        // Both should use FD (shortcut skipped for additive), so results must match.
+        opts.mu_referencing = true;
+        let (_, grad_on) = subject_nll_pop_grad_analytical(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &opts,
+        )
+        .expect("should succeed");
+
+        opts.mu_referencing = false;
+        let (_, grad_off) = subject_nll_pop_grad_analytical(
+            &x,
+            template,
+            &model,
+            &population,
+            0,
+            &eta_hat,
+            &h_matrix,
+            &bounds,
+            &opts,
+        )
+        .expect("should succeed");
+
+        let n = x.len();
+        for j in 0..n {
+            assert!(
+                (grad_on[j] - grad_off[j]).abs() < 1e-10,
+                "additive mu-ref: grad[{j}] differed (shortcut was wrongly applied): \
+                 on={:.6e}, off={:.6e}",
+                grad_on[j],
+                grad_off[j]
             );
         }
     }
