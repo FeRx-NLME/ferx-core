@@ -2356,6 +2356,187 @@ mod tests {
         }
     }
 
+    /// IOV M-step gradient (`obs_nll_subject_grad_iov`) must match the forward-FD
+    /// of `obs_nll_subject_into_iov` in log-packed space. This guards the
+    /// analytical gradient that the gradient-based M-step would use — it is not
+    /// exercised by the default BOBYQA M-step (derivative-free), so without this
+    /// direct test the function is untested. Single subject, 2 occasions, κ on CL.
+    #[test]
+    fn obs_nll_subject_grad_iov_matches_fd() {
+        use crate::types::{
+            BloqMethod, CompiledModel, DoseEvent, ErrorModel, ErrorSpec, GradientMethod,
+            ModelParameters, OmegaMatrix, PkModel, PkParams, ScalingSpec, SigmaVector, Subject,
+        };
+        use std::collections::HashMap;
+
+        // Minimal IOV model: CL = TVCL·exp(ETA_CL + KAPPA_CL), V = TVV.
+        let model = CompiledModel {
+            name: "iov_grad_test".into(),
+            pk_model: PkModel::OneCptIv,
+            error_model: ErrorModel::Proportional,
+            error_spec: ErrorSpec::Single(ErrorModel::Proportional),
+            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
+                p.values[0] = theta[0] * (eta[0] + kappa).exp();
+                p.values[1] = theta[1];
+                p
+            }),
+            n_theta: 2,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 1,
+            kappa_names: vec!["KAPPA_CL".into()],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            indiv_param_partials: crate::types::IndivParamPartials::empty(),
+            default_params: ModelParameters {
+                theta: vec![5.0, 50.0],
+                theta_names: vec!["TVCL".into(), "TVV".into()],
+                theta_lower: vec![0.1, 5.0],
+                theta_upper: vec![50.0, 500.0],
+                theta_fixed: vec![false; 2],
+                omega: OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]),
+                omega_fixed: vec![false],
+                sigma: SigmaVector {
+                    values: vec![0.05],
+                    names: vec!["PROP_ERR".into()],
+                },
+                sigma_fixed: vec![false],
+                omega_iov: Some(OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()])),
+                kappa_fixed: vec![false],
+            },
+            omega_init_as_sd: vec![false],
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: vec![false],
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+        };
+
+        // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(3.5, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            observations: vec![36.0, 28.0, 21.0, 34.0, 26.0, 19.0],
+            obs_cmts: vec![1; 6],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 6],
+            occasions: vec![1, 1, 1, 2, 2, 2],
+            dose_occasions: vec![1, 2],
+        };
+
+        let theta = vec![5.0f64, 50.0];
+        let sigma = vec![0.05f64];
+        let eta = vec![0.1f64];
+        let kappas: Vec<Vec<f64>> = vec![vec![0.05], vec![-0.05]]; // one per occasion
+        let n_theta = 2;
+        let n_sigma = 1;
+        let n = n_theta + n_sigma;
+
+        let mut scratch = EventPkParams::default();
+        let (nll, grad) = obs_nll_subject_grad_iov(
+            &model,
+            &subject,
+            &theta,
+            &sigma,
+            &eta,
+            &kappas,
+            &[true, true, true],
+            &[-1e30; 3],
+            &[1e30; 3],
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+
+        // Reference: forward-FD of obs_nll_subject_into_iov in log-packed space.
+        let f0 = obs_nll_subject_into_iov(
+            &model,
+            &subject,
+            &theta,
+            &sigma,
+            &eta,
+            &kappas,
+            &mut scratch,
+        );
+        assert!((nll - f0).abs() < 1e-10, "nll mismatch: {nll} vs {f0}");
+
+        let h = 1e-6;
+        let mut ref_grad = vec![0.0f64; n];
+        for i in 0..n_theta {
+            let mut tp = theta.clone();
+            tp[i] += h;
+            let fp = obs_nll_subject_into_iov(
+                &model,
+                &subject,
+                &tp,
+                &sigma,
+                &eta,
+                &kappas,
+                &mut scratch,
+            );
+            ref_grad[i] = theta[i] * (fp - f0) / h; // d/d_log = theta · d/d_theta
+        }
+        {
+            let mut sp = sigma.clone();
+            sp[0] += h;
+            let fp = obs_nll_subject_into_iov(
+                &model,
+                &subject,
+                &theta,
+                &sp,
+                &eta,
+                &kappas,
+                &mut scratch,
+            );
+            ref_grad[n_theta] = sigma[0] * (fp - f0) / h;
+        }
+
+        for j in 0..n {
+            let rel = if ref_grad[j].abs() > 1e-8 {
+                (grad[j] - ref_grad[j]).abs() / ref_grad[j].abs()
+            } else {
+                (grad[j] - ref_grad[j]).abs()
+            };
+            assert!(
+                rel < 1e-4,
+                "grad[{j}]: analytical={:.6e}, fd={:.6e}, rel={:.2e}",
+                grad[j],
+                ref_grad[j],
+                rel
+            );
+        }
+    }
+
     /// Per-CMT (multi-endpoint) M-step gradient must match the forward-FD of
     /// `obs_nll_sum` — the correctness gate for the per-CMT `dvar_df` /
     /// `dvar_dlogsigma` score terms. Two endpoints with *different* error

@@ -2998,4 +2998,166 @@ mod tests {
              for the basin-trap regression rationale before adjusting."
         );
     }
+
+    // ── small pure helpers ───────────────────────────────────────────────────
+
+    /// Bare subject with no doses/observations; tests mutate the fields they
+    /// exercise.
+    fn bare_subject(id: &str) -> Subject {
+        Subject {
+            id: id.to_string(),
+            doses: Vec::new(),
+            obs_times: Vec::new(),
+            observations: Vec::new(),
+            obs_cmts: Vec::new(),
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: Vec::new(),
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+        }
+    }
+
+    fn dose(ss: bool) -> DoseEvent {
+        DoseEvent {
+            time: 0.0,
+            amt: 100.0,
+            cmt: 1,
+            rate: 0.0,
+            duration: 0.0,
+            ss,
+            ii: 0.0,
+        }
+    }
+
+    #[test]
+    fn subject_has_bloq_reflects_cens_flags() {
+        let mut s = bare_subject("1");
+        s.cens = vec![0, 0];
+        assert!(!s.has_bloq());
+        s.cens = vec![0, 1];
+        assert!(s.has_bloq());
+    }
+
+    #[test]
+    fn subject_has_ss_doses_detects_steady_state_flag() {
+        let mut s = bare_subject("1");
+        s.doses = vec![dose(false), dose(false)];
+        assert!(!s.has_ss_doses());
+        s.doses.push(dose(true));
+        assert!(s.has_ss_doses());
+    }
+
+    #[test]
+    fn subject_pk_only_cov_falls_back_to_static_map() {
+        let mut s = bare_subject("1");
+        s.covariates.insert("WT".to_string(), 70.0);
+        // No per-EVID-2 snapshots → static map.
+        assert_eq!(s.pk_only_cov(0).get("WT"), Some(&70.0));
+        // With a snapshot at index 0 → that snapshot.
+        let mut snap = HashMap::new();
+        snap.insert("WT".to_string(), 80.0);
+        s.pk_only_covariates = vec![snap];
+        assert_eq!(s.pk_only_cov(0).get("WT"), Some(&80.0));
+        // Out-of-range index → fall back to static map.
+        assert_eq!(s.pk_only_cov(5).get("WT"), Some(&70.0));
+    }
+
+    #[test]
+    fn prune_irrelevant_tv_covariates_clears_only_constant_referenced_covs() {
+        // Subject A: the referenced covariate (WT) is constant across snapshots
+        // but an unreferenced one (DAY) varies → snapshots should be pruned.
+        let mut a = bare_subject("A");
+        a.covariates = HashMap::from([("WT".to_string(), 70.0), ("DAY".to_string(), 1.0)]);
+        a.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0), ("DAY".to_string(), 1.0)]),
+            HashMap::from([("WT".to_string(), 70.0), ("DAY".to_string(), 2.0)]),
+        ];
+        // Subject B: the referenced covariate (WT) genuinely varies → keep.
+        let mut b = bare_subject("B");
+        b.covariates = HashMap::from([("WT".to_string(), 70.0)]);
+        b.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 90.0)]),
+        ];
+
+        let mut pop = Population {
+            subjects: vec![a, b],
+            covariate_names: vec!["WT".to_string(), "DAY".to_string()],
+            dv_column: "DV".to_string(),
+            input_columns: Vec::new(),
+        };
+        let pruned = pop.prune_irrelevant_tv_covariates(&["WT".to_string()]);
+        assert_eq!(pruned, 1, "only subject A should be pruned");
+        assert!(
+            pop.subjects[0].obs_covariates.is_empty(),
+            "A pruned to fast path"
+        );
+        assert!(
+            !pop.subjects[1].obs_covariates.is_empty(),
+            "B keeps TV snapshots"
+        );
+    }
+
+    #[test]
+    fn covariate_kind_label_strings() {
+        assert_eq!(CovariateKind::Continuous.label(), "continuous");
+        assert_eq!(CovariateKind::Categorical.label(), "categorical");
+    }
+
+    #[test]
+    fn scaling_spec_requires_fd_is_always_false() {
+        assert!(!ScalingSpec::None.requires_fd());
+        assert!(!ScalingSpec::ScalarScale(1000.0).requires_fd());
+        assert!(!ScalingSpec::PerCmt(HashMap::new()).requires_fd());
+    }
+
+    #[test]
+    fn estimation_method_label_covers_all_variants() {
+        assert_eq!(EstimationMethod::Foce.label(), "FOCE");
+        assert_eq!(EstimationMethod::FoceI.label(), "FOCEI");
+        assert_eq!(EstimationMethod::FoceGn.label(), "FOCE-GN");
+        assert_eq!(EstimationMethod::FoceGnHybrid.label(), "FOCE-GN-Hybrid");
+        assert_eq!(EstimationMethod::Saem.label(), "SAEM");
+        assert_eq!(EstimationMethod::Imp.label(), "IMP");
+    }
+
+    #[test]
+    fn model_parameters_has_any_fixed_tracks_every_flag_vec() {
+        let mut mp = test_helpers::analytical_model(GradientMethod::Fd).default_params;
+        mp.theta_fixed = vec![false];
+        mp.omega_fixed = vec![false];
+        mp.sigma_fixed = vec![false];
+        mp.kappa_fixed = Vec::new();
+        assert!(!mp.has_any_fixed());
+        mp.sigma_fixed = vec![true];
+        assert!(mp.has_any_fixed());
+    }
+
+    #[test]
+    fn pk_params_from_hashmap_maps_named_fields_and_aliases() {
+        let map = HashMap::from([
+            ("cl".to_string(), 5.0),
+            ("v1".to_string(), 30.0), // v1 alias → V index
+            ("q".to_string(), 2.0),
+            ("v2".to_string(), 50.0),
+            ("ka".to_string(), 1.2),
+            ("f".to_string(), 0.8),
+            ("q3".to_string(), 0.5),
+            ("v3".to_string(), 100.0),
+        ]);
+        let p = PkParams::from_hashmap(&map);
+        assert_eq!(p.values[PK_IDX_CL], 5.0);
+        assert_eq!(p.values[PK_IDX_V], 30.0);
+        assert_eq!(p.values[PK_IDX_Q], 2.0);
+        assert_eq!(p.values[PK_IDX_V2], 50.0);
+        assert_eq!(p.values[PK_IDX_KA], 1.2);
+        assert_eq!(p.values[PK_IDX_F], 0.8);
+        assert_eq!(p.values[PK_IDX_Q3], 0.5);
+        assert_eq!(p.values[PK_IDX_V3], 100.0);
+    }
 }
