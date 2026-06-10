@@ -1,5 +1,7 @@
 # ODE Models
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 For pharmacokinetic models without analytical solutions (e.g., saturable elimination, target-mediated drug disposition), ferx-core provides an ODE solver.
 
 ## Structural Model Declaration

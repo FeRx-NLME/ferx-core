@@ -727,6 +727,10 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
 /// non-fatal — `fit()` pushes their messages into `FitResult.warnings` and
 /// proceeds; `ferx check` reports them as `Warning` diagnostics. Message text
 /// is identical to the historical inline strings.
+///
+/// Feature-presence (data-independent) notices such as the experimental-feature
+/// warnings live in [`check_experimental_features`] instead, so `ferx check`
+/// surfaces them even without a `--data` file.
 pub fn check_model_data_warnings(
     model: &CompiledModel,
     population: &Population,
@@ -824,6 +828,46 @@ pub fn check_model_data_warnings(
     diags
 }
 
+/// Feature-presence (data-independent) *warning*-level checks for experimental
+/// features (issue #175). Stochastic differential equations and neural-network
+/// components are classified `experimental` in the Feature Maturity docs: tested
+/// only on a handful of toy examples. We emit a warning whenever they are used
+/// so results are applied with appropriate caution.
+///
+/// Kept separate from [`check_model_data_warnings`] because these depend only on
+/// the compiled `model`, not on the dataset — so `ferx check model.ferx` (no
+/// `--data`) and `fit()` both surface them. Non-fatal: `fit()` pushes the
+/// messages into `FitResult.warnings`; `ferx check` reports them as warnings.
+pub fn check_experimental_features(model: &CompiledModel) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+
+    if model.is_sde() {
+        diags.push(Diagnostic::warning(
+            "W_EXPERIMENTAL_SDE",
+            "Stochastic differential equations ([diffusion] / Extended Kalman \
+             Filter) are an EXPERIMENTAL feature: validated only on a small set \
+             of toy examples, with estimator support limited to FOCE/FOCEI. \
+             Standard errors and convergence behaviour are not yet proven across \
+             diverse datasets — validate results carefully before relying on \
+             them. See the Feature Maturity page in the documentation.",
+        ));
+    }
+    #[cfg(feature = "nn")]
+    if !model.covariate_nns.is_empty() {
+        diags.push(Diagnostic::warning(
+            "W_EXPERIMENTAL_NN",
+            "Neural-network model components ([covariate_nn] / deep compartment \
+             models) are an EXPERIMENTAL feature: validated only on a small set \
+             of toy examples. Standard errors for network weights are not \
+             reliable and the syntax may still change — validate results \
+             carefully before relying on them. See the Feature Maturity page in \
+             the documentation.",
+        ));
+    }
+
+    diags
+}
+
 /// Map a free-text parser error string to a single structured [`Diagnostic`].
 /// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the
 /// block name attached) and the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`);
@@ -896,6 +940,11 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    clean check and a fit agree. Uses the parsed `[fit_options]`, mirroring
     //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.
     diags.extend(check_model_options(&parsed.model, &parsed.fit_options));
+
+    // 2c. Experimental-feature notices (data-independent): these depend only on
+    //    the model, so they surface from `ferx check model.ferx` even without a
+    //    `--data` file.
+    diags.extend(check_experimental_features(&parsed.model));
 
     // 3. Data-dependent checks (only when a dataset is supplied). Read through
     //    the same covariate-aware chokepoint the fit uses, so `ferx check` and
@@ -2178,6 +2227,10 @@ fn fit_inner(
     // message text is unchanged. Probed against `population` (not the pruned
     // copy) and `init_params`, matching the historical inline checks.
     for d in check_model_data_warnings(model, population, init_params) {
+        accumulated_warnings.push(d.message);
+    }
+    // Experimental-feature notices (data-independent; see check_experimental_features).
+    for d in check_experimental_features(model) {
         accumulated_warnings.push(d.message);
     }
     if options.run_covariance_step && n_params_pre > 30 {
@@ -5522,6 +5575,34 @@ mod sde_integration {
                 "error message should mention gn: {msg}"
             );
         }
+    }
+
+    /// Issue #175: an SDE ([diffusion]) model must surface the experimental
+    /// feature warning, classified into the `experimental` category. The check
+    /// is data-independent (`check_experimental_features` takes only the model),
+    /// so `ferx check` reports it even without a `--data` file. Fast — no fit.
+    #[test]
+    fn sde_emits_experimental_warning() {
+        let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
+        let diags = super::check_experimental_features(&parsed.model);
+        let exp = diags
+            .iter()
+            .find(|d| d.code == "W_EXPERIMENTAL_SDE")
+            .expect("SDE model should emit W_EXPERIMENTAL_SDE");
+        assert_eq!(exp.severity, crate::diagnostics::Severity::Warning);
+        assert_eq!(
+            crate::types::classify_warning(&exp.message).category,
+            "experimental"
+        );
+
+        // Sanity: a non-SDE model must NOT emit the experimental warning.
+        let base = parse_full_model(BASE_MODEL_SRC).expect("base model should parse");
+        assert!(
+            super::check_experimental_features(&base.model)
+                .iter()
+                .all(|d| d.code != "W_EXPERIMENTAL_SDE"),
+            "non-SDE model should not emit W_EXPERIMENTAL_SDE"
+        );
     }
 }
 

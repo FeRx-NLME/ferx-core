@@ -1,5 +1,7 @@
 # Error Model
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 The `[error_model]` block defines the residual error structure, specifying how observed data (DV) relates to model predictions.
 
 ## Syntax

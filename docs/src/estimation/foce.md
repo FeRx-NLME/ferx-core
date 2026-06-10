@@ -1,5 +1,7 @@
 # FOCE / FOCEI
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 First-Order Conditional Estimation (FOCE) and its interaction variant (FOCEI) are the primary estimation methods in ferx-core. They use a two-level nested optimization to find maximum likelihood estimates of population parameters.
 
 ## Algorithm Overview

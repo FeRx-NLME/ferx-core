@@ -1,5 +1,7 @@
 # Time-to-Event Endpoints (`[event_model]`)
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 The `[event_model]` block registers a CMT column as a TTE (time-to-event)
 endpoint.  Observations on that CMT are routed to a parametric survival
 likelihood rather than the Gaussian residual-error model.

@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Feature maturity labels (`stable` / `beta` / `experimental`) documented for
+  every major feature: a new *Feature Maturity* docs page with definitions and a
+  per-feature table, plus a maturity banner on each feature reference page.
+  Experimental features (`[diffusion]` / SDE, `[covariate_nn]` / neural networks)
+  now emit a runtime warning at fit time (`W_EXPERIMENTAL_SDE`,
+  `W_EXPERIMENTAL_NN`), also surfaced by `ferx check` (#175).
 - `covariance_matrix:` block in `*-fit.yaml`: the full optimizer-space parameter
   covariance matrix (log-theta, Cholesky-omega, log-sigma; kappa appended for IOV
   models), parameter-labelled, emitted when the covariance step succeeds or is

@@ -1,5 +1,7 @@
 # Parameters
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 The `[parameters]` block defines all model parameters: fixed effects (theta), between-subject variability (omega), and residual error (sigma).
 
 ## Theta (Fixed Effects)

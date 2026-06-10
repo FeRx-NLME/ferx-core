@@ -1,5 +1,7 @@
 # Individual Parameters
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 The `[individual_parameters]` block defines how population parameters (theta), random effects (eta), and covariates combine to produce individual PK parameters.
 
 ## Syntax

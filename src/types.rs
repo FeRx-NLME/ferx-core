@@ -1836,8 +1836,8 @@ pub enum WarningSeverity {
 /// `bloq_method`, `sir`, `importance_sampling`, `data_quality`,
 /// `omega_structure`, `ebe_convergence`, `gradient_fallback`,
 /// `mu_referencing`, `optimizer_config`, `multi_start`, `cancelled`,
-/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`, `general`
-/// (fallback for unrecognised messages).
+/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`,
+/// `experimental`, `general` (fallback for unrecognised messages).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WarningEntry {
     pub severity: WarningSeverity,
@@ -1914,6 +1914,10 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, "dw_autocorrelation")
     } else if lower.contains("shapiro") || lower.contains("non-normal") {
         (WarningSeverity::Warning, "eta_normality")
+    } else if lower.contains("experimental feature") {
+        // Experimental-feature notices (issue #175): SDE and neural-network
+        // components emit a runtime warning so results are applied with caution.
+        (WarningSeverity::Warning, "experimental")
     } else if lower.contains("m3 bloq") || lower.contains("bloq handling") {
         (WarningSeverity::Warning, "bloq_method")
     } else if lower.contains("sir failed") || lower.contains("sir requested") {
@@ -3126,6 +3130,18 @@ mod tests {
                 "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
                 Warning,
                 "data_quality",
+            ),
+            (
+                "Stochastic differential equations ([diffusion] / Extended Kalman \
+                 Filter) are an EXPERIMENTAL feature: validated only on a small set",
+                Warning,
+                "experimental",
+            ),
+            (
+                "Neural-network model components ([covariate_nn] / deep compartment \
+                 models) are an EXPERIMENTAL feature: validated only on a small set",
+                Warning,
+                "experimental",
             ),
             (
                 "block omega: ETA_CL x ETA_V have mixed lognormal / additive parameterisations",

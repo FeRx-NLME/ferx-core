@@ -66,6 +66,8 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 | `W_STEADY_STATE_II` | warning | SS=1 doses with missing / non-positive `II` (treated as non-SS). |
 | `W_STEADY_STATE_INFUSION` | warning | SS=1 infusion with `T_inf > II` (overlapping pulses; SS skipped). |
 | `W_SDE_RESET` | warning | EVID=3/4 resets under an SDE `[diffusion]` model are not honoured. |
+| `W_EXPERIMENTAL_SDE` | warning | The model uses stochastic differential equations (`[diffusion]`), an [experimental](../maturity.md) feature. |
+| `W_EXPERIMENTAL_NN` | warning | The model uses neural-network components (`[covariate_nn]`), an [experimental](../maturity.md) feature. |
 | `W_NEGATIVE_LAGTIME` | warning | Lag time is negative at the initial typical-value point. |
 | `E_DERIVED_NAME_CONFLICT` | error | A `[derived]` name clashes with a built-in sdtab column, theta, eta, or individual-parameter name. |
 | `W_DERIVED_COVARIATE_SHADOW` | warning | A `[derived]` name shadows a covariate (allowed but may be confusing). |

@@ -1,5 +1,7 @@
 # Lagtime
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 A `lagtime` PK parameter shifts the effective start of every dose record by
 a fixed amount. This is the standard way to model delayed-onset oral
 absorption: even after the dose is administered at clock time `t_dose`,
