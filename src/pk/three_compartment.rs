@@ -418,6 +418,273 @@ pub fn three_cpt_oral_ss(
     three_cpt_oral_f_ss(dose, t, cl, v1, q2, v2, q3, v3, ka, 1.0)
 }
 
+// --- Peripheral compartment concentrations (for compartment_states) ---
+
+/// Returns [C_periph1, C_periph2] for a 3-cpt IV single dose at elapsed time tau.
+///
+/// Peripheral 1 (V2): C2 = (q2/(v1·v2)) · dose.amt ·
+///   [ −(α−k31)/(ab·ag)·e^{-αt} + (β−k31)/(ab·bg)·e^{-βt} − (γ−k31)/(ag·bg)·e^{-γt} ]
+/// Peripheral 2 (V3): swap k31↔k21 and q2/v2 → q3/v3.
+pub(crate) fn three_cpt_iv_peripherals(
+    dose: &DoseEvent,
+    tau: f64,
+    cl: f64,
+    v1: f64,
+    q2: f64,
+    v2: f64,
+    q3: f64,
+    v3: f64,
+) -> [f64; 2] {
+    if tau < 0.0 || v1 <= 0.0 || v2 <= 0.0 || v3 <= 0.0 || cl <= 0.0 || q2 < 0.0 || q3 < 0.0 {
+        return [0.0; 2];
+    }
+    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
+    let ab = alpha - beta;
+    let ag = alpha - gamma;
+    let bg = beta - gamma;
+    if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
+        return [0.0; 2];
+    }
+
+    let c2_scalar = q2 / (v1 * v2); // k12/v2
+    let c3_scalar = q3 / (v1 * v3); // k13/v3
+    let d = dose.amt;
+
+    if dose.ss && dose.ii > 0.0 {
+        let ii = dose.ii;
+        if dose.is_infusion() {
+            let dur = dose.duration;
+            if dur <= 0.0 {
+                // Treat as bolus SS
+                let c2 = c2_scalar
+                    * d
+                    * (-(alpha - k31) / (ab * ag) * (-alpha * tau).exp() * ss_coeff_3(alpha, ii)
+                        + (beta - k31) / (ab * bg) * (-beta * tau).exp() * ss_coeff_3(beta, ii)
+                        - (gamma - k31) / (ag * bg) * (-gamma * tau).exp() * ss_coeff_3(gamma, ii));
+                let c3 = c3_scalar
+                    * d
+                    * (-(alpha - k21) / (ab * ag) * (-alpha * tau).exp() * ss_coeff_3(alpha, ii)
+                        + (beta - k21) / (ab * bg) * (-beta * tau).exp() * ss_coeff_3(beta, ii)
+                        - (gamma - k21) / (ag * bg) * (-gamma * tau).exp() * ss_coeff_3(gamma, ii));
+                return [c2, c3];
+            }
+            if dur > dose.ii {
+                return [0.0; 2];
+            }
+            // Helper for infusion SS peripheral (after-infusion formula with SS coeff)
+            let infusion_periph_ss = |c_scalar: f64, k_far: f64| -> f64 {
+                let r = dose.rate;
+                // After-infusion peripheral formula with SS geometric series:
+                // coeff_X = rate · c_scalar · (X_eigenvalue_residue) / (product · eigenvalue)
+                let coeff_a = -r * c_scalar * (alpha - k_far) / (ab * ag * alpha);
+                let coeff_b = r * c_scalar * (beta - k_far) / (ab * bg * beta);
+                let coeff_g = -r * c_scalar * (gamma - k_far) / (ag * bg * gamma);
+                if tau <= dur {
+                    let cur = coeff_a * (1.0 - (-alpha * tau).exp())
+                        + coeff_b * (1.0 - (-beta * tau).exp())
+                        + coeff_g * (1.0 - (-gamma * tau).exp());
+                    let past = coeff_a
+                        * (1.0 - (-alpha * dur).exp())
+                        * (-alpha * (tau - dur)).exp()
+                        * (-alpha * dose.ii).exp()
+                        * ss_coeff_3(alpha, ii)
+                        + coeff_b
+                            * (1.0 - (-beta * dur).exp())
+                            * (-beta * (tau - dur)).exp()
+                            * (-beta * dose.ii).exp()
+                            * ss_coeff_3(beta, ii)
+                        + coeff_g
+                            * (1.0 - (-gamma * dur).exp())
+                            * (-gamma * (tau - dur)).exp()
+                            * (-gamma * dose.ii).exp()
+                            * ss_coeff_3(gamma, ii);
+                    cur + past
+                } else {
+                    let dt = tau - dur;
+                    coeff_a
+                        * (1.0 - (-alpha * dur).exp())
+                        * (-alpha * dt).exp()
+                        * ss_coeff_3(alpha, ii)
+                        + coeff_b
+                            * (1.0 - (-beta * dur).exp())
+                            * (-beta * dt).exp()
+                            * ss_coeff_3(beta, ii)
+                        + coeff_g
+                            * (1.0 - (-gamma * dur).exp())
+                            * (-gamma * dt).exp()
+                            * ss_coeff_3(gamma, ii)
+                }
+            };
+            [
+                infusion_periph_ss(c2_scalar, k31),
+                infusion_periph_ss(c3_scalar, k21),
+            ]
+        } else {
+            // Bolus SS
+            let c2 = c2_scalar
+                * d
+                * (-(alpha - k31) / (ab * ag) * (-alpha * tau).exp() * ss_coeff_3(alpha, ii)
+                    + (beta - k31) / (ab * bg) * (-beta * tau).exp() * ss_coeff_3(beta, ii)
+                    - (gamma - k31) / (ag * bg) * (-gamma * tau).exp() * ss_coeff_3(gamma, ii));
+            let c3 = c3_scalar
+                * d
+                * (-(alpha - k21) / (ab * ag) * (-alpha * tau).exp() * ss_coeff_3(alpha, ii)
+                    + (beta - k21) / (ab * bg) * (-beta * tau).exp() * ss_coeff_3(beta, ii)
+                    - (gamma - k21) / (ag * bg) * (-gamma * tau).exp() * ss_coeff_3(gamma, ii));
+            [c2, c3]
+        }
+    } else if dose.is_infusion() {
+        let dur = dose.duration;
+        if dur <= 0.0 {
+            let c2 = c2_scalar
+                * d
+                * (-(alpha - k31) / (ab * ag) * (-alpha * tau).exp()
+                    + (beta - k31) / (ab * bg) * (-beta * tau).exp()
+                    - (gamma - k31) / (ag * bg) * (-gamma * tau).exp());
+            let c3 = c3_scalar
+                * d
+                * (-(alpha - k21) / (ab * ag) * (-alpha * tau).exp()
+                    + (beta - k21) / (ab * bg) * (-beta * tau).exp()
+                    - (gamma - k21) / (ag * bg) * (-gamma * tau).exp());
+            return [c2, c3];
+        }
+        let infusion_periph = |c_scalar: f64, k_far: f64| -> f64 {
+            let r = dose.rate;
+            let coeff_a = -r * c_scalar * (alpha - k_far) / (ab * ag * alpha);
+            let coeff_b = r * c_scalar * (beta - k_far) / (ab * bg * beta);
+            let coeff_g = -r * c_scalar * (gamma - k_far) / (ag * bg * gamma);
+            if tau <= dur {
+                coeff_a * (1.0 - (-alpha * tau).exp())
+                    + coeff_b * (1.0 - (-beta * tau).exp())
+                    + coeff_g * (1.0 - (-gamma * tau).exp())
+            } else {
+                let dt = tau - dur;
+                coeff_a * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
+                    + coeff_b * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
+                    + coeff_g * (1.0 - (-gamma * dur).exp()) * (-gamma * dt).exp()
+            }
+        };
+        [
+            infusion_periph(c2_scalar, k31),
+            infusion_periph(c3_scalar, k21),
+        ]
+    } else {
+        // Single-dose bolus
+        let c2 = c2_scalar
+            * d
+            * (-(alpha - k31) / (ab * ag) * (-alpha * tau).exp()
+                + (beta - k31) / (ab * bg) * (-beta * tau).exp()
+                - (gamma - k31) / (ag * bg) * (-gamma * tau).exp());
+        let c3 = c3_scalar
+            * d
+            * (-(alpha - k21) / (ab * ag) * (-alpha * tau).exp()
+                + (beta - k21) / (ab * bg) * (-beta * tau).exp()
+                - (gamma - k21) / (ag * bg) * (-gamma * tau).exp());
+        [c2, c3]
+    }
+}
+
+/// Returns [C_periph1, C_periph2] for a 3-cpt oral single dose at elapsed time tau.
+///
+/// C2(t) = D·(q2/v2) · [ −(α−k31)/((ka−α)·ab·ag) · e^(−ατ)
+///                        + (β−k31)/((ka−β)·ab·bg) · e^(−βτ)
+///                        − (γ−k31)/((ka−γ)·ag·bg) · e^(−γτ)
+///                        + (k31−ka)/((α−ka)(β−ka)(γ−ka)) · e^(−kaτ) ]
+/// and C3 likewise with k21 substituted for k31 and (q3/v3) for (q2/v2).
+/// Each exp term gains a 1/(1−e^(−λ·II)) factor at steady state.
+/// Returns 0 when ka ≈ any eigenvalue (L'Hôpital singularity, see body).
+pub(crate) fn three_cpt_oral_peripherals(
+    dose: &DoseEvent,
+    tau: f64,
+    cl: f64,
+    v1: f64,
+    q2: f64,
+    v2: f64,
+    q3: f64,
+    v3: f64,
+    ka: f64,
+    f_bio: f64,
+) -> [f64; 2] {
+    // This function implements the bolus-only oral formula (depot → central → peripherals).
+    // Infusion doses bypass the depot compartment entirely and must be routed through
+    // `three_cpt_infusion`/`three_cpt_iv_peripherals` by the caller — see `three_cpt_predict`.
+    debug_assert!(
+        !dose.is_infusion(),
+        "three_cpt_oral_peripherals called with an infusion dose — route infusions through three_cpt_iv_peripherals"
+    );
+    if tau < 0.0
+        || v1 <= 0.0
+        || v2 <= 0.0
+        || v3 <= 0.0
+        || cl <= 0.0
+        || q2 < 0.0
+        || q3 < 0.0
+        || ka <= 0.0
+    {
+        return [0.0; 2];
+    }
+    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
+    let ab = alpha - beta;
+    let ag = alpha - gamma;
+    let bg = beta - gamma;
+    if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
+        return [0.0; 2];
+    }
+
+    let d = f_bio * dose.amt * ka / v1;
+    let q2_over_v2 = q2 / v2;
+    let q3_over_v3 = q3 / v3;
+
+    // When ka ≈ any eigenvalue the (ka−λ) residue denominators below are
+    // singular (a genuine L'Hôpital case). The finite limit is algebraically
+    // complex; we conservatively zero the *entire* peripheral result. This
+    // matches the 2-cpt oral peripheral and the edge case (ka coinciding with
+    // a 3-cpt eigenvalue) is rare in real PK data. The central concentration is
+    // unaffected (handled separately in the central formula).
+    if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 || (ka - gamma).abs() < 1e-6 {
+        return [0.0, 0.0];
+    }
+
+    // Per-exponential term, with steady-state geometric accumulation when SS.
+    // The single-dose solution is a sum of exp(−λτ) terms (λ ∈ {α,β,γ,ka}); SS
+    // superposition applies the 1/(1−exp(−λ·II)) factor to each independently.
+    let term = |lambda: f64| -> f64 {
+        let base = (-lambda * tau).exp();
+        if dose.ss && dose.ii > 0.0 {
+            base * ss_coeff_3(lambda, dose.ii)
+        } else {
+            base
+        }
+    };
+
+    // Closed form (issue #205, NONMEM-validated). In Laplace space the central
+    // *amount* after oral input is
+    //   A1(s) = F·D·ka·(s+k21)(s+k31) / [(s+ka)(s+α)(s+β)(s+γ)],
+    // so the peripheral amounts are
+    //   A2(s) = k12·A1(s)/(s+k21) = F·D·ka·k12·(s+k31) / [(s+ka)(s+α)(s+β)(s+γ)]
+    //   A3(s) = k13·A1(s)/(s+k31) = F·D·ka·k13·(s+k21) / [(s+ka)(s+α)(s+β)(s+γ)]
+    // — the coupling pole cancels, leaving four poles. Inverting and dividing
+    // by the peripheral volume gives a residue on each exp(−λτ), λ ∈ {α,β,γ,ka}.
+    // (The prior implementation multiplied each eigenvalue residue by a Bateman
+    // helper, introducing a spurious extra 1/(ka−λ) and a double-counted
+    // exp(−ka·τ) pole — it produced wrong, often negative, peripheral states.)
+    let c2 = q2_over_v2
+        * d
+        * (-(alpha - k31) / ((ka - alpha) * ab * ag) * term(alpha)
+            + (beta - k31) / ((ka - beta) * ab * bg) * term(beta)
+            - (gamma - k31) / ((ka - gamma) * ag * bg) * term(gamma)
+            + (k31 - ka) / ((alpha - ka) * (beta - ka) * (gamma - ka)) * term(ka));
+
+    let c3 = q3_over_v3
+        * d
+        * (-(alpha - k21) / ((ka - alpha) * ab * ag) * term(alpha)
+            + (beta - k21) / ((ka - beta) * ab * bg) * term(beta)
+            - (gamma - k21) / ((ka - gamma) * ag * bg) * term(gamma)
+            + (k21 - ka) / ((alpha - ka) * (beta - ka) * (gamma - ka)) * term(ka));
+
+    [c2, c3]
+}
+
 /// Predict concentration from a single dose at elapsed time t using 3-cmt model.
 pub fn three_cpt_predict(
     dose: &DoseEvent,
@@ -462,6 +729,30 @@ mod tests {
 
     fn infusion_dose(amt: f64, rate: f64) -> DoseEvent {
         DoseEvent::new(0.0, amt, 1, rate, false, 0.0)
+    }
+
+    /// Regression guard for the `three_cpt_oral_peripherals` fix (issue #205).
+    /// Reference peripheral *concentrations* are NONMEM 7.5.1 ADVAN12 TRANS4
+    /// amounts `A(3)`/`A(4)` divided by the peripheral volumes (V2=20, V3=30);
+    /// see `tests/nonmem/oral3.ctl`. Dose 100 to depot, CL=5 V1=10 Q2=2 V2=20
+    /// Q3=1.5 V3=30 KA=1. The previous (Bateman-helper) implementation returned
+    /// negative, ~30× too large values here.
+    #[test]
+    fn oral_peripherals_match_nonmem() {
+        let dose = bolus_dose(100.0);
+        // (tau, periph1_conc = A(3)/20, periph2_conc = A(4)/30)
+        let refs = [
+            (0.5, 1.8163070319 / 20.0, 1.3744591951 / 30.0),
+            (1.0, 5.3388312327 / 20.0, 4.0814462953 / 30.0),
+            (4.0, 17.378583631 / 20.0, 14.498493707 / 30.0),
+            (12.0, 12.175881952 / 20.0, 13.856525401 / 30.0),
+        ];
+        for (tau, p1_ref, p2_ref) in refs {
+            let [p1, p2] =
+                three_cpt_oral_peripherals(&dose, tau, 5.0, 10.0, 2.0, 20.0, 1.5, 30.0, 1.0, 1.0);
+            assert_relative_eq!(p1, p1_ref, max_relative = 1e-4);
+            assert_relative_eq!(p2, p2_ref, max_relative = 1e-4);
+        }
     }
 
     // Typical 3-cpt PK parameters

@@ -10,10 +10,11 @@
 # Reference (simulated): TVLAMBDA = 0.05 h^-1, omega(ETA_LAMBDA) = 0.09.
 # Administrative censoring at t = 30 h.
 #
-# Note: the [structural_model] and [error_model] blocks are syntactically
-# required by the parser; they are inert here because no Gaussian (CMT-1)
-# observations exist in the dataset. sigma and the dummy CL/V carry zero
-# gradient signal and stay at their initial values.
+# Note: this example keeps the legacy dummy PK blocks for historical reference.
+# The parser now allows [structural_model], [error_model], and
+# [individual_parameters] to be omitted for TTE-only models — see
+# examples/tte_weibull.ferx and examples/tte_gompertz.ferx for the compact
+# TTE-only syntax (no dummy blocks needed).
 
 [parameters]
   theta TVLAMBDA(0.05, 0.001, 10.0)

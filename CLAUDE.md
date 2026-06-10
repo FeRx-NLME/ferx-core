@@ -12,6 +12,10 @@ The R wrapper package lives at `../ferx-r` (sibling directory). The R package's 
 
 Note that ferx-r's **CI** does not get the change automatically: it builds from the ferx-core commit pinned in `ferx-r/src/rust/Cargo.lock` (the patch only applies locally). A ferx-r PR that needs a new ferx-core commit — e.g. a newly-`pub` API — must bump that lock, via `ferx-r/tools/update-ferx-core-lock.sh` (never a bare `cargo update`, which the patch will unpin). Otherwise CI fails with `error[E0603]: ... is private`.
 
+## Worktree isolation
+
+When working on a feature branch or any branch other than `main`, always use `EnterWorktree` at the start of the session. This prevents uncommitted WIP from one session contaminating another session on a different branch (a real problem when two chats share the same checkout directory).
+
 ## First-time setup
 
 After cloning, activate the shared pre-commit hook (blocks commits that fail `rustfmt`):
@@ -179,6 +183,24 @@ let disc = { let x = s * s - 4.0 * d; if x > 0.0 { x.sqrt() } else { 0.0 } };
 The same restriction applies to any helper the AD code calls transitively — `macro_rates`, `macro_rates_three_cpt_ad`, etc. The analytical PK functions in `pk/` are fine to use `.max()`/`.min()` because they're called from the non-AD path; only the inlined AD duplicates (in `ad/ad_gradients.rs`) need this care.
 
 This restriction will go away once Enzyme upstream adds rules for the newer intrinsics — track at https://github.com/EnzymeAD/Enzyme/issues. When removing the workaround, re-enable a representative test under CI with the `autodiff` feature to catch regressions.
+
+## Changelog
+
+User-facing changes are tracked in `CHANGELOG.md` at the repo root, in
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format with
+[semantic versioning](https://semver.org/).
+
+**In the same PR as any user-facing change, add a one-line entry under the
+`## [Unreleased]` heading** in the correct category (`Added`, `Changed`,
+`Deprecated`, `Removed`, `Fixed`, `Security`, or `Performance`). Write it in
+user-facing language and reference the issue/PR number (`#NN`). A PR that only
+touches internal refactors, tests, or CI does not need an entry.
+
+At release time (not per-PR), `## [Unreleased]` is renamed to the new version
+with a date, a fresh empty `## [Unreleased]` is started, and the compare links
+at the bottom are updated. The R wrapper (`../ferx-r`) tracks its own
+user-facing changes in `NEWS.md`, so a cross-repo change may need an entry in
+both.
 
 ## Pull Requests
 

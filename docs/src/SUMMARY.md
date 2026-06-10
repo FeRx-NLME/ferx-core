@@ -62,3 +62,6 @@
   - [Simulation](api/simulation.md)
   - [Parsing](api/parsing.md)
 - [FAQ](faq.md)
+- [Development](development/README.md)
+  - [Contributing to FeRx development](development/contributing.md)
+  - [Development Lifecycle (SDLC)](development/sdlc.md)

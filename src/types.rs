@@ -1609,6 +1609,37 @@ impl CompiledModel {
     pub fn residual_variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         self.error_spec.variance_at(cmt, f_pred, sigma)
     }
+
+    /// Canonical compartment names for analytical models, used in `[derived]` expressions.
+    /// For ODE models use `ode_spec.state_names` instead.
+    /// Returns a `'static` slice so it can be used in `DerivedContext` without lifetime issues.
+    pub fn analytical_compartment_names(&self) -> &'static [String] {
+        debug_assert!(
+            self.ode_spec.is_none(),
+            "analytical_compartment_names called on an ODE model — use ode_spec.state_names instead"
+        );
+        use std::sync::OnceLock;
+        macro_rules! names {
+            ($lock:ident, $($name:expr),+) => {{
+                static $lock: OnceLock<Vec<String>> = OnceLock::new();
+                $lock.get_or_init(|| vec![$($name.to_string()),+]).as_slice()
+            }};
+        }
+        match self.pk_model {
+            PkModel::OneCptIv => names!(ONE_CMT_IV, "central"),
+            PkModel::OneCptOral => names!(ONE_CMT_ORAL, "depot", "central"),
+            PkModel::TwoCptIv => names!(TWO_CMT_IV, "central", "peripheral"),
+            PkModel::TwoCptOral => names!(TWO_CMT_ORAL, "depot", "central", "peripheral"),
+            PkModel::ThreeCptIv => names!(THREE_CMT_IV, "central", "peripheral1", "peripheral2"),
+            PkModel::ThreeCptOral => names!(
+                THREE_CMT_ORAL,
+                "depot",
+                "central",
+                "peripheral1",
+                "peripheral2"
+            ),
+        }
+    }
 }
 
 impl std::fmt::Debug for CompiledModel {
@@ -1647,6 +1678,16 @@ pub struct SubjectResult {
     /// blocks exist. Empty if those conditions are not met; output.rs falls back to
     /// a lagtime=0 approximation in that case (correct for the common case).
     pub per_obs_tad: Vec<f64>,
+    /// Full compartment state vector at each observation time. For ODE models this
+    /// is the raw solver state `u[i]` in whatever units the ODE defines (typically
+    /// amounts for standard PK ODEs). For SDE models (`[diffusion]` block), these are
+    /// the deterministic ODE states, not EKF-filtered states. For analytical models
+    /// this is the natural per-compartment value (amounts for depot, concentrations for
+    /// central/peripheral). Indexed `[obs_j][cmt_i]`.
+    /// Empty for IOV subjects and analytical TV-covariate subjects (those cases yield
+    /// NaN in `[derived]`; see W_DERIVED_CMT_IOV_UNSUPPORTED / W_DERIVED_CMT_TV_ANALYTICAL).
+    /// Scaling (`apply_scaling`, Form A/C) is never applied here — only `ipred` is scaled.
+    pub compartment_states: Vec<Vec<f64>>,
 }
 
 // ── Derived expression types ──────────────────────────────────────────────────
@@ -1664,6 +1705,15 @@ pub struct DerivedContext<'a> {
     pub tafd: f64,
     pub tad: f64,
     pub prev_derived: &'a HashMap<String, f64>,
+    /// Raw compartment state at this observation time. For ODE models this is
+    /// the solver state `u[i]`; for SDE models these are deterministic ODE states
+    /// (not EKF-filtered). For analytical models it follows the convention in
+    /// the `compartment_states` docs on `SubjectResult`. Empty slice for IOV subjects,
+    /// analytical TV-covariate subjects, and grid-integral points when
+    /// `uses_compartments` is false.
+    pub compartments: &'a [f64],
+    /// Names parallel to `compartments` — ODE state names or analytical names.
+    pub compartment_names: &'a [String],
 }
 
 pub type DerivedEvalFn = Box<dyn Fn(&DerivedContext<'_>) -> f64 + Send + Sync>;
@@ -1672,6 +1722,10 @@ pub type DerivedFilterFn = Box<dyn Fn(&DerivedContext<'_>) -> bool + Send + Sync
 pub struct DerivedExprSpec {
     pub name: String,
     pub kind: DerivedKind,
+    /// True if any sub-expression in `kind` references `compartments[i]` or a
+    /// named ODE state variable.  Used to gate `W_DERIVED_CMT_*` warnings so
+    /// they fire only when compartment states are actually requested.
+    pub uses_compartments: bool,
 }
 
 pub enum DerivedKind {
@@ -1691,6 +1745,10 @@ pub enum DerivedKind {
         condition: Option<DerivedFilterFn>,
         /// True when integrand references DV → use observation times only.
         data_based: bool,
+        /// True when the integrand references `compartments[i]` or a named ODE
+        /// state variable. When true and the integral uses a fine grid, the ODE
+        /// solver (or analytical formula) is re-run at grid points for accuracy.
+        uses_compartments: bool,
         window: IntegralWindow,
         step: IntegralStep,
     },
@@ -1850,13 +1908,29 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("no multi-start run converged")
     {
         (WarningSeverity::Critical, "convergence")
-    } else if lower.contains("covariance step failed") || lower.contains("covariance failed") {
-        // "ses not available" and "se not available" intentionally omitted:
-        // the only emitter ("Covariance step failed — SEs not available") already
-        // hits "covariance step failed" above, and bare "se not available" is too
-        // broad to safely match future messages.
+    } else if lower.contains("covariance step failed")
+        || lower.contains("covariance failed")
+        || (lower.contains("covariance step") && lower.contains("not positive definite"))
+    {
+        // "ses not available" intentionally omitted — too broad.
+        // The compound check catches format_non_pd_warning ("Covariance step:
+        // Hessian is not positive definite") whose prefix differs from "failed:"
+        // messages. It must be compound so that "SIR failed: covariance not
+        // positive definite" (no "covariance step" token) still routes to "sir".
         (WarningSeverity::Critical, "covariance_step")
+    } else if lower.contains("covariance step regularized")
+        || lower.contains("off-diagonal fd stencil")
+    {
+        // Regularisation warning and off-diagonal NaN soft warning both indicate a
+        // degraded-but-present covariance step result. Severity within the message
+        // (minor/moderate/severe, or "over-optimistic") informs guidance; the
+        // category is always covariance_step.
+        (WarningSeverity::Warning, "covariance_step")
     } else if lower.contains("ill-conditioned") || lower.contains("condition number") {
+        // Note: "covariance step failed: Hessian has ill-conditioned entries" contains
+        // "ill-conditioned" but is caught by "covariance step failed" above (else-if chain).
+        // Any future covariance message that contains "ill-conditioned" but NOT "failed:"
+        // would land here instead — keep this ordering in mind when adding new messages.
         (WarningSeverity::Critical, "condition_number")
     } else if lower.contains("trust radius") || lower.contains("degenerate") {
         (WarningSeverity::Warning, "optimizer_health")
@@ -2242,6 +2316,12 @@ pub struct FitOptions {
     pub inner_maxiter: usize,
     pub inner_tol: f64,
     pub run_covariance_step: bool,
+    /// Relative step size for the finite-difference Hessian in the covariance step.
+    /// The actual step for parameter i is `fd_hessian_step * (1 + |x_hat[i]|)`.
+    /// Default `1e-2`. Increase (e.g. `0.1`) when the default produces non-finite
+    /// Hessian entries; decrease (e.g. `1e-3`) for smoother OFV surfaces where
+    /// FD noise is the main concern.
+    pub fd_hessian_step: f64,
     pub interaction: bool,
     pub verbose: bool,
     pub optimizer: Optimizer,
@@ -2481,6 +2561,7 @@ impl Default for FitOptions {
             // tighter EBEs (e.g. very-small-data simulation work).
             inner_tol: 1e-4,
             run_covariance_step: true,
+            fd_hessian_step: 1e-2,
             interaction: true,
             verbose: true,
             // BOBYQA — derivative-free quadratic trust-region. Chosen as the
@@ -2724,6 +2805,7 @@ impl FitOptions {
 pub fn framework_keys() -> &'static [&'static str] {
     &[
         "covariance",
+        "fd_hessian_step",
         "verbose",
         "sir",
         "sir_samples",
@@ -3109,9 +3191,92 @@ mod tests {
                 Info,
                 "covariance_step",
             ),
+            // format_non_pd_warning path (NonPdHessian variant).
+            (
+                "Covariance step: Hessian is not positive definite. \
+                 Eigenvalues: [8.4000, 2.1000, -0.0100]. SE estimates not available.",
+                Critical,
+                "covariance_step",
+            ),
+            // Covariance step regularised — present in all three severity tiers.
+            (
+                "Covariance step regularized: eigenvalue floor applied to FD Hessian \
+                 (1 of 3 free-block eigenvalues clipped; min eig = 1.2e-6, floor = 8.4e-14; \
+                 severity: minor). Standard errors are likely reliable.",
+                Warning,
+                "covariance_step",
+            ),
+            (
+                "Covariance step regularized: eigenvalue floor applied to FD Hessian \
+                 (3 of 5 free-block eigenvalues clipped; min eig = 1.2e-6, floor = 8.4e-14; \
+                 severity: severe). Standard errors are likely unreliable; \
+                 SIR-based confidence intervals are recommended.",
+                Warning,
+                "covariance_step",
+            ),
+            // Off-diagonal NaN soft warning — Success result, but correlation missing.
+            (
+                "Covariance step: off-diagonal FD stencil(s) non-finite for theta[CL], sigma[1]. \
+                 Cross-partial correlation set to 0; SE for these parameter(s) \
+                 may be over-optimistic. Try tuning fd_hessian_step.",
+                Warning,
+                "covariance_step",
+            ),
+            // Chain-prefixed off-diagonal warning.
+            (
+                "[FOCEI] Covariance step: off-diagonal FD stencil(s) non-finite for theta[CL]. \
+                 Cross-partial correlation set to 0; SE for these parameter(s) \
+                 may be over-optimistic. Try tuning fd_hessian_step.",
+                Warning,
+                "covariance_step",
+            ),
+            // Unusable messages introduced in commit 2.
+            (
+                "Covariance step failed: base OFV is non-finite at convergence \
+                 (likely numerical overflow or underflow in model evaluation). \
+                 SE estimates not available.",
+                Critical,
+                "covariance_step",
+            ),
+            (
+                "Covariance step failed: Hessian has ill-conditioned entries for the \
+                 following parameter(s) — theta[CL] (non-finite diagonal); \
+                 sigma[1] (non-finite off-diagonal). SE estimates not available.",
+                Critical,
+                "covariance_step",
+            ),
+            // Omega near-singular (tiny positive eigenvalue) — "near-singular" descriptor.
+            (
+                "Covariance step failed: Omega matrix is near-singular at \
+                 convergence (min eigenvalue = 1.2e-10; eigenvalues: [0.5000, 1.2e-10]). \
+                 SE estimates not available.",
+                Critical,
+                "covariance_step",
+            ),
+            // Omega truly non-PD (negative eigenvalue) — "not positive definite" descriptor.
+            (
+                "Covariance step failed: Omega matrix is not positive definite at \
+                 convergence (min eigenvalue = -1.0e-3; eigenvalues: [0.5000, -1.0e-3]). \
+                 SE estimates not available.",
+                Critical,
+                "covariance_step",
+            ),
+            // SIR message that also contains "not positive definite" — must
+            // still route to "sir", NOT to covariance_step.
+            (
+                "SIR failed: covariance not positive definite",
+                Warning,
+                "sir",
+            ),
             // -- chain-prefixed (multi-stage) -----------------------------
             (
                 "[FOCEI] Covariance step failed",
+                Critical,
+                "covariance_step",
+            ),
+            (
+                "[FOCEI] Covariance step: Hessian is not positive definite. \
+                 Eigenvalues: [2.1000, -0.0100]. SE estimates not available.",
                 Critical,
                 "covariance_step",
             ),
@@ -3363,5 +3528,172 @@ mod tests {
              for the basin-trap and block-Ω-collapse regression rationale \
              before adjusting."
         );
+    }
+
+    // ── small pure helpers ───────────────────────────────────────────────────
+
+    /// Bare subject with no doses/observations; tests mutate the fields they
+    /// exercise.
+    fn bare_subject(id: &str) -> Subject {
+        Subject {
+            id: id.to_string(),
+            doses: Vec::new(),
+            obs_times: Vec::new(),
+            obs_raw_times: Vec::new(),
+            observations: Vec::new(),
+            obs_cmts: Vec::new(),
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: Vec::new(),
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: Vec::new(),
+        }
+    }
+
+    fn dose(ss: bool) -> DoseEvent {
+        DoseEvent {
+            time: 0.0,
+            amt: 100.0,
+            cmt: 1,
+            rate: 0.0,
+            duration: 0.0,
+            ss,
+            ii: 0.0,
+        }
+    }
+
+    #[test]
+    fn subject_has_bloq_reflects_cens_flags() {
+        let mut s = bare_subject("1");
+        s.cens = vec![0, 0];
+        assert!(!s.has_bloq());
+        s.cens = vec![0, 1];
+        assert!(s.has_bloq());
+    }
+
+    #[test]
+    fn subject_has_ss_doses_detects_steady_state_flag() {
+        let mut s = bare_subject("1");
+        s.doses = vec![dose(false), dose(false)];
+        assert!(!s.has_ss_doses());
+        s.doses.push(dose(true));
+        assert!(s.has_ss_doses());
+    }
+
+    #[test]
+    fn subject_pk_only_cov_falls_back_to_static_map() {
+        let mut s = bare_subject("1");
+        s.covariates.insert("WT".to_string(), 70.0);
+        // No per-EVID-2 snapshots → static map.
+        assert_eq!(s.pk_only_cov(0).get("WT"), Some(&70.0));
+        // With a snapshot at index 0 → that snapshot.
+        let mut snap = HashMap::new();
+        snap.insert("WT".to_string(), 80.0);
+        s.pk_only_covariates = vec![snap];
+        assert_eq!(s.pk_only_cov(0).get("WT"), Some(&80.0));
+        // Out-of-range index → fall back to static map.
+        assert_eq!(s.pk_only_cov(5).get("WT"), Some(&70.0));
+    }
+
+    #[test]
+    fn prune_irrelevant_tv_covariates_clears_only_constant_referenced_covs() {
+        // Subject A: the referenced covariate (WT) is constant across snapshots
+        // but an unreferenced one (DAY) varies → snapshots should be pruned.
+        let mut a = bare_subject("A");
+        a.covariates = HashMap::from([("WT".to_string(), 70.0), ("DAY".to_string(), 1.0)]);
+        a.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0), ("DAY".to_string(), 1.0)]),
+            HashMap::from([("WT".to_string(), 70.0), ("DAY".to_string(), 2.0)]),
+        ];
+        // Subject B: the referenced covariate (WT) genuinely varies → keep.
+        let mut b = bare_subject("B");
+        b.covariates = HashMap::from([("WT".to_string(), 70.0)]);
+        b.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 90.0)]),
+        ];
+
+        let mut pop = Population {
+            subjects: vec![a, b],
+            covariate_names: vec!["WT".to_string(), "DAY".to_string()],
+            dv_column: "DV".to_string(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let pruned = pop.prune_irrelevant_tv_covariates(&["WT".to_string()]);
+        assert_eq!(pruned, 1, "only subject A should be pruned");
+        assert!(
+            pop.subjects[0].obs_covariates.is_empty(),
+            "A pruned to fast path"
+        );
+        assert!(
+            !pop.subjects[1].obs_covariates.is_empty(),
+            "B keeps TV snapshots"
+        );
+    }
+
+    #[test]
+    fn covariate_kind_label_strings() {
+        assert_eq!(CovariateKind::Continuous.label(), "continuous");
+        assert_eq!(CovariateKind::Categorical.label(), "categorical");
+    }
+
+    #[test]
+    fn scaling_spec_requires_fd_is_always_false() {
+        assert!(!ScalingSpec::None.requires_fd());
+        assert!(!ScalingSpec::ScalarScale(1000.0).requires_fd());
+        assert!(!ScalingSpec::PerCmt(HashMap::new()).requires_fd());
+    }
+
+    #[test]
+    fn estimation_method_label_covers_all_variants() {
+        assert_eq!(EstimationMethod::Foce.label(), "FOCE");
+        assert_eq!(EstimationMethod::FoceI.label(), "FOCEI");
+        assert_eq!(EstimationMethod::FoceGn.label(), "FOCE-GN");
+        assert_eq!(EstimationMethod::FoceGnHybrid.label(), "FOCE-GN-Hybrid");
+        assert_eq!(EstimationMethod::Saem.label(), "SAEM");
+        assert_eq!(EstimationMethod::Imp.label(), "IMP");
+    }
+
+    #[test]
+    fn model_parameters_has_any_fixed_tracks_every_flag_vec() {
+        let mut mp = test_helpers::analytical_model(GradientMethod::Fd).default_params;
+        mp.theta_fixed = vec![false];
+        mp.omega_fixed = vec![false];
+        mp.sigma_fixed = vec![false];
+        mp.kappa_fixed = Vec::new();
+        assert!(!mp.has_any_fixed());
+        mp.sigma_fixed = vec![true];
+        assert!(mp.has_any_fixed());
+    }
+
+    #[test]
+    fn pk_params_from_hashmap_maps_named_fields_and_aliases() {
+        let map = HashMap::from([
+            ("cl".to_string(), 5.0),
+            ("v1".to_string(), 30.0), // v1 alias → V index
+            ("q".to_string(), 2.0),
+            ("v2".to_string(), 50.0),
+            ("ka".to_string(), 1.2),
+            ("f".to_string(), 0.8),
+            ("q3".to_string(), 0.5),
+            ("v3".to_string(), 100.0),
+        ]);
+        let p = PkParams::from_hashmap(&map);
+        assert_eq!(p.values[PK_IDX_CL], 5.0);
+        assert_eq!(p.values[PK_IDX_V], 30.0);
+        assert_eq!(p.values[PK_IDX_Q], 2.0);
+        assert_eq!(p.values[PK_IDX_V2], 50.0);
+        assert_eq!(p.values[PK_IDX_KA], 1.2);
+        assert_eq!(p.values[PK_IDX_F], 0.8);
+        assert_eq!(p.values[PK_IDX_Q3], 0.5);
+        assert_eq!(p.values[PK_IDX_V3], 100.0);
     }
 }

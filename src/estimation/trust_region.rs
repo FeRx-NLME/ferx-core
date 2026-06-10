@@ -5,7 +5,9 @@ use rayon::prelude::*;
 
 use crate::estimation::gauss_newton::subject_nll_pop_grad;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
-use crate::estimation::outer_optimizer::{compute_covariance, pop_nll, OuterResult};
+use crate::estimation::outer_optimizer::{
+    compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
+};
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_bounds, compute_mu_k, pack_params, unpack_params, PackedBounds,
 };
@@ -395,35 +397,33 @@ pub fn optimize_trust_region(
         eprintln!("Final OFV = {:.6}", final_ofv);
     }
 
-    let covariance_matrix = if options.run_covariance_step {
-        if options.verbose {
-            eprintln!("Computing covariance matrix...");
-        }
-        match compute_covariance(
-            &best_x,
-            init_params,
-            model,
-            population,
-            &final_ehs,
-            &final_hms,
-            &final_kappas,
-            options,
-        ) {
-            Some(out) => {
-                if let Some(w) = out.warning {
-                    warnings.push(w);
-                }
-                Some(out.matrix)
+    let covariance_matrix =
+        if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
+            if options.verbose {
+                eprintln!("Computing covariance matrix...");
             }
-            None => None,
-        }
-    } else {
-        None
-    };
-
-    if covariance_matrix.is_none() && options.run_covariance_step {
-        warnings.push("Covariance step failed".to_string());
-    }
+            match compute_covariance(
+                &best_x,
+                init_params,
+                model,
+                population,
+                &final_ehs,
+                &final_hms,
+                &final_kappas,
+                options,
+            ) {
+                CovarianceStepResult::Success(out) => {
+                    warnings.extend(out.warnings);
+                    Some(out.matrix)
+                }
+                CovarianceStepResult::Unusable(msg) => {
+                    warnings.push(msg);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     OuterResult {
         params: final_params,

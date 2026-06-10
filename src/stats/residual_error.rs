@@ -238,6 +238,7 @@ mod tests {
             n_obs: 0,
             extra_columns: vec![],
             per_obs_tad: vec![],
+            compartment_states: vec![],
         }
     }
 

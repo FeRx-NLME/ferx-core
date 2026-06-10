@@ -137,6 +137,25 @@ pub fn one_cpt_oral_ss(dose: &DoseEvent, t: f64, cl: f64, v: f64, ka: f64) -> f6
     one_cpt_oral_f_ss(dose, t, cl, v, ka, 1.0)
 }
 
+/// Depot amount for a single oral bolus (or SS oral) dose at elapsed time tau.
+/// Returns 0 for infusion doses (infusions bypass the depot compartment).
+pub(crate) fn one_cpt_oral_depot(dose: &DoseEvent, tau: f64, ka: f64, f_bio: f64) -> f64 {
+    if tau < 0.0 || ka <= 0.0 || dose.is_infusion() {
+        return 0.0;
+    }
+    let a = f_bio * dose.amt * (-ka * tau).exp();
+    if dose.ss && dose.ii > 0.0 {
+        let denom = 1.0 - (-ka * dose.ii).exp();
+        if denom > 0.0 {
+            a / denom
+        } else {
+            0.0
+        }
+    } else {
+        a
+    }
+}
+
 /// One-compartment infusion at steady state.
 ///
 /// Closed form requires `T_inf ≤ II` (non-overlapping infusions). For

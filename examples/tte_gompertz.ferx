@@ -1,0 +1,44 @@
+# Standalone TTE model with Gompertz hazard (Phase 1 TTE).
+#
+# Event time for CMT 2 follows Gompertz(alpha, gamma) where
+#   h(t) = alpha * exp(gamma * t)    (exponentially increasing baseline hazard)
+#   H(t) = (alpha/gamma) * (exp(gamma*t) - 1)
+#
+# and
+#   alpha = TVALPHA                        (fixed population intercept; > 0)
+#   gamma = TVGAMMA * exp(ETA_GAMMA)       (per-subject growth rate; > 0)
+#
+# BSV is placed on the growth rate (gamma) rather than the intercept (alpha)
+# because alpha and gamma are collinear in the population likelihood when both
+# are free: a lower alpha can always be offset by a higher gamma while yielding
+# a similar population survival curve.  Placing BSV on gamma resolves this and
+# gives clean parameter recovery.
+#
+# Data format (DV coding for TTE rows with EVID=0):
+#   DV=0  right-censored
+#   DV=1  exact event
+#
+# Reference (simulated): TVALPHA = 0.002 h^-1, TVGAMMA = 0.05 h^-1,
+# omega(ETA_GAMMA) = 0.04. Administrative censoring at t = 80 h (42/50 events).
+# Simulated dataset: data/tte_gompertz.csv
+#
+# Run:  cargo run --release -- examples/tte_gompertz.ferx --data data/tte_gompertz.csv
+#
+# Note: [structural_model], [error_model], and [individual_parameters] are
+# omitted — all three are optional when [event_model] is the sole endpoint.
+
+[parameters]
+  theta TVALPHA(0.002, 1e-5, 1.0)
+  theta TVGAMMA(0.05,  1e-4, 5.0)
+
+  omega ETA_GAMMA ~ 0.04
+
+[event_model]
+  cmt    = 2
+  family = gompertz
+  alpha  = TVALPHA
+  gamma  = TVGAMMA * exp(ETA_GAMMA)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

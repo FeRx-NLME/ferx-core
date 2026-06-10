@@ -1077,6 +1077,7 @@ fn parse_subjects(
             n_obs,
             extra_columns: vec![],
             per_obs_tad: vec![],
+            compartment_states: vec![],
         });
     }
 
@@ -1667,6 +1668,7 @@ mod tests {
             n_obs,
             extra_columns: vec![],
             per_obs_tad: vec![],
+            compartment_states: vec![],
         }
     }
 

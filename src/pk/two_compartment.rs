@@ -299,6 +299,158 @@ pub fn two_cpt_oral_ss(
     two_cpt_oral_f_ss(dose, t, cl, v1, q, v2, ka, 1.0)
 }
 
+// --- Peripheral compartment concentration (for compartment_states) ---
+
+/// Peripheral concentration for a 2-cpt IV single dose at elapsed time tau.
+/// Handles bolus, infusion, and SS=1 doses.
+///
+/// Derivation: C2(t) = k12/v2/diff * dose.amt * (exp(-β·t) − exp(-α·t))  for bolus.
+/// Infusion uses the convolution integral; SS uses geometric-series factor.
+pub(crate) fn two_cpt_iv_peripheral(
+    dose: &DoseEvent,
+    tau: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+) -> f64 {
+    if tau < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 {
+        return 0.0;
+    }
+    let (alpha, beta, _k21) = macro_rates(cl, v1, q, v2);
+    let diff = alpha - beta;
+    if diff.abs() < 1e-12 || alpha.abs() < 1e-12 || beta.abs() < 1e-12 {
+        return 0.0;
+    }
+    // Shared coefficient: (q/v1)/v2/diff = k12/(v2*diff)
+    let k12_over_v2_diff = q / (v1 * v2 * diff);
+
+    if dose.ss && dose.ii > 0.0 {
+        let ii = dose.ii;
+        if dose.is_infusion() {
+            let dur = dose.duration;
+            if dur <= 0.0 {
+                // Degenerate infusion → treat as bolus SS
+                return k12_over_v2_diff
+                    * dose.amt
+                    * ((-beta * tau).exp() * ss_coeff(beta, ii)
+                        - (-alpha * tau).exp() * ss_coeff(alpha, ii));
+            }
+            if dur > ii {
+                return 0.0;
+            }
+            // c2_coeff for infusion: rate * k12/(v2*diff)
+            let c2 = dose.rate / diff * q / (v1 * v2);
+            if tau <= dur {
+                // Current pulse (during infusion) + past pulses (always "after").
+                let current = c2
+                    * ((1.0 - (-beta * tau).exp()) / beta - (1.0 - (-alpha * tau).exp()) / alpha);
+                let past_b = c2 * (1.0 - (-beta * dur).exp()) / beta
+                    * (-beta * (tau - dur)).exp()
+                    * (-beta * ii).exp()
+                    * ss_coeff(beta, ii);
+                let past_a = c2 * (1.0 - (-alpha * dur).exp()) / alpha
+                    * (-alpha * (tau - dur)).exp()
+                    * (-alpha * ii).exp()
+                    * ss_coeff(alpha, ii);
+                current + past_b - past_a
+            } else {
+                let dt = tau - dur;
+                c2 * ((1.0 - (-beta * dur).exp()) * (-beta * dt).exp() * ss_coeff(beta, ii) / beta
+                    - (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() * ss_coeff(alpha, ii)
+                        / alpha)
+            }
+        } else {
+            // Bolus SS
+            k12_over_v2_diff
+                * dose.amt
+                * ((-beta * tau).exp() * ss_coeff(beta, ii)
+                    - (-alpha * tau).exp() * ss_coeff(alpha, ii))
+        }
+    } else if dose.is_infusion() {
+        let dur = dose.duration;
+        if dur <= 0.0 {
+            return k12_over_v2_diff * dose.amt * ((-beta * tau).exp() - (-alpha * tau).exp());
+        }
+        let c2 = dose.rate / diff * q / (v1 * v2);
+        if tau <= dur {
+            c2 * ((1.0 - (-beta * tau).exp()) / beta - (1.0 - (-alpha * tau).exp()) / alpha)
+        } else {
+            let dt = tau - dur;
+            c2 * ((1.0 - (-beta * dur).exp()) * (-beta * dt).exp() / beta
+                - (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() / alpha)
+        }
+    } else {
+        // Single-dose bolus
+        k12_over_v2_diff * dose.amt * ((-beta * tau).exp() - (-alpha * tau).exp())
+    }
+}
+
+/// Peripheral concentration for a 2-cpt oral single dose at elapsed time tau.
+///
+/// **Derivation — why only 3 terms (no exp(-k21·τ) term):**
+///
+/// In Laplace space:
+/// ```text
+///   A_central(s)  = F·D·ka·(s+k21) / [(s+ka)(s+α)(s+β)]
+///   A_periph(s)   = k12 · A_central(s) / (s+k21)
+///                 = k12·F·D·ka / [(s+ka)(s+α)(s+β)]
+/// ```
+/// The `(s+k21)` factor in `A_central(s)` cancels the `(s+k21)` pole of
+/// `1/(s+k21)`, leaving only 3 poles: `−ka`, `−α`, `−β`. Partial-fraction
+/// expansion gives the 3-term Bateman result below. The `exp(-ka·τ)` term is
+/// implicitly correct: because `A_periph(0) = 0` (no drug in peripheral at
+/// time 0), the residues must sum to zero, so the `exp(-ka·τ)` coefficient
+/// equals minus the sum of the eigenvalue residues.
+///
+/// Formula (non-L'Hôpital):
+///   D = f_bio·dose.amt·ka/v1
+///   C2(τ) = (q/v2)·D · [ exp(-α·τ)/((ka-α)(β-α)) + exp(-β·τ)/((ka-β)(α-β)) + exp(-ka·τ)/((α-ka)(β-ka)) ]
+///
+/// L'Hôpital case (ka≈α or ka≈β): returns 0 (peripheral formula undefined at singularity).
+pub(crate) fn two_cpt_oral_peripheral(
+    dose: &DoseEvent,
+    tau: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
+    ka: f64,
+    f_bio: f64,
+) -> f64 {
+    if tau < 0.0 || v1 <= 0.0 || v2 <= 0.0 || cl <= 0.0 || q < 0.0 || ka <= 0.0 {
+        return 0.0;
+    }
+    let (alpha, beta, _k21) = macro_rates(cl, v1, q, v2);
+    let diff = alpha - beta; // alpha - beta
+    if diff.abs() < 1e-12 {
+        return 0.0;
+    }
+    if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 {
+        return 0.0; // L'Hôpital case; peripheral formula reduces to 0 at this singularity
+    }
+
+    let d = f_bio * dose.amt * ka / v1;
+    // Peripheral formula coefficients (exp terms mirror the central formula, but with k21 cancelled):
+    // C2(τ) = (q/v2)·D·[exp(-α·τ)/((ka-α)(β-α)) + exp(-β·τ)/((ka-β)(α-β)) + exp(-ka·τ)/((α-ka)(β-ka))]
+    let q_over_v2 = q / v2;
+
+    if dose.ss && dose.ii > 0.0 {
+        let ii = dose.ii;
+        q_over_v2
+            * d
+            * ((-alpha * tau).exp() * ss_coeff(alpha, ii) / ((ka - alpha) * (beta - alpha))
+                + (-beta * tau).exp() * ss_coeff(beta, ii) / ((ka - beta) * (alpha - beta))
+                + (-ka * tau).exp() * ss_coeff(ka, ii) / ((alpha - ka) * (beta - ka)))
+    } else {
+        q_over_v2
+            * d
+            * ((-alpha * tau).exp() / ((ka - alpha) * (beta - alpha))
+                + (-beta * tau).exp() / ((ka - beta) * (alpha - beta))
+                + (-ka * tau).exp() / ((alpha - ka) * (beta - ka)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

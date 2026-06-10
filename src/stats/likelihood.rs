@@ -251,6 +251,34 @@ pub(crate) fn obs_nll_subject_into(
             nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
         }
     }
+
+    // TTE data term: add −log p(events | η, θ) so the SAEM theta M-step
+    // gradient receives TTE hazard contributions, not just Gaussian residuals.
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        use crate::survival::tte_data_term;
+        use crate::types::EndpointLikelihood;
+        for (cmt, endpoint) in &model.endpoints {
+            if let EndpointLikelihood::Tte { hazard } = endpoint {
+                // ObsRecord::Event is the only variant (DiscreteState/Count deferred);
+                // the `..` pattern captures all EventType variants (Exact, RightCensored,
+                // IntervalCensored), so this filter correctly passes every TTE record type.
+                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned()
+                    .collect();
+                if records_for_cmt.is_empty() {
+                    continue;
+                }
+                nll += tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+            }
+        }
+    }
+
     nll
 }
 
@@ -421,7 +449,9 @@ pub fn foce_subject_nll(
             &p_obs,
             tte_nll_at_mode,
             tte_h,
-            interaction,
+            // Promote to interaction when M3 BLOQ is active, matching the
+            // non-TTE branch below so M3 subjects always get the CᵀC correction.
+            interaction || m3_active,
         );
     }
 
@@ -604,8 +634,19 @@ pub fn foce_subject_nll_interaction(
     p_obs: &[f64],
     frem_r_override: Option<&[Option<f64>]>,
 ) -> f64 {
-    let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
+    let Some(g) = gaussian_foce_accum(
+        subject,
+        ipreds,
+        h_matrix,
+        error_spec,
+        sigma_values,
+        bloq_method,
+        p_obs,
+        n_eta,
+    ) else {
+        return 1e20;
+    };
 
     // Partition observation indices into quantified vs BLOQ (M3 only).
     let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
@@ -662,28 +703,14 @@ pub fn foce_subject_nll_interaction(
 
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
-    let log_det_omega = omega.log_det;
-
-    // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.  log|H̃| via Cholesky; the 1e20
-    // sentinel handles extreme-η points where H̃ is not PD — the inner-loop
-    // optimiser falls back via Nelder–Mead.
-    let htilde = hrh + 0.5 * ctc + &omega.inv;
+    // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.  log|H̃| via Cholesky.
+    let htilde = g.hrh + 0.5 * g.ctc + &omega.inv;
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
         None => return 1e20,
     };
 
-    // BLOQ contributions: −2·log Φ((lloq − f)/√V) at η̂ (ipred-based variance).
-    let mut bloq_term = 0.0;
-    for &j in &bloq_idx {
-        let lloq = subject.observations[j];
-        let f = ipreds[j];
-        let v = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
-        let z = (lloq - f) / v.sqrt();
-        bloq_term += -2.0 * log_normal_cdf(z);
-    }
-
-    0.5 * (data_ll + eta_prior + log_det_omega + log_det_htilde + bloq_term)
+    0.5 * (g.data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
 }
 
 /// FOCEI NLL with both Gaussian interaction terms and a TTE Laplace correction.
@@ -696,10 +723,9 @@ pub fn foce_subject_nll_interaction(
 /// `tte_hessian`  — FD Hessian of the *raw* TTE NLL w.r.t. η (un-halved).
 ///   Added to `hrh` before the `log|H̃|` computation.
 /// `interaction`  — when `false` (plain FOCE) the η-dependence of the residual
-///   variance is ignored: the `½·CᵀC` interaction term is dropped from `H̃`,
-///   matching `foce_subject_nll_interaction`'s FOCEI-only use. For pure-TTE
-///   subjects there are no Gaussian rows, so `CᵀC` is empty and this is a no-op;
-///   the guard only matters for mixed PK+TTE models run under FOCE.
+///   variance is ignored: the `½·CᵀC` interaction term is dropped from `H̃`.
+///   For pure-TTE subjects CᵀC is all-zero, so this only matters for mixed
+///   PK+TTE models run under FOCE.
 #[cfg(feature = "survival")]
 fn foce_subject_nll_interaction_with_tte(
     subject: &Subject,
@@ -715,26 +741,97 @@ fn foce_subject_nll_interaction_with_tte(
     tte_hessian: DMatrix<f64>, // FD Hessian of the raw TTE NLL w.r.t. η
     interaction: bool,         // include the ½·CᵀC interaction term (FOCEI) or not (FOCE)
 ) -> f64 {
-    let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
+    let Some(g) = gaussian_foce_accum(
+        subject,
+        ipreds,
+        h_matrix,
+        error_spec,
+        sigma_values,
+        bloq_method,
+        p_obs,
+        n_eta,
+    ) else {
+        return 1e20;
+    };
 
+    // Combine Gaussian and TTE data terms.
+    // TTE NLL is scaled by 2 here to match the Gaussian data_ll convention
+    // (both are halved at the end via the 0.5 factor).
+    let data_ll = g.data_ll + 2.0 * tte_data_nll;
+    // Accumulate TTE Hessian into the Gaussian Jacobian outer-product matrix.
+    let hrh = g.hrh + tte_hessian;
+
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+    // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it.
+    let htilde = if interaction {
+        hrh + 0.5 * g.ctc + &omega.inv
+    } else {
+        hrh + &omega.inv
+    };
+    let log_det_htilde = match htilde.cholesky() {
+        Some(c) => chol_log_det(&c.l()),
+        None => return 1e20,
+    };
+
+    0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
+}
+
+/// Output of [`gaussian_foce_accum`].
+struct GaussianFoceTerms {
+    /// Σⱼ [rⱼ²/Vⱼ + ln Vⱼ] over quantified (non-BLOQ) observations.
+    data_ll: f64,
+    /// Σⱼ aⱼ'aⱼ/Vⱼ — Jacobian outer-product / variance (H̃ numerator).
+    hrh: DMatrix<f64>,
+    /// Σⱼ c̃ⱼ'c̃ⱼ — INTER curvature; multiplied by ½ and added for FOCEI.
+    ctc: DMatrix<f64>,
+    /// Σⱼ −2·log Φ((LLOQ−f)/√V) over BLOQ observations (M3 method).
+    bloq_term: f64,
+}
+
+/// Shared Gaussian accumulation loop for the FOCE/FOCEI interaction path.
+///
+/// Computes the per-observation Hessian terms from the Gaussian residuals and
+/// their variance derivatives. Returns `None` if any observation variance is
+/// non-finite or non-positive (callers should return the 1e20 sentinel).
+///
+/// Both [`foce_subject_nll_interaction`] and the TTE variant call this helper
+/// to eliminate the identical inner loop that previously existed in both.
+fn gaussian_foce_accum(
+    subject: &Subject,
+    ipreds: &[f64],
+    h_matrix: &DMatrix<f64>,
+    error_spec: &ErrorSpec,
+    sigma_values: &[f64],
+    bloq_method: BloqMethod,
+    p_obs: &[f64],
+    n_eta: usize,
+) -> Option<GaussianFoceTerms> {
+    let n_obs = subject.observations.len();
+
+    // Partition observation indices into quantified vs BLOQ (M3 only).
     let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
         !(matches!(bloq_method, BloqMethod::M3) && subject.cens.get(j).copied().unwrap_or(0) != 0)
     });
 
-    let mut data_ll = 2.0 * tte_data_nll; // scale by 2 to match Gaussian convention
-    let mut hrh = tte_hessian; // start with TTE Hessian; Gaussian Jacobian terms added below
+    // Accumulate data_ll at η̂ and the conditional Hessian pieces over the
+    // quantified rows.  For SDE the EKF process-noise variance `p_obs` inflates
+    // R additively, treated as η-independent here (EKF-vs-FOCEI cross terms are
+    // dropped under Almquist's first-order convention).
+    let mut data_ll = 0.0_f64;
+    let mut hrh = DMatrix::<f64>::zeros(n_eta, n_eta);
     let mut ctc = DMatrix::<f64>::zeros(n_eta, n_eta);
     for &j in &quant_idx {
         let f = ipreds[j];
         let v_resid = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if !(v.is_finite() && v > 0.0) {
-            return 1e20;
+            return None;
         }
         let r = subject.observations[j] - f;
         data_ll += r * r / v + v.ln();
 
+        // a_j = row j of H (∂f_j/∂η); c̃_j = (∂R_j/∂f_j)·a_j / R_j.
         let aj = h_matrix.row(j);
         let dvar_df = error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values);
         let c_scale = dvar_df / v;
@@ -751,31 +848,25 @@ fn foce_subject_nll_interaction_with_tte(
         }
     }
 
-    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
-    let log_det_omega = omega.log_det;
-
-    // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it. (CᵀC is
-    // all-zero for pure-TTE subjects, so this only bites mixed PK+TTE under FOCE.)
-    let htilde = if interaction {
-        hrh + 0.5 * ctc + &omega.inv
-    } else {
-        hrh + &omega.inv
-    };
-    let log_det_htilde = match htilde.cholesky() {
-        Some(c) => chol_log_det(&c.l()),
-        None => return 1e20,
-    };
-
+    // BLOQ contributions: −2·log Φ((lloq − f)/√V) at η̂ (ipred-based variance).
     let mut bloq_term = 0.0;
     for &j in &bloq_idx {
         let lloq = subject.observations[j];
         let f = ipreds[j];
         let v = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
+        if !(v.is_finite() && v > 0.0) {
+            return None;
+        }
         let z = (lloq - f) / v.sqrt();
         bloq_term += -2.0 * log_normal_cdf(z);
     }
 
-    0.5 * (data_ll + eta_prior + log_det_omega + log_det_htilde + bloq_term)
+    Some(GaussianFoceTerms {
+        data_ll,
+        hrh,
+        ctc,
+        bloq_term,
+    })
 }
 
 /// R_tilde = H * Omega * H' + diag(r_diag)
@@ -1200,6 +1291,32 @@ pub fn individual_nll_iov(
         } else {
             let resid = y - f_pred;
             data_ll += resid * resid / v + v.ln();
+        }
+    }
+
+    // TTE data term: same convention as individual_nll_into_with_schedule —
+    // multiply by 2.0 so the final 0.5 factor gives a net weight of 1.0×.
+    // Kappas are PK-only; the hazard param_fn uses BSV eta, not kappas.
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        use crate::survival::tte_data_term;
+        use crate::types::EndpointLikelihood;
+        for (cmt, endpoint) in &model.endpoints {
+            if let EndpointLikelihood::Tte { hazard } = endpoint {
+                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
+                    .obs_records
+                    .iter()
+                    .filter(
+                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
+                    )
+                    .cloned()
+                    .collect();
+                if records_for_cmt.is_empty() {
+                    continue;
+                }
+                data_ll +=
+                    2.0 * tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+            }
         }
     }
 

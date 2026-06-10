@@ -11,7 +11,8 @@
 pub mod parametric;
 
 pub use parametric::{
-    cum_hazard, hazard_and_cum_hazard, sample_conditional_event_time, sample_event_time,
+    cum_hazard, hazard_and_cum_hazard, mean_survival, median_survival,
+    sample_conditional_event_time, sample_event_time,
 };
 
 use nalgebra::DMatrix;

@@ -1,0 +1,50 @@
+# Covariance-step diagnostic demo: ghost (unidentifiable) parameter.
+#
+# TVABS is declared in [parameters] but never referenced in
+# [individual_parameters].  This triggers two independent diagnostics:
+#
+#   1. Parse warning (before fitting):
+#        "theta 'TVABS' is declared in [parameters] but not referenced in
+#         [individual_parameters] — it will not affect predictions or be
+#         meaningfully estimated"
+#
+#   2. Covariance step failure (after fitting):
+#        "Covariance step failed: Hessian has ill-conditioned entries for
+#         theta[TVABS] (zero diagonal — flat objective).
+#         SE estimates not available."
+#
+# The FD Hessian diagonal for TVABS is identically 0 because the model
+# predictions don't depend on TVABS at all: f(x+h) = f(x) = f(x-h),
+# so (f(x+h) - 2f(x) + f(x-h)) / h^2 = 0.
+#
+# Run with:
+#   cargo run --release -- examples/warfarin_cov_ghost.ferx --data data/warfarin.csv
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVABS(1.0, 0.01, 100.0)  # declared but intentionally unused — triggers demo
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  # TVABS is intentionally absent here
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = foce
+  maxiter    = 300
+  covariance = true

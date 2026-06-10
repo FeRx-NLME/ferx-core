@@ -41,6 +41,30 @@ Named blocks allow multiple TTE endpoints:
   shape  = TVSHAPE_DEATH
 ```
 
+## TTE-only models
+
+For models with only TTE endpoints and no Gaussian PK data, the
+`[structural_model]`, `[error_model]`, and `[individual_parameters]` blocks
+may all be omitted:
+
+```
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+
+[fit_options]
+  method  = focei
+  maxiter = 300
+```
+
+See `examples/tte_weibull.ferx` and `examples/tte_gompertz.ferx` for complete
+Weibull and Gompertz examples using this compact syntax.
+
 ## DV coding
 
 | DV  | Meaning |

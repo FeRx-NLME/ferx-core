@@ -1,0 +1,33 @@
+# Standalone TTE model with Weibull hazard (Phase 1 TTE).
+#
+# Event time for CMT 2 follows Weibull(scale, shape) where
+#   scale = TVSCALE * exp(ETA_SCALE)     (characteristic time; larger = later events)
+#   shape = TVSHAPE                       (> 1 = increasing hazard over time)
+#
+# Data format (DV coding for TTE rows with EVID=0):
+#   DV=0  right-censored
+#   DV=1  exact event
+#
+# Reference (simulated): TVSCALE = 20 h, TVSHAPE = 1.5, omega(ETA_SCALE) = 0.04.
+# Administrative censoring at t = 60 h.  Simulated dataset: data/tte_weibull.csv
+#
+# Run:  cargo run --release -- examples/tte_weibull.ferx --data data/tte_weibull.csv
+#
+# Note: [structural_model], [error_model], and [individual_parameters] are
+# omitted — all three are optional when [event_model] is the sole endpoint.
+
+[parameters]
+  theta TVSCALE(20.0, 0.1, 500.0)
+  theta TVSHAPE(1.5,  0.1, 10.0)
+
+  omega ETA_SCALE ~ 0.04
+
+[event_model]
+  cmt    = 2
+  family = weibull
+  scale  = TVSCALE * exp(ETA_SCALE)
+  shape  = TVSHAPE
+
+[fit_options]
+  method  = focei
+  maxiter = 300

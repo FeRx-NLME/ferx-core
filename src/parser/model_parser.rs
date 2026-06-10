@@ -850,14 +850,38 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         );
     }
 
-    let struct_lines = blocks
-        .get("structural_model")
-        .ok_or("Missing [structural_model] block")?;
+    // A model with [event_model] but no Gaussian PK blocks is valid (TTE-only).
+    // Detect this case early so the three normally-required blocks can be omitted.
+    #[cfg(feature = "survival")]
+    let has_event_model_block =
+        blocks.contains_key("event_model") || extracted.named.contains_key("event_model");
+    #[cfg(not(feature = "survival"))]
+    let has_event_model_block = false;
 
-    let error_lines = blocks
-        .get("error_model")
-        .ok_or("Missing [error_model] block")?;
-    let (parsed_error_model, ltbs_flags) = parse_error_model(error_lines)?;
+    let struct_lines_opt = blocks.get("structural_model");
+    let error_lines_opt = blocks.get("error_model");
+    let indiv_lines_opt = blocks.get("individual_parameters");
+    // All three Gaussian blocks must be absent together for a valid TTE-only model.
+    // Partial omission (e.g. [structural_model] present but no [individual_parameters])
+    // would create an invalid mixed-model state.
+    let is_tte_only = has_event_model_block
+        && struct_lines_opt.is_none()
+        && error_lines_opt.is_none()
+        && indiv_lines_opt.is_none();
+    if struct_lines_opt.is_none() && !is_tte_only {
+        return Err("Missing [structural_model] block".to_string());
+    }
+    let struct_lines: &[String] = struct_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
+
+    if error_lines_opt.is_none() && !is_tte_only {
+        return Err("Missing [error_model] block".to_string());
+    }
+    let (parsed_error_model, ltbs_flags) = if let Some(error_lines) = error_lines_opt {
+        parse_error_model(error_lines)?
+    } else {
+        // TTE-only model: no Gaussian error model — empty per-CMT spec.
+        (ParsedErrorModel::PerCmt(vec![]), LtbsFlags::default())
+    };
     // LTBS log-transforms the structural prediction, which is incompatible with
     // the SDE/EKF measurement model (the extended Kalman filter assumes a
     // natural-scale additive/proportional observation). Reject the combination.
@@ -869,9 +893,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         );
     }
 
-    let indiv_lines = blocks
-        .get("individual_parameters")
-        .ok_or("Missing [individual_parameters] block")?;
+    if indiv_lines_opt.is_none() && !is_tte_only {
+        return Err("Missing [individual_parameters] block".to_string());
+    }
+    let indiv_lines: &[String] = indiv_lines_opt.map(Vec::as_slice).unwrap_or(&[]);
 
     // theta_names is extended below after NN-weight and diffusion thetas are appended
     let mut theta_names: Vec<String> = thetas.iter().map(|t| t.name.clone()).collect();
@@ -1021,7 +1046,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     .to_string(),
             );
         }
-        let (pk_model, pk_param_map) = parse_structural_model(struct_lines)?;
+        // TTE-only models have no [structural_model] block — supply a no-op placeholder.
+        // The PK model is never invoked for pure-TTE subjects (no Gaussian observations).
+        let (pk_model, pk_param_map) = if struct_lines.is_empty() {
+            (PkModel::OneCptIv, HashMap::new())
+        } else {
+            parse_structural_model(struct_lines)?
+        };
         (
             pk_model,
             pk_param_map,
@@ -1735,31 +1766,26 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
-    // Warn about declared-but-unused parameters. These are not errors because a
-    // user may intentionally comment out expressions (e.g. during model
-    // development), but the warning makes clear that such parameters have no
-    // effect on predictions and will not be meaningfully estimated.
-    let unused_warnings = check_unused_parameters(
-        &thetas,
-        &eta_names_bsv,
-        &kappa_names,
-        n_eta,
-        &model.default_params.sigma.names,
-        &indiv_stmts,
-        &used_sigmas_in_error,
-    );
-    model.parse_warnings.extend(unused_warnings);
-
     // ── [derived] block ──
     if let Some(derived_lines) = blocks.get("derived") {
         let cov_names = model.referenced_covariates.clone();
         let mut derived_warnings = Vec::new();
+        // For ODE models, ode_state_names drives uses_compartments detection.
+        // For analytical models, use analytical_compartment_names() so that
+        // named references like `central`, `depot`, `peripheral` in [derived]
+        // also set uses_compartments=true and trigger W_DERIVED_CMT_* warnings.
+        let ode_state_names: Vec<String> = model
+            .ode_spec
+            .as_ref()
+            .map(|s| s.state_names.clone())
+            .unwrap_or_else(|| model.analytical_compartment_names().to_vec());
         let derived_exprs = parse_derived_block(
             derived_lines,
             &model.theta_names.clone(),
             &model.eta_names.clone(),
             &model.indiv_param_names.clone(),
             &cov_names,
+            &ode_state_names,
             &mut derived_warnings,
         )?;
         model.derived_exprs = derived_exprs;
@@ -1774,28 +1800,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // ── Optional [covariates] block ──
     // When present it is authoritative for the covariate *table* and typing:
     // only listed columns are tabled, and declared columns are read strictly.
-    // A covariate used in [individual_parameters] but not declared is still
-    // usable (it is read leniently, like the auto-detect path) — we just warn
-    // that it ought to be declared so its type is known.
+    // A covariate used in [individual_parameters] or [event_model] but not declared
+    // is still usable (read leniently) — we warn after all covariate sources have
+    // been collected (including [event_model], parsed below).
     let covariate_decls = if let Some(lines) = blocks.get("covariates") {
-        let decls = parse_covariates_block(lines)?;
-        let declared: std::collections::HashSet<&str> =
-            decls.iter().map(|d| d.name.as_str()).collect();
-        let undeclared: Vec<&str> = model
-            .referenced_covariates
-            .iter()
-            .filter(|c| !declared.contains(c.as_str()))
-            .map(|s| s.as_str())
-            .collect();
-        if !undeclared.is_empty() {
-            model.parse_warnings.push(format!(
-                "Covariate(s) used in [individual_parameters] but not declared in [covariates]: \
-                 {}. They are still usable, but declaring them (with `continuous`/`categorical`) \
-                 lets ferx record their type and include them in the covariate table.",
-                undeclared.join(", ")
-            ));
-        }
-        Some(decls)
+        Some(parse_covariates_block(lines)?)
     } else {
         None
     };
@@ -1806,6 +1815,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Each block holds `cmt`, `family`, and family-specific parameter expressions.
     // Only compiled when the `survival` feature is enabled; the field
     // `model.endpoints` is always present (cfg-gated) and stays empty otherwise.
+    //
+    // Theta/eta indices used in event_model expressions are collected here so
+    // that check_unused_parameters (below) can suppress false "not referenced"
+    // warnings for parameters that only appear in [event_model].
+    let mut event_model_used_thetas: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut event_model_used_etas: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
     #[cfg(feature = "survival")]
     {
         let theta_names = model.theta_names.clone();
@@ -1823,12 +1840,58 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
 
         for lines in event_blocks {
-            let (cmt, endpoint) =
+            let (cmt, endpoint, event_covs, blk_thetas, blk_etas) =
                 parse_event_model_block(lines, &theta_names, &eta_names, &model.error_spec)?;
             if model.endpoints.contains_key(&cmt) {
                 return Err(format!("[event_model]: CMT={cmt} declared more than once"));
             }
             model.endpoints.insert(cmt, endpoint);
+            // Union covariate names from [event_model] expressions into the model's
+            // covariate set so they appear in the covariate table and validation warnings.
+            for cov in event_covs {
+                if !model.referenced_covariates.contains(&cov) {
+                    model.referenced_covariates.push(cov);
+                }
+            }
+            event_model_used_thetas.extend(blk_thetas);
+            event_model_used_etas.extend(blk_etas);
+        }
+        model.referenced_covariates.sort();
+    }
+
+    // Warn about declared-but-unused parameters. Runs here (after [event_model]
+    // parsing) so that parameters used only in [event_model] are not falsely
+    // reported as unused in mixed PK+TTE models.
+    model.parse_warnings.extend(check_unused_parameters(
+        &thetas,
+        &eta_names_bsv,
+        &kappa_names,
+        n_eta,
+        &model.default_params.sigma.names,
+        &indiv_stmts,
+        &used_sigmas_in_error,
+        &event_model_used_thetas,
+        &event_model_used_etas,
+    ));
+
+    // Undeclared-covariate warning: checked here (after [event_model] parsing) so
+    // that covariates used only in [event_model] expressions are included.
+    if let Some(decls) = &covariate_decls {
+        let declared: std::collections::HashSet<&str> =
+            decls.iter().map(|d| d.name.as_str()).collect();
+        let undeclared: Vec<&str> = model
+            .referenced_covariates
+            .iter()
+            .filter(|c| !declared.contains(c.as_str()))
+            .map(|s| s.as_str())
+            .collect();
+        if !undeclared.is_empty() {
+            model.parse_warnings.push(format!(
+                "Covariate(s) used in model expressions but not declared in [covariates]: \
+                 {}. They are still usable, but declaring them (with `continuous`/`categorical`) \
+                 lets ferx record their type and include them in the covariate table.",
+                undeclared.join(", ")
+            ));
         }
     }
 
@@ -1842,6 +1905,16 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 }
 
 // ── [derived] and [output] block parsers ────────────────────────────────────
+
+/// Maximum `compartments[N]` index accepted at parse time.
+///
+/// `build_derived_vars` pre-seeds sentinel NaN entries for `__cmt_0` through
+/// `__cmt_{MAX_CMT_INDEX}` (i.e. `MAX_CMT_INDEX + 1` entries total).  Any
+/// index > MAX_CMT_INDEX is rejected at parse time so `eval_expression`'s
+/// `.unwrap_or(0.0)` fallback can never silently return 0.0 for an
+/// out-of-range access.  Both constants are derived from this single value so
+/// they cannot drift apart.
+pub(crate) const MAX_CMT_INDEX: usize = 255;
 
 /// Built-in sdtab column names that [derived] names must not clash with.
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
@@ -1989,6 +2062,28 @@ fn build_derived_filter_fn(cond: Condition) -> DerivedFilterFn {
 /// both uppercase and lowercase for the same reason.
 fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
     let mut vars: HashMap<String, f64> = HashMap::new();
+
+    // Index-based compartment keys.
+    // Pre-seed indices 0..=MAX_CMT_INDEX with NaN so that:
+    //   a) valid indices with empty compartment_states (IOV, analytical TV-covariate,
+    //      analytical reset subjects) evaluate to NaN rather than 0.0, and
+    //   b) out-of-range accesses (e.g. compartments[5] on a 1-cpt model) also
+    //      produce NaN — 0.0 would silently look like an empty compartment.
+    // Actual values then overwrite the NaN sentinels for valid indices.
+    // MAX_CMT_INDEX is chosen to cover all practical PK/PBPK models
+    // (largest published PBPK has ~30 compartments; 256 leaves generous headroom).
+    // Any access compartments[i] for i > MAX_CMT_INDEX is rejected at parse time;
+    // indices 0..=MAX_CMT_INDEX that are beyond the model's actual n_states return
+    // NaN via this sentinel. Without the sentinel the HashMap miss returns 0.0,
+    // which silently looks like an empty compartment.
+    // MAX_CMT_INDEX is defined at module scope; the sentinel covers 0..=MAX_CMT_INDEX.
+    for i in 0..=MAX_CMT_INDEX {
+        vars.insert(format!("__cmt_{i}"), f64::NAN);
+    }
+    for (i, &v) in ctx.compartments.iter().enumerate() {
+        vars.insert(format!("__cmt_{i}"), v); // overwrite sentinel with actual
+    }
+
     // Insert each name with original case AND uppercase + lowercase aliases so
     // that case mismatches (e.g. `wt` vs. header `WT`, or `WT` vs. header `wt`)
     // resolve correctly. `eval_expression` looks names up verbatim, so every
@@ -2004,6 +2099,17 @@ fn build_derived_vars(ctx: &DerivedContext<'_>) -> HashMap<String, f64> {
             vars.insert(lo, v);
         }
     };
+
+    // Named compartment access — lowest priority among `insert_ci` inserts.
+    // Pre-insert NaN so unavailable states surface as NaN in [derived];
+    // individual params, covariates, and built-ins below overwrite any clash.
+    for name in ctx.compartment_names.iter() {
+        insert_ci(name, f64::NAN);
+    }
+    for (name, &v) in ctx.compartment_names.iter().zip(ctx.compartments.iter()) {
+        insert_ci(name, v); // overwrite sentinel with actual value
+    }
+
     for (k, &v) in ctx.indiv_params.iter() {
         insert_ci(k, v);
     }
@@ -2049,6 +2155,43 @@ fn cond_refs_dv(cond: &Condition) -> bool {
     }
 }
 
+/// Returns true if the expression subtree references a compartment state.
+/// Matches both `__cmt_N` (from `compartments[N]` syntax) and named ODE state
+/// variables (e.g. `Ce`, `depot`). Named references are detected by checking
+/// `ode_state_names`; an empty slice means only subscript-style access matches.
+fn expr_refs_compartments(expr: &Expression, ode_state_names: &[String]) -> bool {
+    match expr {
+        Expression::Variable(s) => {
+            s.starts_with("__cmt_") || ode_state_names.iter().any(|n| n.eq_ignore_ascii_case(s))
+        }
+        Expression::BinOp(l, _, r) => {
+            expr_refs_compartments(l, ode_state_names) || expr_refs_compartments(r, ode_state_names)
+        }
+        Expression::UnaryFn(_, arg) => expr_refs_compartments(arg, ode_state_names),
+        Expression::Power(b, e) => {
+            expr_refs_compartments(b, ode_state_names) || expr_refs_compartments(e, ode_state_names)
+        }
+        Expression::Conditional(c, t, e) => {
+            cond_refs_compartments(c, ode_state_names)
+                || expr_refs_compartments(t, ode_state_names)
+                || expr_refs_compartments(e, ode_state_names)
+        }
+        _ => false,
+    }
+}
+
+fn cond_refs_compartments(cond: &Condition, ode_state_names: &[String]) -> bool {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            expr_refs_compartments(l, ode_state_names) || expr_refs_compartments(r, ode_state_names)
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            cond_refs_compartments(l, ode_state_names) || cond_refs_compartments(r, ode_state_names)
+        }
+        Condition::Not(c) => cond_refs_compartments(c, ode_state_names),
+    }
+}
+
 /// Parse the interior args of `integral(...)` into a `DerivedKind::Integral`.
 fn parse_integral_kind(
     args: &[&[Token]],
@@ -2063,6 +2206,9 @@ fn parse_integral_kind(
 
     let integrand_expr = parse_derived_expr(args[0], ctx)?;
     let data_based = expr_refs_dv(&integrand_expr);
+    // Also checked against condition below — must be `mut` so we can OR in
+    // the condition's compartment references before the struct is built.
+    let mut uses_compartments = expr_refs_compartments(&integrand_expr, ctx.ode_state_names);
 
     let mut condition: Option<DerivedFilterFn> = None;
     let mut from_val: Option<f64> = None;
@@ -2075,6 +2221,15 @@ fn parse_integral_kind(
     // Second positional arg is a condition if it contains comparison operators.
     if i < args.len() && !is_keyword_arg_tokens(args[i]) && tokens_contain_comparison(args[i]) {
         let cond = parse_derived_cond(args[i], ctx)?;
+        // If the filter condition references a compartment (e.g.
+        // `integral(IPRED, compartments[0] > threshold, from=0, to=24)`),
+        // we must set uses_compartments so the grid path populates the state
+        // vectors before the condition closure is evaluated — otherwise the
+        // filter sees NaN for all __cmt_N keys. Matches max/min/tmax handling
+        // at lines 2332–2335.
+        if cond_refs_compartments(&cond, ctx.ode_state_names) {
+            uses_compartments = true;
+        }
         condition = Some(build_derived_filter_fn(cond));
         i += 1;
     }
@@ -2147,6 +2302,7 @@ fn parse_integral_kind(
         integrand: build_derived_eval_fn(integrand_expr),
         condition,
         data_based,
+        uses_compartments,
         window: int_window,
         step: int_step,
     })
@@ -2166,6 +2322,7 @@ fn parse_derived_block(
     eta_names: &[String],
     indiv_param_names: &[String],
     covariate_names: &[String],
+    ode_state_names: &[String],
     parse_warnings: &mut Vec<String>,
 ) -> Result<Vec<DerivedExprSpec>, String> {
     let mut specs: Vec<DerivedExprSpec> = Vec::new();
@@ -2245,6 +2402,7 @@ fn parse_derived_block(
             defined_vars: &defined_vars,
             fallback_covariate: false,
             nn_specs: &[],
+            ode_state_names,
         };
 
         // ── Tokenize ──────────────────────────────────────────────────────────
@@ -2256,7 +2414,12 @@ fn parse_derived_block(
         }
 
         // ── Detect form ───────────────────────────────────────────────────────
-        let kind = if let Token::Ident(func_name) = &tokens[0] {
+        // `spec_uses_compartments` tracks whether this derived expression
+        // references compartments[i] or named ODE state variables anywhere.
+        // Propagated into `DerivedExprSpec::uses_compartments` so that the
+        // post-fit warning logic can gate on "compartments actually requested"
+        // rather than "any [derived] block exists".
+        let (kind, spec_uses_compartments) = if let Token::Ident(func_name) = &tokens[0] {
             let fname_lc = func_name.to_lowercase();
             if matches!(fname_lc.as_str(), "max" | "min" | "tmax" | "integral")
                 && tokens.get(1) == Some(&Token::LParen)
@@ -2286,7 +2449,15 @@ fn parse_derived_block(
                 let args = split_top_level_commas(interior);
 
                 if fname_lc == "integral" {
-                    parse_integral_kind(&args, ctx, parse_warnings)?
+                    let kind = parse_integral_kind(&args, ctx, parse_warnings)?;
+                    let uses = matches!(
+                        kind,
+                        DerivedKind::Integral {
+                            uses_compartments: true,
+                            ..
+                        }
+                    );
+                    (kind, uses)
                 } else {
                     // max / min / tmax
                     let agg_fn = match fname_lc.as_str() {
@@ -2298,35 +2469,50 @@ fn parse_derived_block(
                     let value_tokens = args.first().copied().unwrap_or(&[]);
                     let filter_tokens = if args.len() >= 2 { Some(args[1]) } else { None };
                     let value_expr = parse_derived_expr(value_tokens, ctx)?;
-                    let filter = if let Some(ft) = filter_tokens {
+                    let value_uses = expr_refs_compartments(&value_expr, ctx.ode_state_names);
+                    let (filter, filter_uses) = if let Some(ft) = filter_tokens {
                         let cond = parse_derived_cond(ft, ctx)?;
-                        Some(build_derived_filter_fn(cond))
+                        let uses = cond_refs_compartments(&cond, ctx.ode_state_names);
+                        (Some(build_derived_filter_fn(cond)), uses)
                     } else {
-                        None
+                        (None, false)
                     };
-                    DerivedKind::Aggregate {
+                    let kind = DerivedKind::Aggregate {
                         func: agg_fn,
                         value: build_derived_eval_fn(value_expr),
                         filter,
-                    }
+                    };
+                    (kind, value_uses || filter_uses)
                 }
             } else {
                 // Plain expression → PerRow
                 let expr = parse_derived_expr(&tokens, ctx)?;
-                DerivedKind::PerRow {
-                    eval: build_derived_eval_fn(expr),
-                }
+                let uses = expr_refs_compartments(&expr, ctx.ode_state_names);
+                (
+                    DerivedKind::PerRow {
+                        eval: build_derived_eval_fn(expr),
+                    },
+                    uses,
+                )
             }
         } else {
             // Starts with a literal or unary minus
             let expr = parse_derived_expr(&tokens, ctx)?;
-            DerivedKind::PerRow {
-                eval: build_derived_eval_fn(expr),
-            }
+            let uses = expr_refs_compartments(&expr, ctx.ode_state_names);
+            (
+                DerivedKind::PerRow {
+                    eval: build_derived_eval_fn(expr),
+                },
+                uses,
+            )
         };
 
         defined_derived.push(name.clone());
-        specs.push(DerivedExprSpec { name, kind });
+        specs.push(DerivedExprSpec {
+            name,
+            kind,
+            uses_compartments: spec_uses_compartments,
+        });
     }
 
     Ok(specs)
@@ -2469,7 +2655,16 @@ fn parse_event_model_block(
     theta_names: &[String],
     eta_names: &[String],
     error_spec: &ErrorSpec,
-) -> Result<(usize, crate::types::EndpointLikelihood), String> {
+) -> Result<
+    (
+        usize,
+        crate::types::EndpointLikelihood,
+        Vec<String>,
+        std::collections::HashSet<usize>,
+        std::collections::HashSet<usize>,
+    ),
+    String,
+> {
     use crate::types::{EndpointLikelihood, HazardFamily, HazardSpec};
 
     let ctx = ParseCtx::new(theta_names, eta_names, &[]);
@@ -2609,6 +2804,34 @@ fn parse_event_model_block(
         }
     }
 
+    // Collect covariate/theta/eta references from all expressions BEFORE they are
+    // moved into the param_fn closure.
+    let event_model_covariates: Vec<String>;
+    let event_model_thetas: std::collections::HashSet<usize>;
+    let event_model_etas: std::collections::HashSet<usize>;
+    {
+        let mut cov_set = std::collections::HashSet::new();
+        let mut theta_set = std::collections::HashSet::new();
+        let mut eta_set = std::collections::HashSet::new();
+        for expr_opt in [
+            &scale_expr,
+            &shape_expr,
+            &alpha_expr,
+            &gamma_expr,
+            &loghr_expr,
+        ] {
+            if let Some(expr) = expr_opt {
+                collect_covariates(expr, &mut cov_set);
+                collect_theta_eta(expr, &mut theta_set, &mut eta_set);
+            }
+        }
+        let mut v: Vec<String> = cov_set.into_iter().collect();
+        v.sort();
+        event_model_covariates = v;
+        event_model_thetas = theta_set;
+        event_model_etas = eta_set;
+    }
+
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
     // Expression nodes hold only indices, so they're safe to move into the closure.
     // Parameter layout matches parametric.rs: [scale/alpha, (shape/gamma), loghr].
@@ -2662,6 +2885,9 @@ fn parse_event_model_block(
         EndpointLikelihood::Tte {
             hazard: HazardSpec::Analytic { family, param_fn },
         },
+        event_model_covariates,
+        event_model_thetas,
+        event_model_etas,
     ))
 }
 
@@ -2849,6 +3075,16 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "covariance" => opts.run_covariance_step = parse_bool("covariance")?,
+        "fd_hessian_step" => {
+            let v = parse_f64("fd_hessian_step")?;
+            if v <= 0.0 || !v.is_finite() {
+                return Err(format!(
+                    "fd_hessian_step must be a positive finite value, got {}",
+                    v
+                ));
+            }
+            opts.fd_hessian_step = v;
+        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -5295,7 +5531,9 @@ fn build_error_spec(
             Ok((model, ErrorSpec::Single(model)))
         }
         ParsedErrorModel::PerCmt(entries) => {
-            if !is_ode {
+            // An empty PerCmt arises for TTE-only models (no [error_model] block) —
+            // allow it regardless of is_ode.  Non-empty PerCmt still requires ODE.
+            if !entries.is_empty() && !is_ode {
                 return Err(
                     "Per-CMT error models (`CMT=N: DV ~ ...`) require an ODE-based \
                      [structural_model]; analytical PK models support a single error \
@@ -5643,17 +5881,22 @@ struct ParseCtx<'a> {
     /// when no `[covariate_nn]` block is present in the model (the
     /// dot-access parser then errors on `FOO.BAR`).
     nn_specs: &'a [(String, Vec<String>)],
+    /// ODE state variable names for detecting compartment references in
+    /// integral integrands (`uses_compartments` flag). Empty for analytical models.
+    ode_state_names: &'a [String],
 }
 
 impl<'a> ParseCtx<'a> {
     fn new(theta_names: &'a [String], eta_names: &'a [String], defined_vars: &'a [String]) -> Self {
         const EMPTY_NN: &[(String, Vec<String>)] = &[];
+        const EMPTY: &[String] = &[];
         Self {
             theta_names,
             eta_names,
             defined_vars,
             fallback_covariate: true,
             nn_specs: EMPTY_NN,
+            ode_state_names: EMPTY,
         }
     }
 
@@ -5666,6 +5909,7 @@ impl<'a> ParseCtx<'a> {
             defined_vars,
             fallback_covariate: false,
             nn_specs: EMPTY_NN,
+            ode_state_names: EMPTY,
         }
     }
 
@@ -5858,18 +6102,24 @@ fn check_unused_parameters(
     sigma_names: &[String],
     indiv_stmts: &[Statement],
     used_sigmas: &std::collections::HashSet<String>,
+    event_model_thetas: &std::collections::HashSet<usize>,
+    event_model_etas: &std::collections::HashSet<usize>,
 ) -> Vec<String> {
     let mut used_thetas = std::collections::HashSet::new();
     let mut used_etas = std::collections::HashSet::new();
     collect_theta_eta_in_stmts(indiv_stmts, &mut used_thetas, &mut used_etas);
+    // Union in parameters used in [event_model] so mixed PK+TTE models do not
+    // produce false "not referenced" warnings for hazard-model thetas/etas.
+    used_thetas.extend(event_model_thetas.iter().copied());
+    used_etas.extend(event_model_etas.iter().copied());
 
     let mut warnings = Vec::new();
 
     for (i, t) in thetas.iter().enumerate() {
         if !used_thetas.contains(&i) {
             warnings.push(format!(
-                "theta '{}' is declared in [parameters] but not referenced in \
-                 [individual_parameters] — it will not affect predictions or be \
+                "theta '{}' is declared in [parameters] but not referenced in any \
+                 model expression — it will not affect predictions or be \
                  meaningfully estimated",
                 t.name
             ));
@@ -5878,8 +6128,8 @@ fn check_unused_parameters(
     for (i, name) in eta_names_bsv.iter().enumerate() {
         if !used_etas.contains(&i) {
             warnings.push(format!(
-                "omega '{}' is declared in [parameters] but not referenced in \
-                 [individual_parameters] — it will not affect predictions or be \
+                "omega '{}' is declared in [parameters] but not referenced in any \
+                 model expression — it will not affect predictions or be \
                  meaningfully estimated",
                 name
             ));
@@ -5888,8 +6138,8 @@ fn check_unused_parameters(
     for (i, name) in kappa_names.iter().enumerate() {
         if !used_etas.contains(&(n_eta + i)) {
             warnings.push(format!(
-                "kappa '{}' is declared in [parameters] but not referenced in \
-                 [individual_parameters] — it will not affect predictions or be \
+                "kappa '{}' is declared in [parameters] but not referenced in any \
+                 model expression — it will not affect predictions or be \
                  meaningfully estimated",
                 name
             ));
@@ -7587,6 +7837,8 @@ enum Token {
     Ident(String),
     LParen,
     RParen,
+    LBracket,
+    RBracket,
     LBrace,
     RBrace,
     Plus,
@@ -7717,6 +7969,14 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::RParen);
                 i += 1;
             }
+            '[' => {
+                tokens.push(Token::LBracket);
+                i += 1;
+            }
+            ']' => {
+                tokens.push(Token::RBracket);
+                i += 1;
+            }
             '+' => {
                 tokens.push(Token::Plus);
                 i += 1;
@@ -7728,6 +7988,7 @@ fn tokenize(s: &str) -> Result<Vec<Token>, String> {
                         tokens.last(),
                         Some(
                             Token::LParen
+                                | Token::LBracket
                                 | Token::LBrace
                                 | Token::Plus
                                 | Token::Minus
@@ -7977,6 +8238,50 @@ fn parse_atom(
             Ok((expr, p + 1))
         }
         Token::Ident(name) => {
+            // compartments[N] — subscript access into DerivedContext::compartments.
+            // Emits Variable("__cmt_N") which build_derived_vars populates at eval time.
+            // Only literal non-negative integer indices are supported.
+            if name.eq_ignore_ascii_case("compartments")
+                && pos + 1 < tokens.len()
+                && tokens[pos + 1] == Token::LBracket
+            {
+                let n_tok = tokens
+                    .get(pos + 2)
+                    .ok_or_else(|| "[derived] `compartments[`: missing index".to_string())?;
+                let n = match n_tok {
+                    Token::Number(v) => {
+                        if v.fract() != 0.0 || *v < 0.0 {
+                            return Err(format!(
+                                "[derived] `compartments[{v}]`: index must be a non-negative integer"
+                            ));
+                        }
+                        *v as usize
+                    }
+                    _ => {
+                        return Err(
+                            "[derived] `compartments[...]`: only literal integer indices are \
+                             supported in Phase 1 — use `compartments[0]`, `compartments[1]`, etc."
+                                .to_string(),
+                        )
+                    }
+                };
+                // MAX_CMT_INDEX is defined at module scope (same value that
+                // build_derived_vars uses to bound its sentinel loop).  Any index
+                // beyond it is not in the sentinel map and would silently return 0.0
+                // via eval_expression's .unwrap_or(0.0).  Reject at parse time.
+                if n > MAX_CMT_INDEX {
+                    return Err(format!(
+                        "[derived] `compartments[{n}]`: index {n} exceeds the maximum \
+                         supported value ({MAX_CMT_INDEX}). \
+                         Use compartments[0] through compartments[{MAX_CMT_INDEX}]."
+                    ));
+                }
+                if tokens.get(pos + 3) != Some(&Token::RBracket) {
+                    return Err("[derived] `compartments[N`: missing closing `]`".to_string());
+                }
+                return Ok((Expression::Variable(format!("__cmt_{n}")), pos + 4));
+            }
+
             // Inline conditional expression: `if (cond) then_expr else else_expr`
             // Used as a value (e.g. `CL = if (SEX == 1) TVCL * 1.2 else TVCL`).
             if name.eq_ignore_ascii_case("if") {
@@ -8208,18 +8513,18 @@ enum StatementMode {
 /// because they separate statements within a block body.
 fn strip_newlines_in_groups(tokens: Vec<Token>) -> Vec<Token> {
     let mut out = Vec::with_capacity(tokens.len());
-    let mut paren_depth = 0i32;
+    let mut depth = 0i32;
     for t in tokens {
         match t {
-            Token::LParen => {
-                paren_depth += 1;
-                out.push(Token::LParen);
+            Token::LParen | Token::LBracket => {
+                depth += 1;
+                out.push(t);
             }
-            Token::RParen => {
-                paren_depth -= 1;
-                out.push(Token::RParen);
+            Token::RParen | Token::RBracket => {
+                depth -= 1;
+                out.push(t);
             }
-            Token::Newline if paren_depth > 0 => {
+            Token::Newline if depth > 0 => {
                 // drop
             }
             other => out.push(other),
@@ -9020,6 +9325,19 @@ mod tests {
             if !cfg!(feature = "nn") {
                 let src = std::fs::read_to_string(&path).unwrap_or_default();
                 if src.contains("[covariate_nn") || src.contains("[dynamics_nn") {
+                    continue;
+                }
+            }
+            // TTE-only files (no [structural_model] block) require the survival feature.
+            // Use a line-start check so the comment "# Note: [structural_model] ..."
+            // present in example file headers does not falsely count as a block.
+            if !cfg!(feature = "survival") {
+                let src = std::fs::read_to_string(&path).unwrap_or_default();
+                let has_event_model = src.contains("[event_model");
+                let has_struct_block = src
+                    .lines()
+                    .any(|l| l.trim_start().starts_with("[structural_model"));
+                if has_event_model && !has_struct_block {
                     continue;
                 }
             }
@@ -10397,6 +10715,36 @@ mod tests {
 
         assert!(apply_fit_option(&mut opts, "inner_maxiter", "oops").is_err());
         assert!(apply_fit_option(&mut opts, "inner_tol", "not_a_num").is_err());
+    }
+
+    #[test]
+    fn test_apply_fit_option_fd_hessian_step_valid() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(&mut opts, "fd_hessian_step", "0.05"),
+            Ok(true)
+        );
+        assert!((opts.fd_hessian_step - 0.05).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_apply_fit_option_fd_hessian_step_zero_rejected() {
+        let mut opts = FitOptions::default();
+        let err = apply_fit_option(&mut opts, "fd_hessian_step", "0").unwrap_err();
+        assert!(
+            err.contains("positive"),
+            "error must mention 'positive': {err}"
+        );
+    }
+
+    #[test]
+    fn test_apply_fit_option_fd_hessian_step_negative_rejected() {
+        let mut opts = FitOptions::default();
+        let err = apply_fit_option(&mut opts, "fd_hessian_step", "-0.01").unwrap_err();
+        assert!(
+            err.contains("positive"),
+            "error must mention 'positive': {err}"
+        );
     }
 
     // ── IOV: kappa keyword and iov_column ──────────────────────────────────
@@ -14696,6 +15044,8 @@ method = foce
                 tafd: 1.0,
                 tad: 1.0,
                 prev_derived: &prev_derived,
+                compartments: &[],
+                compartment_names: &[],
             };
             let ke = eval(&ctx);
             assert!((ke - 0.1).abs() < 1e-10, "KE = CL/V = 1/10 = 0.1, got {ke}");
@@ -14727,6 +15077,8 @@ method = foce
                 tafd: 1.0,
                 tad: 1.0,
                 prev_derived: &prev_derived,
+                compartments: &[],
+                compartment_names: &[],
             };
             let ke = eval(&ctx);
             prev_derived.insert("KE".to_string(), ke);
@@ -14746,6 +15098,8 @@ method = foce
                 tafd: 1.0,
                 tad: 1.0,
                 prev_derived: &prev_derived,
+                compartments: &[],
+                compartment_names: &[],
             };
             let t_half = eval(&ctx);
             let expected = 0.693 / 0.1;
@@ -14941,6 +15295,8 @@ CL V KA WT
                     tafd: 0.0,
                     tad: 0.0,
                     prev_derived: &prev,
+                    compartments: &[],
+                    compartment_names: &[],
                 };
                 let result = eval(&ctx);
                 assert!(
@@ -14975,6 +15331,8 @@ CL V KA WT
                     tafd: 0.0,
                     tad: 0.0,
                     prev_derived: &prev,
+                    compartments: &[],
+                    compartment_names: &[],
                 };
                 let result = eval(&ctx);
                 assert!(
@@ -15005,6 +15363,8 @@ CL V KA WT
                 tafd: 1.0,
                 tad: 0.0, // zero
                 prev_derived: &prev,
+                compartments: &[],
+                compartment_names: &[],
             };
             assert_eq!(eval(&ctx), 1.0, "TAD=0 should be < MACHEPS");
             // TAD = 1.0 >> MACHEPS → flag = 0
@@ -15039,6 +15399,8 @@ CL V KA WT
                 tafd: 0.0,
                 tad: 0.0,
                 prev_derived: &prev,
+                compartments: &[],
+                compartment_names: &[],
             };
             assert_eq!(
                 eval(&ctx),

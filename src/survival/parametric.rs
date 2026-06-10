@@ -52,6 +52,11 @@ pub fn hazard_and_cum_hazard(family: HazardFamily, t: f64, params: &[f64]) -> (f
             let gamma = params[1];
             let loghr = params.get(2).copied().unwrap_or(0.0);
             let exp_loghr = loghr.exp();
+            if gamma == 0.0 {
+                // γ=0: limit of (alpha/gamma)*(exp(gamma*t)-1) as γ→0 is alpha*t
+                let eff = alpha * exp_loghr;
+                return (eff, eff * t);
+            }
             // h(t) = alpha * exp(gamma*t) * exp(loghr)
             // H(t) = (alpha/gamma) * (exp(gamma*t) - 1) * exp(loghr)
             let exp_gt = (gamma * t).exp();
@@ -65,6 +70,110 @@ pub fn hazard_and_cum_hazard(family: HazardFamily, t: f64, params: &[f64]) -> (f
 /// Cumulative hazard H(t) only (cheaper when h is not needed).
 pub fn cum_hazard(family: HazardFamily, t: f64, params: &[f64]) -> f64 {
     hazard_and_cum_hazard(family, t, params).1
+}
+
+/// Median survival time: the unique T satisfying H(T) = ln 2.
+///
+/// Computed analytically for all three families.  Returns `f64::NAN` if
+/// the parameters are degenerate (e.g. `alpha ≤ 0` for Gompertz).
+pub fn median_survival(family: HazardFamily, params: &[f64]) -> f64 {
+    use std::f64::consts::LN_2;
+    match family {
+        HazardFamily::Exponential => {
+            let lambda = params[0];
+            let loghr = params.get(1).copied().unwrap_or(0.0);
+            let eff = lambda * loghr.exp();
+            if eff > 0.0 {
+                LN_2 / eff
+            } else {
+                f64::NAN
+            }
+        }
+        HazardFamily::Weibull => {
+            let scale = params[0];
+            let shape = params[1];
+            let loghr = params.get(2).copied().unwrap_or(0.0);
+            let exp_lhr = loghr.exp();
+            // H(T) = (T/scale)^shape * exp(loghr) = ln2
+            // T = scale * (ln2 / exp(loghr))^(1/shape)
+            if scale > 0.0 && shape > 0.0 && exp_lhr > 0.0 {
+                scale * (LN_2 / exp_lhr).powf(1.0 / shape)
+            } else {
+                f64::NAN
+            }
+        }
+        HazardFamily::Gompertz => {
+            let alpha = params[0];
+            let gamma = params[1];
+            let loghr = params.get(2).copied().unwrap_or(0.0);
+            let exp_lhr = loghr.exp();
+            if alpha <= 0.0 || !(exp_lhr > 0.0) {
+                return f64::NAN;
+            }
+            // H(T) = (alpha/gamma)*(exp(gamma*T)-1)*exp(loghr) = ln2
+            // exp(gamma*T) = 1 + x  where  x = ln2·γ / (α·exp(loghr))
+            if gamma == 0.0 {
+                // γ=0: Gompertz degenerates to Exponential with rate α·exp(loghr)
+                LN_2 / (alpha * exp_lhr)
+            } else if gamma > 0.0 {
+                // ln_1p is numerically stable when γ is small (avoids cancellation in (1+x).ln())
+                let x = LN_2 * gamma / (alpha * exp_lhr);
+                x.ln_1p() / gamma
+            } else {
+                f64::NAN
+            }
+        }
+    }
+}
+
+/// Mean survival time E[T] = ∫₀^∞ S(t) dt.
+///
+/// Uses the analytic form `1 / (λ · exp(loghr))` for the Exponential family and
+/// the midpoint rule (2 000 steps to 40 × median) for Weibull and Gompertz.
+/// Returns `f64::NAN` for degenerate parameters.
+pub fn mean_survival(family: HazardFamily, params: &[f64]) -> f64 {
+    match family {
+        HazardFamily::Exponential => {
+            let lambda = params[0];
+            let loghr = params.get(1).copied().unwrap_or(0.0);
+            let eff = lambda * loghr.exp();
+            if eff > 0.0 {
+                1.0 / eff
+            } else {
+                f64::NAN
+            }
+        }
+        _ => {
+            // Gompertz γ=0 degenerates to Exponential with rate α·exp(loghr).
+            // hazard_and_cum_hazard has its own γ=0 guard, but the integration
+            // upper bound would be 40×median which overshoots the analytic limit —
+            // so we return the exact value directly.
+            if matches!(family, HazardFamily::Gompertz) && params[1] == 0.0 {
+                let alpha = params[0];
+                let loghr = params.get(2).copied().unwrap_or(0.0);
+                let exp_lhr = loghr.exp();
+                return if alpha > 0.0 && exp_lhr > 0.0 {
+                    1.0 / (alpha * exp_lhr)
+                } else {
+                    f64::NAN
+                };
+            }
+            let t_med = median_survival(family, params);
+            if !t_med.is_finite() || t_med <= 0.0 {
+                return f64::NAN;
+            }
+            let t_max = 40.0 * t_med;
+            let n = 2000usize;
+            let dt = t_max / n as f64;
+            let mut sum = 0.0;
+            for i in 0..n {
+                let t = (i as f64 + 0.5) * dt;
+                let (_, cum_h) = hazard_and_cum_hazard(family, t, params);
+                sum += (-cum_h).exp();
+            }
+            sum * dt
+        }
+    }
 }
 
 /// Sample an unconditional event time via analytic inverse-CDF.
@@ -97,6 +206,10 @@ pub fn sample_event_time(family: HazardFamily, params: &[f64], u: f64) -> f64 {
             let gamma = params[1];
             let loghr = params.get(2).copied().unwrap_or(0.0);
             let exp_loghr = loghr.exp();
+            if gamma == 0.0 {
+                // γ=0: degenerate to Exponential; H(T) = alpha*exp(loghr)*T = -log U
+                return neg_log_u / (alpha * exp_loghr);
+            }
             // H(T) = -log U  =>  (alpha/gamma)*(exp(gamma*T)-1)*exp(loghr) = neg_log_u
             // exp(gamma*T) = 1 + neg_log_u * gamma / (alpha * exp(loghr))
             let inner = 1.0 + neg_log_u * gamma / (alpha * exp_loghr);
@@ -150,6 +263,10 @@ pub fn sample_conditional_event_time(
             let gamma = params[1];
             let loghr = params.get(2).copied().unwrap_or(0.0);
             let exp_loghr = loghr.exp();
+            if gamma == 0.0 {
+                // γ=0: memoryless Exponential limit; shift by entry_time
+                return entry_time + neg_log_u / (alpha * exp_loghr);
+            }
             // exp(gamma*T) = exp(gamma*entry) + neg_log_u * gamma / (alpha * exp_loghr)
             let exp_entry = (gamma * entry_time).exp();
             let inner = exp_entry + neg_log_u * gamma / (alpha * exp_loghr);
@@ -363,6 +480,127 @@ mod tests {
                 h_t - h_entry,
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn median_exponential_is_ln2_over_lambda() {
+        // Exp(0.1): median = ln(2)/0.1 ≈ 6.931
+        let t_50 = median_survival(HazardFamily::Exponential, &[0.1]);
+        let expected = std::f64::consts::LN_2 / 0.1;
+        assert!((t_50 - expected).abs() < 1e-12, "median = {t_50}");
+        // Verify S(t_50) ≈ 0.5
+        let (_, cum) = hazard_and_cum_hazard(HazardFamily::Exponential, t_50, &[0.1]);
+        assert!(
+            ((-cum).exp() - 0.5).abs() < 1e-12,
+            "S(median) = {}",
+            (-cum).exp()
+        );
+    }
+
+    #[test]
+    fn median_weibull_consistency() {
+        let params = [20.0_f64, 2.0_f64];
+        let t_50 = median_survival(HazardFamily::Weibull, &params);
+        // S(t_50) must equal 0.5 by construction
+        let (_, cum) = hazard_and_cum_hazard(HazardFamily::Weibull, t_50, &params);
+        assert!(
+            ((-cum).exp() - 0.5).abs() < 1e-12,
+            "S(median)={} for Weibull",
+            (-cum).exp()
+        );
+    }
+
+    #[test]
+    fn median_gompertz_consistency() {
+        let params = [0.002_f64, 0.005_f64, 0.0_f64];
+        let t_50 = median_survival(HazardFamily::Gompertz, &params);
+        let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t_50, &params);
+        assert!(
+            ((-cum).exp() - 0.5).abs() < 1e-10,
+            "S(median)={} for Gompertz",
+            (-cum).exp()
+        );
+    }
+
+    #[test]
+    fn median_gompertz_gamma_zero_matches_exponential() {
+        // γ=0: Gompertz degenerates to Exponential; median must equal ln2/α.
+        // (hazard_and_cum_hazard has a 0/0 form at γ=0, so verify analytically.)
+        let alpha = 0.05_f64;
+        let t_gompertz = median_survival(HazardFamily::Gompertz, &[alpha, 0.0, 0.0]);
+        let t_exp = median_survival(HazardFamily::Exponential, &[alpha]);
+        assert!(
+            t_gompertz.is_finite(),
+            "Gompertz γ=0 median must be finite, got {t_gompertz}"
+        );
+        assert!(
+            (t_gompertz - t_exp).abs() < 1e-10,
+            "Gompertz(γ=0) median {t_gompertz} should equal Exponential median {t_exp}"
+        );
+    }
+
+    #[test]
+    fn mean_gompertz_gamma_zero_matches_exponential() {
+        // γ=0: mean must equal 1/α (analytic Exponential limit), not NaN.
+        let alpha = 0.05_f64;
+        let m_gompertz = mean_survival(HazardFamily::Gompertz, &[alpha, 0.0, 0.0]);
+        let m_exp = mean_survival(HazardFamily::Exponential, &[alpha]);
+        assert!(
+            m_gompertz.is_finite(),
+            "Gompertz γ=0 mean must be finite, got {m_gompertz}"
+        );
+        assert!(
+            (m_gompertz - m_exp).abs() < 1e-10,
+            "Gompertz(γ=0) mean {m_gompertz} should equal Exponential mean {m_exp}"
+        );
+    }
+
+    #[test]
+    fn median_gompertz_small_gamma_stable() {
+        // Very small γ — ln_1p path must not return NaN
+        let params = [0.002_f64, 1e-10_f64, 0.0_f64];
+        let t_50 = median_survival(HazardFamily::Gompertz, &params);
+        assert!(
+            t_50.is_finite(),
+            "Gompertz small-γ median must be finite, got {t_50}"
+        );
+        let (_, cum) = hazard_and_cum_hazard(HazardFamily::Gompertz, t_50, &params);
+        assert!(
+            ((-cum).exp() - 0.5).abs() < 1e-8,
+            "S(median)={} for small-γ Gompertz",
+            (-cum).exp()
+        );
+    }
+
+    #[test]
+    fn mean_exponential_analytic() {
+        // Exp(λ): mean = 1/λ
+        let m = mean_survival(HazardFamily::Exponential, &[0.1]);
+        assert!((m - 10.0).abs() < 1e-12, "mean = {m}");
+    }
+
+    #[test]
+    fn mean_weibull_numerical_plausible() {
+        // shape=1 → Exponential with scale=20: mean should be ~20
+        let m = mean_survival(HazardFamily::Weibull, &[20.0, 1.0]);
+        assert!(
+            (m - 20.0).abs() < 0.05,
+            "Weibull(scale=20, shape=1) mean = {m}"
+        );
+    }
+
+    #[test]
+    fn mean_exceeds_median() {
+        // For right-skewed distributions, mean > median
+        for (fam, params) in [
+            (HazardFamily::Exponential, vec![0.1_f64]),
+            (HazardFamily::Weibull, vec![20.0_f64, 1.5_f64]),
+            (HazardFamily::Gompertz, vec![0.002_f64, 0.005_f64, 0.0_f64]),
+        ] {
+            let med = median_survival(fam, &params);
+            let mu = mean_survival(fam, &params);
+            assert!(mu > med, "{fam:?}: mean {mu} should exceed median {med}");
         }
     }
 }

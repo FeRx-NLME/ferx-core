@@ -1,0 +1,43 @@
+name: Security audit
+
+# Runs `cargo audit` (RUSTSEC advisory DB) against the committed Cargo.lock.
+# Kept off the per-PR critical path (only fires when dependency files change,
+# weekly, or on demand) so a newly-published advisory can't block unrelated
+# PRs, while still catching vulnerable dependencies promptly when the lockfile
+# changes. Scheduled runs open a tracking issue for any new advisory.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+  schedule:
+    - cron: '0 7 * * 1'   # Mondays 07:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  checks: write
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    # rust-toolchain.toml pins the custom `enzyme` channel, which this job
+    # never installs (only the build jobs set up Enzyme). Override it so the
+    # action's `cargo install cargo-audit` / `cargo audit` run on stable,
+    # which is preinstalled on ubuntu-latest. Audit doesn't need Enzyme.
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

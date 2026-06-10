@@ -43,3 +43,6 @@ pub use io::datareader::{read_nonmem_csv, read_nonmem_csv_with_covariates};
 pub use parser::model_parser::{parse_full_model_file, parse_model_file, parse_model_string};
 pub use suggest_start::{inits_from_nca, NcaInit, SuggestedStart};
 pub use types::*;
+
+#[cfg(feature = "survival")]
+pub use api::{predict_survival, SurvivalPredictionResult};

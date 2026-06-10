@@ -1,0 +1,49 @@
+# Covariance-step diagnostic demo: collinear parameters + large FD step.
+#
+# TVCL1 and TVCL2 appear only as their product (TVCL1 * TVCL2), so only
+# the product is identifiable by the data.  The FD Hessian for the
+# {TVCL1, TVCL2} 2x2 block is rank-deficient: one eigenvalue ≈ 2c (the
+# curvature along the identifiable direction log(TVCL1*TVCL2)) and one
+# eigenvalue ≈ 0 (the unidentifiable direction log(TVCL1) - log(TVCL2)).
+#
+# fd_hessian_step = 0.5 (50% relative perturbation) amplifies the
+# approximation error for that near-zero eigenvalue, making it reliably
+# negative.  invert_psd_with_floor clips it to a small positive floor and
+# reports a "covariance step regularized" warning inside a Success result.
+# SE estimates for TVCL1 and TVCL2 are produced but should be treated with
+# caution (they share the same identifiable combination).
+#
+# Expected output in *-fit.yaml warnings:
+#   "Covariance step regularized (...)"
+#
+# Run with:
+#   cargo run --release -- examples/warfarin_cov_collinear.ferx --data data/warfarin.csv
+
+[parameters]
+  theta TVCL1(1.5, 0.01, 20.0)  # ─┐ only TVCL1 * TVCL2 is identifiable
+  theta TVCL2(3.0, 0.01, 20.0)  # ─┘
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL1 * TVCL2 * exp(ETA_CL)
+  V  = TVV   * exp(ETA_V)
+  KA = TVKA  * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method          = foce
+  maxiter         = 300
+  covariance      = true
+  fd_hessian_step = 0.5   # large step amplifies near-zero eigenvalue noise

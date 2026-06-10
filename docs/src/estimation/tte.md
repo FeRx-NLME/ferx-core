@@ -2,8 +2,9 @@
 
 > **Phase 1 (current):** Parametric TTE with exponential, Weibull, and Gompertz hazard
 > families; right-censored, exact, and interval-censored observations; left truncation
-> via `TENTRY`; FOCEI Laplace estimation; fixed-effects (`n_eta = 0`) and random-effects
-> paths.
+> via `TENTRY`; FOCEI and SAEM estimation; fixed-effects (`n_eta = 0`) and random-effects
+> paths. `[structural_model]`, `[error_model]`, and `[individual_parameters]` are all
+> optional for TTE-only models.
 
 ## Overview
 

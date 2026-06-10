@@ -1456,6 +1456,23 @@ pub(crate) fn compute_extra_output_columns(
         // for the mandatory TAD column without re-evaluating PK parameters.
         sr.per_obs_tad = per_obs_tad.clone();
 
+        // Compartment states and names for [derived] expressions.
+        // Empty slices are used for observations where states are not available
+        // (IOV subjects, analytical TV-covariate subjects — see W_DERIVED_CMT_* warnings).
+        let model_cmt_names: &[String] = model
+            .ode_spec
+            .as_ref()
+            .map(|s| s.state_names.as_slice())
+            .unwrap_or_else(|| model.analytical_compartment_names());
+        let per_obs_cmts: Vec<&[f64]> = (0..n_obs)
+            .map(|j| {
+                sr.compartment_states
+                    .get(j)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[])
+            })
+            .collect();
+
         // Session infrastructure for EVID=3/4 stacked subjects.
         // For subjects with no resets (the common case) n_sessions=1, session_obs[0]
         // holds all observation indices, session_shift[0]=0, and obs_session[j]=0
@@ -1570,6 +1587,8 @@ pub(crate) fn compute_extra_output_columns(
                             tafd: per_obs_tafd[j],
                             tad: per_obs_tad[j],
                             prev_derived: &row_prev,
+                            compartments: per_obs_cmts[j],
+                            compartment_names: model_cmt_names,
                         };
                         eval(&ctx)
                     })
@@ -1598,6 +1617,8 @@ pub(crate) fn compute_extra_output_columns(
                             tafd: per_obs_tafd[j],
                             tad: per_obs_tad[j],
                             prev_derived: &row_prev,
+                            compartments: per_obs_cmts[j],
+                            compartment_names: model_cmt_names,
                         };
                         let include = filter.as_ref().map_or(true, |f| f(&ctx));
                         if include {
@@ -1636,6 +1657,7 @@ pub(crate) fn compute_extra_output_columns(
                     integrand,
                     condition,
                     data_based,
+                    uses_compartments,
                     window,
                     step,
                 } => {
@@ -1673,6 +1695,8 @@ pub(crate) fn compute_extra_output_columns(
                                     tafd: per_obs_tafd[j],
                                     tad: per_obs_tad[j],
                                     prev_derived: &row_prev,
+                                    compartments: per_obs_cmts[j],
+                                    compartment_names: model_cmt_names,
                                 };
                                 if condition.as_ref().map_or(false, |f| !f(&ctx)) {
                                     return None;
@@ -1747,9 +1771,65 @@ pub(crate) fn compute_extra_output_columns(
                             _ => 501,
                         };
                         let dt = (to - from) / (n_steps - 1) as f64;
-                        let pts: Vec<(f64, f64)> = (0..n_steps)
-                            .filter_map(|k| {
-                                let t = from + k as f64 * dt;
+                        let grid_times: Vec<f64> =
+                            (0..n_steps).map(|k| from + k as f64 * dt).collect();
+
+                        // Pre-compute per-grid-point compartment states when the integrand
+                        // references compartments[i] or named state variables. For ODE models
+                        // we re-run the solver at grid points (exact); for analytical models
+                        // we evaluate the superposition formula at each grid point.
+                        let grid_cmt_states: Vec<Vec<f64>> = if *uses_compartments {
+                            if model.n_kappa > 0 {
+                                // IOV subjects: eta_hat is BSV-only (kappas zeroed); states
+                                // computed here would use kappa=0 regardless of the actual
+                                // occasion, producing finite but wrong values. Return empty
+                                // so every grid point evaluates to NaN, consistent with
+                                // per-obs compartment_states being empty for IOV subjects.
+                                // W_DERIVED_CMT_IOV_UNSUPPORTED explains why.
+                                vec![]
+                            } else if let Some(ref ode) = model.ode_spec {
+                                let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
+                                crate::ode::ode_dense_solve_states(
+                                    ode,
+                                    &pk_j.values,
+                                    theta,
+                                    eta_hat,
+                                    subject,
+                                    &grid_times,
+                                )
+                            } else if subject.has_resets() {
+                                // Analytical model + EVID=3/4 reset: superposition is invalid
+                                // across reset boundaries. Return empty so every grid point
+                                // evaluates to NaN, consistent with per-obs compartment_states
+                                // being empty for such subjects. W_DERIVED_CMT_RESET_ANALYTICAL
+                                // in fit_inner tells the user why.
+                                vec![]
+                            } else if subject.has_tv_covariates() {
+                                // Analytical model + TV covariates: superposition would use
+                                // a single fixed PK snapshot (grid_cov) while ipred honours
+                                // per-observation TV parameters — the states would be
+                                // silently wrong and finite rather than NaN.  Return empty
+                                // (same as the per-obs path in compute_predictions_with_states)
+                                // so every grid point evaluates to NaN, consistent with
+                                // W_DERIVED_CMT_TV_ANALYTICAL warning.
+                                vec![]
+                            } else {
+                                let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
+                                crate::pk::analytical_state_at_times(
+                                    model.pk_model,
+                                    subject,
+                                    &pk_j,
+                                    &grid_times,
+                                )
+                            }
+                        } else {
+                            vec![]
+                        };
+
+                        let pts: Vec<(f64, f64)> = grid_times
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(k, &t)| {
                                 let tafd_k = {
                                     let fd = subject.occasion_first_dose_time(t);
                                     if fd.is_finite() {
@@ -1807,6 +1887,11 @@ pub(crate) fn compute_extra_output_columns(
                                         (name.clone(), val)
                                     })
                                     .collect();
+                                let grid_cmts: &[f64] = if *uses_compartments {
+                                    grid_cmt_states.get(k).map(|v| v.as_slice()).unwrap_or(&[])
+                                } else {
+                                    &[]
+                                };
                                 let ctx = DerivedContext {
                                     theta,
                                     eta: eta_hat,
@@ -1819,6 +1904,8 @@ pub(crate) fn compute_extra_output_columns(
                                     tafd: tafd_k,
                                     tad: tad_k,
                                     prev_derived: &grid_prev_t,
+                                    compartments: grid_cmts,
+                                    compartment_names: model_cmt_names,
                                 };
                                 if condition.as_ref().map_or(false, |f| !f(&ctx)) {
                                     return None;
@@ -2334,7 +2421,22 @@ fn fit_inner(
 
     let ofv = result.ofv;
     let aic = ofv + 2.0 * n_params as f64;
-    let bic = ofv + n_params as f64 * (n_obs as f64).ln();
+    // BIC = OFV + k·ln(n). For TTE-only models n_obs == 0 (no Gaussian records),
+    // giving ln(0) = -inf. Use total record count (Gaussian + TTE) so BIC is finite.
+    #[cfg(feature = "survival")]
+    let n_for_bic: usize = n_obs
+        + population
+            .subjects
+            .iter()
+            .map(|s| s.obs_records.len())
+            .sum::<usize>();
+    #[cfg(not(feature = "survival"))]
+    let n_for_bic: usize = n_obs;
+    let bic = if n_for_bic > 0 {
+        ofv + n_params as f64 * (n_for_bic as f64).ln()
+    } else {
+        f64::NAN
+    };
 
     // Extract SEs from covariance matrix using converged parameter values
     let (se_theta, se_omega, se_sigma, se_kappa) =
@@ -2342,6 +2444,63 @@ fn fit_inner(
 
     // Optional SIR step
     let mut warnings = result.warnings;
+
+    // Warn when [derived] expressions that reference compartments[i] will
+    // silently evaluate to NaN due to unsupported model/subject configurations.
+    // Gate on `uses_compartments` so that a `[derived]` block with only IPRED/DV
+    // integrals (no compartment references) does not emit spurious CMT warnings.
+    if model.derived_exprs.iter().any(|s| s.uses_compartments) {
+        // IOV (kappa) subjects: the predict_iov path does not compute compartment
+        // states — they stay as vec![] so compartments[i] yields NaN.
+        if result.kappas.iter().any(|ks| !ks.is_empty()) {
+            warnings.push(
+                "W_DERIVED_CMT_IOV_UNSUPPORTED: subjects with IOV (kappa) parameters \
+                 do not have compartment states available; [derived] expressions that \
+                 reference compartments[i] evaluate to NaN for those subjects."
+                    .to_string(),
+            );
+        }
+        // Analytical TV-covariate subjects: states would be computed with baseline
+        // PK params while ipred uses time-varying params — inconsistency is worse
+        // than NaN, so the states path returns empty for such subjects.
+        if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_tv_covariates()) {
+            warnings.push(
+                "W_DERIVED_CMT_TV_ANALYTICAL: analytical model with time-varying \
+                 covariates — compartment states are not available for subjects \
+                 with TV covariates; [derived] expressions that reference \
+                 compartments[i] evaluate to NaN for those subjects."
+                    .to_string(),
+            );
+        }
+        // ODE TV-covariate subjects: states are computed via a deterministic pass
+        // using first-obs PK params — approximate when CL/V/etc. vary over time.
+        // ipred (from the event-driven path) is exact; only states are approximate.
+        if model.ode_spec.is_some() && population.subjects.iter().any(|s| s.has_tv_covariates()) {
+            warnings.push(
+                "W_DERIVED_CMT_TV_ODE: ODE model with time-varying covariates — \
+                 compartment states for TV-covariate subjects are approximate \
+                 (first-observation PK parameters used for the deterministic state \
+                 pass; ipred is exact). Use compartments[i] results with care for \
+                 those subjects."
+                    .to_string(),
+            );
+        }
+        // Analytical model with EVID=3/4 resets: superposition is invalid across
+        // reset boundaries. Per-obs compartment states are empty (→ NaN) and the
+        // grid-integral path also returns NaN for affected sessions.
+        // ODE models with resets are handled correctly (ode_dense_solve_states applies
+        // the reset as a break-point); this warning is analytical-only.
+        if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_resets()) {
+            warnings.push(
+                "W_DERIVED_CMT_RESET_ANALYTICAL: analytical model with EVID=3/4 \
+                 reset events — compartment states and compartment-based integrals \
+                 are not available for subjects with resets; [derived] expressions \
+                 that reference compartments[i] evaluate to NaN for those subjects. \
+                 Use an ODE model if compartment states across resets are required."
+                    .to_string(),
+            );
+        }
+    }
 
     // Report detected mu-referencing relationships (only when feature is enabled)
     if options.mu_referencing && !model.mu_refs.is_empty() {
@@ -2856,12 +3015,23 @@ fn compute_subject_results(
             // exploded, and the EPS-shrinkage warning fired even when the actual
             // fit (and the inner-loop EBE) were fine. Caught on the jasmine peds
             // vancomycin testdata — see `[[focei-laplace-not-sheiner-beal]]`.
-            let ipred = if !kappas.is_empty() {
+            // For IOV subjects: ipred via predict_iov; compartment states are not
+            // yet supported on the IOV path (tracked as follow-up), so they stay empty.
+            // For all other subjects: compute_predictions_with_states returns both ipred
+            // and the per-obs compartment state vector in one pass.
+            let (ipred, compartment_states) = if !kappas.is_empty() {
                 let kappa_slices: Vec<Vec<f64>> =
                     kappas.iter().map(|k| k.as_slice().to_vec()).collect();
-                crate::pk::predict_iov(model, subject, &params.theta, eta.as_slice(), &kappa_slices)
+                let iov_ipred = crate::pk::predict_iov(
+                    model,
+                    subject,
+                    &params.theta,
+                    eta.as_slice(),
+                    &kappa_slices,
+                );
+                (iov_ipred, vec![])
             } else {
-                crate::pk::compute_predictions_with_tv(
+                crate::pk::compute_predictions_with_states(
                     model,
                     subject,
                     &params.theta,
@@ -2942,6 +3112,7 @@ fn compute_subject_results(
                 n_obs: subject.observations.len(),
                 extra_columns: vec![],
                 per_obs_tad: vec![],
+                compartment_states,
             }
         })
         .collect()
@@ -3128,6 +3299,7 @@ mod tests {
             n_obs: n,
             extra_columns: vec![],
             per_obs_tad: vec![],
+            compartment_states: vec![],
         }
     }
 
@@ -3746,6 +3918,11 @@ pub struct SurvivalPredictionResult {
     pub cum_hazard: f64,
     /// Instantaneous hazard h(t).
     pub hazard: f64,
+    /// Median survival time T₅₀ (where S(T₅₀) = 0.5); analytic closed form.
+    pub median_survival: f64,
+    /// Mean survival time E[T] = ∫₀^∞ S(t) dt; analytic for Exponential,
+    /// numerical midpoint rule (2 000 steps) for Weibull and Gompertz.
+    pub mean_survival: f64,
 }
 
 /// Compute survival function predictions for TTE endpoints.
@@ -3762,7 +3939,7 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
-    use crate::survival::hazard_and_cum_hazard;
+    use crate::survival::{hazard_and_cum_hazard, mean_survival, median_survival};
     use crate::types::EndpointLikelihood;
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
@@ -3776,6 +3953,11 @@ pub fn predict_survival(
             let crate::types::HazardSpec::Analytic { family, param_fn } = hazard;
             let params_vec = param_fn(&params.theta, &zero_eta, &subject.covariates);
 
+            // Distributional summaries are parameter-dependent, not time-dependent —
+            // compute once per (subject, cmt) pair and repeat across the time grid.
+            let t_median = median_survival(*family, &params_vec);
+            let t_mean = mean_survival(*family, &params_vec);
+
             for &t in time_grid {
                 let (h_val, cum_h) = hazard_and_cum_hazard(*family, t, &params_vec);
                 let s = (-cum_h).exp();
@@ -3786,6 +3968,8 @@ pub fn predict_survival(
                     survival: s,
                     cum_hazard: cum_h,
                     hazard: h_val,
+                    median_survival: t_median,
+                    mean_survival: t_mean,
                 });
             }
         }
@@ -4144,6 +4328,48 @@ mod iov_integration {
         );
     }
 
+    // ── Test: IMP in a chained methods sequence + IOV exercises the IS IOV path ─
+    // `methods = [foce, imp]` on a kappa-bearing model drives the importance-
+    // sampling marginal-likelihood step through its IOV branch
+    // (`obs_nll_iov_fixed_kappa`, `compute_posterior_hessian`,
+    // `subject_is_estimate`, `build_proposals`). κ is held at its EBE, so the
+    // reported −2LL is a partial marginal (see `KappaTreatment::FixedAtMode`).
+    #[test]
+    fn test_iov_imp_chain_runs_importance_sampling() {
+        let model = make_iov_model();
+        let pop = make_iov_population();
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
+        opts.is_samples = 200; // keep the per-subject sampling cheap
+        opts.is_seed = Some(42); // deterministic proposal draws
+        let result = fit(&model, &pop, &model.default_params, &opts);
+        assert!(
+            result.is_ok(),
+            "FOCE→IMP chain with IOV must succeed, got: {:?}",
+            result.err()
+        );
+        let fr = result.unwrap();
+        let is = fr
+            .importance_sampling
+            .as_ref()
+            .expect("importance_sampling result must be populated by the IMP stage");
+        assert!(
+            is.minus2_log_likelihood.is_finite(),
+            "IS marginal −2LL must be finite, got {}",
+            is.minus2_log_likelihood
+        );
+        assert!(
+            is.mc_standard_error.is_finite() && is.mc_standard_error >= 0.0,
+            "IS Monte-Carlo SE must be finite and non-negative, got {}",
+            is.mc_standard_error
+        );
+        assert_eq!(is.n_samples, 200, "n_samples should echo the IS budget");
+        assert!(
+            fr.omega_iov.is_some(),
+            "omega_iov must survive into the IS-augmented result"
+        );
+    }
+
     // ── Test: trust-region optimizer + IOV must return Err ────────────────────
     // trust_region.rs currently passes `&[]` for kappas to pop_nll, which would
     // silently route the OFV through the non-IOV path. Guard at api.rs blocks
@@ -4254,6 +4480,55 @@ mod iov_integration {
                     .iter()
                     .any(|d| d.code == "E_AD_UNAVAILABLE"),
                 "gradient_method={gm:?} must not trigger E_AD_UNAVAILABLE"
+            );
+        }
+    }
+
+    /// Regression for review finding #5 (IOV + compartments[i]).
+    ///
+    /// When the model has a [derived] expression that references `compartments[i]`
+    /// and the fit has IOV subjects, `W_DERIVED_CMT_IOV_UNSUPPORTED` must be
+    /// emitted. The `predict_iov` path does not compute compartment states; the
+    /// per-subject `compartment_states` vec stays empty (`vec![]`), so any
+    /// `compartments[i]` reference evaluates to NaN. The warning makes this
+    /// explicit rather than silent.
+    #[test]
+    fn iov_with_compartments_derived_emits_unsupported_warning() {
+        let mut model = make_iov_model();
+        // Inject a derived expression that sets uses_compartments = true,
+        // just like a parsed `[derived] cmt0 = compartments[0]` would.
+        model.derived_exprs.push(DerivedExprSpec {
+            name: "cmt0".into(),
+            kind: DerivedKind::PerRow {
+                eval: Box::new(|ctx| ctx.compartments.first().copied().unwrap_or(f64::NAN)),
+            },
+            uses_compartments: true,
+        });
+        let pop = make_iov_population();
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        let result =
+            fit(&model, &pop, &model.default_params.clone(), &opts).expect("fit must succeed");
+
+        // Warning must be present.
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_DERIVED_CMT_IOV_UNSUPPORTED")),
+            "expected W_DERIVED_CMT_IOV_UNSUPPORTED warning; got: {:?}",
+            result.warnings
+        );
+        // Compartment states for IOV subjects must be entirely empty (outer vec
+        // is vec![], not vec![vec![]; n_obs]) — the predict_iov path never
+        // populates them.
+        for sr in &result.subjects {
+            assert!(
+                sr.compartment_states.is_empty(),
+                "IOV subject {} must have empty compartment_states (len={}), \
+                 got {}",
+                sr.id,
+                sr.ipred.len(),
+                sr.compartment_states.len()
             );
         }
     }
@@ -5733,6 +6008,7 @@ mod tests_derived_session_clock {
             n_obs,
             extra_columns: Vec::new(),
             per_obs_tad: Vec::new(),
+            compartment_states: Vec::new(),
         }
     }
 
@@ -5749,6 +6025,7 @@ mod tests_derived_session_clock {
             kind: DerivedKind::PerRow {
                 eval: Box::new(|ctx: &DerivedContext| ctx.time),
             },
+            uses_compartments: false,
         }];
         let model = minimal_model(derived_exprs);
         let subject = two_session_subject();
@@ -5790,6 +6067,7 @@ mod tests_derived_session_clock {
                 value: Box::new(|ctx: &DerivedContext| ctx.ipred),
                 filter: None,
             },
+            uses_compartments: false,
         }];
         let model = minimal_model(derived_exprs);
         let subject = two_session_subject();
@@ -5832,9 +6110,11 @@ mod tests_derived_session_clock {
                 integrand: Box::new(|ctx: &DerivedContext| ctx.time),
                 condition: None,
                 data_based: true,
+                uses_compartments: false,
                 window: IntegralWindow::Explicit { from: 0.0, to: 4.0 },
                 step: IntegralStep::ObsTimes,
             },
+            uses_compartments: false,
         }];
         let model = minimal_model(derived_exprs);
         let subject = two_session_subject();
@@ -5878,12 +6158,14 @@ mod tests_derived_session_clock {
                 integrand: Box::new(|ctx: &DerivedContext| ctx.time),
                 condition: None,
                 data_based: true,
+                uses_compartments: false,
                 window: IntegralWindow::Periodic {
                     period: 5.0,
                     anchor: 0.0,
                 },
                 step: IntegralStep::ObsTimes,
             },
+            uses_compartments: false,
         }];
         let model = minimal_model(derived_exprs);
         let subject = two_session_subject();
@@ -5920,9 +6202,11 @@ mod tests_derived_session_clock {
                 integrand: Box::new(|ctx: &DerivedContext| ctx.time),
                 condition: None,
                 data_based: true,
+                uses_compartments: false,
                 window: IntegralWindow::Explicit { from: 0.0, to: 4.0 },
                 step: IntegralStep::ObsTimes,
             },
+            uses_compartments: false,
         }];
         let model = minimal_model(derived_exprs);
         let subject = Subject {
