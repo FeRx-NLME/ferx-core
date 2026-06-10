@@ -1,0 +1,25 @@
+version: 2
+
+updates:
+  # Rust crate dependencies (Cargo.toml / Cargo.lock at the repo root).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # Batch low-risk minor/patch bumps into one PR to cut review noise;
+      # major bumps still come as individual PRs.
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # GitHub Actions pinned in .github/workflows/*.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
