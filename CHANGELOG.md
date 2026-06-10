@@ -29,6 +29,12 @@ section of the SDLC for the versioning policy).
   (SDLC) page and a Contributing page in the book.
 
 ### Fixed
+- Covariance standard errors now match NONMEM `$COVARIANCE MATRIX=R` (within ~2%
+  on warfarin). The covariance step reconverges the inner EBE loop at every
+  finite-difference point — holding the EBEs fixed gave an indefinite Hessian
+  that was clipped and inflated theta/sigma SEs 30–94× — and applies the correct
+  factor of two for the `−2·logL` objective (every SE was previously `1/√2` too
+  small) (#209, #196, #129).
 - IOV FOCEI marginal likelihood now matches NONMEM after the Almquist Laplace
   correction (#109, #203).
 - SAEM no longer collapses a block Ω to a rank-1 (near-unit-correlation)
@@ -40,6 +46,11 @@ section of the SDLC for the versioning policy).
   (#199, #200).
 
 ### Performance
+- The covariance Hessian is built from a central difference of the analytical
+  population gradient — reusing H-matrix columns for mu-referenced parameters
+  instead of finite-differencing predictions — making the covariance step ~9×
+  faster than scalar finite differencing on warfarin, scaling with the number of
+  free parameters (#209, #196).
 - Autodiff inner gradients now flow through `EVID=3/4` resets and lag time,
   removing a large finite-difference fallback slowdown (#198).
 
