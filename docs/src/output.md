@@ -134,11 +134,11 @@ covariance_matrix:
   # (identity otherwise), sigma log-transformed, omega/kappa Cholesky-factored
   parameters: [TVCL, TVV, log_chol_ETA_CL, log_chol_ETA_V, sigma_1]
   rows:
-    TVCL:           [1.234567e-4, 2.345678e-5, 0.000000e+0, 0.000000e+0, 0.000000e+0]
-    TVV:            [2.345678e-5, 1.456789e-3, 0.000000e+0, 0.000000e+0, 0.000000e+0]
+    TVCL:            [1.234567e-4, 2.345678e-5, 0.000000e+0, 0.000000e+0, 0.000000e+0]
+    TVV:             [2.345678e-5, 1.456789e-3, 0.000000e+0, 0.000000e+0, 0.000000e+0]
     log_chol_ETA_CL: [0.000000e+0, 0.000000e+0, 5.678901e-5, 0.000000e+0, 0.000000e+0]
     log_chol_ETA_V:  [0.000000e+0, 0.000000e+0, 0.000000e+0, 2.345678e-6, 0.000000e+0]
-    sigma_1:   [0.000000e+0, 0.000000e+0, 0.000000e+0, 0.000000e+0, 7.890123e-7]
+    sigma_1:         [0.000000e+0, 0.000000e+0, 0.000000e+0, 0.000000e+0, 7.890123e-7]
 ```
 
 The `covariance_matrix:` block is only present when the covariance step ran
