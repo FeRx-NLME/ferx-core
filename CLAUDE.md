@@ -184,6 +184,24 @@ The same restriction applies to any helper the AD code calls transitively — `m
 
 This restriction will go away once Enzyme upstream adds rules for the newer intrinsics — track at https://github.com/EnzymeAD/Enzyme/issues. When removing the workaround, re-enable a representative test under CI with the `autodiff` feature to catch regressions.
 
+## Changelog
+
+User-facing changes are tracked in `CHANGELOG.md` at the repo root, in
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format with
+[semantic versioning](https://semver.org/).
+
+**In the same PR as any user-facing change, add a one-line entry under the
+`## [Unreleased]` heading** in the correct category (`Added`, `Changed`,
+`Deprecated`, `Removed`, `Fixed`, `Security`, or `Performance`). Write it in
+user-facing language and reference the issue/PR number (`#NN`). A PR that only
+touches internal refactors, tests, or CI does not need an entry.
+
+At release time (not per-PR), `## [Unreleased]` is renamed to the new version
+with a date, a fresh empty `## [Unreleased]` is started, and the compare links
+at the bottom are updated. The R wrapper (`../ferx-r`) tracks its own
+user-facing changes in `NEWS.md`, so a cross-repo change may need an entry in
+both.
+
 ## Pull Requests
 
 When creating a PR in this repo, always read `.github/PULL_REQUEST_TEMPLATE.md` and fill every section before calling `gh pr create`.

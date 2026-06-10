@@ -85,7 +85,8 @@
 
 ## Docs
 - [ ] `docs/src/` updated for user-visible changes
-- [ ] `mdbook build` run and `docs/book/` committed
+- [ ] New pages linked in `docs/src/SUMMARY.md` (do **not** commit `docs/book/` — it is git-ignored; CI builds & deploys it)
+- [ ] `CHANGELOG.md` `[Unreleased]` entry added (user-facing change), or N/A (internal/refactor/CI)
 - [ ] No user-visible change
 
 ## Checklist
