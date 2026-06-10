@@ -2710,6 +2710,8 @@ mod tests {
             dv_pre_logged: false,
             derived_exprs: Vec::new(),
             output_columns: Vec::new(),
+            #[cfg(feature = "survival")]
+            endpoints: HashMap::new(),
         };
 
         // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.
@@ -2732,6 +2734,8 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: Vec::new(),
         };
 
         let theta = vec![5.0f64, 50.0];

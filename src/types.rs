@@ -3457,6 +3457,8 @@ mod tests {
             cens: Vec::new(),
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: Vec::new(),
         }
     }
 
