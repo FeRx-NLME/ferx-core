@@ -3448,4 +3448,82 @@ mod tests {
             result.ofv,
         );
     }
+
+    // ── built-in BFGS optimizer (non-NLopt path) ─────────────────────────────
+
+    /// Drives the `Optimizer::Bfgs` branch of `optimize_population` for a few
+    /// outer iterations. Exercises `optimize_bfgs`, `bfgs_update`, and
+    /// `backtracking_line_search_warm` end-to-end on a tiny 1-cpt IV problem
+    /// without running to convergence (fast, Tier-1).
+    #[test]
+    fn bfgs_optimizer_runs_and_improves_ofv() {
+        use crate::types::{EstimationMethod, FitOptions, Optimizer};
+        let model = make_model();
+        let population = make_population(4);
+        let opts = FitOptions {
+            method: EstimationMethod::Foce,
+            optimizer: Optimizer::Bfgs,
+            outer_maxiter: 5,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+
+        // OFV at the initial point, for an improvement comparison.
+        let init_ofv = {
+            let init = optimize_population(
+                &model,
+                &population,
+                &model.default_params,
+                &FitOptions {
+                    optimizer: Optimizer::Bfgs,
+                    outer_maxiter: 0,
+                    run_covariance_step: false,
+                    ..opts.clone()
+                },
+            );
+            init.ofv
+        };
+
+        let result = optimize_population(&model, &population, &model.default_params, &opts);
+        assert!(result.ofv.is_finite(), "BFGS produced non-finite OFV");
+        assert_eq!(result.eta_hats.len(), population.subjects.len());
+        // Built-in BFGS does not export a final gradient (NLopt-only field).
+        assert!(result.final_gradient.is_none());
+        // A handful of iterations should not make the OFV worse.
+        assert!(
+            result.ofv <= init_ofv + 1e-6,
+            "BFGS worsened OFV: init={init_ofv:.4} final={:.4}",
+            result.ofv
+        );
+    }
+
+    // ── global pre-search (CRS2-LM) ──────────────────────────────────────────
+
+    /// Exercises the `run_global_presearch` branch. CRS2-LM may be absent from
+    /// the linked NLopt build; in that case the pre-search returns `Err` and a
+    /// `global_search disabled` warning is recorded. Either way the run must
+    /// finish with a finite OFV — this test just ensures the branch is taken
+    /// and handled gracefully (small `global_maxeval` keeps it fast).
+    #[test]
+    fn global_presearch_branch_runs_or_warns() {
+        use crate::types::{EstimationMethod, FitOptions, Optimizer};
+        let model = make_model();
+        let population = make_population(4);
+        let opts = FitOptions {
+            method: EstimationMethod::Foce,
+            optimizer: Optimizer::Bobyqa,
+            outer_maxiter: 3,
+            global_search: true,
+            global_maxeval: 8,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let result = optimize_population(&model, &population, &model.default_params, &opts);
+        assert!(
+            result.ofv.is_finite(),
+            "presearch run produced non-finite OFV"
+        );
+    }
 }

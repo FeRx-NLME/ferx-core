@@ -4168,6 +4168,48 @@ mod iov_integration {
         );
     }
 
+    // ── Test: IMP in a chained methods sequence + IOV exercises the IS IOV path ─
+    // `methods = [foce, imp]` on a kappa-bearing model drives the importance-
+    // sampling marginal-likelihood step through its IOV branch
+    // (`obs_nll_iov_fixed_kappa`, `compute_posterior_hessian`,
+    // `subject_is_estimate`, `build_proposals`). κ is held at its EBE, so the
+    // reported −2LL is a partial marginal (see `KappaTreatment::FixedAtMode`).
+    #[test]
+    fn test_iov_imp_chain_runs_importance_sampling() {
+        let model = make_iov_model();
+        let pop = make_iov_population();
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
+        opts.is_samples = 200; // keep the per-subject sampling cheap
+        opts.is_seed = Some(42); // deterministic proposal draws
+        let result = fit(&model, &pop, &model.default_params, &opts);
+        assert!(
+            result.is_ok(),
+            "FOCE→IMP chain with IOV must succeed, got: {:?}",
+            result.err()
+        );
+        let fr = result.unwrap();
+        let is = fr
+            .importance_sampling
+            .as_ref()
+            .expect("importance_sampling result must be populated by the IMP stage");
+        assert!(
+            is.minus2_log_likelihood.is_finite(),
+            "IS marginal −2LL must be finite, got {}",
+            is.minus2_log_likelihood
+        );
+        assert!(
+            is.mc_standard_error.is_finite() && is.mc_standard_error >= 0.0,
+            "IS Monte-Carlo SE must be finite and non-negative, got {}",
+            is.mc_standard_error
+        );
+        assert_eq!(is.n_samples, 200, "n_samples should echo the IS budget");
+        assert!(
+            fr.omega_iov.is_some(),
+            "omega_iov must survive into the IS-augmented result"
+        );
+    }
+
     // ── Test: trust-region optimizer + IOV must return Err ────────────────────
     // trust_region.rs currently passes `&[]` for kappas to pop_nll, which would
     // silently route the OFV through the non-IOV path. Guard at api.rs blocks

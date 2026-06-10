@@ -1803,4 +1803,324 @@ mod tests {
             id_col
         );
     }
+
+    // ── fmt_num / fixed_label: pure formatting helpers ───────────────────────
+
+    #[test]
+    fn fmt_num_nan_is_blank_finite_is_six_dp() {
+        assert_eq!(fmt_num(f64::NAN), "");
+        assert_eq!(fmt_num(1.5), "1.500000");
+        assert_eq!(fmt_num(0.0), "0.000000");
+        assert_eq!(fmt_num(-2.25), "-2.250000");
+    }
+
+    #[test]
+    fn fixed_label_appends_fix_tag() {
+        assert_eq!(fixed_label("CL"), "CL [FIX]");
+    }
+
+    // ── write_sdtab_csv: round-trips through the file writer ──────────────────
+
+    #[test]
+    fn write_sdtab_csv_emits_header_and_blanks_nan_residuals() {
+        // One subject, two observations; the second observation is BLOQ, so its
+        // CWRES/IWRES are NaN and must serialize to an empty cell, not "NaN".
+        let sr = SubjectResult {
+            id: "7".to_string(),
+            eta: nalgebra::DVector::zeros(0),
+            ipred: vec![10.0, 5.0],
+            pred: vec![11.0, 6.0],
+            iwres: vec![0.25, f64::NAN],
+            cwres: vec![-0.5, f64::NAN],
+            ofv_contribution: 3.0,
+            cens: vec![0, 1],
+            n_obs: 2,
+            extra_columns: Vec::new(),
+            per_obs_tad: Vec::new(),
+        };
+        let result = minimal_sdtab_result(vec![sr]);
+        let population = Population {
+            subjects: vec![sdtab_subject("7", 2, vec![1, 1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sdtab.csv");
+        write_sdtab_csv(&result, &population, path.to_str().unwrap()).expect("sdtab write");
+        let csv = std::fs::read_to_string(&path).expect("sdtab read");
+
+        let mut lines = csv.lines();
+        let header = lines.next().expect("header line");
+        assert!(header.starts_with("ID,TIME,DV"), "header={header}");
+        // Subject is BLOQ on one row → CENS column appears.
+        assert!(header.contains("CENS"), "CENS column expected: {header}");
+        assert!(header.contains("CWRES") && header.contains("IWRES"));
+
+        let rows: Vec<&str> = lines.collect();
+        assert_eq!(rows.len(), 2, "two observation rows expected");
+        // Numeric ID is preserved verbatim (parses to 7.0).
+        assert!(rows[0].starts_with("7.000000,"));
+        // BLOQ row: trailing CWRES/IWRES cells are blank (empty between commas).
+        assert!(
+            rows[1].contains(",,"),
+            "NaN residuals should be blank cells, got: {}",
+            rows[1]
+        );
+    }
+
+    // ── write_covtab_csv: CSV escaping + NaN-as-blank ────────────────────────
+
+    #[test]
+    fn write_covtab_csv_escapes_ids_and_blanks_missing() {
+        use crate::types::{CovariateKind, CovariateRow, CovariateTable};
+        let table = CovariateTable {
+            names: vec!["WT".to_string(), "SEX".to_string()],
+            kinds: vec![CovariateKind::Continuous, CovariateKind::Categorical],
+            rows: vec![
+                CovariateRow {
+                    id: "A,1".to_string(), // comma must be quoted by the csv writer
+                    time: 0.0,
+                    evid: 1,
+                    values: vec![70.0, 1.0],
+                },
+                CovariateRow {
+                    id: "B".to_string(),
+                    time: 1.5,
+                    evid: 0,
+                    values: vec![f64::NAN, 0.0], // missing WT → blank cell
+                },
+            ],
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("covtab.csv");
+        write_covtab_csv(&table, path.to_str().unwrap()).expect("covtab write");
+        let csv = std::fs::read_to_string(&path).expect("covtab read");
+
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines[0], "ID,TIME,EVID,WT,SEX");
+        // ID with a comma is quoted, not split across columns.
+        assert!(
+            lines[1].starts_with("\"A,1\",0.000000,1,70.000000,1.000000"),
+            "row 1 escaping wrong: {}",
+            lines[1]
+        );
+        // Missing WT serializes to an empty cell.
+        assert_eq!(lines[2], "B,1.500000,0,,0.000000");
+    }
+
+    // ── parameter_table: theta / omega / sigma rows ──────────────────────────
+
+    fn full_param_result(se_theta: Option<Vec<f64>>) -> FitResult {
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.theta = vec![2.0, 0.0];
+        r.theta_names = vec!["CL".to_string(), "ZERO".to_string()];
+        r.theta_fixed = vec![false, true];
+        r.se_theta = se_theta;
+        r.omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.01, 0.01, 0.04]);
+        r.eta_names = vec!["ETA_CL".to_string(), "ETA_V".to_string()];
+        r
+    }
+
+    #[test]
+    fn parameter_table_lists_theta_omega_sigma_with_se() {
+        let table = parameter_table(&full_param_result(Some(vec![0.2, 0.0])));
+        assert!(table.contains("Parameter") && table.contains("Type"));
+        // THETA row carries an SE and a finite %RSE.
+        let cl = table.lines().find(|l| l.starts_with("CL")).expect("CL row");
+        assert!(cl.contains("THETA") && cl.contains("0.200000"), "{cl}");
+        // OMEGA lower triangle: (1,1),(2,1),(2,2).
+        assert!(table.contains("OMEGA(1,1)"));
+        assert!(table.contains("OMEGA(2,1)"));
+        assert!(table.contains("OMEGA(2,2)"));
+        assert!(table.contains("SIGMA(1)"));
+    }
+
+    #[test]
+    fn parameter_table_dashes_se_when_absent() {
+        let table = parameter_table(&full_param_result(None));
+        let cl = table.lines().find(|l| l.starts_with("CL")).expect("CL row");
+        // No covariance run → SE/%RSE rendered as "---".
+        assert!(cl.contains("---"), "{cl}");
+    }
+
+    // ── print_results: stderr smoke test (exercises both header branches) ────
+
+    #[test]
+    fn print_results_smoke_single_and_chain() {
+        // Single-method, with SEs and a fixed theta.
+        print_results(&full_param_result(Some(vec![0.2, 0.0])));
+        // Method chain (>1) + no SEs → the alternate header + "N/A" branch.
+        let mut chained = full_param_result(None);
+        chained.method_chain = vec![EstimationMethod::Saem, EstimationMethod::FoceI];
+        chained.converged = false;
+        print_results(&chained);
+    }
+
+    // ── comprehensive report fixtures: exercise every optional section ────────
+
+    use crate::types::{ImportanceSamplingResult, KappaTreatment};
+
+    /// A FitResult with *every* optional reporting section populated: free +
+    /// fixed thetas with SEs, a 2×2 block omega (off-diagonal correlation),
+    /// a combined (proportional + additive) sigma, a 2×2 block omega_iov,
+    /// importance-sampling results with a low-ESS subject, SIR CIs for
+    /// theta/omega/sigma, eta/eps/kappa shrinkage (with a NaN entry), a
+    /// computed covariance, and a warning. Drives the maximal branch coverage
+    /// of both `print_results` and `write_estimates_yaml` in one pass.
+    fn comprehensive_result() -> FitResult {
+        let mut r = make_sigma_only_result(ErrorModel::Combined, vec![0.1, 0.5]);
+        // theta: one free (with SE), one fixed.
+        r.theta = vec![2.0, 0.0];
+        r.theta_names = vec!["CL".into(), "BASE".into()];
+        r.theta_fixed = vec![false, true];
+        r.se_theta = Some(vec![0.2, 0.0]);
+        // omega: 2×2 block with an off-diagonal; second eta fixed; param_corr
+        // left None so the correlation fallback path is taken.
+        r.omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.02, 0.02, 0.04]);
+        r.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
+        r.omega_fixed = vec![false, true];
+        r.se_omega = Some(vec![0.01, 0.0]);
+        r.omega_param_corr = None;
+        // sigma: combined → [Proportional, Additive]; one fixed.
+        r.sigma_fixed = vec![false, true];
+        r.se_sigma = Some(vec![0.01, 0.02]);
+        // omega_iov: 2×2 block kappa with an off-diagonal; second kappa fixed.
+        r.omega_iov = Some(DMatrix::from_row_slice(2, 2, &[0.05, 0.01, 0.01, 0.03]));
+        r.kappa_names = vec!["KAPPA_CL".into(), "KAPPA_V".into()];
+        r.kappa_fixed = vec![false, true];
+        r.se_kappa = Some(vec![0.005, 0.0]);
+        r.omega_iov_param_corr = None;
+        // importance sampling, with a low-ESS subject.
+        r.importance_sampling = Some(ImportanceSamplingResult {
+            minus2_log_likelihood: -1234.5,
+            mc_standard_error: 1.2,
+            low_ess_subjects: vec![("S3".into(), 0.05)],
+            n_samples: 500,
+            proposal_df: 5.0,
+            ess_min: 0.05,
+            ess_median: 0.6,
+            kappa_treatment: KappaTreatment::FixedAtMode,
+        });
+        // SIR CIs for theta/omega/sigma.
+        r.sir_ess = Some(123.4);
+        r.sir_ci_theta = Some(vec![(1.8, 2.2), (-0.1, 0.1)]);
+        r.sir_ci_omega = Some(vec![(0.07, 0.11), (0.03, 0.05)]);
+        r.sir_ci_sigma = Some(vec![(0.08, 0.12), (0.4, 0.6)]);
+        // Shrinkage (a NaN entry exercises the is_finite guard).
+        r.shrinkage_eta = vec![0.12, f64::NAN];
+        r.shrinkage_eps = 0.05;
+        r.shrinkage_kappa = vec![0.20, f64::NAN];
+        r.shrinkage_kappa_by_occ = vec![vec![0.10, f64::NAN]];
+        r.covariance_status = CovarianceStatus::Computed;
+        r.warnings = vec!["example warning".into()];
+        r
+    }
+
+    #[test]
+    fn write_estimates_yaml_emits_all_sections() {
+        let r = comprehensive_result();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        // Theta: free with SE, and fixed entry.
+        assert!(yaml.contains("  CL:") && yaml.contains("    se: 0.200000"));
+        assert!(yaml.contains("  BASE:") && yaml.contains("    fixed: true"));
+        // Omega diagonal + off-diagonal covariance block.
+        assert!(yaml.contains("\nomega:"));
+        assert!(yaml.contains("  ETA_V__ETA_CL:"));
+        assert!(yaml.contains("    covariance: 0.020000"));
+        // Sigma: combined → proportional emits cv_pct, additive does not.
+        assert!(yaml.contains("error model: combined"));
+        assert!(yaml.contains("    type: proportional") && yaml.contains("    type: additive"));
+        // IOV block + kappa off-diagonal.
+        assert!(yaml.contains("\nomega_iov:"));
+        assert!(yaml.contains("  KAPPA_V__KAPPA_CL:"));
+        // Importance sampling block.
+        assert!(yaml.contains("\nimportance_sampling:"));
+        assert!(yaml.contains("  kappa_treatment: fixed_at_mode"));
+        assert!(yaml.contains("  low_ess_subjects:") && yaml.contains("- id: \"S3\""));
+        // SIR section with all three CI blocks.
+        assert!(yaml.contains("\nsir:"));
+        assert!(
+            yaml.contains("  ci_theta:")
+                && yaml.contains("  ci_omega:")
+                && yaml.contains("  ci_sigma:")
+        );
+        // Warnings.
+        assert!(yaml.contains("\nwarnings:") && yaml.contains("- \"example warning\""));
+    }
+
+    #[test]
+    fn print_results_smoke_comprehensive() {
+        // Exercises the maximal-section path of the stderr printer.
+        print_results(&comprehensive_result());
+    }
+
+    #[test]
+    fn write_yaml_and_print_handle_no_se_and_failed_covariance() {
+        // No SEs on any non-fixed parameter (→ `se: ~` / N/A arms), a failed
+        // covariance step (→ show_cv=false / "FAILED"), an IS block with the
+        // Marginalized κ treatment and no low-ESS subjects, and no SIR /
+        // shrinkage / warnings.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.theta = vec![2.0];
+        r.theta_names = vec!["CL".into()];
+        r.theta_fixed = vec![false];
+        r.se_theta = None;
+        r.omega = DMatrix::from_row_slice(1, 1, &[0.09]);
+        r.eta_names = vec!["ETA_CL".into()];
+        r.omega_fixed = vec![false];
+        r.se_omega = None;
+        r.sigma_fixed = vec![false];
+        r.se_sigma = None;
+        r.omega_iov = Some(DMatrix::from_row_slice(1, 1, &[0.04]));
+        r.kappa_names = vec!["KAPPA_CL".into()];
+        r.kappa_fixed = vec![false];
+        r.se_kappa = None;
+        r.importance_sampling = Some(ImportanceSamplingResult {
+            minus2_log_likelihood: -10.0,
+            mc_standard_error: 0.5,
+            low_ess_subjects: Vec::new(),
+            n_samples: 100,
+            proposal_df: 4.0,
+            ess_min: 0.9,
+            ess_median: 0.95,
+            kappa_treatment: KappaTreatment::Marginalized,
+        });
+        r.covariance_status = CovarianceStatus::Failed;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(
+            yaml.contains("    se: ~"),
+            "missing-SE entries render as `se: ~`"
+        );
+        assert!(yaml.contains("  kappa_treatment: marginalized"));
+        assert!(yaml.contains("  low_ess_subjects: []"));
+
+        // print_results: failed-covariance branch (no CV%, "FAILED").
+        print_results(&r);
+
+        // Flip the IS κ treatment to NotApplicable to cover that match arm too.
+        if let Some(is) = r.importance_sampling.as_mut() {
+            is.kappa_treatment = KappaTreatment::NotApplicable;
+        }
+        print_results(&r);
+    }
+
+    #[cfg(feature = "nn")]
+    #[test]
+    fn print_results_smoke_with_neural_network_block() {
+        // Covers the `--- NEURAL NETWORKS ---` print branch.
+        print_results(&make_nn_result());
+    }
 }

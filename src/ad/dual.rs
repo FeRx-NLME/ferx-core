@@ -149,3 +149,100 @@ impl PartialOrd for Dual {
         self.val.partial_cmp(&other.val)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Dual;
+
+    const TOL: f64 = 1e-9;
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < TOL
+    }
+
+    #[test]
+    fn constructors_set_value_and_seed_derivative() {
+        assert_eq!(Dual::new(2.0, 3.0).deriv, 3.0);
+        assert_eq!(Dual::constant(2.0).deriv, 0.0);
+        assert_eq!(Dual::variable(2.0).deriv, 1.0);
+    }
+
+    #[test]
+    fn exp_ln_sqrt_derivatives() {
+        // d/dx e^x at x=1 → e, e.
+        let e = Dual::variable(1.0).exp();
+        assert!(close(e.val, std::f64::consts::E) && close(e.deriv, std::f64::consts::E));
+        // d/dx ln(x) at x=2 → ln2, 0.5.
+        let l = Dual::variable(2.0).ln();
+        assert!(close(l.val, 2.0_f64.ln()) && close(l.deriv, 0.5));
+        // d/dx sqrt(x) at x=4 → 2, 0.25.
+        let s = Dual::variable(4.0).sqrt();
+        assert!(close(s.val, 2.0) && close(s.deriv, 0.25));
+        // sqrt at 0 → value 0, derivative floored to 0 (no divide-by-zero).
+        let s0 = Dual::variable(0.0).sqrt();
+        assert!(close(s0.val, 0.0) && close(s0.deriv, 0.0));
+        // ln floors the argument at 1e-30 for non-positive input.
+        let lneg = Dual::variable(-1.0).ln();
+        assert!(lneg.val.is_finite());
+    }
+
+    #[test]
+    fn abs_branches() {
+        let pos = Dual::new(3.0, 1.0).abs();
+        assert!(close(pos.val, 3.0) && close(pos.deriv, 1.0));
+        let neg = Dual::new(-3.0, 1.0).abs();
+        assert!(close(neg.val, 3.0) && close(neg.deriv, -1.0));
+    }
+
+    #[test]
+    fn powf_and_powi() {
+        // d/dx x^3 at x=2 → 8, 12 (powf with constant exponent).
+        let p = Dual::variable(2.0).powf(Dual::constant(3.0));
+        assert!(close(p.val, 8.0) && close(p.deriv, 12.0));
+        // non-positive base short-circuits to constant 0.
+        let p0 = Dual::variable(-2.0).powf(Dual::constant(2.0));
+        assert!(close(p0.val, 0.0) && close(p0.deriv, 0.0));
+        // powi: d/dx x^3 at x=2 → 8, 12.
+        let pi = Dual::variable(2.0).powi(3);
+        assert!(close(pi.val, 8.0) && close(pi.deriv, 12.0));
+    }
+
+    #[test]
+    fn max_picks_branch_and_kills_derivative_when_clamped() {
+        let kept = Dual::new(7.0, 1.0).max(5.0);
+        assert!(close(kept.val, 7.0) && close(kept.deriv, 1.0));
+        let clamped = Dual::new(2.0, 1.0).max(5.0);
+        assert!(close(clamped.val, 5.0) && close(clamped.deriv, 0.0));
+    }
+
+    #[test]
+    fn arithmetic_follows_calculus_rules() {
+        let x = Dual::variable(3.0); // val 3, deriv 1
+        let y = Dual::new(2.0, 0.0); // val 2, deriv 0
+        let add = x + y;
+        assert!(close(add.val, 5.0) && close(add.deriv, 1.0));
+        let sub = x - y;
+        assert!(close(sub.val, 1.0) && close(sub.deriv, 1.0));
+        // product rule: d(xy) = x'y + xy' = 1*2 + 3*0 = 2.
+        let mul = x * y;
+        assert!(close(mul.val, 6.0) && close(mul.deriv, 2.0));
+        // quotient rule: d(x/y) = (x'y - xy')/y² = (1*2 - 3*0)/4 = 0.5.
+        let div = x / y;
+        assert!(close(div.val, 1.5) && close(div.deriv, 0.5));
+        // divide-by-(near)zero short-circuits to constant 0.
+        let div0 = x / Dual::constant(0.0);
+        assert!(close(div0.val, 0.0) && close(div0.deriv, 0.0));
+        // negation flips both components.
+        let neg = -x;
+        assert!(close(neg.val, -3.0) && close(neg.deriv, -1.0));
+    }
+
+    #[test]
+    fn eq_and_ord_compare_value_only() {
+        // Equality ignores the derivative component.
+        assert_eq!(Dual::new(2.0, 1.0), Dual::new(2.0, 9.0));
+        assert_ne!(Dual::new(2.0, 1.0), Dual::new(3.0, 1.0));
+        assert!(Dual::new(1.0, 5.0) < Dual::new(2.0, 0.0));
+        assert!(Dual::new(2.0, 0.0) > Dual::new(1.0, 5.0));
+    }
+}
