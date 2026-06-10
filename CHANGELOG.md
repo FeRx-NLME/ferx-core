@@ -23,7 +23,9 @@ section of the SDLC for the versioning policy).
 - `covariance_matrix:` block in `*-fit.yaml`: the full optimizer-space parameter
   covariance matrix (log-theta, Cholesky-omega, log-sigma; kappa appended for IOV
   models), parameter-labelled, emitted when the covariance step succeeds or is
-  regularised (#236).
+  regularised. Omega/kappa diagonal entries are keyed `log_chol_<eta>` (packed
+  value is `log(L_ii)`); off-diagonal entries are keyed `chol_<row>_<col>`
+  (`L_ij`, not log-transformed) (#236).
 - Time-to-event / survival modelling (Phase 1): `[event_model]` block, TTE
   datareader, likelihood, and API wiring, behind the `survival` feature
   (#191, #192).
