@@ -764,9 +764,11 @@ fn fmt_cov_entry(v: f64) -> String {
 /// Build the ordered parameter name list that matches `pack_params` layout:
 /// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
 ///
-/// For a diagonal omega/kappa each entry is `var_{eta_name}`.
+/// For a diagonal omega/kappa each entry is `log_chol_{eta_name}` — the packed
+/// value is `log(L_ii)` where `omega = L Lᵀ` (Cholesky diagonal, log-transformed).
 /// For a full-block omega/kappa the column-major lower-triangle entries are
-/// `var_{eta_i}` on the diagonal and `chol_{eta_i}_{eta_j}` (i > j) off-diagonal.
+/// `log_chol_{eta_i}` on the diagonal (`log(L_ii)`) and `chol_{eta_i}_{eta_j}`
+/// (i > j) off-diagonal (`L_ij`, not log-transformed).
 fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
     let n_theta = result.theta_names.len();
     let n_eta = result.omega.nrows();
@@ -811,13 +813,13 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
 
     if omega_diagonal {
         for name in &result.eta_names {
-            names.push(format!("var_{name}"));
+            names.push(format!("log_chol_{name}"));
         }
     } else {
         for j in 0..n_eta {
             for i in j..n_eta {
                 if i == j {
-                    names.push(format!("var_{}", result.eta_names[i]));
+                    names.push(format!("log_chol_{}", result.eta_names[i]));
                 } else {
                     names.push(format!(
                         "chol_{}_{}",
@@ -833,13 +835,13 @@ fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
     if n_kappa > 0 {
         if kappa_diagonal {
             for name in &result.kappa_names {
-                names.push(format!("var_{name}"));
+                names.push(format!("log_chol_{name}"));
             }
         } else {
             for j in 0..n_kappa {
                 for i in j..n_kappa {
                     if i == j {
-                        names.push(format!("var_{}", result.kappa_names[i]));
+                        names.push(format!("log_chol_{}", result.kappa_names[i]));
                     } else {
                         names.push(format!(
                             "chol_{}_{}",
@@ -2202,7 +2204,7 @@ mod tests {
             "covariance_matrix block missing"
         );
         assert!(
-            yaml.contains("  parameters: [CL, BASE, var_ETA_CL, chol_ETA_V_ETA_CL, var_ETA_V, EPS_1, EPS_2, var_KAPPA_CL, chol_KAPPA_V_KAPPA_CL, var_KAPPA_V]"),
+            yaml.contains("  parameters: [CL, BASE, log_chol_ETA_CL, chol_ETA_V_ETA_CL, log_chol_ETA_V, EPS_1, EPS_2, log_chol_KAPPA_CL, chol_KAPPA_V_KAPPA_CL, log_chol_KAPPA_V]"),
             "covariance_matrix parameter list wrong:\n{yaml}"
         );
         // Warnings.
@@ -2271,7 +2273,7 @@ mod tests {
 
     #[test]
     fn write_yaml_emits_covariance_matrix_block() {
-        // Diagonal omega (1 eta), 1 theta, 1 sigma → packed: [CL, var_ETA_CL, EPS_1]
+        // Diagonal omega (1 eta), 1 theta, 1 sigma → packed: [CL, log_chol_ETA_CL, EPS_1]
         let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
         r.theta = vec![2.0];
         r.theta_names = vec!["CL".into()];
@@ -2293,11 +2295,14 @@ mod tests {
             "block header missing"
         );
         assert!(
-            yaml.contains("  parameters: [CL, var_ETA_CL, EPS_1]"),
+            yaml.contains("  parameters: [CL, log_chol_ETA_CL, EPS_1]"),
             "parameter list wrong:\n{yaml}"
         );
         assert!(yaml.contains("    CL: ["), "CL row missing");
-        assert!(yaml.contains("    var_ETA_CL: ["), "var_ETA_CL row missing");
+        assert!(
+            yaml.contains("    log_chol_ETA_CL: ["),
+            "log_chol_ETA_CL row missing"
+        );
         assert!(yaml.contains("    EPS_1: ["), "EPS_1 row missing");
         // Identity matrix: diagonal 1 → "1.000000e+0", off-diagonal 0 → "0.000000e+0"
         assert!(
@@ -2326,7 +2331,9 @@ mod tests {
         let yaml2 = std::fs::read_to_string(&path2).expect("yaml read");
 
         assert!(
-            yaml2.contains("  parameters: [CL, var_ETA_CL, chol_ETA_V_ETA_CL, var_ETA_V, EPS_1]"),
+            yaml2.contains(
+                "  parameters: [CL, log_chol_ETA_CL, chol_ETA_V_ETA_CL, log_chol_ETA_V, EPS_1]"
+            ),
             "full-block omega parameter list wrong:\n{yaml2}"
         );
         // No covariance_matrix block when covariance_matrix is None
