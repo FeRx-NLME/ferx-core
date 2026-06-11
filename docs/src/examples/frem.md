@@ -31,8 +31,8 @@ frem <- ferx_to_frem(
 )
 # To FREM only a subset, filter with e.g. covariates = "WT".
 
-# Step 2: Fit the FREM model
-fit <- ferx_fit(frem$model_path, frem$data_path, method = "saem",
+# Step 2: Fit the FREM model. `frem` is a ferx_model, so pass it straight in.
+fit <- ferx_fit(frem, method = "saem",
                 settings = list(n_exploration = 500L, n_convergence = 800L))
 
 # Inspect results

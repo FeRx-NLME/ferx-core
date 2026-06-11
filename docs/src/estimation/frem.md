@@ -75,7 +75,7 @@ frem <- ferx_to_frem(
 # Or filter to a subset of the declared covariates:
 # frem <- ferx_to_frem("warfarin.ferx", "warfarin_cov.csv", covariates = "WT")
 
-fit <- ferx_fit(frem$model_path, frem$data_path, method = "saem")
+fit <- ferx_fit(frem, method = "saem")   # frem is a ferx_model
 ```
 
 ## Interpreting results
