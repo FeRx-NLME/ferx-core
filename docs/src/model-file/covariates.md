@@ -1,5 +1,7 @@
 # Covariates
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 The optional `[covariates]` block declares which dataset columns are
 covariates and whether each is **continuous** or **categorical**. This is a
 declaration of *availability* — it does **not** mean the covariate is used in

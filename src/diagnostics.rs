@@ -33,6 +33,8 @@
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
 //! | `W_STEADY_STATE_INFUSION` | SS=1 infusion with `T_inf > II` (overlapping pulses) |
 //! | `W_SDE_RESET`             | EVID=3/4 resets under an SDE model are not honoured |
+//! | `W_EXPERIMENTAL_SDE`      | an SDE (`[diffusion]`) model uses an experimental feature (see Feature Maturity docs) |
+//! | `W_EXPERIMENTAL_NN`       | a neural-network (`[covariate_nn]`) model uses an experimental feature (see Feature Maturity docs) |
 //! | `W_NEGATIVE_LAGTIME`      | a lag time is negative at the initial estimates |
 //! | `E_DERIVED_NAME_CONFLICT` | `[derived]` name clashes with a built-in sdtab column, theta, eta, or indiv-param name |
 //! | `W_DERIVED_COVARIATE_SHADOW` | `[derived]` name shadows a covariate (allowed but may be confusing) |

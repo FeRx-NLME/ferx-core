@@ -1,5 +1,7 @@
 # Data Selection
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 The optional `[data_selection]` block lets you exclude records from the dataset
 at read time without modifying the CSV file.  It is the ferx equivalent of
 NONMEM's `$DATA IGNORE=` / `$DATA ACCEPT=`.

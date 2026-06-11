@@ -3075,6 +3075,18 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "covariance" => opts.run_covariance_step = parse_bool("covariance")?,
+        "covariance_fallback" => {
+            opts.covariance_fallback = match value.to_lowercase().as_str() {
+                "none" => crate::types::CovarianceFallback::None,
+                "sir" => crate::types::CovarianceFallback::Sir,
+                other => {
+                    return Err(format!(
+                        "fit option `covariance_fallback`: unknown value `{other}` — \
+                         expected none/sir"
+                    ));
+                }
+            };
+        }
         "fd_hessian_step" => {
             let v = parse_f64("fd_hessian_step")?;
             if v <= 0.0 || !v.is_finite() {
@@ -9361,6 +9373,24 @@ mod tests {
         assert_eq!(opts.saem_n_convergence, 400);
         assert!(opts.sir);
         assert_eq!(opts.sir_samples, 2000);
+    }
+
+    #[test]
+    fn test_parse_covariance_fallback_none_and_sir() {
+        use crate::types::CovarianceFallback;
+        let opts = parse_fit_options(&["covariance_fallback = sir".to_string()]).unwrap();
+        assert_eq!(opts.covariance_fallback, CovarianceFallback::Sir);
+
+        let opts2 = parse_fit_options(&["covariance_fallback = none".to_string()]).unwrap();
+        assert_eq!(opts2.covariance_fallback, CovarianceFallback::None);
+
+        // Case-insensitive
+        let opts3 = parse_fit_options(&["covariance_fallback = SIR".to_string()]).unwrap();
+        assert_eq!(opts3.covariance_fallback, CovarianceFallback::Sir);
+
+        // Invalid value returns error
+        let err = parse_fit_options(&["covariance_fallback = hmc".to_string()]);
+        assert!(err.is_err());
     }
 
     // ── mu-referencing pattern detection ─────────────────────────────────

@@ -1,5 +1,7 @@
 # Derived Columns (`[derived]`)
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 The optional `[derived]` block defines extra columns that are computed after the fit and appended to the sdtab output. Each line has the form:
 
 ```

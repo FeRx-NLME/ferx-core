@@ -1,5 +1,7 @@
 # FOCE / FOCEI
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 First-Order Conditional Estimation (FOCE) and its interaction variant (FOCEI) are the primary estimation methods in ferx-core. They use a two-level nested optimization to find maximum likelihood estimates of population parameters.
 
 ## Algorithm Overview
@@ -128,9 +130,13 @@ The covariance is `2·H⁻¹`, where `H` is the finite-difference Hessian of the
 
 The factor of two is because the objective is `−2·logL`: its Hessian is twice the observed information, so the covariance needs `2·H⁻¹` to be on the right scale.
 
+The covariance objective is `2·pop_nll` for **both** FOCE and FOCEI — the Ω penalty is already inside each per-subject marginal and must not be added again. FOCEI's Almquist–Laplace marginal carries `η̂ᵀΩ⁻¹η̂ + log|Ω|` explicitly; FOCE's Sheiner–Beal marginal carries it through `R̃ = HΩHᵀ + R` (equivalent by the Woodbury identity). An earlier version added the Ω prior a second time on the FOCE path, double-counting Ω and under-stating the FOCE omega SEs by ~31% — fixed in issue [#243](https://github.com/FeRx-NLME/ferx-core/issues/243).
+
+For a mixed block + diagonal Ω, the structural-zero cross-block off-diagonals (which are not estimated) are excluded from the covariance parameter set like FIX parameters; otherwise their flat Hessian diagonal aborts the step. (The same #243 change exposed and fixed this for both FOCE and FOCEI.)
+
 ### NONMEM cross-check
 
-FOCEI on `data/warfarin.csv` (10 subjects, 1-cpt oral, proportional error) against NONMEM 7.5.1 `$COVARIANCE MATRIX=R`:
+On `data/warfarin.csv` (10 subjects, 1-cpt oral, proportional error) against NONMEM 7.5.1 `$COVARIANCE MATRIX=R`, **FOCEI** (`$EST METHOD=1 INTER`):
 
 | Parameter | ferx SE | NONMEM SE | rel. diff |
 |-----------|---------|-----------|-----------|
@@ -142,7 +148,19 @@ FOCEI on `data/warfarin.csv` (10 subjects, 1-cpt oral, proportional error) again
 | ω²(V)     | 0.00403 | 0.00431   | −6.4% |
 | ω²(KA)    | 0.1530  | 0.1504    | +1.8% |
 
-(autodiff build; the FD-Jacobian build agrees to within ~10% on the ω block.) The regression guard is `tests/warfarin_covariance_nonmem.rs`.
+and **FOCE** (`$EST METHOD=1`, no `INTER`), where ferx's OFV/estimates already match NONMEM (OFV −280.17 vs −280.36) and, after the #243 covariance fix, the omega SEs do too:
+
+| Parameter | ferx SE | NONMEM SE | rel. diff |
+|-----------|---------|-----------|-----------|
+| TVCL      | 0.00661 | 0.00663   | −0.3% |
+| TVV       | 0.2375  | 0.2340    | +1.5% |
+| TVKA      | 0.1209  | 0.1245    | −2.8% |
+| PROP_ERR (SD) | 0.000922 | 0.000941 | −2.0% |
+| ω²(CL)    | 0.01312 | 0.01280   | +2.5% |
+| ω²(V)     | 0.00454 | 0.00430   | +5.7% |
+| ω²(KA)    | 0.1510  | 0.1607    | −6.1% |
+
+(autodiff build; the FD-Jacobian build agrees to within ~10% on the ω block.) Both methods are guarded by `tests/warfarin_covariance_nonmem.rs` within a 20% band.
 
 ### Hessian regularization
 
@@ -155,6 +173,24 @@ Standard errors should be interpreted with care.
 ```
 
 SEs in the regularised directions are inflated (since `1/λ_clipped` is larger than the would-be true `1/λ`). With the reconverging covariance step this warning should now be rare; if it fires, the surface is genuinely near-identifiable and the SEs in those directions warrant scrutiny. A Hessian whose spectrum is genuinely indefinite — every eigenvalue ≤ 0 — still fails outright with the standard `Covariance step failed` message.
+
+### SIR fallback for non-PD Hessians
+
+When a model is poorly identified or converges to a saddle point, the FD Hessian can have every free-block eigenvalue ≤ 0, making Hessian inversion impossible. Setting `covariance_fallback = sir` triggers a SIR (Sampling Importance Resampling) run instead of leaving the covariance step as failed:
+
+```
+[fit_options]
+  covariance_fallback = sir
+```
+
+ferx-core constructs a proposal covariance by taking the absolute values of the Hessian eigenvalues, inflating by 4× (heavier tails to account for the non-PD correction), and running the same SIR sampler used by `sir = true`. The result is reported as 95% credible intervals in the fit YAML; `covariance_status` is set to `sir_fallback`.
+
+Use this option when:
+- The Hessian is non-PD at convergence due to model mis-specification or weak identifiability
+- You want distributional uncertainty estimates without re-fitting with a more constrained model
+- You need to proceed to a downstream analysis despite a non-PD Hessian
+
+The SIR fallback inherits all `sir_*` settings (`sir_samples`, `sir_df`, `sir_resamples`, etc.) from `[fit_options]`.
 
 ## Convergence
 

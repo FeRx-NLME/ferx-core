@@ -1,5 +1,7 @@
 # Sampling Importance Resampling (SIR)
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 SIR is an optional post-estimation step that provides non-parametric parameter uncertainty estimates. It produces 95% confidence intervals that are more robust than the asymptotic covariance matrix, particularly for models with:
 
 - Non-normal parameter distributions

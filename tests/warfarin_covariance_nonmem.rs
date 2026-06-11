@@ -13,12 +13,15 @@
 //!      the observed information (without the factor of two every SE is 1/√2 too
 //!      small).
 //!
-//! Two cases run the same warfarin model through the two covariance-OFV paths:
-//!   - **FOCEI** (`interaction = true`): the per-subject marginal already carries
-//!     `ηᵀΩ⁻¹η + log|Ω|`, so the covariance OFV is just `2·pop_nll`.
-//!   - **FOCE** (`interaction = false`): `pop_nll` (Sheiner–Beal) omits that prior,
-//!     so `compute_covariance` adds it back analytically via `omega_prior_gradient`.
-//!     This is the only end-to-end guard for that FOCE-specific gradient branch.
+//! Both methods take the covariance OFV as `2·pop_nll` (no separate omega-prior
+//! add-back):
+//!   - **FOCEI** (`interaction = true`): the Almquist–Laplace marginal carries
+//!     `ηᵀΩ⁻¹η + log|Ω|` explicitly.
+//!   - **FOCE** (`interaction = false`): the Sheiner–Beal marginal carries the Ω
+//!     penalty via `R̃ = HΩHᵀ + R` (equivalent by Woodbury to the conditional form
+//!     with `ηᵀΩ⁻¹η + log|Ω|`). An earlier covariance step added that prior again
+//!     for FOCE, double-counting Ω and under-stating the FOCE omega SEs ~31%;
+//!     removing the add-back is the fix in issue #243.
 //!
 //! ## NONMEM reference
 //!
@@ -35,13 +38,11 @@
 //! indefinite-Hessian blow-up (orders of magnitude), loose enough to tolerate the
 //! AD-vs-FD-Jacobian build difference and the FD-step truncation.
 //!
-//! The omega-block band is method-dependent. FOCEI matches NONMEM tightly (20%),
-//! but FOCE runs the Sheiner–Beal objective, whose omega-block curvature differs
-//! from NONMEM's FOCE: on this model ferx's FOCE omega SEs sit ~25–36% below
-//! NONMEM (the theta/sigma SEs still match within ~3%, and the omega *estimates*
-//! agree within ~6%). That is the SB-vs-NONMEM approximation gap, not a fault in
-//! the covariance machinery — so the FOCE omega band is widened to 45%. Tightening
-//! it is tracked with the planned FOCE Sheiner–Beal → Almquist–Laplace switch.
+//! The omega-block band is 20% for both methods. ferx's FOCE estimates already
+//! matched NONMEM FOCE (`METHOD=1`, no INTER): OFV −280.17 vs −280.36, θ within
+//! ~1%. The only defect was the FOCE omega SEs sitting ~31% below NONMEM — a
+//! covariance double-count of Ω (see above), not an objective gap. After the
+//! issue #243 fix the FOCE omega SEs match NONMEM to ~3%, same as FOCEI.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
@@ -81,7 +82,7 @@ struct SeRef {
 
 const TIGHT: f64 = 0.20; // theta + residual-error: NONMEM-anchored
 const OMEGA_FOCEI: f64 = 0.20; // FOCEI omega matches NONMEM tightly
-const OMEGA_FOCE: f64 = 0.45; // FOCE omega: Sheiner–Beal gap (see module docs)
+const OMEGA_FOCE: f64 = 0.20; // FOCE omega matches NONMEM after #243 cov fix
 
 /// NONMEM 7.5.1 `$COVARIANCE MATRIX=R` SEs (.ext, ITER=-1000000001), in the
 /// order [TVCL, TVV, TVKA, PROP_SD, ωCL, ωV, ωKA].
@@ -228,10 +229,9 @@ fn covariance_se_matches_nonmem() {
     assert_covariance_se_matches_nonmem(EstimationMethod::FoceI, true);
 }
 
-/// FOCE (non-interaction) covariance: exercises the Sheiner–Beal path where
-/// `compute_covariance` adds the Ω-prior gradient (`omega_prior_gradient`) that
-/// FOCEI gets for free from the marginal — the only end-to-end guard for that
-/// branch (the unit test `test_covariance_gradient_foce_matches_fd_ofv_fixed`
+/// FOCE (non-interaction) covariance: regression guard for issue #243 — the
+/// FOCE omega SEs now match NONMEM to ~3% after removing the Ω double-count in
+/// the covariance step (the unit test `test_covariance_gradient_foce_matches_fd_ofv_fixed`
 /// checks the gradient in isolation).
 #[test]
 #[cfg_attr(
@@ -240,6 +240,140 @@ fn covariance_se_matches_nonmem() {
 )]
 fn covariance_se_matches_nonmem_foce() {
     assert_covariance_se_matches_nonmem(EstimationMethod::Foce, false);
+}
+
+// ── Block + diagonal omega covariance (structural-zero exclusion) ────────────
+
+/// Warfarin with a 2×2 BLOCK omega on (CL,V) plus a separate diagonal omega on
+/// KA. The cross-block elements ω(KA,CL) and ω(KA,V) are structural zeros
+/// (`free_mask == false`): they are not estimated, so the covariance step must
+/// exclude them from the free set. Before #243 the FOCE omega-prior add-back
+/// iterated all lower-triangle entries and gave these a spurious curvature that
+/// kept the Hessian non-singular; removing the add-back exposed that the
+/// covariance step never excluded structural zeros, so the Hessian had flat
+/// diagonals and the step failed. #243 excludes them explicitly (matching how
+/// NONMEM omits non-estimated off-diagonals), fixing the step for **both** FOCE
+/// and FOCEI (FOCEI had no add-back, so block+diagonal covariance failed on it
+/// too).
+const BLOCK_MODEL_SRC: &str = r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method        = foce
+  mu_referencing = true
+";
+
+/// FOCE covariance with a mixed block+diagonal omega — regression guard for the
+/// #243 structural-zero exclusion. Asserts the step succeeds and the diagonal
+/// SEs match NONMEM FOCE (`$EST METHOD=1`, no INTER, `$OMEGA BLOCK(2)` + diag),
+/// `$COVARIANCE MATRIX=R`. `se_omega` reports only the diagonal variances, so
+/// the CL–V covariance SE is not asserted (it is not exposed by the API).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored covariance SE cross-check (#209/#196/#129/#243): opt in with --features slow-tests"
+)]
+fn covariance_se_matches_nonmem_foce_block_omega() {
+    let model = parse_model_string(BLOCK_MODEL_SRC).expect("block-omega model parses");
+    let pop = read_nonmem_csv(Path::new("data/warfarin_block_omega.csv"), None, None)
+        .expect("block-omega data loads");
+
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::Foce;
+    opts.interaction = false;
+    opts.outer_maxiter = 300;
+    opts.run_covariance_step = true;
+    opts.verbose = false;
+
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("block-omega fit runs");
+
+    // The covariance step must SUCCEED — before #243 it failed here on the
+    // structural-zero cross-block off-diagonals (flat Hessian diagonal).
+    assert!(
+        result.covariance_matrix.is_some(),
+        "block+diagonal omega covariance step must produce a matrix"
+    );
+    let se_theta = result.se_theta.as_ref().expect("theta SEs present");
+    let se_omega = result.se_omega.as_ref().expect("omega SEs present");
+    let se_sigma = result.se_sigma.as_ref().expect("sigma SEs present");
+
+    // NONMEM 7.5.1 FOCE (METHOD=1, no INTER), $OMEGA BLOCK(2) on (CL,V) + diag KA,
+    // $COVARIANCE MATRIX=R; SEs from the .ext row at ITERATION = -1000000001.
+    let refs = [
+        SeRef {
+            name: "TVCL",
+            nm: 6.68028e-3,
+            tol: TIGHT,
+        },
+        SeRef {
+            name: "TVV",
+            nm: 2.35936e-1,
+            tol: TIGHT,
+        },
+        SeRef {
+            name: "TVKA",
+            nm: 1.24451e-1,
+            tol: TIGHT,
+        },
+        SeRef {
+            name: "PROP_ERR",
+            nm: 9.46602e-4,
+            tol: TIGHT,
+        },
+        SeRef {
+            name: "omega_CL",
+            nm: 1.27995e-2,
+            tol: OMEGA_FOCE,
+        },
+        SeRef {
+            name: "omega_V",
+            nm: 4.29739e-3,
+            tol: OMEGA_FOCE,
+        },
+        SeRef {
+            name: "omega_KA",
+            nm: 1.60542e-1,
+            tol: OMEGA_FOCE,
+        },
+    ];
+    let ferx = [
+        se_theta[0],
+        se_theta[1],
+        se_theta[2],
+        se_sigma[0],
+        se_omega[0],
+        se_omega[1],
+        se_omega[2],
+    ];
+
+    for (r, &ferx_se) in refs.iter().zip(ferx.iter()) {
+        let rel = (ferx_se - r.nm).abs() / r.nm;
+        assert!(
+            ferx_se.is_finite() && rel < r.tol,
+            "SE({}) = {ferx_se:.6} vs NONMEM {:.6} — relative diff {:.1}% exceeds {:.0}% band",
+            r.name,
+            r.nm,
+            rel * 100.0,
+            r.tol * 100.0
+        );
+    }
 }
 
 // ── IOV covariance (the `is_iov` second-difference Hessian branch) ───────────
@@ -317,6 +451,14 @@ fn covariance_se_matches_nonmem_iov() {
     assert!(
         result.covariance_matrix.is_some(),
         "IOV covariance step must produce a matrix"
+    );
+    // This well-identified IOV fit has a PD Hessian, so the real covariance must
+    // be returned — not the `covariance_fallback = sir` path (#223). Guards that
+    // the SIR fallback stays inert when the covariance step succeeds.
+    assert_eq!(
+        result.covariance_status,
+        ferx_core::CovarianceStatus::Computed,
+        "well-identified IOV model must produce a real covariance, not a SIR fallback"
     );
     let se_theta = result.se_theta.as_ref().expect("theta SEs present");
     let se_omega = result.se_omega.as_ref().expect("omega SEs present");

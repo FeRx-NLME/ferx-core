@@ -134,3 +134,67 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
         om[2]
     );
 }
+
+/// NONMEM `$COVARIANCE MATRIX=R` cross-check for the LTBS (additive-on-log)
+/// covariance step. The convergence test above pins the MLE; this pins the
+/// standard errors, exercising the covariance step on an error model
+/// (`log(DV) ~ additive`) not covered by the proportional/combined-error and IOV
+/// cross-checks in `warfarin_covariance_nonmem.rs`.
+///
+/// Reference SEs from `tests/nonmem/warfarin_ltbs.lst`, `STANDARD ERROR OF
+/// ESTIMATE` block (`$COVARIANCE UNCONDITIONAL` = `MATRIX=R`). NONMEM reports
+/// `SIGMA(1,1)` on the variance scale; ferx's `ADD_LOG` is an SD, so the
+/// variance-scale SE `1.69e-5` is converted to the SD scale via the delta method
+/// `SE(σ) = SE(σ²) / (2σ)` with `σ = sqrt(1.11601e-4) = 0.010564`.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored LTBS covariance SE cross-check (#120/#223): opt in with --features slow-tests"
+)]
+fn ltbs_covariance_se_matches_nonmem() {
+    let model = parse_model_file(Path::new("examples/warfarin_ltbs.ferx"))
+        .expect("LTBS warfarin model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data must load");
+
+    let mut opts = FitOptions::default();
+    opts.outer_maxiter = 300;
+    opts.run_covariance_step = true;
+    opts.verbose = false;
+
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("LTBS FOCEI fit must succeed");
+
+    assert!(
+        result.covariance_matrix.is_some(),
+        "LTBS covariance step must produce a matrix"
+    );
+    let se_theta = result.se_theta.as_ref().expect("theta SEs present");
+    let se_omega = result.se_omega.as_ref().expect("omega SEs present");
+    let se_sigma = result.se_sigma.as_ref().expect("sigma SEs present");
+
+    // NONMEM 7.5.1 FOCEI $COVARIANCE MATRIX=R SEs (warfarin_ltbs.lst).
+    // (name, ferx SE, NONMEM SE, relative band)
+    const NM_SE_SIGMA_SD: f64 = 1.69e-5 / (2.0 * 0.010564); // var-scale → SD-scale
+    let checks = [
+        ("TVCL", se_theta[0], 7.10e-3, 0.20),
+        ("TVV", se_theta[1], 2.40e-1, 0.20),
+        ("TVKA", se_theta[2], 1.49e-1, 0.20),
+        ("ADD_LOG (SD)", se_sigma[0], NM_SE_SIGMA_SD, 0.25),
+        // ω SEs get a 25% band: still catches the factor-of-2 regression (29%)
+        // and indefinite-Hessian blow-up, but absorbs the larger FD-vs-autodiff
+        // spread on the weakly-determined ω²(KA) (≈42% RSE).
+        ("omega_CL", se_omega[0], 1.09e-2, 0.25),
+        ("omega_V", se_omega[1], 3.98e-3, 0.25),
+        ("omega_KA", se_omega[2], 1.40e-1, 0.25),
+    ];
+    for (name, ferx_se, nm_se, tol) in checks {
+        let rd = (ferx_se - nm_se).abs() / nm_se;
+        assert!(
+            ferx_se.is_finite() && rd < tol,
+            "SE({name}) = {ferx_se:.6} vs NONMEM {nm_se:.6} — relative diff {:.1}% exceeds {:.0}% band",
+            rd * 100.0,
+            tol * 100.0
+        );
+    }
+}

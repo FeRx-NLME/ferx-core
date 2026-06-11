@@ -1841,6 +1841,21 @@ pub enum CovarianceStatus {
     Computed,
     /// Step was attempted but failed (e.g. singular Hessian).
     Failed,
+    /// FD Hessian was non-PD; SIR was run as a fallback and succeeded.
+    SirFallback,
+}
+
+/// What to do when the covariance step produces a non-positive-definite Hessian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CovarianceFallback {
+    /// Do nothing; leave the covariance step as failed (default).
+    #[default]
+    None,
+    /// Run SIR with a proposal built from the rectified (|eigenvalue|) Hessian,
+    /// inflated 4× for heavier tails. Parameter uncertainty is then reported as
+    /// 95% credible intervals from the SIR posterior quantiles instead of
+    /// `H⁻¹`-based standard errors.
+    Sir,
 }
 
 /// Severity level for a structured warning entry.
@@ -1859,8 +1874,8 @@ pub enum WarningSeverity {
 /// `bloq_method`, `sir`, `importance_sampling`, `data_quality`,
 /// `omega_structure`, `ebe_convergence`, `gradient_fallback`,
 /// `mu_referencing`, `optimizer_config`, `multi_start`, `cancelled`,
-/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`, `general`
-/// (fallback for unrecognised messages).
+/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`,
+/// `experimental`, `general` (fallback for unrecognised messages).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WarningEntry {
     pub severity: WarningSeverity,
@@ -1937,6 +1952,10 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, "dw_autocorrelation")
     } else if lower.contains("shapiro") || lower.contains("non-normal") {
         (WarningSeverity::Warning, "eta_normality")
+    } else if lower.contains("experimental feature") {
+        // Experimental-feature notices (issue #175): SDE and neural-network
+        // components emit a runtime warning so results are applied with caution.
+        (WarningSeverity::Warning, "experimental")
     } else if lower.contains("m3 bloq") || lower.contains("bloq handling") {
         (WarningSeverity::Warning, "bloq_method")
     } else if lower.contains("sir failed") || lower.contains("sir requested") {
@@ -2315,12 +2334,18 @@ pub struct FitOptions {
     pub inner_maxiter: usize,
     pub inner_tol: f64,
     pub run_covariance_step: bool,
-    /// Relative step size for the finite-difference Hessian in the covariance step.
-    /// The actual step for parameter i is `fd_hessian_step * (1 + |x_hat[i]|)`.
-    /// Default `1e-2`. Increase (e.g. `0.1`) when the default produces non-finite
-    /// Hessian entries; decrease (e.g. `1e-3`) for smoother OFV surfaces where
-    /// FD noise is the main concern.
+    /// *Initial* relative step size for the finite-difference Hessian in the
+    /// covariance step. The actual step for parameter i is
+    /// `fd_hessian_step * (1 + |x_hat[i]|)`. Default `1e-2`. ferx halves this
+    /// automatically (up to 8×) if a diagonal stencil comes back non-finite, so
+    /// manual tuning is rarely needed for overflow; decrease (e.g. `1e-3`) for
+    /// smoother OFV surfaces where FD noise is the main concern.
     pub fd_hessian_step: f64,
+    /// What to do when the FD Hessian is non-positive-definite.
+    /// Default [`CovarianceFallback::None`] leaves the covariance step as failed.
+    /// [`CovarianceFallback::Sir`] runs SIR with a fallback proposal covariance
+    /// built from the rectified (`|eigenvalue|`) Hessian, inflated 4×.
+    pub covariance_fallback: CovarianceFallback,
     pub interaction: bool,
     pub verbose: bool,
     pub optimizer: Optimizer,
@@ -2557,6 +2582,7 @@ impl Default for FitOptions {
             inner_tol: 1e-4,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
+            covariance_fallback: CovarianceFallback::None,
             interaction: true,
             verbose: true,
             // BOBYQA — derivative-free quadratic trust-region. Chosen as the
@@ -3157,6 +3183,18 @@ mod tests {
                 "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
                 Warning,
                 "data_quality",
+            ),
+            (
+                "Stochastic differential equations ([diffusion] / Extended Kalman \
+                 Filter) are an EXPERIMENTAL feature: validated only on a small set",
+                Warning,
+                "experimental",
+            ),
+            (
+                "Neural-network model components ([covariate_nn] / deep compartment \
+                 models) are an EXPERIMENTAL feature: validated only on a small set",
+                Warning,
+                "experimental",
             ),
             (
                 "block omega: ETA_CL x ETA_V have mixed lognormal / additive parameterisations",

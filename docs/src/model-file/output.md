@@ -1,5 +1,7 @@
 # Output Columns (`[output]`)
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 The optional `[output]` block lists additional columns to include in the sdtab beyond the mandatory minimum. Each entry is a bare name, one or more per line (whitespace or newlines between names).
 
 ```

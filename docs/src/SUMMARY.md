@@ -1,6 +1,7 @@
 # Summary
 
 - [Introduction](introduction.md)
+- [Feature Maturity](maturity.md)
 - [Getting Started](getting-started.md)
   - [Installation](installation.md)
   - [Quick Start](quick-start.md)

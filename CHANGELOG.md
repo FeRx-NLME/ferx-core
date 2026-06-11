@@ -23,6 +23,15 @@ section of the SDLC for the versioning policy).
 - FREM (Full Random Effects Model) covariate analysis: `prepare_frem()` API
   transforms a base model + dataset into a FREM model with extended block omega,
   covariate pseudo-observations, and FREMTYPE dispatch in the likelihood (#194).
+- Feature maturity labels (`stable` / `beta` / `experimental`) documented for
+  every major feature: a new *Feature Maturity* docs page with definitions and a
+  per-feature table, plus a maturity banner on each feature reference page.
+  Experimental features (`[diffusion]` / SDE, `[covariate_nn]` / neural networks)
+  now emit a runtime warning at fit time (`W_EXPERIMENTAL_SDE`,
+  `W_EXPERIMENTAL_NN`), also surfaced by `ferx check` (#175).
+- `covariance_fallback = sir` fit option: when the FD Hessian is non-positive-definite,
+  run SIR with an `|eigenvalue|`-rectified proposal (4× inflated) instead of leaving
+  the covariance step as failed; `covariance_status` reports `sir_fallback` (#223).
 - `covariance_matrix:` block in `*-fit.yaml`: the full optimizer-space parameter
   covariance matrix (log-theta, Cholesky-omega, log-sigma; kappa appended for IOV
   models), parameter-labelled, emitted when the covariance step succeeds or is
@@ -45,12 +54,24 @@ section of the SDLC for the versioning policy).
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
 
 ### Fixed
+- FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
+  `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
+  covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the
+  Sheiner–Beal marginal, which already carries Ω through `R̃ = HΩHᵀ + R` —
+  double-counting Ω and flattening the omega-block curvature. FOCE estimates were
+  already correct; only the SEs were affected (#243).
+- The covariance step now succeeds on models with a mixed block + diagonal Ω: the
+  structural-zero cross-block off-diagonals (`free_mask == false`) are excluded
+  from the parameter set like FIX parameters, so their flat Hessian diagonal no
+  longer aborts the step. This affected both FOCE and FOCEI (#243).
 - Covariance standard errors now match NONMEM `$COVARIANCE MATRIX=R` (within ~2%
   on warfarin). The covariance step reconverges the inner EBE loop at every
   finite-difference point — holding the EBEs fixed gave an indefinite Hessian
   that was clipped and inflated theta/sigma SEs 30–94× — and applies the correct
   factor of two for the `−2·logL` objective (every SE was previously `1/√2` too
   small) (#209, #196, #129).
+- Covariance step: `fd_hessian_step` is now an *initial* step; ferx automatically
+  halves it up to 8× if any diagonal FD stencil is non-finite (#223).
 - IOV FOCEI marginal likelihood now matches NONMEM after the Almquist Laplace
   correction (#109, #203).
 - SAEM no longer collapses a block Ω to a rank-1 (near-unit-correlation)

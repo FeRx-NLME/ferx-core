@@ -1,5 +1,7 @@
 # Steady-State Doses (SS=1)
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 A dose record with `SS=1` and `II > 0` tells ferx-core that, at the time
 of the record, the compartmental state is at steady state under repeated
 dosing of that amount/rate every `II` time units. The record itself is

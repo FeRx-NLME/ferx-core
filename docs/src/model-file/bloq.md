@@ -1,5 +1,7 @@
 # BLOQ / Below Limit of Quantification
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 Observations below the lower limit of quantification (LLOQ) cannot be treated as ordinary data: they carry only the information that the true concentration is somewhere below the detection threshold. Ignoring them (dropping rows) biases parameter estimates; treating the reported value (e.g. LLOQ/2) as a real observation is also biased. The statistically correct approach is to integrate the likelihood over the censored region.
 
 ferx-core supports two strategies, selected via `bloq_method` in `[fit_options]`.

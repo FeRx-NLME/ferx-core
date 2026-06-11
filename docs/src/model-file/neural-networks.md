@@ -1,5 +1,7 @@
 # Neural Networks
 
+> **Maturity: experimental** — see [Feature Maturity](../maturity.md) for what this means.
+
 ferx-core is gaining two complementary neural-network extensions. Both are
 gated behind the `nn` cargo feature (off by default) and are being built
 incrementally — see [`plans/dcm-and-low-dim-node.md`][plan] in the source

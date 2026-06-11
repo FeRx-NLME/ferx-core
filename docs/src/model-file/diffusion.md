@@ -1,5 +1,7 @@
 # Stochastic Differential Equations (SDE / Diffusion)
 
+> **Maturity: experimental** — see [Feature Maturity](../maturity.md) for what this means.
+
 The `[diffusion]` block adds continuous stochastic noise to ODE state variables.
 This models *system noise* — structural uncertainty that accumulates between
 observations — as opposed to measurement noise (sigma) or inter-individual

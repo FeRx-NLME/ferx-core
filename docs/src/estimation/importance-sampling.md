@@ -1,5 +1,7 @@
 # Importance Sampling (IMP)
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 The `imp` stage estimates the marginal log-likelihood
 
 \\[
