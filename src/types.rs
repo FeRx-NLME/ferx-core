@@ -1786,20 +1786,17 @@ pub enum IntegralStep {
 
 /// How per-occasion kappa random effects are treated in the IS marginal likelihood.
 ///
-/// `Marginalized` — kappa is jointly sampled with eta (planned v2; not yet implemented).
+/// `Marginalized` — kappa is jointly sampled with eta using a block-diagonal
+/// posterior Hessian. The IS -2LL integrates over both η and κ uncertainty,
+/// making it directly comparable to NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 /// `FixedAtMode` — kappa is held at its EBE (κ̂) and only eta is sampled. This is a
-/// *partial* marginal likelihood that ignores κ uncertainty, so the reported `-2LL`
-/// is biased downward relative to the true marginal and is not directly comparable
-/// to NONMEM's `$EST METHOD=IMP LAPLACIAN=1` on κ.
+/// *partial* marginal likelihood that ignores κ uncertainty. (Legacy; no longer
+/// used for IOV models.)
 /// `NotApplicable` — model has no kappa declarations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KappaTreatment {
     NotApplicable,
     FixedAtMode,
-    // Reserved for joint (eta, kappa) sampling; see TODO(imp-iov-v2) in
-    // `estimation/importance_sampling.rs`. Never constructed by v1 IMP so
-    // `dead_code` would otherwise fire on a strict clippy run.
-    #[allow(dead_code)]
     Marginalized,
 }
 
@@ -1811,7 +1808,9 @@ pub enum KappaTreatment {
 pub struct ImportanceSamplingResult {
     /// `−2 · Σᵢ log p(yᵢ | θ)` estimated by importance sampling. Lower-bias
     /// alternative to the FOCE/Laplace OFV when subject posteriors are
-    /// non-Gaussian (sparse data, strong nonlinearity).
+    /// non-Gaussian (sparse data, strong nonlinearity). For IOV models,
+    /// this uses joint (eta, kappa) sampling and is directly comparable
+    /// to the FOCE OFV.
     pub minus2_log_likelihood: f64,
     /// Monte-Carlo standard error on `minus2_log_likelihood`. Scales with
     /// `1/sqrt(n_samples)`; halve by quadrupling `is_samples`.

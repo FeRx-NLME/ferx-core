@@ -23,6 +23,12 @@ section of the SDLC for the versioning policy).
 - FREM (Full Random Effects Model) covariate analysis: `prepare_frem()` API
   transforms a base model + dataset into a FREM model with extended block omega,
   covariate pseudo-observations, and FREMTYPE dispatch in the likelihood (#194).
+- `covariance_matrix:` block in `*-fit.yaml`: the full optimizer-space parameter
+  covariance matrix (log-theta, Cholesky-omega, log-sigma; kappa appended for IOV
+  models), parameter-labelled, emitted when the covariance step succeeds or is
+  regularised. Omega/kappa diagonal entries are keyed `log_chol_<eta>` (packed
+  value is `log(L_ii)`); off-diagonal entries are keyed `chol_<row>_<col>`
+  (`L_ij`, not log-transformed) (#236).
 - Time-to-event / survival modelling (Phase 1): `[event_model]` block, TTE
   datareader, likelihood, and API wiring, behind the `survival` feature
   (#191, #192).
@@ -31,7 +37,20 @@ section of the SDLC for the versioning policy).
 - Combined ferx-core + ferx-r development documentation: a Development Lifecycle
   (SDLC) page and a Contributing page in the book.
 
+### Changed
+- IMP (importance sampling) now jointly samples (η, κ) for IOV models,
+  integrating over inter-occasion variability so the reported `−2 log L` is
+  directly comparable to FOCE/FOCEI and NONMEM `METHOD=IMP`. Previously κ was
+  held fixed at its EBE mode, giving a partial marginal; `kappa_treatment` in
+  the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
+
 ### Fixed
+- Covariance standard errors now match NONMEM `$COVARIANCE MATRIX=R` (within ~2%
+  on warfarin). The covariance step reconverges the inner EBE loop at every
+  finite-difference point — holding the EBEs fixed gave an indefinite Hessian
+  that was clipped and inflated theta/sigma SEs 30–94× — and applies the correct
+  factor of two for the `−2·logL` objective (every SE was previously `1/√2` too
+  small) (#209, #196, #129).
 - IOV FOCEI marginal likelihood now matches NONMEM after the Almquist Laplace
   correction (#109, #203).
 - SAEM no longer collapses a block Ω to a rank-1 (near-unit-correlation)
@@ -43,6 +62,11 @@ section of the SDLC for the versioning policy).
   (#199, #200).
 
 ### Performance
+- The covariance Hessian is built from a central difference of the analytical
+  population gradient — reusing H-matrix columns for mu-referenced parameters
+  instead of finite-differencing predictions — making the covariance step ~9×
+  faster than scalar finite differencing on warfarin, scaling with the number of
+  free parameters (#209, #196).
 - Autodiff inner gradients now flow through `EVID=3/4` resets and lag time,
   removing a large finite-difference fallback slowdown (#198).
 

@@ -7,6 +7,7 @@
 //! per-subject PK.
 
 use ferx_core::parser::model_parser::parse_model_file;
+use ferx_core::types::KappaTreatment;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
 
@@ -44,6 +45,65 @@ fn downsample_population(population: &mut ferx_core::types::Population, keep_per
         subj.obs_cmts = obs_cmts;
         subj.cens = cens;
     }
+}
+
+/// Regression test for joint (eta, kappa) IS on the warfarin IOV example.
+///
+/// Before this fix IMP held kappa fixed at its EBE mode, producing a ~64-unit
+/// OFV gap vs FOCEI. Joint sampling closes that gap: ferx IMP should land near
+/// the NONMEM 7.5.1 IMP reference of 310.18.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn warfarin_iov_joint_sampling_matches_nonmem() {
+    let model = parse_model_file(std::path::Path::new("examples/warfarin_iov.ferx"))
+        .expect("warfarin_iov model must parse");
+    let population = read_nonmem_csv(
+        std::path::Path::new("data/warfarin_iov.csv"),
+        None,
+        Some("OCC"),
+    )
+    .expect("warfarin_iov data must load");
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    opts.run_covariance_step = false;
+    opts.methods = vec![
+        EstimationMethod::Saem,
+        EstimationMethod::FoceI,
+        EstimationMethod::Imp,
+    ];
+    opts.is_samples = 3000;
+    opts.is_seed = Some(2026);
+
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("warfarin_iov SAEM → FOCEI → IMP must succeed");
+
+    let imp = result
+        .importance_sampling
+        .as_ref()
+        .expect("IMP stage must populate FitResult.importance_sampling");
+
+    // NONMEM 7.5.1 IMP: 310.18; ferx joint sampling: 309.00.
+    // Tolerance ±2.0 accommodates MC noise and platform-dependent FOCEI polish.
+    // Under the old kappa-fixed path this would have been ~373 (+64 gap) — so
+    // this assertion fails without the joint-sampling fix.
+    assert!(
+        (imp.minus2_log_likelihood - 309.0).abs() < 2.0,
+        "warfarin_iov IMP −2LL should be near 309.0 (NONMEM: 310.18), got {:.4}",
+        imp.minus2_log_likelihood
+    );
+    assert!(
+        imp.mc_standard_error < 0.1,
+        "MC SE should be small at K=3000, got {:.4}",
+        imp.mc_standard_error
+    );
+    assert!(
+        matches!(imp.kappa_treatment, KappaTreatment::Marginalized),
+        "kappa_treatment must be Marginalized for IOV model"
+    );
 }
 
 #[test]

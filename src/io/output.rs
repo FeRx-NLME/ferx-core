@@ -743,6 +743,125 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
+/// Format a covariance matrix entry in YAML 1.1-compatible scientific notation.
+///
+/// Rust's `{:.6e}` omits the `+` sign on non-negative exponents (e.g. `1.0` →
+/// `"1.000000e0"`), which YAML 1.1 parsers (R yaml, PyYAML) reject as a float
+/// and read back as a string.  This helper always emits an explicit sign:
+/// `"1.000000e+0"`, `"1.234567e-4"`, etc.
+fn fmt_cov_entry(v: f64) -> String {
+    let s = format!("{:.6e}", v);
+    // Insert '+' before a bare non-negative exponent, e.g. "e0" → "e+0".
+    if let Some(pos) = s.find('e') {
+        let exp = &s[pos + 1..];
+        if !exp.starts_with('-') {
+            return format!("{}e+{}", &s[..pos], exp);
+        }
+    }
+    s
+}
+
+/// Build the ordered parameter name list that matches `pack_params` layout:
+/// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
+///
+/// For a diagonal omega/kappa each entry is `log_chol_{eta_name}` — the packed
+/// value is `log(L_ii)` where `omega = L Lᵀ` (Cholesky diagonal, log-transformed).
+/// For a full-block omega/kappa the column-major lower-triangle entries are
+/// `log_chol_{eta_i}` on the diagonal (`log(L_ii)`) and `chol_{eta_i}_{eta_j}`
+/// (i > j) off-diagonal (`L_ij`, not log-transformed).
+fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
+    let n_theta = result.theta_names.len();
+    let n_eta = result.omega.nrows();
+    let n_sigma = result.sigma_names.len();
+    let n_kappa = result.kappa_names.len();
+
+    let n_omega_diag = n_eta;
+    let n_omega_full = n_eta * (n_eta + 1) / 2;
+    let n_kappa_diag = n_kappa;
+    let n_kappa_full = if n_kappa > 0 {
+        n_kappa * (n_kappa + 1) / 2
+    } else {
+        0
+    };
+    let n_remaining = n.saturating_sub(n_theta + n_sigma);
+
+    // Try all four diagonal/block combinations; take the first match.
+    //
+    // Known ambiguity: when n_eta == n_kappa > 1 and the two structures differ
+    // (one diagonal, one full-block), both (false, true) and (true, false)
+    // yield the same n_remaining and the code always picks (false, true) —
+    // full-block omega + diagonal kappa.  In that rare case the packed names
+    // will be wrong for the minority of models where kappa is full-block while
+    // omega is diagonal.  A proper fix requires storing `omega_is_block` /
+    // `kappa_is_block` on `FitResult` so the output layer doesn't have to
+    // infer the structure.
+    let combos = [
+        (true, true, n_omega_diag + n_kappa_diag),
+        (false, true, n_omega_full + n_kappa_diag),
+        (true, false, n_omega_diag + n_kappa_full),
+        (false, false, n_omega_full + n_kappa_full),
+    ];
+    let (omega_diagonal, kappa_diagonal) = combos
+        .iter()
+        .find(|(_, _, size)| *size == n_remaining)
+        .map(|(od, kd, _)| (*od, *kd))
+        .unwrap_or((n_eta <= 1, n_kappa <= 1));
+
+    let mut names: Vec<String> = Vec::with_capacity(n);
+
+    names.extend(result.theta_names.iter().cloned());
+
+    if omega_diagonal {
+        for name in &result.eta_names {
+            names.push(format!("log_chol_{name}"));
+        }
+    } else {
+        for j in 0..n_eta {
+            for i in j..n_eta {
+                if i == j {
+                    names.push(format!("log_chol_{}", result.eta_names[i]));
+                } else {
+                    names.push(format!(
+                        "chol_{}_{}",
+                        result.eta_names[i], result.eta_names[j]
+                    ));
+                }
+            }
+        }
+    }
+
+    names.extend(result.sigma_names.iter().cloned());
+
+    if n_kappa > 0 {
+        if kappa_diagonal {
+            for name in &result.kappa_names {
+                names.push(format!("log_chol_{name}"));
+            }
+        } else {
+            for j in 0..n_kappa {
+                for i in j..n_kappa {
+                    if i == j {
+                        names.push(format!("log_chol_{}", result.kappa_names[i]));
+                    } else {
+                        names.push(format!(
+                            "chol_{}_{}",
+                            result.kappa_names[i], result.kappa_names[j]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Pad with generic names if the covariance matrix is larger than expected
+    // (shouldn't happen in practice, but prevents index-out-of-bounds).
+    while names.len() < n {
+        names.push(format!("param_{}", names.len() + 1));
+    }
+    names.truncate(n);
+    names
+}
+
 /// Write parameter estimates and uncertainty as YAML
 pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String> {
     use std::io::Write;
@@ -1130,6 +1249,28 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             for c in &excl.fired_accept {
                 writeln!(f, "    - \"{}\"", c).map_err(|e| e.to_string())?;
             }
+        }
+    }
+
+    // Covariance matrix block (optimizer parameterization).
+    // Emitted when the covariance step succeeded or was regularized, giving
+    // downstream tools (bootstrap, SIR, uncertainty propagation) the full
+    // parameter covariance without re-running the fit.
+    if let Some(ref cov) = result.covariance_matrix {
+        let n = cov.nrows();
+        let names = packed_param_names(result, n);
+        writeln!(f, "\ncovariance_matrix:").map_err(|e| e.to_string())?;
+        writeln!(
+            f,
+            "  # optimizer parameterization: theta log-transformed when lower bound >= 0 \
+             (identity otherwise), sigma log-transformed, omega/kappa Cholesky-factored"
+        )
+        .map_err(|e| e.to_string())?;
+        writeln!(f, "  parameters: [{}]", names.join(", ")).map_err(|e| e.to_string())?;
+        writeln!(f, "  rows:").map_err(|e| e.to_string())?;
+        for i in 0..n {
+            let row: Vec<String> = (0..n).map(|j| fmt_cov_entry(cov[(i, j)])).collect();
+            writeln!(f, "    {}: [{}]", names[i], row.join(", ")).map_err(|e| e.to_string())?;
         }
     }
 
@@ -2020,6 +2161,8 @@ mod tests {
         r.shrinkage_kappa = vec![0.20, f64::NAN];
         r.shrinkage_kappa_by_occ = vec![vec![0.10, f64::NAN]];
         r.covariance_status = CovarianceStatus::Computed;
+        // 2 theta + 3 omega (full 2×2) + 2 sigma + 3 kappa (full 2×2) = 10
+        r.covariance_matrix = Some(DMatrix::identity(10, 10));
         r.warnings = vec!["example warning".into()];
         r
     }
@@ -2055,6 +2198,15 @@ mod tests {
             yaml.contains("  ci_theta:")
                 && yaml.contains("  ci_omega:")
                 && yaml.contains("  ci_sigma:")
+        );
+        // Covariance matrix block.
+        assert!(
+            yaml.contains("\ncovariance_matrix:"),
+            "covariance_matrix block missing"
+        );
+        assert!(
+            yaml.contains("  parameters: [CL, BASE, log_chol_ETA_CL, chol_ETA_V_ETA_CL, log_chol_ETA_V, EPS_1, EPS_2, log_chol_KAPPA_CL, chol_KAPPA_V_KAPPA_CL, log_chol_KAPPA_V]"),
+            "covariance_matrix parameter list wrong:\n{yaml}"
         );
         // Warnings.
         assert!(yaml.contains("\nwarnings:") && yaml.contains("- \"example warning\""));
@@ -2118,6 +2270,82 @@ mod tests {
             is.kappa_treatment = KappaTreatment::NotApplicable;
         }
         print_results(&r);
+    }
+
+    #[test]
+    fn write_yaml_emits_covariance_matrix_block() {
+        // Diagonal omega (1 eta), 1 theta, 1 sigma → packed: [CL, log_chol_ETA_CL, EPS_1]
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.theta = vec![2.0];
+        r.theta_names = vec!["CL".into()];
+        r.theta_fixed = vec![false];
+        r.omega = DMatrix::from_row_slice(1, 1, &[0.09]);
+        r.eta_names = vec!["ETA_CL".into()];
+        r.omega_fixed = vec![false];
+        // 3×3 identity covariance matrix
+        r.covariance_matrix = Some(DMatrix::identity(3, 3));
+        r.covariance_status = CovarianceStatus::Computed;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+
+        assert!(
+            yaml.contains("\ncovariance_matrix:"),
+            "block header missing"
+        );
+        assert!(
+            yaml.contains("  parameters: [CL, log_chol_ETA_CL, EPS_1]"),
+            "parameter list wrong:\n{yaml}"
+        );
+        assert!(yaml.contains("    CL: ["), "CL row missing");
+        assert!(
+            yaml.contains("    log_chol_ETA_CL: ["),
+            "log_chol_ETA_CL row missing"
+        );
+        assert!(yaml.contains("    EPS_1: ["), "EPS_1 row missing");
+        // Identity matrix: diagonal 1 → "1.000000e+0", off-diagonal 0 → "0.000000e+0"
+        assert!(
+            yaml.contains("1.000000e+0"),
+            "diagonal 1 missing or wrong exponent format"
+        );
+        assert!(
+            yaml.contains("0.000000e+0"),
+            "off-diagonal 0 missing or wrong exponent format"
+        );
+
+        // Full-block omega (2 etas): packed names include chol_ off-diagonal entry
+        let mut r2 = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r2.theta = vec![2.0];
+        r2.theta_names = vec!["CL".into()];
+        r2.theta_fixed = vec![false];
+        r2.omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.02, 0.02, 0.04]);
+        r2.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
+        r2.omega_fixed = vec![false, false];
+        // 1 theta + 3 omega (full 2×2) + 1 sigma = 5
+        r2.covariance_matrix = Some(DMatrix::identity(5, 5));
+        r2.covariance_status = CovarianceStatus::Computed;
+
+        let path2 = dir.path().join("fit2.yaml");
+        write_estimates_yaml(&r2, path2.to_str().unwrap()).expect("yaml write");
+        let yaml2 = std::fs::read_to_string(&path2).expect("yaml read");
+
+        assert!(
+            yaml2.contains(
+                "  parameters: [CL, log_chol_ETA_CL, chol_ETA_V_ETA_CL, log_chol_ETA_V, EPS_1]"
+            ),
+            "full-block omega parameter list wrong:\n{yaml2}"
+        );
+        // No covariance_matrix block when covariance_matrix is None
+        let r3 = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        let path3 = dir.path().join("fit3.yaml");
+        write_estimates_yaml(&r3, path3.to_str().unwrap()).expect("yaml write");
+        let yaml3 = std::fs::read_to_string(&path3).expect("yaml read");
+        assert!(
+            !yaml3.contains("covariance_matrix:"),
+            "block should be absent when covariance_matrix is None"
+        );
     }
 
     #[cfg(feature = "nn")]

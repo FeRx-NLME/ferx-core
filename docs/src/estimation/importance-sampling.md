@@ -143,18 +143,17 @@ models is not yet threaded through the IS observation-likelihood path,
 so the marginal would be silently biased. Use FOCE / FOCEI for the
 Laplace OFV on SDE models; IMP for SDE is tracked as a follow-up.
 
-## IOV (current limitation)
+## IOV (inter-occasion variability)
 
-For models with `kappa` declarations, IMP samples η only — per-occasion
-κ is held fixed at its EBE κ̂. The reported `−2 log L` is therefore a
-**partial marginal** that does not integrate over κ uncertainty. It
-underestimates the true marginal variance and is *not* directly
-comparable to NONMEM `$EST METHOD=IMP LAPLACIAN=1` on κ.
+For models with `kappa` declarations, IMP performs **joint sampling** of
+both η (between-subject variability) and κ (between-occasion variability).
+The proposal is built from the full (n_eta + n_kappa × n_occasions)
+posterior Hessian, and the IS weights include both the η and κ priors.
 
-The result struct flags this via `kappa_treatment = "fixed_at_mode"`
-(YAML) and the CLI prints a notice. Joint (η, κ) sampling is planned;
-see the `TODO(imp-iov-v2)` marker in
-`src/estimation/importance_sampling.rs`.
+The result struct flags this via `kappa_treatment = "marginalized"`
+(YAML) and the CLI prints a notice. The reported `−2 log L` integrates
+over both η and κ uncertainty, making it directly comparable to
+NONMEM `$EST METHOD=IMP LAPLACIAN=1` on κ.
 
 ## Cost
 
@@ -184,7 +183,7 @@ importance_sampling:
   proposal_df: 5.0000
   ess_min: 0.1800
   ess_median: 0.6200
-  kappa_treatment: not_applicable
+  kappa_treatment: marginalized  # or not_applicable if no IOV
   low_ess_subjects:
     - id: "12"
       ess_fraction: 0.1800
