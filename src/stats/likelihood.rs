@@ -238,12 +238,19 @@ pub(crate) fn obs_nll_subject_into(
 ) -> f64 {
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
     let preds = pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+    // FREM covariate rows use EPSCOV, not the PK residual error (see
+    // build_frem_r_override); FREM covariate rows are never BLOQ.
+    let frem_ov =
+        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
     let mut nll = 0.0;
     for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let f = f.max(1e-12);
-        let v = model
-            .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
-            .max(1e-12);
+        let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
+            Some(vv) => vv.max(1e-12),
+            None => model
+                .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
+                .max(1e-12),
+        };
         if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
             let z = (y - f) / v.sqrt();
             nll += -crate::stats::special::log_normal_cdf(z);
@@ -1248,9 +1255,17 @@ pub fn individual_nll_iov(
     // Data NLL — single continuous prediction with per-event occasion kappa
     // (proper cross-occasion carryover; issue #104).
     let preds = pk::predict_iov(model, subject, theta, eta, kappas);
+    // FREM covariate pseudo-observations use the covariate sigma (EPSCOV), not
+    // the PK residual error, so the FREM etas are sampled against the right
+    // variance (mirrors the FOCE paths and the non-IOV individual_nll).
+    let frem_ov =
+        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        let v = model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values);
+        let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
+            Some(vv) => vv,
+            None => model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values),
+        };
         if is_m3_bloq(model, subject, j) {
             let z = (y - f_pred) / v.sqrt();
             data_ll += -2.0 * log_normal_cdf(z);

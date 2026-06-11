@@ -360,6 +360,13 @@ pub fn predict_iov(
         return predict_iov_option_a(model, subject, theta, eta_bsv, kappas);
     };
 
+    // FREM override: covariate pseudo-observations are predicted as
+    // theta + FREM eta (a between-subject effect), matching the analytical path
+    // (`compute_predictions_with_tv_*`). Applied before scaling/log so both
+    // prediction paths agree. Without this, FREM + SAEM on an ODE/event-driven
+    // model would score covariate rows against the structural PK prediction.
+    apply_frem_prediction_override(model, subject, theta, eta_bsv, &mut preds);
+
     // `[scaling]` post-multiply, applied **per occasion** so a κ-dependent scale
     // (or a scale referencing a κ-dependent individual parameter) uses that
     // occasion's κ — matching the per-occasion prediction. `apply_scaling`
@@ -1054,6 +1061,35 @@ pub fn compute_predictions_ode(
 ///   - **TV covariates + ODE PK**: per-event TV is wired through the ODE
 ///     segment loop (Phase 4 — until then this falls back to single
 ///     snapshot like the analytical-unsupported branch).
+/// Apply the FREM prediction override in place: for each FREMTYPE > 0
+/// observation, replace the structural PK prediction with `theta[k] + eta[m]`
+/// (the covariate pseudo-observation = typical value + FREM random effect),
+/// using the `(theta, eta)` indices declared by `frem_predictions`.
+///
+/// No-op when the model has no `[frem]` config. `eta` is the BSV eta vector
+/// (the FREM etas are between-subject effects), so callers on the IOV path pass
+/// the BSV slice, not the kappa-augmented vector. Single source of truth shared
+/// by the analytical and IOV/SAEM prediction paths.
+pub(crate) fn apply_frem_prediction_override(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    preds: &mut [f64],
+) {
+    if let Some(ref fc) = model.frem_config {
+        for (j, ft) in subject.fremtype.iter().enumerate() {
+            if *ft > 0 {
+                if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(ft) {
+                    if j < preds.len() {
+                        preds[j] = theta[theta_idx] + eta[eta_idx];
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn compute_predictions_with_tv(
     model: &crate::types::CompiledModel,
     subject: &Subject,
@@ -1156,17 +1192,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
 
     // FREM override: replace predictions for FREMTYPE > 0 observations
     // with theta[k] + eta[m] (covariate pseudo-observation predictions).
-    if let Some(ref fc) = model.frem_config {
-        for (j, ft) in subject.fremtype.iter().enumerate() {
-            if *ft > 0 {
-                if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(ft) {
-                    if j < preds.len() {
-                        preds[j] = theta[theta_idx] + eta[eta_idx];
-                    }
-                }
-            }
-        }
-    }
+    apply_frem_prediction_override(model, subject, theta, eta, &mut preds);
 
     // `[scaling]` post-multiply. Single insertion point covers FOCE/FOCEI,
     // GN, trust-region, SAEM, and IOV — they all route through here.

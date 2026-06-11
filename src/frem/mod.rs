@@ -1016,6 +1016,32 @@ mod tests {
     }
 
     #[test]
+    fn apply_frem_prediction_override_replaces_only_covariate_rows() {
+        // FREMTYPE > 0 rows are replaced with theta[k] + eta[m]; PK rows (FREMTYPE 0)
+        // are left untouched.
+        let mut model = make_test_model();
+        // Map FREMTYPE 100 -> (theta TVCL idx 0, eta ETA_V idx 1).
+        let mut map = std::collections::HashMap::new();
+        map.insert(100u16, (0usize, 1usize));
+        model.frem_config = Some(FremConfig {
+            fremtype_to_indices: map,
+            covariate_sigma_index: 0,
+        });
+
+        let mut subj = make_test_population().subjects.remove(0); // 3 obs
+        subj.fremtype = vec![0, 100, 0];
+
+        let theta = model.default_params.theta.clone(); // [0.2, 10.0, 1.5]
+        let eta = vec![0.1, 0.2, 0.3];
+        let mut preds = vec![5.0, 8.0, 6.0];
+        crate::pk::apply_frem_prediction_override(&model, &subj, &theta, &eta, &mut preds);
+
+        assert_eq!(preds[0], 5.0); // PK row untouched
+        assert_eq!(preds[2], 6.0); // PK row untouched
+        assert_eq!(preds[1], theta[0] + eta[1]); // covariate row = TVCL + ETA_V = 0.4
+    }
+
+    #[test]
     fn resolve_covariates_filter_selects_subset_in_filter_order() {
         // A non-empty filter selects a subset; order follows the filter, kinds
         // come from the block.
