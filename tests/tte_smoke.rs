@@ -113,6 +113,7 @@ mod survival_smoke {
                     cens: vec![],
                     occasions: vec![],
                     dose_occasions: vec![],
+                    fremtype: vec![],
                     obs_records: vec![ObsRecord::Event {
                         time: t,
                         event_type,
@@ -922,6 +923,7 @@ mod survival_smoke {
             cens: vec![],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: vec![],
             obs_records: vec![],
         }
     }
@@ -983,6 +985,7 @@ mod survival_smoke {
                     DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
                 ],
                 dose_occasions: vec![0, 1],
+                fremtype: vec![],
                 // One PK obs per occasion at t=4 and t=28.
                 obs_times: vec![4.0, 28.0],
                 obs_raw_times: vec![4.0, 28.0],
