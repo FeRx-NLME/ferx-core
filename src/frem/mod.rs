@@ -484,21 +484,35 @@ fn resolve_frem_covariates(
     let selected: Vec<&crate::types::CovariateDecl> = if covariate_filter.is_empty() {
         decls.iter().collect()
     } else {
-        let mut sel = Vec::with_capacity(covariate_filter.len());
+        let mut sel: Vec<&crate::types::CovariateDecl> = Vec::with_capacity(covariate_filter.len());
         for name in covariate_filter {
-            let decl = decls.iter().find(|d| &d.name == name).ok_or_else(|| {
-                format!(
-                    "FREM covariate '{}' is not declared in the model's [covariates] block. \
-                     The `covariates` argument selects a subset of the declared covariates \
-                     (declared: {}).",
-                    name,
-                    decls
-                        .iter()
-                        .map(|d| d.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?;
+            // Match the declaration case-insensitively, consistent with how
+            // covariates are matched against the dataset elsewhere; the declared
+            // (canonical) name is what gets used downstream.
+            let decl = decls
+                .iter()
+                .find(|d| d.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| {
+                    format!(
+                        "FREM covariate '{}' is not declared in the model's [covariates] block. \
+                         The `covariates` argument selects a subset of the declared covariates \
+                         (declared: {}).",
+                        name,
+                        decls
+                            .iter()
+                            .map(|d| d.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            // Reject duplicates so we never emit a covariate (and its eta /
+            // FREMTYPE rows) twice, which would produce a degenerate model.
+            if sel.iter().any(|d| d.name == decl.name) {
+                return Err(format!(
+                    "FREM covariate '{}' is listed more than once in the `covariates` filter.",
+                    decl.name
+                ));
+            }
             sel.push(decl);
         }
         sel
@@ -1012,6 +1026,32 @@ mod tests {
             resolve_frem_covariates(&[], Some(&["WT".to_string()]), Some(&decls)).unwrap();
         assert_eq!(covs, vec!["WT", "SEX"]);
         assert_eq!(cats, vec!["WT"]);
+    }
+
+    #[test]
+    fn resolve_covariates_filter_is_case_insensitive_and_canonicalizes() {
+        // Filter matches the declaration case-insensitively; the declared
+        // (canonical) name is returned.
+        let decls = vec![decl("WT", CovariateKind::Continuous)];
+        let (covs, _) = resolve_frem_covariates(&["wt".to_string()], None, Some(&decls)).unwrap();
+        assert_eq!(covs, vec!["WT"]);
+    }
+
+    #[test]
+    fn resolve_covariates_filter_rejects_duplicates() {
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("AGE", CovariateKind::Continuous),
+        ];
+        // Exact and case-variant duplicates both error.
+        assert!(
+            resolve_frem_covariates(&["WT".to_string(), "WT".to_string()], None, Some(&decls))
+                .is_err()
+        );
+        let err =
+            resolve_frem_covariates(&["WT".to_string(), "wt".to_string()], None, Some(&decls))
+                .unwrap_err();
+        assert!(err.contains("more than once"), "got: {err}");
     }
 
     #[test]

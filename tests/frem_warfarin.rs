@@ -24,6 +24,10 @@ const BASE_MODEL: &str = r#"
 
   sigma PROP_ERR ~ 0.02
 
+[covariates]
+  WT  continuous
+  AGE continuous
+
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
   V  = TVV  * exp(ETA_V)
