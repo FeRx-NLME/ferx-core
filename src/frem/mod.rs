@@ -473,12 +473,26 @@ fn resolve_frem_covariates(
 ) -> Result<(Vec<String>, Vec<String>), String> {
     use crate::types::CovariateKind;
 
-    let decls = covariate_decls.filter(|d| !d.is_empty()).ok_or_else(|| {
-        "FREM needs covariates declared in the model's [covariates] block (each tagged \
-         continuous or categorical). The model has no [covariates] block — add one listing \
-         the covariates to fold into the FREM model."
-            .to_string()
-    })?;
+    // The [covariates] block is the source of truth and is required. Distinguish
+    // an absent block from a present-but-empty one so the diagnostic is accurate.
+    let decls = match covariate_decls {
+        Some(d) if !d.is_empty() => d,
+        Some(_) => {
+            return Err(
+                "The model's [covariates] block is empty. Declare at least one \
+                        covariate (each tagged continuous or categorical) for FREM to fold in."
+                    .to_string(),
+            );
+        }
+        None => {
+            return Err(
+                "FREM needs covariates declared in the model's [covariates] block (each \
+                        tagged continuous or categorical). The model has no [covariates] block — \
+                        add one listing the covariates to fold into the FREM model."
+                    .to_string(),
+            );
+        }
+    };
 
     // Select declared covariates: all of them, or the named subset.
     let selected: Vec<&crate::types::CovariateDecl> = if covariate_filter.is_empty() {
@@ -520,7 +534,20 @@ fn resolve_frem_covariates(
 
     let names: Vec<String> = selected.iter().map(|d| d.name.clone()).collect();
     let cats: Vec<String> = match categorical_override {
-        Some(c) if !c.is_empty() => c.to_vec(),
+        Some(c) if !c.is_empty() => {
+            // The override must reference covariates actually in the FREM set,
+            // else it silently points at a covariate that won't be modelled.
+            for cov in c {
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(cov)) {
+                    return Err(format!(
+                        "FREM categorical override '{}' is not among the selected covariates ({}).",
+                        cov,
+                        names.join(", ")
+                    ));
+                }
+            }
+            c.to_vec()
+        }
         _ => selected
             .iter()
             .filter(|d| d.kind == CovariateKind::Categorical)
@@ -1055,10 +1082,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_covariates_categorical_override_must_be_selected() {
+        // An override naming a covariate that isn't in the FREM set is an error.
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        // SEX is excluded by the filter, so overriding it categorical is invalid.
+        let err = resolve_frem_covariates(
+            &["WT".to_string()],
+            Some(&["SEX".to_string()]),
+            Some(&decls),
+        )
+        .unwrap_err();
+        assert!(err.contains("not among the selected"), "got: {err}");
+    }
+
+    #[test]
     fn resolve_covariates_requires_block() {
-        // No (or empty) [covariates] block → error, with or without a filter.
-        assert!(resolve_frem_covariates(&[], None, None).is_err());
-        assert!(resolve_frem_covariates(&[], None, Some(&[])).is_err());
+        // Missing vs empty [covariates] block → distinct, accurate messages.
+        let missing = resolve_frem_covariates(&[], None, None).unwrap_err();
+        assert!(missing.contains("no [covariates] block"), "got: {missing}");
+        let empty = resolve_frem_covariates(&[], None, Some(&[])).unwrap_err();
+        assert!(empty.contains("is empty"), "got: {empty}");
+        // A filter doesn't change the requirement.
         assert!(resolve_frem_covariates(&["WT".to_string()], None, None).is_err());
     }
 }
