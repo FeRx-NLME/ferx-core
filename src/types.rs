@@ -1932,6 +1932,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("missing or unparseable values in iov_column")
     {
         (WarningSeverity::Warning, "data_quality")
+    } else if lower.starts_with("w_missing_dv") {
+        (WarningSeverity::Warning, "data_quality")
     } else if lower.contains("ltbs")
         || lower.contains("non-positive dv")
         || lower.contains("ss=1 dose")
@@ -3128,6 +3130,11 @@ mod tests {
             ),
             (
                 "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
+                Warning,
+                "data_quality",
+            ),
+            (
+                "W_MISSING_DV: 2 observation row(s) (EVID=0) had a missing DV",
                 Warning,
                 "data_quality",
             ),

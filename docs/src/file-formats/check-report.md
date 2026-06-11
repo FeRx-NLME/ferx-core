@@ -76,6 +76,7 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 | `W_OUTPUT_DUPLICATE` | warning | A name in `[output]` is already written to sdtab automatically (e.g. `TAFD`, `TAD`, an eta name). |
 | `W_ADDL_MISSING_II` | warning | ADDL > 0 on a dose row but II is zero or missing; additional doses were not expanded. |
 | `W_IOV_OCC_MISSING` | warning | Some rows in the IOV occasion column had missing or unparseable values; those rows were assigned occasion=0. |
+| `W_MISSING_DV` | warning | One or more `EVID=0` rows had a missing `DV` (`.`/`NA`/blank) but were not marked `MDV=1`; they were skipped rather than scored as `DV=0`. |
 | `E_IOV_MISSING_OCC` | error | Model declares kappa (IOV) parameters but no occasion labels were found in the dataset. Set `iov_column` in `[fit_options]`. |
 
 Codes are stable; new ones may be added over time. Treat an unrecognised code

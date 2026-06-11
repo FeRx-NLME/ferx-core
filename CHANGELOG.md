@@ -48,6 +48,10 @@ section of the SDLC for the versioning policy).
   the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
 
 ### Fixed
+- A missing `DV` (`.`/`NA`/blank) on an `EVID=0` observation row without `MDV=1`
+  is no longer silently scored as `DV=0`. Such rows are now treated as `MDV=1`
+  (skipped) and a single `W_MISSING_DV` warning reports how many rows were
+  skipped, surfaced in fit warnings and `ferx check` (#258).
 - FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
   `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
   covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the
