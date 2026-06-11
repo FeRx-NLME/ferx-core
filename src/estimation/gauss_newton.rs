@@ -3108,6 +3108,7 @@ mod tests {
                 dv_pre_logged: false,
                 derived_exprs: vec![],
                 output_columns: vec![],
+                frem_config: None,
                 #[cfg(feature = "survival")]
                 endpoints: std::collections::HashMap::new(),
             }
@@ -3131,6 +3132,7 @@ mod tests {
                     cens: vec![0; N_OBS],
                     occasions: vec![1; N_OBS],
                     dose_occasions: vec![1],
+                    fremtype: vec![],
                     #[cfg(feature = "survival")]
                     obs_records: vec![],
                 })
