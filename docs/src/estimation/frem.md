@@ -4,6 +4,26 @@ FREM (Karlsson 2012) is a covariate analysis method that treats covariates as
 additional dependent variables, estimating covariate-parameter relationships
 through an extended omega matrix rather than explicit covariate models.
 
+## Specifying covariates
+
+The covariates folded into the FREM model — and whether each is **continuous**
+or **categorical** — are taken from the model's
+[`[covariates]`](../model-file/covariates.md) block. That block is the single
+source of truth and is **required**: the transformation uses every covariate it
+declares.
+
+```text
+[covariates]
+  WT  continuous
+  AGE continuous
+  SEX categorical
+```
+
+If you don't want *every* declared covariate in the FREM model, pass a
+**subset filter** (the `covariates` argument): only the named covariates are
+included, and each must be declared in the block. The filter never introduces
+covariates the model hasn't declared, nor changes their kind.
+
 ## How it works
 
 1. **Data augmentation**: For each subject, pseudo-observation rows are added
@@ -26,11 +46,14 @@ use ferx_core::prepare_frem;
 let result = prepare_frem(
     &base_model_path,
     &data_path,
-    &["WT".into(), "AGE".into()],
-    None,  // no categoricals
+    &[],   // empty filter → use every covariate from the model's [covariates] block
+    None,  // categorical override (None → kinds come from the [covariates] block)
     None,  // default output model path
     None,  // default output data path
 )?;
+
+// Pass e.g. &["WT".into()] instead of &[] to FREM only a subset of the
+// declared covariates.
 
 // result.model_path  — generated FREM .ferx file
 // result.data_path   — augmented CSV with FREMTYPE column
@@ -42,12 +65,15 @@ let result = prepare_frem(
 ```r
 library(ferx)
 
+# Covariates (and their continuous/categorical kind) come from the model's
+# [covariates] block; omit `covariates` to use all of them.
 frem <- ferx_to_frem(
-  model      = "warfarin.ferx",
-  data       = "warfarin_cov.csv",
-  covariates = c("WT", "AGE"),
-  categorical = NULL
+  model = "warfarin.ferx",
+  data  = "warfarin_cov.csv"
 )
+
+# Or filter to a subset of the declared covariates:
+# frem <- ferx_to_frem("warfarin.ferx", "warfarin_cov.csv", covariates = "WT")
 
 fit <- ferx_fit(frem$model_path, frem$data_path, method = "saem")
 ```

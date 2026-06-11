@@ -3,6 +3,16 @@
 This example demonstrates FREM covariate analysis using the warfarin
 one-compartment oral model with body weight (WT) and age (AGE) as covariates.
 
+The covariates and their continuous/categorical kind are declared in the model's
+[`[covariates]`](../model-file/covariates.md) block — the source of truth FREM
+reads from:
+
+```text
+[covariates]
+  WT  continuous
+  AGE continuous
+```
+
 ## Workflow
 
 FREM is a two-step process: **transform** the base model and dataset, then
@@ -13,12 +23,13 @@ FREM is a two-step process: **transform** the base model and dataset, then
 ```r
 library(ferx)
 
-# Step 1: FREM transformation
+# Step 1: FREM transformation. Covariates come from the model's [covariates]
+# block, so `covariates` can be omitted to use all of them.
 frem <- ferx_to_frem(
-  model      = "warfarin.ferx",
-  data       = "warfarin_cov.csv",
-  covariates = c("WT", "AGE")
+  model = "warfarin.ferx",
+  data  = "warfarin_cov.csv"
 )
+# To FREM only a subset, filter with e.g. covariates = "WT".
 
 # Step 2: Fit the FREM model
 fit <- ferx_fit(frem$model_path, frem$data_path, method = "saem",
@@ -36,7 +47,7 @@ use ferx_core::{prepare_frem, fit_from_files};
 let frem = prepare_frem(
     &Path::new("warfarin.ferx"),
     &Path::new("warfarin_cov.csv"),
-    &["WT".into(), "AGE".into()],
+    &[],   // empty filter → all covariates from the [covariates] block
     None, None, None,
 )?;
 

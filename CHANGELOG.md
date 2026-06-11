@@ -22,7 +22,10 @@ section of the SDLC for the versioning policy).
 ### Added
 - FREM (Full Random Effects Model) covariate analysis: `prepare_frem()` API
   transforms a base model + dataset into a FREM model with extended block omega,
-  covariate pseudo-observations, and FREMTYPE dispatch in the likelihood (#194).
+  covariate pseudo-observations, and FREMTYPE dispatch in the likelihood. The
+  covariates (and their continuous/categorical kind) are taken from the model's
+  `[covariates]` block; the `covariates` argument is an optional subset filter
+  over them (#194).
 - Feature maturity labels (`stable` / `beta` / `experimental`) documented for
   every major feature: a new *Feature Maturity* docs page with definitions and a
   per-feature table, plus a maturity banner on each feature reference page.
