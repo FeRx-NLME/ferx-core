@@ -101,6 +101,7 @@ fn single_subject_pop(obs_times: Vec<f64>, observations: Vec<f64>, dose_cmt: usi
             cens: vec![0; n],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: vec![],
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }],

@@ -20,6 +20,9 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- FREM (Full Random Effects Model) covariate analysis: `prepare_frem()` API
+  transforms a base model + dataset into a FREM model with extended block omega,
+  covariate pseudo-observations, and FREMTYPE dispatch in the likelihood (#194).
 - Time-to-event / survival modelling (Phase 1): `[event_model]` block, TTE
   datareader, likelihood, and API wiring, behind the `survival` feature
   (#191, #192).

@@ -35,6 +35,7 @@ fn simple_iv_population() -> Population {
             cens: vec![0; n],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: vec![],
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }],
@@ -230,6 +231,7 @@ fn analytical_1cpt_oral_depot_and_central() {
             cens: vec![0; n],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: vec![],
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }],
@@ -560,6 +562,7 @@ fn simple_oral_population() -> Population {
             cens: vec![0; n],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: vec![],
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }],
@@ -1272,6 +1275,7 @@ fn evid3_reset_population() -> Population {
             cens: vec![0; n],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: vec![],
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }],
@@ -1460,6 +1464,7 @@ fn evid4_reset_population() -> Population {
             cens: vec![0; n],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: vec![],
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }],
@@ -1729,6 +1734,7 @@ fn analytical_integral_over_compartment_with_evid3_reset_returns_nan() {
                 cens: vec![0; n],
                 occasions: vec![],
                 dose_occasions: vec![],
+                fremtype: vec![],
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             }],
@@ -1838,6 +1844,7 @@ fn tv_covariate_iv_population() -> Population {
             cens: vec![0; n],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: vec![],
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }],
@@ -2173,6 +2180,7 @@ fn iov_analytical_integral_of_compartment_is_nan() {
             cens: vec![0; n],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
+            fremtype: vec![],
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }],
@@ -2328,6 +2336,7 @@ fn ode_with_scaling_ipred_is_correctly_scaled() {
             cens: vec![0; n],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: vec![],
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }],
