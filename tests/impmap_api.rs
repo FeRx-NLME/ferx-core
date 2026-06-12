@@ -99,6 +99,37 @@ fn impmap_rejects_iov_models() {
 }
 
 #[test]
+fn impmap_converges_with_mu_referencing_off() {
+    // Regression: the closed-form log-mu-ref θ shift is the EM-correct typical-
+    // value update and must apply regardless of `mu_referencing`. When it was
+    // gated on `mu_referencing`, turning it off left θ stuck at its start (TVCL
+    // ≈ 0.198, init 0.2) and Ω inflated (ETA_CL ≈ 0.19) — the θ/η-mean
+    // confounding. With the fix, mu_referencing = false recovers the same well-
+    // identified estimates (TVCL ≈ 0.13, ETA_CL ≈ 0.03).
+    let (model, population, mut opts) = warfarin_setup();
+    opts.method = EstimationMethod::Impmap;
+    opts.mu_referencing = false;
+    opts.impmap_iterations = 40;
+    opts.impmap_samples = 150;
+    opts.impmap_averaging = 15;
+    let r = fit(&model, &population, &model.default_params, &opts)
+        .expect("impmap with mu_referencing=false must fit");
+
+    // The broken (confounded) result had TVCL ≈ 0.198 and ω²(CL) ≈ 0.19; these
+    // thresholds cleanly separate the fixed result (≈0.13 / ≈0.03) from it.
+    assert!(
+        r.theta[0] < 0.18,
+        "TVCL should move off its 0.2 start toward ~0.13, got {} (θ/η confounding regressed?)",
+        r.theta[0]
+    );
+    assert!(
+        r.omega[(0, 0)] < 0.10,
+        "ω²(ETA_CL) should be ~0.03, not inflated ~0.19, got {}",
+        r.omega[(0, 0)]
+    );
+}
+
+#[test]
 fn impmap_rejects_invalid_proposal_df() {
     // A programmatic caller can set impmap_proposal_df directly, bypassing the
     // parser's range check. A finite df < 1 must return a clean Err, not panic

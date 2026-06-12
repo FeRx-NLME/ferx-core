@@ -215,12 +215,29 @@ pub fn run_impmap(
         }
     }
 
-    // Closed-form mu-referencing M-step: shift `log(θ) += mean(η)` for
-    // log-mu-ref pairs (essential — without it θ and the η mean are confounded
-    // and Ω inflates to absorb the misfit). When active, those θ are pinned out
-    // of the NLopt weighted M-step, which then fits only σ and non-mu-ref θ.
+    // Closed-form mu-referencing M-step: shift `log(θ) += mean(η)` for log-mu-ref
+    // pairs, with those θ pinned out of the NLopt weighted M-step (which then fits
+    // only σ and non-mu-ref θ). This is the EM-correct typical-value update for
+    // log-normal random effects, NOT an optional refinement: without it θ and the
+    // η mean are confounded over the fixed importance samples, so θ stays at its
+    // start and Ω inflates to absorb the misfit. It is therefore applied whenever
+    // log-mu-ref pairs exist, independent of `options.mu_referencing` (which only
+    // governs inner-loop `compute_mu_k` centering, a separate concern). NONMEM's
+    // EM methods likewise require mu-referencing.
+    let mut warnings: Vec<String> = Vec::new();
     let mu_ref_pairs = mu_ref_log_pairs(model);
-    let use_closed_form = options.mu_referencing && !mu_ref_pairs.is_empty();
+    let use_closed_form = !mu_ref_pairs.is_empty();
+    if !use_closed_form {
+        // No log-mu-ref parameter: every typical value goes through the weighted
+        // M-step, which cannot resolve the θ/η-mean confounding on its own. Flag
+        // it — estimates may be unreliable (see the docs caveat).
+        warnings.push(
+            "IMPMAP: no log-mu-referenced parameters found (e.g. `CL = TVCL*exp(ETA)`); \
+             typical-value estimation relies on the weighted M-step alone and may converge \
+             poorly. Prefer a log-mu-referenced parameterization, or use FOCEI."
+                .to_string(),
+        );
+    }
 
     // ---- Iteration state ----
     let mut theta_cur = init_params.theta.clone();
@@ -234,7 +251,6 @@ pub fn run_impmap(
     let mut acc_omega = DMatrix::<f64>::zeros(n_eta, n_eta);
     let mut n_acc = 0usize;
 
-    let mut warnings: Vec<String> = Vec::new();
     let mut last_eta_hats: Vec<DVector<f64>> = Vec::new();
 
     for k in 1..=n_iter {

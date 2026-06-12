@@ -85,6 +85,16 @@ The reported estimate is the running mean of the parameter vector over the final
 `impmap_averaging` iterations. A FOCE-Laplace `ofv` is computed at the final
 parameters for AIC/BIC comparability with FOCE/FOCEI/SAEM.
 
+> **Mu-referencing is required.** The closed-form `log θ += mean(η)` shift is the
+> EM-correct typical-value update for log-normal random effects, so it is always
+> applied for log-mu-referenced parameters (`CL = TVCL * exp(ETA_CL)`),
+> independent of the `mu_referencing` fit option — that option only governs
+> inner-loop centering. Like NONMEM's EM methods, IMPMAP needs a mu-referenced
+> parameterization: a model with random effects whose typical values are *not*
+> log-mu-referenced emits a warning and may estimate those typical values poorly
+> (θ and the η mean are confounded over the importance samples). Use FOCEI for
+> such models.
+
 ## Validation against NONMEM
 
 On the bundled warfarin example (1-cpt oral, proportional error, 3 mu-referenced
