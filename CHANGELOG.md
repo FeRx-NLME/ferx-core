@@ -20,6 +20,11 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Importance sampling can now run **standalone** (`method = imp`), evaluating the
+  IS log-likelihood at the initial parameters — IMP derives the EBEs/Jacobian it
+  needs via a FOCE inner loop at those parameters instead of requiring a
+  preceding estimator. Useful for scoring imported/fixed parameter sets. IMP
+  still may appear at most once and must be the terminal stage of a chain.
 - Feature maturity labels (`stable` / `beta` / `experimental`) documented for
   every major feature: a new *Feature Maturity* docs page with definitions and a
   per-feature table, plus a maturity banner on each feature reference page.

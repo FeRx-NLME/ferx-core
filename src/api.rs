@@ -665,20 +665,12 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // IMP is a likelihood evaluation, not an estimator: it must follow a
-    // parameter-estimating stage, appear at most once, and be the terminal stage.
+    // IMP is a likelihood evaluation, not an estimator: it may appear at most
+    // once and must be the terminal stage. It may run standalone (as the only
+    // stage), in which case the EBEs/Hessians it consumes are evaluated at the
+    // initial parameters — IMP then reports the −2 log L at those parameters
+    // without estimating them.
     if chain.iter().any(|&m| m == EstimationMethod::Imp) {
-        if chain.first().copied() == Some(EstimationMethod::Imp) {
-            diags.push(
-                Diagnostic::error(
-                    "E_IMP_CHAIN",
-                    "method `imp` cannot be the first stage in a chain — it consumes \
-                     EBEs and Hessians from a preceding estimator. Try `methods = [focei, imp]` \
-                     or `methods = [saem, imp]`.",
-                )
-                .with_block("fit_options"),
-            );
-        }
         let n_imp = chain
             .iter()
             .filter(|&&m| m == EstimationMethod::Imp)
@@ -2327,9 +2319,57 @@ fn fit_inner(
         // params/result update at the bottom of the loop so the preceding
         // stage's `OuterResult` continues to be the canonical one.
         if method == EstimationMethod::Imp {
+            // Standalone IMP (no preceding estimator): evaluate the EBEs/Hessians
+            // at the initial parameters so IMP can report the −2 log L there.
+            // This synthetic stage also becomes the canonical `OuterResult` so
+            // the rest of the fit (sdtab, FitResult) sees the (unchanged) params.
+            if result.is_none() {
+                let mu_k = crate::estimation::parameterization::compute_mu_k(
+                    model,
+                    &stage_params.theta,
+                    stage_opts.mu_referencing,
+                );
+                let (eta_hats, h_matrices, _stats, kappas) =
+                    crate::estimation::inner_optimizer::run_inner_loop_warm(
+                        model,
+                        population,
+                        &stage_params,
+                        stage_opts.inner_maxiter,
+                        stage_opts.inner_tol,
+                        None,
+                        Some(&mu_k),
+                        stage_opts.min_obs_for_convergence_check as usize,
+                    );
+                let nll = crate::estimation::outer_optimizer::pop_nll(
+                    model,
+                    population,
+                    &stage_params,
+                    &eta_hats,
+                    &h_matrices,
+                    &kappas,
+                    stage_opts.interaction,
+                );
+                result = Some(crate::estimation::outer_optimizer::OuterResult {
+                    params: stage_params.clone(),
+                    ofv: 2.0 * nll,
+                    converged: true,
+                    n_iterations: 0,
+                    eta_hats,
+                    h_matrices,
+                    kappas,
+                    covariance_matrix: None,
+                    warnings: Vec::new(),
+                    saem_mu_ref_m_step_evals_saved: None,
+                    saem_n_subjects_hmc: None,
+                    ebe_convergence_warnings: 0,
+                    max_unconverged_subjects: 0,
+                    total_ebe_fallbacks: 0,
+                    final_gradient: None,
+                    sir_fallback_proposal: None,
+                });
+            }
             let prev = result.as_ref().expect(
-                "IMP guard above should have rejected an IMP-first chain — \
-                 prior stage's OuterResult must exist here",
+                "IMP stage: prior OuterResult must exist (synthesised above when standalone)",
             );
             match crate::estimation::importance_sampling::run_importance_sampling(
                 model,
