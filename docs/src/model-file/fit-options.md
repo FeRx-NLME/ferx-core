@@ -13,7 +13,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `method` | `foce`, `focei`, `saem`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). |
+| `method` | `foce`, `focei`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). |
 | `maxiter` | integer | `500` | Maximum outer loop iterations |
 | `covariance` | `true`, `false` | `true` | Compute covariance matrix and standard errors |
 | `covariance_method` | `r`, `s`, `rsr` | `r` | Which covariance estimator to assemble, mirroring NONMEM `$COVARIANCE MATRIX=`. `r` = inverse Hessian `R⁻¹` (model-based; the default). `s` = inverse score cross-product `S⁻¹` (empirical information). `rsr` = the Huber–White sandwich `R⁻¹SR⁻¹` (robust to model mis-specification; NONMEM's default). **ferx defaults to `r`, but NONMEM's `$COVARIANCE` default is `rsr`** — set `covariance_method = rsr` when reconciling SEs against a NONMEM run that used the default `$COV`. `s`/`rsr` are currently supported for FOCEI and IOV fits (they need the per-subject score, whose Ω-prior term is only consistent under interaction). All three require a positive-definite FD Hessian: if the Hessian is non-PD the covariance step fails for every method (a non-PD Hessian is not yet routed to the `s` cross-product). Requires `covariance = true`. |
@@ -122,6 +122,39 @@ PK). Use it as a final chain stage:
 
 See [Importance Sampling documentation](../estimation/importance-sampling.md)
 for the algorithm, IOV caveats, and tuning guidance.
+
+## IMPMAP (`importance_sampling_map`)
+
+Unlike `imp` (which only *evaluates* the marginal likelihood), `impmap` is a
+full **estimator** — a Monte-Carlo EM loop equivalent to NONMEM
+`METHOD=IMPMAP`. Each iteration re-centers a per-subject importance-sampling
+proposal at the freshly-computed conditional mode (MAP) and updates θ/Ω/σ from
+the importance-weighted posterior moments. It runs standalone or as a chain
+stage:
+
+```
+[fit_options]
+  method             = importance_sampling_map   # alias: impmap
+  impmap_iterations  = 200
+  impmap_samples     = 300
+  impmap_proposal_df = normal     # multivariate normal (NONMEM default)
+  impmap_seed        = 12345
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `impmap_iterations` | `200` | Number of MCEM iterations (parameter updates). |
+| `impmap_samples` | `300` | Importance samples K per subject per iteration. Larger K reduces Monte-Carlo noise at linear cost. |
+| `impmap_proposal_df` | `normal` | Proposal degrees of freedom. `normal` (or `mvn`) gives a multivariate-normal proposal (NONMEM's default); a finite value ≥ 1 gives a heavier-tailed Student-t. |
+| `impmap_averaging` | `50` | Final iterations whose parameters are averaged into the reported estimate (Monte-Carlo variance reduction). |
+| `impmap_seed` | `12345` | RNG seed. Same seed → identical estimates. |
+| `impmap_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction are flagged as poorly sampled. |
+
+`impmap` reuses `inner_maxiter` / `inner_tol` for the per-iteration MAP step.
+Inter-occasion variability (`[iov]` / `kappa`) and SDE (`[diffusion]`) models
+are not yet supported and are refused up front. See the
+[IMPMAP documentation](../estimation/impmap.md) for the algorithm and the
+NONMEM comparison.
 
 ## Optimizer Choices
 

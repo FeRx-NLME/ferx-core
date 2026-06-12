@@ -32,6 +32,7 @@
   - [SAEM](estimation/saem.md)
   - [SIR](estimation/sir.md)
   - [Importance Sampling (IMP)](estimation/importance-sampling.md)
+  - [IMPMAP](estimation/impmap.md)
   - [Outer Optimizers](estimation/optimizers.md)
   - [Time-to-Event (TTE)](estimation/tte.md)
 - [Data Format](data-format.md)

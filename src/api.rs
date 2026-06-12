@@ -2134,6 +2134,7 @@ fn fit_inner(
                     | EstimationMethod::FoceGn
                     | EstimationMethod::FoceGnHybrid
                     | EstimationMethod::Imp
+                    | EstimationMethod::Impmap
             )
         });
         if uses_gradient_route {
@@ -2391,6 +2392,18 @@ fn fit_inner(
         let stage_result = match method {
             EstimationMethod::Saem => {
                 saem::run_saem(model, population, &stage_params, &stage_opts)?
+            }
+            EstimationMethod::Impmap => {
+                // Warm-start the first MAP inner loop from the preceding stage's
+                // EBEs when chained (e.g. [focei, impmap] / [saem, impmap]).
+                let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
+                crate::estimation::impmap::run_impmap(
+                    model,
+                    population,
+                    &stage_params,
+                    warm,
+                    &stage_opts,
+                )?
             }
             EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
                 crate::estimation::gauss_newton::run_foce_gn(

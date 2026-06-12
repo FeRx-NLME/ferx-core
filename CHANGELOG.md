@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- New `importance_sampling_map` (alias `impmap`) estimation method: a Monte-Carlo
+  EM estimator equivalent to NONMEM `METHOD=IMPMAP`. Each iteration re-centers a
+  per-subject importance-sampling proposal on the conditional mode (MAP) and
+  updates θ/Ω/σ from the importance-weighted posterior moments. Runs standalone
+  or chained (`methods = [focei, impmap]`); multivariate-normal proposal by
+  default (`impmap_proposal_df = normal`), Student-t optional. Validated against
+  FOCEI on warfarin. IOV and SDE models are not yet supported (#270).
 - Feature maturity labels (`stable` / `beta` / `experimental`) documented for
   every major feature: a new *Feature Maturity* docs page with definitions and a
   per-feature table, plus a maturity banner on each feature reference page.

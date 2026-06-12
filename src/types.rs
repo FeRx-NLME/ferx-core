@@ -2419,6 +2419,29 @@ pub struct FitOptions {
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
     pub is_low_ess_threshold: f64,
+    // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
+    // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
+    // loop: each iteration re-centers a per-subject importance-sampling proposal
+    // at the freshly-computed conditional mode (MAP) and first-order variance,
+    // then updates θ/Ω/σ from the importance-weighted posterior moments.
+    /// Number of MCEM iterations (M-step parameter updates). Default 200.
+    pub impmap_iterations: usize,
+    /// Importance samples drawn per subject per iteration (K). Default 300.
+    /// Larger K reduces Monte-Carlo noise in the M-step at linear cost.
+    pub impmap_samples: usize,
+    /// Proposal degrees of freedom. `f64::INFINITY` selects a multivariate
+    /// normal proposal (NONMEM's IMPMAP default; parsed from `normal`); a finite
+    /// value selects a heavier-tailed Student-t. Default `INFINITY` (MVN).
+    pub impmap_proposal_df: f64,
+    /// RNG seed for the IMPMAP sampling. `None` falls back to a fixed default so
+    /// runs are reproducible across invocations.
+    pub impmap_seed: Option<u64>,
+    /// Number of terminal iterations whose parameters are averaged to form the
+    /// reported estimate (Monte-Carlo variance reduction). Default 50.
+    pub impmap_averaging: usize,
+    /// Subjects whose normalized effective sample size (ESS / K) falls below
+    /// this fraction are flagged as poorly-sampled. Default 0.1.
+    pub impmap_low_ess_threshold: f64,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -2613,6 +2636,12 @@ impl Default for FitOptions {
             is_proposal_df: 5.0,
             is_seed: None,
             is_low_ess_threshold: 0.1,
+            impmap_iterations: 200,
+            impmap_samples: 300,
+            impmap_proposal_df: f64::INFINITY,
+            impmap_seed: None,
+            impmap_averaging: 50,
+            impmap_low_ess_threshold: 0.1,
             bloq_method: BloqMethod::Drop,
             steihaug_max_iters: None,
             mu_referencing: true,
@@ -2721,6 +2750,13 @@ pub enum EstimationMethod {
     /// scale) and is typically terminal. Reports `−2 log L_IS` on
     /// `FitResult.importance_sampling`, distinct from the Laplace OFV on `ofv`.
     Imp,
+    /// Importance Sampling assisted by Mode A Posteriori (NONMEM `METHOD=IMPMAP`).
+    /// Unlike [`Imp`](Self::Imp), this *is* an estimator: a Monte-Carlo EM loop
+    /// whose E-step re-evaluates each subject's conditional mode and first-order
+    /// variance every iteration (as in FOCE/ITS) to center a multivariate-normal
+    /// importance-sampling proposal, and whose M-step updates θ/Ω/σ from the
+    /// importance-weighted posterior moments.
+    Impmap,
 }
 
 impl EstimationMethod {
@@ -2732,6 +2768,7 @@ impl EstimationMethod {
             EstimationMethod::FoceGnHybrid => "FOCE-GN-Hybrid",
             EstimationMethod::Saem => "SAEM",
             EstimationMethod::Imp => "IMP",
+            EstimationMethod::Impmap => "IMPMAP",
         }
     }
 }
@@ -2894,6 +2931,16 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "is_proposal_df",
             "is_seed",
             "is_low_ess_threshold",
+        ],
+        EstimationMethod::Impmap => &[
+            "inner_maxiter",
+            "inner_tol",
+            "impmap_iterations",
+            "impmap_samples",
+            "impmap_proposal_df",
+            "impmap_seed",
+            "impmap_averaging",
+            "impmap_low_ess_threshold",
         ],
     }
 }

@@ -2873,6 +2873,11 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         .to_lowercase();
     if val == "saem" {
         Ok(EstimationMethod::Saem)
+    } else if val == "impmap"
+        || val == "importance_sampling_map"
+        || val == "importance-sampling-map"
+    {
+        Ok(EstimationMethod::Impmap)
     } else if val == "imp" || val == "importance_sampling" || val == "importance-sampling" {
         Ok(EstimationMethod::Imp)
     } else if val.contains("hybrid") || val == "gn_hybrid" || val == "gn-hybrid" {
@@ -3097,6 +3102,47 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 ));
             }
             opts.is_low_ess_threshold = v;
+        }
+        "impmap_iterations" => {
+            let v = parse_usize("impmap_iterations")?;
+            if v < 1 {
+                return Err(format!("impmap_iterations must be >= 1, got {v}"));
+            }
+            opts.impmap_iterations = v;
+        }
+        "impmap_samples" => {
+            let v = parse_usize("impmap_samples")?;
+            if v < 2 {
+                return Err(format!("impmap_samples must be >= 2, got {v}"));
+            }
+            opts.impmap_samples = v;
+        }
+        "impmap_proposal_df" => {
+            // `normal` / `mvn` (or a very large df) select a multivariate-normal
+            // proposal — NONMEM's IMPMAP default. A finite value gives Student-t.
+            let tok = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
+                opts.impmap_proposal_df = f64::INFINITY;
+            } else {
+                let v = parse_f64("impmap_proposal_df")?;
+                if v < 1.0 {
+                    return Err(format!(
+                        "impmap_proposal_df must be >= 1.0 or `normal`, got {v}"
+                    ));
+                }
+                opts.impmap_proposal_df = v;
+            }
+        }
+        "impmap_seed" => opts.impmap_seed = parse_u64_opt("impmap_seed")?,
+        "impmap_averaging" => opts.impmap_averaging = parse_usize("impmap_averaging")?,
+        "impmap_low_ess_threshold" => {
+            let v = parse_f64("impmap_low_ess_threshold")?;
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!(
+                    "impmap_low_ess_threshold must be in [0.0, 1.0], got {v}"
+                ));
+            }
+            opts.impmap_low_ess_threshold = v;
         }
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
@@ -8916,6 +8962,65 @@ mod tests {
         assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "-0.1").is_err()); // < 0
                                                                                        // Defaults preserved after a failed apply.
         assert_eq!(opts.is_samples, 1000);
+    }
+
+    #[test]
+    fn test_impmap_method_tokens_parse() {
+        for tok in [
+            "impmap",
+            "importance_sampling_map",
+            "importance-sampling-map",
+        ] {
+            let opts = parse_fit_options(&[format!("method = {tok}")]).expect("parse must succeed");
+            assert_eq!(
+                opts.method,
+                EstimationMethod::Impmap,
+                "token `{tok}` must map to Impmap"
+            );
+        }
+        // `imp` must still resolve to the evaluation-only stage, not Impmap.
+        let opts = parse_fit_options(&["method = imp".to_string()]).expect("parse");
+        assert_eq!(opts.method, EstimationMethod::Imp);
+    }
+
+    #[test]
+    fn test_impmap_options_parse_and_validate() {
+        let opts = parse_fit_options(&[
+            "method = importance_sampling_map".to_string(),
+            "impmap_iterations = 80".to_string(),
+            "impmap_samples = 250".to_string(),
+            "impmap_proposal_df = 8.0".to_string(),
+            "impmap_averaging = 30".to_string(),
+            "impmap_seed = 77".to_string(),
+            "impmap_low_ess_threshold = 0.2".to_string(),
+            "covariance = false".to_string(),
+        ])
+        .expect("parse must succeed");
+        assert_eq!(opts.method, EstimationMethod::Impmap);
+        assert_eq!(opts.impmap_iterations, 80);
+        assert_eq!(opts.impmap_samples, 250);
+        assert_eq!(opts.impmap_proposal_df, 8.0);
+        assert_eq!(opts.impmap_averaging, 30);
+        assert_eq!(opts.impmap_seed, Some(77));
+        assert_eq!(opts.impmap_low_ess_threshold, 0.2);
+        // All keys are method-specific to Impmap and Impmap is selected.
+        assert!(opts.unsupported_keys_warnings().is_empty());
+
+        // `normal` / `mvn` select the multivariate-normal proposal (df = +inf).
+        for kw in ["normal", "mvn", "NORMAL"] {
+            let mut o = FitOptions::default();
+            assert!(apply_fit_option(&mut o, "impmap_proposal_df", kw).is_ok());
+            assert!(o.impmap_proposal_df.is_infinite());
+        }
+
+        // Range validation.
+        let mut o = FitOptions::default();
+        assert!(apply_fit_option(&mut o, "impmap_samples", "1").is_err()); // < 2
+        assert!(apply_fit_option(&mut o, "impmap_iterations", "0").is_err()); // < 1
+        assert!(apply_fit_option(&mut o, "impmap_proposal_df", "0.5").is_err()); // < 1
+        assert!(apply_fit_option(&mut o, "impmap_low_ess_threshold", "1.5").is_err()); // > 1
+                                                                                       // Default (MVN) preserved after the failed applies.
+        assert!(o.impmap_proposal_df.is_infinite());
     }
 
     #[test]
