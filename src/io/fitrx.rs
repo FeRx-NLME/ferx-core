@@ -423,6 +423,7 @@ fn method_to_str(m: EstimationMethod) -> &'static str {
         EstimationMethod::FoceGnHybrid => "foce_gn_hybrid",
         EstimationMethod::Saem => "saem",
         EstimationMethod::Imp => "imp",
+        EstimationMethod::Impmap => "impmap",
     }
 }
 
@@ -430,6 +431,7 @@ fn method_from_str(s: &str) -> Result<EstimationMethod, FitrxError> {
     Ok(match s {
         "foce" => EstimationMethod::Foce,
         "focei" => EstimationMethod::FoceI,
+        "impmap" => EstimationMethod::Impmap,
         "foce_gn" => EstimationMethod::FoceGn,
         "foce_gn_hybrid" => EstimationMethod::FoceGnHybrid,
         "saem" => EstimationMethod::Saem,

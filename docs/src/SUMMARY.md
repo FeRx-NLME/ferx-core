@@ -33,6 +33,7 @@
   - [SIR](estimation/sir.md)
   - [Importance Sampling (IMP)](estimation/importance-sampling.md)
   - [FREM (Covariate Analysis)](estimation/frem.md)
+  - [IMPMAP](estimation/impmap.md)
   - [Outer Optimizers](estimation/optimizers.md)
   - [Time-to-Event (TTE)](estimation/tte.md)
 - [Data Format](data-format.md)

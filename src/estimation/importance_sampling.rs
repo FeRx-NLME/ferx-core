@@ -510,6 +510,174 @@ fn subject_is_estimate(
 }
 
 // ---------------------------------------------------------------------------
+// IMPMAP: MAP-centered draws with retained samples + weighted moments
+// ---------------------------------------------------------------------------
+
+/// Per-subject output of one IMPMAP E-step: the retained importance samples and
+/// their normalized weights (consumed by the θ/σ M-step), the weighted posterior
+/// moments (the Ω sufficient statistic and conditional mean), and the same
+/// marginal-LL / ESS diagnostics the `Imp` kernel reports.
+pub(crate) struct SubjectDraws {
+    /// IS-estimated marginal log-likelihood `log p̂(yᵢ | θ)` (for the OFV trace).
+    pub log_marginal: f64,
+    /// Normalized effective sample size ESS/K (proposal-quality diagnostic).
+    pub ess_fraction: f64,
+    /// The `K` sampled η vectors (each length `d`).
+    pub etas: Vec<Vec<f64>>,
+    /// Self-normalized importance weights `w̃ᵢₖ` (length `K`, sums to 1).
+    pub weights: Vec<f64>,
+    /// Weighted posterior mean `Σₖ w̃ᵢₖ ηᵢₖ` (length `d`) — drives the closed-form
+    /// mu-referencing θ shift.
+    pub mean: Vec<f64>,
+    /// Weighted second moment `Σₖ w̃ᵢₖ ηᵢₖ ηᵢₖᵀ` (d×d) — the per-subject Ω
+    /// sufficient statistic.
+    pub second_moment: DMatrix<f64>,
+}
+
+/// Draw `K` importance samples for one subject from a proposal centered at the
+/// conditional mode `η̂` with first-order-variance scale `Σ = (H + λI)⁻¹`, and
+/// return the retained samples, self-normalized weights, and weighted second
+/// moment for the IMPMAP M-step.
+///
+/// `nu = f64::INFINITY` selects a multivariate-normal proposal (NONMEM IMPMAP
+/// default); a finite `nu ≥ 1` selects a multivariate Student-t. The marginal-LL
+/// and weight math is otherwise identical to [`subject_is_estimate`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn subject_is_draws(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    k_samples: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+) -> SubjectDraws {
+    let mvn = !nu.is_finite();
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let proposal = match build_proposal(h, omega_inv, d) {
+        Some(p) => p,
+        None => {
+            return SubjectDraws {
+                log_marginal: 0.0,
+                ess_fraction: 0.0,
+                etas: Vec::new(),
+                weights: Vec::new(),
+                mean: vec![0.0; d],
+                second_moment: DMatrix::zeros(d, d),
+            };
+        }
+    };
+
+    let normal = StandardNormal;
+    // Student-t scale mixing variable; unused for the MVN branch.
+    let chi_sq = if mvn {
+        None
+    } else {
+        Some(ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller"))
+    };
+
+    let half_d = 0.5 * d as f64;
+    let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
+    // Constant term of log q(η): MVN uses −d/2·log(2π)+½log|Σ⁻¹|; Student-t adds
+    // the Γ-ratio / ν-scaling pieces.
+    let log_q_const = if mvn {
+        -half_d * TWO_PI.ln() + 0.5 * proposal.log_det_inv_scale
+    } else {
+        ln_gamma(0.5 * (nu + d as f64)) - ln_gamma(0.5 * nu) + 0.5 * proposal.log_det_inv_scale
+            - half_d * (nu * std::f64::consts::PI).ln()
+    };
+
+    let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
+    let mut etas: Vec<Vec<f64>> = Vec::with_capacity(k_samples);
+    let mut z = vec![0.0_f64; d];
+    let mut diff = vec![0.0_f64; d];
+
+    for _ in 0..k_samples {
+        for zi in z.iter_mut() {
+            *zi = normal.sample(&mut rng);
+        }
+        let scale = match &chi_sq {
+            Some(c) => {
+                let cc: f64 = c.sample(&mut rng).max(1e-300);
+                (nu / cc).sqrt()
+            }
+            None => 1.0,
+        };
+        let mut eta_sample = vec![0.0_f64; d];
+        proposal.apply_l_sigma(&z, &mut eta_sample, scale);
+        for (j, e) in eta_sample.iter_mut().enumerate() {
+            *e += eta_hat[j];
+        }
+
+        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch);
+        let log_p_y = -obs_nll;
+
+        let mut quad_form = 0.0_f64;
+        for i in 0..d {
+            let mut row = 0.0_f64;
+            for j in 0..d {
+                row += omega_inv[(i, j)] * eta_sample[j];
+            }
+            quad_form += row * eta_sample[i];
+        }
+        let log_p_eta = log_p_eta_const - 0.5 * quad_form;
+
+        for (k, d_slot) in diff.iter_mut().enumerate() {
+            *d_slot = eta_sample[k] - eta_hat[k];
+        }
+        let mahal = proposal.mahalanobis(&diff);
+        let log_q = if mvn {
+            log_q_const - 0.5 * mahal
+        } else {
+            log_q_const - 0.5 * (nu + d as f64) * (1.0 + mahal / nu).ln()
+        };
+
+        log_w.push(log_p_y + log_p_eta - log_q);
+        etas.push(eta_sample);
+    }
+
+    let (lse, weights) = logsumexp_with_normalised(&log_w);
+    let log_marginal = lse - (k_samples as f64).ln();
+    let ess = {
+        let sum_sq: f64 = weights.iter().map(|w| w * w).sum();
+        if sum_sq > 0.0 {
+            1.0 / sum_sq
+        } else {
+            0.0
+        }
+    };
+    let ess_fraction = ess / (k_samples as f64);
+
+    // Weighted first and second moments Σₖ w̃ₖ ηₖ and Σₖ w̃ₖ ηₖ ηₖᵀ.
+    let mut mean = vec![0.0_f64; d];
+    let mut second_moment = DMatrix::<f64>::zeros(d, d);
+    for (w, eta) in weights.iter().zip(etas.iter()) {
+        for i in 0..d {
+            mean[i] += w * eta[i];
+            for j in 0..d {
+                second_moment[(i, j)] += w * eta[i] * eta[j];
+            }
+        }
+    }
+
+    SubjectDraws {
+        log_marginal,
+        ess_fraction,
+        etas,
+        weights,
+        mean,
+        second_moment,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Joint (eta, kappa) sampling for IOV models
 // ---------------------------------------------------------------------------
 
@@ -937,7 +1105,7 @@ fn logsumexp_with_normalised(xs: &[f64]) -> (f64, Vec<f64>) {
 /// variance evaluated at η̂. This is the matrix the IS proposal scales against
 /// — it's the Laplace covariance's inverse.
 #[allow(clippy::too_many_arguments)]
-fn compute_posterior_hessian(
+pub(crate) fn compute_posterior_hessian(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],

@@ -1,0 +1,32 @@
+# One-compartment oral PK model (warfarin) — IMPMAP estimation
+# (Importance Sampling assisted by Mode A Posteriori; NONMEM METHOD=IMPMAP).
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method             = importance_sampling_map
+  impmap_iterations  = 40
+  impmap_samples     = 200
+  impmap_averaging   = 15
+  impmap_seed        = 12345
+  covariance         = false

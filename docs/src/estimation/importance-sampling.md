@@ -36,28 +36,38 @@ much-lower-bias estimate at extra MC cost.
 
 ## How it runs
 
-`imp` is a chain stage, not a standalone method:
+`imp` is usually the terminal stage of a chain, but can also run on its own:
 
 ```
 [fit_options]
-  method        = [focei, imp]
-  is_samples    = 2000     # K, samples per subject
-  is_proposal_df = 5       # ν, Student-t tail weight
+  method        = [focei, imp]   # estimate with FOCEI, then evaluate the IS-LL
+  is_samples    = 2000           # K, samples per subject
+  is_proposal_df = 5             # ν, Student-t tail weight
   is_seed       = 12345
+```
+
+```
+[fit_options]
+  method = imp                   # standalone: IS-LL at the initial parameters
 ```
 
 Rules:
 
-- **Must follow another stage.** `methods = [imp]` and
-  `methods = [imp, focei]` are rejected — IMP needs the previous stage's
-  EBEs and per-subject Jacobian as the proposal centre/scale.
+- **Standalone is allowed.** `method = imp` evaluates the IS-LL at the
+  **initial parameters** — IMP derives the EBEs and per-subject Jacobian it
+  needs (the proposal centre/scale) at those parameters via a FOCE inner loop,
+  rather than from a preceding estimator. It does not estimate the parameters;
+  it reports the −2 log L there (handy for scoring imported/fixed parameter
+  sets). When chained after an estimator (`[focei, imp]`), it uses that stage's
+  EBEs/Jacobian instead.
 - **Must appear at most once.**
-- **Should be terminal.** A non-terminal `imp` produces a warning — the
-  next stage updates parameters and the IS result becomes meaningless.
+- **Must be terminal.** `methods = [imp, focei]` (or any `imp` mid-chain) is
+  rejected — a following stage would overwrite the parameters and make the IS
+  result meaningless.
 
-When IMP runs, `FitResult.method` still reports the previous estimating
-stage (e.g. `FOCEI`), and `FitResult.method_chain` preserves the full
-chain (`[FoceI, Imp]`). The IS-LL itself lands on
+When IMP runs after an estimator, `FitResult.method` reports that estimating
+stage (e.g. `FOCEI`); for a standalone `imp` it reports `IMP`. Either way
+`FitResult.method_chain` preserves the full chain and the IS-LL lands on
 `FitResult.importance_sampling`.
 
 ## Algorithm

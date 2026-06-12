@@ -1858,6 +1858,25 @@ pub enum CovarianceFallback {
     Sir,
 }
 
+/// Which estimator to use for the parameter covariance matrix, mirroring
+/// NONMEM's `$COVARIANCE MATRIX=` options. All three share the same FD Hessian
+/// `R` (the observed information) and per-subject score cross-product
+/// `S = Σᵢ gᵢgᵢᵀ`; they differ only in how those are combined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CovarianceMethod {
+    /// `R⁻¹` — inverse observed-information (Hessian) matrix. The model-based
+    /// covariance; assumes the model is correctly specified (default, NONMEM
+    /// `MATRIX=R`).
+    #[default]
+    Hessian,
+    /// `S⁻¹` — inverse cross-product (outer-product-of-gradients) matrix. The
+    /// empirical-information covariance (NONMEM `MATRIX=S`).
+    CrossProduct,
+    /// `R⁻¹ S R⁻¹` — the Huber–White "sandwich". Robust to model
+    /// mis-specification; NONMEM's default (`MATRIX=RSR`).
+    Sandwich,
+}
+
 /// Severity level for a structured warning entry.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum WarningSeverity {
@@ -2346,6 +2365,11 @@ pub struct FitOptions {
     /// [`CovarianceFallback::Sir`] runs SIR with a fallback proposal covariance
     /// built from the rectified (`|eigenvalue|`) Hessian, inflated 4×.
     pub covariance_fallback: CovarianceFallback,
+    /// Which covariance estimator to assemble, mirroring NONMEM `$COV MATRIX=`.
+    /// Default [`CovarianceMethod::Hessian`] (`R⁻¹`). [`CovarianceMethod::CrossProduct`]
+    /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
+    /// score cross-product `S`; currently supported for FOCEI and IOV fits.
+    pub covariance_method: CovarianceMethod,
     pub interaction: bool,
     pub verbose: bool,
     pub optimizer: Optimizer,
@@ -2418,6 +2442,29 @@ pub struct FitOptions {
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
     pub is_low_ess_threshold: f64,
+    // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
+    // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
+    // loop: each iteration re-centers a per-subject importance-sampling proposal
+    // at the freshly-computed conditional mode (MAP) and first-order variance,
+    // then updates θ/Ω/σ from the importance-weighted posterior moments.
+    /// Number of MCEM iterations (M-step parameter updates). Default 200.
+    pub impmap_iterations: usize,
+    /// Importance samples drawn per subject per iteration (K). Default 300.
+    /// Larger K reduces Monte-Carlo noise in the M-step at linear cost.
+    pub impmap_samples: usize,
+    /// Proposal degrees of freedom. `f64::INFINITY` selects a multivariate
+    /// normal proposal (NONMEM's IMPMAP default; parsed from `normal`); a finite
+    /// value selects a heavier-tailed Student-t. Default `INFINITY` (MVN).
+    pub impmap_proposal_df: f64,
+    /// RNG seed for the IMPMAP sampling. `None` falls back to a fixed default so
+    /// runs are reproducible across invocations.
+    pub impmap_seed: Option<u64>,
+    /// Number of terminal iterations whose parameters are averaged to form the
+    /// reported estimate (Monte-Carlo variance reduction). Default 50.
+    pub impmap_averaging: usize,
+    /// Subjects whose normalized effective sample size (ESS / K) falls below
+    /// this fraction are flagged as poorly-sampled. Default 0.1.
+    pub impmap_low_ess_threshold: f64,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -2583,6 +2630,7 @@ impl Default for FitOptions {
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
+            covariance_method: CovarianceMethod::Hessian,
             interaction: true,
             verbose: true,
             // BOBYQA — derivative-free quadratic trust-region. Chosen as the
@@ -2616,6 +2664,12 @@ impl Default for FitOptions {
             is_proposal_df: 5.0,
             is_seed: None,
             is_low_ess_threshold: 0.1,
+            impmap_iterations: 200,
+            impmap_samples: 300,
+            impmap_proposal_df: f64::INFINITY,
+            impmap_seed: None,
+            impmap_averaging: 50,
+            impmap_low_ess_threshold: 0.1,
             bloq_method: BloqMethod::Drop,
             steihaug_max_iters: None,
             mu_referencing: true,
@@ -2726,6 +2780,13 @@ pub enum EstimationMethod {
     /// scale) and is typically terminal. Reports `−2 log L_IS` on
     /// `FitResult.importance_sampling`, distinct from the Laplace OFV on `ofv`.
     Imp,
+    /// Importance Sampling assisted by Mode A Posteriori (NONMEM `METHOD=IMPMAP`).
+    /// Unlike [`Imp`](Self::Imp), this *is* an estimator: a Monte-Carlo EM loop
+    /// whose E-step re-evaluates each subject's conditional mode and first-order
+    /// variance every iteration (as in FOCE/ITS) to center a multivariate-normal
+    /// importance-sampling proposal, and whose M-step updates θ/Ω/σ from the
+    /// importance-weighted posterior moments.
+    Impmap,
 }
 
 impl EstimationMethod {
@@ -2737,6 +2798,7 @@ impl EstimationMethod {
             EstimationMethod::FoceGnHybrid => "FOCE-GN-Hybrid",
             EstimationMethod::Saem => "SAEM",
             EstimationMethod::Imp => "IMP",
+            EstimationMethod::Impmap => "IMPMAP",
         }
     }
 }
@@ -2899,6 +2961,16 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "is_proposal_df",
             "is_seed",
             "is_low_ess_threshold",
+        ],
+        EstimationMethod::Impmap => &[
+            "inner_maxiter",
+            "inner_tol",
+            "impmap_iterations",
+            "impmap_samples",
+            "impmap_proposal_df",
+            "impmap_seed",
+            "impmap_averaging",
+            "impmap_low_ess_threshold",
         ],
     }
 }

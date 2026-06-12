@@ -26,12 +26,28 @@ section of the SDLC for the versioning policy).
   covariates (and their continuous/categorical kind) are taken from the model's
   `[covariates]` block; the `covariates` argument is an optional subset filter
   over them (#194).
+- New `importance_sampling_map` (alias `impmap`) estimation method: a Monte-Carlo
+  EM estimator equivalent to NONMEM `METHOD=IMPMAP`. Each iteration re-centers a
+  per-subject importance-sampling proposal on the conditional mode (MAP) and
+  updates θ/Ω/σ from the importance-weighted posterior moments. Runs standalone
+  or chained (`methods = [focei, impmap]`); multivariate-normal proposal by
+  default (`impmap_proposal_df = normal`), Student-t optional. Validated against
+  FOCEI on warfarin. IOV and SDE models are not yet supported (#270).
+- Importance sampling can now run **standalone** (`method = imp`), evaluating the
+  IS log-likelihood at the initial parameters — IMP derives the EBEs/Jacobian it
+  needs via a FOCE inner loop at those parameters instead of requiring a
+  preceding estimator. Useful for scoring imported/fixed parameter sets. IMP
+  still may appear at most once and must be the terminal stage of a chain.
 - Feature maturity labels (`stable` / `beta` / `experimental`) documented for
   every major feature: a new *Feature Maturity* docs page with definitions and a
   per-feature table, plus a maturity banner on each feature reference page.
   Experimental features (`[diffusion]` / SDE, `[covariate_nn]` / neural networks)
   now emit a runtime warning at fit time (`W_EXPERIMENTAL_SDE`,
   `W_EXPERIMENTAL_NN`), also surfaced by `ferx check` (#175).
+- `covariance_method` fit option: choose the covariance estimator, mirroring
+  NONMEM `$COV MATRIX=` — `r` (inverse Hessian `R⁻¹`, default), `s` (inverse
+  score cross-product `S⁻¹`), or `rsr` (the Huber–White sandwich `R⁻¹SR⁻¹`,
+  robust to model mis-specification). Supported for FOCEI/IOV fits (#223).
 - `covariance_fallback = sir` fit option: when the FD Hessian is non-positive-definite,
   run SIR with an `|eigenvalue|`-rectified proposal (4× inflated) instead of leaving
   the covariance step as failed; `covariance_status` reports `sir_fallback` (#223).
