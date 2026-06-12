@@ -3757,6 +3757,19 @@ mod tests {
     }
 }
 
+/// Index of L[i,j] (i ≥ j) in column-major lower-triangle packing.
+///
+/// Layout: for j in 0..n { for i in j..n { ... } }, so column j starts at
+/// offset Σ_{k<j}(n−k) = j·n − j·(j−1)/2.
+#[inline]
+fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
+    debug_assert!(i >= j && i < n);
+    // Column j starts at offset j*n - j*(j-1)/2.
+    // For j==0: offset = 0. For j==1: offset = n. For j==2: offset = 2n-1.
+    let col_offset = if j == 0 { 0 } else { j * n - j * (j - 1) / 2 };
+    col_offset + (i - j)
+}
+
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
 fn extract_standard_errors(
@@ -3796,30 +3809,73 @@ fn extract_standard_errors(
         .map(|i| template.theta[i] * se_packed[i])
         .collect();
 
-    // Omega: SE for diagonal variances
-    // omega_ii = L_ii^2, so SE(omega_ii) ≈ 2*L_ii * SE(L_ii)
-    // L_ii = exp(x_i), SE(L_ii) = L_ii * SE(x_i)
-    // SE(omega_ii) = 2 * L_ii^2 * SE(x_i) = 2 * omega_ii * SE(x_i)
+    // Omega: SE via multivariate delta method on Cholesky parameterization.
+    //
+    // Ω = L L^T, so omega_ij = Σ_{k≤min(i,j)} L_ik * L_jk.
+    // Packed params: x = log(L_ii) for diagonals, x = L_ij for off-diags.
+    // SE²(omega_ij) = g^T * C_omega * g, where g = ∂omega_ij/∂x.
+    //
+    // For diagonal omega the off-diagonal L elements are zero, so the formula
+    // simplifies to the original: SE(omega_ii) = 2 * omega_ii * SE(log L_ii).
+    // For block omega we compute the full lower triangle.
     let omega_start = n_theta;
-    let se_omega: Vec<f64> = (0..n_eta)
-        .map(|i| {
-            let idx = if template.omega.diagonal {
-                omega_start + i
-            } else {
-                // L[i,i] in column-major lower-triangle packing (see `pack_params`):
-                // packed entries before column j are sum_{k<j} (n_eta - k), so the
-                // i-th diagonal sits at i*n_eta - i*(i-1)/2.  The previous formula
-                // i*(i+1)/2 + i was row-major and gave the wrong index for n_eta ≥ 3
-                // (e.g. picked L[2,0] instead of L[1,1] for n_eta=3).
-                omega_start + i * n_eta - i * i.saturating_sub(1) / 2
-            };
-            if idx < n {
-                2.0 * template.omega.matrix[(i, i)] * se_packed[idx]
-            } else {
-                0.0
+    let se_omega: Vec<f64> = if template.omega.diagonal {
+        (0..n_eta)
+            .map(|i| {
+                let idx = omega_start + i;
+                if idx < n {
+                    2.0 * template.omega.matrix[(i, i)] * se_packed[idx]
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    } else {
+        let n_lt = n_eta * (n_eta + 1) / 2;
+        let l = &template.omega.chol;
+
+        // Extract omega sub-block of the full covariance matrix.
+        let cov_omega = cov.view((omega_start, omega_start), (n_lt, n_lt));
+
+        let mut se_vec = Vec::with_capacity(n_lt);
+        // Column-major lower-triangle: for j in 0..n, for i in j..n
+        for j in 0..n_eta {
+            for i in j..n_eta {
+                // Build gradient of omega_{ij} w.r.t. packed omega params.
+                // omega_{ij} = Σ_{k=0}^{j} L_{ik} * L_{jk}
+                let mut grad = vec![0.0f64; n_lt];
+                for k in 0..=j {
+                    let idx_ik = chol_lt_idx(i, k, n_eta);
+                    let idx_jk = chol_lt_idx(j, k, n_eta);
+                    // Chain rule: ∂L_{ab}/∂x_{ab} = L_{ab} if a==b (log), else 1.
+                    let chain_ik = if i == k { l[(i, k)] } else { 1.0 };
+                    let chain_jk = if j == k { l[(j, k)] } else { 1.0 };
+                    grad[idx_ik] += l[(j, k)] * chain_ik;
+                    if i != j {
+                        grad[idx_jk] += l[(i, k)] * chain_jk;
+                    } else {
+                        // i == j: both terms contribute to the same index
+                        grad[idx_ik] += l[(i, k)] * chain_ik;
+                    }
+                }
+                // SE²(omega_{ij}) = g^T * C_omega * g
+                let mut var = 0.0;
+                for a in 0..n_lt {
+                    if grad[a] == 0.0 {
+                        continue;
+                    }
+                    for b in 0..n_lt {
+                        if grad[b] == 0.0 {
+                            continue;
+                        }
+                        var += grad[a] * cov_omega[(a, b)] * grad[b];
+                    }
+                }
+                se_vec.push(if var > 0.0 { var.sqrt() } else { 0.0 });
             }
-        })
-        .collect();
+        }
+        se_vec
+    };
 
     // Sigma: SE via delta method (log-transformed)
     let sigma_start = omega_start
@@ -4793,19 +4849,16 @@ mod extract_se_tests {
 
     // ── BSV omega ────────────────────────────────────────────────────────────
 
-    /// Block omega with n_eta = 3.  The packed Cholesky layout is column-major
-    /// (see `pack_params`): L[0,0]=0, L[1,0]=1, L[2,0]=2, L[1,1]=3, L[2,1]=4,
-    /// L[2,2]=5.  The previous index formula `i*(i+1)/2 + i` was row-major and
-    /// returned offsets 0, 2, 5 — picking L[2,0] for the L[1,1] slot.
-    /// For n_eta ≤ 2 the row- and column-major formulas coincide, which is why
-    /// this regressed silently.
+    /// Block omega with n_eta = 3 (numerically diagonal).  se_omega is now the
+    /// full lower triangle (length 6), column-major.  The diagonal elements at
+    /// LT positions 0, 3, 5 should match the old formula; off-diagonals should
+    /// also be finite (non-NaN).
     #[test]
-    fn test_se_omega_block_n3_uses_column_major_indexing() {
+    fn test_se_omega_block_n3_full_lower_triangle() {
         let mut mat = DMatrix::<f64>::zeros(3, 3);
         mat[(0, 0)] = 0.04;
         mat[(1, 1)] = 0.09;
         mat[(2, 2)] = 0.16;
-        let _chol = mat.clone().cholesky().unwrap().l();
         let omega =
             OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into(), "E3".into()], false);
         let template = ModelParameters {
@@ -4825,23 +4878,83 @@ mod extract_se_tests {
             kappa_fixed: vec![],
         };
         // Packed layout: theta(1) + omega_block(6) + sigma(1) = 8.
-        // Within the omega block (start = 1): L[0,0] at idx 1, L[1,1] at idx 4,
-        // L[2,2] at idx 6.  Use distinct cov diagonals so we can tell which one
-        // each SE pulls from.
+        // Within the omega block (start = 1): L[0,0]=1, L[1,0]=2, L[2,0]=3,
+        // L[1,1]=4, L[2,1]=5, L[2,2]=6.
         let n = 8;
         let mut cov = DMatrix::<f64>::zeros(n, n);
         for i in 0..n {
-            cov[(i, i)] = ((i + 1) as f64).powi(2); // se_packed[i] = i + 1
+            cov[(i, i)] = ((i + 1) as f64).powi(2);
         }
         let (_, se_omega, _, _) = extract_standard_errors(&Some(cov), &template);
         let se = se_omega.unwrap();
-        // L[0,0] at packed idx 1 → se_packed = 2 → se_omega[0] = 2 * 0.04 * 2 = 0.16
-        assert!((se[0] - 2.0 * 0.04 * 2.0).abs() < 1e-12, "got {}", se[0]);
-        // L[1,1] at packed idx 4 → se_packed = 5 → se_omega[1] = 2 * 0.09 * 5 = 0.90
-        // Pre-fix this would have used idx 3 (= L[2,0]) → 2 * 0.09 * 4 = 0.72.
-        assert!((se[1] - 2.0 * 0.09 * 5.0).abs() < 1e-12, "got {}", se[1]);
-        // L[2,2] at packed idx 6 → se_packed = 7 → se_omega[2] = 2 * 0.16 * 7 = 2.24
-        assert!((se[2] - 2.0 * 0.16 * 7.0).abs() < 1e-12, "got {}", se[2]);
+        // Full LT: [omega(0,0), omega(1,0), omega(2,0), omega(1,1), omega(2,1), omega(2,2)]
+        assert_eq!(se.len(), 6);
+        // Diagonal SEs: same as before (omega is numerically diagonal → off-diag L=0).
+        // omega(0,0) at LT[0]: 2 * 0.04 * 2.0 = 0.16
+        assert!((se[0] - 0.16).abs() < 1e-12, "se(0,0) = {}", se[0]);
+        // omega(1,1) at LT[3]: 2 * 0.09 * 5.0 = 0.90
+        assert!((se[3] - 0.90).abs() < 1e-12, "se(1,1) = {}", se[3]);
+        // omega(2,2) at LT[5]: 2 * 0.16 * 7.0 = 2.24
+        assert!((se[5] - 2.24).abs() < 1e-12, "se(2,2) = {}", se[5]);
+        // Off-diagonals should be finite
+        for (idx, &v) in se.iter().enumerate() {
+            assert!(v.is_finite(), "se[{}] not finite", idx);
+        }
+
+        // Verify the omega_se_at helper
+        use crate::types::omega_se_at;
+        let se_opt = Some(se);
+        assert!((omega_se_at(&se_opt, 3, 0, 0).unwrap() - 0.16).abs() < 1e-12);
+        assert!((omega_se_at(&se_opt, 3, 1, 1).unwrap() - 0.90).abs() < 1e-12);
+        assert!((omega_se_at(&se_opt, 3, 2, 2).unwrap() - 2.24).abs() < 1e-12);
+        // Symmetric: omega_se_at(1,0) == omega_se_at(0,1)
+        assert_eq!(omega_se_at(&se_opt, 3, 1, 0), omega_se_at(&se_opt, 3, 0, 1));
+    }
+
+    /// Block omega with non-zero off-diagonals: verify off-diagonal SEs are
+    /// positive and that they differ from the (incorrect) zero that would
+    /// result from a diagonal-only implementation.
+    #[test]
+    fn test_se_omega_block_offdiag_positive() {
+        // Ω = [[0.09, 0.02], [0.02, 0.04]]  (corr ≈ 0.33)
+        let mut mat = DMatrix::<f64>::zeros(2, 2);
+        mat[(0, 0)] = 0.09;
+        mat[(1, 1)] = 0.04;
+        mat[(0, 1)] = 0.02;
+        mat[(1, 0)] = 0.02;
+        let omega = OmegaMatrix::from_matrix(mat, vec!["E1".into(), "E2".into()], false);
+        let template = ModelParameters {
+            theta: vec![5.0],
+            theta_names: vec!["TVCL".into()],
+            theta_lower: vec![0.1],
+            theta_upper: vec![50.0],
+            theta_fixed: vec![false],
+            omega,
+            omega_fixed: vec![false; 2],
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+        };
+        // Packed: theta(1) + omega_block(3) + sigma(1) = 5.  Identity cov.
+        let cov = Some(DMatrix::<f64>::identity(5, 5));
+        let (_, se_omega, _, _) = extract_standard_errors(&cov, &template);
+        let se = se_omega.unwrap();
+        // Full LT: [omega(0,0), omega(1,0), omega(1,1)]
+        assert_eq!(se.len(), 3);
+        assert!(se[0] > 0.0, "diagonal SE(0,0) should be positive");
+        assert!(se[1] > 0.0, "off-diagonal SE(1,0) should be positive");
+        assert!(se[2] > 0.0, "diagonal SE(1,1) should be positive");
+        // omega_se_at helper
+        use crate::types::omega_se_at;
+        let se_opt = Some(se);
+        assert!(omega_se_at(&se_opt, 2, 1, 0).unwrap() > 0.0);
+        // diagonal-only format returns None for off-diag
+        let diag_only = Some(vec![0.1, 0.2]);
+        assert!(omega_se_at(&diag_only, 2, 1, 0).is_none());
     }
 
     /// Diagonal omega path is unaffected by the fix; this guards the simple case.

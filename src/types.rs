@@ -2094,6 +2094,12 @@ pub struct FitResult {
     pub error_model: ErrorModel,
     pub covariance_matrix: Option<DMatrix<f64>>,
     pub se_theta: Option<Vec<f64>>,
+    /// Standard errors for omega elements.
+    ///
+    /// - **Diagonal omega**: length = n_eta, one SE per variance.
+    /// - **Block omega**: length = n_eta·(n_eta+1)/2, column-major lower
+    ///   triangle (same layout as the packed Cholesky). Use
+    ///   [`omega_se_at`] to index by (i, j).
     pub se_omega: Option<Vec<f64>>,
     pub se_sigma: Option<Vec<f64>>,
     /// FIX flags carried through from the model so the output layer can
@@ -2344,6 +2350,34 @@ pub struct FitResult {
     /// were active during the fit (or the caller supplied `ignore`/`accept`
     /// expressions).  `None` means no filtering was requested.
     pub exclusions: Option<ExclusionSummary>,
+}
+
+/// Look up the SE for omega element (i, j) from the `se_omega` vector.
+///
+/// `se_omega` may be diagonal-only (length = n_eta) or full lower-triangle
+/// (length = n_eta·(n_eta+1)/2, column-major).  Returns `None` when
+/// `se_omega` is `None`, the index is out of bounds, or the format is
+/// diagonal and an off-diagonal element is requested.
+pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize) -> Option<f64> {
+    let se = se_omega.as_ref()?;
+    let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
+    let n_lt = n_eta * (n_eta + 1) / 2;
+    if se.len() == n_lt && n_lt != n_eta {
+        // Full lower-triangle format (block omega).
+        let col_offset = if c == 0 {
+            0
+        } else {
+            c * n_eta - c * (c - 1) / 2
+        };
+        se.get(col_offset + (r - c)).copied()
+    } else {
+        // Diagonal-only format: only (i, i) is available.
+        if r == c {
+            se.get(r).copied()
+        } else {
+            None
+        }
+    }
 }
 
 /// Minimal per-NN metadata carried on `FitResult` so output writers can
