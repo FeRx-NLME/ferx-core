@@ -22,7 +22,41 @@ section of the SDLC for the versioning policy).
 ### Added
 - FREM (Full Random Effects Model) covariate analysis: `prepare_frem()` API
   transforms a base model + dataset into a FREM model with extended block omega,
-  covariate pseudo-observations, and FREMTYPE dispatch in the likelihood (#194).
+  covariate pseudo-observations, and FREMTYPE dispatch in the likelihood. The
+  covariates (and their continuous/categorical kind) are taken from the model's
+  `[covariates]` block; the `covariates` argument is an optional subset filter
+  over them (#194).
+- New `importance_sampling_map` (alias `impmap`) estimation method: a Monte-Carlo
+  EM estimator equivalent to NONMEM `METHOD=IMPMAP`. Each iteration re-centers a
+  per-subject importance-sampling proposal on the conditional mode (MAP) and
+  updates θ/Ω/σ from the importance-weighted posterior moments. Runs standalone
+  or chained (`methods = [focei, impmap]`); multivariate-normal proposal by
+  default (`impmap_proposal_df = normal`), Student-t optional. Validated against
+  FOCEI on warfarin. IOV and SDE models are not yet supported (#270).
+- Importance sampling can now run **standalone** (`method = imp`), evaluating the
+  IS log-likelihood at the initial parameters — IMP derives the EBEs/Jacobian it
+  needs via a FOCE inner loop at those parameters instead of requiring a
+  preceding estimator. Useful for scoring imported/fixed parameter sets. IMP
+  still may appear at most once and must be the terminal stage of a chain.
+- Feature maturity labels (`stable` / `beta` / `experimental`) documented for
+  every major feature: a new *Feature Maturity* docs page with definitions and a
+  per-feature table, plus a maturity banner on each feature reference page.
+  Experimental features (`[diffusion]` / SDE, `[covariate_nn]` / neural networks)
+  now emit a runtime warning at fit time (`W_EXPERIMENTAL_SDE`,
+  `W_EXPERIMENTAL_NN`), also surfaced by `ferx check` (#175).
+- `covariance_method` fit option: choose the covariance estimator, mirroring
+  NONMEM `$COV MATRIX=` — `r` (inverse Hessian `R⁻¹`, default), `s` (inverse
+  score cross-product `S⁻¹`), or `rsr` (the Huber–White sandwich `R⁻¹SR⁻¹`,
+  robust to model mis-specification). Supported for FOCEI/IOV fits (#223).
+- `covariance_fallback = sir` fit option: when the FD Hessian is non-positive-definite,
+  run SIR with an `|eigenvalue|`-rectified proposal (4× inflated) instead of leaving
+  the covariance step as failed; `covariance_status` reports `sir_fallback` (#223).
+- `covariance_matrix:` block in `*-fit.yaml`: the full optimizer-space parameter
+  covariance matrix (log-theta, Cholesky-omega, log-sigma; kappa appended for IOV
+  models), parameter-labelled, emitted when the covariance step succeeds or is
+  regularised. Omega/kappa diagonal entries are keyed `log_chol_<eta>` (packed
+  value is `log(L_ii)`); off-diagonal entries are keyed `chol_<row>_<col>`
+  (`L_ij`, not log-transformed) (#236).
 - Time-to-event / survival modelling (Phase 1): `[event_model]` block, TTE
   datareader, likelihood, and API wiring, behind the `survival` feature
   (#191, #192).
@@ -31,7 +65,32 @@ section of the SDLC for the versioning policy).
 - Combined ferx-core + ferx-r development documentation: a Development Lifecycle
   (SDLC) page and a Contributing page in the book.
 
+### Changed
+- IMP (importance sampling) now jointly samples (η, κ) for IOV models,
+  integrating over inter-occasion variability so the reported `−2 log L` is
+  directly comparable to FOCE/FOCEI and NONMEM `METHOD=IMP`. Previously κ was
+  held fixed at its EBE mode, giving a partial marginal; `kappa_treatment` in
+  the fit YAML is now `marginalized` rather than `fixed_at_mode` (#186).
+
 ### Fixed
+- FOCE (non-interaction) omega standard errors now match NONMEM `$EST METHOD=1`
+  `$COVARIANCE MATRIX=R` (to ~3–6% on warfarin, previously ~31% low). The
+  covariance step had added the Ω prior (`η̂ᵀΩ⁻¹η̂ + log|Ω|`) on top of the
+  Sheiner–Beal marginal, which already carries Ω through `R̃ = HΩHᵀ + R` —
+  double-counting Ω and flattening the omega-block curvature. FOCE estimates were
+  already correct; only the SEs were affected (#243).
+- The covariance step now succeeds on models with a mixed block + diagonal Ω: the
+  structural-zero cross-block off-diagonals (`free_mask == false`) are excluded
+  from the parameter set like FIX parameters, so their flat Hessian diagonal no
+  longer aborts the step. This affected both FOCE and FOCEI (#243).
+- Covariance standard errors now match NONMEM `$COVARIANCE MATRIX=R` (within ~2%
+  on warfarin). The covariance step reconverges the inner EBE loop at every
+  finite-difference point — holding the EBEs fixed gave an indefinite Hessian
+  that was clipped and inflated theta/sigma SEs 30–94× — and applies the correct
+  factor of two for the `−2·logL` objective (every SE was previously `1/√2` too
+  small) (#209, #196, #129).
+- Covariance step: `fd_hessian_step` is now an *initial* step; ferx automatically
+  halves it up to 8× if any diagonal FD stencil is non-finite (#223).
 - IOV FOCEI marginal likelihood now matches NONMEM after the Almquist Laplace
   correction (#109, #203).
 - SAEM no longer collapses a block Ω to a rank-1 (near-unit-correlation)
@@ -43,6 +102,11 @@ section of the SDLC for the versioning policy).
   (#199, #200).
 
 ### Performance
+- The covariance Hessian is built from a central difference of the analytical
+  population gradient — reusing H-matrix columns for mu-referenced parameters
+  instead of finite-differencing predictions — making the covariance step ~9×
+  faster than scalar finite differencing on warfarin, scaling with the number of
+  free parameters (#209, #196).
 - Autodiff inner gradients now flow through `EVID=3/4` resets and lag time,
   removing a large finite-difference fallback slowdown (#198).
 

@@ -423,6 +423,7 @@ fn method_to_str(m: EstimationMethod) -> &'static str {
         EstimationMethod::FoceGnHybrid => "foce_gn_hybrid",
         EstimationMethod::Saem => "saem",
         EstimationMethod::Imp => "imp",
+        EstimationMethod::Impmap => "impmap",
     }
 }
 
@@ -430,6 +431,7 @@ fn method_from_str(s: &str) -> Result<EstimationMethod, FitrxError> {
     Ok(match s {
         "foce" => EstimationMethod::Foce,
         "focei" => EstimationMethod::FoceI,
+        "impmap" => EstimationMethod::Impmap,
         "foce_gn" => EstimationMethod::FoceGn,
         "foce_gn_hybrid" => EstimationMethod::FoceGnHybrid,
         "saem" => EstimationMethod::Saem,
@@ -460,6 +462,7 @@ fn covariance_status_to_str(s: &CovarianceStatus) -> &'static str {
         CovarianceStatus::NotRequested => "not_requested",
         CovarianceStatus::Computed => "computed",
         CovarianceStatus::Failed => "failed",
+        CovarianceStatus::SirFallback => "sir_fallback",
     }
 }
 
@@ -468,6 +471,7 @@ fn covariance_status_from_str(s: &str) -> Result<CovarianceStatus, FitrxError> {
         "not_requested" => CovarianceStatus::NotRequested,
         "computed" => CovarianceStatus::Computed,
         "failed" => CovarianceStatus::Failed,
+        "sir_fallback" => CovarianceStatus::SirFallback,
         _ => {
             return Err(FitrxError::Corrupt(format!(
                 "unknown covariance_status {:?}",

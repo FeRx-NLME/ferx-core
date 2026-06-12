@@ -1,5 +1,7 @@
 # Gauss-Newton (BHHH)
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 The Gauss-Newton optimizer is an alternative to the standard FOCE/FOCEI approach that exploits the nonlinear-least-squares structure of the FOCE objective. It uses the BHHH (Berndt-Hall-Hall-Hausman) approximation to the Hessian and typically converges in 10-30 iterations, compared to 100+ evaluations for gradient-based methods like SLSQP.
 
 This approach mirrors NONMEM's modified Gauss-Newton algorithm.

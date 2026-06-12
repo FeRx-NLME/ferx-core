@@ -1,5 +1,7 @@
 # FOCE / FOCEI
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 First-Order Conditional Estimation (FOCE) and its interaction variant (FOCEI) are the primary estimation methods in ferx-core. They use a two-level nested optimization to find maximum likelihood estimates of population parameters.
 
 ## Algorithm Overview
@@ -113,15 +115,95 @@ The pre-search uses NLopt's CRS2-LM algorithm (Controlled Random Search) to expl
 
 ## Covariance Step
 
-When `covariance = true`, ferx-core computes the variance-covariance matrix of the parameter estimates using a finite-difference Hessian at the converged solution. This provides:
+When `covariance = true`, ferx-core computes the variance-covariance matrix of the parameter estimates (the **R-matrix**: the inverse observed Fisher information) at the converged solution. This provides:
 
 - **Standard errors (SE)** for all parameters
 - **Relative standard errors (%RSE)** for assessing estimation precision
 - **Omega SEs** via delta method from the Cholesky parameterization
 
+### How the Hessian is built
+
+The covariance is `2·H⁻¹`, where `H` is the finite-difference Hessian of the objective. Two details make the SEs match NONMEM's `$COVARIANCE`:
+
+1. **The EBEs are reconverged at every perturbed point.** Like NONMEM's covariance step, ferx re-solves the inner conditional-estimation loop (warm-started from the converged EBEs) at each finite-difference point. Holding the EBEs fixed omits the response of the conditional optimum to the population parameters, which gives a Hessian with the wrong curvature — indefinite even on well-conditioned surfaces such as warfarin — and was the source of the spurious eigenvalue clipping in issue [#129](https://github.com/FeRx-NLME/ferx-core/issues/129).
+2. **The Hessian is a central difference of the analytical gradient** (issue [#209](https://github.com/FeRx-NLME/ferx-core/issues/209)): `H[:,k] ≈ (g(x̂+hₖeₖ) − g(x̂−hₖeₖ)) / 2hₖ`. This is `2·n_free` gradient evaluations instead of `~2·n_free²` objective evaluations, and it avoids the catastrophic cancellation of a four-point second difference of the OFV. The θ part of that gradient reuses H-matrix columns for mu-referenced parameters (issue [#196](https://github.com/FeRx-NLME/ferx-core/issues/196)). IOV models, whose κ block has no fixed-EBE analytical gradient, fall back to a second difference of the reconverged objective.
+
+The factor of two is because the objective is `−2·logL`: its Hessian is twice the observed information, so the covariance needs `2·H⁻¹` to be on the right scale.
+
+The covariance objective is `2·pop_nll` for **both** FOCE and FOCEI — the Ω penalty is already inside each per-subject marginal and must not be added again. FOCEI's Almquist–Laplace marginal carries `η̂ᵀΩ⁻¹η̂ + log|Ω|` explicitly; FOCE's Sheiner–Beal marginal carries it through `R̃ = HΩHᵀ + R` (equivalent by the Woodbury identity). An earlier version added the Ω prior a second time on the FOCE path, double-counting Ω and under-stating the FOCE omega SEs by ~31% — fixed in issue [#243](https://github.com/FeRx-NLME/ferx-core/issues/243).
+
+For a mixed block + diagonal Ω, the structural-zero cross-block off-diagonals (which are not estimated) are excluded from the covariance parameter set like FIX parameters; otherwise their flat Hessian diagonal aborts the step. (The same #243 change exposed and fixed this for both FOCE and FOCEI.)
+
+### NONMEM cross-check
+
+On `data/warfarin.csv` (10 subjects, 1-cpt oral, proportional error) against NONMEM 7.5.1 `$COVARIANCE MATRIX=R`, **FOCEI** (`$EST METHOD=1 INTER`):
+
+| Parameter | ferx SE | NONMEM SE | rel. diff |
+|-----------|---------|-----------|-----------|
+| TVCL      | 0.00712 | 0.00710   | +0.3% |
+| TVV       | 0.2350  | 0.2401    | −2.1% |
+| TVKA      | 0.1506  | 0.1486    | +1.3% |
+| PROP_ERR (SD) | 0.000832 | 0.000835 | −0.4% |
+| ω²(CL)    | 0.01291 | 0.01279   | +0.9% |
+| ω²(V)     | 0.00403 | 0.00431   | −6.4% |
+| ω²(KA)    | 0.1530  | 0.1504    | +1.8% |
+
+and **FOCE** (`$EST METHOD=1`, no `INTER`), where ferx's OFV/estimates already match NONMEM (OFV −280.17 vs −280.36) and, after the #243 covariance fix, the omega SEs do too:
+
+| Parameter | ferx SE | NONMEM SE | rel. diff |
+|-----------|---------|-----------|-----------|
+| TVCL      | 0.00661 | 0.00663   | −0.3% |
+| TVV       | 0.2375  | 0.2340    | +1.5% |
+| TVKA      | 0.1209  | 0.1245    | −2.8% |
+| PROP_ERR (SD) | 0.000922 | 0.000941 | −2.0% |
+| ω²(CL)    | 0.01312 | 0.01280   | +2.5% |
+| ω²(V)     | 0.00454 | 0.00430   | +5.7% |
+| ω²(KA)    | 0.1510  | 0.1607    | −6.1% |
+
+(autodiff build; the FD-Jacobian build agrees to within ~10% on the ω block.) Both methods are guarded by `tests/warfarin_covariance_nonmem.rs` within a 20% band.
+
+### Covariance estimator: R, S, or sandwich
+
+By default ferx reports the **R-matrix** covariance `R⁻¹` (the inverse observed information), which assumes the model is correctly specified. `covariance_method` selects an alternative, mirroring NONMEM's `$COVARIANCE MATRIX=`:
+
+| `covariance_method` | Estimator | NONMEM | Use when |
+|---|---|---|---|
+| `r` (default) | `R⁻¹` | `MATRIX=R` | Model is well-specified; you want the model-based SEs. |
+| `s` | `S⁻¹` | `MATRIX=S` | You want the empirical-information (cross-product) SEs. |
+| `rsr` | `R⁻¹ S R⁻¹` | `MATRIX=RSR` | You want SEs robust to model mis-specification (the Huber–White "sandwich"). |
+
+Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vectors `gᵢ = ∂(−logLᵢ)/∂θ` — the same per-subject gradients the [Gauss–Newton](optimizers.md) optimizer uses for its BHHH step. At the MLE of a correctly-specified model the information-matrix equality gives `R ≈ S`, so all three estimators converge to the same SEs; they diverge when the model is mis-specified, where `rsr` is the conservative choice.
+
+```
+[fit_options]
+  method           = focei
+  covariance       = true
+  covariance_method = rsr
+```
+
+`s` and `rsr` are currently available for **FOCEI and IOV** fits. They require the per-subject score, whose Ω-prior term (`ηᵀΩ⁻¹η + log|Ω|`) is only consistent with the Hessian under interaction; FOCE / Sheiner–Beal support is a follow-up. Requesting `s`/`rsr` under non-interaction FOCE returns a clear covariance-step error rather than an inconsistent matrix.
+
+#### NONMEM cross-check (S / RSR)
+
+Same warfarin FOCEI fit as the `MATRIX=R` table above, with two additional NONMEM covariance runs (`$COVARIANCE MATRIX=S` and `MATRIX=RSR`); SEs are the `.ext` `ITERATION = -1000000001` row ([#266](https://github.com/FeRx-NLME/ferx-core/issues/266)):
+
+| Parameter | ferx `s` | NONMEM `MATRIX=S` | rel. diff | ferx `rsr` | NONMEM `MATRIX=RSR` | rel. diff |
+|-----------|----------|-------------------|-----------|------------|---------------------|-----------|
+| TVCL      | 0.01031  | 0.00930 | +10.9% | 0.00742 | 0.00710 | +4.6% |
+| TVV       | 0.4250   | 0.4602  | −7.7%  | 0.2418  | 0.2403  | +0.6% |
+| TVKA      | 0.2157   | 0.2268  | −4.9%  | 0.1555  | 0.1487  | +4.5% |
+| PROP_ERR (SD) | 0.001519 | 0.001545 | −1.7% | 0.000790 | 0.000796 | −0.7% |
+| ω²(CL)    | 0.02005  | 0.01764 | +13.7% | 0.01170 | 0.01093 | +7.1% |
+| ω²(V)     | 0.007139 | 0.008287 | −13.9% | 0.003699 | 0.003978 | −7.0% |
+| ω²(KA)    | 0.2265   | 0.2596  | −12.8% | 0.1311  | 0.1396  | −6.1% |
+
+(`ci`/FD build.) The `s` cross-product matches NONMEM within ~14% and `rsr` within ~7% — note the `s` SEs are uniformly larger than `r`/`rsr` here, because with only 10 subjects the score outer-product is a noisy information estimate (the model-equality `R ≈ S` is exact only asymptotically). Guarded by `covariance_se_matches_nonmem_s_rsr` in `tests/covariance_method_sandwich.rs` (20% band for `s`, 15% for `rsr`). The per-subject score `S` is on the `−logL` (NLL) scale and, unlike `R`, carries no factor of two; the close `s` agreement confirms that scaling is correct.
+
+Note that ferx defaults to `covariance_method = r` whereas NONMEM's `$COVARIANCE` default is the `rsr` sandwich; set `covariance_method = rsr` when reconciling SEs against a default NONMEM run.
+
 ### Hessian regularization
 
-The FD second derivative inherits roundoff at scale `≈ (eps_OFV / h²)`, which on well-conditioned surfaces can push one or two eigenvalues of the symmetrised free-block Hessian slightly below zero even when the underlying surface is positive definite (issue [#129](https://github.com/FeRx-NLME/ferx-core/issues/129)). Rather than rejecting the entire covariance step on that artefact, ferx-core inverts via a symmetric eigendecomposition and clips eigenvalues below `max(λ_max · 1e-10, 1e-12)` to that floor before reconstructing `H⁻¹`. PD inputs are inverted unchanged; non-PD inputs recover a PD covariance and a warning is added to `FitResult.warnings`:
+Because the EBEs reconverge, the Hessian is positive-definite on well-conditioned surfaces and no regularization is needed. As a safety net for genuinely ill-conditioned or near-singular problems, ferx-core still inverts via a symmetric eigendecomposition and clips eigenvalues below `max(λ_max · 1e-10, 1e-12)` to that floor before reconstructing `H⁻¹`, adding a warning to `FitResult.warnings`:
 
 ```
 Covariance step regularized: eigenvalue floor applied to FD Hessian
@@ -129,7 +211,25 @@ Covariance step regularized: eigenvalue floor applied to FD Hessian
 Standard errors should be interpreted with care.
 ```
 
-SEs in the regularised directions are inflated (since `1/λ_clipped` is larger than the would-be true `1/λ`), so when this warning fires the rotated reference NONMEM fit or the autodiff build (`--features autodiff`, machine-precision second derivatives) is the right cross-check. A Hessian whose spectrum is genuinely indefinite — every eigenvalue ≤ 0 — still fails outright with the standard `Covariance step failed` message; the floor only rescues near-PD cases.
+SEs in the regularised directions are inflated (since `1/λ_clipped` is larger than the would-be true `1/λ`). With the reconverging covariance step this warning should now be rare; if it fires, the surface is genuinely near-identifiable and the SEs in those directions warrant scrutiny. A Hessian whose spectrum is genuinely indefinite — every eigenvalue ≤ 0 — still fails outright with the standard `Covariance step failed` message.
+
+### SIR fallback for non-PD Hessians
+
+When a model is poorly identified or converges to a saddle point, the FD Hessian can have every free-block eigenvalue ≤ 0, making Hessian inversion impossible. Setting `covariance_fallback = sir` triggers a SIR (Sampling Importance Resampling) run instead of leaving the covariance step as failed:
+
+```
+[fit_options]
+  covariance_fallback = sir
+```
+
+ferx-core constructs a proposal covariance by taking the absolute values of the Hessian eigenvalues, inflating by 4× (heavier tails to account for the non-PD correction), and running the same SIR sampler used by `sir = true`. The result is reported as 95% credible intervals in the fit YAML; `covariance_status` is set to `sir_fallback`.
+
+Use this option when:
+- The Hessian is non-PD at convergence due to model mis-specification or weak identifiability
+- You want distributional uncertainty estimates without re-fitting with a more constrained model
+- You need to proceed to a downstream analysis despite a non-PD Hessian
+
+The SIR fallback inherits all `sir_*` settings (`sir_samples`, `sir_df`, `sir_resamples`, etc.) from `[fit_options]`.
 
 ## Convergence
 

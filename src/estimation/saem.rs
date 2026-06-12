@@ -385,15 +385,26 @@ fn obs_nll_subject_into_iov(
     // consistent. `_pk_scratch` is retained for signature stability but unused
     // (predict_iov manages its own per-event params).
     let preds = crate::pk::predict_iov(model, subject, theta, eta, kappas);
+    // FREM covariate pseudo-observations (FREMTYPE > 0) use the covariate sigma
+    // (EPSCOV), not the PK residual error — otherwise their near-zero residuals
+    // drag PROP/ADD toward zero. See build_frem_r_override.
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma_values,
+    );
     let mut total_nll = 0.0_f64;
     for j in 0..subject.observations.len() {
         // Floors protect log(0) in the M-step objective. individual_nll_iov
         // (the E-step evaluator) does not floor — see obs_nll_subject_grad_iov
         // for why the asymmetry is intentional.
         let f = preds[j].max(1e-12);
-        let v = model
-            .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
-            .max(1e-12);
+        let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
+            Some(vv) => vv.max(1e-12),
+            None => model
+                .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
+                .max(1e-12),
+        };
         if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
             let z = (subject.observations[j] - f) / v.sqrt();
             total_nll += -log_normal_cdf(z);
@@ -504,6 +515,13 @@ fn obs_nll_subject_grad_iov(
     // Non-M3 path: continuous per-occasion-aware base predictions (issue #104).
     let n_obs = subject.observations.len();
     let preds = crate::pk::predict_iov(model, subject, theta, eta, kappas);
+    // FREM covariate rows use EPSCOV, not the PK residual error (see
+    // build_frem_r_override); their variance is η-independent so dvar_df = 0.
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma_values,
+    );
     let mut nll_base = 0.0_f64;
     let mut all_preds_base = vec![0.0f64; n_obs];
     let mut residuals = vec![0.0f64; n_obs];
@@ -513,13 +531,21 @@ fn obs_nll_subject_grad_iov(
     for j in 0..n_obs {
         let cmt = subject.obs_cmts[j];
         let f = preds[j].max(1e-12);
-        let v = model.residual_variance_at(cmt, f, sigma_values).max(1e-12);
+        let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        let v = match frem_vj {
+            Some(vv) => vv.max(1e-12),
+            None => model.residual_variance_at(cmt, f, sigma_values).max(1e-12),
+        };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
         all_preds_base[j] = f;
         residuals[j] = resid;
         variances[j] = v;
-        let dv_df = model.error_spec.dvar_df(cmt, f, sigma_values);
+        let dv_df = if frem_vj.is_some() {
+            0.0
+        } else {
+            model.error_spec.dvar_df(cmt, f, sigma_values)
+        };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
 
@@ -862,6 +888,14 @@ fn obs_nll_subject_grad(
     let mut nll_base = 0.0f64;
     let n_obs = subject.observations.len();
 
+    // FREM covariate rows use EPSCOV, not the PK residual error (see
+    // build_frem_r_override); their variance is η-independent so dvar_df = 0.
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma_values,
+    );
+
     // per-obs residual, variance, d(obs_nll)/d(f_j)
     let mut residuals = vec![0.0f64; n_obs];
     let mut variances = vec![0.0f64; n_obs];
@@ -870,13 +904,21 @@ fn obs_nll_subject_grad(
     for j in 0..n_obs {
         let cmt = subject.obs_cmts[j];
         let f = preds_base[j].max(1e-12);
-        let v = model.residual_variance_at(cmt, f, sigma_values).max(1e-12);
+        let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        let v = match frem_vj {
+            Some(vv) => vv.max(1e-12),
+            None => model.residual_variance_at(cmt, f, sigma_values).max(1e-12),
+        };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
         residuals[j] = resid;
         variances[j] = v;
         // d(obs_nll_j)/d(f_j) = -resid/V + 0.5 * (dV/df) * (1/V - resid²/V²)
-        let dv_df = model.error_spec.dvar_df(cmt, f, sigma_values);
+        let dv_df = if frem_vj.is_some() {
+            0.0
+        } else {
+            model.error_spec.dvar_df(cmt, f, sigma_values)
+        };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
 
@@ -2015,6 +2057,7 @@ pub fn run_saem(
         );
 
     // ---- Covariance step ----
+    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
@@ -2037,6 +2080,14 @@ pub fn run_saem(
                 }
                 CovarianceStepResult::Unusable(msg) => {
                     warnings.push(msg);
+                    None
+                }
+                CovarianceStepResult::FailedNonPd {
+                    reason,
+                    fallback_proposal,
+                } => {
+                    warnings.push(reason);
+                    sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
             }
@@ -2076,6 +2127,7 @@ pub fn run_saem(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        sir_fallback_proposal,
     })
 }
 

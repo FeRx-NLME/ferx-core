@@ -452,7 +452,124 @@ pub fn generate_frem_model(
     Ok(model)
 }
 
+/// Resolve which covariates (and their categorical/continuous split) go into the
+/// FREM model. The model's `[covariates]` block is the source of truth: it
+/// declares the covariates and tags each continuous or categorical.
+///
+/// - The `[covariates]` block is **required**; without it there is nothing to
+///   FREM, and an error is returned.
+/// - `covariate_filter` is an optional **subset filter** over the declared
+///   covariates. Empty → use every declared covariate. Non-empty → use only the
+///   named ones, in the order given; each name must be declared in the block
+///   (an undeclared name is an error).
+/// - The categorical/continuous split always comes from each selected
+///   declaration's `kind`, unless `categorical_override` is supplied non-empty
+///   (an escape hatch for callers that don't go through a `[covariates]` block's
+///   kinds).
+fn resolve_frem_covariates(
+    covariate_filter: &[String],
+    categorical_override: Option<&[String]>,
+    covariate_decls: Option<&[crate::types::CovariateDecl]>,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    use crate::types::CovariateKind;
+
+    // The [covariates] block is the source of truth and is required. Distinguish
+    // an absent block from a present-but-empty one so the diagnostic is accurate.
+    let decls = match covariate_decls {
+        Some(d) if !d.is_empty() => d,
+        Some(_) => {
+            return Err(
+                "The model's [covariates] block is empty. Declare at least one \
+                        covariate (each tagged continuous or categorical) for FREM to fold in."
+                    .to_string(),
+            );
+        }
+        None => {
+            return Err(
+                "FREM needs covariates declared in the model's [covariates] block (each \
+                        tagged continuous or categorical). The model has no [covariates] block — \
+                        add one listing the covariates to fold into the FREM model."
+                    .to_string(),
+            );
+        }
+    };
+
+    // Select declared covariates: all of them, or the named subset.
+    let selected: Vec<&crate::types::CovariateDecl> = if covariate_filter.is_empty() {
+        decls.iter().collect()
+    } else {
+        let mut sel: Vec<&crate::types::CovariateDecl> = Vec::with_capacity(covariate_filter.len());
+        for name in covariate_filter {
+            // Match the declaration case-insensitively, consistent with how
+            // covariates are matched against the dataset elsewhere; the declared
+            // (canonical) name is what gets used downstream.
+            let decl = decls
+                .iter()
+                .find(|d| d.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| {
+                    format!(
+                        "FREM covariate '{}' is not declared in the model's [covariates] block. \
+                         The `covariates` argument selects a subset of the declared covariates \
+                         (declared: {}).",
+                        name,
+                        decls
+                            .iter()
+                            .map(|d| d.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+            // Reject duplicates so we never emit a covariate (and its eta /
+            // FREMTYPE rows) twice, which would produce a degenerate model.
+            if sel.iter().any(|d| d.name == decl.name) {
+                return Err(format!(
+                    "FREM covariate '{}' is listed more than once in the `covariates` filter.",
+                    decl.name
+                ));
+            }
+            sel.push(decl);
+        }
+        sel
+    };
+
+    let names: Vec<String> = selected.iter().map(|d| d.name.clone()).collect();
+    let cats: Vec<String> = match categorical_override {
+        Some(c) if !c.is_empty() => {
+            // The override must reference covariates actually in the FREM set,
+            // else it silently points at a covariate that won't be modelled.
+            for cov in c {
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(cov)) {
+                    return Err(format!(
+                        "FREM categorical override '{}' is not among the selected covariates ({}).",
+                        cov,
+                        names.join(", ")
+                    ));
+                }
+            }
+            c.to_vec()
+        }
+        _ => selected
+            .iter()
+            .filter(|d| d.kind == CovariateKind::Categorical)
+            .map(|d| d.name.clone())
+            .collect(),
+    };
+    Ok((names, cats))
+}
+
 /// Orchestrate FREM preparation: parse model, read data, transform, generate, write.
+///
+/// The model's `[covariates]` block defines the covariates to fold into the FREM
+/// omega block and tags each continuous or categorical — it is the source of
+/// truth and is **required**.
+///
+/// `covariates` is an optional **subset filter** over the declared covariates:
+/// empty means "use every declared covariate"; a non-empty list selects only
+/// those (each must be declared in the block, else an error). It does not
+/// introduce covariates the model hasn't declared.
+///
+/// `categorical_covariates` is an optional override for the categorical split;
+/// when `None`/empty the split is taken from each selected declaration's `kind`.
 pub fn prepare_frem(
     model_path: &Path,
     data_path: &Path,
@@ -462,17 +579,28 @@ pub fn prepare_frem(
     output_data_path: Option<&Path>,
 ) -> Result<FremPrepareResult, String> {
     use crate::io::datareader::read_nonmem_csv;
-    use crate::parser::model_parser::parse_model_file;
+    use crate::parser::model_parser::parse_full_model_file;
 
-    // Parse base model and read data.
-    let base_model = parse_model_file(model_path)?;
+    // Full parse so the optional `[covariates]` block is available for fallback.
+    let parsed = parse_full_model_file(model_path)?;
+    let base_model = &parsed.model;
     let population = read_nonmem_csv(data_path, None, None)?;
 
-    let cat_covs = categorical_covariates.unwrap_or(&[]);
+    // Resolve the covariate list (explicit args, else the model's [covariates]
+    // block) — see `resolve_frem_covariates`.
+    let (resolved_covariates, resolved_categorical) = resolve_frem_covariates(
+        covariates,
+        categorical_covariates,
+        parsed.covariate_decls.as_deref(),
+    )?;
 
     // Transform dataset.
-    let (csv_content, frem_info) =
-        transform_dataset_for_frem(&population, &base_model, covariates, cat_covs)?;
+    let (csv_content, frem_info) = transform_dataset_for_frem(
+        &population,
+        base_model,
+        &resolved_covariates,
+        &resolved_categorical,
+    )?;
 
     // Determine output paths.
     let model_stem = model_path
@@ -492,7 +620,7 @@ pub fn prepare_frem(
         .map_err(|e| format!("Failed to read model file: {}", e))?;
 
     // Generate FREM model.
-    let model_text = generate_frem_model(&base_text, &base_model, &frem_info, out_data)?;
+    let model_text = generate_frem_model(&base_text, base_model, &frem_info, out_data)?;
 
     // Write outputs.
     std::fs::write(out_data, &csv_content)
@@ -865,5 +993,145 @@ mod tests {
         assert!(blocks.contains_key("parameters"));
         assert!(blocks.contains_key("error_model"));
         assert_eq!(blocks["parameters"].len(), 2); // theta line + empty line
+    }
+
+    fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
+        CovariateDecl {
+            name: name.to_string(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn resolve_covariates_uses_all_declared_when_no_filter() {
+        // Empty filter → every declared covariate; categorical split from `kind`.
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("CRCL", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        let (covs, cats) = resolve_frem_covariates(&[], None, Some(&decls)).unwrap();
+        assert_eq!(covs, vec!["WT", "CRCL", "SEX"]);
+        assert_eq!(cats, vec!["SEX"]);
+    }
+
+    #[test]
+    fn apply_frem_prediction_override_replaces_only_covariate_rows() {
+        // FREMTYPE > 0 rows are replaced with theta[k] + eta[m]; PK rows (FREMTYPE 0)
+        // are left untouched.
+        let mut model = make_test_model();
+        // Map FREMTYPE 100 -> (theta TVCL idx 0, eta ETA_V idx 1).
+        let mut map = std::collections::HashMap::new();
+        map.insert(100u16, (0usize, 1usize));
+        model.frem_config = Some(FremConfig {
+            fremtype_to_indices: map,
+            covariate_sigma_index: 0,
+        });
+
+        let mut subj = make_test_population().subjects.remove(0); // 3 obs
+        subj.fremtype = vec![0, 100, 0];
+
+        let theta = model.default_params.theta.clone(); // [0.2, 10.0, 1.5]
+        let eta = vec![0.1, 0.2, 0.3];
+        let mut preds = vec![5.0, 8.0, 6.0];
+        crate::pk::apply_frem_prediction_override(&model, &subj, &theta, &eta, &mut preds);
+
+        assert_eq!(preds[0], 5.0); // PK row untouched
+        assert_eq!(preds[2], 6.0); // PK row untouched
+        assert_eq!(preds[1], theta[0] + eta[1]); // covariate row = TVCL + ETA_V = 0.4
+    }
+
+    #[test]
+    fn resolve_covariates_filter_selects_subset_in_filter_order() {
+        // A non-empty filter selects a subset; order follows the filter, kinds
+        // come from the block.
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("CRCL", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        let (covs, cats) =
+            resolve_frem_covariates(&["SEX".to_string(), "WT".to_string()], None, Some(&decls))
+                .unwrap();
+        assert_eq!(covs, vec!["SEX", "WT"]);
+        assert_eq!(cats, vec!["SEX"]);
+    }
+
+    #[test]
+    fn resolve_covariates_filter_with_undeclared_name_errors() {
+        // Filtering to a covariate not in the block is an error.
+        let decls = vec![decl("WT", CovariateKind::Continuous)];
+        let err = resolve_frem_covariates(&["AGE".to_string()], None, Some(&decls)).unwrap_err();
+        assert!(
+            err.contains("AGE") && err.contains("[covariates]"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_covariates_categorical_override() {
+        // The override forces the categorical split regardless of block kinds.
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        let (covs, cats) =
+            resolve_frem_covariates(&[], Some(&["WT".to_string()]), Some(&decls)).unwrap();
+        assert_eq!(covs, vec!["WT", "SEX"]);
+        assert_eq!(cats, vec!["WT"]);
+    }
+
+    #[test]
+    fn resolve_covariates_filter_is_case_insensitive_and_canonicalizes() {
+        // Filter matches the declaration case-insensitively; the declared
+        // (canonical) name is returned.
+        let decls = vec![decl("WT", CovariateKind::Continuous)];
+        let (covs, _) = resolve_frem_covariates(&["wt".to_string()], None, Some(&decls)).unwrap();
+        assert_eq!(covs, vec!["WT"]);
+    }
+
+    #[test]
+    fn resolve_covariates_filter_rejects_duplicates() {
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("AGE", CovariateKind::Continuous),
+        ];
+        // Exact and case-variant duplicates both error.
+        assert!(
+            resolve_frem_covariates(&["WT".to_string(), "WT".to_string()], None, Some(&decls))
+                .is_err()
+        );
+        let err =
+            resolve_frem_covariates(&["WT".to_string(), "wt".to_string()], None, Some(&decls))
+                .unwrap_err();
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_covariates_categorical_override_must_be_selected() {
+        // An override naming a covariate that isn't in the FREM set is an error.
+        let decls = vec![
+            decl("WT", CovariateKind::Continuous),
+            decl("SEX", CovariateKind::Categorical),
+        ];
+        // SEX is excluded by the filter, so overriding it categorical is invalid.
+        let err = resolve_frem_covariates(
+            &["WT".to_string()],
+            Some(&["SEX".to_string()]),
+            Some(&decls),
+        )
+        .unwrap_err();
+        assert!(err.contains("not among the selected"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_covariates_requires_block() {
+        // Missing vs empty [covariates] block → distinct, accurate messages.
+        let missing = resolve_frem_covariates(&[], None, None).unwrap_err();
+        assert!(missing.contains("no [covariates] block"), "got: {missing}");
+        let empty = resolve_frem_covariates(&[], None, Some(&[])).unwrap_err();
+        assert!(empty.contains("is empty"), "got: {empty}");
+        // A filter doesn't change the requirement.
+        assert!(resolve_frem_covariates(&["WT".to_string()], None, None).is_err());
     }
 }

@@ -1,5 +1,7 @@
 # Structural Model
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 The `[structural_model]` block specifies the pharmacokinetic model used to generate predictions.
 
 ## Analytical PK Models

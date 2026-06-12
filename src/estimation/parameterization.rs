@@ -270,6 +270,52 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
     mask
 }
 
+/// Packed-length mask marking the **structural-zero** off-diagonal entries of a
+/// mixed block + diagonal Ω (and Ω_IOV) — the cross-block elements where
+/// `free_mask[(i,j)] == false`. These are not estimated parameters, so the
+/// covariance step excludes them from its free set exactly like FIX parameters
+/// (issue #243); otherwise their flat Hessian diagonal aborts the step. Theta
+/// and sigma slots, all diagonal entries, and fully diagonal/full-block Ω are
+/// always `false`. Layout mirrors [`packed_fixed_mask`]:
+/// `[theta, Ω (lower-tri col-major), sigma, Ω_IOV (lower-tri col-major)]`.
+pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
+    let mut mask = vec![false; packed_len(template)];
+    let n_theta = template.theta.len();
+
+    // Mark the lower-triangle off-diagonals of `om` that are structural zeros,
+    // walking the same column-major order `packed_fixed_mask` / `pack_params` use.
+    let mark = |mask: &mut [bool], om: &OmegaMatrix, start: usize| {
+        if om.diagonal {
+            return; // diagonal Ω has no off-diagonal entries to mark
+        }
+        let n = om.dim();
+        let mut p = start;
+        for j in 0..n {
+            for i in j..n {
+                if i != j && !om.free_mask[(i, j)] {
+                    mask[p] = true;
+                }
+                p += 1;
+            }
+        }
+    };
+
+    mark(&mut mask, &template.omega, n_theta);
+
+    if let Some(ref iov) = template.omega_iov {
+        let n_eta = template.omega.dim();
+        let n_omega = if template.omega.diagonal {
+            n_eta
+        } else {
+            n_eta * (n_eta + 1) / 2
+        };
+        let iov_start = n_theta + n_omega + template.sigma.values.len();
+        mark(&mut mask, iov, iov_start);
+    }
+
+    mask
+}
+
 /// Compute the number of packed parameters
 pub fn packed_len(template: &ModelParameters) -> usize {
     let n_theta = template.theta.len();
@@ -660,6 +706,120 @@ mod tests {
         let template = make_block_template();
         // 2 theta + 3 omega (lower triangle of 2x2) + 1 sigma = 6
         assert_eq!(packed_len(&template), 6);
+    }
+
+    /// 3×3 mixed Ω: a 2×2 block on (CL,V) plus a separate diagonal KA. The
+    /// cross-block elements (KA,CL)/(KA,V) are structural zeros (`free_mask ==
+    /// false`).
+    fn make_block_plus_diag_omega() -> OmegaMatrix {
+        let mut m = DMatrix::zeros(3, 3);
+        m[(0, 0)] = 0.09;
+        m[(1, 1)] = 0.04;
+        m[(2, 2)] = 0.30;
+        m[(0, 1)] = 0.02;
+        m[(1, 0)] = 0.02;
+        let mut fm = DMatrix::from_element(3, 3, false);
+        // diagonal + the (CL,V) block are free; the cross-block off-diagonals
+        // (2,0)/(2,1) (and their transposes) stay false → structural zeros.
+        for i in 0..3 {
+            fm[(i, i)] = true;
+        }
+        fm[(0, 1)] = true;
+        fm[(1, 0)] = true;
+        OmegaMatrix::from_matrix_with_mask(
+            m,
+            vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
+            false,
+            fm,
+        )
+    }
+
+    #[test]
+    fn test_omega_structural_zero_mask_block_plus_diagonal() {
+        // 2 theta + block+diag Ω (col-major lower-tri: (0,0)(1,0)(2,0)(1,1)(2,1)(2,2))
+        // + 1 sigma. Structural zeros are (2,0) and (2,1).
+        let template = ModelParameters {
+            theta: vec![1.0, 2.0],
+            theta_names: vec!["a".into(), "b".into()],
+            theta_lower: vec![0.0, 0.0],
+            theta_upper: vec![10.0, 10.0],
+            theta_fixed: vec![false, false],
+            omega: make_block_plus_diag_omega(),
+            omega_fixed: vec![false, false, false],
+            sigma: SigmaVector {
+                values: vec![0.3],
+                names: vec!["s".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        let mask = omega_structural_zero_mask(&template);
+        assert_eq!(mask.len(), packed_len(&template)); // 2 + 6 + 1 = 9
+        let n_theta = 2;
+        // omega packed offsets: (0,0)=0 (1,0)=1 (2,0)=2 (1,1)=3 (2,1)=4 (2,2)=5
+        let expected_true = [n_theta + 2, n_theta + 4]; // (2,0) and (2,1)
+        for (i, &m) in mask.iter().enumerate() {
+            assert_eq!(
+                m,
+                expected_true.contains(&i),
+                "mask[{i}] should be {}",
+                expected_true.contains(&i)
+            );
+        }
+    }
+
+    #[test]
+    fn test_omega_structural_zero_mask_diagonal_is_all_false() {
+        // Pure diagonal Ω has no off-diagonals → nothing structural-zero.
+        let template = make_template();
+        let mask = omega_structural_zero_mask(&template);
+        assert_eq!(mask.len(), packed_len(&template));
+        assert!(mask.iter().all(|&m| !m));
+    }
+
+    #[test]
+    fn test_omega_structural_zero_mask_full_block_is_all_false() {
+        // A fully-free 2×2 block has no structural zeros.
+        let template = make_block_template();
+        let mask = omega_structural_zero_mask(&template);
+        assert_eq!(mask.len(), packed_len(&template));
+        assert!(mask.iter().all(|&m| !m));
+    }
+
+    #[test]
+    fn test_omega_structural_zero_mask_block_iov() {
+        // Diagonal BSV (1 eta) + sigma, then a block+diagonal Ω_IOV. The IOV
+        // structural zeros must be marked in the IOV region of the packed vector.
+        // Layout: theta(1) + bsvΩ(1) + sigma(1) + iovΩ(6) = 9.
+        //   iov packed offset 3: (0,0)=3 (1,0)=4 (2,0)=5 (1,1)=6 (2,1)=7 (2,2)=8
+        let template = ModelParameters {
+            theta: vec![1.0],
+            theta_names: vec!["a".into()],
+            theta_lower: vec![0.0],
+            theta_upper: vec![10.0],
+            theta_fixed: vec![false],
+            omega: OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]),
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.3],
+                names: vec!["s".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: Some(make_block_plus_diag_omega()),
+            kappa_fixed: vec![false, false, false],
+        };
+        let mask = omega_structural_zero_mask(&template);
+        assert_eq!(mask.len(), packed_len(&template)); // 1 + 1 + 1 + 6 = 9
+        let expected_true = [5usize, 7]; // iov (2,0) and (2,1)
+        for (i, &m) in mask.iter().enumerate() {
+            assert_eq!(
+                m,
+                expected_true.contains(&i),
+                "mask[{i}] should be {}",
+                expected_true.contains(&i)
+            );
+        }
     }
 
     #[test]

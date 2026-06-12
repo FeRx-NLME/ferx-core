@@ -1,5 +1,7 @@
 # Scaling
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 The optional `[scaling]` block declares how the structural model's raw
 output maps to the observed `DV`. It exists so the user does not have to
 fold unit conversion or amount-to-concentration arithmetic into the

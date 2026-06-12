@@ -635,6 +635,17 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+        if chain.iter().any(|&m| m == EstimationMethod::Impmap) {
+            diags.push(
+                Diagnostic::error(
+                    "E_SDE_INCOMPATIBLE",
+                    "method = impmap is not compatible with a [diffusion] block. \
+                     The EKF process-noise variance is not threaded through the IMPMAP \
+                     importance-sampling likelihood. Use method = foce or method = focei.",
+                )
+                .with_block("fit_options"),
+            );
+        }
         if options.gradient_method == crate::types::GradientMethod::Ad {
             diags.push(
                 Diagnostic::error(
@@ -645,6 +656,21 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+    }
+
+    // IMPMAP does not yet support inter-occasion variability (κ / [iov]); the κ
+    // sufficient statistics and Ω_iov M-step are a planned follow-up. Surface it
+    // at check time so `ferx check` rejects it rather than the fit failing at
+    // runtime (possibly after a chained warm-up stage has already run).
+    if model.n_kappa > 0 && chain.iter().any(|&m| m == EstimationMethod::Impmap) {
+        diags.push(
+            Diagnostic::error(
+                "E_IMPMAP_IOV_UNSUPPORTED",
+                "method = impmap does not yet support inter-occasion variability \
+                 (κ / [iov]). Use method = saem or method = focei for IOV models.",
+            )
+            .with_block("fit_options"),
+        );
     }
 
     // Explicit `gradient_method = ad` on a build compiled WITHOUT the `autodiff`
@@ -666,20 +692,12 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // IMP is a likelihood evaluation, not an estimator: it must follow a
-    // parameter-estimating stage, appear at most once, and be the terminal stage.
+    // IMP is a likelihood evaluation, not an estimator: it may appear at most
+    // once and must be the terminal stage. It may run standalone (as the only
+    // stage), in which case the EBEs/Hessians it consumes are evaluated at the
+    // initial parameters — IMP then reports the −2 log L at those parameters
+    // without estimating them.
     if chain.iter().any(|&m| m == EstimationMethod::Imp) {
-        if chain.first().copied() == Some(EstimationMethod::Imp) {
-            diags.push(
-                Diagnostic::error(
-                    "E_IMP_CHAIN",
-                    "method `imp` cannot be the first stage in a chain — it consumes \
-                     EBEs and Hessians from a preceding estimator. Try `methods = [focei, imp]` \
-                     or `methods = [saem, imp]`.",
-                )
-                .with_block("fit_options"),
-            );
-        }
         let n_imp = chain
             .iter()
             .filter(|&&m| m == EstimationMethod::Imp)
@@ -728,6 +746,10 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
 /// non-fatal — `fit()` pushes their messages into `FitResult.warnings` and
 /// proceeds; `ferx check` reports them as `Warning` diagnostics. Message text
 /// is identical to the historical inline strings.
+///
+/// Feature-presence (data-independent) notices such as the experimental-feature
+/// warnings live in [`check_experimental_features`] instead, so `ferx check`
+/// surfaces them even without a `--data` file.
 pub fn check_model_data_warnings(
     model: &CompiledModel,
     population: &Population,
@@ -825,6 +847,46 @@ pub fn check_model_data_warnings(
     diags
 }
 
+/// Feature-presence (data-independent) *warning*-level checks for experimental
+/// features (issue #175). Stochastic differential equations and neural-network
+/// components are classified `experimental` in the Feature Maturity docs: tested
+/// only on a handful of toy examples. We emit a warning whenever they are used
+/// so results are applied with appropriate caution.
+///
+/// Kept separate from [`check_model_data_warnings`] because these depend only on
+/// the compiled `model`, not on the dataset — so `ferx check model.ferx` (no
+/// `--data`) and `fit()` both surface them. Non-fatal: `fit()` pushes the
+/// messages into `FitResult.warnings`; `ferx check` reports them as warnings.
+pub fn check_experimental_features(model: &CompiledModel) -> Vec<Diagnostic> {
+    let mut diags = Vec::new();
+
+    if model.is_sde() {
+        diags.push(Diagnostic::warning(
+            "W_EXPERIMENTAL_SDE",
+            "Stochastic differential equations ([diffusion] / Extended Kalman \
+             Filter) are an EXPERIMENTAL feature: validated only on a small set \
+             of toy examples, with estimator support limited to FOCE/FOCEI. \
+             Standard errors and convergence behaviour are not yet proven across \
+             diverse datasets — validate results carefully before relying on \
+             them. See the Feature Maturity page in the documentation.",
+        ));
+    }
+    #[cfg(feature = "nn")]
+    if !model.covariate_nns.is_empty() {
+        diags.push(Diagnostic::warning(
+            "W_EXPERIMENTAL_NN",
+            "Neural-network model components ([covariate_nn] / deep compartment \
+             models) are an EXPERIMENTAL feature: validated only on a small set \
+             of toy examples. Standard errors for network weights are not \
+             reliable and the syntax may still change — validate results \
+             carefully before relying on them. See the Feature Maturity page in \
+             the documentation.",
+        ));
+    }
+
+    diags
+}
+
 /// Map a free-text parser error string to a single structured [`Diagnostic`].
 /// Recognises the `"Missing [X] block"` shape (→ `E_MISSING_BLOCK`, with the
 /// block name attached) and the `--features nn` gate (→ `E_NN_FEATURE_DISABLED`);
@@ -897,6 +959,11 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
     //    clean check and a fit agree. Uses the parsed `[fit_options]`, mirroring
     //    what the CLI fit path (`run_model_with_data`) passes to `fit()`.
     diags.extend(check_model_options(&parsed.model, &parsed.fit_options));
+
+    // 2c. Experimental-feature notices (data-independent): these depend only on
+    //    the model, so they surface from `ferx check model.ferx` even without a
+    //    `--data` file.
+    diags.extend(check_experimental_features(&parsed.model));
 
     // 3. Data-dependent checks (only when a dataset is supplied). Read through
     //    the same covariate-aware chokepoint the fit uses, so `ferx check` and
@@ -2086,6 +2153,7 @@ fn fit_inner(
                     | EstimationMethod::FoceGn
                     | EstimationMethod::FoceGnHybrid
                     | EstimationMethod::Imp
+                    | EstimationMethod::Impmap
             )
         });
         if uses_gradient_route {
@@ -2179,6 +2247,10 @@ fn fit_inner(
     // message text is unchanged. Probed against `population` (not the pruned
     // copy) and `init_params`, matching the historical inline checks.
     for d in check_model_data_warnings(model, population, init_params) {
+        accumulated_warnings.push(d.message);
+    }
+    // Experimental-feature notices (data-independent; see check_experimental_features).
+    for d in check_experimental_features(model) {
         accumulated_warnings.push(d.message);
     }
     if options.run_covariance_step && n_params_pre > 30 {
@@ -2275,9 +2347,57 @@ fn fit_inner(
         // params/result update at the bottom of the loop so the preceding
         // stage's `OuterResult` continues to be the canonical one.
         if method == EstimationMethod::Imp {
+            // Standalone IMP (no preceding estimator): evaluate the EBEs/Hessians
+            // at the initial parameters so IMP can report the −2 log L there.
+            // This synthetic stage also becomes the canonical `OuterResult` so
+            // the rest of the fit (sdtab, FitResult) sees the (unchanged) params.
+            if result.is_none() {
+                let mu_k = crate::estimation::parameterization::compute_mu_k(
+                    model,
+                    &stage_params.theta,
+                    stage_opts.mu_referencing,
+                );
+                let (eta_hats, h_matrices, _stats, kappas) =
+                    crate::estimation::inner_optimizer::run_inner_loop_warm(
+                        model,
+                        population,
+                        &stage_params,
+                        stage_opts.inner_maxiter,
+                        stage_opts.inner_tol,
+                        None,
+                        Some(&mu_k),
+                        stage_opts.min_obs_for_convergence_check as usize,
+                    );
+                let nll = crate::estimation::outer_optimizer::pop_nll(
+                    model,
+                    population,
+                    &stage_params,
+                    &eta_hats,
+                    &h_matrices,
+                    &kappas,
+                    stage_opts.interaction,
+                );
+                result = Some(crate::estimation::outer_optimizer::OuterResult {
+                    params: stage_params.clone(),
+                    ofv: 2.0 * nll,
+                    converged: true,
+                    n_iterations: 0,
+                    eta_hats,
+                    h_matrices,
+                    kappas,
+                    covariance_matrix: None,
+                    warnings: Vec::new(),
+                    saem_mu_ref_m_step_evals_saved: None,
+                    saem_n_subjects_hmc: None,
+                    ebe_convergence_warnings: 0,
+                    max_unconverged_subjects: 0,
+                    total_ebe_fallbacks: 0,
+                    final_gradient: None,
+                    sir_fallback_proposal: None,
+                });
+            }
             let prev = result.as_ref().expect(
-                "IMP guard above should have rejected an IMP-first chain — \
-                 prior stage's OuterResult must exist here",
+                "IMP stage: prior OuterResult must exist (synthesised above when standalone)",
             );
             match crate::estimation::importance_sampling::run_importance_sampling(
                 model,
@@ -2339,6 +2459,18 @@ fn fit_inner(
         let stage_result = match method {
             EstimationMethod::Saem => {
                 saem::run_saem(model, population, &stage_params, &stage_opts)?
+            }
+            EstimationMethod::Impmap => {
+                // Warm-start the first MAP inner loop from the preceding stage's
+                // EBEs when chained (e.g. [focei, impmap] / [saem, impmap]).
+                let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
+                crate::estimation::impmap::run_impmap(
+                    model,
+                    population,
+                    &stage_params,
+                    warm,
+                    &stage_opts,
+                )?
             }
             EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
                 crate::estimation::gauss_newton::run_foce_gn(
@@ -2567,6 +2699,39 @@ fn fit_inner(
         None
     };
 
+    // SIR fallback: when the FD Hessian is non-PD and covariance_fallback = sir,
+    // run SIR with the rectified |eigenvalue| proposal built inside compute_covariance.
+    let sir_fallback_result = if options.covariance_fallback == CovarianceFallback::Sir
+        && result.covariance_matrix.is_none()
+        && sir_result.is_none()
+        && !crate::cancel::is_cancelled(&options.cancel)
+    {
+        if let Some(ref proposal) = result.sir_fallback_proposal {
+            if options.verbose {
+                eprintln!("\nRunning SIR fallback (non-PD Hessian)...");
+            }
+            match crate::estimation::sir::run_sir_core(
+                model,
+                population,
+                &result.params,
+                &result.eta_hats,
+                proposal,
+                result.ofv,
+                options,
+            ) {
+                Ok(sir) => Some(sir),
+                Err(e) => {
+                    warnings.push(format!("SIR fallback failed: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // `final_method` reports the last *estimating* stage — IMP is a likelihood
     // evaluation and doesn't produce parameters, so a chain like `[saem, imp]`
     // surfaces as `method = SAEM`. The full chain (including IMP) is preserved
@@ -2608,13 +2773,11 @@ fn fit_inner(
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
     // Covariance status
-    let covariance_status = if !options.run_covariance_step {
-        CovarianceStatus::NotRequested
-    } else if result.covariance_matrix.is_some() {
-        CovarianceStatus::Computed
-    } else {
-        CovarianceStatus::Failed
-    };
+    let covariance_status = resolve_covariance_status(
+        options.run_covariance_step,
+        result.covariance_matrix.is_some(),
+        sir_fallback_result.is_some(),
+    );
 
     let wall_time_secs = fit_start.elapsed().as_secs_f64();
 
@@ -2720,11 +2883,27 @@ fn fit_inner(
         interaction: options.interaction,
         warnings,
         warnings_structured: vec![],
-        sir_ci_theta: sir_result.as_ref().map(|s| s.ci_theta.clone()),
-        sir_ci_omega: sir_result.as_ref().map(|s| s.ci_omega.clone()),
-        sir_ci_sigma: sir_result.as_ref().map(|s| s.ci_sigma.clone()),
-        sir_ess: sir_result.as_ref().map(|s| s.effective_sample_size),
-        sir_resamples_packed: sir_result.as_ref().and_then(|s| s.resamples_packed.clone()),
+        // If the normal SIR ran, use that; otherwise use the fallback result.
+        sir_ci_theta: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.ci_theta.clone()),
+        sir_ci_omega: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.ci_omega.clone()),
+        sir_ci_sigma: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.ci_sigma.clone()),
+        sir_ess: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.effective_sample_size),
+        sir_resamples_packed: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .and_then(|s| s.resamples_packed.clone()),
         importance_sampling: is_result,
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
@@ -2782,6 +2961,10 @@ fn fit_inner(
             EstimationMethod::Saem => "saem",
             EstimationMethod::FoceGn => "gn",
             EstimationMethod::FoceGnHybrid => "gn",
+            // IMPMAP never runs the outer optimizer — its M-step uses an internal
+            // BOBYQA regardless of `options.optimizer`, so report that rather than
+            // a setting that had no effect.
+            EstimationMethod::Impmap => "impmap-bobyqa",
             _ => options.optimizer.label(),
         }
         .to_string(),
@@ -2948,6 +3131,28 @@ fn compute_param_corr(
         }
     }
     Some(corr)
+}
+
+/// Resolve the reported [`CovarianceStatus`] from the three signals that
+/// determine it: whether the covariance step was requested, whether it produced
+/// a covariance matrix, and whether the SIR fallback (`covariance_fallback =
+/// sir`) produced a result. Pulled out of `fit()` so the precedence — a real
+/// covariance always wins over a fallback, which wins over a plain failure — is
+/// unit-testable without driving a full fit to a non-PD Hessian.
+fn resolve_covariance_status(
+    run_covariance_step: bool,
+    has_covariance_matrix: bool,
+    has_sir_fallback: bool,
+) -> CovarianceStatus {
+    if !run_covariance_step {
+        CovarianceStatus::NotRequested
+    } else if has_covariance_matrix {
+        CovarianceStatus::Computed
+    } else if has_sir_fallback {
+        CovarianceStatus::SirFallback
+    } else {
+        CovarianceStatus::Failed
+    }
 }
 
 fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
@@ -4453,6 +4658,20 @@ mod iov_integration {
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 
+    // IMPMAP does not yet support IOV; `ferx check` must flag it up front rather
+    // than letting the fit fail at runtime (review finding #3).
+    #[test]
+    fn test_check_model_options_flags_impmap_iov() {
+        let model = make_iov_model();
+        let opts = fast_opts(EstimationMethod::Impmap, Optimizer::Bobyqa, false);
+        let diags = super::check_model_options(&model, &opts);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_IMPMAP_IOV_UNSUPPORTED")
+            .expect("expected E_IMPMAP_IOV_UNSUPPORTED diagnostic");
+        assert!(d.is_error() && d.message.contains("inter-occasion"));
+    }
+
     // On a build without the `autodiff` feature, explicitly requesting AD must
     // error rather than silently running FD. `auto`/`fd` must still pass.
     #[cfg(not(feature = "autodiff"))]
@@ -4812,6 +5031,53 @@ mod tests_cov_diagnostics {
         assert!(
             (cn - 1.0).abs() < 1e-12,
             "condition_number must be 1.0, got {cn}"
+        );
+    }
+
+    // ── resolve_covariance_status ────────────────────────────────────────────
+
+    #[test]
+    fn cov_status_not_requested_when_step_off() {
+        // When the covariance step is off, neither a (stale) covariance matrix
+        // nor a fallback result can change the reported status.
+        assert_eq!(
+            resolve_covariance_status(false, true, true),
+            CovarianceStatus::NotRequested
+        );
+        assert_eq!(
+            resolve_covariance_status(false, false, false),
+            CovarianceStatus::NotRequested
+        );
+    }
+
+    #[test]
+    fn cov_status_computed_takes_precedence_over_fallback() {
+        // A real covariance matrix always wins, even if a fallback also ran.
+        assert_eq!(
+            resolve_covariance_status(true, true, false),
+            CovarianceStatus::Computed
+        );
+        assert_eq!(
+            resolve_covariance_status(true, true, true),
+            CovarianceStatus::Computed
+        );
+    }
+
+    #[test]
+    fn cov_status_sir_fallback_when_no_matrix_but_fallback_ran() {
+        // The branch the SIR-fallback wiring depends on: no H⁻¹ covariance, but
+        // the |eigenvalue|-rectified SIR fallback produced a result.
+        assert_eq!(
+            resolve_covariance_status(true, false, true),
+            CovarianceStatus::SirFallback
+        );
+    }
+
+    #[test]
+    fn cov_status_failed_when_requested_but_nothing_produced() {
+        assert_eq!(
+            resolve_covariance_status(true, false, false),
+            CovarianceStatus::Failed
         );
     }
 }
@@ -5529,6 +5795,34 @@ mod sde_integration {
                 "error message should mention gn: {msg}"
             );
         }
+    }
+
+    /// Issue #175: an SDE ([diffusion]) model must surface the experimental
+    /// feature warning, classified into the `experimental` category. The check
+    /// is data-independent (`check_experimental_features` takes only the model),
+    /// so `ferx check` reports it even without a `--data` file. Fast — no fit.
+    #[test]
+    fn sde_emits_experimental_warning() {
+        let parsed = parse_full_model(SDE_MODEL_SRC).expect("SDE model should parse");
+        let diags = super::check_experimental_features(&parsed.model);
+        let exp = diags
+            .iter()
+            .find(|d| d.code == "W_EXPERIMENTAL_SDE")
+            .expect("SDE model should emit W_EXPERIMENTAL_SDE");
+        assert_eq!(exp.severity, crate::diagnostics::Severity::Warning);
+        assert_eq!(
+            crate::types::classify_warning(&exp.message).category,
+            "experimental"
+        );
+
+        // Sanity: a non-SDE model must NOT emit the experimental warning.
+        let base = parse_full_model(BASE_MODEL_SRC).expect("base model should parse");
+        assert!(
+            super::check_experimental_features(&base.model)
+                .iter()
+                .all(|d| d.code != "W_EXPERIMENTAL_SDE"),
+            "non-SDE model should not emit W_EXPERIMENTAL_SDE"
+        );
     }
 }
 

@@ -1786,20 +1786,17 @@ pub enum IntegralStep {
 
 /// How per-occasion kappa random effects are treated in the IS marginal likelihood.
 ///
-/// `Marginalized` — kappa is jointly sampled with eta (planned v2; not yet implemented).
+/// `Marginalized` — kappa is jointly sampled with eta using a block-diagonal
+/// posterior Hessian. The IS -2LL integrates over both η and κ uncertainty,
+/// making it directly comparable to NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 /// `FixedAtMode` — kappa is held at its EBE (κ̂) and only eta is sampled. This is a
-/// *partial* marginal likelihood that ignores κ uncertainty, so the reported `-2LL`
-/// is biased downward relative to the true marginal and is not directly comparable
-/// to NONMEM's `$EST METHOD=IMP LAPLACIAN=1` on κ.
+/// *partial* marginal likelihood that ignores κ uncertainty. (Legacy; no longer
+/// used for IOV models.)
 /// `NotApplicable` — model has no kappa declarations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KappaTreatment {
     NotApplicable,
     FixedAtMode,
-    // Reserved for joint (eta, kappa) sampling; see TODO(imp-iov-v2) in
-    // `estimation/importance_sampling.rs`. Never constructed by v1 IMP so
-    // `dead_code` would otherwise fire on a strict clippy run.
-    #[allow(dead_code)]
     Marginalized,
 }
 
@@ -1811,7 +1808,9 @@ pub enum KappaTreatment {
 pub struct ImportanceSamplingResult {
     /// `−2 · Σᵢ log p(yᵢ | θ)` estimated by importance sampling. Lower-bias
     /// alternative to the FOCE/Laplace OFV when subject posteriors are
-    /// non-Gaussian (sparse data, strong nonlinearity).
+    /// non-Gaussian (sparse data, strong nonlinearity). For IOV models,
+    /// this uses joint (eta, kappa) sampling and is directly comparable
+    /// to the FOCE OFV.
     pub minus2_log_likelihood: f64,
     /// Monte-Carlo standard error on `minus2_log_likelihood`. Scales with
     /// `1/sqrt(n_samples)`; halve by quadrupling `is_samples`.
@@ -1842,6 +1841,40 @@ pub enum CovarianceStatus {
     Computed,
     /// Step was attempted but failed (e.g. singular Hessian).
     Failed,
+    /// FD Hessian was non-PD; SIR was run as a fallback and succeeded.
+    SirFallback,
+}
+
+/// What to do when the covariance step produces a non-positive-definite Hessian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CovarianceFallback {
+    /// Do nothing; leave the covariance step as failed (default).
+    #[default]
+    None,
+    /// Run SIR with a proposal built from the rectified (|eigenvalue|) Hessian,
+    /// inflated 4× for heavier tails. Parameter uncertainty is then reported as
+    /// 95% credible intervals from the SIR posterior quantiles instead of
+    /// `H⁻¹`-based standard errors.
+    Sir,
+}
+
+/// Which estimator to use for the parameter covariance matrix, mirroring
+/// NONMEM's `$COVARIANCE MATRIX=` options. All three share the same FD Hessian
+/// `R` (the observed information) and per-subject score cross-product
+/// `S = Σᵢ gᵢgᵢᵀ`; they differ only in how those are combined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CovarianceMethod {
+    /// `R⁻¹` — inverse observed-information (Hessian) matrix. The model-based
+    /// covariance; assumes the model is correctly specified (default, NONMEM
+    /// `MATRIX=R`).
+    #[default]
+    Hessian,
+    /// `S⁻¹` — inverse cross-product (outer-product-of-gradients) matrix. The
+    /// empirical-information covariance (NONMEM `MATRIX=S`).
+    CrossProduct,
+    /// `R⁻¹ S R⁻¹` — the Huber–White "sandwich". Robust to model
+    /// mis-specification; NONMEM's default (`MATRIX=RSR`).
+    Sandwich,
 }
 
 /// Severity level for a structured warning entry.
@@ -1860,8 +1893,8 @@ pub enum WarningSeverity {
 /// `bloq_method`, `sir`, `importance_sampling`, `data_quality`,
 /// `omega_structure`, `ebe_convergence`, `gradient_fallback`,
 /// `mu_referencing`, `optimizer_config`, `multi_start`, `cancelled`,
-/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`, `general`
-/// (fallback for unrecognised messages).
+/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`,
+/// `experimental`, `general` (fallback for unrecognised messages).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WarningEntry {
     pub severity: WarningSeverity,
@@ -1938,6 +1971,10 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, "dw_autocorrelation")
     } else if lower.contains("shapiro") || lower.contains("non-normal") {
         (WarningSeverity::Warning, "eta_normality")
+    } else if lower.contains("experimental feature") {
+        // Experimental-feature notices (issue #175): SDE and neural-network
+        // components emit a runtime warning so results are applied with caution.
+        (WarningSeverity::Warning, "experimental")
     } else if lower.contains("m3 bloq") || lower.contains("bloq handling") {
         (WarningSeverity::Warning, "bloq_method")
     } else if lower.contains("sir failed") || lower.contains("sir requested") {
@@ -2316,12 +2353,23 @@ pub struct FitOptions {
     pub inner_maxiter: usize,
     pub inner_tol: f64,
     pub run_covariance_step: bool,
-    /// Relative step size for the finite-difference Hessian in the covariance step.
-    /// The actual step for parameter i is `fd_hessian_step * (1 + |x_hat[i]|)`.
-    /// Default `1e-2`. Increase (e.g. `0.1`) when the default produces non-finite
-    /// Hessian entries; decrease (e.g. `1e-3`) for smoother OFV surfaces where
-    /// FD noise is the main concern.
+    /// *Initial* relative step size for the finite-difference Hessian in the
+    /// covariance step. The actual step for parameter i is
+    /// `fd_hessian_step * (1 + |x_hat[i]|)`. Default `1e-2`. ferx halves this
+    /// automatically (up to 8×) if a diagonal stencil comes back non-finite, so
+    /// manual tuning is rarely needed for overflow; decrease (e.g. `1e-3`) for
+    /// smoother OFV surfaces where FD noise is the main concern.
     pub fd_hessian_step: f64,
+    /// What to do when the FD Hessian is non-positive-definite.
+    /// Default [`CovarianceFallback::None`] leaves the covariance step as failed.
+    /// [`CovarianceFallback::Sir`] runs SIR with a fallback proposal covariance
+    /// built from the rectified (`|eigenvalue|`) Hessian, inflated 4×.
+    pub covariance_fallback: CovarianceFallback,
+    /// Which covariance estimator to assemble, mirroring NONMEM `$COV MATRIX=`.
+    /// Default [`CovarianceMethod::Hessian`] (`R⁻¹`). [`CovarianceMethod::CrossProduct`]
+    /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
+    /// score cross-product `S`; currently supported for FOCEI and IOV fits.
+    pub covariance_method: CovarianceMethod,
     pub interaction: bool,
     pub verbose: bool,
     pub optimizer: Optimizer,
@@ -2394,6 +2442,29 @@ pub struct FitOptions {
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
     pub is_low_ess_threshold: f64,
+    // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
+    // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
+    // loop: each iteration re-centers a per-subject importance-sampling proposal
+    // at the freshly-computed conditional mode (MAP) and first-order variance,
+    // then updates θ/Ω/σ from the importance-weighted posterior moments.
+    /// Number of MCEM iterations (M-step parameter updates). Default 200.
+    pub impmap_iterations: usize,
+    /// Importance samples drawn per subject per iteration (K). Default 300.
+    /// Larger K reduces Monte-Carlo noise in the M-step at linear cost.
+    pub impmap_samples: usize,
+    /// Proposal degrees of freedom. `f64::INFINITY` selects a multivariate
+    /// normal proposal (NONMEM's IMPMAP default; parsed from `normal`); a finite
+    /// value selects a heavier-tailed Student-t. Default `INFINITY` (MVN).
+    pub impmap_proposal_df: f64,
+    /// RNG seed for the IMPMAP sampling. `None` falls back to a fixed default so
+    /// runs are reproducible across invocations.
+    pub impmap_seed: Option<u64>,
+    /// Number of terminal iterations whose parameters are averaged to form the
+    /// reported estimate (Monte-Carlo variance reduction). Default 50.
+    pub impmap_averaging: usize,
+    /// Subjects whose normalized effective sample size (ESS / K) falls below
+    /// this fraction are flagged as poorly-sampled. Default 0.1.
+    pub impmap_low_ess_threshold: f64,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -2558,6 +2629,8 @@ impl Default for FitOptions {
             inner_tol: 1e-4,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
+            covariance_fallback: CovarianceFallback::None,
+            covariance_method: CovarianceMethod::Hessian,
             interaction: true,
             verbose: true,
             // BOBYQA — derivative-free quadratic trust-region. Chosen as the
@@ -2591,6 +2664,12 @@ impl Default for FitOptions {
             is_proposal_df: 5.0,
             is_seed: None,
             is_low_ess_threshold: 0.1,
+            impmap_iterations: 200,
+            impmap_samples: 300,
+            impmap_proposal_df: f64::INFINITY,
+            impmap_seed: None,
+            impmap_averaging: 50,
+            impmap_low_ess_threshold: 0.1,
             bloq_method: BloqMethod::Drop,
             steihaug_max_iters: None,
             mu_referencing: true,
@@ -2701,6 +2780,13 @@ pub enum EstimationMethod {
     /// scale) and is typically terminal. Reports `−2 log L_IS` on
     /// `FitResult.importance_sampling`, distinct from the Laplace OFV on `ofv`.
     Imp,
+    /// Importance Sampling assisted by Mode A Posteriori (NONMEM `METHOD=IMPMAP`).
+    /// Unlike [`Imp`](Self::Imp), this *is* an estimator: a Monte-Carlo EM loop
+    /// whose E-step re-evaluates each subject's conditional mode and first-order
+    /// variance every iteration (as in FOCE/ITS) to center a multivariate-normal
+    /// importance-sampling proposal, and whose M-step updates θ/Ω/σ from the
+    /// importance-weighted posterior moments.
+    Impmap,
 }
 
 impl EstimationMethod {
@@ -2712,6 +2798,7 @@ impl EstimationMethod {
             EstimationMethod::FoceGnHybrid => "FOCE-GN-Hybrid",
             EstimationMethod::Saem => "SAEM",
             EstimationMethod::Imp => "IMP",
+            EstimationMethod::Impmap => "IMPMAP",
         }
     }
 }
@@ -2874,6 +2961,16 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "is_proposal_df",
             "is_seed",
             "is_low_ess_threshold",
+        ],
+        EstimationMethod::Impmap => &[
+            "inner_maxiter",
+            "inner_tol",
+            "impmap_iterations",
+            "impmap_samples",
+            "impmap_proposal_df",
+            "impmap_seed",
+            "impmap_averaging",
+            "impmap_low_ess_threshold",
         ],
     }
 }
@@ -3158,6 +3255,18 @@ mod tests {
                 "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
                 Warning,
                 "data_quality",
+            ),
+            (
+                "Stochastic differential equations ([diffusion] / Extended Kalman \
+                 Filter) are an EXPERIMENTAL feature: validated only on a small set",
+                Warning,
+                "experimental",
+            ),
+            (
+                "Neural-network model components ([covariate_nn] / deep compartment \
+                 models) are an EXPERIMENTAL feature: validated only on a small set",
+                Warning,
+                "experimental",
             ),
             (
                 "block omega: ETA_CL x ETA_V have mixed lognormal / additive parameterisations",

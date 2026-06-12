@@ -1,5 +1,7 @@
 # `[covariate_nn]` — Deep Compartment Models (DCM)
 
+> **Maturity: experimental** — see [Feature Maturity](../maturity.md) for what this means.
+
 A `[covariate_nn]` block replaces the **typical-value covariate model** with
 a small feed-forward neural network. Instead of writing
 

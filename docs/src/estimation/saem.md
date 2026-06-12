@@ -1,5 +1,7 @@
 # SAEM
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 Stochastic Approximation Expectation-Maximization (SAEM) is an alternative estimation method that uses MCMC sampling for random effects instead of MAP optimization. It is more robust to local minima and can handle complex random effect structures, including models with **inter-occasion variability (IOV)**.
 
 ## Algorithm Overview

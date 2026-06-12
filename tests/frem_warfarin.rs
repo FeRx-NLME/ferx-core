@@ -24,6 +24,11 @@ const BASE_MODEL: &str = r#"
 
   sigma PROP_ERR ~ 0.02
 
+[covariates]
+  WT  continuous
+  AGE continuous
+
+
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
   V  = TVV  * exp(ETA_V)
@@ -296,5 +301,78 @@ fn frem_covariate_omega_matches_sample_variance() {
     assert!(
         age_pct < 15.0,
         "AGE omega diag ({age_var:.2}) should be within 15% of sample var ({age_expected:.2}), got {age_pct:.1}%"
+    );
+}
+
+/// Regression test: under SAEM, adding FREM covariates must NOT shrink the PK
+/// residual error. Before the FREM-aware residual override, SAEM scored the
+/// covariate pseudo-observations with the PK error model; their near-zero
+/// residuals dragged PROP_ERR toward zero. Here we fit the same PK model with
+/// and without FREM (both SAEM, same seed) and require the PK residual error to
+/// be essentially unchanged.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn frem_saem_does_not_collapse_pk_residual_error() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let saem_opts = || {
+        let mut o = FitOptions::default();
+        o.method = ferx_core::EstimationMethod::Saem;
+        o.saem_n_exploration = 500;
+        o.saem_n_convergence = 800;
+        o.saem_seed = Some(20260611);
+        o.run_covariance_step = false;
+        o.verbose = false;
+        o
+    };
+
+    let prop_err = |fit: &ferx_core::FitResult| -> f64 {
+        let idx = fit
+            .sigma_names
+            .iter()
+            .position(|n| n == "PROP_ERR")
+            .expect("PROP_ERR sigma must exist");
+        fit.sigma[idx]
+    };
+
+    // Base PK fit (no FREM).
+    let base_model_path = tmp.path().join("warfarin_base.ferx");
+    std::fs::write(&base_model_path, BASE_MODEL).unwrap();
+    let base_data = write_warfarin_with_covariates(tmp.path());
+    let base_model = parse_model_file(&base_model_path).unwrap();
+    let base_pop = read_nonmem_csv(&base_data, None, None).unwrap();
+    let base_fit = fit(
+        &base_model,
+        &base_pop,
+        &base_model.default_params,
+        &saem_opts(),
+    )
+    .expect("base SAEM fit should succeed");
+    let base_prop = prop_err(&base_fit);
+
+    // FREM fit (same PK model + 2 covariates).
+    let frem = setup_frem(tmp.path());
+    let frem_model = parse_model_file(&frem.model_path).unwrap();
+    let frem_pop = read_nonmem_csv(&frem.data_path, None, None).unwrap();
+    let frem_fit = fit(
+        &frem_model,
+        &frem_pop,
+        &frem_model.default_params,
+        &saem_opts(),
+    )
+    .expect("FREM SAEM fit should succeed");
+    let frem_prop = prop_err(&frem_fit);
+
+    assert!(base_prop.is_finite() && base_prop > 0.0);
+    // The PK residual error must not collapse: it should stay close to the base
+    // fit (the bug drove it to <0.3x). Generous band to tolerate SAEM noise.
+    let ratio = frem_prop / base_prop;
+    assert!(
+        (0.7..1.4).contains(&ratio),
+        "FREM PK PROP_ERR ({frem_prop:.4}) should be ~ base ({base_prop:.4}); ratio {ratio:.2} \
+         — a collapse toward 0 indicates covariate rows are scored with the PK error model"
     );
 }

@@ -72,7 +72,7 @@ Three files are always generated, named after the model file:
 | File | Contents |
 |------|----------|
 | `{model}-sdtab.csv` | Per-observation diagnostics |
-| `{model}-fit.yaml` | Parameter estimates and standard errors |
+| `{model}-fit.yaml` | Parameter estimates, standard errors, and (when the covariance step ran) a `covariance_matrix:` block containing the full optimizer-space parameter covariance matrix |
 | `{model}-timing.txt` | Wall-clock estimation time |
 
 See [Output Files](output.md) for detailed format descriptions.

@@ -1,5 +1,7 @@
 # Outer Optimizers
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.md) for what this means.
+
 The **outer optimizer** is the algorithm that minimises the population objective function (OFV) over the transformed parameter vector `[log θ, chol(Ω), log σ]`.
 
 It only applies to methods that *have* a single outer-loop minimisation over that vector:

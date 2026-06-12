@@ -1,5 +1,7 @@
 # Inter-Occasion Variability (IOV)
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 Inter-Occasion Variability (IOV) models the fact that a subject's PK parameters may shift between occasions (treatment periods, study visits, dosing intervals). Unlike between-subject variability (BSV), which is fixed for a subject across the whole study, IOV is a random effect that is re-drawn for each occasion.
 
 ## Concepts

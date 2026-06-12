@@ -1,5 +1,7 @@
 # Simulation
 
+> **Maturity: stable** — see [Feature Maturity](../maturity.md) for what this means.
+
 The optional `[simulation]` block defines a virtual clinical trial design for generating simulated data. This is useful for model validation and testing.
 
 ## Syntax

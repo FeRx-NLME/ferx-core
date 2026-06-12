@@ -1,6 +1,7 @@
 # Summary
 
 - [Introduction](introduction.md)
+- [Feature Maturity](maturity.md)
 - [Getting Started](getting-started.md)
   - [Installation](installation.md)
   - [Quick Start](quick-start.md)
@@ -31,6 +32,8 @@
   - [SAEM](estimation/saem.md)
   - [SIR](estimation/sir.md)
   - [Importance Sampling (IMP)](estimation/importance-sampling.md)
+  - [FREM (Covariate Analysis)](estimation/frem.md)
+  - [IMPMAP](estimation/impmap.md)
   - [Outer Optimizers](estimation/optimizers.md)
   - [Time-to-Event (TTE)](estimation/tte.md)
 - [Data Format](data-format.md)
@@ -55,6 +58,7 @@
   - [ODE with Lag Time](examples/ode-lagtime.md)
   - [Transit Absorption](examples/transit-absorption.md)
   - [Stochastic Differential Equations](examples/sde.md)
+  - [FREM (Covariate Analysis)](examples/frem.md)
   - [Multi-Start (Michaelis-Menten)](examples/multistart.md)
 - [Rust API](api/README.md)
   - [Core Types](api/types.md)
