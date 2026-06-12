@@ -98,6 +98,23 @@ fn impmap_rejects_iov_models() {
     );
 }
 
+#[test]
+fn impmap_rejects_invalid_proposal_df() {
+    // A programmatic caller can set impmap_proposal_df directly, bypassing the
+    // parser's range check. A finite df < 1 must return a clean Err, not panic
+    // in the ChiSquared proposal sampler.
+    let (model, population, mut opts) = warfarin_setup();
+    opts.method = EstimationMethod::Impmap;
+    opts.impmap_proposal_df = 0.0;
+    let err = fit(&model, &population, &model.default_params, &opts)
+        .err()
+        .expect("impmap_proposal_df = 0 must be rejected");
+    assert!(
+        err.contains("impmap_proposal_df"),
+        "expected impmap_proposal_df error, got: {err}"
+    );
+}
+
 /// Tier 3 — full convergence. IMPMAP should recover the FOCEI solution on
 /// warfarin (the Laplace approximation is accurate for this well-sampled model,
 /// so the MCEM marginal and the FOCEI Laplace estimates agree). Gated behind

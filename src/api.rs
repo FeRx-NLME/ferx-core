@@ -634,6 +634,17 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+        if chain.iter().any(|&m| m == EstimationMethod::Impmap) {
+            diags.push(
+                Diagnostic::error(
+                    "E_SDE_INCOMPATIBLE",
+                    "method = impmap is not compatible with a [diffusion] block. \
+                     The EKF process-noise variance is not threaded through the IMPMAP \
+                     importance-sampling likelihood. Use method = foce or method = focei.",
+                )
+                .with_block("fit_options"),
+            );
+        }
         if options.gradient_method == crate::types::GradientMethod::Ad {
             diags.push(
                 Diagnostic::error(
@@ -644,6 +655,21 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+    }
+
+    // IMPMAP does not yet support inter-occasion variability (κ / [iov]); the κ
+    // sufficient statistics and Ω_iov M-step are a planned follow-up. Surface it
+    // at check time so `ferx check` rejects it rather than the fit failing at
+    // runtime (possibly after a chained warm-up stage has already run).
+    if model.n_kappa > 0 && chain.iter().any(|&m| m == EstimationMethod::Impmap) {
+        diags.push(
+            Diagnostic::error(
+                "E_IMPMAP_IOV_UNSUPPORTED",
+                "method = impmap does not yet support inter-occasion variability \
+                 (κ / [iov]). Use method = saem or method = focei for IOV models.",
+            )
+            .with_block("fit_options"),
+        );
     }
 
     // Explicit `gradient_method = ad` on a build compiled WITHOUT the `autodiff`
@@ -2894,6 +2920,10 @@ fn fit_inner(
             EstimationMethod::Saem => "saem",
             EstimationMethod::FoceGn => "gn",
             EstimationMethod::FoceGnHybrid => "gn",
+            // IMPMAP never runs the outer optimizer — its M-step uses an internal
+            // BOBYQA regardless of `options.optimizer`, so report that rather than
+            // a setting that had no effect.
+            EstimationMethod::Impmap => "impmap-bobyqa",
             _ => options.optimizer.label(),
         }
         .to_string(),
@@ -4583,6 +4613,20 @@ mod iov_integration {
         // A compatible optimizer produces no compatibility diagnostics.
         let ok_opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
+    }
+
+    // IMPMAP does not yet support IOV; `ferx check` must flag it up front rather
+    // than letting the fit fail at runtime (review finding #3).
+    #[test]
+    fn test_check_model_options_flags_impmap_iov() {
+        let model = make_iov_model();
+        let opts = fast_opts(EstimationMethod::Impmap, Optimizer::Bobyqa, false);
+        let diags = super::check_model_options(&model, &opts);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_IMPMAP_IOV_UNSUPPORTED")
+            .expect("expected E_IMPMAP_IOV_UNSUPPORTED diagnostic");
+        assert!(d.is_error() && d.message.contains("inter-occasion"));
     }
 
     // On a build without the `autodiff` feature, explicitly requesting AD must

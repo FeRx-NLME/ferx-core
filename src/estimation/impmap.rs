@@ -126,7 +126,16 @@ pub fn run_impmap(
 
     let n_iter = options.impmap_iterations.max(1);
     let k_samples = options.impmap_samples.max(2);
+    // `INFINITY` selects the multivariate-normal proposal; any finite value must
+    // be a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
+    // bypasses the parser's range check can't reach the `ChiSquared::new(nu)`
+    // panic in `subject_is_draws`. Mirrors `run_importance_sampling`.
     let nu = options.impmap_proposal_df;
+    if nu.is_finite() && nu < 1.0 {
+        return Err(format!(
+            "IMPMAP: impmap_proposal_df must be >= 1.0 (or +inf for a normal proposal), got {nu}"
+        ));
+    }
     let n_avg = options.impmap_averaging.min(n_iter);
     let seed = options.impmap_seed.unwrap_or(12345);
     let threshold = options.impmap_low_ess_threshold;
@@ -532,7 +541,12 @@ pub fn run_impmap(
     Ok(OuterResult {
         params: final_params,
         ofv,
-        converged: true,
+        // IMPMAP runs a fixed iteration schedule (no parameter-stabilization
+        // stopping test yet), so the only convergence signal we can honestly
+        // report is a finite final objective — a non-finite OFV means the MCEM
+        // diverged. Matches SAEM's `converged: ofv.is_finite()`; importantly it
+        // keeps a diverged run from being preferred in multi-start selection.
+        converged: ofv.is_finite(),
         n_iterations: n_iter,
         eta_hats,
         h_matrices,
