@@ -40,6 +40,8 @@ pub struct OuterResult {
     /// Hessian, inflated 4×, and embedded into the full packed parameter space.
     /// `None` when the Hessian succeeded or the covariance step was skipped.
     pub sir_fallback_proposal: Option<DMatrix<f64>>,
+    /// Per-iteration parameter trace from IMPMAP. `None` for all other methods.
+    pub impmap_trace: Option<crate::types::ImpmapTrace>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1280,6 +1282,7 @@ fn optimize_nlopt(
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
         final_gradient,
         sir_fallback_proposal,
+        impmap_trace: None,
     }
 }
 
@@ -1612,6 +1615,7 @@ fn optimize_bfgs(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        impmap_trace: None,
     }
 }
 

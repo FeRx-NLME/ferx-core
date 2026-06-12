@@ -2401,6 +2401,7 @@ fn fit_inner(
                     total_ebe_fallbacks: 0,
                     final_gradient: None,
                     sir_fallback_proposal: None,
+                    impmap_trace: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -2912,6 +2913,7 @@ fn fit_inner(
             .or(sir_fallback_result.as_ref())
             .and_then(|s| s.resamples_packed.clone()),
         importance_sampling: is_result,
+        impmap_trace: result.impmap_trace.clone(),
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
@@ -5368,6 +5370,7 @@ mod simulate_with_uncertainty_tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            impmap_trace: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],

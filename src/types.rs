@@ -1832,6 +1832,38 @@ pub struct ImportanceSamplingResult {
     pub kappa_treatment: KappaTreatment,
 }
 
+/// One row of the IMPMAP per-iteration parameter trace.
+///
+/// Analogous to one line in NONMEM's `.ext` file for `METHOD=IMPMAP`.
+/// Positive `iteration` values are EM iterations; special negative values
+/// mark the final (averaged) estimate and standard errors.
+#[derive(Debug, Clone)]
+pub struct ImpmapTraceRow {
+    /// EM iteration number (1-based). Special values:
+    /// `-1_000_000_000` = final averaged estimate,
+    /// `-1_000_000_001` = standard errors (when covariance step ran).
+    pub iteration: i64,
+    pub theta: Vec<f64>,
+    /// Lower triangle of the omega matrix, row-major: `(0,0), (1,0), (1,1), …`
+    pub omega_lower_tri: Vec<f64>,
+    pub sigma: Vec<f64>,
+    /// Objective function value (−2·log-likelihood from importance sampling).
+    pub ofv: f64,
+}
+
+/// Per-iteration parameter trace from IMPMAP, analogous to NONMEM `.ext`.
+///
+/// Surfaced on `FitResult.impmap_trace` when the final estimating stage is
+/// IMPMAP. Column names follow NONMEM convention (`THETA1`, `OMEGA(1,1)`, …).
+#[derive(Debug, Clone, Default)]
+pub struct ImpmapTrace {
+    pub rows: Vec<ImpmapTraceRow>,
+    pub theta_names: Vec<String>,
+    /// e.g. `"OMEGA(1,1)"`, `"OMEGA(2,1)"`, `"OMEGA(2,2)"`, …
+    pub omega_names: Vec<String>,
+    pub sigma_names: Vec<String>,
+}
+
 /// Outcome of the post-estimation covariance step.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CovarianceStatus {
@@ -2106,6 +2138,9 @@ pub struct FitResult {
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
     pub importance_sampling: Option<ImportanceSamplingResult>,
+    /// Per-iteration IMPMAP parameter trace, analogous to NONMEM `.ext` file
+    /// output. `Some` when the final estimating stage was IMPMAP.
+    pub impmap_trace: Option<ImpmapTrace>,
     // IOV results (present when kappa declarations exist in the model)
     pub omega_iov: Option<DMatrix<f64>>,
     pub kappa_names: Vec<String>,
@@ -2465,6 +2500,9 @@ pub struct FitOptions {
     /// Subjects whose normalized effective sample size (ESS / K) falls below
     /// this fraction are flagged as poorly-sampled. Default 0.1.
     pub impmap_low_ess_threshold: f64,
+    /// When `true`, IMPMAP collects per-iteration parameter values into
+    /// `FitResult.impmap_trace` (analogous to NONMEM `.ext` output). Default `false`.
+    pub impmap_trace: bool,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -2670,6 +2708,7 @@ impl Default for FitOptions {
             impmap_seed: None,
             impmap_averaging: 50,
             impmap_low_ess_threshold: 0.1,
+            impmap_trace: false,
             bloq_method: BloqMethod::Drop,
             steihaug_max_iters: None,
             mu_referencing: true,

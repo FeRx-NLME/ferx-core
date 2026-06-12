@@ -3220,6 +3220,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.impmap_low_ess_threshold = v;
         }
+        "impmap_trace" => opts.impmap_trace = parse_bool("impmap_trace")?,
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
             opts.bloq_method = match value.to_lowercase().as_str() {

@@ -149,6 +149,7 @@ stage:
 | `impmap_averaging` | `50` | Final iterations whose parameters are averaged into the reported estimate (Monte-Carlo variance reduction). |
 | `impmap_seed` | `12345` | RNG seed. Same seed → identical estimates. |
 | `impmap_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction are flagged as poorly sampled. |
+| `impmap_trace` | `false` | When `true`, collect per-iteration parameter values into `FitResult.impmap_trace` — analogous to NONMEM `.ext` output for traceplots. |
 
 `impmap` reuses `inner_maxiter` / `inner_tol` for the per-iteration MAP step.
 Inter-occasion variability (`[iov]` / `kappa`) and SDE (`[diffusion]`) models

@@ -2128,6 +2128,7 @@ pub fn run_saem(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        impmap_trace: None,
     })
 }
 

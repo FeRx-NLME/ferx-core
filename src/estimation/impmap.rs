@@ -253,6 +253,14 @@ pub fn run_impmap(
 
     let mut last_eta_hats: Vec<DVector<f64>> = Vec::new();
 
+    // ---- Trace: collect per-iteration parameters (analogous to NONMEM .ext) ----
+    let collect_trace = options.impmap_trace;
+    let mut trace_rows: Vec<ImpmapTraceRow> = if collect_trace {
+        Vec::with_capacity(n_iter + 2)
+    } else {
+        Vec::new()
+    };
+
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             if verbose {
@@ -345,6 +353,17 @@ pub fn run_impmap(
             }
         }
         let minus2ll = -2.0 * ll;
+
+        // Record this iteration's parameters for the trace (opt-in).
+        if collect_trace {
+            trace_rows.push(ImpmapTraceRow {
+                iteration: k as i64,
+                theta: theta_cur.clone(),
+                omega_lower_tri: lower_triangle(&omega_mat),
+                sigma: sigma_cur.clone(),
+                ofv: minus2ll,
+            });
+        }
 
         // ---- M-step Ω: weighted second moment, structurally masked + floored ----
         let mut new_omega = DMatrix::<f64>::zeros(n_eta, n_eta);
@@ -550,6 +569,69 @@ pub fn run_impmap(
             None
         };
 
+    // ---- Finalize trace ----
+    let impmap_trace = if collect_trace {
+        // Append final (averaged) estimate row.
+        trace_rows.push(ImpmapTraceRow {
+            iteration: -1_000_000_000,
+            theta: final_params.theta.clone(),
+            omega_lower_tri: lower_triangle(&final_params.omega.matrix),
+            sigma: final_params.sigma.values.clone(),
+            ofv,
+        });
+        // Append SE row when the covariance step succeeded.
+        if let Some(ref cov) = covariance_matrix {
+            let se: Vec<f64> = (0..cov.nrows()).map(|i| cov[(i, i)].sqrt()).collect();
+            // Unpack SEs into theta / omega-LT / sigma segments, mirroring
+            // pack_params layout: [theta..., cholesky-omega..., sigma...].
+            let n_free_theta = final_params.theta.len();
+            let n_omega_lt = lower_triangle(&final_params.omega.matrix).len();
+            let n_free_sigma = final_params.sigma.values.len();
+            let se_theta: Vec<f64> = se.iter().take(n_free_theta).copied().collect();
+            let se_omega: Vec<f64> = se
+                .iter()
+                .skip(n_free_theta)
+                .take(n_omega_lt)
+                .copied()
+                .collect();
+            let se_sigma: Vec<f64> = se
+                .iter()
+                .skip(n_free_theta + n_omega_lt)
+                .take(n_free_sigma)
+                .copied()
+                .collect();
+            trace_rows.push(ImpmapTraceRow {
+                iteration: -1_000_000_001,
+                theta: se_theta,
+                omega_lower_tri: se_omega,
+                sigma: se_sigma,
+                ofv: 0.0,
+            });
+        }
+
+        // Build column names following NONMEM convention.
+        let theta_names: Vec<String> = (1..=n_theta).map(|i| format!("THETA{i}")).collect();
+        let omega_names: Vec<String> = {
+            let mut names = Vec::new();
+            for i in 0..n_eta {
+                for j in 0..=i {
+                    names.push(format!("OMEGA({},{})", i + 1, j + 1));
+                }
+            }
+            names
+        };
+        let sigma_names: Vec<String> = (1..=n_sigma).map(|i| format!("SIGMA({i},{i})")).collect();
+
+        Some(ImpmapTrace {
+            rows: trace_rows,
+            theta_names,
+            omega_names,
+            sigma_names,
+        })
+    } else {
+        None
+    };
+
     if verbose {
         eprintln!("IMPMAP completed. Final OFV (Laplace) = {:.4}", ofv);
     }
@@ -576,7 +658,21 @@ pub fn run_impmap(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        impmap_trace,
     })
+}
+
+/// Extract the lower triangle of a square matrix in row-major order:
+/// `(0,0), (1,0), (1,1), (2,0), (2,1), (2,2), …`
+fn lower_triangle(m: &DMatrix<f64>) -> Vec<f64> {
+    let n = m.nrows();
+    let mut out = Vec::with_capacity(n * (n + 1) / 2);
+    for i in 0..n {
+        for j in 0..=i {
+            out.push(m[(i, j)]);
+        }
+    }
+    out
 }
 
 /// Weighted θ/σ M-step: minimize the importance-weighted observation NLL

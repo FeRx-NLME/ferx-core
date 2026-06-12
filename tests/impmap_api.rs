@@ -189,6 +189,63 @@ fn impmap_converges_with_mu_referencing_off() {
 }
 
 #[test]
+fn impmap_trace_collected_when_enabled() {
+    let (model, population, mut opts) = warfarin_setup();
+    opts.method = EstimationMethod::Impmap;
+    opts.impmap_trace = true;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("impmap with trace must produce a fit");
+
+    let trace = result
+        .impmap_trace
+        .as_ref()
+        .expect("impmap_trace should be Some when impmap_trace = true");
+
+    // 12 iteration rows + 1 final row (no covariance → no SE row).
+    assert_eq!(
+        trace.rows.len(),
+        13,
+        "expected 12 iter rows + 1 final row, got {}",
+        trace.rows.len()
+    );
+    assert_eq!(trace.rows[0].iteration, 1);
+    assert_eq!(trace.rows[11].iteration, 12);
+    assert_eq!(trace.rows[12].iteration, -1_000_000_000);
+
+    // Column name counts.
+    assert_eq!(trace.theta_names.len(), 3); // TVCL, TVV, TVKA
+    assert_eq!(trace.sigma_names.len(), 1); // proportional sigma
+                                            // 3 etas → 6 lower-triangle elements: (1,1),(2,1),(2,2),(3,1),(3,2),(3,3)
+    assert_eq!(trace.omega_names.len(), 6);
+
+    // Every row has the right shape and finite values.
+    for row in &trace.rows {
+        assert!(
+            row.ofv.is_finite(),
+            "OFV must be finite at iter {}",
+            row.iteration
+        );
+        assert_eq!(row.theta.len(), 3);
+        assert_eq!(row.omega_lower_tri.len(), 6);
+        assert_eq!(row.sigma.len(), 1);
+    }
+}
+
+#[test]
+fn impmap_trace_absent_when_disabled() {
+    let (model, population, mut opts) = warfarin_setup();
+    opts.method = EstimationMethod::Impmap;
+    // impmap_trace defaults to false
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("impmap without trace must produce a fit");
+
+    assert!(
+        result.impmap_trace.is_none(),
+        "impmap_trace should be None when impmap_trace = false"
+    );
+}
+
+#[test]
 fn impmap_rejects_invalid_proposal_df() {
     // A programmatic caller can set impmap_proposal_df directly, bypassing the
     // parser's range check. A finite df < 1 must return a clean Err, not panic

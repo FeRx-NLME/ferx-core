@@ -20,6 +20,8 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Per-iteration IMPMAP parameter trace (`FitResult.impmap_trace`), analogous to
+  NONMEM `.ext` file output. Opt-in via `impmap_trace = true` in `[fit_options]`.
 - FREM (Full Random Effects Model) covariate analysis: `prepare_frem()` API
   transforms a base model + dataset into a FREM model with extended block omega,
   covariate pseudo-observations, and FREMTYPE dispatch in the likelihood. The
