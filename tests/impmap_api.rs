@@ -77,6 +77,65 @@ fn focei_then_impmap_chain_runs() {
     assert!(result.ofv.is_finite());
 }
 
+/// FOCEI → IMPMAP → IMP chain: the EONLY-equivalent workflow.
+/// IMPMAP should compute covariance (it is the last *estimating* stage),
+/// and IMP should produce an IS-likelihood evaluation at IMPMAP's parameters.
+#[test]
+fn focei_impmap_imp_chain_produces_covariance_and_is_result() {
+    let (model, population, mut opts) = warfarin_setup();
+    opts.methods = vec![
+        EstimationMethod::FoceI,
+        EstimationMethod::Impmap,
+        EstimationMethod::Imp,
+    ];
+    opts.outer_maxiter = 25;
+    opts.run_covariance_step = true;
+    opts.is_samples = 200;
+    opts.is_proposal_df = 5.0;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("focei → impmap → imp chain must produce a fit");
+
+    // IMPMAP is the last estimator; IMP is evaluation-only.
+    assert_eq!(result.method, EstimationMethod::Impmap);
+    assert_eq!(
+        result.method_chain,
+        vec![
+            EstimationMethod::FoceI,
+            EstimationMethod::Impmap,
+            EstimationMethod::Imp,
+        ]
+    );
+    assert!(result.ofv.is_finite());
+
+    // Covariance must be present (computed by IMPMAP, the last estimating stage).
+    assert!(
+        matches!(
+            result.covariance_status,
+            ferx_core::CovarianceStatus::Computed | ferx_core::CovarianceStatus::SirFallback
+        ),
+        "covariance should succeed when IMPMAP precedes IMP, got {:?}",
+        result.covariance_status
+    );
+
+    // IS result must be populated (from the IMP evaluation stage).
+    assert!(
+        result.importance_sampling.is_some(),
+        "importance_sampling result should be populated from IMP stage"
+    );
+    let is = result.importance_sampling.as_ref().unwrap();
+    assert!(
+        is.minus2_log_likelihood.is_finite(),
+        "IS -2LL should be finite, got {}",
+        is.minus2_log_likelihood
+    );
+
+    // SE should be present (extracted from covariance).
+    assert!(
+        result.se_theta.as_ref().map_or(false, |v| !v.is_empty()),
+        "SE(theta) should be available from IMPMAP covariance"
+    );
+}
+
 #[test]
 fn impmap_rejects_iov_models() {
     let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))

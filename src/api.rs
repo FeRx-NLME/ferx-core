@@ -2327,8 +2327,15 @@ fn fit_inner(
             EstimationMethod::Foce => stage_opts.interaction = false,
             _ => {}
         }
-        // Only run the covariance step on the final stage to avoid wasted work.
-        if !is_last {
+        // Run the covariance step on the last *estimating* stage. IMP is a
+        // likelihood evaluation (NONMEM EONLY=1 equivalent), not an estimator,
+        // so when IMP follows an estimator the preceding stage is effectively
+        // the final estimating stage and should compute covariance / SIR.
+        let is_last_estimating = is_last
+            || chain[stage_idx + 1..]
+                .iter()
+                .all(|&m| m == EstimationMethod::Imp);
+        if !is_last_estimating {
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
         }
