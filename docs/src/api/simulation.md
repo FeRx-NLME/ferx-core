@@ -49,6 +49,90 @@ pub fn simulate_with_seed(
 ) -> Vec<SimulationResult>
 ```
 
+## `simulate_with_options()` — propensity-score matching
+
+Same outputs as `simulate()`, with options for a seed and for **propensity-score
+matching** of the simulated random effects.
+
+```rust
+pub fn simulate_with_options(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+) -> Result<Vec<SimulationResult>, String>
+
+pub struct SimulateOptions {
+    pub seed: Option<u64>,        // None draws from entropy
+    pub propensity_match: bool,   // default false
+}
+```
+
+With `propensity_match = false` this is identical to `simulate_with_seed()` (or
+`simulate()` when `seed` is `None`).
+
+### Why match?
+
+In real-world data, therapy is often **adapted in response to a patient's own
+PK** — e.g. high-clearance patients are given longer dosing intervals or more
+frequent sampling. A standard VPC draws each subject's `eta` *independently* of
+its dosing/sampling design, so this design↔eta association is lost and the VPC
+can show spurious model misspecification even when the model is correct.
+
+Propensity-score matching restores the association. For each replicate:
+
+1. Draw a pool of `N` etas from \\( N(0, \Omega) \\) (`N` = number of subjects).
+2. **Optimally** match the `N` drawn etas 1:1 (without replacement) to the `N`
+   subjects' **fitted (posthoc) etas**, minimising the total **Mahalanobis**
+   distance under the model \\( \Omega \\):
+   \\( d^2(a,b) = (a-b)^\top \Omega^{-1} (a-b) \\)
+   (a linear assignment problem; mirrors `MatchIt(method = "optimal",
+   distance = "mahalanobis")`).
+3. Each subject keeps its own observed design but is simulated with the drawn
+   eta that matched its fitted eta — so a high-clearance draw lands on a subject
+   whose adaptive design reflects high clearance.
+
+The fitted etas are computed once via a posthoc (MAP) inner-loop pass over the
+observed `population` at `params`; only the drawn pool and the matching change
+across replicates.
+
+**Requires observed data**: every subject must carry observations (so its
+posthoc eta is defined). The function returns `Err` if the population is empty
+or any subject has no observations. The matching is the only correction applied;
+binning and plotting the VPC is left to the caller (e.g. the `vpc` R package).
+
+### Validation against R
+
+The matching numerics were cross-checked against R on a fixed 8-subject,
+2-eta scenario:
+
+- the Mahalanobis cost matrix matches R's `mahalanobis()` under Ω to `2e-11`;
+- ferx-core's optimal assignment is **identical** to two independent optimal
+  solvers — `clue::solve_LSAP` and `optmatch::pairmatch` (the engine
+  `MatchIt(method = "optimal")` uses) — with the same total cost to 10 dp.
+
+A direct `MatchIt(method = "optimal", distance = "mahalanobis")` call (as in the
+PAGE-poster workflow) returns a slightly different *pairing*, because MatchIt
+scales the Mahalanobis metric by the *empirical* covariance of the combined
+etas rather than the model Ω. The optimal-matching algorithm is the same
+(optmatch); only the metric differs, which is the documented modelling choice
+here (Ω is exact for draws from `N(0, Ω)` and needs no extra estimation).
+
+**Example:**
+```rust
+let pop = read_nonmem_csv(Path::new("rwd.csv"), None)?;   // observed data
+let fit = fit(&model, &pop, &model.default_params, &opts)?;
+
+// Recover the fitted ModelParameters (theta/Omega/sigma) from the result.
+let params = fitted_params_from_result(&fit, &model);
+let sims = simulate_with_options(
+    &model, &pop, &params, 200,
+    &SimulateOptions { seed: Some(42), propensity_match: true },
+)?;
+// → 200 replicates; build the pmVPC from `sims` as usual.
+```
+
 ## `predict()`
 
 Population predictions without random effects (eta = 0). No simulation noise is added.

@@ -3966,6 +3966,87 @@ pub fn simulate_with_seed(
     simulate_inner(model, population, params, n_sim, &mut rng)
 }
 
+/// Options controlling [`simulate_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct SimulateOptions {
+    /// Seed for reproducibility. `None` draws from entropy.
+    pub seed: Option<u64>,
+    /// When `true`, reassign each replicate's drawn etas to subjects by
+    /// **propensity-score matching** against the subjects' fitted (posthoc)
+    /// etas — optimal Mahalanobis matching under the model `Ω`. This restores
+    /// the design↔eta association present in adaptively-dosed real-world data
+    /// and corrects the resulting VPC bias (see [`crate::propensity_match`]).
+    ///
+    /// Requires `population` to be observed data: every subject must carry
+    /// observations so its posthoc eta can be computed. Has no effect for the
+    /// synthetic `[simulation]` block (no observed designs to match against).
+    pub propensity_match: bool,
+}
+
+/// Simulate observations, optionally with propensity-score matching.
+///
+/// With `opts.propensity_match == false` this is identical to
+/// [`simulate_with_seed`] (or [`simulate`] when `opts.seed` is `None`). With it
+/// `true`, the freshly drawn etas of each replicate are reassigned to subjects
+/// so each subject's observed design is paired with a drawn eta close (under the
+/// model `Ω` Mahalanobis metric) to that subject's fitted eta. The fitted
+/// (posthoc) etas are computed once from `params` + the observed `population`.
+///
+/// Returns `Err` if matching is requested but the population is empty or any
+/// subject has no observations.
+pub fn simulate_with_options(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+) -> Result<Vec<SimulationResult>, String> {
+    use rand::SeedableRng;
+    let mut rng: rand::rngs::StdRng = match opts.seed {
+        Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+        None => rand::rngs::StdRng::from_entropy(),
+    };
+
+    if !opts.propensity_match {
+        return Ok(simulate_inner_with_draw(
+            model, population, params, n_sim, 1, None, &mut rng,
+        ));
+    }
+
+    if population.subjects.is_empty() {
+        return Err(
+            "propensity-score matching requires a non-empty observed population".to_string(),
+        );
+    }
+    if let Some(s) = population
+        .subjects
+        .iter()
+        .find(|s| s.observations.is_empty())
+    {
+        return Err(format!(
+            "propensity-score matching requires observations for every subject \
+             (to compute posthoc etas); subject '{}' has none",
+            s.id
+        ));
+    }
+
+    // Fitted (posthoc) BSV etas depend only on the observed data + params, so
+    // compute them once and reuse across replicates.
+    let (eta_hats, _h, _stats, _kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+        model, population, params, 100, 1e-6, None, None, 1,
+    );
+    let omega_inv = &params.omega.inv;
+    Ok(simulate_inner_with_draw(
+        model,
+        population,
+        params,
+        n_sim,
+        1,
+        Some((&eta_hats, omega_inv)),
+        &mut rng,
+    ))
+}
+
 fn simulate_inner<R: rand::Rng>(
     model: &CompiledModel,
     population: &Population,
@@ -3973,15 +4054,80 @@ fn simulate_inner<R: rand::Rng>(
     n_sim: usize,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
-    simulate_inner_with_draw(model, population, params, n_sim, 1, rng)
+    simulate_inner_with_draw(model, population, params, n_sim, 1, None, rng)
 }
 
+/// Emit all observation rows for one subject given a fully-formed `eta_slice`
+/// (length `n_eta + n_kappa`). Draws only residual epsilons from `rng`; the eta
+/// is supplied by the caller (freshly sampled, or propensity-matched).
+#[allow(clippy::too_many_arguments)]
+fn emit_subject_rows<R: rand::Rng>(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_slice: &[f64],
+    draw: usize,
+    sim: usize,
+    normal: rand_distr::Normal<f64>,
+    rng: &mut R,
+    results: &mut Vec<SimulationResult>,
+) {
+    // Compute individual parameters
+    let pk_params = (model.pk_param_fn)(&params.theta, eta_slice, &subject.covariates);
+
+    // Predict concentrations
+    let ipreds = model_preds(model, subject, &pk_params, &params.theta, eta_slice);
+
+    // Add residual error (Gaussian path)
+    for (j, &ipred) in ipreds.iter().enumerate() {
+        let var = model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
+        let eps: f64 = rng.sample(normal);
+        let value = ipred + var.sqrt() * eps;
+
+        results.push(SimulationResult {
+            draw,
+            sim,
+            id: subject.id.clone(),
+            // Raw data TIME (matches sdtab / input); `obs_times` may be
+            // the internal shifted clock for stacked reset occasions.
+            time: subject
+                .obs_raw_times
+                .get(j)
+                .copied()
+                .unwrap_or(subject.obs_times[j]),
+            cmt: subject.obs_cmts[j],
+            ipred,
+            outcome: SimOutcome::Continuous { value },
+        });
+    }
+
+    // TTE simulation path (requires survival feature)
+    #[cfg(feature = "survival")]
+    crate::survival::simulate_tte(
+        model,
+        subject,
+        &params.theta,
+        eta_slice,
+        draw,
+        sim,
+        rng,
+        results,
+    );
+}
+
+/// `matched`, when `Some((fitted_etas, omega_inv))`, reassigns each replicate's
+/// drawn etas to subjects by propensity-score matching against `fitted_etas`
+/// (optimal Mahalanobis matching under `omega_inv`; see `crate::propensity_match`).
+/// `None` is the standard per-subject independent draw and reproduces the
+/// previous behaviour byte-for-byte (same RNG draw order).
+#[allow(clippy::too_many_arguments)]
 fn simulate_inner_with_draw<R: rand::Rng>(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
     draw: usize,
+    matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>)>,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
@@ -3992,56 +4138,58 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     let mut results = Vec::new();
 
     for sim_idx in 0..n_sim {
-        for subject in &population.subjects {
-            // Sample eta from N(0, Omega); append zero kappas for IOV models.
-            let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-            let z_vec = DVector::from_column_slice(&z);
-            let eta = &params.omega.chol * z_vec;
-            let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
-            eta_slice.resize(n_eta + model.n_kappa, 0.0);
-
-            // Compute individual parameters
-            let pk_params = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
-
-            // Predict concentrations
-            let ipreds = model_preds(model, subject, &pk_params, &params.theta, &eta_slice);
-
-            // Add residual error (Gaussian path)
-            for (j, &ipred) in ipreds.iter().enumerate() {
-                let var =
-                    model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
-                let eps: f64 = rng.sample(normal);
-                let value = ipred + var.sqrt() * eps;
-
-                results.push(SimulationResult {
-                    draw,
-                    sim: sim_idx + 1,
-                    id: subject.id.clone(),
-                    // Raw data TIME (matches sdtab / input); `obs_times` may be
-                    // the internal shifted clock for stacked reset occasions.
-                    time: subject
-                        .obs_raw_times
-                        .get(j)
-                        .copied()
-                        .unwrap_or(subject.obs_times[j]),
-                    cmt: subject.obs_cmts[j],
-                    ipred,
-                    outcome: SimOutcome::Continuous { value },
-                });
+        let sim = sim_idx + 1;
+        match matched {
+            Some((fitted, omega_inv)) => {
+                // Draw a pool of one eta per subject for this replicate, then
+                // reassign the draws to subjects by matching them to the fitted
+                // (posthoc) etas. Each subject keeps its own observed design.
+                let n = population.subjects.len();
+                let pool: Vec<DVector<f64>> = (0..n)
+                    .map(|_| {
+                        let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                        &params.omega.chol * DVector::from_column_slice(&z)
+                    })
+                    .collect();
+                let assign =
+                    crate::propensity_match::match_draws_to_fitted(&pool, fitted, omega_inv);
+                for (i, subject) in population.subjects.iter().enumerate() {
+                    let mut eta_slice: Vec<f64> = pool[assign[i]].iter().copied().collect();
+                    eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                    emit_subject_rows(
+                        model,
+                        subject,
+                        params,
+                        &eta_slice,
+                        draw,
+                        sim,
+                        normal,
+                        rng,
+                        &mut results,
+                    );
+                }
             }
-
-            // TTE simulation path (requires survival feature)
-            #[cfg(feature = "survival")]
-            crate::survival::simulate_tte(
-                model,
-                subject,
-                &params.theta,
-                &eta_slice,
-                draw,
-                sim_idx + 1,
-                rng,
-                &mut results,
-            );
+            None => {
+                for subject in &population.subjects {
+                    // Sample eta from N(0, Omega); append zero kappas for IOV models.
+                    let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                    let z_vec = DVector::from_column_slice(&z);
+                    let eta = &params.omega.chol * z_vec;
+                    let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+                    eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                    emit_subject_rows(
+                        model,
+                        subject,
+                        params,
+                        &eta_slice,
+                        draw,
+                        sim,
+                        normal,
+                        rng,
+                        &mut results,
+                    );
+                }
+            }
         }
     }
 
@@ -4108,6 +4256,7 @@ pub fn simulate_with_uncertainty(
             params,
             opts.n_sim_per_draw,
             k + 1,
+            None,
             &mut rng,
         );
         results.append(&mut rows);
