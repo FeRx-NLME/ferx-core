@@ -30,28 +30,36 @@ fn warfarin_setup() -> (
 }
 
 #[test]
-fn imp_only_chain_is_rejected() {
+fn imp_only_chain_runs_standalone() {
+    // Standalone IMP: no preceding estimator. Evaluates the EBEs/Hessians at the
+    // initial parameters and reports the −2 log L there.
     let (model, population, mut opts) = warfarin_setup();
     opts.methods = vec![EstimationMethod::Imp];
-    let err = fit(&model, &population, &model.default_params, &opts)
-        .err()
-        .expect("methods = [imp] must be rejected");
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("methods = [imp] (standalone) must produce a fit");
+    let imp = result
+        .importance_sampling
+        .as_ref()
+        .expect("importance_sampling field should be populated for a standalone imp fit");
     assert!(
-        err.contains("first stage"),
-        "expected `first stage` in error, got: {err}"
+        imp.minus2_log_likelihood.is_finite(),
+        "-2 LL must be finite, got {}",
+        imp.minus2_log_likelihood
     );
+    assert_eq!(result.method_chain, vec![EstimationMethod::Imp]);
 }
 
 #[test]
-fn imp_first_in_chain_is_rejected() {
+fn imp_before_estimator_is_rejected() {
+    // `imp` first but not terminal — caught by the "must be the final stage" rule.
     let (model, population, mut opts) = warfarin_setup();
     opts.methods = vec![EstimationMethod::Imp, EstimationMethod::FoceI];
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
         .expect("methods = [imp, focei] must be rejected");
     assert!(
-        err.contains("first stage"),
-        "expected `first stage` in error, got: {err}"
+        err.contains("final stage"),
+        "expected `final stage` in error, got: {err}"
     );
 }
 
