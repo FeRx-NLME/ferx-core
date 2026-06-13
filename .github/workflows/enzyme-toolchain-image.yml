@@ -1,0 +1,76 @@
+name: Enzyme toolchain image
+
+# DRAFT for discussion (issue #281) — builds the custom rustc+LLVM+Enzyme
+# toolchain ONCE and publishes it to ghcr.io so the per-run autodiff job
+# (autodiff.yml) can just pull it. This is the slow (~1-2 h) build; it runs on
+# a GitHub-hosted runner, never on a developer machine.
+#
+# Cost: both repos are PUBLIC, so standard `ubuntu-latest` minutes and the
+# public ghcr package are free. The only resource risk is runner DISK (handled
+# below), not money.
+
+on:
+  workflow_dispatch: {}            # manual: (re)publish on demand
+  schedule:
+    - cron: "0 4 1 * *"            # monthly refresh — the `nightly` pin drifts
+  push:
+    branches: [main]
+    paths:                          # rebuild when the recipe itself changes
+      - ".github/docker/enzyme-toolchain.Dockerfile"
+      - ".github/workflows/enzyme-toolchain-image.yml"
+
+concurrency:
+  group: enzyme-toolchain-image
+  cancel-in-progress: false        # never cancel a half-finished toolchain build
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300            # the from-source rustc+LLVM build is slow
+    permissions:
+      contents: read
+      packages: write               # push to ghcr.io/<owner>/*
+    steps:
+      - uses: actions/checkout@v4
+
+      # ubuntu-latest ships ~14 GB free; the LLVM+rustc build wants ~30 GB.
+      # This reclaims ~20-30 GB by removing preinstalled SDKs we don't use.
+      - name: Free up runner disk
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          large-packages: true
+          docker-images: false      # we need Docker itself
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/enzyme-toolchain.Dockerfile
+          push: true
+          # ghcr paths must be lowercase; owner is FeRx-NLME -> ferx-nlme.
+          tags: |
+            ghcr.io/ferx-nlme/enzyme-toolchain:latest
+            ghcr.io/ferx-nlme/enzyme-toolchain:${{ github.sha }}
+          # Layer cache so a stage-2-only edit doesn't rebuild LLVM. NOTE: GHA
+          # cache is capped at 10 GB/repo, which the LLVM layers may exceed —
+          # expect cold rebuilds when the cache is evicted.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+# ── AFTER THE FIRST SUCCESSFUL PUBLISH ─────────────────────────────────────
+#  * Make the package PUBLIC (Org -> Packages -> enzyme-toolchain -> Settings ->
+#    visibility). Otherwise autodiff.yml — especially on PRs from forks, whose
+#    GITHUB_TOKEN is read-only — cannot pull the image anonymously.
+#  * If `ubuntu-latest` runs out of disk even after the reclaim step, options:
+#    trim LLVM further, or use a larger runner (BILLED even on public repos), or
+#    do a one-off cloud-VM build and push manually.
