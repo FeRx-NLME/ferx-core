@@ -4031,10 +4031,31 @@ pub fn simulate_with_options(
     }
 
     // Fitted (posthoc) BSV etas depend only on the observed data + params, so
-    // compute them once and reuse across replicates.
+    // compute them once and reuse across replicates. The inner-loop budget here
+    // is a self-contained MAP pass (this entry point takes no FitOptions); the
+    // tolerances only need to localize each EBE well enough to match on, not to
+    // reproduce a specific fit's inner settings.
     let (eta_hats, _h, _stats, _kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
         model, population, params, 100, 1e-6, None, None, 1,
     );
+
+    // A divergent EBE can come back non-finite (`find_ebe` only gates its
+    // `converged` flag on a finite nll, not the returned eta). A NaN/Inf eta
+    // would poison the Mahalanobis cost matrix and make the optimal-assignment
+    // solver spin forever (NaN compares false against every candidate), so fail
+    // loudly here instead.
+    if let Some((i, _)) = eta_hats
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.iter().any(|x| !x.is_finite()))
+    {
+        return Err(format!(
+            "propensity-score matching: the posthoc eta for subject '{}' is \
+             non-finite (its EBE did not converge); cannot match",
+            population.subjects[i].id
+        ));
+    }
+
     let omega_inv = &params.omega.inv;
     Ok(simulate_inner_with_draw(
         model,

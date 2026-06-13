@@ -27,15 +27,15 @@ pub fn mahalanobis_sq(a: &[f64], b: &[f64], omega_inv: &DMatrix<f64>) -> f64 {
     debug_assert_eq!(b.len(), d);
     debug_assert_eq!(omega_inv.nrows(), d);
     debug_assert_eq!(omega_inv.ncols(), d);
+    // Form the difference once, then evaluate the quadratic form diffᵀ Ω⁻¹ diff.
+    let diff: Vec<f64> = (0..d).map(|k| a[k] - b[k]).collect();
     let mut acc = 0.0;
     for i in 0..d {
-        let di = a[i] - b[i];
-        // Symmetric quadratic form; accumulate over the full matrix.
         let mut row = 0.0;
         for j in 0..d {
-            row += omega_inv[(i, j)] * (a[j] - b[j]);
+            row += omega_inv[(i, j)] * diff[j];
         }
-        acc += di * row;
+        acc += diff[i] * row;
     }
     acc
 }
@@ -53,6 +53,13 @@ pub fn optimal_assignment(cost: &DMatrix<f64>) -> Vec<usize> {
         cost.ncols(),
         n,
         "optimal_assignment requires a square matrix"
+    );
+    // Non-finite costs would make the shortest-path search never terminate (a
+    // NaN compares false against every candidate). Callers must screen them out
+    // (e.g. `simulate_with_options` rejects non-finite posthoc etas upstream).
+    debug_assert!(
+        cost.iter().all(|x| x.is_finite()),
+        "optimal_assignment requires all costs to be finite"
     );
     if n == 0 {
         return Vec::new();
