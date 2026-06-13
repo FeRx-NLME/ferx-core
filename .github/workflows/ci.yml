@@ -45,12 +45,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci
-      # `--release` pays an extra ~3-5 min compile vs default once, then runs
-      # the population-fit tests (SDE, IOV, FOCEI, GN-hybrid) 5-10× faster.
-      # Net: replaces the >80 min debug test wall with a single-digit-minute
-      # release wall on average.
+      # `--profile ci-test` keeps release-level optimisation (population-fit
+      # tests — SDE, IOV, FOCEI, GN-hybrid — run 5-10× faster than debug) but
+      # drops fat LTO, whose whole-program link dominated these jobs. Net:
+      # avoids the >80 min debug wall without paying the LTO compile tax.
       - name: cargo test
-        run: cargo test --lib --no-default-features --features ci --release
+        run: cargo test --lib --no-default-features --features ci --profile ci-test
+
+      # The NONMEM-anchored per-(ID,OCC) CL cross-check for IOV (issue #238)
+      # lives in an integration test, which `--lib` above does not build or run.
+      # Run that one file explicitly so the agreement with NONMEM is guarded on
+      # every PR (not just nightly). It is a FIXed-MLE fit over 10 subjects — no
+      # convergence loop, sub-second — and self-contained (reference fixture
+      # committed at tests/nonmem/warfarin_iov_cl_reference.csv).
+      - name: cargo test (NONMEM IOV CL cross-check, issue #238)
+        run: cargo test --test warfarin_iov_nonmem --no-default-features --features ci --profile ci-test
 
   survival:
     name: Survival (TTE)
@@ -69,7 +78,7 @@ jobs:
       # `tte_smoke` integration tests are Tier-2 (a handful of outer iterations),
       # so `--tests` stays fast.
       - name: cargo test (survival)
-        run: cargo test --tests --no-default-features --features ci,survival --release
+        run: cargo test --tests --no-default-features --features ci,survival --profile ci-test
 
   clippy:
     name: Clippy
@@ -97,7 +106,7 @@ jobs:
         run: cargo fmt -- --check
 
   coverage:
-    name: Coverage
+    name: Coverage (full, nightly)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
@@ -126,11 +135,88 @@ jobs:
         # `--no-fail-fast` so a single test-binary failure doesn't abort
         # cargo's run and silently drop coverage from every later binary
         # (mirrors the same flag in slow-tests.yml).
-        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,slow-tests --release --lcov --output-path lcov.info
+        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,slow-tests --profile ci-test --lcov --output-path lcov.info
 
-      - name: Upload to Codecov
+      - name: Upload to Codecov (slow flag)
         uses: codecov/codecov-action@v7
         with:
           files: lcov.info
+          flags: slow
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  coverage-pr:
+    name: Coverage (fast, patch)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write # for the below-floor nudge comment
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal -c llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Own cache key: the instrumented build can't share artifacts with the
+          # normal `ci` cache (different RUSTFLAGS).
+          shared-key: ci-cov
+      - name: Install cargo-llvm-cov
+        # Prebuilt binary (no compile) so the per-PR job stays fast.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate fast coverage report
+        # Fast tier only: `--features ci` (no `slow-tests`, no `survival`). This
+        # is the per-PR patch gate; the full `ci,slow-tests` run is nightly (the
+        # `coverage` job above). Runs in parallel with the other PR jobs and,
+        # like them, builds with `--profile ci-test` (no fat LTO), so it stays
+        # within the PR wall-clock. `--tests` so the integration tests count
+        # (same rationale as the nightly job).
+        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci --profile ci-test --lcov --output-path lcov.info
+
+      - name: Upload to Codecov (fast flag)
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          flags: fast
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Nudge the author while the project is below the floor
+        # Informational, non-blocking. If the project (full, slow-inclusive)
+        # coverage on `main` is below the 90% floor the weekly run enforces,
+        # post/update ONE sticky PR comment so the author is nudged to cover new
+        # lines. Self-resolves once the backfill clears 90%. Never fails the PR
+        # (continue-on-error); skipped on forks (read-only token).
+        if: ${{ github.event.pull_request.head.repo.fork == false }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -u
+          marker='<!-- coverage-floor-nudge -->'
+          cov=$(curl -s --max-time 20 \
+            "https://codecov.io/api/v2/github/FeRx-NLME/repos/ferx-core/totals/" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['totals']['coverage'])" 2>/dev/null || true)
+          if [ -z "${cov:-}" ]; then echo "no coverage figure; skipping nudge"; exit 0; fi
+          below=$(python3 -c "import sys; print('1' if float(sys.argv[1]) < 90 else '0')" "$cov")
+          # `// empty` so a no-match yields an empty string (-> POST a new
+          # comment) instead of the literal `null`; `--paginate` so the marker
+          # isn't missed past the first page of comments.
+          existing=$(gh api --paginate "repos/$REPO/issues/$PR/comments" \
+            --jq "[.[] | select(.body | contains(\"$marker\"))][0].id // empty" 2>/dev/null || true)
+          if [ "$below" = "1" ]; then
+            body=$(printf '%s\n📉 **Coverage floor not yet met.** Project coverage is **%s%%**, below the **90%%** floor enforced on the weekly full-coverage run (see #286).\n\nThis PR is **not blocked**. If it adds code, please make sure the new lines are covered — the `patch` check (target 90%%) grades exactly your changed lines, and the Codecov report below shows the gaps. Thanks for helping clear the floor. 🙏' "$marker" "$cov")
+          else
+            body=$(printf '%s\n✅ Project coverage is at or above the 90%% floor — thanks for keeping it green!' "$marker")
+          fi
+          if [ -n "${existing:-}" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -f body="$body" >/dev/null
+          elif [ "$below" = "1" ]; then
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$body" >/dev/null
+          fi

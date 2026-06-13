@@ -50,3 +50,11 @@ approx = "0.5"
 
 [profile.release]
 lto = "fat"
+
+# Used by the CI test/coverage jobs: release-level optimisation (so the
+# population-fit tests stay fast) but NO fat LTO, whose whole-program link
+# dominated the Test/Survival/coverage jobs (the ~8 min Survival job was ~96%
+# LTO compile, ~20 s of actual tests). The shipped `release` keeps `lto = "fat"`.
+[profile.ci-test]
+inherits = "release"
+lto = false

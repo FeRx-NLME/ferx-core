@@ -1,5 +1,5 @@
 use crate::estimation::gauss_newton::subject_nll_pop_grad;
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::{find_ebe, run_inner_loop_warm};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
 use crate::types::*;
@@ -35,6 +35,11 @@ pub struct OuterResult {
     /// (SLSQP, L-BFGS, MMA) when at least one gradient-requesting iteration
     /// improved the OFV; `None` for BOBYQA, built-in BFGS, GN, and SAEM.
     pub final_gradient: Option<Vec<f64>>,
+    /// Fallback proposal covariance for the SIR sampler, set when the FD
+    /// Hessian is non-PD. Built from the `|eigenvalue|`-rectified free-block
+    /// Hessian, inflated 4×, and embedded into the full packed parameter space.
+    /// `None` when the Hessian succeeded or the covariance step was skipped.
+    pub sir_fallback_proposal: Option<DMatrix<f64>>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1209,6 +1214,7 @@ fn optimize_nlopt(
 
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
+    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
@@ -1230,6 +1236,14 @@ fn optimize_nlopt(
                 }
                 CovarianceStepResult::Unusable(msg) => {
                     warnings.push(msg);
+                    None
+                }
+                CovarianceStepResult::FailedNonPd {
+                    reason,
+                    fallback_proposal,
+                } => {
+                    warnings.push(reason);
+                    sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
             }
@@ -1265,6 +1279,7 @@ fn optimize_nlopt(
         max_unconverged_subjects: ebe_final.max_unconverged as u32,
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
         final_gradient,
+        sir_fallback_proposal,
     }
 }
 
@@ -1539,6 +1554,7 @@ fn optimize_bfgs(
     );
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
+    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
@@ -1560,6 +1576,14 @@ fn optimize_bfgs(
                 }
                 CovarianceStepResult::Unusable(msg) => {
                     warnings.push(msg);
+                    None
+                }
+                CovarianceStepResult::FailedNonPd {
+                    reason,
+                    fallback_proposal,
+                } => {
+                    warnings.push(reason);
+                    sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
             }
@@ -1587,6 +1611,7 @@ fn optimize_bfgs(
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
         final_gradient: None,
+        sir_fallback_proposal,
     }
 }
 
@@ -1725,6 +1750,17 @@ fn ad_population_gradient(
             .1
         })
         .collect();
+    assemble_population_gradient(&per_subj, np)
+}
+
+/// Assemble the covariance-step population gradient `2·Σᵢ gᵢ` from per-subject
+/// gradients, summing over subjects in index order. Both the parallel
+/// [`ad_population_gradient`] and the serial per-point gradient inside
+/// [`compute_covariance`] route their reduction through here, so there is a
+/// single summation order — which is what keeps the flattened (#256) covariance
+/// bit-identical to the pre-flatten serial stencil for FOCE. `np` is the packed
+/// parameter count; each `gᵢ` has length `np`.
+fn assemble_population_gradient(per_subj: &[Vec<f64>], np: usize) -> Vec<f64> {
     (0..np)
         .map(|k| per_subj.iter().map(|gi| gi[k]).sum::<f64>() * 2.0)
         .collect()
@@ -1853,14 +1889,12 @@ fn backtracking_line_search_warm(
     0.0
 }
 
-/// Gradient of the covariance-step objective `2·pop_nll` w.r.t. the packed
-/// parameter vector, with ETAs and H-matrices held fixed.
-///
-/// Both methods carry the Ω dependence inside `pop_nll` already — FOCE through
-/// `R̃ = HΩHᵀ + R` in the Sheiner–Beal marginal (equivalent by Woodbury to the
-/// conditional form with `η̂ᵀΩ⁻¹η̂ + log|Ω|`), FOCEI through the explicit prior in
-/// the Almquist–Laplace marginal — so the gradient is just `ad_population_gradient`
-/// with no separate omega-prior term (issue #243).
+/// Analytic covariance-step gradient with ETAs/H fixed: `2·pop_nll` with no
+/// omega-prior add-back (both the SB and Laplace marginals already carry Ω —
+/// #243/#249). The production stencil inlines a serial variant (plus the #274 Δ
+/// correction); this thin wrapper over [`ad_population_gradient`] is retained for
+/// the gradient-consistency tests that finite-difference the fixed-EBE objective.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn covariance_gradient(
     x: &[f64],
@@ -1874,10 +1908,6 @@ fn covariance_gradient(
     options: &FitOptions,
 ) -> Vec<f64> {
     let n_subj = population.subjects.len();
-    // Gradient of `2·pop_nll` for both methods — no omega-prior add-back. The SB
-    // (FOCE) and Almquist–Laplace (FOCEI) marginals both already carry the Ω
-    // dependence (R̃ for SB, the explicit prior for Laplace); adding it again
-    // double-counted Ω and under-stated the FOCE omega SEs (issue #243).
     ad_population_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
     )
@@ -1898,6 +1928,14 @@ pub(crate) enum CovarianceStepResult {
     /// Structurally unusable. Carries a complete user-facing warning message
     /// (already ends with "SE estimates not available.").
     Unusable(String),
+    /// FD Hessian symmetrised free-block has no positive eigenvalues — cannot
+    /// be inverted. Carries the warning message and a ready-to-use fallback
+    /// proposal covariance (full packed space, zeros for FIX params) built
+    /// from `|eigenvalue|`-rectified Hessian, inflated 4×.
+    FailedNonPd {
+        reason: String,
+        fallback_proposal: DMatrix<f64>,
+    },
 }
 
 /// Human-readable label for the packed parameter at position `packed_idx`.
@@ -2020,6 +2058,216 @@ fn format_non_pd_warning(eigvals: &[f64]) -> String {
     )
 }
 
+/// Largest condition number permitted for the non-PD fallback proposal. The
+/// eigenvalue magnitudes are floored at `λ_max_abs / COND` so a near-zero
+/// curvature direction can't blow its proposal variance up without bound (see
+/// [`build_non_pd_fallback_proposal`]).
+const FALLBACK_PROPOSAL_MAX_COND: f64 = 1e8;
+
+/// Build a SIR proposal covariance for the non-PD-Hessian fallback path.
+///
+/// This is the standard eigenvalue-modification heuristic: the symmetrised
+/// free-block Hessian has at least one non-positive eigenvalue, so it cannot be
+/// inverted into a covariance directly. We take each eigenvalue's *magnitude*
+/// `|λ_i|` as the curvature in that direction, and use `inflation / |λ_i|` as the
+/// corresponding proposal variance (`inflation`× wider than the inverted
+/// absolute Hessian).
+///
+/// The magnitudes are floored **relative to the largest** at
+/// `|λ|_max / FALLBACK_PROPOSAL_MAX_COND` rather than at a fixed absolute value.
+/// A fixed floor (e.g. `1e-10`) is not scale-invariant: on a well-scaled Hessian
+/// a near-zero eigenvalue would yield a proposal variance of `inflation / 1e-10`
+/// ≈ 1e10, scattering every SIR draw far outside the parameter bounds so the
+/// fallback degenerates to "all samples had invalid weights". The relative floor
+/// caps the proposal's condition number at `FALLBACK_PROPOSAL_MAX_COND`, keeping
+/// the draws in a usable range while still giving the weakly-identified
+/// directions the widest proposal.
+///
+/// `inflation = 4.0` is the recommended default: heavier tails account for the
+/// uncertainty introduced by the non-PD correction.
+///
+/// The result is embedded into the full packed-parameter covariance (zeros for
+/// FIX parameters) and explicitly symmetrised, since the eigen-reconstruction
+/// `V·diag·Vᵀ` can leave sub-ULP asymmetry that a downstream Cholesky rejects.
+fn build_non_pd_fallback_proposal(
+    hess_free_sym: &DMatrix<f64>,
+    free_idx: &[usize],
+    n_full: usize,
+    inflation: f64,
+) -> DMatrix<f64> {
+    let eig = SymmetricEigen::new(hess_free_sym.clone());
+    // Largest absolute eigenvalue anchors the relative floor. Guard the
+    // all-zero block (max_abs == 0) with a tiny absolute fallback so the floor
+    // stays positive and we never divide by zero.
+    let max_abs = eig
+        .eigenvalues
+        .iter()
+        .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let floor = (max_abs / FALLBACK_PROPOSAL_MAX_COND).max(1e-10);
+    // Proposal covariance eigenvalues: inflation / max(|λ_i|, floor).
+    let inv_eigs: DVector<f64> = eig.eigenvalues.map(|v| inflation / v.abs().max(floor));
+    // Reconstruct: C_free = V * diag(inv_eigs) * V^T, then symmetrise to remove
+    // any floating-point asymmetry from the matrix products.
+    let cov_free_raw =
+        &eig.eigenvectors * DMatrix::from_diagonal(&inv_eigs) * eig.eigenvectors.transpose();
+    let cov_free = (&cov_free_raw + cov_free_raw.transpose()) * 0.5;
+    // Embed free block into full n×n (FIX rows/cols stay zero).
+    let mut cov = DMatrix::zeros(n_full, n_full);
+    for (a, &i) in free_idx.iter().enumerate() {
+        for (b, &j) in free_idx.iter().enumerate() {
+            cov[(i, j)] = cov_free[(a, b)];
+        }
+    }
+    cov
+}
+
+/// Choose a finite-difference step that keeps all free-parameter diagonal
+/// stencils finite, starting from `initial_eps` and halving up to
+/// `MAX_HALVINGS` times.
+///
+/// Returns `(chosen_eps, n_halvings)`. If every halving fails (all stencils
+/// still non-finite at `initial_eps / 2^MAX_HALVINGS`), returns the final
+/// eps anyway — the FD loop will detect and report the remaining failures.
+///
+/// The probe is on the scalar-OFV second-difference stencil
+/// `(f₊ − 2·f₀ + f₋)/h²`, which is the exact stencil the IOV Hessian path uses.
+/// The non-IOV path instead assembles the Hessian from central differences of
+/// the analytical population gradient, so the OFV probe is a deliberate *proxy*
+/// there: it shares the same underlying model evaluations (an OFV overflow at a
+/// perturbation implies the gradient overflows too), is far cheaper than probing
+/// the gradient, and the gradient FD loop carries its own `is_finite()` guard as
+/// a backstop for the rare case the two disagree.
+fn select_fd_step<F: Fn(&[f64]) -> f64>(
+    x_hat: &[f64],
+    free_idx: &[usize],
+    initial_eps: f64,
+    f0: f64,
+    ofv: &F,
+) -> (f64, usize) {
+    const MAX_HALVINGS: usize = 8;
+    let mut eps = initial_eps;
+    let mut x = x_hat.to_vec();
+    for halvings in 0..MAX_HALVINGS {
+        let all_ok = free_idx.iter().all(|&i| {
+            let hi = eps * (1.0 + x_hat[i].abs());
+            x[i] = x_hat[i] + hi;
+            let fp = ofv(&x);
+            x[i] = x_hat[i] - hi;
+            let fm = ofv(&x);
+            x[i] = x_hat[i]; // always restore before returning
+                             // Mirror the diagonal stencil the FD loop actually computes —
+                             // (fp - 2·f0 + fm) / hi² — including the division. A finite
+                             // numerator can still overflow once divided by a tiny hi², and the
+                             // FD loop rejects on the quotient, so accepting the step here on the
+                             // numerator alone would hand back an eps the loop then rejects.
+            let h_ii = (fp - 2.0 * f0 + fm) / (hi * hi);
+            h_ii.is_finite()
+        });
+        if all_ok {
+            return (eps, halvings);
+        }
+        eps *= 0.5;
+    }
+    (eps, MAX_HALVINGS)
+}
+
+fn covariance_method_label(m: CovarianceMethod) -> &'static str {
+    match m {
+        CovarianceMethod::Hessian => "r",
+        CovarianceMethod::CrossProduct => "s",
+        CovarianceMethod::Sandwich => "rsr",
+    }
+}
+
+/// Combine the observed-information inverse `r_inv = R⁻¹` (already `2·H_ofv⁻¹`)
+/// and the score cross-product `S` into the covariance estimator selected by
+/// `method`:
+///   - `Hessian`      → `R⁻¹`            (model-based; `S` ignored)
+///   - `CrossProduct` → `S⁻¹`            (empirical information)
+///   - `Sandwich`     → `R⁻¹ S R⁻¹`      (Huber–White, robust)
+///
+/// Returns `None` only for `CrossProduct`, when `S` is not strictly
+/// positive-definite — singular *or* merely rank-deficient (fewer subjects than
+/// free parameters, or collinear scores). Unlike the Hessian path, a
+/// rank-deficient `S` is **rejected** rather than eigenvalue-floored: `S⁻¹` of a
+/// regularised `S` would silently report finite-but-fictitious SEs in the
+/// unidentified directions, so the cross-product estimator requires a full-rank
+/// `S`. `Sandwich` never inverts `S`, so it stays defined even when `S` is
+/// rank-deficient.
+fn combine_covariance(
+    method: CovarianceMethod,
+    r_inv: DMatrix<f64>,
+    s: &DMatrix<f64>,
+) -> Option<DMatrix<f64>> {
+    match method {
+        CovarianceMethod::Hessian => Some(r_inv),
+        CovarianceMethod::Sandwich => Some(&r_inv * s * &r_inv),
+        // Accept S⁻¹ only when S is full-rank (no eigenvalues clipped); a
+        // rank-deficient or indefinite S yields `None`.
+        CovarianceMethod::CrossProduct => match invert_psd_with_floor(s) {
+            Some(inv) if inv.n_clipped == 0 => Some(inv.inverse),
+            _ => None,
+        },
+    }
+}
+
+/// Assemble the per-subject score cross-product `S = Σᵢ gᵢgᵢᵀ` over the free
+/// parameter block, where `gᵢ = ∂(−logLᵢ)/∂θ` is subject `i`'s contribution to
+/// the population score (the same per-subject gradient the Gauss–Newton optimizer
+/// uses for its BHHH step). `S` is NONMEM's `S` matrix; combined with the
+/// observed-information `R` it yields the `S⁻¹` and `R⁻¹SR⁻¹` covariance forms.
+///
+/// The result is `n_free × n_free`, ordered to match `free_idx`. Caller embeds it
+/// (or its inverse) back into the full packed space.
+#[allow(clippy::too_many_arguments)]
+fn assemble_score_cross_product(
+    x_hat: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    free_idx: &[usize],
+) -> DMatrix<f64> {
+    let n_free = free_idx.len();
+    let n_subj = population.subjects.len();
+
+    // Per-subject scores in parallel (mirrors `build_gn_system`).
+    let scores: Vec<Vec<f64>> = (0..n_subj)
+        .into_par_iter()
+        .map(|i| {
+            let kap_i = if i < kappas.len() {
+                kappas[i].as_slice()
+            } else {
+                &[]
+            };
+            let (_, gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
+                x_hat,
+                template,
+                model,
+                population,
+                i,
+                &eta_hats[i],
+                &h_matrices[i],
+                kap_i,
+                bounds,
+                options,
+            );
+            gi
+        })
+        .collect();
+
+    let mut s = DMatrix::zeros(n_free, n_free);
+    for gi in &scores {
+        let gi_free = DVector::from_iterator(n_free, free_idx.iter().map(|&k| gi[k]));
+        s.ger(1.0, &gi_free, &gi_free, 1.0); // s += gi_free * gi_freeᵀ (full outer product)
+    }
+    s
+}
+
 /// Compute the parameter covariance matrix at convergence (the R-matrix:
 /// inverse observed Fisher information).
 ///
@@ -2040,10 +2288,20 @@ fn format_non_pd_warning(eigvals: &[f64]) -> String {
 /// is twice the observed information.
 ///
 /// Returns [`CovarianceStepResult::Unusable`] when the FD Hessian is structurally
-/// unusable (non-finite or zero-diagonal entries) or has no positive curvature at
-/// all. A near-singular or marginally-indefinite free block is regularised by
-/// clipping eigenvalues to a small positive floor before inversion (rare now that
-/// the EBEs reconverge), recorded in the returned `warnings`.
+/// unusable (non-finite or zero-diagonal entries, or eigenvalues that diverge to
+/// NaN/Inf so no proposal can be built). When the symmetrised free-block Hessian
+/// is near-singular or has negative eigenvalues — a common FD noise artefact on
+/// well-conditioned surfaces (see issue #129) — it is regularised by clipping
+/// eigenvalues to a small positive floor before inversion, and the returned
+/// `warning` records what was done. When the Hessian has finite eigenvalues but
+/// no positive curvature at all (all eigenvalues ≤ 0), returns
+/// [`CovarianceStepResult::FailedNonPd`], carrying the eigenvalue list formatted
+/// as a warning together with an `|eigenvalue|`-rectified proposal covariance the
+/// caller can hand to SIR when `covariance_fallback = sir`.
+///
+/// The estimator assembled from the Hessian `R` is selected by
+/// [`FitOptions::covariance_method`] — `R⁻¹` (default), the score cross-product
+/// `S⁻¹`, or the sandwich `R⁻¹SR⁻¹` (see [`assemble_score_cross_product`]).
 pub(crate) fn compute_covariance(
     x_hat: &[f64],
     template: &ModelParameters,
@@ -2055,12 +2313,27 @@ pub(crate) fn compute_covariance(
     options: &FitOptions,
 ) -> CovarianceStepResult {
     let n = x_hat.len();
-    let eps = options.fd_hessian_step;
-    if eps <= 0.0 || !eps.is_finite() {
+    let initial_eps = options.fd_hessian_step;
+    if initial_eps <= 0.0 || !initial_eps.is_finite() {
         return CovarianceStepResult::Unusable(format!(
             "Covariance step failed: fd_hessian_step must be positive and finite, got {}. \
              SE estimates not available.",
-            eps
+            initial_eps
+        ));
+    }
+    // Fail fast on a covariance_method that needs the per-subject score `S` for
+    // FOCE (non-interaction). The FOCEI `s`/`rsr` SEs are NONMEM-anchored (#266:
+    // warfarin FOCEI matches `$COV MATRIX=S`/`RSR` within ~14%/~7%), so the
+    // estimator scale is validated *under interaction*. FOCE stays gated: after
+    // #249 removed the separately-added omega_terms the SB score is internally
+    // consistent with the corrected FOCE R-matrix, but no NONMEM `MATRIX=S`/`RSR`
+    // *FOCE* reference yet anchors that absolute scale (#250), so it remains a
+    // conservative "not yet validated" gate.
+    if options.covariance_method != CovarianceMethod::Hessian && !options.interaction {
+        return CovarianceStepResult::Unusable(format!(
+            "covariance_method = {} is not yet validated for FOCE (non-interaction); \
+             use covariance_method = r, or set method = focei.",
+            covariance_method_label(options.covariance_method),
         ));
     }
     let bounds = compute_bounds(template);
@@ -2119,17 +2392,6 @@ pub(crate) fn compute_covariance(
         2.0 * foce_nll
     };
 
-    // Gradient of the covariance OFV at a reconverged point. Uses the analytical
-    // population gradient — issue #196's H-column shortcut makes the θ part exact
-    // for mu-referenced parameters — which is exactly the gradient of `2·pop_nll`
-    // (= `ofv` above) for both FOCE and FOCEI; no omega-prior add-back (#243).
-    let grad = |xv: &[f64]| -> Vec<f64> {
-        let (_, ehs, hms, kaps) = reconverge(xv);
-        covariance_gradient(
-            xv, template, model, population, &ehs, &hms, &kaps, &bounds, options,
-        )
-    };
-
     let base_ofv = ofv(x_hat);
     if !base_ofv.is_finite() {
         // Diagnose: check Omega conditioning to distinguish Omega collapse from
@@ -2184,6 +2446,22 @@ pub(crate) fn compute_covariance(
         .filter(|&i| !fixed_mask[i] && !structural_zero[i])
         .collect();
 
+    let f0 = base_ofv;
+
+    // Adaptively select the FD step: halve up to 8× until all free-parameter
+    // diagonal stencils are finite. Most models use the initial step; halving
+    // only kicks in when the OFV overflows at the default perturbation size.
+    let (eps, n_halvings) = select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv);
+    if options.verbose && n_halvings > 0 {
+        eprintln!(
+            "  [covariance] Adaptive FD step: reduced {:.3e} → {:.3e} ({} halving{})",
+            initial_eps,
+            eps,
+            n_halvings,
+            if n_halvings == 1 { "" } else { "s" }
+        );
+    }
+
     let mut hess = DMatrix::zeros(n, n);
     let is_iov = kappas.iter().any(|k| !k.is_empty());
 
@@ -2193,19 +2471,122 @@ pub(crate) fn compute_covariance(
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
     if !is_iov {
-        // Issue #209: central FD of the analytical population gradient —
+        // Issue #209 + #256 + #274: central FD of the analytical population
+        // gradient, as one flat `par_iter` over the 2·n_free perturbed points.
         //   H[:,k] ≈ (g(x̂ + hₖ·eₖ) − g(x̂ − hₖ·eₖ)) / 2hₖ
-        // 2·n_free gradient evaluations vs ~2·n_free² scalar-OFV evaluations, with
-        // no 4-point cross-stencil cancellation (#129). `grad` reconverges the EBEs
-        // at each perturbed point, so the curvature includes the EBE response.
+        // `point_grad` reconverges the EBEs serially at each perturbed point, so
+        // the curvature includes the EBE response (and the determinant curvature).
+        //
+        // #256: the work-list is point-level, not the per-subject `par_iter` the
+        // gradient used to fan out into. Each point runs its subjects serially, so
+        // there is no nested parallelism, and the parallel width (2·n_free)
+        // saturates the pool even when n_subj < n_cores — removing the fork/join
+        // overhead of firing 4·n_free rayon barriers in series (~9–11× faster).
+        //
+        // #274: for FOCEI the per-point gradient adds the dropped `log|H̃|`
+        // EBE-response term `2·Σᵢ tᵢ` (`subject_eta_response_correction`). The
+        // fixed-η̂ analytic gradient invokes the envelope theorem, which zeros only
+        // the inner objective — not `log|H̃|` — so without this term the non-IOV
+        // FD Hessian omits the determinant EBE-response curvature `Δ` that the IOV
+        // scalar-OFV stencil captures. Adding it makes the two stencils consistent
+        // and recovers ∇²(−2logL). Mu-ref θ block only; vanishes for additive error.
+        let n_subj_cov = population.subjects.len();
+        let point_grad = |xv: &[f64]| -> Vec<f64> {
+            let params = unpack_params(xv, template);
+            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let mut ehs: Vec<DVector<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut hms: Vec<DMatrix<f64>> = Vec::with_capacity(n_subj_cov);
+            for i in 0..n_subj_cov {
+                let ebe = find_ebe(
+                    model,
+                    &population.subjects[i],
+                    &params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    Some(eta_hats[i].as_slice()),
+                    Some(&mu_k),
+                );
+                ehs.push(ebe.eta);
+                hms.push(ebe.h_matrix);
+            }
+            let np = xv.len();
+            // Gradient of `2·pop_nll` (no omega-prior add-back; both the SB and
+            // Laplace marginals already carry Ω — issue #243/#249).
+            //
+            // Build the per-subject gradients serially (subjects are serial inside
+            // each point — the #256 flatten parallelises over points, not subjects)
+            // and reduce through `assemble_population_gradient`, the same reduction
+            // `ad_population_gradient` uses — so the summation order matches and the
+            // FOCE covariance stays bit-identical to the pre-#256 serial stencil.
+            // The Δ correction below is kept as a separate loop (NOT fused): summing
+            // `2·tᵢ` after `2·Σ gᵢ` preserves that reduction order exactly.
+            //
+            // `subject_nll_pop_grad_with_cache` also hands back the per-subject
+            // Laplace intermediates (when this subject took the FOCEI analytical
+            // path); the Δ loop below reuses them so it does not recompute the
+            // predictions or re-factorise H̃.
+            let mut grads: Vec<Vec<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut caches: Vec<Option<crate::estimation::gauss_newton::LaplaceGradCache>> =
+                Vec::with_capacity(n_subj_cov);
+            for i in 0..n_subj_cov {
+                let (_, gi, ci) = crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
+                    xv,
+                    template,
+                    model,
+                    population,
+                    i,
+                    &ehs[i],
+                    &hms[i],
+                    &[],
+                    &bounds,
+                    options,
+                );
+                grads.push(gi);
+                caches.push(ci);
+            }
+            let mut g = assemble_population_gradient(&grads, np);
+            // #274 Δ correction (FOCEI only); summed in subject order to match.
+            if options.interaction {
+                for i in 0..n_subj_cov {
+                    if let Some(ti) =
+                        crate::estimation::gauss_newton::subject_eta_response_correction(
+                            caches[i].as_ref(),
+                            xv,
+                            template,
+                            model,
+                            population,
+                            i,
+                            &ehs[i],
+                            &hms[i],
+                            &bounds,
+                            options,
+                        )
+                    {
+                        for (gk, tk) in g.iter_mut().zip(ti.iter()) {
+                            *gk += 2.0 * *tk;
+                        }
+                    }
+                }
+            }
+            g
+        };
+
+        let mut points: Vec<(usize, f64, Vec<f64>)> = Vec::with_capacity(2 * free_idx.len());
         for &k in &free_idx {
             let hk = eps * (1.0 + x_hat[k].abs());
             let mut x_p = x_hat.to_vec();
             let mut x_m = x_hat.to_vec();
             x_p[k] += hk;
             x_m[k] -= hk;
-            let g_p = grad(&x_p);
-            let g_m = grad(&x_m);
+            points.push((k, hk, x_p));
+            points.push((k, hk, x_m));
+        }
+        let point_grads: Vec<Vec<f64>> =
+            points.par_iter().map(|(_, _, xv)| point_grad(xv)).collect();
+        for (pair, &k) in free_idx.iter().enumerate() {
+            let g_p = &point_grads[2 * pair];
+            let g_m = &point_grads[2 * pair + 1];
+            let hk = points[2 * pair].1;
             for &j in &free_idx {
                 let h_jk = (g_p[j] - g_m[j]) / (2.0 * hk);
                 if h_jk.is_finite() {
@@ -2230,59 +2611,108 @@ pub(crate) fn compute_covariance(
             }
         }
     } else {
-        // IOV fallback: no fixed-EBE analytical gradient covers the kappa block, so
-        // build the Hessian from second differences of the reconverged OFV (3-point
-        // diagonal, 4-point off-diagonal). `ofv` reconverges the joint (η, κ) EBEs.
+        // IOV: no fixed-EBE analytical gradient covers the kappa block, so build
+        // the Hessian from second differences of the reconverged OFV (3-point
+        // diagonal, 4-point off-diagonal), reconverging the joint (η, κ) EBEs.
+        //
+        // #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV
+        // points (subjects iterated serially inside `serial_ofv`) instead of the
+        // old serial loop that fired a per-subject `par_iter` at every point —
+        // removing the fork/join overhead of firing a rayon barrier per point.
+        // Bit-identical to the serial stencil: each point's OFV is the same
+        // `2·pop_nll` at the same per-subject `find_ebe`, and the difference
+        // formulas/assembly are unchanged; only the scheduling differs.
         let f0 = base_ofv;
-        let mut x_ij = x_hat.to_vec();
-        for &i in &free_idx {
-            let hi = eps * (1.0 + x_hat[i].abs());
+        let n_subj_cov = population.subjects.len();
+        let serial_ofv = |xv: &[f64]| -> f64 {
+            let params = unpack_params(xv, template);
+            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+            let mut ehs: Vec<DVector<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut hms: Vec<DMatrix<f64>> = Vec::with_capacity(n_subj_cov);
+            let mut kaps: Vec<Vec<DVector<f64>>> = Vec::with_capacity(n_subj_cov);
+            for i in 0..n_subj_cov {
+                let ebe = find_ebe(
+                    model,
+                    &population.subjects[i],
+                    &params,
+                    options.inner_maxiter,
+                    options.inner_tol,
+                    Some(eta_hats[i].as_slice()),
+                    Some(&mu_k),
+                );
+                ehs.push(ebe.eta);
+                hms.push(ebe.h_matrix);
+                kaps.push(ebe.kappas);
+            }
+            2.0 * pop_nll(
+                model,
+                population,
+                &params,
+                &ehs,
+                &hms,
+                &kaps,
+                options.interaction,
+            )
+        };
 
-            // Diagonal: 3-point formula  (f(x+h) - 2f(x) + f(x-h)) / h^2
-            x_ij[i] = x_hat[i] + hi;
-            let fp = ofv(&x_ij);
-            x_ij[i] = x_hat[i] - hi;
-            let fm = ofv(&x_ij);
-            x_ij[i] = x_hat[i];
-
-            let h_ii = (fp - 2.0 * f0 + fm) / (hi * hi);
+        let nf = free_idx.len();
+        let hsteps: Vec<f64> = free_idx
+            .iter()
+            .map(|&i| eps * (1.0 + x_hat[i].abs()))
+            .collect();
+        // Flat point list: 2 per diagonal (±hᵢ), then 4 per (a<b) off-diagonal pair.
+        let mut pts: Vec<Vec<f64>> = Vec::with_capacity(2 * nf + 2 * nf * nf);
+        for a in 0..nf {
+            let i = free_idx[a];
+            let hi = hsteps[a];
+            let mut xp = x_hat.to_vec();
+            xp[i] += hi;
+            let mut xm = x_hat.to_vec();
+            xm[i] -= hi;
+            pts.push(xp);
+            pts.push(xm);
+        }
+        let n_diag = pts.len();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for a in 0..nf {
+            for b in (a + 1)..nf {
+                let (i, j) = (free_idx[a], free_idx[b]);
+                let (hi, hj) = (hsteps[a], hsteps[b]);
+                for (si, sj) in [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)] {
+                    let mut xv = x_hat.to_vec();
+                    xv[i] += si * hi;
+                    xv[j] += sj * hj;
+                    pts.push(xv);
+                }
+                pairs.push((a, b));
+            }
+        }
+        let vals: Vec<f64> = pts.par_iter().map(|xv| serial_ofv(xv)).collect();
+        // Diagonal: (f(x+h) − 2f(x) + f(x−h)) / h².
+        for a in 0..nf {
+            let i = free_idx[a];
+            let hi = hsteps[a];
+            let h_ii = (vals[2 * a] - 2.0 * f0 + vals[2 * a + 1]) / (hi * hi);
             if h_ii.is_finite() {
                 hess[(i, i)] = h_ii;
             } else {
                 fd_diag_nan.insert(i);
             }
-
-            // Off-diagonal: 4-point stencil (over free indices only)
-            for &j in &free_idx {
-                if j <= i {
-                    continue;
-                }
-                let hj = eps * (1.0 + x_hat[j].abs());
-
-                x_ij[i] = x_hat[i] + hi;
-                x_ij[j] = x_hat[j] + hj;
-                let fpp = ofv(&x_ij);
-
-                x_ij[j] = x_hat[j] - hj;
-                let fpm = ofv(&x_ij);
-
-                x_ij[i] = x_hat[i] - hi;
-                let fmm = ofv(&x_ij);
-
-                x_ij[j] = x_hat[j] + hj;
-                let fmp = ofv(&x_ij);
-
-                x_ij[i] = x_hat[i];
-                x_ij[j] = x_hat[j];
-
-                let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
-                if h_ij.is_finite() {
-                    hess[(i, j)] = h_ij;
-                    hess[(j, i)] = h_ij;
-                } else {
-                    fd_offdiag_nan.insert(i);
-                    fd_offdiag_nan.insert(j);
-                }
+        }
+        // Off-diagonal: (f++ − f+− − f−+ + f−−) / (4 hᵢ hⱼ).
+        let mut off = n_diag;
+        for &(a, b) in &pairs {
+            let (i, j) = (free_idx[a], free_idx[b]);
+            let (hi, hj) = (hsteps[a], hsteps[b]);
+            let (fpp, fpm, fmm, fmp) = (vals[off], vals[off + 1], vals[off + 2], vals[off + 3]);
+            off += 4;
+            let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            if h_ij.is_finite() {
+                hess[(i, j)] = h_ij;
+                hess[(j, i)] = h_ij;
+            } else {
+                fd_offdiag_nan.insert(i);
+                fd_offdiag_nan.insert(j);
             }
         }
     }
@@ -2344,22 +2774,75 @@ pub(crate) fn compute_covariance(
     let inv = match invert_psd_with_floor(&hess_free_sym) {
         Some(inv) => inv,
         None => {
-            // invert_psd_with_floor returns None only when no eigenvalue is positive.
-            // Fold NonPdHessian into Unusable here so callers have a uniform interface.
-            let msg = match extract_eigenvalues(&hess_free_sym) {
-                Some(eigvals) => format_non_pd_warning(&eigvals),
-                None => "Covariance step failed: could not compute eigenvalues of the \
+            // `invert_psd_with_floor` returns None in two distinct cases, and we
+            // must not conflate them: (a) every eigenvalue is finite but the
+            // spectrum has no positive curvature (a genuine non-PD Hessian — a
+            // SIR fallback is meaningful here), or (b) the eigendecomposition
+            // itself diverged and produced a non-finite eigenvalue (the Hessian
+            // contains NaN/Inf — no usable proposal can be built).
+            //
+            // `extract_eigenvalues` returns None for exactly case (b). Building a
+            // fallback proposal there would re-run the same divergent
+            // decomposition and embed NaN eigenvectors into the proposal
+            // covariance, which SIR would then silently turn into NaN samples.
+            // So only build the proposal when the eigenvalues are finite.
+            match extract_eigenvalues(&hess_free_sym) {
+                Some(eigvals) => {
+                    let fallback_proposal =
+                        build_non_pd_fallback_proposal(&hess_free_sym, &free_idx, n, 4.0);
+                    return CovarianceStepResult::FailedNonPd {
+                        reason: format_non_pd_warning(&eigvals),
+                        fallback_proposal,
+                    };
+                }
+                None => {
+                    return CovarianceStepResult::Unusable(
+                        "Covariance step failed: could not compute eigenvalues of the \
                          FD Hessian (Hessian may contain NaN or Inf). \
                          SE estimates not available."
-                    .to_string(),
-            };
-            return CovarianceStepResult::Unusable(msg);
+                            .to_string(),
+                    );
+                }
+            }
         }
     };
     // The FD Hessian is of the OFV = −2·logL. The asymptotic covariance is the
-    // inverse observed Fisher information = Hessian of −logL = ½·H_ofv, so
-    // cov = 2·H_ofv⁻¹. Without this factor every SE is 1/√2 too small.
-    let cov_free = inv.inverse * 2.0;
+    // inverse observed Fisher information R = Hessian of −logL = ½·H_ofv, so
+    // R⁻¹ = 2·H_ofv⁻¹. Without this factor every SE is 1/√2 too small.
+    let r_inv = inv.inverse * 2.0;
+
+    // Select the covariance estimator (NONMEM `$COV MATRIX=`). `R⁻¹` is the
+    // model-based default; `S⁻¹` and `R⁻¹SR⁻¹` additionally need the per-subject
+    // score cross-product `S = Σᵢ gᵢgᵢᵀ`.
+    //
+    // TODO(#250): the absolute scale of the `s` / `rsr` SEs is not yet anchored
+    // to a NONMEM `$COV MATRIX=S` / `RSR` run. The scaling is correct as written
+    // — `S` is on the −logL scale (`gᵢ = ∂(−logLᵢ)/∂θ`, no factor of 2), matching
+    // `R = ½·H_ofv` — but the slow-test consistency band [0.33, 3.0] cannot catch
+    // a constant 2×/4× rescale, so a tight NONMEM reference is still pending. #250
+    // also tracks the `s`-requires-PD-`R` limitation (this branch needs `r_inv`,
+    // computed above) and the `r`-vs-NONMEM-`rsr` default-mismatch doc note.
+    let cov_free = if options.covariance_method == CovarianceMethod::Hessian {
+        r_inv
+    } else {
+        // S/RSR: non-interaction FOCE was rejected at entry (not yet validated, see guard above).
+        let s_free = assemble_score_cross_product(
+            x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
+            &free_idx,
+        );
+        match combine_covariance(options.covariance_method, r_inv, &s_free) {
+            Some(c) => c,
+            None => {
+                return CovarianceStepResult::Unusable(
+                    "Covariance step failed: the score cross-product matrix S is singular or \
+                     rank-deficient (covariance_method = s); typically fewer subjects than free \
+                     parameters, or collinear per-subject scores. Use covariance_method = r or \
+                     rsr. SE estimates not available."
+                        .to_string(),
+                );
+            }
+        }
+    };
 
     let mut cov = DMatrix::zeros(n, n);
     for (a, &i) in free_idx.iter().enumerate() {
@@ -2370,7 +2853,11 @@ pub(crate) fn compute_covariance(
 
     let mut cov_warnings: Vec<String> = Vec::new();
 
-    if inv.n_clipped > 0 {
+    // The Hessian eigenvalue-floor warning is about `R`. It is relevant only when
+    // the returned covariance actually uses `R⁻¹` (Hessian and sandwich); the
+    // cross-product path returns `S⁻¹` (with a full-rank `S` guaranteed above), so
+    // a clipped `R` there would be a misleading note about a matrix it didn't use.
+    if inv.n_clipped > 0 && options.covariance_method != CovarianceMethod::CrossProduct {
         let pct = inv.n_clipped * 100 / n_free.max(1);
         // Informal thresholds: ≤33 % clipped → minor concern; 34–50 % → caution; >50 % → unreliable.
         // Note: integer truncation means the boundary moves in steps of 1/n_free; for small
@@ -2574,6 +3061,81 @@ mod tests {
         }
     }
 
+    /// Helper: assert two matrices agree element-wise.
+    #[cfg(test)]
+    fn assert_mat_close(a: &DMatrix<f64>, b: &DMatrix<f64>, tol: f64, ctx: &str) {
+        assert_eq!(a.shape(), b.shape(), "{ctx}: shape mismatch");
+        for i in 0..a.nrows() {
+            for j in 0..a.ncols() {
+                assert!(
+                    (a[(i, j)] - b[(i, j)]).abs() < tol,
+                    "{ctx}: ({i},{j}) {:.6e} vs {:.6e}",
+                    a[(i, j)],
+                    b[(i, j)]
+                );
+            }
+        }
+    }
+
+    /// Information-matrix equality: when `S = R`, all three estimators collapse
+    /// to the model-based `R⁻¹` (`R⁻¹SR⁻¹ = R⁻¹RR⁻¹ = R⁻¹`, and `S⁻¹ = R⁻¹`). This
+    /// is the asymptotic behaviour at the MLE of a correctly-specified model.
+    #[test]
+    fn test_combine_covariance_collapses_when_s_equals_r() {
+        let l = DMatrix::from_row_slice(2, 2, &[2.0, 0.0, 0.5, 1.3]);
+        let r = l.transpose() * &l; // SPD
+        let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
+        for m in [
+            CovarianceMethod::Hessian,
+            CovarianceMethod::CrossProduct,
+            CovarianceMethod::Sandwich,
+        ] {
+            let cov = combine_covariance(m, r_inv.clone(), &r)
+                .unwrap_or_else(|| panic!("{m:?} should produce a covariance"));
+            assert_mat_close(&cov, &r_inv, 1e-9, &format!("{m:?} with S=R"));
+        }
+    }
+
+    /// With `S ≠ R`, the sandwich is exactly `R⁻¹ S R⁻¹`.
+    #[test]
+    fn test_combine_covariance_sandwich_matches_explicit_product() {
+        let l = DMatrix::from_row_slice(2, 2, &[1.7, 0.0, 0.3, 1.1]);
+        let r = l.transpose() * &l;
+        let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
+        let s = DMatrix::from_row_slice(2, 2, &[3.0, 0.4, 0.4, 2.0]);
+        let sandwich =
+            combine_covariance(CovarianceMethod::Sandwich, r_inv.clone(), &s).expect("sandwich");
+        let expected = &r_inv * &s * &r_inv;
+        assert_mat_close(&sandwich, &expected, 1e-12, "sandwich = R⁻¹SR⁻¹");
+        // Sandwich must stay symmetric (S and R⁻¹ are symmetric).
+        assert_mat_close(
+            &sandwich,
+            &sandwich.transpose(),
+            1e-12,
+            "sandwich symmetric",
+        );
+    }
+
+    /// A rank-deficient `S` (here a single score's outer product) is singular, so
+    /// `S⁻¹` (cross-product) is unavailable — but the sandwich, which never
+    /// inverts `S`, is still defined.
+    #[test]
+    fn test_combine_covariance_singular_s() {
+        let l = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.2, 1.0]);
+        let r = l.transpose() * &l;
+        let r_inv = invert_psd_with_floor(&r).expect("R PD").inverse;
+        let g = DVector::from_column_slice(&[1.0, 2.0]);
+        let s_rank1 = &g * g.transpose(); // rank-1, singular 2×2
+        assert!(
+            combine_covariance(CovarianceMethod::CrossProduct, r_inv.clone(), &s_rank1).is_none(),
+            "S⁻¹ must report singular S"
+        );
+        assert!(
+            combine_covariance(CovarianceMethod::Sandwich, r_inv, &s_rank1).is_some(),
+            "sandwich must tolerate rank-deficient S"
+        );
+    }
+
     /// A near-singular symmetric matrix with one tiny-negative eigenvalue
     /// (the exact failure mode reported in issue #129) is regularised: the
     /// helper flags the clip and returns a PD inverse with positive
@@ -2621,12 +3183,23 @@ mod tests {
         }
     }
 
-    /// Hopelessly indefinite input (all eigenvalues ≤ 0) returns None — the
-    /// caller surfaces this as CovarianceStepResult::Unusable with the eigenvalue list.
+    /// Hopelessly indefinite input (all eigenvalues ≤ 0) returns None. Because
+    /// the eigenvalues are finite, `compute_covariance` surfaces this as
+    /// `CovarianceStepResult::FailedNonPd` — carrying the eigenvalue-list warning
+    /// and a usable fallback proposal — rather than `Unusable`.
     #[test]
     fn test_invert_psd_with_floor_rejects_negative_definite() {
         let h = DMatrix::from_row_slice(2, 2, &[-1.0, 0.0, 0.0, -2.0]);
         assert!(invert_psd_with_floor(&h).is_none());
+        // The eigenvalues are finite, so the fallback path is taken (not Unusable):
+        // extract_eigenvalues succeeds and the proposal is all-finite and PD.
+        let eigs = extract_eigenvalues(&h).expect("finite eigenvalues");
+        assert!(eigs.iter().all(|e| e.is_finite()));
+        let proposal = build_non_pd_fallback_proposal(&h, &[0, 1], 2, 4.0);
+        assert!(
+            proposal.iter().all(|v| v.is_finite()),
+            "fallback proposal must be finite for a finite non-PD Hessian"
+        );
     }
 
     /// extract_eigenvalues returns eigenvalues sorted descending and returns None
@@ -3561,12 +4134,16 @@ mod tests {
         }
     }
 
-    /// End-to-end guard for `compute_covariance` (#209 + the factor-of-2 fix):
-    /// the reconverging central gradient-FD covariance must (a) compute without
-    /// regularization on a well-conditioned surface, (b) be positive-definite,
-    /// and (c) equal `2·H⁻¹` of an *independently* reconverged scalar-FD Hessian.
-    /// A missing factor of two would be ~29% off (caught by the 15% band); a
-    /// broken reconvergence would diverge wildly.
+    /// End-to-end guard for `compute_covariance` (#209 factor-of-2, #256 flatten,
+    /// #274 Δ correction): the reconverging point-flatten gradient-FD covariance
+    /// must (a) compute without regularization on a well-conditioned surface,
+    /// (b) be positive-definite, and (c) equal `2·H⁻¹` of an *independently*
+    /// reconverged scalar-FD Hessian of the same FOCEI objective. Because the
+    /// model has proportional error, the reference (a second difference of the
+    /// reconverged OFV) carries the `log|H̃|` EBE-response curvature `Δ`; the
+    /// gradient-FD path only matches it because the #274 correction adds `Δ` back —
+    /// so this also guards the Δ correction. A missing factor of two would be ~29%
+    /// off (caught by the 15% band); a broken reconvergence would diverge wildly.
     #[test]
     fn test_compute_covariance_reconverged_matches_scalar_fd_with_factor_two() {
         let model = make_model();
@@ -3615,6 +4192,9 @@ mod tests {
             CovarianceStepResult::Success(out) => out,
             CovarianceStepResult::Unusable(msg) => {
                 panic!("covariance must compute on the synthetic 1-cpt model: {msg}")
+            }
+            CovarianceStepResult::FailedNonPd { reason, .. } => {
+                panic!("covariance must be PD on synthetic 1-cpt model: {reason}")
             }
         };
 
@@ -4082,5 +4662,174 @@ mod tests {
         println!("  scalar-FD (old): {:.2}ms/Hessian", scalar_ms);
         println!("  gradient-FD (new): {:.2}ms/Hessian", grad_ms);
         println!("  speedup: {:.1}×", scalar_ms / grad_ms);
+    }
+
+    // ── build_non_pd_fallback_proposal ───────────────────────────────────────
+
+    /// Diagonal 2×2 Hessian with one negative eigenvalue (-2) and one positive
+    /// (4). The proposal covariance should have eigenvalues inflation / |λ_i|,
+    /// inflated by factor 4: so 4/2 = 2.0 and 4/4 = 1.0.
+    #[test]
+    fn build_fallback_proposal_is_pd_and_inflated() {
+        let hess = DMatrix::from_row_slice(2, 2, &[-2.0_f64, 0.0, 0.0, 4.0]);
+        let free_idx = [0usize, 1];
+        let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0);
+        // Result must be symmetric PD.
+        assert!(proposal[(0, 0)] > 0.0, "diagonal must be positive");
+        assert!(proposal[(1, 1)] > 0.0, "diagonal must be positive");
+        assert!(
+            (proposal[(0, 1)] - proposal[(1, 0)]).abs() < 1e-12,
+            "must be symmetric"
+        );
+        // Eigenvalues of the proposal should be inflation / |original eigenvalue|.
+        let eig = SymmetricEigen::new(proposal.clone());
+        let mut evs: Vec<f64> = eig.eigenvalues.iter().cloned().collect();
+        evs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Expected: [4/4, 4/2] = [1.0, 2.0]
+        assert!(
+            (evs[0] - 1.0).abs() < 1e-10,
+            "smaller eigenvalue should be 1.0: {:?}",
+            evs
+        );
+        assert!(
+            (evs[1] - 2.0).abs() < 1e-10,
+            "larger eigenvalue should be 2.0: {:?}",
+            evs
+        );
+    }
+
+    /// Fixed parameter (index 2 absent from free_idx) stays zero in full matrix.
+    #[test]
+    fn build_fallback_proposal_zeros_fixed_params() {
+        let hess = DMatrix::from_row_slice(1, 1, &[2.0_f64]);
+        let free_idx = [0usize];
+        let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 3, 4.0);
+        assert_eq!(proposal.nrows(), 3);
+        assert_eq!(proposal.ncols(), 3);
+        assert!(
+            proposal[(0, 0)] > 0.0,
+            "free param row/col must be non-zero"
+        );
+        assert_eq!(proposal[(1, 1)], 0.0, "fixed param row/col must be zero");
+        assert_eq!(proposal[(2, 2)], 0.0, "fixed param row/col must be zero");
+    }
+
+    /// A near-zero eigenvalue must be floored *relative* to the largest, capping
+    /// the proposal's condition number at `FALLBACK_PROPOSAL_MAX_COND`. With the
+    /// old absolute `1e-10` floor a 1e-9 eigenvalue would give a variance of
+    /// 4/1e-9 = 4e9 (and a 1e12 condition number) — far enough to scatter every
+    /// SIR draw out of bounds. The relative floor caps it at 4/(λ_max/1e8).
+    #[test]
+    fn build_fallback_proposal_caps_condition_number() {
+        // diag(1000, 1e-9): one well-determined direction, one near-flat.
+        let hess = DMatrix::from_row_slice(2, 2, &[1000.0_f64, 0.0, 0.0, 1e-9]);
+        let free_idx = [0usize, 1];
+        let proposal = build_non_pd_fallback_proposal(&hess, &free_idx, 2, 4.0);
+        let eig = SymmetricEigen::new(proposal.clone());
+        let max_var = eig.eigenvalues.iter().cloned().fold(f64::MIN, f64::max);
+        let min_var = eig.eigenvalues.iter().cloned().fold(f64::MAX, f64::min);
+        // floor = 1000 / 1e8 = 1e-5 ⇒ largest variance = 4 / 1e-5 = 4e5,
+        // well below the un-floored 4e9.
+        assert!(
+            max_var < 1e6,
+            "near-zero direction variance must be capped by the relative floor, got {max_var:e}"
+        );
+        // Condition number of the proposal must not exceed the cap (allow a
+        // little slack for the inflation/eigen round-trip).
+        assert!(
+            max_var / min_var <= FALLBACK_PROPOSAL_MAX_COND * 1.01,
+            "proposal condition number {} exceeds cap {}",
+            max_var / min_var,
+            FALLBACK_PROPOSAL_MAX_COND
+        );
+    }
+
+    // ── select_fd_step ───────────────────────────────────────────────────────
+
+    /// When all stencils are finite from the start, no halvings occur and the
+    /// initial step is returned unchanged.
+    #[test]
+    fn select_fd_step_no_halving_needed() {
+        let ofv = |x: &[f64]| x[0] * x[0] + x[1] * x[1];
+        let x_hat = [1.0f64, 2.0];
+        let free_idx = [0usize, 1];
+        let f0 = ofv(&x_hat);
+        let (eps, halvings) = select_fd_step(&x_hat, &free_idx, 0.01, f0, &ofv);
+        assert_eq!(eps, 0.01, "step should be unchanged");
+        assert_eq!(halvings, 0, "no halvings expected");
+    }
+
+    /// When the initial step causes overflow (NaN stencils), the function halves
+    /// until stencils are finite and returns the reduced step.
+    #[test]
+    fn select_fd_step_halves_on_overflow() {
+        // Returns NaN whenever |x[0]| >= 0.5 — simulates model overflow.
+        let ofv = |x: &[f64]| {
+            if x[0].abs() >= 0.5 {
+                f64::NAN
+            } else {
+                x[0] * x[0]
+            }
+        };
+        let x_hat = [0.0f64];
+        let free_idx = [0usize];
+        let f0 = 0.0f64;
+        // initial_eps=1.0 → hi=1.0 → x=1.0 ≥ 0.5 → NaN → halve
+        // eps=0.5 → hi=0.5 → x=0.5 ≥ 0.5 → NaN → halve
+        // eps=0.25 → hi=0.25 → x=0.25 < 0.5 → 0.0625 → OK
+        let (eps, halvings) = select_fd_step(&x_hat, &free_idx, 1.0, f0, &ofv);
+        assert_eq!(eps, 0.25, "should have halved twice");
+        assert_eq!(halvings, 2);
+        // Verify the chosen step actually produces finite stencils.
+        let hi = eps * (1.0 + x_hat[0].abs());
+        let fp = ofv(&[x_hat[0] + hi]);
+        let fm = ofv(&[x_hat[0] - hi]);
+        assert!(fp.is_finite() && fm.is_finite());
+    }
+
+    /// Empty free_idx — vacuously all OK, returns initial eps without halvings.
+    #[test]
+    fn select_fd_step_empty_free_idx() {
+        let ofv = |_x: &[f64]| f64::NAN; // would fail any real stencil
+        let (eps, halvings) = select_fd_step(&[1.0], &[], 0.01, 0.0, &ofv);
+        assert_eq!(eps, 0.01);
+        assert_eq!(halvings, 0);
+    }
+
+    /// Regression: a stencil whose *numerator* (fp − 2·f0 + fm) is finite but
+    /// whose *quotient* (÷ hi²) overflows must not be accepted at halvings == 0.
+    /// The old numerator-only check declared this step usable, then the FD loop —
+    /// which divides — rejected the diagonal and the covariance step failed
+    /// without ever halving. select_fd_step now applies the same quotient the FD
+    /// loop does, so it recognises the step as unusable (and exhausts its
+    /// halvings rather than falsely reporting success on the first try).
+    #[test]
+    fn select_fd_step_rejects_finite_numerator_infinite_quotient() {
+        // f0 = 0; any non-zero perturbation returns 1e200, so the numerator is a
+        // finite 2e200 but hi² is ~1e-200, making the quotient overflow to +inf.
+        let ofv = |x: &[f64]| if x[0] == 0.0 { 0.0 } else { 1e200 };
+        let x_hat = [0.0f64];
+        let free_idx = [0usize];
+        let f0 = 0.0f64;
+        let initial_eps = 1e-100;
+        // Numerator is finite (the old check would accept immediately) …
+        let hi = initial_eps * (1.0 + x_hat[0].abs());
+        let numerator = ofv(&[hi]) - 2.0 * f0 + ofv(&[-hi]);
+        assert!(
+            numerator.is_finite(),
+            "test setup: numerator must be finite"
+        );
+        assert!(
+            !(numerator / (hi * hi)).is_finite(),
+            "test setup: quotient must overflow"
+        );
+        // … but the quotient overflows, so the step is not accepted on the first
+        // pass: halvings > 0 (smaller steps can't rescue this pathological case,
+        // so it exhausts the budget — the point is it did not return 0).
+        let (_eps, halvings) = select_fd_step(&x_hat, &free_idx, initial_eps, f0, &ofv);
+        assert!(
+            halvings > 0,
+            "finite-numerator/infinite-quotient step must not be accepted at halvings == 0"
+        );
     }
 }

@@ -139,7 +139,10 @@ pub fn print_results(result: &FitResult) {
     // Omega estimates
     eprintln!("\n--- OMEGA Estimates ---");
     let n_eta = result.omega.nrows();
-    let show_cv = result.covariance_status != CovarianceStatus::Failed;
+    let show_cv = !matches!(
+        result.covariance_status,
+        CovarianceStatus::Failed | CovarianceStatus::SirFallback
+    );
     // Check if omega has off-diagonal elements
     let has_offdiag = (0..n_eta).any(|i| (0..i).any(|j| result.omega[(i, j)].abs() > 1e-15));
     for i in 0..n_eta {
@@ -444,6 +447,7 @@ pub fn print_results(result: &FitResult) {
         crate::types::CovarianceStatus::Computed => "computed",
         crate::types::CovarianceStatus::Failed => "FAILED",
         crate::types::CovarianceStatus::NotRequested => "not requested",
+        crate::types::CovarianceStatus::SirFallback => "SIR fallback",
     };
     eprintln!("  Covariance: {}", cov_str);
     eprintln!("  Wall time:  {:.1}s", result.wall_time_secs);

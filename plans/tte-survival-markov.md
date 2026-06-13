@@ -878,52 +878,58 @@ survival data.
 
 ## 5. Gap Analysis — What ferx-core Currently Lacks
 
-### 5.1 Observation type system ✅ *Partially resolved — PR #190*
+### 5.1 Observation type system ✅ *Resolved — PRs #190, #192*
 
-`ObsRecord::Event`, `EventType`, and `Subject.obs_records` have been added (behind
-`#[cfg(feature = "survival")]`). Binary/ordinal/count variants deferred to Phase 4.
-`CompiledModel.endpoints: HashMap<usize, EndpointLikelihood>` added (always empty until
-`[event_model]` parser lands in the next Phase 1 PR).
+`ObsRecord::Event`, `EventType`, and `Subject.obs_records` added (behind
+`#[cfg(feature = "survival")]`). `CompiledModel.endpoints: HashMap<usize,
+EndpointLikelihood>` populated by `[event_model]` parser (PR #192). Binary/ordinal/count
+variants deferred to Phase 4.
 
-### 5.2 Individual NLL dispatch
+### 5.2 Individual NLL dispatch ✅ *Resolved — PRs #192, #206*
 
-`individual_nll` hardcodes `Σ(y-f)²/V + log V`. Needs endpoint-type dispatch.
-*(Not yet resolved — requires `[event_model]` parser + `likelihood.rs` changes.)*
+`individual_nll_into_with_schedule` dispatches through `model.endpoints`; TTE data term
+added (2× scaling, FOCEI halving convention). `obs_nll_subject_into` (SAEM M-step) adds
+TTE term for each `EndpointLikelihood::Tte` endpoint (PR #206). IOV + TTE joint path
+also resolved in PR #206.
 
-### 5.3 Outer Laplace data Hessian for non-Gaussian ✅ *Math done — PR #190*
+### 5.3 Outer Laplace data Hessian for non-Gaussian ✅ *Resolved — PRs #190, #192*
 
 `data_term_hessian_fd` (4-point central stencil) and `shi_step_sizes` (Shi 2021 §3.4)
-implemented in `src/survival/mod.rs`. Wiring into `foce_subject_nll_interaction` is
-the next Phase 1 PR — that function still uses the Gaussian Almquist path only.
+in `src/survival/mod.rs`. Wired into `foce_subject_nll_interaction_with_tte` (PR #192):
+FD Hessian + `½ log|det H_total|` for TTE CMTs; combined with Gaussian Almquist correction.
 
-### 5.4 Model DSL blocks
+### 5.4 Model DSL blocks ✅ *Resolved — PR #192, extended PR #206*
 
-No hazard, ordinal, count, or Markov rate matrix blocks.
+`[event_model]` parser landed in PR #192 (Exponential, Weibull, Gompertz; named blocks
+for competing risks; `loghr` PH term). PR #206: `[structural_model]`, `[error_model]`,
+`[individual_parameters]` all optional when `[event_model]` is the sole endpoint.
+Binary/ordinal/count/Markov rate-matrix blocks deferred to Phase 4+.
 
-### 5.5 Cumulative hazard integration
+### 5.5 Cumulative hazard integration *(open — Phase 2)*
 
-Must add CHZ as an extra ODE state for ODE-linked hazard. The existing RK45 handles this.
+Must add CHZ as an extra ODE state for ODE-linked hazard (joint PK-TTE). The existing
+RK45 handles augmented states; wiring is Phase 2 work.
 
-### 5.6 Matrix exponential
+### 5.6 Matrix exponential *(open — Phase 5)*
 
 No expm implementation. Need Padé approximant for CTMM. Van Loan trick for gradients.
 
-### 5.7 Data reader extensions
+### 5.7 Data reader extensions ✅ *Resolved — PR #192*
 
-DV must optionally be interpreted as event indicator, state index, or count. CMT column
-+ model declaration resolves routing unambiguously.
+DV=0/1/2 routed to `subject.obs_records` for TTE CMTs; `TENTRY` column auto-detected
+for left truncation; non-integer DV on TTE CMT → hard error. State-index and count
+routing deferred to Phase 4.
 
-### 5.8 SAEM sigma update for non-Gaussian
+### 5.8 SAEM sigma update for non-Gaussian ✅ *Resolved — PR #206*
 
-The SAEM M-step analytic sigma update is Gaussian-specific. Must skip or generalize
-for endpoints without a sigma parameter.
-*(Not yet resolved — requires `[event_model]` parser so TTE subjects are identifiable.)*
+SAEM M-step now adds the TTE data term for TTE subjects. Sigma update is Gaussian-only
+(no sigma in TTE models), which is correct — skipped automatically when no sigma declared.
 
-### 5.9 f-SAEM proposal (improvement opportunity)
+### 5.9 f-SAEM proposal *(open — improvement opportunity)*
 
 Current SAEM uses random-walk MH proposal. Replacing with Laplace-based independent
-proposal (f-SAEM) would dramatically improve convergence for all non-Gaussian models
-with no change to the estimation framework (§9.1).
+proposal (f-SAEM) would accelerate convergence for all non-Gaussian models (§9.1). PR #265
+(open, "SAEM conditional-distribution pass") is a related incremental improvement.
 
 ---
 

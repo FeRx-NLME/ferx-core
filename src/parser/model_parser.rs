@@ -2873,6 +2873,11 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         .to_lowercase();
     if val == "saem" {
         Ok(EstimationMethod::Saem)
+    } else if val == "impmap"
+        || val == "importance_sampling_map"
+        || val == "importance-sampling-map"
+    {
+        Ok(EstimationMethod::Impmap)
     } else if val == "imp" || val == "importance_sampling" || val == "importance-sampling" {
         Ok(EstimationMethod::Imp)
     } else if val.contains("hybrid") || val == "gn_hybrid" || val == "gn-hybrid" {
@@ -2999,6 +3004,31 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
         "covariance" => opts.run_covariance_step = parse_bool("covariance")?,
+        "covariance_fallback" => {
+            opts.covariance_fallback = match value.to_lowercase().as_str() {
+                "none" => crate::types::CovarianceFallback::None,
+                "sir" => crate::types::CovarianceFallback::Sir,
+                other => {
+                    return Err(format!(
+                        "fit option `covariance_fallback`: unknown value `{other}` — \
+                         expected none/sir"
+                    ));
+                }
+            };
+        }
+        "covariance_method" => {
+            opts.covariance_method = match value.to_lowercase().as_str() {
+                "r" | "hessian" => crate::types::CovarianceMethod::Hessian,
+                "s" | "cross_product" => crate::types::CovarianceMethod::CrossProduct,
+                "rsr" | "sandwich" => crate::types::CovarianceMethod::Sandwich,
+                other => {
+                    return Err(format!(
+                        "fit option `covariance_method`: unknown value `{other}` — \
+                         expected r/s/rsr"
+                    ));
+                }
+            };
+        }
         "fd_hessian_step" => {
             let v = parse_f64("fd_hessian_step")?;
             if v <= 0.0 || !v.is_finite() {
@@ -3072,6 +3102,47 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 ));
             }
             opts.is_low_ess_threshold = v;
+        }
+        "impmap_iterations" => {
+            let v = parse_usize("impmap_iterations")?;
+            if v < 1 {
+                return Err(format!("impmap_iterations must be >= 1, got {v}"));
+            }
+            opts.impmap_iterations = v;
+        }
+        "impmap_samples" => {
+            let v = parse_usize("impmap_samples")?;
+            if v < 2 {
+                return Err(format!("impmap_samples must be >= 2, got {v}"));
+            }
+            opts.impmap_samples = v;
+        }
+        "impmap_proposal_df" => {
+            // `normal` / `mvn` (or a very large df) select a multivariate-normal
+            // proposal — NONMEM's IMPMAP default. A finite value gives Student-t.
+            let tok = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
+                opts.impmap_proposal_df = f64::INFINITY;
+            } else {
+                let v = parse_f64("impmap_proposal_df")?;
+                if v < 1.0 {
+                    return Err(format!(
+                        "impmap_proposal_df must be >= 1.0 or `normal`, got {v}"
+                    ));
+                }
+                opts.impmap_proposal_df = v;
+            }
+        }
+        "impmap_seed" => opts.impmap_seed = parse_u64_opt("impmap_seed")?,
+        "impmap_averaging" => opts.impmap_averaging = parse_usize("impmap_averaging")?,
+        "impmap_low_ess_threshold" => {
+            let v = parse_f64("impmap_low_ess_threshold")?;
+            if !(0.0..=1.0).contains(&v) {
+                return Err(format!(
+                    "impmap_low_ess_threshold must be in [0.0, 1.0], got {v}"
+                ));
+            }
+            opts.impmap_low_ess_threshold = v;
         }
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
@@ -8894,6 +8965,65 @@ mod tests {
     }
 
     #[test]
+    fn test_impmap_method_tokens_parse() {
+        for tok in [
+            "impmap",
+            "importance_sampling_map",
+            "importance-sampling-map",
+        ] {
+            let opts = parse_fit_options(&[format!("method = {tok}")]).expect("parse must succeed");
+            assert_eq!(
+                opts.method,
+                EstimationMethod::Impmap,
+                "token `{tok}` must map to Impmap"
+            );
+        }
+        // `imp` must still resolve to the evaluation-only stage, not Impmap.
+        let opts = parse_fit_options(&["method = imp".to_string()]).expect("parse");
+        assert_eq!(opts.method, EstimationMethod::Imp);
+    }
+
+    #[test]
+    fn test_impmap_options_parse_and_validate() {
+        let opts = parse_fit_options(&[
+            "method = importance_sampling_map".to_string(),
+            "impmap_iterations = 80".to_string(),
+            "impmap_samples = 250".to_string(),
+            "impmap_proposal_df = 8.0".to_string(),
+            "impmap_averaging = 30".to_string(),
+            "impmap_seed = 77".to_string(),
+            "impmap_low_ess_threshold = 0.2".to_string(),
+            "covariance = false".to_string(),
+        ])
+        .expect("parse must succeed");
+        assert_eq!(opts.method, EstimationMethod::Impmap);
+        assert_eq!(opts.impmap_iterations, 80);
+        assert_eq!(opts.impmap_samples, 250);
+        assert_eq!(opts.impmap_proposal_df, 8.0);
+        assert_eq!(opts.impmap_averaging, 30);
+        assert_eq!(opts.impmap_seed, Some(77));
+        assert_eq!(opts.impmap_low_ess_threshold, 0.2);
+        // All keys are method-specific to Impmap and Impmap is selected.
+        assert!(opts.unsupported_keys_warnings().is_empty());
+
+        // `normal` / `mvn` select the multivariate-normal proposal (df = +inf).
+        for kw in ["normal", "mvn", "NORMAL"] {
+            let mut o = FitOptions::default();
+            assert!(apply_fit_option(&mut o, "impmap_proposal_df", kw).is_ok());
+            assert!(o.impmap_proposal_df.is_infinite());
+        }
+
+        // Range validation.
+        let mut o = FitOptions::default();
+        assert!(apply_fit_option(&mut o, "impmap_samples", "1").is_err()); // < 2
+        assert!(apply_fit_option(&mut o, "impmap_iterations", "0").is_err()); // < 1
+        assert!(apply_fit_option(&mut o, "impmap_proposal_df", "0.5").is_err()); // < 1
+        assert!(apply_fit_option(&mut o, "impmap_low_ess_threshold", "1.5").is_err()); // > 1
+                                                                                       // Default (MVN) preserved after the failed applies.
+        assert!(o.impmap_proposal_df.is_infinite());
+    }
+
+    #[test]
     fn test_sir_df_valid_and_invalid() {
         let mut opts = FitOptions::default();
         assert!(apply_fit_option(&mut opts, "sir_df", "5.0").is_ok());
@@ -9271,6 +9401,46 @@ mod tests {
         assert_eq!(opts.saem_n_convergence, 400);
         assert!(opts.sir);
         assert_eq!(opts.sir_samples, 2000);
+    }
+
+    #[test]
+    fn test_parse_covariance_fallback_none_and_sir() {
+        use crate::types::CovarianceFallback;
+        let opts = parse_fit_options(&["covariance_fallback = sir".to_string()]).unwrap();
+        assert_eq!(opts.covariance_fallback, CovarianceFallback::Sir);
+
+        let opts2 = parse_fit_options(&["covariance_fallback = none".to_string()]).unwrap();
+        assert_eq!(opts2.covariance_fallback, CovarianceFallback::None);
+
+        // Case-insensitive
+        let opts3 = parse_fit_options(&["covariance_fallback = SIR".to_string()]).unwrap();
+        assert_eq!(opts3.covariance_fallback, CovarianceFallback::Sir);
+
+        // Invalid value returns error
+        let err = parse_fit_options(&["covariance_fallback = hmc".to_string()]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_parse_covariance_method() {
+        use crate::types::CovarianceMethod;
+        // default
+        let def = parse_fit_options(&[]).unwrap();
+        assert_eq!(def.covariance_method, CovarianceMethod::Hessian);
+        // r / s / rsr (and the long-form aliases), case-insensitive
+        for (input, expected) in [
+            ("r", CovarianceMethod::Hessian),
+            ("hessian", CovarianceMethod::Hessian),
+            ("S", CovarianceMethod::CrossProduct),
+            ("cross_product", CovarianceMethod::CrossProduct),
+            ("RSR", CovarianceMethod::Sandwich),
+            ("sandwich", CovarianceMethod::Sandwich),
+        ] {
+            let opts = parse_fit_options(&[format!("covariance_method = {input}")]).unwrap();
+            assert_eq!(opts.covariance_method, expected, "input `{input}`");
+        }
+        // invalid
+        assert!(parse_fit_options(&["covariance_method = bhhh".to_string()]).is_err());
     }
 
     // ── mu-referencing pattern detection ─────────────────────────────────

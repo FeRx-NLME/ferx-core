@@ -201,7 +201,7 @@ fn tafd_correct_single_dose() {
         vec![10.0],
         vec![DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0)],
     );
-    let (tafd, _) = tafd_tad_for_subject(&subj, 0, 0.0);
+    let (tafd, _) = tafd_tad_for_subject(&subj, 0, &[]);
     assert!((tafd - 5.0).abs() < 1e-10, "TAFD should be 5, got {tafd}");
 }
 
@@ -209,7 +209,7 @@ fn tafd_correct_single_dose() {
 fn tafd_nan_when_no_dose() {
     // No doses → TAFD is NaN
     let subj = make_subject_with_doses(vec![10.0], vec![]);
-    let (tafd, _) = tafd_tad_for_subject(&subj, 0, 0.0);
+    let (tafd, _) = tafd_tad_for_subject(&subj, 0, &[]);
     assert!(
         tafd.is_nan(),
         "TAFD should be NaN with no doses, got {tafd}"
@@ -223,7 +223,7 @@ fn tad_nan_when_dose_after_obs() {
         vec![1.0],
         vec![DoseEvent::new(20.0, 100.0, 1, 0.0, false, 0.0)],
     );
-    let (_, tad) = tafd_tad_for_subject(&subj, 0, 0.0);
+    let (_, tad) = tafd_tad_for_subject(&subj, 0, &[]);
     assert!(
         tad.is_nan(),
         "TAD should be NaN when dose is after obs, got {tad}"
@@ -236,7 +236,7 @@ fn tad_ss_modular() {
     let mut dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 12.0);
     dose.ss = true;
     let subj = make_subject_with_doses(vec![50.0], vec![dose]);
-    let (_, tad) = tafd_tad_for_subject(&subj, 0, 0.0);
+    let (_, tad) = tafd_tad_for_subject(&subj, 0, &[]);
     assert!((tad - 2.0).abs() < 1e-10, "TAD(SS) should be 2, got {tad}");
 }
 
@@ -250,8 +250,84 @@ fn tad_after_addl_expanded_doses() {
         DoseEvent::new(48.0, 100.0, 1, 0.0, false, 0.0),
     ];
     let subj = make_subject_with_doses(vec![50.0], doses);
-    let (_, tad) = tafd_tad_for_subject(&subj, 0, 0.0);
+    let (_, tad) = tafd_tad_for_subject(&subj, 0, &[]);
     assert!((tad - 2.0).abs() < 1e-10, "TAD should be 2, got {tad}");
+}
+
+// ── Per-dose-occasion absorption lag (BID across occasions; follow-up to #238) ──
+
+#[test]
+fn tad_bid_explicit_no_lag() {
+    // Explicit q12h BID, no lag: TAD = time since the most recent dose.
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let subj = make_subject_with_doses(vec![6.0, 14.0, 26.0], doses);
+    let tad: Vec<f64> = (0..3)
+        .map(|j| tafd_tad_for_subject(&subj, j, &[]).1)
+        .collect();
+    assert_eq!(
+        tad,
+        vec![6.0, 2.0, 2.0],
+        "BID TAD = time since the most recent q12h dose"
+    );
+}
+
+#[test]
+fn tad_bid_uniform_lag_excludes_unabsorbed_dose() {
+    // Uniform lag = 1h (no IOV on lag). A dose whose lagged arrival is after the
+    // observation is excluded from the "most recent dose" pick.
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    // obs @12.5: evening dose @12 arrives @13 — not yet → from morning (arrived @1).
+    let subj_a = make_subject_with_doses(vec![12.5], doses.clone());
+    let tad_a = tafd_tad_for_subject(&subj_a, 0, &[1.0, 1.0]).1;
+    assert!(
+        (tad_a - 11.5).abs() < 1e-12,
+        "evening dose not yet absorbed: TAD {tad_a}"
+    );
+    // obs @13.5: evening dose arrived @13 → TAD = 0.5.
+    let subj_b = make_subject_with_doses(vec![13.5], doses);
+    let tad_b = tafd_tad_for_subject(&subj_b, 0, &[1.0, 1.0]).1;
+    assert!(
+        (tad_b - 0.5).abs() < 1e-12,
+        "evening dose absorbed: TAD {tad_b}"
+    );
+}
+
+#[test]
+fn tad_bid_per_dose_occasion_lag() {
+    // BID spanning two IOV occasions with IOV on the absorption lag:
+    //   morning dose @0  (occasion 1, lag 1.0)
+    //   evening dose @12 (occasion 2, lag 1.5)
+    //   obs @13          (occasion 2)
+    // The evening dose arrives at 13.5 — not yet absorbed at obs 13 — so TAD must
+    // count from the morning dose's arrival at 1.0 → 12.0.
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let subj = make_subject_with_doses(vec![13.0], doses);
+
+    // Correct: each dose shifted by its own occasion's lag.
+    let tad_per_dose = tafd_tad_for_subject(&subj, 0, &[1.0, 1.5]).1;
+    assert!(
+        (tad_per_dose - 12.0).abs() < 1e-12,
+        "per-dose lag must pick the morning dose @1.0 → TAD 12.0, got {tad_per_dose}"
+    );
+
+    // Regression contrast: a single obs-occasion scalar (1.5) applied to both
+    // doses mis-shifts the morning dose → 11.5, the behaviour this follow-up
+    // removes. (Pre-#238, the zero-lag scalar gave 1.0 — the wrong dose entirely.)
+    let tad_uniform = tafd_tad_for_subject(&subj, 0, &[1.5, 1.5]).1;
+    assert!(
+        (tad_uniform - 11.5).abs() < 1e-12,
+        "single obs-occasion lag mis-shifts the morning dose, got {tad_uniform}"
+    );
 }
 
 // ── End-to-end: fit() produces finite extra_columns ──────────────────────────

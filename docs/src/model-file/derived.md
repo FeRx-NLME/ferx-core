@@ -249,7 +249,11 @@ and the compartment state is inaccessible by name — use `compartments[i]` inst
   from the EKF posterior mean when process noise is large.
 - **IOV subjects**: `compartments[i]` evaluates to `NaN` — compartment states are
   not yet available on the IOV prediction path
-  (`W_DERIVED_CMT_IOV_UNSUPPORTED` warning is emitted).
+  (`W_DERIVED_CMT_IOV_UNSUPPORTED` warning is emitted). Scalar references —
+  individual parameters (`CL`, `V`, …), `ETA`/`KAPPA`, `IPRED`, `TAD`, etc. — *do*
+  honour each observation's occasion kappa, so `[derived]` expressions and
+  `[output]` columns built from them are occasion-correct; only compartment-state
+  access is unavailable.
 - **Analytical models with time-varying covariates**: `compartments[i]` evaluates
   to `NaN` for affected subjects — states would require time-varying PK params that
   the superposition path does not support

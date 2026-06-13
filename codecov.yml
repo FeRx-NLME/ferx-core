@@ -1,0 +1,98 @@
+# Coverage policy for ferx-core. Rule: CLAUDE.md. Work: #286. Discussion: #285.
+#
+# Sustainability model: coverage is enforced where it's fair, informational
+# where it isn't.
+#   patch                -> every PR's own changed lines must be tested (ENFORCED)
+#   project/default      -> per-PR no-regression context (informational, non-blocking)
+#   project/floor        -> per-PR 90% gap shown to the author (informational)
+#   project/floor_weekly -> 90% floor ENFORCED on the weekly main run (goes red
+#                           below 90%); never evaluated on PRs, so it blocks no one
+# Slow-tests NEVER run on PRs: per-PR upload = `fast` flag (--features ci);
+# nightly upload = `slow` flag (--features ci,slow-tests). carryforward lets the
+# nightly `slow` data augment the project number on PRs without re-running it.
+
+coverage:
+  range: 85..95
+  precision: 2
+  round: down
+  status:
+    project:
+      # Per-PR project statuses are INFORMATIONAL: they never block a
+      # contributor and never show a red X on a PR. (They also read low on a
+      # PR until carryforward is seeded, since the per-PR job is fast-only —
+      # another reason not to gate on them.) The teeth live on `patch` (per
+      # PR) and `floor_weekly` (the weekly main run).
+      #
+      # No-regression context, relative to base.
+      default:
+        target: auto
+        threshold: 0.5%
+        informational: true
+        flags:
+          - fast
+          - slow
+      # The explicit 90% gap, shown on every PR so the author sees how far
+      # under the floor they are — informational, so it challenges without
+      # gatekeeping.
+      floor:
+        target: 90%
+        threshold: 0%
+        informational: true
+        flags:
+          - fast
+          - slow
+      # The teeth: ENFORCED on the weekly full-coverage run on `main` only, so
+      # the project status genuinely goes RED there while we're below 90%.
+      # Never evaluated on PRs (branches: main), so it blocks no one. No later
+      # flip needed — it's enforcing now and turns green on its own once the
+      # backfill clears 90%.
+      floor_weekly:
+        target: 90%
+        threshold: 0%
+        informational: false
+        branches:
+          - main
+        flags:
+          - fast
+          - slow
+    patch:
+      default:
+        target: 90% # new/changed lines must be tested
+        threshold: 0%
+        flags:
+          - fast
+
+flag_management:
+  default_rules:
+    carryforward: true
+  individual_flags:
+    - name: fast
+      carryforward: false
+    - name: slow
+      carryforward: true
+
+comment:
+  layout: "header, diff, flags, files"
+  require_changes: true
+
+# Ignore policy: scope by what the code IS, never by how red it is.
+#   tests/**, build.rs        -> don't measure coverage OF test/build code.
+#   src/bin/generate_data.rs  -> maintainer tool that writes example-data
+#       fixtures; not library, not the user-facing CLI. Guarded at the right
+#       altitude by the e2e smoke test in tests/cli_binaries.rs. Ignorable on
+#       its role (would be even at 100%), not to pad the number.
+#
+# Deliberately NOT ignored:
+#   src/bin/run_model.rs      -> the `ferx` CLI (arg parsing, dispatch, error
+#       exits) is user-facing logic -> refactored into a lib run() and
+#       unit-tested, not excluded (#286).
+#
+# Handled at the source, not here:
+#   src/ad/dual.rs            -> autodiff-only infra. `pub mod dual` is gated
+#       behind feature="autodiff" (like the rest of ad/), so the FD-only `ci`
+#       coverage build no longer compiles or reports it. Re-enters measurement
+#       when the Enzyme coverage job lands (#281).
+ignore:
+  - "tests/**"
+  - "**/build.rs"
+  - "src/bin/generate_data.rs"

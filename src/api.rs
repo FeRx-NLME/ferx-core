@@ -634,6 +634,17 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+        if chain.iter().any(|&m| m == EstimationMethod::Impmap) {
+            diags.push(
+                Diagnostic::error(
+                    "E_SDE_INCOMPATIBLE",
+                    "method = impmap is not compatible with a [diffusion] block. \
+                     The EKF process-noise variance is not threaded through the IMPMAP \
+                     importance-sampling likelihood. Use method = foce or method = focei.",
+                )
+                .with_block("fit_options"),
+            );
+        }
         if options.gradient_method == crate::types::GradientMethod::Ad {
             diags.push(
                 Diagnostic::error(
@@ -644,6 +655,21 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+    }
+
+    // IMPMAP does not yet support inter-occasion variability (κ / [iov]); the κ
+    // sufficient statistics and Ω_iov M-step are a planned follow-up. Surface it
+    // at check time so `ferx check` rejects it rather than the fit failing at
+    // runtime (possibly after a chained warm-up stage has already run).
+    if model.n_kappa > 0 && chain.iter().any(|&m| m == EstimationMethod::Impmap) {
+        diags.push(
+            Diagnostic::error(
+                "E_IMPMAP_IOV_UNSUPPORTED",
+                "method = impmap does not yet support inter-occasion variability \
+                 (κ / [iov]). Use method = saem or method = focei for IOV models.",
+            )
+            .with_block("fit_options"),
+        );
     }
 
     // Explicit `gradient_method = ad` on a build compiled WITHOUT the `autodiff`
@@ -665,20 +691,12 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // IMP is a likelihood evaluation, not an estimator: it must follow a
-    // parameter-estimating stage, appear at most once, and be the terminal stage.
+    // IMP is a likelihood evaluation, not an estimator: it may appear at most
+    // once and must be the terminal stage. It may run standalone (as the only
+    // stage), in which case the EBEs/Hessians it consumes are evaluated at the
+    // initial parameters — IMP then reports the −2 log L at those parameters
+    // without estimating them.
     if chain.iter().any(|&m| m == EstimationMethod::Imp) {
-        if chain.first().copied() == Some(EstimationMethod::Imp) {
-            diags.push(
-                Diagnostic::error(
-                    "E_IMP_CHAIN",
-                    "method `imp` cannot be the first stage in a chain — it consumes \
-                     EBEs and Hessians from a preceding estimator. Try `methods = [focei, imp]` \
-                     or `methods = [saem, imp]`.",
-                )
-                .with_block("fit_options"),
-            );
-        }
         let n_imp = chain
             .iter()
             .filter(|&&m| m == EstimationMethod::Imp)
@@ -1398,37 +1416,62 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
     diags
 }
 
-/// Compute TAFD (time after first dose) and TAD (time after last dose,
-/// SS-aware) for observation index `obs_idx` of `subject`.
-pub fn tafd_tad_for_subject(subject: &Subject, obs_idx: usize, lagtime: f64) -> (f64, f64) {
-    let obs_time = subject.obs_times[obs_idx];
+/// Time after the most recent **absorbed** dose at time `t` (SS-aware), shifting
+/// each dose by its own lag from `dose_lagtimes`. Missing entries — a slice
+/// shorter than `subject.doses`, or `&[]` — default to zero lag. Returns NaN when
+/// no dose has been absorbed by `t`. Shared by the per-observation TAD column and
+/// the model-based integral grid so both apply identical per-dose-lag logic.
+fn tad_at_time(subject: &Subject, t: f64, dose_lagtimes: &[f64]) -> f64 {
+    let last_dose_eff = subject
+        .doses
+        .iter()
+        .enumerate()
+        .filter_map(|(d, dose)| {
+            let lag = dose_lagtimes.get(d).copied().unwrap_or(0.0);
+            if dose.time + lag > t + 1e-12 {
+                return None;
+            }
+            let eff = if dose.ss && dose.ii > 0.0 {
+                let elapsed = t - (dose.time + lag);
+                t - elapsed.rem_euclid(dose.ii)
+            } else {
+                dose.time + lag
+            };
+            Some(eff)
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    if last_dose_eff.is_finite() {
+        t - last_dose_eff
+    } else {
+        f64::NAN
+    }
+}
 
+/// Compute TAFD (time after first dose) and TAD (time after last dose, SS-aware)
+/// for observation index `obs_idx` of `subject`.
+///
+/// `dose_lagtimes[d]` is the absorption lag for dose `d`, evaluated with that
+/// dose's occasion kappa and covariate snapshot (see [`crate::pk::predict_iov`]).
+/// Each dose's effective arrival is `dose.time + dose_lagtimes[d]`, so under a lag
+/// that varies across doses — IOV on the lag, or a time-varying covariate — a dose
+/// given in one occasion is shifted by its *own* lag rather than the observation's,
+/// which matters for the most-recent-dose pick (e.g. BID dosing spanning two
+/// occasions). Missing entries default to zero lag, so callers with no lag can
+/// pass `&[]`. TAFD is unaffected — measured from the raw first-dose time, not the
+/// lagged arrival.
+pub fn tafd_tad_for_subject(
+    subject: &Subject,
+    obs_idx: usize,
+    dose_lagtimes: &[f64],
+) -> (f64, f64) {
+    let obs_time = subject.obs_times[obs_idx];
     let first_dose_time = subject.occasion_first_dose_time(obs_time);
     let tafd = if first_dose_time.is_finite() {
         obs_time - first_dose_time
     } else {
         f64::NAN
     };
-
-    let last_dose_eff = subject
-        .doses
-        .iter()
-        .filter(|d| d.time + lagtime <= obs_time + 1e-12)
-        .map(|d| {
-            if d.ss && d.ii > 0.0 {
-                let elapsed = obs_time - (d.time + lagtime);
-                obs_time - elapsed.rem_euclid(d.ii)
-            } else {
-                d.time + lagtime
-            }
-        })
-        .fold(f64::NEG_INFINITY, f64::max);
-    let tad = if last_dose_eff.is_finite() {
-        obs_time - last_dose_eff
-    } else {
-        f64::NAN
-    };
-
+    let tad = tad_at_time(subject, obs_time, dose_lagtimes);
     (tafd, tad)
 }
 
@@ -1467,6 +1510,7 @@ pub(crate) fn compute_extra_output_columns(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
+    kappas_per_subject: &[Vec<DVector<f64>>],
     subjects: &mut [SubjectResult],
 ) {
     use crate::types::{AggFunction, DerivedContext, DerivedKind, IntegralStep, IntegralWindow};
@@ -1482,18 +1526,73 @@ pub(crate) fn compute_extra_output_columns(
         let eta_hat = sr.eta.as_slice();
         let n_obs = sr.ipred.len();
 
+        // Per-observation full eta vector [BSV η … | occasion κ …].
+        //
+        // `eta_hat` (= `sr.eta`) is BSV-only (length `n_eta`); for IOV models
+        // (`n_kappa > 0`) `pk_param_fn` and `[derived]` expressions expect the
+        // full `n_eta + n_kappa` vector, with the kappas belonging to *this
+        // observation's occasion*. Mirror `pk::predict_iov`'s occasion→kappa
+        // selection exactly so the post-fit derived/diagnostic columns use the
+        // same per-occasion kappa as the predictions that drove the fit. Without
+        // this the kappa slots silently read 0 for every observation (issue #238).
+        let subj_kappas: &[DVector<f64>] = kappas_per_subject
+            .get(si)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+        let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(occ_groups.len());
+        for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
+            occ_to_k.insert(*occ_id, k);
+        }
+        let combined_for = |occ_id: u32| -> Vec<f64> {
+            let mut c = Vec::with_capacity(eta_hat.len() + model.n_kappa);
+            c.extend_from_slice(eta_hat);
+            if model.n_kappa > 0 {
+                match occ_to_k.get(&occ_id) {
+                    Some(&k) if k < subj_kappas.len() => {
+                        c.extend_from_slice(subj_kappas[k].as_slice())
+                    }
+                    _ => c.extend(std::iter::repeat_n(0.0, model.n_kappa)),
+                }
+            }
+            c
+        };
+        let per_obs_eta_full: Vec<Vec<f64>> = (0..n_obs)
+            .map(|j| combined_for(subject.occasions.get(j).copied().unwrap_or(0)))
+            .collect();
+
+        // Per-dose absorption lag, each evaluated with that dose's occasion kappa
+        // and covariate snapshot (mirrors predict_iov's per-dose PK params). TAD
+        // shifts every dose by its own lag, so a dose given in one occasion is not
+        // mis-shifted by the observation's lag — matters when the lag varies across
+        // doses (IOV on the lag, or a time-varying covariate) and dosing spans the
+        // differing values (e.g. BID across two occasions). Computed once per
+        // subject (dose-indexed). Skipped entirely when the model declares no lag:
+        // `dose_lagtimes` stays empty and `tad_at_time` falls back to zero lag,
+        // so the common no-lag case pays nothing for this per-dose pass.
+        let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
+            (0..subject.doses.len())
+                .map(|d| {
+                    let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
+                    let eta_d = combined_for(occ);
+                    (model.pk_param_fn)(theta, &eta_d, subject.dose_cov(d)).lagtime()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Per-observation PK params, indiv maps, TAFD, TAD
         let mut per_obs_cov: Vec<&HashMap<String, f64>> = Vec::with_capacity(n_obs);
         let mut per_obs_indiv: Vec<HashMap<String, f64>> = Vec::with_capacity(n_obs);
         let mut per_obs_tafd: Vec<f64> = Vec::with_capacity(n_obs);
         let mut per_obs_tad: Vec<f64> = Vec::with_capacity(n_obs);
 
-        for j in 0..n_obs {
+        for (j, eta_full) in per_obs_eta_full.iter().enumerate() {
             let cov_j = subject.obs_cov(j);
-            let pk_j = (model.pk_param_fn)(theta, eta_hat, cov_j);
-            let lagtime = pk_j.lagtime();
+            let pk_j = (model.pk_param_fn)(theta, eta_full, cov_j);
             let indiv_j = build_indiv_map(&pk_j, &model.indiv_param_names, &model.pk_indices);
-            let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, lagtime);
+            let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, &dose_lagtimes);
             per_obs_cov.push(cov_j);
             per_obs_indiv.push(indiv_j);
             per_obs_tafd.push(tafd_j);
@@ -1625,7 +1724,7 @@ pub(crate) fn compute_extra_output_columns(
                             .collect();
                         let ctx = DerivedContext {
                             theta,
-                            eta: eta_hat,
+                            eta: &per_obs_eta_full[j],
                             indiv_params: &per_obs_indiv[j],
                             covariates: per_obs_cov[j],
                             ipred: sr.ipred[j],
@@ -1655,7 +1754,7 @@ pub(crate) fn compute_extra_output_columns(
                             .collect();
                         let ctx = DerivedContext {
                             theta,
-                            eta: eta_hat,
+                            eta: &per_obs_eta_full[j],
                             indiv_params: &per_obs_indiv[j],
                             covariates: per_obs_cov[j],
                             ipred: sr.ipred[j],
@@ -1733,7 +1832,7 @@ pub(crate) fn compute_extra_output_columns(
                                     .collect();
                                 let ctx = DerivedContext {
                                     theta,
-                                    eta: eta_hat,
+                                    eta: &per_obs_eta_full[j],
                                     indiv_params: &per_obs_indiv[j],
                                     covariates: per_obs_cov[j],
                                     ipred: sr.ipred[j],
@@ -1776,14 +1875,20 @@ pub(crate) fn compute_extra_output_columns(
                             })
                             .collect()
                     };
-                    let session_grid_lagtime: Vec<f64> = if use_obs {
+                    // Per-session representative full eta vector (BSV η + the κ of
+                    // the session's first observation's occasion). Mirrors the
+                    // first-obs approximation used for session_grid_cov/indiv, so a
+                    // model-based integral over an IOV session uses that occasion's
+                    // κ rather than κ=0 (issue #238).
+                    let session_grid_eta_full: Vec<&[f64]> = if use_obs {
                         vec![]
                     } else {
-                        session_grid_cov
+                        session_obs
                             .iter()
-                            .map(|cov| {
-                                let pk = (model.pk_param_fn)(theta, eta_hat, cov);
-                                pk.lagtime()
+                            .map(|g| {
+                                g.first()
+                                    .map(|&j| per_obs_eta_full[j].as_slice())
+                                    .unwrap_or(eta_hat)
                             })
                             .collect()
                     };
@@ -1809,8 +1914,8 @@ pub(crate) fn compute_extra_output_columns(
                     // expressions referencing TIME see the internal clock, not raw TIME.
                     let eval_integral_grid = |from: f64, to: f64, session_idx: usize| -> f64 {
                         let grid_cov = session_grid_cov[session_idx];
-                        let grid_lagtime = session_grid_lagtime[session_idx];
                         let indiv_s = &session_grid_indiv[session_idx];
+                        let grid_eta_full = session_grid_eta_full[session_idx];
                         let n_steps = match step {
                             IntegralStep::Fixed(s) => {
                                 let n = ((to - from) / s).ceil() as usize + 1;
@@ -1828,20 +1933,22 @@ pub(crate) fn compute_extra_output_columns(
                         // we evaluate the superposition formula at each grid point.
                         let grid_cmt_states: Vec<Vec<f64>> = if *uses_compartments {
                             if model.n_kappa > 0 {
-                                // IOV subjects: eta_hat is BSV-only (kappas zeroed); states
-                                // computed here would use kappa=0 regardless of the actual
-                                // occasion, producing finite but wrong values. Return empty
-                                // so every grid point evaluates to NaN, consistent with
-                                // per-obs compartment_states being empty for IOV subjects.
-                                // W_DERIVED_CMT_IOV_UNSUPPORTED explains why.
+                                // IOV subjects: a single fixed PK snapshot (one occasion's
+                                // kappa) cannot represent a dose history spanning multiple
+                                // occasions — the analytical superposition / single-pass
+                                // solve here would mix occasions and be silently wrong
+                                // (the same reason predict_iov uses the event-driven path).
+                                // Return empty so every grid point evaluates to NaN,
+                                // consistent with per-obs compartment_states being empty
+                                // for IOV subjects. W_DERIVED_CMT_IOV_UNSUPPORTED explains why.
                                 vec![]
                             } else if let Some(ref ode) = model.ode_spec {
-                                let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
+                                let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
                                 crate::ode::ode_dense_solve_states(
                                     ode,
                                     &pk_j.values,
                                     theta,
-                                    eta_hat,
+                                    grid_eta_full,
                                     subject,
                                     &grid_times,
                                 )
@@ -1862,7 +1969,7 @@ pub(crate) fn compute_extra_output_columns(
                                 // W_DERIVED_CMT_TV_ANALYTICAL warning.
                                 vec![]
                             } else {
-                                let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
+                                let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
                                 crate::pk::analytical_state_at_times(
                                     model.pk_model,
                                     subject,
@@ -1886,26 +1993,11 @@ pub(crate) fn compute_extra_output_columns(
                                         f64::NAN
                                     }
                                 };
-                                let tad_k = {
-                                    let last_dose_eff = subject
-                                        .doses
-                                        .iter()
-                                        .filter(|d| d.time + grid_lagtime <= t + 1e-12)
-                                        .map(|d| {
-                                            if d.ss && d.ii > 0.0 {
-                                                let elapsed = t - (d.time + grid_lagtime);
-                                                t - elapsed.rem_euclid(d.ii)
-                                            } else {
-                                                d.time + grid_lagtime
-                                            }
-                                        })
-                                        .fold(f64::NEG_INFINITY, f64::max);
-                                    if last_dose_eff.is_finite() {
-                                        t - last_dose_eff
-                                    } else {
-                                        f64::NAN
-                                    }
-                                };
+                                // Same per-dose-lag TAD as the per-observation column
+                                // (shared `tad_at_time`), so a `[derived]` integral over
+                                // TAD agrees with the `sdtab` TAD column under IOV/TV-cov
+                                // lag — not the old session-representative scalar lag.
+                                let tad_k = tad_at_time(subject, t, &dose_lagtimes);
                                 // Nearest IPRED from this session's observations only.
                                 let nearest_ipred = session_obs[session_idx]
                                     .iter()
@@ -1942,7 +2034,7 @@ pub(crate) fn compute_extra_output_columns(
                                 };
                                 let ctx = DerivedContext {
                                     theta,
-                                    eta: eta_hat,
+                                    eta: grid_eta_full,
                                     indiv_params: indiv_s,
                                     covariates: grid_cov,
                                     ipred: nearest_ipred,
@@ -2134,6 +2226,7 @@ fn fit_inner(
                     | EstimationMethod::FoceGn
                     | EstimationMethod::FoceGnHybrid
                     | EstimationMethod::Imp
+                    | EstimationMethod::Impmap
             )
         });
         if uses_gradient_route {
@@ -2327,9 +2420,57 @@ fn fit_inner(
         // params/result update at the bottom of the loop so the preceding
         // stage's `OuterResult` continues to be the canonical one.
         if method == EstimationMethod::Imp {
+            // Standalone IMP (no preceding estimator): evaluate the EBEs/Hessians
+            // at the initial parameters so IMP can report the −2 log L there.
+            // This synthetic stage also becomes the canonical `OuterResult` so
+            // the rest of the fit (sdtab, FitResult) sees the (unchanged) params.
+            if result.is_none() {
+                let mu_k = crate::estimation::parameterization::compute_mu_k(
+                    model,
+                    &stage_params.theta,
+                    stage_opts.mu_referencing,
+                );
+                let (eta_hats, h_matrices, _stats, kappas) =
+                    crate::estimation::inner_optimizer::run_inner_loop_warm(
+                        model,
+                        population,
+                        &stage_params,
+                        stage_opts.inner_maxiter,
+                        stage_opts.inner_tol,
+                        None,
+                        Some(&mu_k),
+                        stage_opts.min_obs_for_convergence_check as usize,
+                    );
+                let nll = crate::estimation::outer_optimizer::pop_nll(
+                    model,
+                    population,
+                    &stage_params,
+                    &eta_hats,
+                    &h_matrices,
+                    &kappas,
+                    stage_opts.interaction,
+                );
+                result = Some(crate::estimation::outer_optimizer::OuterResult {
+                    params: stage_params.clone(),
+                    ofv: 2.0 * nll,
+                    converged: true,
+                    n_iterations: 0,
+                    eta_hats,
+                    h_matrices,
+                    kappas,
+                    covariance_matrix: None,
+                    warnings: Vec::new(),
+                    saem_mu_ref_m_step_evals_saved: None,
+                    saem_n_subjects_hmc: None,
+                    ebe_convergence_warnings: 0,
+                    max_unconverged_subjects: 0,
+                    total_ebe_fallbacks: 0,
+                    final_gradient: None,
+                    sir_fallback_proposal: None,
+                });
+            }
             let prev = result.as_ref().expect(
-                "IMP guard above should have rejected an IMP-first chain — \
-                 prior stage's OuterResult must exist here",
+                "IMP stage: prior OuterResult must exist (synthesised above when standalone)",
             );
             match crate::estimation::importance_sampling::run_importance_sampling(
                 model,
@@ -2391,6 +2532,18 @@ fn fit_inner(
         let stage_result = match method {
             EstimationMethod::Saem => {
                 saem::run_saem(model, population, &stage_params, &stage_opts)?
+            }
+            EstimationMethod::Impmap => {
+                // Warm-start the first MAP inner loop from the preceding stage's
+                // EBEs when chained (e.g. [focei, impmap] / [saem, impmap]).
+                let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
+                crate::estimation::impmap::run_impmap(
+                    model,
+                    population,
+                    &stage_params,
+                    warm,
+                    &stage_opts,
+                )?
             }
             EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
                 crate::estimation::gauss_newton::run_foce_gn(
@@ -2465,7 +2618,13 @@ fn fit_inner(
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
     // (with individual lagtime) for the mandatory TAD column in output.rs.
     if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_lagtime() {
-        compute_extra_output_columns(model, population, &result.params.theta, &mut subjects);
+        compute_extra_output_columns(
+            model,
+            population,
+            &result.params.theta,
+            &result.kappas,
+            &mut subjects,
+        );
     }
 
     let n_obs = population.n_obs();
@@ -2619,6 +2778,39 @@ fn fit_inner(
         None
     };
 
+    // SIR fallback: when the FD Hessian is non-PD and covariance_fallback = sir,
+    // run SIR with the rectified |eigenvalue| proposal built inside compute_covariance.
+    let sir_fallback_result = if options.covariance_fallback == CovarianceFallback::Sir
+        && result.covariance_matrix.is_none()
+        && sir_result.is_none()
+        && !crate::cancel::is_cancelled(&options.cancel)
+    {
+        if let Some(ref proposal) = result.sir_fallback_proposal {
+            if options.verbose {
+                eprintln!("\nRunning SIR fallback (non-PD Hessian)...");
+            }
+            match crate::estimation::sir::run_sir_core(
+                model,
+                population,
+                &result.params,
+                &result.eta_hats,
+                proposal,
+                result.ofv,
+                options,
+            ) {
+                Ok(sir) => Some(sir),
+                Err(e) => {
+                    warnings.push(format!("SIR fallback failed: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // `final_method` reports the last *estimating* stage — IMP is a likelihood
     // evaluation and doesn't produce parameters, so a chain like `[saem, imp]`
     // surfaces as `method = SAEM`. The full chain (including IMP) is preserved
@@ -2660,13 +2852,11 @@ fn fit_inner(
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
     // Covariance status
-    let covariance_status = if !options.run_covariance_step {
-        CovarianceStatus::NotRequested
-    } else if result.covariance_matrix.is_some() {
-        CovarianceStatus::Computed
-    } else {
-        CovarianceStatus::Failed
-    };
+    let covariance_status = resolve_covariance_status(
+        options.run_covariance_step,
+        result.covariance_matrix.is_some(),
+        sir_fallback_result.is_some(),
+    );
 
     let wall_time_secs = fit_start.elapsed().as_secs_f64();
 
@@ -2772,11 +2962,27 @@ fn fit_inner(
         interaction: options.interaction,
         warnings,
         warnings_structured: vec![],
-        sir_ci_theta: sir_result.as_ref().map(|s| s.ci_theta.clone()),
-        sir_ci_omega: sir_result.as_ref().map(|s| s.ci_omega.clone()),
-        sir_ci_sigma: sir_result.as_ref().map(|s| s.ci_sigma.clone()),
-        sir_ess: sir_result.as_ref().map(|s| s.effective_sample_size),
-        sir_resamples_packed: sir_result.as_ref().and_then(|s| s.resamples_packed.clone()),
+        // If the normal SIR ran, use that; otherwise use the fallback result.
+        sir_ci_theta: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.ci_theta.clone()),
+        sir_ci_omega: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.ci_omega.clone()),
+        sir_ci_sigma: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.ci_sigma.clone()),
+        sir_ess: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .map(|s| s.effective_sample_size),
+        sir_resamples_packed: sir_result
+            .as_ref()
+            .or(sir_fallback_result.as_ref())
+            .and_then(|s| s.resamples_packed.clone()),
         importance_sampling: is_result,
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
@@ -2834,6 +3040,10 @@ fn fit_inner(
             EstimationMethod::Saem => "saem",
             EstimationMethod::FoceGn => "gn",
             EstimationMethod::FoceGnHybrid => "gn",
+            // IMPMAP never runs the outer optimizer — its M-step uses an internal
+            // BOBYQA regardless of `options.optimizer`, so report that rather than
+            // a setting that had no effect.
+            EstimationMethod::Impmap => "impmap-bobyqa",
             _ => options.optimizer.label(),
         }
         .to_string(),
@@ -3000,6 +3210,28 @@ fn compute_param_corr(
         }
     }
     Some(corr)
+}
+
+/// Resolve the reported [`CovarianceStatus`] from the three signals that
+/// determine it: whether the covariance step was requested, whether it produced
+/// a covariance matrix, and whether the SIR fallback (`covariance_fallback =
+/// sir`) produced a result. Pulled out of `fit()` so the precedence — a real
+/// covariance always wins over a fallback, which wins over a plain failure — is
+/// unit-testable without driving a full fit to a non-PD Hessian.
+fn resolve_covariance_status(
+    run_covariance_step: bool,
+    has_covariance_matrix: bool,
+    has_sir_fallback: bool,
+) -> CovarianceStatus {
+    if !run_covariance_step {
+        CovarianceStatus::NotRequested
+    } else if has_covariance_matrix {
+        CovarianceStatus::Computed
+    } else if has_sir_fallback {
+        CovarianceStatus::SirFallback
+    } else {
+        CovarianceStatus::Failed
+    }
 }
 
 fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
@@ -3734,6 +3966,108 @@ pub fn simulate_with_seed(
     simulate_inner(model, population, params, n_sim, &mut rng)
 }
 
+/// Options controlling [`simulate_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct SimulateOptions {
+    /// Seed for reproducibility. `None` draws from entropy.
+    pub seed: Option<u64>,
+    /// When `true`, reassign each replicate's drawn etas to subjects by
+    /// **propensity-score matching** against the subjects' fitted (posthoc)
+    /// etas — optimal Mahalanobis matching under the model `Ω`. This restores
+    /// the design↔eta association present in adaptively-dosed real-world data
+    /// and corrects the resulting VPC bias (see [`crate::propensity_match`]).
+    ///
+    /// Requires `population` to be observed data: every subject must carry
+    /// observations so its posthoc eta can be computed. Has no effect for the
+    /// synthetic `[simulation]` block (no observed designs to match against).
+    pub propensity_match: bool,
+}
+
+/// Simulate observations, optionally with propensity-score matching.
+///
+/// With `opts.propensity_match == false` this is identical to
+/// [`simulate_with_seed`] (or [`simulate`] when `opts.seed` is `None`). With it
+/// `true`, the freshly drawn etas of each replicate are reassigned to subjects
+/// so each subject's observed design is paired with a drawn eta close (under the
+/// model `Ω` Mahalanobis metric) to that subject's fitted eta. The fitted
+/// (posthoc) etas are computed once from `params` + the observed `population`.
+///
+/// Returns `Err` if matching is requested but the population is empty or any
+/// subject has no observations.
+pub fn simulate_with_options(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+) -> Result<Vec<SimulationResult>, String> {
+    use rand::SeedableRng;
+    let mut rng: rand::rngs::StdRng = match opts.seed {
+        Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+        None => rand::rngs::StdRng::from_entropy(),
+    };
+
+    if !opts.propensity_match {
+        return Ok(simulate_inner_with_draw(
+            model, population, params, n_sim, 1, None, &mut rng,
+        ));
+    }
+
+    if population.subjects.is_empty() {
+        return Err(
+            "propensity-score matching requires a non-empty observed population".to_string(),
+        );
+    }
+    if let Some(s) = population
+        .subjects
+        .iter()
+        .find(|s| s.observations.is_empty())
+    {
+        return Err(format!(
+            "propensity-score matching requires observations for every subject \
+             (to compute posthoc etas); subject '{}' has none",
+            s.id
+        ));
+    }
+
+    // Fitted (posthoc) BSV etas depend only on the observed data + params, so
+    // compute them once and reuse across replicates. The inner-loop budget here
+    // is a self-contained MAP pass (this entry point takes no FitOptions); the
+    // tolerances only need to localize each EBE well enough to match on, not to
+    // reproduce a specific fit's inner settings.
+    let (eta_hats, _h, _stats, _kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+        model, population, params, 100, 1e-6, None, None, 1,
+    );
+
+    // A divergent EBE can come back non-finite (`find_ebe` only gates its
+    // `converged` flag on a finite nll, not the returned eta). A NaN/Inf eta
+    // would poison the Mahalanobis cost matrix and make the optimal-assignment
+    // solver spin forever (NaN compares false against every candidate), so fail
+    // loudly here instead.
+    if let Some((i, _)) = eta_hats
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.iter().any(|x| !x.is_finite()))
+    {
+        return Err(format!(
+            "propensity-score matching: the posthoc eta for subject '{}' is \
+             non-finite (its EBE did not converge); cannot match",
+            population.subjects[i].id
+        ));
+    }
+
+    let omega_inv = &params.omega.inv;
+    Ok(simulate_inner_with_draw(
+        model,
+        population,
+        params,
+        n_sim,
+        1,
+        Some((&eta_hats, omega_inv)),
+        &mut rng,
+    ))
+}
+
 fn simulate_inner<R: rand::Rng>(
     model: &CompiledModel,
     population: &Population,
@@ -3741,15 +4075,80 @@ fn simulate_inner<R: rand::Rng>(
     n_sim: usize,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
-    simulate_inner_with_draw(model, population, params, n_sim, 1, rng)
+    simulate_inner_with_draw(model, population, params, n_sim, 1, None, rng)
 }
 
+/// Emit all observation rows for one subject given a fully-formed `eta_slice`
+/// (length `n_eta + n_kappa`). Draws only residual epsilons from `rng`; the eta
+/// is supplied by the caller (freshly sampled, or propensity-matched).
+#[allow(clippy::too_many_arguments)]
+fn emit_subject_rows<R: rand::Rng>(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_slice: &[f64],
+    draw: usize,
+    sim: usize,
+    normal: rand_distr::Normal<f64>,
+    rng: &mut R,
+    results: &mut Vec<SimulationResult>,
+) {
+    // Compute individual parameters
+    let pk_params = (model.pk_param_fn)(&params.theta, eta_slice, &subject.covariates);
+
+    // Predict concentrations
+    let ipreds = model_preds(model, subject, &pk_params, &params.theta, eta_slice);
+
+    // Add residual error (Gaussian path)
+    for (j, &ipred) in ipreds.iter().enumerate() {
+        let var = model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
+        let eps: f64 = rng.sample(normal);
+        let value = ipred + var.sqrt() * eps;
+
+        results.push(SimulationResult {
+            draw,
+            sim,
+            id: subject.id.clone(),
+            // Raw data TIME (matches sdtab / input); `obs_times` may be
+            // the internal shifted clock for stacked reset occasions.
+            time: subject
+                .obs_raw_times
+                .get(j)
+                .copied()
+                .unwrap_or(subject.obs_times[j]),
+            cmt: subject.obs_cmts[j],
+            ipred,
+            outcome: SimOutcome::Continuous { value },
+        });
+    }
+
+    // TTE simulation path (requires survival feature)
+    #[cfg(feature = "survival")]
+    crate::survival::simulate_tte(
+        model,
+        subject,
+        &params.theta,
+        eta_slice,
+        draw,
+        sim,
+        rng,
+        results,
+    );
+}
+
+/// `matched`, when `Some((fitted_etas, omega_inv))`, reassigns each replicate's
+/// drawn etas to subjects by propensity-score matching against `fitted_etas`
+/// (optimal Mahalanobis matching under `omega_inv`; see `crate::propensity_match`).
+/// `None` is the standard per-subject independent draw and reproduces the
+/// previous behaviour byte-for-byte (same RNG draw order).
+#[allow(clippy::too_many_arguments)]
 fn simulate_inner_with_draw<R: rand::Rng>(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
     draw: usize,
+    matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>)>,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
@@ -3760,56 +4159,58 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     let mut results = Vec::new();
 
     for sim_idx in 0..n_sim {
-        for subject in &population.subjects {
-            // Sample eta from N(0, Omega); append zero kappas for IOV models.
-            let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-            let z_vec = DVector::from_column_slice(&z);
-            let eta = &params.omega.chol * z_vec;
-            let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
-            eta_slice.resize(n_eta + model.n_kappa, 0.0);
-
-            // Compute individual parameters
-            let pk_params = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
-
-            // Predict concentrations
-            let ipreds = model_preds(model, subject, &pk_params, &params.theta, &eta_slice);
-
-            // Add residual error (Gaussian path)
-            for (j, &ipred) in ipreds.iter().enumerate() {
-                let var =
-                    model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
-                let eps: f64 = rng.sample(normal);
-                let value = ipred + var.sqrt() * eps;
-
-                results.push(SimulationResult {
-                    draw,
-                    sim: sim_idx + 1,
-                    id: subject.id.clone(),
-                    // Raw data TIME (matches sdtab / input); `obs_times` may be
-                    // the internal shifted clock for stacked reset occasions.
-                    time: subject
-                        .obs_raw_times
-                        .get(j)
-                        .copied()
-                        .unwrap_or(subject.obs_times[j]),
-                    cmt: subject.obs_cmts[j],
-                    ipred,
-                    outcome: SimOutcome::Continuous { value },
-                });
+        let sim = sim_idx + 1;
+        match matched {
+            Some((fitted, omega_inv)) => {
+                // Draw a pool of one eta per subject for this replicate, then
+                // reassign the draws to subjects by matching them to the fitted
+                // (posthoc) etas. Each subject keeps its own observed design.
+                let n = population.subjects.len();
+                let pool: Vec<DVector<f64>> = (0..n)
+                    .map(|_| {
+                        let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                        &params.omega.chol * DVector::from_column_slice(&z)
+                    })
+                    .collect();
+                let assign =
+                    crate::propensity_match::match_draws_to_fitted(&pool, fitted, omega_inv);
+                for (i, subject) in population.subjects.iter().enumerate() {
+                    let mut eta_slice: Vec<f64> = pool[assign[i]].iter().copied().collect();
+                    eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                    emit_subject_rows(
+                        model,
+                        subject,
+                        params,
+                        &eta_slice,
+                        draw,
+                        sim,
+                        normal,
+                        rng,
+                        &mut results,
+                    );
+                }
             }
-
-            // TTE simulation path (requires survival feature)
-            #[cfg(feature = "survival")]
-            crate::survival::simulate_tte(
-                model,
-                subject,
-                &params.theta,
-                &eta_slice,
-                draw,
-                sim_idx + 1,
-                rng,
-                &mut results,
-            );
+            None => {
+                for subject in &population.subjects {
+                    // Sample eta from N(0, Omega); append zero kappas for IOV models.
+                    let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                    let z_vec = DVector::from_column_slice(&z);
+                    let eta = &params.omega.chol * z_vec;
+                    let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+                    eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                    emit_subject_rows(
+                        model,
+                        subject,
+                        params,
+                        &eta_slice,
+                        draw,
+                        sim,
+                        normal,
+                        rng,
+                        &mut results,
+                    );
+                }
+            }
         }
     }
 
@@ -3876,6 +4277,7 @@ pub fn simulate_with_uncertainty(
             params,
             opts.n_sim_per_draw,
             k + 1,
+            None,
             &mut rng,
         );
         results.append(&mut rows);
@@ -4503,6 +4905,20 @@ mod iov_integration {
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 
+    // IMPMAP does not yet support IOV; `ferx check` must flag it up front rather
+    // than letting the fit fail at runtime (review finding #3).
+    #[test]
+    fn test_check_model_options_flags_impmap_iov() {
+        let model = make_iov_model();
+        let opts = fast_opts(EstimationMethod::Impmap, Optimizer::Bobyqa, false);
+        let diags = super::check_model_options(&model, &opts);
+        let d = diags
+            .iter()
+            .find(|d| d.code == "E_IMPMAP_IOV_UNSUPPORTED")
+            .expect("expected E_IMPMAP_IOV_UNSUPPORTED diagnostic");
+        assert!(d.is_error() && d.message.contains("inter-occasion"));
+    }
+
     // On a build without the `autodiff` feature, explicitly requesting AD must
     // error rather than silently running FD. `auto`/`fd` must still pass.
     #[cfg(not(feature = "autodiff"))]
@@ -4862,6 +5278,53 @@ mod tests_cov_diagnostics {
         assert!(
             (cn - 1.0).abs() < 1e-12,
             "condition_number must be 1.0, got {cn}"
+        );
+    }
+
+    // ── resolve_covariance_status ────────────────────────────────────────────
+
+    #[test]
+    fn cov_status_not_requested_when_step_off() {
+        // When the covariance step is off, neither a (stale) covariance matrix
+        // nor a fallback result can change the reported status.
+        assert_eq!(
+            resolve_covariance_status(false, true, true),
+            CovarianceStatus::NotRequested
+        );
+        assert_eq!(
+            resolve_covariance_status(false, false, false),
+            CovarianceStatus::NotRequested
+        );
+    }
+
+    #[test]
+    fn cov_status_computed_takes_precedence_over_fallback() {
+        // A real covariance matrix always wins, even if a fallback also ran.
+        assert_eq!(
+            resolve_covariance_status(true, true, false),
+            CovarianceStatus::Computed
+        );
+        assert_eq!(
+            resolve_covariance_status(true, true, true),
+            CovarianceStatus::Computed
+        );
+    }
+
+    #[test]
+    fn cov_status_sir_fallback_when_no_matrix_but_fallback_ran() {
+        // The branch the SIR-fallback wiring depends on: no H⁻¹ covariance, but
+        // the |eigenvalue|-rectified SIR fallback produced a result.
+        assert_eq!(
+            resolve_covariance_status(true, false, true),
+            CovarianceStatus::SirFallback
+        );
+    }
+
+    #[test]
+    fn cov_status_failed_when_requested_but_nothing_produced() {
+        assert_eq!(
+            resolve_covariance_status(true, false, false),
+            CovarianceStatus::Failed
         );
     }
 }
@@ -6108,7 +6571,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(6)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         let expected = vec![0.0, 1.0, 4.0, 0.0, 1.0, 4.0];
         for (j, (&got, &exp)) in col.iter().zip(expected.iter()).enumerate() {
@@ -6153,7 +6616,7 @@ mod tests_derived_session_clock {
         // ipred peak is at j=4 (shifted t=6, raw t=1) which should give tmax=1.
         sr.ipred = vec![1.0, 2.0, 1.5, 0.5, 3.0, 1.0];
         let mut subjects_results = vec![sr];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // All entries should be 1.0 (raw time of peak at j=4).
         for &v in col {
@@ -6197,7 +6660,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(6)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // Expected AUC = 8.0 for every row in each session.
         for (j, &v) in col.iter().enumerate() {
@@ -6248,7 +6711,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(6)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // All obs land in the raw-clock window [0,5); all three per-session
         // points contribute → AUC=8.0 for every row.
@@ -6307,7 +6770,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(3)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // AUC = trapezoid([(0,0),(1,1),(4,4)]) = 8.0
         for &v in col {
@@ -6316,5 +6779,389 @@ mod tests_derived_session_clock {
                 "Single-session AUC should be 8.0, got {v}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_derived_iov_kappa {
+    //! Regression tests for issue #238: `compute_extra_output_columns` must
+    //! thread each observation's **occasion** kappa into `pk_param_fn` and into
+    //! `DerivedContext.eta`, instead of silently using a BSV-only eta vector
+    //! (kappas → 0). Both the individual-parameter map (driving `[derived]`
+    //! expressions and `[output]` columns) and `ctx.eta` are checked.
+
+    use super::*;
+    use crate::types::{
+        BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, DoseEvent,
+        ErrorModel, ErrorSpec, GradientMethod, IndivParamPartials, ModelParameters, OmegaMatrix,
+        PkModel, PkParams, Population, ScalingSpec, SigmaVector, Subject, PK_IDX_LAGTIME,
+    };
+    use nalgebra::DVector;
+    use std::collections::HashMap;
+
+    /// 1-cpt IV model with one BSV eta (`ETA_CL`) and one IOV kappa
+    /// (`KAPPA_CL`). CL = 10 · exp(κ); the kappa is read from `eta[1]` with a
+    /// `.get(1)` guard, so the *broken* (BSV-only) path would read κ=0 → CL=10
+    /// for every observation, while the fix yields the per-occasion CL.
+    fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
+        CompiledModel {
+            name: "test_iov_kappa".into(),
+            pk_model: PkModel::OneCptIv,
+            error_model: ErrorModel::Additive,
+            error_spec: ErrorSpec::Single(ErrorModel::Additive),
+            pk_param_fn: Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
+                let kappa = eta.get(1).copied().unwrap_or(0.0);
+                let mut p = PkParams::default();
+                p.values[0] = 10.0 * kappa.exp(); // CL slot
+                p
+            }),
+            n_theta: 0,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 1,
+            kappa_names: vec!["KAPPA_CL".into()],
+            theta_names: Vec::new(),
+            eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into()],
+            indiv_param_partials: IndivParamPartials::empty(),
+            default_params: ModelParameters {
+                theta: Vec::new(),
+                theta_names: Vec::new(),
+                theta_lower: Vec::new(),
+                theta_upper: Vec::new(),
+                theta_fixed: Vec::new(),
+                omega: OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]),
+                omega_fixed: vec![false],
+                sigma: SigmaVector {
+                    values: vec![0.1],
+                    names: vec!["ERR".into()],
+                },
+                sigma_fixed: vec![false],
+                omega_iov: Some(OmegaMatrix::from_diagonal(&[1.0], vec!["KAPPA_CL".into()])),
+                kappa_fixed: vec![false],
+            },
+            omega_init_as_sd: vec![false],
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: vec![false],
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: Some(Box::new(|_t, _c| vec![])),
+            pk_indices: vec![0],
+            eta_map: Vec::new(),
+            pk_idx_f64: Vec::new(),
+            sel_flat: Vec::new(),
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+            derived_exprs,
+            output_columns: Vec::new(),
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Subject with two occasions: obs 0,1 on occasion 1; obs 2,3 on occasion 2.
+    fn two_occasion_subject() -> Subject {
+        Subject {
+            id: "S1".into(),
+            doses: Vec::new(),
+            obs_times: vec![0.0, 1.0, 2.0, 3.0],
+            obs_raw_times: vec![0.0, 1.0, 2.0, 3.0],
+            observations: vec![1.0; 4],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    fn sr_iov(n_obs: usize) -> SubjectResult {
+        SubjectResult {
+            id: "S1".into(),
+            eta: DVector::from_vec(vec![0.0]), // BSV η = 0 so CL is driven purely by κ
+            ipred: vec![1.0; n_obs],
+            pred: vec![1.0; n_obs],
+            iwres: vec![0.0; n_obs],
+            cwres: vec![0.0; n_obs],
+            ofv_contribution: 0.0,
+            cens: vec![0; n_obs],
+            n_obs,
+            extra_columns: Vec::new(),
+            per_obs_tad: Vec::new(),
+            compartment_states: Vec::new(),
+        }
+    }
+
+    /// Both the indiv-param map (CL, via `pk_param_fn`) and `ctx.eta` must carry
+    /// the per-observation occasion kappa. With κ₁ = ln 2 (occasion 1) and
+    /// κ₂ = ln 3 (occasion 2), CL = 10·exp(κ) = [20, 20, 30, 30] and the kappa
+    /// exposed through `ctx.eta[1]` = [ln2, ln2, ln3, ln3]. The pre-fix code
+    /// produced CL = 10 for every row (κ silently 0).
+    #[test]
+    fn derived_and_indiv_use_per_occasion_kappa() {
+        let ln2 = 2.0_f64.ln();
+        let ln3 = 3.0_f64.ln();
+
+        let derived_exprs = vec![
+            // CL_OUT exercises the pk_param_fn call that builds per_obs_indiv.
+            DerivedExprSpec {
+                name: "CL_OUT".into(),
+                kind: DerivedKind::PerRow {
+                    eval: Box::new(|ctx: &DerivedContext| {
+                        ctx.indiv_params.get("CL").copied().unwrap_or(f64::NAN)
+                    }),
+                },
+                uses_compartments: false,
+            },
+            // K_OUT exercises DerivedContext.eta threading (eta[1] = occasion κ).
+            DerivedExprSpec {
+                name: "K_OUT".into(),
+                kind: DerivedKind::PerRow {
+                    eval: Box::new(|ctx: &DerivedContext| ctx.eta.get(1).copied().unwrap_or(-1.0)),
+                },
+                uses_compartments: false,
+            },
+        ];
+
+        let model = minimal_iov_model(derived_exprs);
+        let population = Population {
+            subjects: vec![two_occasion_subject()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        // ebe_kappas[subject][occasion]; occasion order matches split_obs_by_occasion
+        // (first-seen): occasion 1 → index 0 (κ=ln2), occasion 2 → index 1 (κ=ln3).
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
+            DVector::from_vec(vec![ln2]),
+            DVector::from_vec(vec![ln3]),
+        ]];
+        let mut subjects_results = vec![sr_iov(4)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let cols = &subjects_results[0].extra_columns;
+        let cl = &cols.iter().find(|(n, _)| n == "CL_OUT").unwrap().1;
+        let kout = &cols.iter().find(|(n, _)| n == "K_OUT").unwrap().1;
+
+        let expected_cl = [20.0, 20.0, 30.0, 30.0];
+        let expected_k = [ln2, ln2, ln3, ln3];
+        for (j, (&got, &exp)) in cl.iter().zip(expected_cl.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-9,
+                "CL_OUT[{j}] (occasion {}): got {got}, expected {exp}",
+                if j < 2 { 1 } else { 2 }
+            );
+        }
+        for (j, (&got, &exp)) in kout.iter().zip(expected_k.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-12,
+                "ctx.eta[1] at obs {j}: got {got}, expected occasion κ {exp}"
+            );
+        }
+    }
+
+    /// Defensive path: when a subject's kappa vector is missing (e.g. fewer
+    /// occasion entries than occasions seen), the kappa slots fall back to 0
+    /// rather than panicking — CL collapses to the κ=0 value (10).
+    #[test]
+    fn missing_kappa_falls_back_to_zero() {
+        let derived_exprs = vec![DerivedExprSpec {
+            name: "CL_OUT".into(),
+            kind: DerivedKind::PerRow {
+                eval: Box::new(|ctx: &DerivedContext| {
+                    ctx.indiv_params.get("CL").copied().unwrap_or(f64::NAN)
+                }),
+            },
+            uses_compartments: false,
+        }];
+        let model = minimal_iov_model(derived_exprs);
+        let population = Population {
+            subjects: vec![two_occasion_subject()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        // Empty kappas for the subject → every occasion lookup misses → κ=0.
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]];
+        let mut subjects_results = vec![sr_iov(4)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let cl = &subjects_results[0].extra_columns[0].1;
+        for (j, &v) in cl.iter().enumerate() {
+            assert!(
+                (v - 10.0).abs() < 1e-9,
+                "CL_OUT[{j}] with missing kappa should fall back to κ=0 → 10, got {v}"
+            );
+        }
+    }
+
+    /// Caller-level regression for the per-dose-occasion absorption lag
+    /// (follow-up to #238). `compute_extra_output_columns` must build TAD using
+    /// each *dose's* occasion lag, not the observation's. The model puts IOV on
+    /// the lag (`lag = 1.0 + κ`); a subject is dosed BID across two occasions:
+    ///   morning dose @0  (occasion 1, κ=0.0 → lag 1.0)
+    ///   evening dose @12 (occasion 2, κ=0.5 → lag 1.5)
+    /// with observations @2 (occ 1) and @13 (occ 2). At obs @13 the evening dose
+    /// arrives at 13.5 — not yet absorbed — so TAD counts from the morning dose's
+    /// arrival at 1.0 → 12.0. Applying the obs-occasion lag (1.5) to every dose,
+    /// as before this follow-up, would give 11.5.
+    #[test]
+    fn tad_uses_per_dose_occasion_lag() {
+        let mut model = minimal_iov_model(vec![]);
+        // Declare an absorption lag (ALAG → PK_IDX_LAGTIME) so `model.has_lagtime()`
+        // holds; compute_extra_output_columns only builds per-dose lags for models
+        // that declare a lag.
+        model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
+        model.pk_indices = vec![0, PK_IDX_LAGTIME];
+        // Drive the absorption lag (slot PK_IDX_LAGTIME) from the occasion kappa.
+        model.pk_param_fn = Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
+            let kappa = eta.get(1).copied().unwrap_or(0.0);
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = 1.0 + kappa;
+            p
+        });
+
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![2.0, 13.0],
+            obs_raw_times: vec![2.0, 13.0],
+            observations: vec![1.0, 1.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 2],
+            dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        // ebe_kappas in split_obs_by_occasion order: occ 1 → idx 0 (κ=0.0),
+        // occ 2 → idx 1 (κ=0.5).
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
+            DVector::from_vec(vec![0.0]),
+            DVector::from_vec(vec![0.5]),
+        ]];
+        let mut subjects_results = vec![sr_iov(2)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let tad = &subjects_results[0].per_obs_tad;
+        assert!(
+            (tad[0] - 1.0).abs() < 1e-9,
+            "obs@2 TAD: morning dose arrives @1.0 → 1.0, got {}",
+            tad[0]
+        );
+        assert!(
+            (tad[1] - 12.0).abs() < 1e-9,
+            "obs@13 TAD must be 12.0 (evening dose uses its own occ-2 lag 1.5 → arrives \
+             @13.5, excluded; counts from morning @1.0). The pre-follow-up obs-occasion \
+             lag would give 11.5. Got {}",
+            tad[1]
+        );
+    }
+
+    /// Caller-level regression: the per-dose lag uses each dose's *covariate*
+    /// snapshot (`dose_cov`), not the observation's — so a lag depending on a
+    /// time-varying covariate is shifted by conditions at dosing, matching
+    /// `predict_iov`. Lag = `LAGCOV`: the dose sees `LAGCOV=1` (lag 1.0), the
+    /// observation sees `LAGCOV=5` (lag 5.0). With a dose @0 and obs @3, the dose
+    /// covariate gives arrival @1.0 → TAD 2.0; the obs covariate would push arrival
+    /// to @5.0 (after the obs) → TAD NaN. Asserting TAD = 2.0 proves `dose_cov` is
+    /// used. (No IOV here — this isolates the covariate basis, not kappa.)
+    #[test]
+    fn tad_lag_uses_dose_covariate_not_obs() {
+        let mut model = minimal_iov_model(vec![]);
+        model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
+        model.pk_indices = vec![0, PK_IDX_LAGTIME];
+        // Lag = LAGCOV covariate (time-varying); independent of eta/kappa.
+        model.pk_param_fn = Box::new(|_theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = cov.get("LAGCOV").copied().unwrap_or(0.0);
+            p
+        });
+
+        let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
+        let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![3.0],
+            obs_raw_times: vec![3.0],
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: vec![cov_dose],
+            obs_covariates: vec![cov_obs],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["LAGCOV".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![DVector::from_vec(vec![0.0])]];
+        let mut subjects_results = vec![sr_iov(1)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let tad = &subjects_results[0].per_obs_tad;
+        assert!(
+            (tad[0] - 2.0).abs() < 1e-9,
+            "TAD must use the dose covariate (LAGCOV=1 → lag 1.0 → arrival @1.0 → TAD 2.0); \
+             the obs covariate (LAGCOV=5) would push arrival to @5.0 (after the obs) → NaN. \
+             Got {}",
+            tad[0]
+        );
     }
 }

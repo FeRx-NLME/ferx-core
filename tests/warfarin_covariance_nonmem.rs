@@ -452,6 +452,14 @@ fn covariance_se_matches_nonmem_iov() {
         result.covariance_matrix.is_some(),
         "IOV covariance step must produce a matrix"
     );
+    // This well-identified IOV fit has a PD Hessian, so the real covariance must
+    // be returned — not the `covariance_fallback = sir` path (#223). Guards that
+    // the SIR fallback stays inert when the covariance step succeeds.
+    assert_eq!(
+        result.covariance_status,
+        ferx_core::CovarianceStatus::Computed,
+        "well-identified IOV model must produce a real covariance, not a SIR fallback"
+    );
     let se_theta = result.se_theta.as_ref().expect("theta SEs present");
     let se_omega = result.se_omega.as_ref().expect("omega SEs present");
     let se_sigma = result.se_sigma.as_ref().expect("sigma SEs present");

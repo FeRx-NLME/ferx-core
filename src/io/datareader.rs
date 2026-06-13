@@ -1336,6 +1336,86 @@ mod tests {
         f
     }
 
+    // ── "no happy paths": malformed-input rejection ──────────────────────────
+    // The reader's validation surface — branches where a bug silently corrupts
+    // (or crashes on) real NONMEM datasets. All deterministic and fit-free:
+    // feed malformed CSV, assert the exact error or warning. These error paths
+    // are otherwise exercised only indirectly, if at all.
+
+    #[test]
+    fn missing_required_columns_are_rejected() {
+        // ID / TIME / DV are mandatory; each missing one is a hard error that
+        // names the absent column.
+        let f = write_csv("TIME,DV,EVID,AMT\n0,.,1,100\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("Missing ID column"), "{err}");
+
+        let f = write_csv("ID,DV,EVID,AMT\n1,.,1,100\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("Missing TIME column"), "{err}");
+
+        let f = write_csv("ID,TIME,EVID,AMT\n1,0,1,100\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("Missing DV column"), "{err}");
+    }
+
+    #[test]
+    fn unknown_iov_column_is_rejected() {
+        // A requested IOV column that isn't in the header is a hard error, not a
+        // silent "no occasions" — otherwise an IOV model would quietly collapse.
+        let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
+        let err = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap_err();
+        assert!(
+            err.contains("iov_column 'OCC'") && err.contains("not found"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn declared_covariate_column_missing_is_rejected() {
+        // `[covariates]` declares WT but the dataset has no WT column → hard
+        // error (a silently-vanished covariate would evaluate to nothing).
+        let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
+        assert!(err.contains(ERR_COV_MISSING_COLUMNS), "{err}");
+        assert!(err.contains("WT"), "missing column should be named: {err}");
+    }
+
+    #[test]
+    fn declared_covariate_non_numeric_value_is_rejected() {
+        // A declared covariate must be numerically coded; a text value is a hard
+        // error rather than a silent 0.0 that would bias the fit.
+        let f = write_csv("ID,TIME,DV,EVID,AMT,WT\n1,0,.,1,100,heavy\n1,1,5.0,0,.,heavy\n");
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
+        assert!(err.contains(ERR_COV_NON_NUMERIC), "{err}");
+        assert!(
+            err.contains("WT"),
+            "offending covariate should be named: {err}"
+        );
+    }
+
+    #[test]
+    fn unparseable_iov_occasion_values_warn_not_fail() {
+        // A non-numeric occasion value doesn't abort the read: the row is
+        // assigned occ=0 and surfaced as a W_IOV_OCC_MISSING population warning
+        // so the user can clean the data (a hard error here would be too brittle).
+        let f = write_csv("ID,TIME,DV,EVID,AMT,OCC\n1,0,.,1,100,x\n1,1,5.0,0,.,x\n");
+        let pop = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap();
+        assert!(
+            pop.warnings.iter().any(|w| w.contains("W_IOV_OCC_MISSING")),
+            "expected an IOV-occasion warning, got {:?}",
+            pop.warnings
+        );
+    }
+
     #[test]
     fn test_obs_cmt_dot_defaults_to_compartment_one() {
         // Regression: a "." (missing) CMT on an observation row must default to
@@ -1973,5 +2053,70 @@ mod tests {
         );
         // Standard and IOV columns must not appear in covariate_names.
         assert_eq!(pop.covariate_names, vec!["WT"]);
+    }
+
+    #[test]
+    fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
+        // `read_nonmem_csv_filtered_tte` / `_with_covariates_tte` (used by
+        // api::read_population_for for [event_model] models) are always compiled
+        // but only *called* on the TTE path, so they read as uncovered in the
+        // FD-only build. With an empty tte_cmts set they delegate to the Gaussian
+        // reader; drive them directly to cover the column-augmentation / union /
+        // delegation lines. (The cfg(survival) row-routing inside the impl is
+        // exercised by the survival job, not here.)
+        let no_tte = std::collections::HashSet::new();
+        let csv = "ID,TIME,DV,EVID,AMT,WT,STUDY,AGE\n\
+                   1,0,.,1,100,70,1,30\n\
+                   1,1,5.0,0,.,70,1,30\n\
+                   2,0,.,1,100,80,2,40\n\
+                   2,1,4.0,0,.,80,2,40\n";
+        let f = write_csv(csv);
+
+        // filtered_tte: explicit covariate list, augmented by a filter that
+        // references an out-of-list column (STUDY) — exercises the augmentation
+        // branch; the filter then drops STUDY==2 (subject 2).
+        let cols: &[&str] = &["WT"];
+        let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
+        let pop = read_nonmem_csv_filtered_tte(f.path(), Some(cols), None, Some(&filter), &no_tte)
+            .unwrap();
+        assert_eq!(
+            pop.subjects
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"],
+            "STUDY==2 subject should be filtered out via the augmented column"
+        );
+
+        // with_covariates_tte: declared WT + an undeclared `extra` (STUDY) + a
+        // filter referencing a *third* column (AGE) — exercises BOTH the
+        // extra-columns dedup loop and the filter-referenced-column merge, and
+        // *validates* the merge: AGE==40 can only drop subject 2 if AGE was
+        // actually pulled into the read union, so the assertion fails if the
+        // merge regresses.
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let extra = ["STUDY".to_string()];
+        let drop_age40 = SelectionFilter::from_opts(&["AGE == 40".to_string()], &[], &[]).unwrap();
+        let (pop2, _table) = read_nonmem_csv_with_covariates_tte(
+            f.path(),
+            &decls,
+            &extra,
+            None,
+            Some(&drop_age40),
+            &no_tte,
+        )
+        .unwrap();
+        // Subject 2 (AGE=40) is dropped via the merged AGE column; subject 1 remains.
+        assert_eq!(
+            pop2.subjects
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"],
+            "AGE==40 must drop subject 2 — proving AGE was pulled into the read union"
+        );
     }
 }
