@@ -2485,13 +2485,22 @@ pub(crate) fn compute_covariance(
 
     let mut hess = DMatrix::zeros(n, n);
     let is_iov = kappas.iter().any(|k| !k.is_empty());
+    // Route non-interaction FOCE with f-dependent error (proportional/combined)
+    // through the OFV second-difference stencil (the IOV path), which builds
+    // the true Hessian of the actual marginal. The analytical SB gradient is an
+    // envelope approximation with no EBE-response Δ (that correction exists only
+    // for FOCEI, #274), so its central-FD Hessian comes out indefinite on the
+    // f-dependent FOCE surface. Additive FOCE keeps the cheap analytical path
+    // (the Δ vanishes for f-independent variance, and it already matches NONMEM).
+    let force_ofv_hessian = !options.interaction && model.error_spec.has_f_dependent_variance();
+    let use_analytical = !is_iov && !force_ofv_hessian;
 
     // Track FD failures at source so diagnostics name the right cause (a NaN/Inf
     // stencil result is not a genuine zero curvature). HashSet for O(1) ops.
     let mut fd_diag_nan: HashSet<usize> = HashSet::new();
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
-    if !is_iov {
+    if use_analytical {
         // Issue #209 + #256 + #274: central FD of the analytical population
         // gradient, as one flat `par_iter` over the 2·n_free perturbed points.
         //   H[:,k] ≈ (g(x̂ + hₖ·eₖ) − g(x̂ − hₖ·eₖ)) / 2hₖ

@@ -750,8 +750,18 @@ fn subject_nll_pop_grad_analytical(
         .map(|(j, &ip)| ip - h_eta[j])
         .collect();
 
-    // r_diag: at f0 (standard) or at ipreds (interaction)
-    let r_pred_point: &[f64] = if options.interaction { &ipreds } else { &f0 };
+    // FOCE (no interaction): evaluate R at the population prediction f(η=0),
+    // matching `foce_subject_nll_standard`. f0 = f(η̂) − H·η̂ can cross zero on
+    // a nonlinear model and make R̃ ill-conditioned; f(η=0) is always sensible.
+    // Additive error is f-independent → keep f0 (bit-identical, no extra eval).
+    let use_pop_var = model.error_spec.has_f_dependent_variance();
+    let zeros_eta = vec![0.0_f64; n_eta];
+    let pop_preds: Vec<f64> = if use_pop_var {
+        pk::compute_predictions_with_tv(model, subject, &params.theta, &zeros_eta)
+    } else {
+        Vec::new()
+    };
+    let r_pred_point: &[f64] = if use_pop_var { &pop_preds } else { &f0 };
     let r_diag = compute_r_diag(
         &model.error_spec,
         r_pred_point,
@@ -818,11 +828,40 @@ fn subject_nll_pop_grad_analytical(
                 .collect()
         };
 
+        // d(f(η=0))/dx_k for the variance chain rule, when R is evaluated at the
+        // population prediction (f-dependent error). No mu-ref shortcut: the
+        // H-column gives ∂f/∂η at η̂, not the θ-derivative of f at η=0, so this
+        // is always FD. Cheap (one extra prediction eval per free θ) and only on
+        // the f-dependent path. For additive error `dr_j == 0`, so it is unused.
+        let d_pop_preds: Vec<f64> = if use_pop_var {
+            let h = eps * (1.0 + x[k].abs());
+            let xk_plus = (x[k] + h).min(bounds.upper[k]);
+            let actual_h = xk_plus - x[k];
+            if actual_h.abs() < 1e-16 {
+                vec![0.0; n_obs]
+            } else {
+                let mut x_pert = x.to_vec();
+                x_pert[k] = xk_plus;
+                let params_pert = unpack_params(&x_pert, template);
+                pk::compute_predictions_with_tv(model, subject, &params_pert.theta, &zeros_eta)
+                    .iter()
+                    .zip(pop_preds.iter())
+                    .map(|(&p, &b)| (p - b) / actual_h)
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // Variance-point derivative: d(f(η=0)) on the f-dependent path, else
+        // d(f0)=d(ipreds). The mean term below always uses d(f0)=d_ipreds.
+        let d_var_pred: &[f64] = if use_pop_var { &d_pop_preds } else { &d_ipreds };
+
         // d(f0) = d(ipreds); d(v) = -d(f0)
-        // For sigma-dependent r: d(r_j)/d(x[k]) via chain rule through r(f0 or ipreds)
+        // For sigma-dependent r: d(r_j)/d(x[k]) via chain rule through r at r_pred_point
         let dr: Vec<f64> = r_diag
             .iter()
-            .zip(r_pred_point.iter().zip(d_ipreds.iter()))
+            .zip(r_pred_point.iter().zip(d_var_pred.iter()))
             .map(|(&r_j, (&pred_j, &dp_j))| match model.error_model {
                 ErrorModel::Additive => 0.0,
                 ErrorModel::Proportional => {
@@ -1810,6 +1849,21 @@ fn subject_nll_at(
             &[],
         )
     } else {
+        // FOCE (no interaction): evaluate R at the population prediction f(η=0)
+        // for f-dependent error, consistent with the marginal in likelihood.rs
+        // and with `subject_nll_pop_grad_analytical` (so GN's NLL matches its
+        // gradient). Additive error keeps f0 (bit-identical).
+        let pop_preds: Option<Vec<f64>> = if model.error_spec.has_f_dependent_variance() {
+            let zeros = vec![0.0_f64; eta_hat.len()];
+            Some(crate::pk::compute_predictions_with_tv(
+                model,
+                subject,
+                &params.theta,
+                &zeros,
+            ))
+        } else {
+            None
+        };
         foce_subject_nll_standard(
             subject,
             &ipreds,
@@ -1820,6 +1874,7 @@ fn subject_nll_at(
             &model.error_spec,
             model.bloq_method,
             &[],
+            pop_preds.as_deref(),
         )
     }
 }

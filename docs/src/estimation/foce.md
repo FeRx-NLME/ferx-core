@@ -76,7 +76,15 @@ where \\( H \\) is the Jacobian matrix \\( \partial f / \partial \eta \\). The p
 
 \\[ \text{OFV}_i = (y - f_0)^T \tilde{R}^{-1} (y - f_0) + \log|\tilde{R}| \\]
 
-where \\( \tilde{R} = H \Omega H^T + R(f_0) \\).
+where \\( \tilde{R} = H \Omega H^T + R(f(\eta{=}0)) \\). The residual variance \\( R \\)
+is evaluated at the **population prediction** \\( f(\eta{=}0) \\) — matching NONMEM's
+`METHOD=1` (no `INTER`) semantics — not at the linearized point \\( f_0 \\). On a
+nonlinear model (e.g. oral absorption) the linearization \\( f_0 = f(\hat\eta) - H\hat\eta \\)
+can extrapolate to a near-zero or negative concentration where the true typical-individual
+prediction is healthy; evaluating a proportional variance \\( (f\sigma)^2 \\) there collapses
+the weight and makes the objective multimodal with an indefinite covariance. \\( f(\eta{=}0) \\)
+is always physically sensible, so FOCE+proportional converges deterministically and matches
+NONMEM FOCE. Additive error is unaffected (\\( R \\) does not depend on \\( f \\)).
 
 ### FOCEI (Interaction)
 

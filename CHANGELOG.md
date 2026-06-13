@@ -68,6 +68,18 @@ section of the SDLC for the versioning policy).
   (SDLC) page and a Contributing page in the book.
 
 ### Changed
+- FOCE (non-interaction) now evaluates the residual variance at the population
+  prediction `f(η=0)` — NONMEM's `METHOD=1` (no `INTER`) semantics — instead of
+  the linearized `f0 = f(η̂) − H·η̂`. On nonlinear models (e.g. oral absorption)
+  with proportional/combined error, `f0` could extrapolate to near-zero or
+  negative concentrations, collapsing `R(f0) = (f0·σ)²` and making the marginal
+  multimodal with an indefinite covariance Hessian (garbage SEs reported as
+  "likely reliable"). FOCE+proportional fits now converge deterministically,
+  reproduce NONMEM FOCE estimates/SEs (within ~3% on a 1-cpt oral benchmark),
+  and yield a positive-definite covariance. Additive-error FOCE is unchanged
+  (its variance is `f`-independent). The FOCE covariance for `f`-dependent error
+  uses the reconverged-OFV second-difference Hessian (the true objective
+  curvature) rather than the envelope-approximation analytical gradient.
 - IMP (importance sampling) now jointly samples (η, κ) for IOV models,
   integrating over inter-occasion variability so the reported `−2 log L` is
   directly comparable to FOCE/FOCEI and NONMEM `METHOD=IMP`. Previously κ was

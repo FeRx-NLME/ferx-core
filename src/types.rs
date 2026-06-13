@@ -889,6 +889,22 @@ impl ErrorSpec {
     /// scaling path. Fit-time validation rejects an uncovered CMT up front,
     /// and `build_error_spec` resolves indices against the real sigma vector,
     /// so a `NaN` here is only reachable via a hand-constructed model.
+    /// Whether the residual variance depends on the prediction `f` for any
+    /// endpoint (proportional or combined). When `false` (purely additive),
+    /// the variance is constant in `f`, so FOCE's choice of evaluation point
+    /// (linearized `f0` vs population `f(η=0)`) is irrelevant and the cheap
+    /// path stays bit-identical. Used to gate the FOCE population-variance
+    /// (`f(η=0)`) treatment in the marginal, analytical gradient, and
+    /// covariance step.
+    pub fn has_f_dependent_variance(&self) -> bool {
+        match self {
+            ErrorSpec::Single(em) => !matches!(em, ErrorModel::Additive),
+            ErrorSpec::PerCmt(map) => map
+                .values()
+                .any(|ep| !matches!(ep.error_model, ErrorModel::Additive)),
+        }
+    }
+
     pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         use crate::stats::residual_error::residual_variance;
         match self {
@@ -3132,6 +3148,30 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_spec_has_f_dependent_variance() {
+        use std::collections::HashMap;
+        // Single endpoint: only additive is f-independent.
+        assert!(!ErrorSpec::Single(ErrorModel::Additive).has_f_dependent_variance());
+        assert!(ErrorSpec::Single(ErrorModel::Proportional).has_f_dependent_variance());
+        assert!(ErrorSpec::Single(ErrorModel::Combined).has_f_dependent_variance());
+
+        // PerCmt: f-dependent if ANY endpoint is non-additive.
+        let ep = |em: ErrorModel| EndpointError {
+            error_model: em,
+            sigma_idx: vec![0],
+        };
+        let mut all_additive = HashMap::new();
+        all_additive.insert(1usize, ep(ErrorModel::Additive));
+        all_additive.insert(2usize, ep(ErrorModel::Additive));
+        assert!(!ErrorSpec::PerCmt(all_additive).has_f_dependent_variance());
+
+        let mut mixed = HashMap::new();
+        mixed.insert(1usize, ep(ErrorModel::Additive));
+        mixed.insert(2usize, ep(ErrorModel::Proportional));
+        assert!(ErrorSpec::PerCmt(mixed).has_f_dependent_variance());
+    }
 
     #[test]
     fn classify_warning_convergence_is_critical() {
