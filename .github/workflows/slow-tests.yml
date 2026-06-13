@@ -22,6 +22,11 @@ on:
       - 'src/ode/ekf.rs'
       - 'src/ode/predictions.rs'
       - 'src/ode/solver.rs'
+      # The parser compiles every model the heavy fits run, so a change to model
+      # compilation (e.g. the structural-param binding in #261) can shift a fit's
+      # objective or break it outright — including the NONMEM-anchored slow test
+      # in tests/structural_param_nonmem.rs.
+      - 'src/parser/**'
       - 'src/stats/likelihood.rs'
 
 env:
