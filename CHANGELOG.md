@@ -27,7 +27,7 @@ section of the SDLC for the versioning policy).
   subject's observed dosing/sampling design is paired with a similar drawn eta.
   This corrects VPC bias from treatment adaptation in real-world data (longer
   intervals for high-clearance patients, etc.). Operates on observed data;
-  returns the usual simulation rows for the caller to build the VPC.
+  returns the usual simulation rows for the caller to build the VPC (#288).
 - New `importance_sampling_map` (alias `impmap`) estimation method: a Monte-Carlo
   EM estimator equivalent to NONMEM `METHOD=IMPMAP`. Each iteration re-centers a
   per-subject importance-sampling proposal on the conditional mode (MAP) and
