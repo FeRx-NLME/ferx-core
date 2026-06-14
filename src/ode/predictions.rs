@@ -264,6 +264,11 @@ pub(crate) fn input_rate_consumes_cmt(ode: &OdeSpec, cmt_1based: usize) -> bool 
 /// nothing. `reset_floor` turns off doses delivered before the most recent
 /// EVID=3/4 reset, mirroring [`active_infusions`]. This is the input-rate
 /// analogue of the `+rate` infusion injection in the wrapped RHS.
+///
+/// The shape parameters come from `params` (the current segment's snapshot), so
+/// with IOV every superposed dose's tail uses the *current* occasion's `n`/`mtt`.
+/// This is exact for IIV and when `II` exceeds the absorption window; only
+/// overlapping-occasion tails are approximated.
 #[inline]
 #[allow(clippy::too_many_arguments)] // mirrors the dose context threaded into the RHS wrappers
 fn add_input_rate_forcing(
@@ -280,6 +285,10 @@ fn add_input_rate_forcing(
         if forcing.cmt >= dy.len() {
             continue;
         }
+        // Precompute the dose-invariant constants (ln Γ, KTR, …) once per forcing
+        // — not once per dose — so the superposition loop below does only the
+        // tad/dose-dependent arithmetic.
+        let prepared = forcing.prepare(params);
         let mut acc = 0.0;
         for (k, d) in doses.iter().enumerate() {
             if d.cmt.saturating_sub(1) != forcing.cmt {
@@ -297,7 +306,7 @@ fn add_input_rate_forcing(
                 continue;
             }
             let dose_mass = dose_f_bio.get(k).copied().unwrap_or(1.0) * d.amt;
-            acc += forcing.rate(tad, dose_mass, params);
+            acc += prepared.rate(tad, dose_mass);
         }
         dy[forcing.cmt] += acc;
     }

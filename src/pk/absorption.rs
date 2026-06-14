@@ -28,18 +28,13 @@ use crate::stats::special::ln_gamma;
 ///
 /// Domain: `mtt > 0`, `n ≥ 0` (enforce upstream with [`validate_transit`]).
 /// Evaluated in the log domain for stability with large `n` / `(KTR·tad)^n`.
+///
+/// This is the readable reference form (used by tests and one-shot callers); the
+/// ODE hot path goes through [`InputRateForcing::prepare`] +
+/// [`PreparedInputRate::rate`], which hoist the dose-invariant constants
+/// (`ln Γ`, `KTR`, `ln KTR`) out of the per-dose superposition loop.
 pub fn transit_input_rate(tad: f64, n: f64, mtt: f64, dose: f64) -> f64 {
-    if tad <= 0.0 || dose <= 0.0 {
-        return 0.0;
-    }
-    let ktr = (n + 1.0) / mtt;
-    let x = ktr * tad; // > 0 (tad > 0, ktr > 0 for valid params)
-
-    // ln R_in = ln dose + ln KTR + n·ln(KTR·tad) − KTR·tad − ln Γ(n + 1).
-    // For n = 0 the middle term is 0·ln x = 0, reducing to the first-order
-    // (Bateman) input dose·KTR·exp(−KTR·tad).
-    let ln_rin = dose.ln() + ktr.ln() + n * x.ln() - x - ln_gamma(n + 1.0);
-    ln_rin.exp()
+    PreparedInputRate::transit(n, mtt).rate(tad, dose)
 }
 
 /// Validate transit parameters: `mtt` strictly positive, `n` non-negative.
@@ -82,19 +77,91 @@ pub struct InputRateForcing {
 }
 
 impl InputRateForcing {
-    /// Appearance rate `R_in(tad)` into [`Self::cmt`] for one dose, where
-    /// `dose = F · amt` and `params` is the flat individual-parameter vector.
-    /// Per-dose contributions are summed by the caller; `tad ≤ 0 ⇒ 0`.
-    pub fn rate(&self, tad: f64, dose: f64, params: &[f64]) -> f64 {
-        let arg = |i: usize, dflt: f64| {
-            self.arg_slots
-                .get(i)
-                .and_then(|&s| params.get(s))
-                .copied()
-                .unwrap_or(dflt)
-        };
+    /// Read this forcing's argument `i` from the flat individual-parameter
+    /// vector `params`, falling back to `dflt` if the slot is absent.
+    #[inline]
+    fn arg(&self, params: &[f64], i: usize, dflt: f64) -> f64 {
+        self.arg_slots
+            .get(i)
+            .and_then(|&s| params.get(s))
+            .copied()
+            .unwrap_or(dflt)
+    }
+
+    /// Precompute the dose-invariant constants for this forcing's parameters
+    /// (read from the flat individual-parameter vector `params`). Call **once**
+    /// per RHS evaluation, then evaluate [`PreparedInputRate::rate`] per dose —
+    /// this keeps the expensive `ln Γ` (and `KTR`, `ln KTR`) out of the per-dose
+    /// superposition loop on the ODE hot path.
+    pub fn prepare(&self, params: &[f64]) -> PreparedInputRate {
         match self.kind {
-            InputRateKind::Transit => transit_input_rate(tad, arg(0, 0.0), arg(1, 1.0), dose),
+            InputRateKind::Transit => {
+                PreparedInputRate::transit(self.arg(params, 0, 0.0), self.arg(params, 1, 1.0))
+            }
+        }
+    }
+
+    /// Validate this forcing's parameters (read from the flat individual-parameter
+    /// vector `params`) against the model's domain, naming the offending value.
+    /// Wired into the fit-time data checks (evaluated on typical values, η = 0) so
+    /// an out-of-domain or non-finite `n`/`mtt` is rejected loudly instead of
+    /// propagating as a `NaN` through the ODE RHS.
+    pub fn validate(&self, params: &[f64]) -> Result<(), String> {
+        match self.kind {
+            InputRateKind::Transit => {
+                validate_transit(self.arg(params, 0, 0.0), self.arg(params, 1, 1.0))
+            }
+        }
+    }
+}
+
+/// An input-rate forcing with its dose-invariant constants precomputed for the
+/// ODE hot path. Built once per RHS evaluation by [`InputRateForcing::prepare`];
+/// [`Self::rate`] then costs only the `tad`/`dose`-dependent arithmetic per dose.
+#[derive(Debug, Clone, Copy)]
+pub enum PreparedInputRate {
+    /// Savic transit constants: `KTR`, `ln KTR`, `n`, and `ln Γ(n + 1)`.
+    Transit {
+        ktr: f64,
+        ln_ktr: f64,
+        n: f64,
+        ln_gamma_np1: f64,
+    },
+}
+
+impl PreparedInputRate {
+    /// Precompute the transit constants for `(n, mtt)`.
+    #[inline]
+    fn transit(n: f64, mtt: f64) -> Self {
+        let ktr = (n + 1.0) / mtt;
+        PreparedInputRate::Transit {
+            ktr,
+            ln_ktr: ktr.ln(),
+            n,
+            ln_gamma_np1: ln_gamma(n + 1.0),
+        }
+    }
+
+    /// Appearance rate `R_in(tad)` for one dose (`dose = F · amt`). Per-dose
+    /// contributions are summed by the caller; `tad ≤ 0` or `dose ≤ 0 ⇒ 0`.
+    #[inline]
+    pub fn rate(&self, tad: f64, dose: f64) -> f64 {
+        if tad <= 0.0 || dose <= 0.0 {
+            return 0.0;
+        }
+        match *self {
+            // ln R_in = ln dose + ln KTR + n·ln(KTR·tad) − KTR·tad − ln Γ(n + 1).
+            // For n = 0 the middle term is 0·ln x = 0, reducing to the first-order
+            // (Bateman) input dose·KTR·exp(−KTR·tad).
+            PreparedInputRate::Transit {
+                ktr,
+                ln_ktr,
+                n,
+                ln_gamma_np1,
+            } => {
+                let x = ktr * tad; // > 0 (tad > 0, ktr > 0 for valid params)
+                (dose.ln() + ln_ktr + n * x.ln() - x - ln_gamma_np1).exp()
+            }
         }
     }
 }
@@ -170,5 +237,50 @@ mod tests {
         assert!(validate_transit(-1.0, 2.0).is_err());
         assert!(validate_transit(f64::NAN, 2.0).is_err());
         assert!(validate_transit(3.0, f64::NAN).is_err());
+    }
+
+    /// `prepare(...).rate(...)` (the hoisted ODE-hot-path form) must agree bit-for-bit
+    /// with the readable reference `transit_input_rate` — guards the two from drifting
+    /// and pins the `arg_slots` wiring in `prepare`.
+    #[test]
+    fn prepared_rate_matches_reference_and_reads_slots() {
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::Transit,
+            arg_slots: vec![6, 7], // n @ 6, mtt @ 7
+        };
+        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
+        params[6] = 3.0; // n
+        params[7] = 2.0; // mtt
+        let prepared = forcing.prepare(&params);
+        for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
+            assert_eq!(
+                prepared.rate(tad, 100.0),
+                transit_input_rate(tad, 3.0, 2.0, 100.0)
+            );
+        }
+    }
+
+    /// `InputRateForcing::validate` reads `n`/`mtt` from the right slots and
+    /// surfaces the domain error — the hook the fit-time check relies on.
+    #[test]
+    fn forcing_validate_reads_slots_and_flags_domain() {
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::Transit,
+            arg_slots: vec![6, 7],
+        };
+        let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
+        ok[6] = 3.0;
+        ok[7] = 2.0;
+        assert!(forcing.validate(&ok).is_ok());
+
+        let mut bad_mtt = ok.clone();
+        bad_mtt[7] = -1.0; // mtt ≤ 0
+        assert!(forcing.validate(&bad_mtt).unwrap_err().contains("mtt"));
+
+        let mut bad_n = ok.clone();
+        bad_n[6] = -2.0; // n < 0
+        assert!(forcing.validate(&bad_n).unwrap_err().contains("n "));
     }
 }

@@ -649,6 +649,34 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
         );
     }
 
+    // Parameter-domain validation (data-level): an out-of-domain or non-finite
+    // input-rate parameter (e.g. transit `mtt ≤ 0` or `n < 0`) would otherwise
+    // propagate as a NaN through the ODE RHS and surface only as an opaque fit
+    // failure. Evaluated on typical values (η = 0) per subject, so a covariate
+    // relationship that pushes a subject's typical `mtt`/`n` out of range is
+    // caught too. Reported once — a single fatal error already halts the fit.
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    'subjects: for subject in &population.subjects {
+        let pk = (model.pk_param_fn)(&model.default_params.theta, &zero_eta, &subject.covariates);
+        for forcing in &ode.input_rate {
+            if let Err(msg) = forcing.validate(&pk.values) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_ABSORPTION_DOMAIN",
+                        format!(
+                            "Built-in absorption input-rate parameter out of domain at typical \
+                             values (subject {}): {msg}. Constrain the parameter so it stays in \
+                             range (e.g. `MTT = TVMTT * exp(ETA_MTT)` keeps MTT > 0).",
+                            subject.id
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+                break 'subjects;
+            }
+        }
+    }
+
     diags
 }
 

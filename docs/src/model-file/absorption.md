@@ -69,12 +69,18 @@ delivers the mass.
   as for ordinary doses — see [Bioavailability](ode-models.md#bioavailability).
   Do **not** multiply `transit(...)` by `F` in the RHS.
 - **Lagtime** shifts `tad` (the input starts at `dose time + lagtime`).
-- **Multiple doses** superpose: `R_in` is summed per dose.
+- **Multiple doses** superpose: `R_in` is summed per dose. With **IOV** on the
+  transit parameters, an absorption tail that is still appearing when the next
+  occasion begins is evaluated with the *current* occasion's `n`/`mtt` — exact
+  when `II` exceeds the absorption window (the usual case) and for IIV-only
+  models, approximate only for overlapping occasions.
 
 ### Parameter domains
 
-Validated at parse / fit time: `mtt > 0` and `n ≥ 0`. A non-finite or
-out-of-domain value is an error, not a silently clamped result.
+Validated at fit time on typical values (η = 0, per subject, so covariate
+relationships are included): `mtt > 0` and `n ≥ 0`. A non-finite or
+out-of-domain value is rejected with `E_ABSORPTION_DOMAIN` — an error, not a
+silently clamped result or an opaque `NaN` fit failure.
 
 ### Not yet supported (Phase 0)
 

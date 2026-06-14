@@ -90,6 +90,43 @@ const TRANSIT_DIFFUSION_MODEL: &str = r#"
   method = foce
 "#;
 
+/// Transit absorption whose mean transit time is out of domain at typical
+/// values: `MTT = TVMTT` with a *negative* typical `TVMTT`, so `mtt ≤ 0`. Without
+/// the fit-time domain guard this would produce `ktr.ln() = NaN` and propagate a
+/// NaN through the ODE RHS; with it, the model is rejected loudly.
+const TRANSIT_BAD_DOMAIN_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0,  0.1, 100.0)
+  theta TVV(50.0,  5.0, 500.0)
+  theta TVKA(1.0, 0.05,  24.0)
+  theta TVMTT(-1.0, -10.0, 24.0)
+  theta TVN(3.0,   0.1,  30.0)
+
+  omega ETA_CL ~ 0.0
+
+  sigma PROP_ERR ~ 0.01 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  MTT = TVMTT
+  NTR = TVN
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = transit(n=NTR, mtt=MTT) - KA*depot
+  d/dt(central) = KA*depot/V - CL/V*central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+"#;
+
 /// Single oral bolus of 100 mg into the depot (CMT 1), observed on central
 /// (CMT 2) over a fine grid out to 72 h (~10 elimination half-lives).
 fn pop_single_oral(obs_times: Vec<f64>) -> Population {
@@ -222,6 +259,23 @@ fn transit_with_diffusion_block_is_rejected() {
     assert!(
         diags.iter().any(|d| d.code == "E_ABSORPTION_DIFFUSION"),
         "expected E_ABSORPTION_DIFFUSION, got {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn out_of_domain_transit_parameter_is_rejected() {
+    // A transit `mtt ≤ 0` at typical values must be rejected at fit time rather
+    // than silently propagating a NaN through the ODE RHS (the `validate_transit`
+    // domain guard, evaluated on η = 0 per subject).
+    let model = parse_full_model(TRANSIT_BAD_DOMAIN_MODEL)
+        .expect("bad-domain transit model still parses")
+        .model;
+    let pop = pop_single_oral(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags.iter().any(|d| d.code == "E_ABSORPTION_DOMAIN"),
+        "expected E_ABSORPTION_DOMAIN, got {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
 }
