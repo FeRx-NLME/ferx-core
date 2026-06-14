@@ -242,6 +242,67 @@ pub(crate) fn active_infusions(
         .collect()
 }
 
+/// True if a built-in absorption input-rate forcing (transit/etc.) feeds the
+/// compartment `cmt_1based` (the data file's 1-based CMT). A dose into such a
+/// compartment delivers its mass via `R_in(tad)` integrated over time
+/// (`∫R_in dt = F·amt`), so its instantaneous **bolus must be suppressed** to
+/// avoid double-counting the dose — the dose feeds the input-rate function, not
+/// the state directly (see `plans/absorption-models.md`).
+#[inline]
+pub(crate) fn input_rate_consumes_cmt(ode: &OdeSpec, cmt_1based: usize) -> bool {
+    !ode.input_rate.is_empty()
+        && ode
+            .input_rate
+            .iter()
+            .any(|f| f.cmt == cmt_1based.saturating_sub(1))
+}
+
+/// Add every built-in absorption input-rate forcing into `dy` at integration
+/// time `t`. For each forcing, sums `R_in(tad)` over all doses targeting its
+/// compartment (Savic superposition), with `tad = t − (dose.time + lag)` and
+/// dose mass `F·amt`. `R_in = 0` for `tad ≤ 0`, so future doses contribute
+/// nothing. `reset_floor` turns off doses delivered before the most recent
+/// EVID=3/4 reset, mirroring [`active_infusions`]. This is the input-rate
+/// analogue of the `+rate` infusion injection in the wrapped RHS.
+#[inline]
+#[allow(clippy::too_many_arguments)] // mirrors the dose context threaded into the RHS wrappers
+fn add_input_rate_forcing(
+    ode: &OdeSpec,
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    dose_f_bio: &[f64],
+    reset_floor: f64,
+    params: &[f64],
+    t: f64,
+    dy: &mut [f64],
+) {
+    for forcing in &ode.input_rate {
+        if forcing.cmt >= dy.len() {
+            continue;
+        }
+        let mut acc = 0.0;
+        for (k, d) in doses.iter().enumerate() {
+            if d.cmt.saturating_sub(1) != forcing.cmt {
+                continue;
+            }
+            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+            let t_eff = d.time + lag;
+            // Doses delivered before the most recent reset are off — the reset
+            // zeroed the compartments, same rule as `active_infusions`.
+            if t_eff < reset_floor - INFUSION_EPS {
+                continue;
+            }
+            let tad = t - t_eff;
+            if tad <= 0.0 {
+                continue;
+            }
+            let dose_mass = dose_f_bio.get(k).copied().unwrap_or(1.0) * d.amt;
+            acc += forcing.rate(tad, dose_mass, params);
+        }
+        dy[forcing.cmt] += acc;
+    }
+}
+
 /// Function that computes the observable from
 /// `(state, pk_params_flat, theta, eta, covariates)`. Used by `[scaling]
 /// y = <expr>` (Form C) to replace the default `u[obs_cmt_idx]` readout
@@ -505,8 +566,11 @@ pub fn ode_predictions(
             if dose.ss && dose.ii > 0.0 {
                 u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
             }
-            if !is_real_infusion(dose) {
-                // dose.cmt is 1-based; state indices are 0-based
+            if !is_real_infusion(dose) && !input_rate_consumes_cmt(ode, dose.cmt) {
+                // dose.cmt is 1-based; state indices are 0-based. A dose into a
+                // built-in input-rate compartment (transit/etc.) is delivered as
+                // R_in over time by the wrapped RHS below — not as a bolus — so
+                // it's skipped here to avoid double-counting the dose.
                 let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n {
                     u[cmt_idx] += f_bio * dose.amt;
@@ -592,6 +656,21 @@ pub fn ode_predictions(
                 if cmt_idx < dy.len() {
                     dy[cmt_idx] += rate;
                 }
+            }
+            // Built-in absorption input-rate forcing (transit/etc.): adds
+            // R_in(tad) into its compartment, superposed over doses. No resets
+            // on the plain path (those route to the event-driven walker).
+            if !ode.input_rate.is_empty() {
+                add_input_rate_forcing(
+                    ode,
+                    &subject.doses,
+                    &dose_lagtimes,
+                    &dose_f_bio,
+                    f64::NEG_INFINITY,
+                    p,
+                    t,
+                    dy,
+                );
             }
         };
         let sol = solve_ode(
@@ -861,6 +940,21 @@ pub fn ode_predictions_event_driven(
                         dy[cmt_idx] += rate;
                     }
                 }
+                // Built-in absorption input-rate forcing (transit/etc.): adds
+                // R_in(tad) into its compartment, superposed over doses. Doses
+                // before `reset_floor` (the most recent EVID=3/4) are off.
+                if !ode.input_rate.is_empty() {
+                    add_input_rate_forcing(
+                        ode,
+                        &subject.doses,
+                        &dose_lagtimes,
+                        &dose_f_bio,
+                        reset_floor,
+                        p,
+                        t,
+                        dy,
+                    );
+                }
             };
             let saveat = vec![t_event];
             let sol = solve_ode(
@@ -889,8 +983,10 @@ pub fn ode_predictions_event_driven(
                 }
                 // Boluses: add amt to state. Infusions: no instantaneous
                 // change — handled via the wrapped RHS for segments inside
-                // [d.time, d.time + d.duration].
-                if !is_real_infusion(d) {
+                // [d.time, d.time + d.duration]. A dose into a built-in
+                // input-rate compartment (transit/etc.) is delivered as R_in
+                // over time by the wrapped RHS, so it's skipped here too.
+                if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt) {
                     let cmt_idx = d.cmt.saturating_sub(1);
                     if cmt_idx < n {
                         u[cmt_idx] += pk_now.f_bio() * d.amt;
@@ -1164,13 +1260,18 @@ pub fn ode_predictions_with_states(
                     u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
                 }
                 if !is_real_infusion(dose) {
-                    // dose.cmt is 1-based; CMT=0 means no compartment — ignore.
-                    if dose.cmt > 0 {
-                        let cmt = dose.cmt - 1;
-                        if cmt < n {
-                            u[cmt] += dose.amt * f;
+                    if !input_rate_consumes_cmt(ode, dose.cmt) {
+                        // dose.cmt is 1-based; CMT=0 means no compartment — ignore.
+                        if dose.cmt > 0 {
+                            let cmt = dose.cmt - 1;
+                            if cmt < n {
+                                u[cmt] += dose.amt * f;
+                            }
                         }
                     }
+                    // else: the dose feeds a built-in input-rate function
+                    // (transit/etc.) and is delivered as R_in over time by the
+                    // wrapped RHS below — no bolus here (would double-count).
                 } else {
                     let end_t = t_eff + dose.duration;
                     active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
@@ -1245,6 +1346,7 @@ pub fn ode_predictions_with_states(
         let wrapped_rhs = {
             let infusions = current_infusions.clone();
             let f_bio_snap = dose_f_bio.clone();
+            let lag_snap = dose_lagtimes.clone();
             move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
                 (ode.rhs)(y, p, t, dy);
                 for &(di, t_start_inf, t_end_inf) in &infusions {
@@ -1263,6 +1365,20 @@ pub fn ode_predictions_with_states(
                             }
                         }
                     }
+                }
+                // Built-in absorption input-rate forcing (transit/etc.):
+                // R_in(tad) superposed over doses. No resets on this path.
+                if !ode.input_rate.is_empty() {
+                    add_input_rate_forcing(
+                        ode,
+                        &subject.doses,
+                        &lag_snap,
+                        &f_bio_snap,
+                        f64::NEG_INFINITY,
+                        p,
+                        t,
+                        dy,
+                    );
                 }
             }
         };
@@ -1478,13 +1594,18 @@ pub fn ode_dense_solve_states(
                     u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
                 }
                 if !is_real_infusion(dose) {
-                    // dose.cmt is 1-based; CMT=0 means no compartment — ignore.
-                    if dose.cmt > 0 {
-                        let cmt = dose.cmt - 1;
-                        if cmt < n {
-                            u[cmt] += dose.amt * f;
+                    if !input_rate_consumes_cmt(ode, dose.cmt) {
+                        // dose.cmt is 1-based; CMT=0 means no compartment — ignore.
+                        if dose.cmt > 0 {
+                            let cmt = dose.cmt - 1;
+                            if cmt < n {
+                                u[cmt] += dose.amt * f;
+                            }
                         }
                     }
+                    // else: the dose feeds a built-in input-rate function
+                    // (transit/etc.) and is delivered as R_in over time by the
+                    // wrapped RHS below — no bolus here (would double-count).
                 } else {
                     let end_t = t_eff + dose.duration;
                     active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
@@ -1542,9 +1663,20 @@ pub fn ode_dense_solve_states(
         active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
         let current_infusions = active_infusions.clone();
 
+        // Doses delivered before the most recent reset (EVID=3/4) at or before
+        // this segment are off for the input-rate forcing — mirroring how the
+        // reset clears `active_infusions` and re-seeds `u` above.
+        let reset_floor = subject
+            .reset_times
+            .iter()
+            .cloned()
+            .filter(|&rt| rt <= t_start + 1e-12)
+            .fold(f64::NEG_INFINITY, f64::max);
+
         let wrapped_rhs = {
             let infusions = current_infusions.clone();
             let f_bio_snap = dose_f_bio.clone();
+            let lag_snap = dose_lagtimes.clone();
             move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
                 (ode.rhs)(y, p, t, dy);
                 for &(di, t_start_inf, t_end_inf) in &infusions {
@@ -1562,6 +1694,20 @@ pub fn ode_dense_solve_states(
                             }
                         }
                     }
+                }
+                // Built-in absorption input-rate forcing (transit/etc.):
+                // R_in(tad) superposed over doses, off before `reset_floor`.
+                if !ode.input_rate.is_empty() {
+                    add_input_rate_forcing(
+                        ode,
+                        &subject.doses,
+                        &lag_snap,
+                        &f_bio_snap,
+                        reset_floor,
+                        p,
+                        t,
+                        dy,
+                    );
                 }
             }
         };
@@ -1679,6 +1825,133 @@ mod tests {
         p.values[0] = kin;
         p.values[1] = kout;
         p
+    }
+
+    // ── Built-in absorption input-rate forcing (transit) ──────────────────
+    use crate::pk::absorption::{InputRateForcing, InputRateKind};
+
+    /// Single compartment that only *accumulates* the transit input (`dy = 0`),
+    /// so its amount at large `t` equals the total delivered mass `∫R_in = F·amt`
+    /// — a direct mass-balance probe of the forcing through the real integrator.
+    /// Transit args live at free slots: `n` @ 6, `mtt` @ 7.
+    fn transit_accumulator_spec() -> OdeSpec {
+        OdeSpec {
+            rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            }),
+            n_states: 1,
+            state_names: vec!["depot".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: vec![InputRateForcing {
+                cmt: 0,
+                kind: InputRateKind::Transit,
+                arg_slots: vec![6, 7],
+            }],
+            init_fn: None,
+        }
+    }
+
+    fn pk_transit_vec(n: f64, mtt: f64, f: f64) -> Vec<f64> {
+        let mut v = vec![0.0; crate::types::MAX_PK_PARAMS];
+        v[6] = n;
+        v[7] = mtt;
+        v[crate::types::PK_IDX_F] = f;
+        v
+    }
+
+    fn pk_transit_struct(n: f64, mtt: f64, f: f64) -> PkParams {
+        let mut p = PkParams::default();
+        p.values[6] = n;
+        p.values[7] = mtt;
+        p.values[crate::types::PK_IDX_F] = f;
+        p
+    }
+
+    #[test]
+    fn input_rate_consumes_cmt_matches_forcing_compartment() {
+        let ode = transit_accumulator_spec(); // forcing on state 0 ≡ 1-based CMT 1
+        assert!(input_rate_consumes_cmt(&ode, 1));
+        assert!(!input_rate_consumes_cmt(&ode, 2));
+        // A spec with no input-rate term never consumes a dose.
+        assert!(!input_rate_consumes_cmt(&one_cpt_ode_spec(), 1));
+    }
+
+    #[test]
+    fn transit_forcing_delivers_full_dose_mass() {
+        // The accumulator depot should hold ∫R_in = F·amt = 100 once absorption
+        // is complete — NOT 200 (bolus would double-count) and NOT 0 (no forcing).
+        let ode = transit_accumulator_spec();
+        let pk = pk_transit_vec(3.0, 2.0, 1.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let subj = make_subject(doses, vec![40.0]);
+        let preds = ode_predictions(&ode, &pk, &[], &[], &subj);
+        assert_relative_eq!(preds[0], 100.0, max_relative = 5e-3);
+    }
+
+    #[test]
+    fn transit_dose_does_not_enter_as_bolus() {
+        // An observation exactly at the dose time reads ~0: the transit dose is
+        // delivered as R_in over time, never as an instantaneous bolus jump. (A
+        // trailing obs keeps the break-time loop non-empty.) The late obs then
+        // confirms the full mass still arrives.
+        let ode = transit_accumulator_spec();
+        let pk = pk_transit_vec(3.0, 2.0, 1.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let subj = make_subject(doses, vec![0.0, 40.0]);
+        let preds = ode_predictions(&ode, &pk, &[], &[], &subj);
+        assert!(
+            preds[0].abs() < 1e-9,
+            "bolus not suppressed: got {}",
+            preds[0]
+        );
+        assert_relative_eq!(preds[1], 100.0, max_relative = 5e-3);
+    }
+
+    #[test]
+    fn transit_forcing_scales_with_bioavailability() {
+        // F = 0.4 ⇒ delivered mass = 0.4·100 = 40.
+        let ode = transit_accumulator_spec();
+        let pk = pk_transit_vec(3.0, 2.0, 0.4);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let subj = make_subject(doses, vec![40.0]);
+        let preds = ode_predictions(&ode, &pk, &[], &[], &subj);
+        assert_relative_eq!(preds[0], 40.0, max_relative = 5e-3);
+    }
+
+    #[test]
+    fn transit_forcing_superposes_over_doses() {
+        // Two doses (100 @ t=0, 50 @ t=10) superpose: ∫R_in = F·(100+50) = 150.
+        let ode = transit_accumulator_spec();
+        let pk = pk_transit_vec(3.0, 2.0, 1.0);
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, 50.0, 1, 0.0, false, 0.0),
+        ];
+        let subj = make_subject(doses, vec![60.0]);
+        let preds = ode_predictions(&ode, &pk, &[], &[], &subj);
+        assert_relative_eq!(preds[0], 150.0, max_relative = 5e-3);
+    }
+
+    #[test]
+    fn transit_forcing_respects_reset_floor() {
+        // Event-driven path: an EVID=3 reset at t=1 zeros the depot AND turns off
+        // the pre-reset dose's input rate. With no post-reset dose, the
+        // accumulator stays at 0 — the t=0 dose's R_in must not resume.
+        let ode = transit_accumulator_spec();
+        let pk = pk_transit_struct(3.0, 2.0, 1.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let mut subj = make_subject(doses, vec![40.0]);
+        subj.reset_times = vec![1.0];
+        let dose_pk = vec![pk; subj.doses.len()];
+        let obs_pk = vec![pk; subj.obs_times.len()];
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &dose_pk, &obs_pk, &[]);
+        assert!(
+            preds[0].abs() < 1e-6,
+            "pre-reset dose R_in leaked past the reset: got {}",
+            preds[0]
+        );
     }
 
     #[test]

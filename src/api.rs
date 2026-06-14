@@ -568,6 +568,7 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_iov_occasions(model, population));
+    diags.extend(check_absorption_dosing(model, population));
     diags.extend(validate_output_columns(model, population));
     diags
 }
@@ -593,6 +594,62 @@ fn check_iov_occasions(model: &CompiledModel, population: &Population) -> Vec<Di
          [fit_options] so that per-occasion kappas can be estimated.",
     )
     .with_block("fit_options")]
+}
+
+/// Built-in absorption input-rate models (e.g. `transit()`) are integrated
+/// through the standard ODE prediction paths. Two combinations are not yet
+/// supported and are rejected here — loudly — rather than silently mis-modeled:
+///   - a steady-state dose (`SS=1`) into an input-rate compartment: periodic
+///     steady state with an unfinished `R_in` tail needs dedicated treatment
+///     (a later phase of `plans/absorption-models.md`);
+///   - an input-rate model combined with a `[diffusion]` block (the SDE/EKF
+///     path), whose Kalman propagation does not carry the `R_in` forcing.
+fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let Some(ode) = &model.ode_spec else {
+        return Vec::new();
+    };
+    if ode.input_rate.is_empty() {
+        return Vec::new();
+    }
+    let mut diags = Vec::new();
+
+    // input-rate + [diffusion]/EKF (model-level): the EKF propagator does not
+    // apply the R_in forcing, so the absorption term would be silently dropped.
+    if !ode.diffusion_var.is_empty() {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_DIFFUSION",
+                "A built-in absorption input-rate model (e.g. transit()) cannot yet be \
+                 combined with a [diffusion] block (the SDE/EKF path): the EKF \
+                 propagation does not carry the input-rate forcing. Remove the \
+                 [diffusion] block or the absorption term.",
+            )
+            .with_block("odes"),
+        );
+    }
+
+    // SS=1 dose into an input-rate compartment (data-level): the steady-state
+    // equilibration applies the dose as a bolus pulse, not as R_in over the cycle.
+    use std::collections::BTreeSet;
+    let cmts: BTreeSet<usize> = ode.input_rate.iter().map(|f| f.cmt + 1).collect();
+    let has_ss = population.subjects.iter().any(|s| {
+        s.doses
+            .iter()
+            .any(|d| d.ss && d.ii > 0.0 && cmts.contains(&d.cmt))
+    });
+    if has_ss {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_SS",
+                "Steady-state dosing (SS=1) into a built-in absorption input-rate \
+                 compartment (e.g. transit()) is not yet supported. Expand the run-in \
+                 with explicit dosing records, or remove the absorption term.",
+            )
+            .with_block("odes"),
+        );
+    }
+
+    diags
 }
 
 /// Model + estimation-option *compatibility* checks that don't depend on data:
