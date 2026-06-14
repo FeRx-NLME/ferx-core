@@ -779,11 +779,13 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<f64, String> {
     // float `==` (clippy::float_cmp); the cell parses from text so `-1`/`-2` are
     // exact, but the tolerance keeps clippy quiet and is harmless.
     let detail = if (rate + 1.0).abs() < 1e-9 {
-        "RATE=-1 (NONMEM: infusion RATE modeled via R1 in $PK)"
+        "RATE=-1 (NONMEM: infusion RATE modeled via R1 in $PK)".to_string()
     } else if (rate + 2.0).abs() < 1e-9 {
-        "RATE=-2 (NONMEM: infusion DURATION modeled via D1 in $PK)"
+        "RATE=-2 (NONMEM: infusion DURATION modeled via D1 in $PK)".to_string()
     } else {
-        "a negative RATE"
+        // Echo the offending value so the bad row is identifiable, matching the
+        // -1/-2/non-finite branches.
+        format!("RATE={rate} (a negative value, not a recognised NONMEM code)")
     };
     Err(format!(
         "subject {id}, time {time}: {detail} is not yet supported by ferx-core; \
@@ -1807,10 +1809,14 @@ mod tests {
         let e = validate_dose_rate(-2.0, "7", 0.0).unwrap_err();
         assert!(e.contains("RATE=-2") && e.contains("D1"), "{e}");
 
-        // Other negatives are not recognised NONMEM codes.
+        // Other negatives are not recognised NONMEM codes; the message echoes
+        // the offending value so the bad row is identifiable.
         for r in [-0.5, -3.0, -100.0] {
             let e = validate_dose_rate(r, "1", 0.0).unwrap_err();
-            assert!(e.contains("a negative RATE"), "r={r}: {e}");
+            assert!(
+                e.contains(&format!("RATE={r}")) && e.contains("negative value"),
+                "r={r}: {e}"
+            );
         }
 
         // Non-finite RATE on a dose row is malformed.
