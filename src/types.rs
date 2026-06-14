@@ -992,6 +992,22 @@ impl ErrorSpec {
     /// scaling path. Fit-time validation rejects an uncovered CMT up front,
     /// and `build_error_spec` resolves indices against the real sigma vector,
     /// so a `NaN` here is only reachable via a hand-constructed model.
+    /// Whether the residual variance depends on the prediction `f` for any
+    /// endpoint (proportional or combined). When `false` (purely additive),
+    /// the variance is constant in `f`, so FOCE's choice of evaluation point
+    /// (linearized `f0` vs population `f(η=0)`) is irrelevant and the cheap
+    /// path stays bit-identical. Used to gate the FOCE population-variance
+    /// (`f(η=0)`) treatment in the marginal, analytical gradient, and
+    /// covariance step.
+    pub fn has_f_dependent_variance(&self) -> bool {
+        match self {
+            ErrorSpec::Single(em) => !matches!(em, ErrorModel::Additive),
+            ErrorSpec::PerCmt(map) => map
+                .values()
+                .any(|ep| !matches!(ep.error_model, ErrorModel::Additive)),
+        }
+    }
+
     pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         use crate::stats::residual_error::residual_variance;
         match self {
@@ -1689,6 +1705,28 @@ impl CompiledModel {
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
+    }
+
+    /// Copy the configured ODE solver tolerances from `opts` onto this model's
+    /// [`OdeSpec`] (no-op for analytical models). Call this once after the
+    /// model file's `[fit_options]` and any call-time `settings` overrides have
+    /// been merged into `opts`, so the integrator uses the requested accuracy.
+    /// The parser calls it at parse time, so `.ferx` `[fit_options]` and any
+    /// entry that integrates the parsed spec as-is (`predict`, `fit_from_files`)
+    /// already use the configured accuracy.
+    ///
+    /// Note: [`fit`](crate::fit) takes `&CompiledModel` and does **not** call
+    /// this. The integrator reads [`OdeSpec::solver_opts`], never
+    /// `FitOptions::ode_reltol` directly, so a caller that merges call-time
+    /// `settings` into its own `FitOptions` (as the R wrapper's `ferx_fit`
+    /// does) must re-apply this on an owned model *before* `fit` for those
+    /// overrides to reach the solver. Idempotent.
+    pub fn sync_ode_solver_opts(&mut self, opts: &FitOptions) {
+        if let Some(ode) = self.ode_spec.as_mut() {
+            ode.solver_opts.reltol = opts.ode_reltol;
+            ode.solver_opts.abstol = opts.ode_abstol;
+            ode.solver_opts.max_steps = opts.ode_max_steps;
+        }
     }
 
     /// Returns true when the model has a `[diffusion]` block (SDE / EKF path).
@@ -2486,6 +2524,22 @@ pub struct FitOptions {
     pub outer_gtol: f64,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
+    /// RK45 ODE solver relative tolerance (`[fit_options] ode_reltol`, or via
+    /// `ferx_fit(settings = list(ode_reltol = ...))`). Default `1e-4`. Only
+    /// affects ODE models. The default reproduces analytical closed forms in
+    /// PRED to ~1e-4, but the FOCE OFV amplifies solver error, so a tighter
+    /// value (e.g. `1e-10`) is needed for the ODE-form OFV to match the
+    /// analytical OFV. Copied onto `OdeSpec::solver_opts` via
+    /// [`CompiledModel::sync_ode_solver_opts`].
+    pub ode_reltol: f64,
+    /// RK45 ODE solver absolute tolerance (`[fit_options] ode_abstol`).
+    /// Default `1e-6`. See [`FitOptions::ode_reltol`].
+    pub ode_abstol: f64,
+    /// RK45 ODE solver maximum step count per integration segment
+    /// (`[fit_options] ode_max_steps`). Default `10000`. Raise if a tight
+    /// `ode_reltol` exhausts the step budget on stiff multi-compartment
+    /// segments. See [`FitOptions::ode_reltol`].
+    pub ode_max_steps: usize,
     pub run_covariance_step: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
@@ -2746,16 +2800,32 @@ impl Default for FitOptions {
             outer_maxiter: 500,
             outer_gtol: 1e-6,
             inner_maxiter: 200,
-            // 1e-4 matches typical NLME engines (NONMEM's default inner-loop
-            // SIGDIGITS is ~3, equivalent to ~1e-3). Tighter tolerances
-            // (1e-6 or 1e-8) over-converge the EBE relative to the
-            // Sheiner–Beal linearisation error and force BFGS to do many
-            // extra iterations per find_ebe — measured ~15x slowdown on
-            // a 100-subject 2-cpt FOCEI fit when set to 1e-8 vs 1e-4,
-            // with no measurable change in the final OFV. Override via
-            // `inner_tol = ...` in `[fit_options]` for studies that need
-            // tighter EBEs (e.g. very-small-data simulation work).
-            inner_tol: 1e-4,
+            // 1e-5, not the looser 1e-4 that an earlier comment justified as
+            // matching "NONMEM's ~3-SIGDIGITS inner loop" — that conflated the
+            // *outer* control (NSIG/SIGDIGITS, default 3) with the *inner*
+            // conditional precision (SIGL, default ~10 significant digits), which
+            // NONMEM runs far tighter. A loose inner tolerance leaves residual
+            // noise in each subject's EBE solution, which propagates into the
+            // marginal OFV the *outer* optimizer sees. On models with a noisy or
+            // flat marginal surface (FD-inner FOCE such as LTBS) that noise made
+            // the derivative-free BOBYQA outer optimizer false-converge a few OFV
+            // units above the true minimum. Tightening to 1e-5 removes enough of
+            // that noise to reach NONMEM's minimum (LTBS now matches to <0.001
+            // OFV), at ~1.5x the per-fit cost. Note tighter is not uniformly
+            // better: at 1e-6 some ill-conditioned fits (3x3 block-Ω,
+            // KA=KE+exp(...) coupling) over-converge the inner Hessian and BOBYQA
+            // navigates into a worse basin — 1e-5 sits below the LTBS noise floor
+            // while staying clear of that pathology. It does change the converged
+            // point versus 1e-4; the previous "no measurable OFV change" claim
+            // only held for well-conditioned fits. Override via `inner_tol = ...`
+            // in `[fit_options]` (loosen for speed; tighten with care).
+            inner_tol: 1e-5,
+            // ODE solver tolerances: match OdeSolverOptions::default() so the
+            // engine default is unchanged. Opt into tighter accuracy per model
+            // via `[fit_options] ode_reltol = ...` (see FitOptions::ode_reltol).
+            ode_reltol: 1e-4,
+            ode_abstol: 1e-6,
+            ode_max_steps: 10_000,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
@@ -3208,6 +3278,7 @@ pub(crate) mod test_helpers {
                     readout: crate::ode::OdeReadout::ObsCmt(0),
                     diffusion_var: Vec::new(),
                     init_fn: None,
+                    solver_opts: crate::ode::OdeSolverOptions::default(),
                 })
             } else {
                 None
@@ -3280,6 +3351,30 @@ mod tests {
         assert_eq!(TwoCptOral.canonical_name(), "two_cpt_oral");
         assert_eq!(ThreeCptIv.canonical_name(), "three_cpt_iv");
         assert_eq!(ThreeCptOral.canonical_name(), "three_cpt_oral");
+    }
+
+    #[test]
+    fn error_spec_has_f_dependent_variance() {
+        use std::collections::HashMap;
+        // Single endpoint: only additive is f-independent.
+        assert!(!ErrorSpec::Single(ErrorModel::Additive).has_f_dependent_variance());
+        assert!(ErrorSpec::Single(ErrorModel::Proportional).has_f_dependent_variance());
+        assert!(ErrorSpec::Single(ErrorModel::Combined).has_f_dependent_variance());
+
+        // PerCmt: f-dependent if ANY endpoint is non-additive.
+        let ep = |em: ErrorModel| EndpointError {
+            error_model: em,
+            sigma_idx: vec![0],
+        };
+        let mut all_additive = HashMap::new();
+        all_additive.insert(1usize, ep(ErrorModel::Additive));
+        all_additive.insert(2usize, ep(ErrorModel::Additive));
+        assert!(!ErrorSpec::PerCmt(all_additive).has_f_dependent_variance());
+
+        let mut mixed = HashMap::new();
+        mixed.insert(1usize, ep(ErrorModel::Additive));
+        mixed.insert(2usize, ep(ErrorModel::Proportional));
+        assert!(ErrorSpec::PerCmt(mixed).has_f_dependent_variance());
     }
 
     #[test]

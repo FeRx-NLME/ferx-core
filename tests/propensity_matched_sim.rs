@@ -10,7 +10,8 @@ use ferx_core::{
     parse_model_string, simulate_with_options, simulate_with_seed, DoseEvent, Population,
     SimulateOptions, Subject,
 };
-use std::collections::HashMap;
+
+mod common;
 
 const MODEL: &str = r#"
 [parameters]
@@ -38,25 +39,13 @@ fn template_population(n: usize) -> Population {
             // Phase-shift the (5-point) grid per subject so designs vary.
             let times: Vec<f64> = (0..5).map(|j| grid[(i + j) % grid.len()]).collect();
             let n_obs = times.len();
-            Subject {
-                id: format!("{i}"),
-                doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
-                obs_times: times,
-                obs_raw_times: Vec::new(),
-                observations: vec![0.0; n_obs],
-                obs_cmts: vec![1; n_obs],
-                covariates: HashMap::new(),
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                cens: vec![0; n_obs],
-                occasions: Vec::new(),
-                dose_occasions: Vec::new(),
-                #[cfg(feature = "survival")]
-                obs_records: vec![],
-            }
+            common::subject(
+                &format!("{i}"),
+                vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+                times,
+                vec![0.0; n_obs],
+                vec![1; n_obs],
+            )
         })
         .collect();
     Population {
@@ -170,25 +159,13 @@ fn unmatched_options_path_equals_simulate_with_seed() {
 fn matching_requires_observations() {
     let model = parse_model_string(MODEL).expect("model parses");
     // A subject with no observation records → posthoc eta undefined.
-    let obsless = Subject {
-        id: "1".into(),
-        doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
-        obs_times: Vec::new(),
-        obs_raw_times: Vec::new(),
-        observations: Vec::new(),
-        obs_cmts: Vec::new(),
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        cens: Vec::new(),
-        occasions: Vec::new(),
-        dose_occasions: Vec::new(),
-        #[cfg(feature = "survival")]
-        obs_records: vec![],
-    };
+    let obsless = common::subject(
+        "1",
+        vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
     let pop = Population {
         subjects: vec![obsless],
         covariate_names: vec![],

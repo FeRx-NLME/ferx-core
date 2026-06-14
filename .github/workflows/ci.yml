@@ -61,6 +61,14 @@ jobs:
       - name: cargo test (NONMEM IOV CL cross-check, issue #238)
         run: cargo test --test warfarin_iov_nonmem --no-default-features --features ci --profile ci-test
 
+      # Analytical/ODE equivalence guard for the standard PK models (ferx-r
+      # #127). Like the IOV check above it is an integration test `--lib` does
+      # not run, but it is fast (just `predict()`, no `fit()`), so run it on
+      # every PR rather than only nightly — otherwise a regression in the
+      # analytical or ODE prediction path stays green until the slow-tests run.
+      - name: cargo test (analytical/ODE equivalence, ferx-r #127)
+        run: cargo test --test analytical_ode_equivalence --no-default-features --features ci --profile ci-test
+
   survival:
     name: Survival (TTE)
     runs-on: ubuntu-latest

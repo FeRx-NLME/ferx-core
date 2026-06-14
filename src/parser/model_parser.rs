@@ -1536,6 +1536,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let mut model = model;
     model.bloq_method = fit_options.bloq_method;
 
+    // Bake the configured ODE solver tolerances from [fit_options] onto the
+    // OdeSpec so predict()/fit_from_files (which integrate the parsed spec
+    // as-is) use the requested accuracy. Callers that merge call-time `settings`
+    // into their own FitOptions (the R wrapper's ferx_fit) must re-apply
+    // sync_ode_solver_opts on the owned model for those overrides to win;
+    // ferx-core fit() takes &CompiledModel and does not. No-op for analytical.
+    model.sync_ode_solver_opts(&fit_options);
+
     // ── [scaling] block ──
     // Parsed after `parse_fit_options` so we can validate the
     // `ExpressionScale + gradient = ad` combination (which is rejected for
@@ -3184,6 +3192,31 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "maxiter" => opts.outer_maxiter = parse_usize("maxiter")?,
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
+        "ode_reltol" => {
+            let v = parse_f64("ode_reltol")?;
+            if v <= 0.0 || !v.is_finite() {
+                return Err(format!(
+                    "ode_reltol must be a positive finite value, got {v}"
+                ));
+            }
+            opts.ode_reltol = v;
+        }
+        "ode_abstol" => {
+            let v = parse_f64("ode_abstol")?;
+            if v <= 0.0 || !v.is_finite() {
+                return Err(format!(
+                    "ode_abstol must be a positive finite value, got {v}"
+                ));
+            }
+            opts.ode_abstol = v;
+        }
+        "ode_max_steps" => {
+            let v = parse_usize("ode_max_steps")?;
+            if v == 0 {
+                return Err("ode_max_steps must be a positive integer".to_string());
+            }
+            opts.ode_max_steps = v;
+        }
         "covariance" => opts.run_covariance_step = parse_bool("covariance")?,
         "covariance_fallback" => {
             opts.covariance_fallback = match value.to_lowercase().as_str() {
@@ -4839,6 +4872,9 @@ fn build_ode_spec(
         readout: crate::ode::OdeReadout::ObsCmt(obs_cmt_idx),
         diffusion_var: Vec::new(),
         init_fn,
+        // Default tolerances; overwritten from [fit_options] / settings by
+        // CompiledModel::sync_ode_solver_opts once fit options are merged.
+        solver_opts: crate::ode::OdeSolverOptions::default(),
     })
 }
 
@@ -9977,6 +10013,77 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_fit_option_ode_solver_tolerances() {
+        let mut opts = FitOptions::default();
+        // Defaults match OdeSolverOptions::default() (engine default unchanged).
+        assert_eq!(opts.ode_reltol, 1e-4);
+        assert_eq!(opts.ode_abstol, 1e-6);
+        assert_eq!(opts.ode_max_steps, 10_000);
+
+        assert_eq!(apply_fit_option(&mut opts, "ode_reltol", "1e-10"), Ok(true));
+        assert_eq!(apply_fit_option(&mut opts, "ode_abstol", "1e-12"), Ok(true));
+        assert_eq!(
+            apply_fit_option(&mut opts, "ode_max_steps", "200000"),
+            Ok(true)
+        );
+        assert_eq!(opts.ode_reltol, 1e-10);
+        assert_eq!(opts.ode_abstol, 1e-12);
+        assert_eq!(opts.ode_max_steps, 200_000);
+
+        // Non-positive / non-finite / zero are rejected, and a failed apply
+        // must not mutate the previously-set value.
+        assert!(apply_fit_option(&mut opts, "ode_reltol", "0").is_err());
+        assert!(apply_fit_option(&mut opts, "ode_reltol", "-1e-9").is_err());
+        assert!(apply_fit_option(&mut opts, "ode_abstol", "nan").is_err());
+        assert!(apply_fit_option(&mut opts, "ode_max_steps", "0").is_err());
+        assert!(apply_fit_option(&mut opts, "ode_max_steps", "x").is_err());
+        assert_eq!(opts.ode_reltol, 1e-10);
+        assert_eq!(opts.ode_max_steps, 200_000);
+    }
+
+    #[test]
+    fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
+        // [fit_options] ODE solver tolerances must be baked onto
+        // OdeSpec.solver_opts by the parser (via sync_ode_solver_opts) so the
+        // integrator - including predict(), which receives no fit options -
+        // uses the requested accuracy.
+        let base = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        // Default: OdeSpec inherits OdeSolverOptions::default().
+        let def = parse_full_model(base).unwrap();
+        let s = def.model.ode_spec.as_ref().unwrap().solver_opts;
+        assert_eq!(s.reltol, 1e-4);
+        assert_eq!(s.abstol, 1e-6);
+        assert_eq!(s.max_steps, 10_000);
+
+        // Override via [fit_options].
+        let with_opts = format!(
+            "{base}\n[fit_options]\n  ode_reltol = 1e-9\n  ode_abstol = 1e-11\n  ode_max_steps = 50000\n"
+        );
+        let p = parse_full_model(&with_opts).unwrap();
+        let s2 = p.model.ode_spec.as_ref().unwrap().solver_opts;
+        assert_eq!(s2.reltol, 1e-9);
+        assert_eq!(s2.abstol, 1e-11);
+        assert_eq!(s2.max_steps, 50_000);
+    }
+
+    #[test]
     fn test_imp_method_and_is_options_parse() {
         // `methods = [focei, imp]` plus the four `is_*` keys must apply
         // cleanly and produce no `unsupported_keys_warnings`.
@@ -11764,12 +11871,12 @@ mod tests {
     #[test]
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
-        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-4,
+        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-5,
         //   steihaug_max_iters = None (adaptive).
         let opts = FitOptions::default();
         assert_eq!(opts.optimizer, Optimizer::Bobyqa);
         assert_eq!(opts.inner_maxiter, 200);
-        assert!((opts.inner_tol - 1e-4).abs() < 1e-20);
+        assert!((opts.inner_tol - 1e-5).abs() < 1e-20);
         assert_eq!(opts.steihaug_max_iters, None);
     }
 

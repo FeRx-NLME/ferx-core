@@ -1,4 +1,3 @@
-use crate::estimation::gauss_newton::subject_nll_pop_grad;
 use crate::estimation::inner_optimizer::{find_ebe, run_inner_loop_warm};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
@@ -1732,22 +1731,48 @@ fn ad_population_gradient(
     debug_assert_eq!(hms.len(), n_subj);
     debug_assert_eq!(kappas.len(), n_subj);
     let np = x.len();
+    // For FOCEI (interaction), add the `log|H̃|` EBE-response term `t_i` (the
+    // #274/#289 Δ) the fixed-η̂ analytic gradient drops, so slsqp/L-BFGS see the
+    // full marginal gradient and reach the true minimum instead of stalling
+    // above it. Reuses the Laplace cache the gradient just formed (one extra
+    // n_eta×n_eta solve per subject); θ-block (mu-ref) only, zero for additive
+    // error. IOV routes through the reconverged-FD gradient, not here, so this
+    // only affects non-IOV FOCEI gradient steps.
     let per_subj: Vec<Vec<f64>> = (0..n_subj)
         .into_par_iter()
         .map(|i| {
-            subject_nll_pop_grad(
-                x,
-                init_params,
-                model,
-                population,
-                i,
-                &ehs[i],
-                &hms[i],
-                kappas[i].as_slice(),
-                bounds,
-                options,
-            )
-            .1
+            let (_, mut gi, cache) =
+                crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
+                    x,
+                    init_params,
+                    model,
+                    population,
+                    i,
+                    &ehs[i],
+                    &hms[i],
+                    kappas[i].as_slice(),
+                    bounds,
+                    options,
+                );
+            if let Some(c) = cache.as_ref() {
+                if let Some(t) = crate::estimation::gauss_newton::subject_eta_response_correction(
+                    Some(c),
+                    x,
+                    init_params,
+                    model,
+                    population,
+                    i,
+                    &ehs[i],
+                    &hms[i],
+                    bounds,
+                    options,
+                ) {
+                    for (g, ti) in gi.iter_mut().zip(t.iter()) {
+                        *g += *ti;
+                    }
+                }
+            }
+            gi
         })
         .collect();
     assemble_population_gradient(&per_subj, np)
@@ -2462,13 +2487,22 @@ pub(crate) fn compute_covariance(
 
     let mut hess = DMatrix::zeros(n, n);
     let is_iov = kappas.iter().any(|k| !k.is_empty());
+    // Route non-interaction FOCE with f-dependent error (proportional/combined)
+    // through the OFV second-difference stencil (the IOV path), which builds
+    // the true Hessian of the actual marginal. The analytical SB gradient is an
+    // envelope approximation with no EBE-response Δ (that correction exists only
+    // for FOCEI, #274), so its central-FD Hessian comes out indefinite on the
+    // f-dependent FOCE surface. Additive FOCE keeps the cheap analytical path
+    // (the Δ vanishes for f-independent variance, and it already matches NONMEM).
+    let force_ofv_hessian = !options.interaction && model.error_spec.has_f_dependent_variance();
+    let use_analytical = !is_iov && !force_ofv_hessian;
 
     // Track FD failures at source so diagnostics name the right cause (a NaN/Inf
     // stencil result is not a genuine zero curvature). HashSet for O(1) ops.
     let mut fd_diag_nan: HashSet<usize> = HashSet::new();
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
-    if !is_iov {
+    if use_analytical {
         // Issue #209 + #256 + #274: central FD of the analytical population
         // gradient, as one flat `par_iter` over the 2·n_free perturbed points.
         //   H[:,k] ≈ (g(x̂ + hₖ·eₖ) − g(x̂ − hₖ·eₖ)) / 2hₖ
@@ -2614,9 +2648,14 @@ pub(crate) fn compute_covariance(
             }
         }
     } else {
-        // IOV: no fixed-EBE analytical gradient covers the kappa block, so build
-        // the Hessian from second differences of the reconverged OFV (3-point
-        // diagonal, 4-point off-diagonal), reconverging the joint (η, κ) EBEs.
+        // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
+        // off-diagonal), reconverging the EBEs at each perturbed point. Taken
+        // when the analytical fixed-EBE gradient does not cover the true marginal
+        // curvature: (a) IOV — no analytical gradient covers the kappa block; or
+        // (b) `force_ofv_hessian` — non-IOV FOCE with f-dependent error, whose SB
+        // gradient lacks the EBE-response Δ and yields an indefinite analytical
+        // Hessian. `pop_nll` dispatches on the kappa count, so this stencil is
+        // correct for both the IOV (joint η, κ) and the non-IOV (η-only) cases.
         //
         // #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV
         // points (subjects iterated serially inside `serial_ofv`) instead of the

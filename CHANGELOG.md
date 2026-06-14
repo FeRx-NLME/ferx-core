@@ -23,6 +23,14 @@ section of the SDLC for the versioning policy).
 - Example `dose_rate.ferx` (+ `data/dose_rate.csv`) demonstrating the supported
   NONMEM `RATE` dosing forms — a bolus (`RATE=0`) and a constant-rate infusion
   (`RATE>0`) mixed in one dataset (#324).
+- Configurable RK45 ODE solver tolerances via `[fit_options]` (and call-time
+  settings): `ode_reltol` (default `1e-4`), `ode_abstol` (default `1e-6`), and
+  `ode_max_steps` (default `10000`). Defaults are unchanged, so existing fits
+  are unaffected. Previously the tolerance was hardcoded, which made the OFV of
+  an ODE-form model differ from its analytical equivalent by several units
+  (the FOCE objective amplifies the ~`1e-4` solver error); a tighter
+  `ode_reltol` now lets the two forms agree. Carried on `OdeSpec::solver_opts`
+  and applied via `CompiledModel::sync_ode_solver_opts` (#127).
 - Propensity-score-matched simulation: `simulate_with_options()` with a new
   `SimulateOptions { seed, propensity_match }`. When `propensity_match` is set,
   each replicate's drawn etas are reassigned to subjects by optimal Mahalanobis
@@ -87,6 +95,34 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- FOCEI gradient-based optimizers (SLSQP, L-BFGS, built-in BFGS, Gauss-Newton)
+  now add the `log|H̃|` EBE-response term (the #274/#289 Δ) to the population
+  gradient, so they reach the true marginal minimum instead of stalling above it
+  on the fixed-EBE gradient (e.g. warfarin FOCEI −282.8 → −286.0, matching the
+  derivative-free BOBYQA default). The term reuses the Laplace intermediates the
+  gradient already forms (one extra `n_eta×n_eta` solve per subject) and is zero
+  for additive error; the BOBYQA default is unaffected (it uses no gradient). The
+  ω-block of the correction remains deferred (#335) (#330).
+- The default inner (per-subject EBE) convergence tolerance `inner_tol` is now
+  `1e-5` (was `1e-4`). A looser inner tolerance left residual noise in each
+  subject's EBE solution that propagated into the marginal objective, causing the
+  derivative-free BOBYQA outer optimizer to false-converge above the true
+  minimum on noisy-marginal models (notably log-transform-both-sides FOCE). The
+  tighter default matches NONMEM's minimum at roughly 1.5× the per-fit cost;
+  loosen it via `inner_tol` in `[fit_options]` to recover the old speed on
+  well-conditioned fits (#330).
+- FOCE (non-interaction) now evaluates the residual variance at the population
+  prediction `f(η=0)` — NONMEM's `METHOD=1` (no `INTER`) semantics — instead of
+  the linearized `f0 = f(η̂) − H·η̂`. On nonlinear models (e.g. oral absorption)
+  with proportional/combined error, `f0` could extrapolate to near-zero or
+  negative concentrations, collapsing `R(f0) = (f0·σ)²` and making the marginal
+  multimodal with an indefinite covariance Hessian (garbage SEs reported as
+  "likely reliable"). FOCE+proportional fits now converge deterministically,
+  reproduce NONMEM FOCE estimates/SEs (within ~3% on a 1-cpt oral benchmark),
+  and yield a positive-definite covariance. Additive-error FOCE is unchanged
+  (its variance is `f`-independent). The FOCE covariance for `f`-dependent error
+  uses the reconverged-OFV second-difference Hessian (the true objective
+  curvature) rather than the envelope-approximation analytical gradient (#319).
 - IMP (importance sampling) now jointly samples (η, κ) for IOV models,
   integrating over inter-occasion variability so the reported `−2 log L` is
   directly comparable to FOCE/FOCEI and NONMEM `METHOD=IMP`. Previously κ was

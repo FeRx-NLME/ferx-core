@@ -5,10 +5,12 @@
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::read_nonmem_csv;
-use ferx_core::types::{DoseEvent, Population, Subject};
+use ferx_core::types::{DoseEvent, Population};
 use ferx_core::{fit, FitOptions};
 use std::collections::HashMap;
 use std::path::Path;
+
+mod common;
 
 fn simple_iv_population() -> Population {
     let obs_times = vec![1.0, 4.0, 12.0, 24.0];
@@ -19,25 +21,13 @@ fn simple_iv_population() -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        subjects: vec![common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times,
-            obs_raw_times: vec![],
-            observations: vec![5.0, 3.0, 1.5, 0.7],
-            obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            cens: vec![0; n],
-            occasions: vec![],
-            dose_occasions: vec![],
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
-        }],
+            vec![5.0, 3.0, 1.5, 0.7],
+            vec![1; n],
+        )],
     }
 }
 
@@ -214,25 +204,13 @@ fn analytical_1cpt_oral_depot_and_central() {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        subjects: vec![common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times,
-            obs_raw_times: vec![],
-            observations: vec![1.0, 2.0, 3.5, 4.0, 3.0, 2.0, 0.5],
-            obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            cens: vec![0; n],
-            occasions: vec![],
-            dose_occasions: vec![],
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
-        }],
+            vec![1.0, 2.0, 3.5, 4.0, 3.0, 2.0, 0.5],
+            vec![1; n],
+        )],
     };
 
     const MODEL: &str = "
@@ -544,25 +522,13 @@ fn simple_oral_population() -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        subjects: vec![common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times,
-            obs_raw_times: vec![],
-            observations: vec![1.0, 2.0, 3.5, 4.0, 3.0, 2.0, 0.5],
-            obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            cens: vec![0; n],
-            occasions: vec![],
-            dose_occasions: vec![],
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
-        }],
+            vec![1.0, 2.0, 3.5, 4.0, 3.0, 2.0, 0.5],
+            vec![1; n],
+        )],
     }
 }
 
@@ -1253,27 +1219,19 @@ fn evid3_reset_population() -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs_times,
-            obs_raw_times: vec![],
+        subjects: vec![{
             // DV ≈ model prediction: monoexponential up to reset, near-zero after.
             // Additive error on the model side avoids proportional-error issues
             // when IPRED ≈ 0 post-reset.
-            observations: vec![8.2, 4.5, 2.0, 0.9, 0.05, 0.05, 0.05],
-            obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![12.0], // EVID=3 reset at t=12
-            cens: vec![0; n],
-            occasions: vec![],
-            dose_occasions: vec![],
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
+            let mut s = common::subject(
+                "1",
+                vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times,
+                vec![8.2, 4.5, 2.0, 0.9, 0.05, 0.05, 0.05],
+                vec![1; n],
+            );
+            s.reset_times = vec![12.0]; // EVID=3 reset at t=12
+            s
         }],
     }
 }
@@ -1439,29 +1397,21 @@ fn evid4_reset_population() -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![
-                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-                DoseEvent::new(12.0, 50.0, 1, 0.0, false, 0.0), // re-dose
-            ],
-            obs_times,
-            obs_raw_times: vec![],
+        subjects: vec![{
             // Session 0 DV ≈ monoexponential decay from 100 mg.
             // Session 1 DV > 0 because a 50 mg dose fires at t=12.
-            observations: vec![8.2, 4.5, 2.0, 0.9, 4.0, 2.2, 1.1],
-            obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![12.0], // EVID=4 reset at t=12 (re-dose also fires)
-            cens: vec![0; n],
-            occasions: vec![],
-            dose_occasions: vec![],
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
+            let mut s = common::subject(
+                "1",
+                vec![
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(12.0, 50.0, 1, 0.0, false, 0.0), // re-dose
+                ],
+                obs_times,
+                vec![8.2, 4.5, 2.0, 0.9, 4.0, 2.2, 1.1],
+                vec![1; n],
+            );
+            s.reset_times = vec![12.0]; // EVID=4 reset at t=12 (re-dose also fires)
+            s
         }],
     }
 }
@@ -1713,24 +1663,16 @@ fn analytical_integral_over_compartment_with_evid3_reset_returns_nan() {
             input_columns: vec![],
             exclusions: None,
             warnings: vec![],
-            subjects: vec![Subject {
-                id: "1".into(),
-                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                obs_times,
-                obs_raw_times: vec![],
-                observations: vec![8.2, 4.5, 2.0, 0.9, 0.05, 0.05, 0.05],
-                obs_cmts: vec![1; n],
-                covariates: HashMap::new(),
-                dose_covariates: vec![],
-                obs_covariates: vec![],
-                pk_only_times: vec![],
-                pk_only_covariates: vec![],
-                reset_times: vec![12.0],
-                cens: vec![0; n],
-                occasions: vec![],
-                dose_occasions: vec![],
-                #[cfg(feature = "survival")]
-                obs_records: vec![],
+            subjects: vec![{
+                let mut s = common::subject(
+                    "1",
+                    vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                    obs_times,
+                    vec![8.2, 4.5, 2.0, 0.9, 0.05, 0.05, 0.05],
+                    vec![1; n],
+                );
+                s.reset_times = vec![12.0];
+                s
             }],
         }
     };
@@ -1818,28 +1760,21 @@ fn tv_covariate_iv_population() -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs_times,
-            obs_raw_times: vec![],
-            observations: vec![5.0, 3.0, 1.5, 0.7],
-            obs_cmts: vec![1; n],
-            covariates: {
+        subjects: vec![{
+            let mut s = common::subject(
+                "1",
+                vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times,
+                vec![5.0, 3.0, 1.5, 0.7],
+                vec![1; n],
+            );
+            s.covariates = {
                 let mut m = HashMap::new();
                 m.insert("WT".into(), 70.0);
                 m
-            },
-            dose_covariates: vec![],
-            obs_covariates,
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            cens: vec![0; n],
-            occasions: vec![],
-            dose_occasions: vec![],
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
+            };
+            s.obs_covariates = obs_covariates;
+            s
         }],
     }
 }
@@ -2154,27 +2089,20 @@ fn iov_analytical_integral_of_compartment_is_nan() {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![
-                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), // occ 1
-                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0), // occ 2
-            ],
-            obs_times,
-            obs_raw_times: vec![],
-            observations: vec![7.0, 4.0, 1.5, 7.5, 4.5, 2.0],
-            obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            cens: vec![0; n],
-            occasions: vec![1, 1, 1, 2, 2, 2],
-            dose_occasions: vec![1, 2],
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
+        subjects: vec![{
+            let mut s = common::subject(
+                "1",
+                vec![
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), // occ 1
+                    DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0), // occ 2
+                ],
+                obs_times,
+                vec![7.0, 4.0, 1.5, 7.5, 4.5, 2.0],
+                vec![1; n],
+            );
+            s.occasions = vec![1, 1, 1, 2, 2, 2];
+            s.dose_occasions = vec![1, 2];
+            s
         }],
     };
 
@@ -2312,25 +2240,13 @@ fn ode_with_scaling_ipred_is_correctly_scaled() {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        subjects: vec![common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times,
-            obs_raw_times: vec![],
-            observations: vec![0.082, 0.045, 0.011, 0.001],
-            obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            cens: vec![0; n],
-            occasions: vec![],
-            dose_occasions: vec![],
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
-        }],
+            vec![0.082, 0.045, 0.011, 0.001],
+            vec![1; n],
+        )],
     };
 
     let mut opts = FitOptions::default();

@@ -45,6 +45,7 @@ const E7: f64 = -1.0 / 40.0;
 pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
 
 /// ODE solver options
+#[derive(Debug, Clone, Copy)]
 pub struct OdeSolverOptions {
     pub abstol: f64,
     pub reltol: f64,

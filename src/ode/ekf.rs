@@ -155,12 +155,12 @@ pub fn solve_ekf(
     doses: &[DoseEvent],
     obs_times: &[f64],
     r_obs_vec: &[f64],
+    opts: OdeSolverOptions,
 ) -> Vec<EkfObsPoint> {
     use std::collections::HashMap;
 
     let n = n_states;
     let n_obs = obs_times.len();
-    let opts = OdeSolverOptions::default();
 
     // Seed the EKF mean from the model's initial compartment amounts
     // (`init(state) = expr`); zeros for models without an init block. The
@@ -378,6 +378,7 @@ mod tests {
             &doses,
             &obs_times,
             &r_obs_vec,
+            OdeSolverOptions::default(),
         );
 
         let subj = Subject {
@@ -406,6 +407,7 @@ mod tests {
             readout: crate::ode::OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
             init_fn: None,
+            solver_opts: OdeSolverOptions::default(),
         };
         let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 
@@ -441,6 +443,7 @@ mod tests {
                 &doses,
                 &obs_times,
                 &r_obs_vec,
+                OdeSolverOptions::default(),
             )
         };
         let full = run(&pk_full);
@@ -486,6 +489,7 @@ mod tests {
             &doses,
             &obs_times,
             &r_obs_vec,
+            OdeSolverOptions::default(),
         );
 
         for (i, &t) in obs_times.iter().enumerate() {
@@ -513,6 +517,7 @@ mod tests {
             &doses,
             &obs_times,
             &r_obs_vec,
+            OdeSolverOptions::default(),
         );
 
         for pt in &ekf_pts {
