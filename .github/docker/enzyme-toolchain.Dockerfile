@@ -2,7 +2,6 @@
 #
 # Lean Enzyme-enabled Rust toolchain image for ferx-core CI  (issue #281)
 # =======================================================================
-# DRAFT for discussion — not wired into CI yet.
 #
 # Why this exists
 # ---------------
@@ -91,14 +90,16 @@ RUN rustup toolchain link enzyme /opt/enzyme-toolchain \
 
 ENV RUSTUP_TOOLCHAIN=enzyme
 
-# ── OPEN QUESTIONS for the team (validate on first build) ──────────────────
-#  1. cargo-in-toolchain: ferx-r links `build/host/stage1` and runs cargo fine.
-#     If `cargo` complains it's missing from the `enzyme` toolchain, either add
-#     `./x build --stage 1 cargo` in stage 1, or in the consumer job invoke the
-#     enzyme rustc via nightly cargo: `RUSTC=$(rustup which --toolchain enzyme rustc)`.
-#  2. Verification depth: `rustc +enzyme --version` only proves the toolchain
-#     LOADS, not that differentiation WORKS — installation.md warns a
-#     mismatched-LLVM Enzyme passes --version yet hangs on real autodiff. The
-#     REAL functional check is ferx-core's `autodiff_fd_consistency` suite, run
-#     by autodiff.yml against this image. (Could add a tiny inline #[autodiff]
-#     smoke compile+run here to fail the image build earlier.)
+# ── Notes ──────────────────────────────────────────────────────────────────
+#  * cargo-in-toolchain: cargo comes from the nightly proxies installed above;
+#    the `enzyme` toolchain supplies only the Enzyme rustc. This is the proven
+#    ferx-r pattern (link `build/host/stage1` + `rustup default enzyme`). If a
+#    future rust/rustup ever needs cargo inside the linked toolchain, either add
+#    `./x build --stage 1 cargo` in stage 1 or set
+#    `RUSTC=$(rustup which --toolchain enzyme rustc)` in the consumer job.
+#  * Verification depth: `rustc +enzyme --version` only proves the toolchain
+#    LOADS, not that differentiation WORKS (installation.md warns a
+#    mismatched-LLVM Enzyme can pass --version yet hang on real autodiff). The
+#    real functional check is ferx-core's `autodiff_fd_consistency` suite, run by
+#    autodiff.yml against this image. A future hardening is a tiny inline
+#    #[autodiff] smoke compile+run here to fail the monthly rebuild earlier.

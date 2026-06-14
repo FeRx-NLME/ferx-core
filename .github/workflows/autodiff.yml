@@ -1,21 +1,28 @@
 name: Autodiff (Enzyme)
 
-# DRAFT for discussion (issue #281) — exercises the autodiff (Enzyme) inner-
-# gradient path that the normal FD-only CI never builds. This is the gap that
-# let the whole #278 bug class ship undetected. It runs ferx-core's AD-vs-FD
-# consistency guard inside the prebuilt Enzyme toolchain image
+# Issue #281 — exercises the autodiff (Enzyme) inner-gradient path that the
+# normal FD-only CI (`--features ci`) never builds. ferx-core's *default* build
+# is `default = ["autodiff"]`, so without this job the AD path — and the
+# `autodiff_fd_consistency` guard #280 added — run NOWHERE automatically. That
+# blind spot let the whole #278 bug class ship undetected. This job runs the
+# AD-vs-FD consistency guard inside the prebuilt Enzyme toolchain image
 # (see enzyme-toolchain-image.yml).
 #
-# Heavy (fat-LTO autodiff compile), so it is nightly + path-filtered + manual,
-# NOT a blocking every-PR gate — matching how the repo already treats slow work
-# (slow-tests.yml, the weekly coverage job).
+# Cadence mirrors slow-tests.yml: schedule (daily) + manual dispatch + push to
+# `main` on AD-relevant paths. It is NOT a per-PR gate — the fat-LTO Enzyme
+# compile is heavy, and a per-PR run would (a) go red on fork PRs whose
+# read-only GITHUB_TOKEN can't pull the image until it's public and (b) add
+# noise before the image is proven. Daily + push-to-main still catches AD
+# regressions within a day and on every main merge touching AD code. Future:
+# promote to a PR-path / required check once the job is proven fast and stable.
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 5 * * *"            # nightly
-  pull_request:
-    paths:                          # only PRs that can plausibly affect AD
+    - cron: "0 5 * * *"            # daily (offset from slow-tests' 06:00 UTC)
+  push:
+    branches: [main]
+    paths:                          # only main merges that can plausibly affect AD
       - "src/ad/**"
       - "src/estimation/**"
       - "src/pk/**"
@@ -36,7 +43,7 @@ jobs:
     container:
       image: ghcr.io/ferx-nlme/enzyme-toolchain:latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # The image provides the rustc; this only caches cargo deps + target.
       # NOTE: image sets CARGO_HOME=/opt/cargo — confirm rust-cache picks that
@@ -48,8 +55,7 @@ jobs:
       # autodiff REQUIRES fat LTO for cross-crate Enzyme correctness
       # (docs/src/installation.md). So use the fat-LTO `release` profile — NOT
       # the no-LTO `ci-test` profile the FD jobs use. `autodiff` is the default
-      # feature; `survival` adds the TTE (Weibull/Gompertz) cases. This is the
-      # SAME 8/8 suite the PR validated locally, now run on every relevant PR.
+      # feature; `survival` adds the TTE (Weibull/Gompertz) cases.
       - name: AD-vs-FD consistency guard
         env:
           RUSTFLAGS: "-Z autodiff=Enable"
@@ -57,12 +63,9 @@ jobs:
           cargo test --release --features autodiff,survival \
             --test autodiff_fd_consistency -- --nocapture
 
-# ── OPEN QUESTIONS for the team ────────────────────────────────────────────
-#  * Profile: `--release` (fat LTO) is the correct/safe choice for Enzyme, but
-#    it's slow. Confirm whether a dedicated `[profile.autodiff-ci]` (release +
-#    fat LTO, maybe codegen-units tuning) is worth adding to Cargo.toml.
-#  * Scope: start with `autodiff_fd_consistency` only. Optionally add the
+# ── Follow-ups (once this job is proven green against the published image) ──
+#  * Scope: starts with `autodiff_fd_consistency` only. Consider adding the
 #    `#[cfg(autodiff)]` *unit* tests (`cargo test --release --lib --features
-#    autodiff,survival`) once the job is proven green and time is acceptable.
-#  * Gate strength: nightly + path-filtered to begin. If it proves fast/stable
-#    enough, consider promoting to a required check on the filtered paths.
+#    autodiff,survival`) once the job is proven green and runtime is acceptable.
+#  * Gate strength: schedule + push-to-main to begin. If it proves fast/stable,
+#    consider promoting to a required check on the filtered paths (per-PR).

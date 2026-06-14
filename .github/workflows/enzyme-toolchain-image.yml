@@ -1,13 +1,21 @@
 name: Enzyme toolchain image
 
-# DRAFT for discussion (issue #281) — builds the custom rustc+LLVM+Enzyme
-# toolchain ONCE and publishes it to ghcr.io so the per-run autodiff job
-# (autodiff.yml) can just pull it. This is the slow (~1-2 h) build; it runs on
-# a GitHub-hosted runner, never on a developer machine.
+# Issue #281 — builds the custom rustc+LLVM+Enzyme toolchain ONCE and publishes
+# it to ghcr.io so the per-run autodiff job (autodiff.yml) can just pull it.
+# This is the slow (~1-2 h) from-source build; it runs on a GitHub-hosted
+# runner, never on a developer machine. The image is owned by ferx-core (where
+# the autodiff code and its `autodiff_fd_consistency` test live), keeping this
+# repo's CI self-contained; the recipe tracks ferx-r/Dockerfile's enzyme-builder
+# stage (see the Dockerfile header).
 #
-# Cost: both repos are PUBLIC, so standard `ubuntu-latest` minutes and the
-# public ghcr package are free. The only resource risk is runner DISK (handled
-# below), not money.
+# Cost: the repo is PUBLIC, so standard `ubuntu-latest` minutes and the public
+# ghcr package are free. The only resource risk is runner DISK (handled below),
+# not money.
+#
+# Bootstrap: `workflow_dispatch` only works once this file is on the default
+# branch, so the FIRST image build comes from the `push: main` trigger when the
+# PR lands (it touches both paths below). After that first publish, set the ghcr
+# package visibility to PUBLIC (see footer) so autodiff.yml can pull it.
 
 on:
   workflow_dispatch: {}            # manual: (re)publish on demand
@@ -31,7 +39,7 @@ jobs:
       contents: read
       packages: write               # push to ghcr.io/<owner>/*
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # ubuntu-latest ships ~14 GB free; the LLVM+rustc build wants ~30 GB.
       # This reclaims ~20-30 GB by removing preinstalled SDKs we don't use.
