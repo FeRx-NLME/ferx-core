@@ -93,12 +93,17 @@ Multi-pathway models (Freijer sum-of-two-IG, parallel first-order) use repeated
   pathway  = { mat = MAT2, cv2 = CV2_2 }   # last frac defaults to 1 - sum(others)
 ```
 
+> The `pathway = { ... }` inline-record form is a **new grammar construct** (no DSL
+> precedent today). For the common ≤2-pathway case, repeated scalar keys (`mat1=`, `cv2_1=`,
+> `frac1=`, `mat2=`, …) reach parity with zero new grammar; defer the brace form until a
+> >2-pathway need is real.
+
 Rules (all enforced at parse time, all with negative tests):
 - `[absorption]` present ⇒ the `pk *_oral` line must **not** also map `ka=` (mutually
   exclusive: first-order is the no-`[absorption]` default). Mapping both is a parse error.
 - `[absorption]` is only valid with an **oral** disposition (`one/two/three_cpt_oral`);
-  combining with an IV-only model or with `RATE>0` infusion dosing is a parse error /
-  warning (see Robustness).
+  combining with an IV-only model, or with a subject carrying `RATE>0` infusion dose rows,
+  is a **parse error** (the dose route is ambiguous — see Robustness).
 - Every referenced name must be a declared individual parameter (reuse the existing
   "undefined name" machinery — `parser/model_parser.rs` visit_*_nodes); unknown keys for a
   model are rejected; pathway fractions must be in (0,1] and sum to ≈1.
@@ -120,21 +125,28 @@ superposed. `D` = `F·amt`.
 | `weibull` | `D·(β/Td)(tad/Td)^{β−1}·exp(−(tad/Td)^β)` | td (scale), beta (shape) | powf | β<1 ⇒ ∞ (integrable), guard |
 
 Notes:
-- **transit:** the gamma density is the chain output; it forces the **depot**, which empties
-  to central via first-order `ka` (defaulting to `KTR`), matching rxode2/PKPDsim's
-  `transit()`. Continuous N via `ln_gamma` (Stirling/Lanczos). This is the headline feature.
+- **transit:** `n` counts the transit compartments **excluding** the final absorption (`ka`)
+  compartment, so `KTR=(n+1)/MTT`. The gamma density is the chain output; it forces the
+  **depot**, which empties to central via first-order `ka` (defaulting to `KTR` when omitted),
+  matching rxode2/PKPDsim's `transit()`. Continuous N via `ln_gamma` (Lanczos; see Engine).
+  Headline feature.
 - **inverse_gaussian:** single or sum-of-two (Freijer biphasic). MAT = mean absorption time,
-  CV² = relative dispersion of the absorption-time distribution.
+  CV² = relative dispersion of the absorption-time distribution — i.e. the standard
+  inverse-Gaussian density with mean `μ=MAT` and shape `λ=MAT/CV²` (implementer mapping).
 
 ## Engine architecture
 
 Decouple **input function** from **disposition**, reusing existing machinery:
 
-1. **Input function (new `src/pk/absorption.rs`):** `R_in(tad; θ)` per model, written
-   generically over a `Float`-like trait so the **same code serves the f64 path and the AD
-   path** (avoids hand-maintained AD duplicates). Honor the `ad/` rule: **no `f64::max`/`min`**
-   — use explicit comparisons (see CLAUDE.md). Each model also exposes:
-   `validate(θ) -> Result` and the analytic mass `∫R_in = F·Dose` (test invariant).
+1. **Input function (new `src/pk/absorption.rs`):** `R_in(tad; θ)` per model. `src/ad/dual.rs`'s
+   `Dual` already implements `exp`/`ln`/`sqrt`/`powf`, so the input functions can be written
+   once over a small numeric trait that both `f64` and `Dual` satisfy — sharing one body across
+   the plain-f64, dual-number, and Enzyme (concrete-f64) paths. This needs a **new** shared
+   trait (today's AD path uses hand-written `_ad` duplicates, not generics) plus a `Dual` impl
+   of `ln_gamma`; if either proves awkward, fall back to the existing duplicate-function
+   pattern. Honor the `ad/` rule: **no `f64::max`/`min`** — use explicit comparisons (see
+   CLAUDE.md). Each model also exposes `validate(θ) -> Result` and the analytic mass
+   `∫R_in = F·Dose` (test invariant).
 2. **Disposition + forcing (`src/ode/predictions.rs`):** synthesize the linear 1/2/3-cpt
    disposition ODE internally and add `+R_in(tad)` as an appearance term into the depot (or
    central) compartment — the **same RHS-wrapper mechanism that already injects `+rate` for
@@ -144,9 +156,11 @@ Decouple **input function** from **disposition**, reusing existing machinery:
    - **lagtime/F:** reuse `PK_IDX_LAGTIME` (shift `tad`) and `PK_IDX_F` (scale `D`) — already
      applied to the dose, not the RHS.
    - Multiple doses / ADDL: superpose `R_in` per dose, same as discrete-dose superposition.
-3. **Special functions (`src/stats/special.rs`):** add `ln_gamma` (AD-safe, following the
-   existing `erf` precedent that is "differentiable by Enzyme"). IGD needs only `exp/sqrt`;
-   Weibull needs `powf` — both already AD-safe.
+3. **Special functions (`src/stats/special.rs`):** add `ln_gamma` via a **Lanczos** rational
+   approximation (AD-safe, following the existing `erf` A&S precedent) — **not** bare Stirling:
+   `N` is estimated continuously and transit `N` is commonly 1–10, where Stirling errs ~8% at
+   N=1 / ~0.8% at N=10, enough to bias the absorption peak. IGD needs only `exp/sqrt`; Weibull
+   needs `powf` — both already AD-safe.
 4. **Optional Phase 3 perf fast-path:** transit→1-cpt (and →2-cpt) has a closed-form
    convolution via the **lower incomplete gamma** `P(a,x)`; implementing that in
    `special.rs` lets transit skip ODE integration. Deferred — the ODE path is the robust
@@ -163,8 +177,8 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 - **Singularity guards:** `tad ≤ ε ⇒ R_in = 0`; transit `0^N` and `log(tad)` guarded;
   Weibull `β<1` integrable spike capped/handled; IGD essential singularity at `tad→0`.
 - **Mutual exclusivity & route checks:** `[absorption]` + `ka=` ⇒ error; `[absorption]` on
-  IV-only disposition ⇒ error; `[absorption]` + infusion dose rows ⇒ error or documented
-  precedence.
+  IV-only disposition ⇒ error; `[absorption]` + a `RATE>0` infusion dose row ⇒ **parse error**
+  (the dose route is ambiguous; decided over "documented precedence").
 - **Mass-balance invariant** `∫R_in dt = F·Dose` as a unit test per model (catches a wrong
   normalization constant — the classic transit/IGD bug).
 - **AD-safety:** no `f64::max`/`min` anywhere reachable from the AD path; re-enable a
@@ -230,4 +244,6 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   transit. Quantify on warfarin-sized data.
 - **AD through `ln_gamma` / `powf`:** must verify Enzyme handles them (the `autodiff` CI from
   issue #281 is the gate); fall back to FD for the absorption params if needed.
-- **DSL ergonomics for multi-pathway** (`pathway = {...}`): new sub-grammar; keep it minimal.
+- **DSL ergonomics for multi-pathway** (`pathway = {...}`): a new inline-record sub-grammar
+  with no DSL precedent — deferred in favour of repeated scalar keys for the ≤2-pathway case
+  (see DSL surface).
