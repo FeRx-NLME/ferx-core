@@ -17,7 +17,7 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 | `EVID` | integer | 0 | Event ID: 0 = observation, 1 = dose, 2 = other event, 3 = system reset, 4 = reset + dose. If the column is omitted, the record type is inferred from `AMT` — see [Inferring doses without an `EVID` column](#inferring-doses-without-an-evid-column). |
 | `AMT` | numeric | 0 | Dose amount (for `EVID=1`/`EVID=4`; also the dose-inference signal when `EVID` is absent) |
 | `CMT` | integer | 1 | Compartment number (1-indexed) |
-| `RATE` | numeric | 0 | Infusion rate. 0 = bolus dose |
+| `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM's coded values `-1` (modeled rate) and `-2` (modeled duration) are **not yet supported** and are rejected with an error — see [Infusion Doses](#infusion-doses). |
 | `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored |
 | `II` | numeric | 0 | Interdose interval for repeated dosing |
 | `SS` | integer | 0 | Steady-state flag. 1 = assume steady state |
@@ -212,6 +212,25 @@ ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
 ```
 
 This administers 500 units at a rate of 50 units/hour (duration = 10 hours).
+
+### NONMEM coded `RATE` values
+
+NONMEM overloads the `RATE` column with negative codes that change its meaning:
+
+| `RATE` | NONMEM meaning | ferx-core |
+|--------|----------------|-----------|
+| `0`    | IV bolus | ✅ supported |
+| `> 0`  | Constant-rate infusion (duration = `AMT/RATE`) | ✅ supported |
+| `-1`   | Infusion **rate** is *modeled* — defined by `R1` in `$PK` | ⛔ rejected (error) |
+| `-2`   | Infusion **duration** is *modeled* — defined by `D1` in `$PK` | ⛔ rejected (error) |
+
+The coded forms `-1`/`-2` (and any other negative or non-finite `RATE`) on a
+dose row are rejected with an informative error. Earlier versions silently
+treated them as an IV bolus, producing wrong predictions with no warning (#324).
+Until modeled rate/duration support lands, convert such rows to an explicit
+positive `RATE` (= `AMT` ÷ infusion duration) before importing. Note that this
+is **not** a `DURATION` data column — NONMEM's `-1`/`-2` are driven by `$PK`
+parameters, not a separate column.
 
 ## Steady-State Dosing
 
