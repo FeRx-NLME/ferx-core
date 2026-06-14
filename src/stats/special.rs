@@ -1,4 +1,5 @@
-//! Special functions for M3 BLOQ likelihood: erf, normal CDF, and log normal CDF.
+//! Special functions: erf, normal CDF, log normal CDF (M3 BLOQ likelihood), and
+//! ln Γ (Lanczos) — the latter for the transit-compartment absorption model.
 //!
 //! These are implemented from polynomial/rational approximations (Abramowitz &
 //! Stegun 7.1.26 for erf) so that they are differentiable by Enzyme without
@@ -68,6 +69,49 @@ pub fn log_normal_cdf(z: f64) -> f64 {
         // z < 0, so -z > 0 and ln(-z) is well-defined; series > 0 for z < -5.
         log_phi - (-z).ln() + series.ln()
     }
+}
+
+/// Natural log of the Gamma function, ln Γ(x), via the Lanczos approximation
+/// (g = 7, n = 9), accurate to ~1e-13 (relative) for x > 0.
+///
+/// Added for the transit-compartment absorption model (Savic et al. 2007): its
+/// gamma-density input rate needs `ln Γ(n + 1)` for a *continuous* number of
+/// transit compartments `n`, where `n!` is undefined. Bare Stirling errs ~8% at
+/// n = 1 — enough to bias the absorption peak — so Lanczos is used instead.
+///
+/// AD/Enzyme-safe: only `+`, `-`, `*`, `/`, `.ln()`, and (on the reflection
+/// branch) `.sin()` — no `f64::max`/`min` intrinsics (see CLAUDE.md). The
+/// reflection branch (x < 0.5) is never exercised by the transit path
+/// (n ≥ 0 ⇒ argument ≥ 1) but keeps the function correct over the whole
+/// domain x > 0.
+pub fn ln_gamma(x: f64) -> f64 {
+    // Lanczos coefficients for g = 7 (n = 9 terms).
+    const G: f64 = 7.0;
+    const COEF: [f64; 9] = [
+        0.999_999_999_999_809_93,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_13,
+        -176.615_029_162_140_59,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_571_6e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+
+    // Reflection for x < 0.5: ln Γ(x) = ln(π / sin(πx)) − ln Γ(1 − x).
+    if x < 0.5 {
+        let pi = std::f64::consts::PI;
+        return (pi / (pi * x).sin()).ln() - ln_gamma(1.0 - x);
+    }
+
+    let x = x - 1.0;
+    let mut a = COEF[0];
+    for (i, &c) in COEF.iter().enumerate().skip(1) {
+        a += c / (x + i as f64);
+    }
+    let t = x + G + 0.5;
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
 }
 
 #[cfg(test)]
@@ -153,5 +197,64 @@ mod tests {
             );
             prev = v;
         }
+    }
+
+    #[test]
+    fn ln_gamma_integer_factorials() {
+        // ln Γ(n+1) = ln(n!). Includes the near-zero cases (0! = 1! = 1).
+        let cases = [
+            (1.0, 0.0),                    // 0! = 1
+            (2.0, 0.0),                    // 1! = 1
+            (3.0, std::f64::consts::LN_2), // 2! = 2
+            (5.0, 24.0_f64.ln()),          // 4! = 24
+            (6.0, 120.0_f64.ln()),         // 5! = 120
+            (11.0, 3_628_800.0_f64.ln()),  // 10! = 3628800
+        ];
+        for (x, want) in cases {
+            assert_relative_eq!(ln_gamma(x), want, epsilon = 1e-9, max_relative = 1e-10);
+        }
+    }
+
+    #[test]
+    fn ln_gamma_half_integers_closed_form() {
+        // ln Γ(1/2) = ln √π (main branch, x = 0.5 exactly).
+        assert_relative_eq!(
+            ln_gamma(0.5),
+            0.5 * std::f64::consts::PI.ln(),
+            epsilon = 1e-12
+        );
+        // ln Γ(3/2) = ln(√π / 2).
+        assert_relative_eq!(
+            ln_gamma(1.5),
+            (std::f64::consts::PI.sqrt() / 2.0).ln(),
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn ln_gamma_reflection_branch_small_x() {
+        // x < 0.5 exercises the reflection formula. ln Γ(1/4) = 1.2880225246980776.
+        assert_relative_eq!(ln_gamma(0.25), 1.288_022_524_698_077_6, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn ln_gamma_recurrence() {
+        // Functional equation: ln Γ(x+1) = ln Γ(x) + ln x (spans both branches).
+        for &x in &[0.3, 0.7, 1.0, 2.5, 4.2, 9.0] {
+            assert_relative_eq!(
+                ln_gamma(x + 1.0),
+                ln_gamma(x) + x.ln(),
+                epsilon = 1e-9,
+                max_relative = 1e-10
+            );
+        }
+    }
+
+    #[test]
+    fn ln_gamma_large_argument_no_overflow() {
+        // Γ(100) overflows f64, but ln Γ(100) = 359.1342053695754 is finite.
+        let v = ln_gamma(100.0);
+        assert!(v.is_finite());
+        assert_relative_eq!(v, 359.134_205_369_575_4, max_relative = 1e-11);
     }
 }
