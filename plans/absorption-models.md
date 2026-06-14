@@ -1,4 +1,4 @@
-# Plan: Built-in absorption models (`[absorption]` block)
+# Plan: Built-in absorption models (input-rate functions + `ode_template`)
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
@@ -19,39 +19,33 @@ and forces the user to do math the engine should do.
 The goal is to compute these **in Rust** as first-class, user-friendly built-ins, with
 **robust handling of edge cases (no happy-path-only code)**. The named anchors are
 **Savic 2007** (transit) and **Freijer & Post** (convection–dispersion ⇒ inverse-Gaussian
-density input). The mechanism is a set of **built-in input-rate functions** (`transit`,
-`igd`, `weibull`, `zero_order`, `first_order`) exposed two ways (see "DSL surface"):
-**Layer 1** — callable directly in the `[odes]` RHS so the user writes the ODE explicitly
-(Ron's proposal: `d/dt(depot) = transit(NTR, MTT) - KA*depot`), and **Layer 2** — an optional
-`[absorption]` block that, on an analytical `pk` model, uses a closed form where one exists
-and otherwise desugars to the Layer-1 ODE with a clear warning.
+density input). The mechanism is a set of **built-in input-rate functions** (`transit`, `igd`, `weibull`,
+`zero_order`, `first_order`) callable in the `[odes]` RHS, so the user writes the ODE
+explicitly (Ron's proposal: `d/dt(depot) = transit(NTR, MTT) - KA*depot`). The disposition is
+supplied explicitly — a hand-written `ode(...)` or a generated `ode_template ...` — never
+invented behind an analytical `pk` request (which errors instead). See "DSL surface".
 
 This is a **large, multi-PR feature**; the plan is phased so each model lands with its own
 tests, NONMEM anchor, and docs.
 
 ## Goals / non-goals
 
-- **Goal:** `[absorption]` block selecting transit / inverse-Gaussian / Weibull /
-  zero-order / sequential / parallel / mixed, with parameters bound to
+- **Goal:** built-in absorption input-rate functions (`transit`, `igd`, `weibull`,
+  `zero_order`, `first_order`) usable in `[odes]`, with arguments bound to
   `[individual_parameters]` (so they carry IIV, covariates, etc. for free).
-- **Goal:** the `[absorption]` type works on **both** analytical (`pk ...`) and ODE
-  (`ode(...)`) disposition models (Ron's review). On ODE models it injects the input as RHS
-  forcing into the dosing compartment; on analytical models it dispatches a **closed form
-  where one exists**, and falls back to numerical integration only where none does.
-- **Goal:** **closed-form-first, not ODE-always.** Most absorption types reduce to
-  superpositions of the analytical building blocks ferx already has (see "Which models stay
-  analytical"), so they stay in the fast analytical engine. Weibull, inverse-Gaussian, and
-  continuous-N transit have no elementary closed form; when one of those is applied to an
-  analytically-specified model ferx integrates numerically **and emits a clear warning**
-  (Ron's requirement) — never a silent ODE swap.
-- **Goal:** **transparency.** Each model's math and its explicit ODE form are documented;
-  `ferx check` surfaces the effective (synthesized) model so the numerical path is
-  inspectable, not a black box. Where both forms exist they are cross-checked under the
-  analytical↔ODE equivalence harness (ferx-r#127 / `tests/analytical_ode_equivalence.rs`).
+- **Goal:** **explicit disposition, no surprises** (Ron). Absorption feeds an ODE supplied by
+  the user — hand-written `ode(...)` or generated `ode_template ...`. Asking for an
+  ODE-only absorption model (transit / IG / Weibull) on an analytical `pk ...` is a clear
+  **error** pointing at `ode_template` — never a silent (or even warned) analytical→ODE swap.
+- **Goal:** `ode_template NAME(...)` generates the standard disposition ODE from the codified
+  analytical↔ODE transforms (ferx-r#127 / `tests/analytical_ode_equivalence.rs`); a general
+  primitive, reusable beyond absorption (TMDD, …).
 - **Goal:** continuous (non-integer) N for the Savic transit model — the key thing the
   current hand-written ODE example cannot do.
+- **Non-goal (this plan):** the declarative `[absorption]` block — **dropped** (see DSL
+  surface); absorption is the input-rate functions plus an explicit ODE disposition.
 - **Non-goal (this plan):** changing the existing analytical `pk` disposition solvers; they
-  keep working unchanged for first-order/IV. Absorption models layer on top.
+  keep working unchanged for the standard closed-form models.
 - **Non-goal (this plan):** the NONMEM coded-`RATE` data path itself (`RATE=-1`/`-2`,
   issue #324) — a separate data-reader feature this plan depends on for its zero-order
   family. See "Relationship to #324".
@@ -84,17 +78,20 @@ Decision: ship #324's Phase 0 safety net first (independently valuable); its `D1
 modeled-duration path establishes the estimated-duration forcing this plan's Phase 2 then
 reuses. Phase 0/1 of this plan can start in parallel, since they don't depend on it.
 
-## DSL surface — two layers over one set of input-rate functions
+## DSL surface
 
-The absorption math lives in **built-in input-rate functions** — `transit(n, mtt)`,
+Absorption is a set of **built-in input-rate functions** — `transit(n, mtt)`,
 `igd(mat, cv2)` (inverse-Gaussian / Freijer & Post), `weibull(td, beta)`, `zero_order(dur)`,
-and `first_order(ka)` (for composition). They are the single source of truth, exposed two
-ways.
+and `first_order(ka)` (for composition) — used **inside an ODE**. The disposition the
+absorption feeds is supplied **explicitly**, never invented behind the user's back. Three
+ways to supply it: a hand-written `ode(...)`, an analytical `pk ...` (closed-form models
+only — see the error rule), or a generated `ode_template ...` (Ron's proposal — ferx writes
+the standard disposition ODE for you). No model is ever *silently* turned into an ODE.
 
-### Layer 1 — input-rate functions in `[odes]` (Ron's proposal; transparent foundation)
+### Absorption: input-rate functions in `[odes]`
 
-The user writes the ODE explicitly and calls the built-in for the input rate — keeping full
-control of the compartment structure and *seeing* that it is an ODE — but without
+The user writes (or generates, below) the ODE and calls the built-in for the input rate —
+keeping full control of the compartment structure and *seeing* that it is an ODE — without
 hand-coding the Stirling gamma density:
 
 ```
@@ -114,8 +111,8 @@ models (Weibull, IG, continuous-N transit) and satisfies Ron's transparency ask 
 
 **Input-rate function for each model.** Each returns the dose-driven appearance rate into the
 compartment it is added to (dose amount × F, superposed over doses). Fractions for parallel /
-biphasic pathways are **plain scalar multipliers** — so no `pathway` grammar is needed in
-Layer 1, and `frac` just splits the dose by linearity.
+biphasic pathways are **plain scalar multipliers** — so no `pathway` grammar is needed, and
+`frac` just splits the dose by linearity.
 
 *Savic transit* — `transit(n, mtt)` into a depot, then first-order `ka` (shown above);
 `ktr = (n+1)/mtt`, continuous `n`.
@@ -174,49 +171,53 @@ function* (it is the chain input) and must **not** also enter as a bolus into th
 compartment — define and test this rule explicitly (it is the classic Savic "dose into the
 virtual transit, not the depot" subtlety).
 
-### Layer 2 — `[absorption]` block (optional convenience; desugars to Layer 1 / closed forms)
+### Disposition: `ode_template` (Ron's proposal) — explicit, no surprises
 
-A one-liner on an analytical disposition for users who don't want to write the ODE. It
-selects the input model declaratively; the engine uses a **closed form where one exists**
-(see "Which models stay analytical") and otherwise auto-builds the equivalent Layer-1 ODE,
-emitting `W_ABSORPTION_NUMERICAL`. Parameters reference `[individual_parameters]` names
-(like `cl=CL` on the pk line):
+Writing the full disposition ODE by hand every time is verbose. `ode_template NAME(...)`
+tells ferx to **generate** the standard disposition ODE for a named model — the codified
+analytical→ODE transforms already specified in ferx-r#127 / `ode-analytical-equivalence.md`
+(e.g. `two_cpt_oral` → `depot`/`central`/`periph` states with the micro-constant RHS and
+`obs_scale = V1`). The user then extends it with absorption input-rate functions:
 
 ```
 [structural_model]
-  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2)   # NB: no ka= when [absorption] present
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2)   # ferx writes the 2-cpt oral ODE
 
-[absorption]
-  model = transit
-  mtt   = MTT          # mean transit time
-  n     = NTR          # number of transit compartments (continuous)
-  ka    = KA           # optional; defaults to KTR=(n+1)/mtt
+[odes]
+  # add the Savic transit input into the generated depot
+  d/dt(depot) += transit(NTR, MTT)        # extend the generated RHS (syntax TBD; see Open Qs)
 ```
 
-Multi-pathway models (Freijer sum-of-two-IG, parallel first-order) use repeated
-`pathway` entries with a fraction:
+Because the user typed `ode_template`, they **expect** ferx to write ODEs — there is no
+hidden conversion (Ron's core requirement). The same primitive generalizes beyond
+absorption (e.g. **TMDD**: generate a standard disposition, then add target-binding terms),
+so it is worth building as a general mechanism, not an absorption-specific one (Ron's last
+point).
 
-```
-[absorption]
-  model    = inverse_gaussian
-  pathway  = { mat = MAT1, cv2 = CV2_1, frac = FR1 }
-  pathway  = { mat = MAT2, cv2 = CV2_2 }   # last frac defaults to 1 - sum(others)
-```
+### The error rule (analytical + ODE-only absorption ⇒ error)
 
-> The `pathway = { ... }` inline-record form is a **new grammar construct** (no DSL
-> precedent today). For the common ≤2-pathway case, repeated scalar keys (`mat1=`, `cv2_1=`,
-> `frac1=`, `mat2=`, …) reach parity with zero new grammar; defer the brace form until a
-> >2-pathway need is real.
+If a user writes an **analytical** `pk one/two/three_cpt_oral(...)` and *also* asks for an
+absorption model with no closed form (transit / IG / Weibull), ferx **errors** with a
+message pointing at `ode_template` — it does **not** silently (or even with a warning) build
+an ODE behind an analytical request. This is Ron's "avoid surprises":
 
-Rules (all enforced at parse time, all with negative tests):
-- `[absorption]` present ⇒ the `pk *_oral` line must **not** also map `ka=` (mutually
-  exclusive: first-order is the no-`[absorption]` default). Mapping both is a parse error.
-- `[absorption]` is only valid with an **oral** disposition (`one/two/three_cpt_oral`);
-  combining with an IV-only model, or with a subject carrying `RATE>0` infusion dose rows,
-  is a **parse error** (the dose route is ambiguous — see Robustness).
-- Every referenced name must be a declared individual parameter (reuse the existing
-  "undefined name" machinery — `parser/model_parser.rs` visit_*_nodes); unknown keys for a
-  model are rejected; pathway fractions must be in (0,1] and sum to ≈1.
+> *"transit absorption requires an ODE; replace `pk two_cpt_oral(...)` with
+> `ode_template two_cpt_oral(...)` and add `transit(...)` in `[odes]`."*
+
+### Dropped: the declarative `[absorption]` block
+
+An earlier draft proposed a declarative `[absorption]` block on an analytical `pk` model
+that would pick a closed form or silently desugar to an ODE. **Dropped** — that is exactly
+the silent analytical→ODE conversion Ron objected to, and with `ode_template` + one-line
+input-rate functions it buys almost no convenience for a lot of machinery (closed-form
+dispatch, the `W_ABSORPTION_NUMERICAL` warning, a `pathway = {}` grammar). If a one-liner is
+ever wanted it can return later as pure sugar over `ode_template` — never over `pk`.
+
+Parser rules (enforced, with negative tests): input-rate-function arguments must be declared
+individual parameters (reuse the undefined-name machinery in `parser/model_parser.rs`);
+unknown function names / wrong arity are rejected; an input-rate function combined with an
+analytical `pk` disposition triggers the error rule above; parallel/biphasic fractions must
+be in (0,1].
 
 ## The models (input rate `R_in(t)`, ∫₀^∞ R_in dt = F·Dose)
 
@@ -225,7 +226,7 @@ superposed. `D` = `F·amt`.
 
 | `model =` | `R_in(t)` | Params | Special fn | t→0 edge |
 |---|---|---|---|---|
-| `first_order` (default, no block) | `D·ka·e^{−ka·tad}` | ka | — | finite |
+| `first_order` (default) | `D·ka·e^{−ka·tad}` | ka | — | finite |
 | `zero_order` | `D/Dur` on `[0,Dur]` else 0 | dur | — | step |
 | `sequential` (0→1st) | zero-order fills depot over `dur`, then `ka` out | dur, ka | — | step |
 | `parallel` (dual 1st-order) | `D·Σ fᵢ·kaᵢ·e^{−kaᵢ·tad}` | ka1,ka2,frac | — | finite |
@@ -244,12 +245,16 @@ Notes:
   CV² = relative dispersion of the absorption-time distribution — i.e. the standard
   inverse-Gaussian density with mean `μ=MAT` and shape `λ=MAT/CV²` (implementer mapping).
 
-## Which models stay analytical vs need numerical integration
+## Which models *could* be accelerated with a closed form (internal only)
 
-This is the crux of Ron's review: *does adding an absorption model silently turn an
-analytical model into an ODE?* Mostly **no** — only where the math forces it.
+With the error rule above, the user always specifies their disposition explicitly, so this
+table is **no longer a user-facing dispatch** — it is an internal performance note. Where an
+`ode_template`/`ode` absorption model happens to have a closed form, ferx *may* compute it
+via the fast analytical path instead of integrating, **provided the two are proven identical
+under the equivalence harness** (so there is no behavioural surprise — same numbers, faster).
+Everything else integrates.
 
-| Absorption model | Closed form with linear disposition? | Engine |
+| Absorption model | Closed form with linear disposition? | Can ferx accelerate internally? |
 |---|---|---|
 | `first_order` | yes (Bateman) — already shipped | analytical |
 | `zero_order` | yes (= infusion into depot/central) | analytical |
@@ -261,19 +266,13 @@ analytical model into an ODE?* Mostly **no** — only where the math forces it.
 | `weibull` | **no** elementary closed form | numerical |
 | `inverse_gaussian` (Freijer & Post) | **no** elementary closed form (general multi-cpt) | numerical |
 
-So, will analytical models be made into ODEs? **Not in general.** The
-first-order/zero-order/parallel/sequential/mixed family and integer-N transit reduce to
-**superpositions of the closed forms ferx already has** (e.g. `parallel` = two `two_cpt_oral`
-evaluations weighted by `frac`) and stay analytical. Continuous-N transit stays analytical
-once the incomplete-gamma special function lands (Phase 3, promoted from "optional"). Only
-**Weibull** and **inverse-Gaussian** are inherently numerical — there is no closed-form
-convolution of those input densities with a multi-compartment disposition, so they are
-integrated (ODE / convolution quadrature) regardless of how the disposition was written.
-
-**When the numerical path is used on an analytically-specified model, ferx warns**
-(`W_ABSORPTION_NUMERICAL`, e.g. "absorption=weibull has no closed form with two_cpt_oral;
-predictions use numerical integration (slower)"). A model written as `ode(...)` gets no
-warning — the user already chose numerical integration.
+The first-order / zero-order / parallel / sequential / mixed family and integer-N transit
+are superpositions of closed forms ferx already has (e.g. `parallel` = two `two_cpt_oral`
+evaluations weighted by `frac`); continuous-N transit gains a closed form once the
+incomplete-gamma special function lands (Phase 3). **Weibull** and **inverse-Gaussian** have
+no elementary closed-form convolution with a multi-compartment disposition and always
+integrate. The user-facing model is the ODE they wrote; any closed-form acceleration is an
+equivalence-tested optimization underneath it, not a different code path they can observe.
 
 ## Engine architecture
 
@@ -288,24 +287,23 @@ Decouple **input function** from **disposition**, reusing existing machinery:
    pattern. Honor the `ad/` rule: **no `f64::max`/`min`** — use explicit comparisons (see
    CLAUDE.md). Each model also exposes `validate(θ) -> Result` and the analytic mass
    `∫R_in = F·Dose` (test invariant).
-2. **Disposition — two dispatch modes** (chosen per absorption×disposition combo, per the
-   table above):
-   - **(a) Closed-form (preferred).** Stay in the analytical engine. The first-order /
-     zero-order / parallel / sequential / mixed family and integer-N transit map `R_in` to a
-     **superposition of the existing `pk/` closed forms** (e.g. `parallel` = two
-     `two_cpt_oral` evaluations weighted by `frac`); continuous-N transit uses the
-     incomplete-gamma closed form (Phase 3). No ODE solve, no warning.
-   - **(b) Numerical fallback.** Weibull / inverse-Gaussian / continuous-N transit before the
-     incomplete-gamma path lands: add `+R_in(tad)` forcing into the dosing compartment via the
-     **same RHS-wrapper mechanism that already injects `+rate` for infusions**
-     (`ode/predictions.rs` header doc: "adding `+rate` … via an RHS wrapper"). Emit
-     `W_ABSORPTION_NUMERICAL` when the disposition was specified analytically.
-   - **Works on both model kinds.** On an `ode(...)` disposition the absorption type injects
-     the same `R_in(tad)` forcing into the user's dosing compartment (no warning — they chose
-     ODE). On a `pk ...` disposition, mode (a)/(b) is selected by the table.
-   - Shared by both modes: observed value via the existing obs-compartment plumbing; **SS=1**
-     reuses `equilibrate_ss_state`; **lagtime/F** reuse `PK_IDX_LAGTIME` (shift `tad`) and
-     `PK_IDX_F` (scale `D`); multiple doses / ADDL superpose `R_in` per dose.
+2. **Forcing into the user's ODE.** `R_in(tad)` is added into the dosing compartment of the
+   disposition the user supplied (`ode(...)` or the `ode_template`-generated states) via the
+   **same RHS-wrapper mechanism that already injects `+rate` for infusions**
+   (`ode/predictions.rs` header doc: "adding `+rate` … via an RHS wrapper"). No silent
+   conversion: an analytical `pk` disposition + an ODE-only absorption model is rejected by the
+   error rule, not forced. Shared plumbing: observed value via the existing obs-compartment
+   path; **SS=1** reuses `equilibrate_ss_state`; **lagtime/F** reuse `PK_IDX_LAGTIME` (shift
+   `tad`) and `PK_IDX_F` (scale `D`); multiple doses / ADDL superpose `R_in` per dose.
+   - **Internal closed-form acceleration (optional):** where the combo has a closed form
+     (first/zero/parallel/sequential/mixed, integer-N transit, continuous-N transit via
+     incomplete gamma), ferx *may* compute it via the `pk/` solvers instead of integrating —
+     **only** when proven identical under the equivalence harness, so the user sees the same
+     numbers, faster. This is an optimization beneath the ODE the user wrote, never a separate
+     observable path.
+   - **`ode_template` generation:** the named-model → ODE transform (states, micro-constant
+     RHS, `obs_scale`) is codified once from `ode-analytical-equivalence.md`; the absorption
+     term is appended to the generated depot/dosing compartment.
 3. **Special functions (`src/stats/special.rs`):** add `ln_gamma` via a **Lanczos** rational
    approximation (AD-safe, following the existing `erf` A&S precedent) — **not** bare Stirling:
    `N` is estimated continuously and transit `N` is commonly 1–10, where Stirling errs ~8% at
@@ -328,9 +326,10 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   `W_NEGATIVE_LAGTIME` pattern in `diagnostics.rs`).
 - **Singularity guards:** `tad ≤ ε ⇒ R_in = 0`; transit `0^N` and `log(tad)` guarded;
   Weibull `β<1` integrable spike capped/handled; IGD essential singularity at `tad→0`.
-- **Mutual exclusivity & route checks:** `[absorption]` + `ka=` ⇒ error; `[absorption]` on
-  IV-only disposition ⇒ error; `[absorption]` + a `RATE>0` infusion dose row ⇒ **parse error**
-  (the dose route is ambiguous; decided over "documented precedence").
+- **Route checks:** an ODE-only absorption input-rate function (`transit`/`igd`/`weibull`) on
+  an analytical `pk` disposition ⇒ **error** pointing at `ode_template` (the error rule); an
+  input-rate function plus a `RATE>0` infusion dose row into the same compartment ⇒ **parse
+  error** (dose route ambiguous).
 - **Mass-balance invariant** `∫R_in dt = F·Dose` as a unit test per model (catches a wrong
   normalization constant — the classic transit/IGD bug).
 - **AD-safety:** no `f64::max`/`min` anywhere reachable from the AD path; re-enable a
@@ -341,9 +340,10 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 
 - `src/types.rs` — new `AbsorptionSpec` + `AbsorptionModel` enum on `CompiledModel`; oral
   `PkModel` paths gain an optional spec.
-- `src/parser/model_parser.rs` — parse/validate `[absorption]`; reuse undefined-name walker
-  and the `consumes_pk_slot`/"declared-but-unused" census.
-- `src/pk/absorption.rs` (new) — generic input functions + validation + mass.
+- `src/parser/model_parser.rs` — parse `ode_template NAME(...)` + the input-rate function
+  intrinsics; the error rule; reuse the undefined-name walker / "declared-but-unused" census.
+- `src/pk/absorption.rs` (new) — generic input functions + validation + mass; `ode_template`
+  generation reuses the `ode-analytical-equivalence.md` transforms.
 - `src/stats/special.rs` — `ln_gamma` (+ later regularized incomplete gamma).
 - `src/ode/predictions.rs` — synthesized-disposition + `R_in` forcing; SS reuse.
 - prediction dispatcher / `src/estimation/inner_optimizer.rs` — route oral+absorption to the
@@ -361,13 +361,12 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   `RATE=-2`/`D1` modeled-duration path establishes the estimated-duration forcing that this
   plan's Phase 2 zero-order family reuses. Independent of this plan's Phase 0/1, which can
   start in parallel.
-- **Phase 0 — `transit()` input-rate function (Layer 1 first).** Implement the built-in
-  `transit(n, mtt)` intrinsic callable in `[odes]` (Ron's proposal): the input-rate
-  evaluator, dose-context wiring, the dose-routing rule (dose feeds the function, not a
-  bolus), and `ln_gamma`. Anchor against the existing `transit_2cpt` dataset and a NONMEM
-  Savic run — this proves the transparent path end-to-end. The optional `[absorption]` block
-  (Layer 2), the closed-form-vs-numerical dispatch, and the `W_ABSORPTION_NUMERICAL` warning
-  land here or as a Layer-2 follow-up (see Open questions).
+- **Phase 0 — `transit()` input-rate function + `ode_template`.** Implement the built-in
+  `transit(n, mtt)` intrinsic callable in `[odes]` (Ron's proposal): the input-rate evaluator,
+  dose-context wiring, the dose-routing rule (dose feeds the function, not a bolus), `ln_gamma`,
+  and `ode_template` generation for the standard PK models + the analytical-`pk`-plus-absorption
+  **error rule**. Anchor against the existing `transit_2cpt` dataset and a NONMEM Savic run —
+  proves the transparent path end-to-end.
 - **Phase 1 — inverse-Gaussian (Freijer & Post).** Single + sum-of-two IG; **numerical**
   (no closed form). Anchor vs the Freijer & Post paper / a NONMEM `$DES` IG run.
 - **Phase 2 — Weibull + zero-order + sequential + parallel + mixed.** Round out the
@@ -382,8 +381,9 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 
 - **Tier 1 (unit):** input-fn values vs hand-computed; mass-balance integral; `ln_gamma` vs
   reference; every param-validation error/warning.
-- **Tier 2 (`tests/*.rs`):** parse `[absorption]` → `CompiledModel`; `fit()` returns
-  immediately / errors on a bad spec (no convergence loop).
+- **Tier 2 (`tests/*.rs`):** parse `ode_template` + input-rate functions → `CompiledModel`;
+  the error rule fires on `pk` + ODE-only absorption; `fit()` returns immediately / errors on a
+  bad spec (no convergence loop).
 - **Tier 3 (slow, gated):** full fits per model to convergence (gate with
   `cfg_attr(not(feature="slow-tests"), ignore)`).
 - **NONMEM comparison** (required for numeric features): transit & IG estimates/OFV vs
@@ -409,11 +409,15 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 
 ## Open questions
 
-- **Keep Layer 2 (`[absorption]` block) at all, or ship Layer-1 functions only?** Ron's
-  proposal is just the `[odes]` input-rate functions (fully transparent, composable, no
-  silent ODE). The block adds convenience but also the closed-form dispatch + warning
-  machinery. Decision pending: ship Layer 1 first (Phase 0), then decide whether Layer 2
-  earns its complexity once Layer 1 is in users' hands.
+- **`[absorption]` block — decided to drop** (see DSL surface). Recommendation pending your /
+  Ron's sign-off: ship input-rate functions + `ode_template`; if a one-liner is wanted later
+  it returns as sugar over `ode_template`, never over `pk`.
+- **`ode_template` extend-vs-override syntax** — how does the user add the absorption term to
+  a generated RHS? Options: `d/dt(depot) += transit(...)` (append), re-declaring `d/dt(depot)`
+  to override, or a dedicated `[absorption_into = depot]` hint. Needs a decision in Phase 0.
+- **`ode_template` scope** — ship it absorption-only first, or design the general primitive
+  (TMDD etc.) up front? Ron flagged the reuse; lean to designing the generation hook generally
+  but ship the standard PK templates first.
 - **`transit()` argument form** — `transit(n, mtt)` (explicit, recommended) vs `transit(n)`
   reading a conventional `MTT`/`KTR` param. Explicit args avoid magic.
 
