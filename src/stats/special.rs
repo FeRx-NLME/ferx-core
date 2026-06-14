@@ -257,4 +257,19 @@ mod tests {
         assert!(v.is_finite());
         assert_relative_eq!(v, 359.134_205_369_575_4, max_relative = 1e-11);
     }
+
+    #[test]
+    fn ln_gamma_legendre_duplication() {
+        // Legendre duplication formula — an independent identity that needs no
+        // external reference table and exercises both branches (z = 0.3 takes
+        // the reflection path):
+        //   ln Γ(z) + ln Γ(z+½) = (1−2z)·ln2 + ½·ln π + ln Γ(2z).
+        let ln2 = std::f64::consts::LN_2;
+        let half_ln_pi = 0.5 * std::f64::consts::PI.ln();
+        for &z in &[0.3, 0.7, 1.3, 2.0, 3.5, 6.1] {
+            let lhs = ln_gamma(z) + ln_gamma(z + 0.5);
+            let rhs = (1.0 - 2.0 * z) * ln2 + half_ln_pi + ln_gamma(2.0 * z);
+            assert_relative_eq!(lhs, rhs, epsilon = 1e-9, max_relative = 1e-10);
+        }
+    }
 }
