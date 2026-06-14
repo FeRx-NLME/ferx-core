@@ -1,3 +1,4 @@
+pub mod absorption;
 pub mod event_driven;
 pub mod one_compartment;
 pub mod three_compartment;
