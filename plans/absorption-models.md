@@ -177,22 +177,26 @@ Writing the full disposition ODE by hand every time is verbose. `ode_template NA
 tells ferx to **generate** the standard disposition ODE for a named model — the codified
 analytical→ODE transforms already specified in ferx-r#127 / `ode-analytical-equivalence.md`
 (e.g. `two_cpt_oral` → `depot`/`central`/`periph` states with the micro-constant RHS and
-`obs_scale = V1`). The user then extends it with absorption input-rate functions:
+`obs_scale = V1`). The user customises it in `[odes]` using **override semantics** (Ron's
+call): any `d/dt(X)` declared in `[odes]` **replaces** the template's equation for compartment
+`X` (maximum flexibility); compartments left undeclared keep the generated RHS. To add the
+Savic input, re-declare the depot with the transit term:
 
 ```
 [structural_model]
   ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2)   # ferx writes the 2-cpt oral ODE
 
 [odes]
-  # add the Savic transit input into the generated depot
-  d/dt(depot) += transit(NTR, MTT)        # extend the generated RHS (syntax TBD; see Open Qs)
+  # re-declaring d/dt(depot) OVERRIDES the template's depot equation
+  d/dt(depot) = transit(NTR, MTT) - KA*depot
+  # d/dt(central) and d/dt(periph) keep the generated equations
 ```
 
 Because the user typed `ode_template`, they **expect** ferx to write ODEs — there is no
-hidden conversion (Ron's core requirement). The same primitive generalizes beyond
-absorption (e.g. **TMDD**: generate a standard disposition, then add target-binding terms),
-so it is worth building as a general mechanism, not an absorption-specific one (Ron's last
-point).
+hidden conversion (Ron's core requirement). The same primitive generalizes beyond absorption
+(Ron: future uses such as **TMDD**, **TGI**, **neutropenia** — generate a standard
+disposition, then add the extra terms), so it is worth building generically; this plan keeps
+scope to **absorption first**.
 
 ### The error rule (analytical + ODE-only absorption ⇒ error)
 
@@ -206,12 +210,13 @@ an ODE behind an analytical request. This is Ron's "avoid surprises":
 
 ### Dropped: the declarative `[absorption]` block
 
-An earlier draft proposed a declarative `[absorption]` block on an analytical `pk` model
-that would pick a closed form or silently desugar to an ODE. **Dropped** — that is exactly
-the silent analytical→ODE conversion Ron objected to, and with `ode_template` + one-line
-input-rate functions it buys almost no convenience for a lot of machinery (closed-form
-dispatch, the `W_ABSORPTION_NUMERICAL` warning, a `pathway = {}` grammar). If a one-liner is
-ever wanted it can return later as pure sugar over `ode_template` — never over `pk`.
+An earlier draft proposed a declarative `[absorption]` block. **Dropped** — Ron confirmed it
+is not needed (2026-06-14): the input-rate functions already give a one-line absorption term,
+and keeping the surface generic/simple beats a dedicated block. On an analytical `pk` it would
+be the silent analytical→ODE conversion Ron objected to (the error rule above handles that);
+on `ode_template` it would be a second, redundant way to write what the functions already
+express, plus a `pathway = {}` grammar and closed-form-dispatch machinery for no real gain.
+Absorption = input-rate functions + an explicit ODE disposition (`ode` or `ode_template`).
 
 Parser rules (enforced, with negative tests): input-rate-function arguments must be declared
 individual parameters (reuse the undefined-name machinery in `parser/model_parser.rs`);
@@ -407,17 +412,17 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   (#281 cadence) verifies the AD path. Mass-balance and the AD≡FD gradient-agreement test are
   the fast regression backstop and the bridge between the two.
 
+## Resolved decisions (Ron, 2026-06-14)
+
+- **No `[absorption]` block.** Input-rate functions in `[odes]` suffice; keep the surface
+  generic/simple. Both **A** (hand-written `ode`) and **B** (`ode_template`) ship and coexist.
+- **`ode_template` scope: absorption first.** TMDD / TGI / neutropenia are future uses of the
+  same primitive, out of scope here.
+- **Override semantics:** a `d/dt(X)` re-declared in `[odes]` **overrides** the template's
+  equation for `X` (maximum flexibility) — no `+=` append form.
+
 ## Open questions
 
-- **`[absorption]` block — decided to drop** (see DSL surface). Recommendation pending your /
-  Ron's sign-off: ship input-rate functions + `ode_template`; if a one-liner is wanted later
-  it returns as sugar over `ode_template`, never over `pk`.
-- **`ode_template` extend-vs-override syntax** — how does the user add the absorption term to
-  a generated RHS? Options: `d/dt(depot) += transit(...)` (append), re-declaring `d/dt(depot)`
-  to override, or a dedicated `[absorption_into = depot]` hint. Needs a decision in Phase 0.
-- **`ode_template` scope** — ship it absorption-only first, or design the general primitive
-  (TMDD etc.) up front? Ron flagged the reuse; lean to designing the generation hook generally
-  but ship the standard PK templates first.
 - **`transit()` argument form** — `transit(n, mtt)` (explicit, recommended) vs `transit(n)`
   reading a conventional `MTT`/`KTR` param. Explicit args avoid magic.
 
