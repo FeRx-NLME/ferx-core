@@ -44,27 +44,30 @@ tests, NONMEM anchor, and docs.
 ## Relationship to issue #324 (NONMEM coded RATE values)
 
 #324 adds end-to-end support for NONMEM's coded `RATE` column (consolidating #95 and the
-now-closed #282). It is itself phased:
+now-closed #282). In NONMEM, coded `RATE` is *parameter-driven*, not data-column-driven:
+`RATE=-1` ⇒ the infusion **rate** is modeled (`R1` in `$PK`); `RATE=-2` ⇒ the infusion
+**duration** is modeled (`D1` in `$PK`). Neither reads a data column; duration is the more
+commonly estimated of the two. #324 is scoped to:
 
-- **#324 Phase 0** — safety net: reject/warn on negative coded `RATE` instead of silently
-  treating it as an IV bolus (today's bug).
-- **#324 Phase 1** — `RATE=-1` duration-defined infusion (reads a `DURATION` column,
-  `rate = amt/duration`); the most common clinical convention.
-- **#324 Phase 2** — `RATE=-2` model-estimated duration: a `D1`-style `.ferx` DSL parameter
-  controls the infusion duration at runtime.
+- **#324 Phase 0** — safety net: reject coded/malformed `RATE` (`-1`, `-2`, other negatives,
+  non-finite) on a dose row instead of silently treating it as an IV bolus (today's bug).
+  Ships first, standalone (PR #326).
+- **#324 faithful support** — `RATE=-1` = rate modeled via an `R1`-style `.ferx` DSL
+  parameter; `RATE=-2` = duration modeled via a `D1`-style DSL parameter. Both
+  runtime/parameter-driven; **no `DURATION` data column**.
 
-The piece this plan depends on is **#324 Phase 2**: a *zero-order forcing term whose
-duration is an estimated model parameter* (`D1`-style plumbing in both analytical and ODE
-paths). That same mechanism is what the zero-order absorption family (`zero_order`,
-`sequential`, `mixed`) reuses.
+The piece this plan depends on is the **`RATE=-2` / `D1` modeled-duration** plumbing: a
+*zero-order forcing term whose duration is an estimated model parameter* (`D1`-style
+plumbing in both analytical and ODE paths). That same mechanism is what the zero-order
+absorption family (`zero_order`, `sequential`, `mixed`) reuses.
 
 - **Not a prerequisite** for Phase 0 (transit) or Phase 1 (inverse-Gaussian) of this plan —
   neither involves a zero-order input. The two headline models are unblocked by #324.
 - **Is the foundation** for the zero-order absorption family in Phase 2 below.
 
-Decision: do #324 first (its Phase 0/1 are independently valuable; its Phase 2 establishes
-the estimated-duration forcing this plan's Phase 2 then reuses) — but start Phase 0/1 of
-this plan in parallel, since they don't depend on it.
+Decision: ship #324's Phase 0 safety net first (independently valuable); its `D1`
+modeled-duration path establishes the estimated-duration forcing this plan's Phase 2 then
+reuses. Phase 0/1 of this plan can start in parallel, since they don't depend on it.
 
 ## DSL surface (decided: new `[absorption]` block)
 
@@ -202,12 +205,13 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 
 ## Phasing (one PR each)
 
-- **Phase −1 — issue #324 (NONMEM coded `RATE`), standalone first.** Support `RATE=-1`
-  (duration-defined, via a `DURATION` column) and `RATE=-2` (model-estimated duration via a
-  `D1`-style DSL parameter), behind a safety net for unsupported coded values. Independently
-  shippable and a user win on its own; its `RATE=-2` part (#324 Phase 2) establishes the
-  estimated-duration forcing that this plan's Phase 2 zero-order family reuses. Phase 0/1
-  here can start in parallel since they don't depend on it.
+- **Phase −1 — issue #324 (NONMEM coded `RATE`), standalone first.** Ship the safety net
+  first (reject coded/malformed `RATE` instead of a silent IV bolus; PR #326). Faithful
+  support follows as a parameter-driven DSL feature: `RATE=-1` = rate modeled (`R1`-style),
+  `RATE=-2` = duration modeled (`D1`-style) — **no `DURATION` data column**. The
+  `RATE=-2`/`D1` modeled-duration path establishes the estimated-duration forcing that this
+  plan's Phase 2 zero-order family reuses. Independent of this plan's Phase 0/1, which can
+  start in parallel.
 - **Phase 0 — engine + Savic transit.** `[absorption]` grammar, `AbsorptionSpec`, generic
   input-fn trait, ODE-forcing plumbing, `ln_gamma`, transit end-to-end. Anchor against the
   existing `transit_2cpt` dataset and a NONMEM Savic run. Proves the architecture.
