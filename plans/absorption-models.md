@@ -21,7 +21,7 @@ The goal is to compute these **in Rust** as first-class, user-friendly built-ins
 **Savic 2007** (transit) and **Freijer & Post** (convection–dispersion ⇒ inverse-Gaussian
 density input). The mechanism is a set of **built-in input-rate functions** (`transit`, `igd`, `weibull`,
 `zero_order`, `first_order`) callable in the `[odes]` RHS, so the user writes the ODE
-explicitly (Ron's proposal: `d/dt(depot) = transit(NTR, MTT) - KA*depot`). The disposition is
+explicitly (Ron's proposal: `d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot`). The disposition is
 supplied explicitly — a hand-written `ode(...)` or a generated `ode_template ...` — never
 invented behind an analytical `pk` request (which errors instead). See "DSL surface".
 
@@ -99,20 +99,22 @@ hand-coding the Stirling gamma density:
   ode(obs_cmt=central, states=[depot, central])
 
 [odes]
-  d/dt(depot)   = transit(NTR, MTT) - KA*depot
+  d/dt(depot)   = transit(n=NTR, mtt=MTT) - KA*depot
   d/dt(central) = KA*depot - (CL/V)*central
 ```
 
-`transit(NTR, MTT)` returns the Savic transit-chain appearance rate into that compartment,
+`transit(n=NTR, mtt=MTT)` returns the Savic transit-chain appearance rate into that compartment,
 evaluated by the engine from time-after-dose and the dose amount (×F), superposed over doses
 — the same dose context the infusion RHS-wrapper already carries. `igd(...)`, `weibull(...)`,
 `zero_order(...)` behave identically. This is the natural home for the inherently-numerical
 models (Weibull, IG, continuous-N transit) and satisfies Ron's transparency ask directly.
 
 **Input-rate function for each model.** Each returns the dose-driven appearance rate into the
-compartment it is added to (dose amount × F, superposed over doses). Fractions for parallel /
-biphasic pathways are **plain scalar multipliers** — so no `pathway` grammar is needed, and
-`frac` just splits the dose by linearity.
+compartment it is added to (dose amount × F, superposed over doses). Arguments are **named**
+(matching the `pk(...)` convention): `transit(n=NTR, mtt=MTT)` — order-proof and
+parser-validated, so a swapped or typo'd argument errors instead of silently giving wrong
+numbers. Fractions for parallel / biphasic pathways are **plain scalar multipliers** — so no
+`pathway` grammar is needed, and `frac` just splits the dose by linearity.
 
 *Savic transit* — `transit(n, mtt)` into a depot, then first-order `ka` (shown above);
 `ktr = (n+1)/mtt`, continuous `n`.
@@ -122,42 +124,42 @@ form is two terms split by a fraction:
 ```
 [odes]
   # single IG into 1-cpt
-  d/dt(central) = igd(MAT, CV2) - (CL/V)*central
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central
   # Freijer biphasic (sum of two IG), fraction FR through pathway 1
-  d/dt(central) = FR*igd(MAT1, CV2_1) + (1-FR)*igd(MAT2, CV2_2) - (CL/V)*central
+  d/dt(central) = FR*igd(mat=MAT1, cv2=CV2_1) + (1-FR)*igd(mat=MAT2, cv2=CV2_2) - (CL/V)*central
 ```
 
 *Weibull* — `weibull(td, beta)` (td = scale, beta = shape):
 ```
 [odes]
-  d/dt(central) = weibull(TD, BETA) - (CL/V)*central
+  d/dt(central) = weibull(td=TD, beta=BETA) - (CL/V)*central
 ```
 
 *Zero-order, estimated duration* — `zero_order(dur)` (constant rate over `dur`; this is the
 modeled-duration / #324 `D1` case, reusable as an absorption input):
 ```
 [odes]
-  d/dt(central) = zero_order(DUR) - (CL/V)*central
+  d/dt(central) = zero_order(dur=DUR) - (CL/V)*central
 ```
 
 *Parallel / dual first-order* — compose two `first_order(ka)` terms with a fraction (no need
 for two depot compartments or per-compartment F):
 ```
 [odes]
-  d/dt(central) = FR*first_order(KA1) + (1-FR)*first_order(KA2) - (CL/V)*central
+  d/dt(central) = FR*first_order(ka=KA1) + (1-FR)*first_order(ka=KA2) - (CL/V)*central
 ```
 
 *Sequential (zero-order then first-order)* — `zero_order` fills the depot, `ka` to central:
 ```
 [odes]
-  d/dt(depot)   = zero_order(DUR) - KA*depot
+  d/dt(depot)   = zero_order(dur=DUR) - KA*depot
   d/dt(central) = KA*depot - (CL/V)*central
 ```
 
 *Mixed (zero-order + first-order, in parallel)*:
 ```
 [odes]
-  d/dt(central) = (1-FZO)*first_order(KA) + FZO*zero_order(DUR) - (CL/V)*central
+  d/dt(central) = (1-FZO)*first_order(ka=KA) + FZO*zero_order(dur=DUR) - (CL/V)*central
 ```
 
 (`first_order(ka)` is the existing first-order absorption exposed as an input-rate function
@@ -188,7 +190,7 @@ Savic input, re-declare the depot with the transit term:
 
 [odes]
   # re-declaring d/dt(depot) OVERRIDES the template's depot equation
-  d/dt(depot) = transit(NTR, MTT) - KA*depot
+  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot
   # d/dt(central) and d/dt(periph) keep the generated equations
 ```
 
@@ -412,8 +414,9 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   (#281 cadence) verifies the AD path. Mass-balance and the AD≡FD gradient-agreement test are
   the fast regression backstop and the bridge between the two.
 
-## Resolved decisions (Ron, 2026-06-14)
+## Resolved decisions
 
+Ron, 2026-06-14:
 - **No `[absorption]` block.** Input-rate functions in `[odes]` suffice; keep the surface
   generic/simple. Both **A** (hand-written `ode`) and **B** (`ode_template`) ship and coexist.
 - **`ode_template` scope: absorption first.** TMDD / TGI / neutropenia are future uses of the
@@ -421,10 +424,14 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 - **Override semantics:** a `d/dt(X)` re-declared in `[odes]` **overrides** the template's
   equation for `X` (maximum flexibility) — no `+=` append form.
 
-## Open questions
+Argument convention:
+- **Input-rate functions take named args** — `transit(n=NTR, mtt=MTT)`, not positional and
+  not a conventional-param lookup. Matches the `pk(...)` convention; order-proof and
+  parser-validated (swapped/typo'd args error rather than silently producing wrong results,
+  per the repo's no-silent-wrong-results rule). Reuses the `pk(...)` kwarg-parsing logic,
+  extended into the `[odes]` expression parser (today only `UnaryFn` exists there).
 
-- **`transit()` argument form** — `transit(n, mtt)` (explicit, recommended) vs `transit(n)`
-  reading a conventional `MTT`/`KTR` param. Explicit args avoid magic.
+No open questions outstanding.
 
 ## Open risks
 
