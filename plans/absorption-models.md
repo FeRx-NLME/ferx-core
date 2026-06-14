@@ -31,12 +31,24 @@ tests, NONMEM anchor, and docs.
 - **Goal:** `[absorption]` block selecting transit / inverse-Gaussian / Weibull /
   zero-order / sequential / parallel / mixed, with parameters bound to
   `[individual_parameters]` (so they carry IIV, covariates, etc. for free).
-- **Goal:** one engine path that works for **any** input function, reusing the ODE
-  RHS-forcing mechanism already used for infusions.
+- **Goal:** the `[absorption]` type works on **both** analytical (`pk ...`) and ODE
+  (`ode(...)`) disposition models (Ron's review). On ODE models it injects the input as RHS
+  forcing into the dosing compartment; on analytical models it dispatches a **closed form
+  where one exists**, and falls back to numerical integration only where none does.
+- **Goal:** **closed-form-first, not ODE-always.** Most absorption types reduce to
+  superpositions of the analytical building blocks ferx already has (see "Which models stay
+  analytical"), so they stay in the fast analytical engine. Weibull, inverse-Gaussian, and
+  continuous-N transit have no elementary closed form; when one of those is applied to an
+  analytically-specified model ferx integrates numerically **and emits a clear warning**
+  (Ron's requirement) — never a silent ODE swap.
+- **Goal:** **transparency.** Each model's math and its explicit ODE form are documented;
+  `ferx check` surfaces the effective (synthesized) model so the numerical path is
+  inspectable, not a black box. Where both forms exist they are cross-checked under the
+  analytical↔ODE equivalence harness (ferx-r#127 / `tests/analytical_ode_equivalence.rs`).
 - **Goal:** continuous (non-integer) N for the Savic transit model — the key thing the
-  current ODE example cannot do.
-- **Non-goal (this plan):** changing the analytical closed-form `pk` disposition solvers;
-  they keep working unchanged for first-order/IV. Absorption models layer on top.
+  current hand-written ODE example cannot do.
+- **Non-goal (this plan):** changing the existing analytical `pk` disposition solvers; they
+  keep working unchanged for first-order/IV. Absorption models layer on top.
 - **Non-goal (this plan):** the NONMEM coded-`RATE` data path itself (`RATE=-1`/`-2`,
   issue #324) — a separate data-reader feature this plan depends on for its zero-order
   family. See "Relationship to #324".
@@ -137,6 +149,37 @@ Notes:
   CV² = relative dispersion of the absorption-time distribution — i.e. the standard
   inverse-Gaussian density with mean `μ=MAT` and shape `λ=MAT/CV²` (implementer mapping).
 
+## Which models stay analytical vs need numerical integration
+
+This is the crux of Ron's review: *does adding an absorption model silently turn an
+analytical model into an ODE?* Mostly **no** — only where the math forces it.
+
+| Absorption model | Closed form with linear disposition? | Engine |
+|---|---|---|
+| `first_order` | yes (Bateman) — already shipped | analytical |
+| `zero_order` | yes (= infusion into depot/central) | analytical |
+| `parallel` (dual first-order) | yes — superpose two `*_oral` solutions weighted by `frac` | analytical (reuses existing solvers) |
+| `sequential` (0→1st) | yes (piecewise: zero-order fill, then first-order) | analytical |
+| `mixed` (0 + 1st) | yes (superpose zero-order + first-order) | analytical |
+| `transit` (Savic), **integer N** | yes (generalized Bateman / sum of N+1 terms) | analytical |
+| `transit` (Savic), **continuous N** | yes **iff** the lower incomplete gamma `P(a,x)` is implemented; else numerical | analytical (Phase 3) or numerical |
+| `weibull` | **no** elementary closed form | numerical |
+| `inverse_gaussian` (Freijer & Post) | **no** elementary closed form (general multi-cpt) | numerical |
+
+So, will analytical models be made into ODEs? **Not in general.** The
+first-order/zero-order/parallel/sequential/mixed family and integer-N transit reduce to
+**superpositions of the closed forms ferx already has** (e.g. `parallel` = two `two_cpt_oral`
+evaluations weighted by `frac`) and stay analytical. Continuous-N transit stays analytical
+once the incomplete-gamma special function lands (Phase 3, promoted from "optional"). Only
+**Weibull** and **inverse-Gaussian** are inherently numerical — there is no closed-form
+convolution of those input densities with a multi-compartment disposition, so they are
+integrated (ODE / convolution quadrature) regardless of how the disposition was written.
+
+**When the numerical path is used on an analytically-specified model, ferx warns**
+(`W_ABSORPTION_NUMERICAL`, e.g. "absorption=weibull has no closed form with two_cpt_oral;
+predictions use numerical integration (slower)"). A model written as `ode(...)` gets no
+warning — the user already chose numerical integration.
+
 ## Engine architecture
 
 Decouple **input function** from **disposition**, reusing existing machinery:
@@ -150,24 +193,35 @@ Decouple **input function** from **disposition**, reusing existing machinery:
    pattern. Honor the `ad/` rule: **no `f64::max`/`min`** — use explicit comparisons (see
    CLAUDE.md). Each model also exposes `validate(θ) -> Result` and the analytic mass
    `∫R_in = F·Dose` (test invariant).
-2. **Disposition + forcing (`src/ode/predictions.rs`):** synthesize the linear 1/2/3-cpt
-   disposition ODE internally and add `+R_in(tad)` as an appearance term into the depot (or
-   central) compartment — the **same RHS-wrapper mechanism that already injects `+rate` for
-   infusions** (`ode/predictions.rs` header doc: "adding `+rate` … via an RHS wrapper").
-   - Observed value = `A_central / V` (reuse existing obs-compartment plumbing).
-   - **SS=1:** reuse `equilibrate_ss_state` (already cycles apply-dose/integrate-II).
-   - **lagtime/F:** reuse `PK_IDX_LAGTIME` (shift `tad`) and `PK_IDX_F` (scale `D`) — already
-     applied to the dose, not the RHS.
-   - Multiple doses / ADDL: superpose `R_in` per dose, same as discrete-dose superposition.
+2. **Disposition — two dispatch modes** (chosen per absorption×disposition combo, per the
+   table above):
+   - **(a) Closed-form (preferred).** Stay in the analytical engine. The first-order /
+     zero-order / parallel / sequential / mixed family and integer-N transit map `R_in` to a
+     **superposition of the existing `pk/` closed forms** (e.g. `parallel` = two
+     `two_cpt_oral` evaluations weighted by `frac`); continuous-N transit uses the
+     incomplete-gamma closed form (Phase 3). No ODE solve, no warning.
+   - **(b) Numerical fallback.** Weibull / inverse-Gaussian / continuous-N transit before the
+     incomplete-gamma path lands: add `+R_in(tad)` forcing into the dosing compartment via the
+     **same RHS-wrapper mechanism that already injects `+rate` for infusions**
+     (`ode/predictions.rs` header doc: "adding `+rate` … via an RHS wrapper"). Emit
+     `W_ABSORPTION_NUMERICAL` when the disposition was specified analytically.
+   - **Works on both model kinds.** On an `ode(...)` disposition the absorption type injects
+     the same `R_in(tad)` forcing into the user's dosing compartment (no warning — they chose
+     ODE). On a `pk ...` disposition, mode (a)/(b) is selected by the table.
+   - Shared by both modes: observed value via the existing obs-compartment plumbing; **SS=1**
+     reuses `equilibrate_ss_state`; **lagtime/F** reuse `PK_IDX_LAGTIME` (shift `tad`) and
+     `PK_IDX_F` (scale `D`); multiple doses / ADDL superpose `R_in` per dose.
 3. **Special functions (`src/stats/special.rs`):** add `ln_gamma` via a **Lanczos** rational
    approximation (AD-safe, following the existing `erf` A&S precedent) — **not** bare Stirling:
    `N` is estimated continuously and transit `N` is commonly 1–10, where Stirling errs ~8% at
    N=1 / ~0.8% at N=10, enough to bias the absorption peak. IGD needs only `exp/sqrt`; Weibull
    needs `powf` — both already AD-safe.
-4. **Optional Phase 3 perf fast-path:** transit→1-cpt (and →2-cpt) has a closed-form
-   convolution via the **lower incomplete gamma** `P(a,x)`; implementing that in
-   `special.rs` lets transit skip ODE integration. Deferred — the ODE path is the robust
-   baseline first.
+4. **Incomplete-gamma closed form for transit (Phase 3, promoted from optional):** because
+   keeping continuous-N transit analytical is now a goal (Ron's transparency concern),
+   implement the regularized lower incomplete gamma `P(a,x)` (AD-safe) in `special.rs` so
+   transit→1/2-cpt skips numerical integration. Sequence: ship transit on the numerical
+   fallback first to prove the pipeline, then add the closed form and assert the two agree
+   under the equivalence harness.
 
 ## Robustness ("no happy paths") — explicit requirements
 
@@ -213,14 +267,19 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   plan's Phase 2 zero-order family reuses. Independent of this plan's Phase 0/1, which can
   start in parallel.
 - **Phase 0 — engine + Savic transit.** `[absorption]` grammar, `AbsorptionSpec`, generic
-  input-fn trait, ODE-forcing plumbing, `ln_gamma`, transit end-to-end. Anchor against the
-  existing `transit_2cpt` dataset and a NONMEM Savic run. Proves the architecture.
-- **Phase 1 — inverse-Gaussian (Freijer & Post).** Single + sum-of-two IG; anchor vs the
-  Freijer & Post paper / a NONMEM `$DES` IG run.
+  input-fn trait, the **closed-form-vs-numerical dispatch**, the `W_ABSORPTION_NUMERICAL`
+  warning, and `[absorption]`-on-both-engines (analytical `pk` + `ode(...)`). Ship transit on
+  the numerical fallback first (with `ln_gamma`), anchored against the existing `transit_2cpt`
+  dataset and a NONMEM Savic run. Proves the architecture end-to-end.
+- **Phase 1 — inverse-Gaussian (Freijer & Post).** Single + sum-of-two IG; **numerical**
+  (no closed form). Anchor vs the Freijer & Post paper / a NONMEM `$DES` IG run.
 - **Phase 2 — Weibull + zero-order + sequential + parallel + mixed.** Round out the
-  catalogue; each with a NONMEM anchor. The zero-order family reuses the estimated-duration
-  forcing from #324 (Phase 2).
-- **Phase 3 (optional) — analytical incomplete-gamma fast path** for transit→1/2-cpt.
+  catalogue; each with a NONMEM anchor. **Closed-form** for zero-order/sequential/parallel/
+  mixed (superpose existing solvers; the zero-order family reuses #324's estimated-duration
+  forcing); **numerical** for Weibull (warned on an analytical disposition).
+- **Phase 3 — analytical incomplete-gamma closed form for transit** (1/2-cpt) so continuous-N
+  transit stays in the analytical engine; assert it matches the Phase-0 numerical form under
+  the equivalence harness.
 
 ## Tests & NONMEM anchoring (CLAUDE.md mandates)
 
