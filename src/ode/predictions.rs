@@ -338,6 +338,12 @@ pub struct OdeSpec {
     /// integration entry point (`ode_predictions*`, EKF) uses the configured
     /// accuracy without threading options through each call.
     pub solver_opts: OdeSolverOptions,
+    /// Built-in absorption input-rate forcing terms (design A,
+    /// `plans/absorption-models.md`). Each adds `R_in(tad)` into its compartment
+    /// during integration, superposed over doses — the same RHS-wrapper layer
+    /// that injects `+rate` for infusions. Empty for models with no built-in
+    /// `transit()`/etc. input-rate term (the historical default).
+    pub input_rate: Vec<crate::pk::absorption::InputRateForcing>,
 }
 
 impl OdeSpec {
@@ -1612,6 +1618,7 @@ mod tests {
             readout: OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
             init_fn: None,
         }
     }
@@ -1659,6 +1666,7 @@ mod tests {
             readout: OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
             init_fn: Some(Box::new(|p: &[f64]| {
                 let (kin, kout) = (p[0], p[1]);
                 vec![if kout > 0.0 { kin / kout } else { 0.0 }]
@@ -1885,6 +1893,7 @@ mod tests {
             readout: OdeReadout::ObsCmt(1),
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
             init_fn: None,
         }
     }
@@ -2324,6 +2333,7 @@ mod tests {
             )),
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
             init_fn: None,
         }
     }
@@ -2457,6 +2467,7 @@ mod tests {
             readout: OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
             init_fn: None,
         };
         let pk = pk_one(1.0, 1.0);

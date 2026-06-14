@@ -58,6 +58,47 @@ pub fn validate_transit(n: f64, mtt: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// Which built-in absorption input-rate model a forcing term uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputRateKind {
+    /// Savic transit-compartment chain — `transit(n, mtt)`.
+    Transit,
+}
+
+/// A built-in absorption input-rate term attached to one ODE compartment.
+///
+/// Design A (see `plans/absorption-models.md`): the input-rate function is split
+/// out of the `[odes]` RHS at parse time and evaluated here with dose context,
+/// rather than threaded through the expression AST / bytecode VM / symbolic-AD
+/// machinery. `arg_slots` index the flat individual-parameter vector for this
+/// model's parameters — for [`InputRateKind::Transit`], `[n, mtt]`.
+#[derive(Debug, Clone)]
+pub struct InputRateForcing {
+    /// 0-based ODE compartment that receives `R_in`.
+    pub cmt: usize,
+    pub kind: InputRateKind,
+    /// Indices into the flat individual-parameter vector for this model's args.
+    pub arg_slots: Vec<usize>,
+}
+
+impl InputRateForcing {
+    /// Appearance rate `R_in(tad)` into [`Self::cmt`] for one dose, where
+    /// `dose = F · amt` and `params` is the flat individual-parameter vector.
+    /// Per-dose contributions are summed by the caller; `tad ≤ 0 ⇒ 0`.
+    pub fn rate(&self, tad: f64, dose: f64, params: &[f64]) -> f64 {
+        let arg = |i: usize, dflt: f64| {
+            self.arg_slots
+                .get(i)
+                .and_then(|&s| params.get(s))
+                .copied()
+                .unwrap_or(dflt)
+        };
+        match self.kind {
+            InputRateKind::Transit => transit_input_rate(tad, arg(0, 0.0), arg(1, 1.0), dose),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

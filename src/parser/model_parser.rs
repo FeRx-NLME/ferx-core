@@ -4875,6 +4875,9 @@ fn build_ode_spec(
         // Default tolerances; overwritten from [fit_options] / settings by
         // CompiledModel::sync_ode_solver_opts once fit options are merged.
         solver_opts: crate::ode::OdeSolverOptions::default(),
+        // Populated by the [odes] input-rate parse-split (transit() etc.); empty
+        // until that lands — no built-in absorption forcing for existing models.
+        input_rate: Vec::new(),
     })
 }
 
