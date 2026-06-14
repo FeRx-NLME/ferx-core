@@ -20,11 +20,11 @@ The goal is to compute these **in Rust** as first-class, user-friendly built-ins
 **robust handling of edge cases (no happy-path-only code)**. The named anchors are
 **Savic 2007** (transit) and **Freijer & Post** (convection–dispersion ⇒ inverse-Gaussian
 density input). The mechanism is a set of **built-in input-rate functions** (`transit`,
-`igd`, `weibull`, `zero_order`) exposed two ways (see "DSL surface"): **Layer 1** — callable
-directly in the `[odes]` RHS so the user writes the ODE explicitly (Ron's proposal:
-`d/dt(depot) = transit(NTR, MTT) - KA*depot`), and **Layer 2** — an optional `[absorption]`
-block that, on an analytical `pk` model, uses a closed form where one exists and otherwise
-desugars to the Layer-1 ODE with a clear warning.
+`igd`, `weibull`, `zero_order`, `first_order`) exposed two ways (see "DSL surface"):
+**Layer 1** — callable directly in the `[odes]` RHS so the user writes the ODE explicitly
+(Ron's proposal: `d/dt(depot) = transit(NTR, MTT) - KA*depot`), and **Layer 2** — an optional
+`[absorption]` block that, on an analytical `pk` model, uses a closed form where one exists
+and otherwise desugars to the Layer-1 ODE with a clear warning.
 
 This is a **large, multi-PR feature**; the plan is phased so each model lands with its own
 tests, NONMEM anchor, and docs.
@@ -87,8 +87,9 @@ reuses. Phase 0/1 of this plan can start in parallel, since they don't depend on
 ## DSL surface — two layers over one set of input-rate functions
 
 The absorption math lives in **built-in input-rate functions** — `transit(n, mtt)`,
-`igd(mat, cv2)` (inverse-Gaussian / Freijer & Post), `weibull(td, beta)`,
-`zero_order(dur)`. They are the single source of truth, exposed two ways.
+`igd(mat, cv2)` (inverse-Gaussian / Freijer & Post), `weibull(td, beta)`, `zero_order(dur)`,
+and `first_order(ka)` (for composition). They are the single source of truth, exposed two
+ways.
 
 ### Layer 1 — input-rate functions in `[odes]` (Ron's proposal; transparent foundation)
 
@@ -108,10 +109,62 @@ hand-coding the Stirling gamma density:
 `transit(NTR, MTT)` returns the Savic transit-chain appearance rate into that compartment,
 evaluated by the engine from time-after-dose and the dose amount (×F), superposed over doses
 — the same dose context the infusion RHS-wrapper already carries. `igd(...)`, `weibull(...)`,
-`zero_order(...)` behave identically. Multi-pathway / parallel absorption is just additional
-RHS terms (`transit(...) + igd(...)`) — no new grammar. This is the natural home for the
-inherently-numerical models (Weibull, IG, continuous-N transit) and satisfies Ron's
-transparency ask directly.
+`zero_order(...)` behave identically. This is the natural home for the inherently-numerical
+models (Weibull, IG, continuous-N transit) and satisfies Ron's transparency ask directly.
+
+**Input-rate function for each model.** Each returns the dose-driven appearance rate into the
+compartment it is added to (dose amount × F, superposed over doses). Fractions for parallel /
+biphasic pathways are **plain scalar multipliers** — so no `pathway` grammar is needed in
+Layer 1, and `frac` just splits the dose by linearity.
+
+*Savic transit* — `transit(n, mtt)` into a depot, then first-order `ka` (shown above);
+`ktr = (n+1)/mtt`, continuous `n`.
+
+*Inverse-Gaussian (Freijer & Post)* — `igd(mat, cv2)` straight into central; the biphasic
+form is two terms split by a fraction:
+```
+[odes]
+  # single IG into 1-cpt
+  d/dt(central) = igd(MAT, CV2) - (CL/V)*central
+  # Freijer biphasic (sum of two IG), fraction FR through pathway 1
+  d/dt(central) = FR*igd(MAT1, CV2_1) + (1-FR)*igd(MAT2, CV2_2) - (CL/V)*central
+```
+
+*Weibull* — `weibull(td, beta)` (td = scale, beta = shape):
+```
+[odes]
+  d/dt(central) = weibull(TD, BETA) - (CL/V)*central
+```
+
+*Zero-order, estimated duration* — `zero_order(dur)` (constant rate over `dur`; this is the
+modeled-duration / #324 `D1` case, reusable as an absorption input):
+```
+[odes]
+  d/dt(central) = zero_order(DUR) - (CL/V)*central
+```
+
+*Parallel / dual first-order* — compose two `first_order(ka)` terms with a fraction (no need
+for two depot compartments or per-compartment F):
+```
+[odes]
+  d/dt(central) = FR*first_order(KA1) + (1-FR)*first_order(KA2) - (CL/V)*central
+```
+
+*Sequential (zero-order then first-order)* — `zero_order` fills the depot, `ka` to central:
+```
+[odes]
+  d/dt(depot)   = zero_order(DUR) - KA*depot
+  d/dt(central) = KA*depot - (CL/V)*central
+```
+
+*Mixed (zero-order + first-order, in parallel)*:
+```
+[odes]
+  d/dt(central) = (1-FZO)*first_order(KA) + FZO*zero_order(DUR) - (CL/V)*central
+```
+
+(`first_order(ka)` is the existing first-order absorption exposed as an input-rate function
+for composition; standalone first-order still uses the analytical `pk *_oral` path.)
 
 Two implementation notes: **(i)** these are **engine intrinsics**, not pure expressions — the
 `[odes]` evaluator must hand them the dose schedule, amount, F, and time-after-dose (extend
