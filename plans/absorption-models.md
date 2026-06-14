@@ -228,6 +228,13 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   `cfg_attr(not(feature="slow-tests"), ignore)`).
 - **NONMEM comparison** (required for numeric features): transit & IG estimates/OFV vs
   equivalent NONMEM models, documented in the example pages or PR descriptions.
+- **Gradient agreement (AD ≡ FD):** per model, a unit test asserting the AD/`Dual` gradient
+  of `individual_nll` w.r.t. the absorption params matches the central-FD gradient to
+  tolerance on a small fixture. It compiles/runs under **both** the default `--features ci`
+  (FD) job and the `--features autodiff` (Enzyme) job — the FD job is the per-PR backstop;
+  the `autodiff` job (#281 cadence) is where the AD path is actually exercised. This is the
+  bridge that stops an AD-only regression (e.g. a wrong `ln_gamma` dual rule) slipping past
+  FD-only PR CI — the #317 failure mode.
 
 ## Verification
 
@@ -236,7 +243,9 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   patch ≥90% on each PR's diff.
 - End-to-end smoke per phase: `ferx examples/transit_savic.ferx --data data/transit_2cpt.csv`
   → converges, `converged: true`, MTT/N estimates near the data-generating values.
-- Mass-balance + AD-invariance unit tests are the fast regression backstop.
+- Per-PR `--features ci` (FD) verifies the FD gradient path; the `--features autodiff` job
+  (#281 cadence) verifies the AD path. Mass-balance and the AD≡FD gradient-agreement test are
+  the fast regression backstop and the bridge between the two.
 
 ## Open risks
 
