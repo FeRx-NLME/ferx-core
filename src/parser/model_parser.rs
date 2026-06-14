@@ -4321,6 +4321,191 @@ fn ode_param_slots(names: &[String]) -> Result<Vec<usize>, String> {
     Ok(slots)
 }
 
+/// Find `name(` at a word boundary in `s` (ASCII), returning the index of `name`.
+fn find_word_call(s: &str, name: &str) -> Option<usize> {
+    let pat = format!("{name}(");
+    let b = s.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(&pat) {
+        let i = from + rel;
+        let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if before_ok {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// Given the index of a `(` in `s` (ASCII), return the inner text and the index
+/// just past the matching `)`. `None` if unbalanced.
+fn balanced_parens(s: &str, open: usize) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    if b.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for i in open..b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((s[open + 1..i].to_string(), i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// State name `X` if `line` is a `d/dt(X) = …` equation, else `None`.
+fn diffeq_state(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("d/dt(")?;
+    let close = rest.find(')')?;
+    Some(rest[..close].trim().to_string())
+}
+
+/// True if the span `[start, end)` in `line` (ASCII) is immediately preceded or
+/// followed (skipping spaces) by `*`, `/`, or `^` — i.e. a scaled call.
+fn adjacent_scales(line: &str, start: usize, end: usize) -> bool {
+    let b = line.as_bytes();
+    let mut i = start;
+    while i > 0 && b[i - 1] == b' ' {
+        i -= 1;
+    }
+    let before = i > 0 && matches!(b[i - 1], b'*' | b'/' | b'^');
+    let mut j = end;
+    while j < b.len() && b[j] == b' ' {
+        j += 1;
+    }
+    let after = j < b.len() && matches!(b[j], b'*' | b'/' | b'^');
+    before || after
+}
+
+/// Split a string on top-level commas (commas outside nested parentheses).
+fn split_args_on_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut last = 0;
+    for (i, &c) in s.as_bytes().iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&s[last..i]);
+                last = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[last..]);
+    parts
+}
+
+/// Extract built-in absorption input-rate calls (currently `transit(...)`,
+/// design A) from the `[odes]` RHS lines. For each
+/// `d/dt(STATE) = … transit(n=P, mtt=Q) …`, records an [`InputRateForcing`]
+/// (`cmt` ← STATE index; `n`/`mtt` resolved to individual-parameter slots) and
+/// rewrites the call to `0` so the remaining RHS parses as a normal expression.
+/// Returns the cleaned lines and the collected forcing terms.
+///
+/// Validation (negative-tested): `transit(...)` must be the input rate of a
+/// top-level `d/dt(...)` equation; args are exactly `n` and `mtt`, each a
+/// declared individual parameter; a scaled call (`FR*transit(...)`) and more than
+/// one call per equation are rejected (parallel/biphasic comes with later models).
+fn extract_input_rate_terms(
+    rhs_lines: &[String],
+    state_names: &[String],
+    indiv_param_names: &[String],
+    indiv_param_slots: &[usize],
+) -> Result<(Vec<String>, Vec<crate::pk::absorption::InputRateForcing>), String> {
+    use crate::pk::absorption::{InputRateForcing, InputRateKind};
+    let resolve_slot = |val: &str, arg: &str| -> Result<usize, String> {
+        indiv_param_names
+            .iter()
+            .position(|p| p == val)
+            .map(|i| indiv_param_slots[i])
+            .ok_or_else(|| {
+                format!(
+                    "[odes]: transit({arg}={val}): `{val}` is not a declared individual parameter"
+                )
+            })
+    };
+
+    let mut forcings = Vec::new();
+    let mut cleaned = Vec::with_capacity(rhs_lines.len());
+    for raw in rhs_lines {
+        let Some(start) = find_word_call(raw, "transit") else {
+            cleaned.push(raw.clone());
+            continue;
+        };
+        let state = diffeq_state(raw).ok_or_else(|| {
+            format!(
+                "[odes]: transit(...) may only be the input rate of a `d/dt(...)` equation — \
+                 found it in `{}`",
+                raw.trim()
+            )
+        })?;
+        let cmt = state_names
+            .iter()
+            .position(|s| s == &state)
+            .ok_or_else(|| format!("[odes]: d/dt({state}): undeclared state"))?;
+
+        let open = start + "transit".len();
+        let (inner, end) = balanced_parens(raw, open).ok_or_else(|| {
+            format!(
+                "[odes]: transit(...): unbalanced parentheses in `{}`",
+                raw.trim()
+            )
+        })?;
+        if adjacent_scales(raw, start, end) {
+            return Err(
+                "[odes]: a scaled transit(...) (e.g. `FR*transit(...)`) is not yet supported; \
+                 use it as a standalone additive input rate"
+                    .to_string(),
+            );
+        }
+
+        let mut n_slot = None;
+        let mut mtt_slot = None;
+        for part in split_args_on_commas(&inner) {
+            let (name, val) = part.split_once('=').ok_or_else(|| {
+                format!(
+                    "[odes]: transit(...) arguments must be `name=parameter`, got `{}`",
+                    part.trim()
+                )
+            })?;
+            let (name, val) = (name.trim(), val.trim());
+            match name {
+                "n" => n_slot = Some(resolve_slot(val, "n")?),
+                "mtt" => mtt_slot = Some(resolve_slot(val, "mtt")?),
+                other => {
+                    return Err(format!(
+                        "[odes]: transit(...) has no argument `{other}` (expected `n` and `mtt`)"
+                    ))
+                }
+            }
+        }
+        let n_slot = n_slot.ok_or("[odes]: transit(...) missing required argument `n`")?;
+        let mtt_slot = mtt_slot.ok_or("[odes]: transit(...) missing required argument `mtt`")?;
+
+        forcings.push(InputRateForcing {
+            cmt,
+            kind: InputRateKind::Transit,
+            arg_slots: vec![n_slot, mtt_slot],
+        });
+
+        let new_line = format!("{}0{}", &raw[..start], &raw[end..]);
+        if find_word_call(&new_line, "transit").is_some() {
+            return Err("[odes]: at most one transit(...) per d/dt equation (Phase 0)".to_string());
+        }
+        cleaned.push(new_line);
+    }
+    Ok((cleaned, forcings))
+}
+
 fn build_ode_spec(
     lines: &[String],
     state_names: &[String],
@@ -4420,6 +4605,16 @@ fn build_ode_spec(
             rhs_lines.push(raw.clone());
         }
     }
+
+    // Design A: pull built-in input-rate calls (transit(...)) out of each d/dt RHS
+    // into forcing terms before expression parsing, so they never enter the
+    // expression AST / bytecode / symbolic-AD core (each call is rewritten to `0`).
+    let (rhs_lines, input_rate) = extract_input_rate_terms(
+        &rhs_lines,
+        state_names,
+        indiv_param_names,
+        indiv_param_slots,
+    )?;
 
     // For ODE RHS expressions, states + individual params get injected into the
     // `vars` map at eval time, so every bare identifier should resolve to a
@@ -4875,9 +5070,9 @@ fn build_ode_spec(
         // Default tolerances; overwritten from [fit_options] / settings by
         // CompiledModel::sync_ode_solver_opts once fit options are merged.
         solver_opts: crate::ode::OdeSolverOptions::default(),
-        // Populated by the [odes] input-rate parse-split (transit() etc.); empty
-        // until that lands — no built-in absorption forcing for existing models.
-        input_rate: Vec::new(),
+        // Built-in absorption forcing terms split out of the [odes] RHS above
+        // (design A); empty for models with no transit()/etc. input-rate call.
+        input_rate,
     })
 }
 
@@ -9062,6 +9257,65 @@ fn parse_if_statement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── transit() input-rate parse-split (#322, design A) ────────────────────
+    #[test]
+    fn extract_transit_input_rate_basic() {
+        let lines = vec![
+            "d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot".to_string(),
+            "d/dt(central) = KA*depot - (CL/V)*central".to_string(),
+        ];
+        let states = vec!["depot".to_string(), "central".to_string()];
+        let names = vec![
+            "NTR".to_string(),
+            "MTT".to_string(),
+            "KA".to_string(),
+            "CL".to_string(),
+            "V".to_string(),
+        ];
+        let slots = vec![10, 11, 4, 0, 1];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        // transit(...) replaced by 0; the rest of the RHS is untouched.
+        assert_eq!(cleaned[0], "d/dt(depot) = 0 - KA*depot");
+        assert_eq!(cleaned[1], "d/dt(central) = KA*depot - (CL/V)*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].cmt, 0); // depot
+        assert!(matches!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::Transit
+        ));
+        assert_eq!(forcings[0].arg_slots, vec![10, 11]); // [n=NTR slot, mtt=MTT slot]
+    }
+
+    #[test]
+    fn extract_transit_input_rate_rejects_bad_specs() {
+        let states = vec!["depot".to_string()];
+        let names = vec!["NTR".to_string(), "MTT".to_string()];
+        let slots = vec![0, 1];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=ZZZ)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        assert!(go("d/dt(depot) = transit(n=NTR, foo=MTT)")
+            .unwrap_err()
+            .contains("no argument `foo`"));
+        assert!(go("d/dt(depot) = transit(n=NTR)")
+            .unwrap_err()
+            .contains("missing required argument `mtt`"));
+        assert!(go("x = transit(n=NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("d/dt"));
+        assert!(go("d/dt(depot) = FR*transit(n=NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("scaled"));
+        // No transit() → unchanged, no forcings.
+        let (cleaned, f) = go("d/dt(depot) = -KA*depot").unwrap();
+        assert_eq!(cleaned[0], "d/dt(depot) = -KA*depot");
+        assert!(f.is_empty());
+    }
 
     // Issue #176 retired the split `*_iv_bolus` / `*_infusion` model names
     // in favour of a single `*_iv` per compartment count. The parser must
