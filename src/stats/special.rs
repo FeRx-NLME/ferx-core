@@ -14,6 +14,8 @@ const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 /// Smallest probability retained before taking `ln`. Prevents `-inf` contamination
 /// of the likelihood when a BLOQ observation lies many SDs above the prediction.
 const MIN_PROB: f64 = 1e-300;
+/// ½·ln(2π) — the constant term of the Lanczos `ln_gamma` formula.
+const HALF_LN_2PI: f64 = 0.918_938_533_204_672_74;
 
 /// Abramowitz & Stegun 7.1.26 — max error ~1.5e-7 over the whole real line.
 /// Entirely polynomial in t = 1/(1 + p*|x|) and exp(-x²), so Enzyme-safe.
@@ -111,7 +113,7 @@ pub fn ln_gamma(x: f64) -> f64 {
         a += c / (x + i as f64);
     }
     let t = x + G + 0.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
+    HALF_LN_2PI + (x + 0.5) * t.ln() - t + a.ln()
 }
 
 #[cfg(test)]
