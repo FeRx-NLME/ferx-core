@@ -2,7 +2,8 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap, not yet implemented. Multi-PR / phased.
+**Status:** approved roadmap. Prerequisite #324 safety net (PR #326) **merged 2026-06-14**;
+remaining models not yet implemented. Multi-PR / phased.
 
 ---
 
@@ -58,9 +59,9 @@ now-closed #282). In NONMEM, coded `RATE` is *parameter-driven*, not data-column
 **duration** is modeled (`D1` in `$PK`). Neither reads a data column; duration is the more
 commonly estimated of the two. #324 is scoped to:
 
-- **#324 safety net (PR #326)** — reject coded/malformed `RATE` (`-1`, `-2`, other negatives,
-  non-finite) on a dose row instead of silently treating it as an IV bolus (today's bug).
-  Ships first, standalone.
+- **#324 safety net (PR #326) — ✅ MERGED 2026-06-14.** Rejects coded/malformed `RATE` (`-1`,
+  `-2`, other negatives, non-finite) on a dose row instead of silently treating it as a bolus
+  (the original bug). Shipped standalone.
 - **#324 faithful support** — `RATE=-1` = rate modeled via an `R1`-style `.ferx` DSL
   parameter; `RATE=-2` = duration modeled via a `D1`-style DSL parameter. Both
   runtime/parameter-driven; **no `DURATION` data column**.
@@ -361,8 +362,8 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 
 ## Phasing (one PR each)
 
-- **Prerequisite — issue #324 (NONMEM coded `RATE`), standalone first.** Ship the safety net
-  first (reject coded/malformed `RATE` instead of a silent IV bolus; PR #326). Faithful
+- **Prerequisite — issue #324 (NONMEM coded `RATE`), standalone first.** Safety net **✅ MERGED**
+  (PR #326, 2026-06-14: rejects coded/malformed `RATE` instead of a silent bolus). Faithful
   support follows as a parameter-driven DSL feature: `RATE=-1` = rate modeled (`R1`-style),
   `RATE=-2` = duration modeled (`D1`-style) — **no `DURATION` data column**. The
   `RATE=-2`/`D1` modeled-duration path establishes the estimated-duration forcing that this
