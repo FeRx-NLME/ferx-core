@@ -19,9 +19,12 @@ and forces the user to do math the engine should do.
 The goal is to compute these **in Rust** as first-class, user-friendly built-ins, with
 **robust handling of edge cases (no happy-path-only code)**. The named anchors are
 **Savic 2007** (transit) and **Freijer & Post** (convection–dispersion ⇒ inverse-Gaussian
-density input). This plan adds a new `[absorption]` block that selects a built-in
-absorption model whose input rate `R_in(t)` is computed analytically in Rust and routed
-into the existing disposition machinery.
+density input). The mechanism is a set of **built-in input-rate functions** (`transit`,
+`igd`, `weibull`, `zero_order`) exposed two ways (see "DSL surface"): **Layer 1** — callable
+directly in the `[odes]` RHS so the user writes the ODE explicitly (Ron's proposal:
+`d/dt(depot) = transit(NTR, MTT) - KA*depot`), and **Layer 2** — an optional `[absorption]`
+block that, on an analytical `pk` model, uses a closed form where one exists and otherwise
+desugars to the Layer-1 ODE with a clear warning.
 
 This is a **large, multi-PR feature**; the plan is phased so each model lands with its own
 tests, NONMEM anchor, and docs.
@@ -81,11 +84,50 @@ Decision: ship #324's Phase 0 safety net first (independently valuable); its `D1
 modeled-duration path establishes the estimated-duration forcing this plan's Phase 2 then
 reuses. Phase 0/1 of this plan can start in parallel, since they don't depend on it.
 
-## DSL surface (decided: new `[absorption]` block)
+## DSL surface — two layers over one set of input-rate functions
 
-Disposition stays on the `pk` line; absorption moves to its own block, mirroring
-`[odes]`/`[error_model]`. Parameters reference names declared in
-`[individual_parameters]` (exactly like `cl=CL` on the pk line):
+The absorption math lives in **built-in input-rate functions** — `transit(n, mtt)`,
+`igd(mat, cv2)` (inverse-Gaussian / Freijer & Post), `weibull(td, beta)`,
+`zero_order(dur)`. They are the single source of truth, exposed two ways.
+
+### Layer 1 — input-rate functions in `[odes]` (Ron's proposal; transparent foundation)
+
+The user writes the ODE explicitly and calls the built-in for the input rate — keeping full
+control of the compartment structure and *seeing* that it is an ODE — but without
+hand-coding the Stirling gamma density:
+
+```
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = transit(NTR, MTT) - KA*depot
+  d/dt(central) = KA*depot - (CL/V)*central
+```
+
+`transit(NTR, MTT)` returns the Savic transit-chain appearance rate into that compartment,
+evaluated by the engine from time-after-dose and the dose amount (×F), superposed over doses
+— the same dose context the infusion RHS-wrapper already carries. `igd(...)`, `weibull(...)`,
+`zero_order(...)` behave identically. Multi-pathway / parallel absorption is just additional
+RHS terms (`transit(...) + igd(...)`) — no new grammar. This is the natural home for the
+inherently-numerical models (Weibull, IG, continuous-N transit) and satisfies Ron's
+transparency ask directly.
+
+Two implementation notes: **(i)** these are **engine intrinsics**, not pure expressions — the
+`[odes]` evaluator must hand them the dose schedule, amount, F, and time-after-dose (extend
+the expression evaluator plus the dose context the RHS-wrapper already holds). **(ii) Dose
+routing:** when a compartment's RHS contains an input-rate function, the dose *feeds that
+function* (it is the chain input) and must **not** also enter as a bolus into the same
+compartment — define and test this rule explicitly (it is the classic Savic "dose into the
+virtual transit, not the depot" subtlety).
+
+### Layer 2 — `[absorption]` block (optional convenience; desugars to Layer 1 / closed forms)
+
+A one-liner on an analytical disposition for users who don't want to write the ODE. It
+selects the input model declaratively; the engine uses a **closed form where one exists**
+(see "Which models stay analytical") and otherwise auto-builds the equivalent Layer-1 ODE,
+emitting `W_ABSORPTION_NUMERICAL`. Parameters reference `[individual_parameters]` names
+(like `cl=CL` on the pk line):
 
 ```
 [structural_model]
@@ -266,11 +308,13 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   `RATE=-2`/`D1` modeled-duration path establishes the estimated-duration forcing that this
   plan's Phase 2 zero-order family reuses. Independent of this plan's Phase 0/1, which can
   start in parallel.
-- **Phase 0 — engine + Savic transit.** `[absorption]` grammar, `AbsorptionSpec`, generic
-  input-fn trait, the **closed-form-vs-numerical dispatch**, the `W_ABSORPTION_NUMERICAL`
-  warning, and `[absorption]`-on-both-engines (analytical `pk` + `ode(...)`). Ship transit on
-  the numerical fallback first (with `ln_gamma`), anchored against the existing `transit_2cpt`
-  dataset and a NONMEM Savic run. Proves the architecture end-to-end.
+- **Phase 0 — `transit()` input-rate function (Layer 1 first).** Implement the built-in
+  `transit(n, mtt)` intrinsic callable in `[odes]` (Ron's proposal): the input-rate
+  evaluator, dose-context wiring, the dose-routing rule (dose feeds the function, not a
+  bolus), and `ln_gamma`. Anchor against the existing `transit_2cpt` dataset and a NONMEM
+  Savic run — this proves the transparent path end-to-end. The optional `[absorption]` block
+  (Layer 2), the closed-form-vs-numerical dispatch, and the `W_ABSORPTION_NUMERICAL` warning
+  land here or as a Layer-2 follow-up (see Open questions).
 - **Phase 1 — inverse-Gaussian (Freijer & Post).** Single + sum-of-two IG; **numerical**
   (no closed form). Anchor vs the Freijer & Post paper / a NONMEM `$DES` IG run.
 - **Phase 2 — Weibull + zero-order + sequential + parallel + mixed.** Round out the
@@ -309,6 +353,16 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 - Per-PR `--features ci` (FD) verifies the FD gradient path; the `--features autodiff` job
   (#281 cadence) verifies the AD path. Mass-balance and the AD≡FD gradient-agreement test are
   the fast regression backstop and the bridge between the two.
+
+## Open questions
+
+- **Keep Layer 2 (`[absorption]` block) at all, or ship Layer-1 functions only?** Ron's
+  proposal is just the `[odes]` input-rate functions (fully transparent, composable, no
+  silent ODE). The block adds convenience but also the closed-form dispatch + warning
+  machinery. Decision pending: ship Layer 1 first (Phase 0), then decide whether Layer 2
+  earns its complexity once Layer 1 is in users' hands.
+- **`transit()` argument form** — `transit(n, mtt)` (explicit, recommended) vs `transit(n)`
+  reading a conventional `MTT`/`KTR` param. Explicit args avoid magic.
 
 ## Open risks
 
