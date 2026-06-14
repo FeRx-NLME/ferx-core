@@ -20,6 +20,9 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Example `dose_rate.ferx` (+ `data/dose_rate.csv`) demonstrating the supported
+  NONMEM `RATE` dosing forms — a bolus (`RATE=0`) and a constant-rate infusion
+  (`RATE>0`) mixed in one dataset (#324).
 - Propensity-score-matched simulation: `simulate_with_options()` with a new
   `SimulateOptions { seed, propensity_match }`. When `propensity_match` is set,
   each replicate's drawn etas are reassigned to subjects by optimal Mahalanobis

@@ -232,6 +232,10 @@ positive `RATE` (= `AMT` ÷ infusion duration) before importing. Note that this
 is **not** a `DURATION` data column — NONMEM's `-1`/`-2` are driven by `$PK`
 parameters, not a separate column.
 
+A runnable demo of the supported forms — a bolus (`RATE=0`) and a constant-rate
+infusion (`RATE>0`) mixed in one dataset — is in `examples/dose_rate.ferx`
+(data: `data/dose_rate.csv`).
+
 ## Steady-State Dosing
 
 For steady-state simulations, set `SS=1` and `II` to the dosing interval:
