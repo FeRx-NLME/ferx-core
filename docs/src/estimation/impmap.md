@@ -122,6 +122,25 @@ cross-engine margin. This comparison is asserted by the gated
 companion `impmap_converges_to_focei_on_warfarin` test checks agreement with
 ferx's own FOCEI.
 
+## Multi-start MAP (`impmap_mceta`)
+
+In high-dimensional models (e.g. FREM with many covariates, ≥ 5 ETAs) the
+per-subject MAP optimization can converge to a local mode, degrading
+importance-sampling efficiency (low ESS) and biasing the M-step. The
+`impmap_mceta` option (analogous to NONMEM `MCETA`) adds random starting
+points drawn from N(0, Ω) and keeps the start with the lowest individual NLL:
+
+```
+[fit_options]
+  method        = impmap
+  impmap_mceta  = 3       # 1 warm-start + 3 random starts per subject
+```
+
+The default is `0` (single warm-start, matching previous behaviour).
+`impmap_mceta = 3` is a good choice for FREM models. The cost is roughly
+`(1 + mceta) ×` the MAP step per iteration, but since E-step B (IS draws)
+dominates, the total wall-time increase is typically 15–40%.
+
 ## Cost
 
 Per iteration ≈ one MAP inner loop (parallel over subjects) plus

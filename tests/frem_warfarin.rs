@@ -95,6 +95,7 @@ fn setup_frem(dir: &Path) -> FremPrepareResult {
         None, // no categoricals
         None, // default output model path
         None, // default output data path
+        None, // default missing value (-99)
     )
     .expect("prepare_frem should succeed")
 }
@@ -375,4 +376,200 @@ fn frem_saem_does_not_collapse_pk_residual_error() {
         "FREM PK PROP_ERR ({frem_prop:.4}) should be ~ base ({base_prop:.4}); ratio {ratio:.2} \
          — a collapse toward 0 indicates covariate rows are scored with the PK error model"
     );
+}
+
+/// IMPMAP with `impmap_mceta = 3` runs to completion on a FREM model and
+/// produces a finite OFV. This exercises the multi-start MAP helper
+/// (`run_map_multistart`) in a high-dimensional setting (5 ETAs).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn frem_impmap_mceta_produces_finite_ofv() {
+    let tmp = tempfile::tempdir().unwrap();
+    let frem = setup_frem(tmp.path());
+    let model = parse_model_file(&frem.model_path).unwrap();
+    let pop = read_nonmem_csv(&frem.data_path, None, None).unwrap();
+
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Impmap;
+    opts.impmap_iterations = 20;
+    opts.impmap_samples = 50;
+    opts.impmap_mceta = 3;
+    opts.impmap_seed = Some(42);
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+
+    let result =
+        fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP+MCETA fit should succeed");
+    assert!(
+        result.ofv.is_finite(),
+        "OFV should be finite, got {}",
+        result.ofv
+    );
+}
+
+/// Cross-method comparison on the 5-ETA FREM warfarin model: FOCEI, SAEM,
+/// IMPMAP (mceta=0), IMPMAP (mceta=3).  Prints a comparison table.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn frem_estimation_method_comparison() {
+    let tmp = tempfile::tempdir().unwrap();
+    let frem = setup_frem(tmp.path());
+    let model = parse_model_file(&frem.model_path).unwrap();
+    let pop = read_nonmem_csv(&frem.data_path, None, None).unwrap();
+
+    // Expected sample variances (the FREM ground truth for covariate omegas).
+    let wt_var_expected = 111.56;
+    let age_var_expected = 99.38;
+
+    struct MethodResult {
+        name: String,
+        ofv: f64,
+        theta: Vec<f64>,
+        omega_diag: Vec<f64>,
+        sigma: Vec<f64>,
+    }
+
+    let mut results: Vec<MethodResult> = Vec::new();
+
+    // ---- FOCEI ----
+    {
+        let mut opts = FitOptions::default();
+        opts.method = ferx_core::EstimationMethod::FoceI;
+        opts.outer_maxiter = 300;
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        let r = fit(&model, &pop, &model.default_params, &opts).expect("FOCEI fit should succeed");
+        let n = r.omega.nrows();
+        results.push(MethodResult {
+            name: "FOCEI".to_string(),
+            ofv: r.ofv,
+            theta: r.theta.clone(),
+            omega_diag: (0..n).map(|i| r.omega[(i, i)]).collect(),
+            sigma: r.sigma.clone(),
+        });
+    }
+
+    // ---- SAEM ----
+    {
+        let mut opts = FitOptions::default();
+        opts.method = ferx_core::EstimationMethod::Saem;
+        opts.saem_n_exploration = 500;
+        opts.saem_n_convergence = 800;
+        opts.saem_seed = Some(20260614);
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        let r = fit(&model, &pop, &model.default_params, &opts).expect("SAEM fit should succeed");
+        let n = r.omega.nrows();
+        results.push(MethodResult {
+            name: "SAEM".to_string(),
+            ofv: r.ofv,
+            theta: r.theta.clone(),
+            omega_diag: (0..n).map(|i| r.omega[(i, i)]).collect(),
+            sigma: r.sigma.clone(),
+        });
+    }
+
+    // ---- IMPMAP (mceta=0) ----
+    {
+        let mut opts = FitOptions::default();
+        opts.method = ferx_core::EstimationMethod::Impmap;
+        opts.impmap_iterations = 200;
+        opts.impmap_samples = 300;
+        opts.impmap_mceta = 0;
+        opts.impmap_seed = Some(12345);
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        let r = fit(&model, &pop, &model.default_params, &opts)
+            .expect("IMPMAP mceta=0 fit should succeed");
+        let n = r.omega.nrows();
+        results.push(MethodResult {
+            name: "IMPMAP".to_string(),
+            ofv: r.ofv,
+            theta: r.theta.clone(),
+            omega_diag: (0..n).map(|i| r.omega[(i, i)]).collect(),
+            sigma: r.sigma.clone(),
+        });
+    }
+
+    // ---- IMPMAP (mceta=3) ----
+    {
+        let mut opts = FitOptions::default();
+        opts.method = ferx_core::EstimationMethod::Impmap;
+        opts.impmap_iterations = 200;
+        opts.impmap_samples = 300;
+        opts.impmap_mceta = 3;
+        opts.impmap_seed = Some(12345);
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        let r = fit(&model, &pop, &model.default_params, &opts)
+            .expect("IMPMAP mceta=3 fit should succeed");
+        let n = r.omega.nrows();
+        results.push(MethodResult {
+            name: "IMPMAP+MCETA3".to_string(),
+            ofv: r.ofv,
+            theta: r.theta.clone(),
+            omega_diag: (0..n).map(|i| r.omega[(i, i)]).collect(),
+            sigma: r.sigma.clone(),
+        });
+    }
+
+    // ---- Print comparison table ----
+    let theta_names = ["TVCL", "TVV", "TVKA"];
+    let omega_names = ["w2_CL", "w2_V", "w2_KA", "w2_WT", "w2_AGE"];
+
+    eprintln!("\n=== FREM Warfarin Estimation Method Comparison (5 ETAs, 10 subjects) ===\n");
+    eprint!("{:<16}", "Parameter");
+    for r in &results {
+        eprint!("{:>16}", r.name);
+    }
+    eprintln!();
+    eprintln!("{}", "-".repeat(16 + 16 * results.len()));
+
+    // OFV
+    eprint!("{:<16}", "OFV");
+    for r in &results {
+        eprint!("{:>16.2}", r.ofv);
+    }
+    eprintln!();
+
+    // Thetas (first 3 only, 4-5 are FIX)
+    for (i, name) in theta_names.iter().enumerate() {
+        eprint!("{:<16}", name);
+        for r in &results {
+            eprint!("{:>16.4}", r.theta[i]);
+        }
+        eprintln!();
+    }
+
+    // Omega diagonals
+    for (i, name) in omega_names.iter().enumerate() {
+        eprint!("{:<16}", name);
+        for r in &results {
+            eprint!("{:>16.4}", r.omega_diag[i]);
+        }
+        eprintln!();
+    }
+
+    // Sigma
+    eprint!("{:<16}", "sigma_PROP");
+    for r in &results {
+        eprint!("{:>16.6}", r.sigma[0]);
+    }
+    eprintln!();
+
+    eprintln!(
+        "\nExpected covariate variances: WT = {:.2}, AGE = {:.2}",
+        wt_var_expected, age_var_expected
+    );
+
+    // Basic sanity assertions
+    for r in &results {
+        assert!(r.ofv.is_finite(), "{} OFV not finite: {}", r.name, r.ofv);
+    }
 }

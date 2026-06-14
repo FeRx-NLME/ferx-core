@@ -2537,6 +2537,9 @@ pub struct FitOptions {
     /// When `true`, IMPMAP collects per-iteration parameter values into
     /// `FitResult.impmap_trace` (analogous to NONMEM `.ext` output). Default `false`.
     pub impmap_trace: bool,
+    /// Number of additional random starting points for per-subject MAP
+    /// (analogous to NONMEM MCETA). 0 = single start (current behaviour).
+    pub impmap_mceta: usize,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -2743,6 +2746,7 @@ impl Default for FitOptions {
             impmap_averaging: 50,
             impmap_low_ess_threshold: 0.1,
             impmap_trace: false,
+            impmap_mceta: 0,
             bloq_method: BloqMethod::Drop,
             steihaug_max_iters: None,
             mu_referencing: true,
@@ -2983,6 +2987,8 @@ pub fn framework_keys() -> &'static [&'static str] {
         "max_unconverged_frac",
         "min_obs_for_convergence_check",
         "inits_from_nca",
+        "frem_predictions",
+        "frem_sigma",
     ]
 }
 
@@ -3045,6 +3051,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_averaging",
             "impmap_low_ess_threshold",
             "impmap_trace",
+            "impmap_mceta",
         ],
     }
 }

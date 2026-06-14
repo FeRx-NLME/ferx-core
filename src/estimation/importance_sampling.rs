@@ -713,8 +713,22 @@ fn compute_joint_posterior_hessian(
     let kappa_slices: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
     let ipreds = predict_iov(model, subject, theta, eta_hat.as_slice(), &kappa_slices);
 
-    // Compute residual variance
-    let r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    // Compute residual variance with FREM overrides
+    let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma,
+    );
+    if let Some(ref overrides) = frem_ov {
+        for (j, ov) in overrides.iter().enumerate() {
+            if let Some(v) = ov {
+                if j < r_diag.len() {
+                    r_diag[j] = *v;
+                }
+            }
+        }
+    }
 
     // Build the full Jacobian via FD for kappa columns
     // eta columns come from jacobian_eta (already computed by inner loop)
@@ -1123,7 +1137,23 @@ pub(crate) fn compute_posterior_hessian(
     }
     let ipreds =
         compute_predictions_with_tv_into(model, subject, theta, eta_hat.as_slice(), scratch);
-    let r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    // Apply FREM R-diagonal overrides: covariate pseudo-observations use EPSCOV²
+    // instead of the PK error model variance.
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma,
+    );
+    if let Some(ref overrides) = frem_ov {
+        for (j, ov) in overrides.iter().enumerate() {
+            if let Some(v) = ov {
+                if j < r_diag.len() {
+                    r_diag[j] = *v;
+                }
+            }
+        }
+    }
     let mut h_post = omega_inv.clone();
     for j in 0..n_obs {
         let rj = r_diag[j].max(1e-12);

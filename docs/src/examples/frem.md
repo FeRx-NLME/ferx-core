@@ -48,7 +48,7 @@ let frem = prepare_frem(
     &Path::new("warfarin.ferx"),
     &Path::new("warfarin_cov.csv"),
     &[],   // empty filter → all covariates from the [covariates] block
-    None, None, None,
+    None, None, None, None,
 )?;
 
 let result = fit_from_files(

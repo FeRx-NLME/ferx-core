@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `impmap_mceta` fit option: multi-start MAP for IMPMAP (NONMEM `MCETA` equivalent),
+  improving IS efficiency in high-dimensional models (e.g. FREM with ≥5 ETAs).
+- Full off-diagonal omega standard errors for block omega via multivariate delta
+  method on the Cholesky parameterization. `se_omega` is now the full lower
+  triangle (length n_eta*(n_eta+1)/2) instead of diagonal-only. Added
+  `omega_se_at()` helper for indexed lookup.
 - Per-iteration IMPMAP parameter trace (`FitResult.impmap_trace`), analogous to
   NONMEM `.ext` file output. Opt-in via `impmap_trace = true` in `[fit_options]`.
 - FREM (Full Random Effects Model) covariate analysis: `prepare_frem()` API
@@ -102,6 +108,20 @@ section of the SDLC for the versioning policy).
 - `sdtab` no longer emits stray ETA columns (regression from #185).
 - `warfarin --simulate` works again, and the docs `verify-build` step is fixed
   (#199, #200).
+- FREM with `log_additive` error model: covariate pseudo-observation predictions
+  are no longer log-transformed. The FREM override (θ + η) now runs after the
+  LTBS log-transform, producing raw covariate predictions as NONMEM does. Without
+  this fix the OFV was inflated by ~10 orders of magnitude.
+- FREM with IMPMAP/IMP: the IS posterior Hessian now applies the FREM R-diagonal
+  override (EPSCOV² variance) for covariate pseudo-observations, matching the
+  FOCEI and SAEM code paths.
+- `frem_predictions` and `frem_sigma` fit options are now registered as framework
+  keys, suppressing spurious "not used by method" warnings on non-FOCEI chains.
+- FREM data generation: missing covariate values (default -99) are now excluded
+  from mean/variance computation and their pseudo-observation rows are omitted,
+  matching PsN/NONMEM behavior.
+- FREM data generation: records within each subject are now sorted by (time,
+  event priority) to prevent backwards-in-time sequences that NONMEM rejects.
 
 ### Performance
 - The covariance Hessian is built from a central difference of the analytical

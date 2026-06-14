@@ -42,6 +42,19 @@ pub struct FremPrepareResult {
     pub n_total_etas: usize,
 }
 
+/// Information about how a categorical covariate is expanded into indicators.
+#[derive(Debug, Clone)]
+struct CategoricalExpansion {
+    /// Original covariate name (e.g., "RACE").
+    original_name: String,
+    /// Reference level (most frequent; omitted from indicators).
+    _reference_level: f64,
+    /// Non-reference levels, sorted ascending. Each becomes an indicator column.
+    indicator_levels: Vec<f64>,
+    /// Indicator column names (e.g., ["RACE_2", "RACE_3"]).
+    indicator_names: Vec<String>,
+}
+
 /// Transform a dataset for FREM by adding covariate pseudo-observation rows.
 ///
 /// For each subject, inserts one row per covariate with:
@@ -50,13 +63,25 @@ pub struct FremPrepareResult {
 /// - EVID = 0, MDV = 0, AMT = 0
 /// - FREMTYPE = covariate index * 100 (100, 200, 300, ...)
 ///
+/// Categorical covariates with K > 2 levels are automatically binarized into
+/// K-1 indicator variables (matching PsN/NONMEM convention). The most frequent
+/// level is used as the reference. Binary categoricals (K = 2) are kept as-is.
+///
+/// Missing covariate values (default: -99) are handled by:
+/// - Excluding them from population mean/variance computation
+/// - Omitting the pseudo-observation row for that subject/covariate
+/// This matches PsN/NONMEM FREM behaviour where the omega correlation structure
+/// effectively imputes missing covariates.
+///
 /// Returns the augmented CSV content (as a string) and metadata.
 pub fn transform_dataset_for_frem(
     population: &Population,
     base_model: &CompiledModel,
     covariates: &[String],
-    _categorical_covariates: &[String],
+    categorical_covariates: &[String],
+    missing_value: Option<f64>,
 ) -> Result<(String, FremDataInfo), String> {
+    let missing_val = missing_value.unwrap_or(-99.0);
     // Validate covariates exist in the dataset.
     for cov in covariates {
         let found = population
@@ -71,12 +96,102 @@ pub fn transform_dataset_for_frem(
         }
     }
 
-    // Collect covariate values across all subjects for statistics.
-    let n_cov = covariates.len();
-    let mut cov_values: Vec<Vec<f64>> = vec![Vec::new(); n_cov];
+    // ── Categorical expansion ──────────────────────────────────────
+    // For each categorical covariate with K > 2 levels, expand into K-1
+    // indicator variables. Binary (K=2) categoricals are kept as-is.
+    let mut expansions: HashMap<String, CategoricalExpansion> = HashMap::new();
+    for cat_name in categorical_covariates {
+        // Collect unique levels across all subjects, excluding missing values.
+        let mut level_counts: HashMap<i64, usize> = HashMap::new();
+        for subj in &population.subjects {
+            if let Some(&val) = subj.covariates.get(cat_name) {
+                if val.is_finite() && (val - missing_val).abs() > 0.5 {
+                    *level_counts.entry(val as i64).or_insert(0) += 1;
+                }
+            }
+        }
+        let n_levels = level_counts.len();
+        if n_levels <= 2 {
+            continue; // Binary or constant — keep as-is, no expansion needed.
+        }
+
+        // Reference level = most frequent.
+        let reference = *level_counts
+            .iter()
+            .max_by_key(|(_, &count)| count)
+            .unwrap()
+            .0;
+
+        // Non-reference levels, sorted ascending.
+        let mut other_levels: Vec<i64> = level_counts
+            .keys()
+            .copied()
+            .filter(|&l| l != reference)
+            .collect();
+        other_levels.sort();
+
+        let indicator_names: Vec<String> = other_levels
+            .iter()
+            .map(|l| format!("{}_{}", cat_name, l))
+            .collect();
+        let indicator_levels: Vec<f64> = other_levels.iter().map(|&l| l as f64).collect();
+
+        expansions.insert(
+            cat_name.clone(),
+            CategoricalExpansion {
+                original_name: cat_name.clone(),
+                _reference_level: reference as f64,
+                indicator_levels,
+                indicator_names,
+            },
+        );
+    }
+
+    // Build the final expanded covariate list: replace expanded categoricals
+    // with their indicators, keep everything else as-is.
+    let mut expanded_covariates: Vec<String> = Vec::new();
+    for cov in covariates {
+        if let Some(exp) = expansions.get(cov) {
+            expanded_covariates.extend(exp.indicator_names.iter().cloned());
+        } else {
+            expanded_covariates.push(cov.clone());
+        }
+    }
+
+    // Helper: look up the value of an expanded covariate for a subject.
+    // Returns None if the covariate is missing (equals missing_val).
+    let get_expanded_value = |subj: &crate::types::Subject, exp_name: &str| -> Option<f64> {
+        // Check if this is an indicator from an expansion.
+        for exp in expansions.values() {
+            if let Some(pos) = exp.indicator_names.iter().position(|n| n == exp_name) {
+                let original_val = subj.covariates.get(&exp.original_name)?;
+                // If the original categorical is missing, all indicators are missing.
+                if (original_val - missing_val).abs() < 0.5 {
+                    return None;
+                }
+                let level = exp.indicator_levels[pos];
+                return Some(if (*original_val - level).abs() < 0.5 {
+                    1.0
+                } else {
+                    0.0
+                });
+            }
+        }
+        // Not an indicator — look up the original covariate.
+        let val = subj.covariates.get(exp_name).copied()?;
+        if (val - missing_val).abs() < 0.5 {
+            None // Continuous covariate is missing
+        } else {
+            Some(val)
+        }
+    };
+
+    // Collect expanded covariate values across all subjects for statistics.
+    let n_exp = expanded_covariates.len();
+    let mut cov_values: Vec<Vec<f64>> = vec![Vec::new(); n_exp];
     for subject in &population.subjects {
-        for (k, cov_name) in covariates.iter().enumerate() {
-            if let Some(&val) = subject.covariates.get(cov_name) {
+        for (k, exp_name) in expanded_covariates.iter().enumerate() {
+            if let Some(val) = get_expanded_value(subject, exp_name) {
                 if val.is_finite() {
                     cov_values[k].push(val);
                 }
@@ -85,13 +200,13 @@ pub fn transform_dataset_for_frem(
     }
 
     // Compute means and variances.
-    let mut covariate_means = Vec::with_capacity(n_cov);
-    let mut covariate_variances = Vec::with_capacity(n_cov);
+    let mut covariate_means = Vec::with_capacity(n_exp);
+    let mut covariate_variances = Vec::with_capacity(n_exp);
     for (k, vals) in cov_values.iter().enumerate() {
         if vals.is_empty() {
             return Err(format!(
                 "FREM covariate '{}' has no valid (finite) values across subjects",
-                covariates[k]
+                expanded_covariates[k]
             ));
         }
         let n = vals.len() as f64;
@@ -105,15 +220,24 @@ pub fn transform_dataset_for_frem(
         covariate_variances.push(if var > 1e-10 { var } else { 1e-10 }); // guard against zero variance
     }
 
-    // Build FREMTYPE map.
-    let fremtype_map: Vec<(String, u16)> = covariates
+    // Build FREMTYPE map for expanded covariates.
+    let fremtype_map: Vec<(String, u16)> = expanded_covariates
         .iter()
         .enumerate()
         .map(|(k, name)| (name.clone(), (k as u16 + 1) * 100))
         .collect();
 
+    // Collect indicator column names that need to be added to the CSV.
+    let mut indicator_col_names: Vec<String> = Vec::new();
+    for exp in expansions.values() {
+        for name in &exp.indicator_names {
+            indicator_col_names.push(name.clone());
+        }
+    }
+    indicator_col_names.sort(); // deterministic column order
+
     // Build augmented CSV.
-    // Header: ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS,CENS,FREMTYPE,<original_covariates>
+    // Header: ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS,CENS,FREMTYPE,<original_covariates>,<indicator_cols>
     let mut csv = String::new();
     let mut header_parts = vec![
         "ID".to_string(),
@@ -132,13 +256,41 @@ pub fn transform_dataset_for_frem(
     for cov_name in &population.covariate_names {
         header_parts.push(cov_name.clone());
     }
+    for ind_name in &indicator_col_names {
+        header_parts.push(ind_name.clone());
+    }
     csv.push_str(&header_parts.join(","));
     csv.push('\n');
+
+    // Helper to append original + indicator covariate columns for a subject row.
+    let append_cov_columns = |row: &mut Vec<String>, subj: &crate::types::Subject| {
+        for cov_name in &population.covariate_names {
+            row.push(
+                subj.covariates
+                    .get(cov_name)
+                    .map(|v| format!("{}", v))
+                    .unwrap_or_else(|| ".".to_string()),
+            );
+        }
+        for ind_name in &indicator_col_names {
+            row.push(
+                get_expanded_value(subj, ind_name)
+                    .map(|v| format!("{}", v))
+                    .unwrap_or_else(|| ".".to_string()),
+            );
+        }
+    };
 
     for subject in &population.subjects {
         let first_obs_time = subject.obs_times.first().copied().unwrap_or(0.0);
 
-        // Write original dose rows.
+        // Collect all records for this subject, then sort by time.
+        // Each record: (time, evid_priority, row_string)
+        // evid_priority: 0=dose (EVID=1), 1=cov pseudo-obs, 2=PK obs
+        // Within the same time, doses come first, then pseudo-obs, then PK obs.
+        let mut records: Vec<(f64, u8, String)> = Vec::new();
+
+        // Dose rows.
         for dose in &subject.doses {
             let mut row = vec![
                 subject.id.clone(),
@@ -162,26 +314,17 @@ pub fn transform_dataset_for_frem(
                 "0".to_string(), // CENS
                 "0".to_string(), // FREMTYPE
             ];
-            for cov_name in &population.covariate_names {
-                row.push(
-                    subject
-                        .covariates
-                        .get(cov_name)
-                        .map(|v| format!("{}", v))
-                        .unwrap_or_else(|| ".".to_string()),
-                );
-            }
-            csv.push_str(&row.join(","));
-            csv.push('\n');
+            append_cov_columns(&mut row, subject);
+            records.push((dose.time, 0, row.join(",")));
         }
 
-        // Insert covariate pseudo-observation rows (before PK observations).
-        for (k, cov_name) in covariates.iter().enumerate() {
-            let cov_val = subject
-                .covariates
-                .get(cov_name)
-                .copied()
-                .unwrap_or(covariate_means[k]);
+        // Covariate pseudo-observation rows.
+        // Skip pseudo-obs for covariates where the subject has a missing value.
+        for (k, exp_name) in expanded_covariates.iter().enumerate() {
+            let cov_val = match get_expanded_value(subject, exp_name) {
+                Some(v) => v,
+                None => continue, // Missing covariate — omit pseudo-obs row
+            };
             let ft = fremtype_map[k].1;
             let mut row = vec![
                 subject.id.clone(),
@@ -197,20 +340,11 @@ pub fn transform_dataset_for_frem(
                 "0".to_string(), // CENS
                 format!("{}", ft),
             ];
-            for cn in &population.covariate_names {
-                row.push(
-                    subject
-                        .covariates
-                        .get(cn)
-                        .map(|v| format!("{}", v))
-                        .unwrap_or_else(|| ".".to_string()),
-                );
-            }
-            csv.push_str(&row.join(","));
-            csv.push('\n');
+            append_cov_columns(&mut row, subject);
+            records.push((first_obs_time, 1, row.join(",")));
         }
 
-        // Write original observation rows.
+        // Original PK observation rows.
         for (j, (&time, &dv)) in subject
             .obs_times
             .iter()
@@ -233,22 +367,26 @@ pub fn transform_dataset_for_frem(
                 format!("{}", cens_flag), // CENS
                 "0".to_string(),          // FREMTYPE (PK observation)
             ];
-            for cov_name in &population.covariate_names {
-                row.push(
-                    subject
-                        .covariates
-                        .get(cov_name)
-                        .map(|v| format!("{}", v))
-                        .unwrap_or_else(|| ".".to_string()),
-                );
-            }
-            csv.push_str(&row.join(","));
+            append_cov_columns(&mut row, subject);
+            records.push((time, 2, row.join(",")));
+        }
+
+        // Sort by (time, evid_priority) to ensure chronological order.
+        // Within the same time: doses first, then pseudo-obs, then PK obs.
+        records.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+
+        for (_, _, row_str) in &records {
+            csv.push_str(row_str);
             csv.push('\n');
         }
     }
 
     let info = FremDataInfo {
-        covariate_names: covariates.to_vec(),
+        covariate_names: expanded_covariates,
         covariate_means,
         covariate_variances,
         fremtype_map,
@@ -577,6 +715,7 @@ pub fn prepare_frem(
     categorical_covariates: Option<&[String]>,
     output_model_path: Option<&Path>,
     output_data_path: Option<&Path>,
+    missing_value: Option<f64>,
 ) -> Result<FremPrepareResult, String> {
     use crate::io::datareader::read_nonmem_csv;
     use crate::parser::model_parser::parse_full_model_file;
@@ -600,6 +739,7 @@ pub fn prepare_frem(
         base_model,
         &resolved_covariates,
         &resolved_categorical,
+        missing_value,
     )?;
 
     // Determine output paths.
@@ -812,7 +952,7 @@ mod tests {
         let pop = make_test_population();
         let model = make_test_model();
         let covs = vec!["WT".to_string(), "AGE".to_string()];
-        let (csv, info) = transform_dataset_for_frem(&pop, &model, &covs, &[]).unwrap();
+        let (csv, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
 
         // Subject 1: 1 dose + 2 cov obs + 3 PK obs = 6 rows
         // Subject 2: 1 dose + 2 cov obs + 2 PK obs = 5 rows
@@ -828,7 +968,7 @@ mod tests {
         let pop = make_test_population();
         let model = make_test_model();
         let covs = vec!["WT".to_string(), "AGE".to_string()];
-        let (csv, info) = transform_dataset_for_frem(&pop, &model, &covs, &[]).unwrap();
+        let (csv, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
 
         assert_eq!(info.fremtype_map[0], ("WT".to_string(), 100));
         assert_eq!(info.fremtype_map[1], ("AGE".to_string(), 200));
@@ -852,7 +992,7 @@ mod tests {
         let pop = make_test_population();
         let model = make_test_model();
         let covs = vec!["WT".to_string(), "AGE".to_string()];
-        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[]).unwrap();
+        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
 
         // WT: (70 + 80) / 2 = 75
         assert!((info.covariate_means[0] - 75.0).abs() < 1e-10);
@@ -865,7 +1005,7 @@ mod tests {
         let pop = make_test_population();
         let model = make_test_model();
         let covs = vec!["WT".to_string()];
-        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[]).unwrap();
+        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
 
         // WT: var = ((70-75)^2 + (80-75)^2) / (2-1) = 50
         assert!((info.covariate_variances[0] - 50.0).abs() < 1e-10);
@@ -876,7 +1016,7 @@ mod tests {
         let pop = make_test_population();
         let model = make_test_model();
         let covs = vec!["NONEXISTENT".to_string()];
-        let result = transform_dataset_for_frem(&pop, &model, &covs, &[]);
+        let result = transform_dataset_for_frem(&pop, &model, &covs, &[], None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("NONEXISTENT"));
     }
@@ -912,7 +1052,7 @@ mod tests {
         let pop = make_test_population();
         let model = make_test_model();
         let covs = vec!["WT".to_string(), "AGE".to_string()];
-        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[]).unwrap();
+        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
 
         let result = generate_frem_model(base_text, &model, &info, Path::new("test_frem_data.csv"));
         assert!(result.is_ok());
@@ -969,7 +1109,7 @@ mod tests {
         let pop = make_test_population();
         let model = make_test_model();
         let covs = vec!["WT".to_string()];
-        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[]).unwrap();
+        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
 
         let model_text =
             generate_frem_model(base_text, &model, &info, Path::new("test.csv")).unwrap();
@@ -1122,6 +1262,233 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not among the selected"), "got: {err}");
+    }
+
+    fn make_test_population_with_race() -> Population {
+        let mut subjects = Vec::new();
+        // 3 subjects with RACE: 1 (most common), 2, 3
+        for (id, race) in &[("1", 1.0), ("2", 1.0), ("3", 2.0), ("4", 3.0)] {
+            subjects.push(Subject {
+                id: id.to_string(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0],
+                obs_raw_times: vec![1.0],
+                observations: vec![5.0],
+                obs_cmts: vec![1],
+                covariates: {
+                    let mut m = HashMap::new();
+                    m.insert("WT".to_string(), 70.0);
+                    m.insert("RACE".to_string(), *race);
+                    m
+                },
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: Vec::new(),
+            });
+        }
+        Population {
+            subjects,
+            covariate_names: vec!["WT".to_string(), "RACE".to_string()],
+            dv_column: "dv".to_string(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_categorical_binarization_expands_race() {
+        let pop = make_test_population_with_race();
+        let model = make_test_model();
+        let covs = vec!["WT".to_string(), "RACE".to_string()];
+        let cats = vec!["RACE".to_string()];
+        let (csv, info) = transform_dataset_for_frem(&pop, &model, &covs, &cats, None).unwrap();
+
+        // RACE has 3 levels (1,2,3) → expanded to RACE_2, RACE_3.
+        // Final covariates: WT, RACE_2, RACE_3 (3 total, not 2).
+        assert_eq!(info.covariate_names, vec!["WT", "RACE_2", "RACE_3"]);
+        assert_eq!(info.fremtype_map.len(), 3);
+        assert_eq!(info.fremtype_map[0], ("WT".to_string(), 100));
+        assert_eq!(info.fremtype_map[1], ("RACE_2".to_string(), 200));
+        assert_eq!(info.fremtype_map[2], ("RACE_3".to_string(), 300));
+
+        // Check RACE_2 mean: 1 out of 4 subjects has RACE=2 → mean=0.25
+        assert!((info.covariate_means[1] - 0.25).abs() < 1e-10);
+        // Check RACE_3 mean: 1 out of 4 has RACE=3 → mean=0.25
+        assert!((info.covariate_means[2] - 0.25).abs() < 1e-10);
+
+        // CSV should have RACE_2 and RACE_3 indicator columns.
+        let header = csv.lines().next().unwrap();
+        assert!(header.contains("RACE_2"));
+        assert!(header.contains("RACE_3"));
+
+        // Each subject should have 3 pseudo-obs (WT, RACE_2, RACE_3).
+        let ft_col = header.split(',').position(|h| h == "FREMTYPE").unwrap();
+        let dv_col = header.split(',').position(|h| h == "DV").unwrap();
+        let lines: Vec<&str> = csv.lines().collect();
+
+        // Subject 1 (RACE=1): RACE_2 pseudo-obs DV=0, RACE_3 pseudo-obs DV=0
+        // Find subject 1's FREMTYPE=200 row (RACE_2)
+        let subj1_race2 = lines.iter().find(|l| {
+            let parts: Vec<&str> = l.split(',').collect();
+            parts[0] == "1" && parts[ft_col] == "200"
+        });
+        assert!(subj1_race2.is_some());
+        let parts: Vec<&str> = subj1_race2.unwrap().split(',').collect();
+        assert_eq!(parts[dv_col], "0"); // RACE=1 → RACE_2 indicator = 0
+
+        // Subject 3 (RACE=2): RACE_2 pseudo-obs DV=1
+        let subj3_race2 = lines.iter().find(|l| {
+            let parts: Vec<&str> = l.split(',').collect();
+            parts[0] == "3" && parts[ft_col] == "200"
+        });
+        assert!(subj3_race2.is_some());
+        let parts: Vec<&str> = subj3_race2.unwrap().split(',').collect();
+        assert_eq!(parts[dv_col], "1"); // RACE=2 → RACE_2 indicator = 1
+    }
+
+    #[test]
+    fn test_binary_categorical_not_expanded() {
+        // NCI-like binary covariate (levels 0, 1) should NOT be expanded.
+        let mut pop = make_test_population();
+        for (i, subj) in pop.subjects.iter_mut().enumerate() {
+            subj.covariates
+                .insert("NCI".to_string(), if i == 0 { 0.0 } else { 1.0 });
+        }
+        pop.covariate_names.push("NCI".to_string());
+
+        let model = make_test_model();
+        let covs = vec!["WT".to_string(), "NCI".to_string()];
+        let cats = vec!["NCI".to_string()];
+        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &cats, None).unwrap();
+
+        // NCI has only 2 levels → kept as-is, not expanded.
+        assert_eq!(info.covariate_names, vec!["WT", "NCI"]);
+        assert_eq!(info.fremtype_map.len(), 2);
+    }
+
+    #[test]
+    fn test_missing_covariate_values_excluded() {
+        // Subject 1: WT=70, AGE=30, HT=170
+        // Subject 2: WT=80, AGE=40, HT=-99 (missing)
+        let mut pop = make_test_population();
+        for subj in pop.subjects.iter_mut() {
+            if subj.id == "1" {
+                subj.covariates.insert("HT".to_string(), 170.0);
+            } else {
+                subj.covariates.insert("HT".to_string(), -99.0);
+            }
+        }
+        pop.covariate_names.push("HT".to_string());
+
+        let model = make_test_model();
+        let covs = vec!["WT".to_string(), "HT".to_string(), "AGE".to_string()];
+        let (csv, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
+
+        // HT mean should be computed from subject 1 only (170.0), not (170 + (-99)) / 2.
+        let ht_idx = info.covariate_names.iter().position(|n| n == "HT").unwrap();
+        assert!(
+            (info.covariate_means[ht_idx] - 170.0).abs() < 1e-10,
+            "HT mean = {} (expected 170.0)",
+            info.covariate_means[ht_idx]
+        );
+
+        // Subject 2 should NOT have a FREMTYPE=200 (HT) pseudo-obs row.
+        let lines: Vec<&str> = csv.lines().collect();
+        let header = lines[0];
+        let ft_col = header.split(',').position(|h| h == "FREMTYPE").unwrap();
+        let id_col = header.split(',').position(|h| h == "ID").unwrap();
+
+        let subj2_ht = lines.iter().find(|l| {
+            let parts: Vec<&str> = l.split(',').collect();
+            parts[id_col] == "2" && parts[ft_col] == "200"
+        });
+        assert!(
+            subj2_ht.is_none(),
+            "Subject 2 should not have HT pseudo-obs (HT is missing)"
+        );
+
+        // Subject 1 should have the HT pseudo-obs row.
+        let subj1_ht = lines.iter().find(|l| {
+            let parts: Vec<&str> = l.split(',').collect();
+            parts[id_col] == "1" && parts[ft_col] == "200"
+        });
+        assert!(subj1_ht.is_some(), "Subject 1 should have HT pseudo-obs");
+    }
+
+    #[test]
+    fn test_missing_categorical_excluded() {
+        // RACE: subject 1=1, subject 2=-99 (missing), subject 3=2
+        // (Need 3 subjects for a polychotomous test.)
+        let mut pop = make_test_population();
+        // Add a third subject.
+        pop.subjects.push(Subject {
+            id: "3".to_string(),
+            observations: vec![3.0],
+            obs_times: vec![1.0],
+            obs_raw_times: vec![1.0],
+            obs_cmts: vec![1],
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            covariates: {
+                let mut m = HashMap::new();
+                m.insert("WT".to_string(), 90.0);
+                m.insert("AGE".to_string(), 50.0);
+                m.insert("RACE".to_string(), 2.0);
+                m
+            },
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: Vec::new(),
+        });
+        // Subject 1: RACE=1, Subject 2: RACE=-99
+        pop.subjects[0].covariates.insert("RACE".to_string(), 1.0);
+        pop.subjects[1].covariates.insert("RACE".to_string(), -99.0);
+        pop.covariate_names.push("RACE".to_string());
+
+        let model = make_test_model();
+        let covs = vec!["WT".to_string(), "RACE".to_string()];
+        let cats = vec!["RACE".to_string()];
+        let (csv, info) = transform_dataset_for_frem(&pop, &model, &covs, &cats, None).unwrap();
+
+        // RACE has 3 subjects but only 2 valid (1 and 2) → K=2 levels → binary, not expanded.
+        // So "RACE" stays as-is in covariate_names.
+        assert!(
+            info.covariate_names.contains(&"RACE".to_string()),
+            "Binary RACE should not be expanded: {:?}",
+            info.covariate_names
+        );
+
+        // Subject 2 (RACE=-99) should not have a RACE pseudo-obs row.
+        let lines: Vec<&str> = csv.lines().collect();
+        let header = lines[0];
+        let ft_col = header.split(',').position(|h| h == "FREMTYPE").unwrap();
+        let id_col = header.split(',').position(|h| h == "ID").unwrap();
+
+        // RACE is the 2nd covariate → FREMTYPE=200
+        let subj2_race = lines.iter().find(|l| {
+            let parts: Vec<&str> = l.split(',').collect();
+            parts[id_col] == "2" && parts[ft_col] == "200"
+        });
+        assert!(
+            subj2_race.is_none(),
+            "Subject 2 should not have RACE pseudo-obs (missing)"
+        );
     }
 
     #[test]

@@ -50,6 +50,7 @@ let result = prepare_frem(
     None,  // categorical override (None → kinds come from the [covariates] block)
     None,  // default output model path
     None,  // default output data path
+    None,  // missing value indicator (default: -99)
 )?;
 
 // Pass e.g. &["WT".into()] instead of &[] to FREM only a subset of the
@@ -91,7 +92,37 @@ fit <- ferx_fit(frem, method = "saem")   # frem is a ferx_model
 
 - **SAEM** is recommended for FREM models with many covariates, as the large
   block omega can cause convergence difficulties with gradient-based methods.
-- **FOCEI** works well for smaller FREM models (2-3 covariates).
+- **IMPMAP** with `impmap_mceta` is a strong alternative to SAEM for FREM.
+  The multi-start MAP (`impmap_mceta = 3`) helps the per-subject mode search
+  escape local optima in the high-dimensional random-effect space. On larger
+  FREM models (many covariates / ETAs) where the MAP surface has multiple
+  modes, MCETA can dramatically improve importance-sampling efficiency and OFV.
+- **FOCEI** works well for smaller FREM models (2-3 covariates) but can
+  struggle with large block omegas.
+
+### Warfarin FREM comparison (5 ETAs: 3 PK + WT + AGE, 10 subjects)
+
+All methods use default tuning (SAEM: 500+800 iters; IMPMAP: 200 iters,
+K=300). Covariate omega diagonals should approximate sample variances
+(WT: 111.6, AGE: 99.4). OFV is the FOCE-Laplace objective.
+
+| Parameter | FOCEI | SAEM | IMPMAP | IMPMAP+MCETA3 |
+|-----------|------:|-----:|-------:|--------------:|
+| OFV | -177.3 | -220.7 | -220.3 | -220.7 |
+| TVCL | 0.133 | 0.133 | 0.133 | 0.133 |
+| TVV | 7.73 | 7.74 | 7.74 | 7.74 |
+| TVKA | 0.791 | 0.811 | 0.811 | 0.811 |
+| ω²(CL) | 0.026 | 0.029 | 0.029 | 0.029 |
+| ω²(V) | 0.012 | 0.010 | 0.010 | 0.010 |
+| ω²(KA) | 0.351 | 0.336 | 0.336 | 0.336 |
+| ω²(WT) | 135.1 | 106.8 | 106.8 | 106.8 |
+| ω²(AGE) | 95.1 | 93.8 | 93.8 | 93.8 |
+| σ (PROP) | 0.0106 | 0.0105 | 0.0111 | 0.0106 |
+
+FOCEI is ~43 OFV units worse and overestimates the covariate variances,
+while SAEM, IMPMAP, and IMPMAP+MCETA3 all agree closely. On this small model
+(5 ETAs) the MCETA benefit is modest (~0.4 OFV); on larger FREM models with
+many covariates the improvement can be dramatic.
 
 ## Limitations
 

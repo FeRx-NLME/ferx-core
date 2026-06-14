@@ -32,7 +32,7 @@
 //! the same reason `IMP` refuses them. Use SAEM or FOCEI for those.
 
 use crate::estimation::importance_sampling::{compute_posterior_hessian, subject_is_draws};
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::{find_ebe, EbeResult, InnerLoopStats};
 use crate::estimation::outer_optimizer::{
     compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
 };
@@ -41,6 +41,9 @@ use crate::pk::EventPkParams;
 use crate::stats::likelihood::obs_nll_subject_into;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
 /// Floor the free Ω diagonal to keep the proposal/prior positive-definite.
@@ -81,6 +84,93 @@ fn mu_ref_log_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
         }
     }
     pairs
+}
+
+/// Multi-start MAP: for each subject, run `find_ebe` with the warm-start (or
+/// cold-start) and then `mceta` additional random starting points drawn from
+/// N(0, Ω). The start with the lowest NLL wins. When `mceta == 0` this
+/// degrades to a single warm-start — identical to the previous behaviour.
+///
+/// Returns `(eta_hats, h_matrices, stats)`. Kappas are always empty because
+/// IMPMAP refuses IOV models.
+#[allow(clippy::too_many_arguments)]
+fn run_map_multistart(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    inner_maxiter: usize,
+    inner_tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: &[f64],
+    mceta: usize,
+    seed: u64,
+    iteration: usize,
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats) {
+    let n_eta = model.n_eta;
+
+    // Cholesky of Ω for drawing random starts (computed once, outside the
+    // per-subject parallel loop).
+    let omega_chol = if mceta > 0 {
+        params.omega.matrix.clone().cholesky().map(|c| c.l())
+    } else {
+        None
+    };
+
+    let results: Vec<EbeResult> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let warm = prev_etas.map(|pe| pe[i].as_slice());
+            let mu = Some(mu_k);
+
+            // Baseline: warm-start (or cold-start from η = 0).
+            let mut best = find_ebe(model, subject, params, inner_maxiter, inner_tol, warm, mu);
+
+            if let Some(ref l_omega) = omega_chol {
+                // Deterministic per-subject, per-iteration seed, separated from IS draws.
+                let subj_seed = seed
+                    .wrapping_add(i as u64)
+                    .wrapping_add((iteration as u64) << 32)
+                    .wrapping_add(0x4D43_4554_4100u64);
+                let mut rng = StdRng::seed_from_u64(subj_seed);
+
+                for _start in 0..mceta {
+                    // Draw z ~ N(0, I), compute eta_start = L_Ω · z.
+                    let z: Vec<f64> = (0..n_eta)
+                        .map(|_| StandardNormal.sample(&mut rng))
+                        .collect();
+                    let z_dv = DVector::from_vec(z);
+                    let eta_start = l_omega * &z_dv;
+                    let eta_slice: Vec<f64> = eta_start.iter().copied().collect();
+
+                    let candidate = find_ebe(
+                        model,
+                        subject,
+                        params,
+                        inner_maxiter,
+                        inner_tol,
+                        Some(&eta_slice),
+                        mu,
+                    );
+                    if candidate.nll < best.nll {
+                        best = candidate;
+                    }
+                }
+            }
+
+            best
+        })
+        .collect();
+
+    let stats = InnerLoopStats {
+        n_unconverged: results.iter().filter(|r| !r.converged).count(),
+        n_fallback: results.iter().filter(|r| r.used_fallback).count(),
+    };
+    let eta_hats: Vec<DVector<f64>> = results.iter().map(|r| r.eta.clone()).collect();
+    let h_matrices: Vec<DMatrix<f64>> = results.iter().map(|r| r.h_matrix.clone()).collect();
+
+    (eta_hats, h_matrices, stats)
 }
 
 /// Run IMPMAP. `warm_etas`, when supplied by a preceding chain stage, seed the
@@ -148,9 +238,14 @@ pub fn run_impmap(
         } else {
             "normal".to_string()
         };
+        let mceta_msg = if options.impmap_mceta > 0 {
+            format!(", MCETA={}", options.impmap_mceta)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "IMPMAP: {} subjects, {} ETAs, {} iters, K={}/subject, {} proposal, seed={}",
-            n_subjects, n_eta, n_iter, k_samples, prop, seed
+            "IMPMAP: {} subjects, {} ETAs, {} iters, K={}/subject, {} proposal, seed={}{}",
+            n_subjects, n_eta, n_iter, k_samples, prop, seed, mceta_msg
         );
     }
 
@@ -294,15 +389,18 @@ pub fn run_impmap(
 
         // ---- E-step A: MAP recenter (conditional mode + Jacobian) ----
         let mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
-        let (eta_hats, h_matrices, _stats, _kappas) = run_inner_loop_warm(
+        let mceta = options.impmap_mceta;
+        let (eta_hats, h_matrices, _stats) = run_map_multistart(
             model,
             population,
             &params_k,
             options.inner_maxiter,
             options.inner_tol,
             prev_etas.as_deref(),
-            Some(&mu_k),
-            0,
+            &mu_k,
+            mceta,
+            seed,
+            k,
         );
 
         let omega_inv = params_k.omega.inv.clone();
@@ -511,16 +609,19 @@ pub fn run_impmap(
         Some(last_eta_hats.as_slice())
     };
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _stats, final_kappas) = run_inner_loop_warm(
+    let (eta_hats, h_matrices, _stats) = run_map_multistart(
         model,
         population,
         &final_params,
         options.inner_maxiter,
         options.inner_tol,
         warm,
-        Some(&final_mu_k),
-        0,
+        &final_mu_k,
+        options.impmap_mceta,
+        seed,
+        n_iter + 1, // distinct iteration index for final EBEs
     );
+    let final_kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n_subjects];
 
     let ofv = 2.0
         * pop_nll(

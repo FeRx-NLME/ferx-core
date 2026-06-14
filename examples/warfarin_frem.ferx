@@ -8,7 +8,7 @@
 #   - FREMTYPE dispatch via frem_predictions fit option
 #
 # To run from Rust:
-#   let result = prepare_frem(&base_model, &data, &["WT", "AGE"], None, None, None)?;
+#   let result = prepare_frem(&base_model, &data, &["WT", "AGE"], None, None, None, None)?;
 #   let fit = fit_from_files(&result.model_path, &result.data_path, None, None)?;
 #
 # To run from R:

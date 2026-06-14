@@ -3221,6 +3221,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.impmap_low_ess_threshold = v;
         }
         "impmap_trace" => opts.impmap_trace = parse_bool("impmap_trace")?,
+        "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
             opts.bloq_method = match value.to_lowercase().as_str() {
@@ -9084,6 +9085,7 @@ mod tests {
             "impmap_averaging = 30".to_string(),
             "impmap_seed = 77".to_string(),
             "impmap_low_ess_threshold = 0.2".to_string(),
+            "impmap_mceta = 3".to_string(),
             "covariance = false".to_string(),
         ])
         .expect("parse must succeed");
@@ -9094,6 +9096,7 @@ mod tests {
         assert_eq!(opts.impmap_averaging, 30);
         assert_eq!(opts.impmap_seed, Some(77));
         assert_eq!(opts.impmap_low_ess_threshold, 0.2);
+        assert_eq!(opts.impmap_mceta, 3);
         // All keys are method-specific to Impmap and Impmap is selected.
         assert!(opts.unsupported_keys_warnings().is_empty());
 
