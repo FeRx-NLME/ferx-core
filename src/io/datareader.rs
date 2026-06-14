@@ -753,14 +753,14 @@ fn is_dosing_amt(amt: f64) -> bool {
 /// [`DoseEvent::new`].
 ///
 /// NONMEM overloads `RATE` with coded values:
-///   - `0`  → IV bolus
+///   - `0`  → bolus (route set by the dose compartment)
 ///   - `>0` → constant-rate infusion (duration = `AMT/RATE`)
 ///   - `-1` → infusion **rate** is *modeled* (a `$PK` `R1` parameter)
 ///   - `-2` → infusion **duration** is *modeled* (a `$PK` `D1` parameter)
 ///
 /// ferx-core does not yet support the modeled forms (`-1`/`-2`), and previously
 /// fell through to [`DoseEvent::is_infusion`]'s `rate > 0.0` test — silently
-/// turning them into IV boluses (wrong predictions, no warning). Reject them, and
+/// turning them into boluses (wrong predictions, no warning). Reject them, and
 /// any other negative or non-finite `RATE`, with an informative error instead of
 /// producing a silently-wrong dose (#324). A NONMEM dataset that uses `-1`/`-2`
 /// without the matching `R1`/`D1` parameter is likewise an error in NONMEM, so
@@ -789,7 +789,7 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<f64, String> {
     };
     Err(format!(
         "subject {id}, time {time}: {detail} is not yet supported by ferx-core; \
-         it was previously (and silently) treated as an IV bolus. Supply an \
+         it was previously (and silently) treated as a bolus. Supply an \
          explicit positive RATE (= AMT/duration) before importing. Recognised \
          RATE values are 0 (bolus), >0 (rate), -1, -2."
     ))
@@ -1795,7 +1795,7 @@ mod tests {
     // ── NONMEM coded RATE values (#324) ──────────────────────────────────────
     // `RATE` is overloaded: 0 = bolus, >0 = infusion rate, -1 = modeled rate
     // (R1 in $PK), -2 = modeled duration (D1 in $PK). The modeled forms aren't
-    // supported yet and previously fell through to a silent IV bolus. They must
+    // supported yet and previously fell through to a silent bolus. They must
     // now be rejected loudly. `validate_dose_rate` is the unit under test.
 
     #[test]

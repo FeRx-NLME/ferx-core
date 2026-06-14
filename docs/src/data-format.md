@@ -219,14 +219,14 @@ NONMEM overloads the `RATE` column with negative codes that change its meaning:
 
 | `RATE` | NONMEM meaning | ferx-core |
 |--------|----------------|-----------|
-| `0`    | IV bolus | ✅ supported |
+| `0`    | Bolus — route set by the dose compartment | ✅ supported |
 | `> 0`  | Constant-rate infusion (duration = `AMT/RATE`) | ✅ supported |
 | `-1`   | Infusion **rate** is *modeled* — defined by `R1` in `$PK` | ⛔ rejected (error) |
 | `-2`   | Infusion **duration** is *modeled* — defined by `D1` in `$PK` | ⛔ rejected (error) |
 
 The coded forms `-1`/`-2` (and any other negative or non-finite `RATE`) on a
 dose row are rejected with an informative error. Earlier versions silently
-treated them as an IV bolus, producing wrong predictions with no warning (#324).
+treated them as a bolus, producing wrong predictions with no warning (#324).
 Until modeled rate/duration support lands, convert such rows to an explicit
 positive `RATE` (= `AMT` ÷ infusion duration) before importing. Note that this
 is **not** a `DURATION` data column — NONMEM's `-1`/`-2` are driven by `$PK`
