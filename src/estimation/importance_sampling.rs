@@ -37,6 +37,101 @@ use rayon::prelude::*;
 /// `2π` as `f64`.  Used in the Gaussian-prior log-density.
 const TWO_PI: f64 = std::f64::consts::TAU;
 
+// ---------------------------------------------------------------------------
+// Inverse normal CDF (Acklam rational approximation)
+// ---------------------------------------------------------------------------
+
+/// Inverse normal CDF (probit function): given u ∈ (0, 1), returns z such that
+/// Φ(z) = u. Uses the Acklam rational approximation with full f64 precision
+/// (~1.15e-9 relative error over the entire range).
+///
+/// Used to transform uniform Sobol quasi-random points to N(0,1) draws.
+fn inv_normal_cdf(u: f64) -> f64 {
+    let u = u.clamp(1e-15, 1.0 - 1e-15);
+
+    // Acklam (2003) rational approximation coefficients
+    const A: [f64; 6] = [
+        -3.969683028665376e+01,
+        2.209460984245205e+02,
+        -2.759285104469687e+02,
+        1.383577518672690e+02,
+        -3.066479806614716e+01,
+        2.506628277459239e+00,
+    ];
+    const B: [f64; 5] = [
+        -5.447609879822406e+01,
+        1.615858368580409e+02,
+        -1.556989798598866e+02,
+        6.680131188771972e+01,
+        -1.328068155288572e+01,
+    ];
+    const C: [f64; 6] = [
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e+00,
+        -2.549732539343734e+00,
+        4.374664141464968e+00,
+        2.938163982698783e+00,
+    ];
+    const D: [f64; 4] = [
+        7.784695709041462e-03,
+        3.224671290700398e-01,
+        2.445134137142996e+00,
+        3.754408661907416e+00,
+    ];
+
+    const P_LOW: f64 = 0.02425;
+    const P_HIGH: f64 = 1.0 - P_LOW;
+
+    if u < P_LOW {
+        // Lower tail
+        let q = (-2.0 * u.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if u <= P_HIGH {
+        // Central region
+        let q = u - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        // Upper tail (symmetry)
+        let q = (-2.0 * (1.0 - u).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    }
+}
+
+/// Generate `k_samples` quasi-random N(0,1) vectors of dimension `d` using
+/// Sobol sequences with Cranley-Patterson randomization.
+///
+/// Returns a Vec of k_samples vectors, each of length d.
+fn sobol_normal_draws(d: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
+    use sobol::params::JoeKuoD6;
+    use sobol::Sobol;
+
+    // Cranley-Patterson rotation: shift Sobol points by a uniform random vector
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x534F_424F_4C00_0000u64));
+    let shift: Vec<f64> = (0..d).map(|_| rand::Rng::gen::<f64>(&mut rng)).collect();
+
+    let params = JoeKuoD6::minimal(); // supports up to 100 dims
+    let sobol_seq = Sobol::<f64>::new(d, &params);
+
+    sobol_seq
+        .take(k_samples)
+        .map(|point| {
+            point
+                .iter()
+                .zip(shift.iter())
+                .map(|(&u, &s)| {
+                    let u_shifted = (u + s) % 1.0;
+                    inv_normal_cdf(u_shifted)
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Estimate `−2 log L` by importance sampling. See module docstring for the
 /// algorithm and IOV caveats.
 pub fn run_importance_sampling(
@@ -546,6 +641,10 @@ pub(crate) struct SubjectDraws {
 ///
 /// `iscale` scales the proposal standard deviation: Σ_prop = iscale² · H⁻¹.
 /// Use 1.0 for unscaled (default). NONMEM ISCALE range is typically [0.1, 10.0].
+///
+/// `use_sobol`: when `true` **and** the proposal is MVN (ν = ∞), replace
+/// pseudo-random N(0,I) draws with Sobol quasi-random sequences
+/// (Cranley-Patterson randomized).  Falls back to pseudo-random for Student-t.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_is_draws(
     model: &CompiledModel,
@@ -562,6 +661,7 @@ pub(crate) fn subject_is_draws(
     seed: u64,
     scratch: &mut EventPkParams,
     iscale: f64,
+    use_sobol: bool,
 ) -> SubjectDraws {
     let mvn = !nu.is_finite();
     let mut rng = StdRng::seed_from_u64(seed);
@@ -611,9 +711,21 @@ pub(crate) fn subject_is_draws(
     let mut z = vec![0.0_f64; d];
     let mut diff = vec![0.0_f64; d];
 
-    for _ in 0..k_samples {
-        for zi in z.iter_mut() {
-            *zi = normal.sample(&mut rng);
+    // Pre-generate Sobol quasi-random draws if requested and MVN.
+    let sobol_draws = if use_sobol && mvn {
+        Some(sobol_normal_draws(d, k_samples, seed))
+    } else {
+        None
+    };
+
+    for sample_idx in 0..k_samples {
+        if let Some(ref qr) = sobol_draws {
+            // Sobol quasi-random N(0,I) draws (MVN only)
+            z.copy_from_slice(&qr[sample_idx]);
+        } else {
+            for zi in z.iter_mut() {
+                *zi = normal.sample(&mut rng);
+            }
         }
         let scale = match &chi_sq {
             Some(c) => {
@@ -744,6 +856,7 @@ pub(crate) fn find_optimal_iscale(
             pilot_seed,
             scratch,
             scale,
+            false, // pilot draws don't need Sobol
         );
         if draws.ess_fraction > best_ess {
             best_ess = draws.ess_fraction;
@@ -1404,5 +1517,34 @@ mod tests {
         let ess_fraction = ess / (k as f64);
         let var = (1.0 / ess_fraction - 1.0) / (k as f64);
         assert!(var.abs() < 1e-12);
+    }
+
+    #[test]
+    fn inv_normal_cdf_known_quantiles() {
+        // Φ⁻¹(0.5) = 0
+        assert!(inv_normal_cdf(0.5).abs() < 1e-8);
+        // Φ⁻¹(0.975) ≈ 1.96
+        let q975 = inv_normal_cdf(0.975);
+        assert!((q975 - 1.96).abs() < 0.05, "Φ⁻¹(0.975) = {q975}");
+        // Φ⁻¹(0.025) ≈ -1.96
+        let q025 = inv_normal_cdf(0.025);
+        assert!((q025 + 1.96).abs() < 0.05, "Φ⁻¹(0.025) = {q025}");
+        // Φ⁻¹(0.84) ≈ 1.0
+        let q84 = inv_normal_cdf(0.84);
+        assert!((q84 - 1.0).abs() < 0.05, "Φ⁻¹(0.84) = {q84}");
+    }
+
+    #[test]
+    fn sobol_draws_have_correct_shape_and_near_zero_mean() {
+        let d = 5;
+        let k = 1000;
+        let draws = sobol_normal_draws(d, k, 42);
+        assert_eq!(draws.len(), k);
+        assert_eq!(draws[0].len(), d);
+        // Mean of each dimension should be near zero for a large sample
+        for dim in 0..d {
+            let mean: f64 = draws.iter().map(|v| v[dim]).sum::<f64>() / k as f64;
+            assert!(mean.abs() < 0.15, "dim {dim} mean = {mean}, expected ~0");
+        }
     }
 }

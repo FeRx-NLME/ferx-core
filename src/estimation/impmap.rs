@@ -231,6 +231,7 @@ pub fn run_impmap(
     let n_avg = options.impmap_averaging.min(n_iter);
     let seed = options.impmap_seed.unwrap_or(12345);
     let threshold = options.impmap_low_ess_threshold;
+    let use_sobol = options.impmap_sobol && nu.is_infinite();
     let verbose = options.verbose;
     let cancel = &options.cancel;
 
@@ -459,6 +460,7 @@ pub fn run_impmap(
                     subj_seed,
                     scratch,
                     iscale,
+                    use_sobol,
                 )
             })
             .collect();

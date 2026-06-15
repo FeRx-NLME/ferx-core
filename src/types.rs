@@ -2540,6 +2540,9 @@ pub struct FitOptions {
     /// Number of additional random starting points for per-subject MAP
     /// (analogous to NONMEM MCETA). 0 = single start (current behaviour).
     pub impmap_mceta: usize,
+    /// Use Sobol quasi-random sequences for IS draws instead of pseudo-random.
+    /// Only applies to MVN proposals (impmap_proposal_df = normal). Default false.
+    pub impmap_sobol: bool,
     /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
     /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
     /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
@@ -2754,6 +2757,7 @@ impl Default for FitOptions {
             impmap_low_ess_threshold: 0.1,
             impmap_trace: false,
             impmap_mceta: 0,
+            impmap_sobol: false,
             iscale_min: 0.1,
             iscale_max: 10.0,
             bloq_method: BloqMethod::Drop,
@@ -3063,6 +3067,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_low_ess_threshold",
             "impmap_trace",
             "impmap_mceta",
+            "impmap_sobol",
             "iscale_min",
             "iscale_max",
         ],

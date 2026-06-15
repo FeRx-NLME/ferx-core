@@ -28,6 +28,9 @@ section of the SDLC for the versioning policy).
 - `iscale_min` / `iscale_max` fit options: adaptive IS proposal scaling (NONMEM
   `ISCALE_MIN`/`ISCALE_MAX` equivalent). Per-subject pilot search over log-spaced
   scale factors selects the proposal width that maximises ESS. Defaults: 0.1–10.0.
+- `impmap_sobol` fit option: use Sobol quasi-random sequences (with Cranley-Patterson
+  randomization) for IMPMAP IS draws instead of pseudo-random, giving more uniform
+  coverage of the posterior. MVN proposals only; Student-t falls back to pseudo-random.
 - Full off-diagonal omega standard errors for block omega via multivariate delta
   method on the Cholesky parameterization. `se_omega` is now the full lower
   triangle (length n_eta*(n_eta+1)/2) instead of diagonal-only. Added
