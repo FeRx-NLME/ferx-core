@@ -522,8 +522,11 @@ pub(crate) struct SubjectDraws {
     pub log_marginal: f64,
     /// Normalized effective sample size ESS/K (proposal-quality diagnostic).
     pub ess_fraction: f64,
-    /// The `K` sampled η vectors (each length `d`).
-    pub etas: Vec<Vec<f64>>,
+    /// The `K` sampled η vectors stored row-major in one flat buffer of length
+    /// `K·d` (sample `k` is `etas[k*d..(k+1)*d]`). A single allocation per subject
+    /// instead of `K` small `Vec`s — at K=500 this is the hot allocation in the
+    /// E-step. Iterate with `etas.chunks_exact(d)`.
+    pub etas: Vec<f64>,
     /// Self-normalized importance weights `w̃ᵢₖ` (length `K`, sums to 1).
     pub weights: Vec<f64>,
     /// Weighted posterior mean `Σₖ w̃ᵢₖ ηᵢₖ` (length `d`) — drives the closed-form
@@ -570,6 +573,7 @@ pub(crate) fn subject_is_draws(
                 etas: Vec::new(),
                 weights: Vec::new(),
                 mean: vec![0.0; d],
+                // (early-return on a non-PD proposal; no samples retained)
                 second_moment: DMatrix::zeros(d, d),
             };
         }
@@ -595,11 +599,13 @@ pub(crate) fn subject_is_draws(
     };
 
     let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
-    let mut etas: Vec<Vec<f64>> = Vec::with_capacity(k_samples);
+    // One flat buffer for all K retained samples (row-major, K·d). Filled in
+    // place per sample — no per-sample allocation.
+    let mut etas: Vec<f64> = vec![0.0_f64; k_samples * d];
     let mut z = vec![0.0_f64; d];
     let mut diff = vec![0.0_f64; d];
 
-    for _ in 0..k_samples {
+    for k in 0..k_samples {
         for zi in z.iter_mut() {
             *zi = normal.sample(&mut rng);
         }
@@ -610,13 +616,14 @@ pub(crate) fn subject_is_draws(
             }
             None => 1.0,
         };
-        let mut eta_sample = vec![0.0_f64; d];
-        proposal.apply_l_sigma(&z, &mut eta_sample, scale);
+        let eta_sample = &mut etas[k * d..(k + 1) * d];
+        proposal.apply_l_sigma(&z, eta_sample, scale);
         for (j, e) in eta_sample.iter_mut().enumerate() {
             *e += eta_hat[j];
         }
+        let eta_sample: &[f64] = eta_sample;
 
-        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &eta_sample, scratch);
+        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, eta_sample, scratch);
         let log_p_y = -obs_nll;
 
         let mut quad_form = 0.0_f64;
@@ -629,8 +636,8 @@ pub(crate) fn subject_is_draws(
         }
         let log_p_eta = log_p_eta_const - 0.5 * quad_form;
 
-        for (k, d_slot) in diff.iter_mut().enumerate() {
-            *d_slot = eta_sample[k] - eta_hat[k];
+        for (j, d_slot) in diff.iter_mut().enumerate() {
+            *d_slot = eta_sample[j] - eta_hat[j];
         }
         let mahal = proposal.mahalanobis(&diff);
         let log_q = if mvn {
@@ -640,7 +647,6 @@ pub(crate) fn subject_is_draws(
         };
 
         log_w.push(log_p_y + log_p_eta - log_q);
-        etas.push(eta_sample);
     }
 
     let (lse, weights) = logsumexp_with_normalised(&log_w);
@@ -658,7 +664,7 @@ pub(crate) fn subject_is_draws(
     // Weighted first and second moments Σₖ w̃ₖ ηₖ and Σₖ w̃ₖ ηₖ ηₖᵀ.
     let mut mean = vec![0.0_f64; d];
     let mut second_moment = DMatrix::<f64>::zeros(d, d);
-    for (w, eta) in weights.iter().zip(etas.iter()) {
+    for (w, eta) in weights.iter().zip(etas.chunks_exact(d)) {
         for i in 0..d {
             mean[i] += w * eta[i];
             for j in 0..d {

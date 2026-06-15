@@ -6,6 +6,7 @@
 /// Two-phase step-size schedule (Monolix convention):
 ///   Phase 1 (exploration, k ≤ K1):  γₖ = 1          — rapid basin convergence
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
+use crate::estimation::em_common::{floor_omega_diagonal, get_mu_ref_pairs, OMEGA_DIAG_FLOOR};
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
     compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
@@ -39,15 +40,6 @@ pub(crate) const MSTEP_NLOPT_ALGORITHM: nlopt::Algorithm = nlopt::Algorithm::Bob
 // SAEM state
 // ---------------------------------------------------------------------------
 
-/// Positive-definite floor for free BSV Ω diagonals in the M-step.
-///
-/// Larger than the IOV floor (1e-8) because the BSV MH proposal scale is
-/// `step_scale · chol(Ω)`: if a diagonal is allowed near zero the proposal for
-/// that η collapses and the chain can no longer move it, so Ω must stay large
-/// enough to keep the random walk alive. 1e-6 keeps a free η explorable while
-/// being far below any plausible estimated variance.
-const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
-
 /// Target acceptance rate for the componentwise (1-D) eta kernel. The optimal
 /// scaling result for single-coordinate random-walk Metropolis is ≈0.44
 /// (Roberts & Rosenthal 2001), higher than the block kernel's 0.40 target.
@@ -60,18 +52,6 @@ const CW_TARGET_ACCEPT: f64 = 0.44;
 /// rank-1 collapse feedback. In the convergence phase the cap is lifted and Ω
 /// uses the full decaying γ = 1/(k−k1), the same Robbins-Monro schedule as θ.
 const OMEGA_SA_MAX_STEP: f64 = 0.1;
-
-/// Raise every *free* diagonal entry of the BSV Ω that has fallen below `floor`
-/// up to `floor`. FIX-ed diagonals (`omega_fixed[i] == true`) are left untouched
-/// — they carry the user's declared variance and must not be perturbed.
-fn floor_omega_diagonal(omega_mat: &mut DMatrix<f64>, omega_fixed: &[bool], floor: f64) {
-    for i in 0..omega_mat.nrows() {
-        let fixed = omega_fixed.get(i).copied().unwrap_or(false);
-        if !fixed && omega_mat[(i, i)] < floor {
-            omega_mat[(i, i)] = floor;
-        }
-    }
-}
 
 struct SaemState {
     /// Per-subject current ETAs
@@ -995,34 +975,6 @@ fn obs_nll_sum_iov(
         .sum()
 }
 
-/// Build (theta_idx, eta_idx) pairs for log-transformed mu-references only.
-///
-/// Only `log_transformed = true` mu-refs (patterns `THETA*exp(ETA)` and
-/// `exp(log(THETA)+ETA)`) participate in the gradient-step M-step.  For these
-/// the chain rule gives `d/d_log(theta) = -Σᵢ d/d_eta`, which matches the
-/// update applied in the SAEM loop.  Additive mu-refs (`THETA + ETA`,
-/// `log_transformed = false`) require the extra factor of `theta` from the
-/// log-space chain rule and are deliberately excluded — they fall through to
-/// the regular NLopt M-step.
-fn get_mu_ref_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
-    for (eta_idx, eta_name) in model.eta_names.iter().enumerate() {
-        if let Some(mu_ref) = model.mu_refs.get(eta_name) {
-            if !mu_ref.log_transformed {
-                continue;
-            }
-            if let Some(theta_idx) = model
-                .theta_names
-                .iter()
-                .position(|n| n == &mu_ref.theta_name)
-            {
-                pairs.push((theta_idx, eta_idx));
-            }
-        }
-    }
-    pairs
-}
-
 /// One-line description of the SAEM E-step sampler kernel, for the startup
 /// banner. SAEM's estimation is sampling-based (not gradient-driven), so the
 /// banner reports the kernel here instead of a gradient route. HMC is used
@@ -1397,7 +1349,7 @@ pub fn run_saem(
             // diagonal is shared across subjects) rather than per subject inside
             // the parallel kernel. Floored to match the Ω diagonal floor.
             let cw_sd: Vec<f64> = (0..n_eta)
-                .map(|j| omega_k.matrix[(j, j)].max(SAEM_OMEGA_DIAG_FLOOR).sqrt())
+                .map(|j| omega_k.matrix[(j, j)].max(OMEGA_DIAG_FLOOR).sqrt())
                 .collect();
             let cw_sd_ref = &cw_sd;
             // For IOV models, eta proposals must target p(η | κ, θ, data):
@@ -1662,7 +1614,7 @@ pub fn run_saem(
             floor_omega_diagonal(
                 &mut state.omega_mat,
                 &init_params.omega_fixed,
-                SAEM_OMEGA_DIAG_FLOOR,
+                OMEGA_DIAG_FLOOR,
             );
 
             // ---- Step 3b: Omega_iov (analytic, IOV only) ----
@@ -2172,87 +2124,8 @@ mod tests {
         m
     }
 
-    #[test]
-    fn floor_omega_diagonal_floors_free_entries_only() {
-        // Three etas: a free near-zero diagonal (should be floored), a free
-        // healthy diagonal (untouched), and a FIX-ed near-zero diagonal (kept).
-        let mut omega = DMatrix::<f64>::zeros(3, 3);
-        omega[(0, 0)] = 1e-9; // free, below floor → raised
-        omega[(1, 1)] = 0.2; // free, above floor → unchanged
-        omega[(2, 2)] = 1e-9; // FIX-ed, below floor → preserved
-                              // an off-diagonal that must not be touched by the diagonal floor
-        omega[(0, 1)] = 0.01;
-        omega[(1, 0)] = 0.01;
-
-        let omega_fixed = vec![false, false, true];
-        floor_omega_diagonal(&mut omega, &omega_fixed, 1e-6);
-
-        assert_eq!(
-            omega[(0, 0)],
-            1e-6,
-            "free near-zero diagonal must be floored"
-        );
-        assert_eq!(
-            omega[(1, 1)],
-            0.2,
-            "healthy free diagonal must be unchanged"
-        );
-        assert_eq!(
-            omega[(2, 2)],
-            1e-9,
-            "FIX-ed diagonal must be left exactly as declared"
-        );
-        assert_eq!(omega[(0, 1)], 0.01, "off-diagonals must not be touched");
-    }
-
-    #[test]
-    fn floor_omega_diagonal_treats_missing_fixed_flags_as_free() {
-        // `omega_fixed` shorter than the matrix: missing entries default to free.
-        let mut omega = DMatrix::<f64>::zeros(2, 2);
-        omega[(0, 0)] = 1e-9;
-        omega[(1, 1)] = 1e-9;
-        floor_omega_diagonal(&mut omega, &[], 1e-6);
-        assert_eq!(omega[(0, 0)], 1e-6);
-        assert_eq!(omega[(1, 1)], 1e-6);
-    }
-
-    #[test]
-    fn get_mu_ref_pairs_empty_when_no_mu_refs() {
-        let m = analytical_model(GradientMethod::Auto);
-        assert!(get_mu_ref_pairs(&m).is_empty());
-    }
-
-    #[test]
-    fn get_mu_ref_pairs_returns_log_transformed_pair() {
-        let m = model_with_mu_refs(
-            &["CL", "V"],
-            &["ETA_CL", "ETA_V"],
-            &[("ETA_CL", "CL", true), ("ETA_V", "V", true)],
-        );
-        let mut pairs = get_mu_ref_pairs(&m);
-        pairs.sort();
-        assert_eq!(pairs, vec![(0, 0), (1, 1)]);
-    }
-
-    #[test]
-    fn get_mu_ref_pairs_excludes_additive_mu_refs() {
-        // ETA_CL is lognormal (THETA*exp(ETA)) — included.
-        // ETA_V is additive (THETA+ETA) — excluded because the gradient-step
-        // chain rule used in run_saem assumes log-transformed parameters.
-        let m = model_with_mu_refs(
-            &["CL", "V"],
-            &["ETA_CL", "ETA_V"],
-            &[("ETA_CL", "CL", true), ("ETA_V", "V", false)],
-        );
-        assert_eq!(get_mu_ref_pairs(&m), vec![(0, 0)]);
-    }
-
-    #[test]
-    fn get_mu_ref_pairs_skips_orphaned_theta() {
-        // mu_ref points at a theta name that doesn't exist — silently skipped.
-        let m = model_with_mu_refs(&["CL"], &["ETA_CL"], &[("ETA_CL", "MISSING", true)]);
-        assert!(get_mu_ref_pairs(&m).is_empty());
-    }
+    // `floor_omega_diagonal` and `get_mu_ref_pairs` are tested in
+    // `estimation::em_common` (their canonical home, shared with IMPMAP).
 
     // ---- Regression tests for the three SAEM correctness bugs ----
 

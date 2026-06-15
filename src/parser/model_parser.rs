@@ -3337,7 +3337,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "impmap_proposal_df" => {
             // `normal` / `mvn` (or a very large df) select a multivariate-normal
             // proposal — NONMEM's IMPMAP default. A finite value gives Student-t.
-            let tok = value.trim().trim_matches(|c| c == '"' || c == '\'');
+            let tok = value.trim_matches(|c| c == '"' || c == '\'');
             if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
                 opts.impmap_proposal_df = f64::INFINITY;
             } else {

@@ -31,6 +31,7 @@
 //! such models are refused up front. SDE / `[diffusion]` models are refused for
 //! the same reason `IMP` refuses them. Use SAEM or FOCEI for those.
 
+use crate::estimation::em_common::{floor_omega_diagonal, get_mu_ref_pairs, OMEGA_DIAG_FLOOR};
 use crate::estimation::importance_sampling::{compute_posterior_hessian, subject_is_draws};
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
@@ -42,46 +43,6 @@ use crate::stats::likelihood::obs_nll_subject_into;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
-
-/// Floor the free Ω diagonal to keep the proposal/prior positive-definite.
-/// Mirrors SAEM's `floor_omega_diagonal`: FIX-ed diagonals are left untouched.
-fn floor_omega_diagonal(omega_mat: &mut DMatrix<f64>, omega_fixed: &[bool], floor: f64) {
-    for i in 0..omega_mat.nrows() {
-        if omega_fixed.get(i).copied().unwrap_or(false) {
-            continue;
-        }
-        if omega_mat[(i, i)] < floor {
-            omega_mat[(i, i)] = floor;
-        }
-    }
-}
-
-/// Positive-definite floor for free Ω diagonals (matches the SAEM constant).
-const OMEGA_DIAG_FLOOR: f64 = 1e-6;
-
-/// Log-transformed mu-referencing pairs `(theta_idx, eta_idx)`. For these the
-/// typical value satisfies `log(P_i) = log(θ) + η_i`, so the EM M-step shifts
-/// `log(θ) += mean(η)` in closed form — without it θ and the η mean are
-/// confounded and the variance Ω absorbs the misfit instead. Mirrors SAEM's
-/// `get_mu_ref_pairs`.
-fn mu_ref_log_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
-    for (eta_idx, eta_name) in model.eta_names.iter().enumerate() {
-        if let Some(mu_ref) = model.mu_refs.get(eta_name) {
-            if !mu_ref.log_transformed {
-                continue;
-            }
-            if let Some(theta_idx) = model
-                .theta_names
-                .iter()
-                .position(|n| n == &mu_ref.theta_name)
-            {
-                pairs.push((theta_idx, eta_idx));
-            }
-        }
-    }
-    pairs
-}
 
 /// Run IMPMAP. `warm_etas`, when supplied by a preceding chain stage, seed the
 /// first MAP inner loop; otherwise the inner loop cold-starts from η = 0.
@@ -225,7 +186,7 @@ pub fn run_impmap(
     // governs inner-loop `compute_mu_k` centering, a separate concern). NONMEM's
     // EM methods likewise require mu-referencing.
     let mut warnings: Vec<String> = Vec::new();
-    let mu_ref_pairs = mu_ref_log_pairs(model);
+    let mu_ref_pairs = get_mu_ref_pairs(model);
     let use_closed_form = !mu_ref_pairs.is_empty();
     if !use_closed_form {
         // No log-mu-ref parameter: every typical value goes through the weighted
@@ -251,7 +212,30 @@ pub fn run_impmap(
     let mut acc_omega = DMatrix::<f64>::zeros(n_eta, n_eta);
     let mut n_acc = 0usize;
 
-    let mut last_eta_hats: Vec<DVector<f64>> = Vec::new();
+    // Reusable per-iteration parameter bundle. Only `theta`, `sigma.values`, and
+    // `omega` change between iterations; the invariant metadata (names, bounds,
+    // fixed masks) is cloned once here and left untouched, instead of rebuilding
+    // the full struct every iteration.
+    let mut params_k = ModelParameters {
+        theta: theta_cur.clone(),
+        theta_names: init_params.theta_names.clone(),
+        theta_lower: init_params.theta_lower.clone(),
+        theta_upper: init_params.theta_upper.clone(),
+        theta_fixed: init_params.theta_fixed.clone(),
+        omega: OmegaMatrix::from_matrix(
+            omega_mat.clone(),
+            init_params.omega.eta_names.clone(),
+            init_params.omega.diagonal,
+        ),
+        omega_fixed: init_params.omega_fixed.clone(),
+        sigma: SigmaVector {
+            values: sigma_cur.clone(),
+            names: init_params.sigma.names.clone(),
+        },
+        sigma_fixed: init_params.sigma_fixed.clone(),
+        omega_iov: None,
+        kappa_fixed: init_params.kappa_fixed.clone(),
+    };
 
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
@@ -261,28 +245,15 @@ pub fn run_impmap(
             break;
         }
 
-        // Assemble current params for the inner loop / E-step.
-        let omega_k = OmegaMatrix::from_matrix(
+        // Refresh only the three mutated pieces for this iteration (the rest of
+        // `params_k` is invariant — see its construction above).
+        params_k.theta.clone_from(&theta_cur);
+        params_k.sigma.values.clone_from(&sigma_cur);
+        params_k.omega = OmegaMatrix::from_matrix(
             omega_mat.clone(),
             init_params.omega.eta_names.clone(),
             init_params.omega.diagonal,
         );
-        let params_k = ModelParameters {
-            theta: theta_cur.clone(),
-            theta_names: init_params.theta_names.clone(),
-            theta_lower: init_params.theta_lower.clone(),
-            theta_upper: init_params.theta_upper.clone(),
-            theta_fixed: init_params.theta_fixed.clone(),
-            omega: omega_k,
-            omega_fixed: init_params.omega_fixed.clone(),
-            sigma: SigmaVector {
-                values: sigma_cur.clone(),
-                names: init_params.sigma.names.clone(),
-            },
-            sigma_fixed: init_params.sigma_fixed.clone(),
-            omega_iov: None,
-            kappa_fixed: init_params.kappa_fixed.clone(),
-        };
 
         // ---- E-step A: MAP recenter (conditional mode + Jacobian) ----
         let mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
@@ -426,8 +397,8 @@ pub fn run_impmap(
         sigma_cur = log_sigma.iter().map(|&s| s.exp()).collect();
 
         // Warm-start next iteration's inner loop from this iteration's modes.
-        prev_etas = Some(eta_hats.clone());
-        last_eta_hats = eta_hats;
+        // `prev_etas` also carries the final modes out for the post-loop EBE pass.
+        prev_etas = Some(eta_hats);
 
         // ---- Parameter averaging over the final n_avg iterations ----
         if k > n_iter - n_avg {
@@ -463,34 +434,21 @@ pub fn run_impmap(
         (theta_cur.clone(), sigma_cur.clone(), omega_mat.clone())
     };
 
-    let final_omega = OmegaMatrix::from_matrix(
+    // Reuse the per-iteration bundle for the final params — only the three
+    // mutated pieces differ from the invariant metadata already in `params_k`.
+    let mut final_params = params_k;
+    final_params.theta = final_theta;
+    final_params.sigma.values = final_sigma;
+    final_params.omega = OmegaMatrix::from_matrix(
         final_omega_mat,
         init_params.omega.eta_names.clone(),
         init_params.omega.diagonal,
     );
-    let final_params = ModelParameters {
-        theta: final_theta,
-        theta_names: init_params.theta_names.clone(),
-        theta_lower: init_params.theta_lower.clone(),
-        theta_upper: init_params.theta_upper.clone(),
-        theta_fixed: init_params.theta_fixed.clone(),
-        omega: final_omega,
-        omega_fixed: init_params.omega_fixed.clone(),
-        sigma: SigmaVector {
-            values: final_sigma,
-            names: init_params.sigma.names.clone(),
-        },
-        sigma_fixed: init_params.sigma_fixed.clone(),
-        omega_iov: None,
-        kappa_fixed: init_params.kappa_fixed.clone(),
-    };
 
     // ---- Final EBEs (warm-started) + FOCE Laplace OFV for comparability ----
-    let warm = if last_eta_hats.is_empty() {
-        None
-    } else {
-        Some(last_eta_hats.as_slice())
-    };
+    // `prev_etas` holds the final iteration's modes (or the caller's warm start
+    // if `n_iter == 0` never ran the body).
+    let warm = prev_etas.as_deref();
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
     let (eta_hats, h_matrices, _stats, final_kappas) = run_inner_loop_warm(
         model,
@@ -640,7 +598,7 @@ fn theta_sigma_weighted_mstep(
             .zip(draws.par_iter())
             .map_init(EventPkParams::default, |scratch, (subject, d)| {
                 let mut s = 0.0f64;
-                for (w, eta) in d.weights.iter().zip(d.etas.iter()) {
+                for (w, eta) in d.weights.iter().zip(d.etas.chunks_exact(model.n_eta)) {
                     if *w == 0.0 {
                         continue;
                     }
