@@ -72,10 +72,18 @@ jobs:
   survival:
     name: Survival (TTE)
     runs-on: ubuntu-latest
+    # Override the global nightly: this job builds `--features ci,survival`
+    # (autodiff OFF), so it needs no nightly-only code (`feature(autodiff)` in
+    # src/lib.rs is the crate's only nightly attr). Stable's rustc version is
+    # stable for ~6 weeks vs nightly's daily bump, so the instrumented cache
+    # (keyed on rustc version) stays warm instead of cold-rebuilding the whole
+    # dep graph under coverage RUSTFLAGS every run.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
-      - name: Install nightly toolchain
-        run: rustup toolchain install nightly --profile minimal -c llvm-tools-preview
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal -c llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -134,13 +142,17 @@ jobs:
         run: cargo fmt -- --check
 
   coverage:
-    name: Coverage (full, nightly)
+    name: Coverage (full)
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Stable, not nightly: builds `--features ci,slow-tests` (autodiff OFF) so no
+    # nightly-only code. Keeps the instrumented `ci-slow` cache warm. See survival.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
-      - name: Install nightly toolchain
-        run: rustup toolchain install nightly --profile minimal -c llvm-tools-preview
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal -c llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -180,10 +192,15 @@ jobs:
     permissions:
       contents: read
       pull-requests: write # for the below-floor nudge comment
+    # Stable, not nightly: builds `--features ci` (autodiff OFF) so no
+    # nightly-only code. Keeps the instrumented `ci-cov` cache warm across runs
+    # (stable rustc bumps ~6-weekly vs nightly daily). See the survival job.
+    env:
+      RUSTUP_TOOLCHAIN: stable
     steps:
       - uses: actions/checkout@v6
-      - name: Install nightly toolchain
-        run: rustup toolchain install nightly --profile minimal -c llvm-tools-preview
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal -c llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
         with:
