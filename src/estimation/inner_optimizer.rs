@@ -266,9 +266,12 @@ pub(crate) fn resolve_gradient_method(
         // propagator — both the single-snapshot superposition (`ad_gradients`)
         // and the event-driven (`event_driven_ad`) path — is bolus-only. They
         // inject `amt` into the depot and ignore the infusion rate, whereas the
-        // analytical value path (`event_driven::propagate_with_bounds`) applies
-        // the zero-order input. Differentiating that mismatch yields a gradient
-        // inconsistent with the objective, so route these subjects to FD.
+        // analytical value path applies the central zero-order input
+        // (`event_driven::propagate_*_oral` now carry it; the superposition path
+        // models it as a depot-bypassing IV-into-central infusion). Differentiating
+        // that mismatch yields a gradient inconsistent with the objective, so
+        // route these subjects to FD. (When the AD oral kernels learn the infusion
+        // input — tracked with #281 autodiff CI — this guard can narrow.)
         if is_oral_model(model.pk_model) && subject.doses.iter().any(|d| d.rate > 0.0) {
             return InnerGradientMethod::Fd;
         }

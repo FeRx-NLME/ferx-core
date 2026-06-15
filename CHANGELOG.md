@@ -134,6 +134,16 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- Infusion (zero-order, `RATE>0`) doses into the central compartment of an
+  **oral** model are no longer silently dropped on the event-driven analytical
+  path. The oral propagators ignored the infusion input rate, so a depot-bypass
+  infusion produced ~0 concentration for any subject routed through the
+  event-driven path (time-varying covariates, EVID=3/4 resets, or IOV) — while
+  no-covariate subjects (superposition path) got the correct curve. The oral
+  propagators now carry the central zero-order input by linear superposition,
+  matching the superposition path and NONMEM. (Infusion into an oral *depot*
+  compartment, `cmt=1`, remains an explicit error rather than silently bypassing
+  the depot.)
 - NONMEM coded `RATE` values (`-1` = modeled rate, `-2` = modeled duration) — and
   any other negative or non-finite `RATE` on a dose row — are now rejected with an
   informative error naming the subject and time, instead of being silently treated
