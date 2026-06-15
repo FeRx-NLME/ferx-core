@@ -238,6 +238,11 @@ fn assigned_vars_in_order(stmts: &[Statement]) -> Vec<String> {
 /// Branch-local helpers (e.g. `SCALE = ...` inside an `if` body) are
 /// intentionally excluded: including them would corrupt the AD inner loop
 /// by placing the helper in a PK slot (typically overwriting CL at slot 0).
+///
+/// These names are *always* individual parameters. `indiv_var_names` is this
+/// set plus the subset of all-branch-assigned names that a downstream block
+/// actually consumes (see `unconditionally_assigned_vars` and the call site in
+/// `parse_full_model`, issue #357).
 fn top_level_assigned_vars(stmts: &[Statement]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for s in stmts {
@@ -248,6 +253,109 @@ fn top_level_assigned_vars(stmts: &[Statement]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Variable names that are *unconditionally* defined by the end of the block:
+/// every top-level assignment, PLUS any name assigned on EVERY branch of an
+/// `if`/`else` (recursively). Such a name has a definite value on all code
+/// paths, so it *can* be a genuine individual parameter — unlike a branch-local
+/// helper assigned in only some branches.
+///
+/// This is a SUPERSET of `top_level_assigned_vars`. The all-branch extras are
+/// only promoted to actual individual parameters at the call site when a
+/// downstream block consumes them (issue #357) — promoting *every* such name
+/// would slot throwaway intermediates into the PK array (silently hijacking the
+/// reserved F/lagtime slots, aliasing the CL slot in `pk_indices`, or
+/// exhausting the 16-slot layout). See `parse_full_model`.
+///
+/// Motivating case: a PK parameter written only inside symmetric `if`/`else`
+/// branches (the natural NONMEM-style `IF (cond) CL = ...` / `IF (!cond) CL =
+/// ...` construction) must still get a PK slot, be written back by
+/// `pk_param_fn`, and be visible to the `[odes]` RHS name resolver — but only
+/// because `[odes]` references it.
+///
+/// First-occurrence order, deduplicated. An `if` with no `else`, or one where
+/// some branch omits the name, does NOT contribute that name — it could be
+/// undefined on the missing path, so it stays branch-local (matching
+/// `top_level_assigned_vars` for that case).
+fn unconditionally_assigned_vars(stmts: &[Statement]) -> Vec<String> {
+    // `unconditional_names_in` already deduplicates (its `push` closure), so no
+    // second pass is needed here.
+    unconditional_names_in(stmts)
+}
+
+/// Recursive worker for `unconditionally_assigned_vars`. Returns the names
+/// definitely assigned within `stmts`, in first-occurrence order: top-level
+/// `Assign`s, plus the intersection of unconditional names across all branches
+/// of any `if`/`else` (requires an `else`; the intersection preserves the
+/// order in which names first appear in the leading branch).
+fn unconditional_names_in(stmts: &[Statement]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |name: &str, out: &mut Vec<String>| {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    };
+    for s in stmts {
+        match s {
+            Statement::Assign(name, _) => push(name, &mut out),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                // Without an `else`, no name is guaranteed across all paths.
+                if let Some(eb) = else_body {
+                    let mut sets: Vec<Vec<String>> =
+                        branches.iter().map(|(_, b)| unconditional_names_in(b)).collect();
+                    sets.push(unconditional_names_in(eb));
+                    if let Some((first, rest)) = sets.split_first() {
+                        for name in first {
+                            if rest.iter().all(|s| s.iter().any(|n| n == name)) {
+                                push(name, &mut out);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Collect every identifier-like token (`[A-Za-z_][A-Za-z0-9_]*`) appearing in
+/// `lines`, upper-cased, into `out`. Used to decide whether an all-branch
+/// individual parameter is actually *consumed* by a downstream block (issue
+/// #357): such a name is promoted to a PK-slotted individual parameter only if
+/// some block outside `[individual_parameters]` references it. A purely
+/// internal helper (used only to compute another param within
+/// `[individual_parameters]`) stays branch-local, preserving the pre-#357
+/// behaviour and avoiding spurious PK-slot allocation / reserved-slot hijack.
+///
+/// Deliberately crude (lexical, case-folded, no scope awareness): a false
+/// positive only over-promotes a name that genuinely appears downstream — the
+/// safe direction. Keywords / state names that happen to collide are harmless;
+/// they would only matter if the user *also* named an individual parameter
+/// identically, in which case promoting it is correct anyway. Matched
+/// case-insensitively to mirror the ODE/analytical name resolvers, which alias
+/// both cases.
+fn collect_referenced_identifiers(lines: &[String], out: &mut std::collections::HashSet<String>) {
+    for line in lines {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'_' || bytes[i].is_ascii_alphabetic() {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                    i += 1;
+                }
+                out.insert(line[start..i].to_ascii_uppercase());
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Union of eta indices touched by every assignment to `var_name` anywhere in
@@ -930,12 +1038,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // full set registered as defined_vars so any in-block reference (forward
     // or backward) resolves as Variable rather than Covariate.
     //
-    // `indiv_var_names` contains only TOP-LEVEL assignments — these are the
-    // individual parameters that map to PK slots and the TV output vector.
-    // Branch-local helpers (assigned only inside if-bodies) are intentionally
-    // excluded to prevent them from corrupting the AD inner-loop slot layout.
-    // The ParseCtx still receives the full set (via assigned_vars_in_order) so
-    // branch-local names parse as Variable rather than Covariate.
+    // `indiv_var_names` — the names that map to PK slots and the TV output
+    // vector. Two tiers (issue #357):
+    //   1. Every top-level assignment is always an individual parameter.
+    //   2. A name assigned on *all* branches of an if/else is promoted ONLY
+    //      when a downstream block ([odes], [structural_model], [scaling],
+    //      [derived]) actually references it — i.e. it is consumed as a PK
+    //      parameter. This is what makes the NONMEM-style `IF (cond) CL = ...`
+    //      / `IF (!cond) CL = ...` construction work: CL appears in [odes], so
+    //      it earns a slot, is written back by pk_param_fn, and resolves in the
+    //      ODE RHS.
+    // Promoting *every* all-branch name (the naive fix) would slot throwaway
+    // intermediates into the PK array — silently hijacking the reserved
+    // F/lagtime slots, aliasing the CL slot in pk_indices, or exhausting the
+    // 16-slot layout. So a branch-only helper used purely to compute another
+    // param stays branch-local. The ParseCtx still receives the full set (via
+    // assigned_vars_in_order) so such helpers parse as Variable, not Covariate.
     let indiv_text = indiv_lines.join("\n");
     // NN-output lookup table for `TYPICAL_PK.CL`-style dot-access in
     // [individual_parameters]. Always present (empty when no [covariate_nn]
@@ -955,7 +1073,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let bare_ctx = ParseCtx::new(&theta_names, &eta_names, &[]).with_nn_specs(&nn_specs_for_ctx);
     let pre_stmts = parse_block_statements(&indiv_text, bare_ctx, StatementMode::Plain)?;
     let all_assigned = assigned_vars_in_order(&pre_stmts);
-    let indiv_var_names = top_level_assigned_vars(&pre_stmts);
+    // Tier 1 (always) + tier 2 (all-branch names referenced downstream). See
+    // the comment above for the rationale behind the downstream-consumption gate.
+    let top_level_names = top_level_assigned_vars(&pre_stmts);
+    let mut downstream_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for key in ["odes", "structural_model", "scaling", "derived"] {
+        if let Some(lines) = blocks.get(key) {
+            collect_referenced_identifiers(lines, &mut downstream_refs);
+        }
+    }
+    let indiv_var_names: Vec<String> = unconditionally_assigned_vars(&pre_stmts)
+        .into_iter()
+        .filter(|n| {
+            top_level_names.iter().any(|t| t == n)
+                || downstream_refs.contains(&n.to_ascii_uppercase())
+        })
+        .collect();
     let indiv_ctx =
         ParseCtx::new(&theta_names, &eta_names, &all_assigned).with_nn_specs(&nn_specs_for_ctx);
     let indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
@@ -8237,9 +8370,18 @@ fn simplify_expr(expr: &Expression) -> Expression {
 #[allow(dead_code)] // no runtime consumer after #145; see struct doc.
 pub struct IndivParamPartials {
     /// Indiv-param names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
-    /// `[individual_parameters]` source-declaration order. Equals the
-    /// top-level `Assign(name, _)` order, matching
-    /// `CompiledModel.indiv_param_names`.
+    /// `[individual_parameters]` source-declaration order — one row per
+    /// top-level `Assign(name, _)`.
+    ///
+    /// CAUTION (issue #357): this is a *subset* of
+    /// `CompiledModel.indiv_param_names`, not a positional twin. A parameter
+    /// assigned only inside `if`/`else` branches and promoted because a
+    /// downstream block references it (e.g. a conditional `CL`) appears in
+    /// `indiv_param_names` but has NO row here — `build_indiv_param_partials`
+    /// skips `Statement::If`, and a piecewise param has no single symbolic
+    /// partial anyway (the AD inner loop falls back to FD; see the `eta_map`
+    /// note in `parse_full_model`). A future AD consumer MUST look partials up
+    /// by name, never zip them positionally against `indiv_param_names`.
     pub(crate) names: Vec<String>,
     /// `d_d_theta[i][k]` = ∂P_i/∂θ_k. Inner Vec length = `n_theta_base`
     /// (user-declared θ count, NOT including NN-weight or diffusion θ which
@@ -13019,6 +13161,67 @@ if (1 > 0) {
         let all = assigned_vars_in_order(&stmts);
         assert!(all.contains(&"SCALE".to_string()));
         assert!(all.contains(&"V".to_string()));
+    }
+
+    #[test]
+    fn test_unconditionally_assigned_vars_includes_all_branch_assignments() {
+        // V is assigned on BOTH branches → unconditionally defined → promoted.
+        // SCALE is assigned in only one branch → branch-local → excluded.
+        // (Issue #357: a param written on every branch must earn a PK slot.)
+        let block = "
+CL = 1.0
+if (1 > 0) {
+  SCALE = 2.0
+  V = SCALE * 3.0
+} else {
+  V = 4.0
+}
+";
+        let ctx = empty_ctx();
+        let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+        let uncond = unconditionally_assigned_vars(&stmts);
+        assert_eq!(
+            uncond,
+            vec!["CL", "V"],
+            "V is assigned on every branch and must be promoted; SCALE must not"
+        );
+        // top_level still excludes V (its only assignments are inside branches).
+        let top = top_level_assigned_vars(&stmts);
+        assert_eq!(top, vec!["CL"]);
+    }
+
+    #[test]
+    fn test_unconditionally_assigned_vars_branch_only_param() {
+        // The exact issue #357 shape: CL assigned only inside if/else, V at
+        // top level. CL must come first (leading-branch order), then V.
+        let block = "
+if (WT > 70) {
+  CL = TVCL * 1.5
+} else {
+  CL = TVCL
+}
+V = TVV
+";
+        let ctx = empty_ctx();
+        let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+        let uncond = unconditionally_assigned_vars(&stmts);
+        assert_eq!(uncond, vec!["CL", "V"]);
+    }
+
+    #[test]
+    fn test_unconditionally_assigned_vars_if_without_else_excludes() {
+        // No `else` → the name could be undefined on the fall-through path, so
+        // it stays branch-local (not promoted).
+        let block = "
+CL = 1.0
+if (WT > 70) {
+  V = 2.0
+}
+";
+        let ctx = empty_ctx();
+        let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+        let uncond = unconditionally_assigned_vars(&stmts);
+        assert_eq!(uncond, vec!["CL"], "V lacks an else branch — not unconditional");
     }
 
     #[test]

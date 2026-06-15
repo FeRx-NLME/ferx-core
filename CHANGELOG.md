@@ -167,6 +167,15 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- An individual parameter assigned only inside symmetric `if`/`else` branches in
+  `[individual_parameters]` (the NONMEM-style `IF (cond) CL = ...` /
+  `IF (!cond) CL = ...` construction) on an **ODE model** is no longer rejected
+  by the `[odes]` RHS validator as an undefined name. A name written on every
+  branch is now promoted to a real individual parameter — getting a PK slot,
+  being written back, and resolving in the ODE RHS — provided a downstream block
+  (`[odes]`, `[structural_model]`, `[scaling]`, `[derived]`) actually references
+  it. Purely internal branch helpers stay branch-local and never consume a PK
+  slot (#357).
 - The covariance-family fit options `covariance_method`, `covariance_fallback`,
   and `covariance_ofv_hessian` no longer emit a spurious "is not used by method
   `<method>` and will be ignored" warning. They are framework-wide covariance-step
