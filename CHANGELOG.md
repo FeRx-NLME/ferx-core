@@ -20,6 +20,17 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ode_template NAME(...)`** in `[structural_model]` generates the standard
+  disposition ODE for a named model (`one/two/three_cpt_iv|oral`) from the same
+  closed-form↔ODE transcription the analytical `pk NAME(...)` uses — so you get
+  the explicit, runnable ODE form without hand-writing the states, RHS, and
+  `obs_scale`. It takes the same parameters as `pk NAME(...)` (including `ka` for
+  oral routes). Re-declaring a `d/dt(X)` in `[odes]` **overrides** the generated
+  equation for compartment `X` (e.g. to add a `transit(...)` absorption input);
+  undeclared compartments keep their generated equations. Combining an ODE-only
+  absorption function (`transit`, future `igd`/`weibull`) with an analytical
+  `pk NAME(...)` is now a clear error pointing at `ode_template`, never a silent
+  analytical→ODE conversion (#322).
 - Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The

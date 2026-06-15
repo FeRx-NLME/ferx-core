@@ -807,7 +807,13 @@ pub fn parse_model_string(content: &str) -> Result<CompiledModel, String> {
 
 /// Parse a full model string including all optional blocks.
 pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
-    let extracted = extract_blocks(content)?;
+    let mut extracted = extract_blocks(content)?;
+    // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
+    // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
+    // hand-written `ode(...)` form *before* anything else looks at the blocks, so
+    // the rest of this function — including ODE detection below — sees a normal
+    // ODE model with no special-casing.
+    apply_ode_template(&mut extracted)?;
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
@@ -964,6 +970,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let is_ode = struct_lines
         .iter()
         .any(|l| l.starts_with("ode(") || l.starts_with("ode "));
+
+    // The error rule (#322 Phase 0b): an ODE-only absorption input-rate function
+    // (`transit`/`igd`/`weibull`) has no closed form, so it cannot ride on an
+    // analytical `pk ...` disposition. Reject the combination loudly, pointing at
+    // `ode_template`, rather than silently ignoring the [odes] block. An
+    // `ode_template`/`ode(...)` disposition sets `is_ode`, so this only fires for
+    // an analytical `pk` model that also carries an ODE-only absorption term.
+    if !is_ode {
+        if let Some(fname) = ode_only_absorption_fn_in_odes(blocks.get("odes")) {
+            return Err(format!(
+                "[structural_model]: `{fname}(...)` absorption requires an ODE disposition, but \
+                 the model uses an analytical `pk ...`. {fname}(...) has no closed form, so ferx \
+                 will not silently turn the analytical model into an ODE. Replace `pk NAME(...)` \
+                 with `ode_template NAME(...)` (ferx writes the disposition ODE) and keep \
+                 `{fname}(...)` in [odes]."
+            ));
+        }
+    }
 
     // For ODE models, map each individual parameter to a slot in the fixed
     // PkParams array (canonical names → their PK slot, others → free slots,
@@ -3977,6 +4001,160 @@ fn parse_scaling_block(
         None
     };
     Ok((scaling, readout))
+}
+
+// ── ode_template desugaring + the analytical+ODE-only-absorption error rule ──
+
+/// Built-in absorption input-rate functions with **no closed form**, which
+/// therefore require an ODE disposition (the error rule, #322 Phase 0b). The
+/// closed-form-capable functions (`first_order`, `zero_order`) are intentionally
+/// excluded — they can ride on an analytical `pk` model.
+const ODE_ONLY_ABSORPTION_FNS: [&str; 3] = ["transit", "igd", "weibull"];
+
+/// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
+/// the first such function name found. Drives the error rule that rejects an
+/// analytical `pk` disposition combined with an ODE-only absorption term.
+fn ode_only_absorption_fn_in_odes(odes: Option<&Vec<String>>) -> Option<&'static str> {
+    let lines = odes?;
+    for line in lines {
+        for &f in ODE_ONLY_ABSORPTION_FNS.iter() {
+            if find_word_call(line, f).is_some() {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// Desugar an `ode_template NAME(...)` directive in `[structural_model]` into the
+/// hand-written ODE form (#322 Phase 0b).
+///
+/// Generates the standard disposition ODE for the named model
+/// (`crate::pk::ode_template::generate`), then rewrites the `structural_model`,
+/// `odes`, and `scaling` blocks so the ordinary ODE pipeline takes over with no
+/// special-casing. **Override semantics** (Ron, 2026-06-14): a `d/dt(X)` declared
+/// by the user in `[odes]` *replaces* the generated equation for compartment `X`;
+/// compartments the user leaves undeclared keep the generated RHS (no `+=`
+/// append form). A no-op if `[structural_model]` has no `ode_template` line.
+fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
+    // Detect the `ode_template NAME(params)` line (and reject mixing it with a
+    // `pk`/`ode(...)` disposition) in a scope that releases the immutable borrow
+    // before the block rewrites below.
+    let tmpl_re = Regex::new(r"^ode_template\s+(\w+)\s*\(([^)]*)\)\s*$").unwrap();
+    let (model_name, params_str) = {
+        let struct_lines = match extracted.unnamed.get("structural_model") {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        let mut found: Option<(String, String)> = None;
+        let mut has_other_disposition = false;
+        for line in struct_lines {
+            if let Some(caps) = tmpl_re.captures(line) {
+                if found.is_some() {
+                    return Err(
+                        "[structural_model]: more than one `ode_template` line; declare exactly one."
+                            .to_string(),
+                    );
+                }
+                found = Some((caps[1].to_string(), caps[2].to_string()));
+            } else if line.starts_with("pk ")
+                || line.starts_with("ode(")
+                || line.starts_with("ode ")
+            {
+                has_other_disposition = true;
+            }
+        }
+        match found {
+            None => return Ok(()),
+            Some(_) if has_other_disposition => {
+                return Err(
+                    "[structural_model]: `ode_template` cannot be combined with a `pk ...` or \
+                     `ode(...)` disposition — choose one. `ode_template` already generates the \
+                     full disposition ODE; add absorption / custom terms via override `d/dt(...)` \
+                     lines in [odes]."
+                        .to_string(),
+                );
+            }
+            Some(x) => x,
+        }
+    };
+
+    // Parse `role=VAR` pairs (same convention as `pk NAME(...)`).
+    let mut params: HashMap<String, String> = HashMap::new();
+    for pair in params_str.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = pair.split('=').map(str::trim).collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err(format!(
+                "ode_template {model_name}: malformed parameter `{pair}` (expected `role=VARNAME`)."
+            ));
+        }
+        if params
+            .insert(parts[0].to_lowercase(), parts[1].to_string())
+            .is_some()
+        {
+            return Err(format!(
+                "ode_template {model_name}: duplicate parameter `{}`.",
+                parts[0]
+            ));
+        }
+    }
+
+    let generated = crate::pk::ode_template::generate(&model_name, &params)?;
+
+    // --- Override merge into [odes] -----------------------------------------
+    // User-declared `d/dt(X)` lines replace the generated equation for X.
+    let user_odes = extracted.unnamed.get("odes").cloned().unwrap_or_default();
+    let dt_re = Regex::new(r"^d/dt\(\s*(\w+)\s*\)").unwrap();
+    let mut overridden: Vec<String> = Vec::new();
+    for line in &user_odes {
+        if let Some(caps) = dt_re.captures(line) {
+            let cmt = caps[1].to_string();
+            if !generated.states.iter().any(|s| s == &cmt) {
+                return Err(format!(
+                    "[odes]: d/dt({cmt}) overrides a compartment not generated by \
+                     `ode_template {model_name}` (generated states: {}). Override only a \
+                     generated compartment, or use a hand-written `ode(...)` model instead.",
+                    generated.states.join(", ")
+                ));
+            }
+            overridden.push(cmt);
+        }
+    }
+    // User lines first (they may define helper vars used by their overrides),
+    // then the generated equations for every non-overridden compartment. The
+    // duplicate-`d/dt` check in `build_ode_spec` is the backstop against a merge
+    // bug ever letting two equations through for the same state.
+    let mut merged = user_odes;
+    for (state, line) in &generated.odes {
+        if !overridden.iter().any(|s| s == state) {
+            merged.push(line.clone());
+        }
+    }
+    extracted.unnamed.insert("odes".to_string(), merged);
+
+    // --- Rewrite [structural_model] to the synthesized ode(...) form --------
+    extracted.unnamed.insert(
+        "structural_model".to_string(),
+        vec![format!(
+            "ode(obs_cmt={}, states=[{}])",
+            generated.obs_cmt,
+            generated.states.join(", ")
+        )],
+    );
+
+    // --- Supply obs_scale via [scaling] unless the user wrote their own -----
+    // A user-provided [scaling] block wins (e.g. a Form C `y = <expr>` readout);
+    // otherwise inject the generated central-volume scale.
+    extracted
+        .unnamed
+        .entry("scaling".to_string())
+        .or_insert_with(|| vec![format!("obs_scale = {}", generated.obs_scale)]);
+
+    Ok(())
 }
 
 // ── [structural_model] ODE variant parser ───────────────────────────────────
@@ -9326,6 +9504,174 @@ fn parse_if_statement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
+
+    /// Parse `src`, asserting it fails; returns the error message. (`ParsedModel`
+    /// is not `Debug`, so `unwrap_err()` can't be used directly.)
+    fn parse_err(src: &str) -> String {
+        match parse_full_model(src) {
+            Ok(_) => panic!("expected a parse error, but the model parsed"),
+            Err(e) => e,
+        }
+    }
+
+    /// Two-cpt-oral parameter header (CL/V1/Q/V2/KA) plus optional extra
+    /// individual params, used to build `ode_template` test models.
+    fn two_cpt_oral_model(structural: &str, extra_indiv: &str, odes: &str) -> String {
+        format!(
+            "[parameters]\n\
+             \x20 theta TVCL(3.0, 0.01, 100.0)\n\
+             \x20 theta TVV1(15.0, 1.0, 500.0)\n\
+             \x20 theta TVQ(3.0, 0.01, 100.0)\n\
+             \x20 theta TVV2(30.0, 1.0, 500.0)\n\
+             \x20 theta TVKA(1.1, 0.01, 50.0)\n\
+             \x20 omega ETA_CL ~ 0.09\n\
+             \x20 sigma PROP ~ 0.01 (sd)\n\n\
+             [individual_parameters]\n\
+             \x20 CL = TVCL * exp(ETA_CL)\n\
+             \x20 V1 = TVV1\n\
+             \x20 Q  = TVQ\n\
+             \x20 V2 = TVV2\n\
+             \x20 KA = TVKA\n{extra_indiv}\n\
+             [structural_model]\n  {structural}\n\n{odes}\
+             [error_model]\n  DV ~ proportional(PROP)\n"
+        )
+    }
+
+    #[test]
+    fn ode_template_desugars_to_ode_model() {
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "",
+            "",
+        );
+        let model = parse_full_model(&src)
+            .unwrap_or_else(|e| panic!("ode_template should parse: {e}"))
+            .model;
+        let ode = model
+            .ode_spec
+            .expect("ode_template must produce an ODE model");
+        assert_eq!(ode.state_names, vec!["depot", "central", "periph"]);
+        // Pure disposition — no built-in input-rate forcing without an override.
+        assert!(ode.input_rate.is_empty());
+        // Observed compartment is central (state index 1).
+        match ode.readout {
+            crate::ode::OdeReadout::ObsCmt(idx) => assert_eq!(idx, 1),
+            _ => panic!("expected an ObsCmt readout for ode_template"),
+        }
+    }
+
+    #[test]
+    fn ode_template_override_replaces_only_named_compartment() {
+        // Override the generated depot with a transit input; central & periph
+        // keep their generated equations (so the 3-state structure is intact and
+        // exactly one transit forcing lands on the depot, compartment 0).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
+        );
+        let model = parse_full_model(&src)
+            .unwrap_or_else(|e| panic!("override should parse: {e}"))
+            .model;
+        let ode = model.ode_spec.expect("ODE model");
+        assert_eq!(ode.state_names, vec!["depot", "central", "periph"]);
+        assert_eq!(ode.input_rate.len(), 1, "exactly one transit forcing");
+        assert_eq!(ode.input_rate[0].cmt, 0, "transit forces the depot (cmt 0)");
+    }
+
+    #[test]
+    fn ode_template_override_unknown_compartment_errors() {
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "",
+            "[odes]\n  d/dt(gut) = -KA*gut\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("d/dt(gut)") && err.contains("generated states"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_template_missing_required_role_errors() {
+        // Surfaced through the full-model parse, not just the generator.
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2)",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("requires `ka`"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_rejects_mixing_with_pk_or_ode() {
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)\n  pk one_cpt_iv(cl=CL, v=V1)",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("cannot be combined"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_malformed_arg_errors() {
+        let src = two_cpt_oral_model("ode_template one_cpt_iv(cl)", "", "");
+        let err = parse_err(&src);
+        assert!(err.contains("malformed parameter"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_duplicate_arg_errors() {
+        let src = two_cpt_oral_model("ode_template one_cpt_iv(cl=CL, cl=V1)", "", "");
+        let err = parse_err(&src);
+        assert!(err.contains("duplicate parameter"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_multiple_lines_errors() {
+        let src = two_cpt_oral_model(
+            "ode_template one_cpt_iv(cl=CL, v=V1)\n  ode_template two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("more than one"), "got: {err}");
+    }
+
+    #[test]
+    fn error_rule_analytical_pk_plus_transit() {
+        // Analytical disposition + an ODE-only absorption function → hard error
+        // pointing at ode_template, never a silent analytical→ODE swap.
+        let src = two_cpt_oral_model(
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("ode_template"),
+            "should point at ode_template: {err}"
+        );
+        assert!(err.contains("transit"), "should name the function: {err}");
+    }
+
+    #[test]
+    fn ode_only_absorption_fn_detection() {
+        let transit = vec!["d/dt(depot) = transit(n=N, mtt=M) - KA*depot".to_string()];
+        assert_eq!(
+            ode_only_absorption_fn_in_odes(Some(&transit)),
+            Some("transit")
+        );
+        // A plain disposition ODE has no ODE-only absorption call.
+        let plain = vec!["d/dt(central) = -(CL/V)*central".to_string()];
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&plain)), None);
+        assert_eq!(ode_only_absorption_fn_in_odes(None), None);
+    }
 
     // ── transit() input-rate parse-split (#322, design A) ────────────────────
     #[test]
