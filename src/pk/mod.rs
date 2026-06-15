@@ -263,8 +263,9 @@ pub fn compute_event_pk_params_into(
 /// observations) uses zero kappa. EVID=2 rows carry no occasion label and also
 /// use zero kappa.
 ///
-/// Falls back to Option-A superposition only for models with neither an ODE
-/// spec nor event-driven analytical support (none of the current `PkModel`s).
+/// Every `PkModel` variant has event-driven analytical support and every ODE
+/// model takes the ODE path, so the dispatch below is total; an unsupported
+/// model is a wiring bug and fails loud rather than silently mis-predicting.
 ///
 /// **Occasion-dependent PK dynamics are exact**: per-event params carry the
 /// occasion κ, so CL/V/KA switch correctly across occasions. `[scaling]` is also
@@ -357,7 +358,17 @@ pub fn predict_iov(
             &pk_only_params,
         )
     } else {
-        return predict_iov_option_a(model, subject, theta, eta_bsv, kappas);
+        // Unreachable today: every `PkModel` variant has event-driven analytical
+        // support and ODE models took the branch above. A new analytical variant
+        // not wired into `supports_event_driven` lands here and fails loud —
+        // far better than silently mis-predicting. (The legacy Option-A
+        // superposition that used to live here dropped bioavailability F on
+        // IV/infusion doses; see #327.)
+        unreachable!(
+            "predict_iov: model {:?} has neither an ODE spec nor event-driven \
+             analytical support; wire it into `supports_event_driven`",
+            model.pk_model
+        )
     };
 
     // `[scaling]` post-multiply, applied **per occasion** so a κ-dependent scale
@@ -377,34 +388,10 @@ pub fn predict_iov(
             }
         }
     }
-    // LTBS log-wrap. Reached only on the main (event-driven/ODE) path; the
-    // option-A fallback above returns early through `compute_predictions_with_tv`,
-    // which already log-wraps — so predictions are logged exactly once.
+    // LTBS log-wrap. The IOV dispatch above is total (ODE or event-driven), so
+    // this is the single log-wrap point for the IOV path — predictions are
+    // logged exactly once.
     apply_log_transform(model, &mut preds);
-    preds
-}
-
-/// Legacy Option-A IOV prediction: per-occasion superposition over the whole
-/// dose history. Retained only as a fallback for models that support neither
-/// the ODE nor the event-driven analytical path. See [`predict_iov`].
-fn predict_iov_option_a(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_bsv: &[f64],
-    kappas: &[Vec<f64>],
-) -> Vec<f64> {
-    let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
-    let n_obs = subject.obs_times.len();
-    let mut preds = vec![0.0_f64; n_obs];
-    for (k, (_occ_id, obs_indices)) in occ_groups.iter().enumerate() {
-        let kap: &[f64] = kappas.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
-        let combined: Vec<f64> = eta_bsv.iter().copied().chain(kap.iter().copied()).collect();
-        let all_preds = compute_predictions_with_tv(model, subject, theta, &combined);
-        for &j in obs_indices {
-            preds[j] = all_preds[j];
-        }
-    }
     preds
 }
 
@@ -478,50 +465,63 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
     let v = p.v();
     let infusion = dose.is_infusion();
 
-    if dose.ss && dose.ii > 0.0 {
+    // Bioavailability F scales the dosed amount/rate on every route. The
+    // oral-depot bolus arms apply it internally (`*_oral_f`); every other arm —
+    // IV bolus, and infusions (which bypass the depot even on oral models) —
+    // uses an F-agnostic closed form that is linear in the dose, so F is
+    // applied here by scaling the (single) result. This matches the
+    // event-driven path (`f_bio*amt` / `f_bio*rate`) and NONMEM's F1 on
+    // IV/infusion doses (#327).
+    let f_scale = if pk_model.is_oral() && !infusion {
+        1.0
+    } else {
+        p.f_bio()
+    };
+
+    let raw = if dose.ss && dose.ii > 0.0 {
         match pk_model {
             PkModel::OneCptIv => {
-                return if infusion {
+                if infusion {
                     one_cpt_infusion_ss(dose, tau, cl, v)
                 } else {
                     one_cpt_iv_bolus_ss(dose, tau, cl, v)
-                };
+                }
             }
             PkModel::OneCptOral => {
                 // Infusions bypass the depot — use the IV infusion SS formula,
                 // matching single_dose_states and the TwoCptOral/ThreeCptOral fix.
-                return if infusion {
+                if infusion {
                     one_cpt_infusion_ss(dose, tau, cl, v)
                 } else {
                     one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio())
-                };
+                }
             }
             PkModel::TwoCptIv => {
-                return if infusion {
+                if infusion {
                     two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2())
                 } else {
                     two_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2())
-                };
+                }
             }
             PkModel::TwoCptOral => {
                 // Infusions bypass the depot and enter central directly —
                 // use the IV infusion SS formula, matching single_dose_states.
-                return if infusion {
+                if infusion {
                     two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2())
                 } else {
                     two_cpt_oral_f_ss(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio())
-                };
+                }
             }
             PkModel::ThreeCptIv => {
-                return if infusion {
+                if infusion {
                     three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
                 } else {
                     three_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                };
+                }
             }
             PkModel::ThreeCptOral => {
                 // Same infusion-bypasses-depot logic as TwoCptOral.
-                return if infusion {
+                if infusion {
                     three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
                 } else {
                     three_cpt_oral_f_ss(
@@ -536,69 +536,71 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
                         p.ka(),
                         p.f_bio(),
                     )
-                };
+                }
             }
         }
-    }
+    } else {
+        match pk_model {
+            PkModel::OneCptIv => {
+                if infusion {
+                    one_cpt_infusion(dose, tau, cl, v)
+                } else {
+                    one_cpt_iv_bolus(dose, tau, cl, v)
+                }
+            }
+            PkModel::OneCptOral => {
+                // Infusions bypass the depot — use the IV infusion formula.
+                if infusion {
+                    one_cpt_infusion(dose, tau, cl, v)
+                } else {
+                    one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio())
+                }
+            }
+            PkModel::TwoCptIv => {
+                if infusion {
+                    two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
+                } else {
+                    two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2())
+                }
+            }
+            PkModel::TwoCptOral => {
+                // Infusions bypass the depot — use the IV formula, matching single_dose_states.
+                if infusion {
+                    two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
+                } else {
+                    two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio())
+                }
+            }
+            PkModel::ThreeCptIv => {
+                if infusion {
+                    three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                } else {
+                    three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                }
+            }
+            PkModel::ThreeCptOral => {
+                // Same infusion-bypasses-depot logic as TwoCptOral.
+                if infusion {
+                    three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                } else {
+                    three_cpt_oral_f(
+                        dose,
+                        tau,
+                        cl,
+                        v,
+                        p.q(),
+                        p.v2(),
+                        p.q3(),
+                        p.v3(),
+                        p.ka(),
+                        p.f_bio(),
+                    )
+                }
+            }
+        }
+    };
 
-    match pk_model {
-        PkModel::OneCptIv => {
-            if infusion {
-                one_cpt_infusion(dose, tau, cl, v)
-            } else {
-                one_cpt_iv_bolus(dose, tau, cl, v)
-            }
-        }
-        PkModel::OneCptOral => {
-            // Infusions bypass the depot — use the IV infusion formula.
-            if infusion {
-                one_cpt_infusion(dose, tau, cl, v)
-            } else {
-                one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio())
-            }
-        }
-        PkModel::TwoCptIv => {
-            if infusion {
-                two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
-            } else {
-                two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2())
-            }
-        }
-        PkModel::TwoCptOral => {
-            // Infusions bypass the depot — use the IV formula, matching single_dose_states.
-            if infusion {
-                two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
-            } else {
-                two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio())
-            }
-        }
-        PkModel::ThreeCptIv => {
-            if infusion {
-                three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-            } else {
-                three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-            }
-        }
-        PkModel::ThreeCptOral => {
-            // Same infusion-bypasses-depot logic as TwoCptOral.
-            if infusion {
-                three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-            } else {
-                three_cpt_oral_f(
-                    dose,
-                    tau,
-                    cl,
-                    v,
-                    p.q(),
-                    p.v2(),
-                    p.q3(),
-                    p.v3(),
-                    p.ka(),
-                    p.f_bio(),
-                )
-            }
-        }
-    }
+    f_scale * raw
 }
 
 // --- Compartment-state helpers for `compartment_states` in SubjectResult ---
@@ -619,6 +621,20 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
     let v = p.v();
     let infusion = dose.is_infusion();
 
+    // Bioavailability F scales the dosed amount on every route — the states are
+    // linear in the dose. The oral-depot arms apply F internally (depot via
+    // `one_cpt_oral_depot`, central via `*_oral_f`); every other route — IV
+    // bolus and infusions, which bypass the depot — uses F-agnostic closed
+    // forms. So the raw state vector is built first and scaled by `f_scale`
+    // once at the end. The oral-depot case takes `f_scale == 1.0`, making the
+    // scale a no-op there so F is never double-applied. Matches
+    // single_dose_concentration and the event-driven path (#327).
+    let f_scale = if pk_model.is_oral() && !infusion {
+        1.0
+    } else {
+        p.f_bio()
+    };
+
     // SS early-exit: mirrors single_dose_concentration's top-level guard.
     //
     // Peripheral and depot helpers (two_cpt_iv_peripheral, two_cpt_oral_peripheral,
@@ -627,7 +643,7 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
     // are called with the same arguments regardless of SS — the correct SS value is
     // returned automatically. Only the *central* concentration functions need explicit
     // SS dispatch here (they lack the internal guard in their non-SS variants).
-    if dose.ss && dose.ii > 0.0 {
+    let mut state = if dose.ss && dose.ii > 0.0 {
         match pk_model {
             PkModel::OneCptIv => {
                 let c = if infusion {
@@ -635,19 +651,20 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                 } else {
                     one_cpt_iv_bolus_ss(dose, tau, cl, v)
                 };
-                return vec![c];
+                vec![c]
             }
             PkModel::OneCptOral => {
                 // Infusions bypass the depot — treat as 1-cpt IV SS infusion,
                 // consistent with single_dose_concentration and TwoCptOral/ThreeCptOral.
                 if infusion {
                     let c = one_cpt_infusion_ss(dose, tau, cl, v);
-                    return vec![0.0, c];
+                    vec![0.0, c]
+                } else {
+                    // one_cpt_oral_depot handles SS internally.
+                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+                    let central = one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio());
+                    vec![depot, central]
                 }
-                // one_cpt_oral_depot handles SS internally.
-                let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-                let central = one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio());
-                return vec![depot, central];
             }
             PkModel::TwoCptIv => {
                 let central = if infusion {
@@ -657,14 +674,14 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                 };
                 // two_cpt_iv_peripheral handles SS internally.
                 let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
-                return vec![central, periph];
+                vec![central, periph]
             }
             PkModel::TwoCptOral => {
                 if infusion {
                     // Infusions bypass depot; treat as 2-cpt IV SS infusion.
                     let c = two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2());
                     let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
-                    return vec![0.0, c, periph];
+                    vec![0.0, c, periph]
                 } else {
                     // Depot and peripheral handle SS internally.
                     let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
@@ -672,7 +689,7 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                         two_cpt_oral_f_ss(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
                     let periph =
                         two_cpt_oral_peripheral(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
-                    return vec![depot, central, periph];
+                    vec![depot, central, periph]
                 }
             }
             PkModel::ThreeCptIv => {
@@ -684,7 +701,7 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                 // three_cpt_iv_peripherals handles SS internally.
                 let [p1, p2] =
                     three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-                return vec![central, p1, p2];
+                vec![central, p1, p2]
             }
             PkModel::ThreeCptOral => {
                 if infusion {
@@ -692,7 +709,7 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                     let c = three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
                     let [p1, p2] =
                         three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-                    return vec![0.0, c, p1, p2];
+                    vec![0.0, c, p1, p2]
                 } else {
                     // Depot and peripherals handle SS internally.
                     let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
@@ -720,102 +737,109 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                         p.ka(),
                         p.f_bio(),
                     );
-                    return vec![depot, central, p1, p2];
+                    vec![depot, central, p1, p2]
                 }
             }
         }
-    }
-
-    // Non-SS path.
-    match pk_model {
-        PkModel::OneCptIv => {
-            let c = if infusion {
-                one_cpt_infusion(dose, tau, cl, v)
-            } else {
-                one_cpt_iv_bolus(dose, tau, cl, v)
-            };
-            vec![c]
-        }
-        PkModel::OneCptOral => {
-            // Infusions bypass the depot — treat as 1-cpt IV, matching single_dose_concentration.
-            if infusion {
-                let c = one_cpt_infusion(dose, tau, cl, v);
-                vec![0.0, c]
-            } else {
-                let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-                let central = one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio());
-                vec![depot, central]
+    } else {
+        // Non-SS path.
+        match pk_model {
+            PkModel::OneCptIv => {
+                let c = if infusion {
+                    one_cpt_infusion(dose, tau, cl, v)
+                } else {
+                    one_cpt_iv_bolus(dose, tau, cl, v)
+                };
+                vec![c]
             }
-        }
-        PkModel::TwoCptIv => {
-            let central = if infusion {
-                two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
-            } else {
-                two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2())
-            };
-            let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
-            vec![central, periph]
-        }
-        PkModel::TwoCptOral => {
-            if infusion {
-                // Infusions bypass depot; treat as 2-cpt IV
-                let c = two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2());
+            PkModel::OneCptOral => {
+                // Infusions bypass the depot — treat as 1-cpt IV, matching single_dose_concentration.
+                if infusion {
+                    let c = one_cpt_infusion(dose, tau, cl, v);
+                    vec![0.0, c]
+                } else {
+                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+                    let central = one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio());
+                    vec![depot, central]
+                }
+            }
+            PkModel::TwoCptIv => {
+                let central = if infusion {
+                    two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
+                } else {
+                    two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2())
+                };
                 let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
-                vec![0.0, c, periph]
-            } else {
-                let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-                let central = two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
-                let periph =
-                    two_cpt_oral_peripheral(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
-                vec![depot, central, periph]
+                vec![central, periph]
             }
-        }
-        PkModel::ThreeCptIv => {
-            let central = if infusion {
-                three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-            } else {
-                three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-            };
-            let [p1, p2] =
-                three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-            vec![central, p1, p2]
-        }
-        PkModel::ThreeCptOral => {
-            if infusion {
-                let c = three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+            PkModel::TwoCptOral => {
+                if infusion {
+                    // Infusions bypass depot; treat as 2-cpt IV
+                    let c = two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2());
+                    let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
+                    vec![0.0, c, periph]
+                } else {
+                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+                    let central =
+                        two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
+                    let periph =
+                        two_cpt_oral_peripheral(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
+                    vec![depot, central, periph]
+                }
+            }
+            PkModel::ThreeCptIv => {
+                let central = if infusion {
+                    three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                } else {
+                    three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
+                };
                 let [p1, p2] =
                     three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-                vec![0.0, c, p1, p2]
-            } else {
-                let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-                let central = three_cpt_oral_f(
-                    dose,
-                    tau,
-                    cl,
-                    v,
-                    p.q(),
-                    p.v2(),
-                    p.q3(),
-                    p.v3(),
-                    p.ka(),
-                    p.f_bio(),
-                );
-                let [p1, p2] = three_cpt_oral_peripherals(
-                    dose,
-                    tau,
-                    cl,
-                    v,
-                    p.q(),
-                    p.v2(),
-                    p.q3(),
-                    p.v3(),
-                    p.ka(),
-                    p.f_bio(),
-                );
-                vec![depot, central, p1, p2]
+                vec![central, p1, p2]
+            }
+            PkModel::ThreeCptOral => {
+                if infusion {
+                    let c = three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+                    let [p1, p2] =
+                        three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+                    vec![0.0, c, p1, p2]
+                } else {
+                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
+                    let central = three_cpt_oral_f(
+                        dose,
+                        tau,
+                        cl,
+                        v,
+                        p.q(),
+                        p.v2(),
+                        p.q3(),
+                        p.v3(),
+                        p.ka(),
+                        p.f_bio(),
+                    );
+                    let [p1, p2] = three_cpt_oral_peripherals(
+                        dose,
+                        tau,
+                        cl,
+                        v,
+                        p.q(),
+                        p.v2(),
+                        p.q3(),
+                        p.v3(),
+                        p.ka(),
+                        p.f_bio(),
+                    );
+                    vec![depot, central, p1, p2]
+                }
             }
         }
+    };
+
+    // Apply bioavailability uniformly (no-op for oral-depot where f_scale == 1.0).
+    for s in &mut state {
+        *s *= f_scale;
     }
+    state
 }
 
 /// Compute the full compartment state vector at arbitrary `times` for an analytical model.
@@ -1178,6 +1202,47 @@ mod tests {
         p.values[0] = cl;
         p.values[1] = v;
         p
+    }
+
+    #[test]
+    fn iv_bolus_and_infusion_apply_f_matching_nonmem_closed_form() {
+        // NONMEM anchor for #327. With bioavailability F1 on an IV dose, NONMEM
+        // delivers F1·AMT, so for a 1-cpt model (ADVAN1/TRANS2, `F1 = THETA(3)`
+        // in $PK) the closed forms are:
+        //   bolus:    C(t) = F·Dose/V · exp(-k·t)
+        //   infusion: C(t) = F·R/CL · (1 − exp(-k·t))                 (t ≤ T_inf)
+        //             C(t) = F·R/CL · (1 − exp(-k·T)) · exp(-k·(t−T)) (t > T_inf)
+        // F scales the infusion *rate* with the duration T = AMT/R preserved —
+        // identical to NONMEM, where F changes the bioavailable amount (F·AMT)
+        // but the RATE-derived duration is unchanged. The analytical
+        // superposition path (`predict_concentration`) must reproduce these.
+        let (cl, v, f) = (5.0_f64, 50.0_f64, 0.4_f64);
+        let k = cl / v;
+        let mut pk = make_pk_params(cl, v);
+        pk.values[crate::types::PK_IDX_F] = f;
+
+        // IV bolus.
+        let amt = 100.0;
+        let doses = vec![bolus_dose(0.0, amt)];
+        for &t in &[0.25_f64, 1.0, 4.0, 12.0] {
+            let got = predict_concentration(PkModel::OneCptIv, &doses, t, &pk);
+            let want = f * amt / v * (-k * t).exp();
+            assert_relative_eq!(got, want, max_relative = 1e-12);
+        }
+
+        // IV infusion: R=25 over T = AMT/R = 4 h.
+        let rate = 25.0;
+        let t_inf = amt / rate;
+        let doses = vec![DoseEvent::new(0.0, amt, 1, rate, false, 0.0)];
+        for &t in &[1.0_f64, 4.0, 8.0] {
+            let got = predict_concentration(PkModel::OneCptIv, &doses, t, &pk);
+            let want = if t <= t_inf {
+                f * rate / cl * (1.0 - (-k * t).exp())
+            } else {
+                f * rate / cl * (1.0 - (-k * t_inf).exp()) * (-k * (t - t_inf)).exp()
+            };
+            assert_relative_eq!(got, want, max_relative = 1e-12);
+        }
     }
 
     #[test]

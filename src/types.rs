@@ -793,11 +793,13 @@ impl PkModel {
     ///   - every required structural slot (`required_pk_params`);
     ///   - `lagtime`, applied to *every* dose (`predict_concentration` shifts the
     ///     effective dose time for IV and oral alike);
-    ///   - `f` (bioavailability) **only** for oral models — the IV closed forms
-    ///     never read it, so `f` on an IV model is inert.
+    ///   - `f` (bioavailability), applied to *every* dose and route — IV bolus,
+    ///     infusion, and oral depot — scaling the bioavailable amount/rate
+    ///     (#327). Both the superposition and event-driven analytical paths read
+    ///     it for every model, IV included, so it is never inert.
     pub(crate) fn consumes_pk_slot(&self, slot: usize) -> bool {
         slot == PK_IDX_LAGTIME
-            || (slot == PK_IDX_F && self.is_oral())
+            || slot == PK_IDX_F
             || self.required_pk_params().iter().any(|(s, _)| *s == slot)
     }
 }

@@ -1226,6 +1226,125 @@ mod tests {
     }
 
     #[test]
+    fn f_bioavailability_superposition_matches_event_driven_iv_bolus_and_infusion() {
+        // Regression for #327. Bioavailability F must scale IV-bolus and
+        // infusion doses on the analytical *superposition* path
+        // (`predict_concentration`) exactly as it already does on the
+        // event-driven path. Before the fix the superposition path silently
+        // dropped F for these routes, so the same model gave F×-different
+        // predictions for a no-TV subject (superposition) versus a TV/IOV
+        // subject (event-driven). Asserts the two analytical paths agree at
+        // F=0.4. (Oral-model infusions are covered separately by
+        // `f_bioavailability_scales_oral_infusion_on_superposition`: the
+        // event-driven path currently drops infusion input on oral models — a
+        // distinct bug — so cross-path equality is not assertable there yet.)
+        let f = 0.4_f64;
+        let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
+        let with_f = |mut p: PkParams| {
+            p.values[crate::types::PK_IDX_F] = f;
+            p
+        };
+
+        // rate=0 → bolus; rate>0 → infusion (duration = amt/rate). IV doses go
+        // to the central compartment (cmt 1); an oral-model infusion routes to
+        // central (cmt 2) — the depot-bypass case.
+        let bolus = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 0.0, false, 0.0);
+        let infusion = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 25.0, false, 0.0);
+
+        let cases: Vec<(&str, PkModel, PkParams, DoseEvent)> = vec![
+            (
+                "1cpt-iv bolus",
+                PkModel::OneCptIv,
+                with_f(pk_one(5.0, 50.0)),
+                bolus(1),
+            ),
+            (
+                "1cpt-iv infusion",
+                PkModel::OneCptIv,
+                with_f(pk_one(5.0, 50.0)),
+                infusion(1),
+            ),
+            (
+                "2cpt-iv bolus",
+                PkModel::TwoCptIv,
+                with_f(pk_two(5.0, 40.0, 3.0, 60.0)),
+                bolus(1),
+            ),
+            (
+                "2cpt-iv infusion",
+                PkModel::TwoCptIv,
+                with_f(pk_two(5.0, 40.0, 3.0, 60.0)),
+                infusion(1),
+            ),
+            (
+                "3cpt-iv bolus",
+                PkModel::ThreeCptIv,
+                with_f(pk_three(5.0, 40.0, 3.0, 60.0, 1.0, 120.0)),
+                bolus(1),
+            ),
+            (
+                "3cpt-iv infusion",
+                PkModel::ThreeCptIv,
+                with_f(pk_three(5.0, 40.0, 3.0, 60.0, 1.0, 120.0)),
+                infusion(1),
+            ),
+        ];
+
+        for (label, model, pk, dose) in cases {
+            let subj = make_subject(vec![dose], obs_times.clone());
+            let superposition: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk))
+                .collect();
+            let ev = event_driven_predictions(
+                model,
+                &subj,
+                &vec![pk; 1],
+                &vec![pk; obs_times.len()],
+                &[],
+            );
+            for (j, (&s, &e)) in superposition.iter().zip(ev.iter()).enumerate() {
+                assert!(
+                    e > 0.0,
+                    "{label}: event-driven conc should be >0 at obs {j}"
+                );
+                assert_relative_eq!(s, e, epsilon = 1e-9, max_relative = 1e-7);
+            }
+        }
+    }
+
+    #[test]
+    fn f_bioavailability_scales_oral_infusion_on_superposition() {
+        // #327: an infusion on an oral model bypasses the depot and enters
+        // central directly, so the analytical superposition path must scale it
+        // by F. Cross-checking against the event-driven path is deferred —
+        // that path currently drops infusion input on oral models entirely (a
+        // separate bug). Here we assert F is applied and linear on the
+        // superposition path, which is the path that ran F-blind before #327.
+        let obs_times = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
+        // rate=25 → 4 h infusion into central (cmt 2) on a 1-cpt oral model.
+        let dose = DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0);
+        let subj = make_subject(vec![dose], obs_times.to_vec());
+
+        let mut pk_full = pk_one_oral(5.0, 50.0, 1.2);
+        pk_full.values[crate::types::PK_IDX_F] = 1.0;
+        let mut pk_half = pk_one_oral(5.0, 50.0, 1.2);
+        pk_half.values[crate::types::PK_IDX_F] = 0.4;
+
+        for &t in &obs_times {
+            let full =
+                crate::pk::predict_concentration(PkModel::OneCptOral, &subj.doses, t, &pk_full);
+            let half =
+                crate::pk::predict_concentration(PkModel::OneCptOral, &subj.doses, t, &pk_half);
+            assert!(
+                full > 0.0,
+                "oral infusion should give nonzero conc at t={t}"
+            );
+            assert_relative_eq!(half, 0.4 * full, max_relative = 1e-12);
+        }
+    }
+
+    #[test]
     fn lagtime_shifts_bolus_and_infusion_in_time() {
         let (cl, v, amt, lag) = (5.0, 50.0, 100.0, 1.5);
         // Sample strictly after the lag so the lagged curve is "on".

@@ -324,6 +324,11 @@ fn single_dose_ad(
     match pk_model_id {
         0 => {
             // OneCptIv — bolus when dur<=0, infusion otherwise.
+            // Bioavailability F scales the dosed amount/rate, IV included
+            // (#327) — mirrors the oral arms and the superposition path in
+            // `pk/mod.rs`.
+            let amt = f_bio * amt;
+            let rate = f_bio * rate;
             let k = cl / v;
             if dur <= 0.0 {
                 (amt / v) * (-k * tau).exp()
@@ -356,6 +361,10 @@ fn single_dose_ad(
             // `TwoCptIvBolus` arm carried the guard but it was dead in
             // practice — keeping the bolus and infusion branches
             // symmetric here matches that prior author's decision.
+            // Bioavailability F scales the dosed amount/rate, IV included
+            // (#327) — mirrors the oral arms and the superposition path.
+            let amt = f_bio * amt;
+            let rate = f_bio * rate;
             let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
             let diff = alpha - beta;
             if dur <= 0.0 {
@@ -411,6 +420,10 @@ fn single_dose_ad(
             // revision did) collapses physically-valid bolus answers
             // to zero whenever a slowly-equilibrating 3-cpt has one of
             // α/β/γ near zero — see issue #176 review.
+            // Bioavailability F scales the dosed amount/rate, IV included
+            // (#327) — mirrors the oral arms and the superposition path.
+            let amt = f_bio * amt;
+            let rate = f_bio * rate;
             let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_ad(cl, v, q, v2, q3, v3);
             let ab = alpha - beta;
             let ag = alpha - gamma;

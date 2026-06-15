@@ -421,15 +421,36 @@ fn run_family(f: &Family) {
         RTOL,
     );
 
-    // -- bioavailability (oral only) ----------------------------------------
-    if f.is_oral {
-        let (an_f, ode_f) = build_pair(f, false, true);
+    // -- bioavailability (every route, IV included since #327) --------------
+    // Bolus F applies to the oral depot and the IV bolus alike: the analytical
+    // superposition path now scales the dose by F to match the ODE engine
+    // (which auto-applies F at the dose). Before #327 the analytical IV/infusion
+    // arms dropped F, so this check ran oral-only and the IV/infusion drift went
+    // unnoticed.
+    let (an_f, ode_f) = build_pair(f, false, true);
+    assert_equiv(
+        &format!("{}/bioavailability_bolus", f.label),
+        &an_f,
+        &ode_f,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)],
+            obs.clone(),
+            oc,
+        ),
+        RTOL,
+    );
+
+    // Infusion F (IV families only — infusion into a depot is not a standard
+    // combo, mirroring the base-infusion case above). F scales the infusion
+    // rate; the duration is preserved, matching NONMEM's F1 on a modeled-rate
+    // infusion.
+    if !f.is_oral {
         assert_equiv(
-            &format!("{}/bioavailability", f.label),
+            &format!("{}/bioavailability_infusion", f.label),
             &an_f,
             &ode_f,
             &population(
-                vec![DoseEvent::new(0.0, 100.0, dc, 0.0, false, 0.0)],
+                vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)],
                 obs.clone(),
                 oc,
             ),
