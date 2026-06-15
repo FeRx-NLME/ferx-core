@@ -80,6 +80,136 @@ pub const PK_IDX_LAGTIME: usize = 8;
 /// parameters routed here. Single source of truth so those sites can't drift.
 pub(crate) const RESERVED_PK_SLOTS: [usize; 2] = [PK_IDX_F, PK_IDX_LAGTIME];
 
+/// A dose-modifying attribute that NONMEM keys by **compartment** — `Fn`
+/// (bioavailability), `ALAGn` (absorption lag), `Dn` (modeled infusion
+/// *duration*, `RATE=-2`), `Rn` (modeled infusion *rate*, `RATE=-1`). A dose
+/// into compartment `n` uses the attribute declared for `n`; ferx additionally
+/// honours a bare `F`/`lagtime` as the all-compartment default (see
+/// [`DoseAttrMap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DoseAttr {
+    /// Bioavailability fraction (`Fn`); default 1.0.
+    F,
+    /// Absorption/dose lag time (`ALAGn`); default 0.0.
+    Lag,
+    /// Modeled infusion duration (`Dn`, `RATE=-2`). No bare default — a coded
+    /// `RATE=-2` row with no matching `Dn` is an error (as in NONMEM).
+    Duration,
+    /// Modeled infusion rate (`Rn`, `RATE=-1`). No bare default — see above.
+    Rate,
+}
+
+/// Resolves a dose's effective bioavailability / lag / modeled duration / rate
+/// from the per-dose [`PkParams`] vector, keyed by the dose's **compartment**.
+///
+/// NONMEM makes these dose attributes compartment-indexed (`F1`/`F2`,
+/// `ALAG1`/`ALAG2`, `D1`/`D2`, `R1`/`R2`); the single `PK_IDX_F`/`PK_IDX_LAGTIME`
+/// slots can only carry one value, which silently mis-applies when a subject is
+/// dosed into more than one compartment (the ODE-engine case; the analytical
+/// engine has a single fixed route, so this collapses to the bare slot there).
+/// This map is the **single source of truth** for "which slot holds attribute
+/// `a` for compartment `c`", so every dose-application path (ODE RHS, analytical
+/// infusion, FD gradient) resolves identically and a new path cannot drift.
+///
+/// Resolution order for a dose into 1-based compartment `cmt`:
+///   1. the indexed entry `(attr, cmt)` if the model declared one (`Fn`/`ALAGn`/…);
+///   2. for `F`/`Lag` only, the bare slot (`PK_IDX_F` = 1.0, `PK_IDX_LAGTIME` = 0.0)
+///      as the all-compartment default — preserving pre-existing bare-`F`/`lagtime`
+///      models unchanged;
+///   3. `Duration`/`Rate` have no bare fallback (a coded `RATE` with no matching
+///      `Dn`/`Rn` parameter is rejected upstream), so [`Self::indexed_slot`]
+///      returns `None` and the caller errors.
+#[derive(Debug, Clone, Default)]
+pub struct DoseAttrMap {
+    /// `(attribute, 1-based compartment) -> PkParams slot`. Empty for the common
+    /// single-route / bare-`F`/`lagtime` model, where every lookup falls through
+    /// to the reserved slot.
+    indexed: HashMap<(DoseAttr, usize), usize>,
+}
+
+impl DoseAttr {
+    /// Recognise a compartment-indexed dose-attribute parameter name, returning
+    /// `(attr, 1-based compartment)`. Case-insensitive; the numeric suffix must
+    /// be a positive integer (so `F0` is *not* an attribute, and bare `F` /
+    /// `lagtime` — handled by the reserved slots — return `None`).
+    ///
+    /// Recognised today: `F{n}` (bioavailability) and `ALAG{n}` / `LAGTIME{n}`
+    /// (lag). The modeled-infusion forms `D{n}` (`RATE=-2`) and `R{n}`
+    /// (`RATE=-1`) are intentionally **not** recognised here yet — their `D`/`R`
+    /// prefixes collide with ordinary ODE rate constants, so #324 adds them with
+    /// a data-driven gate (only when a coded-`RATE` dose references the
+    /// compartment). `S{n}` is also excluded — that is the `[scaling]` block's
+    /// compartment scale, a separate concept.
+    ///
+    /// Recognising a name does not by itself make it a dose attribute — the
+    /// caller still gates on engine (compartment-indexed `F`/`Lag` are ODE-only)
+    /// and on the compartment existing. `alag` and `lagtime` both map to
+    /// [`DoseAttr::Lag`], matching the existing bare `alag`/`lagtime` aliases.
+    pub fn from_indexed_name(name: &str) -> Option<(DoseAttr, usize)> {
+        let lower = name.to_ascii_lowercase();
+        // Order matters: try the longer `lagtime`/`alag` prefixes before `f` so
+        // a `lagtime…` / `alag…` name is never misclassified.
+        for (prefix, attr) in [
+            ("lagtime", DoseAttr::Lag),
+            ("alag", DoseAttr::Lag),
+            ("f", DoseAttr::F),
+        ] {
+            if let Some(suffix) = lower.strip_prefix(prefix) {
+                // The suffix must be a pure positive integer; `f_bio`, `cl`, etc.
+                // (non-numeric or empty suffixes) are not attributes.
+                if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+                    if let Ok(cmt) = suffix.parse::<usize>() {
+                        if cmt >= 1 {
+                            return Some((attr, cmt));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+impl DoseAttrMap {
+    /// Record that compartment `cmt`'s `attr` is held in PkParams `slot`.
+    pub fn insert(&mut self, attr: DoseAttr, cmt: usize, slot: usize) {
+        self.indexed.insert((attr, cmt), slot);
+    }
+
+    /// The PkParams slot holding `attr` for compartment `cmt`, if the model
+    /// declared a compartment-indexed parameter for it.
+    pub fn indexed_slot(&self, attr: DoseAttr, cmt: usize) -> Option<usize> {
+        self.indexed.get(&(attr, cmt)).copied()
+    }
+
+    /// Bioavailability for a dose into 1-based `cmt`: `F{cmt}` if declared, else
+    /// the bare `PK_IDX_F` slot (default 1.0 when the model has no `F` at all).
+    pub fn f_bio(&self, cmt: usize, params: &[f64]) -> f64 {
+        self.resolve_or(DoseAttr::F, cmt, PK_IDX_F, 1.0, params)
+    }
+
+    /// Lag time for a dose into 1-based `cmt`: `ALAG{cmt}` if declared, else the
+    /// bare `PK_IDX_LAGTIME` slot (default 0.0 when the model has no lag at all).
+    pub fn lagtime(&self, cmt: usize, params: &[f64]) -> f64 {
+        self.resolve_or(DoseAttr::Lag, cmt, PK_IDX_LAGTIME, 0.0, params)
+    }
+
+    /// Read `attr` for `cmt` from its indexed slot, else from `bare_slot`, else
+    /// `dflt` (both reads are bounds-checked so a short `params` slice — e.g. an
+    /// analytical model whose vector stops at slot 8 — cannot panic).
+    fn resolve_or(
+        &self,
+        attr: DoseAttr,
+        cmt: usize,
+        bare_slot: usize,
+        dflt: f64,
+        params: &[f64],
+    ) -> f64 {
+        let slot = self.indexed_slot(attr, cmt).unwrap_or(bare_slot);
+        params.get(slot).copied().unwrap_or(dflt)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PkParams {
     pub values: [f64; MAX_PK_PARAMS],
@@ -1771,7 +1901,11 @@ impl CompiledModel {
         }
         self.indiv_param_names.iter().any(|n| {
             let u = n.to_uppercase();
-            u == "LAGTIME" || u == "ALAG"
+            // Bare `lagtime`/`alag`, or a compartment-indexed `ALAGn`/`LAGTIMEn`
+            // (issue #369) — all route lag through the dose application.
+            u == "LAGTIME"
+                || u == "ALAG"
+                || matches!(DoseAttr::from_indexed_name(n), Some((DoseAttr::Lag, _)))
         })
     }
 
@@ -3354,6 +3488,7 @@ pub(crate) mod test_helpers {
                     init_fn: None,
                     solver_opts: crate::ode::OdeSolverOptions::default(),
                     input_rate: Vec::new(),
+                    dose_attr_map: Default::default(),
                 })
             } else {
                 None
@@ -3940,6 +4075,78 @@ mod tests {
         assert_eq!(default.lagtime(), 0.0);
         // F still defaults to 1.0 (unchanged).
         assert_eq!(default.f_bio(), 1.0);
+    }
+
+    #[test]
+    fn dose_attr_map_resolves_indexed_then_bare_then_default() {
+        // params: slot 5 = bare F, slot 8 = bare lag, slots 9/10 = F2/ALAG2.
+        let mut params = [0.0f64; MAX_PK_PARAMS];
+        params[PK_IDX_F] = 0.8; // bare F
+        params[PK_IDX_LAGTIME] = 0.5; // bare lag
+        params[9] = 0.3; // F for compartment 2
+        params[10] = 1.25; // ALAG for compartment 2
+
+        let mut map = DoseAttrMap::default();
+        map.insert(DoseAttr::F, 2, 9);
+        map.insert(DoseAttr::Lag, 2, 10);
+
+        // Compartment 1 has no indexed entry -> falls through to the bare slot.
+        assert_eq!(map.f_bio(1, &params), 0.8);
+        assert_eq!(map.lagtime(1, &params), 0.5);
+        // Compartment 2 is overridden by its indexed slot.
+        assert_eq!(map.f_bio(2, &params), 0.3);
+        assert_eq!(map.lagtime(2, &params), 1.25);
+        // indexed_slot exposes the raw mapping (used by upstream validation).
+        assert_eq!(map.indexed_slot(DoseAttr::F, 2), Some(9));
+        assert_eq!(map.indexed_slot(DoseAttr::F, 1), None);
+    }
+
+    #[test]
+    fn dose_attr_from_indexed_name_recognizes_f_and_lag_only() {
+        use DoseAttr::*;
+        // Bioavailability and both lag spellings, case-insensitive.
+        assert_eq!(DoseAttr::from_indexed_name("F1"), Some((F, 1)));
+        assert_eq!(DoseAttr::from_indexed_name("f2"), Some((F, 2)));
+        assert_eq!(DoseAttr::from_indexed_name("ALAG1"), Some((Lag, 1)));
+        assert_eq!(DoseAttr::from_indexed_name("alag3"), Some((Lag, 3)));
+        assert_eq!(DoseAttr::from_indexed_name("LAGTIME2"), Some((Lag, 2)));
+
+        // Bare forms and zero index are not compartment-indexed attributes.
+        assert_eq!(DoseAttr::from_indexed_name("F"), None);
+        assert_eq!(DoseAttr::from_indexed_name("lagtime"), None);
+        assert_eq!(DoseAttr::from_indexed_name("alag"), None);
+        assert_eq!(DoseAttr::from_indexed_name("F0"), None);
+
+        // Must not capture canonical PK names, the [scaling] `S{n}` names, or
+        // non-numeric suffixes.
+        for n in [
+            "CL", "V1", "V2", "Q2", "Q3", "KA", "S1", "S2", "f_bio", "rate",
+        ] {
+            assert_eq!(DoseAttr::from_indexed_name(n), None, "{n} must not match");
+        }
+
+        // D{n}/R{n} are reserved for #324 and not recognised yet (avoids
+        // reinterpreting ODE rate constants like `R0`/`D1` before that lands).
+        assert_eq!(DoseAttr::from_indexed_name("D1"), None);
+        assert_eq!(DoseAttr::from_indexed_name("R1"), None);
+    }
+
+    #[test]
+    fn dose_attr_map_empty_yields_engine_defaults() {
+        // An empty map (the common bare-/single-route model) must reproduce the
+        // pre-existing defaults: F = 1.0, lag = 0.0, even for a params slice too
+        // short to hold the reserved slots (cannot panic).
+        let map = DoseAttrMap::default();
+        let full = PkParams::default().values; // F slot already 1.0
+        assert_eq!(map.f_bio(1, &full), 1.0);
+        assert_eq!(map.lagtime(1, &full), 0.0);
+
+        let short: [f64; 3] = [2.0, 3.0, 4.0];
+        assert_eq!(map.f_bio(1, &short), 1.0);
+        assert_eq!(map.lagtime(1, &short), 0.0);
+        // Duration/Rate have no bare fallback -> no indexed slot means None.
+        assert_eq!(map.indexed_slot(DoseAttr::Duration, 1), None);
+        assert_eq!(map.indexed_slot(DoseAttr::Rate, 1), None);
     }
 
     #[test]

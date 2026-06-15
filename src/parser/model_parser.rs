@@ -1937,19 +1937,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .iter()
             .enumerate()
             .filter(|(_, name)| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
-            // Exempt engine-applied slots on ODE models: `f`/`lagtime`/`alag` are
-            // applied to the dose by the engine without a textual RHS reference, so
-            // absence from `[odes]` does not make them dead. Reuse `ode_param_slots`'
-            // own routing (`ode_slot_map`, parallel to `indiv_param_names`) rather
-            // than re-deriving the slot from the name, so the exemption can't drift
-            // from how the parameter is actually routed. No-op for analytical models
-            // (`is_ode` false; their F/lagtime are bound via an explicit `pk(...)`
-            // mapping the census already counts).
-            .filter(|(i, _)| {
+            // Exempt engine-applied slots on ODE models: bare `f`/`lagtime`/`alag`
+            // (routed to RESERVED_PK_SLOTS) and the compartment-indexed dose
+            // attributes `Fn`/`ALAGn` (issue #369) are applied to the dose by the
+            // engine without a textual RHS reference, so absence from `[odes]` does
+            // not make them dead. The bare case reuses `ode_param_slots`' own routing
+            // (`ode_slot_map`, parallel to `indiv_param_names`) so the exemption can't
+            // drift; the indexed case matches the same `from_indexed_name` predicate
+            // that built `dose_attr_map`. No-op for analytical models (`is_ode` false;
+            // their F/lagtime are bound via an explicit `pk(...)` mapping the census
+            // already counts).
+            .filter(|(i, name)| {
                 !(is_ode
-                    && ode_slot_map
+                    && (ode_slot_map
                         .get(*i)
-                        .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot)))
+                        .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot))
+                        || crate::types::DoseAttr::from_indexed_name(name).is_some()))
             })
             .map(|(_, name)| name.clone())
             .collect();
@@ -5087,6 +5090,30 @@ fn build_ode_spec(
         }))
     };
 
+    // Compartment-indexed dose attributes (NONMEM `Fn`/`ALAGn`; issue #369). An
+    // individual parameter named `F{c}` / `ALAG{c}` / `LAGTIME{c}` binds the
+    // bioavailability / lag for doses into compartment `c` (1-based); the bare
+    // `F`/`lagtime` (at PK_IDX_F/PK_IDX_LAGTIME) remain the all-compartment
+    // default, overridden per compartment by an indexed entry. The slot is the
+    // one `ode_param_slots` already assigned the name (parallel to
+    // `indiv_param_names`), so the RHS can still read the same value.
+    let mut dose_attr_map = crate::types::DoseAttrMap::default();
+    for (i, name) in indiv_param_names.iter().enumerate() {
+        if let Some((attr, cmt)) = crate::types::DoseAttr::from_indexed_name(name) {
+            if cmt > n_states {
+                return Err(format!(
+                    "[individual_parameters]: `{name}` is a compartment-indexed dose \
+                     attribute for compartment {cmt}, but the model has only {n_states} \
+                     compartment(s) {state_names:?}. Compartment indices are 1-based."
+                ));
+            }
+            let slot = indiv_param_slots.get(i).copied().ok_or_else(|| {
+                format!("internal: no Pk slot assigned for dose attribute `{name}`")
+            })?;
+            dose_attr_map.insert(attr, cmt, slot);
+        }
+    }
+
     Ok(crate::ode::OdeSpec {
         rhs,
         n_states,
@@ -5100,6 +5127,7 @@ fn build_ode_spec(
         // Built-in absorption forcing terms split out of the [odes] RHS above
         // (design A); empty for models with no transit()/etc. input-rate call.
         input_rate,
+        dose_attr_map,
     })
 }
 
@@ -17562,6 +17590,96 @@ CL V KA WT
             let ctx2 = DerivedContext { tad: 1.0, ..ctx };
             assert_eq!(eval(&ctx2), 0.0, "TAD=1 should not be < MACHEPS");
         }
+    }
+
+    #[test]
+    fn ode_compartment_indexed_dose_attrs_populate_map() {
+        // `F2` / `ALAG2` in a 2-compartment ODE model must (a) parse without
+        // tripping the dead-parameter census — they are engine-applied dose
+        // attributes, not dead structural params — and (b) populate the
+        // `dose_attr_map` and enable `has_lagtime()` (#369).
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF2(0.6, 0.01, 1.0)
+  theta TVLAG2(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  F2 = TVF2
+  ALAG2 = TVLAG2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("parse ok");
+        let map = &parsed
+            .model
+            .ode_spec
+            .as_ref()
+            .expect("ode spec")
+            .dose_attr_map;
+        assert!(
+            map.indexed_slot(crate::types::DoseAttr::F, 2).is_some(),
+            "F2 must map for compartment 2"
+        );
+        assert!(
+            map.indexed_slot(crate::types::DoseAttr::Lag, 2).is_some(),
+            "ALAG2 must map for compartment 2"
+        );
+        // No compartment-1 override was declared.
+        assert!(map.indexed_slot(crate::types::DoseAttr::F, 1).is_none());
+        assert!(
+            parsed.model.has_lagtime(),
+            "ALAG2 must enable has_lagtime() so downstream lag handling runs"
+        );
+    }
+
+    #[test]
+    fn ode_dose_attr_compartment_out_of_range_errors() {
+        // `F3` references compartment 3, but the model has only 2 states — a loud
+        // parse error, never a silently-ignored spare slot (#369).
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF3(0.6, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  F3 = TVF3
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(src)
+            .err()
+            .expect("F3 with 2 compartments must error");
+        assert!(
+            err.contains("compartment 3") && err.contains("F3"),
+            "error must name the attribute and compartment, got: {err}"
+        );
     }
 
     #[test]

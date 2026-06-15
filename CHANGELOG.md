@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Compartment-indexed bioavailability and lag for ODE models** — name an
+  individual parameter `F{n}` or `ALAG{n}`/`LAGTIME{n}` (e.g. `F2`, `ALAG2`) to
+  apply a per-route bioavailability/lag to doses into compartment `n`, mirroring
+  NONMEM's `F1`/`F2`/`ALAG1`/`ALAG2`. A bare `F`/`lagtime` stays the
+  all-compartment default (existing single-route models are unchanged); an
+  indexed value overrides only its compartment. Resolved uniformly across every
+  ODE dose-application path (event-driven, steady-state, and the EKF/diffusion
+  path — the latter applies `F` but not lag). An index past the model's
+  compartment count is a parse error rather than a silently-ignored parameter.
+  Foundation for the modeled-duration/rate (`Dn`/`Rn`) work in #324 (#369).
 - Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The
