@@ -9,6 +9,8 @@ use ferx_core::types::{DoseEvent, Population, Subject};
 use ferx_core::{fit, FitOptions};
 use std::collections::HashMap;
 
+mod common;
+
 // ── Minimal model template ───────────────────────────────────────────────────
 
 const BASE_MODEL: &str = "
@@ -44,24 +46,16 @@ fn one_dose_population() -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs_times,
-            obs_raw_times: Vec::new(),
-            observations: vec![5.0, 3.0, 1.5, 0.7],
-            obs_cmts: vec![1; n_obs],
-            covariates: cov,
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            cens: vec![0; n_obs],
-            occasions: vec![],
-            dose_occasions: vec![],
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
+        subjects: vec![{
+            let mut s = common::subject(
+                "1",
+                vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times,
+                vec![5.0, 3.0, 1.5, 0.7],
+                vec![1; n_obs],
+            );
+            s.covariates = cov;
+            s
         }],
     }
 }
@@ -173,25 +167,7 @@ fn derived_integral_step_ignored_warning_for_dv() {
 
 fn make_subject_with_doses(obs_times: Vec<f64>, doses: Vec<DoseEvent>) -> Subject {
     let n = obs_times.len();
-    Subject {
-        id: "1".into(),
-        doses,
-        obs_times,
-        obs_raw_times: Vec::new(),
-        observations: vec![0.0; n],
-        obs_cmts: vec![1; n],
-        covariates: HashMap::new(),
-        dose_covariates: vec![],
-        obs_covariates: vec![],
-        pk_only_times: vec![],
-        pk_only_covariates: vec![],
-        reset_times: vec![],
-        cens: vec![0; n],
-        occasions: vec![],
-        dose_occasions: vec![],
-        #[cfg(feature = "survival")]
-        obs_records: vec![],
-    }
+    common::subject("1", doses, obs_times, vec![0.0; n], vec![1; n])
 }
 
 #[test]

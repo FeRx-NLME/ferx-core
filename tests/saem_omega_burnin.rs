@@ -41,7 +41,8 @@
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, OmegaMatrix, Population, Subject};
 use ferx_core::{fit, simulate_with_seed, EstimationMethod, FitOptions};
-use std::collections::HashMap;
+
+mod common;
 
 const MODEL: &str = r#"
 [parameters]
@@ -73,25 +74,13 @@ fn sparse_population(n: usize) -> Population {
     let subjects: Vec<Subject> = (1..=n)
         .map(|i| {
             let t = times[i % times.len()];
-            Subject {
-                id: format!("{i}"),
-                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                obs_times: vec![t],
-                obs_raw_times: Vec::new(),
-                observations: vec![0.0],
-                obs_cmts: vec![1],
-                covariates: HashMap::new(),
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                cens: vec![0],
-                occasions: Vec::new(),
-                dose_occasions: Vec::new(),
-                #[cfg(feature = "survival")]
-                obs_records: vec![],
-            }
+            common::subject(
+                &format!("{i}"),
+                vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                vec![t],
+                vec![0.0],
+                vec![1],
+            )
         })
         .collect();
 

@@ -1180,6 +1180,95 @@ mod tests {
         }
     }
 
+    // ── F (bioavailability) & lagtime across RATE options (#324 follow-up) ──
+    // The active (event-driven) path must apply F and lagtime correctly to
+    // BOTH dose forms reachable via the RATE column: bolus (RATE=0) and
+    // infusion (RATE>0). NONMEM scales the bolus *amount* and the infusion
+    // *rate* by F (duration unchanged), so concentrations are linear in F; and
+    // a lagtime L shifts the whole curve later by L. (Coded RATE -1/-2 never
+    // reach here — they are rejected by the datareader, see #324.)
+
+    #[test]
+    fn f_bioavailability_scales_bolus_and_infusion_linearly() {
+        let (cl, v, amt) = (5.0, 50.0, 100.0);
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
+        // rate=0 → bolus; rate=25 → infusion (duration = amt/rate = 4 h).
+        for &rate in &[0.0_f64, 25.0] {
+            let dose = DoseEvent::new(0.0, amt, 1, rate, false, 0.0);
+            let subj = make_subject(vec![dose], obs_times.clone());
+
+            let mut pk_full = pk_one(cl, v);
+            pk_full.values[crate::types::PK_IDX_F] = 1.0;
+            let mut pk_half = pk_one(cl, v);
+            pk_half.values[crate::types::PK_IDX_F] = 0.5;
+
+            let full = event_driven_predictions(
+                PkModel::OneCptIv,
+                &subj,
+                &vec![pk_full; 1],
+                &vec![pk_full; obs_times.len()],
+                &[],
+            );
+            let half = event_driven_predictions(
+                PkModel::OneCptIv,
+                &subj,
+                &vec![pk_half; 1],
+                &vec![pk_half; obs_times.len()],
+                &[],
+            );
+
+            for (j, (&f, &h)) in full.iter().zip(half.iter()).enumerate() {
+                assert!(f > 0.0, "rate={rate}: expected nonzero conc at obs {j}");
+                // F=0.5 must halve every concentration (linear in F).
+                assert_relative_eq!(h, 0.5 * f, max_relative = 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn lagtime_shifts_bolus_and_infusion_in_time() {
+        let (cl, v, amt, lag) = (5.0, 50.0, 100.0, 1.5);
+        // Sample strictly after the lag so the lagged curve is "on".
+        let obs_times = vec![2.0, 3.0, 5.0, 9.0];
+        let shifted: Vec<f64> = obs_times.iter().map(|t| t - lag).collect();
+        for &rate in &[0.0_f64, 25.0] {
+            // Lagged dose, sampled at t.
+            let subj_lag = make_subject(
+                vec![DoseEvent::new(0.0, amt, 1, rate, false, 0.0)],
+                obs_times.clone(),
+            );
+            let mut pk_lag = pk_one(cl, v);
+            pk_lag.values[crate::types::PK_IDX_LAGTIME] = lag;
+            let lagged = event_driven_predictions(
+                PkModel::OneCptIv,
+                &subj_lag,
+                &vec![pk_lag; 1],
+                &vec![pk_lag; obs_times.len()],
+                &[],
+            );
+
+            // Same dose, no lag, sampled at t-L.
+            let subj_nolag = make_subject(
+                vec![DoseEvent::new(0.0, amt, 1, rate, false, 0.0)],
+                shifted.clone(),
+            );
+            let pk_nolag = pk_one(cl, v); // lagtime defaults to 0
+            let unlagged = event_driven_predictions(
+                PkModel::OneCptIv,
+                &subj_nolag,
+                &vec![pk_nolag; 1],
+                &vec![pk_nolag; shifted.len()],
+                &[],
+            );
+
+            for (j, (&l, &u)) in lagged.iter().zip(unlagged.iter()).enumerate() {
+                assert!(u > 0.0, "rate={rate}: expected nonzero conc at obs {j}");
+                // C_lagged(t) == C_unlagged(t - L).
+                assert_relative_eq!(l, u, max_relative = 1e-9);
+            }
+        }
+    }
+
     // ── System resets (EVID=3 / EVID=4) ───────────────────────────────────
 
     #[test]

@@ -330,6 +330,14 @@ pub struct OdeSpec {
     /// A system reset (EVID=3/4) re-applies this on the ODE event-driven path.
     #[allow(clippy::type_complexity)]
     pub init_fn: Option<Box<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync>>,
+    /// RK45 solver tolerances used to integrate this system. Defaults to
+    /// `OdeSolverOptions::default()` (reltol 1e-4 / abstol 1e-6); overridden
+    /// from the model's `[fit_options]` (`ode_reltol` / `ode_abstol` /
+    /// `ode_max_steps`) and call-time `settings` via
+    /// [`CompiledModel::sync_ode_solver_opts`]. Carried on the spec so every
+    /// integration entry point (`ode_predictions*`, EKF) uses the configured
+    /// accuracy without threading options through each call.
+    pub solver_opts: OdeSolverOptions,
 }
 
 impl OdeSpec {
@@ -392,7 +400,7 @@ pub fn ode_predictions(
 ) -> Vec<f64> {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
-    let opts = OdeSolverOptions::default();
+    let opts = ode.solver_opts;
 
     // Seed compartments from `init(state) = expr` (zeros when none declared).
     let mut u = ode.initial_state(pk_params_flat);
@@ -659,7 +667,7 @@ pub fn ode_predictions_event_driven(
 
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
-    let opts = OdeSolverOptions::default();
+    let opts = ode.solver_opts;
 
     // First-dose time anchor for TAFD injection via extended params.
     // fold yields INFINITY when there are no doses; convert to NaN so the ODE
@@ -974,6 +982,7 @@ pub fn ode_predictions_ekf_with_diffusion(
         &subject.doses,
         &subject.obs_times,
         &r_obs_vec,
+        ode.solver_opts,
     );
 
     let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
@@ -1032,6 +1041,7 @@ pub fn ode_predictions_ekf(
         &subject.doses,
         &subject.obs_times,
         &r_obs_vec,
+        ode.solver_opts,
     );
 
     let ipreds: Vec<f64> = pts.iter().map(|p| p.ipred).collect();
@@ -1073,7 +1083,7 @@ pub fn ode_predictions_with_states(
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
-    let opts = OdeSolverOptions::default();
+    let opts = ode.solver_opts;
 
     let mut u = ode.initial_state(pk_params_flat);
     let mut predictions = vec![f64::NAN; n_obs];
@@ -1376,7 +1386,7 @@ pub fn ode_dense_solve_states(
         return vec![];
     }
     let n = ode.n_states;
-    let opts = OdeSolverOptions::default();
+    let opts = ode.solver_opts;
 
     let mut u = ode.initial_state(pk_params_flat);
     let mut result: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; saveat.len()];
@@ -1601,6 +1611,7 @@ mod tests {
             state_names: vec!["central".into()],
             readout: OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
             init_fn: None,
         }
     }
@@ -1647,6 +1658,7 @@ mod tests {
             state_names: vec!["R".into()],
             readout: OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
             init_fn: Some(Box::new(|p: &[f64]| {
                 let (kin, kout) = (p[0], p[1]);
                 vec![if kout > 0.0 { kin / kout } else { 0.0 }]
@@ -1872,6 +1884,7 @@ mod tests {
             state_names: vec!["depot".into(), "central".into()],
             readout: OdeReadout::ObsCmt(1),
             diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
             init_fn: None,
         }
     }
@@ -2310,6 +2323,7 @@ mod tests {
                 },
             )),
             diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
             init_fn: None,
         }
     }
@@ -2442,6 +2456,7 @@ mod tests {
             state_names: vec!["central".into()],
             readout: OdeReadout::ObsCmt(0),
             diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
             init_fn: None,
         };
         let pk = pk_one(1.0, 1.0);

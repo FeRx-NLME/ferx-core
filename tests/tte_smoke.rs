@@ -8,12 +8,14 @@
 //! file compiles on every PR without the feature enabled (it just contributes
 //! no test functions).
 
+mod common;
+
 #[cfg(feature = "survival")]
 mod survival_smoke {
+    use crate::common;
     use ferx_core::parser::model_parser::parse_model_string;
-    use ferx_core::types::{DoseEvent, EventType, ObsRecord, Population, Subject};
+    use ferx_core::types::{DoseEvent, EventType, ObsRecord, Population};
     use ferx_core::{fit, EndpointLikelihood, FitOptions};
-    use std::collections::HashMap;
 
     // ── Model strings ────────────────────────────────────────────────────────
 
@@ -97,29 +99,14 @@ mod survival_smoke {
                 } else {
                     EventType::RightCensored
                 };
-                Subject {
-                    id: format!("{}", i + 1),
-                    doses: vec![],
-                    obs_times: vec![],
-                    obs_raw_times: vec![],
-                    observations: vec![],
-                    obs_cmts: vec![],
-                    covariates: HashMap::new(),
-                    dose_covariates: vec![],
-                    obs_covariates: vec![],
-                    pk_only_times: vec![],
-                    pk_only_covariates: vec![],
-                    reset_times: vec![],
-                    cens: vec![],
-                    occasions: vec![],
-                    dose_occasions: vec![],
-                    obs_records: vec![ObsRecord::Event {
-                        time: t,
-                        event_type,
-                        entry_time: 0.0,
-                        cmt: 2,
-                    }],
-                }
+                let mut s = common::subject(&format!("{}", i + 1), vec![], vec![], vec![], vec![]);
+                s.obs_records = vec![ObsRecord::Event {
+                    time: t,
+                    event_type,
+                    entry_time: 0.0,
+                    cmt: 2,
+                }];
+                s
             })
             .collect();
 
@@ -902,30 +889,6 @@ mod survival_smoke {
         }
     }
 
-    /// DoseEvent helper — not used in TTE-only tests but checks Subject
-    /// constructors compile correctly with the obs_records field.
-    #[allow(dead_code)]
-    fn _dummy_subject_with_dose() -> Subject {
-        Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs_times: vec![],
-            obs_raw_times: vec![],
-            observations: vec![],
-            obs_cmts: vec![],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            cens: vec![],
-            occasions: vec![],
-            dose_occasions: vec![],
-            obs_records: vec![],
-        }
-    }
-
     // ── Phase 1 follow-up: IOV + TTE subjects ────────────────────────────────
 
     /// Mixed IOV+TTE model: one-cpt IV PK with a per-occasion kappa on CL,
@@ -975,33 +938,29 @@ mod survival_smoke {
         let pk_conc = 6.7_f64;
 
         let subjects = (0..n)
-            .map(|i| Subject {
-                id: format!("{}", i + 1),
+            .map(|i| {
                 // Dose 100 at t=0 (occ 0) and dose 100 at t=24 (occ 1).
-                doses: vec![
-                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-                    DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-                ],
-                dose_occasions: vec![0, 1],
                 // One PK obs per occasion at t=4 and t=28.
-                obs_times: vec![4.0, 28.0],
-                obs_raw_times: vec![4.0, 28.0],
-                observations: vec![pk_conc, pk_conc],
-                obs_cmts: vec![1, 1],
-                occasions: vec![0, 1],
-                obs_records: vec![ObsRecord::Event {
+                let mut s = common::subject(
+                    &format!("{}", i + 1),
+                    vec![
+                        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                        DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+                    ],
+                    vec![4.0, 28.0],
+                    vec![pk_conc, pk_conc],
+                    vec![1, 1],
+                );
+                s.obs_raw_times = vec![4.0, 28.0];
+                s.occasions = vec![0, 1];
+                s.dose_occasions = vec![0, 1];
+                s.obs_records = vec![ObsRecord::Event {
                     time: event_times[i % event_times.len()],
                     event_type: EventType::Exact,
                     entry_time: 0.0,
                     cmt: 2,
-                }],
-                covariates: HashMap::new(),
-                dose_covariates: vec![],
-                obs_covariates: vec![],
-                pk_only_times: vec![],
-                pk_only_covariates: vec![],
-                reset_times: vec![],
-                cens: vec![0, 0],
+                }];
+                s
             })
             .collect();
 

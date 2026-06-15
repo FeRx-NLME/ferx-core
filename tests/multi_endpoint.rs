@@ -11,10 +11,11 @@
 //! `examples/emax_pkpd.ferx`.
 
 use ferx_core::parser::model_parser::{parse_model_file, parse_model_string};
-use ferx_core::types::{DoseEvent, ErrorSpec, Population, SigmaType, Subject};
+use ferx_core::types::{DoseEvent, ErrorSpec, Population, SigmaType};
 use ferx_core::{fit, predict, EstimationMethod, FitOptions};
-use std::collections::HashMap;
 use std::path::Path;
+
+mod common;
 
 /// Small linear-ODE PK/PD model: central compartment (PK, CMT=1, proportional
 /// error) plus a biophase effect compartment (PD, CMT=2, additive error).
@@ -58,32 +59,19 @@ const LINEAR_PKPD: &str = r"
 fn pkpd_pop() -> Population {
     let times = vec![1.0, 1.0, 2.0, 2.0, 4.0, 4.0];
     let cmts = vec![1, 2, 1, 2, 1, 2];
-    let n = times.len();
     Population {
         covariate_names: Vec::new(),
         dv_column: "DV".to_string(),
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs_times: times,
-            obs_raw_times: Vec::new(),
-            observations: vec![8.0, 1.0, 6.0, 2.0, 4.0, 3.0],
-            obs_cmts: cmts,
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            cens: vec![0; n],
-            occasions: Vec::new(),
-            dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
-        }],
+        subjects: vec![common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            times,
+            vec![8.0, 1.0, 6.0, 2.0, 4.0, 3.0],
+            cmts,
+        )],
     }
 }
 

@@ -946,6 +946,7 @@ mod tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             n_kappa: 0,

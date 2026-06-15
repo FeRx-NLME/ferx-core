@@ -82,7 +82,7 @@ Set `reconverge_gradient_interval = 1` to re-solve the inner loop at every gradi
 
 On this cefepime 2-compartment dataset `bobyqa` reaches a near-optimal solution faster than any reconverged `slsqp` setting. The reconverged gradient is most useful when derivative-free search is too slow (high parameter count) or when a gradient optimizer is required for other reasons.
 
-IOV models (`kappa`/`block_kappa`) always reconverge regardless of this setting.
+IOV models (`kappa`/`block_kappa`) always reconverge regardless of this setting. Even so, a *pure* `slsqp` cold-start on an IOV model can terminate a few OFV units above the minimum, and the exact stopping point is platform-dependent (the re-converged FD gradient's summation order differs across architectures — issue #160). Prefer the default `bobyqa` or a `methods = [saem, focei]` chain for IOV fits; both reach the minimum platform-independently. See [Inter-Occasion Variability](../model-file/iov.md#limitations).
 
 ---
 

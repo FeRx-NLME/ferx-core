@@ -26,7 +26,7 @@
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
 use crate::stats::likelihood::{obs_nll_subject_into, split_obs_by_occasion};
 use crate::stats::residual_error::compute_r_diag;
-use crate::stats::special::log_normal_cdf;
+use crate::stats::special::{ln_gamma, log_normal_cdf};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
@@ -1042,37 +1042,6 @@ fn build_proposal(h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize) -> Optio
 // Numerical helpers
 // ---------------------------------------------------------------------------
 
-/// log Γ(x) via the Lanczos approximation. Standard library doesn't expose
-/// `f64::ln_gamma` on stable, so we inline the textbook coefficients.
-fn ln_gamma(x: f64) -> f64 {
-    // Cody's coefficients for Lanczos g=7, n=9. Accuracy ~1e-15 for x > 0.
-    const G: f64 = 7.0;
-    const C: [f64; 9] = [
-        0.999_999_999_999_81,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_2,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_1,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    if x < 0.5 {
-        // Reflection.
-        return std::f64::consts::PI.ln()
-            - (std::f64::consts::PI * x).sin().ln()
-            - ln_gamma(1.0 - x);
-    }
-    let x = x - 1.0;
-    let mut a = C[0];
-    for (i, &c) in C.iter().enumerate().skip(1) {
-        a += c / (x + i as f64);
-    }
-    let t = x + G + 0.5;
-    0.5 * (TWO_PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
-}
-
 /// Numerically stable `log Σ exp(xᵢ)` plus the normalised weights `wᵢ`.
 fn logsumexp_with_normalised(xs: &[f64]) -> (f64, Vec<f64>) {
     if xs.is_empty() {
@@ -1170,19 +1139,6 @@ mod tests {
         let (lse, w) = logsumexp_with_normalised(&[f64::NEG_INFINITY; 3]);
         assert_eq!(lse, f64::NEG_INFINITY);
         assert_eq!(w, vec![0.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn ln_gamma_matches_known_values() {
-        // ln Γ(0.5) = ln √π
-        assert!((ln_gamma(0.5) - 0.5 * std::f64::consts::PI.ln()).abs() < 1e-10);
-        // ln Γ(1) = 0
-        assert!(ln_gamma(1.0).abs() < 1e-10);
-        // ln Γ(5) = ln 24
-        assert!((ln_gamma(5.0) - 24.0_f64.ln()).abs() < 1e-10);
-        // ln Γ(10) = ln 9!
-        let factorial_9: f64 = (1..=9).map(|n| n as f64).product();
-        assert!((ln_gamma(10.0) - factorial_9.ln()).abs() < 1e-9);
     }
 
     #[test]

@@ -35,7 +35,8 @@ use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, OmegaMatrix, Population, Subject};
 use ferx_core::{fit, simulate_with_seed, EstimationMethod, FitOptions};
 use nalgebra::DMatrix;
-use std::collections::HashMap;
+
+mod common;
 
 const MODEL: &str = r#"
 [parameters]
@@ -100,26 +101,14 @@ fn template_population(n: usize) -> Population {
             // 5 observations per subject, phase-shifted across the grid.
             let times: Vec<f64> = (0..5).map(|j| grid[(i + j) % grid.len()]).collect();
             let n_obs = times.len();
-            Subject {
-                id: format!("{i}"),
-                // amt=1000, rate=500 → a 2 h infusion into the central compartment.
-                doses: vec![DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0)],
-                obs_times: times,
-                obs_raw_times: Vec::new(),
-                observations: vec![0.0; n_obs],
-                obs_cmts: vec![1; n_obs],
-                covariates: HashMap::new(),
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                cens: vec![0; n_obs],
-                occasions: Vec::new(),
-                dose_occasions: Vec::new(),
-                #[cfg(feature = "survival")]
-                obs_records: vec![],
-            }
+            // amt=1000, rate=500 → a 2 h infusion into the central compartment.
+            common::subject(
+                &format!("{i}"),
+                vec![DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0)],
+                times,
+                vec![0.0; n_obs],
+                vec![1; n_obs],
+            )
         })
         .collect();
 

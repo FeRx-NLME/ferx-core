@@ -48,11 +48,15 @@ A CSV file with per-observation diagnostics, one row per observation per subject
 ### Residual Definitions
 
 **IWRES** (Individual Weighted Residual):
-\\[ \text{IWRES}_j = \frac{y_j - \text{IPRED}_j}{\sqrt{V_j}} \\]
+<div>
+\[ \text{IWRES}_j = \frac{y_j - \text{IPRED}_j}{\sqrt{V_j}} \]
+</div>
 where \\( V_j \\) is the residual variance evaluated at the individual prediction.
 
 **CWRES** (Conditional Weighted Residual):
-\\[ \text{CWRES}_j = \frac{y_j - f_{0,j}}{\sqrt{\tilde{R}_{jj}}} \\]
+<div>
+\[ \text{CWRES}_j = \frac{y_j - f_{0,j}}{\sqrt{\tilde{R}_{jj}}} \]
+</div>
 where \\( f_0 = f(\hat{\eta}) - H\hat{\eta} \\) is the linearized population prediction and \\( \tilde{R} = H\Omega H^T + R \\) is the conditional variance.
 
 ### Example
@@ -169,12 +173,16 @@ The following fields are populated on the `FitResult` struct returned by `fit()`
 Two shrinkage metrics are reported after every fit:
 
 **ETA shrinkage** (per random effect — `shrinkage_eta: Vec<f64>`):
-\\[ \text{shrinkage}_k = 1 - \frac{\sqrt{\frac{1}{n}\sum_i \hat{\eta}_{k,i}^2}}{\sqrt{\omega_{kk}}} \\]
+<div>
+\[ \text{shrinkage}_k = 1 - \frac{\sqrt{\frac{1}{n}\sum_i \hat{\eta}_{k,i}^2}}{\sqrt{\omega_{kk}}} \]
+</div>
 
 A value near 1 means individual EBEs are all pulled toward zero — the data are not informative about that random effect. A value near 0 means the ETAs are spread consistent with the prior omega.
 
 **EPS shrinkage** (scalar — `shrinkage_eps: f64`):
-\\[ \text{shrinkage}_\varepsilon = 1 - \sqrt{\frac{1}{n}\sum_j \text{IWRES}_j^2} \\]
+<div>
+\[ \text{shrinkage}_\varepsilon = 1 - \sqrt{\frac{1}{n}\sum_j \text{IWRES}_j^2} \]
+</div>
 
 Both formulas use the **uncentered second moment with `n` divisor**, matching the NONMEM / PsN / Monolix convention — the population model assumes `E[η]=0` and `E[IWRES²]=1`, so the natural estimator is `√(Σx²/n)` rather than the unbiased sample SD (which centers on the sample mean and divides by `n-1`). The unbiased form would inflate SD by `√(n/(n-1))` and routinely produce spurious negative shrinkage on small samples.
 
@@ -187,7 +195,9 @@ Values of `NaN` indicate a zero-variance omega component (ETA) or fewer than two
 When the model contains `kappa` or `block_kappa` declarations, two additional shrinkage metrics are computed using the same uncentered-moment convention.
 
 *Pooled* — one value per kappa parameter `j`, averaged over all `N_\text{pairs}` (subject, occasion) pairs:
-\\[ \text{shrinkage}_{\kappa,j} = 1 - \frac{\sqrt{\frac{1}{N_{\text{pairs}}}\sum_i \sum_{q} \hat{\kappa}_{iqj}^2}}{\sqrt{\omega_{\text{iov},jj}}} \\]
+<div>
+\[ \text{shrinkage}_{\kappa,j} = 1 - \frac{\sqrt{\frac{1}{N_{\text{pairs}}}\sum_i \sum_{q} \hat{\kappa}_{iqj}^2}}{\sqrt{\omega_{\text{iov},jj}}} \]
+</div>
 where `q` indexes occasions and `N_\text{pairs} = \sum_i K_i` (total subject-occasion pairs; equals `N_\text{subj} \cdot K` only for balanced designs).
 
 *Per-occasion slot* — the same formula restricted to occasion slot `occ_idx`, stored in `shrinkage_kappa_by_occ[occ_idx][kappa_idx]`. Only reported when two or more occasions are present. Useful for identifying sparse occasions (high shrinkage in one slot suggests that occasion has little information on kappa).
@@ -203,7 +213,9 @@ Two pooled autocorrelation diagnostics are reported after every fit:
 **`iwres_lag1_r`** — pooled lag-1 Pearson correlation of IWRES across subjects. Values near 0 indicate no serial dependence; values approaching ±1 indicate strong autocorrelation.
 
 **`dw_statistic`** — pooled Durbin-Watson statistic:
-\\[ \text{DW} = \frac{\sum_i \sum_t (e_{i,t} - e_{i,t-1})^2}{\sum_i \sum_t e_{i,t}^2} \\]
+<div>
+\[ \text{DW} = \frac{\sum_i \sum_t (e_{i,t} - e_{i,t-1})^2}{\sum_i \sum_t e_{i,t}^2} \]
+</div>
 
 | DW range | Interpretation |
 |----------|---------------|

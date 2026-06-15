@@ -12,6 +12,8 @@ For standard compartmental models, use the `pk` keyword with a model function:
 pk MODEL_NAME(param=VALUE, param=VALUE, ...)
 ```
 
+Each `VALUE` is either a parameter defined in `[individual_parameters]` or a numeric constant (e.g. `ka=1.0` fixes absorption at 1.0). Referencing a name that is **not** a defined parameter is a parse error — ferx does not silently default the slot to 0.0 (which previously produced a "converged" but structurally broken fit, #261). An unrecognized `param` key (e.g. the typo `clx=`) is likewise rejected.
+
 ### Available Models
 
 | Model Function | Compartments | Route | Required Parameters |
@@ -24,6 +26,12 @@ pk MODEL_NAME(param=VALUE, param=VALUE, ...)
 | `three_cpt_oral` | 3 | Oral | `cl`, `v1`, `q2`, `v2`, `q3`, `v3`, `ka` |
 
 Each model has a `*_compartment_*` long-form alias (e.g. `three_compartment_iv`); the short and long names are interchangeable.
+
+Every parameter in the **Required Parameters** column must be mapped on the `pk(...)` line. Omitting one is a parse error (issue #309) — ferx will **not** silently default the missing slot to `0.0`, which would otherwise yield a structurally broken fit (e.g. a missing `ka` means no absorption, so every prediction floors to the log constant). Bioavailability `f` and `lagtime` (alias `alag`) are optional and default to `1.0` and `0.0` respectively.
+
+Conversely, mapping a parameter the chosen model does **not** use — e.g. `ka` or `f` on an IV model (no absorption, no bioavailability term), or `q`/`v2` on a one-compartment model — is accepted but emits a parse warning, since the mapping has no effect. `lagtime` is never flagged (every model applies it to the dose); `f` (bioavailability) is applied only by **oral** models, so mapping it on an IV model is flagged.
+
+In the other direction, an individual parameter that is **declared but never used** — neither mapped into the `pk(...)` line nor referenced in any other block — is also flagged, since it is computed but has no effect. The common case is declaring `F` to estimate bioavailability but forgetting to add `f=F` to the `pk(...)` line: analytical models bind `F` (and `lagtime`) only through an explicit `f=`/`lagtime=` mapping.
 
 There is no separate bolus or infusion variant: every IV model selects the closed form per dose from the `RATE` column (`RATE=0` ⇒ bolus, `RATE>0` ⇒ infusion). A single subject can mix the two. This matches NONMEM, nlmixr2, and Monolix.
 
@@ -99,6 +107,8 @@ amount-only ODE form and supply `[scaling] y = <expr>`:
 [scaling]
   y = central / V
 ```
+
+As with analytical models, an individual parameter that is **declared but never used** — never referenced in the `[odes]` right-hand side (nor in `[scaling]`/`[derived]`/`[output]`) — is flagged with a parse warning, since it is computed but has no effect (issue #315). The exceptions are the engine-applied `F` (bioavailability) and `lagtime` (alias `alag`): they act on the dose without appearing in the RHS (see [Bioavailability](#bioavailability) above), so they are never flagged.
 
 See [ODE Models](ode-models.md) for full ODE syntax and
 [Scaling](scaling.md) for the `[scaling]` block.

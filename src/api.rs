@@ -2780,36 +2780,18 @@ fn fit_inner(
 
     // SIR fallback: when the FD Hessian is non-PD and covariance_fallback = sir,
     // run SIR with the rectified |eigenvalue| proposal built inside compute_covariance.
-    let sir_fallback_result = if options.covariance_fallback == CovarianceFallback::Sir
-        && result.covariance_matrix.is_none()
-        && sir_result.is_none()
-        && !crate::cancel::is_cancelled(&options.cancel)
-    {
-        if let Some(ref proposal) = result.sir_fallback_proposal {
-            if options.verbose {
-                eprintln!("\nRunning SIR fallback (non-PD Hessian)...");
-            }
-            match crate::estimation::sir::run_sir_core(
-                model,
-                population,
-                &result.params,
-                &result.eta_hats,
-                proposal,
-                result.ofv,
-                options,
-            ) {
-                Ok(sir) => Some(sir),
-                Err(e) => {
-                    warnings.push(format!("SIR fallback failed: {}", e));
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let sir_fallback_result = resolve_sir_fallback(
+        options,
+        result.covariance_matrix.is_some(),
+        sir_result.is_some(),
+        result.sir_fallback_proposal.as_ref(),
+        model,
+        population,
+        &result.params,
+        &result.eta_hats,
+        result.ofv,
+        &mut warnings,
+    );
 
     // `final_method` reports the last *estimating* stage — IMP is a likelihood
     // evaluation and doesn't produce parameters, so a chain like `[saem, imp]`
@@ -3231,6 +3213,71 @@ fn resolve_covariance_status(
         CovarianceStatus::SirFallback
     } else {
         CovarianceStatus::Failed
+    }
+}
+
+/// Pure gate for the non-PD-Hessian SIR fallback: should it run? It fires only
+/// when the user opted in (`covariance_fallback = sir`), the FD-Hessian
+/// covariance did **not** succeed (`!has_covariance_matrix`), a normal
+/// `sir = true` run did **not** already produce intervals (`!normal_sir_ran`),
+/// and `compute_covariance` actually handed back a fallback proposal
+/// (`has_fallback_proposal`). Split out of [`resolve_sir_fallback`] so the
+/// decision is unit-testable without driving a fit to a non-PD Hessian (#264).
+fn should_run_sir_fallback(
+    fallback_is_sir: bool,
+    has_covariance_matrix: bool,
+    normal_sir_ran: bool,
+    has_fallback_proposal: bool,
+) -> bool {
+    fallback_is_sir && !has_covariance_matrix && !normal_sir_ran && has_fallback_proposal
+}
+
+/// Run the non-PD-Hessian SIR fallback when [`should_run_sir_fallback`] permits.
+///
+/// Returns `Some(SirResult)` when the fallback fired and SIR succeeded; `None`
+/// when the gate declined, the run was cancelled, or SIR itself failed (the
+/// failure case pushes a `"SIR fallback failed: …"` warning). Extracted from
+/// `fit_inner` so the gate → `run_sir_core` → warning wiring is exercised by a
+/// unit test with a controlled (tame) proposal, rather than relying on a real
+/// non-PD fit — which the optimizer's fixed warmup budget cannot reach and a
+/// degenerate fixture cannot reliably survive in SIR (#264).
+#[allow(clippy::too_many_arguments)]
+fn resolve_sir_fallback(
+    options: &FitOptions,
+    has_covariance_matrix: bool,
+    normal_sir_ran: bool,
+    fallback_proposal: Option<&DMatrix<f64>>,
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    ofv: f64,
+    warnings: &mut Vec<String>,
+) -> Option<crate::estimation::sir::SirResult> {
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return None;
+    }
+    if !should_run_sir_fallback(
+        options.covariance_fallback == CovarianceFallback::Sir,
+        has_covariance_matrix,
+        normal_sir_ran,
+        fallback_proposal.is_some(),
+    ) {
+        return None;
+    }
+    let proposal =
+        fallback_proposal.expect("should_run_sir_fallback guarantees a proposal is present");
+    if options.verbose {
+        eprintln!("\nRunning SIR fallback (non-PD Hessian)...");
+    }
+    match crate::estimation::sir::run_sir_core(
+        model, population, params, eta_hats, proposal, ofv, options,
+    ) {
+        Ok(sir) => Some(sir),
+        Err(e) => {
+            warnings.push(format!("SIR fallback failed: {}", e));
+            None
+        }
     }
 }
 
@@ -4507,6 +4554,7 @@ mod iov_integration {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -5330,6 +5378,156 @@ mod tests_cov_diagnostics {
 }
 
 #[cfg(test)]
+mod tests_sir_fallback {
+    use super::*;
+    use std::path::Path;
+
+    // ── should_run_sir_fallback (pure gate, #264) ────────────────────────────
+
+    #[test]
+    fn sir_fallback_gate_fires_only_when_all_conditions_hold() {
+        // Opted in, no real covariance, no normal SIR, proposal present.
+        assert!(should_run_sir_fallback(true, false, false, true));
+    }
+
+    #[test]
+    fn sir_fallback_gate_blocked_by_each_condition() {
+        // Each single deviation from the firing case blocks the fallback.
+        assert!(!should_run_sir_fallback(false, false, false, true)); // covariance_fallback != sir
+        assert!(!should_run_sir_fallback(true, true, false, true)); // a real H⁻¹ covariance exists
+        assert!(!should_run_sir_fallback(true, false, true, true)); // a normal sir=true run already produced CIs
+        assert!(!should_run_sir_fallback(true, false, false, false)); // compute_covariance produced no proposal
+    }
+
+    // ── resolve_sir_fallback (gate + run_sir_core + status, #264) ─────────────
+
+    fn warfarin_fixture() -> (
+        CompiledModel,
+        Population,
+        ModelParameters,
+        Vec<DVector<f64>>,
+        DMatrix<f64>,
+    ) {
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let params = model.default_params.clone();
+        let eta_hats: Vec<DVector<f64>> = (0..pop.subjects.len())
+            .map(|_| DVector::zeros(params.omega.dim()))
+            .collect();
+        // Tame fallback-style proposal: small PD diagonal in packed space, so
+        // draws stay near valid parameters (positive θ/σ, PD Ω) and SIR yields
+        // finite weights. A real non-PD fixture risks a wide proposal whose draws
+        // overflow `exp(...)` → "all invalid weights" → status `Failed`.
+        let n_packed = crate::estimation::parameterization::pack_params(&params).len();
+        let proposal = DMatrix::from_diagonal(&DVector::from_element(n_packed, 0.01));
+        (model, pop, params, eta_hats, proposal)
+    }
+
+    /// `resolve_sir_fallback` short-circuits to `None` (without touching the SIR
+    /// machinery) when the gate declines — here because `covariance_fallback`
+    /// defaults to `none`. No warning is emitted for a simple decline.
+    #[test]
+    fn resolve_sir_fallback_is_none_when_option_off() {
+        let (model, pop, params, eta_hats, proposal) = warfarin_fixture();
+        let opts = FitOptions::default(); // covariance_fallback = None
+        let mut warnings = Vec::new();
+        let result = resolve_sir_fallback(
+            &opts,
+            false,
+            false,
+            Some(&proposal),
+            &model,
+            &pop,
+            &params,
+            &eta_hats,
+            0.0,
+            &mut warnings,
+        );
+        assert!(
+            result.is_none(),
+            "fallback must not fire when covariance_fallback = none"
+        );
+        assert!(
+            warnings.is_empty(),
+            "no warning when the gate simply declines: {warnings:?}"
+        );
+    }
+
+    /// End-to-end fallback wiring (#264): with `covariance_fallback = sir`, no
+    /// real covariance, and a tame PD proposal (the part a real non-PD fit can't
+    /// reliably deliver), `resolve_sir_fallback` runs SIR and returns a result
+    /// whose θ/Ω/σ credible intervals are populated and finite — and the status
+    /// the caller derives from it is `SirFallback`. Slow: a full SIR pass
+    /// (sampling + per-draw population likelihood).
+    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: full SIR pass; opt in with --features slow-tests"
+    )]
+    fn resolve_sir_fallback_fires_and_yields_finite_cis() {
+        let (model, pop, params, eta_hats, proposal) = warfarin_fixture();
+        let mut opts = FitOptions::default();
+        opts.covariance_fallback = CovarianceFallback::Sir;
+        opts.verbose = false;
+        opts.sir_samples = 400;
+        opts.sir_resamples = 200;
+        // Own the determinism explicitly rather than leaning on run_sir_core's
+        // `None => fixed seed` fallback, so a future change to that fallback can't
+        // silently make this sampling test flaky.
+        opts.sir_seed = Some(20240612);
+
+        let mut warnings = Vec::new();
+        let result = resolve_sir_fallback(
+            &opts,
+            false,
+            false,
+            Some(&proposal),
+            &model,
+            &pop,
+            &params,
+            &eta_hats,
+            // ofv_hat cancels in the SIR log-sum-exp weight normalisation, so any
+            // finite value yields identical CIs — 0.0 keeps the fixture simple.
+            0.0,
+            &mut warnings,
+        );
+
+        // Derive the reported status from the actual outcome, *before* unwrapping,
+        // so this checks the real fire→status mapping rather than a constant.
+        assert_eq!(
+            resolve_covariance_status(true, false, result.is_some()),
+            CovarianceStatus::SirFallback
+        );
+        let sir = result.expect("fallback should fire and SIR should succeed with a tame proposal");
+
+        assert!(!sir.ci_theta.is_empty(), "theta CIs must be populated");
+        for (lo, hi) in sir
+            .ci_theta
+            .iter()
+            .chain(&sir.ci_omega)
+            .chain(&sir.ci_sigma)
+        {
+            assert!(
+                lo.is_finite() && hi.is_finite() && lo <= hi,
+                "SIR-fallback CI must be finite and ordered, got ({lo}, {hi})"
+            );
+        }
+        assert!(
+            sir.effective_sample_size.is_finite() && sir.effective_sample_size > 0.0,
+            "ESS must be finite and positive, got {}",
+            sir.effective_sample_size
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("SIR fallback failed")),
+            "no failure warning expected on the success path: {warnings:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests_param_corr {
     use super::compute_param_corr;
     use nalgebra::DMatrix;
@@ -5515,6 +5713,7 @@ mod simulate_with_uncertainty_tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -6278,6 +6477,7 @@ mod tests_sdtab_tv_cov {
             referenced_covariates: vec!["WT".into()],
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -6483,6 +6683,7 @@ mod tests_derived_session_clock {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -6857,6 +7058,7 @@ mod tests_derived_iov_kappa {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]

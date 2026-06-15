@@ -76,7 +76,15 @@ where \\( H \\) is the Jacobian matrix \\( \partial f / \partial \eta \\). The p
 
 \\[ \text{OFV}_i = (y - f_0)^T \tilde{R}^{-1} (y - f_0) + \log|\tilde{R}| \\]
 
-where \\( \tilde{R} = H \Omega H^T + R(f_0) \\).
+where \\( \tilde{R} = H \Omega H^T + R(f(\eta{=}0)) \\). The residual variance \\( R \\)
+is evaluated at the **population prediction** \\( f(\eta{=}0) \\) — matching NONMEM's
+`METHOD=1` (no `INTER`) semantics — not at the linearized point \\( f_0 \\). On a
+nonlinear model (e.g. oral absorption) the linearization \\( f_0 = f(\hat\eta) - H\hat\eta \\)
+can extrapolate to a near-zero or negative concentration where the true typical-individual
+prediction is healthy; evaluating a proportional variance \\( (f\sigma)^2 \\) there collapses
+the weight and makes the objective multimodal with an indefinite covariance. \\( f(\eta{=}0) \\)
+is always physically sensible, so FOCE+proportional converges deterministically and matches
+NONMEM FOCE. Additive error is unaffected (\\( R \\) does not depend on \\( f \\)).
 
 ### FOCEI (Interaction)
 
@@ -181,9 +189,9 @@ Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vecto
   covariance_method = rsr
 ```
 
-`s` and `rsr` are currently available for **FOCEI and IOV** fits. They require the per-subject score, whose Ω-prior term (`ηᵀΩ⁻¹η + log|Ω|`) is only consistent with the Hessian under interaction; FOCE / Sheiner–Beal support is a follow-up. Requesting `s`/`rsr` under non-interaction FOCE returns a clear covariance-step error rather than an inconsistent matrix.
+`s` and `rsr` are available for **FOCEI, FOCE, and IOV** fits. Note that `s` requires a positive-definite FD Hessian (it reuses `r_inv`; a non-PD `R` is not yet rerouted to `S⁻¹` directly — see `TODO` in `outer_optimizer.rs`).
 
-#### NONMEM cross-check (S / RSR)
+#### NONMEM cross-check (S / RSR, FOCEI)
 
 Same warfarin FOCEI fit as the `MATRIX=R` table above, with two additional NONMEM covariance runs (`$COVARIANCE MATRIX=S` and `MATRIX=RSR`); SEs are the `.ext` `ITERATION = -1000000001` row ([#266](https://github.com/FeRx-NLME/ferx-core/issues/266)):
 
@@ -197,7 +205,23 @@ Same warfarin FOCEI fit as the `MATRIX=R` table above, with two additional NONME
 | ω²(V)     | 0.007139 | 0.008287 | −13.9% | 0.003699 | 0.003978 | −7.0% |
 | ω²(KA)    | 0.2265   | 0.2596  | −12.8% | 0.1311  | 0.1396  | −6.1% |
 
-(`ci`/FD build.) The `s` cross-product matches NONMEM within ~14% and `rsr` within ~7% — note the `s` SEs are uniformly larger than `r`/`rsr` here, because with only 10 subjects the score outer-product is a noisy information estimate (the model-equality `R ≈ S` is exact only asymptotically). Guarded by `covariance_se_matches_nonmem_s_rsr` in `tests/covariance_method_sandwich.rs` (20% band for `s`, 15% for `rsr`). The per-subject score `S` is on the `−logL` (NLL) scale and, unlike `R`, carries no factor of two; the close `s` agreement confirms that scaling is correct.
+(`ci`/FD build.) The `s` cross-product matches NONMEM within ~14% and `rsr` within ~7%. Guarded by `covariance_se_matches_nonmem_s_rsr` in `tests/covariance_method_sandwich.rs` (20% band for `s`, 15% for `rsr`). The per-subject score `S` is on the `−logL` (NLL) scale and, unlike `R`, carries no factor of two; the close agreement confirms that scaling is correct.
+
+#### NONMEM cross-check (S / RSR, FOCE)
+
+Same warfarin model, `$EST METHOD=1` (no `INTER`), `$COVARIANCE MATRIX=S` and `MATRIX=RSR` ([#250](https://github.com/FeRx-NLME/ferx-core/issues/250)):
+
+| Parameter | ferx `s` | NONMEM `MATRIX=S` | rel. diff | ferx `rsr` | NONMEM `MATRIX=RSR` | rel. diff |
+|-----------|----------|-------------------|-----------|------------|---------------------|-----------|
+| TVCL      | 0.00824  | 0.00838 | −1.6%  | 0.00720 | 0.00757 | −4.9% |
+| TVV       | 0.3822   | 0.3996  | −4.4%  | 0.2552  | 0.2457  | +3.8% |
+| TVKA      | 0.1445   | 0.1495  | −3.3%  | 0.1373  | 0.1328  | +3.4% |
+| PROP_ERR (SD) | 0.001593 | 0.001573 | +1.3% | 0.000942 | 0.000947 | −0.6% |
+| ω²(CL)    | 0.01604  | 0.01771 | −9.4%  | 0.01038 | 0.01092 | −5.0% |
+| ω²(V)     | 0.008768 | 0.008387 | +4.5%  | 0.004057 | 0.003957 | +2.5% |
+| ω²(KA)    | 0.2443   | 0.2336  | +4.5%  | 0.1460  | 0.1549  | −5.7% |
+
+(`ci`/FD build.) All within ~10%. Guarded by `covariance_se_matches_nonmem_foce_s_rsr` in `tests/covariance_method_sandwich.rs`.
 
 Note that ferx defaults to `covariance_method = r` whereas NONMEM's `$COVARIANCE` default is the `rsr` sandwich; set `covariance_method = rsr` when reconciling SEs against a default NONMEM run.
 
@@ -238,7 +262,7 @@ The outer loop terminates when any of:
 - The maximum number of iterations (`maxiter`) is reached
 - The optimizer reports convergence (NLopt `XtolReached` or `FtolReached`)
 
-The inner loop terminates when the gradient norm falls below `inner_tol` (default `1e-4`, matching NONMEM's ~3 SIGDIGITS inner-loop precision — see [`fit-options.md`](../model-file/fit-options.md#general-options) for tuning guidance) or `inner_maxiter` (default 200) iterations are reached.
+The inner loop terminates when the gradient norm falls below `inner_tol` (default `1e-5`, tight enough that residual EBE noise does not perturb the marginal objective the outer optimizer minimises — see [`fit-options.md`](../model-file/fit-options.md#general-options) for tuning guidance) or `inner_maxiter` (default 200) iterations are reached.
 
 ## Warm Starting
 

@@ -1181,6 +1181,79 @@ mod tests {
     }
 
     #[test]
+    fn consumes_pk_slot_matches_solver() {
+        // Pin `PkModel::consumes_pk_slot` — the source of truth for the parser's
+        // unused-param warning (#309) — to what the analytical solvers actually
+        // read: perturbing a *consumed* slot must change the predicted
+        // concentration, and perturbing a *non-consumed* slot must leave it
+        // bit-identical. A future variant whose closed form reads a new slot but
+        // isn't reflected in `consumes_pk_slot`/`required_pk_params` fails here,
+        // closing the drift gap between the parser table and the solvers.
+        use crate::types::{
+            PK_IDX_CL, PK_IDX_F, PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V,
+            PK_IDX_V2, PK_IDX_V3,
+        };
+        let named_slots = [
+            PK_IDX_CL,
+            PK_IDX_V,
+            PK_IDX_Q,
+            PK_IDX_V2,
+            PK_IDX_KA,
+            PK_IDX_F,
+            PK_IDX_Q3,
+            PK_IDX_V3,
+            PK_IDX_LAGTIME,
+        ];
+        let baseline = || {
+            let mut p = PkParams::default();
+            p.values[PK_IDX_CL] = 1.0;
+            p.values[PK_IDX_V] = 10.0;
+            p.values[PK_IDX_Q] = 0.7;
+            p.values[PK_IDX_V2] = 20.0;
+            p.values[PK_IDX_KA] = 1.3;
+            p.values[PK_IDX_F] = 0.6;
+            p.values[PK_IDX_Q3] = 0.4;
+            p.values[PK_IDX_V3] = 30.0;
+            p.values[PK_IDX_LAGTIME] = 0.5;
+            p
+        };
+        let doses = vec![bolus_dose(0.0, 100.0)];
+        let t = 2.0;
+        for model in [
+            PkModel::OneCptIv,
+            PkModel::OneCptOral,
+            PkModel::TwoCptIv,
+            PkModel::TwoCptOral,
+            PkModel::ThreeCptIv,
+            PkModel::ThreeCptOral,
+        ] {
+            let c0 = predict_concentration(model, &doses, t, &baseline());
+            assert!(
+                c0 > 0.0,
+                "{model:?}: baseline concentration should be positive"
+            );
+            for &slot in &named_slots {
+                let mut perturbed = baseline();
+                perturbed.values[slot] *= 5.0;
+                let c1 = predict_concentration(model, &doses, t, &perturbed);
+                if model.consumes_pk_slot(slot) {
+                    assert!(
+                        (c1 - c0).abs() > 1e-9,
+                        "{model:?}: slot {slot} is marked consumed but perturbing it \
+                         did not change the prediction (c0={c0}, c1={c1})"
+                    );
+                } else {
+                    assert_eq!(
+                        c1, c0,
+                        "{model:?}: slot {slot} is marked unused but perturbing it \
+                         changed the prediction"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_superposition_single_dose() {
         let doses = vec![bolus_dose(0.0, 1000.0)];
         let pk = make_pk_params(10.0, 100.0);
@@ -1330,6 +1403,7 @@ mod tests {
             referenced_covariates: vec!["CR".into()],
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             indiv_param_names: Vec::new(),
             indiv_param_partials: crate::types::IndivParamPartials::empty(),

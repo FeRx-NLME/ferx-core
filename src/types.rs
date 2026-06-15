@@ -73,6 +73,13 @@ pub const PK_IDX_Q3: usize = 6;
 pub const PK_IDX_V3: usize = 7;
 pub const PK_IDX_LAGTIME: usize = 8;
 
+/// The engine-reserved PK slots: bioavailability (`F`) and absorption lag
+/// (`lagtime`). `ode_param_slots` keeps these free for an undeclared F/lagtime
+/// (issue #122), both the analytical and ODE engines apply them to the dose
+/// itself rather than the RHS, and the "computed but never used" census exempts
+/// parameters routed here. Single source of truth so those sites can't drift.
+pub(crate) const RESERVED_PK_SLOTS: [usize; 2] = [PK_IDX_F, PK_IDX_LAGTIME];
+
 #[derive(Debug, Clone, Copy)]
 pub struct PkParams {
     pub values: [f64; MAX_PK_PARAMS],
@@ -699,6 +706,102 @@ pub enum PkModel {
     ThreeCptOral,
 }
 
+impl PkModel {
+    /// Canonical PK slots that MUST be mapped in a `[structural_model]` `pk(...)`
+    /// line for this model, each paired with the conventional name shown in
+    /// parser errors. `f`/`lagtime` are intentionally absent — they are optional
+    /// and default to 1.0 / 0.0 (see `PkParams::default`).
+    ///
+    /// Slots are canonical (`name_to_index` values), so the `v`/`v1` and `q`/`q2`
+    /// aliases satisfy the same requirement. The display names mirror the
+    /// "Required Parameters" table in `docs/src/model-file/structural-model.md`;
+    /// the parser enforces what that table documents (issue #309).
+    pub(crate) fn required_pk_params(&self) -> &'static [(usize, &'static str)] {
+        match self {
+            PkModel::OneCptIv => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v")],
+            PkModel::OneCptOral => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v"), (PK_IDX_KA, "ka")],
+            PkModel::TwoCptIv => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q"),
+                (PK_IDX_V2, "v2"),
+            ],
+            PkModel::TwoCptOral => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_KA, "ka"),
+            ],
+            PkModel::ThreeCptIv => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q2"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_Q3, "q3"),
+                (PK_IDX_V3, "v3"),
+            ],
+            PkModel::ThreeCptOral => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q2"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_Q3, "q3"),
+                (PK_IDX_V3, "v3"),
+                (PK_IDX_KA, "ka"),
+            ],
+        }
+    }
+
+    /// The canonical short model name (e.g. `one_cpt_oral`), used in parser
+    /// diagnostics. Long-form aliases (`one_compartment_oral`) normalise to this.
+    ///
+    /// Deliberately the inverse of the string→`PkModel` match in
+    /// `parse_structural_model` (which additionally accepts the long-form
+    /// aliases, so the two can't be a single bidirectional table);
+    /// `canonical_name_round_trips_through_parser` guards them against drift.
+    pub(crate) fn canonical_name(&self) -> &'static str {
+        match self {
+            PkModel::OneCptIv => "one_cpt_iv",
+            PkModel::OneCptOral => "one_cpt_oral",
+            PkModel::TwoCptIv => "two_cpt_iv",
+            PkModel::TwoCptOral => "two_cpt_oral",
+            PkModel::ThreeCptIv => "three_cpt_iv",
+            PkModel::ThreeCptOral => "three_cpt_oral",
+        }
+    }
+
+    /// Whether this is a first-order-absorption (oral) model. Oral models read
+    /// `ka` and `f`; IV models do not. The canonical home for this predicate.
+    ///
+    /// The `#[cfg(feature = "autodiff")]` free fn `is_oral_model` in
+    /// `estimation/inner_optimizer.rs` is a pre-existing identical copy; it should
+    /// delegate here, but that path isn't compiled in the default/CI build, so the
+    /// change can't be verified yet — fold it in when autodiff runs in CI (#281).
+    pub(crate) fn is_oral(&self) -> bool {
+        matches!(
+            self,
+            PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+        )
+    }
+
+    /// Whether the analytical solver for this model actually reads the given PK
+    /// slot. This is the single source of truth for "is a mapped param used", and
+    /// it mirrors what the `pk/` closed forms consume — pinned to real solver
+    /// behaviour by `consumes_pk_slot_matches_solver` in `pk/mod.rs`, so a future
+    /// variant that reads a new slot can't silently drift from this:
+    ///   - every required structural slot (`required_pk_params`);
+    ///   - `lagtime`, applied to *every* dose (`predict_concentration` shifts the
+    ///     effective dose time for IV and oral alike);
+    ///   - `f` (bioavailability) **only** for oral models — the IV closed forms
+    ///     never read it, so `f` on an IV model is inert.
+    pub(crate) fn consumes_pk_slot(&self, slot: usize) -> bool {
+        slot == PK_IDX_LAGTIME
+            || (slot == PK_IDX_F && self.is_oral())
+            || self.required_pk_params().iter().any(|(s, _)| *s == slot)
+    }
+}
+
 /// Supported residual error models
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorModel {
@@ -889,6 +992,22 @@ impl ErrorSpec {
     /// scaling path. Fit-time validation rejects an uncovered CMT up front,
     /// and `build_error_spec` resolves indices against the real sigma vector,
     /// so a `NaN` here is only reachable via a hand-constructed model.
+    /// Whether the residual variance depends on the prediction `f` for any
+    /// endpoint (proportional or combined). When `false` (purely additive),
+    /// the variance is constant in `f`, so FOCE's choice of evaluation point
+    /// (linearized `f0` vs population `f(η=0)`) is irrelevant and the cheap
+    /// path stays bit-identical. Used to gate the FOCE population-variance
+    /// (`f(η=0)`) treatment in the marginal, analytical gradient, and
+    /// covariance step.
+    pub fn has_f_dependent_variance(&self) -> bool {
+        match self {
+            ErrorSpec::Single(em) => !matches!(em, ErrorModel::Additive),
+            ErrorSpec::PerCmt(map) => map
+                .values()
+                .any(|ep| !matches!(ep.error_model, ErrorModel::Additive)),
+        }
+    }
+
     pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         use crate::stats::residual_error::residual_variance;
         match self {
@@ -1030,13 +1149,14 @@ impl ScalingSpec {
     ///
     /// All variants are subject-static: the closure (`ExpressionScale`)
     /// is evaluated at most once per subject. AD therefore treats the
-    /// scale as a constant w.r.t. eta, which matches the documented
-    /// Phase 1 simplification — for the common case where the scale
-    /// expression doesn't reference eta (e.g. `WT/70`, `TVV/1000`,
-    /// `V` which only sees the EBE value), AD and FD give identical
-    /// gradients. For the rare case of a scale that explicitly references
-    /// eta, the AD gradient ignores that dependence; FD captures it. See
-    /// `docs/src/model-file/scaling.md` for the user-facing note.
+    /// scale as a constant w.r.t. eta. For a genuinely eta-independent
+    /// scale (`WT/70`, `TVV/1000` — covariates/thetas only) AD and FD give
+    /// identical gradients. For a scale that depends on eta (e.g.
+    /// `obs_scale = V` with `V = TVV*exp(ETA_V)`, or `1000/V`) the frozen
+    /// scale drops `d obs_scale / d eta`, so the inner loop is routed to FD
+    /// by `inner_optimizer::analytical_ad_unsupported`
+    /// (`ScalingSpec::breaks_ad_inner_gradient`) rather than silently
+    /// producing a wrong AD gradient. See `docs/src/model-file/scaling.md`.
     ///
     /// Invalid scale values (0, negative, NaN, inf — e.g. from a covariate
     /// that's missing, or from a `1/(TVV-x)` near a singularity) propagate
@@ -1138,6 +1258,32 @@ impl ScalingSpec {
             Self::None | Self::ScalarScale(_) => false,
             Self::ExpressionScale { .. } => true,
             Self::PerCmt(map) => map.values().any(Self::needs_pk_eval),
+        }
+    }
+
+    /// Returns true when an `ExpressionScale` makes the analytical AD inner
+    /// gradient unsafe, so the inner loop must use finite differences.
+    ///
+    /// `build_obs_scale_array` materialises the scale **subject-static** (once
+    /// per gradient call), so the AD Jacobian treats `obs_scale` as constant
+    /// w.r.t. eta. When the scale expression actually depends on eta (e.g.
+    /// `obs_scale = V` with `V = TVV*exp(ETA_V)`, or `1000/V`), that drops
+    /// `d obs_scale / d eta` and the AD gradient disagrees with the objective -
+    /// observed as a ~12 OFV gap on the bundled `scaling_expression` example
+    /// (issue #278 follow-up).
+    ///
+    /// This is **conservative**: it returns true for *any* `ExpressionScale`,
+    /// including the eta-independent ones (`WT/70`, `TVV/1000`) that are AD-exact
+    /// - routing those to FD costs a little speed but never correctness. A
+    /// precise eta-dependence check would need the parser to record whether the
+    /// scale expression reads an eta-bearing quantity; tracked as a follow-up.
+    /// `None` / `ScalarScale` are always eta-independent and stay on AD.
+    #[inline]
+    pub fn breaks_ad_inner_gradient(&self) -> bool {
+        match self {
+            Self::None | Self::ScalarScale(_) => false,
+            Self::ExpressionScale { .. } => true,
+            Self::PerCmt(map) => map.values().any(Self::breaks_ad_inner_gradient),
         }
     }
 }
@@ -1447,6 +1593,13 @@ pub struct CompiledModel {
     /// Warnings generated at parse time (e.g. mu-referencing disabled for
     /// conditional parameters).  Prepended to `FitResult.warnings` by `fit()`.
     pub parse_warnings: Vec<String>,
+    /// True when an individual parameter is assigned inside an `if`-branch that
+    /// references an ETA (e.g. `if (WT>70) { CL = TVCL*exp(ETA_CL) } else {...}`).
+    /// Set by the parser. The analytical AD kernels can't represent the branch
+    /// structure, so `inner_optimizer::analytical_ad_unsupported` routes such
+    /// models to FD. (Structured replacement for matching the "conditional
+    /// parameter" `parse_warnings` string.)
+    pub has_conditional_eta_params: bool,
     /// Per-ETA transformation metadata derived from the `[individual_parameters]`
     /// expressions at parse time. Length ≤ n_eta (only ETAs whose expression was
     /// classified are present). Forwarded into `FitResult`.
@@ -1554,9 +1707,51 @@ impl CompiledModel {
         self.ode_spec.is_some()
     }
 
+    /// Copy the configured ODE solver tolerances from `opts` onto this model's
+    /// [`OdeSpec`] (no-op for analytical models). Call this once after the
+    /// model file's `[fit_options]` and any call-time `settings` overrides have
+    /// been merged into `opts`, so the integrator uses the requested accuracy.
+    /// The parser calls it at parse time, so `.ferx` `[fit_options]` and any
+    /// entry that integrates the parsed spec as-is (`predict`, `fit_from_files`)
+    /// already use the configured accuracy.
+    ///
+    /// Note: [`fit`](crate::fit) takes `&CompiledModel` and does **not** call
+    /// this. The integrator reads [`OdeSpec::solver_opts`], never
+    /// `FitOptions::ode_reltol` directly, so a caller that merges call-time
+    /// `settings` into its own `FitOptions` (as the R wrapper's `ferx_fit`
+    /// does) must re-apply this on an owned model *before* `fit` for those
+    /// overrides to reach the solver. Idempotent.
+    pub fn sync_ode_solver_opts(&mut self, opts: &FitOptions) {
+        if let Some(ode) = self.ode_spec.as_mut() {
+            ode.solver_opts.reltol = opts.ode_reltol;
+            ode.solver_opts.abstol = opts.ode_abstol;
+            ode.solver_opts.max_steps = opts.ode_max_steps;
+        }
+    }
+
     /// Returns true when the model has a `[diffusion]` block (SDE / EKF path).
     pub fn is_sde(&self) -> bool {
         self.diffusion_theta_start.is_some()
+    }
+
+    /// Returns true when the model has a time-to-event (`[event_model]`)
+    /// endpoint. The analytical single-snapshot AD kernel computes the
+    /// PK-observation NLL, not the hazard/survival likelihood, so its
+    /// eta-gradient through the hazard (especially the shape parameters) is
+    /// wrong - `tte_weibull` / `tte_gompertz` diverged ~2-5 OFV from FD under
+    /// AD. `inner_optimizer::analytical_ad_unsupported` routes these to FD.
+    #[cfg(feature = "survival")]
+    pub fn has_tte(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Tte { .. }))
+    }
+
+    /// Always false without the `survival` feature - TTE endpoints can't be
+    /// parsed, so no model can carry one.
+    #[cfg(not(feature = "survival"))]
+    pub fn has_tte(&self) -> bool {
+        false
     }
 
     /// Returns true when `[individual_parameters]` declares `LAGTIME` (or its
@@ -2331,6 +2526,22 @@ pub struct FitOptions {
     pub outer_gtol: f64,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
+    /// RK45 ODE solver relative tolerance (`[fit_options] ode_reltol`, or via
+    /// `ferx_fit(settings = list(ode_reltol = ...))`). Default `1e-4`. Only
+    /// affects ODE models. The default reproduces analytical closed forms in
+    /// PRED to ~1e-4, but the FOCE OFV amplifies solver error, so a tighter
+    /// value (e.g. `1e-10`) is needed for the ODE-form OFV to match the
+    /// analytical OFV. Copied onto `OdeSpec::solver_opts` via
+    /// [`CompiledModel::sync_ode_solver_opts`].
+    pub ode_reltol: f64,
+    /// RK45 ODE solver absolute tolerance (`[fit_options] ode_abstol`).
+    /// Default `1e-6`. See [`FitOptions::ode_reltol`].
+    pub ode_abstol: f64,
+    /// RK45 ODE solver maximum step count per integration segment
+    /// (`[fit_options] ode_max_steps`). Default `10000`. Raise if a tight
+    /// `ode_reltol` exhausts the step budget on stiff multi-compartment
+    /// segments. See [`FitOptions::ode_reltol`].
+    pub ode_max_steps: usize,
     pub run_covariance_step: bool,
     /// *Initial* relative step size for the finite-difference Hessian in the
     /// covariance step. The actual step for parameter i is
@@ -2591,16 +2802,32 @@ impl Default for FitOptions {
             outer_maxiter: 500,
             outer_gtol: 1e-6,
             inner_maxiter: 200,
-            // 1e-4 matches typical NLME engines (NONMEM's default inner-loop
-            // SIGDIGITS is ~3, equivalent to ~1e-3). Tighter tolerances
-            // (1e-6 or 1e-8) over-converge the EBE relative to the
-            // Sheiner–Beal linearisation error and force BFGS to do many
-            // extra iterations per find_ebe — measured ~15x slowdown on
-            // a 100-subject 2-cpt FOCEI fit when set to 1e-8 vs 1e-4,
-            // with no measurable change in the final OFV. Override via
-            // `inner_tol = ...` in `[fit_options]` for studies that need
-            // tighter EBEs (e.g. very-small-data simulation work).
-            inner_tol: 1e-4,
+            // 1e-5, not the looser 1e-4 that an earlier comment justified as
+            // matching "NONMEM's ~3-SIGDIGITS inner loop" — that conflated the
+            // *outer* control (NSIG/SIGDIGITS, default 3) with the *inner*
+            // conditional precision (SIGL, default ~10 significant digits), which
+            // NONMEM runs far tighter. A loose inner tolerance leaves residual
+            // noise in each subject's EBE solution, which propagates into the
+            // marginal OFV the *outer* optimizer sees. On models with a noisy or
+            // flat marginal surface (FD-inner FOCE such as LTBS) that noise made
+            // the derivative-free BOBYQA outer optimizer false-converge a few OFV
+            // units above the true minimum. Tightening to 1e-5 removes enough of
+            // that noise to reach NONMEM's minimum (LTBS now matches to <0.001
+            // OFV), at ~1.5x the per-fit cost. Note tighter is not uniformly
+            // better: at 1e-6 some ill-conditioned fits (3x3 block-Ω,
+            // KA=KE+exp(...) coupling) over-converge the inner Hessian and BOBYQA
+            // navigates into a worse basin — 1e-5 sits below the LTBS noise floor
+            // while staying clear of that pathology. It does change the converged
+            // point versus 1e-4; the previous "no measurable OFV change" claim
+            // only held for well-conditioned fits. Override via `inner_tol = ...`
+            // in `[fit_options]` (loosen for speed; tighten with care).
+            inner_tol: 1e-5,
+            // ODE solver tolerances: match OdeSolverOptions::default() so the
+            // engine default is unchanged. Opt into tighter accuracy per model
+            // via `[fit_options] ode_reltol = ...` (see FitOptions::ode_reltol).
+            ode_reltol: 1e-4,
+            ode_abstol: 1e-6,
+            ode_max_steps: 10_000,
             run_covariance_step: true,
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
@@ -3053,6 +3280,7 @@ pub(crate) mod test_helpers {
                     readout: crate::ode::OdeReadout::ObsCmt(0),
                     diffusion_var: Vec::new(),
                     init_fn: None,
+                    solver_opts: crate::ode::OdeSolverOptions::default(),
                 })
             } else {
                 None
@@ -3061,6 +3289,7 @@ pub(crate) mod test_helpers {
             referenced_covariates: vec![],
             gradient_method,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -3079,6 +3308,76 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_pk_params_match_docs_table() {
+        // Locks the per-model required slots to the "Required Parameters" table
+        // in docs/src/model-file/structural-model.md (issue #309).
+        use PkModel::*;
+        let cases: &[(PkModel, &[&str])] = &[
+            (OneCptIv, &["cl", "v"]),
+            (OneCptOral, &["cl", "v", "ka"]),
+            (TwoCptIv, &["cl", "v1", "q", "v2"]),
+            (TwoCptOral, &["cl", "v1", "q", "v2", "ka"]),
+            (ThreeCptIv, &["cl", "v1", "q2", "v2", "q3", "v3"]),
+            (ThreeCptOral, &["cl", "v1", "q2", "v2", "q3", "v3", "ka"]),
+        ];
+        for (model, expected_names) in cases {
+            let req = model.required_pk_params();
+            let names: Vec<&str> = req.iter().map(|(_, n)| *n).collect();
+            assert_eq!(&names, expected_names, "wrong required names for {model:?}");
+            // Every (slot, name) pair must be self-consistent with name_to_index,
+            // so the parser's key→slot canonicalisation lines up with this table.
+            for (slot, name) in req {
+                assert_eq!(
+                    PkParams::name_to_index(name),
+                    Some(*slot),
+                    "slot/name mismatch for `{name}` in {model:?}"
+                );
+            }
+            // f / lagtime are optional and must never appear as required.
+            assert!(
+                !req.iter()
+                    .any(|(s, _)| *s == PK_IDX_F || *s == PK_IDX_LAGTIME),
+                "{model:?} must not require f/lagtime"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_name_covers_all_variants() {
+        use PkModel::*;
+        assert_eq!(OneCptIv.canonical_name(), "one_cpt_iv");
+        assert_eq!(OneCptOral.canonical_name(), "one_cpt_oral");
+        assert_eq!(TwoCptIv.canonical_name(), "two_cpt_iv");
+        assert_eq!(TwoCptOral.canonical_name(), "two_cpt_oral");
+        assert_eq!(ThreeCptIv.canonical_name(), "three_cpt_iv");
+        assert_eq!(ThreeCptOral.canonical_name(), "three_cpt_oral");
+    }
+
+    #[test]
+    fn error_spec_has_f_dependent_variance() {
+        use std::collections::HashMap;
+        // Single endpoint: only additive is f-independent.
+        assert!(!ErrorSpec::Single(ErrorModel::Additive).has_f_dependent_variance());
+        assert!(ErrorSpec::Single(ErrorModel::Proportional).has_f_dependent_variance());
+        assert!(ErrorSpec::Single(ErrorModel::Combined).has_f_dependent_variance());
+
+        // PerCmt: f-dependent if ANY endpoint is non-additive.
+        let ep = |em: ErrorModel| EndpointError {
+            error_model: em,
+            sigma_idx: vec![0],
+        };
+        let mut all_additive = HashMap::new();
+        all_additive.insert(1usize, ep(ErrorModel::Additive));
+        all_additive.insert(2usize, ep(ErrorModel::Additive));
+        assert!(!ErrorSpec::PerCmt(all_additive).has_f_dependent_variance());
+
+        let mut mixed = HashMap::new();
+        mixed.insert(1usize, ep(ErrorModel::Additive));
+        mixed.insert(2usize, ep(ErrorModel::Proportional));
+        assert!(ErrorSpec::PerCmt(mixed).has_f_dependent_variance());
+    }
 
     #[test]
     fn classify_warning_convergence_is_critical() {

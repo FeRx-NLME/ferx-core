@@ -59,9 +59,10 @@
 //! `A(4)`=periph2. ferx params: `cl=5, v1=10, q2=2, v2=20, q3=1.5, v3=30, ka=1`.
 
 use ferx_core::parser::model_parser::parse_model_string;
-use ferx_core::types::{DoseEvent, Population, Subject};
+use ferx_core::types::{DoseEvent, Population};
 use ferx_core::{fit, FitOptions};
-use std::collections::HashMap;
+
+mod common;
 
 /// Combined absolute+relative tolerance. The depot amount decays to ~4e-9 by
 /// t=24, where a pure relative tolerance is meaningless, so an absolute floor
@@ -85,25 +86,13 @@ fn single_subject_pop(obs_times: Vec<f64>, observations: Vec<f64>, dose_cmt: usi
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, dose_cmt, 0.0, false, 0.0)],
+        subjects: vec![common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, dose_cmt, 0.0, false, 0.0)],
             obs_times,
-            obs_raw_times: vec![],
             observations,
-            obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            cens: vec![0; n],
-            occasions: vec![],
-            dose_occasions: vec![],
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
-        }],
+            vec![1; n],
+        )],
     }
 }
 

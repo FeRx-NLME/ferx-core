@@ -12,9 +12,10 @@
 //! `fit()` calls — so they don't need to be gated behind `slow-tests`.
 
 use ferx_core::parser::model_parser::parse_model_string;
-use ferx_core::types::{DoseEvent, Population, Subject};
+use ferx_core::types::{DoseEvent, Population};
+
+mod common;
 use ferx_core::{predict, ScalingSpec};
-use std::collections::HashMap;
 
 fn one_subject_pop() -> Population {
     let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
@@ -25,25 +26,13 @@ fn one_subject_pop() -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![Subject {
-            id: "1".into(),
-            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        subjects: vec![common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times,
-            obs_raw_times: Vec::new(),
-            observations: vec![0.0; n_obs],
-            obs_cmts: vec![1; n_obs],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            cens: vec![0; n_obs],
-            occasions: Vec::new(),
-            dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
-            obs_records: vec![],
-        }],
+            vec![0.0; n_obs],
+            vec![1; n_obs],
+        )],
     }
 }
 
@@ -246,24 +235,14 @@ fn two_cmt_pop() -> Population {
     let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
     let obs_cmts = vec![1, 1, 1, 2, 2];
     let n_obs = obs_times.len();
-    let mk_subject = |id: &str| Subject {
-        id: id.into(),
-        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        obs_times: obs_times.clone(),
-        obs_raw_times: Vec::new(),
-        observations: vec![0.0; n_obs],
-        obs_cmts: obs_cmts.clone(),
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        cens: vec![0; n_obs],
-        occasions: Vec::new(),
-        dose_occasions: Vec::new(),
-        #[cfg(feature = "survival")]
-        obs_records: vec![],
+    let mk_subject = |id: &str| {
+        common::subject(
+            id,
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times.clone(),
+            vec![0.0; n_obs],
+            obs_cmts.clone(),
+        )
     };
     Population {
         covariate_names: Vec::new(),

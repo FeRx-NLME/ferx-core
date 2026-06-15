@@ -1,0 +1,38 @@
+# Dosing via the NONMEM `RATE` column (#324) — runnable demo.
+#
+# Demonstrates the two SUPPORTED `RATE` forms on a 1-compartment IV model,
+# mixed within one dataset (the route is read per dose event):
+#   RATE = 0   → bolus (instantaneous; route set by the dose compartment)
+#   RATE > 0   → constant-rate infusion (duration = AMT / RATE)
+#
+# NONMEM's coded `RATE` values are NOT supported and are rejected at import:
+#   RATE = -1  → infusion rate modeled (R1 in $PK)
+#   RATE = -2  → infusion duration modeled (D1 in $PK)
+# Convert those to an explicit positive RATE (= AMT / intended duration) first.
+# See docs/src/data-format.md ("NONMEM coded RATE values") and the FAQ.
+#
+# Run:
+#   cargo run --release -- examples/dose_rate.ferx --data data/dose_rate.csv
+
+[parameters]
+  theta TVCL(5.0,  0.1, 100.0)
+  theta TVV(50.0,  1.0, 500.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+
+  sigma PROP_ERR ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

@@ -61,24 +61,52 @@ jobs:
       - name: cargo test (NONMEM IOV CL cross-check, issue #238)
         run: cargo test --test warfarin_iov_nonmem --no-default-features --features ci --profile ci-test
 
+      # Analytical/ODE equivalence guard for the standard PK models (ferx-r
+      # #127). Like the IOV check above it is an integration test `--lib` does
+      # not run, but it is fast (just `predict()`, no `fit()`), so run it on
+      # every PR rather than only nightly — otherwise a regression in the
+      # analytical or ODE prediction path stays green until the slow-tests run.
+      - name: cargo test (analytical/ODE equivalence, ferx-r #127)
+        run: cargo test --test analytical_ode_equivalence --no-default-features --features ci --profile ci-test
+
   survival:
     name: Survival (TTE)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly toolchain
-        run: rustup toolchain install nightly --profile minimal
+        run: rustup toolchain install nightly --profile minimal -c llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-survival
-      # All TTE/survival code is behind `#[cfg(feature = "survival")]`, so the
-      # default `ci` jobs above neither compile nor exercise it. Build and run
-      # the feature explicitly here so a break can't land with CI green. The
-      # `tte_smoke` integration tests are Tier-2 (a handful of outer iterations),
-      # so `--tests` stays fast.
-      - name: cargo test (survival)
-        run: cargo test --tests --no-default-features --features ci,survival --profile ci-test
+          # Instrumented build (coverage RUSTFLAGS) can't share the plain `ci`
+          # caches; own key, like the other coverage jobs (`coverage-pr` -> ci-cov).
+          shared-key: ci-cov-survival
+      - name: Install cargo-llvm-cov
+        # Prebuilt binary (no compile) so this job stays fast.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # All TTE/survival code is behind `#[cfg(feature = "survival")]`, so neither
+      # the default `ci` jobs nor the FD coverage jobs (`fast`/`slow` flags)
+      # compile it — Codecov reports those lines as missed even though they're
+      # exercised here, undercounting the true surface (#293). So this job both
+      # GATES the survival code (a break still fails it) and MEASURES it: it runs
+      # under `cargo llvm-cov` and uploads the `survival` flag, which Codecov
+      # merges with `fast`/`slow`. `tte_smoke` is Tier-2 (a handful of outer
+      # iterations), so `--tests` stays fast; `--profile ci-test` (no fat LTO)
+      # keeps it cheap. `--no-fail-fast` mirrors the other coverage jobs.
+      - name: Generate survival coverage report
+        run: cargo llvm-cov --tests --no-fail-fast --no-default-features --features ci,survival --profile ci-test --lcov --output-path lcov.info
+
+      - name: Upload to Codecov (survival flag)
+        uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+          flags: survival
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   clippy:
     name: Clippy
