@@ -90,11 +90,12 @@ Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP op
 
 ### GPU backend (`saem_backend`)
 
-The SAEM E-step evaluates the per-subject individual log-likelihood many
-times per iteration — an embarrassingly parallel workload. When ferx-core is
-built with the `gpu` Cargo feature, that batched evaluation can run on a GPU
-via a [`cubecl`](https://github.com/tracel-ai/cubecl) kernel (wgpu → Metal /
-Vulkan / DX12, or CUDA on NVIDIA).
+The SAEM E-step runs an independent Metropolis-Hastings chain per subject —
+an embarrassingly parallel workload. When ferx-core is built with the `gpu`
+Cargo feature, the whole per-subject block random-walk MH sweep runs on a GPU
+(one thread per subject) via a [`cubecl`](https://github.com/tracel-ai/cubecl)
+kernel (wgpu → Metal / Vulkan / DX12, or CUDA on NVIDIA), with the M-step and
+step-size adaptation staying on the CPU.
 
 | Value | Behaviour |
 |-------|-----------|
@@ -108,13 +109,22 @@ environments without a GPU. The CPU and GPU paths are validated for numerical
 parity (within `f32` tolerance — GPUs that lack `f64`, such as Metal, run the
 kernel in `f32`).
 
-**Supported subset.** The current kernel covers the 1-compartment IV-bolus
+Because the per-proposal η changes CL/V every step and the θ,η→PK-parameter
+transform is an arbitrary DSL closure, the kernel reconstructs CL/V from a
+**log-linear** model `CL = CL0·exp(a·η)` whose coefficients are extracted and
+*verified* against the real closure on the host; models that are not log-linear
+in η fall back to CPU. The in-kernel RNG is counter-based, so the GPU and CPU
+chains are not bit-identical — SAEM is stochastic and the Robbins-Monro M-step
+averages over draws, so the two converge to statistically equivalent estimates
+(validated by a full-fit convergence test).
+
+**Supported subset.** The GPU MH E-step covers the 1-compartment IV-bolus
 analytical model with a single Gaussian endpoint (additive / proportional /
-combined error). Anything outside it — other PK models, infusions,
-steady-state doses, system resets, time-varying covariates, M3 BLOQ, SDE, or
-TTE endpoints — transparently falls back to the CPU path. The GPU port of the
-full Metropolis-Hastings / HMC proposal loop is tracked as follow-up work in
-issue #368.
+combined error), a **diagonal Ω**, and **≤ 8** random effects. Anything outside
+it — other PK models, infusions, steady-state doses, system resets,
+time-varying covariates, M3 BLOQ, SDE/TTE, block Ω (which needs the
+componentwise decorrelating sweep), IOV, or HMC (`n_leapfrog > 0`) —
+transparently falls back to the CPU E-step.
 
 ## SIR (Sampling Importance Resampling)
 

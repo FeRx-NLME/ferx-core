@@ -21,15 +21,17 @@ section of the SDLC for the versioning policy).
 
 ### Added
 - Optional **GPU-accelerated SAEM E-step** behind the new `gpu` Cargo feature
-  (off by default). A `cubecl` kernel (wgpu → Metal/Vulkan/DX12, or CUDA)
-  evaluates the batched per-subject individual log-likelihood for the
-  1-compartment IV-bolus analytical model with Gaussian error. Selected per fit
-  via the new `saem_backend = auto|cpu|gpu` `[fit_options]` key (default
-  `auto`). The CPU path remains the reference and the default: the GPU path is
-  fully optional and falls back to CPU — with a warning when `gpu` was
-  explicitly requested — whenever the feature is unbuilt, no device is
-  available, or the model is outside the supported subset, so results are
-  unchanged in environments without a GPU. CPU/GPU parity is tested (#368).
+  (off by default). A `cubecl` kernel (wgpu → Metal/Vulkan/DX12, or CUDA) runs
+  the whole per-subject block random-walk Metropolis-Hastings sweep on the GPU
+  (one thread per subject) for the 1-compartment IV-bolus analytical model with
+  Gaussian error, a diagonal Ω, and ≤ 8 random effects; the M-step and
+  step-size adaptation stay on the CPU. Selected per fit via the new
+  `saem_backend = auto|cpu|gpu` `[fit_options]` key (default `auto`). The CPU
+  path remains the reference and the default: the GPU path is fully optional and
+  falls back to CPU — with a warning when `gpu` was explicitly requested —
+  whenever the feature is unbuilt, no device is available, or the model is
+  outside the supported subset, so results are unchanged in environments without
+  a GPU. CPU/GPU NLL parity and full-fit convergence are tested (#368).
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The
   dose is delivered as this appearance rate into the depot (∫R_in dt = F·Dose) —

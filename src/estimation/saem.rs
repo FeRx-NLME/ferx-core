@@ -1333,6 +1333,15 @@ pub fn run_saem(
     // Only meaningful when `using_hmc = true`; stays all-false otherwise.
     let mut hmc_subjects = vec![false; n_subjects];
 
+    // GPU E-step (issue #368): whether the GPU MH sweep ran on any iteration.
+    // `gpu_estep_eligible` is true when the user asked for the GPU and the
+    // sampler config permits the GPU kernel (no IOV, no HMC).
+    let gpu_estep_eligible = cfg!(feature = "gpu")
+        && matches!(options.saem_backend, SaemBackend::Gpu | SaemBackend::Auto)
+        && n_kappa == 0
+        && !using_hmc;
+    let mut gpu_estep_used = false;
+
     // Main loop
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -1396,7 +1405,48 @@ pub fn run_saem(
         // (`mh_steps_componentwise`) that perturbs one η at a time. Kernel (2)
         // is what keeps a block Ω from collapsing to rank-1 — see that fn's
         // docstring.
-        {
+        // GPU E-step fast path (issue #368): run the whole block-RW MH sweep on
+        // the GPU when eligible (diagonal Ω, log-linear PK, supported model —
+        // all checked inside `gpu_mh_sweep`, which returns None to fall back).
+        // Block kernel only; the componentwise decorrelating sweep is for block
+        // Ω, which the GPU path excludes, so it is skipped here.
+        let gpu_estep_done = if gpu_estep_eligible {
+            if let Some(out) = crate::estimation::gpu_saem::gpu_mh_sweep(
+                model,
+                population,
+                &state.theta,
+                &state.etas,
+                &state.sigma_vals,
+                &omega_k,
+                &state.step_scales,
+                n_mh_steps,
+                master_seed.wrapping_add(k as u64 * 100_000),
+            ) {
+                state.etas = out.etas;
+                for i in 0..n_subjects {
+                    state.accept_counts[i] += out.accepts[i];
+                    state.proposal_counts[i] += n_mh_steps;
+                }
+                // Refresh the NLL cache in f64 on the host for objective
+                // fidelity (one eval/subject — negligible vs the sweep).
+                state.nll_cache = crate::estimation::gpu_saem::batched_individual_nll_cpu(
+                    model,
+                    population,
+                    &state.theta,
+                    &state.etas,
+                    &omega_k,
+                    &state.sigma_vals,
+                );
+                gpu_estep_used = true;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !gpu_estep_done {
             use rayon::prelude::*;
             let theta_ref = &state.theta;
             let sigma_ref = &state.sigma_vals;
@@ -1942,6 +1992,18 @@ pub fn run_saem(
 
             crate::estimation::trace::write_saem(k, phase, cond_nll, gamma, mh_accept_rate);
         }
+    }
+
+    // GPU E-step diagnostic (issue #368): if the user explicitly asked for the
+    // GPU but the MH sweep never ran (e.g. block Ω, non-log-linear PK, > max
+    // etas, or no device), the E-step ran on the CPU — surface that.
+    if cfg!(feature = "gpu") && options.saem_backend == SaemBackend::Gpu && !gpu_estep_used {
+        warnings.push(
+            "saem_backend=gpu requested but the GPU MH E-step did not run \
+             (requires a diagonal Ω, a log-linear analytical 1-cpt IV model, \
+             ≤ 8 etas, and an available device); the E-step ran on the CPU."
+                .to_string(),
+        );
     }
 
     // If the user cancelled mid-run the loop broke early; skip the final
