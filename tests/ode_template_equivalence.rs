@@ -281,3 +281,80 @@ fn ode_template_matches_analytical_all_models() {
         }
     }
 }
+
+/// `ode_template` injects `[scaling] obs_scale = <central volume>` only when the
+/// user did not write their own `[scaling]` — and a user-supplied `obs_scale`
+/// takes precedence (no duplicate-key error, the user's value is what's used).
+/// This guards the precedence claim that was previously asserted without a test.
+#[test]
+fn ode_template_user_obs_scale_takes_precedence() {
+    let header = "\
+[parameters]
+  theta TVCL(3.0, 0.01, 100.0)
+  theta TVV1(15.0, 1.0, 500.0)
+  theta TVQ(3.0, 0.01, 100.0)
+  theta TVV2(30.0, 1.0, 500.0)
+  theta TVKA(1.1, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+
+[structural_model]
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+";
+    let err = "\n[error_model]\n  DV ~ proportional(PROP)\n";
+    // (a) no [scaling] → ode_template injects obs_scale = V1.
+    let injected = format!("{header}{err}");
+    // (b) user supplies the same obs_scale = V1 → must parse (no duplicate-key
+    //     error) and predict identically to the injected default.
+    let explicit_v1 = format!("{header}\n[scaling]\n  obs_scale = V1\n{err}");
+    // (c) user supplies obs_scale = 1.0 → the central STATE is an amount, so this
+    //     reads amounts (not concentration). It must take precedence over the
+    //     injected V1, so predictions differ by ~V1 (= 15) from (a).
+    let explicit_one = format!("{header}\n[scaling]\n  obs_scale = 1.0\n{err}");
+
+    let pop = population(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+        2,
+    );
+    let preds = |src: &str| {
+        let m = parse_full_model(src)
+            .unwrap_or_else(|e| panic!("did not parse: {e}"))
+            .model;
+        predict(&m, &pop, &m.default_params)
+            .into_iter()
+            .map(|p| p.pred)
+            .collect::<Vec<f64>>()
+    };
+
+    let a = preds(&injected);
+    let b = preds(&explicit_v1);
+    let c = preds(&explicit_one);
+
+    // (b) == (a): an explicit obs_scale = V1 neither errors (no duplicate inject)
+    // nor changes the result — it is exactly what `ode_template` would inject.
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert!(
+            (x - y).abs() <= 1e-9 + 1e-9 * x.abs(),
+            "explicit obs_scale=V1 should match the injected default: {x} vs {y}"
+        );
+    }
+    // (c) != (a): the user's obs_scale = 1.0 is what's applied (amounts), proving
+    // the user value wins over the injected V1. With V1 = 15 the gap is large.
+    let differ = a
+        .iter()
+        .zip(c.iter())
+        .any(|(x, y)| (x - y).abs() > 1e-3 * x.abs().max(1e-6));
+    assert!(
+        differ,
+        "user obs_scale=1.0 must take precedence over the injected V1 (amount vs \
+         concentration), but predictions were unchanged: {a:?} vs {c:?}"
+    );
+}

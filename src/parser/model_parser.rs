@@ -4076,7 +4076,20 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
             }
         }
         match found {
-            None => return Ok(()),
+            // `has_template` was true (some line starts with `ode_template`), so a
+            // `None` here means that line did not match `ode_template NAME(...)` —
+            // a malformed directive. Reject it explicitly rather than silently
+            // falling through to a confusing "No PK model found" downstream (or,
+            // with a `transit()` in [odes], the error rule telling the user to
+            // "use ode_template" when they already are).
+            None => {
+                return Err(
+                    "[structural_model]: malformed `ode_template` line — expected \
+                     `ode_template NAME(role=VAR, ...)`, e.g. \
+                     `ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)`."
+                        .to_string(),
+                );
+            }
             Some(_) if has_other_disposition => {
                 return Err(
                     "[structural_model]: `ode_template` cannot be combined with a `pk ...` or \
@@ -9634,6 +9647,25 @@ mod tests {
         let src = two_cpt_oral_model("ode_template one_cpt_iv(cl)", "", "");
         let err = parse_err(&src);
         assert!(err.contains("malformed parameter"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_missing_parens_errors_clearly() {
+        // A line that *looks* like an ode_template directive but doesn't match
+        // `NAME(...)` must produce a clear "malformed ode_template" error — not
+        // fall through to a confusing "No PK model found". Pair it with a
+        // transit() in [odes] (the worst case: the error rule would otherwise
+        // tell the user to "use ode_template" when they already are).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("malformed `ode_template`"),
+            "expected a clear malformed-ode_template error, got: {err}"
+        );
     }
 
     #[test]
