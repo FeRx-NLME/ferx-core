@@ -2357,6 +2357,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_missing_dv_count_aggregates_across_subjects() {
+        // Issue #258: the per-subject missing-DV counts are summed into ONE
+        // population warning. Two subjects, one skipped row each → a single
+        // W_MISSING_DV reporting two rows (plural), not two warnings.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,0,.,1,1,100,1\n\
+                   1,1,.,0,0,.,1\n\
+                   1,2,7.0,0,0,.,1\n\
+                   2,0,.,1,1,100,1\n\
+                   2,1,5.0,0,0,.,1\n\
+                   2,2,.,0,0,.,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+
+        // Each subject keeps only its single valid observation.
+        assert_eq!(pop.subjects[0].observations, vec![7.0]);
+        assert_eq!(pop.subjects[1].observations, vec![5.0]);
+
+        let warns: Vec<&String> = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_MISSING_DV"))
+            .collect();
+        assert_eq!(warns.len(), 1, "expected one aggregated W_MISSING_DV");
+        assert!(
+            warns[0].contains("2 observation row"),
+            "expected aggregated count of 2, got: {}",
+            warns[0]
+        );
+    }
+
+    #[test]
+    fn test_missing_dv_recognizes_na_nan_and_blank_sentinels() {
+        // `is_missing_cell` treats `.`, `NA`/`na`, `NaN`/`nan`, and blank as
+        // missing — all of these on a scored obs row must be skipped and counted,
+        // not just the `.` sentinel exercised by the other tests.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,0,.,1,1,100,1\n\
+                   1,1,NA,0,0,.,1\n\
+                   1,2,nan,0,0,.,1\n\
+                   1,3,,0,0,.,1\n\
+                   1,4,6.0,0,0,.,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        // Only the single numeric observation survives.
+        assert_eq!(subj.observations, vec![6.0]);
+        assert_eq!(subj.obs_times, vec![4.0]);
+
+        let warns: Vec<&String> = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_MISSING_DV"))
+            .collect();
+        assert_eq!(warns.len(), 1);
+        assert!(
+            warns[0].contains("3 observation row"),
+            "expected 3 skipped (NA, nan, blank), got: {}",
+            warns[0]
+        );
+    }
+
+    #[test]
+    fn test_missing_dv_and_amt_not_dosed_warnings_coexist() {
+        // The missing-DV summary (#258) and the dose-coverage summary (#262) are
+        // independent population warnings and must both fire when a dataset trips
+        // both: a missing-DV scored obs row AND a nonzero-AMT row that is not a
+        // dose (EVID=2, MDV=1) so its AMT is ignored.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,0,.,1,1,100,1\n\
+                   1,1,.,0,0,.,1\n\
+                   1,2,5.0,0,0,.,1\n\
+                   1,3,.,2,1,5000,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+
+        assert_eq!(pop.subjects[0].observations, vec![5.0]);
+        assert!(
+            pop.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
+            "missing-DV warning should fire; warnings: {:?}",
+            pop.warnings
+        );
+        assert!(
+            pop.warnings
+                .iter()
+                .any(|w| w.starts_with("W_AMT_NOT_DOSED")),
+            "AMT-not-dosed warning should fire; warnings: {:?}",
+            pop.warnings
+        );
+    }
+
     fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
         CovariateDecl {
             name: name.to_string(),
