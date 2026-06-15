@@ -88,6 +88,37 @@ RUN rustup toolchain link enzyme /opt/enzyme-toolchain \
     && chmod -R a+rX /opt/enzyme-toolchain \
     && rustc +enzyme --version --verbose
 
+# Functional autodiff smoke test — `rustc +enzyme --version` only proves the
+# toolchain LOADS; a mismatched-LLVM Enzyme passes --version yet HANGS in
+# llvm::Constant::getNullValue the moment it differentiates anything
+# (docs/src/installation.md §4). This compiles + runs a real #[autodiff_forward]
+# function under fat LTO (the autodiff link mode) so a broken monthly rebuild
+# FAILS HERE in seconds instead of wedging autodiff.yml for 90 min on a timeout.
+# `timeout` converts the silent getNullValue hang into a hard build failure.
+RUN <<'BASH'
+set -eux
+cat > /tmp/ad_check.rs <<'EOF'
+#![feature(autodiff)]
+use std::autodiff::autodiff_forward;
+
+// d/dx of f(x,y) = exp(x*y) + x*x  is  y*exp(x*y) + 2x.
+#[autodiff_forward(df, Dual, Const, Dual)]
+#[inline(never)]
+fn f(x: f64, y: f64) -> f64 { (x * y).exp() + x * x }
+
+fn main() {
+    let (val, dfdx) = df(1.5, 1.0, 2.0);          // x=1.5, dx=1, y=2
+    let expect = 2.0 * (1.5 * 2.0_f64).exp() + 2.0 * 1.5;
+    assert!((dfdx - expect).abs() < 1e-9);
+    println!("autodiff OK: f={val:.4}, df/dx={dfdx:.4}");
+}
+EOF
+timeout 180 rustc +enzyme -Zautodiff=Enable -Clto=fat -Copt-level=2 \
+    /tmp/ad_check.rs -o /tmp/ad_check
+/tmp/ad_check
+rm -f /tmp/ad_check /tmp/ad_check.rs
+BASH
+
 ENV RUSTUP_TOOLCHAIN=enzyme
 
 # ── Notes ──────────────────────────────────────────────────────────────────
@@ -100,6 +131,6 @@ ENV RUSTUP_TOOLCHAIN=enzyme
 #  * Verification depth: `rustc +enzyme --version` only proves the toolchain
 #    LOADS, not that differentiation WORKS (installation.md warns a
 #    mismatched-LLVM Enzyme can pass --version yet hang on real autodiff). The
-#    real functional check is ferx-core's `autodiff_fd_consistency` suite, run by
-#    autodiff.yml against this image. A future hardening is a tiny inline
-#    #[autodiff] smoke compile+run here to fail the monthly rebuild earlier.
+#    inline #[autodiff_forward] smoke test above (timeout-guarded) catches a
+#    broken toolchain at IMAGE BUILD time; ferx-core's `autodiff_fd_consistency`
+#    suite (run by autodiff.yml against this image) is the deeper functional check.
