@@ -841,7 +841,7 @@ fn propagate_one_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_centra
     // reuse `propagate_one_cpt` to avoid duplicating the closed form (#327
     // follow-up: the event-driven path previously dropped this input on oral
     // models).
-    if rate_central != 0.0 {
+    if rate_central > 0.0 {
         let mut inflow = [0.0_f64];
         propagate_one_cpt(&mut inflow, dt, pk, rate_central);
         state[1] += inflow[0];
@@ -928,7 +928,7 @@ fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_centra
 
     // Constant infusion into central (depot bypass) — see propagate_one_cpt_oral.
     // Reuse the 2-cpt IV propagator's forced response from a zero initial state.
-    if rate_central != 0.0 {
+    if rate_central > 0.0 {
         let mut inflow = [0.0_f64, 0.0];
         propagate_two_cpt(&mut inflow, dt, pk, rate_central, 0.0);
         state[1] += inflow[0];
@@ -1160,7 +1160,7 @@ fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_cent
 
     // Constant infusion into central (depot bypass) — see propagate_one_cpt_oral.
     // Reuse the 3-cpt IV propagator's forced response from a zero initial state.
-    if rate_central != 0.0 {
+    if rate_central > 0.0 {
         let mut inflow = [0.0_f64, 0.0, 0.0];
         propagate_three_cpt(&mut inflow, dt, pk, rate_central, 0.0, 0.0);
         state[1] += inflow[0];
@@ -1896,6 +1896,75 @@ mod tests {
             }
 
             // (2) Linear in F (the infusion rate is scaled by f_bio).
+            let mut pkf = base;
+            pkf.values[crate::types::PK_IDX_F] = 0.4;
+            let ed_f = event_driven_predictions(
+                model,
+                &subj,
+                &vec![pkf; 1],
+                &vec![pkf; obs_times.len()],
+                &[],
+            );
+            for (a_f, a_1) in ed_f.iter().zip(ed.iter()) {
+                assert_relative_eq!(*a_f, 0.4 * *a_1, max_relative = 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn event_driven_applies_oral_ss_infusion_into_central() {
+        // Steady-state companion to the test above. An SS (ss=1, II=24 h)
+        // infusion into an oral model's central compartment must equilibrate
+        // correctly — it shares `propagate_*_oral`, which previously dropped the
+        // input — not return ~0. Cross-path uses a looser tolerance because the
+        // event-driven path equilibrates SS with a finite cycle count vs the
+        // exact analytical SS closed form; the F-linearity check is exact.
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
+        // SS infusion into central (cmt 2); dur = amt/rate = 4 h < II.
+        let dose = DoseEvent::new(0.0, 100.0, 2, 25.0, true, 24.0);
+        let subj = make_subject(vec![dose], obs_times.clone());
+
+        let cases: Vec<(&str, PkModel, PkParams)> = vec![
+            (
+                "1cpt-oral SS",
+                PkModel::OneCptOral,
+                pk_one_oral(5.0, 50.0, 1.2),
+            ),
+            (
+                "2cpt-oral SS",
+                PkModel::TwoCptOral,
+                pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2),
+            ),
+            (
+                "3cpt-oral SS",
+                PkModel::ThreeCptOral,
+                pk_three_oral(5.0, 40.0, 3.0, 60.0, 1.0, 120.0, 1.2),
+            ),
+        ];
+
+        for (label, model, base) in cases {
+            let mut pk1 = base;
+            pk1.values[crate::types::PK_IDX_F] = 1.0;
+            let ed = event_driven_predictions(
+                model,
+                &subj,
+                &vec![pk1; 1],
+                &vec![pk1; obs_times.len()],
+                &[],
+            );
+            let sup: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk1))
+                .collect();
+            for (j, (&e, &s)) in ed.iter().zip(sup.iter()).enumerate() {
+                assert!(
+                    e > 0.0,
+                    "{label}: SS oral infusion should be >0 at obs {j} (was dropped before the fix)"
+                );
+                assert_relative_eq!(e, s, epsilon = 1e-9, max_relative = 2e-3);
+            }
+
+            // F-linearity (exact — the infusion rate is scaled by f_bio).
             let mut pkf = base;
             pkf.values[crate::types::PK_IDX_F] = 0.4;
             let ed_f = event_driven_predictions(
