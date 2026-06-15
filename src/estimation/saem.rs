@@ -6,7 +6,9 @@
 /// Two-phase step-size schedule (Monolix convention):
 ///   Phase 1 (exploration, k ≤ K1):  γₖ = 1          — rapid basin convergence
 ///   Phase 2 (convergence, k > K1):  γₖ = 1/(k−K1)   — almost-sure convergence to MLE
-use crate::estimation::em_common::{floor_omega_diagonal, get_mu_ref_pairs, OMEGA_DIAG_FLOOR};
+use crate::estimation::em_common::{
+    floor_omega_diagonal, get_mu_ref_pairs, unpack_thetas, PackedThetaSigma, OMEGA_DIAG_FLOOR,
+};
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
     compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
@@ -601,20 +603,6 @@ fn theta_sigma_mstep_light(
         x[i] = x[i].clamp(lower[i], upper[i]);
     }
 
-    // Unpack a slice of packed theta values into natural-scale theta.
-    // Closure (not local fn) so it captures `theta_packs_log_mask`.
-    let unpack_thetas = |packed: &[f64]| -> Vec<f64> {
-        (0..n_theta)
-            .map(|i| {
-                if theta_packs_log_mask[i] {
-                    packed[i].exp()
-                } else {
-                    packed[i]
-                }
-            })
-            .collect()
-    };
-
     // Objective operating on the unscaled packed parameters.
     //
     // Gradient strategy: single rayon pass over subjects, each computing its
@@ -629,7 +617,7 @@ fn theta_sigma_mstep_light(
     //  • Pinned dims (lower == upper) are skipped per-subject, saving the
     //    predict calls entirely (same as the old FD guard).
     let obj = |xv: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
-        let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
+        let th: Vec<f64> = unpack_thetas(&xv[..n_theta], theta_packs_log_mask);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
 
         if let Some(g) = grad {
@@ -1177,66 +1165,19 @@ pub fn run_saem(
     // `t.max(1e-10).ln()` packing and could never be estimated —
     // visible regression: SAD_SCEN4 SAEM left γ_CL stuck at 0 (truth
     // -0.8), letting the rest of the fit drift to compensate.
-    let theta_packs_log_mask: Vec<bool> = init_params
-        .theta_lower
-        .iter()
-        .map(|&lo| crate::estimation::parameterization::theta_packs_log(lo))
-        .collect();
-    let pack_theta = |i: usize, t: f64| -> f64 {
-        if theta_packs_log_mask[i] {
-            t.max(1e-10).ln()
-        } else {
-            t
-        }
-    };
-    let unpack_theta = |i: usize, packed: f64| -> f64 {
-        if theta_packs_log_mask[i] {
-            packed.exp()
-        } else {
-            packed
-        }
-    };
-
-    // Pack initial theta (per-mask) and sigma (always log).
-    let mut log_theta: Vec<f64> = (0..n_theta).map(|i| pack_theta(i, theta_cur[i])).collect();
-    let mut log_sigma: Vec<f64> = sigma_cur.iter().map(|&s| s.max(1e-10).ln()).collect();
-
-    // Bounds in packed space — log when log-packed, identity otherwise.
-    let mut log_theta_lower: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_lower[i].max(1e-10).ln()
-            } else {
-                init_params.theta_lower[i]
-            }
-        })
-        .collect();
-    let mut log_theta_upper: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_upper[i].min(1e9).ln()
-            } else {
-                init_params.theta_upper[i]
-            }
-        })
-        .collect();
-    let mut log_sigma_lower = vec![-8.0f64; n_sigma];
-    let mut log_sigma_upper = vec![5.0f64; n_sigma];
-
-    // Pin FIX parameters: set lower == upper == packed_value so the inner
-    // NLopt M-step treats them as constants. Matches the FOCE/FOCEI treatment.
-    for i in 0..n_theta {
-        if init_params.theta_fixed.get(i).copied().unwrap_or(false) {
-            log_theta_lower[i] = log_theta[i];
-            log_theta_upper[i] = log_theta[i];
-        }
-    }
-    for i in 0..n_sigma {
-        if init_params.sigma_fixed.get(i).copied().unwrap_or(false) {
-            log_sigma_lower[i] = log_sigma[i];
-            log_sigma_upper[i] = log_sigma[i];
-        }
-    }
+    //
+    // The full packed-space scaffolding is shared with IMPMAP via em_common.
+    // `theta_cur`/`sigma_cur` equal `init_params.theta`/`.sigma.values` here
+    // (just cloned, not yet mutated), so packing from `init_params` is identical.
+    let PackedThetaSigma {
+        theta_packs_log_mask,
+        mut log_theta,
+        mut log_sigma,
+        log_theta_lower,
+        log_theta_upper,
+        log_sigma_lower,
+        log_sigma_upper,
+    } = PackedThetaSigma::new(init_params);
 
     let mut state = SaemState {
         etas,
@@ -1755,9 +1696,7 @@ pub fn run_saem(
                 log_sigma = sigma_new;
             }
 
-            state.theta = (0..n_theta)
-                .map(|i| unpack_theta(i, log_theta[i]))
-                .collect();
+            state.theta = unpack_thetas(&log_theta, &theta_packs_log_mask);
             state.sigma_vals = log_sigma.iter().map(|&v| v.exp()).collect();
         }
 
@@ -2044,8 +1983,8 @@ pub fn run_saem(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::test_helpers::analytical_model;
-    use crate::types::{GradientMethod, MuRef};
+    use crate::types::test_helpers::{analytical_model, model_with_mu_refs};
+    use crate::types::GradientMethod;
 
     /// Pin the SAEM M-step optimizer choice.
     ///
@@ -2097,31 +2036,6 @@ mod tests {
             s2.starts_with("HMC"),
             "autodiff build with analytical model + leapfrog steps should use HMC, got: {s2}"
         );
-    }
-
-    fn model_with_mu_refs(
-        theta_names: &[&str],
-        eta_names: &[&str],
-        mu_refs: &[(&str, &str, bool)],
-    ) -> CompiledModel {
-        let mut m = analytical_model(GradientMethod::Auto);
-        m.theta_names = theta_names.iter().map(|s| (*s).to_string()).collect();
-        m.eta_names = eta_names.iter().map(|s| (*s).to_string()).collect();
-        m.n_theta = theta_names.len();
-        m.n_eta = eta_names.len();
-        m.mu_refs = mu_refs
-            .iter()
-            .map(|(eta, theta, log_t)| {
-                (
-                    (*eta).to_string(),
-                    MuRef {
-                        theta_name: (*theta).to_string(),
-                        log_transformed: *log_t,
-                    },
-                )
-            })
-            .collect();
-        m
     }
 
     // `floor_omega_diagonal` and `get_mu_ref_pairs` are tested in

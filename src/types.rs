@@ -3295,6 +3295,34 @@ pub(crate) mod test_helpers {
         make_compiled_model(true, gradient_method)
     }
 
+    /// Build an analytical model with the given theta/eta names and mu-references.
+    /// Each `mu_refs` entry is `(eta_name, theta_name, log_transformed)`. Shared by
+    /// the SAEM and IMPMAP / em_common tests that exercise mu-ref-pair selection.
+    pub(crate) fn model_with_mu_refs(
+        theta_names: &[&str],
+        eta_names: &[&str],
+        mu_refs: &[(&str, &str, bool)],
+    ) -> CompiledModel {
+        let mut m = analytical_model(GradientMethod::Auto);
+        m.theta_names = theta_names.iter().map(|s| (*s).to_string()).collect();
+        m.eta_names = eta_names.iter().map(|s| (*s).to_string()).collect();
+        m.n_theta = theta_names.len();
+        m.n_eta = eta_names.len();
+        m.mu_refs = mu_refs
+            .iter()
+            .map(|(eta, theta, log_t)| {
+                (
+                    (*eta).to_string(),
+                    MuRef {
+                        theta_name: (*theta).to_string(),
+                        log_transformed: *log_t,
+                    },
+                )
+            })
+            .collect();
+        m
+    }
+
     fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> CompiledModel {
         CompiledModel {
             name: "test".into(),

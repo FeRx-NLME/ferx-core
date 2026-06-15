@@ -7,7 +7,8 @@
 //! rule or the mu-ref-pair selection cannot silently diverge between the two
 //! estimators (which is exactly how the IMPMAP duplicates were introduced).
 
-use crate::types::CompiledModel;
+use crate::estimation::parameterization::theta_packs_log;
+use crate::types::{CompiledModel, ModelParameters};
 use nalgebra::DMatrix;
 
 /// Positive-definite floor for free BSV Ω diagonals in the M-step.
@@ -61,36 +62,123 @@ pub(crate) fn get_mu_ref_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
     pairs
 }
 
+/// Unpack a packed θ vector back to natural space, per the packing mask.
+///
+/// `mask[i] == true` means θ_i was log-packed (so unpack with `exp`); `false`
+/// means identity packing (covariate exponents with a negative lower bound,
+/// which must not be forced positive). The SAEM and IMPMAP θ/σ M-steps share
+/// this so the unpack can never drift from the pack in [`PackedThetaSigma`].
+pub(crate) fn unpack_thetas(packed: &[f64], mask: &[bool]) -> Vec<f64> {
+    packed
+        .iter()
+        .zip(mask)
+        .map(|(&p, &is_log)| if is_log { p.exp() } else { p })
+        .collect()
+}
+
+/// Initial θ/σ values and bounds in the packed (log/identity) optimizer space
+/// shared by the SAEM and IMPMAP M-steps.
+///
+/// θ uses log-packing when its lower bound is ≥ 0 (`theta_packs_log`), identity
+/// otherwise — so a covariate exponent with a negative lower bound is not pinned
+/// near 0 by `ln`. σ is always log-packed with fixed `[-8, 5]` bounds. FIX-ed
+/// parameters get `lower == upper == packed value`, so the inner NLopt M-step
+/// treats them as constants (matching the FOCE/FOCEI treatment). Built once from
+/// `init_params`; both estimators then mutate the packed `log_theta`/`log_sigma`
+/// in place across iterations and unpack via [`unpack_thetas`].
+pub(crate) struct PackedThetaSigma {
+    /// Per-θ packing selector: `true` → log, `false` → identity.
+    pub theta_packs_log_mask: Vec<bool>,
+    /// Initial θ in packed space.
+    pub log_theta: Vec<f64>,
+    /// Initial σ in packed space (always log).
+    pub log_sigma: Vec<f64>,
+    pub log_theta_lower: Vec<f64>,
+    pub log_theta_upper: Vec<f64>,
+    pub log_sigma_lower: Vec<f64>,
+    pub log_sigma_upper: Vec<f64>,
+}
+
+impl PackedThetaSigma {
+    pub(crate) fn new(init: &ModelParameters) -> Self {
+        let n_theta = init.theta.len();
+        let n_sigma = init.sigma.values.len();
+
+        let theta_packs_log_mask: Vec<bool> = init
+            .theta_lower
+            .iter()
+            .map(|&lo| theta_packs_log(lo))
+            .collect();
+        let pack_theta = |i: usize, t: f64| -> f64 {
+            if theta_packs_log_mask[i] {
+                t.max(1e-10).ln()
+            } else {
+                t
+            }
+        };
+
+        // Pack initial θ (per-mask) and σ (always log).
+        let log_theta: Vec<f64> = (0..n_theta).map(|i| pack_theta(i, init.theta[i])).collect();
+        let log_sigma: Vec<f64> = init
+            .sigma
+            .values
+            .iter()
+            .map(|&s| s.max(1e-10).ln())
+            .collect();
+
+        // Bounds in packed space — log when log-packed, identity otherwise.
+        let mut log_theta_lower: Vec<f64> = (0..n_theta)
+            .map(|i| {
+                if theta_packs_log_mask[i] {
+                    init.theta_lower[i].max(1e-10).ln()
+                } else {
+                    init.theta_lower[i]
+                }
+            })
+            .collect();
+        let mut log_theta_upper: Vec<f64> = (0..n_theta)
+            .map(|i| {
+                if theta_packs_log_mask[i] {
+                    init.theta_upper[i].min(1e9).ln()
+                } else {
+                    init.theta_upper[i]
+                }
+            })
+            .collect();
+        let mut log_sigma_lower = vec![-8.0f64; n_sigma];
+        let mut log_sigma_upper = vec![5.0f64; n_sigma];
+
+        // Pin FIX parameters: lower == upper == packed value.
+        for i in 0..n_theta {
+            if init.theta_fixed.get(i).copied().unwrap_or(false) {
+                log_theta_lower[i] = log_theta[i];
+                log_theta_upper[i] = log_theta[i];
+            }
+        }
+        for i in 0..n_sigma {
+            if init.sigma_fixed.get(i).copied().unwrap_or(false) {
+                log_sigma_lower[i] = log_sigma[i];
+                log_sigma_upper[i] = log_sigma[i];
+            }
+        }
+
+        PackedThetaSigma {
+            theta_packs_log_mask,
+            log_theta,
+            log_sigma,
+            log_theta_lower,
+            log_theta_upper,
+            log_sigma_lower,
+            log_sigma_upper,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::test_helpers::analytical_model;
-    use crate::types::{GradientMethod, MuRef};
-
-    fn model_with_mu_refs(
-        theta_names: &[&str],
-        eta_names: &[&str],
-        mu_refs: &[(&str, &str, bool)],
-    ) -> CompiledModel {
-        let mut m = analytical_model(GradientMethod::Auto);
-        m.theta_names = theta_names.iter().map(|s| (*s).to_string()).collect();
-        m.eta_names = eta_names.iter().map(|s| (*s).to_string()).collect();
-        m.n_theta = theta_names.len();
-        m.n_eta = eta_names.len();
-        m.mu_refs = mu_refs
-            .iter()
-            .map(|(eta, theta, log_t)| {
-                (
-                    (*eta).to_string(),
-                    MuRef {
-                        theta_name: (*theta).to_string(),
-                        log_transformed: *log_t,
-                    },
-                )
-            })
-            .collect();
-        m
-    }
+    use crate::types::test_helpers::{analytical_model, model_with_mu_refs};
+    use crate::types::GradientMethod;
 
     #[test]
     fn floor_omega_diagonal_floors_free_entries_only() {
@@ -172,5 +260,90 @@ mod tests {
         // mu_ref points at a theta name that doesn't exist — silently skipped.
         let m = model_with_mu_refs(&["CL"], &["ETA_CL"], &[("ETA_CL", "MISSING", true)]);
         assert!(get_mu_ref_pairs(&m).is_empty());
+    }
+
+    #[test]
+    fn unpack_thetas_applies_mask_per_index() {
+        // mask[0]=log → exp; mask[1]=identity → passthrough (negative-bound exponent).
+        let out = unpack_thetas(&[1.0, -0.8], &[true, false]);
+        assert!((out[0] - 1.0_f64.exp()).abs() < 1e-12);
+        assert_eq!(
+            out[1], -0.8,
+            "identity-packed theta must pass through unchanged"
+        );
+    }
+
+    /// Build a minimal ModelParameters with the given theta bounds/fixed flags
+    /// and a single sigma, for exercising PackedThetaSigma.
+    fn params(
+        theta: &[f64],
+        theta_lower: &[f64],
+        theta_upper: &[f64],
+        theta_fixed: &[bool],
+        sigma: &[f64],
+        sigma_fixed: &[bool],
+    ) -> ModelParameters {
+        use crate::types::{OmegaMatrix, SigmaVector};
+        ModelParameters {
+            theta: theta.to_vec(),
+            theta_names: (0..theta.len()).map(|i| format!("T{i}")).collect(),
+            theta_lower: theta_lower.to_vec(),
+            theta_upper: theta_upper.to_vec(),
+            theta_fixed: theta_fixed.to_vec(),
+            omega: OmegaMatrix::from_diagonal(&[0.1], vec!["ETA".into()]),
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: sigma.to_vec(),
+                names: (0..sigma.len()).map(|i| format!("E{i}")).collect(),
+            },
+            sigma_fixed: sigma_fixed.to_vec(),
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn packed_theta_sigma_log_packs_only_nonneg_lower_bound_theta() {
+        // T0: lower 0 → log-packed; T1: lower -1 (covariate exponent) → identity.
+        let p = params(
+            &[2.0, -0.5],
+            &[0.0, -1.0],
+            &[100.0, 5.0],
+            &[false, false],
+            &[0.3],
+            &[false],
+        );
+        let packed = PackedThetaSigma::new(&p);
+        assert_eq!(packed.theta_packs_log_mask, vec![true, false]);
+        assert!((packed.log_theta[0] - 2.0_f64.ln()).abs() < 1e-12);
+        assert_eq!(packed.log_theta[1], -0.5, "identity theta packed as-is");
+        // Sigma is always log-packed with fixed [-8, 5] bounds.
+        assert!((packed.log_sigma[0] - 0.3_f64.ln()).abs() < 1e-12);
+        assert_eq!(packed.log_sigma_lower, vec![-8.0]);
+        assert_eq!(packed.log_sigma_upper, vec![5.0]);
+        // Round-trips back through unpack_thetas.
+        let nat = unpack_thetas(&packed.log_theta, &packed.theta_packs_log_mask);
+        assert!((nat[0] - 2.0).abs() < 1e-12);
+        assert!((nat[1] - (-0.5)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn packed_theta_sigma_pins_fixed_params() {
+        // T1 fixed and sigma fixed → lower == upper == packed value.
+        let p = params(
+            &[2.0, 7.0],
+            &[0.0, 0.0],
+            &[100.0, 100.0],
+            &[false, true],
+            &[0.3],
+            &[true],
+        );
+        let packed = PackedThetaSigma::new(&p);
+        assert_eq!(packed.log_theta_lower[1], packed.log_theta[1]);
+        assert_eq!(packed.log_theta_upper[1], packed.log_theta[1]);
+        assert_eq!(packed.log_sigma_lower[0], packed.log_sigma[0]);
+        assert_eq!(packed.log_sigma_upper[0], packed.log_sigma[0]);
+        // The free theta keeps its real bounds, not pinned.
+        assert!(packed.log_theta_lower[0] < packed.log_theta_upper[0]);
     }
 }

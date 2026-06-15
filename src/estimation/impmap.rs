@@ -31,13 +31,15 @@
 //! such models are refused up front. SDE / `[diffusion]` models are refused for
 //! the same reason `IMP` refuses them. Use SAEM or FOCEI for those.
 
-use crate::estimation::em_common::{floor_omega_diagonal, get_mu_ref_pairs, OMEGA_DIAG_FLOOR};
+use crate::estimation::em_common::{
+    floor_omega_diagonal, get_mu_ref_pairs, unpack_thetas, PackedThetaSigma, OMEGA_DIAG_FLOOR,
+};
 use crate::estimation::importance_sampling::{compute_posterior_hessian, subject_is_draws};
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::estimation::outer_optimizer::{
     compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
 };
-use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
+use crate::estimation::parameterization::{compute_mu_k, pack_params};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::obs_nll_subject_into;
 use crate::types::*;
@@ -115,66 +117,16 @@ pub fn run_impmap(
         );
     }
 
-    // ---- Packing scaffolding (mirrors SAEM) ----
-    // Per-theta packing: log for `theta_lower >= 0`, identity otherwise (so
-    // covariate exponents with negative lower bounds are not pinned to ~0).
-    let theta_packs_log_mask: Vec<bool> = init_params
-        .theta_lower
-        .iter()
-        .map(|&lo| theta_packs_log(lo))
-        .collect();
-    let pack_theta = |i: usize, t: f64| -> f64 {
-        if theta_packs_log_mask[i] {
-            t.max(1e-10).ln()
-        } else {
-            t
-        }
-    };
-
-    let mut log_theta: Vec<f64> = (0..n_theta)
-        .map(|i| pack_theta(i, init_params.theta[i]))
-        .collect();
-    let mut log_sigma: Vec<f64> = init_params
-        .sigma
-        .values
-        .iter()
-        .map(|&s| s.max(1e-10).ln())
-        .collect();
-
-    let mut log_theta_lower: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_lower[i].max(1e-10).ln()
-            } else {
-                init_params.theta_lower[i]
-            }
-        })
-        .collect();
-    let mut log_theta_upper: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_upper[i].min(1e9).ln()
-            } else {
-                init_params.theta_upper[i]
-            }
-        })
-        .collect();
-    let mut log_sigma_lower = vec![-8.0f64; n_sigma];
-    let mut log_sigma_upper = vec![5.0f64; n_sigma];
-
-    // Pin FIX parameters: lower == upper == packed value.
-    for i in 0..n_theta {
-        if init_params.theta_fixed.get(i).copied().unwrap_or(false) {
-            log_theta_lower[i] = log_theta[i];
-            log_theta_upper[i] = log_theta[i];
-        }
-    }
-    for i in 0..n_sigma {
-        if init_params.sigma_fixed.get(i).copied().unwrap_or(false) {
-            log_sigma_lower[i] = log_sigma[i];
-            log_sigma_upper[i] = log_sigma[i];
-        }
-    }
+    // ---- Packing scaffolding (shared with SAEM via em_common) ----
+    let PackedThetaSigma {
+        theta_packs_log_mask,
+        mut log_theta,
+        mut log_sigma,
+        log_theta_lower,
+        log_theta_upper,
+        log_sigma_lower,
+        log_sigma_upper,
+    } = PackedThetaSigma::new(init_params);
 
     // Closed-form mu-referencing M-step: shift `log(θ) += mean(η)` for log-mu-ref
     // pairs, with those θ pinned out of the NLopt weighted M-step (which then fits
@@ -387,15 +339,7 @@ pub fn run_impmap(
             }
         }
 
-        theta_cur = (0..n_theta)
-            .map(|i| {
-                if theta_packs_log_mask[i] {
-                    log_theta[i].exp()
-                } else {
-                    log_theta[i]
-                }
-            })
-            .collect();
+        theta_cur = unpack_thetas(&log_theta, &theta_packs_log_mask);
         sigma_cur = log_sigma.iter().map(|&s| s.exp()).collect();
 
         // Warm-start next iteration's inner loop from this iteration's modes.
@@ -448,8 +392,15 @@ pub fn run_impmap(
     );
 
     // ---- Final EBEs (warm-started) + FOCE Laplace OFV for comparability ----
-    // `prev_etas` holds the final iteration's modes (or the caller's warm start
-    // if `n_iter == 0` never ran the body).
+    // `prev_etas` holds the final iteration's modes. `n_iter = ...max(1)` (above)
+    // guarantees the loop body ran at least once and overwrote `prev_etas`, so
+    // this is never the caller's stale seed (or `None`). If a future change ever
+    // lets the body be skipped, this assert flags that the warm start below would
+    // silently fall back to etas computed under the *initial* params.
+    debug_assert!(
+        n_iter >= 1,
+        "IMPMAP final warm-start assumes the iteration loop ran at least once"
+    );
     let warm = prev_etas.as_deref();
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
     let (eta_hats, h_matrices, _stats, final_kappas) = run_inner_loop_warm(
@@ -577,22 +528,10 @@ fn theta_sigma_weighted_mstep(
         x[i] = x[i].clamp(lower[i], upper[i]);
     }
 
-    let unpack_thetas = |packed: &[f64]| -> Vec<f64> {
-        (0..n_theta)
-            .map(|i| {
-                if theta_packs_log_mask[i] {
-                    packed[i].exp()
-                } else {
-                    packed[i]
-                }
-            })
-            .collect()
-    };
-
     // Weighted observation NLL, parallel over subjects. Each subject contributes
     // Σₖ w̃ₖ · obs_nll(yᵢ | ηᵢₖ, θ, σ).
     let obj = |xv: &[f64], _: Option<&mut [f64]>, _: &mut ()| -> f64 {
-        let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
+        let th: Vec<f64> = unpack_thetas(&xv[..n_theta], theta_packs_log_mask);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
         let val: f64 = population
             .subjects
