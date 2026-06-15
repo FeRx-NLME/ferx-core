@@ -358,7 +358,9 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   forced path; `src/diagnostics.rs` — new `W_ABSORPTION_*`.
 - Docs: new `docs/src/model-file/absorption.md` + `SUMMARY.md`; cross-link
   `structural-model.md`; new `examples/*.ferx`; `CHANGELOG.md` (`[Unreleased] → Added`).
-- `../ferx-r` follow-up PR for the new `pub` surface (+ `tools/update-ferx-core-lock.sh`).
+- `../ferx-r` follow-up PR per user-facing phase — pin bump (`tools/update-ferx-core-lock.sh`)
+  + an R example/test/`NEWS.md`; the input-rate functions need no new R glue. See the
+  "ferx-r follow-up" section below.
 
 ## Phasing (one PR each)
 
@@ -384,6 +386,47 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 - **Phase 3 — analytical incomplete-gamma closed form for transit** (1/2-cpt) so continuous-N
   transit stays in the analytical engine; assert it matches the Phase-0 numerical form under
   the equivalence harness.
+
+## ferx-r follow-up (per user-facing feature)
+
+Every user-facing feature here must reach R users through `../ferx-r` (CLAUDE.md: a
+newly-`pub` ferx-core change "expects a matching PR in `ferx-r`"). The follow-up for
+this plan is **light**, because the absorption input-rate functions (`transit`, `igd`,
+`weibull`, `zero_order`, `first_order`) and `ode_template` are **model-file DSL/parser
+features**: ferx-r hands the `.ferx` file straight to ferx-core's parser
+(`ferx_core::parser::model_parser::parse_full_model_file`, ferx-r `src/rust/src/lib.rs`)
+and the R layer only carries file paths. So there is **no new exported R function** to
+write — the feature works from R the moment ferx-r builds against a ferx-core commit
+that has it.
+
+Each user-facing phase's ferx-r PR therefore needs:
+
+- **Pin bump (required for CI/release availability).** Bump `ferx-r/src/rust/Cargo.lock`
+  to the ferx-core commit that landed the phase, via `ferx-r/tools/update-ferx-core-lock.sh`
+  — never a bare `cargo update` (the `[patch]` would unpin it). Local ferx-r builds
+  already see the feature through the `[patch]`; the bump is what makes it available in
+  **CI and release** builds, which use the pinned lock. Note these are DSL features, so
+  ferx-r still *compiles* against a stale pin — it simply can't *parse/run* the new model
+  syntax until bumped (contrast a consumed `pub` API, where a stale pin fails CI with
+  `error[E0603]: ... is private`).
+- **R-facing surface (required for a user-facing model).** Register an example model +
+  dataset in `ferx_example()` (e.g. `transit_savic`), add a fast R test that fits it, note
+  it in the relevant vignette/reference, and add a `NEWS.md` entry.
+- **No R glue** for the input-rate functions / `ode_template` themselves — they are model
+  syntax, not R-callable APIs.
+
+Per-phase mapping:
+
+| Phase | ferx-core feature | User-facing? | ferx-r follow-up |
+|---|---|---|---|
+| 0a | `transit()` | yes | pin bump + `transit_savic` example/test + `NEWS.md` |
+| 0b | `ode_template` | yes | pin bump + example/docs + `NEWS.md` |
+| 1 | `igd()` | yes | pin bump + IG example/test + `NEWS.md` |
+| 2 | `weibull` / `zero_order` / `sequential` / `mixed` | yes | pin bump + examples + `NEWS.md` |
+| 3 | incomplete-gamma closed form | **no** (internal accel, numerically identical) | none — no API or behaviour change for R |
+
+#324's faithful `R1`/`D1` is a separate data-format feature (coded `RATE`), so its ferx-r
+follow-up — a pin bump plus any R-side dose-column docs — is tracked on #324, not here.
 
 ## Tests & NONMEM anchoring (CLAUDE.md mandates)
 
