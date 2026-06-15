@@ -151,6 +151,8 @@ stage:
 | `impmap_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction are flagged as poorly sampled. |
 | `impmap_trace` | `false` | When `true`, collect per-iteration parameter values into `FitResult.impmap_trace` — analogous to NONMEM `.ext` output for traceplots. |
 | `impmap_mceta` | `0` | Number of additional random starting points for per-subject MAP optimization (analogous to NONMEM `MCETA`). Each start draws η from N(0, Ω). The start with the lowest individual NLL wins. `0` = single warm-start (default). `3` is a good choice for high-dimensional models (e.g. FREM with ≥ 5 ETAs). |
+| `iscale_min` | `0.1` | Minimum proposal scaling factor for adaptive IS (NONMEM `ISCALE_MIN`). The IS proposal covariance is multiplied by `s²` where `s` is chosen from `[iscale_min, iscale_max]` to maximise per-subject ESS. Set both to `1.0` to disable. |
+| `iscale_max` | `10.0` | Maximum proposal scaling factor (NONMEM `ISCALE_MAX`). |
 
 `impmap` reuses `inner_maxiter` / `inner_tol` for the per-iteration MAP step.
 Inter-occasion variability (`[iov]` / `kappa`) and SDE (`[diffusion]`) models

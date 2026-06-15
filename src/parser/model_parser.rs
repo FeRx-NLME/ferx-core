@@ -3222,6 +3222,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "impmap_trace" => opts.impmap_trace = parse_bool("impmap_trace")?,
         "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,
+        "iscale_min" => {
+            let v = parse_f64("iscale_min")?;
+            if v <= 0.0 {
+                return Err("fit option `iscale_min` must be > 0".to_string());
+            }
+            opts.iscale_min = v;
+        }
+        "iscale_max" => {
+            let v = parse_f64("iscale_max")?;
+            if v <= 0.0 {
+                return Err("fit option `iscale_max` must be > 0".to_string());
+            }
+            opts.iscale_max = v;
+        }
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
             opts.bloq_method = match value.to_lowercase().as_str() {

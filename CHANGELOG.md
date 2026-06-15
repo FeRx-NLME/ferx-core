@@ -22,6 +22,12 @@ section of the SDLC for the versioning policy).
 ### Added
 - `impmap_mceta` fit option: multi-start MAP for IMPMAP (NONMEM `MCETA` equivalent),
   improving IS efficiency in high-dimensional models (e.g. FREM with ≥5 ETAs).
+- Analytical Jacobian for FREM pseudo-observations: covariate rows in the FD
+  Jacobian are overwritten with exact ∂Y/∂η values (0 or 1), eliminating noise
+  that corrupted the IS proposal in high-dimensional FREM models.
+- `iscale_min` / `iscale_max` fit options: adaptive IS proposal scaling (NONMEM
+  `ISCALE_MIN`/`ISCALE_MAX` equivalent). Per-subject pilot search over log-spaced
+  scale factors selects the proposal width that maximises ESS. Defaults: 0.1–10.0.
 - Full off-diagonal omega standard errors for block omega via multivariate delta
   method on the Cholesky parameterization. `se_omega` is now the full lower
   triangle (length n_eta*(n_eta+1)/2) instead of diagonal-only. Added

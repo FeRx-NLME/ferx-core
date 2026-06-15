@@ -292,6 +292,7 @@ pub fn run_importance_sampling(
                     nu,
                     subj_seed,
                     scratch,
+                    1.0, // iscale: no adaptive scaling for IMP EONLY
                 )
             }
         })
@@ -393,6 +394,7 @@ fn subject_is_estimate(
     nu: f64,
     seed: u64,
     scratch: &mut EventPkParams,
+    iscale: f64,
 ) -> SubjectIsOutput {
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -414,12 +416,15 @@ fn subject_is_estimate(
     let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
 
     // Constant pieces of log q (Student-t) and log p_η (Gaussian) pulled out
-    // of the per-sample loop.
+    // of the per-sample loop. ISCALE adjusts the proposal: Σ_prop = iscale² · Σ.
     let half_d = 0.5 * d as f64;
+    let iscale_log_adj = -(d as f64) * iscale.ln();
+    let inv_iscale_sq = 1.0 / (iscale * iscale);
     let log_t_const = ln_gamma(0.5 * (nu + d as f64))
         - ln_gamma(0.5 * nu)
         - half_d * (nu * std::f64::consts::PI).ln()
-        + 0.5 * proposal.log_det_inv_scale; // −0.5 log|Σ| = +0.5 log|H_reg|
+        + 0.5 * proposal.log_det_inv_scale
+        + iscale_log_adj;
     let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
 
     // Preallocate every per-sample buffer once. With K typically in the
@@ -432,12 +437,12 @@ fn subject_is_estimate(
     let mut diff = vec![0.0_f64; d];
 
     for _ in 0..k_samples {
-        // Draw z ~ N(0, I_d) and c ~ χ²_ν; build η = η̂ + sqrt(ν/c) · L_Σ z.
+        // Draw z ~ N(0, I_d) and c ~ χ²_ν; build η = η̂ + iscale·sqrt(ν/c) · L_Σ z.
         for zi in z.iter_mut() {
             *zi = normal.sample(&mut rng);
         }
         let c: f64 = chi_sq.sample(&mut rng).max(1e-300);
-        let scale = (nu / c).sqrt();
+        let scale = (nu / c).sqrt() * iscale;
         // L_Σ z via the precomputed factor.
         proposal.apply_l_sigma(&z, &mut eta_sample, scale);
         for (j, e) in eta_sample.iter_mut().enumerate() {
@@ -461,16 +466,12 @@ fn subject_is_estimate(
         }
         let log_p_eta = log_p_eta_const - 0.5 * quad_form;
 
-        // log q(η): multivariate t at (η̂, Σ, ν).
-        // Fill the preallocated `diff` buffer in place — avoids a per-sample
-        // `Vec` allocation from the previous `.collect()` form.
+        // log q(η): multivariate t at (η̂, iscale²·Σ, ν).
         for (k, d_slot) in diff.iter_mut().enumerate() {
             *d_slot = eta_sample[k] - eta_hat[k];
         }
-        // (η-η̂)' H_reg (η-η̂) via the precomputed Cholesky of H_reg = L L'.
-        // Σ⁻¹ = H_reg, so the Mahalanobis term is ‖L'·diff‖².
         let mahal = proposal.mahalanobis(&diff);
-        let log_q = log_t_const - 0.5 * (nu + d as f64) * (1.0 + mahal / nu).ln();
+        let log_q = log_t_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln();
 
         log_w.push(log_p_y + log_p_eta - log_q);
     }
@@ -542,6 +543,9 @@ pub(crate) struct SubjectDraws {
 /// `nu = f64::INFINITY` selects a multivariate-normal proposal (NONMEM IMPMAP
 /// default); a finite `nu ≥ 1` selects a multivariate Student-t. The marginal-LL
 /// and weight math is otherwise identical to [`subject_is_estimate`].
+///
+/// `iscale` scales the proposal standard deviation: Σ_prop = iscale² · H⁻¹.
+/// Use 1.0 for unscaled (default). NONMEM ISCALE range is typically [0.1, 10.0].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_is_draws(
     model: &CompiledModel,
@@ -557,6 +561,7 @@ pub(crate) fn subject_is_draws(
     nu: f64,
     seed: u64,
     scratch: &mut EventPkParams,
+    iscale: f64,
 ) -> SubjectDraws {
     let mvn = !nu.is_finite();
     let mut rng = StdRng::seed_from_u64(seed);
@@ -585,12 +590,19 @@ pub(crate) fn subject_is_draws(
 
     let half_d = 0.5 * d as f64;
     let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
-    // Constant term of log q(η): MVN uses −d/2·log(2π)+½log|Σ⁻¹|; Student-t adds
-    // the Γ-ratio / ν-scaling pieces.
+
+    // Constant term of log q(η) with ISCALE adjustment.
+    // MVN: −d/2·log(2π) + ½log|Σ⁻¹| − d·log(iscale)
+    //   where the −d·log(iscale) accounts for det(s²Σ) = s^{2d}·det(Σ).
+    // Student-t: Γ-ratio + ½log|Σ⁻¹| − d·log(iscale) − d/2·log(ν·π).
+    let iscale_log_adj = -(d as f64) * iscale.ln();
+    let inv_iscale_sq = 1.0 / (iscale * iscale);
     let log_q_const = if mvn {
-        -half_d * TWO_PI.ln() + 0.5 * proposal.log_det_inv_scale
+        -half_d * TWO_PI.ln() + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
     } else {
-        ln_gamma(0.5 * (nu + d as f64)) - ln_gamma(0.5 * nu) + 0.5 * proposal.log_det_inv_scale
+        ln_gamma(0.5 * (nu + d as f64)) - ln_gamma(0.5 * nu)
+            + 0.5 * proposal.log_det_inv_scale
+            + iscale_log_adj
             - half_d * (nu * std::f64::consts::PI).ln()
     };
 
@@ -606,9 +618,9 @@ pub(crate) fn subject_is_draws(
         let scale = match &chi_sq {
             Some(c) => {
                 let cc: f64 = c.sample(&mut rng).max(1e-300);
-                (nu / cc).sqrt()
+                (nu / cc).sqrt() * iscale
             }
-            None => 1.0,
+            None => iscale,
         };
         let mut eta_sample = vec![0.0_f64; d];
         proposal.apply_l_sigma(&z, &mut eta_sample, scale);
@@ -634,9 +646,9 @@ pub(crate) fn subject_is_draws(
         }
         let mahal = proposal.mahalanobis(&diff);
         let log_q = if mvn {
-            log_q_const - 0.5 * mahal
+            log_q_const - 0.5 * inv_iscale_sq * mahal
         } else {
-            log_q_const - 0.5 * (nu + d as f64) * (1.0 + mahal / nu).ln()
+            log_q_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln()
         };
 
         log_w.push(log_p_y + log_p_eta - log_q);
@@ -675,6 +687,70 @@ pub(crate) fn subject_is_draws(
         mean,
         second_moment,
     }
+}
+
+/// Find the optimal ISCALE for a subject via pilot draws.
+///
+/// Tries a grid of log-spaced scale factors in `[iscale_min, iscale_max]`
+/// using `n_pilot` draws each, and returns the scale that maximises ESS.
+/// Returns 1.0 if ISCALE is disabled (min >= max or both == 1.0).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_optimal_iscale(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    iscale_min: f64,
+    iscale_max: f64,
+) -> f64 {
+    if iscale_min >= iscale_max || (iscale_min == 1.0 && iscale_max == 1.0) {
+        return 1.0;
+    }
+    // Grid of 7 log-spaced scale factors from iscale_min to iscale_max
+    let n_grid = 7;
+    let n_pilot = 50;
+    let log_min = iscale_min.ln();
+    let log_max = iscale_max.ln();
+    let mut best_scale = 1.0_f64;
+    let mut best_ess = f64::NEG_INFINITY;
+
+    for g in 0..n_grid {
+        let frac = g as f64 / (n_grid - 1) as f64;
+        let scale = (log_min + frac * (log_max - log_min)).exp();
+        // Use a different seed per scale to avoid correlations
+        let pilot_seed = seed
+            .wrapping_add(0x4953_4341_4C45_0000u64)
+            .wrapping_add(g as u64);
+        let draws = subject_is_draws(
+            model,
+            subject,
+            theta,
+            sigma,
+            eta_hat,
+            h,
+            omega_inv,
+            log_det_omega,
+            d,
+            n_pilot,
+            nu,
+            pilot_seed,
+            scratch,
+            scale,
+        );
+        if draws.ess_fraction > best_ess {
+            best_ess = draws.ess_fraction;
+            best_scale = scale;
+        }
+    }
+    best_scale
 }
 
 // ---------------------------------------------------------------------------

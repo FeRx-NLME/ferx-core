@@ -2540,6 +2540,13 @@ pub struct FitOptions {
     /// Number of additional random starting points for per-subject MAP
     /// (analogous to NONMEM MCETA). 0 = single start (current behaviour).
     pub impmap_mceta: usize,
+    /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
+    /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
+    /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
+    pub iscale_min: f64,
+    /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
+    /// Default 10.0.
+    pub iscale_max: f64,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -2747,6 +2754,8 @@ impl Default for FitOptions {
             impmap_low_ess_threshold: 0.1,
             impmap_trace: false,
             impmap_mceta: 0,
+            iscale_min: 0.1,
+            iscale_max: 10.0,
             bloq_method: BloqMethod::Drop,
             steihaug_max_iters: None,
             mu_referencing: true,
@@ -3040,6 +3049,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "is_proposal_df",
             "is_seed",
             "is_low_ess_threshold",
+            "iscale_min",
+            "iscale_max",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -3052,6 +3063,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_low_ess_threshold",
             "impmap_trace",
             "impmap_mceta",
+            "iscale_min",
+            "iscale_max",
         ],
     }
 }

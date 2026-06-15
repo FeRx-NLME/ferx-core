@@ -31,7 +31,9 @@
 //! such models are refused up front. SDE / `[diffusion]` models are refused for
 //! the same reason `IMP` refuses them. Use SAEM or FOCEI for those.
 
-use crate::estimation::importance_sampling::{compute_posterior_hessian, subject_is_draws};
+use crate::estimation::importance_sampling::{
+    compute_posterior_hessian, find_optimal_iscale, subject_is_draws,
+};
 use crate::estimation::inner_optimizer::{find_ebe, EbeResult, InnerLoopStats};
 use crate::estimation::outer_optimizer::{
     compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
@@ -407,6 +409,8 @@ pub fn run_impmap(
         let log_det_omega = params_k.omega.log_det;
 
         // ---- E-step B: importance sampling around each mode ----
+        let iscale_min = options.iscale_min;
+        let iscale_max = options.iscale_max;
         let draws: Vec<_> = population
             .subjects
             .par_iter()
@@ -423,6 +427,23 @@ pub fn run_impmap(
                     n_eta,
                     scratch,
                 );
+                let subj_seed = seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32);
+                let iscale = find_optimal_iscale(
+                    model,
+                    subject,
+                    &params_k.theta,
+                    &params_k.sigma.values,
+                    &eta_hats[i],
+                    &h_post,
+                    &omega_inv,
+                    log_det_omega,
+                    n_eta,
+                    nu,
+                    subj_seed,
+                    scratch,
+                    iscale_min,
+                    iscale_max,
+                );
                 subject_is_draws(
                     model,
                     subject,
@@ -435,8 +456,9 @@ pub fn run_impmap(
                     n_eta,
                     k_samples,
                     nu,
-                    seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32),
+                    subj_seed,
                     scratch,
+                    iscale,
                 )
             })
             .collect();
