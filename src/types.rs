@@ -4129,6 +4129,13 @@ mod tests {
         // reinterpreting ODE rate constants like `R0`/`D1` before that lands).
         assert_eq!(DoseAttr::from_indexed_name("D1"), None);
         assert_eq!(DoseAttr::from_indexed_name("R1"), None);
+
+        // An all-digit suffix that overflows usize fails to parse -> not an
+        // attribute (exercises the parse-error guard, not just the success path).
+        assert_eq!(
+            DoseAttr::from_indexed_name(&format!("F{}", "9".repeat(40))),
+            None
+        );
     }
 
     #[test]

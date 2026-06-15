@@ -7525,12 +7525,8 @@ mod tests_derived_iov_kappa {
         compute_extra_output_columns(&model, &population, &theta, &kappas, &mut subjects_results);
 
         let tad = &subjects_results[0].per_obs_tad;
-        assert!(
-            (tad[0] - 1.0).abs() < 1e-9,
-            "TAD must count from the ALAG2-shifted arrival (3 - (0 + 2) = 1.0); the \
-             pre-fix bare-lag path gives 3.0. Got {}",
-            tad[0]
-        );
+        // 3 − (dose@0 + ALAG2=2) = 1.0; the pre-fix bare-lag path gives 3.0.
+        assert!((tad[0] - 1.0).abs() < 1e-9, "tad: {}", tad[0]);
     }
 
     /// Regression for issue #369: a negative compartment-indexed `ALAGn` must
@@ -7602,6 +7598,63 @@ mod tests_derived_iov_kappa {
             neg.message.contains("ALAG2") && neg.message.contains("compartment-2"),
             "warning must name the offending compartment-indexed lag, got: {}",
             neg.message
+        );
+    }
+
+    /// The per-compartment negative-lag scan is ODE-only. An analytical model can
+    /// still report `has_lagtime()` (lag bound via `pk_indices`), so
+    /// `check_model_data_warnings` must take the `ode_spec == None` path: the bare
+    /// negative lag still warns, but no compartment-indexed `ALAGn` is emitted.
+    #[test]
+    fn negative_lag_scan_skips_analytical_models() {
+        let mut model = minimal_iov_model(vec![]);
+        // Analytical (ode_spec stays None); has_lagtime() via pk_indices carrying
+        // PK_IDX_LAGTIME; bare lag evaluates negative.
+        model.indiv_param_names = vec!["CL".into(), "LAGTIME".into()];
+        model.pk_indices = vec![0, PK_IDX_LAGTIME];
+        model.pk_param_fn = Box::new(|_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| {
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = -1.0;
+            p
+        });
+        assert!(model.has_lagtime() && model.ode_spec.is_none());
+
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: vec![1.0],
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_NEGATIVE_LAGTIME"),
+            "bare negative lag must still warn on an analytical model"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("ALAG")),
+            "no compartment-indexed ALAGn warning for an analytical (non-ODE) model"
         );
     }
 

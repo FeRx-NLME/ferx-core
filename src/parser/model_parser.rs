@@ -5107,9 +5107,10 @@ fn build_ode_spec(
                      compartment(s) {state_names:?}. Compartment indices are 1-based."
                 ));
             }
-            let slot = indiv_param_slots.get(i).copied().ok_or_else(|| {
-                format!("internal: no Pk slot assigned for dose attribute `{name}`")
-            })?;
+            // `indiv_param_slots` is parallel to `indiv_param_names` (asserted
+            // above), so the slot for `i` always exists — index directly, as the
+            // input-rate extractor (`extract_input_rate_terms`) already does.
+            let slot = indiv_param_slots[i];
             dose_attr_map.insert(attr, cmt, slot);
         }
     }

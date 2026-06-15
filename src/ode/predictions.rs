@@ -1982,12 +1982,82 @@ mod tests {
 
         // Compartment 2: F2 = 0.25 and ALAG2 = 5 -> 0 before lag, 25 after.
         let c2 = ode_predictions(&two_cpt_accumulator(1, map), &p.values, &[], &[], &subj);
-        assert!(
-            c2[0].abs() < 1e-9,
-            "cmt2 @t=1 (pre-lag) should be 0: {}",
-            c2[0]
-        );
+        assert!(c2[0].abs() < 1e-9, "cmt2 pre-lag: {}", c2[0]);
         assert!((c2[1] - 25.0).abs() < 1e-9, "cmt2 @t=10 (F2): {}", c2[1]);
+    }
+
+    /// Coverage: the steady-state branch of the event-driven TAD anchor in
+    /// `ode_predictions_event_driven` (`last_dose_eff` reckons from the most
+    /// recent SS cycle). Smoke-level — predictions must stay finite.
+    #[test]
+    fn event_driven_ss_dose_predictions_finite() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(5.0, 80.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)]; // SS bolus
+        let subj = make_subject(doses, vec![6.0, 18.0]);
+        let dose_pk = vec![pk; subj.doses.len()];
+        let obs_pk = vec![pk; subj.obs_times.len()];
+        let preds = ode_predictions_event_driven(&ode, &subj, &[], &[], &dose_pk, &obs_pk, &[]);
+        assert!(
+            preds.iter().all(|p| p.is_finite()),
+            "SS preds finite: {preds:?}"
+        );
+    }
+
+    /// Coverage: the infusion break-time branch of `ode_predictions_with_states`.
+    #[test]
+    fn with_states_infusion_dose_runs() {
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(5.0, 80.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0)]; // infusion, dur=10
+        assert!(is_real_infusion(&doses[0]));
+        let subj = make_subject(doses, vec![5.0, 20.0]);
+        let (preds, states) = ode_predictions_with_states(&ode, &pk.values, &[], &[], &subj);
+        assert_eq!(states.len(), 2);
+        assert!(preds.iter().all(|p| p.is_finite()));
+    }
+
+    /// Coverage: `ode_dense_solve_states` with a steady-state, *lagged* infusion —
+    /// exercises the infusion break, the SS pre-seed at the dose record time, and
+    /// the SS branch of the dense TAD anchor in a single pass.
+    #[test]
+    fn dense_solve_ss_lagged_infusion_runs() {
+        let ode = one_cpt_ode_spec();
+        let mut pk = pk_one(5.0, 80.0);
+        pk.values[crate::types::PK_IDX_LAGTIME] = 2.0; // lag > 0
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 10.0, true, 12.0)]; // SS infusion
+        let subj = make_subject(doses, vec![6.0]);
+        let states = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subj, &[6.0, 14.0]);
+        assert_eq!(states.len(), 2);
+        assert!(states.iter().all(|s| s.iter().all(|x| x.is_finite())));
+    }
+
+    /// Coverage: the `ode_predictions_ekf` wrapper (a 1-state `[diffusion]` spec);
+    /// elsewhere only `solve_ekf` is exercised directly.
+    #[test]
+    fn ode_predictions_ekf_wrapper_runs() {
+        let ode = OdeSpec {
+            rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ke * y[0];
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: vec![0.1],
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
+            dose_attr_map: Default::default(),
+            init_fn: None,
+        };
+        let pk = pk_one(5.0, 80.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let subj = make_subject(doses, vec![2.0, 8.0]);
+        let (ipreds, p_obs) = ode_predictions_ekf(&ode, &pk.values, &subj, |_| 1.0);
+        assert_eq!(ipreds.len(), 2);
+        assert!(ipreds.iter().chain(p_obs.iter()).all(|x| x.is_finite()));
     }
 
     /// Turnover model with a baseline initial condition:
