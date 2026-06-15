@@ -1,4 +1,5 @@
 pub mod gauss_newton;
+pub mod gpu_saem;
 pub(crate) mod hmc;
 pub mod impmap;
 pub mod importance_sampling;

@@ -3283,6 +3283,19 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "seed" | "saem_seed" => opts.saem_seed = parse_u64_opt("seed")?,
+        "backend" | "saem_backend" => {
+            opts.saem_backend = match value.to_lowercase().as_str() {
+                "auto" => crate::types::SaemBackend::Auto,
+                "cpu" => crate::types::SaemBackend::Cpu,
+                "gpu" => crate::types::SaemBackend::Gpu,
+                other => {
+                    return Err(format!(
+                        "fit option `saem_backend`: unknown value `{other}` — \
+                         expected auto/cpu/gpu"
+                    ));
+                }
+            };
+        }
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         "sir" => opts.sir = parse_bool("sir")?,
         "sir_samples" => opts.sir_samples = parse_usize("sir_samples")?,

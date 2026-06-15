@@ -27,6 +27,13 @@ survival = []
 # Heavy fit-based tests (5–60 min wall each on a 2-core CI runner).
 # Default `cargo test` `#[ignore]`s them; a nightly/manual job opts in.
 slow-tests = []
+# GPU-accelerated SAEM E-step (batched analytical-PK NLL kernel via cubecl,
+# wgpu/Metal + CUDA backends). Off by default: the default build compiles and
+# runs the CPU SAEM path unchanged. With `gpu` enabled the backend is still
+# opt-in per fit (`saem_backend = auto|gpu`) and falls back to CPU at runtime
+# when no device is available or the model is outside the supported subset.
+# See plans / issue #368.
+gpu = ["dep:cubecl"]
 
 [dependencies]
 nalgebra = "0.34"
@@ -44,6 +51,9 @@ argmin = { version = "0.11", features = ["serde1"] }
 argmin-math = { version = "0.5", features = ["nalgebra_latest"] }
 tempfile = "3"
 sha2 = "0.10"
+# Optional GPU compute backend (enabled by the `gpu` feature). The wgpu backend
+# targets Metal (Apple) / Vulkan / DX12; a CUDA backend is available on NVIDIA.
+cubecl = { version = "0.10", features = ["wgpu"], optional = true }
 
 [dev-dependencies]
 approx = "0.5"

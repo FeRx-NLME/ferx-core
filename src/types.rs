@@ -2614,6 +2614,12 @@ pub struct FitOptions {
     /// A positive value (e.g. `3`) enables HMC; requires the `autodiff`
     /// feature and an analytical PK model — falls back to MH otherwise.
     pub saem_n_leapfrog: usize,
+    /// Compute backend for the SAEM E-step. `Auto` (default) uses the GPU when
+    /// the `gpu` feature is built, a device is available, and the model is in
+    /// the GPU-supported subset; otherwise it runs on the CPU. `Cpu` forces the
+    /// existing CPU path. `Gpu` requests the GPU and still falls back to CPU
+    /// (with a warning) when unavailable. See issue #368.
+    pub saem_backend: SaemBackend,
     /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
     pub gn_lambda: f64,
     // SIR options
@@ -2881,6 +2887,7 @@ impl Default for FitOptions {
             saem_omega_burnin: 20,
             saem_seed: None,
             saem_n_leapfrog: 0,
+            saem_backend: SaemBackend::default(),
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -3054,6 +3061,36 @@ pub enum EstimationMethod {
     /// importance-sampling proposal, and whose M-step updates θ/Ω/σ from the
     /// importance-weighted posterior moments.
     Impmap,
+}
+
+/// Compute backend for the SAEM E-step (issue #368).
+///
+/// The CPU path is always available and is the reference implementation. The
+/// GPU path (batched analytical-PK NLL kernel via `cubecl`) is compiled only
+/// under the `gpu` feature and is engaged only for models in the supported
+/// subset; in every other case the engine transparently falls back to the CPU
+/// path so results are unchanged in environments without a GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaemBackend {
+    /// Use the GPU when the `gpu` feature is built, a device initialises, and
+    /// the model is GPU-supported; otherwise use the CPU. The safe default.
+    #[default]
+    Auto,
+    /// Always use the CPU E-step (the reference path).
+    Cpu,
+    /// Prefer the GPU E-step; fall back to CPU (with a warning) when the `gpu`
+    /// feature is absent, no device is available, or the model is unsupported.
+    Gpu,
+}
+
+impl SaemBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SaemBackend::Auto => "auto",
+            SaemBackend::Cpu => "cpu",
+            SaemBackend::Gpu => "gpu",
+        }
+    }
 }
 
 impl EstimationMethod {

@@ -86,6 +86,35 @@ Stochastic Approximation EM. Uses Metropolis-Hastings sampling instead of MAP op
 | `adapt_interval` | `50` | Iterations between step-size adaptation |
 | `omega_burnin` | `20` | Initial exploration iterations during which Ω (and Ω<sub>IOV</sub>) are held at their starting values while the MH chain warms up. Clamped to `n_exploration`; set `0` to disable. Prevents the Ω collapse described in the SAEM page. |
 | `seed` | `12345` | RNG seed for reproducibility |
+| `saem_backend` | `auto` | Compute backend for the SAEM E-step: `auto`, `cpu`, or `gpu`. See below. |
+
+### GPU backend (`saem_backend`)
+
+The SAEM E-step evaluates the per-subject individual log-likelihood many
+times per iteration — an embarrassingly parallel workload. When ferx-core is
+built with the `gpu` Cargo feature, that batched evaluation can run on a GPU
+via a [`cubecl`](https://github.com/tracel-ai/cubecl) kernel (wgpu → Metal /
+Vulkan / DX12, or CUDA on NVIDIA).
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | Use the GPU when the `gpu` feature is built, a device initialises, and the model is in the GPU-supported subset; otherwise use the CPU. Never errors. |
+| `cpu` | Always use the CPU E-step (the reference path). |
+| `gpu` | Prefer the GPU; fall back to CPU (emitting a warning in `FitResult.warnings`) when the feature is absent, no device is available, or the model is unsupported. |
+
+The GPU path is **opt-in and fully optional**: the default build does not pull
+in `cubecl`, and `saem_backend` defaults to `auto`, so results are unchanged in
+environments without a GPU. The CPU and GPU paths are validated for numerical
+parity (within `f32` tolerance — GPUs that lack `f64`, such as Metal, run the
+kernel in `f32`).
+
+**Supported subset.** The current kernel covers the 1-compartment IV-bolus
+analytical model with a single Gaussian endpoint (additive / proportional /
+combined error). Anything outside it — other PK models, infusions,
+steady-state doses, system resets, time-varying covariates, M3 BLOQ, SDE, or
+TTE endpoints — transparently falls back to the CPU path. The GPU port of the
+full Metropolis-Hastings / HMC proposal loop is tracked as follow-up work in
+issue #368.
 
 ## SIR (Sampling Importance Resampling)
 

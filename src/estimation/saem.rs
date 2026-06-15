@@ -13,8 +13,7 @@ use crate::estimation::outer_optimizer::{
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
-    individual_nll, individual_nll_into, individual_nll_iov, obs_nll_subject_into,
-    split_obs_by_occasion,
+    individual_nll_into, individual_nll_iov, obs_nll_subject_into, split_obs_by_occasion,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -1188,12 +1187,12 @@ pub fn run_saem(
     } else {
         None
     };
-    let nll_cache: Vec<f64> = population
-        .subjects
-        .iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            if n_kappa > 0 {
+    let nll_cache: Vec<f64> = if n_kappa > 0 {
+        population
+            .subjects
+            .iter()
+            .enumerate()
+            .map(|(i, subject)| {
                 individual_nll_iov(
                     model,
                     subject,
@@ -1204,18 +1203,28 @@ pub fn run_saem(
                     omega_iov_init_om.as_ref(),
                     &sigma_cur,
                 )
-            } else {
-                individual_nll(
-                    model,
-                    subject,
-                    &theta_cur,
-                    &etas[i],
-                    &init_params.omega,
-                    &sigma_cur,
-                )
-            }
-        })
-        .collect();
+            })
+            .collect()
+    } else {
+        // Backend-dispatched batched NLL (issue #368): runs the GPU kernel when
+        // `saem_backend` selects it, the `gpu` feature is built, a device is
+        // available, and the model is in the supported subset; otherwise falls
+        // back to the CPU path. The dispatch reports which path ran so we can
+        // surface a warning when the GPU was explicitly requested but skipped.
+        let dispatch = crate::estimation::gpu_saem::batched_individual_nll(
+            options.saem_backend,
+            model,
+            population,
+            &theta_cur,
+            &etas,
+            &init_params.omega,
+            &sigma_cur,
+        );
+        if let Some(w) = dispatch.warning {
+            warnings.push(w);
+        }
+        dispatch.nll
+    };
 
     // Per-theta packing flag: log for `theta_lower >= 0` (CL/V/KA…),
     // identity when `theta_lower < 0` (covariate exponents like
