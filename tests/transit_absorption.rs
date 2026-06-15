@@ -264,6 +264,21 @@ fn transit_with_diffusion_block_is_rejected() {
 }
 
 #[test]
+fn transit_model_with_undeclared_param_fails_to_parse() {
+    // The `extract_input_rate_terms` error must propagate all the way out of
+    // `build_ode_spec` / `parse_full_model` (the `?` at the call site), not only
+    // from the unit-level helper. `mtt=NOPE` references an undeclared parameter.
+    let bad = TRANSIT_MODEL.replace("mtt=MTT", "mtt=NOPE");
+    let err = parse_full_model(&bad)
+        .err()
+        .expect("expected a parse error for an undeclared transit parameter");
+    assert!(
+        err.contains("not a declared individual parameter"),
+        "unexpected parse error: {err}"
+    );
+}
+
+#[test]
 fn out_of_domain_transit_parameter_is_rejected() {
     // A transit `mtt ≤ 0` at typical values must be rejected at fit time rather
     // than silently propagating a NaN through the ODE RHS (the `validate_transit`

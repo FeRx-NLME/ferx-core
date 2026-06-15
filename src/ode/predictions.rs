@@ -1910,11 +1910,7 @@ mod tests {
         let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
         let subj = make_subject(doses, vec![0.0, 40.0]);
         let preds = ode_predictions(&ode, &pk, &[], &[], &subj);
-        assert!(
-            preds[0].abs() < 1e-9,
-            "bolus not suppressed: got {}",
-            preds[0]
-        );
+        assert!(preds[0].abs() < 1e-9, "bolus not suppressed: {}", preds[0]);
         assert_relative_eq!(preds[1], 100.0, max_relative = 5e-3);
     }
 
@@ -1961,6 +1957,37 @@ mod tests {
             "pre-reset dose R_in leaked past the reset: got {}",
             preds[0]
         );
+    }
+
+    #[test]
+    fn transit_forcing_applied_in_with_states_path() {
+        // The per-compartment states path (`ode_predictions_with_states`, used for
+        // derived-output state extraction) must inject the transit forcing too —
+        // the accumulator state holds ∫R_in = F·amt = 100.
+        let ode = transit_accumulator_spec();
+        let pk = pk_transit_vec(3.0, 2.0, 1.0);
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        let subj = make_subject(doses, vec![40.0]);
+        let (preds, states) = ode_predictions_with_states(&ode, &pk, &[], &[], &subj);
+        assert_relative_eq!(preds[0], 100.0, max_relative = 5e-3);
+        assert_relative_eq!(states[0][0], 100.0, max_relative = 5e-3);
+    }
+
+    #[test]
+    fn transit_forcing_in_dense_solve_states_skips_other_cmt_dose() {
+        // `ode_dense_solve_states` applies the forcing; a dose targeting a
+        // *non-forcing* compartment is skipped by the superposition loop. State 0
+        // (the forcing cmt ≡ CMT 1) holds only the CMT-1 dose's mass — not the
+        // CMT-2 dose, which never feeds R_in.
+        let ode = transit_accumulator_spec();
+        let pk = pk_transit_vec(3.0, 2.0, 1.0);
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), // CMT 1: feeds R_in
+            DoseEvent::new(0.0, 50.0, 2, 0.0, false, 0.0),  // CMT 2: not the forcing cmt
+        ];
+        let subj = make_subject(doses, vec![40.0]);
+        let states = ode_dense_solve_states(&ode, &pk, &[], &[], &subj, &[40.0]);
+        assert_relative_eq!(states[0][0], 100.0, max_relative = 5e-3);
     }
 
     #[test]

@@ -9311,6 +9311,27 @@ mod tests {
         assert!(go("d/dt(depot) = FR*transit(n=NTR, mtt=MTT)")
             .unwrap_err()
             .contains("scaled"));
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT")
+            .unwrap_err()
+            .contains("unbalanced"));
+        assert!(go("d/dt(depot) = transit(NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("name=parameter"));
+        assert!(
+            go("d/dt(depot) = transit(n=NTR, mtt=MTT) + transit(n=NTR, mtt=MTT)")
+                .unwrap_err()
+                .contains("at most one")
+        );
+        // Nested parens in an arg value are split correctly, then rejected as a
+        // non-parameter (exercises the comma-splitter's paren-depth tracking).
+        assert!(go("d/dt(depot) = transit(n=foo(a,b), mtt=MTT)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        // A word *ending* in `transit` (e.g. `xtransit(`) is not a transit() call:
+        // left unchanged, no forcing recorded.
+        let (kept, none) = go("d/dt(depot) = xtransit(n=NTR, mtt=MTT) - depot").unwrap();
+        assert_eq!(kept[0], "d/dt(depot) = xtransit(n=NTR, mtt=MTT) - depot");
+        assert!(none.is_empty());
         // No transit() → unchanged, no forcings.
         let (cleaned, f) = go("d/dt(depot) = -KA*depot").unwrap();
         assert_eq!(cleaned[0], "d/dt(depot) = -KA*depot");
