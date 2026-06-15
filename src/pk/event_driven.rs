@@ -1234,7 +1234,8 @@ mod tests {
         // dropped F for these routes, so the same model gave F×-different
         // predictions for a no-TV subject (superposition) versus a TV/IOV
         // subject (event-driven). Asserts the two analytical paths agree at
-        // F=0.4. (Oral-model infusions are covered separately by
+        // F=0.4, including steady-state (SS) bolus and infusion. (Oral-model
+        // infusions are covered separately by
         // `f_bioavailability_scales_oral_infusion_on_superposition`: the
         // event-driven path currently drops infusion input on oral models — a
         // distinct bug — so cross-path equality is not assertable there yet.)
@@ -1250,6 +1251,11 @@ mod tests {
         // central (cmt 2) — the depot-bypass case.
         let bolus = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 0.0, false, 0.0);
         let infusion = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 25.0, false, 0.0);
+        // Steady-state variants (ss=1, II=24 h). The SS closed forms are linear
+        // in the dose too, so `f_scale` must apply there as well — and the
+        // event-driven SS equilibration must agree.
+        let ss_bolus = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 0.0, true, 24.0);
+        let ss_infusion = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 25.0, true, 24.0);
 
         let cases: Vec<(&str, PkModel, PkParams, DoseEvent)> = vec![
             (
@@ -1288,9 +1294,40 @@ mod tests {
                 with_f(pk_three(5.0, 40.0, 3.0, 60.0, 1.0, 120.0)),
                 infusion(1),
             ),
+            // Steady-state (F!=1) across both routes and compartment counts.
+            (
+                "1cpt-iv SS bolus",
+                PkModel::OneCptIv,
+                with_f(pk_one(5.0, 50.0)),
+                ss_bolus(1),
+            ),
+            (
+                "1cpt-iv SS infusion",
+                PkModel::OneCptIv,
+                with_f(pk_one(5.0, 50.0)),
+                ss_infusion(1),
+            ),
+            (
+                "2cpt-iv SS infusion",
+                PkModel::TwoCptIv,
+                with_f(pk_two(5.0, 40.0, 3.0, 60.0)),
+                ss_infusion(1),
+            ),
+            (
+                "3cpt-iv SS infusion",
+                PkModel::ThreeCptIv,
+                with_f(pk_three(5.0, 40.0, 3.0, 60.0, 1.0, 120.0)),
+                ss_infusion(1),
+            ),
         ];
 
         for (label, model, pk, dose) in cases {
+            // The single-dose paths are bit-for-bit equal; the event-driven SS
+            // path uses finite-cycle equilibration vs the exact analytical SS
+            // closed form, so allow a looser (but still tight) tolerance there.
+            // The point of the SS cases is that `F` is applied to the SS arms —
+            // any `F`-drop would be a ~F× discrepancy, far above this tolerance.
+            let rtol = if dose.ss { 1e-3 } else { 1e-7 };
             let subj = make_subject(vec![dose], obs_times.clone());
             let superposition: Vec<f64> = obs_times
                 .iter()
@@ -1308,7 +1345,7 @@ mod tests {
                     e > 0.0,
                     "{label}: event-driven conc should be >0 at obs {j}"
                 );
-                assert_relative_eq!(s, e, epsilon = 1e-9, max_relative = 1e-7);
+                assert_relative_eq!(s, e, epsilon = 1e-9, max_relative = rtol);
             }
         }
     }
