@@ -77,22 +77,44 @@ delivers the mass.
 
 ### Parameter domains
 
-Validated at fit time on typical values (η = 0, per subject, so covariate
-relationships are included): `mtt > 0` and `n ≥ 0`. A non-finite or
-out-of-domain value is rejected with `E_ABSORPTION_DOMAIN` — an error, not a
-silently clamped result or an opaque `NaN` fit failure.
+The domain is `mtt > 0` and `n ≥ 0`. It is enforced in two places:
+
+- **Typical values** (η = 0, per subject, so covariate relationships are
+  included) are validated at fit time. A non-finite or out-of-domain typical
+  value is rejected with `E_ABSORPTION_DOMAIN` — a clear error, not an opaque
+  `NaN` fit failure. Constrain the parameter so it stays in range, e.g.
+  `MTT = TVMTT * exp(ETA_MTT)` keeps `MTT > 0`.
+- **Transient mid-fit excursions** are clamped. With an additive
+  parameterisation (`MTT = TVMTT + ETA_MTT`), the inner EBE search or a
+  finite-difference step can momentarily push `mtt ≤ 0` / `n < 0` even though the
+  typical value is in range. There `R_in` is evaluated at the domain boundary
+  (a finite value) rather than producing a `NaN` that would poison the objective.
+  Because the converged optimum is interior, this clamp never affects reported
+  estimates — it only keeps the optimiser numerically stable. (A log-normal
+  parameterisation avoids the excursion entirely and is recommended.)
 
 ### Not yet supported (Phase 0)
 
 These combinations are **rejected with a clear error** rather than silently
 mis-modeled:
 
+- **An infusion (`RATE>0`) into a transit compartment** (`E_ABSORPTION_RATE`) —
+  the dose mass is delivered through `R_in`, computed from the dose *amount*, so
+  an infusion rate on the same record would double-count it. Use a plain bolus
+  record (`RATE=0`) into the absorption compartment; the transit chain provides
+  the input-rate shape.
 - **Steady-state dosing (`SS=1`) into a transit compartment** (`E_ABSORPTION_SS`)
   — periodic steady state with an in-progress absorption tail needs dedicated
   treatment. Expand the run-in with explicit dosing records instead.
 - **A `[diffusion]` block (SDE/EKF) together with `transit()`**
   (`E_ABSORPTION_DIFFUSION`) — the EKF propagation does not yet carry the
   input-rate forcing.
+
+> **Note:** these guards run at `fit()` time (and via `ferx check`), which is
+> where model–data compatibility is validated. The lower-level `predict()` and
+> `simulate()` entry points assume an already-checked model and do not re-run
+> them, so run `ferx check` (or `fit()`) on a new model before relying on
+> `predict`/`simulate` output.
 
 ## Worked example
 

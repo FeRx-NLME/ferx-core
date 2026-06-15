@@ -27,9 +27,12 @@ section of the SDLC for the versioning policy).
   not also as a bolus — so a flexible, continuously-estimable absorption shape
   takes one line instead of a hand-coded transit chain. Honors `F`/lagtime and
   superposes over doses; works with IIV/IOV, resets, and time-varying covariates.
-  Steady-state dosing into a transit compartment, and combining `transit()` with
-  a `[diffusion]` block, are rejected with a clear error (`E_ABSORPTION_SS` /
-  `E_ABSORPTION_DIFFUSION`). New example `examples/transit_savic.ferx` and docs
+  Unsupported combinations are rejected with a clear error rather than silently
+  mis-modeled: steady-state dosing into a transit compartment (`E_ABSORPTION_SS`),
+  an infusion (`RATE>0`) into a transit compartment (`E_ABSORPTION_RATE`, which
+  would double-count the dose), a `[diffusion]` block together with `transit()`
+  (`E_ABSORPTION_DIFFUSION`), and an out-of-domain `mtt`/`n` at typical values
+  (`E_ABSORPTION_DOMAIN`). New example `examples/transit_savic.ferx` and docs
   page *Built-in Absorption Models* (#322).
 - Example `dose_rate.ferx` (+ `data/dose_rate.csv`) demonstrating the supported
   NONMEM `RATE` dosing forms — a bolus (`RATE=0`) and a constant-rate infusion

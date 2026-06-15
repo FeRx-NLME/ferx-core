@@ -248,6 +248,40 @@ fn ss_dose_into_transit_compartment_is_rejected() {
 }
 
 #[test]
+fn infusion_into_transit_compartment_is_rejected() {
+    // An infusion (RATE>0) into a transit compartment would be delivered twice —
+    // once as the `+rate` infusion injection in the ODE RHS wrapper, once as
+    // R_in(tad) superposed by the forcing — silently ~doubling exposure. The
+    // transit chain already defines the input rate from the dose amount, so an
+    // infusion rate on that record is undefined and must be rejected loudly.
+    let model = parse_full_model(TRANSIT_MODEL)
+        .expect("transit model parses")
+        .model;
+    let inf_dose = DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0); // RATE=10>0 into depot (CMT 1)
+    let n = 2;
+    let pop = Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject(
+            "1",
+            vec![inf_dose],
+            vec![1.0, 6.0],
+            vec![0.0; n],
+            vec![2; n],
+        )],
+    };
+    let diags = check_model_data(&model, &pop);
+    assert!(
+        diags.iter().any(|d| d.code == "E_ABSORPTION_RATE"),
+        "expected E_ABSORPTION_RATE, got {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn transit_with_diffusion_block_is_rejected() {
     // A built-in input-rate model + a [diffusion] block (SDE/EKF) is rejected:
     // the EKF propagation does not carry the R_in forcing.

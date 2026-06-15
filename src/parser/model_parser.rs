@@ -4367,21 +4367,28 @@ fn diffeq_state(line: &str) -> Option<String> {
     Some(rest[..close].trim().to_string())
 }
 
-/// True if the span `[start, end)` in `line` (ASCII) is immediately preceded or
-/// followed (skipping spaces) by `*`, `/`, or `^` — i.e. a scaled call.
-fn adjacent_scales(line: &str, start: usize, end: usize) -> bool {
+/// True if the call spanning `[start, end)` in `line` (ASCII) is **not** a bare,
+/// positively-signed, top-level additive term — i.e. it is scaled (`*` `/` `^`),
+/// negated (a leading `-`), or grouped (`(` immediately before / `)` immediately
+/// after, which can hide an outer scale such as `(transit(...))/V`). The
+/// input-rate forcing is always injected as `+R_in`, unscaled, so only a bare
+/// `+ transit(...)` term is faithful; any other context would silently drop the
+/// sign or scale. Surrounding spaces are skipped; the faithful preceding chars
+/// are `=` (RHS start) and `+`, the faithful following chars are end-of-line,
+/// `+`, and `-` (each starts a new additive term).
+fn call_is_scaled_or_signed(line: &str, start: usize, end: usize) -> bool {
     let b = line.as_bytes();
     let mut i = start;
     while i > 0 && b[i - 1] == b' ' {
         i -= 1;
     }
-    let before = i > 0 && matches!(b[i - 1], b'*' | b'/' | b'^');
+    let before_bad = i > 0 && matches!(b[i - 1], b'*' | b'/' | b'^' | b'-' | b'(');
     let mut j = end;
     while j < b.len() && b[j] == b' ' {
         j += 1;
     }
-    let after = j < b.len() && matches!(b[j], b'*' | b'/' | b'^');
-    before || after
+    let after_bad = j < b.len() && matches!(b[j], b'*' | b'/' | b'^' | b')');
+    before_bad || after_bad
 }
 
 /// Split a string on top-level commas (commas outside nested parentheses).
@@ -4460,10 +4467,13 @@ fn extract_input_rate_terms(
                 raw.trim()
             )
         })?;
-        if adjacent_scales(raw, start, end) {
+        if call_is_scaled_or_signed(raw, start, end) {
             return Err(
-                "[odes]: a scaled transit(...) (e.g. `FR*transit(...)`) is not yet supported; \
-                 use it as a standalone additive input rate"
+                "[odes]: transit(...) must be a standalone, positively-signed additive input \
+                 rate — it cannot be scaled (`* / ^`), negated (a leading `-`), or wrapped in \
+                 parentheses (e.g. `FR*transit(...)`, `-transit(...)`, `(transit(...))/V`), \
+                 since these silently drop the sign/scale. Write it as a bare `+ transit(...)` \
+                 term."
                     .to_string(),
             );
         }
@@ -9311,6 +9321,20 @@ mod tests {
         assert!(go("d/dt(depot) = FR*transit(n=NTR, mtt=MTT)")
             .unwrap_err()
             .contains("scaled"));
+        // Leading unary minus: the forcing is injected `+R_in`, so a negated call
+        // would silently flip the sign of the input rate. Must be rejected.
+        assert!(go("d/dt(depot) = -transit(n=NTR, mtt=MTT) - KA*depot")
+            .unwrap_err()
+            .contains("standalone"));
+        // Subtracted term (wrong sign) even without `*`/`/` scaling.
+        assert!(go("d/dt(depot) = KA*depot - transit(n=NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("standalone"));
+        // Parenthesised + scaled outside the group: the old adjacency check saw
+        // only the flanking `(`/`)`, so the `/V` was silently dropped — now rejected.
+        assert!(go("d/dt(depot) = (transit(n=NTR, mtt=MTT))/V")
+            .unwrap_err()
+            .contains("standalone"));
         assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT")
             .unwrap_err()
             .contains("unbalanced"));
@@ -9336,6 +9360,13 @@ mod tests {
         let (cleaned, f) = go("d/dt(depot) = -KA*depot").unwrap();
         assert_eq!(cleaned[0], "d/dt(depot) = -KA*depot");
         assert!(f.is_empty());
+
+        // Positive controls for the tightened sign/scale guard: a bare additive
+        // `transit(...)` is accepted whether it is the only term, the first term
+        // before a `-` disposition term, or a later `+` term.
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT)").is_ok());
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot").is_ok());
+        assert!(go("d/dt(depot) = -KA*depot + transit(n=NTR, mtt=MTT)").is_ok());
     }
 
     // Issue #176 retired the split `*_iv_bolus` / `*_infusion` model names

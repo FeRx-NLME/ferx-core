@@ -649,6 +649,32 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
         );
     }
 
+    // Infusion (RATE>0) into an input-rate compartment (data-level): the dose
+    // would be delivered twice — once as the `+rate` infusion injection in the
+    // ODE RHS wrapper, and again as `R_in(tad)` superposed by the input-rate
+    // forcing — silently ~doubling exposure. A transit dose carries its mass
+    // through `R_in` from the bolus amount; an infusion rate on that record is
+    // undefined, so reject it loudly. (Coded RATE=-1/-2 is already rejected at
+    // the datareader, so `is_infusion()` is the remaining case.)
+    let has_infusion = population.subjects.iter().any(|s| {
+        s.doses
+            .iter()
+            .any(|d| d.is_infusion() && cmts.contains(&d.cmt))
+    });
+    if has_infusion {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_RATE",
+                "An infusion (RATE>0) into a built-in absorption input-rate \
+                 compartment (e.g. transit()) is not supported: the dose mass is \
+                 delivered through the input-rate function R_in computed from the dose \
+                 amount, so an infusion rate would double-count it. Use a plain bolus \
+                 dose record (RATE=0) into the absorption compartment.",
+            )
+            .with_block("odes"),
+        );
+    }
+
     // Parameter-domain validation (data-level): an out-of-domain or non-finite
     // input-rate parameter (e.g. transit `mtt ≤ 0` or `n < 0`) would otherwise
     // propagate as a NaN through the ODE RHS and surface only as an opaque fit

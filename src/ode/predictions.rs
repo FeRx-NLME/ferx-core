@@ -114,6 +114,15 @@ fn equilibrate_ss_state(
             }
         } else {
             // Bolus pulse + decay for one cycle.
+            //
+            // NOTE: this applies the SS dose as an instantaneous bolus and does
+            // not route it through an input-rate forcing (`R_in`). That is correct
+            // only because SS dosing into a built-in absorption (e.g. transit())
+            // compartment is rejected upstream by `E_ABSORPTION_SS`
+            // (`api::check_absorption_dosing`). When SS + input-rate is supported
+            // (a later phase of `plans/absorption-models.md`), this pulse must be
+            // suppressed for an input-rate compartment and `R_in` integrated over
+            // the cycle instead.
             u[cmt_idx] += f_bio * dose.amt;
             let sol = solve_ode(
                 &ode.rhs,
@@ -195,6 +204,9 @@ fn ss_state_at_phase(
             }
         }
     } else {
+        // Instantaneous SS bolus (no `R_in` routing) — sound only because SS into
+        // an input-rate compartment is rejected upstream by `E_ABSORPTION_SS`;
+        // see the matching note in `equilibrate_ss_state`.
         u[cmt_idx] += f_bio * dose.amt;
         let sol = solve_ode(&ode.rhs, &u, (0.0, phase), pk_params_flat, &[phase], opts);
         if let Some(last) = sol.last() {

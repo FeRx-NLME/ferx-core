@@ -130,9 +130,34 @@ pub enum PreparedInputRate {
 }
 
 impl PreparedInputRate {
+    /// Domain floor for `mtt` when clamping a transient mid-fit excursion (see
+    /// [`Self::transit`]). Far below any realistic mean transit time, so it never
+    /// perturbs a converged fit — it only keeps a transient `mtt ≤ 0` from
+    /// turning `ktr.ln()` into a `NaN`.
+    const MIN_MTT: f64 = 1e-8;
+
     /// Precompute the transit constants for `(n, mtt)`.
+    ///
+    /// The arguments are **clamped to the valid domain** (`mtt > 0`, `n ≥ 0`).
+    /// The fit-time guard ([`validate_transit`], wired into
+    /// `check_absorption_dosing`) already rejects an out-of-domain *typical*
+    /// value loudly; but during estimation the inner BFGS perturbs `eta` and the
+    /// outer FD step perturbs `theta`, so an additive parameterisation
+    /// (`MTT = TVMTT + ETA_MTT`) or a wide FD step can drive a transient
+    /// `mtt ≤ 0` / `n < 0` *mid-search*. Left unclamped that yields
+    /// `ktr.ln()` / `ln Γ(n+1) = NaN`, which propagates through the ODE RHS into
+    /// an opaque `NaN` OFV instead of a recoverable step. Clamping keeps `R_in`
+    /// finite at the domain wall so the optimiser can climb back to the interior;
+    /// the converged optimum is interior, so reported estimates are unaffected.
+    /// `NaN` inputs also fall to the floor (every `>`/`>=` is false for `NaN`).
     #[inline]
     fn transit(n: f64, mtt: f64) -> Self {
+        let mtt = if mtt > Self::MIN_MTT {
+            mtt
+        } else {
+            Self::MIN_MTT
+        };
+        let n = if n >= 0.0 { n } else { 0.0 };
         let ktr = (n + 1.0) / mtt;
         PreparedInputRate::Transit {
             ktr,
@@ -237,6 +262,31 @@ mod tests {
         assert!(validate_transit(-1.0, 2.0).is_err());
         assert!(validate_transit(f64::NAN, 2.0).is_err());
         assert!(validate_transit(3.0, f64::NAN).is_err());
+    }
+
+    /// A *transient* domain excursion (`mtt ≤ 0`, `n < 0`, or `NaN`) — reachable
+    /// mid-fit when an additive `eta` or a wide FD step leaves the domain — must
+    /// yield a **finite, non-negative** `R_in`, never a `NaN` that silently
+    /// poisons the ODE RHS / OFV. The loud fit-start `validate_transit` still
+    /// rejects out-of-domain *typical* values; this guards the search path
+    /// (`PreparedInputRate::transit` clamps to the domain).
+    #[test]
+    fn transit_rate_is_finite_for_domain_excursions() {
+        for &(n, mtt) in &[
+            (3.0, 0.0),      // mtt = 0  → ktr = +∞ unclamped
+            (3.0, -1.0),     // mtt < 0  → ktr < 0, ln(ktr) = NaN unclamped
+            (-1.0, 2.0),     // n  < 0
+            (f64::NAN, 2.0), // NaN n
+            (3.0, f64::NAN), // NaN mtt
+        ] {
+            for &tad in &[0.5, 2.0, 10.0] {
+                let r = transit_input_rate(tad, n, mtt, 100.0);
+                assert!(
+                    r.is_finite() && r >= 0.0,
+                    "R_in must be finite & non-negative at n={n}, mtt={mtt}, tad={tad}, got {r}"
+                );
+            }
+        }
     }
 
     /// `prepare(...).rate(...)` (the hoisted ODE-hot-path form) must agree bit-for-bit
