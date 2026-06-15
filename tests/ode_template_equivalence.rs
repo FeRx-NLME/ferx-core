@@ -358,3 +358,80 @@ fn ode_template_user_obs_scale_takes_precedence() {
          concentration), but predictions were unchanged: {a:?} vs {c:?}"
     );
 }
+
+/// A `d/dt(X)` nested in an `if {...}` is a *conditional* tweak, not a full
+/// override: the generated unconditional equation for X must be KEPT (otherwise
+/// X silently has no derivative outside the branch). Here the override branch
+/// (`V < 0`) never fires, so if the generated `central` equation were suppressed,
+/// `central` would stay 0 and predictions would collapse to ~0. Asserting the
+/// model still predicts the normal analytical curve proves the default was kept.
+#[test]
+fn ode_template_conditional_override_keeps_generated_default() {
+    let header = "\
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.2, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+";
+    let analytical = format!(
+        "{header}\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    // Conditional override of central in a never-firing branch.
+    let conditional = format!(
+        "{header}\n[structural_model]\n  ode_template one_cpt_oral(cl=CL, v=V, ka=KA)\n\n\
+         [odes]\n  if (V < 0) {{\n    d/dt(central) = -(CL/V) * central\n  }}\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+
+    let pop = population(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
+        2,
+    );
+    let preds = |src: &str| {
+        let m = parse_full_model(src)
+            .unwrap_or_else(|e| panic!("did not parse: {e}"))
+            .model;
+        predict(&m, &pop, &m.default_params)
+            .into_iter()
+            .map(|p| p.pred)
+            .collect::<Vec<f64>>()
+    };
+    let an = preds(&analytical);
+    let cond = preds(&conditional);
+    // The generated central is kept → matches the analytical oral curve, and is
+    // clearly non-zero (would be ~0 if the conditional override had suppressed it).
+    assert!(
+        an.iter().any(|&p| p > 1e-3),
+        "analytical curve should be non-trivial"
+    );
+    for (x, y) in an.iter().zip(cond.iter()) {
+        let tol = ATOL + RTOL * x.abs();
+        assert!(
+            (x - y).abs() <= tol,
+            "conditional override must keep the generated central: analytical {x:.6} vs {y:.6}"
+        );
+    }
+}
+
+/// The shipped `examples/transit_ode_template.ferx` (ode_template + a transit
+/// depot override) must parse, so a future parser change can't silently rot it.
+#[test]
+fn transit_ode_template_example_parses() {
+    let src = std::fs::read_to_string("examples/transit_ode_template.ferx")
+        .expect("read examples/transit_ode_template.ferx");
+    let model = parse_full_model(&src)
+        .expect("examples/transit_ode_template.ferx should parse")
+        .model;
+    let ode = model.ode_spec.expect("ODE model");
+    assert_eq!(ode.state_names, vec!["depot", "central", "periph"]);
+    assert_eq!(ode.input_rate.len(), 1, "one transit forcing on the depot");
+}

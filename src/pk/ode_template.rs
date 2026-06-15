@@ -305,6 +305,22 @@ mod tests {
         .unwrap();
         assert_eq!(g.states, vec!["central", "periph1", "periph2"]);
         assert_eq!(g.obs_scale, "V1");
+        // Assert the full micro-constant RHS, not just the shape — a wrong
+        // cross-term (q2/q3 ↔ v2/v3 swap) would otherwise only surface in the
+        // slow equivalence test.
+        let lines: Vec<&str> = g.odes.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(
+            lines[0],
+            "d/dt(central) = -(CL/V1 + Q2/V1 + Q3/V1) * central + (Q2/V2) * periph1 + (Q3/V3) * periph2"
+        );
+        assert_eq!(
+            lines[1],
+            "d/dt(periph1) = (Q2/V1) * central - (Q2/V2) * periph1"
+        );
+        assert_eq!(
+            lines[2],
+            "d/dt(periph2) = (Q3/V1) * central - (Q3/V3) * periph2"
+        );
     }
 
     #[test]
