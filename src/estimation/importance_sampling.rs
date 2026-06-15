@@ -523,10 +523,15 @@ pub(crate) struct SubjectDraws {
     /// Normalized effective sample size ESS/K (proposal-quality diagnostic).
     pub ess_fraction: f64,
     /// The `K` sampled η vectors stored row-major in one flat buffer of length
-    /// `K·d` (sample `k` is `etas[k*d..(k+1)*d]`). A single allocation per subject
-    /// instead of `K` small `Vec`s — at K=500 this is the hot allocation in the
-    /// E-step. Iterate with `etas.chunks_exact(d)`.
-    pub etas: Vec<f64>,
+    /// `K·n_dim`. A single allocation per subject instead of `K` small `Vec`s —
+    /// at K=500 this is the hot allocation in the E-step. Private so callers
+    /// cannot mis-chunk it; iterate via [`SubjectDraws::samples`], which always
+    /// uses the producer's own stride.
+    etas: Vec<f64>,
+    /// Per-sample η dimension `d` (the stride of `etas`). Carried with the data
+    /// so the chunk width is the one the producer used, not one re-derived at the
+    /// consumption site.
+    n_dim: usize,
     /// Self-normalized importance weights `w̃ᵢₖ` (length `K`, sums to 1).
     pub weights: Vec<f64>,
     /// Weighted posterior mean `Σₖ w̃ᵢₖ ηᵢₖ` (length `d`) — drives the closed-form
@@ -535,6 +540,18 @@ pub(crate) struct SubjectDraws {
     /// Weighted second moment `Σₖ w̃ᵢₖ ηᵢₖ ηᵢₖᵀ` (d×d) — the per-subject Ω
     /// sufficient statistic.
     pub second_moment: DMatrix<f64>,
+}
+
+impl SubjectDraws {
+    /// Iterate the retained samples as `&[f64]` slices of length `n_dim`, the
+    /// stride the producer stored them with. This is the only way to read the
+    /// samples, so a consumer can never pick the wrong chunk width. Yields `K`
+    /// slices (zero for an early-return / non-PD-proposal subject).
+    pub(crate) fn samples(&self) -> std::slice::ChunksExact<'_, f64> {
+        // `n_dim == 0` is impossible: IMPMAP refuses `n_eta == 0` up front, and
+        // `subject_is_draws` always records the `d` it was called with.
+        self.etas.chunks_exact(self.n_dim)
+    }
 }
 
 /// Draw `K` importance samples for one subject from a proposal centered at the
@@ -570,10 +587,12 @@ pub(crate) fn subject_is_draws(
             return SubjectDraws {
                 log_marginal: 0.0,
                 ess_fraction: 0.0,
+                // early-return on a non-PD proposal: no samples retained, but
+                // n_dim still records the stride so `samples()` is well-formed.
                 etas: Vec::new(),
+                n_dim: d,
                 weights: Vec::new(),
                 mean: vec![0.0; d],
-                // (early-return on a non-PD proposal; no samples retained)
                 second_moment: DMatrix::zeros(d, d),
             };
         }
@@ -677,6 +696,7 @@ pub(crate) fn subject_is_draws(
         log_marginal,
         ess_fraction,
         etas,
+        n_dim: d,
         weights,
         mean,
         second_moment,

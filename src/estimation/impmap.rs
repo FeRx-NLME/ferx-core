@@ -268,7 +268,9 @@ pub fn run_impmap(
             0,
         );
 
-        let omega_inv = params_k.omega.inv.clone();
+        // Borrow rather than clone: `params_k` is only read for the rest of this
+        // iteration, so the n_eta×n_eta inverse need not be copied per iteration.
+        let omega_inv = &params_k.omega.inv;
         let log_det_omega = params_k.omega.log_det;
 
         // ---- E-step B: importance sampling around each mode ----
@@ -284,7 +286,7 @@ pub fn run_impmap(
                     &eta_hats[i],
                     &params_k.sigma.values,
                     &h_matrices[i],
-                    &omega_inv,
+                    omega_inv,
                     n_eta,
                     scratch,
                 );
@@ -295,7 +297,7 @@ pub fn run_impmap(
                     &params_k.sigma.values,
                     &eta_hats[i],
                     &h_post,
-                    &omega_inv,
+                    omega_inv,
                     log_det_omega,
                     n_eta,
                     k_samples,
@@ -598,7 +600,7 @@ fn theta_sigma_weighted_mstep(
             .zip(draws.par_iter())
             .map_init(EventPkParams::default, |scratch, (subject, d)| {
                 let mut s = 0.0f64;
-                for (w, eta) in d.weights.iter().zip(d.etas.chunks_exact(model.n_eta)) {
+                for (w, eta) in d.weights.iter().zip(d.samples()) {
                     if *w == 0.0 {
                         continue;
                     }
