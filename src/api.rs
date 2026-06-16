@@ -569,6 +569,7 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_iov_occasions(model, population));
     diags.extend(check_absorption_dosing(model, population));
+    diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(validate_output_columns(model, population));
     diags
 }
@@ -654,8 +655,9 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // ODE RHS wrapper, and again as `R_in(tad)` superposed by the input-rate
     // forcing — silently ~doubling exposure. A transit dose carries its mass
     // through `R_in` from the bolus amount; an infusion rate on that record is
-    // undefined, so reject it loudly. (Coded RATE=-1/-2 is already rejected at
-    // the datareader, so `is_infusion()` is the remaining case.)
+    // undefined, so reject it loudly. RATE=-2 (modeled duration) is also an
+    // infusion (`is_infusion()` is true for it), so it is caught here too;
+    // RATE=-1 is rejected at the datareader.
     let has_infusion = population.subjects.iter().any(|s| {
         s.doses
             .iter()
@@ -703,6 +705,75 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
         }
     }
 
+    diags
+}
+
+/// NONMEM coded `RATE=-2` (modeled infusion duration → `D{cmt}`) needs two
+/// model-aware checks the datareader cannot make (it has no model). Both are
+/// fatal — never a silent fall-through to a bolus (the original #324 bug):
+///   - **ODE engine.** Modeled duration is ODE-only; the analytical engine has
+///     no spare-slot routing for a `D{n}` parameter yet (a tracked #324
+///     follow-up). A `RATE=-2` dose on an analytical model is rejected.
+///   - **Matching `D{cmt}` parameter.** A `RATE=-2` dose into compartment `n`
+///     requires a `D{n}` parameter (so `resolve_rate` has a slot to read);
+///     otherwise it is rejected.
+///
+/// Reported once per offending compartment (naming the first dose that hits it),
+/// so a dataset with many `RATE=-2` rows yields one actionable error per cause.
+/// (The `D{n}`-is-also-an-RHS-rate-constant name collision is handled the same
+/// way `F{n}` is — a documented reserved-name note in `docs/`, not a runtime
+/// check — see ode-models.md.)
+fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    use crate::types::{DoseAttr, RateMode};
+    let mut diags = Vec::new();
+    // De-dup by compartment so N identical RATE=-2 rows give one error, not N.
+    let mut reported: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for subject in &population.subjects {
+        for dose in &subject.doses {
+            if dose.rate_mode != RateMode::ModeledDuration || !reported.insert(dose.cmt) {
+                continue;
+            }
+            let cmt = dose.cmt;
+            match &model.ode_spec {
+                None => diags.push(
+                    Diagnostic::error(
+                        "E_MODELED_DURATION_ANALYTICAL",
+                        format!(
+                            "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
+                             compartment {cmt} is only supported for ODE models; analytical \
+                             support is a tracked follow-up to #324. Use an `ode(...)` model with \
+                             a `D{cmt}` parameter, or supply an explicit positive RATE \
+                             (= AMT/duration).",
+                            subject.id, dose.time
+                        ),
+                    )
+                    .with_block("structural_model"),
+                ),
+                Some(ode) => {
+                    if ode
+                        .dose_attr_map
+                        .indexed_slot(DoseAttr::Duration, cmt)
+                        .is_none()
+                    {
+                        diags.push(
+                            Diagnostic::error(
+                                "E_MODELED_DURATION_NO_PARAM",
+                                format!(
+                                    "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
+                                     compartment {cmt} requires a `D{cmt}` parameter in \
+                                     [individual_parameters], but none is declared. Add \
+                                     `D{cmt} = ...` (the modeled duration), or supply an explicit \
+                                     positive RATE.",
+                                    subject.id, dose.time
+                                ),
+                            )
+                            .with_block("individual_parameters"),
+                        );
+                    }
+                }
+            }
+        }
+    }
     diags
 }
 

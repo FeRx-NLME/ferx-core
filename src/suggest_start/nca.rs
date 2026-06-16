@@ -674,24 +674,8 @@ mod tests {
         let subject = Subject {
             id: "1".into(),
             doses: vec![
-                DoseEvent {
-                    time: 0.0,
-                    amt: dose_amt,
-                    rate: 0.0,
-                    duration: 0.0,
-                    cmt: 1,
-                    ss: false,
-                    ii: 0.0,
-                },
-                DoseEvent {
-                    time: 24.0,
-                    amt: dose_amt,
-                    rate: 0.0,
-                    duration: 0.0,
-                    cmt: 1,
-                    ss: false,
-                    ii: 0.0,
-                },
+                DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, dose_amt, 1, 0.0, false, 0.0),
             ],
             obs_times: times_all.clone(),
             obs_raw_times: Vec::new(),

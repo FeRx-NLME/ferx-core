@@ -9,7 +9,8 @@
 
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
 use crate::pk::absorption::PreparedInputRate;
-use crate::types::{DoseEvent, PkParams, Subject};
+use crate::types::{DoseEvent, PkParams, RateMode, Subject};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Epsilon used to decide whether an infusion fully spans a segment.
@@ -25,7 +26,68 @@ const INFUSION_EPS: f64 = 1e-12;
 /// break-time sort. Such rows fall back to the bolus branch instead
 /// (a zero/negative bolus update — visible, not silently dropped).
 pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
+    // Tripwire (#324): every ODE entrypoint resolves modeled-RATE doses to
+    // `Fixed` (via `resolve_subject_doses*`) before any infusion logic runs, so
+    // a non-`Fixed` dose here means a path forgot to resolve — panic in debug /
+    // tests rather than silently mis-handling it (an unresolved modeled dose has
+    // `duration == 0`, so it would quietly degrade to a bolus).
+    let resolved = matches!(d.rate_mode, RateMode::Fixed);
+    debug_assert!(resolved, "is_real_infusion: unresolved modeled dose");
     d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
+}
+
+/// Resolve any modeled-`RATE` doses (#324, e.g. `RATE=-2` → modeled duration
+/// `D{cmt}`) in `subject` to concrete (`Fixed`) doses, using `params` for
+/// **every** dose — the no-time-varying-covariate ODE paths, where the PK
+/// snapshot is constant across doses. Returns the subject **borrowed** (no
+/// allocation) when every dose is already `Fixed` (the common case), and an
+/// owned copy with resolved `doses` otherwise.
+///
+/// Single source of truth: every ODE entrypoint funnels its subject through this
+/// (or [`resolve_subject_doses_per_dose`]) before building the dose timeline, so
+/// the integrator and SS helpers only ever see a concrete `rate`/`duration` and
+/// a coded `RATE=-2` cannot reach them unresolved.
+fn resolve_subject_doses<'a>(
+    subject: &'a Subject,
+    attr_map: &crate::types::DoseAttrMap,
+    params: &[f64],
+) -> Cow<'a, Subject> {
+    if subject
+        .doses
+        .iter()
+        .all(|d| matches!(d.rate_mode, RateMode::Fixed))
+    {
+        return Cow::Borrowed(subject);
+    }
+    let mut owned = subject.clone();
+    for d in &mut owned.doses {
+        *d = d.resolve_rate(attr_map, params);
+    }
+    Cow::Owned(owned)
+}
+
+/// Like [`resolve_subject_doses`] but resolves dose `k` with its own per-dose PK
+/// parameters `pk_at_dose[k]` — the time-varying-covariate / event-driven paths,
+/// where each dose's modeled `D{cmt}` is evaluated at that dose's
+/// covariates/occasion. `pk_at_dose` is parallel to `subject.doses` (the callers
+/// assert equal lengths).
+fn resolve_subject_doses_per_dose<'a>(
+    subject: &'a Subject,
+    attr_map: &crate::types::DoseAttrMap,
+    pk_at_dose: &[PkParams],
+) -> Cow<'a, Subject> {
+    if subject
+        .doses
+        .iter()
+        .all(|d| matches!(d.rate_mode, RateMode::Fixed))
+    {
+        return Cow::Borrowed(subject);
+    }
+    let mut owned = subject.clone();
+    for (k, d) in owned.doses.iter_mut().enumerate() {
+        *d = d.resolve_rate(attr_map, &pk_at_dose[k].values);
+    }
+    Cow::Owned(owned)
 }
 
 /// Number of dosing cycles to simulate when pre-equilibrating an SS=1
@@ -624,14 +686,21 @@ pub fn ode_predictions(
     let mut u = ode.initial_state(pk_params_flat);
     let mut predictions = vec![f64::NAN; n_obs];
 
+    // Resolve modeled-RATE doses to concrete (`Fixed`) doses ONCE, before
+    // building the timeline/forcing: `resolve_subject_doses` is the single source
+    // of truth (#324), so every `subject.doses` read below sees a concrete
+    // rate/duration and a coded RATE=-2 (modeled duration `D{cmt}`) cannot reach
+    // the integrator unresolved. Borrowed (no clone) for the common all-`Fixed`
+    // dataset; parameters are constant across doses on this no-TV path.
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
+
     // Lagtime shifts the effective start (and end) of every dose record; F
     // scales the amount entering the compartment (NONMEM's F·AMT bolus / F·RATE
     // infusion). Both default (lag 0.0, F 1.0) when not declared, so existing
     // models behave identically. Resolved **per dose compartment** so a model
     // with `Fn`/`ALAGn` (issue #369) applies the right value to each route; the
-    // common bare-`F`/`lagtime` model gets a uniform vector. Parameters are
-    // constant across doses on this no-TV path, so all doses read the same
-    // `pk_params_flat`.
+    // common bare-`F`/`lagtime` model gets a uniform vector.
     let dose_lagtimes: Vec<f64> = subject
         .doses
         .iter()
@@ -898,6 +967,13 @@ pub fn ode_predictions_event_driven(
     assert_eq!(pk_at_dose.len(), subject.doses.len());
     assert_eq!(pk_at_obs.len(), subject.obs_times.len());
     assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
+
+    // Resolve modeled-RATE doses to concrete (`Fixed`) doses once (#324), each
+    // with its own per-dose PK snapshot `pk_at_dose[k]` (this is the event-driven
+    // / time-varying-covariate path). Borrowed (no clone) for the common
+    // all-`Fixed` dataset. Single source of truth — see `resolve_subject_doses`.
+    let resolved = resolve_subject_doses_per_dose(subject, &ode.dose_attr_map, pk_at_dose);
+    let subject: &Subject = &resolved;
 
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
@@ -1209,6 +1285,12 @@ pub fn ode_predictions_ekf_with_diffusion(
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::ode::ekf::solve_ekf;
 
+    // Resolve modeled-RATE doses once (#324) so both the plain ODE pass and the
+    // EKF propagation (which reads `dose.duration`) see concrete rate/duration;
+    // borrowed (no clone) for the common all-`Fixed` dataset.
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
+
     // EKF path: parser rejects SDE + Form C, so output_fn is always None
     // here and theta/eta would never be consulted. Pass empty slices.
     let ipred_plain = ode_predictions(ode, pk_params_flat, &[], &[], subject);
@@ -1269,6 +1351,12 @@ pub fn ode_predictions_ekf(
     r_obs_fn: impl Fn(f64) -> f64,
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::ode::ekf::solve_ekf;
+
+    // Resolve modeled-RATE doses once (#324) so both the plain ODE pass and the
+    // EKF propagation (which reads `dose.duration`) see concrete rate/duration;
+    // borrowed (no clone) for the common all-`Fixed` dataset.
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
 
     // Compute per-observation R for the Kalman update from a standard ODE pass.
     // Using per-observation R is correct for proportional and combined error models.
@@ -1346,6 +1434,11 @@ pub fn ode_predictions_with_states(
     let mut u = ode.initial_state(pk_params_flat);
     let mut predictions = vec![f64::NAN; n_obs];
     let mut states: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; n_obs];
+
+    // Resolve modeled-RATE doses once (#324) before building the timeline so the
+    // states pass sees concrete rate/duration; borrowed for all-`Fixed`.
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
 
     // Per dose-compartment bioavailability / lag (`Fn`/`ALAGn`; issue #369),
     // falling back to the bare `PK_IDX_F`/`PK_IDX_LAGTIME` slots. Uniform on
@@ -1652,6 +1745,11 @@ pub fn ode_dense_solve_states(
 
     let mut u = ode.initial_state(pk_params_flat);
     let mut result: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; saveat.len()];
+
+    // Resolve modeled-RATE doses once (#324) before building the timeline so the
+    // states pass sees concrete rate/duration; borrowed for all-`Fixed`.
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
 
     // Per dose-compartment bioavailability / lag (`Fn`/`ALAGn`; issue #369),
     // falling back to the bare `PK_IDX_F`/`PK_IDX_LAGTIME` slots. Uniform on

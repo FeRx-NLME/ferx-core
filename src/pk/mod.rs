@@ -998,6 +998,15 @@ pub fn compute_predictions_with_states(
 /// Uses analytical equations for standard PK models, or delegates to ODE solver
 /// when an OdeSpec is provided.
 pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
+    // Defensive tripwire (#324): modeled-RATE doses (RATE=-2 -> D{cmt}) are
+    // ODE-only; `check_model_data` rejects them on analytical models. Reaching
+    // the analytical path with one means the join was bypassed (e.g. `predict()`
+    // on unvalidated input) — fail loudly in debug/tests, not silently.
+    let all_fixed = subject
+        .doses
+        .iter()
+        .all(|d| matches!(d.rate_mode, crate::types::RateMode::Fixed));
+    debug_assert!(all_fixed, "modeled-RATE dose on analytical path");
     // Dose superposition cannot express a system reset (EVID=3/4): a reset
     // zeros the compartments mid-record, which is not a sum of independent
     // dose responses. Route reset-bearing subjects through the

@@ -8,6 +8,32 @@ use std::collections::HashMap;
 // and the `Debug`/`Clone` derives are reachable from outside the crate.
 pub use crate::parser::model_parser::IndivParamPartials;
 
+/// How a dose's infusion `rate`/`duration` are determined.
+///
+/// NONMEM overloads the `RATE` column with negative codes that make the
+/// infusion **parameter-driven** rather than data-driven (see
+/// [`crate::io`] data-format docs):
+///   - `RATE = -2` → the infusion *duration* is the model parameter `D{cmt}`
+///     ([`RateMode::ModeledDuration`]); the rate is then `amt / duration`.
+///   - `RATE = -1` → the infusion *rate* is the model parameter `R{cmt}`
+///     (not yet supported — `#324` Phase B; rejected at data-read time).
+///
+/// The modeled values are not known at parse/read time (they depend on the
+/// per-iteration `theta`/`eta`/covariates), so a coded dose stores its mode
+/// here and is resolved to a concrete ([`RateMode::Fixed`]) dose per iteration
+/// by [`DoseEvent::resolve_rate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RateMode {
+    /// `RATE ≥ 0`: `rate`/`duration` are the literal stored values. The default
+    /// keeps every existing `DoseEvent` construction (and serialized data)
+    /// behaving exactly as before.
+    #[default]
+    Fixed,
+    /// `RATE = -2`: infusion duration is the modeled parameter `D{cmt}` resolved
+    /// from the dose compartment via the model's `DoseAttrMap`.
+    ModeledDuration,
+}
+
 /// A single dose event (bolus, infusion, or oral)
 #[derive(Debug, Clone)]
 pub struct DoseEvent {
@@ -18,6 +44,10 @@ pub struct DoseEvent {
     pub duration: f64,
     pub ss: bool,
     pub ii: f64,
+    /// How `rate`/`duration` are determined. [`RateMode::Fixed`] for ordinary
+    /// (data-driven) doses; a modeled variant for a NONMEM coded `RATE`, which
+    /// is resolved per iteration by [`Self::resolve_rate`].
+    pub rate_mode: RateMode,
 }
 
 impl DoseEvent {
@@ -31,11 +61,84 @@ impl DoseEvent {
             duration,
             ss,
             ii,
+            rate_mode: RateMode::Fixed,
+        }
+    }
+
+    /// Construct a dose whose infusion `rate`/`duration` are *modeled* (a NONMEM
+    /// coded `RATE`). The concrete `rate`/`duration` are unknown until the
+    /// per-iteration parameters are available, so they are left at `0.0` and
+    /// filled in by [`Self::resolve_rate`]; until then [`Self::is_infusion`]
+    /// still reports `true` from the mode.
+    pub fn modeled(time: f64, amt: f64, cmt: usize, ss: bool, ii: f64, mode: RateMode) -> Self {
+        Self {
+            time,
+            amt,
+            cmt,
+            rate: 0.0,
+            duration: 0.0,
+            ss,
+            ii,
+            rate_mode: mode,
+        }
+    }
+
+    /// Domain floor for a modeled infusion `duration` when clamping a transient
+    /// mid-fit excursion (see [`Self::resolve_rate`]). Mirrors
+    /// [`crate::pk::absorption::PreparedInputRate::MIN_MTT`]: far below any
+    /// realistic duration, so it never perturbs a converged fit — it only keeps
+    /// a transient `D ≤ 0` (or `NaN`) from turning `amt / D` into a non-finite
+    /// rate. `NaN` falls to the floor (every `>` is false for `NaN`).
+    pub(crate) const DURATION_FLOOR: f64 = 1e-8;
+
+    /// Resolve a modeled-duration dose into a concrete ([`RateMode::Fixed`]) dose
+    /// for this iteration's per-dose `PkParams` (`params` = `PkParams::values`).
+    ///
+    /// **Single source of truth** for the modeled-`RATE` rule. Every prediction
+    /// entrypoint maps its doses through this *before* integrating, so all
+    /// downstream machinery (ODE forcing, SS equilibration, the break-time
+    /// timeline) sees only a concrete `rate`/`duration` and a new dose-application
+    /// path cannot silently diverge — the recurring failure mode that F (#327),
+    /// lag (#369), and now duration (#324) each had to thread through every path.
+    ///
+    /// It is **`F`-agnostic**: it derives `(rate, duration)` from the *raw*
+    /// `amt`, leaving bioavailability to the existing per-compartment `F`
+    /// machinery downstream (so `F` is applied exactly once — `F·amt` delivered
+    /// over `D`, matching NONMEM's `F·RATE` for an infusion).
+    ///
+    /// f64-only / FD-only by construction: modeled doses are ODE-only (analytical
+    /// support is a follow-up) and ODE has no autodiff path, so no `Dual` twin is
+    /// needed. A transient `D ≤ 0` mid-search is clamped to [`Self::DURATION_FLOOR`].
+    pub(crate) fn resolve_rate(&self, attr_map: &DoseAttrMap, params: &[f64]) -> DoseEvent {
+        match self.rate_mode {
+            RateMode::Fixed => self.clone(),
+            RateMode::ModeledDuration => {
+                // The slot's existence is an invariant enforced by
+                // `check_model_data` (a `RATE=-2` dose with no matching `D{cmt}`
+                // is rejected before any prediction runs).
+                let slot = attr_map
+                    .indexed_slot(DoseAttr::Duration, self.cmt)
+                    .expect("modeled-duration dose slot validated by check_model_data");
+                let d_raw = params.get(slot).copied().unwrap_or(0.0);
+                let duration = if d_raw > Self::DURATION_FLOOR {
+                    d_raw
+                } else {
+                    Self::DURATION_FLOOR
+                };
+                DoseEvent {
+                    rate: self.amt / duration,
+                    duration,
+                    rate_mode: RateMode::Fixed,
+                    ..self.clone()
+                }
+            }
         }
     }
 
     pub fn is_infusion(&self) -> bool {
-        self.rate > 0.0
+        // A modeled-duration dose is an infusion even before `resolve_rate` fills
+        // in the concrete `rate` (which is `0.0` until then).
+        self.rate > 0.0 || !matches!(self.rate_mode, RateMode::Fixed)
     }
 }
 
@@ -133,27 +236,34 @@ impl DoseAttr {
     /// be a positive integer (so `F0` is *not* an attribute, and bare `F` /
     /// `lagtime` — handled by the reserved slots — return `None`).
     ///
-    /// Recognised today: `F{n}` (bioavailability) and `ALAG{n}` / `LAGTIME{n}`
-    /// (lag). The modeled-infusion forms `D{n}` (`RATE=-2`) and `R{n}`
-    /// (`RATE=-1`) are intentionally **not** recognised here yet — their `D`/`R`
-    /// prefixes collide with ordinary ODE rate constants, so #324 adds them with
-    /// a data-driven gate (only when a coded-`RATE` dose references the
-    /// compartment). `S{n}` is also excluded — that is the `[scaling]` block's
-    /// compartment scale, a separate concept.
+    /// Recognised today: `F{n}` (bioavailability), `ALAG{n}` / `LAGTIME{n}`
+    /// (lag), and `D{n}` (modeled infusion *duration*, `RATE=-2`; #324). The
+    /// modeled-*rate* form `R{n}` (`RATE=-1`) is intentionally **not** recognised
+    /// yet — its `R` prefix collides with ordinary ODE rate constants and modeled
+    /// rate is a follow-up (#324 Phase B). `S{n}` is also excluded — that is the
+    /// `[scaling]` block's compartment scale, a separate concept.
+    ///
+    /// `D{n}` shares that collision risk (a `D`-prefixed rate constant), so it is
+    /// only *reserved* for the duration when a `RATE=-2` dose targets compartment
+    /// `n`: recognising the name merely makes the [`DoseAttrMap`] entry available
+    /// (harmless if never dosed against), and the data-driven gate + collision
+    /// warning live in `check_model_data`.
     ///
     /// Recognising a name does not by itself make it a dose attribute — the
-    /// caller still gates on engine (compartment-indexed `F`/`Lag` are ODE-only)
-    /// and on the compartment existing. `alag` and `lagtime` both map to
-    /// [`DoseAttr::Lag`], matching the existing bare `alag`/`lagtime` aliases.
+    /// caller still gates on engine (compartment-indexed `F`/`Lag`/`Duration` are
+    /// ODE-only) and on the compartment existing. `alag` and `lagtime` both map
+    /// to [`DoseAttr::Lag`], matching the existing bare `alag`/`lagtime` aliases.
     pub fn from_indexed_name(name: &str) -> Option<(DoseAttr, usize)> {
         let lower = name.to_ascii_lowercase();
-        // The three prefixes are mutually exclusive — no name starts with both a
-        // lag prefix and `f`, and neither `lagtime` nor `alag` is a prefix of the
-        // other — so the iteration order does not affect the result.
+        // The prefixes are mutually exclusive — no name starts with two of them,
+        // and none is a prefix of another (`lagtime`/`alag`/`f`/`d` all differ in
+        // their first byte except the two lag aliases, which are disjoint) — so
+        // the iteration order does not affect the result.
         for (prefix, attr) in [
             ("lagtime", DoseAttr::Lag),
             ("alag", DoseAttr::Lag),
             ("f", DoseAttr::F),
+            ("d", DoseAttr::Duration),
         ] {
             if let Some(suffix) = lower.strip_prefix(prefix) {
                 // The suffix must be a pure positive integer; `f_bio`, `cl`, etc.
@@ -4196,7 +4306,7 @@ mod tests {
     }
 
     #[test]
-    fn dose_attr_from_indexed_name_recognizes_f_and_lag_only() {
+    fn dose_attr_from_indexed_name_recognizes_f_lag_and_duration() {
         use DoseAttr::*;
         // Bioavailability and both lag spellings, case-insensitive.
         assert_eq!(DoseAttr::from_indexed_name("F1"), Some((F, 1)));
@@ -4204,24 +4314,28 @@ mod tests {
         assert_eq!(DoseAttr::from_indexed_name("ALAG1"), Some((Lag, 1)));
         assert_eq!(DoseAttr::from_indexed_name("alag3"), Some((Lag, 3)));
         assert_eq!(DoseAttr::from_indexed_name("LAGTIME2"), Some((Lag, 2)));
+        // Modeled infusion duration D{n} (RATE=-2; #324), case-insensitive.
+        assert_eq!(DoseAttr::from_indexed_name("D1"), Some((Duration, 1)));
+        assert_eq!(DoseAttr::from_indexed_name("d2"), Some((Duration, 2)));
 
         // Bare forms and zero index are not compartment-indexed attributes.
         assert_eq!(DoseAttr::from_indexed_name("F"), None);
         assert_eq!(DoseAttr::from_indexed_name("lagtime"), None);
         assert_eq!(DoseAttr::from_indexed_name("alag"), None);
         assert_eq!(DoseAttr::from_indexed_name("F0"), None);
+        assert_eq!(DoseAttr::from_indexed_name("D0"), None);
+        assert_eq!(DoseAttr::from_indexed_name("D"), None);
 
         // Must not capture canonical PK names, the [scaling] `S{n}` names, or
-        // non-numeric suffixes.
+        // non-numeric suffixes — including `D`-prefixed words (`delta`, `decay`).
         for n in [
-            "CL", "V1", "V2", "Q2", "Q3", "KA", "S1", "S2", "f_bio", "rate",
+            "CL", "V1", "V2", "Q2", "Q3", "KA", "S1", "S2", "f_bio", "rate", "delta", "decay",
         ] {
             assert_eq!(DoseAttr::from_indexed_name(n), None, "{n} must not match");
         }
 
-        // D{n}/R{n} are reserved for #324 and not recognised yet (avoids
-        // reinterpreting ODE rate constants like `R0`/`D1` before that lands).
-        assert_eq!(DoseAttr::from_indexed_name("D1"), None);
+        // Modeled *rate* R{n} (RATE=-1) is still reserved for #324 Phase B — its
+        // `R` prefix collides with ODE rate constants, so it is not recognised.
         assert_eq!(DoseAttr::from_indexed_name("R1"), None);
 
         // An all-digit suffix that overflows usize fails to parse -> not an
@@ -4248,6 +4362,58 @@ mod tests {
         // Duration/Rate have no bare fallback -> no indexed slot means None.
         assert_eq!(map.indexed_slot(DoseAttr::Duration, 1), None);
         assert_eq!(map.indexed_slot(DoseAttr::Rate, 1), None);
+    }
+
+    #[test]
+    fn dose_event_resolve_rate_modeled_duration_matches_explicit_infusion() {
+        // RATE=-2 with D{1} in slot 9: a 100-unit dose over D = 5 must resolve to
+        // the same (rate, duration) as an explicit RATE = 100/5 = 20 infusion.
+        let mut map = DoseAttrMap::default();
+        map.insert(DoseAttr::Duration, 1, 9);
+        let mut params = [0.0; MAX_PK_PARAMS];
+        params[9] = 5.0; // D1
+
+        let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
+        assert!(
+            modeled.is_infusion(),
+            "modeled dose is an infusion pre-resolve"
+        );
+        let resolved = modeled.resolve_rate(&map, &params);
+
+        assert_eq!(resolved.rate_mode, RateMode::Fixed);
+        assert_eq!(resolved.duration, 5.0);
+        assert_eq!(resolved.rate, 20.0);
+        // Bit-equal to the hand-written explicit infusion (the #324 invariant).
+        let explicit = DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0);
+        assert_eq!(resolved.rate, explicit.rate);
+        assert_eq!(resolved.duration, explicit.duration);
+        // cmt/time/amt/ss/ii are preserved through resolution.
+        assert_eq!(resolved.cmt, 1);
+        assert_eq!(resolved.amt, 100.0);
+
+        // A Fixed dose is returned unchanged (the common, allocation-cheap path).
+        let same = explicit.resolve_rate(&map, &params);
+        assert_eq!(
+            (same.rate, same.duration, same.rate_mode),
+            (20.0, 5.0, RateMode::Fixed)
+        );
+    }
+
+    #[test]
+    fn dose_event_resolve_rate_clamps_nonpositive_duration() {
+        // A transient D <= 0 (or NaN) mid-search clamps to DURATION_FLOOR so
+        // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_MTT).
+        let mut map = DoseAttrMap::default();
+        map.insert(DoseAttr::Duration, 1, 9);
+        let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
+
+        for bad in [0.0, -3.0, f64::NAN] {
+            let mut params = [0.0; MAX_PK_PARAMS];
+            params[9] = bad;
+            let r = modeled.resolve_rate(&map, &params);
+            assert_eq!(r.duration, DoseEvent::DURATION_FLOOR, "clamp at floor");
+            assert!(r.rate.is_finite() && r.rate > 0.0, "rate finite");
+        }
     }
 
     #[test]
@@ -4317,15 +4483,7 @@ mod tests {
     }
 
     fn dose(ss: bool) -> DoseEvent {
-        DoseEvent {
-            time: 0.0,
-            amt: 100.0,
-            cmt: 1,
-            rate: 0.0,
-            duration: 0.0,
-            ss,
-            ii: 0.0,
-        }
+        DoseEvent::new(0.0, 100.0, 1, 0.0, ss, 0.0)
     }
 
     #[test]

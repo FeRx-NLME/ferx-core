@@ -5,10 +5,14 @@
 #   RATE = 0   → bolus (instantaneous; route set by the dose compartment)
 #   RATE > 0   → constant-rate infusion (duration = AMT / RATE)
 #
-# NONMEM's coded `RATE` values are NOT supported and are rejected at import:
-#   RATE = -1  → infusion rate modeled (R1 in $PK)
-#   RATE = -2  → infusion duration modeled (D1 in $PK)
-# Convert those to an explicit positive RATE (= AMT / intended duration) first.
+# NONMEM's coded `RATE` values are parameter-driven (not a DURATION column):
+#   RATE = -2  → infusion DURATION modeled via a `D{cmt}` parameter. Supported on
+#                ODE models (see docs/src/model-file/ode-models.md). This
+#                analytical `pk` model has a single fixed route, so `-2` here is
+#                rejected with a pointer to the ODE form (analytical support is a
+#                tracked #324 follow-up).
+#   RATE = -1  → infusion RATE modeled (R{cmt}); not yet supported — convert to an
+#                explicit positive RATE (= AMT / intended duration) first.
 # See docs/src/data-format.md ("NONMEM coded RATE values") and the FAQ.
 #
 # Run:
