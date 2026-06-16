@@ -428,6 +428,13 @@ pub fn run_bayes(
     let mut eta_sum: Vec<DVector<f64>> = (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
     let mut eta_record_count: u64 = 0;
 
+    // HMC eta-block routing (autodiff builds only; opt-in via n_leapfrog > 0,
+    // analytical-PK subjects). Default n_leapfrog = 0 keeps the MH kernel.
+    #[cfg(feature = "autodiff")]
+    let n_leapfrog = options.saem_n_leapfrog;
+    #[cfg(feature = "autodiff")]
+    let using_hmc = n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some();
+
     for chain in 0..n_chains {
         let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
         let mut scratch = EventPkParams::default();
@@ -488,24 +495,57 @@ pub fn run_bayes(
                 .collect();
 
             // ---- 1. η block ----
+            // HMC (gradient-guided) when available + opt-in (n_leapfrog > 0 on
+            // an autodiff build, analytical-PK subject); otherwise the
+            // chol(Ω)-preconditioned block random walk. Same routing as SAEM.
             for i in 0..n_subjects {
-                let (na, nll_new) = mh_steps(
-                    &mut etas[i],
-                    nll[i],
-                    &population.subjects[i],
-                    model,
-                    &theta,
-                    &omega_cur,
-                    &sigma,
-                    eta_scale,
-                    &mut rng,
-                    n_eta_mh,
-                    &mut scratch,
-                    None,
-                );
-                nll[i] = nll_new;
-                acc_eta += na as u64;
-                prop_eta += n_eta_mh as u64;
+                #[cfg(feature = "autodiff")]
+                let did_hmc = if using_hmc {
+                    if let Some((new_eta, new_nll, accepted)) = crate::estimation::hmc::hmc_step(
+                        &population.subjects[i],
+                        &etas[i],
+                        nll[i],
+                        model,
+                        &theta,
+                        &omega_cur,
+                        &sigma,
+                        eta_scale,
+                        n_leapfrog,
+                        &mut rng,
+                    ) {
+                        etas[i] = new_eta;
+                        nll[i] = new_nll;
+                        acc_eta += accepted as u64;
+                        prop_eta += 1;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                #[cfg(not(feature = "autodiff"))]
+                let did_hmc = false;
+
+                if !did_hmc {
+                    let (na, nll_new) = mh_steps(
+                        &mut etas[i],
+                        nll[i],
+                        &population.subjects[i],
+                        model,
+                        &theta,
+                        &omega_cur,
+                        &sigma,
+                        eta_scale,
+                        &mut rng,
+                        n_eta_mh,
+                        &mut scratch,
+                        None,
+                    );
+                    nll[i] = nll_new;
+                    acc_eta += na as u64;
+                    prop_eta += n_eta_mh as u64;
+                }
             }
 
             // ---- 2. Ω block (conjugate inverse-Wishart) ----
