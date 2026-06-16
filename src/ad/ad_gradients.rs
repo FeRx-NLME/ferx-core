@@ -661,11 +661,10 @@ impl FlatDoseData {
         // (no AD path) and `resolve_gradient_method` FD-gates anything else; an
         // unresolved one would snapshot a 0 rate/duration and yield a silently
         // wrong gradient (#317). Fail loudly in debug/tests instead.
-        let all_fixed = subject
-            .doses
-            .iter()
-            .all(|d| matches!(d.rate_mode, RateMode::Fixed));
-        debug_assert!(all_fixed, "modeled-RATE dose reached the AD path");
+        debug_assert!(
+            subject.all_doses_fixed(),
+            "modeled-RATE dose reached the AD path"
+        );
         Self {
             times: subject.doses.iter().map(|d| d.time).collect(),
             amts: subject.doses.iter().map(|d| d.amt).collect(),

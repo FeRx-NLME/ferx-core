@@ -411,15 +411,15 @@ pub fn event_driven_predictions(
     pk_at_pk_only: &[PkParams],
 ) -> Vec<f64> {
     // Defensive tripwire (#324): modeled-RATE doses (e.g. RATE=-2 -> D{cmt}) are
-    // ODE-only; `check_model_data` rejects them on analytical models before any
-    // fit/`ferx check`. Reaching here with one means a path bypassed that gate
-    // (e.g. `predict()` on hand-built, unvalidated input) — fail loudly in
-    // debug/tests rather than silently mis-handling a 0-rate "infusion".
-    let all_fixed = subject
-        .doses
-        .iter()
-        .all(|d| matches!(d.rate_mode, crate::types::RateMode::Fixed));
-    debug_assert!(all_fixed, "modeled-RATE dose on analytical path");
+    // ODE-only. Every public entrypoint that can see them rejects analytical
+    // models first — `fit()` / `ferx check` via `check_model_data`, and
+    // `predict()` / `simulate()` via `assert_modeled_doses_supported`. Reaching
+    // here with one means a path bypassed every gate; fail loudly in debug/tests
+    // rather than silently mis-handling a 0-rate "infusion".
+    debug_assert!(
+        subject.all_doses_fixed(),
+        "modeled-RATE dose on analytical path"
+    );
     let dose_lagtimes: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
     let schedule = EventSchedule::for_subject(subject, pk_model, &dose_lagtimes);
     event_driven_predictions_with_schedule(

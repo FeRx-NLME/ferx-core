@@ -9,7 +9,7 @@
 
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
 use crate::pk::absorption::PreparedInputRate;
-use crate::types::{DoseEvent, PkParams, RateMode, Subject};
+use crate::types::{DoseEvent, PkParams, Subject};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
@@ -31,63 +31,58 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
     // a non-`Fixed` dose here means a path forgot to resolve — panic in debug /
     // tests rather than silently mis-handling it (an unresolved modeled dose has
     // `duration == 0`, so it would quietly degrade to a bolus).
-    let resolved = matches!(d.rate_mode, RateMode::Fixed);
-    debug_assert!(resolved, "is_real_infusion: unresolved modeled dose");
+    debug_assert!(d.is_fixed(), "is_real_infusion: unresolved modeled dose");
     d.is_infusion() && d.duration > 0.0 && d.duration.is_finite()
 }
 
 /// Resolve any modeled-`RATE` doses (#324, e.g. `RATE=-2` → modeled duration
-/// `D{cmt}`) in `subject` to concrete (`Fixed`) doses, using `params` for
-/// **every** dose — the no-time-varying-covariate ODE paths, where the PK
-/// snapshot is constant across doses. Returns the subject **borrowed** (no
-/// allocation) when every dose is already `Fixed` (the common case), and an
-/// owned copy with resolved `doses` otherwise.
+/// `D{cmt}`) in `subject` to concrete (`Fixed`) doses. `pk_for_dose(k)` supplies
+/// the per-dose `PkParams::values` slice used to evaluate dose `k`'s modeled
+/// parameter. Returns the subject **borrowed** (no allocation) when every dose
+/// is already `Fixed` (the common case — see [`Subject::all_doses_fixed`]), and
+/// an owned copy with resolved `doses` otherwise.
 ///
 /// Single source of truth: every ODE entrypoint funnels its subject through this
-/// (or [`resolve_subject_doses_per_dose`]) before building the dose timeline, so
-/// the integrator and SS helpers only ever see a concrete `rate`/`duration` and
-/// a coded `RATE=-2` cannot reach them unresolved.
-fn resolve_subject_doses<'a>(
+/// (via the two thin wrappers below) before building the dose timeline, so the
+/// integrator and SS helpers only ever see a concrete `rate`/`duration` and a
+/// coded `RATE=-2` cannot reach them unresolved.
+fn resolve_subject_doses_with<'a>(
     subject: &'a Subject,
     attr_map: &crate::types::DoseAttrMap,
-    params: &[f64],
+    pk_for_dose: impl Fn(usize) -> &'a [f64],
 ) -> Cow<'a, Subject> {
-    if subject
-        .doses
-        .iter()
-        .all(|d| matches!(d.rate_mode, RateMode::Fixed))
-    {
-        return Cow::Borrowed(subject);
-    }
-    let mut owned = subject.clone();
-    for d in &mut owned.doses {
-        *d = d.resolve_rate(attr_map, params);
-    }
-    Cow::Owned(owned)
-}
-
-/// Like [`resolve_subject_doses`] but resolves dose `k` with its own per-dose PK
-/// parameters `pk_at_dose[k]` — the time-varying-covariate / event-driven paths,
-/// where each dose's modeled `D{cmt}` is evaluated at that dose's
-/// covariates/occasion. `pk_at_dose` is parallel to `subject.doses` (the callers
-/// assert equal lengths).
-fn resolve_subject_doses_per_dose<'a>(
-    subject: &'a Subject,
-    attr_map: &crate::types::DoseAttrMap,
-    pk_at_dose: &[PkParams],
-) -> Cow<'a, Subject> {
-    if subject
-        .doses
-        .iter()
-        .all(|d| matches!(d.rate_mode, RateMode::Fixed))
-    {
+    if subject.all_doses_fixed() {
         return Cow::Borrowed(subject);
     }
     let mut owned = subject.clone();
     for (k, d) in owned.doses.iter_mut().enumerate() {
-        *d = d.resolve_rate(attr_map, &pk_at_dose[k].values);
+        *d = d.resolve_rate(attr_map, pk_for_dose(k));
     }
     Cow::Owned(owned)
+}
+
+/// Resolve modeled-`RATE` doses using `params` for **every** dose — the
+/// no-time-varying-covariate ODE paths, where the PK snapshot is constant across
+/// doses. See [`resolve_subject_doses_with`].
+fn resolve_subject_doses<'a>(
+    subject: &'a Subject,
+    attr_map: &crate::types::DoseAttrMap,
+    params: &'a [f64],
+) -> Cow<'a, Subject> {
+    resolve_subject_doses_with(subject, attr_map, |_| params)
+}
+
+/// Resolve dose `k` with its own per-dose PK parameters `pk_at_dose[k]` — the
+/// time-varying-covariate / event-driven path, where each dose's modeled
+/// `D{cmt}` is evaluated at that dose's covariates/occasion. `pk_at_dose` is
+/// parallel to `subject.doses` (the callers assert equal lengths). See
+/// [`resolve_subject_doses_with`].
+fn resolve_subject_doses_per_dose<'a>(
+    subject: &'a Subject,
+    attr_map: &crate::types::DoseAttrMap,
+    pk_at_dose: &'a [PkParams],
+) -> Cow<'a, Subject> {
+    resolve_subject_doses_with(subject, attr_map, |k| &pk_at_dose[k].values)
 }
 
 /// Number of dosing cycles to simulate when pre-equilibrating an SS=1

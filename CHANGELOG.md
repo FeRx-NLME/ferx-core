@@ -28,9 +28,10 @@ section of the SDLC for the versioning policy).
   once — `F·AMT` over `Dn`) and `ALAG{n}` (shifts the window; `Dn` sets its
   length), and works with steady state, multi-dose, and system resets. A
   `RATE=-2` dose with no matching `D{n}` parameter — or on an analytical model —
-  is now a loud error at the model+data join rather than a silent bolus (the
-  original #324 bug). `RATE=-1` (modeled *rate*, `Rn`) and analytical-engine
-  support remain tracked #324 follow-ups (#324).
+  is now a loud error rather than a silent bolus (the original #324 bug), both at
+  the model+data join (`fit`/`ferx check`) and at the `predict()`/`simulate()`
+  entrypoints (which skip the full data-check). `RATE=-1` (modeled *rate*, `Rn`)
+  and analytical-engine support remain tracked #324 follow-ups (#324).
 - **Compartment-indexed bioavailability and lag for ODE models** — name an
   individual parameter `F{n}` or `ALAG{n}`/`LAGTIME{n}` (e.g. `F2`, `ALAG2`) to
   apply a per-route bioavailability/lag to doses into compartment `n`, mirroring

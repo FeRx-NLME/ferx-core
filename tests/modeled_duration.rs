@@ -19,9 +19,9 @@
 //! All return immediately (`predict` with fixed params / a `check_model_data`
 //! pass — no convergence loop), so they need no `slow-tests` gate.
 
-use ferx_core::api::check_model_data;
+use ferx_core::api::{check_model_data, check_model_data_warnings};
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::{predict, read_nonmem_csv, CompiledModel, Population, Severity};
+use ferx_core::{predict, read_nonmem_csv, simulate, CompiledModel, Population, Severity};
 use std::io::Write;
 use std::path::Path;
 use tempfile::NamedTempFile;
@@ -455,6 +455,133 @@ fn one_cpt_infusion_closed_form(t: f64) -> f64 {
     } else {
         plateau * (1.0 - (-k * d1).exp()) * (-k * (t - d1)).exp()
     }
+}
+
+// One-compartment analytical (non-ODE) model: modeled duration is unsupported
+// here, so a `RATE=-2` dose must be rejected at the public boundaries too.
+const ANALYTICAL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+// ODE model with NO `D1` parameter — a `RATE=-2` dose into CMT=1 has no slot to
+// resolve against, the join error `E_MODELED_DURATION_NO_PARAM`.
+const ODE_NO_D1: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+#[test]
+#[should_panic(expected = "model cannot honour")]
+fn predict_on_analytical_model_with_modeled_dose_panics() {
+    // `predict()` runs no `check_model_data`, so before #384's entrypoint guard a
+    // RATE=-2 dose on an analytical model reached the predictor and silently
+    // degraded to a 0-rate "infusion" in release (the `debug_assert` is a no-op).
+    // The guard now turns it into a loud panic carrying the diagnostic.
+    let model = model_of(ANALYTICAL);
+    assert!(model.ode_spec.is_none(), "model must be analytical");
+    let pop = pop_of(&coded_csv());
+    let _ = predict(&model, &pop, &model.default_params);
+}
+
+#[test]
+#[should_panic(expected = "model cannot honour")]
+fn predict_on_ode_missing_param_panics() {
+    // RATE=-2 into a compartment with no `D{cmt}` would hit `resolve_rate`'s
+    // slot `.expect` deep in the ODE path; the entrypoint guard intercepts it
+    // first with the actionable `E_MODELED_DURATION_NO_PARAM` message.
+    let model = model_of(ODE_NO_D1);
+    let pop = pop_of(&coded_csv());
+    let _ = predict(&model, &pop, &model.default_params);
+}
+
+#[test]
+#[should_panic(expected = "model cannot honour")]
+fn simulate_on_analytical_model_with_modeled_dose_panics() {
+    // The same guard covers every `simulate*` variant via the shared
+    // `simulate_inner_with_draw` chokepoint.
+    let model = model_of(ANALYTICAL);
+    let pop = pop_of(&coded_csv());
+    let _ = simulate(&model, &pop, &model.default_params, 1);
+}
+
+#[test]
+fn valid_modeled_dose_predicts_without_panicking() {
+    // The guard is a no-op on a supported config: a RATE=-2 dose on an ODE model
+    // with the matching `D1` predicts normally (the all-`Fixed` Ok path of the
+    // entrypoint guard, and a regression guard that the guard isn't over-eager).
+    let model = model_of(ODE_D1);
+    let preds = predict(&model, &pop_of(&coded_csv()), &model.default_params);
+    assert!(preds.iter().any(|p| p.pred > 0.1), "expected real uptake");
+}
+
+#[test]
+fn modeled_duration_steady_state_overlap_warns() {
+    // W_STEADY_STATE_INFUSION (T_inf > II) must fire for a *modeled* SS infusion
+    // too: the warning's effective-duration check resolves `D{cmt}` at init
+    // params (#384), since `dose.duration` is 0 until `resolve_rate`. Here
+    // D1=5 > II=4, so the overlapping-pulse warning is expected.
+    let model = model_of(ODE_D1);
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS\n\
+               1,0,.,1,100,1,-2,1,4,1\n\
+               1,2,0,0,0,1,0,0,0,0\n";
+    let pop = pop_of(csv);
+    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+    assert!(
+        diags.iter().any(|d| d.code == "W_STEADY_STATE_INFUSION"),
+        "modeled SS infusion with D1=5 > II=4 must warn; got {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn modeled_duration_steady_state_no_overlap_does_not_warn() {
+    // Converse: D1=5 <= II=6 is a non-overlapping SS infusion — no warning. This
+    // pins that the effective-duration resolution compares the *resolved* D, not
+    // the unresolved 0 (which would never warn) nor a false positive.
+    let model = model_of(ODE_D1);
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS\n\
+               1,0,.,1,100,1,-2,1,6,1\n\
+               1,2,0,0,0,1,0,0,0,0\n";
+    let pop = pop_of(csv);
+    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+    assert!(
+        !diags.iter().any(|d| d.code == "W_STEADY_STATE_INFUSION"),
+        "D1=5 <= II=6 must not warn; got {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
 }
 
 #[test]

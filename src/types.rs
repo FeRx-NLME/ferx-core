@@ -138,7 +138,21 @@ impl DoseEvent {
     pub fn is_infusion(&self) -> bool {
         // A modeled-duration dose is an infusion even before `resolve_rate` fills
         // in the concrete `rate` (which is `0.0` until then).
-        self.rate > 0.0 || !matches!(self.rate_mode, RateMode::Fixed)
+        self.rate > 0.0 || !self.is_fixed()
+    }
+
+    /// True when this dose's `rate`/`duration` are concrete (data-driven), i.e.
+    /// [`RateMode::Fixed`] — either an ordinary dose or one already passed through
+    /// [`Self::resolve_rate`]. False for a still-modeled NONMEM coded `RATE`.
+    ///
+    /// **Single source of truth** for "is this dose resolved?". Every prediction
+    /// path that snapshots `rate`/`duration` (the ODE resolve shadows, and the
+    /// analytical / AD tripwires) tests this rather than re-spelling the
+    /// `matches!(rate_mode, Fixed)` predicate, so when a second modeled variant
+    /// lands (`RATE=-1` → `Rn`, #383) "resolved" changes in exactly one place
+    /// instead of across every dose-application site.
+    pub fn is_fixed(&self) -> bool {
+        matches!(self.rate_mode, RateMode::Fixed)
     }
 }
 
@@ -539,6 +553,16 @@ impl Subject {
     /// SS warning in `api.rs`.
     pub fn has_ss_doses(&self) -> bool {
         self.doses.iter().any(|d| d.ss)
+    }
+
+    /// True when every dose carries concrete (`Fixed`) `rate`/`duration` — i.e.
+    /// no dose is still a modeled NONMEM coded `RATE` awaiting
+    /// [`DoseEvent::resolve_rate`]. The common case (no coded doses) is `true`,
+    /// so the ODE resolve shadows return `Cow::Borrowed` and the analytical / AD
+    /// tripwires pass. Single source of truth alongside [`DoseEvent::is_fixed`]
+    /// (#324 / #383): a future coded variant changes "resolved" in one place.
+    pub fn all_doses_fixed(&self) -> bool {
+        self.doses.iter().all(|d| d.is_fixed())
     }
 
     /// Time of the first dose of the reset-occasion containing `obs_time`,

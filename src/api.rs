@@ -777,6 +777,31 @@ fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> V
     diags
 }
 
+/// Precondition shared by [`predict`] and the `simulate*` family: every
+/// modeled-`RATE` dose (#324, e.g. `RATE=-2` → `D{cmt}`) must be supported by
+/// the model (an ODE engine with the matching `D{cmt}` parameter).
+///
+/// `fit()` enforces this via [`first_error`] over the full [`check_model_data`],
+/// but `predict()` / `simulate()` deliberately skip that data-check (they assume
+/// a model the caller already validated, and run no other data validation). A
+/// modeled dose slipping through would otherwise hit one of two failure modes
+/// downstream that the per-path `debug_assert!` tripwires only catch in
+/// debug/test builds — silently in release: a 0-rate "infusion" on the
+/// analytical path, or [`DoseEvent::resolve_rate`]'s slot `.expect`. This gate
+/// turns both into a loud, actionable panic carrying the same diagnostic message
+/// `check_model_data` would have produced, reusing the single-source-of-truth
+/// [`check_modeled_dose_rates`]. It is O(doses) and runs once per public call
+/// (not in the inner loop), and is a no-op for the common all-`Fixed` dataset.
+pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: &Population) {
+    if let Err(msg) = first_error(&check_modeled_dose_rates(model, population)) {
+        panic!(
+            "predict()/simulate() received a dose the model cannot honour: {msg}\n\
+             (fit() reports this as an error rather than panicking; validate with \
+             `check_model_data` before predicting on untrusted input.)"
+        );
+    }
+}
+
 /// Model + estimation-option *compatibility* checks that don't depend on data:
 /// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
 /// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a
@@ -959,14 +984,36 @@ pub fn check_model_data_warnings(
     }
 
     // SS=1 infusion with T_inf > II — overlapping pulses have no closed form;
-    // the SS pre-equilibration is skipped.
+    // the SS pre-equilibration is skipped. The effective infusion length is
+    // `d.duration` for an ordinary infusion, but for a modeled-duration dose
+    // (RATE=-2 → `D{cmt}`; #324) it is unresolved here (`rate`/`duration` are 0
+    // until `resolve_rate`), so evaluate `D{cmt}` at `init_params` to recover
+    // it — otherwise a modeled SS infusion silently skips this warning while
+    // still degrading at runtime. (Analytical models reject modeled doses
+    // upstream, so the `ode_spec`-less branch only sees `Fixed` doses.)
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    let effective_duration = |s: &Subject, d: &DoseEvent| -> f64 {
+        if d.is_fixed() {
+            return d.duration;
+        }
+        match &model.ode_spec {
+            Some(ode) => {
+                let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates);
+                ode.dose_attr_map
+                    .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
+                    .map(|slot| pk.values[slot])
+                    .unwrap_or(0.0)
+            }
+            None => 0.0,
+        }
+    };
     let n_ss_overlapping_inf = population
         .subjects
         .iter()
         .filter(|s| {
             s.doses
                 .iter()
-                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii)
+                .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && effective_duration(s, d) > d.ii)
         })
         .count();
     if n_ss_overlapping_inf > 0 {
@@ -4420,6 +4467,12 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
 
+    // Single chokepoint for every `simulate*` variant (both `simulate_inner` and
+    // the propensity path funnel through here). Guard the modeled-`RATE` dose
+    // precondition once per call, as `predict()` does — `simulate()` runs no
+    // data-check otherwise. #324.
+    assert_modeled_doses_supported(model, population);
+
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
 
@@ -4588,6 +4641,11 @@ pub fn predict(
     population: &Population,
     params: &ModelParameters,
 ) -> Vec<PredictionResult> {
+    // `predict()` runs no data-check (unlike `fit()`); guard the one
+    // model-aware dose precondition so a modeled-`RATE` dose can't reach the
+    // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
+    assert_modeled_doses_supported(model, population);
+
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
 
