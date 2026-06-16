@@ -147,8 +147,9 @@ impl DoseAttr {
     /// [`DoseAttr::Lag`], matching the existing bare `alag`/`lagtime` aliases.
     pub fn from_indexed_name(name: &str) -> Option<(DoseAttr, usize)> {
         let lower = name.to_ascii_lowercase();
-        // Order matters: try the longer `lagtime`/`alag` prefixes before `f` so
-        // a `lagtime…` / `alag…` name is never misclassified.
+        // The three prefixes are mutually exclusive — no name starts with both a
+        // lag prefix and `f`, and neither `lagtime` nor `alag` is a prefix of the
+        // other — so the iteration order does not affect the result.
         for (prefix, attr) in [
             ("lagtime", DoseAttr::Lag),
             ("alag", DoseAttr::Lag),
@@ -1901,11 +1902,14 @@ impl CompiledModel {
         }
         self.indiv_param_names.iter().any(|n| {
             let u = n.to_uppercase();
-            // Bare `lagtime`/`alag`, or a compartment-indexed `ALAGn`/`LAGTIMEn`
-            // (issue #369) — all route lag through the dose application.
+            // Bare `lagtime`/`alag` apply on any engine. A compartment-indexed
+            // `ALAGn`/`LAGTIMEn` (issue #369) only routes lag on the ODE engine
+            // — the analytical path has a single fixed dose route, where such a
+            // name lands in an unused spare slot — so gate it on `ode_spec`.
             u == "LAGTIME"
                 || u == "ALAG"
-                || matches!(DoseAttr::from_indexed_name(n), Some((DoseAttr::Lag, _)))
+                || (self.ode_spec.is_some()
+                    && matches!(DoseAttr::from_indexed_name(n), Some((DoseAttr::Lag, _))))
         })
     }
 

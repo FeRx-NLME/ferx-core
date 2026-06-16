@@ -1986,6 +1986,57 @@ mod tests {
         assert!((c2[1] - 25.0).abs() < 1e-9, "cmt2 @t=10 (F2): {}", c2[1]);
     }
 
+    #[test]
+    fn ode_predictions_event_driven_apply_per_compartment_bioavailability_and_lag() {
+        // #369 review #3: the event-driven path is the actual fit path and
+        // resolves F through a *distinct* inline form
+        // (`dose_attr_map.f_bio(d.cmt, &pk_now.values)`), so per-compartment
+        // correctness must be asserted here too — not only on `ode_predictions`.
+        // Same 2-compartment accumulator and expectations as the no-TV test.
+        let mut map = crate::types::DoseAttrMap::default();
+        map.insert(crate::types::DoseAttr::F, 2, 9);
+        map.insert(crate::types::DoseAttr::Lag, 2, 10);
+
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_F] = 0.5;
+        p.values[9] = 0.25; // F2
+        p.values[10] = 5.0; // ALAG2
+
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0),
+        ];
+        let subj = make_subject(doses, vec![1.0, 10.0]);
+        let dose_pk = vec![p; subj.doses.len()];
+        let obs_pk = vec![p; subj.obs_times.len()];
+
+        // Compartment 1: bare F = 0.5, no lag.
+        let c1 = ode_predictions_event_driven(
+            &two_cpt_accumulator(0, map.clone()),
+            &subj,
+            &[],
+            &[],
+            &dose_pk,
+            &obs_pk,
+            &[],
+        );
+        assert!((c1[0] - 50.0).abs() < 1e-9, "cmt1 @t=1: {}", c1[0]);
+        assert!((c1[1] - 50.0).abs() < 1e-9, "cmt1 @t=10: {}", c1[1]);
+
+        // Compartment 2: F2 = 0.25, ALAG2 = 5 -> 0 pre-lag, 25 after.
+        let c2 = ode_predictions_event_driven(
+            &two_cpt_accumulator(1, map),
+            &subj,
+            &[],
+            &[],
+            &dose_pk,
+            &obs_pk,
+            &[],
+        );
+        assert!(c2[0].abs() < 1e-9, "cmt2 pre-lag: {}", c2[0]);
+        assert!((c2[1] - 25.0).abs() < 1e-9, "cmt2 @t=10 (F2): {}", c2[1]);
+    }
+
     /// Coverage: the steady-state branch of the event-driven TAD anchor in
     /// `ode_predictions_event_driven` (`last_dose_eff` reckons from the most
     /// recent SS cycle). Smoke-level — predictions must stay finite.

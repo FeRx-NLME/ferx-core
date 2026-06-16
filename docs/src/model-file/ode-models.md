@@ -227,6 +227,11 @@ absorption lag can differ by route. Mirroring NONMEM's `F1`/`F2` and
   fall back to the bare value (or to `F = 1`, `lag = 0`).
 - The index must refer to a compartment the model actually has — `F3` on a
   two-state model is a parse error, not a silently-ignored parameter.
+- Each declared `Fn`/`ALAGn` occupies one of the seven spare slots in the
+  fixed 16-slot PK parameter layout (shared with other ODE structural
+  parameters). Declaring the full set for many compartments can exhaust them;
+  if so, `ode_param_slots` reports a clear "too many individual parameters"
+  error rather than failing silently.
 
 This is an **ODE-engine** feature: the analytical PK functions have a single
 fixed dose route, so they take only the bare `f=`/`lagtime=` mapping. (The

@@ -458,6 +458,53 @@ mod tests {
         }
     }
 
+    /// #369 review #3: the EKF dose loop is a separate dose-application path, so
+    /// assert it applies **per-compartment** bioavailability (`Fn`). Uses a
+    /// 2-compartment accumulator (`d/dt = 0`) dosed into both compartments with
+    /// bare `F = 0.5` overridden by `F2 = 0.25`; the observed amount is then the
+    /// bioavailable dose for that compartment. (The EKF path applies no lagtime,
+    /// so this checks `F` routing only.)
+    #[test]
+    fn ekf_applies_per_compartment_bioavailability() {
+        fn two_cpt_zero_rhs(_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]) {
+            dy[0] = 0.0;
+            dy[1] = 0.0;
+        }
+        let mut map = crate::types::DoseAttrMap::default();
+        map.insert(crate::types::DoseAttr::F, 2, 9); // F2 -> spare slot 9
+
+        let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+        pk[crate::types::PK_IDX_F] = 0.5; // bare F (compartment 1)
+        pk[9] = 0.25; // F2 (compartment 2)
+
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![1.0];
+        let diffusion_var = vec![0.0, 0.0];
+        let r_obs_vec = vec![0.01; obs_times.len()];
+
+        let run = |obs_cmt_idx: usize| -> f64 {
+            solve_ekf(
+                &two_cpt_zero_rhs,
+                2,
+                obs_cmt_idx,
+                &diffusion_var,
+                &pk,
+                &map,
+                &[],
+                &doses,
+                &obs_times,
+                &r_obs_vec,
+                OdeSolverOptions::default(),
+            )[0]
+            .ipred
+        };
+        assert!((run(0) - 50.0).abs() < 1e-9, "cmt1 F=0.5: {}", run(0));
+        assert!((run(1) - 25.0).abs() < 1e-9, "cmt2 F2=0.25: {}", run(1));
+    }
+
     /// Linear 1D SDE: dX = -ke·X dt + σ_w dW.
     ///
     /// The variance of the conditional distribution satisfies a Riccati ODE:
