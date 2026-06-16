@@ -408,7 +408,11 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   forcing); **numerical** for Weibull (warned on an analytical disposition).
 - **Phase 3 — analytical incomplete-gamma closed form for transit** (1/2-cpt) so continuous-N
   transit stays in the analytical engine; assert it matches the Phase-0 numerical form under
-  the equivalence harness.
+  the equivalence harness. The speed win is twofold: it removes the adaptive ODE solve *and*
+  moves transit onto the AD-capable analytical `pk` path, dropping the FD-gradient multiplier
+  (ODE models fall back to finite differences — `(n_params+1)` solves per gradient — which is
+  also what forces the tight ODE tolerance). The NONMEM anchor (PR #385) quantified the gap:
+  ~89 s release at `ode_*tol=1e-9` vs NONMEM's ~16 s.
 
 ## ferx-r follow-up (per user-facing feature)
 
