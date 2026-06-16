@@ -4009,7 +4009,13 @@ fn parse_scaling_block(
 /// therefore require an ODE disposition (the error rule, #322 Phase 0b). The
 /// closed-form-capable functions (`first_order`, `zero_order`) are intentionally
 /// excluded — they can ride on an analytical `pk` model.
-const ODE_ONLY_ABSORPTION_FNS: [&str; 3] = ["transit", "igd", "weibull"];
+///
+/// This lists only the functions that are **actually implemented** as input
+/// rates today (`transit`, #343). Each later absorption function adds its own
+/// name here in the same PR that implements it — Phase 1 `igd` (#347), Phase 2
+/// `weibull` — so the error rule never advertises a function the engine can't yet
+/// run (which would send the user to `ode_template` for a dead end, Ron #363).
+const ODE_ONLY_ABSORPTION_FNS: [&str; 1] = ["transit"];
 
 /// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
 /// the first such function name found. Drives the error rule that rejects an
@@ -4103,29 +4109,9 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
         }
     };
 
-    // Parse `role=VAR` pairs (same convention as `pk NAME(...)`).
-    let mut params: HashMap<String, String> = HashMap::new();
-    for pair in params_str.split(',') {
-        let pair = pair.trim();
-        if pair.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = pair.split('=').map(str::trim).collect();
-        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
-            return Err(format!(
-                "ode_template {model_name}: malformed parameter `{pair}` (expected `role=VARNAME`)."
-            ));
-        }
-        if params
-            .insert(parts[0].to_lowercase(), parts[1].to_string())
-            .is_some()
-        {
-            return Err(format!(
-                "ode_template {model_name}: duplicate parameter `{}`.",
-                parts[0]
-            ));
-        }
-    }
+    // Parse `role=VAR` pairs through the same strict helper as `pk NAME(...)`
+    // (`parse_role_pairs`) so the two paths agree on malformed/duplicate handling.
+    let params = parse_role_pairs(&params_str, &format!("ode_template {model_name}"))?;
 
     let generated = crate::pk::ode_template::generate(&model_name, &params)?;
 
@@ -6014,6 +6000,39 @@ fn build_omega_fixed(
 
 // --- Structural model parsing ---
 
+/// Parse a `role=VAR, role=VAR, …` list from a `pk NAME(...)` / `ode_template
+/// NAME(...)` parameter string into a `role(lowercased) → VAR` map.
+///
+/// **Strict and single-sourced** (Ron, #363): a pair that is not exactly
+/// `role=VAR` with both sides non-empty is a hard error, and a duplicate role is
+/// a hard error — for both the analytical `pk` and the `ode_template` paths, so
+/// the two can't drift in strictness (they used to: `pk` silently dropped
+/// malformed pairs and last-wins on duplicates). A trailing comma (empty pair) is
+/// tolerated. `ctx` is the directive prefix used in error messages, e.g.
+/// `"pk two_cpt_oral"` or `"ode_template two_cpt_oral"`.
+fn parse_role_pairs(params_str: &str, ctx: &str) -> Result<HashMap<String, String>, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    for pair in params_str.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = pair.split('=').map(str::trim).collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err(format!(
+                "{ctx}: malformed parameter `{pair}` (expected `role=VARNAME`)."
+            ));
+        }
+        if map
+            .insert(parts[0].to_lowercase(), parts[1].to_string())
+            .is_some()
+        {
+            return Err(format!("{ctx}: duplicate parameter `{}`.", parts[0]));
+        }
+    }
+    Ok(map)
+}
+
 fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, String>), String> {
     // pk model_name(param=VAR, param=VAR, ...)
     let pk_re = Regex::new(r"pk\s+(\w+)\(([^)]+)\)").unwrap();
@@ -6021,55 +6040,51 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
     for line in lines {
         if let Some(caps) = pk_re.captures(line) {
             let model_name = &caps[1];
-            let pk_model = match model_name {
-                "one_cpt_iv" | "one_compartment_iv" => PkModel::OneCptIv,
-                "one_cpt_oral" | "one_compartment_oral" => PkModel::OneCptOral,
-                "two_cpt_iv" | "two_compartment_iv" => PkModel::TwoCptIv,
-                "two_cpt_oral" | "two_compartment_oral" => PkModel::TwoCptOral,
-                "three_cpt_iv" | "three_compartment_iv" => PkModel::ThreeCptIv,
-                "three_cpt_oral" | "three_compartment_oral" => PkModel::ThreeCptOral,
+            // Name → model is resolved through the shared `PkModel::from_name`
+            // (canonical + long-form aliases) so the `pk` and `ode_template` paths
+            // accept exactly the same set; retired and unknown names are handled
+            // here because they produce path-specific diagnostics, not a `PkModel`.
+            let pk_model = match PkModel::from_name(model_name) {
+                Some(m) => m,
                 // Retired names (issue #176): bolus and infusion are no longer
                 // separate model variants — the route is read per-dose from the
                 // RATE column. Emit a migration error so users update their
                 // model files explicitly rather than relying on a silent alias.
-                retired @ ("one_cpt_iv_bolus"
-                | "one_compartment_iv_bolus"
-                | "one_cpt_infusion"
-                | "one_compartment_infusion"
-                | "two_cpt_iv_bolus"
-                | "two_compartment_iv_bolus"
-                | "two_cpt_infusion"
-                | "two_compartment_infusion"
-                | "three_cpt_iv_bolus"
-                | "three_compartment_iv_bolus"
-                | "three_cpt_infusion"
-                | "three_compartment_infusion") => {
-                    let n = if retired.starts_with("one") {
-                        "one"
-                    } else if retired.starts_with("two") {
-                        "two"
-                    } else {
-                        "three"
-                    };
-                    return Err(format!(
-                        "`{retired}` was removed in #176; use `{n}_cpt_iv` instead. \
-                         Bolus and infusion administration are now driven by the \
-                         RATE column in the dataset (RATE=0 for bolus, RATE>0 for \
-                         infusion), so a single `{n}_cpt_iv` model handles either \
-                         or a mix of both within the same subject."
-                    ));
-                }
-                other => return Err(format!("Unknown PK model: {}", other)),
+                None => match model_name {
+                    retired @ ("one_cpt_iv_bolus"
+                    | "one_compartment_iv_bolus"
+                    | "one_cpt_infusion"
+                    | "one_compartment_infusion"
+                    | "two_cpt_iv_bolus"
+                    | "two_compartment_iv_bolus"
+                    | "two_cpt_infusion"
+                    | "two_compartment_infusion"
+                    | "three_cpt_iv_bolus"
+                    | "three_compartment_iv_bolus"
+                    | "three_cpt_infusion"
+                    | "three_compartment_infusion") => {
+                        let n = if retired.starts_with("one") {
+                            "one"
+                        } else if retired.starts_with("two") {
+                            "two"
+                        } else {
+                            "three"
+                        };
+                        return Err(format!(
+                            "`{retired}` was removed in #176; use `{n}_cpt_iv` instead. \
+                             Bolus and infusion administration are now driven by the \
+                             RATE column in the dataset (RATE=0 for bolus, RATE>0 for \
+                             infusion), so a single `{n}_cpt_iv` model handles either \
+                             or a mix of both within the same subject."
+                        ));
+                    }
+                    other => return Err(format!("Unknown PK model: {}", other)),
+                },
             };
 
-            let params_str = &caps[2];
-            let mut param_map = HashMap::new();
-            for pair in params_str.split(',') {
-                let parts: Vec<&str> = pair.split('=').map(|s| s.trim()).collect();
-                if parts.len() == 2 {
-                    param_map.insert(parts[0].to_lowercase(), parts[1].to_string());
-                }
-            }
+            // Strict, shared with `ode_template` (`parse_role_pairs`): a malformed
+            // or duplicate `role=VAR` pair is rejected rather than silently dropped.
+            let param_map = parse_role_pairs(&caps[2], &format!("pk {model_name}"))?;
 
             // Structural-mapping validation (required params present, unused
             // params, undefined references) is deferred to `parse_full_model`,
@@ -9750,16 +9765,14 @@ mod tests {
             ode_only_absorption_fn_in_odes(Some(&transit)),
             Some("transit")
         );
-        // All three forward-declared ODE-only functions are detected (igd/weibull
-        // are not yet implemented as input rates, but the error rule must already
-        // recognise them so Phases 1–2 inherit it).
+        // The error rule only recognises functions that are actually implemented
+        // (Ron #363): `igd`/`weibull` are not yet input rates, so they must NOT be
+        // detected — otherwise the rule would point the user at `ode_template` for a
+        // function the engine can't run. Each phase adds its name here when it lands.
         let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
-        assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), Some("igd"));
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), None);
         let weibull = vec!["d/dt(central) = weibull(td=TD, beta=B) - (CL/V)*central".to_string()];
-        assert_eq!(
-            ode_only_absorption_fn_in_odes(Some(&weibull)),
-            Some("weibull")
-        );
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&weibull)), None);
         // A plain disposition ODE has no ODE-only absorption call.
         let plain = vec!["d/dt(central) = -(CL/V)*central".to_string()];
         assert_eq!(ode_only_absorption_fn_in_odes(Some(&plain)), None);
@@ -9834,6 +9847,25 @@ mod tests {
         assert!(
             err.contains("ode_template") && err.contains("[diffusion]"),
             "diffusion error should name ode_template + [diffusion]: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_template_transit_on_non_ddt_line_errors_with_pointer() {
+        // Under ode_template, a `transit(...)` that is not the input rate of a
+        // `d/dt(...)` equation (here a bare helper assignment) must not be silently
+        // retained as a dead term: the input-rate extractor catches it and points
+        // at the correct `d/dt(...)` form (Ron #363, finding 5 — confirmed already
+        // guarded, pinned here so it can't regress).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  rate = transit(n=NTR, mtt=MTT)\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("d/dt"),
+            "a transit() off a d/dt line should point at the d/dt form, got: {err}"
         );
     }
 
@@ -9936,6 +9968,60 @@ mod tests {
         assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT)").is_ok());
         assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot").is_ok());
         assert!(go("d/dt(depot) = -KA*depot + transit(n=NTR, mtt=MTT)").is_ok());
+    }
+
+    #[test]
+    fn pk_param_parser_is_strict_about_duplicates_and_malformed_pairs() {
+        // The analytical `pk NAME(...)` parser now shares the strict
+        // `parse_role_pairs` helper with `ode_template` (Ron #363, finding 2). It
+        // previously silently dropped malformed pairs and let a duplicate role
+        // last-win; both are now hard errors, single-sourced so the two paths can't
+        // drift in strictness again.
+
+        // Duplicate role → rejected (was: silent last-win, here `cl=V` would have
+        // shadowed `cl=CL` with no warning).
+        let dup = vec!["pk one_cpt_iv(cl=CL, cl=V)".to_string()];
+        let err = parse_structural_model(&dup).unwrap_err();
+        assert!(
+            err.contains("duplicate parameter") && err.contains("cl"),
+            "duplicate pk param should error: {err}"
+        );
+
+        // Malformed pairs (no `=`, double `=`, empty side) → rejected (was: silently
+        // dropped, then surfaced only as a confusing missing-required error later).
+        for bad in [
+            "pk one_cpt_iv(cl, v=V)",
+            "pk one_cpt_iv(cl=CL=X, v=V)",
+            "pk one_cpt_iv(=CL, v=V)",
+            "pk one_cpt_iv(cl=, v=V)",
+        ] {
+            let lines = vec![bad.to_string()];
+            let err = parse_structural_model(&lines).unwrap_err();
+            assert!(
+                err.contains("malformed parameter"),
+                "`{bad}` should be a malformed-parameter error, got: {err}"
+            );
+        }
+
+        // A well-formed list (incl. a tolerated trailing comma) still parses.
+        let ok = vec!["pk one_cpt_iv(cl=CL, v=V, )".to_string()];
+        let (model, params) = parse_structural_model(&ok).expect("well-formed pk must parse");
+        assert_eq!(model, PkModel::OneCptIv);
+        assert_eq!(params.get("cl").map(String::as_str), Some("CL"));
+        assert_eq!(params.get("v").map(String::as_str), Some("V"));
+    }
+
+    #[test]
+    fn unknown_pk_model_name_errors() {
+        // A model name that is neither a valid name/alias (`PkModel::from_name`)
+        // nor a retired #176 spelling falls through to the generic "Unknown PK
+        // model" error — the `None`/`other` arm of the name resolution.
+        let lines = vec!["pk four_cpt_iv(cl=CL, v=V)".to_string()];
+        let err = parse_structural_model(&lines).unwrap_err();
+        assert!(
+            err.contains("Unknown PK model") && err.contains("four_cpt_iv"),
+            "got: {err}"
+        );
     }
 
     // Issue #176 retired the split `*_iv_bolus` / `*_infusion` model names

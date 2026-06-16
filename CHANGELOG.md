@@ -27,10 +27,11 @@ section of the SDLC for the versioning policy).
   `obs_scale`. It takes the same parameters as `pk NAME(...)` (including `ka` for
   oral routes). Re-declaring a `d/dt(X)` in `[odes]` **overrides** the generated
   equation for compartment `X` (e.g. to add a `transit(...)` absorption input);
-  undeclared compartments keep their generated equations. Combining an ODE-only
-  absorption function (`transit`, future `igd`/`weibull`) with an analytical
-  `pk NAME(...)` is now a clear error pointing at `ode_template`, never a silent
-  analytical→ODE conversion (#322).
+  undeclared compartments keep their generated equations. Combining the ODE-only
+  `transit(...)` absorption with an analytical `pk NAME(...)` is now a clear error
+  pointing at `ode_template`, never a silent analytical→ODE conversion. (Future
+  ODE-only absorption functions join that error rule as each is implemented.)
+  (#322).
 - Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The
@@ -139,6 +140,12 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- The analytical `pk NAME(...)` parameter list is now parsed strictly: a malformed
+  `role=VAR` pair (no `=`, an empty side, or a stray extra `=`) or a duplicate role
+  is a clear parse error instead of being silently dropped or last-winning. The
+  `pk` and `ode_template NAME(...)` directives share one strict parser, so they
+  can't drift in strictness. Well-formed model files (including a tolerated
+  trailing comma) are unaffected (#363).
 - FOCEI gradient-based optimizers (SLSQP, L-BFGS, built-in BFGS, Gauss-Newton)
   now add the `log|H̃|` EBE-response term (the #274/#289 Δ) to the population
   gradient, so they reach the true marginal minimum instead of stalling above it

@@ -24,6 +24,7 @@
 //! `central` equation still needs the `ka` depot→central transfer constant, so
 //! the generated model is runnable as written.
 
+use crate::types::PkModel;
 use std::collections::HashMap;
 
 /// A standard PK disposition lowered from `ode_template NAME(...)` to the
@@ -40,33 +41,6 @@ pub struct GeneratedDisposition {
     pub obs_scale: String,
 }
 
-/// Canonical model key for a name, accepting the same aliases as the analytical
-/// `pk` parser (`one_cpt_iv` / `one_compartment_iv`, …).
-fn canonical(name: &str) -> Option<&'static str> {
-    match name {
-        "one_cpt_iv" | "one_compartment_iv" => Some("one_cpt_iv"),
-        "one_cpt_oral" | "one_compartment_oral" => Some("one_cpt_oral"),
-        "two_cpt_iv" | "two_compartment_iv" => Some("two_cpt_iv"),
-        "two_cpt_oral" | "two_compartment_oral" => Some("two_cpt_oral"),
-        "three_cpt_iv" | "three_compartment_iv" => Some("three_cpt_iv"),
-        "three_cpt_oral" | "three_compartment_oral" => Some("three_cpt_oral"),
-        _ => None,
-    }
-}
-
-/// The role names (lowercased keys, as in `pk NAME(...)`) each model requires.
-fn required_roles(model: &str) -> &'static [&'static str] {
-    match model {
-        "one_cpt_iv" => &["cl", "v"],
-        "one_cpt_oral" => &["cl", "v", "ka"],
-        "two_cpt_iv" => &["cl", "v1", "q", "v2"],
-        "two_cpt_oral" => &["cl", "v1", "q", "v2", "ka"],
-        "three_cpt_iv" => &["cl", "v1", "q2", "v2", "q3", "v3"],
-        "three_cpt_oral" => &["cl", "v1", "q2", "v2", "q3", "v3", "ka"],
-        _ => &[],
-    }
-}
-
 /// Generate the disposition ODE for `ode_template model_name(params)`.
 ///
 /// `params` maps each lowercased role (`cl`, `v1`, `ka`, …) to the user's
@@ -78,19 +52,29 @@ pub fn generate(
     model_name: &str,
     params: &HashMap<String, String>,
 ) -> Result<GeneratedDisposition, String> {
-    let model = canonical(model_name).ok_or_else(|| {
+    // Name → model and the required-role set both come from the shared analytical
+    // `PkModel` tables (`from_name` / `required_pk_params`), so `ode_template`'s
+    // accepted names and required parameters can never drift from the analytical
+    // `pk NAME(...)` signature for the same model (Ron #363). The role names are
+    // the conventional keys (`cl`, `v1`, `ka`, …) carried alongside each slot.
+    let model = PkModel::from_name(model_name).ok_or_else(|| {
         format!(
             "Unknown ode_template model: {model_name}. Valid names are one_cpt_iv, \
              one_cpt_oral, two_cpt_iv, two_cpt_oral, three_cpt_iv, three_cpt_oral."
         )
     })?;
+    let name = model.canonical_name();
+    let required: Vec<&'static str> = model
+        .required_pk_params()
+        .iter()
+        .map(|(_, role)| *role)
+        .collect();
 
-    let required = required_roles(model);
-    for &role in required {
+    for &role in &required {
         if !params.contains_key(role) {
             return Err(format!(
-                "ode_template {model} requires `{role}`, which is not mapped. \
-                 Map it as `{role}=VARNAME` in ode_template {model}(...). \
+                "ode_template {name} requires `{role}`, which is not mapped. \
+                 Map it as `{role}=VARNAME` in ode_template {name}(...). \
                  Required parameters: {}.",
                 required.join(", ")
             ));
@@ -104,7 +88,7 @@ pub fn generate(
     if !extra.is_empty() {
         extra.sort_unstable();
         return Err(format!(
-            "ode_template {model}: unknown parameter(s) `{}`; valid names are {}.",
+            "ode_template {name}: unknown parameter(s) `{}`; valid names are {}.",
             extra.join(", "),
             required.join(", ")
         ));
@@ -116,7 +100,7 @@ pub fn generate(
     let dt = |state: &str, rhs: String| (state.to_string(), format!("d/dt({state}) = {rhs}"));
 
     let (states, obs_scale, odes): (Vec<&str>, &str, Vec<(String, String)>) = match model {
-        "one_cpt_iv" => {
+        PkModel::OneCptIv => {
             let (cl, v) = (g("cl"), g("v"));
             (
                 vec!["central"],
@@ -124,7 +108,7 @@ pub fn generate(
                 vec![dt("central", format!("-({cl}/{v}) * central"))],
             )
         }
-        "one_cpt_oral" => {
+        PkModel::OneCptOral => {
             let (cl, v, ka) = (g("cl"), g("v"), g("ka"));
             (
                 vec!["depot", "central"],
@@ -135,7 +119,7 @@ pub fn generate(
                 ],
             )
         }
-        "two_cpt_iv" => {
+        PkModel::TwoCptIv => {
             let (cl, v1, q, v2) = (g("cl"), g("v1"), g("q"), g("v2"));
             (
                 vec!["central", "periph"],
@@ -152,7 +136,7 @@ pub fn generate(
                 ],
             )
         }
-        "two_cpt_oral" => {
+        PkModel::TwoCptOral => {
             let (cl, v1, q, v2, ka) = (g("cl"), g("v1"), g("q"), g("v2"), g("ka"));
             (
                 vec!["depot", "central", "periph"],
@@ -172,7 +156,7 @@ pub fn generate(
                 ],
             )
         }
-        "three_cpt_iv" => {
+        PkModel::ThreeCptIv => {
             let (cl, v1, q2, v2, q3, v3) = (g("cl"), g("v1"), g("q2"), g("v2"), g("q3"), g("v3"));
             (
                 vec!["central", "periph1", "periph2"],
@@ -196,7 +180,7 @@ pub fn generate(
                 ],
             )
         }
-        "three_cpt_oral" => {
+        PkModel::ThreeCptOral => {
             let (cl, v1, q2, v2, q3, v3, ka) = (
                 g("cl"),
                 g("v1"),
@@ -229,7 +213,6 @@ pub fn generate(
                 ],
             )
         }
-        _ => unreachable!("canonical() already gated the model name"),
     };
 
     Ok(GeneratedDisposition {
@@ -366,5 +349,46 @@ mod tests {
     fn unknown_model_errors() {
         let err = generate("four_cpt_oral", &map(&[("cl", "CL")])).unwrap_err();
         assert!(err.contains("Unknown ode_template model"), "got: {err}");
+    }
+
+    #[test]
+    fn required_roles_track_pkmodel_required_params() {
+        // The drift guard Ron asked for (#363): `generate` derives its required
+        // roles from `PkModel::required_pk_params` rather than a private copy, so it
+        // must require *exactly* that set for every model — accepting the full set,
+        // and rejecting the omission of any single required role by name. Add a 7th
+        // model or rename a role and this fails unless `generate` is updated too.
+        for model in [
+            PkModel::OneCptIv,
+            PkModel::OneCptOral,
+            PkModel::TwoCptIv,
+            PkModel::TwoCptOral,
+            PkModel::ThreeCptIv,
+            PkModel::ThreeCptOral,
+        ] {
+            let name = model.canonical_name();
+            let roles: Vec<&str> = model.required_pk_params().iter().map(|(_, r)| *r).collect();
+
+            // Exactly the required roles mapped → generates successfully, and the
+            // generated state count matches the model's compartment count.
+            let full: Vec<(&str, &str)> = roles.iter().map(|r| (*r, "X")).collect();
+            let g = generate(name, &map(&full))
+                .unwrap_or_else(|e| panic!("{name} should accept its required roles: {e}"));
+            assert_eq!(g.states.len(), g.odes.len(), "{name}: one ODE per state");
+
+            // Drop each required role in turn → a parse error naming that role.
+            for omit in &roles {
+                let partial: Vec<(&str, &str)> = roles
+                    .iter()
+                    .filter(|r| *r != omit)
+                    .map(|r| (*r, "X"))
+                    .collect();
+                let err = generate(name, &map(&partial)).unwrap_err();
+                assert!(
+                    err.contains(&format!("requires `{omit}`")),
+                    "{name}: omitting `{omit}` should error naming it, got: {err}"
+                );
+            }
+        }
     }
 }
