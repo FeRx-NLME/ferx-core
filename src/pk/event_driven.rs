@@ -2164,6 +2164,58 @@ mod tests {
     }
 
     #[test]
+    fn event_driven_oral_multi_dose_infusion_matches_superposition() {
+        // Review gap: only a single oral central infusion was covered. Two
+        // sequential infusions into an oral model's central compartment (cmt 2,
+        // depot bypass) must accumulate across intervals on the event-driven
+        // path exactly as the superposition reference does — exercising state
+        // carried forward between doses (and an infusion still ongoing at an
+        // observation), not just a single isolated forced response.
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 2, 25.0, false, 0.0),
+        ];
+        // 12.5 and 14.0 fall inside the second (t=12..16) infusion.
+        let obs_times = vec![0.5, 2.0, 4.0, 8.0, 12.5, 14.0, 16.0, 24.0];
+        let subj = make_subject(doses, obs_times.clone());
+
+        let cases: Vec<(&str, PkModel, PkParams)> = vec![
+            (
+                "1cpt-oral",
+                PkModel::OneCptOral,
+                pk_one_oral(5.0, 50.0, 1.2),
+            ),
+            (
+                "2cpt-oral",
+                PkModel::TwoCptOral,
+                pk_two_oral(5.0, 40.0, 3.0, 60.0, 1.2),
+            ),
+            (
+                "3cpt-oral",
+                PkModel::ThreeCptOral,
+                pk_three_oral(5.0, 40.0, 3.0, 60.0, 1.0, 120.0, 1.2),
+            ),
+        ];
+
+        for (label, model, pk) in cases {
+            let pk_dose = vec![pk; subj.doses.len()];
+            let pk_obs = vec![pk; obs_times.len()];
+            let preds = event_driven_predictions(model, &subj, &pk_dose, &pk_obs, &[]);
+            let expected: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk))
+                .collect();
+            for (j, (a, e)) in preds.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    *a > 0.0,
+                    "{label}: obs {j} should be >0 (infusion accumulation)"
+                );
+                assert_relative_eq!(*a, *e, epsilon = 1e-8, max_relative = 1e-7);
+            }
+        }
+    }
+
+    #[test]
     fn three_cpt_iv_bolus_matches_superposition() {
         let doses = vec![
             DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0),
