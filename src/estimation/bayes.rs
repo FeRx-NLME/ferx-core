@@ -110,131 +110,14 @@ pub fn inverse_wishart_draw(
 }
 
 // ---------------------------------------------------------------------------
-// Posterior summaries & convergence diagnostics
+// Posterior summaries
 // ---------------------------------------------------------------------------
+// The generic MCMC diagnostics (split-R̂, ESS, quantile) live in
+// `crate::stats::convergence` so any sampler can share them; only the
+// Bayes-specific `PosteriorSummary` assembly stays here.
 
+use crate::stats::convergence::{effective_sample_size, mean, quantile_sorted, split_rhat};
 use crate::types::PosteriorSummary;
-
-/// Type-7 (linear-interpolation) quantile of an already-sorted slice.
-/// `q ∈ [0, 1]`. Empty input returns NaN.
-pub fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
-    let n = sorted.len();
-    if n == 0 {
-        return f64::NAN;
-    }
-    if n == 1 {
-        return sorted[0];
-    }
-    let h = (n as f64 - 1.0) * q;
-    let lo = h.floor() as usize;
-    let hi = (lo + 1).min(n - 1);
-    let frac = h - lo as f64;
-    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
-}
-
-/// Split-R̂ (Gelman et al. / Vehtari et al. 2021) across `chains` of equal-ish
-/// length. Each chain is split in half, giving `2·M` sub-chains of length `n`;
-/// R̂ = √(v̂ar⁺ / W). Values near 1.0 indicate mixing; `> 1.01` flags
-/// non-convergence. Returns NaN if there are fewer than 2 usable sub-chains or
-/// `n < 2`.
-pub fn split_rhat(chains: &[Vec<f64>]) -> f64 {
-    // Split each chain in half (drop the middle element when odd).
-    let mut subs: Vec<&[f64]> = Vec::with_capacity(chains.len() * 2);
-    for c in chains {
-        let half = c.len() / 2;
-        if half < 2 {
-            continue;
-        }
-        subs.push(&c[..half]);
-        subs.push(&c[c.len() - half..]);
-    }
-    let m = subs.len();
-    if m < 2 {
-        return f64::NAN;
-    }
-    let n = subs[0].len();
-    let means: Vec<f64> = subs.iter().map(|s| mean(s)).collect();
-    let vars: Vec<f64> = subs.iter().map(|s| sample_var(s)).collect();
-    let grand = mean(&means);
-
-    // Between-chain variance B (per draw) and within-chain variance W.
-    let b = n as f64 / (m as f64 - 1.0) * means.iter().map(|mj| (mj - grand).powi(2)).sum::<f64>();
-    let w = vars.iter().sum::<f64>() / m as f64;
-    if w <= 0.0 {
-        return f64::NAN;
-    }
-    let var_plus = (n as f64 - 1.0) / n as f64 * w + b / n as f64;
-    (var_plus / w).sqrt()
-}
-
-/// Effective sample size via the combined multi-chain autocorrelation with
-/// Geyer's initial-positive / initial-monotone truncation (Vehtari et al.
-/// 2021, eq. 10–11). `chains` are equal-length. Returns the total draw count
-/// when the chains are essentially uncorrelated, less when autocorrelated.
-pub fn effective_sample_size(chains: &[Vec<f64>]) -> f64 {
-    let m = chains.len();
-    if m == 0 {
-        return 0.0;
-    }
-    let n = chains[0].len();
-    if n < 4 || chains.iter().any(|c| c.len() != n) {
-        return (m * n) as f64;
-    }
-    let means: Vec<f64> = chains.iter().map(|c| mean(c)).collect();
-    let vars: Vec<f64> = chains.iter().map(|c| sample_var(c)).collect();
-    let grand = mean(&means);
-    let w = vars.iter().sum::<f64>() / m as f64;
-
-    // With a single chain there is no between-chain term; the marginal variance
-    // estimate is just W. With ≥2 chains use the standard B/W combination.
-    let var_plus = if m == 1 {
-        w
-    } else {
-        let b =
-            n as f64 / (m as f64 - 1.0) * means.iter().map(|mj| (mj - grand).powi(2)).sum::<f64>();
-        (n as f64 - 1.0) / n as f64 * w + b / n as f64
-    };
-    if var_plus.is_nan() || var_plus <= 0.0 {
-        return (m * n) as f64;
-    }
-
-    // Combined autocorrelation at each lag: ρ_t = 1 − (W − mean_m acov_m(t)) / var⁺.
-    let max_lag = n - 1;
-    let mut rho = vec![0.0_f64; max_lag + 1];
-    for (t, rho_t) in rho.iter_mut().enumerate() {
-        let mean_acov: f64 = chains
-            .iter()
-            .zip(&means)
-            .map(|(c, &mu)| autocov(c, t, mu))
-            .sum::<f64>()
-            / m as f64;
-        *rho_t = 1.0 - (w - mean_acov) / var_plus;
-    }
-
-    // Geyer initial-positive sequence: sum paired autocorrelations Ρ_k =
-    // ρ_{2k} + ρ_{2k+1} while positive, enforcing a monotone non-increasing cap.
-    let mut tau = 1.0; // ρ_0 = 1 contributes once via the 1 + 2Σ form below.
-    let mut prev_pair = f64::INFINITY;
-    let mut k = 1;
-    while 2 * k < max_lag {
-        let mut pair = rho[2 * k] + rho[2 * k + 1];
-        if pair < 0.0 {
-            break;
-        }
-        // Initial-monotone: never let a pair exceed the previous one.
-        if pair > prev_pair {
-            pair = prev_pair;
-        }
-        prev_pair = pair;
-        tau += 2.0 * pair;
-        k += 1;
-    }
-    // ρ_1 is added once (the k=0 pair's ρ_1 half); include it explicitly.
-    tau += 2.0 * rho[1].max(0.0);
-
-    let ess = (m * n) as f64 / tau.max(1.0);
-    ess.min((m * n) as f64)
-}
 
 /// Build a [`PosteriorSummary`] for one parameter from its per-chain draws.
 pub fn summarize_param(name: &str, chains: &[Vec<f64>]) -> PosteriorSummary {
@@ -265,36 +148,6 @@ pub fn summarize_param(name: &str, chains: &[Vec<f64>]) -> PosteriorSummary {
             f64::NAN
         },
     }
-}
-
-fn mean(xs: &[f64]) -> f64 {
-    if xs.is_empty() {
-        return f64::NAN;
-    }
-    xs.iter().sum::<f64>() / xs.len() as f64
-}
-
-/// Sample variance with denominator `n − 1`.
-fn sample_var(xs: &[f64]) -> f64 {
-    let n = xs.len();
-    if n < 2 {
-        return 0.0;
-    }
-    let m = mean(xs);
-    xs.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (n as f64 - 1.0)
-}
-
-/// Biased (divide-by-N) lag-`t` autocovariance of `xs` about supplied mean `mu`.
-fn autocov(xs: &[f64], t: usize, mu: f64) -> f64 {
-    let n = xs.len();
-    if t >= n {
-        return 0.0;
-    }
-    let mut s = 0.0;
-    for i in 0..(n - t) {
-        s += (xs[i] - mu) * (xs[i + t] - mu);
-    }
-    s / n as f64
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +235,18 @@ pub fn run_bayes(
     } else {
         std::collections::HashSet::new()
     };
+    // The conjugate Gaussian θ move requires EVERY η to be a non-fixed log
+    // mu-reference. When only some are (partial mu-referencing), the conjugate
+    // move is disabled and those θ fall back to the random-walk block, which
+    // mixes poorly (the data pins θ at fixed η). Flag it so a high R̂ has an
+    // actionable cause rather than looking like a generic non-convergence.
+    let n_log_mu_ref = (0..n_eta)
+        .filter(|&j| match mu_pairs[j] {
+            Some(ti) => !init_params.theta_fixed.get(ti).copied().unwrap_or(false),
+            None => false,
+        })
+        .count();
+    let partial_mu_ref = n_log_mu_ref > 0 && !full_mu_ref;
 
     // ----- population RW coordinates (free θ not handled conjugately, then σ) -----
     let mut pop_coords: Vec<PopCoord> = Vec::new();
@@ -831,14 +696,21 @@ pub fn run_bayes(
         draws: None,
     };
 
-    let warnings = if max_rhat > 1.1 {
-        vec![format!(
+    let mut warnings = Vec::new();
+    if max_rhat > 1.1 {
+        warnings.push(format!(
             "Bayes: max split-R-hat = {max_rhat:.3} (> 1.1) — chains may not have converged; \
              increase bayes_warmup / bayes_iters."
-        )]
-    } else {
-        Vec::new()
-    };
+        ));
+    }
+    if partial_mu_ref {
+        warnings.push(
+            "Bayes: only some random effects are log mu-referenced — the conjugate θ Gibbs \
+             move is disabled and those θ are sampled by random walk, which mixes slowly. \
+             For best mixing, log mu-reference every η (P_i = θ·exp(η_i))."
+                .to_string(),
+        );
+    }
 
     Ok(OuterResult {
         params: mean_params,
@@ -1011,72 +883,6 @@ mod tests {
     }
 
     #[test]
-    fn test_quantile_sorted() {
-        let s = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        assert_eq!(quantile_sorted(&s, 0.0), 1.0);
-        assert_eq!(quantile_sorted(&s, 1.0), 5.0);
-        assert_eq!(quantile_sorted(&s, 0.5), 3.0);
-        assert!((quantile_sorted(&s, 0.25) - 2.0).abs() < 1e-12);
-        assert!(quantile_sorted(&[], 0.5).is_nan());
-    }
-
-    #[test]
-    fn test_split_rhat_mixed_is_near_one() {
-        let chains = iid_normal_chains(4, 1000, 100);
-        let rhat = split_rhat(&chains);
-        assert!(rhat < 1.02, "R-hat for iid chains should be ~1, got {rhat}");
-    }
-
-    #[test]
-    fn test_split_rhat_unmixed_is_large() {
-        // Two chains with very different means → poor mixing → large R-hat.
-        let mut chains = iid_normal_chains(2, 1000, 7);
-        for x in chains[0].iter_mut() {
-            *x += 10.0; // shift one chain far away
-        }
-        let rhat = split_rhat(&chains);
-        assert!(
-            rhat > 1.5,
-            "R-hat for separated chains should be large, got {rhat}"
-        );
-    }
-
-    #[test]
-    fn test_ess_iid_near_total() {
-        let m = 4;
-        let n = 1000;
-        let chains = iid_normal_chains(m, n, 314);
-        let ess = effective_sample_size(&chains);
-        let total = (m * n) as f64;
-        assert!(
-            ess > 0.6 * total && ess <= total,
-            "iid ESS should be near total {total}, got {ess}"
-        );
-    }
-
-    #[test]
-    fn test_ess_autocorrelated_is_reduced() {
-        // AR(1) with phi = 0.8 → strong positive autocorrelation → ESS ≪ N.
-        let mut rng = StdRng::seed_from_u64(55);
-        let phi = 0.8_f64;
-        let n = 4000;
-        let mut x = 0.0_f64;
-        let chain: Vec<f64> = (0..n)
-            .map(|_| {
-                let eps: f64 = rng.sample(StandardNormal);
-                x = phi * x + eps;
-                x
-            })
-            .collect();
-        let ess = effective_sample_size(&[chain]);
-        assert!(
-            ess < 0.4 * n as f64,
-            "AR(1) phi=0.8 ESS should be well below {n}, got {ess}"
-        );
-        assert!(ess > 1.0, "ESS should stay positive, got {ess}");
-    }
-
-    #[test]
     fn test_summarize_param_normal() {
         let chains = iid_normal_chains(4, 2000, 999);
         let s = summarize_param("X", &chains);
@@ -1087,6 +893,37 @@ mod tests {
         assert!((s.q025 + 1.96).abs() < 0.2, "q025 ~ -1.96, got {}", s.q025);
         assert!(s.rhat < 1.02);
         assert!(s.mcse > 0.0 && s.mcse < 0.1);
+    }
+
+    /// Partial mu-referencing (not every η has a non-fixed log mu-ref θ)
+    /// disables the conjugate θ move; the run must warn so a high R̂ has an
+    /// actionable cause. Fixing one of warfarin's three mu-ref θ (TVKA) makes
+    /// the all-η-mu-ref condition false while leaving the other two as live
+    /// log mu-refs — the partial case.
+    #[test]
+    fn run_bayes_warns_on_partial_mu_ref() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let mut params = model.default_params.clone();
+        params.theta_fixed[2] = true; // fix TVKA → its mu-ref pair is excluded
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 20;
+        opts.bayes_iters = 40;
+        opts.bayes_chains = 1;
+        opts.bayes_seed = Some(1);
+        opts.saem_n_mh_steps = 3;
+
+        let res = run_bayes(&model, &pop, &params, &opts).expect("bayes runs");
+        assert!(
+            res.warnings.iter().any(|w| w.contains("mu-referenced")),
+            "expected a partial-mu-ref warning, got: {:?}",
+            res.warnings
+        );
     }
 
     /// End-to-end smoke test: short Bayes run on the bundled warfarin model.
