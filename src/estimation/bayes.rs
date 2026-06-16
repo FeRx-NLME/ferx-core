@@ -19,11 +19,16 @@
 //!   - inverse-Wishart via the Bartlett decomposition of a Wishart draw, then
 //!     matrix inversion ([`inverse_wishart_draw`], [`wishart_draw`]).
 
-// TODO(ferx-core#380, Phase 2): remove once the sweep loop consumes these.
-#![allow(dead_code)]
-
-use nalgebra::{Cholesky, DMatrix};
-use rand::Rng;
+use crate::estimation::outer_optimizer::OuterResult;
+use crate::estimation::saem::mh_steps;
+use crate::pk::EventPkParams;
+use crate::stats::likelihood::individual_nll_into;
+use crate::types::{
+    BayesResult, CompiledModel, FitOptions, ModelParameters, OmegaMatrix, Population, SigmaVector,
+};
+use nalgebra::{Cholesky, DMatrix, DVector};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rand_distr::{ChiSquared, Distribution, Gamma, StandardNormal};
 
 /// Draw from an inverse-gamma distribution `InvGamma(shape, scale)` with the
@@ -37,6 +42,9 @@ use rand_distr::{ChiSquared, Distribution, Gamma, StandardNormal};
 /// Posterior use: for a Normal residual with `n` observations, scatter
 /// `SS = Σ (y−f)²`, and conjugate prior `InvGamma(a₀, b₀)`, the full conditional
 /// of the residual variance is `InvGamma(a₀ + n/2, b₀ + SS/2)`.
+// Not yet used by run_bayes (σ is currently drawn by the RW-MH population block);
+// retained for the conjugate-σ optimization (ferx-core#380, Phase 2b).
+#[allow(dead_code)]
 pub fn inverse_gamma_draw(shape: f64, scale: f64, rng: &mut impl Rng) -> f64 {
     debug_assert!(
         shape > 0.0 && scale > 0.0,
@@ -289,11 +297,479 @@ fn autocov(xs: &[f64], t: usize, mu: f64) -> f64 {
     s / n as f64
 }
 
+// ---------------------------------------------------------------------------
+// Gibbs-within-HMC sampler
+// ---------------------------------------------------------------------------
+
+/// Weakly-informative prior SD (on the unconstrained, log-where-positive scale)
+/// for the population θ / σ random-walk block. Broad ⇒ near-flat.
+const POP_PRIOR_SD: f64 = 10.0;
+/// Floor for variances / scales to keep logs and Cholesky factors finite.
+const TINY: f64 = 1e-12;
+
+/// One coordinate of the population random-walk block.
+#[derive(Clone, Copy)]
+enum PopCoord {
+    Theta { idx: usize, log: bool },
+    Sigma { idx: usize },
+}
+
+/// Full MCMC Bayesian estimation entry point (Path A: Gibbs-within-HMC).
+///
+/// First cut: **BSV-only** (no IOV / `omega_iov`). Per sweep, per chain:
+///   1. η block — `mh_steps` (block random-walk preconditioned by `chol(Ω)`),
+///      sampling `ηᵢ | θ, Ω, σ, y` for each subject;
+///   2. Ω block — conjugate inverse-Wishart draw from `S = Σ ηᵢηᵢᵀ`, with the
+///      structural `free_mask` / fixed entries re-imposed;
+///   3. (θ, σ) block — random-walk Metropolis in unconstrained space
+///      (log where the lower bound is ≥ 0), objective `Σᵢ individual_nll` with η
+///      and Ω held fixed (the η-prior term is then constant and cancels).
+///
+/// Returns an [`OuterResult`] whose point estimate is the posterior mean and
+/// whose [`OuterResult::bayes`] carries the posterior summaries + diagnostics.
+pub fn run_bayes(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> Result<OuterResult, String> {
+    if init_params.omega_iov.is_some() || !model.kappa_names.is_empty() {
+        return Err(
+            "Bayesian estimation (method = bayes) does not yet support IOV (kappa) models \
+             — BSV-only in this first cut (see ferx-core#380)"
+                .to_string(),
+        );
+    }
+
+    let n_subjects = population.subjects.len();
+    let n_eta = model.n_eta;
+    let n_theta = model.n_theta;
+    let n_sigma = init_params.sigma.values.len();
+    if n_eta == 0 {
+        return Err("Bayesian estimation requires at least one random effect (eta)".to_string());
+    }
+
+    let n_warmup = options.bayes_warmup;
+    let n_sample = options.bayes_iters;
+    let thin = options.bayes_thin.max(1);
+    let n_chains = options.bayes_chains.max(1);
+    let n_eta_mh = options.saem_n_mh_steps.max(1);
+    let master_seed = options.bayes_seed.unwrap_or(0x6E_61_6D_63_62_61_79_65); // "bayesnam"
+
+    // Mu-referenced (log) θ↔η pairs — used only for documentation/diagnostics
+    // here; the RW block moves all free θ regardless of mu-referencing.
+    // (Conjugate normal draws for mu-ref θ are a Phase-2b mixing optimization.)
+
+    // ----- population RW coordinates (free θ then free σ) -----
+    let mut pop_coords: Vec<PopCoord> = Vec::new();
+    for j in 0..n_theta {
+        if !init_params.theta_fixed.get(j).copied().unwrap_or(false) {
+            let log = init_params.theta_lower.get(j).copied().unwrap_or(0.0) >= 0.0;
+            pop_coords.push(PopCoord::Theta { idx: j, log });
+        }
+    }
+    for k in 0..n_sigma {
+        if !init_params.sigma_fixed.get(k).copied().unwrap_or(false) {
+            pop_coords.push(PopCoord::Sigma { idx: k });
+        }
+    }
+
+    // ----- recorded-parameter layout: θ (all), Ω free lower-tri, σ (all) -----
+    let mut omega_coords: Vec<(usize, usize)> = Vec::new();
+    for i in 0..n_eta {
+        for j in 0..=i {
+            if init_params.omega.free_mask[(i, j)] {
+                omega_coords.push((i, j));
+            }
+        }
+    }
+    let mut param_names: Vec<String> = Vec::new();
+    param_names.extend(init_params.theta_names.iter().cloned());
+    for &(i, j) in &omega_coords {
+        param_names.push(format!("OMEGA({},{})", i + 1, j + 1));
+    }
+    param_names.extend(init_params.sigma.names.iter().cloned());
+    let n_params = param_names.len();
+
+    // Prior scale Λ₀ and df ν₀ for the Ω inverse-Wishart full conditional.
+    let omega_all_fixed =
+        (0..n_eta).all(|i| init_params.omega_fixed.get(i).copied().unwrap_or(false));
+    let lambda0 = init_params.omega.matrix.clone();
+    let nu0 = n_eta as f64 + 2.0;
+
+    // Per-chain recorded draws: draws_by_chain[c][param] = Vec over retained sweeps.
+    let mut draws_by_chain: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_chains);
+    // Posterior-mean η accumulation (across all chains' retained draws).
+    let mut eta_sum: Vec<DVector<f64>> = (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
+    let mut eta_record_count: u64 = 0;
+
+    for chain in 0..n_chains {
+        let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
+        let mut scratch = EventPkParams::default();
+
+        // Chain state.
+        let mut theta = init_params.theta.clone();
+        let mut sigma = init_params.sigma.values.clone();
+        let mut omega_mat = init_params.omega.matrix.clone();
+        let mut omega_cur = OmegaMatrix::from_matrix(
+            omega_mat.clone(),
+            init_params.omega.eta_names.clone(),
+            init_params.omega.diagonal,
+        );
+        let mut etas: Vec<Vec<f64>> = vec![vec![0.0; n_eta]; n_subjects];
+
+        // Unconstrained population vector + its prior centre.
+        let pack = |theta: &[f64], sigma: &[f64]| -> Vec<f64> {
+            pop_coords
+                .iter()
+                .map(|c| match *c {
+                    PopCoord::Theta { idx, log } => {
+                        if log {
+                            theta[idx].max(TINY).ln()
+                        } else {
+                            theta[idx]
+                        }
+                    }
+                    PopCoord::Sigma { idx } => sigma[idx].max(TINY).ln(),
+                })
+                .collect()
+        };
+        let u0 = pack(&theta, &sigma);
+
+        let mut rw_scale = 0.1_f64;
+        let mut eta_scale = 0.6_f64;
+        let mut acc_pop = 0u64;
+        let mut prop_pop = 0u64;
+        let mut acc_eta = 0u64;
+        let mut prop_eta = 0u64;
+
+        let mut chain_draws: Vec<Vec<f64>> = vec![Vec::new(); n_params];
+
+        let total_sweeps = n_warmup + n_sample;
+        for sweep in 0..total_sweeps {
+            // (re)compute the per-subject NLL at the current (θ, Ω, σ, η).
+            let mut nll: Vec<f64> = (0..n_subjects)
+                .map(|i| {
+                    individual_nll_into(
+                        model,
+                        &population.subjects[i],
+                        &theta,
+                        &etas[i],
+                        &omega_cur,
+                        &sigma,
+                        &mut scratch,
+                    )
+                })
+                .collect();
+
+            // ---- 1. η block ----
+            for i in 0..n_subjects {
+                let (na, nll_new) = mh_steps(
+                    &mut etas[i],
+                    nll[i],
+                    &population.subjects[i],
+                    model,
+                    &theta,
+                    &omega_cur,
+                    &sigma,
+                    eta_scale,
+                    &mut rng,
+                    n_eta_mh,
+                    &mut scratch,
+                    None,
+                );
+                nll[i] = nll_new;
+                acc_eta += na as u64;
+                prop_eta += n_eta_mh as u64;
+            }
+
+            // ---- 2. Ω block (conjugate inverse-Wishart) ----
+            if !omega_all_fixed {
+                let mut s = DMatrix::<f64>::zeros(n_eta, n_eta);
+                for e in &etas {
+                    let ev = DVector::from_column_slice(e);
+                    s += &ev * ev.transpose();
+                }
+                let psi_post = &lambda0 + s;
+                if let Some(draw) =
+                    inverse_wishart_draw(nu0 + n_subjects as f64, &psi_post, &mut rng)
+                {
+                    let mut m = draw;
+                    // Re-impose structural zeros and fixed rows/cols, then floor.
+                    for i in 0..n_eta {
+                        for j in 0..n_eta {
+                            if !init_params.omega.free_mask[(i, j)] {
+                                m[(i, j)] = 0.0;
+                            }
+                            let fi = init_params.omega_fixed.get(i).copied().unwrap_or(false);
+                            let fj = init_params.omega_fixed.get(j).copied().unwrap_or(false);
+                            if fi || fj {
+                                m[(i, j)] = init_params.omega.matrix[(i, j)];
+                            }
+                        }
+                    }
+                    for i in 0..n_eta {
+                        if m[(i, i)] < TINY {
+                            m[(i, i)] = TINY;
+                        }
+                    }
+                    omega_mat = m;
+                    omega_cur = OmegaMatrix::from_matrix(
+                        omega_mat.clone(),
+                        init_params.omega.eta_names.clone(),
+                        init_params.omega.diagonal,
+                    );
+                    // η-block NLLs are now stale w.r.t. Ω; they are recomputed at
+                    // the top of the next sweep, and the (θ,σ) block below
+                    // recomputes its own proposal NLLs, so no refresh needed here.
+                }
+            }
+
+            // ---- 3. (θ, σ) block (random-walk Metropolis) ----
+            if !pop_coords.is_empty() {
+                let u_cur = pack(&theta, &sigma);
+                let u_prop: Vec<f64> = u_cur
+                    .iter()
+                    .map(|&u| u + rw_scale * rng.sample::<f64, _>(StandardNormal))
+                    .collect();
+                let mut theta_prop = theta.clone();
+                let mut sigma_prop = sigma.clone();
+                for (c, &up) in pop_coords.iter().zip(&u_prop) {
+                    match *c {
+                        PopCoord::Theta { idx, log } => {
+                            theta_prop[idx] = if log { up.exp() } else { up };
+                        }
+                        PopCoord::Sigma { idx } => {
+                            sigma_prop[idx] = up.exp();
+                        }
+                    }
+                }
+                // Proposal population NLL (η, Ω fixed ⇒ η-prior term cancels).
+                let nll_prop: Vec<f64> = (0..n_subjects)
+                    .map(|i| {
+                        individual_nll_into(
+                            model,
+                            &population.subjects[i],
+                            &theta_prop,
+                            &etas[i],
+                            &omega_cur,
+                            &sigma_prop,
+                            &mut scratch,
+                        )
+                    })
+                    .collect();
+                let sum_cur: f64 = nll.iter().sum();
+                let sum_prop: f64 = nll_prop.iter().sum();
+                let nlp_cur = neg_log_prior(&u_cur, &u0);
+                let nlp_prop = neg_log_prior(&u_prop, &u0);
+                let log_alpha = (sum_cur + nlp_cur) - (sum_prop + nlp_prop);
+                prop_pop += 1;
+                if rng.gen::<f64>().ln() < log_alpha {
+                    theta = theta_prop;
+                    sigma = sigma_prop;
+                    nll = nll_prop;
+                    acc_pop += 1;
+                }
+            }
+
+            // ---- warmup adaptation of the two step sizes ----
+            if sweep < n_warmup && (sweep + 1) % 50 == 0 {
+                if prop_pop > 0 {
+                    let r = acc_pop as f64 / prop_pop as f64;
+                    rw_scale *= ((r - 0.234) * 1.0).exp();
+                    rw_scale = rw_scale.clamp(1e-4, 100.0);
+                }
+                if prop_eta > 0 {
+                    let r = acc_eta as f64 / prop_eta as f64;
+                    eta_scale *= ((r - 0.234) * 1.0).exp();
+                    eta_scale = eta_scale.clamp(1e-4, 100.0);
+                }
+                acc_pop = 0;
+                prop_pop = 0;
+                acc_eta = 0;
+                prop_eta = 0;
+            }
+
+            // ---- record retained draws ----
+            if sweep >= n_warmup && (sweep - n_warmup) % thin == 0 {
+                let mut p = 0;
+                for &t in &theta {
+                    chain_draws[p].push(t);
+                    p += 1;
+                }
+                for &(i, j) in &omega_coords {
+                    chain_draws[p].push(omega_mat[(i, j)]);
+                    p += 1;
+                }
+                for &s in &sigma {
+                    chain_draws[p].push(s);
+                    p += 1;
+                }
+                for i in 0..n_subjects {
+                    eta_sum[i] += DVector::from_column_slice(&etas[i]);
+                }
+                eta_record_count += 1;
+            }
+        }
+
+        draws_by_chain.push(chain_draws);
+    }
+
+    // ----- summaries -----
+    let summaries: Vec<PosteriorSummary> = (0..n_params)
+        .map(|p| {
+            let chains: Vec<Vec<f64>> = draws_by_chain.iter().map(|c| c[p].clone()).collect();
+            summarize_param(&param_names[p], &chains)
+        })
+        .collect();
+    let max_rhat = summaries
+        .iter()
+        .map(|s| s.rhat)
+        .filter(|r| r.is_finite())
+        .fold(0.0_f64, f64::max);
+    let n_draws_per_chain = draws_by_chain.first().map(|c| c[0].len()).unwrap_or(0);
+
+    // ----- posterior-mean point estimate -----
+    let mean_of = |name_pred: &dyn Fn(usize) -> bool| -> Vec<f64> {
+        (0..n_params)
+            .filter(|&p| name_pred(p))
+            .map(|p| {
+                let all: Vec<f64> = draws_by_chain
+                    .iter()
+                    .flat_map(|c| c[p].iter().copied())
+                    .collect();
+                all.iter().sum::<f64>() / all.len().max(1) as f64
+            })
+            .collect()
+    };
+    let theta_mean = mean_of(&|p| p < n_theta);
+    let omega_entries_mean = mean_of(&|p| p >= n_theta && p < n_theta + omega_coords.len());
+    let sigma_mean = mean_of(&|p| p >= n_theta + omega_coords.len());
+
+    let mut omega_mean_mat = init_params.omega.matrix.clone();
+    for (slot, &(i, j)) in omega_coords.iter().enumerate() {
+        omega_mean_mat[(i, j)] = omega_entries_mean[slot];
+        omega_mean_mat[(j, i)] = omega_entries_mean[slot];
+    }
+    let omega_mean = OmegaMatrix::from_matrix(
+        omega_mean_mat,
+        init_params.omega.eta_names.clone(),
+        init_params.omega.diagonal,
+    );
+
+    let mean_params = ModelParameters {
+        theta: theta_mean.clone(),
+        theta_names: init_params.theta_names.clone(),
+        theta_lower: init_params.theta_lower.clone(),
+        theta_upper: init_params.theta_upper.clone(),
+        theta_fixed: init_params.theta_fixed.clone(),
+        omega: omega_mean.clone(),
+        omega_fixed: init_params.omega_fixed.clone(),
+        sigma: SigmaVector {
+            values: sigma_mean.clone(),
+            names: init_params.sigma.names.clone(),
+        },
+        sigma_fixed: init_params.sigma_fixed.clone(),
+        omega_iov: None,
+        kappa_fixed: init_params.kappa_fixed.clone(),
+    };
+
+    // Final EBEs + sensitivity (H) matrices at the posterior mean, warm-started
+    // from the posterior-mean η. Mirrors the SAEM post-loop pass; gives the
+    // correctly-shaped (n_obs × n_eta) H matrices that CWRES/shrinkage need and
+    // keeps the reported EBEs consistent with the point-estimate params.
+    let warm_etas: Vec<DVector<f64>> = (0..n_subjects)
+        .map(|i| {
+            if eta_record_count > 0 {
+                &eta_sum[i] / eta_record_count as f64
+            } else {
+                DVector::zeros(n_eta)
+            }
+        })
+        .collect();
+    let (eta_hats, h_matrices, _inner_stats, kappas) =
+        crate::estimation::inner_optimizer::run_inner_loop_warm(
+            model,
+            population,
+            &mean_params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(&warm_etas),
+            None,
+            0,
+        );
+
+    // OFV at the posterior mean (2·Σ individual_nll). NOTE: this is the
+    // posterior-mean joint NLL ×2, NOT a FOCE/Laplace marginal OFV — it is
+    // reported for a rough AIC-style comparison only.
+    let mut scratch = EventPkParams::default();
+    let ofv = 2.0
+        * (0..n_subjects)
+            .map(|i| {
+                individual_nll_into(
+                    model,
+                    &population.subjects[i],
+                    &theta_mean,
+                    eta_hats[i].as_slice(),
+                    &omega_mean,
+                    &sigma_mean,
+                    &mut scratch,
+                )
+            })
+            .sum::<f64>();
+
+    let bayes = BayesResult {
+        summaries,
+        n_chains,
+        n_warmup,
+        n_draws_per_chain,
+        n_divergent: 0, // MH eta block has no divergence concept; HMC count TBD
+        max_rhat,
+        draws: None,
+    };
+
+    let warnings = if max_rhat > 1.1 {
+        vec![format!(
+            "Bayes: max split-R-hat = {max_rhat:.3} (> 1.1) — chains may not have converged; \
+             increase bayes_warmup / bayes_iters."
+        )]
+    } else {
+        Vec::new()
+    };
+
+    Ok(OuterResult {
+        params: mean_params,
+        ofv,
+        converged: max_rhat.is_finite() && max_rhat < 1.1,
+        n_iterations: n_warmup + n_sample,
+        eta_hats,
+        h_matrices,
+        kappas,
+        covariance_matrix: None,
+        warnings,
+        saem_mu_ref_m_step_evals_saved: None,
+        saem_n_subjects_hmc: None,
+        ebe_convergence_warnings: 0,
+        max_unconverged_subjects: 0,
+        total_ebe_fallbacks: 0,
+        final_gradient: None,
+        sir_fallback_proposal: None,
+        bayes: Some(bayes),
+    })
+}
+
+/// Negative log of the (unnormalized) Gaussian population prior on the
+/// unconstrained vector `u`, centred at `u0` with SD [`POP_PRIOR_SD`].
+fn neg_log_prior(u: &[f64], u0: &[f64]) -> f64 {
+    u.iter()
+        .zip(u0)
+        .map(|(&x, &m)| 0.5 * ((x - m) / POP_PRIOR_SD).powi(2))
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::StdRng;
-    use rand::SeedableRng;
 
     /// InvGamma(a, b) has mean b/(a−1). Check the sample mean converges.
     #[test]
@@ -508,5 +984,98 @@ mod tests {
         assert!((s.q025 + 1.96).abs() < 0.2, "q025 ~ -1.96, got {}", s.q025);
         assert!(s.rhat < 1.02);
         assert!(s.mcse > 0.0 && s.mcse < 0.1);
+    }
+
+    /// End-to-end smoke test: short Bayes run on the bundled warfarin model.
+    /// Asserts the sampler produces finite, well-ordered posterior summaries
+    /// and a populated BayesResult. Short chains ⇒ no convergence assertion
+    /// beyond finiteness.
+    #[test]
+    fn run_bayes_warfarin_smoke() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let params = model.default_params.clone();
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 40;
+        opts.bayes_iters = 80;
+        opts.bayes_chains = 2;
+        opts.bayes_seed = Some(1);
+        opts.saem_n_mh_steps = 4; // keep the eta block cheap for a smoke test
+
+        let res = run_bayes(&model, &pop, &params, &opts).expect("bayes runs");
+        let bayes = res.bayes.as_ref().expect("BayesResult present");
+
+        assert_eq!(bayes.n_chains, 2);
+        assert_eq!(bayes.n_warmup, 40);
+        assert!(bayes.n_draws_per_chain >= 1);
+        assert!(!bayes.summaries.is_empty(), "expected posterior summaries");
+        for s in &bayes.summaries {
+            assert!(s.mean.is_finite(), "{}: mean not finite", s.name);
+            assert!(s.sd.is_finite() && s.sd >= 0.0, "{}: bad sd", s.name);
+            assert!(
+                s.q025 <= s.median && s.median <= s.q975,
+                "{}: quantiles out of order",
+                s.name
+            );
+            assert!(s.rhat.is_finite(), "{}: R-hat not finite", s.name);
+        }
+        assert!(res.ofv.is_finite(), "OFV not finite");
+        assert!(bayes.max_rhat.is_finite());
+        assert_eq!(res.eta_hats.len(), pop.subjects.len());
+    }
+
+    /// IOV models are not supported in the first cut — must error clearly
+    /// rather than silently mis-sample.
+    #[test]
+    fn run_bayes_rejects_iov() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let mut params = model.default_params.clone();
+        // Fake an IOV omega to trip the guard.
+        params.omega_iov = Some(params.omega.clone());
+        let opts = FitOptions::default();
+        let err = run_bayes(&model, &pop, &params, &opts)
+            .err()
+            .expect("IOV model should be rejected");
+        assert!(err.contains("IOV"), "expected IOV rejection, got: {err}");
+    }
+
+    /// Full dispatch path: `fit` with `method = bayes` must route to run_bayes
+    /// and surface the posterior on `FitResult.bayes`.
+    #[test]
+    fn fit_dispatch_bayes_populates_fitresult() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+
+        let mut opts = FitOptions::default();
+        opts.method = crate::types::EstimationMethod::Bayes;
+        opts.run_covariance_step = false;
+        opts.bayes_warmup = 20;
+        opts.bayes_iters = 40;
+        opts.bayes_chains = 2;
+        opts.bayes_seed = Some(2);
+        opts.saem_n_mh_steps = 3;
+
+        let fitres = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+        assert_eq!(fitres.method, crate::types::EstimationMethod::Bayes);
+        let b = fitres
+            .bayes
+            .as_ref()
+            .expect("FitResult.bayes set by dispatch");
+        assert!(!b.summaries.is_empty());
+        assert!(b.max_rhat.is_finite());
     }
 }

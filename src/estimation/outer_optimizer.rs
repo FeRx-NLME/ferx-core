@@ -39,6 +39,11 @@ pub struct OuterResult {
     /// Hessian, inflated 4×, and embedded into the full packed parameter space.
     /// `None` when the Hessian succeeded or the covariance step was skipped.
     pub sir_fallback_proposal: Option<DMatrix<f64>>,
+    /// Posterior summaries + diagnostics from a Bayesian (`method=bayes`) run.
+    /// `Some` only for `EstimationMethod::Bayes`; `None` for all point
+    /// estimators. Carried here so the chain dispatch can lift it onto
+    /// `FitResult.bayes` through the generic OuterResult → FitResult path.
+    pub bayes: Option<crate::types::BayesResult>,
 }
 
 /// Run the outer optimization loop (population parameter estimation).
@@ -1329,6 +1334,7 @@ fn optimize_nlopt(
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
         final_gradient,
         sir_fallback_proposal,
+        bayes: None,
     }
 }
 
@@ -1667,6 +1673,7 @@ fn optimize_bfgs(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        bayes: None,
     }
 }
 

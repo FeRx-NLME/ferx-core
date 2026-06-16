@@ -420,6 +420,7 @@ pub fn run_foce_gn(
             total_ebe_fallbacks: 0,
             final_gradient,
             sir_fallback_proposal,
+            bayes: None,
         };
     }
 
@@ -534,6 +535,7 @@ pub fn run_foce_gn(
         total_ebe_fallbacks: 0,
         final_gradient,
         sir_fallback_proposal,
+        bayes: None,
     }
 }
 

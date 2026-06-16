@@ -2086,6 +2086,7 @@ pub fn run_saem(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        bayes: None,
     })
 }
 
