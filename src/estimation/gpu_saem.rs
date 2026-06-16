@@ -294,6 +294,7 @@ fn gpu_unavailable_reason(model: &CompiledModel) -> String {
 mod kernel {
     use super::{FlatBatch, MhBatch, GPU_MH_MAX_ETA};
     use cubecl::prelude::*;
+    use cubecl::server::Handle;
     use cubecl::wgpu::WgpuRuntime;
     use std::sync::OnceLock;
 
@@ -629,81 +630,135 @@ mod kernel {
         }
     }
 
-    /// Run one MH sweep on the GPU. Returns `(updated etas flattened, accept
-    /// counts, final nll)` or `None` if no device is available.
-    pub(super) fn run_mh_sweep(
-        batch: &MhBatch,
-        scales: &[f32],
-        n_steps: usize,
-        seed: u64,
-    ) -> Option<(Vec<f32>, Vec<u32>, Vec<f32>)> {
-        let client = client()?;
-        let n = batch.n_subjects;
-        if n == 0 {
-            return Some((Vec::new(), Vec::new(), Vec::new()));
-        }
-        let eta_io = client.create_from_slice(f32::as_bytes(&batch.eta));
-        let cl0 = client.create_from_slice(f32::as_bytes(&batch.cl0));
-        let v0 = client.create_from_slice(f32::as_bytes(&batch.v0));
-        let a_cl = client.create_from_slice(f32::as_bytes(&batch.a_cl));
-        let a_v = client.create_from_slice(f32::as_bytes(&batch.a_v));
-        let omega_diag = client.create_from_slice(f32::as_bytes(&batch.omega_diag));
-        let step_scale = client.create_from_slice(f32::as_bytes(scales));
-        let dose_off = client.create_from_slice(u32::as_bytes(&batch.dose_off));
-        let dose_cnt = client.create_from_slice(u32::as_bytes(&batch.dose_cnt));
-        let dose_amt = client.create_from_slice(u32_pad_f32(&batch.dose_amt));
-        let dose_t = client.create_from_slice(u32_pad_f32(&batch.dose_t));
-        let obs_off = client.create_from_slice(u32::as_bytes(&batch.obs_off));
-        let obs_cnt = client.create_from_slice(u32::as_bytes(&batch.obs_cnt));
-        let obs_y = client.create_from_slice(u32_pad_f32(&batch.obs_y));
-        let obs_t = client.create_from_slice(u32_pad_f32(&batch.obs_t));
-        let fparams = client.create_from_slice(f32::as_bytes(&batch.fparams));
-        let iparams_vec = [batch.n_eta as u32, n_steps as u32, seed as u32];
-        let iparams = client.create_from_slice(u32::as_bytes(&iparams_vec));
-        let accept = client.empty(n * core::mem::size_of::<u32>());
-        let nll = client.empty(n * core::mem::size_of::<f32>());
+    /// A persistent MH-sweep session: the per-subject **static** buffers
+    /// (dose/observation arrays) are uploaded once and live on the device for
+    /// the whole SAEM run; only the per-iteration **dynamic** data (etas,
+    /// intercepts, Ω diagonal, step scales, sigmas, seed) is uploaded each
+    /// sweep. This removes the per-iteration re-upload of the largest arrays.
+    pub(super) struct Session {
+        n: usize,
+        dose_off: Handle,
+        dose_cnt: Handle,
+        dose_amt: Handle,
+        dose_t: Handle,
+        obs_off: Handle,
+        obs_cnt: Handle,
+        obs_y: Handle,
+        obs_t: Handle,
+        l_dose_off: usize,
+        l_dose_cnt: usize,
+        l_dose_amt: usize,
+        l_dose_t: usize,
+        l_obs_off: usize,
+        l_obs_cnt: usize,
+        l_obs_y: usize,
+        l_obs_t: usize,
+    }
 
-        let threads = 64u32;
-        let blocks = ((n as u32) + threads - 1) / threads;
-        unsafe {
-            mh_sweep_kernel::launch_unchecked::<R>(
-                client,
-                CubeCount::Static(blocks, 1, 1),
-                CubeDim::new_1d(threads),
-                ArrayArg::from_raw_parts(eta_io.clone(), batch.eta.len()),
-                ArrayArg::from_raw_parts(cl0, batch.cl0.len()),
-                ArrayArg::from_raw_parts(v0, batch.v0.len()),
-                ArrayArg::from_raw_parts(a_cl, batch.a_cl.len()),
-                ArrayArg::from_raw_parts(a_v, batch.a_v.len()),
-                ArrayArg::from_raw_parts(omega_diag, batch.omega_diag.len()),
-                ArrayArg::from_raw_parts(step_scale, scales.len()),
-                ArrayArg::from_raw_parts(dose_off, batch.dose_off.len()),
-                ArrayArg::from_raw_parts(dose_cnt, batch.dose_cnt.len()),
-                ArrayArg::from_raw_parts(dose_amt, batch.dose_amt.len().max(1)),
-                ArrayArg::from_raw_parts(dose_t, batch.dose_t.len().max(1)),
-                ArrayArg::from_raw_parts(obs_off, batch.obs_off.len()),
-                ArrayArg::from_raw_parts(obs_cnt, batch.obs_cnt.len()),
-                ArrayArg::from_raw_parts(obs_y, batch.obs_y.len().max(1)),
-                ArrayArg::from_raw_parts(obs_t, batch.obs_t.len().max(1)),
-                ArrayArg::from_raw_parts(fparams, batch.fparams.len()),
-                ArrayArg::from_raw_parts(iparams, iparams_vec.len()),
-                ArrayArg::from_raw_parts(accept.clone(), n),
-                ArrayArg::from_raw_parts(nll.clone(), n),
-            );
+    impl Session {
+        /// Upload the static (dose/obs) buffers once. `None` if no device.
+        pub(super) fn new(batch: &MhBatch) -> Option<Session> {
+            let client = client()?;
+            Some(Session {
+                n: batch.n_subjects,
+                dose_off: client.create_from_slice(u32::as_bytes(&batch.dose_off)),
+                dose_cnt: client.create_from_slice(u32::as_bytes(&batch.dose_cnt)),
+                dose_amt: client.create_from_slice(u32_pad_f32(&batch.dose_amt)),
+                dose_t: client.create_from_slice(u32_pad_f32(&batch.dose_t)),
+                obs_off: client.create_from_slice(u32::as_bytes(&batch.obs_off)),
+                obs_cnt: client.create_from_slice(u32::as_bytes(&batch.obs_cnt)),
+                obs_y: client.create_from_slice(u32_pad_f32(&batch.obs_y)),
+                obs_t: client.create_from_slice(u32_pad_f32(&batch.obs_t)),
+                l_dose_off: batch.dose_off.len(),
+                l_dose_cnt: batch.dose_cnt.len(),
+                l_dose_amt: batch.dose_amt.len().max(1),
+                l_dose_t: batch.dose_t.len().max(1),
+                l_obs_off: batch.obs_off.len(),
+                l_obs_cnt: batch.obs_cnt.len(),
+                l_obs_y: batch.obs_y.len().max(1),
+                l_obs_t: batch.obs_t.len().max(1),
+            })
         }
-        let eta_bytes = client.read_one(eta_io).ok()?;
-        let accept_bytes = client.read_one(accept).ok()?;
-        let nll_bytes = client.read_one(nll).ok()?;
-        Some((
-            f32::from_bytes(&eta_bytes).to_vec(),
-            u32::from_bytes(&accept_bytes).to_vec(),
-            f32::from_bytes(&nll_bytes).to_vec(),
-        ))
+
+        /// Run one MH sweep, reusing the resident static buffers and uploading
+        /// only the dynamic arrays. Returns `(etas flat, accepts, final nll)`.
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn sweep(
+            &self,
+            eta: &[f32],
+            cl0: &[f32],
+            v0: &[f32],
+            a_cl: &[f32],
+            a_v: &[f32],
+            omega_diag: &[f32],
+            scales: &[f32],
+            fparams: &[f32],
+            n_eta: usize,
+            n_steps: usize,
+            seed: u32,
+        ) -> Option<(Vec<f32>, Vec<u32>, Vec<f32>)> {
+            let client = client()?;
+            let n = self.n;
+            if n == 0 {
+                return Some((Vec::new(), Vec::new(), Vec::new()));
+            }
+            let eta_io = client.create_from_slice(f32::as_bytes(eta));
+            let cl0_h = client.create_from_slice(f32::as_bytes(cl0));
+            let v0_h = client.create_from_slice(f32::as_bytes(v0));
+            let a_cl_h = client.create_from_slice(f32::as_bytes(a_cl));
+            let a_v_h = client.create_from_slice(f32::as_bytes(a_v));
+            let omega_h = client.create_from_slice(f32::as_bytes(omega_diag));
+            let scale_h = client.create_from_slice(f32::as_bytes(scales));
+            let fparams_h = client.create_from_slice(f32::as_bytes(fparams));
+            let iparams_vec = [n_eta as u32, n_steps as u32, seed];
+            let iparams = client.create_from_slice(u32::as_bytes(&iparams_vec));
+            let accept = client.empty(n * core::mem::size_of::<u32>());
+            let nll = client.empty(n * core::mem::size_of::<f32>());
+
+            let threads = 64u32;
+            let blocks = ((n as u32) + threads - 1) / threads;
+            unsafe {
+                mh_sweep_kernel::launch_unchecked::<R>(
+                    client,
+                    CubeCount::Static(blocks, 1, 1),
+                    CubeDim::new_1d(threads),
+                    ArrayArg::from_raw_parts(eta_io.clone(), eta.len()),
+                    ArrayArg::from_raw_parts(cl0_h, cl0.len()),
+                    ArrayArg::from_raw_parts(v0_h, v0.len()),
+                    ArrayArg::from_raw_parts(a_cl_h, a_cl.len()),
+                    ArrayArg::from_raw_parts(a_v_h, a_v.len()),
+                    ArrayArg::from_raw_parts(omega_h, omega_diag.len()),
+                    ArrayArg::from_raw_parts(scale_h, scales.len()),
+                    ArrayArg::from_raw_parts(self.dose_off.clone(), self.l_dose_off),
+                    ArrayArg::from_raw_parts(self.dose_cnt.clone(), self.l_dose_cnt),
+                    ArrayArg::from_raw_parts(self.dose_amt.clone(), self.l_dose_amt),
+                    ArrayArg::from_raw_parts(self.dose_t.clone(), self.l_dose_t),
+                    ArrayArg::from_raw_parts(self.obs_off.clone(), self.l_obs_off),
+                    ArrayArg::from_raw_parts(self.obs_cnt.clone(), self.l_obs_cnt),
+                    ArrayArg::from_raw_parts(self.obs_y.clone(), self.l_obs_y),
+                    ArrayArg::from_raw_parts(self.obs_t.clone(), self.l_obs_t),
+                    ArrayArg::from_raw_parts(fparams_h, fparams.len()),
+                    ArrayArg::from_raw_parts(iparams, iparams_vec.len()),
+                    ArrayArg::from_raw_parts(accept.clone(), n),
+                    ArrayArg::from_raw_parts(nll.clone(), n),
+                );
+            }
+            // Single batched read = one device sync per sweep, not three.
+            let mut out = client.read(vec![eta_io, accept, nll]);
+            let nll_bytes = out.pop()?;
+            let accept_bytes = out.pop()?;
+            let eta_bytes = out.pop()?;
+            Some((
+                f32::from_bytes(&eta_bytes).to_vec(),
+                u32::from_bytes(&accept_bytes).to_vec(),
+                f32::from_bytes(&nll_bytes).to_vec(),
+            ))
+        }
     }
 }
 
 #[cfg(feature = "gpu")]
-use kernel::{gpu_data_ll, run_mh_sweep};
+use kernel::gpu_data_ll;
 
 #[cfg(not(feature = "gpu"))]
 fn gpu_data_ll(_batch: &FlatBatch) -> Option<Vec<f32>> {
@@ -757,6 +812,7 @@ fn extract_loglinear(
     theta: &[f64],
     n_eta: usize,
     etas: &[Vec<f64>],
+    verify: bool,
 ) -> Option<LogLinear> {
     let zero = vec![0.0_f64; n_eta];
     let cov0 = &population.subjects[0].covariates;
@@ -796,14 +852,18 @@ fn extract_loglinear(
         // Verify log-linearity for this subject at a non-trivial η and at its
         // current η: the reconstruction must match the real closure. This
         // catches non-log-normal transforms and covariate×η interactions.
-        for probe in [vec![0.3_f64; n_eta], etas[i].clone()] {
-            let actual = (model.pk_param_fn)(theta, &probe, cov);
-            let pred_cl = cl0_i * dot(&a_cl, &probe).exp();
-            let pred_v = v0_i * dot(&a_v, &probe).exp();
-            if rel_err(pred_cl, actual.values[PK_IDX_CL]) > 1e-4
-                || rel_err(pred_v, actual.values[PK_IDX_V]) > 1e-4
-            {
-                return None;
+        // Done once at session setup (`verify = true`); per-iteration sweeps
+        // reuse the verified structure and only recompute the intercepts.
+        if verify {
+            for probe in [vec![0.3_f64; n_eta], etas[i].clone()] {
+                let actual = (model.pk_param_fn)(theta, &probe, cov);
+                let pred_cl = cl0_i * dot(&a_cl, &probe).exp();
+                let pred_v = v0_i * dot(&a_v, &probe).exp();
+                if rel_err(pred_cl, actual.values[PK_IDX_CL]) > 1e-4
+                    || rel_err(pred_v, actual.values[PK_IDX_V]) > 1e-4
+                {
+                    return None;
+                }
             }
         }
         cl0.push(cl0_i as f32);
@@ -818,17 +878,13 @@ fn extract_loglinear(
     })
 }
 
-/// Flattened batch for the MH-sweep kernel.
+/// Static (per-run) layout for the MH-sweep kernel: the dose/observation
+/// arrays that do not change across SAEM iterations. The dynamic per-iteration
+/// data (etas, intercepts, Ω diagonal, sigmas) is supplied to each sweep.
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 struct MhBatch {
     n_subjects: usize,
     n_eta: usize,
-    eta: Vec<f32>,
-    cl0: Vec<f32>,
-    v0: Vec<f32>,
-    a_cl: Vec<f32>,
-    a_v: Vec<f32>,
-    omega_diag: Vec<f32>,
     dose_off: Vec<u32>,
     dose_cnt: Vec<u32>,
     dose_amt: Vec<f32>,
@@ -837,18 +893,18 @@ struct MhBatch {
     obs_cnt: Vec<u32>,
     obs_y: Vec<f32>,
     obs_t: Vec<f32>,
-    fparams: [f32; 3],
 }
 
-/// Build the MH batch, or `None` when the model/population/Ω are outside the
-/// GPU MH-supported subset (diagonal Ω, ≤ `GPU_MH_MAX_ETA` etas, log-linear in
-/// η, plus the same structural gates as [`flatten`]).
+/// Build the static MH batch (and run the gating + log-linear verification), or
+/// `None` when the model/population/Ω are outside the GPU MH-supported subset
+/// (diagonal Ω, ≤ `GPU_MH_MAX_ETA` etas, log-linear in η, plus the same
+/// structural gates as [`flatten`]).
 fn build_mh_batch(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
     etas: &[Vec<f64>],
-    sigma: &[f64],
+    _sigma: &[f64],
     omega: &OmegaMatrix,
 ) -> Option<MhBatch> {
     if !gpu_model_supported(model) || !omega.diagonal || population.subjects.is_empty() {
@@ -858,25 +914,19 @@ fn build_mh_batch(
     if n_eta == 0 || n_eta > GPU_MH_MAX_ETA || etas.iter().any(|e| e.len() != n_eta) {
         return None;
     }
-    let mut omega_diag = Vec::with_capacity(n_eta);
     for j in 0..n_eta {
-        let d = omega.matrix[(j, j)];
-        if !(d > 0.0) {
+        if !(omega.matrix[(j, j)] > 0.0) {
             return None;
         }
-        omega_diag.push(d as f32);
     }
-    let em = match &model.error_spec {
-        ErrorSpec::Single(em) => *em,
-        ErrorSpec::PerCmt(_) => return None,
-    };
-    let s0 = *sigma.first().unwrap_or(&0.0) as f32;
-    let s1 = *sigma.get(1).unwrap_or(&0.0) as f32;
+    if !matches!(model.error_spec, ErrorSpec::Single(_)) {
+        return None;
+    }
 
-    let ll = extract_loglinear(model, population, theta, n_eta, etas)?;
+    // Gating: verify the log-linear (CL, V)-in-η reconstruction once here.
+    extract_loglinear(model, population, theta, n_eta, etas, true)?;
 
     let n = population.subjects.len();
-    let mut eta = Vec::with_capacity(n * n_eta);
     let mut dose_off = Vec::with_capacity(n);
     let mut dose_cnt = Vec::with_capacity(n);
     let mut dose_amt = Vec::new();
@@ -886,7 +936,7 @@ fn build_mh_batch(
     let mut obs_y = Vec::new();
     let mut obs_t = Vec::new();
 
-    for (i, subject) in population.subjects.iter().enumerate() {
+    for subject in population.subjects.iter() {
         if subject.has_tv_covariates() || subject.has_resets() || subject.has_ss_doses() {
             return None;
         }
@@ -898,9 +948,6 @@ fn build_mh_batch(
             if d.is_infusion() || d.ss {
                 return None;
             }
-        }
-        for &e in &etas[i] {
-            eta.push(e as f32);
         }
         dose_off.push(dose_amt.len() as u32);
         dose_cnt.push(subject.doses.len() as u32);
@@ -919,12 +966,6 @@ fn build_mh_batch(
     Some(MhBatch {
         n_subjects: n,
         n_eta,
-        eta,
-        cl0: ll.cl0,
-        v0: ll.v0,
-        a_cl: ll.a_cl,
-        a_v: ll.a_v,
-        omega_diag,
         dose_off,
         dose_cnt,
         dose_amt,
@@ -933,7 +974,6 @@ fn build_mh_batch(
         obs_cnt,
         obs_y,
         obs_t,
-        fparams: [error_code(em), s0, s1],
     })
 }
 
@@ -947,10 +987,149 @@ pub struct MhSweepOut {
     pub nll: Vec<f64>,
 }
 
-/// Run one GPU block-RW MH sweep of `n_steps` proposals per subject, or return
-/// `None` when the GPU path is unavailable or the model is unsupported (caller
-/// falls back to the CPU E-step). `step_scales` is per-subject; `seed` should
-/// vary per SAEM iteration.
+/// A persistent GPU MH-sweep session for one SAEM run. Create it once (it
+/// gates the model/population and uploads the static dose/observation buffers
+/// to the device); then call [`GpuMhSession::sweep`] each iteration, which
+/// uploads only the dynamic per-iteration data. `None` from `new` means the
+/// model is unsupported or no GPU is available — the caller uses the CPU E-step.
+#[cfg(feature = "gpu")]
+pub struct GpuMhSession {
+    inner: kernel::Session,
+    n_eta: usize,
+    n_subjects: usize,
+    em: ErrorModel,
+}
+
+/// Stub on non-`gpu` builds: never constructed.
+#[cfg(not(feature = "gpu"))]
+pub struct GpuMhSession {
+    _priv: (),
+}
+
+impl GpuMhSession {
+    /// Gate the model/population and upload the static buffers. `None` when the
+    /// GPU MH path is unavailable or the model is unsupported.
+    #[cfg(feature = "gpu")]
+    pub fn new(
+        model: &CompiledModel,
+        population: &Population,
+        theta: &[f64],
+        etas: &[Vec<f64>],
+        sigma: &[f64],
+        omega: &OmegaMatrix,
+    ) -> Option<Self> {
+        let batch = build_mh_batch(model, population, theta, etas, sigma, omega)?;
+        let em = match &model.error_spec {
+            ErrorSpec::Single(e) => *e,
+            ErrorSpec::PerCmt(_) => return None,
+        };
+        let inner = kernel::Session::new(&batch)?;
+        Some(Self {
+            inner,
+            n_eta: batch.n_eta,
+            n_subjects: batch.n_subjects,
+            em,
+        })
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    pub fn new(
+        _model: &CompiledModel,
+        _population: &Population,
+        _theta: &[f64],
+        _etas: &[Vec<f64>],
+        _sigma: &[f64],
+        _omega: &OmegaMatrix,
+    ) -> Option<Self> {
+        None
+    }
+
+    /// Run one block-RW MH sweep of `n_steps` proposals per subject. Recomputes
+    /// the (cheap) per-subject intercepts for the current `theta`, uploads only
+    /// dynamic data, and reuses the resident static buffers. `seed` should vary
+    /// per SAEM iteration.
+    #[cfg(feature = "gpu")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sweep(
+        &mut self,
+        model: &CompiledModel,
+        population: &Population,
+        theta: &[f64],
+        etas: &[Vec<f64>],
+        sigma: &[f64],
+        omega: &OmegaMatrix,
+        step_scales: &[f64],
+        n_steps: usize,
+        seed: u64,
+    ) -> Option<MhSweepOut> {
+        if etas.len() != self.n_subjects {
+            return None;
+        }
+        let n_eta = self.n_eta;
+        // Reconstruct intercepts/coefficients for the current theta (no verify —
+        // the structure was verified at session creation). Cheap: O(N + n_eta)
+        // closure evals, no per-iteration re-upload of the static buffers.
+        let ll = extract_loglinear(model, population, theta, n_eta, etas, false)?;
+        let mut omega_diag = Vec::with_capacity(n_eta);
+        for j in 0..n_eta {
+            let d = omega.matrix[(j, j)];
+            if !(d > 0.0) {
+                return None;
+            }
+            omega_diag.push(d as f32);
+        }
+        let eta: Vec<f32> = etas
+            .iter()
+            .flat_map(|e| e.iter().map(|&x| x as f32))
+            .collect();
+        let scales: Vec<f32> = step_scales.iter().map(|&s| s as f32).collect();
+        let s0 = *sigma.first().unwrap_or(&0.0) as f32;
+        let s1 = *sigma.get(1).unwrap_or(&0.0) as f32;
+        let fparams = [error_code(self.em), s0, s1];
+
+        let (eta_out, accepts, nll) = self.inner.sweep(
+            &eta,
+            &ll.cl0,
+            &ll.v0,
+            &ll.a_cl,
+            &ll.a_v,
+            &omega_diag,
+            &scales,
+            &fparams,
+            n_eta,
+            n_steps,
+            seed as u32,
+        )?;
+        Some(MhSweepOut {
+            etas: eta_out
+                .chunks(n_eta)
+                .map(|c| c.iter().map(|&x| x as f64).collect())
+                .collect(),
+            accepts: accepts.iter().map(|&a| a as usize).collect(),
+            nll: nll.iter().map(|&x| x as f64).collect(),
+        })
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn sweep(
+        &mut self,
+        _model: &CompiledModel,
+        _population: &Population,
+        _theta: &[f64],
+        _etas: &[Vec<f64>],
+        _sigma: &[f64],
+        _omega: &OmegaMatrix,
+        _step_scales: &[f64],
+        _n_steps: usize,
+        _seed: u64,
+    ) -> Option<MhSweepOut> {
+        None
+    }
+}
+
+/// One-shot convenience wrapper (used by tests): create a session and run a
+/// single sweep. Production SAEM uses a persistent [`GpuMhSession`].
 pub fn gpu_mh_sweep(
     model: &CompiledModel,
     population: &Population,
@@ -962,29 +1141,18 @@ pub fn gpu_mh_sweep(
     n_steps: usize,
     seed: u64,
 ) -> Option<MhSweepOut> {
-    let batch = build_mh_batch(model, population, theta, etas, sigma, omega)?;
-    let scales: Vec<f32> = step_scales.iter().map(|&s| s as f32).collect();
-    let (eta_out, accepts, nll) = run_mh_sweep(&batch, &scales, n_steps, seed)?;
-    let n_eta = batch.n_eta;
-    let etas_out: Vec<Vec<f64>> = eta_out
-        .chunks(n_eta)
-        .map(|c| c.iter().map(|&x| x as f64).collect())
-        .collect();
-    Some(MhSweepOut {
-        etas: etas_out,
-        accepts: accepts.iter().map(|&a| a as usize).collect(),
-        nll: nll.iter().map(|&x| x as f64).collect(),
-    })
-}
-
-#[cfg(not(feature = "gpu"))]
-fn run_mh_sweep(
-    _batch: &MhBatch,
-    _scales: &[f32],
-    _n_steps: usize,
-    _seed: u64,
-) -> Option<(Vec<f32>, Vec<u32>, Vec<f32>)> {
-    None
+    let mut session = GpuMhSession::new(model, population, theta, etas, sigma, omega)?;
+    session.sweep(
+        model,
+        population,
+        theta,
+        etas,
+        sigma,
+        omega,
+        step_scales,
+        n_steps,
+        seed,
+    )
 }
 
 #[cfg(test)]
@@ -1209,7 +1377,7 @@ mod tests {
     fn loglinear_extraction_supported_and_rejected() {
         let (model, pop, theta, _sigma, _omega, etas) = fixture();
         // 1-cpt IV with CL=TVCL*exp(ETA_CL), V=TVV*exp(ETA_V) is log-linear.
-        let ll = extract_loglinear(&model, &pop, &theta, 2, &etas);
+        let ll = extract_loglinear(&model, &pop, &theta, 2, &etas, true);
         assert!(
             ll.is_some(),
             "log-normal CL/V must be detected as log-linear"
@@ -1361,6 +1529,69 @@ mod tests {
             let g = gpu.params.omega.matrix[(j, j)];
             let rel = (c - g).abs() / c.abs().max(1e-6);
             assert!(rel < 0.40, "omega[{j}] cpu={c} gpu={g} rel={rel}");
+        }
+    }
+
+    /// Wall-clock CPU vs GPU SAEM across subject counts. Not an assertion —
+    /// run manually:
+    /// `cargo test --release --no-default-features --features ci,gpu
+    ///  gpu_saem_benchmark -- --ignored --nocapture`
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "benchmark: run manually with --ignored --nocapture"]
+    fn gpu_saem_benchmark() {
+        use crate::estimation::saem::run_saem;
+        use crate::types::FitOptions;
+        use std::time::Instant;
+
+        let model = iv_combined_model();
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+        opts.run_covariance_step = false;
+        opts.saem_n_exploration = 50;
+        opts.saem_n_convergence = 100;
+        opts.saem_seed = Some(1);
+
+        let bench = |opts: &mut FitOptions, data: &Population| -> (f64, f64, bool) {
+            opts.saem_backend = SaemBackend::Cpu;
+            let t = Instant::now();
+            let _ = run_saem(&model, data, &model.default_params, opts).expect("cpu");
+            let cpu_ms = t.elapsed().as_secs_f64() * 1e3;
+            opts.saem_backend = SaemBackend::Gpu;
+            let t = Instant::now();
+            let g = run_saem(&model, data, &model.default_params, opts).expect("gpu");
+            let gpu_ms = t.elapsed().as_secs_f64() * 1e3;
+            let used = !g
+                .warnings
+                .iter()
+                .any(|w| w.contains("GPU MH E-step did not run"));
+            (cpu_ms, gpu_ms, used)
+        };
+
+        println!("\n  (A) vary n_subjects, n_mh_steps = 20");
+        println!("  n_subj |   CPU (ms) |   GPU (ms) | speedup | gpu_used");
+        println!("  -------+------------+------------+---------+---------");
+        opts.saem_n_mh_steps = 20;
+        for &n in &[50usize, 200, 1000, 4000, 8000] {
+            let data = synthetic_population(n);
+            let (cpu_ms, gpu_ms, used) = bench(&mut opts, &data);
+            println!(
+                "  {n:>6} | {cpu_ms:>10.1} | {gpu_ms:>10.1} | {:>6.2}x | {used}",
+                cpu_ms / gpu_ms
+            );
+        }
+
+        println!("\n  (B) vary n_mh_steps, n_subjects = 2000");
+        println!("  mh_stp |   CPU (ms) |   GPU (ms) | speedup | gpu_used");
+        println!("  -------+------------+------------+---------+---------");
+        let data = synthetic_population(2000);
+        for &steps in &[20usize, 100, 500, 2000] {
+            opts.saem_n_mh_steps = steps;
+            let (cpu_ms, gpu_ms, used) = bench(&mut opts, &data);
+            println!(
+                "  {steps:>6} | {cpu_ms:>10.1} | {gpu_ms:>10.1} | {:>6.2}x | {used}",
+                cpu_ms / gpu_ms
+            );
         }
     }
 }

@@ -1341,6 +1341,22 @@ pub fn run_saem(
         && n_kappa == 0
         && !using_hmc;
     let mut gpu_estep_used = false;
+    // Persistent GPU session: gates the model and uploads the static
+    // dose/observation buffers once; each iteration's sweep uploads only the
+    // dynamic data. `None` ⇒ the GPU MH path is unavailable; the CPU E-step
+    // runs instead.
+    let mut gpu_session = if gpu_estep_eligible {
+        crate::estimation::gpu_saem::GpuMhSession::new(
+            model,
+            population,
+            &state.theta,
+            &state.etas,
+            &state.sigma_vals,
+            &init_params.omega,
+        )
+    } else {
+        None
+    };
 
     // Main loop
     for k in 1..=n_iter {
@@ -1410,8 +1426,8 @@ pub fn run_saem(
         // all checked inside `gpu_mh_sweep`, which returns None to fall back).
         // Block kernel only; the componentwise decorrelating sweep is for block
         // Ω, which the GPU path excludes, so it is skipped here.
-        let gpu_estep_done = if gpu_estep_eligible {
-            if let Some(out) = crate::estimation::gpu_saem::gpu_mh_sweep(
+        let gpu_estep_done = if let Some(sess) = gpu_session.as_mut() {
+            if let Some(out) = sess.sweep(
                 model,
                 population,
                 &state.theta,
@@ -1427,16 +1443,10 @@ pub fn run_saem(
                     state.accept_counts[i] += out.accepts[i];
                     state.proposal_counts[i] += n_mh_steps;
                 }
-                // Refresh the NLL cache in f64 on the host for objective
-                // fidelity (one eval/subject — negligible vs the sweep).
-                state.nll_cache = crate::estimation::gpu_saem::batched_individual_nll_cpu(
-                    model,
-                    population,
-                    &state.theta,
-                    &state.etas,
-                    &omega_k,
-                    &state.sigma_vals,
-                );
+                // Use the kernel's returned per-subject NLL for the cache (f32
+                // precision; the cache feeds diagnostics, not the M-step). This
+                // avoids a full CPU NLL pass per iteration.
+                state.nll_cache = out.nll;
                 gpu_estep_used = true;
                 true
             } else {
