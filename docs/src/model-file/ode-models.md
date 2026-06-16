@@ -168,6 +168,7 @@ The solver automatically adapts step sizes based on local error estimates.
 - **Infusion doses** (`RATE > 0`): Treated as a continuous zero-order input. The integrator's timeline is broken at the infusion's end (`time + amt/rate`), and `F · RATE` is added to the target compartment's derivative for every segment fully spanned by the infusion. Overlapping infusions on the same compartment sum their rates
 - **Compartment indexing**: Compartments are 1-indexed in the data file (`CMT=1` corresponds to the first state in the `states` list)
 - **Multiple doses**: The ODE is integrated in segments between dose events, with state discontinuities at each bolus
+- **Built-in absorption input rates**: A dose can instead be delivered as a dose-driven appearance rate `R_in(tad)` (e.g. transit-compartment absorption) added into the depot over time — see [Built-in Absorption Models](absorption.md)
 
 ### Bioavailability
 

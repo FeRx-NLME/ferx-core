@@ -318,3 +318,39 @@ fn iov_analytical_gradient_path_returns_finite_ofv() {
         result.ofv
     );
 }
+
+/// Fast coverage for the `Rescale2` scaling path and the non-mu-ref (covariate)
+/// θ-gradient FD branch — neither is reachable from the warfarin tests (warfarin
+/// is all mu-ref + the fast tests use BOBYQA). `two_cpt_oral_cov` has
+/// non-mu-referenced covariate coefficients (`THETA_WT`/`THETA_CRCL`), so:
+///   - built-in `Bfgs` under the `Auto` default resolves to `Rescale2`, running
+///     `compute_rescale2_scale` and the `optimize_bfgs` scale block;
+///   - the covariate θ columns exercise the analytic Laplace θ-gradient's FD
+///     branch (the mu-ref shortcut handles only mu-referenced thetas);
+///   - `covariance_method = rsr` runs the score cross-product (the `log|H̃|`
+///     EBE-response) over those covariate columns.
+/// A modest `outer_maxiter` keeps it fast — this guards that the paths execute
+/// and a covariance status is decided, not convergence accuracy.
+#[test]
+fn bfgs_rescale2_and_covariate_covariance_paths_run() {
+    use ferx_core::{CovarianceMethod, CovarianceStatus};
+    let model = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx"))
+        .expect("two_cpt_oral_cov model must parse");
+    let population = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data must load");
+    let mut opts = FitOptions::default(); // parameter_scaling = Auto (→ Rescale2 for bfgs)
+    opts.method = EstimationMethod::FoceI;
+    opts.optimizer = Optimizer::Bfgs; // built-in BFGS scale block
+    opts.outer_maxiter = 8; // exercise paths; convergence not required
+    opts.run_covariance_step = true;
+    opts.covariance_method = CovarianceMethod::Sandwich; // rsr → score cross-product
+    opts.verbose = false;
+    let r = fit(&model, &population, &model.default_params, &opts)
+        .expect("two_cpt_oral_cov FOCEI bfgs+rsr fit must run");
+    assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
+    assert_ne!(
+        r.covariance_status,
+        CovarianceStatus::NotRequested,
+        "covariance was requested; status must be decided"
+    );
+}

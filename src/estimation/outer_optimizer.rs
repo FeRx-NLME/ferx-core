@@ -496,6 +496,49 @@ fn run_global_presearch(
     }
 }
 
+/// nlmixr2-style `rescale2` preconditioner: scale each packed param by its
+/// bounds half-range `(hi−lo)/2`, so every coordinate spans ~2 units in scaled
+/// space (the optimizer sees comparable per-parameter search ranges → similar
+/// gradient/step magnitudes). This is value/bounds-based normalization (what
+/// nlmixr2's `normType="rescale2"` does), not curvature-based — it worked where
+/// the BHHH-diagonal preconditioner did not. Fixed params (lo==hi) and
+/// degenerate ranges fall back to 1.0. Selected by
+/// `parameter_scaling = rescale2` (see [`ParameterScaling::Rescale2`]).
+fn compute_rescale2_scale(bounds: &PackedBounds) -> Vec<f64> {
+    (0..bounds.lower.len())
+        .map(|k| {
+            let hw = (bounds.upper[k] - bounds.lower[k]).abs() * 0.5;
+            if hw.is_finite() && hw > 1e-6 {
+                hw
+            } else {
+                1.0
+            }
+        })
+        .collect()
+}
+
+/// Resolve [`ParameterScaling::Auto`] to a concrete strategy. `Auto` applies
+/// `Rescale2` to the gradient-based optimizers that benefit (`Bfgs`, `Lbfgs`,
+/// `NloptLbfgs`, `Slsqp`) and `None` otherwise — critically, the derivative-free
+/// default `Bobyqa` is left unscaled because `Rescale2` distorts its trust-region
+/// quadratic model and regresses multi-cpt / PD fits (e.g. emax_pkpd −36.8→−13.5,
+/// three_cpt_iv −730.6→−715.9). `Slsqp` is included because the bound-half-width
+/// rescaling fixes its cold-start convergence — e.g. pure FOCEI/SLSQP on
+/// warfarin_iov reaches OFV 307.84 from the cold default start instead of
+/// stalling at 343.5 (#335). `Mma`/`TrustRegion` are left to the unscaled (legacy
+/// `scale_params` / IOV-auto) branch. Non-`Auto` values pass through unchanged.
+fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
+    match ps {
+        ParameterScaling::Auto => match opt {
+            Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::NloptLbfgs | Optimizer::Slsqp => {
+                ParameterScaling::Rescale2
+            }
+            _ => ParameterScaling::None,
+        },
+        other => other,
+    }
+}
+
 fn optimize_nlopt(
     model: &CompiledModel,
     population: &Population,
@@ -544,10 +587,17 @@ fn optimize_nlopt(
     // intentional. This auto-enable now only fires for an explicit
     // `optimizer = slsqp` on IOV models (the path it was originally written for).
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
-    let scale: Vec<f64> = if (options.scale_params || auto_scale_iov) && !has_identity_theta {
-        compute_scale(&x0)
-    } else {
-        vec![1.0; n]
+    let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
+        ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
+        ParameterScaling::Abs => compute_scale(&x0),
+        // `Auto` is resolved away by `resolve_scaling`; group with `None`.
+        ParameterScaling::None | ParameterScaling::Auto => {
+            if (options.scale_params || auto_scale_iov) && !has_identity_theta {
+                compute_scale(&x0)
+            } else {
+                vec![1.0; n]
+            }
+        }
     };
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
@@ -1386,10 +1436,16 @@ fn optimize_bfgs(
     };
 
     // Per-element scale factors for the BFGS outer loop.
-    let scale: Vec<f64> = if options.scale_params {
-        compute_scale(&x)
-    } else {
-        vec![1.0; n]
+    let scale: Vec<f64> = match resolve_scaling(options.parameter_scaling, options.optimizer) {
+        ParameterScaling::Rescale2 => compute_rescale2_scale(&bounds),
+        ParameterScaling::Abs => compute_scale(&x),
+        ParameterScaling::None | ParameterScaling::Auto => {
+            if options.scale_params {
+                compute_scale(&x)
+            } else {
+                vec![1.0; n]
+            }
+        }
     };
     let lower_s: Vec<f64> = (0..n).map(|i| bounds.lower[i] / scale[i]).collect();
     let upper_s: Vec<f64> = (0..n).map(|i| bounds.upper[i] / scale[i]).collect();
@@ -2253,6 +2309,20 @@ fn assemble_score_cross_product(
     let n_subj = population.subjects.len();
 
     // Per-subject scores in parallel (mirrors `build_gn_system`).
+    //
+    // The score cross-product evaluates the per-subject gradient directly at x̂.
+    // Unlike the FD-built R-matrix — which reconverges η̂ at every perturbed point
+    // and so captures the `log|H̃|` EBE-response `½·∂log|H̃|/∂η̂·dη̂/dθ` — the raw
+    // analytic gradient holds η̂ fixed and drops it. Add it back here (the #274
+    // `tᵢ` term, in −logL units; `point_grad` adds `2·tᵢ` to the −2logL gradient)
+    // so the score matches how NONMEM differences the individual objective with
+    // its conditional estimate responding to θ. This is what makes the FOCEI
+    // S/RSR match NONMEM (warfarin RSR ≈ 1.8% with it, ≈ 5% without); the
+    // alternative `∂a/∂θ` "a-response" was tested and is NOT what NONMEM's S
+    // carries (it holds the model sensitivities `a` fixed at the linearization).
+    // FOCE (`!interaction`) uses the Sheiner–Beal gradient, which has no `log|H̃|`
+    // term — applying this Laplace-form `tᵢ` to FOCE was tested and over-corrects
+    // (warfarin FOCE RSR 1.3% → 9.8% vs NONMEM), so the correction is FOCEI-only.
     let scores: Vec<Vec<f64>> = (0..n_subj)
         .into_par_iter()
         .map(|i| {
@@ -2261,7 +2331,7 @@ fn assemble_score_cross_product(
             } else {
                 &[]
             };
-            let (_, gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
+            let (_, mut gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
                 x_hat,
                 template,
                 model,
@@ -2273,6 +2343,24 @@ fn assemble_score_cross_product(
                 bounds,
                 options,
             );
+            if options.interaction {
+                if let Some(ti) = crate::estimation::gauss_newton::subject_eta_response_correction(
+                    None,
+                    x_hat,
+                    template,
+                    model,
+                    population,
+                    i,
+                    &eta_hats[i],
+                    &h_matrices[i],
+                    bounds,
+                    options,
+                ) {
+                    for (g, t) in gi.iter_mut().zip(ti.iter()) {
+                        *g += *t;
+                    }
+                }
+            }
             gi
         })
         .collect();
@@ -2494,7 +2582,15 @@ pub(crate) fn compute_covariance(
     // for FOCEI, #274), so its central-FD Hessian comes out indefinite on the
     // f-dependent FOCE surface. Additive FOCE keeps the cheap analytical path
     // (the Δ vanishes for f-independent variance, and it already matches NONMEM).
-    let force_ofv_hessian = !options.interaction && model.error_spec.has_f_dependent_variance();
+    // Route through the OFV second-difference Hessian when: (a) f-dependent FOCE
+    // (the analytical SB gradient comes out indefinite there), or (b) the user
+    // opts in via `covariance_ofv_hessian`. The latter trades speed for an R
+    // that recomputes `a = ∂f/∂η` at every perturbed point, capturing the
+    // `∂a/∂θ` curvature the analytical stencil drops — which removes the
+    // weakly-identified-θ SE bias (e.g. warfarin TVKA ~9% high vs a Richardson
+    // FD-of-OFV ground truth).
+    let force_ofv_hessian = (!options.interaction && model.error_spec.has_f_dependent_variance())
+        || options.covariance_ofv_hessian;
     let use_analytical = !is_iov && !force_ofv_hessian;
 
     // Track FD failures at source so diagnostics name the right cause (a NaN/Inf
@@ -3078,6 +3174,39 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    /// `resolve_scaling` maps `Auto` to `Rescale2` for the gradient-based
+    /// optimizers that benefit (incl. `Slsqp` — the #335 cold-start fix) and to
+    /// `None` for the derivative-free `Bobyqa` default (and `Mma`/`TrustRegion`);
+    /// explicit non-`Auto` values pass through unchanged. Guards the #341/#335
+    /// default-scaling routing.
+    #[test]
+    fn resolve_scaling_routes_auto_by_optimizer() {
+        use crate::types::ParameterScaling::{Abs, Auto, None as PsNone, Rescale2};
+        for opt in [
+            Optimizer::Bfgs,
+            Optimizer::Lbfgs,
+            Optimizer::NloptLbfgs,
+            Optimizer::Slsqp,
+        ] {
+            assert_eq!(
+                resolve_scaling(Auto, opt),
+                Rescale2,
+                "{opt:?} should be Rescale2 under Auto"
+            );
+        }
+        for opt in [Optimizer::Bobyqa, Optimizer::Mma, Optimizer::TrustRegion] {
+            assert_eq!(
+                resolve_scaling(Auto, opt),
+                PsNone,
+                "{opt:?} should be unscaled under Auto"
+            );
+        }
+        // Explicit values pass through regardless of optimizer.
+        assert_eq!(resolve_scaling(Rescale2, Optimizer::Bobyqa), Rescale2);
+        assert_eq!(resolve_scaling(PsNone, Optimizer::Bfgs), PsNone);
+        assert_eq!(resolve_scaling(Abs, Optimizer::Slsqp), Abs);
+    }
 
     // ── invert_psd_with_floor: regularised PD inversion ──────────────────────
 

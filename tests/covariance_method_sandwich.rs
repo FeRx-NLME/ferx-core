@@ -67,6 +67,35 @@ fn all_ses(r: &ferx_core::FitResult) -> Vec<f64> {
     v
 }
 
+/// Fast (not slow-gated) cross-check that the FOCEI `rsr` covariance assembles
+/// and returns finite positive SEs. This is the Tier-2 guard that runs in the
+/// per-PR fast job — where the NONMEM-anchored convergence tests below are
+/// `#[ignore]`d — so it exercises the score cross-product's `log|H̃|`
+/// EBE-response path (#335) and `compute_covariance`'s OFV-Hessian R stencil on
+/// every PR. Accuracy vs NONMEM is asserted by the slow tests; this guards that
+/// the assembly runs and the EBE-response term stays finite. A modest
+/// `outer_maxiter` keeps it fast (the covariance step still runs at the final
+/// point regardless of convergence).
+#[test]
+fn covariance_rsr_assembles_finite_ses_fast() {
+    let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let mut opts = warfarin_focei_opts(CovarianceMethod::Sandwich);
+    opts.outer_maxiter = 60;
+    let r = fit(&model, &pop, &model.default_params, &opts).expect("FOCEI rsr fit must succeed");
+    assert_eq!(
+        r.covariance_status,
+        CovarianceStatus::Computed,
+        "rsr covariance must be Computed"
+    );
+    let ses = all_ses(&r);
+    assert!(
+        ses.iter().all(|s| s.is_finite() && *s > 0.0),
+        "all rsr SEs must be finite and positive, got {ses:?}"
+    );
+}
+
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -131,12 +160,18 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
 /// held to 15%. A factor-of-2 error in the score scale would push the `s` SEs
 /// ~29–41% off systematically — well outside these bands (issue #266 note).
 #[test]
-// TEMP-DISABLED (#335): the tighter default inner_tol (1e-4 → 1e-5, #330) shifts
-// the covariance score cross-product S, pushing the RSR sandwich SE(TVKA) to ~24%
-// (band 15%). The Hessian-R covariance (covariance_se_matches_nonmem) still matches
-// NONMEM; only the S-based sandwich regresses. The θ-block Δ goes to the optimizer
-// gradient, not the covariance S. Tracked in #335.
-#[ignore = "covariance-S sandwich SE vs tighter inner_tol — tracked in #335"]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow + NONMEM-anchored FOCEI s/rsr covariance SE cross-check (#266/#335): opt in with --features slow-tests"
+)]
+// Re-enabled (#335): the regression was the analytical R-matrix's weakly-identified-θ
+// bias (it holds a=∂f/∂η fixed in the log|H̃| θ-gradient), which the tighter
+// inner_tol (#330) exposed and which propagated through the RSR sandwich
+// (R⁻¹SR⁻¹), pushing SE(TVKA) to ~24% (band 15%). Computing R from the OFV
+// second-difference stencil (`covariance_ofv_hessian = true`) recomputes `a` at
+// every perturbed point and matches a Richardson FD-of-OFV ground truth to <1%,
+// bringing the RSR back within band. The `s` (pure cross-product) estimator is a
+// 10-subject outer-product and is inherently noisier (20% band).
 fn covariance_se_matches_nonmem_s_rsr() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
     let pop =
@@ -155,7 +190,11 @@ fn covariance_se_matches_nonmem_s_rsr() {
     ];
 
     let ferx_ses = |m: CovarianceMethod| {
-        let r = fit(&model, &pop, &model.default_params, &warfarin_focei_opts(m))
+        // Build R from the OFV second-difference stencil so the weakly-identified
+        // θ curvature (warfarin TVKA) is captured exactly — see the note above.
+        let mut opts = warfarin_focei_opts(m);
+        opts.covariance_ofv_hessian = true;
+        let r = fit(&model, &pop, &model.default_params, &opts)
             .unwrap_or_else(|e| panic!("{m:?} fit failed: {e}"));
         assert_eq!(
             r.covariance_status,

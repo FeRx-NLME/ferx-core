@@ -18,10 +18,18 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 | `AMT` | numeric | 0 | Dose amount (for `EVID=1`/`EVID=4`; also the dose-inference signal when `EVID` is absent) |
 | `CMT` | integer | 1 | Compartment number (1-indexed) |
 | `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM's coded values `-1` (modeled rate) and `-2` (modeled duration) are **not yet supported** and are rejected with an error — see [Infusion Doses](#infusion-doses). |
-| `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored |
+| `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored (row excluded from the likelihood) |
 | `II` | numeric | 0 | Interdose interval for repeated dosing |
 | `SS` | integer | 0 | Steady-state flag. 1 = assume steady state |
 | `CENS` | integer | 0 | Censoring flag. 1 = observation is below LLOQ; `DV` carries the LLOQ value. Paired with `bloq_method = m3` in `[fit_options]` to enable likelihood-based handling — see [BLOQ example](examples/bloq.md). |
+
+> **Missing DV on observation rows.** An `EVID=0` row contributes to the
+> likelihood only when its `DV` is present. If the `DV` is missing
+> (`.`, `NA`, or blank), mark the row `MDV=1`. As a safety net, ferx also treats
+> an `EVID=0` row with a missing `DV` as `MDV=1` even when the flag is absent —
+> the row is skipped rather than scored as `DV=0` — and emits a single
+> `W_MISSING_DV` warning reporting how many rows were skipped. Set `MDV=1`
+> explicitly to silence it, or fix the data if the missing values are an error.
 
 ## Inferring doses without an `EVID` column
 

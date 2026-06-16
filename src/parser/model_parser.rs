@@ -238,6 +238,11 @@ fn assigned_vars_in_order(stmts: &[Statement]) -> Vec<String> {
 /// Branch-local helpers (e.g. `SCALE = ...` inside an `if` body) are
 /// intentionally excluded: including them would corrupt the AD inner loop
 /// by placing the helper in a PK slot (typically overwriting CL at slot 0).
+///
+/// These names are *always* individual parameters. `indiv_var_names` is this
+/// set plus the subset of all-branch-assigned names that a downstream block
+/// actually consumes (see `unconditionally_assigned_vars` and the call site in
+/// `parse_full_model`, issue #357).
 fn top_level_assigned_vars(stmts: &[Statement]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for s in stmts {
@@ -248,6 +253,111 @@ fn top_level_assigned_vars(stmts: &[Statement]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Variable names that are *unconditionally* defined by the end of the block:
+/// every top-level assignment, PLUS any name assigned on EVERY branch of an
+/// `if`/`else` (recursively). Such a name has a definite value on all code
+/// paths, so it *can* be a genuine individual parameter — unlike a branch-local
+/// helper assigned in only some branches.
+///
+/// This is a SUPERSET of `top_level_assigned_vars`. The all-branch extras are
+/// only promoted to actual individual parameters at the call site when a
+/// downstream block consumes them (issue #357) — promoting *every* such name
+/// would slot throwaway intermediates into the PK array (silently hijacking the
+/// reserved F/lagtime slots, aliasing the CL slot in `pk_indices`, or
+/// exhausting the 16-slot layout). See `parse_full_model`.
+///
+/// Motivating case: a PK parameter written only inside symmetric `if`/`else`
+/// branches (the natural NONMEM-style `IF (cond) CL = ...` / `IF (!cond) CL =
+/// ...` construction) must still get a PK slot, be written back by
+/// `pk_param_fn`, and be visible to the `[odes]` RHS name resolver — but only
+/// because `[odes]` references it.
+///
+/// First-occurrence order, deduplicated. An `if` with no `else`, or one where
+/// some branch omits the name, does NOT contribute that name — it could be
+/// undefined on the missing path, so it stays branch-local (matching
+/// `top_level_assigned_vars` for that case).
+fn unconditionally_assigned_vars(stmts: &[Statement]) -> Vec<String> {
+    // `unconditional_names_in` already deduplicates (its `push` closure), so no
+    // second pass is needed here.
+    unconditional_names_in(stmts)
+}
+
+/// Recursive worker for `unconditionally_assigned_vars`. Returns the names
+/// definitely assigned within `stmts`, in first-occurrence order: top-level
+/// `Assign`s, plus the intersection of unconditional names across all branches
+/// of any `if`/`else` (requires an `else`; the intersection preserves the
+/// order in which names first appear in the leading branch).
+fn unconditional_names_in(stmts: &[Statement]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |name: &str, out: &mut Vec<String>| {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    };
+    for s in stmts {
+        match s {
+            Statement::Assign(name, _) => push(name, &mut out),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                // Without an `else`, no name is guaranteed across all paths.
+                if let Some(eb) = else_body {
+                    let mut sets: Vec<Vec<String>> = branches
+                        .iter()
+                        .map(|(_, b)| unconditional_names_in(b))
+                        .collect();
+                    sets.push(unconditional_names_in(eb));
+                    if let Some((first, rest)) = sets.split_first() {
+                        for name in first {
+                            if rest.iter().all(|s| s.iter().any(|n| n == name)) {
+                                push(name, &mut out);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Collect every identifier-like token (`[A-Za-z_][A-Za-z0-9_]*`) appearing in
+/// `lines`, upper-cased, into `out`. Used to decide whether an all-branch
+/// individual parameter is actually *consumed* by a downstream block (issue
+/// #357): such a name is promoted to a PK-slotted individual parameter only if
+/// some block outside `[individual_parameters]` references it. A purely
+/// internal helper (used only to compute another param within
+/// `[individual_parameters]`) stays branch-local, preserving the pre-#357
+/// behaviour and avoiding spurious PK-slot allocation / reserved-slot hijack.
+///
+/// Deliberately crude (lexical, case-folded, no scope awareness): a false
+/// positive only over-promotes a name that genuinely appears downstream — the
+/// safe direction. Keywords / state names that happen to collide are harmless;
+/// they would only matter if the user *also* named an individual parameter
+/// identically, in which case promoting it is correct anyway. Matched
+/// case-insensitively to mirror the ODE/analytical name resolvers, which alias
+/// both cases.
+fn collect_referenced_identifiers(lines: &[String], out: &mut std::collections::HashSet<String>) {
+    for line in lines {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'_' || bytes[i].is_ascii_alphabetic() {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                    i += 1;
+                }
+                out.insert(line[start..i].to_ascii_uppercase());
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Union of eta indices touched by every assignment to `var_name` anywhere in
@@ -930,12 +1040,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // full set registered as defined_vars so any in-block reference (forward
     // or backward) resolves as Variable rather than Covariate.
     //
-    // `indiv_var_names` contains only TOP-LEVEL assignments — these are the
-    // individual parameters that map to PK slots and the TV output vector.
-    // Branch-local helpers (assigned only inside if-bodies) are intentionally
-    // excluded to prevent them from corrupting the AD inner-loop slot layout.
-    // The ParseCtx still receives the full set (via assigned_vars_in_order) so
-    // branch-local names parse as Variable rather than Covariate.
+    // `indiv_var_names` — the names that map to PK slots and the TV output
+    // vector. Two tiers (issue #357):
+    //   1. Every top-level assignment is always an individual parameter.
+    //   2. A name assigned on *all* branches of an if/else is promoted ONLY
+    //      when a downstream block ([odes], [structural_model], [scaling],
+    //      [derived]) actually references it — i.e. it is consumed as a PK
+    //      parameter. This is what makes the NONMEM-style `IF (cond) CL = ...`
+    //      / `IF (!cond) CL = ...` construction work: CL appears in [odes], so
+    //      it earns a slot, is written back by pk_param_fn, and resolves in the
+    //      ODE RHS.
+    // Promoting *every* all-branch name (the naive fix) would slot throwaway
+    // intermediates into the PK array — silently hijacking the reserved
+    // F/lagtime slots, aliasing the CL slot in pk_indices, or exhausting the
+    // 16-slot layout. So a branch-only helper used purely to compute another
+    // param stays branch-local. The ParseCtx still receives the full set (via
+    // assigned_vars_in_order) so such helpers parse as Variable, not Covariate.
     let indiv_text = indiv_lines.join("\n");
     // NN-output lookup table for `TYPICAL_PK.CL`-style dot-access in
     // [individual_parameters]. Always present (empty when no [covariate_nn]
@@ -955,7 +1075,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let bare_ctx = ParseCtx::new(&theta_names, &eta_names, &[]).with_nn_specs(&nn_specs_for_ctx);
     let pre_stmts = parse_block_statements(&indiv_text, bare_ctx, StatementMode::Plain)?;
     let all_assigned = assigned_vars_in_order(&pre_stmts);
-    let indiv_var_names = top_level_assigned_vars(&pre_stmts);
+    // Tier 1 (always) + tier 2 (all-branch names referenced downstream). See
+    // the comment above for the rationale behind the downstream-consumption gate.
+    let top_level_names = top_level_assigned_vars(&pre_stmts);
+    let mut downstream_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for key in ["odes", "structural_model", "scaling", "derived"] {
+        if let Some(lines) = blocks.get(key) {
+            collect_referenced_identifiers(lines, &mut downstream_refs);
+        }
+    }
+    let indiv_var_names: Vec<String> = unconditionally_assigned_vars(&pre_stmts)
+        .into_iter()
+        .filter(|n| {
+            top_level_names.iter().any(|t| t == n)
+                || downstream_refs.contains(&n.to_ascii_uppercase())
+        })
+        .collect();
     let indiv_ctx =
         ParseCtx::new(&theta_names, &eta_names, &all_assigned).with_nn_specs(&nn_specs_for_ctx);
     let indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
@@ -3253,6 +3388,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.fd_hessian_step = v;
         }
+        "covariance_ofv_hessian" => {
+            opts.covariance_ofv_hessian = parse_bool("covariance_ofv_hessian")?
+        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -3429,6 +3567,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.reconverge_gradient_interval = parse_usize("reconverge_gradient_interval")?
         }
         "scale_params" => opts.scale_params = parse_bool("scale_params")?,
+        "parameter_scaling" => {
+            opts.parameter_scaling = match value.to_lowercase().as_str() {
+                "auto" => ParameterScaling::Auto,
+                "none" | "off" => ParameterScaling::None,
+                "abs" => ParameterScaling::Abs,
+                "rescale2" => ParameterScaling::Rescale2,
+                other => {
+                    return Err(format!(
+                        "fit option `parameter_scaling`: unknown value `{other}` — \
+                         expected auto/none/abs/rescale2"
+                    ));
+                }
+            };
+        }
         "max_unconverged_frac" => opts.max_unconverged_frac = parse_f64("max_unconverged_frac")?,
         "min_obs_for_convergence_check" => {
             opts.min_obs_for_convergence_check =
@@ -4321,6 +4473,201 @@ fn ode_param_slots(names: &[String]) -> Result<Vec<usize>, String> {
     Ok(slots)
 }
 
+/// Find `name(` at a word boundary in `s` (ASCII), returning the index of `name`.
+fn find_word_call(s: &str, name: &str) -> Option<usize> {
+    let pat = format!("{name}(");
+    let b = s.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(&pat) {
+        let i = from + rel;
+        let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if before_ok {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// Given the index of a `(` in `s` (ASCII), return the inner text and the index
+/// just past the matching `)`. `None` if unbalanced.
+fn balanced_parens(s: &str, open: usize) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    if b.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for i in open..b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((s[open + 1..i].to_string(), i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// State name `X` if `line` is a `d/dt(X) = …` equation, else `None`.
+fn diffeq_state(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("d/dt(")?;
+    let close = rest.find(')')?;
+    Some(rest[..close].trim().to_string())
+}
+
+/// True if the call spanning `[start, end)` in `line` (ASCII) is **not** a bare,
+/// positively-signed, top-level additive term — i.e. it is scaled (`*` `/` `^`),
+/// negated (a leading `-`), or grouped (`(` immediately before / `)` immediately
+/// after, which can hide an outer scale such as `(transit(...))/V`). The
+/// input-rate forcing is always injected as `+R_in`, unscaled, so only a bare
+/// `+ transit(...)` term is faithful; any other context would silently drop the
+/// sign or scale. Surrounding spaces are skipped; the faithful preceding chars
+/// are `=` (RHS start) and `+`, the faithful following chars are end-of-line,
+/// `+`, and `-` (each starts a new additive term).
+fn call_is_scaled_or_signed(line: &str, start: usize, end: usize) -> bool {
+    let b = line.as_bytes();
+    let mut i = start;
+    while i > 0 && b[i - 1] == b' ' {
+        i -= 1;
+    }
+    let before_bad = i > 0 && matches!(b[i - 1], b'*' | b'/' | b'^' | b'-' | b'(');
+    let mut j = end;
+    while j < b.len() && b[j] == b' ' {
+        j += 1;
+    }
+    let after_bad = j < b.len() && matches!(b[j], b'*' | b'/' | b'^' | b')');
+    before_bad || after_bad
+}
+
+/// Split a string on top-level commas (commas outside nested parentheses).
+fn split_args_on_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut last = 0;
+    for (i, &c) in s.as_bytes().iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&s[last..i]);
+                last = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[last..]);
+    parts
+}
+
+/// Extract built-in absorption input-rate calls (currently `transit(...)`,
+/// design A) from the `[odes]` RHS lines. For each
+/// `d/dt(STATE) = … transit(n=P, mtt=Q) …`, records an [`InputRateForcing`]
+/// (`cmt` ← STATE index; `n`/`mtt` resolved to individual-parameter slots) and
+/// rewrites the call to `0` so the remaining RHS parses as a normal expression.
+/// Returns the cleaned lines and the collected forcing terms.
+///
+/// Validation (negative-tested): `transit(...)` must be the input rate of a
+/// top-level `d/dt(...)` equation; args are exactly `n` and `mtt`, each a
+/// declared individual parameter; a scaled call (`FR*transit(...)`) and more than
+/// one call per equation are rejected (parallel/biphasic comes with later models).
+fn extract_input_rate_terms(
+    rhs_lines: &[String],
+    state_names: &[String],
+    indiv_param_names: &[String],
+    indiv_param_slots: &[usize],
+) -> Result<(Vec<String>, Vec<crate::pk::absorption::InputRateForcing>), String> {
+    use crate::pk::absorption::{InputRateForcing, InputRateKind};
+    let resolve_slot = |val: &str, arg: &str| -> Result<usize, String> {
+        indiv_param_names
+            .iter()
+            .position(|p| p == val)
+            .map(|i| indiv_param_slots[i])
+            .ok_or_else(|| {
+                format!(
+                    "[odes]: transit({arg}={val}): `{val}` is not a declared individual parameter"
+                )
+            })
+    };
+
+    let mut forcings = Vec::new();
+    let mut cleaned = Vec::with_capacity(rhs_lines.len());
+    for raw in rhs_lines {
+        let Some(start) = find_word_call(raw, "transit") else {
+            cleaned.push(raw.clone());
+            continue;
+        };
+        let state = diffeq_state(raw).ok_or_else(|| {
+            format!(
+                "[odes]: transit(...) may only be the input rate of a `d/dt(...)` equation — \
+                 found it in `{}`",
+                raw.trim()
+            )
+        })?;
+        let cmt = state_names
+            .iter()
+            .position(|s| s == &state)
+            .ok_or_else(|| format!("[odes]: d/dt({state}): undeclared state"))?;
+
+        let open = start + "transit".len();
+        let (inner, end) = balanced_parens(raw, open).ok_or_else(|| {
+            format!(
+                "[odes]: transit(...): unbalanced parentheses in `{}`",
+                raw.trim()
+            )
+        })?;
+        if call_is_scaled_or_signed(raw, start, end) {
+            return Err(
+                "[odes]: transit(...) must be a standalone, positively-signed additive input \
+                 rate — it cannot be scaled (`* / ^`), negated (a leading `-`), or wrapped in \
+                 parentheses (e.g. `FR*transit(...)`, `-transit(...)`, `(transit(...))/V`), \
+                 since these silently drop the sign/scale. Write it as a bare `+ transit(...)` \
+                 term."
+                    .to_string(),
+            );
+        }
+
+        let mut n_slot = None;
+        let mut mtt_slot = None;
+        for part in split_args_on_commas(&inner) {
+            let (name, val) = part.split_once('=').ok_or_else(|| {
+                format!(
+                    "[odes]: transit(...) arguments must be `name=parameter`, got `{}`",
+                    part.trim()
+                )
+            })?;
+            let (name, val) = (name.trim(), val.trim());
+            match name {
+                "n" => n_slot = Some(resolve_slot(val, "n")?),
+                "mtt" => mtt_slot = Some(resolve_slot(val, "mtt")?),
+                other => {
+                    return Err(format!(
+                        "[odes]: transit(...) has no argument `{other}` (expected `n` and `mtt`)"
+                    ))
+                }
+            }
+        }
+        let n_slot = n_slot.ok_or("[odes]: transit(...) missing required argument `n`")?;
+        let mtt_slot = mtt_slot.ok_or("[odes]: transit(...) missing required argument `mtt`")?;
+
+        forcings.push(InputRateForcing {
+            cmt,
+            kind: InputRateKind::Transit,
+            arg_slots: vec![n_slot, mtt_slot],
+        });
+
+        let new_line = format!("{}0{}", &raw[..start], &raw[end..]);
+        if find_word_call(&new_line, "transit").is_some() {
+            return Err("[odes]: at most one transit(...) per d/dt equation (Phase 0)".to_string());
+        }
+        cleaned.push(new_line);
+    }
+    Ok((cleaned, forcings))
+}
+
 fn build_ode_spec(
     lines: &[String],
     state_names: &[String],
@@ -4420,6 +4767,16 @@ fn build_ode_spec(
             rhs_lines.push(raw.clone());
         }
     }
+
+    // Design A: pull built-in input-rate calls (transit(...)) out of each d/dt RHS
+    // into forcing terms before expression parsing, so they never enter the
+    // expression AST / bytecode / symbolic-AD core (each call is rewritten to `0`).
+    let (rhs_lines, input_rate) = extract_input_rate_terms(
+        &rhs_lines,
+        state_names,
+        indiv_param_names,
+        indiv_param_slots,
+    )?;
 
     // For ODE RHS expressions, states + individual params get injected into the
     // `vars` map at eval time, so every bare identifier should resolve to a
@@ -4875,6 +5232,9 @@ fn build_ode_spec(
         // Default tolerances; overwritten from [fit_options] / settings by
         // CompiledModel::sync_ode_solver_opts once fit options are merged.
         solver_opts: crate::ode::OdeSolverOptions::default(),
+        // Built-in absorption forcing terms split out of the [odes] RHS above
+        // (design A); empty for models with no transit()/etc. input-rate call.
+        input_rate,
     })
 }
 
@@ -6797,11 +7157,11 @@ fn compile_bytecode(expr: &Expression) -> Bytecode {
 ///   Jump        :   0
 ///   JumpIfFalse :  -1
 ///
-/// The single linear scan returns an *upper bound* (not the exact peak):
-/// `Conditional` emits both then- and else-branches inline with a `Jump`
-/// between them, so the linear walk credits BOTH branches' pushes against
-/// running depth even though execution only takes one branch at runtime.
-/// That over-estimate is exactly what `eval_bytecode` wants for its
+/// A single linear scan ([`scan_stack_depth`]) returns an *upper bound* (not
+/// the exact peak): `Conditional` emits both then- and else-branches inline
+/// with a `Jump` between them, so the linear walk credits BOTH branches'
+/// pushes against running depth even though execution only takes one branch at
+/// runtime. That over-estimate is exactly what `eval_bytecode` wants for its
 /// `stack.reserve(max_stack)` call — under-estimating here would let the
 /// unchecked-write hot loop go OOB on the conservative-FD path. The
 /// `depth >= 0` and balanced-end debug asserts catch a future opcode
@@ -6811,6 +7171,30 @@ fn compile_bytecode(expr: &Expression) -> Bytecode {
 /// If backward jumps (e.g. for loops) are ever added, this linear-scan
 /// algorithm no longer holds — fixed-point iteration would be required.
 fn compute_max_stack(ops: &[Op]) -> usize {
+    let (peak, depth) = scan_stack_depth(ops);
+    // A well-formed *jump-free* expression leaves exactly one value on the
+    // stack (the result); this catches off-by-one push/pop emissions in any
+    // future `compile_expr_into` change. Bytecode with branches can't be
+    // checked this way (the linear scan walks both arms — see
+    // `bytecode_has_branch`), so the predicate exempts them. `peak` stays a
+    // safe over-estimate either way.
+    debug_assert!(
+        ends_at_expected_depth(ops, depth),
+        "compute_max_stack: bytecode ends at depth {depth}, expected 1",
+    );
+    peak.max(1) as usize
+}
+
+/// Single linear pass over `ops` returning `(peak, end_depth)`: the maximum
+/// running f64-stack depth and the depth left after the final op. Split out
+/// from [`compute_max_stack`] so the end-depth invariant can be checked on
+/// *real* compiled bytecode from a unit test (see
+/// `compute_max_stack_jumpfree_bytecode_ends_at_depth_one`) even under the
+/// `ci-test` profile, where the `debug_assert!` that normally guards it is
+/// compiled out. Returning `end_depth` — rather than only consuming it inside
+/// that `debug_assert!` — is what lets a future `compile_expr_into` off-by-one
+/// be caught in CI, not just under the local dev profile.
+fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
     let mut depth: i32 = 0;
     let mut peak: i32 = 0;
     for op in ops {
@@ -6861,14 +7245,32 @@ fn compute_max_stack(ops: &[Op]) -> usize {
             peak = depth;
         }
     }
-    // A well-formed expression bytecode leaves exactly one value on the
-    // stack (the result). Catch off-by-one push/pop emissions in any
-    // future compile_expr_into change.
-    debug_assert!(
-        depth == 1 || ops.is_empty(),
-        "compute_max_stack: bytecode ends at depth {depth}, expected 1",
-    );
-    peak.max(1) as usize
+    (peak, depth)
+}
+
+/// True if `ops` contains a branch (`Jump` / `JumpIfFalse`). The end-of-scan
+/// depth invariant in [`compute_max_stack`] only holds for branch-free
+/// bytecode: a `Conditional` emits both arms inline, so the linear walk ends
+/// above depth 1 even though execution takes one arm. Extracted (and
+/// unit-tested directly) so the branch check is exercised independently of the
+/// debug-only assertion that consumes it.
+fn bytecode_has_branch(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|op| matches!(op, Op::Jump(_) | Op::JumpIfFalse(_)))
+}
+
+/// Whether a completed linear scan of `ops` ending at `depth` satisfies the
+/// well-formed end-depth invariant: a jump-free expression must leave exactly
+/// one value on the stack. Branchy bytecode is exempt — a `Conditional` emits
+/// both arms inline, so the linear walk ends above depth 1 even though
+/// execution takes one arm (see [`bytecode_has_branch`]). The cheap `depth`
+/// check is tried first so the common jump-free path skips the O(n) scan.
+///
+/// Returned rather than inlined into the `debug_assert!` so the invariant is
+/// exercised even under the `ci-test` profile, where `debug_assert!` is
+/// compiled out and the assertion itself never runs.
+fn ends_at_expected_depth(ops: &[Op], depth: i32) -> bool {
+    depth == 1 || ops.is_empty() || bytecode_has_branch(ops)
 }
 
 fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
@@ -7970,9 +8372,18 @@ fn simplify_expr(expr: &Expression) -> Expression {
 #[allow(dead_code)] // no runtime consumer after #145; see struct doc.
 pub struct IndivParamPartials {
     /// Indiv-param names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
-    /// `[individual_parameters]` source-declaration order. Equals the
-    /// top-level `Assign(name, _)` order, matching
-    /// `CompiledModel.indiv_param_names`.
+    /// `[individual_parameters]` source-declaration order — one row per
+    /// top-level `Assign(name, _)`.
+    ///
+    /// CAUTION (issue #357): this is a *subset* of
+    /// `CompiledModel.indiv_param_names`, not a positional twin. A parameter
+    /// assigned only inside `if`/`else` branches and promoted because a
+    /// downstream block references it (e.g. a conditional `CL`) appears in
+    /// `indiv_param_names` but has NO row here — `build_indiv_param_partials`
+    /// skips `Statement::If`, and a piecewise param has no single symbolic
+    /// partial anyway (the AD inner loop falls back to FD; see the `eta_map`
+    /// note in `parse_full_model`). A future AD consumer MUST look partials up
+    /// by name, never zip them positionally against `indiv_param_names`.
     pub(crate) names: Vec<String>,
     /// `d_d_theta[i][k]` = ∂P_i/∂θ_k. Inner Vec length = `n_theta_base`
     /// (user-declared θ count, NOT including NN-weight or diffusion θ which
@@ -9059,6 +9470,107 @@ fn parse_if_statement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── transit() input-rate parse-split (#322, design A) ────────────────────
+    #[test]
+    fn extract_transit_input_rate_basic() {
+        let lines = vec![
+            "d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot".to_string(),
+            "d/dt(central) = KA*depot - (CL/V)*central".to_string(),
+        ];
+        let states = vec!["depot".to_string(), "central".to_string()];
+        let names = vec![
+            "NTR".to_string(),
+            "MTT".to_string(),
+            "KA".to_string(),
+            "CL".to_string(),
+            "V".to_string(),
+        ];
+        let slots = vec![10, 11, 4, 0, 1];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        // transit(...) replaced by 0; the rest of the RHS is untouched.
+        assert_eq!(cleaned[0], "d/dt(depot) = 0 - KA*depot");
+        assert_eq!(cleaned[1], "d/dt(central) = KA*depot - (CL/V)*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].cmt, 0); // depot
+        assert!(matches!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::Transit
+        ));
+        assert_eq!(forcings[0].arg_slots, vec![10, 11]); // [n=NTR slot, mtt=MTT slot]
+    }
+
+    #[test]
+    fn extract_transit_input_rate_rejects_bad_specs() {
+        let states = vec!["depot".to_string()];
+        let names = vec!["NTR".to_string(), "MTT".to_string()];
+        let slots = vec![0, 1];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=ZZZ)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        assert!(go("d/dt(depot) = transit(n=NTR, foo=MTT)")
+            .unwrap_err()
+            .contains("no argument `foo`"));
+        assert!(go("d/dt(depot) = transit(n=NTR)")
+            .unwrap_err()
+            .contains("missing required argument `mtt`"));
+        assert!(go("x = transit(n=NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("d/dt"));
+        assert!(go("d/dt(depot) = FR*transit(n=NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("scaled"));
+        // Leading unary minus: the forcing is injected `+R_in`, so a negated call
+        // would silently flip the sign of the input rate. Must be rejected.
+        assert!(go("d/dt(depot) = -transit(n=NTR, mtt=MTT) - KA*depot")
+            .unwrap_err()
+            .contains("standalone"));
+        // Subtracted term (wrong sign) even without `*`/`/` scaling.
+        assert!(go("d/dt(depot) = KA*depot - transit(n=NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("standalone"));
+        // Parenthesised + scaled outside the group: the old adjacency check saw
+        // only the flanking `(`/`)`, so the `/V` was silently dropped — now rejected.
+        assert!(go("d/dt(depot) = (transit(n=NTR, mtt=MTT))/V")
+            .unwrap_err()
+            .contains("standalone"));
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT")
+            .unwrap_err()
+            .contains("unbalanced"));
+        assert!(go("d/dt(depot) = transit(NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("name=parameter"));
+        assert!(
+            go("d/dt(depot) = transit(n=NTR, mtt=MTT) + transit(n=NTR, mtt=MTT)")
+                .unwrap_err()
+                .contains("at most one")
+        );
+        // Nested parens in an arg value are split correctly, then rejected as a
+        // non-parameter (exercises the comma-splitter's paren-depth tracking).
+        assert!(go("d/dt(depot) = transit(n=foo(a,b), mtt=MTT)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        // A word *ending* in `transit` (e.g. `xtransit(`) is not a transit() call:
+        // left unchanged, no forcing recorded.
+        let (kept, none) = go("d/dt(depot) = xtransit(n=NTR, mtt=MTT) - depot").unwrap();
+        assert_eq!(kept[0], "d/dt(depot) = xtransit(n=NTR, mtt=MTT) - depot");
+        assert!(none.is_empty());
+        // No transit() → unchanged, no forcings.
+        let (cleaned, f) = go("d/dt(depot) = -KA*depot").unwrap();
+        assert_eq!(cleaned[0], "d/dt(depot) = -KA*depot");
+        assert!(f.is_empty());
+
+        // Positive controls for the tightened sign/scale guard: a bare additive
+        // `transit(...)` is accepted whether it is the only term, the first term
+        // before a `-` disposition term, or a later `+` term.
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT)").is_ok());
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot").is_ok());
+        assert!(go("d/dt(depot) = -KA*depot + transit(n=NTR, mtt=MTT)").is_ok());
+    }
 
     // Issue #176 retired the split `*_iv_bolus` / `*_infusion` model names
     // in favour of a single `*_iv` per compartment count. The parser must
@@ -10304,7 +10816,12 @@ mod tests {
         for method in ["foce", "focei", "gn", "gn_hybrid", "saem"] {
             let opts = parse_fit_options(&[
                 format!("method = {method}"),
-                "covariance = false".to_string(),
+                "covariance = true".to_string(),
+                // The whole covariance family is framework-wide — none of these
+                // are method-specific, so none must warn under any method.
+                "covariance_method = s".to_string(),
+                "covariance_fallback = sir".to_string(),
+                "covariance_ofv_hessian = true".to_string(),
                 "verbose = false".to_string(),
                 "sir = true".to_string(),
                 "bloq_method = m3".to_string(),
@@ -10601,6 +11118,29 @@ mod tests {
         }
         // invalid
         assert!(parse_fit_options(&["covariance_method = bhhh".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_parse_parameter_scaling_and_ofv_hessian() {
+        use crate::types::ParameterScaling;
+        // Defaults: parameter_scaling = Auto, covariance_ofv_hessian = true.
+        let def = parse_fit_options(&[]).unwrap();
+        assert_eq!(def.parameter_scaling, ParameterScaling::Auto);
+        assert!(def.covariance_ofv_hessian);
+        // parameter_scaling keywords, case-insensitive.
+        for (input, expected) in [
+            ("auto", ParameterScaling::Auto),
+            ("none", ParameterScaling::None),
+            ("ABS", ParameterScaling::Abs),
+            ("rescale2", ParameterScaling::Rescale2),
+        ] {
+            let opts = parse_fit_options(&[format!("parameter_scaling = {input}")]).unwrap();
+            assert_eq!(opts.parameter_scaling, expected, "input `{input}`");
+        }
+        assert!(parse_fit_options(&["parameter_scaling = bogus".to_string()]).is_err());
+        // covariance_ofv_hessian bool.
+        let off = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap();
+        assert!(!off.covariance_ofv_hessian);
     }
 
     // ── mu-referencing pattern detection ─────────────────────────────────
@@ -12626,6 +13166,71 @@ if (1 > 0) {
         let all = assigned_vars_in_order(&stmts);
         assert!(all.contains(&"SCALE".to_string()));
         assert!(all.contains(&"V".to_string()));
+    }
+
+    #[test]
+    fn test_unconditionally_assigned_vars_includes_all_branch_assignments() {
+        // V is assigned on BOTH branches → unconditionally defined → promoted.
+        // SCALE is assigned in only one branch → branch-local → excluded.
+        // (Issue #357: a param written on every branch must earn a PK slot.)
+        let block = "
+CL = 1.0
+if (1 > 0) {
+  SCALE = 2.0
+  V = SCALE * 3.0
+} else {
+  V = 4.0
+}
+";
+        let ctx = empty_ctx();
+        let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+        let uncond = unconditionally_assigned_vars(&stmts);
+        assert_eq!(
+            uncond,
+            vec!["CL", "V"],
+            "V is assigned on every branch and must be promoted; SCALE must not"
+        );
+        // top_level still excludes V (its only assignments are inside branches).
+        let top = top_level_assigned_vars(&stmts);
+        assert_eq!(top, vec!["CL"]);
+    }
+
+    #[test]
+    fn test_unconditionally_assigned_vars_branch_only_param() {
+        // The exact issue #357 shape: CL assigned only inside if/else, V at
+        // top level. CL must come first (leading-branch order), then V.
+        let block = "
+if (WT > 70) {
+  CL = TVCL * 1.5
+} else {
+  CL = TVCL
+}
+V = TVV
+";
+        let ctx = empty_ctx();
+        let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+        let uncond = unconditionally_assigned_vars(&stmts);
+        assert_eq!(uncond, vec!["CL", "V"]);
+    }
+
+    #[test]
+    fn test_unconditionally_assigned_vars_if_without_else_excludes() {
+        // No `else` → the name could be undefined on the fall-through path, so
+        // it stays branch-local (not promoted).
+        let block = "
+CL = 1.0
+if (WT > 70) {
+  V = 2.0
+}
+";
+        let ctx = empty_ctx();
+        let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+        let uncond = unconditionally_assigned_vars(&stmts);
+        assert_eq!(
+            uncond,
+            vec!["CL"],
+            "V lacks an else branch — not unconditional"
+        );
     }
 
     #[test]
@@ -15373,6 +15978,124 @@ if (1 > 0) {
     }
     fn cmp(l: Expression, op: CmpOp, r: Expression) -> Condition {
         Condition::Compare(l, op, r)
+    }
+
+    #[test]
+    fn compute_max_stack_allows_branching_bytecode() {
+        // Regression: a `Conditional` compiles to
+        //   cond; JumpIfFalse(else); then; Jump(end); else
+        // so `compute_max_stack`'s linear scan walks BOTH arms and ends above
+        // depth 1 (one extra per branch). The end-depth assertion must be
+        // skipped when jumps are present; before the fix, `compile_bytecode`
+        // panicked here under debug-assertions ("bytecode ends at depth 2").
+        let expr = cond(cmp(lit(2.0), CmpOp::Lt, lit(3.0)), lit(1.0), lit(-1.0));
+        let bc = compile_bytecode(&expr); // would panic pre-fix
+        assert!(
+            bc.max_stack >= 1,
+            "max_stack must be >= 1, got {}",
+            bc.max_stack
+        );
+
+        // The reserved size must actually be sufficient to evaluate correctly:
+        // 2 < 3 ⇒ the `then` arm (1.0).
+        let nn: Vec<Vec<f64>> = Vec::new();
+        let mut stack: Vec<f64> = Vec::new();
+        let by = eval_bytecode(&bc, &[], &[], &[], &[], &nn, &mut stack);
+        assert_eq!(by.to_bits(), 1.0_f64.to_bits());
+
+        // Nested conditionals (deeper branch nesting) must also not trip it,
+        // and a deeper `peak` must still be returned.
+        let nested = cond(
+            cmp(lit(1.0), CmpOp::Gt, lit(0.0)),
+            cond(cmp(lit(2.0), CmpOp::Lt, lit(5.0)), lit(10.0), lit(20.0)),
+            lit(-1.0),
+        );
+        assert!(compute_max_stack(&compile_bytecode(&nested).ops) >= 1);
+
+        // The jump-free path is unchanged: `1 + 2` pushes two operands before
+        // `Add`, so the peak (the returned size) is 2 — and its end-depth of 1
+        // still satisfies the (retained) jump-free assertion.
+        assert_eq!(
+            compute_max_stack(&compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops),
+            2
+        );
+
+        // `bytecode_has_branch` (which gates the assertion) — true for
+        // conditional bytecode, false for a jump-free arithmetic expression.
+        assert!(bytecode_has_branch(&compile_bytecode(&expr).ops));
+        assert!(!bytecode_has_branch(
+            &compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops
+        ));
+
+        // `ends_at_expected_depth` — the returnable predicate the `debug_assert!`
+        // consumes. Exercised directly (with hard-coded depths) so its branching
+        // logic is covered even under the `ci-test` profile (debug-assertions
+        // off), where the assertion is compiled out and never runs. Branchy
+        // bytecode is exempt at any end depth; jump-free bytecode must end at
+        // depth 1. The depth real bytecode actually compiles to is pinned
+        // separately in `compute_max_stack_jumpfree_bytecode_ends_at_depth_one`.
+        let cond_ops = compile_bytecode(&expr).ops;
+        let addops = compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops;
+        assert!(ends_at_expected_depth(&cond_ops, 2)); // branchy: exempt even at depth 2
+        assert!(ends_at_expected_depth(&addops, 1)); // jump-free: depth 1 ok
+        assert!(!ends_at_expected_depth(&addops, 2)); // jump-free: depth 2 rejected
+        assert!(ends_at_expected_depth(&[], 0)); // empty: ok
+    }
+
+    #[test]
+    fn compute_max_stack_jumpfree_bytecode_ends_at_depth_one() {
+        // Closes the gap the sibling test leaves open. That one feeds
+        // `ends_at_expected_depth` HARD-CODED depths, so it pins the predicate's
+        // branching logic but never the depth a real expression compiles to — a
+        // future `compile_expr_into` off-by-one would slip past it. Here we scan
+        // REAL bytecode and assert the end-depth invariant directly.
+        //
+        // `scan_stack_depth` *returns* the end depth (rather than only feeding it
+        // to the `debug_assert!` in `compute_max_stack`), so these are plain
+        // value assertions that hold under every profile — including `ci-test`,
+        // where debug-assertions are off. That is what makes such a regression
+        // catchable in CI, not only under the local dev profile.
+        for expr in [
+            lit(3.0),
+            binop(BinOp::Add, lit(1.0), lit(2.0)),
+            binop(BinOp::Sub, binop(BinOp::Mul, lit(2.0), lit(3.0)), lit(4.0)),
+            unary("exp", lit(0.5)),
+            unary("ln", binop(BinOp::Div, lit(6.0), lit(2.0))),
+        ] {
+            let ops = compile_bytecode(&expr).ops;
+            assert!(
+                !bytecode_has_branch(&ops),
+                "expr must compile jump-free for this invariant: {ops:?}"
+            );
+            let (peak, end_depth) = scan_stack_depth(&ops);
+            // A well-formed expression leaves exactly one result on the stack.
+            assert_eq!(
+                end_depth, 1,
+                "jump-free expr must end at depth 1, got {end_depth}: {ops:?}"
+            );
+            // `peak` (the reserved stack size) never under-counts the end depth,
+            // and `compute_max_stack` returns exactly `peak.max(1)`.
+            assert!(
+                peak >= end_depth,
+                "peak {peak} < end_depth {end_depth}: {ops:?}"
+            );
+            assert_eq!(compute_max_stack(&ops), peak.max(1) as usize);
+        }
+
+        // Counterpart to the exemption: branchy bytecode genuinely ends ABOVE
+        // depth 1 (the linear scan walks both arms), which is exactly why
+        // `compute_max_stack` skips the end-depth assert when jumps are present.
+        let cond_ops = compile_bytecode(&cond(
+            cmp(lit(2.0), CmpOp::Lt, lit(3.0)),
+            lit(1.0),
+            lit(-1.0),
+        ))
+        .ops;
+        assert!(bytecode_has_branch(&cond_ops));
+        assert!(
+            scan_stack_depth(&cond_ops).1 > 1,
+            "conditional should end above depth 1 (both arms walked): {cond_ops:?}"
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@
   - [Error Model](model-file/error-model.md)
   - [BLOQ / Censored Observations](model-file/bloq.md)
   - [ODE Models](model-file/ode-models.md)
+  - [Built-in Absorption Models](model-file/absorption.md)
   - [Scaling](model-file/scaling.md)
   - [Stochastic Differential Equations](model-file/diffusion.md)
   - [Neural Networks (DCM / NODE)](model-file/neural-networks.md)

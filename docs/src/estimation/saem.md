@@ -35,7 +35,9 @@ Each SAEM iteration consists of:
 
 For each subject, sample from the conditional distribution of random effects:
 
-\\[ p(\eta_i | y_i, \theta, \Omega, \sigma) \\]
+<div>
+\[ p(\eta_i | y_i, \theta, \Omega, \sigma) \]
+</div>
 
 Two samplers are available:
 
@@ -49,13 +51,15 @@ Two MH kernels run per subject per SAEM iteration (the mixture of Kuhn & Laviell
 
 Both kernels are symmetric in \\( \eta \\), so the proposal density cancels and the acceptance log-ratio is the difference of `individual_nll` values, which encodes the prior \\( N(0, \Omega) \\) plus the observation likelihood.
 
-**Acceptance**: \\( \min(1, \exp(\text{NLL}_{\text{current}} - \text{NLL}_{\text{prop}})) \\). Target acceptance rate: 40%.
+**Acceptance**: \\( \min(1, \exp(\text{NLL}\_{\text{current}} - \text{NLL}\_{\text{prop}})) \\). Target acceptance rate: 40%.
 
 #### HMC (Hamiltonian Monte Carlo, `n_leapfrog > 0`)
 
 When `n_leapfrog` is set to a positive integer (e.g. `3`), one HMC proposal replaces the `n_mh_steps` MH proposals per subject per iteration. HMC uses the gradient of the individual NLL to make longer, more directed moves through the posterior:
 
-\\[ H(\eta, p) = \text{NLL}(\eta) + \tfrac{1}{2} \|p\|^2 \\]
+<div>
+\[ H(\eta, p) = \text{NLL}(\eta) + \tfrac{1}{2} \|p\|^2 \]
+</div>
 
 with momentum \\( p \sim N(0, I) \\) and a standard velocity Störmer-Verlet (leapfrog) integrator. Acceptance is on \\( \Delta H \\), targeting ~65% acceptance.
 
@@ -77,13 +81,17 @@ The startup banner reports the resolved E-step kernel on a `sampler:` line, e.g.
 
 Update the sufficient statistic for \\( \Omega \\):
 
-\\[ S_2 \leftarrow (1 - \gamma_k^\Omega) \cdot S_2 + \gamma_k^\Omega \cdot \frac{1}{N} \sum_{i=1}^{N} \eta_i \eta_i^T \\]
+<div>
+\[ S_2 \leftarrow (1 - \gamma_k^\Omega) \cdot S_2 + \gamma_k^\Omega \cdot \frac{1}{N} \sum_{i=1}^{N} \eta_i \eta_i^T \]
+</div>
 
 **Damped Ω step.** The θ/σ M-step uses the full \\( \gamma_k \\) (1.0 during exploration), but the Ω sufficient statistic uses a *capped* step \\( \gamma_k^\Omega = \min(\gamma_k, 0.1) \\). With the full \\( \gamma=1 \\), Ω would be overwritten every exploration iteration by a single warm-started, not-yet-equilibrated MCMC draw; for a correlated block that one snapshot is biased toward the chain's current correlation, and the bias feeds back through \\( \mathrm{chol}(\Omega) \\) into the next proposal — the same rank-1 runaway the componentwise kernel guards against, here attacked from the M-step side. Capping the Ω learning rate during exploration averages those draws (Robbins-Monro) and breaks the feedback while θ still moves at full speed. The cap applies during exploration only; in the convergence phase it is lifted and Ω uses the full decaying \\( \gamma_k = 1/(k-K_1) \\) — the same Robbins-Monro schedule as θ — so the SA estimate settles correctly (by then the chain is equilibrated, so the single-draw overwrite risk no longer applies).
 
 ### 3. M-Step for Omega (Closed Form)
 
-\\[ \Omega_k = S_2 \\]
+<div>
+\[ \Omega_k = S_2 \]
+</div>
 
 with structurally-zero entries (cross-block off-diagonals, standalone-vs-block off-diagonals, and all off-diagonals in a fully-diagonal Ω) zeroed out — the SA accumulator \\( (1/N) \sum_i \eta_i \eta_i^T \\) is dense by construction, but the model declares which entries are free parameters. Without this projection the chain feeds spurious sampling correlations into the next iteration's MH proposal Cholesky and Ω drifts toward rank-deficiency. Free diagonals are then floored at `1e-6` to keep them away from zero (which would collapse the per-eta proposal scale `δ·chol(Ω)`); this floor does not by itself guarantee positive-definiteness of a full block Ω.
 
@@ -93,11 +101,15 @@ with structurally-zero entries (cross-block off-diagonals, standalone-vs-block o
 
 Minimize the conditional observation negative log-likelihood with ETAs held fixed:
 
-\\[ \sum_{i=1}^{N} \sum_{j=1}^{n_i} \left[ \frac{1}{2} \log V_{ij} + \frac{1}{2} \frac{(y_{ij} - f_{ij})^2}{V_{ij}} \right] \\]
+<div>
+\[ \sum_{i=1}^{N} \sum_{j=1}^{n_i} \left[ \frac{1}{2} \log V_{ij} + \frac{1}{2} \frac{(y_{ij} - f_{ij})^2}{V_{ij}} \right] \]
+</div>
 
 When `mu_referencing = true` (the default), ferx detects lognormal parameters from the `[individual_parameters]` block and applies the **closed-form EM update** for those thetas instead of running NLopt:
 
-\\[ \log \theta_j \leftarrow \log \theta_j + \gamma_k \cdot \overline{\eta_j} \\]
+<div>
+\[ \log \theta_j \leftarrow \log \theta_j + \gamma_k \cdot \overline{\eta_j} \]
+</div>
 
 where \\( \overline{\eta_j} = (1/N) \sum_i \eta_{i,j} \\) is the empirical mean of the post-MH random effects for the eta paired with \\( \theta_j \\). For a log-mu-referenced model where \\( \log P_i = \log \theta + \eta_i \\) with \\( \eta_i \sim N(0, \omega^2) \\), this is exactly the M-step that maximises the complete-data log-likelihood, scaled by the SA step size \\( \gamma_k \\). After the update the etas are re-centred by the same shift so they remain deviations from the new \\( \log \theta_j \\).
 
@@ -248,7 +260,9 @@ SAEM completed. Final OFV = ...
 
 During the iterations ferx prints `condNLL`, the **conditional** (joint) negative log-likelihood summed over subjects, evaluated at the *current MH/HMC-sampled* etas:
 
-\\[ \text{condNLL} = \sum_{i=1}^{N} \text{NLL}(\eta_i^{\text{sampled}}) \\]
+<div>
+\[ \text{condNLL} = \sum_{i=1}^{N} \text{NLL}(\eta_i^{\text{sampled}}) \]
+</div>
 
 This is a cheap per-iteration progress signal. It is **not** the marginal objective function value (OFV): it is evaluated at one stochastic draw of the random effects rather than integrated over their distribution, so unlike the FOCE/FOCEI outer-loop OFV it is noisy, will not decrease monotonically, and is **not comparable across runs** for model selection.
 

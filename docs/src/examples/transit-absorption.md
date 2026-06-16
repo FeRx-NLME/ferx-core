@@ -2,6 +2,8 @@
 
 This example demonstrates a two-compartment model with transit-compartment absorption and allometric scaling on body weight. The complete model file is [`examples/transit_2cpt.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_2cpt.ferx).
 
+> 💡 **Tip:** this page codes the transit chain as **explicit** ODE states (fixed integer `n`). For most models the built-in [`transit(n, mtt)`](../model-file/absorption.md) input-rate function is simpler — one line, with a single **continuous** (estimable) `n` — see `examples/transit_savic.ferx`.
+
 ## When to use
 
 Use a transit-compartment chain when:

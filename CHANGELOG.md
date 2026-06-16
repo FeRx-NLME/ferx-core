@@ -20,6 +20,20 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
+  input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
+  `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The
+  dose is delivered as this appearance rate into the depot (∫R_in dt = F·Dose) —
+  not also as a bolus — so a flexible, continuously-estimable absorption shape
+  takes one line instead of a hand-coded transit chain. Honors `F`/lagtime and
+  superposes over doses; works with IIV/IOV, resets, and time-varying covariates.
+  Unsupported combinations are rejected with a clear error rather than silently
+  mis-modeled: steady-state dosing into a transit compartment (`E_ABSORPTION_SS`),
+  an infusion (`RATE>0`) into a transit compartment (`E_ABSORPTION_RATE`, which
+  would double-count the dose), a `[diffusion]` block together with `transit()`
+  (`E_ABSORPTION_DIFFUSION`), and an out-of-domain `mtt`/`n` at typical values
+  (`E_ABSORPTION_DOMAIN`). New example `examples/transit_savic.ferx` and docs
+  page *Built-in Absorption Models* (#322).
 - Example `dose_rate.ferx` (+ `data/dose_rate.csv`) demonstrating the supported
   NONMEM `RATE` dosing forms — a bolus (`RATE=0`) and a constant-rate infusion
   (`RATE>0`) mixed in one dataset (#324).
@@ -31,6 +45,25 @@ section of the SDLC for the versioning policy).
   (the FOCE objective amplifies the ~`1e-4` solver error); a tighter
   `ode_reltol` now lets the two forms agree. Carried on `OdeSpec::solver_opts`
   and applied via `CompiledModel::sync_ode_solver_opts` (#127).
+- `parameter_scaling` fit option (`none` / `abs` / `rescale2`): parameter
+  scaling for the outer optimizer. `rescale2` is the nlmixr2-style
+  bound-half-width normalisation (maps each packed parameter toward `(−1, 1)`)
+  and substantially improves cold-start convergence for gradient-based
+  optimizers on ill-conditioned multi-parameter surfaces — e.g. `bfgs` reaches
+  OFV −1198.97 on `two_cpt_oral_cov` (≈ nlmixr2's −1199.24) where the unscaled
+  optimizer stalls near −1192. The default `auto` applies `rescale2` to the
+  gradient-based optimizers (`bfgs`/`lbfgs`/`nlopt_lbfgs`/`slsqp`) and leaves the
+  derivative-free `bobyqa` unscaled (where `rescale2` distorts its trust region)
+  (#341).
+- `covariance_ofv_hessian` fit option: build the covariance R-matrix from second
+  differences of the reconverged marginal OFV instead of a central difference of
+  the analytical population gradient. The analytical stencil holds the H-matrix
+  `a = ∂f/∂η` fixed in the `log|H̃|` θ-gradient, biasing the SE of
+  weakly-identified structural parameters (e.g. warfarin TVKA reads ~9% high
+  versus a Richardson FD-of-OFV ground truth); the OFV-Hessian stencil recomputes
+  `a` at every perturbed point and matches the ground truth to <1%, at ≈ the same
+  wall-clock cost (both stencils parallelise over perturbation points). Default
+  `true`; set `false` to force the faster analytical-gradient stencil (#335).
 - Propensity-score-matched simulation: `simulate_with_options()` with a new
   `SimulateOptions { seed, propensity_match }`. When `propensity_match` is set,
   each replicate's drawn etas are reassigned to subjects by optimal Mahalanobis
@@ -134,6 +167,24 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- An individual parameter assigned only inside symmetric `if`/`else` branches in
+  `[individual_parameters]` (the NONMEM-style `IF (cond) CL = ...` /
+  `IF (!cond) CL = ...` construction) on an **ODE model** is no longer rejected
+  by the `[odes]` RHS validator as an undefined name. A name written on every
+  branch is now promoted to a real individual parameter — getting a PK slot,
+  being written back, and resolving in the ODE RHS — provided a downstream block
+  (`[odes]`, `[structural_model]`, `[scaling]`, `[derived]`) actually references
+  it. Purely internal branch helpers stay branch-local and never consume a PK
+  slot (#357).
+- The covariance-family fit options `covariance_method`, `covariance_fallback`,
+  and `covariance_ofv_hessian` no longer emit a spurious "is not used by method
+  `<method>` and will be ignored" warning. They are framework-wide covariance-step
+  options (honoured for every estimator) but were missing from the warning's
+  allowlist; the options were always applied — only the warning was wrong.
+- A missing `DV` (`.`/`NA`/blank) on an `EVID=0` observation row without `MDV=1`
+  is no longer silently scored as `DV=0`. Such rows are now treated as `MDV=1`
+  (skipped) and a single `W_MISSING_DV` warning reports how many rows were
+  skipped, surfaced in fit warnings and `ferx check` (#258).
 - Bioavailability `F` is now applied to **IV bolus and infusion** doses on the
   analytical path, not just oral depot doses. The analytical superposition path
   (used for subjects with no time-varying covariates) previously dropped `F` for
@@ -150,6 +201,19 @@ section of the SDLC for the versioning policy).
   as an IV bolus (which produced wrong predictions with no warning). Modeled
   rate/duration support is not yet implemented; convert such rows to an explicit
   positive `RATE` (= `AMT`/duration) before importing (#324).
+- Cold-start FOCEI/SLSQP on IOV models now reaches the marginal minimum instead
+  of stalling: under the default `parameter_scaling = auto`, `slsqp` now gets the
+  `rescale2` bound-half-width scaling, so pure FOCEI/SLSQP on `warfarin_iov`
+  converges to OFV 307.84 (ω_iov ≈ 0.046) from the cold default start rather than
+  stalling at 343.5 with ω_iov pinned at its init (#335).
+- FOCEI covariance score cross-product (`covariance_method = s` / `rsr`) now
+  carries the `log|H̃|` EBE-response term (`½·∂log|H̃|/∂η̂·dη̂/dθ`, the #274 `tᵢ`):
+  the per-subject score is differenced with the conditional estimate η̂ responding
+  to the parameters, matching how NONMEM forms its S matrix. Previously the score
+  held η̂ fixed (the R-matrix already captured this term via reconvergence, but S
+  did not), so the RSR sandwich SEs were biased on weakly-identified structural
+  parameters — warfarin SE(TVKA) ~5% out. With the term, FOCEI RSR matches NONMEM
+  7.5.1 to <1.8% on every parameter (#335).
 - A `[structural_model]` PK parameter that references a name not defined in
   `[individual_parameters]` (e.g. `pk one_cpt_oral(cl=CL, ...)` with no `CL`)
   is now a parse error instead of being silently dropped and defaulting the

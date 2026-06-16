@@ -14,7 +14,9 @@ An **occasion** is a distinct time window during which the same kappa value appl
 
 **Kappa** (κ) is the IOV random effect, analogous to eta (η) for BSV. Each kappa is drawn independently per occasion:
 
-\\[ \kappa_{ik} \sim \mathcal{N}(0, \Omega_\text{IOV}) \\]
+<div>
+\[ \kappa_{ik} \sim \mathcal{N}(0, \Omega_\text{IOV}) \]
+</div>
 
 where *i* indexes subjects and *k* indexes occasions. The IOV omega matrix Ω_IOV is estimated alongside the BSV omega.
 
@@ -109,18 +111,22 @@ See `examples/warfarin_iov.ferx` for a complete runnable example.
 
 When a model has kappa declarations and the subject has occasion labels, the inner optimizer runs `find_ebe_iov` instead of the standard `find_ebe`. It jointly optimizes over:
 
-\\[ p = [\underbrace{\eta_1, \ldots, \eta_{n_\eta}}_{\text{BSV}},\ \underbrace{\kappa_{1,1}, \ldots, \kappa_{1,n_\kappa}}_{\text{occasion 1}},\ \ldots,\ \underbrace{\kappa_{K,1}, \ldots, \kappa_{K,n_\kappa}}_{\text{occasion K}}] \\]
+<div>
+\[ p = [\underbrace{\eta_1, \ldots, \eta_{n_\eta}}_{\text{BSV}},\ \underbrace{\kappa_{1,1}, \ldots, \kappa_{1,n_\kappa}}_{\text{occasion 1}},\ \ldots,\ \underbrace{\kappa_{K,1}, \ldots, \kappa_{K,n_\kappa}}_{\text{occasion K}}] \]
+</div>
 
 The joint negative log-posterior is:
 
-\\[
+<div>
+\[
 -\log p(p \mid y_i) = \frac{1}{2}\left[
   \eta^T \Omega^{-1} \eta + \log|\Omega|
   + \sum_{k=1}^{K} \kappa_k^T \Omega_\text{IOV}^{-1} \kappa_k
   + K \log|\Omega_\text{IOV}|
   + \sum_{j} \left(\frac{(y_{ij} - f_{ij}^{(k_j)})^2}{V_{ij}} + \log V_{ij}\right)
 \right]
-\\]
+\]
+</div>
 
 where \\( k_j \\) is the occasion of observation *j* and \\( f_{ij}^{(k)} = f(\theta, \eta_i, \kappa_{ik}) \\).
 
@@ -130,23 +136,29 @@ Optimization uses BFGS; the gradient is computed by finite differences (no AD pa
 
 The IOV omega is packed after the sigma block in the optimizer vector. For Option A (diagonal Ω_IOV) only the log-diagonal entries are appended; for Option B the full Cholesky lower triangle is appended (log-diagonals plus off-diagonals as-is), mirroring the BSV omega packing:
 
-\\[
+<div>
+\[
 x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Omega_\text{IOV})]
-\\]
+\]
+</div>
 
 The per-subject FOCE objective is a *proper augmented marginal*: the per-occasion kappas are integrated out through the linearised marginal exactly like the BSV etas. The random-effect vector is \\( b = [\eta,\ \kappa_1, \ldots, \kappa_K] \\) with block-diagonal prior covariance
 
-\\[
+<div>
+\[
 \Sigma_b = \text{blockdiag}(\Omega_\text{BSV},\ \Omega_\text{IOV},\ \ldots,\ \Omega_\text{IOV})
-\\]
+\]
+</div>
 
 (*K* copies of Ω_IOV), and the H-matrix is **augmented** with kappa columns,
 \\( H_\text{full} = [\,\partial f/\partial\eta \mid \partial f/\partial\kappa_1 \mid \cdots \mid \partial f/\partial\kappa_K\,] \\). Because \\( \kappa_k \\) enters only occasion-*k*'s predictions, its columns are non-zero only on that occasion's rows. The objective is then the ordinary Sheiner–Beal form
 
-\\[
+<div>
+\[
 \text{NLL}_i = \tfrac{1}{2}\left[(y - f_0)^T \tilde{R}^{-1} (y - f_0) + \log|\tilde{R}|\right],\qquad
 \tilde{R} = H_\text{full}\,\Sigma_b\,H_\text{full}^T + R
-\\]
+\]
+</div>
 
 with no separate kappa prior added (it is already folded into \\( \tilde{R} \\)). This reduces exactly to the BSV-only FOCE objective when there are no kappas.
 

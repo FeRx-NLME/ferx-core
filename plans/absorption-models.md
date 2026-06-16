@@ -2,8 +2,10 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap. Prerequisite #324 safety net (PR #326) **merged 2026-06-14**;
-remaining models not yet implemented. Multi-PR / phased.
+**Status:** approved roadmap, in progress. Prerequisite #324 safety net (PR #326) **merged
+2026-06-14**. **Phase 0a — built-in `transit()` absorption — implemented in PR #343 (open,
+2026-06-14)**; `ln_gamma` building block merged (#340). `ode_template` (Phase 0b) and the
+remaining models (Phases 1–3) not yet implemented. Multi-PR / phased.
 
 ---
 
@@ -295,14 +297,24 @@ Decouple **input function** from **disposition**, reusing existing machinery:
    pattern. Honor the `ad/` rule: **no `f64::max`/`min`** — use explicit comparisons (see
    CLAUDE.md). Each model also exposes `validate(θ) -> Result` and the analytic mass
    `∫R_in = F·Dose` (test invariant).
+   - **Phase 0a finding:** the shared numeric trait was **not needed** for transit. ODE models
+     always differentiate via **finite differences** (`model.tv_fn` is `None` for any ODE model,
+     so `gradient = ad` falls back to FD — see `OdeReadout::requires_fd`), and the forcing is
+     evaluated only on the FD/forward path, so no `Dual`/Enzyme path is reachable.
+     `transit_input_rate` is plain `f64` (still kept `max`/`min`-free). Revisit the trait only
+     if/when an autodiff ODE path is added.
 2. **Forcing into the user's ODE.** `R_in(tad)` is added into the dosing compartment of the
    disposition the user supplied (`ode(...)` or the `ode_template`-generated states) via the
    **same RHS-wrapper mechanism that already injects `+rate` for infusions**
    (`ode/predictions.rs` header doc: "adding `+rate` … via an RHS wrapper"). No silent
    conversion: an analytical `pk` disposition + an ODE-only absorption model is rejected by the
    error rule, not forced. Shared plumbing: observed value via the existing obs-compartment
-   path; **SS=1** reuses `equilibrate_ss_state`; **lagtime/F** reuse `PK_IDX_LAGTIME` (shift
-   `tad`) and `PK_IDX_F` (scale `D`); multiple doses / ADDL superpose `R_in` per dose.
+   path; **lagtime/F** reuse `PK_IDX_LAGTIME` (shift `tad`) and `PK_IDX_F` (scale `D`); multiple
+   doses / ADDL superpose `R_in` per dose. **SS=1** was intended to reuse `equilibrate_ss_state`,
+   but Phase 0a **defers and rejects** it (`E_ABSORPTION_SS`): the periodic steady state of a
+   forcing whose `R_in` tail spills across the dosing interval needs dedicated treatment (the
+   per-cycle pulse equilibration is only exact when `II ≫` the absorption window). A later phase
+   adds proper SS-with-forcing.
    - **Internal closed-form acceleration (optional):** where the combo has a closed form
      (first/zero/parallel/sequential/mixed, integer-N transit, continuous-N transit via
      incomplete gamma), ferx *may* compute it via the `pk/` solvers instead of integrating —
@@ -358,7 +370,9 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   forced path; `src/diagnostics.rs` — new `W_ABSORPTION_*`.
 - Docs: new `docs/src/model-file/absorption.md` + `SUMMARY.md`; cross-link
   `structural-model.md`; new `examples/*.ferx`; `CHANGELOG.md` (`[Unreleased] → Added`).
-- `../ferx-r` follow-up PR for the new `pub` surface (+ `tools/update-ferx-core-lock.sh`).
+- `../ferx-r` follow-up PR per user-facing phase — pin bump (`tools/update-ferx-core-lock.sh`)
+  + an R example/test/`NEWS.md`; the input-rate functions need no new R glue. See the
+  "ferx-r follow-up" section below.
 
 ## Phasing (one PR each)
 
@@ -369,12 +383,23 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   `RATE=-2`/`D1` modeled-duration path establishes the estimated-duration forcing that this
   plan's Phase 2 zero-order family reuses. Independent of this plan's Phase 0/1, which can
   start in parallel.
-- **Phase 0 — `transit()` input-rate function + `ode_template`.** Implement the built-in
-  `transit(n, mtt)` intrinsic callable in `[odes]` (Ron's proposal): the input-rate evaluator,
-  dose-context wiring, the dose-routing rule (dose feeds the function, not a bolus), `ln_gamma`,
-  and `ode_template` generation for the standard PK models + the analytical-`pk`-plus-absorption
-  **error rule**. Anchor against the existing `transit_2cpt` dataset and a NONMEM Savic run —
-  proves the transparent path end-to-end.
+- **Phase 0a — `transit()` input-rate function. ✅ IMPLEMENTED — PR #343 (open, 2026-06-14).**
+  Built-in `transit(n, mtt)` intrinsic in `[odes]`: log-domain Savic evaluator (`ln_gamma`
+  shipped in #340), dose-context wiring, and the dose-routing rule — the dose feeds `R_in`, its
+  bolus is **suppressed**, `∫R_in dt = F·Dose`. `R_in(tad)` is injected via the infusion
+  RHS-wrapper across **all four** ODE prediction paths (`ode_predictions`, event-driven, and the
+  two compartment-state variants); F scales the mass, lagtime shifts `tad`, multiple doses
+  superpose, and resets turn off pre-reset doses. Not-yet-supported combinations are **rejected
+  loudly** (not silently mis-modeled): SS=1 into a transit compartment (`E_ABSORPTION_SS`) and
+  `transit()` + a `[diffusion]` block (`E_ABSORPTION_DIFFUSION`). Validated by parameter recovery
+  (`examples/transit_savic.ferx --simulate`: TVN 3.0→3.19, MTT 1.0→0.90) + the absorption-
+  independent **AUC∞ = Dose/CL** invariant. **NONMEM Savic anchor still TODO** — does not block
+  #343; flagged for a follow-up (or fold into Phase 3, which adds the analytical form to compare).
+- **Phase 0b — `ode_template` generation + the analytical-`pk`-plus-absorption error rule.**
+  DEFERRED out of #343 (not needed for the raw `[odes]` + `transit()` path that Phase 0a ships).
+  Generate the standard PK disposition ODEs from the codified analytical↔ODE transforms, and
+  reject an analytical `pk` disposition combined with an ODE-only absorption model, pointing the
+  user at `ode_template`. Reuses the undefined-name walker / "declared-but-unused" census.
 - **Phase 1 — inverse-Gaussian (Freijer & Post).** Single + sum-of-two IG; **numerical**
   (no closed form). Anchor vs the Freijer & Post paper / a NONMEM `$DES` IG run.
 - **Phase 2 — Weibull + zero-order + sequential + parallel + mixed.** Round out the
@@ -384,6 +409,47 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 - **Phase 3 — analytical incomplete-gamma closed form for transit** (1/2-cpt) so continuous-N
   transit stays in the analytical engine; assert it matches the Phase-0 numerical form under
   the equivalence harness.
+
+## ferx-r follow-up (per user-facing feature)
+
+Every user-facing feature here must reach R users through `../ferx-r` (CLAUDE.md: a
+newly-`pub` ferx-core change "expects a matching PR in `ferx-r`"). The follow-up for
+this plan is **light**, because the absorption input-rate functions (`transit`, `igd`,
+`weibull`, `zero_order`, `first_order`) and `ode_template` are **model-file DSL/parser
+features**: ferx-r hands the `.ferx` file straight to ferx-core's parser
+(`ferx_core::parser::model_parser::parse_full_model_file`, ferx-r `src/rust/src/lib.rs`)
+and the R layer only carries file paths. So there is **no new exported R function** to
+write — the feature works from R the moment ferx-r builds against a ferx-core commit
+that has it.
+
+Each user-facing phase's ferx-r PR therefore needs:
+
+- **Pin bump (required for CI/release availability).** Bump `ferx-r/src/rust/Cargo.lock`
+  to the ferx-core commit that landed the phase, via `ferx-r/tools/update-ferx-core-lock.sh`
+  — never a bare `cargo update` (the `[patch]` would unpin it). Local ferx-r builds
+  already see the feature through the `[patch]`; the bump is what makes it available in
+  **CI and release** builds, which use the pinned lock. Note these are DSL features, so
+  ferx-r still *compiles* against a stale pin — it simply can't *parse/run* the new model
+  syntax until bumped (contrast a consumed `pub` API, where a stale pin fails CI with
+  `error[E0603]: ... is private`).
+- **R-facing surface (required for a user-facing model).** Register an example model +
+  dataset in `ferx_example()` (e.g. `transit_savic`), add a fast R test that fits it, note
+  it in the relevant vignette/reference, and add a `NEWS.md` entry.
+- **No R glue** for the input-rate functions / `ode_template` themselves — they are model
+  syntax, not R-callable APIs.
+
+Per-phase mapping:
+
+| Phase | ferx-core feature | User-facing? | ferx-r follow-up |
+|---|---|---|---|
+| 0a | `transit()` | yes | pin bump + `transit_savic` example/test + `NEWS.md` |
+| 0b | `ode_template` | yes | pin bump + example/docs + `NEWS.md` |
+| 1 | `igd()` | yes | pin bump + IG example/test + `NEWS.md` |
+| 2 | `weibull` / `zero_order` / `sequential` / `mixed` | yes | pin bump + examples + `NEWS.md` |
+| 3 | incomplete-gamma closed form | **no** (internal accel, numerically identical) | none — no API or behaviour change for R |
+
+#324's faithful `R1`/`D1` is a separate data-format feature (coded `RATE`), so its ferx-r
+follow-up — a pin bump plus any R-side dose-column docs — is tracked on #324, not here.
 
 ## Tests & NONMEM anchoring (CLAUDE.md mandates)
 
