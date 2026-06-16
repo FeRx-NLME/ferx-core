@@ -12,15 +12,15 @@
 //!
 //! ## Reference
 //!
-//! The reference (`REFERENCE` below) is the **exact closed-form** solution of
-//! this mixed-route one-compartment model — a superposition of the oral Bateman
-//! term and the lagged IV bolus term — computed independently of ferx's ODE
-//! integrator (and verified against it by `reference_equals_closed_form`). With
-//! `S2 = V` and η = 0 this is, to machine precision, the `PRED` that NONMEM 7.5.1
-//! ADVAN2 produces under `$ESTIMATION MAXEVAL=0`. The control file that
-//! reproduces these numbers is committed at `tests/nonmem/two_cmt_dose.ctl`;
-//! re-running it (`nmfe75 two_cmt_dose.ctl out`) on a NONMEM-equipped host
-//! confirms the anchor against a real NONMEM run.
+//! `REFERENCE` below is the **exact closed-form** solution of this mixed-route
+//! one-compartment model — a superposition of the oral Bateman term and the
+//! lagged IV bolus term — computed independently of ferx's ODE integrator (and
+//! checked against it by `reference_equals_closed_form`). It was **confirmed
+//! against a real NONMEM 7.5.1 run** (`nmfe75`) of the control file committed at
+//! `tests/nonmem/two_cmt_dose.ctl` — ADVAN2 TRANS2, `$ESTIMATION MAXEVAL=0`
+//! (fixed θ, η = 0, `S2 = V`): NONMEM's `PRED` (sdtab1, transcribed below)
+//! matches `REFERENCE` to all of NONMEM's printed digits. So the ferx ODE
+//! engine, NONMEM, and the analytic solution all agree.
 //!
 //! ### `two_cmt_dose.ctl` — ADVAN2 TRANS2; CL=5 V=50 KA=1.5 F1=0.70 F2=0.40 ALAG2=2.0
 //! ```text
@@ -35,7 +35,9 @@
 //! $ESTIMATION MAXEVAL=0 METHOD=0 POSTHOC NOABORT
 //! ```
 //! Subject dosed `AMT=100, CMT=1` (oral) **and** `AMT=50, CMT=2` (IV), both at
-//! t=0; observations on the central compartment (CMT=2).
+//! t=0; observations on the central compartment (CMT=2). NONMEM `PRED` (sdtab1):
+//! 0.71829, 1.0226, 1.1537, 1.5134, 1.3293, 0.89351, 0.59894, 0.32871, 0.18040
+//! at t = 0.5, 1, 1.9, 2.5, 4, 8, 12, 18, 24 — matching `REFERENCE` to 5 sig figs.
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{predict, read_nonmem_csv};
