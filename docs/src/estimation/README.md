@@ -12,6 +12,8 @@ ferx-core separates two orthogonal choices: the **statistical method** (how rand
 
 - **[IMPMAP](impmap.md)** — Importance Sampling assisted by Mode A Posteriori (NONMEM `METHOD=IMPMAP`). A Monte-Carlo EM estimator that re-centers a per-subject importance-sampling proposal on the conditional mode every iteration. Targets high-dimensional, rich-data models where a non-MAP importance-sampling EM stalls. Runs standalone (`method = impmap`) or chained (`methods = [focei, impmap]`).
 
+- **[Bayesian (MCMC)](bayes.md)** — Full posterior sampling (`method = bayes`, Gibbs-within-HMC, NONMEM `METHOD=BAYES` parity). Reports posterior means, credible intervals, and convergence diagnostics (split-R̂, ESS) instead of a point estimate. BSV-only in this first cut.
+
 ## Post-estimation steps
 
 These chain after a primary method via `methods = [...]` and refine the result rather than re-estimating from scratch:
