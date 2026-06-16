@@ -103,6 +103,15 @@ step-size adaptation staying on the CPU.
 | `cpu` | Always use the CPU E-step (the reference path). |
 | `gpu` | Prefer the GPU; fall back to CPU (emitting a warning in `FitResult.warnings`) when the feature is absent, no device is available, or the model is unsupported. |
 
+**When it helps.** The GPU runs one MH chain per subject, so the win grows
+with the population size and the per-iteration work. On an Apple M5 Pro the GPU
+E-step overtakes the rayon CPU baseline at roughly ≥ 1500 subjects with the
+default `n_mh_steps = 20`, and wins by a wide margin as `n_mh_steps` (or data
+density) rises — e.g. at 2000 subjects it is ~2.6× faster at `n_mh_steps = 100`
+and ~10× at `500`. Small, light fits stay on a comparable footing, which is why
+`auto` is conservative. (Measured with 50 exploration + 100 convergence
+iterations; numbers are indicative, not a guarantee.)
+
 The GPU path is **opt-in and fully optional**: the default build does not pull
 in `cubecl`, and `saem_backend` defaults to `auto`, so results are unchanged in
 environments without a GPU. The CPU and GPU paths are validated for numerical
