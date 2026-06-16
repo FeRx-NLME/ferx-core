@@ -1,0 +1,35 @@
+$PROBLEM Warfarin 1-cpt oral - ferx-core BAYES cross-check (#380)
+$DATA warfarin.csv IGNORE=@
+$INPUT ID TIME DV EVID AMT CMT=DROP RATE MDV
+$SUBROUTINES ADVAN2 TRANS2
+$PK
+  MU_1 = LOG(THETA(1))
+  MU_2 = LOG(THETA(2))
+  MU_3 = LOG(THETA(3))
+  CL = EXP(MU_1 + ETA(1))
+  V  = EXP(MU_2 + ETA(2))
+  KA = EXP(MU_3 + ETA(3))
+  S2 = V
+$ERROR
+  IPRED = F
+  Y = IPRED*(1 + EPS(1))
+$THETA (0, 0.2)   ; TVCL
+$THETA (0, 10.0)  ; TVV
+$THETA (0, 1.5)   ; TVKA
+$OMEGA 0.09       ; ETA_CL
+$OMEGA 0.04       ; ETA_V
+$OMEGA 0.30       ; ETA_KA
+$SIGMA 0.0004     ; proportional variance (0.02 SD), matching the .ferx init
+; --- Weakly-informative priors for BAYES (diffuse, ~flat) ---
+$PRIOR NWPRI
+$THETAP (0.2)(10.0)(1.5)
+$THETAPV BLOCK(3) FIX
+ 10000 0 10000 0 0 10000
+$OMEGAP 0.09
+$OMEGAP 0.04
+$OMEGAP 0.30
+$OMEGAPD (2)(2)(2)
+$SIGMAP 0.0004
+$SIGMAPD (2)
+$ESTIMATION METHOD=BAYES INTERACTION NBURN=1000 NITER=2000 PRINT=200 SEED=1 NOABORT
+$TABLE ID TIME NOPRINT ONEHEADER FILE=sdtab_bayes
