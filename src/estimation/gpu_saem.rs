@@ -460,6 +460,7 @@ mod kernel {
 
     /// Standard normal via Box-Muller from two uniforms.
     #[cube]
+    #[allow(clippy::approx_constant)] // 2π literal in-kernel; const path not usable in cube
     fn rand_n(seed: u32, subj: u32, step: u32, slot: u32) -> f32 {
         let u1 = rand_u(seed, subj, step, slot * 2u32);
         let u2 = rand_u(seed, subj, step, slot * 2u32 + 1u32);
