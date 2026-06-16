@@ -2198,6 +2198,56 @@ pub struct ImportanceSamplingResult {
     pub kappa_treatment: KappaTreatment,
 }
 
+/// Posterior summary for a single scalar parameter, computed across all
+/// post-warmup, post-thinning draws from every chain.
+#[derive(Debug, Clone)]
+pub struct PosteriorSummary {
+    /// Parameter name (e.g. `TVCL`, `OMEGA(1,1)`, `SIGMA(1)`).
+    pub name: String,
+    pub mean: f64,
+    pub sd: f64,
+    /// 2.5% posterior quantile (lower 95% credible bound).
+    pub q025: f64,
+    pub median: f64,
+    /// 97.5% posterior quantile (upper 95% credible bound).
+    pub q975: f64,
+    /// Split-R̂ convergence diagnostic. Values near 1.0 indicate the chains
+    /// have mixed; `> 1.01` flags non-convergence.
+    pub rhat: f64,
+    /// Bulk effective sample size (mixing of the centre of the distribution).
+    pub ess_bulk: f64,
+    /// Tail effective sample size (mixing of the 5%/95% quantiles).
+    pub ess_tail: f64,
+    /// Monte-Carlo standard error of the posterior mean.
+    pub mcse: f64,
+}
+
+/// Result of a full MCMC Bayesian fit (`EstimationMethod::Bayes`). Surfaced on
+/// [`FitResult::bayes`]. Carries posterior summaries + convergence diagnostics
+/// instead of a single point estimate; the optimizer-style fields on
+/// `FitResult` (theta/omega/sigma) are populated with the posterior means so
+/// downstream consumers that expect a point estimate still work.
+#[derive(Debug, Clone)]
+pub struct BayesResult {
+    /// Per-parameter posterior summaries, ordered θ, then Ω entries, then Σ.
+    pub summaries: Vec<PosteriorSummary>,
+    /// Number of independent chains run.
+    pub n_chains: usize,
+    /// Warmup sweeps per chain (discarded from the posterior).
+    pub n_warmup: usize,
+    /// Retained sampling draws per chain (post-warmup, post-thinning).
+    pub n_draws_per_chain: usize,
+    /// Total divergent HMC transitions across all chains. Non-zero counts
+    /// indicate posterior geometry the sampler could not traverse reliably.
+    pub n_divergent: usize,
+    /// Worst (largest) split-R̂ across all parameters; convenience for a
+    /// single-number convergence check.
+    pub max_rhat: f64,
+    /// Raw posterior draws, row-major `[chain][draw][param]` flattened, retained
+    /// only when the caller requests them (large). `None` otherwise.
+    pub draws: Option<Vec<f64>>,
+}
+
 /// Outcome of the post-estimation covariance step.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CovarianceStatus {
@@ -2474,6 +2524,9 @@ pub struct FitResult {
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
     pub importance_sampling: Option<ImportanceSamplingResult>,
+    /// Full MCMC Bayesian result. `Some` when `method = bayes` was run;
+    /// carries posterior summaries + convergence diagnostics. See [`BayesResult`].
+    pub bayes: Option<BayesResult>,
     // IOV results (present when kappa declarations exist in the model)
     pub omega_iov: Option<DMatrix<f64>>,
     pub kappa_names: Vec<String>,
@@ -2814,6 +2867,22 @@ pub struct FitOptions {
     /// A positive value (e.g. `3`) enables HMC; requires the `autodiff`
     /// feature and an analytical PK model — falls back to MH otherwise.
     pub saem_n_leapfrog: usize,
+    // Bayes (Gibbs-within-HMC) options — see EstimationMethod::Bayes.
+    /// Number of warmup (burn-in + adaptation) sweeps per chain, discarded from
+    /// the reported posterior. HMC step size / leapfrog count adapt during this
+    /// phase. Default 1000.
+    pub bayes_warmup: usize,
+    /// Number of post-warmup sampling sweeps retained per chain (before
+    /// thinning). Default 1000.
+    pub bayes_iters: usize,
+    /// Number of independent chains (run with distinct seeds; used for
+    /// split-R̂ / cross-chain diagnostics). Default 4.
+    pub bayes_chains: usize,
+    /// Keep every `bayes_thin`-th sampling draw. `1` (default) keeps all draws.
+    pub bayes_thin: usize,
+    /// Base RNG seed for the Bayes sampler. Chain `c` uses a seed derived from
+    /// this. `None` draws a nondeterministic seed.
+    pub bayes_seed: Option<u64>,
     /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
     pub gn_lambda: f64,
     // SIR options
@@ -3090,6 +3159,11 @@ impl Default for FitOptions {
             saem_omega_burnin: 20,
             saem_seed: None,
             saem_n_leapfrog: 0,
+            bayes_warmup: 1000,
+            bayes_iters: 1000,
+            bayes_chains: 4,
+            bayes_thin: 1,
+            bayes_seed: None,
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -3265,6 +3339,13 @@ pub enum EstimationMethod {
     /// importance-sampling proposal, and whose M-step updates θ/Ω/σ from the
     /// importance-weighted posterior moments.
     Impmap,
+    /// Full MCMC Bayesian estimation (Path A — Gibbs-within-HMC, NONMEM
+    /// `METHOD=BAYES` parity). Draws from the joint posterior
+    /// `p(θ, Ω, Σ, {ηᵢ} | y)` by alternating a per-subject η block (reusing the
+    /// SAEM HMC / MH kernel) with conjugate population draws (Ω: inverse-Wishart,
+    /// σ²: inverse-gamma, mu-referenced θ: normal). Reports posterior summaries +
+    /// convergence diagnostics on `FitResult.bayes`, not a point estimate.
+    Bayes,
 }
 
 impl EstimationMethod {
@@ -3277,6 +3358,7 @@ impl EstimationMethod {
             EstimationMethod::Saem => "SAEM",
             EstimationMethod::Imp => "IMP",
             EstimationMethod::Impmap => "IMPMAP",
+            EstimationMethod::Bayes => "BAYES",
         }
     }
 }
@@ -3455,6 +3537,17 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_seed",
             "impmap_averaging",
             "impmap_low_ess_threshold",
+        ],
+        EstimationMethod::Bayes => &[
+            "inner_maxiter",
+            "inner_tol",
+            "n_mh_steps",
+            "n_leapfrog",
+            "bayes_warmup",
+            "bayes_iters",
+            "bayes_chains",
+            "bayes_thin",
+            "bayes_seed",
         ],
     }
 }

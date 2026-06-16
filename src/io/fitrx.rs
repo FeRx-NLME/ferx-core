@@ -426,6 +426,7 @@ fn method_to_str(m: EstimationMethod) -> &'static str {
         EstimationMethod::Saem => "saem",
         EstimationMethod::Imp => "imp",
         EstimationMethod::Impmap => "impmap",
+        EstimationMethod::Bayes => "bayes",
     }
 }
 
@@ -1587,6 +1588,7 @@ fn wire_to_fit_result(
         // .fitrx v1: importance_sampling is not serialised — re-run via
         // `methods = [..., imp]` if the consumer needs the IS LL.
         importance_sampling: None,
+        bayes: None,
         omega_iov,
         kappa_names,
         kappa_fixed,
@@ -1784,6 +1786,7 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],

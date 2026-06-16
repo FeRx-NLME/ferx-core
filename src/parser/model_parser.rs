@@ -3240,6 +3240,8 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         Ok(EstimationMethod::FoceI)
     } else if val == "foce" {
         Ok(EstimationMethod::Foce)
+    } else if val == "bayes" || val == "bayesian" || val == "mcmc" {
+        Ok(EstimationMethod::Bayes)
     } else {
         Err(format!("unknown estimation method: `{}`", token.trim()))
     }
@@ -3446,6 +3448,11 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "seed" | "saem_seed" => opts.saem_seed = parse_u64_opt("seed")?,
+        "bayes_warmup" => opts.bayes_warmup = parse_usize("bayes_warmup")?,
+        "bayes_iters" => opts.bayes_iters = parse_usize("bayes_iters")?,
+        "bayes_chains" => opts.bayes_chains = parse_usize("bayes_chains")?,
+        "bayes_thin" => opts.bayes_thin = parse_usize("bayes_thin")?,
+        "bayes_seed" => opts.bayes_seed = parse_u64_opt("bayes_seed")?,
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         "sir" => opts.sir = parse_bool("sir")?,
         "sir_samples" => opts.sir_samples = parse_usize("sir_samples")?,
@@ -13116,6 +13123,46 @@ mod tests {
         assert_eq!(opts.steihaug_max_iters, Some(30));
         // Reject malformed (e.g. negative) value.
         assert!(apply_fit_option(&mut opts, "steihaug_max_iters", "-1").is_err());
+    }
+
+    #[test]
+    fn test_parse_method_token_bayes() {
+        assert_eq!(parse_method_token("bayes"), Ok(EstimationMethod::Bayes));
+        assert_eq!(parse_method_token("BAYES"), Ok(EstimationMethod::Bayes));
+        assert_eq!(parse_method_token("mcmc"), Ok(EstimationMethod::Bayes));
+        assert_eq!(EstimationMethod::Bayes.label(), "BAYES");
+    }
+
+    #[test]
+    fn test_apply_fit_option_bayes_keys() {
+        let mut opts = FitOptions::default();
+        assert_eq!(apply_fit_option(&mut opts, "bayes_warmup", "500"), Ok(true));
+        assert_eq!(opts.bayes_warmup, 500);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_iters", "2000"), Ok(true));
+        assert_eq!(opts.bayes_iters, 2000);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_chains", "2"), Ok(true));
+        assert_eq!(opts.bayes_chains, 2);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_thin", "5"), Ok(true));
+        assert_eq!(opts.bayes_thin, 5);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_seed", "42"), Ok(true));
+        assert_eq!(opts.bayes_seed, Some(42));
+        assert!(apply_fit_option(&mut opts, "bayes_warmup", "oops").is_err());
+
+        // All Bayes keys are recognised by method_specific_keys (no spurious
+        // "unsupported key" warning when method = bayes).
+        opts.method = EstimationMethod::Bayes;
+        for k in [
+            "bayes_warmup",
+            "bayes_iters",
+            "bayes_chains",
+            "bayes_thin",
+            "bayes_seed",
+        ] {
+            assert!(
+                crate::types::method_specific_keys(EstimationMethod::Bayes).contains(&k),
+                "method_specific_keys(Bayes) missing `{k}`"
+            );
+        }
     }
 
     #[test]

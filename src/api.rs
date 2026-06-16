@@ -2703,6 +2703,17 @@ fn fit_inner(
                 )
             }
             EstimationMethod::Imp => unreachable!("handled by the IMP branch above"),
+            EstimationMethod::Bayes => {
+                // Phase 0 scaffolding: the Gibbs-within-HMC sampler is not wired
+                // yet. Selectable end-to-end so options/parser/result plumbing
+                // can be exercised, but errors clearly until the sampler lands.
+                // See ferx-core#380.
+                return Err(
+                    "Bayesian estimation (method = bayes) is not yet implemented \
+                     — Phase 0 scaffolding only (see ferx-core#380)"
+                        .to_string(),
+                );
+            }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
 
@@ -3132,6 +3143,7 @@ fn fit_inner(
             .or(sir_fallback_result.as_ref())
             .and_then(|s| s.resamples_packed.clone()),
         importance_sampling: is_result,
+        bayes: None,
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
@@ -5983,6 +5995,7 @@ mod simulate_with_uncertainty_tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],
