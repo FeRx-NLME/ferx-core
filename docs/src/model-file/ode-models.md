@@ -233,6 +233,14 @@ absorption lag can differ by route. Mirroring NONMEM's `F1`/`F2` and
   if so, `ode_param_slots` reports a clear "too many individual parameters"
   error rather than failing silently.
 
+> ⚠️ **`F{n}` / `ALAG{n}` / `LAGTIME{n}` are reserved names** (just like the
+> bare `F` / `lagtime` above, and exactly as in NONMEM). On an ODE model,
+> declaring an individual parameter with one of these names binds it as
+> compartment `n`'s bioavailability / lag and applies it to **every** dose into
+> compartment `n` — even if you also reference the parameter in the `[odes]`
+> RHS. So don't reuse `F2`, `ALAG2`, … for an unrelated fraction or rate term;
+> give such a quantity a different (un-indexed-looking) name.
+
 This is an **ODE-engine** feature: the analytical PK functions have a single
 fixed dose route, so they take only the bare `f=`/`lagtime=` mapping. (The
 EKF/`[diffusion]` path applies per-compartment `F` but, as elsewhere, does not
