@@ -1467,8 +1467,8 @@ fn probe_nlopt_algorithms() -> Vec<String> {
 /// Mandatory sdtab column names that are always written — declaring them in
 /// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
 const OUTPUT_MANDATORY: &[&str] = &[
-    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV",
-    "N_OBS", "TAFD", "TAD",
+    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD",
+    "EBE_OFV", "N_OBS", "TAFD", "TAD",
 ];
 
 /// Validate `model.output_columns` against known quantities, emitting
@@ -2738,6 +2738,23 @@ fn fit_inner(
         );
     }
 
+    // Post-fit: simulation-based NPDE / NPD diagnostics (issue #260). Opt-in via
+    // `[fit_options] npde_nsim`; skipped entirely when 0 so the common path pays
+    // nothing. Subjects are built in population order, so the zip aligns.
+    if options.npde_nsim > 0 {
+        let per_subj = crate::stats::npde::compute_npde_npd(
+            model,
+            population,
+            &result.params,
+            options.npde_nsim,
+            options.npde_seed,
+        );
+        for (sr, sn) in subjects.iter_mut().zip(per_subj) {
+            sr.npde = sn.npde;
+            sr.npd = sn.npd;
+        }
+    }
+
     let n_obs = population.n_obs();
     let n_params = n_params_pre;
 
@@ -3549,6 +3566,9 @@ fn compute_subject_results(
                 pred,
                 iwres,
                 cwres,
+                // Filled post-fit (only when npde_nsim > 0); see compute_npde_npd.
+                npde: vec![],
+                npd: vec![],
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
@@ -3736,6 +3756,8 @@ mod tests {
             pred: vec![0.0; n],
             iwres,
             cwres: vec![0.0; n],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n],
             n_obs: n,
@@ -6848,6 +6870,8 @@ mod tests_derived_session_clock {
             pred: vec![1.0; n_obs],
             iwres: vec![0.0; n_obs],
             cwres: vec![0.0; n_obs],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
@@ -7215,6 +7239,8 @@ mod tests_derived_iov_kappa {
             pred: vec![1.0; n_obs],
             iwres: vec![0.0; n_obs],
             cwres: vec![0.0; n_obs],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,

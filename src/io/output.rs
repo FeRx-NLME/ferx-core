@@ -515,8 +515,16 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     let mut ipreds = Vec::with_capacity(n_total);
     let mut cwres_vec = Vec::with_capacity(n_total);
     let mut iwres_vec = Vec::with_capacity(n_total);
+    let mut npde_vec = Vec::with_capacity(n_total);
+    let mut npd_vec = Vec::with_capacity(n_total);
     let mut ebe_ofv_col = Vec::with_capacity(n_total);
     let mut n_obs_col = Vec::with_capacity(n_total);
+    // NPDE/NPD are only computed when `[fit_options] npde_nsim > 0`; emit the
+    // columns only when at least one subject carries them.
+    let any_npde = result
+        .subjects
+        .iter()
+        .any(|s| !s.npde.is_empty() || !s.npd.is_empty());
 
     for (si, sr) in result.subjects.iter().enumerate() {
         let subj = &population.subjects[si];
@@ -540,6 +548,10 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
             ipreds.push(sr.ipred[j]);
             cwres_vec.push(sr.cwres[j]);
             iwres_vec.push(sr.iwres[j]);
+            if any_npde {
+                npde_vec.push(sr.npde.get(j).copied().unwrap_or(f64::NAN));
+                npd_vec.push(sr.npd.get(j).copied().unwrap_or(f64::NAN));
+            }
             ebe_ofv_col.push(sr.ofv_contribution);
             n_obs_col.push(sr.n_obs as f64);
         }
@@ -564,6 +576,12 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         ("IPRED".to_string(), ipreds),
         ("CWRES".to_string(), cwres_vec),
         ("IWRES".to_string(), iwres_vec),
+    ]);
+    if any_npde {
+        cols.push(("NPDE".to_string(), npde_vec));
+        cols.push(("NPD".to_string(), npd_vec));
+    }
+    cols.extend([
         ("EBE_OFV".to_string(), ebe_ofv_col),
         ("N_OBS".to_string(), n_obs_col),
     ]);
@@ -1645,6 +1663,8 @@ mod tests {
             pred: vec![1.0; n_obs],
             iwres: vec![0.0; n_obs],
             cwres: vec![0.0; n_obs],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
@@ -1845,6 +1865,56 @@ mod tests {
     }
 
     #[test]
+    fn sdtab_npde_columns_present_when_populated() {
+        let mut sr = sdtab_subject_result("1", 2);
+        sr.npde = vec![0.3, -1.2];
+        sr.npd = vec![0.4, -1.0];
+        let result = minimal_sdtab_result(vec![sr]);
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        let npde = cols
+            .iter()
+            .find(|(name, _)| name == "NPDE")
+            .map(|(_, v)| v.clone())
+            .expect("NPDE column should be present when populated");
+        let npd = cols
+            .iter()
+            .find(|(name, _)| name == "NPD")
+            .map(|(_, v)| v.clone())
+            .expect("NPD column should be present when populated");
+        assert_eq!(npde, vec![0.3, -1.2]);
+        assert_eq!(npd, vec![0.4, -1.0]);
+    }
+
+    #[test]
+    fn sdtab_npde_columns_absent_by_default() {
+        // sdtab_subject_result leaves npde/npd empty (the npde_nsim = 0 default).
+        let result = minimal_sdtab_result(vec![sdtab_subject_result("1", 2)]);
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        assert!(
+            cols.iter().all(|(name, _)| name != "NPDE" && name != "NPD"),
+            "NPDE/NPD columns should be absent when npde_nsim = 0"
+        );
+    }
+
+    #[test]
     fn sdtab_cmt_column_absent_for_single_cmt() {
         let result = minimal_sdtab_result(vec![sdtab_subject_result("1", 2)]);
         let population = Population {
@@ -1978,6 +2048,8 @@ mod tests {
             pred: vec![11.0, 6.0],
             iwres: vec![0.25, f64::NAN],
             cwres: vec![-0.5, f64::NAN],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 3.0,
             cens: vec![0, 1],
             n_obs: 2,
