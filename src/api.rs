@@ -3162,6 +3162,13 @@ fn fit_inner(
         saem_seed: options.saem_seed,
         sir_seed: options.sir_seed,
         is_seed: options.is_seed,
+        // Record the *resolved* NPDE seed (default included) so the diagnostic
+        // is reproducible from the output; `None` when NPDE did not run.
+        npde_seed: if options.npde_nsim > 0 {
+            Some(crate::stats::npde::effective_seed(options.npde_seed))
+        } else {
+            None
+        },
         bloq_method: model.bloq_method.label().to_string(),
         outer_maxiter: options.outer_maxiter,
         outer_gtol: options.outer_gtol,
@@ -5991,6 +5998,7 @@ mod simulate_with_uncertainty_tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,
             outer_gtol: 0.0,

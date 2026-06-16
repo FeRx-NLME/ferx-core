@@ -49,6 +49,14 @@ use rayon::prelude::*;
 /// reproducible across invocations.
 const DEFAULT_NPDE_SEED: u64 = 42;
 
+/// The seed actually used given the optional `[fit_options] npde_seed` override:
+/// the explicit value when set, otherwise the built-in default. Recording this
+/// resolved value (rather than the `Option`) is what lets a run be reproduced
+/// from the fit output alone.
+pub fn effective_seed(seed: Option<u64>) -> u64 {
+    seed.unwrap_or(DEFAULT_NPDE_SEED)
+}
+
 /// Per-subject NPDE/NPD vectors, each parallel to the subject's observation list.
 #[derive(Debug, Clone)]
 pub struct SubjectNpde {
@@ -76,7 +84,7 @@ pub fn compute_npde_npd(
     nsim: usize,
     seed: Option<u64>,
 ) -> Vec<SubjectNpde> {
-    let base_seed = seed.unwrap_or(DEFAULT_NPDE_SEED);
+    let base_seed = effective_seed(seed);
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
 
@@ -290,6 +298,13 @@ mod tests {
         let scores = npd_scores(&[50.0, 50.0], &[0, 1], &sims);
         assert!(scores[0].is_finite());
         assert!(scores[1].is_nan());
+    }
+
+    #[test]
+    fn effective_seed_resolves_default_and_override() {
+        // Unset falls back to the built-in default; an explicit value passes through.
+        assert_eq!(effective_seed(None), DEFAULT_NPDE_SEED);
+        assert_eq!(effective_seed(Some(20240601)), 20240601);
     }
 
     #[test]

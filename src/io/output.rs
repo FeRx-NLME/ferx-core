@@ -905,6 +905,11 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  saem_n_subjects_hmc: {n_hmc}").map_err(|e| e.to_string())?;
         writeln!(f, "  saem_n_subjects_mh: {n_mh}").map_err(|e| e.to_string())?;
     }
+    // Effective seed of the NPDE/NPD simulation (only when those diagnostics
+    // ran), so the sdtab NPDE/NPD columns can be regenerated exactly.
+    if let Some(seed) = result.npde_seed {
+        writeln!(f, "  npde_seed: {seed}").map_err(|e| e.to_string())?;
+    }
 
     writeln!(f, "\nobjective_function:").map_err(|e| e.to_string())?;
     writeln!(f, "  ofv: {:.6}", result.ofv).map_err(|e| e.to_string())?;
@@ -1459,6 +1464,7 @@ mod tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,
             outer_gtol: 0.0,
@@ -1789,6 +1795,7 @@ mod tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,
             outer_gtol: 0.0,
@@ -2285,6 +2292,31 @@ mod tests {
         );
         // Warnings.
         assert!(yaml.contains("\nwarnings:") && yaml.contains("- \"example warning\""));
+    }
+
+    #[test]
+    fn write_yaml_emits_npde_seed_only_when_present() {
+        // When NPDE ran, the resolved seed is recorded; otherwise the line is absent.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.npde_seed = Some(20240601);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("  npde_seed: 20240601"),
+            "npde_seed should be emitted when set"
+        );
+
+        r.npde_seed = None;
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("npde_seed"),
+            "npde_seed line should be absent when NPDE did not run"
+        );
     }
 
     #[test]

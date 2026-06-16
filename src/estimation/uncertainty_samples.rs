@@ -417,6 +417,7 @@ mod tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,
             outer_gtol: 0.0,

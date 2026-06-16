@@ -74,6 +74,12 @@ npde_nsim = 1000     # replicates per subject (off when 0, the default)
 npde_seed = 12345    # optional, for reproducibility
 ```
 
+The **effective** seed actually used — the explicit `npde_seed` when given,
+otherwise the built-in default — is recorded as `model: npde_seed:` in the
+`{model}-fit.yaml` output (and round-trips through `.fitrx`), so the `NPDE`/`NPD`
+columns can always be regenerated from the saved fit, even when no seed was set
+in the model file. The line is omitted when NPDE did not run (`npde_nsim = 0`).
+
 For each observation `y_ij`, ferx simulates `K = npde_nsim` replicates under the
 fitted `θ/Ω/Σ` (sampling `η ~ N(0, Ω)` and the residual error), evaluated at the
 subject's own observation design:
@@ -101,6 +107,36 @@ distribution:
 This matches the `npde` R package's `autonpde()` (same Cholesky decorrelation and
 edge-clamping) to Monte-Carlo noise. See `tests/npde_validation.rs` for the
 engine-side check and an R reproduction recipe.
+
+### NONMEM cross-validation
+
+NONMEM has no native NPDE output; the reference pipeline is a NONMEM `$SIMULATION`
+post-processed by the `npde` R package. The same warfarin data was fit with NONMEM
+7.5.1 (`ADVAN2 TRANS2`, `METHOD=1 INTER`, proportional error) and the two fits
+agree, so any difference in the diagnostics is attributable to the NPDE
+computation rather than the fit:
+
+| Quantity | ferx (FOCEI) | NONMEM 7.5.1 |
+|----------|-------------|--------------|
+| TVCL     | 0.1328 | 0.1327 |
+| TVV      | 7.738  | 7.738  |
+| TVKA     | 0.817  | 0.811  |
+| OFV      | −286.0015 | −286.0042 |
+
+Feeding a 1000-replicate NONMEM `$SIMULATION` (under the NONMEM estimates) and the
+observed data to `npde::autonpde()` (Cholesky decorrelation, edge-clamping)
+reproduces ferx's NPDE/NPD on the same 110 observations:
+
+| Diagnostic | ferx mean | ferx var | npde-pkg mean | npde-pkg var |
+|------------|-----------|----------|---------------|--------------|
+| NPDE       |  0.005 | 1.09 |  0.036 | 1.04 |
+| NPD        | −0.009 | 0.91 | −0.004 | 0.91 |
+
+The NPD variance (the quantity that should sit below 1 because NPD retains the
+within-subject correlation) matches to three figures (0.91 vs 0.91); the small
+NPDE-variance gap is Monte-Carlo noise between two independent simulation draws.
+Both engines give NPDE ≈ N(0, 1) and a mean-zero NPD, as expected under this
+well-specified model.
 
 **Limitations.** M3/BLQ censored observations need the predictive-CDF variant and
 are out of scope: censored rows (`CENS != 0`) are emitted as empty/`NaN` (matching

@@ -27,8 +27,12 @@ section of the SDLC for the versioning policy).
   Monte-Carlo simulation under the fitted model (Brendel et al. 2006; Comets et
   al. 2008). Unlike CWRES, these are robust to model nonlinearity and non-Gaussian
   random effects, and follow N(0,1) under a correctly specified model. Off by
-  default (`npde_nsim = 0`). M3/BLQ censoring and IOV-kappa resampling are out of
-  scope (#260).
+  default (`npde_nsim = 0`). The effective simulation seed (including the default
+  when `npde_seed` is unset) is recorded as `npde_seed` in `{model}-fit.yaml` and
+  the `.fitrx` archive, so the diagnostics are reproducible from the saved fit.
+  Validated against a NONMEM `$SIMULATION` + `npde` R-package reference on the
+  warfarin example. M3/BLQ censoring and IOV-kappa resampling are out of scope
+  (#260).
 - Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The

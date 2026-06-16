@@ -261,6 +261,8 @@ struct FitWire {
     sir_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     is_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    npde_seed: Option<u64>,
     #[serde(default)]
     bloq_method: String,
     #[serde(default)]
@@ -760,6 +762,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         saem_seed: r.saem_seed,
         sir_seed: r.sir_seed,
         is_seed: r.is_seed,
+        npde_seed: r.npde_seed,
         bloq_method: r.bloq_method.clone(),
         outer_maxiter: r.outer_maxiter,
         outer_gtol: r.outer_gtol,
@@ -1637,6 +1640,7 @@ fn wire_to_fit_result(
         saem_seed: w.saem_seed,
         sir_seed: w.sir_seed,
         is_seed: w.is_seed,
+        npde_seed: w.npde_seed,
         bloq_method: w.bloq_method,
         outer_maxiter: w.outer_maxiter,
         outer_gtol: w.outer_gtol,
@@ -1850,6 +1854,7 @@ mod tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 300,
             outer_gtol: 1e-4,
@@ -1944,6 +1949,25 @@ mod tests {
             assert!(s.npde.is_empty(), "npde must stay empty when not written");
             assert!(s.npd.is_empty(), "npd must stay empty when not written");
         }
+    }
+
+    #[test]
+    fn roundtrip_preserves_npde_seed() {
+        // The effective NPDE seed survives the save/load round-trip; `None`
+        // (NPDE did not run) round-trips as `None`.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+
+        let mut r = minimal_fit_result();
+        r.npde_seed = Some(20240601);
+        let with = dir.path().join("seed.fitrx");
+        save_fit(&r, &p, "src\n", &with, SaveFitOptions::default()).unwrap();
+        assert_eq!(load_fit(&with).unwrap().fit.npde_seed, Some(20240601));
+
+        let none = dir.path().join("noseed.fitrx");
+        let r0 = minimal_fit_result(); // npde_seed defaults to None
+        save_fit(&r0, &p, "src\n", &none, SaveFitOptions::default()).unwrap();
+        assert_eq!(load_fit(&none).unwrap().fit.npde_seed, None);
     }
 
     #[test]

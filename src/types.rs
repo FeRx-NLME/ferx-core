@@ -2477,6 +2477,12 @@ pub struct FitResult {
     /// Seed used for the importance-sampling Monte Carlo step.  `None` when IS
     /// was not run or no explicit seed was set.
     pub is_seed: Option<u64>,
+    /// Effective RNG seed used for the simulation-based NPDE/NPD diagnostics —
+    /// the value actually fed to the simulator, including the built-in default
+    /// when `[fit_options] npde_seed` was left unset, so the diagnostic is
+    /// reproducible from this field alone. `None` when NPDE did not run
+    /// (`npde_nsim = 0`).
+    pub npde_seed: Option<u64>,
     /// BLOQ handling method: "drop" (observations below LOQ are excluded) or
     /// "m3" (M3 likelihood for censored observations).
     pub bloq_method: String,
