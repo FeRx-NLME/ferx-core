@@ -136,7 +136,7 @@ struct SaemState {
 /// `log(CL_i) − log(TVCL)`, while `mu_k = log(TVCL)`, so the model evaluated
 /// `CL = TVCL · exp(log TVCL) = TVCL²` for every accepted exploration step.
 #[allow(clippy::too_many_arguments)]
-fn mh_steps(
+pub(crate) fn mh_steps(
     eta: &mut [f64],
     nll_current: f64,
     subject: &Subject,
