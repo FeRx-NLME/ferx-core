@@ -134,7 +134,10 @@ fn assert_branch_matches_top_level(wt: f64) {
             any_positive = true;
         }
     }
-    assert!(any_positive, "all predictions were zero (WT={wt}) — model is degenerate");
+    assert!(
+        any_positive,
+        "all predictions were zero (WT={wt}) — model is degenerate"
+    );
 }
 
 #[test]

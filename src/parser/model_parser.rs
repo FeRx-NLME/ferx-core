@@ -305,8 +305,10 @@ fn unconditional_names_in(stmts: &[Statement]) -> Vec<String> {
             } => {
                 // Without an `else`, no name is guaranteed across all paths.
                 if let Some(eb) = else_body {
-                    let mut sets: Vec<Vec<String>> =
-                        branches.iter().map(|(_, b)| unconditional_names_in(b)).collect();
+                    let mut sets: Vec<Vec<String>> = branches
+                        .iter()
+                        .map(|(_, b)| unconditional_names_in(b))
+                        .collect();
                     sets.push(unconditional_names_in(eb));
                     if let Some((first, rest)) = sets.split_first() {
                         for name in first {
@@ -13221,7 +13223,11 @@ if (WT > 70) {
         let ctx = empty_ctx();
         let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
         let uncond = unconditionally_assigned_vars(&stmts);
-        assert_eq!(uncond, vec!["CL"], "V lacks an else branch — not unconditional");
+        assert_eq!(
+            uncond,
+            vec!["CL"],
+            "V lacks an else branch — not unconditional"
+        );
     }
 
     #[test]
