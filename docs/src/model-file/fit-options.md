@@ -103,14 +103,25 @@ step-size adaptation staying on the CPU.
 | `cpu` | Always use the CPU E-step (the reference path). |
 | `gpu` | Prefer the GPU; fall back to CPU (emitting a warning in `FitResult.warnings`) when the feature is absent, no device is available, or the model is unsupported. |
 
-**When it helps.** The GPU runs one MH chain per subject, so the win grows
-with the population size and the per-iteration work. On an Apple M5 Pro the GPU
-E-step overtakes the rayon CPU baseline at roughly ≥ 1500 subjects with the
-default `n_mh_steps = 20`, and wins by a wide margin as `n_mh_steps` (or data
-density) rises — e.g. at 2000 subjects it is ~2.6× faster at `n_mh_steps = 100`
-and ~10× at `500`. Small, light fits stay on a comparable footing, which is why
-`auto` is conservative. (Measured with 50 exploration + 100 convergence
-iterations; numbers are indicative, not a guarantee.)
+**When it helps.** The GPU runs one MH chain per subject, so the win grows with
+the population size and the per-iteration work. For the model this kernel
+currently supports — a simple, well-identified 1-compartment IV model — the
+realistic regime is the **default `n_mh_steps`** with a **large, sparsely
+sampled population** (e.g. phase-3-style: thousands of subjects, few samples
+each). There the GPU E-step overtakes the rayon CPU baseline at roughly ≥ 1500
+subjects and reaches ~1.3–1.7× by 4000–8000 subjects on an Apple M5 Pro. Small
+and medium studies sit at parity or below, which is why `auto` is conservative
+and keeps them on the CPU.
+
+Raising `n_mh_steps` makes the GPU win by a wide margin (e.g. ~2.6× at 100,
+~10× at 500 on 2000 subjects), but you would not normally do that for a simple
+1-cpt model — the default mixes fine. That scaling matters because per-iteration
+overhead is fixed while compute is not: it is **latent headroom** for the harder
+models that genuinely need many MH steps (or HMC) to mix — correlated/block Ω,
+ODE/PD, high-dimensional η — which are exactly the cases that currently fall
+back to the CPU. As those kernels are added, the compute-scaling advantage
+becomes the real payoff. (Measured with 50 exploration + 100 convergence
+iterations; indicative, not a guarantee.)
 
 The GPU path is **opt-in and fully optional**: the default build does not pull
 in `cubecl`, and `saem_backend` defaults to `auto`, so results are unchanged in
