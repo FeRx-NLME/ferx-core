@@ -30,6 +30,18 @@ section of the SDLC for the versioning policy).
   path — the latter applies `F` but not lag). An index past the model's
   compartment count is a parse error rather than a silently-ignored parameter.
   Foundation for the modeled-duration/rate (`Dn`/`Rn`) work in #324 (#369).
+- **`ode_template NAME(...)`** in `[structural_model]` generates the standard
+  disposition ODE for a named model (`one/two/three_cpt_iv|oral`) from the same
+  closed-form↔ODE transcription the analytical `pk NAME(...)` uses — so you get
+  the explicit, runnable ODE form without hand-writing the states, RHS, and
+  `obs_scale`. It takes the same parameters as `pk NAME(...)` (including `ka` for
+  oral routes). Re-declaring a `d/dt(X)` in `[odes]` **overrides** the generated
+  equation for compartment `X` (e.g. to add a `transit(...)` absorption input);
+  undeclared compartments keep their generated equations. Combining the ODE-only
+  `transit(...)` absorption with an analytical `pk NAME(...)` is now a clear error
+  pointing at `ode_template`, never a silent analytical→ODE conversion. (Future
+  ODE-only absorption functions join that error rule as each is implemented.)
+  (#322).
 - Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The
@@ -138,6 +150,12 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- The analytical `pk NAME(...)` parameter list is now parsed strictly: a malformed
+  `role=VAR` pair (no `=`, an empty side, or a stray extra `=`) or a duplicate role
+  is a clear parse error instead of being silently dropped or last-winning. The
+  `pk` and `ode_template NAME(...)` directives share one strict parser, so they
+  can't drift in strictness. Well-formed model files (including a tolerated
+  trailing comma) are unaffected (#363).
 - FOCEI gradient-based optimizers (SLSQP, L-BFGS, built-in BFGS, Gauss-Newton)
   now add the `log|H̃|` EBE-response term (the #274/#289 Δ) to the population
   gradient, so they reach the true marginal minimum instead of stalling above it
@@ -177,6 +195,15 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- An individual parameter assigned only inside symmetric `if`/`else` branches in
+  `[individual_parameters]` (the NONMEM-style `IF (cond) CL = ...` /
+  `IF (!cond) CL = ...` construction) on an **ODE model** is no longer rejected
+  by the `[odes]` RHS validator as an undefined name. A name written on every
+  branch is now promoted to a real individual parameter — getting a PK slot,
+  being written back, and resolving in the ODE RHS — provided a downstream block
+  (`[odes]`, `[structural_model]`, `[scaling]`, `[derived]`) actually references
+  it. Purely internal branch helpers stay branch-local and never consume a PK
+  slot (#357).
 - The covariance-family fit options `covariance_method`, `covariance_fallback`,
   and `covariance_ofv_hessian` no longer emit a spurious "is not used by method
   `<method>` and will be ignored" warning. They are framework-wide covariance-step
@@ -186,6 +213,26 @@ section of the SDLC for the versioning policy).
   is no longer silently scored as `DV=0`. Such rows are now treated as `MDV=1`
   (skipped) and a single `W_MISSING_DV` warning reports how many rows were
   skipped, surfaced in fit warnings and `ferx check` (#258).
+- Bioavailability `F` is now applied to **IV bolus and infusion** doses on the
+  analytical path, not just oral depot doses. The analytical superposition path
+  (used for subjects with no time-varying covariates) previously dropped `F` for
+  IV/infusion dosing, so the same model gave `F`×-different predictions for a
+  no-TV subject versus a time-varying/IOV subject (the event-driven path applied
+  `F` correctly) — a silent inconsistency that biased fits and made an estimated
+  `F` a no-op on all-IV/infusion datasets. `F` now scales the bioavailable
+  amount/rate on every route, matching NONMEM's `F1`, the ODE engine, and the
+  event-driven path. Mapping `f=` on an IV model is no longer warned as unused
+  (#327).
+- Infusion (zero-order, `RATE>0`) doses into the central compartment of an
+  **oral** model are no longer silently dropped on the event-driven analytical
+  path. The oral propagators ignored the infusion input rate, so a depot-bypass
+  infusion produced ~0 concentration for any subject routed through the
+  event-driven path (time-varying covariates, EVID=3/4 resets, or IOV) — while
+  no-covariate subjects (superposition path) got the correct curve. The oral
+  propagators now carry the central zero-order input by linear superposition,
+  matching the superposition path and NONMEM. (Infusion into an oral *depot*
+  compartment, `cmt=1`, remains an explicit error rather than silently bypassing
+  the depot.)
 - NONMEM coded `RATE` values (`-1` = modeled rate, `-2` = modeled duration) — and
   any other negative or non-finite `RATE` on a dose row — are now rejected with an
   informative error naming the subject and time, instead of being silently treated

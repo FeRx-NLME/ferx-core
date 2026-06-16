@@ -315,6 +315,23 @@ fn single_dose_ad(
         return 0.0;
     }
 
+    // Bioavailability F scales the bioavailable amount/rate on every route — IV
+    // included (#327) — matching the superposition path's `route_f_scale` and the
+    // event-driven path's `PkParams::bioavailable_amount`/`bioavailable_rate`.
+    // Applied once here (rather than per-arm) because this `#[autodiff]` function
+    // works on flat scalars and cannot call those `&self` helpers. All six arms
+    // below read the pre-scaled `amt`; only the IV arms read the pre-scaled `rate`.
+    //
+    // The oral arms (ids 1/3/5) evaluate only the bolus Bateman form — they ignore
+    // `rate`/`dur`, so they are wrong for an oral *infusion* dose (which the value
+    // path routes to the IV-infusion form). That is currently safe, not a live bug:
+    // the inner optimizer sends every oral model with a `rate>0` dose to FD before
+    // AD is selected (`is_oral_model && rate>0 -> Fd`, see
+    // `estimation/inner_optimizer.rs`), so these arms only ever see bolus doses. If
+    // that guard is removed, make the oral arms infusion-aware first (#349 review).
+    let amt = f_bio * amt;
+    let rate = f_bio * rate;
+
     // Per issue #176, IV variants no longer split by administration type at
     // the model level. Each IV branch below handles bolus and infusion via
     // the per-dose `dur` (and `rate`) — the `dur <= 0.0` fall-through is
@@ -336,7 +353,7 @@ fn single_dose_ad(
         1 => {
             // OneCptOral
             let k = cl / v;
-            let d = f_bio * amt;
+            let d = amt;
             if (ka - k).abs() < 1e-6 {
                 (d * ka / v) * tau * (-k * tau).exp()
             } else {
@@ -381,7 +398,7 @@ fn single_dose_ad(
             if diff.abs() < 1e-12 {
                 return 0.0;
             }
-            let coeff = f_bio * amt * ka / v;
+            let coeff = amt * ka / v;
             let p = if (ka - alpha).abs() < 1e-6 {
                 coeff * (alpha - k21) / diff * tau * (-alpha * tau).exp()
             } else {
@@ -459,7 +476,7 @@ fn single_dose_ad(
             if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
                 return 0.0;
             }
-            let coeff = f_bio * amt * ka / v;
+            let coeff = amt * ka / v;
             let a_c = (alpha - k21) * (alpha - k31) / (ab * ag);
             let b_c = (beta - k21) * (beta - k31) / (-ab * bg);
             let g_c = (gamma - k21) * (gamma - k31) / (ag * bg);

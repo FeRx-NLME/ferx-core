@@ -1,0 +1,72 @@
+# Transit absorption on a generated disposition — `ode_template` + `transit()`
+#
+# Two-compartment oral model with Savic transit-chain absorption, written with
+# `ode_template` so ferx *generates* the disposition ODE — you only write the
+# one equation you want to customise (the depot, with the transit input).
+#
+#   ode_template two_cpt_oral(...)   generates, in amounts:
+#       d/dt(depot)   = -KA*depot
+#       d/dt(central) =  KA*depot - (CL/V1 + Q/V1)*central + (Q/V2)*periph
+#       d/dt(periph)  =  (Q/V1)*central - (Q/V2)*periph
+#     plus  obs_scale = V1   (central concentration = amount / V1)
+#
+# Re-declaring `d/dt(depot)` in [odes] OVERRIDES the generated depot equation
+# with the transit input; `d/dt(central)` and `d/dt(periph)` keep their
+# generated equations. Contrast `examples/transit_savic.ferx`, which hand-writes
+# a one-compartment disposition — here the two-compartment disposition (central
+# + peripheral) is generated for you, matching the analytical
+# `pk two_cpt_oral(...)` exactly (see tests/ode_template_equivalence.rs).
+#
+# ── Unit convention ──────────────────────────────────────────────────────────
+#   CMT=1  depot    — oral dose lands here (amount, mg); receives R_in(tad)
+#   CMT=2  central  — concentration (mg/L); C = amount / V1
+#
+# Self-contained: run with no data file
+#   cargo run --release -- examples/transit_ode_template.ferx --simulate
+
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)   # typical clearance (L/h)
+  theta TVV1(50.0,  5.0, 500.0)   # typical central volume (L)
+  theta TVQ(8.0,    0.1, 100.0)   # intercompartmental clearance (L/h)
+  theta TVV2(80.0,  5.0, 999.0)   # peripheral volume (L)
+  theta TVKA(1.0,  0.05,  24.0)   # absorption rate constant (/h)
+  theta TVMTT(1.0, 0.05,  24.0)   # mean transit time (h); KTR = (N+1)/MTT
+  theta TVN(3.0,    0.1,  30.0)   # number of transit compartments (continuous)
+
+  omega ETA_CL ~ 0.09             # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09             # IIV on V1 (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)      # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V1  = TVV1 * exp(ETA_V)
+  Q   = TVQ
+  V2  = TVV2
+  KA  = TVKA
+  MTT = TVMTT
+  NTR = TVN
+
+[structural_model]
+  # ferx generates the 2-cpt oral disposition (depot, central, periph) + obs_scale=V1
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[odes]
+  # Override only the depot: deliver the dose through the transit input rate.
+  # central and periph keep their generated equations.
+  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7

@@ -29,7 +29,7 @@ Each model has a `*_compartment_*` long-form alias (e.g. `three_compartment_iv`)
 
 Every parameter in the **Required Parameters** column must be mapped on the `pk(...)` line. Omitting one is a parse error (issue #309) — ferx will **not** silently default the missing slot to `0.0`, which would otherwise yield a structurally broken fit (e.g. a missing `ka` means no absorption, so every prediction floors to the log constant). Bioavailability `f` and `lagtime` (alias `alag`) are optional and default to `1.0` and `0.0` respectively.
 
-Conversely, mapping a parameter the chosen model does **not** use — e.g. `ka` or `f` on an IV model (no absorption, no bioavailability term), or `q`/`v2` on a one-compartment model — is accepted but emits a parse warning, since the mapping has no effect. `lagtime` is never flagged (every model applies it to the dose); `f` (bioavailability) is applied only by **oral** models, so mapping it on an IV model is flagged.
+Conversely, mapping a parameter the chosen model does **not** use — e.g. `ka` on an IV model (no absorption), or `q`/`v2` on a one-compartment model — is accepted but emits a parse warning, since the mapping has no effect. `lagtime` and `f` (bioavailability) are never flagged: every model applies both to the dose — `lagtime` shifts the dose time, and `f` scales the bioavailable amount for IV bolus, infusion, and oral routes alike (#327).
 
 In the other direction, an individual parameter that is **declared but never used** — neither mapped into the `pk(...)` line nor referenced in any other block — is also flagged, since it is computed but has no effect. The common case is declaring `F` to estimate bioavailability but forgetting to add `f=F` to the `pk(...)` line: analytical models bind `F` (and `lagtime`) only through an explicit `f=`/`lagtime=` mapping.
 
@@ -65,7 +65,7 @@ Three-compartment IV (note that `q2`/`q3` and `v2`/`v3` distinguish the two peri
 
 ### Bioavailability
 
-For oral models, bioavailability (F) defaults to 1.0. To estimate it, define an `F` parameter in `[individual_parameters]` -- it will be automatically used by the oral PK functions.
+Bioavailability (F) defaults to 1.0. To estimate it, define an `F` parameter in `[individual_parameters]` and map it on the `pk(...)` line with `f=F`. It scales the bioavailable amount on **every** route — oral depot absorption, IV bolus (`F · AMT`), and infusion (`F · RATE`, with the duration preserved) — matching NONMEM's `F1`. Before #327 the analytical path applied `F` only to oral depot doses, silently dropping it on IV bolus and infusion; it now applies on all routes.
 
 This applies to [ODE models](ode-models.md) too: an `F` parameter is applied when the dose enters the compartment (`F · AMT`), matching NONMEM and the analytical PK functions. Do not also multiply by `F` in the ODE right-hand side.
 
@@ -109,6 +109,24 @@ amount-only ODE form and supply `[scaling] y = <expr>`:
 ```
 
 As with analytical models, an individual parameter that is **declared but never used** — never referenced in the `[odes]` right-hand side (nor in `[scaling]`/`[derived]`/`[output]`) — is flagged with a parse warning, since it is computed but has no effect (issue #315). The exceptions are the engine-applied `F` (bioavailability) and `lagtime` (alias `alag`): they act on the dose without appearing in the RHS (see [Bioavailability](#bioavailability) above), so they are never flagged.
+
+### Generating a standard disposition — `ode_template`
+
+To get the explicit ODE form of a **standard** PK model without writing out the
+states and equations by hand, use `ode_template NAME(...)`:
+
+```
+[structural_model]
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+```
+
+ferx generates the same disposition ODE (states, micro-constant RHS, and
+`obs_scale`) that the analytical `pk two_cpt_oral(...)` solves in closed form,
+using the **same parameters**. You can then re-declare any `d/dt(X)` in `[odes]`
+to override that compartment — the standard way to attach a built-in absorption
+input such as `transit(...)`. See [Built-in Absorption Models](absorption.md) for
+`ode_template`, override semantics, and the rule that an ODE-only absorption
+function on an analytical `pk` model is an error.
 
 See [ODE Models](ode-models.md) for full ODE syntax and
 [Scaling](scaling.md) for the `[scaling]` block.

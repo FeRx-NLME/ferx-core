@@ -140,3 +140,69 @@ RHS-wrapper mechanism that injects `+rate` for infusions). An analytical
 closed form for continuous-`n` transit (via the regularized incomplete gamma
 function) is planned so 1-/2-compartment transit models can stay in the
 analytical engine — see `plans/absorption-models.md`.
+
+## Generating the disposition — `ode_template`
+
+The transit example above hand-writes the disposition ODE
+(`d/dt(central) = KA*depot/V - CL/V*central`). For the **standard** PK models you
+do not have to: `ode_template NAME(...)` tells ferx to **generate** the standard
+disposition ODE for a named model — the same closed-form↔ODE transcription that
+[`pk NAME(...)`](structural-model.md) uses, but written out as states you can
+then customise. The generated model is fully runnable on its own:
+
+```text
+[structural_model]
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+```
+
+is exactly equivalent to writing the `ode(obs_cmt=central, states=[depot, central, periph])`
+structural line, the three `d/dt(...)` disposition equations, and
+`[scaling] obs_scale = V1` by hand. `ode_template NAME(...)` takes the **same
+parameters as the analytical `pk NAME(...)`** for the same model — including
+`ka` for the oral routes (the generated `central` equation needs the
+depot→central transfer constant, so it is required even when you override the
+depot below).
+
+Supported names: `one_cpt_iv`, `one_cpt_oral`, `two_cpt_iv`, `two_cpt_oral`,
+`three_cpt_iv`, `three_cpt_oral` (the `*_compartment_*` spellings also work).
+
+### Override semantics — re-declare a compartment to replace it
+
+To add absorption (or any custom dynamics), re-declare that compartment's
+equation in `[odes]`. A `d/dt(X)` you write **replaces** the template's equation
+for compartment `X`; every compartment you leave undeclared keeps its generated
+equation. (There is no `+=` append form — an override is a full replacement.)
+
+```text
+[structural_model]
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[odes]
+  # Replaces the generated depot equation with a transit input;
+  # d/dt(central) and d/dt(periph) keep their generated equations.
+  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot
+```
+
+A `d/dt(X)` for a compartment the template does not generate is an error (it
+names the generated states) — write a fully hand-written `ode(...)` model if you
+need a different compartment structure.
+
+## The error rule — ODE-only absorption needs an ODE disposition
+
+`transit(...)` (and the planned `igd(...)` / `weibull(...)`) have **no closed
+form**, so they can only feed an ODE disposition. Combining one with an
+analytical `pk NAME(...)` is a **hard error**, not a silent conversion:
+
+```text
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)   # analytical — closed form
+
+[odes]
+  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot   # ERROR
+```
+
+ferx rejects this and points you at the fix: replace `pk two_cpt_oral(...)` with
+`ode_template two_cpt_oral(...)` and keep the `transit(...)` override in
+`[odes]`. ferx never silently turns an analytical `pk` request into an ODE —
+asking for the closed-form model and getting numerical integration instead would
+be a surprise.

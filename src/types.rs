@@ -243,6 +243,30 @@ impl PkParams {
     pub fn f_bio(&self) -> f64 {
         self.values[PK_IDX_F]
     }
+
+    /// Bioavailable dose amount: `F · amount`. `F` scales the input on **every**
+    /// route — IV bolus, infusion, and oral depot alike — matching NONMEM's `F1`
+    /// (#327).
+    ///
+    /// This pair is the single source of truth for the F-on-dose rule. The three
+    /// prediction paths derive their `F` handling from it:
+    /// * event-driven (`pk/event_driven.rs`) calls these directly;
+    /// * the analytical superposition path (`pk/mod.rs`) applies the same rule as
+    ///   a post-multiply via `route_f_scale` — the oral-depot closed forms bake
+    ///   `F` in, so they take the `1.0` branch;
+    /// * the autodiff path (`ad/ad_gradients.rs`) inlines `f_bio * amt` /
+    ///   `f_bio * rate` once, because under `#[autodiff]` it works on flat scalars
+    ///   and cannot call `&self` methods.
+    ///
+    /// A change to the rule must be mirrored in those sites.
+    pub(crate) fn bioavailable_amount(&self, amount: f64) -> f64 {
+        self.f_bio() * amount
+    }
+
+    /// Bioavailable infusion rate: `F · rate`. See [`Self::bioavailable_amount`].
+    pub(crate) fn bioavailable_rate(&self, rate: f64) -> f64 {
+        self.f_bio() * rate
+    }
     pub fn q3(&self) -> f64 {
         self.values[PK_IDX_Q3]
     }
@@ -902,8 +926,31 @@ impl PkModel {
         }
     }
 
+    /// Resolve a `[structural_model]` model name (canonical or long-form alias,
+    /// e.g. `one_cpt_iv` / `one_compartment_iv`) to its `PkModel`. `None` for any
+    /// unrecognised name (including the retired `*_bolus` / `*_infusion` spellings,
+    /// which the parser handles separately with a migration error).
+    ///
+    /// The single source of truth for name → model, shared by the analytical `pk`
+    /// parser (`parse_structural_model`) and the `ode_template` desugarer, so the
+    /// accepted aliases can't drift between the two paths. The inverse of
+    /// `canonical_name` (which omits the aliases); `from_name_round_trips_and_accepts_aliases`
+    /// and `canonical_name_round_trips_through_parser` pin them together.
+    pub(crate) fn from_name(name: &str) -> Option<PkModel> {
+        match name {
+            "one_cpt_iv" | "one_compartment_iv" => Some(PkModel::OneCptIv),
+            "one_cpt_oral" | "one_compartment_oral" => Some(PkModel::OneCptOral),
+            "two_cpt_iv" | "two_compartment_iv" => Some(PkModel::TwoCptIv),
+            "two_cpt_oral" | "two_compartment_oral" => Some(PkModel::TwoCptOral),
+            "three_cpt_iv" | "three_compartment_iv" => Some(PkModel::ThreeCptIv),
+            "three_cpt_oral" | "three_compartment_oral" => Some(PkModel::ThreeCptOral),
+            _ => None,
+        }
+    }
+
     /// Whether this is a first-order-absorption (oral) model. Oral models read
-    /// `ka` and `f`; IV models do not. The canonical home for this predicate.
+    /// `ka`; IV models do not. (`f` is read by every model since #327 — it scales
+    /// IV bolus/infusion doses too.) The canonical home for this predicate.
     ///
     /// The `#[cfg(feature = "autodiff")]` free fn `is_oral_model` in
     /// `estimation/inner_optimizer.rs` is a pre-existing identical copy; it should
@@ -924,11 +971,13 @@ impl PkModel {
     ///   - every required structural slot (`required_pk_params`);
     ///   - `lagtime`, applied to *every* dose (`predict_concentration` shifts the
     ///     effective dose time for IV and oral alike);
-    ///   - `f` (bioavailability) **only** for oral models — the IV closed forms
-    ///     never read it, so `f` on an IV model is inert.
+    ///   - `f` (bioavailability), applied to *every* dose and route — IV bolus,
+    ///     infusion, and oral depot — scaling the bioavailable amount/rate
+    ///     (#327). Both the superposition and event-driven analytical paths read
+    ///     it for every model, IV included, so it is never inert.
     pub(crate) fn consumes_pk_slot(&self, slot: usize) -> bool {
         slot == PK_IDX_LAGTIME
-            || (slot == PK_IDX_F && self.is_oral())
+            || slot == PK_IDX_F
             || self.required_pk_params().iter().any(|(s, _)| *s == slot)
     }
 }
@@ -3565,6 +3614,47 @@ mod tests {
         assert_eq!(TwoCptOral.canonical_name(), "two_cpt_oral");
         assert_eq!(ThreeCptIv.canonical_name(), "three_cpt_iv");
         assert_eq!(ThreeCptOral.canonical_name(), "three_cpt_oral");
+    }
+
+    #[test]
+    fn from_name_round_trips_and_accepts_aliases() {
+        use PkModel::*;
+        // `from_name` is the single source of name → model for both the `pk` parser
+        // and the `ode_template` desugarer (Ron #363). It must be the inverse of
+        // `canonical_name` on the canonical spelling and accept every long-form
+        // alias the parser historically accepted.
+        let cases: &[(PkModel, &str)] = &[
+            (OneCptIv, "one_compartment_iv"),
+            (OneCptOral, "one_compartment_oral"),
+            (TwoCptIv, "two_compartment_iv"),
+            (TwoCptOral, "two_compartment_oral"),
+            (ThreeCptIv, "three_compartment_iv"),
+            (ThreeCptOral, "three_compartment_oral"),
+        ];
+        for (model, alias) in cases {
+            assert_eq!(
+                PkModel::from_name(model.canonical_name()),
+                Some(*model),
+                "canonical name of {model:?} must round-trip"
+            );
+            assert_eq!(
+                PkModel::from_name(alias),
+                Some(*model),
+                "alias `{alias}` must resolve to {model:?}"
+            );
+        }
+        // Unknown names and the retired `*_bolus` / `*_infusion` spellings do NOT
+        // resolve — the parser maps the retired ones to a migration error itself,
+        // so `from_name` must return `None` for them (not a wrong variant).
+        for none in [
+            "four_cpt_oral",
+            "one_cpt_iv_bolus",
+            "two_cpt_infusion",
+            "",
+            "pk",
+        ] {
+            assert_eq!(PkModel::from_name(none), None, "`{none}` must not resolve");
+        }
     }
 
     #[test]

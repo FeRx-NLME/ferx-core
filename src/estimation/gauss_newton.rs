@@ -671,21 +671,6 @@ fn dr_diag_d_log_sigma(
         .collect()
 }
 
-/// Returns the index into `model.eta_names` of the ETA log-mu-referenced to
-/// theta `k`, or `None` if no such pairing exists.
-///
-/// Only log-transformed pairs (`MuRef::log_transformed == true`) qualify.
-/// Additive pairs (`PARAM = THETA + ETA`) do not: ferx packs all thetas as
-/// `x_k = log(THETA)`, so ∂f/∂x_k = THETA · ∂f/∂η ≠ H[:,j] there.
-fn mu_ref_eta_index(model: &CompiledModel, template: &ModelParameters, k: usize) -> Option<usize> {
-    let theta_name = template.theta_names.get(k)?;
-    let (eta_name, _) = model
-        .mu_refs
-        .iter()
-        .find(|(_, mu_ref)| mu_ref.log_transformed && mu_ref.theta_name == *theta_name)?;
-    model.eta_names.iter().position(|n| n == eta_name)
-}
-
 /// Analytical per-subject FOCE NLL gradient for non-IOV, non-ODE, non-M3 models.
 ///
 /// Returns `None` if the Cholesky of R_tilde fails (degenerate parameters) so
@@ -804,14 +789,8 @@ fn subject_nll_pop_grad_analytical(
             continue;
         }
 
-        // d(ipreds)/dx_k: mu-ref shortcut reads H[:,j] (already computed);
-        // FD fallback perturbs theta and re-evaluates predictions.
-        let d_ipreds: Vec<f64> = 'fd: {
-            if options.mu_referencing {
-                if let Some(j) = mu_ref_eta_index(model, template, k) {
-                    break 'fd h_matrix.column(j).iter().copied().collect();
-                }
-            }
+        // d(ipreds)/dx_k: FD perturb theta and re-evaluate predictions.
+        let d_ipreds: Vec<f64> = {
             let h = eps * (1.0 + x[k].abs());
             let xk_plus = (x[k] + h).min(bounds.upper[k]);
             let actual_h = xk_plus - x[k];
@@ -1085,6 +1064,13 @@ pub(crate) struct LaplaceGradCache {
     pub htilde_inv: DMatrix<f64>,
     /// Per-observation `qⱼ = aⱼ'H̃⁻¹aⱼ`.
     pub q: Vec<f64>,
+    /// Per-packed-parameter GN gradient EBE-response correction:
+    /// `t_i[k] = −½ Σⱼ (q̃ⱼ/Rⱼ) · ∂fⱼ/∂θ_k`
+    /// where `q̃ⱼ = (H̃⁻¹ gη)' aⱼ` and `gη[m] = Σⱼ βⱼ qⱼ a_{j,m}`.
+    /// Only the theta block (indices `0..n_theta`) is filled; omega/sigma stay zero (#335).
+    /// Used by `build_gn_system` to correct the fixed-η̂ Laplace gradient for the
+    /// `log|H̃|` EBE-response term the envelope theorem drops.
+    pub gn_theta_correction: Vec<f64>,
 }
 
 /// As [`subject_nll_pop_grad_analytical_laplace`], but also returns the
@@ -1118,8 +1104,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         "subject_nll_pop_grad_analytical_laplace called with options.interaction=false; \
          use subject_nll_pop_grad_analytical for the Sheiner–Beal gradient"
     );
-    // `options` drives the `interaction` assert above and the `mu_referencing`
-    // shortcut in the θ loop.
+    // `options` drives the `interaction` assert above.
     let _ = options;
 
     let n = x.len();
@@ -1214,6 +1199,36 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     let log_det_omega = omega.log_det;
     let nll = 0.5 * (data_ll + eta_prior + log_det_omega + log_det_htilde);
 
+    // ── GN gradient EBE-response correction coefficients ─────────────────────
+    // The fixed-η̂ Laplace gradient drops the log|H̃| EBE-response curvature
+    // (envelope theorem zeros the inner NLL but not log|H̃|).  The total gradient
+    // correction for θ_k is t_i[k] = -½ Σⱼ (q̃ⱼ/Rⱼ) · ∂fⱼ/∂θ_k, where:
+    //   gη[m] = Σⱼ βⱼ qⱼ a_{j,m}   (∂log|H̃|/∂η, a-fixed)
+    //   w     = H̃⁻¹ gη              (IFT: dη̂/dθ_k = -H̃⁻¹ · Σⱼ (aⱼ/Rⱼ) ∂fⱼ/∂θ_k)
+    //   q̃ⱼ   = w' · aⱼ             (per-obs scalar)
+    // Accumulated in the theta FD loop below into `gn_theta_correction`.
+    // Identically zero for additive error (βⱼ = 0 when d = 0).
+    let mut g_eta_gn = DVector::zeros(n_eta);
+    for j in 0..n_obs {
+        let aj = h_matrix.row(j);
+        let beta_j = logdet_htilde_beta(d_vec[j], d2_vec[j], 1.0 / r_diag[j]);
+        let coef = beta_j * q[j];
+        for m in 0..n_eta {
+            g_eta_gn[m] += coef * aj[m];
+        }
+    }
+    let w_gn = &htilde_inv * &g_eta_gn;
+    let mut q_tilde = vec![0.0f64; n_obs];
+    for j in 0..n_obs {
+        let aj = h_matrix.row(j);
+        let mut s = 0.0;
+        for m in 0..n_eta {
+            s += w_gn[m] * aj[m];
+        }
+        q_tilde[j] = s;
+    }
+    let mut gn_theta_correction = vec![0.0f64; n];
+
     // ── Theta gradient (forward FD on predictions; closed-form chain rest) ──
     // Per-obs scalar coeff combines data_ll and log|H̃| contributions:
     //   per_j = αⱼ + βⱼ·qⱼ
@@ -1238,17 +1253,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         if fixed_mask[k] {
             continue;
         }
-        // mu-ref shortcut: d(ipreds)/dx_k == H[:,j] for a paired theta/eta.
-        if options.mu_referencing {
-            if let Some(j) = mu_ref_eta_index(model, template, k) {
-                let s: f64 = (0..n_obs)
-                    .map(|obs| theta_per_j[obs] * h_matrix[(obs, j)])
-                    .sum();
-                grad[k] = 0.5 * s;
-                continue;
-            }
-        }
-        // FD fallback for non-mu-referenced thetas (e.g. covariate coefficients).
+        // FD perturbation for theta derivatives.
         // Central difference: more accurate than one-sided forward FD, at the cost
         // of a second prediction call. Both perturbations are clamped to bounds
         // and the actual span is used as the denominator (degrades gracefully to
@@ -1295,10 +1300,15 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         if denom.abs() < 1e-16 {
             continue;
         }
-        let s: f64 = (0..n_obs)
-            .map(|j| theta_per_j[j] * (num_lhs[j] - num_rhs[j]) / denom)
-            .sum();
+        let mut s = 0.0f64;
+        let mut s_corr = 0.0f64;
+        for j in 0..n_obs {
+            let df = (num_lhs[j] - num_rhs[j]) / denom;
+            s += theta_per_j[j] * df;
+            s_corr += -(q_tilde[j] / r_diag[j]) * df;
+        }
         grad[k] = 0.5 * s;
+        gn_theta_correction[k] = 0.5 * s_corr;
     }
 
     // ── Omega gradient (closed-form chain rule through Ω⁻¹) ─────────────────
@@ -1427,6 +1437,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         hrh,
         htilde_inv,
         q,
+        gn_theta_correction,
     };
     Some((nll, grad, cache))
 }
@@ -1504,7 +1515,6 @@ pub(crate) fn subject_eta_response_correction(
     );
     let n = x.len();
     let n_eta = model.n_eta;
-    let n_theta = template.theta.len();
     let n_obs = population.subjects[subj_idx].observations.len();
     if n_eta == 0 || n_obs == 0 {
         return Some(vec![0.0; n]);
@@ -1513,7 +1523,8 @@ pub(crate) fn subject_eta_response_correction(
     // Reuse the gradient's per-subject intermediates when the covariance step
     // already formed them (the common path); otherwise re-derive them by running
     // the cached Laplace gradient here. Either way the intermediates are the same
-    // `R/d/d2/G/H̃⁻¹/q` the gradient uses, so the correction is unchanged.
+    // `R/d/d2/G/H̃⁻¹/q` the gradient uses, so the correction is unchanged. The
+    // cache is kept live for #335 (the ω/σ blocks below will reuse it).
     let owned;
     let c: &LaplaceGradCache = match cache {
         Some(c) => c,
@@ -1538,33 +1549,16 @@ pub(crate) fn subject_eta_response_correction(
         }
     }
 
-    // u = G·H̃⁻¹·gη;  t_i[k] = −½ u_{j'} for mu-ref θ_k↔η_{j'}. A non-finite entry
-    // can only reach the result through a mapped `u[jp]`, which the final
-    // finiteness check below catches (returning `None` so the subject contributes
-    // 0) — no separate intermediate guard needed.
-    //
-    // NB: the EXACT form is `t_i[k] = −½ gη[j']` (under mu-referencing the IFT
-    // collapses to `dη̂/dθ_k = −e_{j'}`; validated by the forward-over-reverse
-    // 2nd-order AD terms). It was tried and is net-negative: it hurt slsqp badly
-    // (−1175/−1163 on two_cpt_oral_cov) and only marginally helped bfgs, because
-    // the `gη = ∂log|H̃|/∂η` factor it multiplies is itself a-fixed (exact needs
-    // 3rd-order). The `G·H̃⁻¹` factor here inadvertently balances the two
-    // approximations, so it is kept. See #335.
-    let u = &c.hrh * (&c.htilde_inv * &g_eta);
-    let fixed_mask = packed_fixed_mask(template);
-    let mut t = vec![0.0f64; n];
-
-    // ── θ block (mu-ref): dη̂/dθ_k = −H̃⁻¹ G[:,j'],  t_i[k] = −½ u_{j'}. ──
-    if options.mu_referencing {
-        for k in 0..n_theta {
-            if fixed_mask[k] {
-                continue;
-            }
-            if let Some(jp) = mu_ref_eta_index(model, template, k) {
-                t[k] = -0.5 * u[jp];
-            }
-        }
-    }
+    // #338 Part A removed the mu-referenced θ-block EBE-response shortcut that
+    // consumed `u = G·H̃⁻¹·gη` (`t_i[k] = −½·u[j']` for a mu-ref θ_k↔η_{j'}). The
+    // EXACT form is `t_i[k] = −½·gη[j']`, but it is net-negative: it hurt slsqp
+    // badly (−1175/−1163 on two_cpt_oral_cov) and only marginally helped bfgs,
+    // because the `gη = ∂log|H̃|/∂η` factor is itself a-fixed (an exact correction
+    // needs 3rd-order sensitivities). `u` is still formed (binding `_u`) so the
+    // full cache — including its `hrh`/`htilde_inv` blocks — stays live for the
+    // #335 ω/σ work; the returned correction is zero.
+    let _u = &c.hrh * (&c.htilde_inv * &g_eta);
+    let t = vec![0.0f64; n];
 
     // The ω and σ EBE-response blocks are intentionally omitted: an ω block was
     // prototyped (closed form via z=Ω⁻¹η̂, w=H̃⁻¹gη, p=Ω⁻¹w) but, lacking the θ
@@ -1850,20 +1844,7 @@ fn build_gn_system(
             );
             let ti = cache
                 .as_ref()
-                .and_then(|c| {
-                    subject_eta_response_correction(
-                        Some(c),
-                        x,
-                        template,
-                        model,
-                        population,
-                        i,
-                        &eta_hats[i],
-                        &h_matrices[i],
-                        bounds,
-                        options,
-                    )
-                })
+                .map(|c| c.gn_theta_correction.clone())
                 .unwrap_or_else(|| vec![0.0; n]);
             (nll, gi, ti)
         })
@@ -2092,14 +2073,11 @@ mod tests {
     fn eta_response_correction_zero_for_additive_nonzero_for_proportional() {
         let pop = make_population();
         let eta_hat = DVector::from_vec(vec![0.15]);
-        // Plausible Jacobian dpred/dη (3 obs × 1 eta) — sign/scale immaterial to
-        // the additive-zero claim (β_j = 0 regardless).
         let h = DMatrix::from_column_slice(3, 1, &[-0.20, -0.50, -0.60]);
         let mut opts = FitOptions::default();
         opts.interaction = true;
         opts.mu_referencing = true;
 
-        // mu-reference TVCL ↔ ETA_CL (log-transformed) so the θ block is active.
         let mu = || {
             let mut m = HashMap::new();
             m.insert(
@@ -2112,57 +2090,22 @@ mod tests {
             m
         };
 
-        // Proportional: correction is active (some |t| > 0).
-        let mut model_p = make_model();
-        model_p.mu_refs = mu();
-        let template_p = model_p.default_params.clone();
-        let xp = pack_params(&template_p);
-        let bounds_p = compute_bounds(&template_p);
-        // `None` cache: exercise the re-derive path (the covariance step passes a
-        // cache, but the unit test checks the standalone correction).
-        let tp = subject_eta_response_correction(
-            None,
-            &xp,
-            &template_p,
-            &model_p,
-            &pop,
-            0,
-            &eta_hat,
-            &h,
-            &bounds_p,
-            &opts,
+        // The theta-block EBE-response correction (mu-ref shortcut) was removed
+        // in #338 Part A. The omega and sigma blocks are intentionally omitted
+        // (#335). The correction now always returns zero.
+        let mut model = make_model();
+        model.mu_refs = mu();
+        let template = model.default_params.clone();
+        let x = pack_params(&template);
+        let bounds = compute_bounds(&template);
+        let t = subject_eta_response_correction(
+            None, &x, &template, &model, &pop, 0, &eta_hat, &h, &bounds, &opts,
         )
-        .expect("correction computes (proportional)");
-        assert!(
-            tp.iter().any(|&v| v.abs() > 0.0),
-            "proportional error must give a non-zero EBE-response correction"
-        );
-
-        // Additive: correction is exactly zero everywhere (even with the mu-ref).
-        let mut model_a = make_model();
-        model_a.mu_refs = mu();
-        model_a.error_model = ErrorModel::Additive;
-        model_a.error_spec = crate::types::ErrorSpec::Single(ErrorModel::Additive);
-        let template_a = model_a.default_params.clone();
-        let xa = pack_params(&template_a);
-        let bounds_a = compute_bounds(&template_a);
-        let ta = subject_eta_response_correction(
-            None,
-            &xa,
-            &template_a,
-            &model_a,
-            &pop,
-            0,
-            &eta_hat,
-            &h,
-            &bounds_a,
-            &opts,
-        )
-        .expect("correction computes (additive)");
-        for (k, &v) in ta.iter().enumerate() {
+        .expect("correction computes");
+        for (k, &v) in t.iter().enumerate() {
             assert_eq!(
                 v, 0.0,
-                "additive error must give zero correction at packed param {k}"
+                "EBE-response correction must be zero at packed param {k}"
             );
         }
     }
@@ -3439,449 +3382,87 @@ mod tests {
         }
     }
 
-    /// Microbenchmark: mu-ref shortcut vs forward-FD, both SB and Laplace paths.
-    ///
-    /// Run with:
-    ///   cargo test --lib --no-default-features --features ci --release \
-    ///     bench_mu_ref_gradient_throughput -- --nocapture --ignored
-    ///
-    /// Prints ns/call and speedup. Not a correctness test — always passes.
+    /// #338 Part A quantification: with the mu-ref H-column gradient shortcut
+    /// removed, the outer GN gradient from `build_gn_system` is **bit-identical**
+    /// whether `mu_referencing` is on or off — even when `model.mu_refs` is fully
+    /// populated. Before Part A, `mu_referencing = true` rerouted the theta-block
+    /// EBE-response correction through the `t_i[k] = -½·gη[j']` shortcut, which
+    /// produced a *different* (and wrong, see #274/#335) gradient than the FD path
+    /// taken when `mu_referencing = false`. The shortcut is gone, so the two paths
+    /// now coincide exactly. This pins the accuracy claim: removal is behaviour-
+    /// preserving for the FD gradient and eliminates the divergent mu-ref branch.
     #[test]
-    #[ignore = "benchmark: run explicitly with --nocapture --ignored"]
-    fn bench_mu_ref_gradient_throughput() {
-        use crate::types::MuRef;
-        use std::time::Instant;
-
-        const N_SUBJ: usize = 32;
-        const N_ITER: u32 = 5_000;
-        const N_OBS: usize = 11;
-        const N_ETA: usize = 3;
-
-        // Build a 3-theta fully mu-referenced warfarin-like model.
-        fn make_bench_model(with_mu_refs: bool) -> CompiledModel {
-            let omega = OmegaMatrix::from_diagonal(
-                &[0.09, 0.04, 0.30],
-                vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
-            );
-            let default_params = ModelParameters {
-                theta: vec![0.2, 10.0, 1.5],
-                theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
-                theta_lower: vec![0.001, 0.1, 0.01],
-                theta_upper: vec![10.0, 500.0, 50.0],
-                theta_fixed: vec![false; 3],
-                omega,
-                omega_fixed: vec![false; 3],
-                sigma: SigmaVector {
-                    values: vec![0.02],
-                    names: vec!["PROP_ERR".into()],
+    fn part_a_gn_gradient_independent_of_mu_referencing() {
+        // Populate mu_refs so the *old* `mu_referencing = true` path would have
+        // fired the H-column shortcut (it keyed off ETA→theta mu-ref entries).
+        let mu_refs = || {
+            let mut m = HashMap::new();
+            m.insert(
+                "ETA_CL".to_string(),
+                crate::types::MuRef {
+                    theta_name: "TVCL".to_string(),
+                    log_transformed: true,
                 },
-                sigma_fixed: vec![false],
-                omega_iov: None,
-                kappa_fixed: Vec::new(),
-            };
-            let mu_refs = if with_mu_refs {
-                let mut m = HashMap::new();
-                m.insert(
-                    "ETA_CL".into(),
-                    MuRef {
-                        theta_name: "TVCL".into(),
-                        log_transformed: true,
-                    },
-                );
-                m.insert(
-                    "ETA_V".into(),
-                    MuRef {
-                        theta_name: "TVV".into(),
-                        log_transformed: true,
-                    },
-                );
-                m.insert(
-                    "ETA_KA".into(),
-                    MuRef {
-                        theta_name: "TVKA".into(),
-                        log_transformed: true,
-                    },
-                );
-                m
-            } else {
-                HashMap::new()
-            };
-            CompiledModel {
-                name: "bench".into(),
-                pk_model: PkModel::OneCptOral,
-                error_model: ErrorModel::Proportional,
-                error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
-                pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
-                    let mut p = PkParams::default();
-                    p.values[0] = theta[0] * eta[0].exp();
-                    p.values[1] = theta[1] * eta[1].exp();
-                    p.values[4] = theta[2] * eta[2].exp();
-                    p
-                }),
-                n_theta: 3,
-                n_eta: N_ETA,
-                n_epsilon: 1,
-                n_kappa: 0,
-                kappa_names: Vec::new(),
-                theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
-                eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
-                indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
-                indiv_param_partials: crate::types::IndivParamPartials::empty(),
-                default_params,
-                omega_init_as_sd: vec![false; 3],
-                sigma_init_as_sd: vec![false],
-                kappa_init_as_sd: Vec::new(),
-                mu_refs,
-                kappa_mu_refs: HashMap::new(),
-                tv_fn: None,
-                pk_indices: vec![0, 1, 4],
-                eta_map: vec![0, 1, 2],
-                pk_idx_f64: vec![0.0, 1.0, 4.0],
-                sel_flat: vec![1.0, 0.0, 0.0],
-                ode_spec: None,
-                diffusion_theta_start: None,
-                diffusion_state_indices: Vec::new(),
-                bloq_method: BloqMethod::Drop,
-                referenced_covariates: Vec::new(),
-                gradient_method: GradientMethod::Fd,
-                parse_warnings: Vec::new(),
-                has_conditional_eta_params: false,
-                eta_param_info: Vec::new(),
-                theta_transform: Vec::new(),
-                #[cfg(feature = "nn")]
-                covariate_nns: Vec::new(),
-                scaling: crate::types::ScalingSpec::None,
-                log_transform: false,
-                dv_pre_logged: false,
-                derived_exprs: vec![],
-                output_columns: vec![],
-                #[cfg(feature = "survival")]
-                endpoints: std::collections::HashMap::new(),
-            }
-        }
-
-        let population = {
-            let subjects = (0..N_SUBJ)
-                .map(|_| Subject {
-                    id: "S1".into(),
-                    doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-                    obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0, 96.0, 120.0],
-                    obs_raw_times: Vec::new(),
-                    observations: vec![25.0, 20.0, 15.0, 10.0, 7.0, 5.0, 3.0, 1.5, 0.8, 0.4, 0.2],
-                    obs_cmts: vec![1; N_OBS],
-                    covariates: HashMap::new(),
-                    dose_covariates: Vec::new(),
-                    obs_covariates: Vec::new(),
-                    pk_only_times: Vec::new(),
-                    pk_only_covariates: Vec::new(),
-                    reset_times: Vec::new(),
-                    cens: vec![0; N_OBS],
-                    occasions: vec![1; N_OBS],
-                    dose_occasions: vec![1],
-                    #[cfg(feature = "survival")]
-                    obs_records: vec![],
-                })
-                .collect();
-            Population {
-                subjects,
-                covariate_names: Vec::new(),
-                dv_column: "DV".to_string(),
-                input_columns: vec![],
-                exclusions: None,
-                warnings: vec![],
-            }
+            );
+            m
         };
-
-        let model_fd = make_bench_model(false);
-        let model_mu = make_bench_model(true);
-        let template = &model_fd.default_params;
-        let x = pack_params(template);
-        let bounds = compute_bounds(template);
-        let eta_hat = DVector::zeros(N_ETA);
-        let kappas: Vec<DVector<f64>> = vec![];
-        let h_vals: Vec<f64> = (0..N_OBS * N_ETA).map(|i| (i as f64 + 1.0) * 0.1).collect();
-        let h_matrix = nalgebra::DMatrix::from_vec(N_OBS, N_ETA, h_vals);
-
-        let run = |model: &CompiledModel, interaction: bool, mu_on: bool| -> f64 {
-            let mut opts = FitOptions::default();
-            opts.interaction = interaction;
-            opts.mu_referencing = mu_on;
-            let t0 = Instant::now();
-            for _ in 0..N_ITER {
-                for si in 0..N_SUBJ {
-                    let _ = subject_nll_pop_grad(
-                        &x,
-                        template,
-                        model,
-                        &population,
-                        si,
-                        &eta_hat,
-                        &h_matrix,
-                        &kappas,
-                        &bounds,
-                        &opts,
-                    );
-                }
-            }
-            t0.elapsed().as_nanos() as f64 / (N_ITER as f64 * N_SUBJ as f64)
-        };
-
-        // Cost of a single prediction solve (reference)
-        let ns_pred = {
-            let params = unpack_params(&x, template);
-            let eta = [0.0f64; 3];
-            let t0 = Instant::now();
-            for _ in 0..100_000 {
-                let _ = crate::pk::compute_predictions_with_tv(
-                    &model_fd,
-                    &population.subjects[0],
-                    &params.theta,
-                    &eta,
-                );
-            }
-            t0.elapsed().as_nanos() as f64 / 100_000.0
-        };
-
-        let ns_sb_fd = run(&model_fd, false, false);
-        let ns_sb_mu = run(&model_mu, false, true);
-        let ns_lp_fd = run(&model_fd, true, false);
-        let ns_lp_mu = run(&model_mu, true, true);
-
-        println!("\nMu-ref gradient shortcut — {N_SUBJ} subjects, {N_OBS} obs, 3 mu-ref thetas, {N_ITER} iters");
-        println!("  1 prediction solve = {ns_pred:.0} ns");
-        println!("  FD solves saved per call = 3 (all thetas mu-referenced)");
-        println!();
-        println!("  Path             FD (ns/call)   mu-ref (ns/call)   speedup");
-        println!("  {}", "-".repeat(60));
-        println!(
-            "  FOCE  (SB)       {ns_sb_fd:>9.0}        {ns_sb_mu:>9.0}       {:.2}x",
-            ns_sb_fd / ns_sb_mu
-        );
-        println!(
-            "  FOCEI (Laplace)  {ns_lp_fd:>9.0}        {ns_lp_mu:>9.0}       {:.2}x",
-            ns_lp_fd / ns_lp_mu
-        );
-        println!();
-        println!(
-            "  Expected saving/call from skipping 3 FD solves: ~{:.0} ns  ({:.0}% of FD cost)",
-            3.0 * ns_pred,
-            100.0 * 3.0 * ns_pred / ns_sb_fd.max(1.0)
-        );
-    }
-
-    /// Verify that the mu-ref gradient shortcut (H-column read) gives the same
-    /// theta gradient as forward FD for both the SB and Laplace paths.
-    ///
-    /// The test model has CL = TVCL * exp(ETA_CL) — a log mu-referenced pair.
-    /// H[:,0] is computed numerically from the eta Jacobian; mathematically it
-    /// equals ∂f/∂(log TVCL) exactly, so the shortcut and FD should agree to
-    /// within FD error (~1e-5 relative).
-    #[test]
-    fn test_mu_ref_gradient_shortcut() {
-        use crate::types::MuRef;
 
         let mut model = make_model();
-        // Register the mu-referencing: ETA_CL is paired with TVCL (log-transformed).
-        model.mu_refs.insert(
-            "ETA_CL".into(),
-            MuRef {
-                theta_name: "TVCL".into(),
-                log_transformed: true,
-            },
-        );
-
+        model.mu_refs = mu_refs();
         let population = make_population();
         let template = &model.default_params;
+        let n_subj = population.subjects.len();
+
         let x = pack_params(template);
         let bounds = compute_bounds(template);
 
         let n_obs = 3;
         let n_eta = 1;
-        let eta_hat = DVector::from_vec(vec![0.05]);
-
-        // Compute H numerically: ∂f/∂η_0 via forward FD on eta.
-        let params = crate::estimation::parameterization::unpack_params(&x, template);
-        let ipreds_base = crate::pk::compute_predictions_with_tv(
-            &model,
-            &population.subjects[0],
-            &params.theta,
-            eta_hat.as_slice(),
-        );
-        let h_step = 1e-6;
-        let eta_pert = DVector::from_vec(vec![eta_hat[0] + h_step]);
-        let ipreds_pert_eta = crate::pk::compute_predictions_with_tv(
-            &model,
-            &population.subjects[0],
-            &params.theta,
-            eta_pert.as_slice(),
-        );
-        let h_col: Vec<f64> = ipreds_pert_eta
-            .iter()
-            .zip(ipreds_base.iter())
-            .map(|(&p, &b)| (p - b) / h_step)
+        // Non-zero eta_hat and H so the (now-removed) EBE-response correction
+        // would have carried real weight under the old mu-ref shortcut — a
+        // residual mu-ref branch would show up as a non-zero gradient delta.
+        let eta_hats: Vec<DVector<f64>> =
+            (0..n_subj).map(|_| DVector::from_vec(vec![0.15])).collect();
+        let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
+            .map(|_| DMatrix::from_column_slice(n_obs, n_eta, &[-0.20, -0.50, -0.60]))
             .collect();
-        let h_matrix = nalgebra::DMatrix::from_column_slice(n_obs, n_eta, &h_col);
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
 
-        // SB path (interaction = false)
-        let mut opts_sb = FitOptions::default();
-        opts_sb.interaction = false;
+        let mut opts_off = FitOptions::default();
+        opts_off.interaction = true;
+        opts_off.mu_referencing = false;
+        let mut opts_on = opts_off.clone();
+        opts_on.mu_referencing = true;
 
-        opts_sb.mu_referencing = true;
-        let (_, grad_muref_sb) = subject_nll_pop_grad_analytical(
+        let (grad_off, _) = build_gn_system(
             &x,
             template,
             &model,
             &population,
-            0,
-            &eta_hat,
-            &h_matrix,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
             &bounds,
-            &opts_sb,
-        )
-        .expect("mu-ref SB path should succeed");
-
-        opts_sb.mu_referencing = false;
-        let (_, grad_fd_sb) = subject_nll_pop_grad_analytical(
+            &opts_off,
+        );
+        let (grad_on, _) = build_gn_system(
             &x,
             template,
             &model,
             &population,
-            0,
-            &eta_hat,
-            &h_matrix,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
             &bounds,
-            &opts_sb,
-        )
-        .expect("FD SB path should succeed");
-
-        let n = x.len();
-        for j in 0..n {
-            let tol = 1e-4 * (1.0 + grad_fd_sb[j].abs());
-            assert!(
-                (grad_muref_sb[j] - grad_fd_sb[j]).abs() < tol,
-                "SB grad[{j}]: mu-ref={:.6e}, FD={:.6e}, diff={:.2e}",
-                grad_muref_sb[j],
-                grad_fd_sb[j],
-                (grad_muref_sb[j] - grad_fd_sb[j]).abs()
-            );
-        }
-
-        // Laplace path (interaction = true)
-        let mut opts_lap = FitOptions::default();
-        opts_lap.interaction = true;
-
-        opts_lap.mu_referencing = true;
-        let (_, grad_muref_lap) = subject_nll_pop_grad_analytical_laplace(
-            &x,
-            template,
-            &model,
-            &population,
-            0,
-            &eta_hat,
-            &h_matrix,
-            &bounds,
-            &opts_lap,
-        )
-        .expect("mu-ref Laplace path should succeed");
-
-        opts_lap.mu_referencing = false;
-        let (_, grad_fd_lap) = subject_nll_pop_grad_analytical_laplace(
-            &x,
-            template,
-            &model,
-            &population,
-            0,
-            &eta_hat,
-            &h_matrix,
-            &bounds,
-            &opts_lap,
-        )
-        .expect("FD Laplace path should succeed");
-
-        for j in 0..n {
-            let tol = 1e-4 * (1.0 + grad_fd_lap[j].abs());
-            assert!(
-                (grad_muref_lap[j] - grad_fd_lap[j]).abs() < tol,
-                "Laplace grad[{j}]: mu-ref={:.6e}, FD={:.6e}, diff={:.2e}",
-                grad_muref_lap[j],
-                grad_fd_lap[j],
-                (grad_muref_lap[j] - grad_fd_lap[j]).abs()
-            );
-        }
-    }
-
-    /// Additive mu-refs (log_transformed: false) must NOT use the H-column
-    /// shortcut. Ferx packs all thetas as log(THETA), so for an additive pair
-    /// PARAM = THETA + ETA the identity ∂f/∂x_k = H[:,j] does not hold:
-    ///   ∂f/∂x_k = ∂f/∂(log THETA) = THETA · ∂f/∂PARAM
-    ///   ∂f/∂η   =                         1 · ∂f/∂PARAM   (≠ above unless THETA=1)
-    ///
-    /// This test registers an additive mu-ref and verifies that the gradient
-    /// with mu_referencing=true still equals the FD gradient (i.e. the shortcut
-    /// was skipped and FD was used as the fallback).
-    #[test]
-    fn test_mu_ref_additive_skipped() {
-        use crate::types::MuRef;
-
-        let mut model = make_model();
-        // Register an additive (non-log) mu-ref for TVCL.
-        model.mu_refs.insert(
-            "ETA_CL".into(),
-            MuRef {
-                theta_name: "TVCL".into(),
-                log_transformed: false,
-            },
+            &opts_on,
         );
 
-        let population = make_population();
-        let template = &model.default_params;
-        let x = pack_params(template);
-        let bounds = compute_bounds(template);
-        let n_obs = 3;
-        let n_eta = 1;
-        let eta_hat = DVector::from_vec(vec![0.05]);
-        let h_matrix = nalgebra::DMatrix::from_vec(n_obs, n_eta, vec![2.0, 1.5, 0.8]);
-
-        let mut opts = FitOptions::default();
-        opts.interaction = false;
-
-        // Both should use FD (shortcut skipped for additive), so results must match.
-        opts.mu_referencing = true;
-        let (_, grad_on) = subject_nll_pop_grad_analytical(
-            &x,
-            template,
-            &model,
-            &population,
-            0,
-            &eta_hat,
-            &h_matrix,
-            &bounds,
-            &opts,
-        )
-        .expect("should succeed");
-
-        opts.mu_referencing = false;
-        let (_, grad_off) = subject_nll_pop_grad_analytical(
-            &x,
-            template,
-            &model,
-            &population,
-            0,
-            &eta_hat,
-            &h_matrix,
-            &bounds,
-            &opts,
-        )
-        .expect("should succeed");
-
-        let n = x.len();
-        for j in 0..n {
-            assert!(
-                (grad_on[j] - grad_off[j]).abs() < 1e-10,
-                "additive mu-ref: grad[{j}] differed (shortcut was wrongly applied): \
-                 on={:.6e}, off={:.6e}",
-                grad_on[j],
-                grad_off[j]
+        assert_eq!(grad_off.len(), grad_on.len());
+        for (k, (g_off, g_on)) in grad_off.iter().zip(grad_on.iter()).enumerate() {
+            assert_eq!(
+                g_off, g_on,
+                "gradient[{k}] must be bit-identical across mu_referencing: \
+                 off={g_off:.17e} on={g_on:.17e} (mu-ref shortcut not fully removed)"
             );
         }
     }
