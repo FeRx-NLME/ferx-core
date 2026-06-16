@@ -2554,6 +2554,13 @@ fn fit_inner(
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
         }
+        // Bayesian estimation reports posterior credible intervals, not a
+        // Hessian-based covariance matrix; the FD covariance / SIR steps are
+        // meaningless (and wasteful) for it.
+        if matches!(method, EstimationMethod::Bayes) {
+            stage_opts.run_covariance_step = false;
+            stage_opts.sir = false;
+        }
 
         if options.verbose && n_stages > 1 {
             eprintln!(

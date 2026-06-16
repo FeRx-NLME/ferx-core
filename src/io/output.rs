@@ -360,6 +360,28 @@ pub fn print_results(result: &FitResult) {
         }
     }
 
+    // Bayesian posterior
+    if let Some(ref b) = result.bayes {
+        eprintln!("\n--- Bayesian posterior (Gibbs-within-HMC) ---");
+        eprintln!(
+            "  chains = {}, warmup = {}, draws/chain = {}, max R-hat = {:.3}",
+            b.n_chains, b.n_warmup, b.n_draws_per_chain, b.max_rhat
+        );
+        if b.n_divergent > 0 {
+            eprintln!("  divergent transitions: {}", b.n_divergent);
+        }
+        eprintln!(
+            "  {:<14} {:>10} {:>10} {:>10} {:>10} {:>6} {:>8}",
+            "param", "mean", "sd", "2.5%", "97.5%", "Rhat", "ESS"
+        );
+        for s in &b.summaries {
+            eprintln!(
+                "  {:<14} {:>10.4} {:>10.4} {:>10.4} {:>10.4} {:>6.3} {:>8.0}",
+                s.name, s.mean, s.sd, s.q025, s.q975, s.rhat, s.ess_bulk
+            );
+        }
+    }
+
     // SIR results
     if let Some(ess) = result.sir_ess {
         eprintln!("\n--- SIR Uncertainty (95% CI) ---");
@@ -1208,6 +1230,29 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 writeln!(f, "    - id: \"{}\"", id).map_err(|e| e.to_string())?;
                 writeln!(f, "      ess_fraction: {:.4}", frac).map_err(|e| e.to_string())?;
             }
+        }
+    }
+
+    // Bayesian posterior section
+    if let Some(ref b) = result.bayes {
+        writeln!(f, "\nbayes:").map_err(|e| e.to_string())?;
+        writeln!(f, "  n_chains: {}", b.n_chains).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_warmup: {}", b.n_warmup).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_draws_per_chain: {}", b.n_draws_per_chain).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_divergent: {}", b.n_divergent).map_err(|e| e.to_string())?;
+        writeln!(f, "  max_rhat: {:.4}", b.max_rhat).map_err(|e| e.to_string())?;
+        writeln!(f, "  parameters:").map_err(|e| e.to_string())?;
+        for s in &b.summaries {
+            writeln!(f, "    - name: \"{}\"", s.name).map_err(|e| e.to_string())?;
+            writeln!(f, "      mean: {:.6}", s.mean).map_err(|e| e.to_string())?;
+            writeln!(f, "      sd: {:.6}", s.sd).map_err(|e| e.to_string())?;
+            writeln!(f, "      q025: {:.6}", s.q025).map_err(|e| e.to_string())?;
+            writeln!(f, "      median: {:.6}", s.median).map_err(|e| e.to_string())?;
+            writeln!(f, "      q975: {:.6}", s.q975).map_err(|e| e.to_string())?;
+            writeln!(f, "      rhat: {:.4}", s.rhat).map_err(|e| e.to_string())?;
+            writeln!(f, "      ess_bulk: {:.1}", s.ess_bulk).map_err(|e| e.to_string())?;
+            writeln!(f, "      ess_tail: {:.1}", s.ess_tail).map_err(|e| e.to_string())?;
+            writeln!(f, "      mcse: {:.6}", s.mcse).map_err(|e| e.to_string())?;
         }
     }
 
@@ -2248,6 +2293,26 @@ mod tests {
         // 2 theta + 3 omega (full 2×2) + 2 sigma + 3 kappa (full 2×2) = 10
         r.covariance_matrix = Some(DMatrix::identity(10, 10));
         r.warnings = vec!["example warning".into()];
+        r.bayes = Some(crate::types::BayesResult {
+            summaries: vec![crate::types::PosteriorSummary {
+                name: "CL".into(),
+                mean: 2.0,
+                sd: 0.2,
+                q025: 1.6,
+                median: 2.0,
+                q975: 2.4,
+                rhat: 1.01,
+                ess_bulk: 1500.0,
+                ess_tail: 1400.0,
+                mcse: 0.005,
+            }],
+            n_chains: 4,
+            n_warmup: 1000,
+            n_draws_per_chain: 1000,
+            n_divergent: 0,
+            max_rhat: 1.01,
+            draws: None,
+        });
         r
     }
 
@@ -2276,6 +2341,10 @@ mod tests {
         assert!(yaml.contains("\nimportance_sampling:"));
         assert!(yaml.contains("  kappa_treatment: fixed_at_mode"));
         assert!(yaml.contains("  low_ess_subjects:") && yaml.contains("- id: \"S3\""));
+        // Bayesian posterior block.
+        assert!(yaml.contains("\nbayes:"));
+        assert!(yaml.contains("  max_rhat: 1.0100"));
+        assert!(yaml.contains("  parameters:") && yaml.contains("    - name: \"CL\""));
         // SIR section with all three CI blocks.
         assert!(yaml.contains("\nsir:"));
         assert!(
