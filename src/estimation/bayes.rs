@@ -356,17 +356,42 @@ pub fn run_bayes(
     let n_eta_mh = options.saem_n_mh_steps.max(1);
     let master_seed = options.bayes_seed.unwrap_or(0x6E_61_6D_63_62_61_79_65); // "bayesnam"
 
-    // Mu-referenced (log) θ↔η pairs — used only for documentation/diagnostics
-    // here; the RW block moves all free θ regardless of mu-referencing.
-    // (Conjugate normal draws for mu-ref θ are a Phase-2b mixing optimization.)
+    // Mu-referenced (log) θ↔η map: mu_pairs[eta_idx] = Some(theta_idx) when that
+    // η is the log-deviation of θ (`P_i = θ·exp(η_i)`). When EVERY η is a
+    // non-fixed log mu-ref, the whole θ-mean vector is drawn from its exact
+    // Gaussian full conditional (the hierarchical-normal Gibbs move) instead of
+    // the random-walk block — without it the RW barely moves θ (the data pins θ
+    // at fixed η) and the chains do not mix.
+    let mut mu_pairs: Vec<Option<usize>> = vec![None; n_eta];
+    for (ei, ename) in model.eta_names.iter().enumerate() {
+        if let Some(mr) = model.mu_refs.get(ename) {
+            if mr.log_transformed {
+                if let Some(ti) = model.theta_names.iter().position(|t| t == &mr.theta_name) {
+                    mu_pairs[ei] = Some(ti);
+                }
+            }
+        }
+    }
+    let full_mu_ref = n_eta > 0
+        && (0..n_eta).all(|j| match mu_pairs[j] {
+            Some(ti) => !init_params.theta_fixed.get(ti).copied().unwrap_or(false),
+            None => false,
+        });
+    let conjugate_theta: std::collections::HashSet<usize> = if full_mu_ref {
+        mu_pairs.iter().filter_map(|&o| o).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
 
-    // ----- population RW coordinates (free θ then free σ) -----
+    // ----- population RW coordinates (free θ not handled conjugately, then σ) -----
     let mut pop_coords: Vec<PopCoord> = Vec::new();
     for j in 0..n_theta {
-        if !init_params.theta_fixed.get(j).copied().unwrap_or(false) {
-            let log = init_params.theta_lower.get(j).copied().unwrap_or(0.0) >= 0.0;
-            pop_coords.push(PopCoord::Theta { idx: j, log });
+        if init_params.theta_fixed.get(j).copied().unwrap_or(false) || conjugate_theta.contains(&j)
+        {
+            continue;
         }
+        let log = init_params.theta_lower.get(j).copied().unwrap_or(0.0) >= 0.0;
+        pop_coords.push(PopCoord::Theta { idx: j, log });
     }
     for k in 0..n_sigma {
         if !init_params.sigma_fixed.get(k).copied().unwrap_or(false) {
@@ -522,6 +547,44 @@ pub fn run_bayes(
                     // η-block NLLs are now stale w.r.t. Ω; they are recomputed at
                     // the top of the next sweep, and the (θ,σ) block below
                     // recomputes its own proposal NLLs, so no refresh needed here.
+                }
+            }
+
+            // ---- 2b. mu-ref θ block (exact Gaussian full conditional) ----
+            // For P_i = θ·exp(η_i) with η ~ N(0, Ω), the population mean
+            // μ = log θ has full conditional μ ~ N(μ_old + η̄, Ω/N). Draw the
+            // shift s = η̄ + chol(Ω/N)·z, set θ ← θ·exp(s), and re-centre
+            // η_i ← η_i − s so each individual parameter logφ_i = μ + η_i is
+            // unchanged (the data likelihood is invariant; only the η-prior
+            // moves). This is an always-accepted Gibbs move and is what makes
+            // the chains mix.
+            if full_mu_ref {
+                let mut eta_bar = vec![0.0; n_eta];
+                for e in &etas {
+                    for j in 0..n_eta {
+                        eta_bar[j] += e[j];
+                    }
+                }
+                for v in eta_bar.iter_mut() {
+                    *v /= n_subjects as f64;
+                }
+                let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(StandardNormal)).collect();
+                let lz = &omega_cur.chol * DVector::from_column_slice(&z);
+                let inv_sqrt_n = 1.0 / (n_subjects as f64).sqrt();
+                let s: Vec<f64> = (0..n_eta)
+                    .map(|j| eta_bar[j] + inv_sqrt_n * lz[j])
+                    .collect();
+                for j in 0..n_eta {
+                    if let Some(ti) = mu_pairs[j] {
+                        let lo = init_params.theta_lower.get(ti).copied().unwrap_or(f64::MIN);
+                        let hi = init_params.theta_upper.get(ti).copied().unwrap_or(f64::MAX);
+                        theta[ti] = (theta[ti].max(TINY).ln() + s[j]).exp().clamp(lo, hi);
+                    }
+                }
+                for e in etas.iter_mut() {
+                    for j in 0..n_eta {
+                        e[j] -= s[j];
+                    }
                 }
             }
 
@@ -1047,6 +1110,106 @@ mod tests {
             .err()
             .expect("IOV model should be rejected");
         assert!(err.contains("IOV"), "expected IOV rejection, got: {err}");
+    }
+
+    #[test]
+    #[ignore = "exploratory: prints FOCEI vs Bayes posterior means"]
+    fn bayes_vs_focei_print() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("parse");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("data");
+
+        let mut fopts = FitOptions::default();
+        fopts.method = crate::types::EstimationMethod::FoceI;
+        fopts.run_covariance_step = false;
+        let f = crate::api::fit(&model, &pop, &model.default_params, &fopts).expect("focei");
+        eprintln!("FOCEI theta = {:?}", f.theta);
+        eprintln!("FOCEI omega diag = {:?}", f.omega.diagonal());
+        eprintln!("FOCEI sigma = {:?}", f.sigma);
+
+        let mut bopts = FitOptions::default();
+        bopts.method = crate::types::EstimationMethod::Bayes;
+        bopts.run_covariance_step = false;
+        bopts.bayes_warmup = 1000;
+        bopts.bayes_iters = 2000;
+        bopts.bayes_chains = 4;
+        bopts.bayes_seed = Some(1);
+        bopts.saem_n_mh_steps = 10;
+        let b = crate::api::fit(&model, &pop, &model.default_params, &bopts).expect("bayes");
+        let br = b.bayes.as_ref().unwrap();
+        for s in &br.summaries {
+            eprintln!(
+                "BAYES {:>12}: mean={:.4} sd={:.4} [{:.4}, {:.4}] Rhat={:.3} ESS={:.0}",
+                s.name, s.mean, s.sd, s.q025, s.q975, s.rhat, s.ess_bulk
+            );
+        }
+        eprintln!("BAYES max_rhat = {:.4}", br.max_rhat);
+    }
+
+    /// Accuracy + mixing regression on the bundled warfarin model. The
+    /// posterior means must land near the FOCEI point estimate
+    /// (TVCL≈0.133, TVV≈7.74, TVKA≈0.82; PROP_ERR var≈0.0106) and the chains
+    /// must mix (max split-R̂ < 1.05). Ω posterior means run a little above the
+    /// FOCEI MLE (inverse-Wishart posterior-mean bias at N=10 subjects), so
+    /// their bounds are deliberately loose.
+    #[test]
+    fn run_bayes_warfarin_accuracy() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 400;
+        opts.bayes_iters = 800;
+        opts.bayes_chains = 2;
+        opts.bayes_seed = Some(1);
+        opts.saem_n_mh_steps = 10;
+
+        let res = run_bayes(&model, &pop, &model.default_params, &opts).expect("bayes runs");
+        let b = res.bayes.as_ref().unwrap();
+        let get = |name: &str| -> &PosteriorSummary {
+            b.summaries.iter().find(|s| s.name == name).expect(name)
+        };
+
+        let tvcl = get("TVCL");
+        let tvv = get("TVV");
+        let tvka = get("TVKA");
+        let prop = get("PROP_ERR");
+
+        assert!(
+            b.max_rhat < 1.05,
+            "chains did not mix: max R-hat = {}",
+            b.max_rhat
+        );
+        assert!(
+            (0.11..0.16).contains(&tvcl.mean),
+            "TVCL posterior mean {} off (FOCEI ~0.133)",
+            tvcl.mean
+        );
+        assert!(
+            (6.5..9.0).contains(&tvv.mean),
+            "TVV mean {} off (~7.74)",
+            tvv.mean
+        );
+        assert!(
+            (0.6..1.1).contains(&tvka.mean),
+            "TVKA mean {} off (~0.82)",
+            tvka.mean
+        );
+        assert!(
+            (0.006..0.016).contains(&prop.mean),
+            "PROP_ERR mean {} off (~0.0106)",
+            prop.mean
+        );
+        // Thetas should be well-mixed (conjugate block ⇒ high ESS).
+        for s in [tvcl, tvv, tvka] {
+            assert!(s.ess_bulk > 200.0, "{} ESS too low: {}", s.name, s.ess_bulk);
+        }
     }
 
     /// Full dispatch path: `fit` with `method = bayes` must route to run_bayes
