@@ -320,8 +320,15 @@ fn single_dose_ad(
     // event-driven path's `PkParams::bioavailable_amount`/`bioavailable_rate`.
     // Applied once here (rather than per-arm) because this `#[autodiff]` function
     // works on flat scalars and cannot call those `&self` helpers. All six arms
-    // below read the pre-scaled `amt`; the IV arms also read the pre-scaled
-    // `rate` (oral arms enter through the depot and never read bare `rate`).
+    // below read the pre-scaled `amt`; only the IV arms read the pre-scaled `rate`.
+    //
+    // The oral arms (ids 1/3/5) evaluate only the bolus Bateman form — they ignore
+    // `rate`/`dur`, so they are wrong for an oral *infusion* dose (which the value
+    // path routes to the IV-infusion form). That is currently safe, not a live bug:
+    // the inner optimizer sends every oral model with a `rate>0` dose to FD before
+    // AD is selected (`is_oral_model && rate>0 -> Fd`, see
+    // `estimation/inner_optimizer.rs`), so these arms only ever see bolus doses. If
+    // that guard is removed, make the oral arms infusion-aware first (#349 review).
     let amt = f_bio * amt;
     let rate = f_bio * rate;
 
