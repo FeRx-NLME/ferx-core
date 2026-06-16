@@ -204,6 +204,54 @@ RHS that is *not* bioavailability, give it a different name.
 
 See `examples/bioavailability_ode.ferx` for a complete worked model.
 
+### Compartment-indexed bioavailability and lag (`Fn` / `ALAGn`)
+
+When a model is dosed into **more than one compartment**, bioavailability and
+absorption lag can differ by route. Mirroring NONMEM's `F1`/`F2` and
+`ALAG1`/`ALAG2`, name an individual parameter `F{n}` or `ALAG{n}` (equivalently
+`LAGTIME{n}`), where `n` is the 1-based dose compartment:
+
+```text
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  F1    = inv_logit(THETA_F1)   # bioavailability for doses into compartment 1
+  F2    = inv_logit(THETA_F2)   # ... and into compartment 2
+  ALAG2 = TVLAG2                # absorption lag for compartment-2 doses only
+```
+
+- A dose into compartment `n` uses `F{n}` / `ALAG{n}` if declared.
+- A **bare** `F` / `lagtime` (no index) remains the all-compartment default, so
+  existing single-route models are unchanged. An indexed value overrides the
+  bare default for its compartment only; compartments without an indexed entry
+  fall back to the bare value (or to `F = 1`, `lag = 0`).
+- The index must refer to a compartment the model actually has — `F3` on a
+  two-state model is a parse error, not a silently-ignored parameter.
+- Each declared `Fn`/`ALAGn` occupies one of the seven spare slots in the
+  fixed 16-slot PK parameter layout (shared with other ODE structural
+  parameters). Declaring the full set for many compartments can exhaust them;
+  if so, `ode_param_slots` reports a clear "too many individual parameters"
+  error rather than failing silently.
+
+> ⚠️ **`F{n}` / `ALAG{n}` / `LAGTIME{n}` are reserved names** (just like the
+> bare `F` / `lagtime` above, and exactly as in NONMEM). On an ODE model,
+> declaring an individual parameter with one of these names binds it as
+> compartment `n`'s bioavailability / lag and applies it to **every** dose into
+> compartment `n` — even if you also reference the parameter in the `[odes]`
+> RHS. So don't reuse `F2`, `ALAG2`, … for an unrelated fraction or rate term;
+> give such a quantity a different (un-indexed-looking) name.
+
+This is an **ODE-engine** feature: the analytical PK functions have a single
+fixed dose route, so they take only the bare `f=`/`lagtime=` mapping. (The
+EKF/`[diffusion]` path applies per-compartment `F` but, as elsewhere, does not
+apply absorption lag.)
+
+> Per-compartment **observation scaling** (NONMEM's `Sn`, e.g. `S2 = V`) is a
+> separate, readout-side concept — it divides a compartment's amount to give the
+> observed concentration. It is configured in the [`[scaling]`](scaling.md)
+> block (`obs_scale[CMT=n] = …` or `y[CMT=n] = …`), not via a reserved `Sn`
+> individual parameter.
+
 ## Stochastic ODE Models (SDE)
 
 To model within-subject system noise that accumulates between observations, add

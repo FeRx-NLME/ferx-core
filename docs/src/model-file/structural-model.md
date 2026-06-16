@@ -110,5 +110,23 @@ amount-only ODE form and supply `[scaling] y = <expr>`:
 
 As with analytical models, an individual parameter that is **declared but never used** — never referenced in the `[odes]` right-hand side (nor in `[scaling]`/`[derived]`/`[output]`) — is flagged with a parse warning, since it is computed but has no effect (issue #315). The exceptions are the engine-applied `F` (bioavailability) and `lagtime` (alias `alag`): they act on the dose without appearing in the RHS (see [Bioavailability](#bioavailability) above), so they are never flagged.
 
+### Generating a standard disposition — `ode_template`
+
+To get the explicit ODE form of a **standard** PK model without writing out the
+states and equations by hand, use `ode_template NAME(...)`:
+
+```
+[structural_model]
+  ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+```
+
+ferx generates the same disposition ODE (states, micro-constant RHS, and
+`obs_scale`) that the analytical `pk two_cpt_oral(...)` solves in closed form,
+using the **same parameters**. You can then re-declare any `d/dt(X)` in `[odes]`
+to override that compartment — the standard way to attach a built-in absorption
+input such as `transit(...)`. See [Built-in Absorption Models](absorption.md) for
+`ode_template`, override semantics, and the rule that an ODE-only absorption
+function on an analytical `pk` model is an error.
+
 See [ODE Models](ode-models.md) for full ODE syntax and
 [Scaling](scaling.md) for the `[scaling]` block.

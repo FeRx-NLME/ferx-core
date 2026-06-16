@@ -951,6 +951,32 @@ pub fn check_model_data_warnings(
                     ),
                 ));
             }
+            // Compartment-indexed `ALAGn` lags (issue #369) live in their own
+            // spare slots, so the bare check above never sees them — flag each one
+            // that is negative at the typical-value point. Ordered by compartment
+            // for deterministic diagnostics.
+            if let Some(ode) = &model.ode_spec {
+                for cmt in 1..=ode.n_states {
+                    let Some(slot) = ode
+                        .dose_attr_map
+                        .indexed_slot(crate::types::DoseAttr::Lag, cmt)
+                    else {
+                        continue;
+                    };
+                    let lag = pk.values.get(slot).copied().unwrap_or(0.0);
+                    if lag < 0.0 {
+                        diags.push(Diagnostic::warning(
+                            "W_NEGATIVE_LAGTIME",
+                            format!(
+                                "ALAG{cmt} (compartment-{cmt} lag) evaluates to {lag:.4} (< 0) \
+                                 at the initial typical-value point (eta = 0). Negative lagtimes \
+                                 are physically nonsensical and are not clamped — consider an \
+                                 exp() or other positive-link parameterisation."
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -1686,7 +1712,19 @@ pub(crate) fn compute_extra_output_columns(
                 .map(|d| {
                     let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
                     let eta_d = combined_for(occ);
-                    (model.pk_param_fn)(theta, &eta_d, subject.dose_cov(d)).lagtime()
+                    let pk_d = (model.pk_param_fn)(theta, &eta_d, subject.dose_cov(d));
+                    // On ODE models the lag is keyed by dose compartment (`ALAGn`;
+                    // issue #369), so resolve through `dose_attr_map` — the same
+                    // single source of truth the prediction paths use — rather than
+                    // the bare `PK_IDX_LAGTIME` slot, which a model declaring only
+                    // `ALAG2` leaves at 0 (TAD would then ignore that route's lag).
+                    // The analytical engine has one fixed route → the bare lag.
+                    match &model.ode_spec {
+                        Some(ode) => ode
+                            .dose_attr_map
+                            .lagtime(subject.doses[d].cmt, &pk_d.values),
+                        None => pk_d.lagtime(),
+                    }
                 })
                 .collect()
         } else {
@@ -7483,6 +7521,212 @@ mod tests_derived_iov_kappa {
              @13.5, excluded; counts from morning @1.0). The pre-follow-up obs-occasion \
              lag would give 11.5. Got {}",
             tad[1]
+        );
+    }
+
+    /// Regression for the per-compartment TAD lag (issue #369). On an ODE model
+    /// declaring `ALAGn`, the TAD column must anchor each dose on *its own*
+    /// compartment's lag — resolved through `dose_attr_map`, the same single
+    /// source of truth the prediction paths use — not the bare `PK_IDX_LAGTIME`
+    /// slot, which a model declaring only `ALAG2` leaves at 0. A dose into
+    /// compartment 2 at t=0 with `ALAG2 = 2` effectively arrives at t=2, so an
+    /// observation at t=3 has TAD = 1.0. The pre-fix code read the bare lag (0)
+    /// and reported TAD = 3.0.
+    #[test]
+    fn tad_uses_per_compartment_alag_on_ode_models() {
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAG2(2.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  ALAG2 = TVLAG2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+        assert!(model.has_lagtime(), "ALAG2 must enable has_lagtime()");
+
+        // Dose into compartment 2 (central) at t=0; observe cmt 2 at t=3.
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
+            obs_times: vec![3.0],
+            obs_raw_times: vec![3.0],
+            observations: vec![1.0],
+            obs_cmts: vec![2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let theta = model.default_params.theta.clone();
+        let kappas: Vec<Vec<DVector<f64>>> = Vec::new(); // no IOV
+        let mut subjects_results = vec![sr_iov(1)];
+
+        compute_extra_output_columns(&model, &population, &theta, &kappas, &mut subjects_results);
+
+        let tad = &subjects_results[0].per_obs_tad;
+        // 3 − (dose@0 + ALAG2=2) = 1.0; the pre-fix bare-lag path gives 3.0.
+        assert!((tad[0] - 1.0).abs() < 1e-9, "tad: {}", tad[0]);
+    }
+
+    /// Regression for issue #369: a negative compartment-indexed `ALAGn` must
+    /// raise `W_NEGATIVE_LAGTIME`. The bare-slot check alone never sees the
+    /// `ALAG2` spare slot, so a bad per-route lag would otherwise slip through.
+    #[test]
+    fn negative_alag_emits_negative_lagtime_warning() {
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAG2(-1.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  ALAG2 = TVLAG2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
+            obs_times: vec![3.0],
+            obs_raw_times: vec![3.0],
+            observations: vec![1.0],
+            obs_cmts: vec![2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        let neg = diags
+            .iter()
+            .find(|d| d.code == "W_NEGATIVE_LAGTIME")
+            .expect("a negative ALAG2 must raise W_NEGATIVE_LAGTIME");
+        assert!(
+            neg.message.contains("ALAG2") && neg.message.contains("compartment-2"),
+            "warning must name the offending compartment-indexed lag, got: {}",
+            neg.message
+        );
+    }
+
+    /// The per-compartment negative-lag scan is ODE-only. An analytical model can
+    /// still report `has_lagtime()` (lag bound via `pk_indices`), so
+    /// `check_model_data_warnings` must take the `ode_spec == None` path: the bare
+    /// negative lag still warns, but no compartment-indexed `ALAGn` is emitted.
+    #[test]
+    fn negative_lag_scan_skips_analytical_models() {
+        let mut model = minimal_iov_model(vec![]);
+        // Analytical (ode_spec stays None); has_lagtime() via pk_indices carrying
+        // PK_IDX_LAGTIME; bare lag evaluates negative.
+        model.indiv_param_names = vec!["CL".into(), "LAGTIME".into()];
+        model.pk_indices = vec![0, PK_IDX_LAGTIME];
+        model.pk_param_fn = Box::new(|_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| {
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = -1.0;
+            p
+        });
+        assert!(model.has_lagtime() && model.ode_spec.is_none());
+
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: vec![1.0],
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_NEGATIVE_LAGTIME"),
+            "bare negative lag must still warn on an analytical model"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("ALAG")),
+            "no compartment-indexed ALAGn warning for an analytical (non-ODE) model"
         );
     }
 

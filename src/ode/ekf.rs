@@ -19,7 +19,7 @@
 
 use crate::ode::predictions::{active_infusions, is_real_infusion};
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
-use crate::types::{DoseEvent, PK_IDX_F};
+use crate::types::DoseEvent;
 use nalgebra::{DMatrix, DVector};
 
 const FD_H: f64 = 1e-5;
@@ -151,6 +151,7 @@ pub fn solve_ekf(
     obs_cmt_idx: usize,
     diffusion_var: &[f64],
     pk_params_flat: &[f64],
+    dose_attr_map: &crate::types::DoseAttrMap,
     initial_state: &[f64],
     doses: &[DoseEvent],
     obs_times: &[f64],
@@ -170,10 +171,6 @@ pub fn solve_ekf(
     } else {
         vec![0.0f64; n]
     };
-    // Bioavailability F (slot PK_IDX_F, default 1.0) scales the amount that
-    // enters the dosing compartment — NONMEM's F·AMT (bolus) / F·RATE
-    // (infusion), matching the analytical and plain-ODE paths.
-    let f_bio = pk_params_flat.get(PK_IDX_F).copied().unwrap_or(1.0);
     let mut p_mat = DMatrix::zeros(n, n);
     let mut results = vec![
         EkfObsPoint {
@@ -198,9 +195,12 @@ pub fn solve_ekf(
             break_times.push(dose.time + dose.duration);
         }
     }
-    // Bioavailability is constant across doses on the EKF path (no per-dose
-    // time-varying parameters), so the per-dose F slice is uniform.
-    let dose_f_bio = vec![f_bio; doses.len()];
+    // Bioavailability resolved per dose compartment (`Fn`; issue #369), falling
+    // back to the bare `F` slot. (The EKF path does not apply lagtime.)
+    let dose_f_bio: Vec<f64> = doses
+        .iter()
+        .map(|d| dose_attr_map.f_bio(d.cmt, pk_params_flat))
+        .collect();
     break_times.push(t_last);
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
@@ -210,11 +210,11 @@ pub fn solve_ekf(
         let t_end = break_times[k + 1];
 
         // Apply bolus doses at t_start (infusions enter via the wrapped RHS).
-        for dose in doses {
+        for (di, dose) in doses.iter().enumerate() {
             if (dose.time - t_start).abs() < 1e-12 && !is_real_infusion(dose) {
                 let cmt_idx = dose.cmt.saturating_sub(1);
                 if cmt_idx < n {
-                    u[cmt_idx] += f_bio * dose.amt;
+                    u[cmt_idx] += dose_f_bio[di] * dose.amt;
                 }
             }
         }
@@ -374,6 +374,7 @@ mod tests {
             0,
             &diffusion_var,
             &pk,
+            &Default::default(),
             &[], // no init block in test: empty seeds zero state
             &doses,
             &obs_times,
@@ -409,6 +410,7 @@ mod tests {
             init_fn: None,
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            dose_attr_map: Default::default(),
         };
         let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 
@@ -429,9 +431,9 @@ mod tests {
         let doses = vec![bolus_dose(100.0)];
 
         let mut pk_full = make_pk(5.0, 80.0);
-        pk_full[PK_IDX_F] = 1.0;
+        pk_full[crate::types::PK_IDX_F] = 1.0;
         let mut pk_half = make_pk(5.0, 80.0);
-        pk_half[PK_IDX_F] = 0.5;
+        pk_half[crate::types::PK_IDX_F] = 0.5;
 
         let run = |pk: &[f64]| {
             solve_ekf(
@@ -440,6 +442,7 @@ mod tests {
                 0,
                 &diffusion_var,
                 pk,
+                &Default::default(),
                 &[],
                 &doses,
                 &obs_times,
@@ -453,6 +456,53 @@ mod tests {
             assert!(f.ipred > 0.0, "expected positive ipred");
             assert_relative_eq!(h.ipred, 0.5 * f.ipred, epsilon = 1e-9, max_relative = 1e-6);
         }
+    }
+
+    /// #369 review #3: the EKF dose loop is a separate dose-application path, so
+    /// assert it applies **per-compartment** bioavailability (`Fn`). Uses a
+    /// 2-compartment accumulator (`d/dt = 0`) dosed into both compartments with
+    /// bare `F = 0.5` overridden by `F2 = 0.25`; the observed amount is then the
+    /// bioavailable dose for that compartment. (The EKF path applies no lagtime,
+    /// so this checks `F` routing only.)
+    #[test]
+    fn ekf_applies_per_compartment_bioavailability() {
+        fn two_cpt_zero_rhs(_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]) {
+            dy[0] = 0.0;
+            dy[1] = 0.0;
+        }
+        let mut map = crate::types::DoseAttrMap::default();
+        map.insert(crate::types::DoseAttr::F, 2, 9); // F2 -> spare slot 9
+
+        let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
+        pk[crate::types::PK_IDX_F] = 0.5; // bare F (compartment 1)
+        pk[9] = 0.25; // F2 (compartment 2)
+
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0),
+        ];
+        let obs_times = vec![1.0];
+        let diffusion_var = vec![0.0, 0.0];
+        let r_obs_vec = vec![0.01; obs_times.len()];
+
+        let run = |obs_cmt_idx: usize| -> f64 {
+            solve_ekf(
+                &two_cpt_zero_rhs,
+                2,
+                obs_cmt_idx,
+                &diffusion_var,
+                &pk,
+                &map,
+                &[],
+                &doses,
+                &obs_times,
+                &r_obs_vec,
+                OdeSolverOptions::default(),
+            )[0]
+            .ipred
+        };
+        assert!((run(0) - 50.0).abs() < 1e-9, "cmt1 F=0.5: {}", run(0));
+        assert!((run(1) - 25.0).abs() < 1e-9, "cmt2 F2=0.25: {}", run(1));
     }
 
     /// Linear 1D SDE: dX = -ke·X dt + σ_w dW.
@@ -486,6 +536,7 @@ mod tests {
             0,
             &[sigma2_w],
             &pk,
+            &Default::default(),
             &[], // no init block in test: empty seeds zero state
             &doses,
             &obs_times,
@@ -514,6 +565,7 @@ mod tests {
             0,
             &[0.1],
             &pk,
+            &Default::default(),
             &[], // no init block in test: empty seeds zero state
             &doses,
             &obs_times,

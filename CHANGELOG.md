@@ -33,6 +33,28 @@ section of the SDLC for the versioning policy).
   Validated against a NONMEM `$SIMULATION` + `npde` R-package reference on the
   warfarin example. M3/BLQ censoring and IOV-kappa resampling are out of scope
   (#260).
+- **Compartment-indexed bioavailability and lag for ODE models** — name an
+  individual parameter `F{n}` or `ALAG{n}`/`LAGTIME{n}` (e.g. `F2`, `ALAG2`) to
+  apply a per-route bioavailability/lag to doses into compartment `n`, mirroring
+  NONMEM's `F1`/`F2`/`ALAG1`/`ALAG2`. A bare `F`/`lagtime` stays the
+  all-compartment default (existing single-route models are unchanged); an
+  indexed value overrides only its compartment. Resolved uniformly across every
+  ODE dose-application path (event-driven, steady-state, and the EKF/diffusion
+  path — the latter applies `F` but not lag). An index past the model's
+  compartment count is a parse error rather than a silently-ignored parameter.
+  Foundation for the modeled-duration/rate (`Dn`/`Rn`) work in #324 (#369).
+- **`ode_template NAME(...)`** in `[structural_model]` generates the standard
+  disposition ODE for a named model (`one/two/three_cpt_iv|oral`) from the same
+  closed-form↔ODE transcription the analytical `pk NAME(...)` uses — so you get
+  the explicit, runnable ODE form without hand-writing the states, RHS, and
+  `obs_scale`. It takes the same parameters as `pk NAME(...)` (including `ka` for
+  oral routes). Re-declaring a `d/dt(X)` in `[odes]` **overrides** the generated
+  equation for compartment `X` (e.g. to add a `transit(...)` absorption input);
+  undeclared compartments keep their generated equations. Combining the ODE-only
+  `transit(...)` absorption with an analytical `pk NAME(...)` is now a clear error
+  pointing at `ode_template`, never a silent analytical→ODE conversion. (Future
+  ODE-only absorption functions join that error rule as each is implemented.)
+  (#322).
 - Built-in **transit-compartment absorption** for ODE models via a `transit(n, mtt)`
   input-rate function in the `[odes]` block (Savic et al. 2007, continuous `n`):
   `R_in(tad) = F·Dose·KTR·(KTR·tad)^n·e^(−KTR·tad)/Γ(n+1)`, `KTR=(n+1)/mtt`. The
@@ -141,6 +163,12 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- The analytical `pk NAME(...)` parameter list is now parsed strictly: a malformed
+  `role=VAR` pair (no `=`, an empty side, or a stray extra `=`) or a duplicate role
+  is a clear parse error instead of being silently dropped or last-winning. The
+  `pk` and `ode_template NAME(...)` directives share one strict parser, so they
+  can't drift in strictness. Well-formed model files (including a tolerated
+  trailing comma) are unaffected (#363).
 - FOCEI gradient-based optimizers (SLSQP, L-BFGS, built-in BFGS, Gauss-Newton)
   now add the `log|H̃|` EBE-response term (the #274/#289 Δ) to the population
   gradient, so they reach the true marginal minimum instead of stalling above it

@@ -917,7 +917,13 @@ pub fn parse_model_string(content: &str) -> Result<CompiledModel, String> {
 
 /// Parse a full model string including all optional blocks.
 pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
-    let extracted = extract_blocks(content)?;
+    let mut extracted = extract_blocks(content)?;
+    // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
+    // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
+    // hand-written `ode(...)` form *before* anything else looks at the blocks, so
+    // the rest of this function — including ODE detection below — sees a normal
+    // ODE model with no special-casing.
+    apply_ode_template(&mut extracted)?;
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
@@ -1099,6 +1105,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let is_ode = struct_lines
         .iter()
         .any(|l| l.starts_with("ode(") || l.starts_with("ode "));
+
+    // The error rule (#322 Phase 0b): an ODE-only absorption input-rate function
+    // (`transit`/`igd`/`weibull`) has no closed form, so it cannot ride on an
+    // analytical `pk ...` disposition. Reject the combination loudly, pointing at
+    // `ode_template`, rather than silently ignoring the [odes] block. An
+    // `ode_template`/`ode(...)` disposition sets `is_ode`, so this only fires for
+    // an analytical `pk` model that also carries an ODE-only absorption term.
+    if !is_ode {
+        if let Some(fname) = ode_only_absorption_fn_in_odes(blocks.get("odes")) {
+            return Err(format!(
+                "[structural_model]: `{fname}(...)` absorption requires an ODE disposition, but \
+                 the model uses an analytical `pk ...`. {fname}(...) has no closed form, so ferx \
+                 will not silently turn the analytical model into an ODE. Replace `pk NAME(...)` \
+                 with `ode_template NAME(...)` (ferx writes the disposition ODE) and keep \
+                 `{fname}(...)` in [odes]."
+            ));
+        }
+    }
 
     // For ODE models, map each individual parameter to a slot in the fixed
     // PkParams array (canonical names → their PK slot, others → free slots,
@@ -2073,19 +2097,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .iter()
             .enumerate()
             .filter(|(_, name)| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
-            // Exempt engine-applied slots on ODE models: `f`/`lagtime`/`alag` are
-            // applied to the dose by the engine without a textual RHS reference, so
-            // absence from `[odes]` does not make them dead. Reuse `ode_param_slots`'
-            // own routing (`ode_slot_map`, parallel to `indiv_param_names`) rather
-            // than re-deriving the slot from the name, so the exemption can't drift
-            // from how the parameter is actually routed. No-op for analytical models
-            // (`is_ode` false; their F/lagtime are bound via an explicit `pk(...)`
-            // mapping the census already counts).
-            .filter(|(i, _)| {
+            // Exempt engine-applied slots on ODE models: bare `f`/`lagtime`/`alag`
+            // (routed to RESERVED_PK_SLOTS) and the compartment-indexed dose
+            // attributes `Fn`/`ALAGn` (issue #369) are applied to the dose by the
+            // engine without a textual RHS reference, so absence from `[odes]` does
+            // not make them dead. The bare case reuses `ode_param_slots`' own routing
+            // (`ode_slot_map`, parallel to `indiv_param_names`) so the exemption can't
+            // drift; the indexed case matches the same `from_indexed_name` predicate
+            // that built `dose_attr_map`. No-op for analytical models (`is_ode` false;
+            // their F/lagtime are bound via an explicit `pk(...)` mapping the census
+            // already counts).
+            .filter(|(i, name)| {
                 !(is_ode
-                    && ode_slot_map
+                    && (ode_slot_map
                         .get(*i)
-                        .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot)))
+                        .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot))
+                        || crate::types::DoseAttr::from_indexed_name(name).is_some()))
             })
             .map(|(_, name)| name.clone())
             .collect();
@@ -4117,6 +4144,199 @@ fn parse_scaling_block(
     Ok((scaling, readout))
 }
 
+// ── ode_template desugaring + the analytical+ODE-only-absorption error rule ──
+
+/// Built-in absorption input-rate functions with **no closed form**, which
+/// therefore require an ODE disposition (the error rule, #322 Phase 0b). The
+/// closed-form-capable functions (`first_order`, `zero_order`) are intentionally
+/// excluded — they can ride on an analytical `pk` model.
+///
+/// This lists only the functions that are **actually implemented** as input
+/// rates today (`transit`, #343). Each later absorption function adds its own
+/// name here in the same PR that implements it — Phase 1 `igd` (#347), Phase 2
+/// `weibull` — so the error rule never advertises a function the engine can't yet
+/// run (which would send the user to `ode_template` for a dead end, Ron #363).
+const ODE_ONLY_ABSORPTION_FNS: [&str; 1] = ["transit"];
+
+/// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
+/// the first such function name found. Drives the error rule that rejects an
+/// analytical `pk` disposition combined with an ODE-only absorption term.
+fn ode_only_absorption_fn_in_odes(odes: Option<&Vec<String>>) -> Option<&'static str> {
+    let lines = odes?;
+    for line in lines {
+        for &f in ODE_ONLY_ABSORPTION_FNS.iter() {
+            if find_word_call(line, f).is_some() {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// Desugar an `ode_template NAME(...)` directive in `[structural_model]` into the
+/// hand-written ODE form (#322 Phase 0b).
+///
+/// Generates the standard disposition ODE for the named model
+/// (`crate::pk::ode_template::generate`), then rewrites the `structural_model`,
+/// `odes`, and `scaling` blocks so the ordinary ODE pipeline takes over with no
+/// special-casing. **Override semantics** (Ron, 2026-06-14): a `d/dt(X)` declared
+/// by the user in `[odes]` *replaces* the generated equation for compartment `X`;
+/// compartments the user leaves undeclared keep the generated RHS (no `+=`
+/// append form). A no-op if `[structural_model]` has no `ode_template` line.
+fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
+    // Cheap pre-check so the common (non-`ode_template`) model pays no regex
+    // compilation: bail before any work unless `[structural_model]` actually
+    // contains an `ode_template` line.
+    let has_template = matches!(
+        extracted.unnamed.get("structural_model"),
+        Some(lines) if lines.iter().any(|l| l.starts_with("ode_template"))
+    );
+    if !has_template {
+        return Ok(());
+    }
+
+    // Detect the `ode_template NAME(params)` line (and reject mixing it with a
+    // `pk`/`ode(...)` disposition) in a scope that releases the immutable borrow
+    // before the block rewrites below.
+    let tmpl_re = Regex::new(r"^ode_template\s+(\w+)\s*\(([^)]*)\)\s*$").unwrap();
+    let (model_name, params_str) = {
+        let struct_lines = match extracted.unnamed.get("structural_model") {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        let mut found: Option<(String, String)> = None;
+        let mut has_other_disposition = false;
+        for line in struct_lines {
+            if let Some(caps) = tmpl_re.captures(line) {
+                if found.is_some() {
+                    return Err(
+                        "[structural_model]: more than one `ode_template` line; declare exactly one."
+                            .to_string(),
+                    );
+                }
+                found = Some((caps[1].to_string(), caps[2].to_string()));
+            } else if line.starts_with("pk ")
+                || line.starts_with("ode(")
+                || line.starts_with("ode ")
+            {
+                has_other_disposition = true;
+            }
+        }
+        match found {
+            // `has_template` was true (some line starts with `ode_template`), so a
+            // `None` here means that line did not match `ode_template NAME(...)` —
+            // a malformed directive. Reject it explicitly rather than silently
+            // falling through to a confusing "No PK model found" downstream (or,
+            // with a `transit()` in [odes], the error rule telling the user to
+            // "use ode_template" when they already are).
+            None => {
+                return Err(
+                    "[structural_model]: malformed `ode_template` line — expected \
+                     `ode_template NAME(role=VAR, ...)`, e.g. \
+                     `ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)`."
+                        .to_string(),
+                );
+            }
+            Some(_) if has_other_disposition => {
+                return Err(
+                    "[structural_model]: `ode_template` cannot be combined with a `pk ...` or \
+                     `ode(...)` disposition — choose one. `ode_template` already generates the \
+                     full disposition ODE; add absorption / custom terms via override `d/dt(...)` \
+                     lines in [odes]."
+                        .to_string(),
+                );
+            }
+            Some(x) => x,
+        }
+    };
+
+    // Parse `role=VAR` pairs through the same strict helper as `pk NAME(...)`
+    // (`parse_role_pairs`) so the two paths agree on malformed/duplicate handling.
+    let params = parse_role_pairs(&params_str, &format!("ode_template {model_name}"))?;
+
+    let generated = crate::pk::ode_template::generate(&model_name, &params)?;
+
+    // `ode_template` produces a concentration readout via the injected
+    // `obs_scale` (amount-based states / V), which the SDE/EKF path does not yet
+    // support (it runs in the unscaled observation space). Without this guard the
+    // injected `obs_scale` trips the generic SDE-scaling error downstream, which
+    // blames a `[scaling]` block the user never wrote. Reject the combination
+    // here with an accurate message instead.
+    if extracted.unnamed.contains_key("diffusion") {
+        return Err(
+            "[structural_model]: `ode_template` is not supported with a `[diffusion]` (SDE/EKF) \
+             model — it generates a concentration readout (`obs_scale`), which the EKF path does \
+             not yet handle. Write the disposition by hand with `ode(...)` in amount space instead."
+                .to_string(),
+        );
+    }
+
+    // --- Override merge into [odes] -----------------------------------------
+    // A **top-level** user `d/dt(X)` replaces the generated equation for X. Reuse
+    // `diffeq_state` (whitespace-insensitive, matching `build_ode_spec`'s token
+    // parser) so override detection can't drift from what the engine treats as a
+    // state equation. Only top-level equations count: a `d/dt(X)` nested inside an
+    // `if {...}` is a *conditional* tweak, so the generated unconditional equation
+    // is kept (the two coexist — the conditional one wins when its branch fires,
+    // the generated default applies otherwise). Suppressing the default for a
+    // conditional override would silently leave X with no derivative outside the
+    // branch. Brace depth is tracked across lines; an inline `if (..) { d/dt.. }`
+    // line never starts with `d/dt`, so it is naturally excluded.
+    let user_odes = extracted.unnamed.get("odes").cloned().unwrap_or_default();
+    let mut overridden: Vec<String> = Vec::new();
+    let mut brace_depth: i32 = 0;
+    for line in &user_odes {
+        if brace_depth == 0 {
+            if let Some(cmt) = diffeq_state(line) {
+                if !generated.states.iter().any(|s| s == &cmt) {
+                    return Err(format!(
+                        "[odes]: d/dt({cmt}) overrides a compartment not generated by \
+                         `ode_template {model_name}` (generated states: {}). Override only a \
+                         generated compartment, or use a hand-written `ode(...)` model instead.",
+                        generated.states.join(", ")
+                    ));
+                }
+                overridden.push(cmt);
+            }
+        }
+        brace_depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if brace_depth < 0 {
+            brace_depth = 0;
+        }
+    }
+    // User lines first (they may define helper vars used by their overrides),
+    // then the generated equations for every non-overridden compartment. The
+    // duplicate-`d/dt` check in `build_ode_spec` is the backstop against a merge
+    // bug ever letting two equations through for the same state.
+    let mut merged = user_odes;
+    for (state, line) in &generated.odes {
+        if !overridden.iter().any(|s| s == state) {
+            merged.push(line.clone());
+        }
+    }
+    extracted.unnamed.insert("odes".to_string(), merged);
+
+    // --- Rewrite [structural_model] to the synthesized ode(...) form --------
+    extracted.unnamed.insert(
+        "structural_model".to_string(),
+        vec![format!(
+            "ode(obs_cmt={}, states=[{}])",
+            generated.obs_cmt,
+            generated.states.join(", ")
+        )],
+    );
+
+    // --- Supply obs_scale via [scaling] unless the user wrote their own -----
+    // A user-provided [scaling] block wins (e.g. a Form C `y = <expr>` readout);
+    // otherwise inject the generated central-volume scale.
+    extracted
+        .unnamed
+        .entry("scaling".to_string())
+        .or_insert_with(|| vec![format!("obs_scale = {}", generated.obs_scale)]);
+
+    Ok(())
+}
+
 // ── [structural_model] ODE variant parser ───────────────────────────────────
 
 fn parse_ode_structural(lines: &[String]) -> Result<(Vec<String>, Option<String>), String> {
@@ -4516,10 +4736,21 @@ fn balanced_parens(s: &str, open: usize) -> Option<(String, usize)> {
 }
 
 /// State name `X` if `line` is a `d/dt(X) = …` equation, else `None`.
+///
+/// Whitespace-insensitive, matching the **token-based** `[odes]` statement
+/// parser ([`parse_statement`], which recognises `d/dt(NAME)` as the token
+/// sequence `Ident("d") Slash Ident("dt") LParen Ident RParen` regardless of
+/// spacing — so `d/dt (central)` and `d / dt(central)` are valid state
+/// equations there). A literal `strip_prefix("d/dt(")` would diverge from that
+/// and, in the `ode_template` override merge, miss a spaced override — leaving
+/// both the generated and the user equation in place for a misleading
+/// "duplicate d/dt" error. We collapse interior whitespace before matching so
+/// the two definitions can never drift apart.
 fn diffeq_state(line: &str) -> Option<String> {
-    let rest = line.trim_start().strip_prefix("d/dt(")?;
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    let rest = compact.strip_prefix("d/dt(")?;
     let close = rest.find(')')?;
-    Some(rest[..close].trim().to_string())
+    Some(rest[..close].to_string())
 }
 
 /// True if the call spanning `[start, end)` in `line` (ASCII) is **not** a bare,
@@ -5225,6 +5456,31 @@ fn build_ode_spec(
         }))
     };
 
+    // Compartment-indexed dose attributes (NONMEM `Fn`/`ALAGn`; issue #369). An
+    // individual parameter named `F{c}` / `ALAG{c}` / `LAGTIME{c}` binds the
+    // bioavailability / lag for doses into compartment `c` (1-based); the bare
+    // `F`/`lagtime` (at PK_IDX_F/PK_IDX_LAGTIME) remain the all-compartment
+    // default, overridden per compartment by an indexed entry. The slot is the
+    // one `ode_param_slots` already assigned the name (parallel to
+    // `indiv_param_names`), so the RHS can still read the same value.
+    let mut dose_attr_map = crate::types::DoseAttrMap::default();
+    for (i, name) in indiv_param_names.iter().enumerate() {
+        if let Some((attr, cmt)) = crate::types::DoseAttr::from_indexed_name(name) {
+            if cmt > n_states {
+                return Err(format!(
+                    "[individual_parameters]: `{name}` is a compartment-indexed dose \
+                     attribute for compartment {cmt}, but the model has only {n_states} \
+                     compartment(s) {state_names:?}. Compartment indices are 1-based."
+                ));
+            }
+            // `indiv_param_slots` is parallel to `indiv_param_names` (asserted
+            // above), so the slot for `i` always exists — index directly, as the
+            // input-rate extractor (`extract_input_rate_terms`) already does.
+            let slot = indiv_param_slots[i];
+            dose_attr_map.insert(attr, cmt, slot);
+        }
+    }
+
     Ok(crate::ode::OdeSpec {
         rhs,
         n_states,
@@ -5238,6 +5494,7 @@ fn build_ode_spec(
         // Built-in absorption forcing terms split out of the [odes] RHS above
         // (design A); empty for models with no transit()/etc. input-rate call.
         input_rate,
+        dose_attr_map,
     })
 }
 
@@ -5910,6 +6167,39 @@ fn build_omega_fixed(
 
 // --- Structural model parsing ---
 
+/// Parse a `role=VAR, role=VAR, …` list from a `pk NAME(...)` / `ode_template
+/// NAME(...)` parameter string into a `role(lowercased) → VAR` map.
+///
+/// **Strict and single-sourced** (Ron, #363): a pair that is not exactly
+/// `role=VAR` with both sides non-empty is a hard error, and a duplicate role is
+/// a hard error — for both the analytical `pk` and the `ode_template` paths, so
+/// the two can't drift in strictness (they used to: `pk` silently dropped
+/// malformed pairs and last-wins on duplicates). A trailing comma (empty pair) is
+/// tolerated. `ctx` is the directive prefix used in error messages, e.g.
+/// `"pk two_cpt_oral"` or `"ode_template two_cpt_oral"`.
+fn parse_role_pairs(params_str: &str, ctx: &str) -> Result<HashMap<String, String>, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    for pair in params_str.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = pair.split('=').map(str::trim).collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err(format!(
+                "{ctx}: malformed parameter `{pair}` (expected `role=VARNAME`)."
+            ));
+        }
+        if map
+            .insert(parts[0].to_lowercase(), parts[1].to_string())
+            .is_some()
+        {
+            return Err(format!("{ctx}: duplicate parameter `{}`.", parts[0]));
+        }
+    }
+    Ok(map)
+}
+
 fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, String>), String> {
     // pk model_name(param=VAR, param=VAR, ...)
     let pk_re = Regex::new(r"pk\s+(\w+)\(([^)]+)\)").unwrap();
@@ -5917,55 +6207,51 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
     for line in lines {
         if let Some(caps) = pk_re.captures(line) {
             let model_name = &caps[1];
-            let pk_model = match model_name {
-                "one_cpt_iv" | "one_compartment_iv" => PkModel::OneCptIv,
-                "one_cpt_oral" | "one_compartment_oral" => PkModel::OneCptOral,
-                "two_cpt_iv" | "two_compartment_iv" => PkModel::TwoCptIv,
-                "two_cpt_oral" | "two_compartment_oral" => PkModel::TwoCptOral,
-                "three_cpt_iv" | "three_compartment_iv" => PkModel::ThreeCptIv,
-                "three_cpt_oral" | "three_compartment_oral" => PkModel::ThreeCptOral,
+            // Name → model is resolved through the shared `PkModel::from_name`
+            // (canonical + long-form aliases) so the `pk` and `ode_template` paths
+            // accept exactly the same set; retired and unknown names are handled
+            // here because they produce path-specific diagnostics, not a `PkModel`.
+            let pk_model = match PkModel::from_name(model_name) {
+                Some(m) => m,
                 // Retired names (issue #176): bolus and infusion are no longer
                 // separate model variants — the route is read per-dose from the
                 // RATE column. Emit a migration error so users update their
                 // model files explicitly rather than relying on a silent alias.
-                retired @ ("one_cpt_iv_bolus"
-                | "one_compartment_iv_bolus"
-                | "one_cpt_infusion"
-                | "one_compartment_infusion"
-                | "two_cpt_iv_bolus"
-                | "two_compartment_iv_bolus"
-                | "two_cpt_infusion"
-                | "two_compartment_infusion"
-                | "three_cpt_iv_bolus"
-                | "three_compartment_iv_bolus"
-                | "three_cpt_infusion"
-                | "three_compartment_infusion") => {
-                    let n = if retired.starts_with("one") {
-                        "one"
-                    } else if retired.starts_with("two") {
-                        "two"
-                    } else {
-                        "three"
-                    };
-                    return Err(format!(
-                        "`{retired}` was removed in #176; use `{n}_cpt_iv` instead. \
-                         Bolus and infusion administration are now driven by the \
-                         RATE column in the dataset (RATE=0 for bolus, RATE>0 for \
-                         infusion), so a single `{n}_cpt_iv` model handles either \
-                         or a mix of both within the same subject."
-                    ));
-                }
-                other => return Err(format!("Unknown PK model: {}", other)),
+                None => match model_name {
+                    retired @ ("one_cpt_iv_bolus"
+                    | "one_compartment_iv_bolus"
+                    | "one_cpt_infusion"
+                    | "one_compartment_infusion"
+                    | "two_cpt_iv_bolus"
+                    | "two_compartment_iv_bolus"
+                    | "two_cpt_infusion"
+                    | "two_compartment_infusion"
+                    | "three_cpt_iv_bolus"
+                    | "three_compartment_iv_bolus"
+                    | "three_cpt_infusion"
+                    | "three_compartment_infusion") => {
+                        let n = if retired.starts_with("one") {
+                            "one"
+                        } else if retired.starts_with("two") {
+                            "two"
+                        } else {
+                            "three"
+                        };
+                        return Err(format!(
+                            "`{retired}` was removed in #176; use `{n}_cpt_iv` instead. \
+                             Bolus and infusion administration are now driven by the \
+                             RATE column in the dataset (RATE=0 for bolus, RATE>0 for \
+                             infusion), so a single `{n}_cpt_iv` model handles either \
+                             or a mix of both within the same subject."
+                        ));
+                    }
+                    other => return Err(format!("Unknown PK model: {}", other)),
+                },
             };
 
-            let params_str = &caps[2];
-            let mut param_map = HashMap::new();
-            for pair in params_str.split(',') {
-                let parts: Vec<&str> = pair.split('=').map(|s| s.trim()).collect();
-                if parts.len() == 2 {
-                    param_map.insert(parts[0].to_lowercase(), parts[1].to_string());
-                }
-            }
+            // Strict, shared with `ode_template` (`parse_role_pairs`): a malformed
+            // or duplicate `role=VAR` pair is rejected rather than silently dropped.
+            let param_map = parse_role_pairs(&caps[2], &format!("pk {model_name}"))?;
 
             // Structural-mapping validation (required params present, unused
             // params, undefined references) is deferred to `parse_full_model`,
@@ -9474,6 +9760,291 @@ fn parse_if_statement(
 mod tests {
     use super::*;
 
+    // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
+
+    /// Parse `src`, asserting it fails; returns the error message. (`ParsedModel`
+    /// is not `Debug`, so `unwrap_err()` can't be used directly.)
+    fn parse_err(src: &str) -> String {
+        match parse_full_model(src) {
+            Ok(_) => panic!("expected a parse error, but the model parsed"),
+            Err(e) => e,
+        }
+    }
+
+    /// Two-cpt-oral parameter header (CL/V1/Q/V2/KA) plus optional extra
+    /// individual params, used to build `ode_template` test models.
+    fn two_cpt_oral_model(structural: &str, extra_indiv: &str, odes: &str) -> String {
+        format!(
+            "[parameters]\n\
+             \x20 theta TVCL(3.0, 0.01, 100.0)\n\
+             \x20 theta TVV1(15.0, 1.0, 500.0)\n\
+             \x20 theta TVQ(3.0, 0.01, 100.0)\n\
+             \x20 theta TVV2(30.0, 1.0, 500.0)\n\
+             \x20 theta TVKA(1.1, 0.01, 50.0)\n\
+             \x20 omega ETA_CL ~ 0.09\n\
+             \x20 sigma PROP ~ 0.01 (sd)\n\n\
+             [individual_parameters]\n\
+             \x20 CL = TVCL * exp(ETA_CL)\n\
+             \x20 V1 = TVV1\n\
+             \x20 Q  = TVQ\n\
+             \x20 V2 = TVV2\n\
+             \x20 KA = TVKA\n{extra_indiv}\n\
+             [structural_model]\n  {structural}\n\n{odes}\
+             [error_model]\n  DV ~ proportional(PROP)\n"
+        )
+    }
+
+    #[test]
+    fn ode_template_desugars_to_ode_model() {
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "",
+            "",
+        );
+        let model = parse_full_model(&src)
+            .unwrap_or_else(|e| panic!("ode_template should parse: {e}"))
+            .model;
+        let ode = model
+            .ode_spec
+            .expect("ode_template must produce an ODE model");
+        assert_eq!(ode.state_names, vec!["depot", "central", "periph"]);
+        // Pure disposition — no built-in input-rate forcing without an override.
+        assert!(ode.input_rate.is_empty());
+        // Observed compartment is central (state index 1).
+        match ode.readout {
+            crate::ode::OdeReadout::ObsCmt(idx) => assert_eq!(idx, 1),
+            _ => panic!("expected an ObsCmt readout for ode_template"),
+        }
+    }
+
+    #[test]
+    fn ode_template_override_replaces_only_named_compartment() {
+        // Override the generated depot with a transit input; central & periph
+        // keep their generated equations (so the 3-state structure is intact and
+        // exactly one transit forcing lands on the depot, compartment 0).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
+        );
+        let model = parse_full_model(&src)
+            .unwrap_or_else(|e| panic!("override should parse: {e}"))
+            .model;
+        let ode = model.ode_spec.expect("ODE model");
+        assert_eq!(ode.state_names, vec!["depot", "central", "periph"]);
+        assert_eq!(ode.input_rate.len(), 1, "exactly one transit forcing");
+        assert_eq!(ode.input_rate[0].cmt, 0, "transit forces the depot (cmt 0)");
+    }
+
+    #[test]
+    fn ode_template_override_unknown_compartment_errors() {
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "",
+            "[odes]\n  d/dt(gut) = -KA*gut\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("d/dt(gut)") && err.contains("generated states"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_template_missing_required_role_errors() {
+        // Surfaced through the full-model parse, not just the generator.
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2)",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("requires `ka`"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_rejects_mixing_with_pk_or_ode() {
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)\n  pk one_cpt_iv(cl=CL, v=V1)",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("cannot be combined"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_malformed_arg_errors() {
+        let src = two_cpt_oral_model("ode_template one_cpt_iv(cl)", "", "");
+        let err = parse_err(&src);
+        assert!(err.contains("malformed parameter"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_missing_parens_errors_clearly() {
+        // A line that *looks* like an ode_template directive but doesn't match
+        // `NAME(...)` must produce a clear "malformed ode_template" error — not
+        // fall through to a confusing "No PK model found". Pair it with a
+        // transit() in [odes] (the worst case: the error rule would otherwise
+        // tell the user to "use ode_template" when they already are).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("malformed `ode_template`"),
+            "expected a clear malformed-ode_template error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_template_duplicate_arg_errors() {
+        let src = two_cpt_oral_model("ode_template one_cpt_iv(cl=CL, cl=V1)", "", "");
+        let err = parse_err(&src);
+        assert!(err.contains("duplicate parameter"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_multiple_lines_errors() {
+        let src = two_cpt_oral_model(
+            "ode_template one_cpt_iv(cl=CL, v=V1)\n  ode_template two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("more than one"), "got: {err}");
+    }
+
+    #[test]
+    fn error_rule_analytical_pk_plus_transit() {
+        // Analytical disposition + an ODE-only absorption function → hard error
+        // pointing at ode_template, never a silent analytical→ODE swap.
+        let src = two_cpt_oral_model(
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("ode_template"),
+            "should point at ode_template: {err}"
+        );
+        assert!(err.contains("transit"), "should name the function: {err}");
+    }
+
+    #[test]
+    fn ode_only_absorption_fn_detection() {
+        let transit = vec!["d/dt(depot) = transit(n=N, mtt=M) - KA*depot".to_string()];
+        assert_eq!(
+            ode_only_absorption_fn_in_odes(Some(&transit)),
+            Some("transit")
+        );
+        // The error rule only recognises functions that are actually implemented
+        // (Ron #363): `igd`/`weibull` are not yet input rates, so they must NOT be
+        // detected — otherwise the rule would point the user at `ode_template` for a
+        // function the engine can't run. Each phase adds its name here when it lands.
+        let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), None);
+        let weibull = vec!["d/dt(central) = weibull(td=TD, beta=B) - (CL/V)*central".to_string()];
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&weibull)), None);
+        // A plain disposition ODE has no ODE-only absorption call.
+        let plain = vec!["d/dt(central) = -(CL/V)*central".to_string()];
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&plain)), None);
+        assert_eq!(ode_only_absorption_fn_in_odes(None), None);
+    }
+
+    #[test]
+    fn ode_template_rejects_mixing_with_ode() {
+        // The `ode(...)` arm of the mixing guard (the `pk` arm is covered above).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)\n  \
+             ode(obs_cmt=central, states=[depot, central, periph])",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("cannot be combined"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_trailing_comma_ok() {
+        // A trailing comma yields an empty `role=VAR` pair, which is skipped.
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, )",
+            "",
+            "",
+        );
+        assert!(
+            parse_full_model(&src).is_ok(),
+            "a trailing comma in the parameter list should be tolerated"
+        );
+    }
+
+    #[test]
+    fn ode_template_override_tolerates_whitespace_in_d_dt() {
+        // `build_ode_spec` recognises `d/dt(NAME)` at the token level, so spacing
+        // like `d/dt (central)` / `d / dt(central)` is a valid state equation
+        // there. Override detection must agree — otherwise the override is missed,
+        // the generated equation also survives, and the user gets a misleading
+        // "duplicate d/dt(central)" error instead of their override taking effect.
+        for lhs in ["d/dt (central)", "d / dt(central)", "d/dt(  central  )"] {
+            let src = two_cpt_oral_model(
+                "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+                "",
+                &format!("[odes]\n  {lhs} = KA*depot - (CL/V1 + Q/V1)*central + (Q/V2)*periph\n\n"),
+            );
+            let model = parse_full_model(&src)
+                .unwrap_or_else(|e| panic!("spaced override `{lhs}` should parse: {e}"))
+                .model;
+            // Override consumed the generated central → still exactly 3 states,
+            // and no duplicate-d/dt error fired.
+            assert_eq!(
+                model.ode_spec.expect("ODE model").state_names,
+                vec!["depot", "central", "periph"],
+                "override `{lhs}`"
+            );
+        }
+    }
+
+    #[test]
+    fn ode_template_rejected_with_diffusion_block() {
+        // ode_template injects obs_scale (a concentration readout), which the SDE
+        // path can't carry. Reject with a message that names the real cause
+        // (`ode_template` + `[diffusion]`), not the injected `[scaling]` block the
+        // user never wrote.
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "",
+            "[diffusion]\n  central ~ 0.1\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("ode_template") && err.contains("[diffusion]"),
+            "diffusion error should name ode_template + [diffusion]: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_template_transit_on_non_ddt_line_errors_with_pointer() {
+        // Under ode_template, a `transit(...)` that is not the input rate of a
+        // `d/dt(...)` equation (here a bare helper assignment) must not be silently
+        // retained as a dead term: the input-rate extractor catches it and points
+        // at the correct `d/dt(...)` form (Ron #363, finding 5 — confirmed already
+        // guarded, pinned here so it can't regress).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  rate = transit(n=NTR, mtt=MTT)\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("d/dt"),
+            "a transit() off a d/dt line should point at the d/dt form, got: {err}"
+        );
+    }
+
     // ── transit() input-rate parse-split (#322, design A) ────────────────────
     #[test]
     fn extract_transit_input_rate_basic() {
@@ -9573,6 +10144,60 @@ mod tests {
         assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT)").is_ok());
         assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot").is_ok());
         assert!(go("d/dt(depot) = -KA*depot + transit(n=NTR, mtt=MTT)").is_ok());
+    }
+
+    #[test]
+    fn pk_param_parser_is_strict_about_duplicates_and_malformed_pairs() {
+        // The analytical `pk NAME(...)` parser now shares the strict
+        // `parse_role_pairs` helper with `ode_template` (Ron #363, finding 2). It
+        // previously silently dropped malformed pairs and let a duplicate role
+        // last-win; both are now hard errors, single-sourced so the two paths can't
+        // drift in strictness again.
+
+        // Duplicate role → rejected (was: silent last-win, here `cl=V` would have
+        // shadowed `cl=CL` with no warning).
+        let dup = vec!["pk one_cpt_iv(cl=CL, cl=V)".to_string()];
+        let err = parse_structural_model(&dup).unwrap_err();
+        assert!(
+            err.contains("duplicate parameter") && err.contains("cl"),
+            "duplicate pk param should error: {err}"
+        );
+
+        // Malformed pairs (no `=`, double `=`, empty side) → rejected (was: silently
+        // dropped, then surfaced only as a confusing missing-required error later).
+        for bad in [
+            "pk one_cpt_iv(cl, v=V)",
+            "pk one_cpt_iv(cl=CL=X, v=V)",
+            "pk one_cpt_iv(=CL, v=V)",
+            "pk one_cpt_iv(cl=, v=V)",
+        ] {
+            let lines = vec![bad.to_string()];
+            let err = parse_structural_model(&lines).unwrap_err();
+            assert!(
+                err.contains("malformed parameter"),
+                "`{bad}` should be a malformed-parameter error, got: {err}"
+            );
+        }
+
+        // A well-formed list (incl. a tolerated trailing comma) still parses.
+        let ok = vec!["pk one_cpt_iv(cl=CL, v=V, )".to_string()];
+        let (model, params) = parse_structural_model(&ok).expect("well-formed pk must parse");
+        assert_eq!(model, PkModel::OneCptIv);
+        assert_eq!(params.get("cl").map(String::as_str), Some("CL"));
+        assert_eq!(params.get("v").map(String::as_str), Some("V"));
+    }
+
+    #[test]
+    fn unknown_pk_model_name_errors() {
+        // A model name that is neither a valid name/alias (`PkModel::from_name`)
+        // nor a retired #176 spelling falls through to the generic "Unknown PK
+        // model" error — the `None`/`other` arm of the name resolution.
+        let lines = vec!["pk four_cpt_iv(cl=CL, v=V)".to_string()];
+        let err = parse_structural_model(&lines).unwrap_err();
+        assert!(
+            err.contains("Unknown PK model") && err.contains("four_cpt_iv"),
+            "got: {err}"
+        );
     }
 
     // Issue #176 retired the split `*_iv_bolus` / `*_infusion` model names
@@ -17790,6 +18415,96 @@ CL V KA WT
             let ctx2 = DerivedContext { tad: 1.0, ..ctx };
             assert_eq!(eval(&ctx2), 0.0, "TAD=1 should not be < MACHEPS");
         }
+    }
+
+    #[test]
+    fn ode_compartment_indexed_dose_attrs_populate_map() {
+        // `F2` / `ALAG2` in a 2-compartment ODE model must (a) parse without
+        // tripping the dead-parameter census — they are engine-applied dose
+        // attributes, not dead structural params — and (b) populate the
+        // `dose_attr_map` and enable `has_lagtime()` (#369).
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF2(0.6, 0.01, 1.0)
+  theta TVLAG2(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  F2 = TVF2
+  ALAG2 = TVLAG2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("parse ok");
+        let map = &parsed
+            .model
+            .ode_spec
+            .as_ref()
+            .expect("ode spec")
+            .dose_attr_map;
+        assert!(
+            map.indexed_slot(crate::types::DoseAttr::F, 2).is_some(),
+            "F2 must map for compartment 2"
+        );
+        assert!(
+            map.indexed_slot(crate::types::DoseAttr::Lag, 2).is_some(),
+            "ALAG2 must map for compartment 2"
+        );
+        // No compartment-1 override was declared.
+        assert!(map.indexed_slot(crate::types::DoseAttr::F, 1).is_none());
+        assert!(
+            parsed.model.has_lagtime(),
+            "ALAG2 must enable has_lagtime() so downstream lag handling runs"
+        );
+    }
+
+    #[test]
+    fn ode_dose_attr_compartment_out_of_range_errors() {
+        // `F3` references compartment 3, but the model has only 2 states — a loud
+        // parse error, never a silently-ignored spare slot (#369).
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF3(0.6, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  F3 = TVF3
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(src)
+            .err()
+            .expect("F3 with 2 compartments must error");
+        assert!(
+            err.contains("compartment 3") && err.contains("F3"),
+            "error must name the attribute and compartment, got: {err}"
+        );
     }
 
     #[test]
