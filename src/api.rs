@@ -568,6 +568,7 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_iov_occasions(model, population));
+    diags.extend(check_absorption_dosing(model, population));
     diags.extend(validate_output_columns(model, population));
     diags
 }
@@ -593,6 +594,116 @@ fn check_iov_occasions(model: &CompiledModel, population: &Population) -> Vec<Di
          [fit_options] so that per-occasion kappas can be estimated.",
     )
     .with_block("fit_options")]
+}
+
+/// Built-in absorption input-rate models (e.g. `transit()`) are integrated
+/// through the standard ODE prediction paths. Two combinations are not yet
+/// supported and are rejected here — loudly — rather than silently mis-modeled:
+///   - a steady-state dose (`SS=1`) into an input-rate compartment: periodic
+///     steady state with an unfinished `R_in` tail needs dedicated treatment
+///     (a later phase of `plans/absorption-models.md`);
+///   - an input-rate model combined with a `[diffusion]` block (the SDE/EKF
+///     path), whose Kalman propagation does not carry the `R_in` forcing.
+fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let Some(ode) = &model.ode_spec else {
+        return Vec::new();
+    };
+    if ode.input_rate.is_empty() {
+        return Vec::new();
+    }
+    let mut diags = Vec::new();
+
+    // input-rate + [diffusion]/EKF (model-level): the EKF propagator does not
+    // apply the R_in forcing, so the absorption term would be silently dropped.
+    if !ode.diffusion_var.is_empty() {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_DIFFUSION",
+                "A built-in absorption input-rate model (e.g. transit()) cannot yet be \
+                 combined with a [diffusion] block (the SDE/EKF path): the EKF \
+                 propagation does not carry the input-rate forcing. Remove the \
+                 [diffusion] block or the absorption term.",
+            )
+            .with_block("odes"),
+        );
+    }
+
+    // SS=1 dose into an input-rate compartment (data-level): the steady-state
+    // equilibration applies the dose as a bolus pulse, not as R_in over the cycle.
+    use std::collections::BTreeSet;
+    let cmts: BTreeSet<usize> = ode.input_rate.iter().map(|f| f.cmt + 1).collect();
+    let has_ss = population.subjects.iter().any(|s| {
+        s.doses
+            .iter()
+            .any(|d| d.ss && d.ii > 0.0 && cmts.contains(&d.cmt))
+    });
+    if has_ss {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_SS",
+                "Steady-state dosing (SS=1) into a built-in absorption input-rate \
+                 compartment (e.g. transit()) is not yet supported. Expand the run-in \
+                 with explicit dosing records, or remove the absorption term.",
+            )
+            .with_block("odes"),
+        );
+    }
+
+    // Infusion (RATE>0) into an input-rate compartment (data-level): the dose
+    // would be delivered twice — once as the `+rate` infusion injection in the
+    // ODE RHS wrapper, and again as `R_in(tad)` superposed by the input-rate
+    // forcing — silently ~doubling exposure. A transit dose carries its mass
+    // through `R_in` from the bolus amount; an infusion rate on that record is
+    // undefined, so reject it loudly. (Coded RATE=-1/-2 is already rejected at
+    // the datareader, so `is_infusion()` is the remaining case.)
+    let has_infusion = population.subjects.iter().any(|s| {
+        s.doses
+            .iter()
+            .any(|d| d.is_infusion() && cmts.contains(&d.cmt))
+    });
+    if has_infusion {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_RATE",
+                "An infusion (RATE>0) into a built-in absorption input-rate \
+                 compartment (e.g. transit()) is not supported: the dose mass is \
+                 delivered through the input-rate function R_in computed from the dose \
+                 amount, so an infusion rate would double-count it. Use a plain bolus \
+                 dose record (RATE=0) into the absorption compartment.",
+            )
+            .with_block("odes"),
+        );
+    }
+
+    // Parameter-domain validation (data-level): an out-of-domain or non-finite
+    // input-rate parameter (e.g. transit `mtt ≤ 0` or `n < 0`) would otherwise
+    // propagate as a NaN through the ODE RHS and surface only as an opaque fit
+    // failure. Evaluated on typical values (η = 0) per subject, so a covariate
+    // relationship that pushes a subject's typical `mtt`/`n` out of range is
+    // caught too. Reported once — a single fatal error already halts the fit.
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    'subjects: for subject in &population.subjects {
+        let pk = (model.pk_param_fn)(&model.default_params.theta, &zero_eta, &subject.covariates);
+        for forcing in &ode.input_rate {
+            if let Err(msg) = forcing.validate(&pk.values) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_ABSORPTION_DOMAIN",
+                        format!(
+                            "Built-in absorption input-rate parameter out of domain at typical \
+                             values (subject {}): {msg}. Constrain the parameter so it stays in \
+                             range (e.g. `MTT = TVMTT * exp(ETA_MTT)` keeps MTT > 0).",
+                            subject.id
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+                break 'subjects;
+            }
+        }
+    }
+
+    diags
 }
 
 /// Model + estimation-option *compatibility* checks that don't depend on data:

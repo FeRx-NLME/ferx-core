@@ -310,7 +310,7 @@ fn equilibrate_ss_state_event_driven(
     for _ in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             // Bolus pulse: instantaneous amount jump (with F).
-            state[cmt_idx] += pk.f_bio() * dose.amt;
+            state[cmt_idx] += pk.bioavailable_amount(dose.amt);
         }
         propagate_with_bounds(
             &mut state,
@@ -374,7 +374,7 @@ fn ss_state_at_phase_event_driven(
             f64::NEG_INFINITY,
         );
     } else {
-        state[cmt_idx] += pk.f_bio() * dose.amt;
+        state[cmt_idx] += pk.bioavailable_amount(dose.amt);
         propagate_with_bounds(
             &mut state,
             &[0.0, phase],
@@ -518,7 +518,7 @@ pub fn event_driven_predictions_with_schedule(
                     // high-dose subjects came out F× too small.
                     let cmt_idx = d.cmt.saturating_sub(1);
                     if cmt_idx < n_states {
-                        state[cmt_idx] += pk_now.f_bio() * d.amt;
+                        state[cmt_idx] += pk_now.bioavailable_amount(d.amt);
                     } else {
                         panic!(
                             "event-driven PK: dose into compartment {} but model has \
@@ -649,7 +649,6 @@ fn propagate_with_bounds(
         let mut rate_periph2 = 0.0;
         // F multiplies infusion rate so a dur→0 infusion limits to a bolus
         // of amount F·AMT — same convention as the EventKind::Dose arm above.
-        let f_bio = pk.f_bio();
         for (k, d) in doses.iter().enumerate() {
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
             let t_start = d.time + lag;
@@ -659,7 +658,7 @@ fn propagate_with_bounds(
                 continue;
             }
             if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
-                let r = f_bio * d.rate;
+                let r = pk.bioavailable_rate(d.rate);
                 match (pk_model, d.cmt) {
                     (PkModel::OneCptIv, 1) => rate_central += r,
                     (PkModel::OneCptOral, 2) => rate_central += r,
@@ -1257,6 +1256,162 @@ mod tests {
                 // F=0.5 must halve every concentration (linear in F).
                 assert_relative_eq!(h, 0.5 * f, max_relative = 1e-9);
             }
+        }
+    }
+
+    #[test]
+    fn f_bioavailability_superposition_matches_event_driven_iv_bolus_and_infusion() {
+        // Regression for #327. Bioavailability F must scale IV-bolus and
+        // infusion doses on the analytical *superposition* path
+        // (`predict_concentration`) exactly as it already does on the
+        // event-driven path. Before the fix the superposition path silently
+        // dropped F for these routes, so the same model gave F×-different
+        // predictions for a no-TV subject (superposition) versus a TV/IOV
+        // subject (event-driven). Asserts the two analytical paths agree at
+        // F=0.4, including steady-state (SS) bolus and infusion. (Oral-model
+        // infusions are covered separately by
+        // `f_bioavailability_scales_oral_infusion_on_superposition`: the
+        // event-driven path currently drops infusion input on oral models — a
+        // distinct bug — so cross-path equality is not assertable there yet.)
+        let f = 0.4_f64;
+        let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
+        let with_f = |mut p: PkParams| {
+            p.values[crate::types::PK_IDX_F] = f;
+            p
+        };
+
+        // rate=0 → bolus; rate>0 → infusion (duration = amt/rate). IV doses go
+        // to the central compartment (cmt 1); an oral-model infusion routes to
+        // central (cmt 2) — the depot-bypass case.
+        let bolus = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 0.0, false, 0.0);
+        let infusion = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 25.0, false, 0.0);
+        // Steady-state variants (ss=1, II=24 h). The SS closed forms are linear
+        // in the dose too, so `f_scale` must apply there as well — and the
+        // event-driven SS equilibration must agree.
+        let ss_bolus = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 0.0, true, 24.0);
+        let ss_infusion = |cmt: usize| DoseEvent::new(0.0, 100.0, cmt, 25.0, true, 24.0);
+
+        let cases: Vec<(&str, PkModel, PkParams, DoseEvent)> = vec![
+            (
+                "1cpt-iv bolus",
+                PkModel::OneCptIv,
+                with_f(pk_one(5.0, 50.0)),
+                bolus(1),
+            ),
+            (
+                "1cpt-iv infusion",
+                PkModel::OneCptIv,
+                with_f(pk_one(5.0, 50.0)),
+                infusion(1),
+            ),
+            (
+                "2cpt-iv bolus",
+                PkModel::TwoCptIv,
+                with_f(pk_two(5.0, 40.0, 3.0, 60.0)),
+                bolus(1),
+            ),
+            (
+                "2cpt-iv infusion",
+                PkModel::TwoCptIv,
+                with_f(pk_two(5.0, 40.0, 3.0, 60.0)),
+                infusion(1),
+            ),
+            (
+                "3cpt-iv bolus",
+                PkModel::ThreeCptIv,
+                with_f(pk_three(5.0, 40.0, 3.0, 60.0, 1.0, 120.0)),
+                bolus(1),
+            ),
+            (
+                "3cpt-iv infusion",
+                PkModel::ThreeCptIv,
+                with_f(pk_three(5.0, 40.0, 3.0, 60.0, 1.0, 120.0)),
+                infusion(1),
+            ),
+            // Steady-state (F!=1) across both routes and compartment counts.
+            (
+                "1cpt-iv SS bolus",
+                PkModel::OneCptIv,
+                with_f(pk_one(5.0, 50.0)),
+                ss_bolus(1),
+            ),
+            (
+                "1cpt-iv SS infusion",
+                PkModel::OneCptIv,
+                with_f(pk_one(5.0, 50.0)),
+                ss_infusion(1),
+            ),
+            (
+                "2cpt-iv SS infusion",
+                PkModel::TwoCptIv,
+                with_f(pk_two(5.0, 40.0, 3.0, 60.0)),
+                ss_infusion(1),
+            ),
+            (
+                "3cpt-iv SS infusion",
+                PkModel::ThreeCptIv,
+                with_f(pk_three(5.0, 40.0, 3.0, 60.0, 1.0, 120.0)),
+                ss_infusion(1),
+            ),
+        ];
+
+        for (label, model, pk, dose) in cases {
+            // The single-dose paths are bit-for-bit equal; the event-driven SS
+            // path uses finite-cycle equilibration vs the exact analytical SS
+            // closed form, so allow a looser (but still tight) tolerance there.
+            // The point of the SS cases is that `F` is applied to the SS arms —
+            // any `F`-drop would be a ~F× discrepancy, far above this tolerance.
+            let rtol = if dose.ss { 1e-3 } else { 1e-7 };
+            let subj = make_subject(vec![dose], obs_times.clone());
+            let superposition: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pk))
+                .collect();
+            let ev = event_driven_predictions(
+                model,
+                &subj,
+                &vec![pk; 1],
+                &vec![pk; obs_times.len()],
+                &[],
+            );
+            for (j, (&s, &e)) in superposition.iter().zip(ev.iter()).enumerate() {
+                assert!(
+                    e > 0.0,
+                    "{label}: event-driven conc should be >0 at obs {j}"
+                );
+                assert_relative_eq!(s, e, epsilon = 1e-9, max_relative = rtol);
+            }
+        }
+    }
+
+    #[test]
+    fn f_bioavailability_scales_oral_infusion_on_superposition() {
+        // #327: an infusion on an oral model bypasses the depot and enters
+        // central directly, so the analytical superposition path must scale it
+        // by F. Cross-checking against the event-driven path is deferred —
+        // that path currently drops infusion input on oral models entirely (a
+        // separate bug). Here we assert F is applied and linear on the
+        // superposition path, which is the path that ran F-blind before #327.
+        let obs_times = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
+        // rate=25 → 4 h infusion into central (cmt 2) on a 1-cpt oral model.
+        let dose = DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0);
+        let subj = make_subject(vec![dose], obs_times.to_vec());
+
+        let mut pk_full = pk_one_oral(5.0, 50.0, 1.2);
+        pk_full.values[crate::types::PK_IDX_F] = 1.0;
+        let mut pk_half = pk_one_oral(5.0, 50.0, 1.2);
+        pk_half.values[crate::types::PK_IDX_F] = 0.4;
+
+        for &t in &obs_times {
+            let full =
+                crate::pk::predict_concentration(PkModel::OneCptOral, &subj.doses, t, &pk_full);
+            let half =
+                crate::pk::predict_concentration(PkModel::OneCptOral, &subj.doses, t, &pk_half);
+            assert!(
+                full > 0.0,
+                "oral infusion should give nonzero conc at t={t}"
+            );
+            assert_relative_eq!(half, 0.4 * full, max_relative = 1e-12);
         }
     }
 

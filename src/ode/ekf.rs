@@ -408,6 +408,7 @@ mod tests {
             diffusion_var: Vec::new(),
             init_fn: None,
             solver_opts: OdeSolverOptions::default(),
+            input_rate: Vec::new(),
         };
         let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 

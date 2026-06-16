@@ -1,0 +1,67 @@
+# Savic transit-compartment absorption — built-in `transit()` input rate
+#
+# One-compartment oral disposition with a Savic et al. (2007) transit-chain
+# absorption delay, expressed with the built-in `transit()` input-rate function
+# instead of a hand-coded chain of physical transit compartments.
+#
+#   R_in(tad) = F·Dose · KTR · (KTR·tad)^N · exp(−KTR·tad) / Γ(N + 1)
+#   KTR = (N + 1) / MTT          (mean transit time MTT, continuous N)
+#
+# `transit(n=NTR, mtt=MTT)` is added into the depot compartment as a dose-driven
+# appearance rate; the oral dose feeds that function and is NOT also added as a
+# bolus (∫ R_in dt = F·Dose). Contrast `examples/transit_2cpt.ferx`, which codes
+# the same idea as three explicit transit ODE states — here N is a single
+# continuous parameter, so the absorption *shape* is itself estimable.
+#
+# ── Unit convention (same as examples/bioavailability_ode.ferx) ──────────────
+#   CMT=1  depot    — oral dose lands here (amount, mg); receives R_in(tad)
+#   CMT=2  central  — concentration (mg/L); C = amount / V
+#
+# Self-contained: the [simulation] block below lets you run it with no data file
+#   cargo run --release -- examples/transit_savic.ferx --simulate
+# which simulates an oral 100 mg dose into CMT=1, observed on CMT=2, and fits it
+# back. True simulation parameters: TVCL=5, TVV=50, TVKA=1.0, TVMTT=1.0, TVN=3,
+#   omega_CL=omega_V=0.09, sigma_prop=0.15.
+
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)   # typical clearance (L/h)
+  theta TVV(50.0,   5.0, 500.0)   # typical central volume (L)
+  theta TVKA(1.0,  0.05,  24.0)   # typical absorption rate constant (/h)
+  theta TVMTT(1.0, 0.05,  24.0)   # mean transit time (h); KTR = (N+1)/MTT
+  theta TVN(3.0,    0.1,  30.0)   # number of transit compartments (continuous)
+
+  omega ETA_CL ~ 0.09             # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09             # IIV on V  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)      # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  KA  = TVKA
+  MTT = TVMTT
+  NTR = TVN
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  # depot  : oral-dose compartment (mg); transit() delivers F·Dose over time
+  # central: concentration compartment (mg/L)
+  d/dt(depot)   = transit(n=NTR, mtt=MTT) - KA*depot
+  d/dt(central) = KA*depot/V - CL/V*central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7

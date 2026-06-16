@@ -29,7 +29,7 @@ Each model has a `*_compartment_*` long-form alias (e.g. `three_compartment_iv`)
 
 Every parameter in the **Required Parameters** column must be mapped on the `pk(...)` line. Omitting one is a parse error (issue #309) — ferx will **not** silently default the missing slot to `0.0`, which would otherwise yield a structurally broken fit (e.g. a missing `ka` means no absorption, so every prediction floors to the log constant). Bioavailability `f` and `lagtime` (alias `alag`) are optional and default to `1.0` and `0.0` respectively.
 
-Conversely, mapping a parameter the chosen model does **not** use — e.g. `ka` or `f` on an IV model (no absorption, no bioavailability term), or `q`/`v2` on a one-compartment model — is accepted but emits a parse warning, since the mapping has no effect. `lagtime` is never flagged (every model applies it to the dose); `f` (bioavailability) is applied only by **oral** models, so mapping it on an IV model is flagged.
+Conversely, mapping a parameter the chosen model does **not** use — e.g. `ka` on an IV model (no absorption), or `q`/`v2` on a one-compartment model — is accepted but emits a parse warning, since the mapping has no effect. `lagtime` and `f` (bioavailability) are never flagged: every model applies both to the dose — `lagtime` shifts the dose time, and `f` scales the bioavailable amount for IV bolus, infusion, and oral routes alike (#327).
 
 In the other direction, an individual parameter that is **declared but never used** — neither mapped into the `pk(...)` line nor referenced in any other block — is also flagged, since it is computed but has no effect. The common case is declaring `F` to estimate bioavailability but forgetting to add `f=F` to the `pk(...)` line: analytical models bind `F` (and `lagtime`) only through an explicit `f=`/`lagtime=` mapping.
 
@@ -65,7 +65,7 @@ Three-compartment IV (note that `q2`/`q3` and `v2`/`v3` distinguish the two peri
 
 ### Bioavailability
 
-For oral models, bioavailability (F) defaults to 1.0. To estimate it, define an `F` parameter in `[individual_parameters]` -- it will be automatically used by the oral PK functions.
+Bioavailability (F) defaults to 1.0. To estimate it, define an `F` parameter in `[individual_parameters]` and map it on the `pk(...)` line with `f=F`. It scales the bioavailable amount on **every** route — oral depot absorption, IV bolus (`F · AMT`), and infusion (`F · RATE`, with the duration preserved) — matching NONMEM's `F1`. Before #327 the analytical path applied `F` only to oral depot doses, silently dropping it on IV bolus and infusion; it now applies on all routes.
 
 This applies to [ODE models](ode-models.md) too: an `F` parameter is applied when the dose enters the compartment (`F · AMT`), matching NONMEM and the analytical PK functions. Do not also multiply by `F` in the ODE right-hand side.
 

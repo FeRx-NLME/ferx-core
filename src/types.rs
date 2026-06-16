@@ -112,6 +112,30 @@ impl PkParams {
     pub fn f_bio(&self) -> f64 {
         self.values[PK_IDX_F]
     }
+
+    /// Bioavailable dose amount: `F · amount`. `F` scales the input on **every**
+    /// route — IV bolus, infusion, and oral depot alike — matching NONMEM's `F1`
+    /// (#327).
+    ///
+    /// This pair is the single source of truth for the F-on-dose rule. The three
+    /// prediction paths derive their `F` handling from it:
+    /// * event-driven (`pk/event_driven.rs`) calls these directly;
+    /// * the analytical superposition path (`pk/mod.rs`) applies the same rule as
+    ///   a post-multiply via `route_f_scale` — the oral-depot closed forms bake
+    ///   `F` in, so they take the `1.0` branch;
+    /// * the autodiff path (`ad/ad_gradients.rs`) inlines `f_bio * amt` /
+    ///   `f_bio * rate` once, because under `#[autodiff]` it works on flat scalars
+    ///   and cannot call `&self` methods.
+    ///
+    /// A change to the rule must be mirrored in those sites.
+    pub(crate) fn bioavailable_amount(&self, amount: f64) -> f64 {
+        self.f_bio() * amount
+    }
+
+    /// Bioavailable infusion rate: `F · rate`. See [`Self::bioavailable_amount`].
+    pub(crate) fn bioavailable_rate(&self, rate: f64) -> f64 {
+        self.f_bio() * rate
+    }
     pub fn q3(&self) -> f64 {
         self.values[PK_IDX_Q3]
     }
@@ -772,7 +796,8 @@ impl PkModel {
     }
 
     /// Whether this is a first-order-absorption (oral) model. Oral models read
-    /// `ka` and `f`; IV models do not. The canonical home for this predicate.
+    /// `ka`; IV models do not. (`f` is read by every model since #327 — it scales
+    /// IV bolus/infusion doses too.) The canonical home for this predicate.
     ///
     /// The `#[cfg(feature = "autodiff")]` free fn `is_oral_model` in
     /// `estimation/inner_optimizer.rs` is a pre-existing identical copy; it should
@@ -793,11 +818,13 @@ impl PkModel {
     ///   - every required structural slot (`required_pk_params`);
     ///   - `lagtime`, applied to *every* dose (`predict_concentration` shifts the
     ///     effective dose time for IV and oral alike);
-    ///   - `f` (bioavailability) **only** for oral models — the IV closed forms
-    ///     never read it, so `f` on an IV model is inert.
+    ///   - `f` (bioavailability), applied to *every* dose and route — IV bolus,
+    ///     infusion, and oral depot — scaling the bioavailable amount/rate
+    ///     (#327). Both the superposition and event-driven analytical paths read
+    ///     it for every model, IV included, so it is never inert.
     pub(crate) fn consumes_pk_slot(&self, slot: usize) -> bool {
         slot == PK_IDX_LAGTIME
-            || (slot == PK_IDX_F && self.is_oral())
+            || slot == PK_IDX_F
             || self.required_pk_params().iter().any(|(s, _)| *s == slot)
     }
 }
@@ -2161,6 +2188,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("missing or unparseable values in iov_column")
     {
         (WarningSeverity::Warning, "data_quality")
+    } else if lower.starts_with("w_missing_dv") {
+        (WarningSeverity::Warning, "data_quality")
     } else if lower.contains("ltbs")
         || lower.contains("non-positive dv")
         || lower.contains("ss=1 dose")
@@ -2558,6 +2587,22 @@ pub struct FitOptions {
     /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
     /// score cross-product `S`; currently supported for FOCEI and IOV fits.
     pub covariance_method: CovarianceMethod,
+    /// Build the covariance R-matrix (Hessian) from second differences of the
+    /// reconverged marginal OFV, rather than from a central difference of the
+    /// analytical population gradient. **Default `true`.** The analytical stencil
+    /// holds the H-matrix `a = ∂f/∂η` fixed in the `log|H̃|` θ-gradient (it omits
+    /// `∂a/∂θ = ∂²f/∂η∂θ`), which biases the SE of *weakly-identified* structural
+    /// parameters — e.g. TVKA on warfarin reads ~9% high versus a Richardson
+    /// FD-of-OFV ground truth. The OFV-Hessian stencil recomputes `a` (and
+    /// everything else) at every perturbed point, so it captures that curvature
+    /// exactly (up to the FD step) and matches the ground truth to <1%; it is the
+    /// same stencil used for IOV and f-dependent FOCE. It costs O(n²) reconverged
+    /// OFV evaluations versus O(n) gradient evaluations, but both stencils
+    /// parallelise over perturbation points so the wall-clock cost is ≈ equal in
+    /// practice. Set `false` to force the faster analytical-gradient stencil
+    /// (e.g. on very high-dimensional models where the O(n²) point count
+    /// dominates).
+    pub covariance_ofv_hessian: bool,
     pub interaction: bool,
     pub verbose: bool,
     pub optimizer: Optimizer,
@@ -2755,6 +2800,16 @@ pub struct FitOptions {
     /// the well-tested pre-scaling-layer behaviour; `true` is left as an
     /// opt-in for experimentation.
     pub scale_params: bool,
+    /// Parameter-scaling strategy for the outer optimizer. When non-`None` this
+    /// supersedes [`scale_params`]: `Rescale2` (nlmixr2-style bound-half-width
+    /// normalisation) is the recommended setting for gradient-based optimizers
+    /// and substantially improves cold-start convergence (see
+    /// [`ParameterScaling`]). **Default: `Auto`** — applies `Rescale2` to the
+    /// gradient-based optimizers that benefit (`Bfgs`/`Lbfgs`/`NloptLbfgs`/`Slsqp`)
+    /// and leaves the derivative-free default `Bobyqa` unscaled (where `Rescale2`
+    /// distorts its trust-region model). Set via `[fit_options]` key
+    /// `parameter_scaling = none|abs|rescale2` to override.
+    pub parameter_scaling: ParameterScaling,
     /// Fraction of subjects allowed to have unconverged EBEs before the outer
     /// optimizer rejects the current parameter step (returns OFV = ∞).  Set to
     /// `1.0` to disable the guard (old behaviour).  Default: `0.1`.
@@ -2830,6 +2885,7 @@ impl Default for FitOptions {
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
+            covariance_ofv_hessian: true,
             interaction: true,
             verbose: true,
             // BOBYQA — derivative-free quadratic trust-region. Chosen as the
@@ -2883,6 +2939,7 @@ impl Default for FitOptions {
             reconverge_gradient_interval: 0,
             optimizer_trace: false,
             scale_params: false,
+            parameter_scaling: ParameterScaling::Auto,
             max_unconverged_frac: 0.1,
             min_obs_for_convergence_check: 2,
             stagnation_guard: true,
@@ -2947,6 +3004,46 @@ pub enum Optimizer {
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
     TrustRegion,
+}
+
+/// Parameter-scaling strategy for the outer optimizer. Maps the packed
+/// parameter vector into a better-conditioned space before the optimizer sees
+/// it (and maps gradients/bounds back). Distinct from the legacy
+/// [`FitOptions::scale_params`] bool, which it supersedes when set to a
+/// non-`None` value.
+///
+/// On `two_cpt_oral_cov` (FOCEI, mu-referencing), `Rescale2` + `bfgs` reaches
+/// OFV −1198.97 from a cold start — matching nlmixr2 (−1199.24) — where the
+/// unscaled gradient-based optimizers stall near −1152/−1192. This mirrors
+/// nlmixr2's finding that parameter scaling, not gradient exactness, is the
+/// lever for cold-start robustness of *gradient-based* optimizers.
+///
+/// Crucially, `Rescale2` is **harmful to the derivative-free default `Bobyqa`**
+/// (e.g. it drops `emax_pkpd` from OFV −36.76 to −13.51 and `three_cpt_iv` from
+/// −730.6 to −715.9): rescaling the trust region of a gradient-free optimizer
+/// distorts its quadratic model. Hence the default is [`Auto`](Self::Auto),
+/// which applies `Rescale2` only to the gradient-based optimizers that benefit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ParameterScaling {
+    /// **Default.** Apply `Rescale2` for the gradient-based optimizers that
+    /// benefit from it (`Bfgs`, `Lbfgs`, `NloptLbfgs`, `Slsqp`) and no scaling
+    /// otherwise — so the derivative-free `Bobyqa` default (where `Rescale2` is
+    /// harmful) and `Mma`/`TrustRegion` are left unscaled, with the legacy
+    /// `scale_params` / IOV-auto-enable still applying in that unscaled branch.
+    /// `Slsqp` is scaled because the bound-half-width rescaling fixes its
+    /// cold-start convergence on IOV models (#335).
+    #[default]
+    Auto,
+    /// No scaling: fall back to the legacy `scale_params` bool (and the IOV+SLSQP
+    /// auto-enable). Preserves the pre-`Auto` unscaled behaviour for any optimizer.
+    None,
+    /// Normalise each coordinate by `|packed value|` (the legacy `compute_scale`
+    /// strategy). O(1) for log-packed thetas; 1.0 fallback near zero.
+    Abs,
+    /// nlmixr2-style: normalise each coordinate by the half-width of its bound
+    /// range, mapping it toward `(−1, 1)`. The recommended scaling for
+    /// gradient-based optimizers (`bfgs`/`lbfgs`); harmful to `Bobyqa`.
+    Rescale2,
 }
 
 impl Optimizer {
@@ -3084,6 +3181,9 @@ impl FitOptions {
 pub fn framework_keys() -> &'static [&'static str] {
     &[
         "covariance",
+        "covariance_method",
+        "covariance_fallback",
+        "covariance_ofv_hessian",
         "fd_hessian_step",
         "verbose",
         "sir",
@@ -3104,6 +3204,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "iov_column",
         "optimizer_trace",
         "scale_params",
+        "parameter_scaling",
         "max_unconverged_frac",
         "min_obs_for_convergence_check",
         "inits_from_nca",
@@ -3279,6 +3380,7 @@ pub(crate) mod test_helpers {
                     diffusion_var: Vec::new(),
                     init_fn: None,
                     solver_opts: crate::ode::OdeSolverOptions::default(),
+                    input_rate: Vec::new(),
                 })
             } else {
                 None
@@ -3521,6 +3623,11 @@ mod tests {
             ),
             (
                 "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
+                Warning,
+                "data_quality",
+            ),
+            (
+                "W_MISSING_DV: 2 observation row(s) (EVID=0) had a missing DV",
                 Warning,
                 "data_quality",
             ),
