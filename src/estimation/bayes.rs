@@ -194,7 +194,7 @@ pub fn effective_sample_size(chains: &[Vec<f64>]) -> f64 {
             n as f64 / (m as f64 - 1.0) * means.iter().map(|mj| (mj - grand).powi(2)).sum::<f64>();
         (n as f64 - 1.0) / n as f64 * w + b / n as f64
     };
-    if !(var_plus > 0.0) {
+    if var_plus.is_nan() || var_plus <= 0.0 {
         return (m * n) as f64;
     }
 
@@ -216,7 +216,7 @@ pub fn effective_sample_size(chains: &[Vec<f64>]) -> f64 {
     let mut tau = 1.0; // ρ_0 = 1 contributes once via the 1 + 2Σ form below.
     let mut prev_pair = f64::INFINITY;
     let mut k = 1;
-    while 2 * k + 1 <= max_lag {
+    while 2 * k < max_lag {
         let mut pair = rho[2 * k] + rho[2 * k + 1];
         if pair < 0.0 {
             break;
