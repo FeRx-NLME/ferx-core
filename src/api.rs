@@ -3010,9 +3010,11 @@ fn fit_inner(
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
-    // Covariance status
+    // Covariance status. Bayesian fits report posterior credible intervals
+    // instead of a Hessian covariance, so the covariance step is never
+    // "requested" for them (reporting it as FAILED would be misleading).
     let covariance_status = resolve_covariance_status(
-        options.run_covariance_step,
+        options.run_covariance_step && result.bayes.is_none(),
         result.covariance_matrix.is_some(),
         sir_fallback_result.is_some(),
     );
