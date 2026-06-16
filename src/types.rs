@@ -112,6 +112,30 @@ impl PkParams {
     pub fn f_bio(&self) -> f64 {
         self.values[PK_IDX_F]
     }
+
+    /// Bioavailable dose amount: `F · amount`. `F` scales the input on **every**
+    /// route — IV bolus, infusion, and oral depot alike — matching NONMEM's `F1`
+    /// (#327).
+    ///
+    /// This pair is the single source of truth for the F-on-dose rule. The three
+    /// prediction paths derive their `F` handling from it:
+    /// * event-driven (`pk/event_driven.rs`) calls these directly;
+    /// * the analytical superposition path (`pk/mod.rs`) applies the same rule as
+    ///   a post-multiply via `route_f_scale` — the oral-depot closed forms bake
+    ///   `F` in, so they take the `1.0` branch;
+    /// * the autodiff path (`ad/ad_gradients.rs`) inlines `f_bio * amt` /
+    ///   `f_bio * rate` once, because under `#[autodiff]` it works on flat scalars
+    ///   and cannot call `&self` methods.
+    ///
+    /// A change to the rule must be mirrored in those sites.
+    pub(crate) fn bioavailable_amount(&self, amount: f64) -> f64 {
+        self.f_bio() * amount
+    }
+
+    /// Bioavailable infusion rate: `F · rate`. See [`Self::bioavailable_amount`].
+    pub(crate) fn bioavailable_rate(&self, rate: f64) -> f64 {
+        self.f_bio() * rate
+    }
     pub fn q3(&self) -> f64 {
         self.values[PK_IDX_Q3]
     }
@@ -772,7 +796,8 @@ impl PkModel {
     }
 
     /// Whether this is a first-order-absorption (oral) model. Oral models read
-    /// `ka` and `f`; IV models do not. The canonical home for this predicate.
+    /// `ka`; IV models do not. (`f` is read by every model since #327 — it scales
+    /// IV bolus/infusion doses too.) The canonical home for this predicate.
     ///
     /// The `#[cfg(feature = "autodiff")]` free fn `is_oral_model` in
     /// `estimation/inner_optimizer.rs` is a pre-existing identical copy; it should

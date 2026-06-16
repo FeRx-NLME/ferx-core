@@ -315,6 +315,16 @@ fn single_dose_ad(
         return 0.0;
     }
 
+    // Bioavailability F scales the bioavailable amount/rate on every route — IV
+    // included (#327) — matching the superposition path's `route_f_scale` and the
+    // event-driven path's `PkParams::bioavailable_amount`/`bioavailable_rate`.
+    // Applied once here (rather than per-arm) because this `#[autodiff]` function
+    // works on flat scalars and cannot call those `&self` helpers. All six arms
+    // below read the pre-scaled `amt`; the IV arms also read the pre-scaled
+    // `rate` (oral arms enter through the depot and never read bare `rate`).
+    let amt = f_bio * amt;
+    let rate = f_bio * rate;
+
     // Per issue #176, IV variants no longer split by administration type at
     // the model level. Each IV branch below handles bolus and infusion via
     // the per-dose `dur` (and `rate`) — the `dur <= 0.0` fall-through is
@@ -324,11 +334,6 @@ fn single_dose_ad(
     match pk_model_id {
         0 => {
             // OneCptIv — bolus when dur<=0, infusion otherwise.
-            // Bioavailability F scales the dosed amount/rate, IV included
-            // (#327) — mirrors the oral arms and the superposition path in
-            // `pk/mod.rs`.
-            let amt = f_bio * amt;
-            let rate = f_bio * rate;
             let k = cl / v;
             if dur <= 0.0 {
                 (amt / v) * (-k * tau).exp()
@@ -341,7 +346,7 @@ fn single_dose_ad(
         1 => {
             // OneCptOral
             let k = cl / v;
-            let d = f_bio * amt;
+            let d = amt;
             if (ka - k).abs() < 1e-6 {
                 (d * ka / v) * tau * (-k * tau).exp()
             } else {
@@ -361,10 +366,6 @@ fn single_dose_ad(
             // `TwoCptIvBolus` arm carried the guard but it was dead in
             // practice — keeping the bolus and infusion branches
             // symmetric here matches that prior author's decision.
-            // Bioavailability F scales the dosed amount/rate, IV included
-            // (#327) — mirrors the oral arms and the superposition path.
-            let amt = f_bio * amt;
-            let rate = f_bio * rate;
             let (alpha, beta, k21) = macro_rates(cl, v, q, v2);
             let diff = alpha - beta;
             if dur <= 0.0 {
@@ -390,7 +391,7 @@ fn single_dose_ad(
             if diff.abs() < 1e-12 {
                 return 0.0;
             }
-            let coeff = f_bio * amt * ka / v;
+            let coeff = amt * ka / v;
             let p = if (ka - alpha).abs() < 1e-6 {
                 coeff * (alpha - k21) / diff * tau * (-alpha * tau).exp()
             } else {
@@ -420,10 +421,6 @@ fn single_dose_ad(
             // revision did) collapses physically-valid bolus answers
             // to zero whenever a slowly-equilibrating 3-cpt has one of
             // α/β/γ near zero — see issue #176 review.
-            // Bioavailability F scales the dosed amount/rate, IV included
-            // (#327) — mirrors the oral arms and the superposition path.
-            let amt = f_bio * amt;
-            let rate = f_bio * rate;
             let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_ad(cl, v, q, v2, q3, v3);
             let ab = alpha - beta;
             let ag = alpha - gamma;
@@ -472,7 +469,7 @@ fn single_dose_ad(
             if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
                 return 0.0;
             }
-            let coeff = f_bio * amt * ka / v;
+            let coeff = amt * ka / v;
             let a_c = (alpha - k21) * (alpha - k31) / (ab * ag);
             let b_c = (beta - k21) * (beta - k31) / (-ab * bg);
             let g_c = (gamma - k21) * (gamma - k31) / (ag * bg);

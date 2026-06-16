@@ -1996,11 +1996,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     ));
 
     // Warn about analytical PK parameters that are mapped but unused by the
-    // chosen model — e.g. `ka` or `f` on an IV model (no absorption / no
-    // bioavailability term), or `q`/`v2` on a one-compartment model. They are set
-    // but have no effect (#309). `PkModel::consumes_pk_slot` is the single source
-    // of truth for what each model's closed form actually reads (`lagtime` for
-    // every model, `f` only for oral). Sibling to the declared-but-unused check.
+    // chosen model — e.g. `ka` on an IV model (no absorption compartment), or
+    // `q`/`v2` on a one-compartment model. They are set but have no effect
+    // (#309). `PkModel::consumes_pk_slot` is the single source of truth for what
+    // each model's closed form actually reads (`f` and `lagtime` apply to every
+    // model — `f` scales IV bolus/infusion doses too since #327). Sibling to the
+    // declared-but-unused check.
     if !pk_param_map.is_empty() {
         let mut unused: Vec<&str> = pk_param_map
             .iter()

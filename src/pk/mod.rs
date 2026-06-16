@@ -448,6 +448,22 @@ pub fn predict_concentration(
     conc.max(0.0)
 }
 
+/// External bioavailability multiplier for the analytical superposition closed
+/// forms. Same `F`-on-every-route rule as [`PkParams::bioavailable_amount`], but
+/// expressed as a post-multiply: the oral-depot bolus forms (`*_oral_f`) bake `F`
+/// in internally, so they take the `1.0` branch to avoid double-application;
+/// every other route — IV bolus, and infusions (which bypass the depot even on
+/// oral models) — uses an `F`-agnostic closed form that is linear in the dose, so
+/// `F` is applied by scaling the result. Matches the event-driven path and
+/// NONMEM's `F1` on IV/infusion doses (#327).
+fn route_f_scale(pk_model: PkModel, infusion: bool, p: &PkParams) -> f64 {
+    if pk_model.is_oral() && !infusion {
+        1.0
+    } else {
+        p.f_bio()
+    }
+}
+
 /// Concentration contribution from a single dose at elapsed time tau.
 ///
 /// For IV variants the bolus-vs-infusion closed form is chosen per dose
@@ -465,19 +481,7 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
     let cl = p.cl();
     let v = p.v();
     let infusion = dose.is_infusion();
-
-    // Bioavailability F scales the dosed amount/rate on every route. The
-    // oral-depot bolus arms apply it internally (`*_oral_f`); every other arm —
-    // IV bolus, and infusions (which bypass the depot even on oral models) —
-    // uses an F-agnostic closed form that is linear in the dose, so F is
-    // applied here by scaling the (single) result. This matches the
-    // event-driven path (`f_bio*amt` / `f_bio*rate`) and NONMEM's F1 on
-    // IV/infusion doses (#327).
-    let f_scale = if pk_model.is_oral() && !infusion {
-        1.0
-    } else {
-        p.f_bio()
-    };
+    let f_scale = route_f_scale(pk_model, infusion, p);
 
     let raw = if dose.ss && dose.ii > 0.0 {
         match pk_model {
@@ -622,19 +626,11 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
     let v = p.v();
     let infusion = dose.is_infusion();
 
-    // Bioavailability F scales the dosed amount on every route — the states are
-    // linear in the dose. The oral-depot arms apply F internally (depot via
-    // `one_cpt_oral_depot`, central via `*_oral_f`); every other route — IV
-    // bolus and infusions, which bypass the depot — uses F-agnostic closed
-    // forms. So the raw state vector is built first and scaled by `f_scale`
-    // once at the end. The oral-depot case takes `f_scale == 1.0`, making the
-    // scale a no-op there so F is never double-applied. Matches
-    // single_dose_concentration and the event-driven path (#327).
-    let f_scale = if pk_model.is_oral() && !infusion {
-        1.0
-    } else {
-        p.f_bio()
-    };
+    // The states are linear in the dose, so bioavailability is applied by
+    // scaling the raw state vector once at the end (see `route_f_scale`). The
+    // oral-depot arms bake F into the depot/central closed forms and so take the
+    // `f_scale == 1.0` branch, leaving the scale a no-op there.
+    let f_scale = route_f_scale(pk_model, infusion, p);
 
     // SS early-exit: mirrors single_dose_concentration's top-level guard.
     //
@@ -2458,5 +2454,80 @@ mod tests {
             "TwoCptOral bolus: concentration={conc} ≠ central state={}",
             states[1]
         );
+    }
+
+    /// Closes PR #327 review finding #5: bioavailability `F` must scale **every**
+    /// element of the `single_dose_states` vector — depot, central, and all
+    /// peripheral compartments — on every route. The analytical states are linear
+    /// in the dose, so the invariant is `states(F) == F · states(F=1)`
+    /// element-wise. This pins down what the central-only
+    /// `single_dose_concentration` checks cannot see: a depot wrongly scaled, a
+    /// scale missed on a peripheral arm, or `F` applied twice. `compartment_states`
+    /// feeds `[derived]`/`[output]` expressions, so a silent error here would
+    /// surface in user output.
+    #[test]
+    fn single_dose_states_scales_every_compartment_by_f() {
+        let f = 0.4_f64;
+        let tau = 6.0_f64;
+        let ii = 12.0_f64;
+        let amt = 100.0_f64;
+        let rate = 40.0_f64; // 2.5 h infusion (< ii, so a valid SS infusion)
+
+        // Full structural params for up to three compartments; F set per call.
+        let params = |f_bio: f64| {
+            let mut p = PkParams::default();
+            p.values[crate::types::PK_IDX_CL] = 3.0;
+            p.values[crate::types::PK_IDX_V] = 50.0;
+            p.values[crate::types::PK_IDX_Q] = 2.0;
+            p.values[crate::types::PK_IDX_V2] = 40.0;
+            p.values[crate::types::PK_IDX_KA] = 1.1;
+            p.values[crate::types::PK_IDX_Q3] = 1.5;
+            p.values[crate::types::PK_IDX_V3] = 30.0;
+            p.values[crate::types::PK_IDX_F] = f_bio;
+            p
+        };
+        let p1 = params(1.0);
+        let pf = params(f);
+
+        let models = [
+            PkModel::OneCptIv,
+            PkModel::OneCptOral,
+            PkModel::TwoCptIv,
+            PkModel::TwoCptOral,
+            PkModel::ThreeCptIv,
+            PkModel::ThreeCptOral,
+        ];
+        // bolus / infusion, each non-SS and SS, all dosed into compartment 1.
+        let doses = [
+            ("bolus", DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0)),
+            ("infusion", DoseEvent::new(0.0, amt, 1, rate, false, 0.0)),
+            ("SS bolus", DoseEvent::new(0.0, amt, 1, 0.0, true, ii)),
+            ("SS infusion", DoseEvent::new(0.0, amt, 1, rate, true, ii)),
+        ];
+
+        for model in models {
+            for (label, dose) in &doses {
+                let s1 = single_dose_states(model, dose, tau, &p1);
+                let sf = single_dose_states(model, dose, tau, &pf);
+                assert_eq!(
+                    s1.len(),
+                    sf.len(),
+                    "{model:?} {label}: state-vector length must not depend on F"
+                );
+                // Guard against a vacuous pass (all-zero states scale trivially).
+                assert!(
+                    s1.iter().any(|&x| x.abs() > 1e-9),
+                    "{model:?} {label}: all states ~0 at F=1 — test would be vacuous"
+                );
+                for (i, (&a, &b)) in s1.iter().zip(sf.iter()).enumerate() {
+                    assert!(
+                        approx::relative_eq!(b, f * a, max_relative = 1e-9, epsilon = 1e-12),
+                        "{model:?} {label}: state[{i}] = {b} at F={f}, expected {} = F·{a} \
+                         — F must scale every compartment exactly once",
+                        f * a
+                    );
+                }
+            }
+        }
     }
 }

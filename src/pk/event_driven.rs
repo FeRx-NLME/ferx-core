@@ -310,7 +310,7 @@ fn equilibrate_ss_state_event_driven(
     for _ in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             // Bolus pulse: instantaneous amount jump (with F).
-            state[cmt_idx] += pk.f_bio() * dose.amt;
+            state[cmt_idx] += pk.bioavailable_amount(dose.amt);
         }
         propagate_with_bounds(
             &mut state,
@@ -374,7 +374,7 @@ fn ss_state_at_phase_event_driven(
             f64::NEG_INFINITY,
         );
     } else {
-        state[cmt_idx] += pk.f_bio() * dose.amt;
+        state[cmt_idx] += pk.bioavailable_amount(dose.amt);
         propagate_with_bounds(
             &mut state,
             &[0.0, phase],
@@ -518,7 +518,7 @@ pub fn event_driven_predictions_with_schedule(
                     // high-dose subjects came out F× too small.
                     let cmt_idx = d.cmt.saturating_sub(1);
                     if cmt_idx < n_states {
-                        state[cmt_idx] += pk_now.f_bio() * d.amt;
+                        state[cmt_idx] += pk_now.bioavailable_amount(d.amt);
                     } else {
                         panic!(
                             "event-driven PK: dose into compartment {} but model has \
@@ -649,7 +649,6 @@ fn propagate_with_bounds(
         let mut rate_periph2 = 0.0;
         // F multiplies infusion rate so a dur→0 infusion limits to a bolus
         // of amount F·AMT — same convention as the EventKind::Dose arm above.
-        let f_bio = pk.f_bio();
         for (k, d) in doses.iter().enumerate() {
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
             let t_start = d.time + lag;
@@ -659,7 +658,7 @@ fn propagate_with_bounds(
                 continue;
             }
             if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
-                let r = f_bio * d.rate;
+                let r = pk.bioavailable_rate(d.rate);
                 match (pk_model, d.cmt) {
                     (PkModel::OneCptIv, 1) => rate_central += r,
                     (PkModel::OneCptOral, 2) => rate_central += r,
