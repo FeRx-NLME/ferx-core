@@ -1996,13 +1996,18 @@ mod tests {
         // returned ~0 instead of the correct curve. This affected TV-covariate,
         // reset, and IOV subjects on oral+infusion models.
         //
-        // Two checks, both independent of the #327 superposition-F fix:
+        // Three checks:
         //   1. At F=1, event-driven == the superposition reference
         //      (`predict_concentration` models an oral infusion as a depot-
         //      bypassing IV-into-central infusion — the NONMEM result). Before
         //      the fix this was ~0 vs a positive curve.
         //   2. Predictions scale linearly with F (F=0.4 → 0.4×), confirming F is
         //      applied to the infusion rate.
+        //   3. Cross-path agreement at F≠1: with #327/#349 now applying F on the
+        //      superposition path too, event-driven == superposition at F=0.4 —
+        //      not just F=1. Guards against either path silently dropping F
+        //      (the gap Ron's #351 review flagged that the F=1-only check (1)
+        //      cannot catch).
         let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
         // rate=25 → 4 h infusion into central (cmt 2) on an oral model.
         let dose = DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0);
@@ -2062,6 +2067,17 @@ mod tests {
             );
             for (a_f, a_1) in ed_f.iter().zip(ed.iter()) {
                 assert_relative_eq!(*a_f, 0.4 * *a_1, max_relative = 1e-9);
+            }
+
+            // (3) Cross-path agreement at F≠1: the superposition reference must
+            // match the event-driven path at F=0.4, not only F=1. This fails iff
+            // one path applies F to the infusion rate and the other does not.
+            let sup_f: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pkf))
+                .collect();
+            for (a_f, s_f) in ed_f.iter().zip(sup_f.iter()) {
+                assert_relative_eq!(*a_f, *s_f, epsilon = 1e-9, max_relative = 1e-7);
             }
         }
     }
@@ -2131,6 +2147,18 @@ mod tests {
             );
             for (a_f, a_1) in ed_f.iter().zip(ed.iter()) {
                 assert_relative_eq!(*a_f, 0.4 * *a_1, max_relative = 1e-9);
+            }
+
+            // Cross-path agreement at F≠1 (looser SS tolerance, as for F=1):
+            // the SS equilibration path also applies F to the infusion rate, so
+            // event-driven == superposition at F=0.4, guarding the SS path
+            // against silently dropping F.
+            let sup_f: Vec<f64> = obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(model, &subj.doses, t, &pkf))
+                .collect();
+            for (a_f, s_f) in ed_f.iter().zip(sup_f.iter()) {
+                assert_relative_eq!(*a_f, *s_f, epsilon = 1e-9, max_relative = 2e-3);
             }
         }
     }
