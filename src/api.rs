@@ -6043,6 +6043,44 @@ mod simulate_with_uncertainty_tests {
     }
 
     #[test]
+    fn compute_npde_npd_shapes_finite_and_reproducible() {
+        // Drives the full post-fit NPDE/NPD simulation path on a real (model,
+        // population, params). nsim > n_obs (3) so the decorrelated NPDE is
+        // non-NaN, and a fixed seed must reproduce bit-for-bit.
+        let model = tiny_model();
+        let pop = tiny_population();
+        let nsim = 200;
+
+        let a = crate::stats::npde::compute_npde_npd(
+            &model,
+            &pop,
+            &model.default_params,
+            nsim,
+            Some(7),
+        );
+        let b = crate::stats::npde::compute_npde_npd(
+            &model,
+            &pop,
+            &model.default_params,
+            nsim,
+            Some(7),
+        );
+
+        assert_eq!(a.len(), pop.subjects.len());
+        for (sn, subj) in a.iter().zip(pop.subjects.iter()) {
+            assert_eq!(sn.npd.len(), subj.observations.len());
+            assert_eq!(sn.npde.len(), subj.observations.len());
+            assert!(sn.npd.iter().all(|v| v.is_finite()), "NPD finite");
+            assert!(sn.npde.iter().all(|v| v.is_finite()), "NPDE finite");
+        }
+        // Reproducible across calls with the same seed.
+        for (sa, sb) in a.iter().zip(b.iter()) {
+            assert_eq!(sa.npd, sb.npd);
+            assert_eq!(sa.npde, sb.npde);
+        }
+    }
+
+    #[test]
     fn fit_rejects_ltbs_with_proportional_error() {
         // Defensive guard against hand-built `CompiledModel`s: the parser already
         // rejects this combination, but a Rust caller flipping `log_transform = true`

@@ -181,17 +181,17 @@ fn npde_scores(observed: &[f64], cens: &[u8], sims: &DMatrix<f64>) -> Vec<f64> {
     };
 
     // Decorrelate via forward substitution: w = L⁻¹ (x − mean). One batched solve
-    // for all replicates, one for the observed vector.
-    let sims_d = match l.solve_lower_triangular(&centered) {
-        Some(w) => w,
-        None => return vec![f64::NAN; n],
+    // for all replicates, one for the observed vector. The Cholesky factor `l` is
+    // non-singular (positive diagonal) by construction, so the triangular solve
+    // never returns `None`.
+    let solve = |b: &DMatrix<f64>| {
+        l.solve_lower_triangular(b)
+            .expect("Cholesky factor is non-singular, so the triangular solve cannot fail")
     };
+    let sims_d = solve(&centered);
     let obs_centered =
-        DVector::from_iterator(n, observed.iter().zip(mean.iter()).map(|(y, m)| y - m));
-    let obs_d = match l.solve_lower_triangular(&obs_centered) {
-        Some(w) => w,
-        None => return vec![f64::NAN; n],
-    };
+        DMatrix::from_iterator(n, 1, observed.iter().zip(mean.iter()).map(|(y, m)| y - m));
+    let obs_d = solve(&obs_centered);
 
     (0..n)
         .map(|j| empirical_score(obs_d[j], sims_d.row(j).iter().copied()))
@@ -338,6 +338,42 @@ mod tests {
         let sims = sims_matrix(&[vec![1.0, 2.0], vec![1.5, 2.5]]);
         let out = npde_scores(&[1.0, 2.0], &[0, 0], &sims);
         assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|v| v.is_nan()));
+    }
+
+    #[test]
+    fn npde_scores_empty_for_zero_observations() {
+        let sims = DMatrix::<f64>::zeros(0, 10);
+        assert!(npde_scores(&[], &[], &sims).is_empty());
+    }
+
+    #[test]
+    fn npde_scores_jitter_rescues_zero_variance_row() {
+        // K > n_obs so the rank guard passes, but observation 0 is constant across
+        // replicates → cov[0,0] = 0 → covariance is non-PD → the jitter retry must
+        // rescue the Cholesky and still yield finite scores.
+        let k = 20;
+        let rows: Vec<Vec<f64>> = (0..k)
+            .map(|i| vec![5.0, i as f64]) // row 0 constant, row 1 varies
+            .collect();
+        let sims = sims_matrix(&rows);
+        let out = npde_scores(&[5.0, 10.0], &[0, 0], &sims);
+        assert_eq!(out.len(), 2);
+        assert!(
+            out.iter().all(|v| v.is_finite()),
+            "jitter path must yield finite NPDE, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn npde_scores_nan_when_covariance_is_nan() {
+        // A non-finite simulated value makes the covariance non-finite; Cholesky
+        // fails even after jitter, so the whole subject's NPDE is NaN.
+        let k = 10;
+        let mut rows: Vec<Vec<f64>> = (0..k).map(|i| vec![i as f64, (k - i) as f64]).collect();
+        rows[3][0] = f64::NAN;
+        let sims = sims_matrix(&rows);
+        let out = npde_scores(&[1.0, 2.0], &[0, 0], &sims);
         assert!(out.iter().all(|v| v.is_nan()));
     }
 
