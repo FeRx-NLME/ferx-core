@@ -938,6 +938,78 @@ mod tests {
         );
     }
 
+    /// Exercises the multi-coordinate componentwise (θ,σ) block. The
+    /// bioavailability model has several free non-mu-ref θ — TVV / TVKA have no
+    /// η, THETA_F's η is logit (not log) — so the conjugate move is disabled and
+    /// all four θ plus σ are sampled componentwise. Asserts the path runs and
+    /// recovers the simulation truth (TVCL≈5, TVV≈50, TVKA≈1.5, THETA_F≈0.7);
+    /// R̂ is deliberately NOT asserted tightly — these params are correlated and
+    /// mix slowly under a random walk (the adaptive-covariance proposal is the
+    /// follow-up), but the posterior MEANS are unbiased.
+    #[test]
+    fn run_bayes_multi_coord_nonmuref_block() {
+        use std::path::Path;
+        let model = crate::parser::model_parser::parse_model_file(Path::new(
+            "examples/bioavailability.ferx",
+        ))
+        .expect("bioavailability model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/bioavailability_oral.csv"), None, None)
+            .expect("bioavailability data loads");
+        let params = model.default_params.clone();
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 1500;
+        opts.bayes_iters = 1500;
+        opts.bayes_chains = 2;
+        opts.bayes_seed = Some(1);
+        opts.saem_n_mh_steps = 10;
+
+        let res = run_bayes(&model, &pop, &params, &opts).expect("bayes runs");
+        // Partial mu-referencing (only ETA_CL is a log mu-ref) ⇒ all θ go to the
+        // componentwise block; the run must warn.
+        assert!(
+            res.warnings.iter().any(|w| w.contains("mu-referenced")),
+            "expected partial-mu-ref warning, got: {:?}",
+            res.warnings
+        );
+        let b = res.bayes.as_ref().expect("BayesResult present");
+        let get = |n: &str| b.summaries.iter().find(|s| s.name == n).expect(n);
+        for s in &b.summaries {
+            assert!(
+                s.mean.is_finite() && s.sd.is_finite() && s.sd >= 0.0,
+                "{}",
+                s.name
+            );
+            assert!(
+                s.q025 <= s.median && s.median <= s.q975,
+                "{} quantiles",
+                s.name
+            );
+        }
+        // Posterior means recover the simulation truth (broad bounds — the chain
+        // is correlated, but the means are unbiased with a fixed seed).
+        assert!(
+            (3.5..6.5).contains(&get("TVCL").mean),
+            "TVCL {}",
+            get("TVCL").mean
+        );
+        assert!(
+            (42.0..60.0).contains(&get("TVV").mean),
+            "TVV {}",
+            get("TVV").mean
+        );
+        assert!(
+            (1.2..1.9).contains(&get("TVKA").mean),
+            "TVKA {}",
+            get("TVKA").mean
+        );
+        assert!(
+            (0.55..0.85).contains(&get("THETA_F").mean),
+            "THETA_F {}",
+            get("THETA_F").mean
+        );
+    }
+
     /// End-to-end smoke test: short Bayes run on the bundled warfarin model.
     /// Asserts the sampler produces finite, well-ordered posterior summaries
     /// and a populated BayesResult. Short chains ⇒ no convergence assertion
