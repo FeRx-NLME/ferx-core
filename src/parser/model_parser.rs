@@ -1279,29 +1279,40 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             if attr != crate::types::DoseAttr::Duration {
                 continue;
             }
-            // Mirror the ODE `cmt > n_states` guard: reject an out-of-range
-            // compartment at parse time. The analytical engine routes a dose by
-            // model structure rather than the `cmt` value, so this only bounds the
-            // declared index; a `D{cmt}` whose compartment no dose actually targets
-            // is caught later by the `check_modeled_dose_rates` data gate.
-            if cmt < 1 || cmt > pk_model.n_compartments() {
+            // Reject a `D{cmt}` whose compartment the analytical engine cannot
+            // infuse into — the central compartment for every model, plus the
+            // peripheral compartment(s) of the 2-/3-cpt IV models, but NOT an oral
+            // depot or oral peripheral (see `PkModel::infusable_compartments`). A
+            // looser bound (e.g. raw compartment count) would let a `RATE=-2` into
+            // an oral depot pass parse + the data gate, then either silently route
+            // into central (no-TV superposition) or panic in the event-driven
+            // walker — the silent/abrupt failure class this feature exists to
+            // prevent. Caught here at parse time with an actionable message.
+            let infusable = pk_model.infusable_compartments();
+            if !infusable.contains(&cmt) {
+                let supported = infusable
+                    .iter()
+                    .map(|c| format!("`D{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 return Err(format!(
                     "[individual_parameters]: `{name}` is a modeled infusion duration \
-                     (RATE=-2) for compartment {cmt}, but the analytical `{}` model has \
-                     only {} compartment(s). Compartment indices are 1-based.",
+                     (RATE=-2) for compartment {cmt}, but the analytical `{}` model can \
+                     only infuse into compartment(s) {:?} ({supported}). A zero-order \
+                     input into another compartment (e.g. an oral depot) needs an \
+                     `ode(...)` model.",
                     pk_model.canonical_name(),
-                    pk_model.n_compartments()
+                    infusable,
                 ));
             }
-            // The cmt-range guard above bounds the number of distinct `D{cmt}`
-            // parameters by `n_compartments()` (≤ 4 for `three_cpt_oral`), so at
-            // most 4 spare slots (9..=12) are ever used — comfortably inside the
-            // 9..16 spare region. A debug assertion documents that invariant
-            // without a permanently-dead user-facing error arm.
+            // `infusable_compartments()` has ≤ 3 entries, so at most 3 distinct
+            // `D{cmt}` parameters are routed — comfortably inside the 9..16 spare
+            // region. A debug assertion documents that invariant without a
+            // permanently-dead user-facing error arm.
             debug_assert!(
                 next_slot < crate::types::MAX_PK_PARAMS,
                 "modeled-duration slot {next_slot} exceeds MAX_PK_PARAMS; \
-                 n_compartments() should have bounded the D{{cmt}} count"
+                 infusable_compartments() should have bounded the D{{cmt}} count"
             );
             let slot = next_slot;
             next_slot += 1;
@@ -18784,8 +18795,8 @@ CL V KA WT
 
     #[test]
     fn analytical_modeled_duration_out_of_range_compartment_errors() {
-        // `D2` on a 1-compartment IV analytical model (1 compartment) is out of
-        // range — a loud parse error mirroring the ODE `n_states` guard, never a
+        // `D2` on a 1-cpt IV analytical model is not an infusable compartment
+        // (infusable = {1} for one_cpt_iv) — a loud parse error, never a
         // silently-ignored slot (#394).
         let src = r#"
 [parameters]
@@ -18812,6 +18823,42 @@ CL V KA WT
         assert!(
             err.contains("compartment 2") && err.contains("D2"),
             "error must name the attribute and compartment, got: {err}"
+        );
+    }
+
+    #[test]
+    fn analytical_modeled_duration_into_oral_depot_is_rejected() {
+        // `D1` on a `one_cpt_oral` model targets the DEPOT (cmt 1), which the
+        // analytical closed forms cannot infuse into (infusable = {2}, the central
+        // compartment). It must be a loud parse error — not silently routed into
+        // central (no-TV path) or a runtime panic (event-driven path). #394 review.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  D1 = TVD1
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(src)
+            .err()
+            .expect("D1 (oral depot) on an analytical oral model must error");
+        assert!(
+            err.contains("compartment 1") && err.contains("D1") && err.contains("ode("),
+            "error must name the compartment, the param, and point to ode(...): {err}"
         );
     }
 

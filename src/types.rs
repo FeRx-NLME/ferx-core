@@ -1078,21 +1078,26 @@ impl PkModel {
         }
     }
 
-    /// Number of (1-based) compartments a dose may target for this analytical
-    /// model — the upper bound used to validate a `D{cmt}` modeled-duration
-    /// parameter (`RATE=-2`, #324/#394). Mirrors NONMEM's ADVAN compartment
-    /// numbering: oral models add a depot at compartment 1 (central shifts to 2),
-    /// so a 1-cpt oral model has 2 compartments, etc. The analytical closed forms
-    /// route a dose by model *structure* (oral → depot, IV → central) rather than
-    /// by the `cmt` value, so this only bounds the declared `D{cmt}` index; a
-    /// `D{cmt}` whose compartment no dose actually targets is caught later by the
-    /// `check_modeled_dose_rates` data gate.
-    pub(crate) fn n_compartments(&self) -> usize {
+    /// The (1-based) compartments the **analytical** engine can deliver a
+    /// zero-order infusion into — i.e. the only compartments a modeled infusion
+    /// *duration* `D{cmt}` (`RATE=-2`, #324/#394) may target. Single source of
+    /// truth, kept in lockstep with the infusion-routing `match (pk_model, d.cmt)`
+    /// in [`crate::pk::event_driven`] (and the equivalent superposition dispatch):
+    /// the **central** compartment for every model, plus the **peripheral**
+    /// compartment(s) for the 2-/3-cpt IV models. Notably this EXCLUDES the oral
+    /// **depot** (an oral model's depot only takes bolus input — a zero-order
+    /// into-depot input needs an `ode(...)` model) and oral peripherals, which the
+    /// closed forms cannot infuse into. A `D{cmt}` outside this set is rejected at
+    /// parse time rather than silently mis-routed (no-TV path) or panicking
+    /// (event-driven path).
+    pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
         match self {
-            PkModel::OneCptIv => 1,
-            PkModel::OneCptOral | PkModel::TwoCptIv => 2,
-            PkModel::TwoCptOral | PkModel::ThreeCptIv => 3,
-            PkModel::ThreeCptOral => 4,
+            PkModel::OneCptIv => &[1],
+            PkModel::OneCptOral => &[2],
+            PkModel::TwoCptIv => &[1, 2],
+            PkModel::TwoCptOral => &[2],
+            PkModel::ThreeCptIv => &[1, 2, 3],
+            PkModel::ThreeCptOral => &[2],
         }
     }
 

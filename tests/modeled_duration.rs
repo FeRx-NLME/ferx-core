@@ -658,9 +658,10 @@ fn analytical_iov_modeled_duration_predicts_and_matches_explicit() {
 
 #[test]
 fn analytical_modeled_duration_resolves_per_compartment_d2() {
-    // A 2-cpt analytical model dosed `RATE=-2` into the central compartment (CMT=2
-    // for `two_cpt_iv`: depot/central numbering) resolves through `D2`. Equivalent
-    // to the explicit `RATE = AMT/D2` infusion.
+    // A 2-cpt IV analytical model dosed `RATE=-2` into the PERIPHERAL compartment
+    // (CMT=2 for `two_cpt_iv`; central is CMT=1) resolves through `D2`. Equivalent
+    // to the explicit `RATE = AMT/D2` infusion. (Peripheral infusion is in the
+    // analytical infusable set for IV models — see `infusable_compartments`.)
     let two_cpt = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
