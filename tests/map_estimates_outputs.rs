@@ -86,3 +86,89 @@ fn sdtab_omits_eta_columns_after_fit() {
         );
     }
 }
+
+#[test]
+fn sdtab_omits_npde_columns_when_disabled() {
+    // Default npde_nsim = 0 → no simulation, no NPDE/NPD columns.
+    let (model, population) = warfarin_setup();
+    let opts = fast_options();
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("warfarin fit must succeed");
+
+    let cols = sdtab(&result, &population);
+    let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        !names.contains(&"NPDE") && !names.contains(&"NPD"),
+        "NPDE/NPD must be absent when npde_nsim = 0; have: {:?}",
+        names
+    );
+}
+
+#[test]
+fn sdtab_emits_finite_npde_columns_when_enabled() {
+    // With npde_nsim > 0, the post-fit simulation populates NPDE/NPD as
+    // per-observation columns; every value must be finite for this well-posed
+    // warfarin fit (no censoring, covariance non-degenerate).
+    let (model, population) = warfarin_setup();
+    let mut opts = fast_options();
+    opts.npde_nsim = 500;
+    opts.npde_seed = Some(12345);
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("warfarin fit must succeed");
+
+    let cols = sdtab(&result, &population);
+    let get = |name: &str| -> Vec<f64> {
+        cols.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("sdtab must contain `{name}` when npde_nsim > 0"))
+    };
+    let npde = get("NPDE");
+    let npd = get("NPD");
+
+    // Columns are per-observation, aligned with the other diagnostic columns.
+    let n_obs_total: usize = result.subjects.iter().map(|s| s.npde.len()).sum();
+    assert_eq!(npde.len(), n_obs_total);
+    assert_eq!(npd.len(), n_obs_total);
+    assert!(n_obs_total > 0);
+
+    assert!(
+        npde.iter().all(|v| v.is_finite()),
+        "all NPDE values must be finite; got {:?}",
+        npde
+    );
+    assert!(
+        npd.iter().all(|v| v.is_finite()),
+        "all NPD values must be finite; got {:?}",
+        npd
+    );
+
+    // The whole-population NPD/NPDE should be roughly mean-zero, unit-variance
+    // (standard-normal under a reasonable fit) — a loose sanity band, not a
+    // convergence assertion (the fit is deliberately truncated).
+    let mean = npde.iter().sum::<f64>() / npde.len() as f64;
+    assert!(
+        mean.abs() < 1.0,
+        "NPDE population mean should be near 0, got {mean}"
+    );
+}
+
+#[test]
+fn npde_is_reproducible_across_runs_with_same_seed() {
+    // A fixed npde_seed must give bit-identical NPDE/NPD across fits.
+    let (model, population) = warfarin_setup();
+    let mut opts = fast_options();
+    opts.npde_nsim = 200;
+    opts.npde_seed = Some(777);
+
+    let r1 = fit(&model, &population, &model.default_params, &opts).expect("fit 1");
+    let r2 = fit(&model, &population, &model.default_params, &opts).expect("fit 2");
+
+    for (s1, s2) in r1.subjects.iter().zip(r2.subjects.iter()) {
+        assert_eq!(
+            s1.npde, s2.npde,
+            "NPDE must be reproducible for a fixed seed"
+        );
+        assert_eq!(s1.npd, s2.npd, "NPD must be reproducible for a fixed seed");
+    }
+}

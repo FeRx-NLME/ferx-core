@@ -27,4 +27,9 @@ $OMEGA BLOCK(1) SAME   ; KAPPA_CL occasion 2 (same variance => IOV)
 $SIGMA 0.04       ; proportional variance
 $ESTIMATION METHOD=1 INTER MAXEVAL=9999 NSIG=3 SIGL=9 PRINT=5 NOABORT
 $COVARIANCE UNCONDITIONAL
-$TABLE ID TIME OCC NOPRINT ONEHEADER FILE=sdtab_iov
+; CL is per-occasion (CL = THETA(1)*EXP(ETA(1) + IOVCL)); V/KA are BSV-only.
+; Emitting CL/V/KA gives the per-(ID,OCC) individual-parameter reference that
+; ferx's sdtab CL column is cross-checked against (issue #238). NONMEM writes
+; the POSTHOC (EBE) CL per data record, so occasion-1 and occasion-2 rows of the
+; same subject carry that occasion's kappa.
+$TABLE ID TIME OCC CL V KA NOPRINT ONEHEADER FILE=sdtab_iov

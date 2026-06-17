@@ -215,11 +215,12 @@ fn iov_saem_smoke_returns_finite_ofv() {
 /// platform gap while still catching the pre-fix stall at OFV ≈ 292. The
 /// companion `omega_iov > 0.02` assertion guards the mechanism that #101
 /// rec #2 actually fixed (variance component moves off its 0.01 init).
+// Re-enabled (#335): cold-start SLSQP on this IOV model used to stall at OFV 343.5
+// with omega_iov pinned at its 0.01 init. The fix is `parameter_scaling = rescale2`
+// now applying to SLSQP under `Auto` (bound-half-width rescaling — see
+// `resolve_scaling`): with it, pure FOCEI/SLSQP from the cold default start reaches
+// OFV 307.84 and omega_iov climbs to ≈0.046, matching the default BOBYQA.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
 fn iov_pure_slsqp_from_cold_start_reaches_minimum() {
     let focei = run_single(EstimationMethod::FoceI, Optimizer::Slsqp);
     assert!(

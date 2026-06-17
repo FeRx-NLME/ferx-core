@@ -476,6 +476,20 @@ pub fn foce_subject_nll(
             frem_r_override.as_deref(),
         )
     } else {
+        // FOCE (no interaction): evaluate the residual variance R at the
+        // population prediction f(η=0) — NONMEM's no-interaction semantics —
+        // not the SB-linearized f0. f0 = f(η̂) − H·η̂ can extrapolate to
+        // near-zero/negative concentrations on a nonlinear (e.g. oral) model,
+        // collapsing R(f0)=(f0·σ)² to the floor and making R̃ ill-conditioned;
+        // f(η=0) is the physically sensible typical-individual prediction
+        // (always ≥0). Skipped for additive error (variance is f-independent,
+        // so f0 and f(η=0) give the same R) to keep that path bit-identical.
+        let pop_preds: Option<Vec<f64>> = if model.error_spec.has_f_dependent_variance() {
+            let zeros = vec![0.0_f64; eta_hat.len()];
+            Some(model_predictions(model, subject, theta, &zeros))
+        } else {
+            None
+        };
         foce_subject_nll_standard(
             subject,
             &ipreds,
@@ -487,6 +501,7 @@ pub fn foce_subject_nll(
             model.bloq_method,
             &p_obs,
             frem_r_override.as_deref(),
+            pop_preds.as_deref(),
         )
     }
 }
@@ -532,6 +547,11 @@ pub fn foce_subject_nll_standard(
     _bloq_method: BloqMethod,
     p_obs: &[f64],
     frem_r_override: Option<&[Option<f64>]>,
+    // When `Some`, evaluate the residual variance R at these predictions
+    // instead of the SB-linearized f0. Used to evaluate R at the population
+    // prediction f(η=0) — NONMEM's no-interaction semantics — which is always
+    // ≥0, avoiding the f0 zero-crossing pathology on oral proportional models.
+    r_pred_override: Option<&[f64]>,
 ) -> f64 {
     let n_obs = subject.observations.len();
 
@@ -554,6 +574,9 @@ pub fn foce_subject_nll_standard(
             }
         }
     }
+    // R diagonal; inflate with EKF process-noise variance for SDE models.
+    let r_eval: &[f64] = r_pred_override.unwrap_or(&f0);
+    let mut r_diag = compute_r_diag(error_spec, r_eval, &subject.obs_cmts, sigma_values);
     for (j, r) in r_diag.iter_mut().enumerate() {
         *r += p_obs.get(j).copied().unwrap_or(0.0);
     }
@@ -1021,6 +1044,26 @@ pub fn foce_subject_nll_iov(
             None,
         )
     } else {
+        // FOCE (no interaction): evaluate R at the population prediction with
+        // all random effects zero (η=0, κ=0), matching the non-IOV marginal so
+        // the zero-κ / Ω_iov→0 reduction collapses exactly to the BSV marginal.
+        // Additive error keeps f0 (bit-identical).
+        let pop_preds: Option<Vec<f64>> = if model.error_spec.has_f_dependent_variance() {
+            let zeros_eta = vec![0.0_f64; n_eta];
+            let zero_kappas: Vec<Vec<f64>> = kappa_slices
+                .iter()
+                .map(|k| vec![0.0_f64; k.len()])
+                .collect();
+            Some(pk::predict_iov(
+                model,
+                subject,
+                theta,
+                &zeros_eta,
+                &zero_kappas,
+            ))
+        } else {
+            None
+        };
         foce_subject_nll_standard(
             subject,
             &ipreds,
@@ -1032,6 +1075,7 @@ pub fn foce_subject_nll_iov(
             model.bloq_method,
             &p_obs_iov,
             None,
+            pop_preds.as_deref(),
         )
     }
 }
@@ -1388,6 +1432,7 @@ mod tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             n_kappa: 0,
@@ -1633,6 +1678,65 @@ mod tests {
         assert!(
             (small - large).abs() > 1e-6,
             "Ω_iov must change the marginal OFV (small={small}, large={large})"
+        );
+    }
+
+    /// Regression for the FOCE+proportional fix: the residual variance must be
+    /// evaluated at a supplied population prediction `f(η=0)`, not the
+    /// SB-linearized `f0 = ipred − H·η̂`. When `f0` crosses zero (a nonlinear
+    /// model's linearization undershooting), `R(f0) = (f0·σ)²` collapses to the
+    /// floor and that observation's huge weight blows up the marginal — the
+    /// pathology that made FOCE+proportional multimodal with an indefinite
+    /// covariance. Passing `r_pred_override = Some(positive preds)` must avoid it.
+    #[test]
+    fn foce_standard_variance_uses_override_not_zero_crossing_f0() {
+        let subject = make_simple_subject(); // 6 obs
+        let omega = make_omega(0.09);
+        let sigma = vec![0.2]; // proportional SD
+        let error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+
+        // ipreds all positive; H·η̂ drives the first f0 component to exactly 0.
+        let ipreds = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let eta_hat = DVector::from_vec(vec![1.0]);
+        let h_matrix = DMatrix::from_column_slice(6, 1, &[10.0, 5.0, 5.0, 5.0, 5.0, 5.0]);
+        // f0 = ipred − H·η̂ = [0, 15, 25, 35, 45, 55] → first R(f0) hits the floor.
+
+        let nll_f0 = foce_subject_nll_standard(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h_matrix,
+            &omega,
+            &sigma,
+            &error_spec,
+            BloqMethod::Drop,
+            &[],
+            None,
+        );
+        let nll_override = foce_subject_nll_standard(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h_matrix,
+            &omega,
+            &sigma,
+            &error_spec,
+            BloqMethod::Drop,
+            &[],
+            Some(&ipreds),
+        );
+
+        assert!(nll_override.is_finite() && nll_f0.is_finite());
+        // The f0 path's near-floored first-observation variance inflates the
+        // marginal above the override path (which weights by the true ~positive
+        // prediction). The two differ by a clear, deterministic margin (~56 on
+        // this construction) — confirming R is evaluated at the override, not f0.
+        // (The HΩH' term in R̃ cushions the floored R(f0), so the gap is moderate
+        // rather than catastrophic, but it is well above FP noise.)
+        assert!(
+            nll_f0 - nll_override > 20.0,
+            "override must change the SB marginal (R evaluated at f(η=0), not f0): \
+             nll_f0={nll_f0}, nll_override={nll_override}"
         );
     }
 

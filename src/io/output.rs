@@ -365,6 +365,28 @@ pub fn print_results(result: &FitResult) {
         }
     }
 
+    // Bayesian posterior
+    if let Some(ref b) = result.bayes {
+        eprintln!("\n--- Bayesian posterior (Gibbs-within-HMC) ---");
+        eprintln!(
+            "  chains = {}, warmup = {}, draws/chain = {}, max R-hat = {:.3}",
+            b.n_chains, b.n_warmup, b.n_draws_per_chain, b.max_rhat
+        );
+        if b.n_divergent > 0 {
+            eprintln!("  divergent transitions: {}", b.n_divergent);
+        }
+        eprintln!(
+            "  {:<14} {:>10} {:>10} {:>10} {:>10} {:>6} {:>8}",
+            "param", "mean", "sd", "2.5%", "97.5%", "Rhat", "ESS"
+        );
+        for s in &b.summaries {
+            eprintln!(
+                "  {:<14} {:>10.4} {:>10.4} {:>10.4} {:>10.4} {:>6.3} {:>8.0}",
+                s.name, s.mean, s.sd, s.q025, s.q975, s.rhat, s.ess_bulk
+            );
+        }
+    }
+
     // SIR results
     if let Some(ess) = result.sir_ess {
         eprintln!("\n--- SIR Uncertainty (95% CI) ---");
@@ -520,8 +542,16 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     let mut ipreds = Vec::with_capacity(n_total);
     let mut cwres_vec = Vec::with_capacity(n_total);
     let mut iwres_vec = Vec::with_capacity(n_total);
+    let mut npde_vec = Vec::with_capacity(n_total);
+    let mut npd_vec = Vec::with_capacity(n_total);
     let mut ebe_ofv_col = Vec::with_capacity(n_total);
     let mut n_obs_col = Vec::with_capacity(n_total);
+    // NPDE/NPD are only computed when `[fit_options] npde_nsim > 0`; emit the
+    // columns only when at least one subject carries them.
+    let any_npde = result
+        .subjects
+        .iter()
+        .any(|s| !s.npde.is_empty() || !s.npd.is_empty());
 
     for (si, sr) in result.subjects.iter().enumerate() {
         let subj = &population.subjects[si];
@@ -545,6 +575,10 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
             ipreds.push(sr.ipred[j]);
             cwres_vec.push(sr.cwres[j]);
             iwres_vec.push(sr.iwres[j]);
+            if any_npde {
+                npde_vec.push(sr.npde.get(j).copied().unwrap_or(f64::NAN));
+                npd_vec.push(sr.npd.get(j).copied().unwrap_or(f64::NAN));
+            }
             ebe_ofv_col.push(sr.ofv_contribution);
             n_obs_col.push(sr.n_obs as f64);
         }
@@ -569,6 +603,12 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         ("IPRED".to_string(), ipreds),
         ("CWRES".to_string(), cwres_vec),
         ("IWRES".to_string(), iwres_vec),
+    ]);
+    if any_npde {
+        cols.push(("NPDE".to_string(), npde_vec));
+        cols.push(("NPD".to_string(), npd_vec));
+    }
+    cols.extend([
         ("EBE_OFV".to_string(), ebe_ofv_col),
         ("N_OBS".to_string(), n_obs_col),
     ]);
@@ -892,6 +932,11 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  saem_n_subjects_hmc: {n_hmc}").map_err(|e| e.to_string())?;
         writeln!(f, "  saem_n_subjects_mh: {n_mh}").map_err(|e| e.to_string())?;
     }
+    // Effective seed of the NPDE/NPD simulation (only when those diagnostics
+    // ran), so the sdtab NPDE/NPD columns can be regenerated exactly.
+    if let Some(seed) = result.npde_seed {
+        writeln!(f, "  npde_seed: {seed}").map_err(|e| e.to_string())?;
+    }
 
     writeln!(f, "\nobjective_function:").map_err(|e| e.to_string())?;
     writeln!(f, "  ofv: {:.6}", result.ofv).map_err(|e| e.to_string())?;
@@ -1198,6 +1243,29 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    // Bayesian posterior section
+    if let Some(ref b) = result.bayes {
+        writeln!(f, "\nbayes:").map_err(|e| e.to_string())?;
+        writeln!(f, "  n_chains: {}", b.n_chains).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_warmup: {}", b.n_warmup).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_draws_per_chain: {}", b.n_draws_per_chain).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_divergent: {}", b.n_divergent).map_err(|e| e.to_string())?;
+        writeln!(f, "  max_rhat: {:.4}", b.max_rhat).map_err(|e| e.to_string())?;
+        writeln!(f, "  parameters:").map_err(|e| e.to_string())?;
+        for s in &b.summaries {
+            writeln!(f, "    - name: \"{}\"", s.name).map_err(|e| e.to_string())?;
+            writeln!(f, "      mean: {:.6}", s.mean).map_err(|e| e.to_string())?;
+            writeln!(f, "      sd: {:.6}", s.sd).map_err(|e| e.to_string())?;
+            writeln!(f, "      q025: {:.6}", s.q025).map_err(|e| e.to_string())?;
+            writeln!(f, "      median: {:.6}", s.median).map_err(|e| e.to_string())?;
+            writeln!(f, "      q975: {:.6}", s.q975).map_err(|e| e.to_string())?;
+            writeln!(f, "      rhat: {:.4}", s.rhat).map_err(|e| e.to_string())?;
+            writeln!(f, "      ess_bulk: {:.1}", s.ess_bulk).map_err(|e| e.to_string())?;
+            writeln!(f, "      ess_tail: {:.1}", s.ess_tail).map_err(|e| e.to_string())?;
+            writeln!(f, "      mcse: {:.6}", s.mcse).map_err(|e| e.to_string())?;
+        }
+    }
+
     // SIR section
     if let Some(ess) = result.sir_ess {
         writeln!(f, "\nsir:").map_err(|e| e.to_string())?;
@@ -1399,6 +1467,7 @@ mod tests {
             sir_resamples_packed: None,
             importance_sampling: None,
             impmap_trace: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),
@@ -1452,6 +1521,7 @@ mod tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,
             outer_gtol: 0.0,
@@ -1656,6 +1726,8 @@ mod tests {
             pred: vec![1.0; n_obs],
             iwres: vec![0.0; n_obs],
             cwres: vec![0.0; n_obs],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
@@ -1729,6 +1801,7 @@ mod tests {
             sir_resamples_packed: None,
             importance_sampling: None,
             impmap_trace: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),
@@ -1782,6 +1855,7 @@ mod tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,
             outer_gtol: 0.0,
@@ -1855,6 +1929,56 @@ mod tests {
             .expect("CMT column should be present for multi-endpoint data");
 
         assert_eq!(cmt_col, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn sdtab_npde_columns_present_when_populated() {
+        let mut sr = sdtab_subject_result("1", 2);
+        sr.npde = vec![0.3, -1.2];
+        sr.npd = vec![0.4, -1.0];
+        let result = minimal_sdtab_result(vec![sr]);
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        let npde = cols
+            .iter()
+            .find(|(name, _)| name == "NPDE")
+            .map(|(_, v)| v.clone())
+            .expect("NPDE column should be present when populated");
+        let npd = cols
+            .iter()
+            .find(|(name, _)| name == "NPD")
+            .map(|(_, v)| v.clone())
+            .expect("NPD column should be present when populated");
+        assert_eq!(npde, vec![0.3, -1.2]);
+        assert_eq!(npd, vec![0.4, -1.0]);
+    }
+
+    #[test]
+    fn sdtab_npde_columns_absent_by_default() {
+        // sdtab_subject_result leaves npde/npd empty (the npde_nsim = 0 default).
+        let result = minimal_sdtab_result(vec![sdtab_subject_result("1", 2)]);
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let cols = sdtab(&result, &population);
+        assert!(
+            cols.iter().all(|(name, _)| name != "NPDE" && name != "NPD"),
+            "NPDE/NPD columns should be absent when npde_nsim = 0"
+        );
     }
 
     #[test]
@@ -1991,6 +2115,8 @@ mod tests {
             pred: vec![11.0, 6.0],
             iwres: vec![0.25, f64::NAN],
             cwres: vec![-0.5, f64::NAN],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 3.0,
             cens: vec![0, 1],
             n_obs: 2,
@@ -2180,6 +2306,26 @@ mod tests {
         // 2 theta + 3 omega (full 2×2) + 2 sigma + 3 kappa (full 2×2) = 10
         r.covariance_matrix = Some(DMatrix::identity(10, 10));
         r.warnings = vec!["example warning".into()];
+        r.bayes = Some(crate::types::BayesResult {
+            summaries: vec![crate::types::PosteriorSummary {
+                name: "CL".into(),
+                mean: 2.0,
+                sd: 0.2,
+                q025: 1.6,
+                median: 2.0,
+                q975: 2.4,
+                rhat: 1.01,
+                ess_bulk: 1500.0,
+                ess_tail: 1400.0,
+                mcse: 0.005,
+            }],
+            n_chains: 4,
+            n_warmup: 1000,
+            n_draws_per_chain: 1000,
+            n_divergent: 0,
+            max_rhat: 1.01,
+            draws: None,
+        });
         r
     }
 
@@ -2208,6 +2354,10 @@ mod tests {
         assert!(yaml.contains("\nimportance_sampling:"));
         assert!(yaml.contains("  kappa_treatment: fixed_at_mode"));
         assert!(yaml.contains("  low_ess_subjects:") && yaml.contains("- id: \"S3\""));
+        // Bayesian posterior block.
+        assert!(yaml.contains("\nbayes:"));
+        assert!(yaml.contains("  max_rhat: 1.0100"));
+        assert!(yaml.contains("  parameters:") && yaml.contains("    - name: \"CL\""));
         // SIR section with all three CI blocks.
         assert!(yaml.contains("\nsir:"));
         assert!(
@@ -2226,6 +2376,31 @@ mod tests {
         );
         // Warnings.
         assert!(yaml.contains("\nwarnings:") && yaml.contains("- \"example warning\""));
+    }
+
+    #[test]
+    fn write_yaml_emits_npde_seed_only_when_present() {
+        // When NPDE ran, the resolved seed is recorded; otherwise the line is absent.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.npde_seed = Some(20240601);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("  npde_seed: 20240601"),
+            "npde_seed should be emitted when set"
+        );
+
+        r.npde_seed = None;
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("npde_seed"),
+            "npde_seed line should be absent when NPDE did not run"
+        );
     }
 
     #[test]

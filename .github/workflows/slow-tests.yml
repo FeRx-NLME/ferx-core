@@ -22,6 +22,11 @@ on:
       - 'src/ode/ekf.rs'
       - 'src/ode/predictions.rs'
       - 'src/ode/solver.rs'
+      # The parser compiles every model the heavy fits run, so a change to model
+      # compilation (e.g. the structural-param binding in #261) can shift a fit's
+      # objective or break it outright — including the NONMEM-anchored slow test
+      # in tests/structural_param_nonmem.rs.
+      - 'src/parser/**'
       - 'src/stats/likelihood.rs'
 
 env:
@@ -42,7 +47,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-slow
-      - name: cargo test (release + slow-tests)
+      - name: cargo test (ci-test profile + slow-tests)
+        # `--profile ci-test` (defined in Cargo.toml) keeps release-level
+        # optimisation so the heavy fits run fast, but drops fat LTO — the
+        # whole-program link tax that otherwise dominates this build.
+        #
         # `--lib` is intentionally omitted so integration tests in `tests/`
         # are compiled and run here. Gated slow tests (the `slow-tests` feature
         # removes their `#[ignore]`) and ungated integration tests both execute.
@@ -51,4 +60,4 @@ jobs:
         # fails. Without it, cargo aborts at the first failed binary and the
         # remaining ~15 integration-test binaries (alphabetically after the
         # failing one) silently never run, masking concurrent regressions.
-        run: cargo test --no-default-features --features ci,slow-tests --release --no-fail-fast
+        run: cargo test --no-default-features --features ci,slow-tests --profile ci-test --no-fail-fast

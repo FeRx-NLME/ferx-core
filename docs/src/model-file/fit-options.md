@@ -16,16 +16,22 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | `method` | `foce`, `focei`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). |
 | `maxiter` | integer | `500` | Maximum outer loop iterations |
 | `covariance` | `true`, `false` | `true` | Compute covariance matrix and standard errors |
-| `covariance_method` | `r`, `s`, `rsr` | `r` | Which covariance estimator to assemble, mirroring NONMEM `$COVARIANCE MATRIX=`. `r` = inverse Hessian `R⁻¹` (model-based; the default). `s` = inverse score cross-product `S⁻¹` (empirical information). `rsr` = the Huber–White sandwich `R⁻¹SR⁻¹` (robust to model mis-specification; NONMEM's default). **ferx defaults to `r`, but NONMEM's `$COVARIANCE` default is `rsr`** — set `covariance_method = rsr` when reconciling SEs against a NONMEM run that used the default `$COV`. `s`/`rsr` are currently supported for FOCEI and IOV fits (they need the per-subject score, whose Ω-prior term is only consistent under interaction). All three require a positive-definite FD Hessian: if the Hessian is non-PD the covariance step fails for every method (a non-PD Hessian is not yet routed to the `s` cross-product). Requires `covariance = true`. |
+| `covariance_method` | `r`, `s`, `rsr` | `r` | Which covariance estimator to assemble, mirroring NONMEM `$COVARIANCE MATRIX=`. `r` = inverse Hessian `R⁻¹` (model-based; the default). `s` = inverse score cross-product `S⁻¹` (empirical information). `rsr` = the Huber–White sandwich `R⁻¹SR⁻¹` (robust to model mis-specification; NONMEM's default). **ferx defaults to `r`, but NONMEM's `$COVARIANCE` default is `rsr`** — set `covariance_method = rsr` when reconciling SEs against a NONMEM run that used the default `$COV`. `s`/`rsr` are supported for FOCEI, FOCE, and IOV fits; all three anchored against NONMEM `$COV MATRIX=S`/`RSR` within ~10%. All methods require a positive-definite FD Hessian (a non-PD Hessian is not yet routed to the `s` cross-product). Requires `covariance = true`. |
 | `covariance_fallback` | `none`, `sir` | `none` | What to do when the FD Hessian is not positive definite (non-PD). `none` leaves the covariance step as failed. `sir` runs SIR with a fallback proposal covariance built from the `\|eigenvalue\|`-rectified Hessian, inflated 4×; the YAML reports SIR-based 95% CIs instead of Hessian SEs. Requires `covariance = true`. Ignored when the Hessian succeeds. |
+| `covariance_ofv_hessian` | `true`, `false` | `true` | Build the covariance R-matrix (Hessian) from second differences of the reconverged marginal OFV, rather than from a central difference of the analytical population gradient. The analytical-gradient stencil holds the H-matrix `a = ∂f/∂η` fixed in the `log\|H̃\|` θ-gradient, which biases the SE of *weakly-identified* structural parameters (e.g. warfarin `TVKA` reads ~9% high versus a Richardson FD-of-OFV ground truth). The OFV-Hessian stencil (the default) recomputes `a` (and everything else) at every perturbed point, so it matches the ground truth to <1%; both stencils parallelise over perturbation points, so the wall-clock cost is ≈ the same. Set `false` to force the faster analytical-gradient stencil. Requires `covariance = true`. |
 | `fd_hessian_step` | float | `1e-2` | Initial relative step size for the finite-difference Hessian used in the covariance step. The actual perturbation for parameter `i` is `fd_hessian_step * (1 + |x_hat[i]|)`. ferx automatically halves this value up to 8 times if any diagonal stencil evaluates to a non-finite value, so in most cases the default requires no tuning. Set explicitly only if the automatic reduction is insufficient (try `0.1`) or if FD noise is the main concern on a very smooth surface (try `1e-3`). Must be positive and finite. |
 | `optimizer` | `bobyqa`, `slsqp`, `bfgs`, `lbfgs`, `nlopt_lbfgs`, `mma`, `trust_region` | `bobyqa` | Outer-loop optimisation algorithm. Applies to `method = foce` / `focei` and to the FOCEI polish phase of `method = gn_hybrid`. Ignored (with a runtime warning) under `method = saem` / `imp` / `gn` — see the [Outer Optimizers](../estimation/optimizers.md) page for the applicability matrix and the rationale for the BOBYQA default. |
 | `inner_maxiter` | integer | `200` | Max iterations for the inner (per-subject EBE) optimizer |
-| `inner_tol` | float | `1e-4` | Gradient-norm convergence tolerance for the inner (per-subject EBE) optimizer. The default of `1e-4` matches the precision of typical NLME engines (NONMEM's default inner-loop SIGDIGITS is ~3, equivalent to ~`1e-3`). Tighter values (e.g. `1e-6`, `1e-8`) over-converge the EBE relative to the Sheiner–Beal linearisation error and can slow FOCEI fits by 10–15× without measurable change in the final OFV. Use a tighter value only if you're comparing post-hoc EBE values across runs at high precision. |
+| `inner_tol` | float | `1e-5` | Gradient-norm convergence tolerance for the inner (per-subject EBE) optimizer. A looser tolerance leaves residual noise in each subject's EBE solution, which propagates into the marginal objective the outer optimizer sees; on models with a noisy or flat marginal surface (FD-inner FOCE such as log-transform-both-sides) that noise can make the derivative-free BOBYQA outer optimizer false-converge above the true minimum. `1e-5` removes enough of that noise to match NONMEM's minimum, at roughly 1.5× the per-fit cost of the older `1e-4` default. (For reference, NONMEM runs its inner conditional optimization far tighter than its outer convergence: the inner precision `SIGL` defaults to ~10 significant digits, versus the outer `NSIG`/SIGDIGITS default of 3.) Tighter is not uniformly better: at `1e-6` some ill-conditioned fits over-converge the inner Hessian and the outer optimizer can land in a worse basin. Loosen it (e.g. `1e-4`) to speed up well-conditioned fits where it makes no difference; change it further only with validation against a reference fit. |
 | `steihaug_max_iters` | integer | adaptive | Max CG iterations for the Steihaug subproblem (only used when `optimizer = trust_region`). Default (unset) uses `ceil(sqrt(n_params)).clamp(5, n_params)` — typically 5 for standard NLME models. Set explicitly (e.g. `steihaug_max_iters = 50`) to pin the budget. |
+| `ode_reltol` | float | `1e-4` | RK45 ODE solver **relative** tolerance. ODE models only (ignored for analytical PK). The default reproduces analytical closed forms in PRED to ~`1e-4`, but the FOCE objective amplifies solver error, so the OFV of an ODE-form model can differ from its analytical equivalent by several units. Set a tighter value (e.g. `1e-10`) when the ODE-form **OFV** must match an analytical reference; expect slower fits. |
+| `ode_abstol` | float | `1e-6` | RK45 ODE solver **absolute** tolerance (companion to `ode_reltol`). ODE models only. |
+| `ode_max_steps` | integer | `10000` | Max RK45 steps per integration segment. ODE models only. Raise (e.g. `1000000`) if a tight `ode_reltol` exhausts the step budget on stiff multi-compartment systems. |
 | `global_search` | `true`, `false` | `false` | Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a gradient-free global pre-search before the local optimizer. CRS2-LM samples within the parameter bounds; the local optimizer (e.g. `bobyqa`, `slsqp`) starts from the best point found. Useful for poorly-identified models — when the local optimizer can land in a degenerate basin (collapsed ETA, V/Q swap, parameters at bounds) from a far-from-truth start, the global pre-search usually escapes it. Adds the pre-search budget on top of the local optimisation, but typically more efficient than running multiple full fits from scratch. Requires a full NLopt build (e.g. `brew install nlopt` or `apt install libnlopt-dev`); a clear warning is emitted if CRS2-LM is unavailable. |
 | `global_maxeval` | integer | `200 * (n_params + 1)` | Maximum evaluations of the FOCE objective during the global pre-search. Each eval is a full inner-loop pass over all subjects, so this is the dominant cost of `global_search = true`. The default (`0` → auto) is empirically enough to escape bad basins on 10–20 parameter PK models without dominating the wall time of the subsequent local refine. |
 | `bloq_method` | `drop`, `m3` | `drop` | How to handle rows with `CENS=1`. `m3` enables Beal's M3 likelihood (see [BLOQ example](../examples/bloq.md)). |
+| `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde--npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. A typical value is `1000`. Cost scales linearly with the count. |
+| `npde_seed` | integer | — | RNG seed for the NPDE/NPD simulation, for reproducible diagnostics. Unset falls back to a fixed default. Only used when `npde_nsim > 0`. |
 | `mu_referencing` | `true`, `false` | `true` | Re-centre inner-loop ETA estimates on the current population mean (auto-detected from `[individual_parameters]`). See the [FAQ entry](../faq.md#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem--nlmixr2) for details. Set `false` to reproduce pre-automatic-mu behaviour. |
 | `iov_column` | string | — | Name of the occasion column in the dataset (e.g. `OCC`). Required when the model uses `kappa` or `block_kappa` declarations. The column must contain integer occasion indices. Case-insensitive. Only supported with `foce` / `focei` — not `saem`. See [IOV documentation](iov.md). |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
@@ -50,6 +56,97 @@ a valid NCA estimate.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
+
+## Simulation-based diagnostics (NPDE / NPD)
+
+Setting `npde_nsim > 0` adds two simulation-based goodness-of-fit columns to the
+`sdtab` output: **NPD** (Normalized Prediction Discrepancies) and **NPDE**
+(Normalized Prediction Distribution Errors). Unlike CWRES — which linearises the
+model around the conditional mode and so inherits the bias of a first-order
+approximation — NPDE/NPD are built entirely from Monte-Carlo simulation under the
+fitted model, so they are robust to model nonlinearity and to non-Gaussian random
+effects (Brendel et al. 2006; Comets et al. 2008, the `npde` R package).
+
+```ini
+[fit_options]
+method = focei
+npde_nsim = 1000     # replicates per subject (off when 0, the default)
+npde_seed = 12345    # optional, for reproducibility
+```
+
+The **effective** seed actually used — the explicit `npde_seed` when given,
+otherwise the built-in default — is recorded as `model: npde_seed:` in the
+`{model}-fit.yaml` output (and round-trips through `.fitrx`), so the `NPDE`/`NPD`
+columns can always be regenerated from the saved fit, even when no seed was set
+in the model file. The line is omitted when NPDE did not run (`npde_nsim = 0`).
+
+For each observation `y_ij`, ferx simulates `K = npde_nsim` replicates under the
+fitted `θ/Ω/Σ` (sampling `η ~ N(0, Ω)` and the residual error), evaluated at the
+subject's own observation design:
+
+- **NPD** (no decorrelation): `pd_ij` is the empirical CDF of the simulated values
+  at observation `ij`, and `npd_ij = Φ⁻¹(pd_ij)`.
+- **NPDE** (decorrelated): within each subject the observed and simulated vectors
+  are decorrelated with the empirical mean and Cholesky factor of the simulated
+  covariance (the Brendel/Comets procedure) *before* the empirical CDF and inverse-
+  normal transform. This removes the within-subject correlation that NPD ignores.
+
+Empirical-CDF probabilities at 0 or 1 are clamped to `[1/(2K), 1 − 1/(2K)]` before
+`Φ⁻¹`, matching the `npde`-package convention, so the scores stay finite.
+
+**Under a correctly specified model, NPDE follows a standard normal distribution.**
+On the warfarin example (`examples/warfarin.ferx`, `data/warfarin.csv`), a converged
+FOCEI fit with `npde_nsim = 1000` gives the expected mean-zero, unit-variance
+distribution:
+
+| Diagnostic | mean | variance | reference |
+|------------|------|----------|-----------|
+| NPDE       | 0.006 | 1.02 | ≈ N(0, 1) |
+| NPD        | −0.002 | 0.88 | mean ≈ 0; variance < 1 because NPD retains within-subject correlation |
+
+This matches the `npde` R package's `autonpde()` (same Cholesky decorrelation and
+edge-clamping) to Monte-Carlo noise. See `tests/npde_validation.rs` for the
+engine-side check and an R reproduction recipe.
+
+### NONMEM cross-validation
+
+NONMEM has no native NPDE output; the reference pipeline is a NONMEM `$SIMULATION`
+post-processed by the `npde` R package. The same warfarin data was fit with NONMEM
+7.5.1 (`ADVAN2 TRANS2`, `METHOD=1 INTER`, proportional error) and the two fits
+agree, so any difference in the diagnostics is attributable to the NPDE
+computation rather than the fit:
+
+| Quantity | ferx (FOCEI) | NONMEM 7.5.1 |
+|----------|-------------|--------------|
+| TVCL     | 0.1328 | 0.1327 |
+| TVV      | 7.738  | 7.738  |
+| TVKA     | 0.817  | 0.811  |
+| OFV      | −286.0015 | −286.0042 |
+
+Feeding a 1000-replicate NONMEM `$SIMULATION` (under the NONMEM estimates) and the
+observed data to `npde::autonpde()` (Cholesky decorrelation, edge-clamping)
+reproduces ferx's NPDE/NPD on the same 110 observations:
+
+| Diagnostic | ferx mean | ferx var | npde-pkg mean | npde-pkg var |
+|------------|-----------|----------|---------------|--------------|
+| NPDE       |  0.005 | 1.09 |  0.036 | 1.04 |
+| NPD        | −0.009 | 0.91 | −0.004 | 0.91 |
+
+The NPD variance (the quantity that should sit below 1 because NPD retains the
+within-subject correlation) matches to three figures (0.91 vs 0.91); the small
+NPDE-variance gap is Monte-Carlo noise between two independent simulation draws.
+Both engines give NPDE ≈ N(0, 1) and a mean-zero NPD, as expected under this
+well-specified model.
+
+**Limitations.** M3/BLQ censored observations need the predictive-CDF variant and
+are out of scope: censored rows (`CENS != 0`) are emitted as empty/`NaN` (matching
+the CWRES/IWRES convention), and a subject's NPDE is `NaN` as a whole when it has
+any censored row, since the within-subject decorrelation would otherwise mix the
+LLOQ into the uncensored rows. NPDE also requires more replicates than a subject
+has observations (`npde_nsim > n_obs`) for a full-rank simulated covariance;
+otherwise that subject's NPDE is `NaN` (NPD is still computed). For IOV (`kappa`)
+models the simulation holds kappas at zero (the existing `simulate()` convention),
+so NPDE/NPD omit the inter-occasion component of the predictive variance.
 
 ## Estimation Methods
 
@@ -188,7 +285,8 @@ Notes:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `scale_params` | `false` | Divide each packed (log/Cholesky) coordinate by its initial magnitude before passing it to the optimizer. **Off by default since issue #99:** the scaling-enabled path only ever runs on log/Cholesky coordinates, where dividing by `\|log value\|` is counterproductive — e.g. `ln(V)=ln(20)≈3` gets scale 3, turning the optimizer's unit step into a ≈20× multiplicative jump in V, which overshoots and (via the uniform SLSQP gradient cap) starves the step in other dimensions such as OMEGA, halting short of the minimum. The OFV value is unchanged at any fixed point, but the optimizer *trajectory* and stop point are not. Set to `true` only for experimentation. |
+| `parameter_scaling` | `auto`, `none`, `abs`, `rescale2` | `auto` | Parameter-scaling strategy for the outer optimizer (supersedes `scale_params` when non-`none`). The default `auto` applies `rescale2` to the gradient-based optimizers that benefit (`bfgs`/`lbfgs`/`nlopt_lbfgs`/`slsqp`) and leaves the derivative-free `bobyqa` default unscaled (where `rescale2` distorts its trust region). `rescale2` is the nlmixr2-style normalisation: each packed coordinate is divided by its bound half-range `(upper−lower)/2`, mapping it toward `(−1, 1)` so the optimizer sees comparable per-parameter search ranges. This markedly improves cold-start convergence — e.g. `optimizer = bfgs` reaches OFV −1198.97 on `two_cpt_oral_cov` (≈ nlmixr2's −1199.24) where the unscaled optimizer stalls near −1192, and cold-start FOCEI/`slsqp` on `warfarin_iov` reaches the marginal minimum instead of stalling (#335). `abs` is the legacy `\|packed value\|` normalisation (same as `scale_params = true`); `none` disables scaling for all optimizers. Writing `parameter_scaling = none` therefore also disables the `slsqp` cold-start fix. |
+| `scale_params` | `false` | Legacy boolean alias for `parameter_scaling = abs`. Divide each packed (log/Cholesky) coordinate by its initial magnitude before passing it to the optimizer. **Off by default since issue #99:** the scaling-enabled path only ever runs on log/Cholesky coordinates, where dividing by `\|log value\|` is counterproductive — e.g. `ln(V)=ln(20)≈3` gets scale 3, turning the optimizer's unit step into a ≈20× multiplicative jump in V, which overshoots and (via the uniform SLSQP gradient cap) starves the step in other dimensions such as OMEGA, halting short of the minimum. Prefer `parameter_scaling = rescale2` for gradient-based optimizers. The OFV value is unchanged at any fixed point, but the optimizer *trajectory* and stop point are not. |
 | `max_unconverged_frac` | `0.1` | Fraction of subjects (with at least `min_obs_for_convergence_check` observations) allowed to have unconverged EBEs before the outer optimizer rejects the step (returns OFV = ∞). Set to `1.0` to disable the guard. |
 | `min_obs_for_convergence_check` | `2` | Subjects with fewer than this many observations are excluded from the `max_unconverged_frac` check (they still run normally). |
 | `stagnation_guard` | `true` | Short-circuit the NLopt-based outer optimizers once recent evals show no OFV improvement above 1e-3 over a window of `3*(n+1).max(50)` evals. This lets SLSQP / L-BFGS terminate quickly via their own xtol/ftol on numerically-flat plateaus (e.g. γ-bearing FOCEI problems) instead of grinding through the remaining `outer_maxiter` budget at full inner-loop cost. Set to `false` to let the optimizer run to its natural termination criterion — useful when debugging or for problems with very slow but real OFV improvements below the threshold. |

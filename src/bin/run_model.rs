@@ -350,7 +350,7 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 mod tests {
     use super::{
         parse_check_args, parse_inits_from_nca_flag, parse_output_flag, parse_threads_flag,
-        CheckArgsError,
+        print_check_human, run_check, CheckArgsError,
     };
     use ferx_core::NcaInit;
 
@@ -473,5 +473,90 @@ mod tests {
             parse_check_args(&args(&["check", "model.ferx", "--data", "--json"])),
             Err(CheckArgsError::MissingDataValue)
         );
+    }
+
+    // ── run_check: in-process coverage of the `check` subcommand ──────────────
+    // `run_check` (and, through it, `print_check_human`) is otherwise exercised
+    // only by the `cli_binaries.rs` end-to-end tests, which spawn `ferx` as a
+    // child process — coverage the instrumented build does not capture. Driving
+    // it in-process with absolute fixture paths (so CWD is irrelevant) registers
+    // the coverage and pins the documented exit-code contract: 0 = valid,
+    // 1 = errors found, 2 = usage / bad arguments.
+
+    const VALID_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/one_cpt_iv.ferx");
+    const VALID_DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/data/one_cpt_iv.csv");
+
+    #[test]
+    fn run_check_usage_errors_return_2() {
+        // No model path, and a flag where the model should be — both usage (2).
+        assert_eq!(run_check(&args(&["check"])), 2);
+        assert_eq!(run_check(&args(&["check", "--json"])), 2);
+    }
+
+    #[test]
+    fn run_check_missing_data_value_returns_2() {
+        assert_eq!(run_check(&args(&["check", VALID_MODEL, "--data"])), 2);
+    }
+
+    #[test]
+    fn run_check_valid_model_human_and_json_return_0() {
+        // A clean example model has no errors → valid → 0. Covers both the human
+        // (`print_check_human`) and `--json` (serde) rendering branches.
+        assert_eq!(run_check(&args(&["check", VALID_MODEL])), 0);
+        assert_eq!(run_check(&args(&["check", VALID_MODEL, "--json"])), 0);
+    }
+
+    #[test]
+    fn run_check_with_data_runs_data_path_without_usage_error() {
+        // 0 (valid) or 1 (data-dependent findings) — never 2. Exercises the
+        // data-dependent branch of `validate_model_file`.
+        assert_ne!(
+            run_check(&args(&["check", VALID_MODEL, "--data", VALID_DATA])),
+            2
+        );
+    }
+
+    #[test]
+    fn run_check_invalid_model_returns_1() {
+        // An unparseable model → errors → invalid → 1. Covers the invalid-summary
+        // and error-diagnostic branches of `print_check_human`, plus `--json` on
+        // an invalid report.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bad = dir.path().join("bad.ferx");
+        std::fs::write(&bad, "this is not a valid ferx model\n").expect("write bad model");
+        let bad_path = bad.to_str().unwrap();
+        assert_eq!(run_check(&args(&["check", bad_path])), 1);
+        assert_eq!(run_check(&args(&["check", bad_path, "--json"])), 1);
+    }
+
+    #[test]
+    fn print_check_human_covers_all_diagnostic_shapes() {
+        // Drive `print_check_human` directly over diagnostics that hit every arm:
+        // both severities, all three `loc` shapes (block+line / block-only /
+        // none), and suggestion present/absent — branches the model-file fixtures
+        // above don't deterministically reach.
+        use ferx_core::{CheckReport, Diagnostic};
+        let invalid = CheckReport::new(
+            "m.ferx",
+            Some("d.csv".to_string()),
+            vec![
+                Diagnostic::warning("W_X", "a warning")
+                    .with_block("error_model")
+                    .with_line(7)
+                    .with_suggestion("try this instead"),
+                Diagnostic::error("E_Y", "block-scoped error").with_block("odes"),
+                Diagnostic::error("E_Z", "locationless error"),
+            ],
+        );
+        // Must not panic; output is captured by the test harness.
+        print_check_human(&invalid);
+        assert!(!invalid.valid);
+        assert_eq!(invalid.error_count(), 2);
+        assert_eq!(invalid.warning_count(), 1);
+
+        // A clean report exercises the valid-summary branch through the same printer.
+        let ok = CheckReport::new("m.ferx", None, vec![]);
+        print_check_human(&ok);
+        assert!(ok.valid);
     }
 }

@@ -1,0 +1,71 @@
+model:
+  converged: true
+  method: FOCEI
+  uses_ode_solver: true
+  uses_sde: false
+
+objective_function:
+  ofv: -1069.071423
+  aic: -1053.071423
+  bic: -1025.226311
+
+data:
+  n_subjects: 20
+  n_observations: 240
+  n_parameters: 8
+
+theta:
+  TVCL:
+    estimate: 5.240470
+    se: 0.340470
+    rse_pct: 6.50
+  TVV:
+    estimate: 52.562737
+    se: 4.213061
+    rse_pct: 8.02
+  TVKA:
+    estimate: 1.017633
+    se: 0.138058
+    rse_pct: 13.57
+  TVMTT:
+    estimate: 1.006536
+    se: 0.062621
+    rse_pct: 6.22
+  TVN:
+    estimate: 3.033121
+    se: 0.130803
+    rse_pct: 4.31
+
+omega:
+  ETA_CL:
+    variance: 0.078251
+    cv_pct: 27.97
+    se: 0.032577
+  ETA_V:
+    variance: 0.094977
+    cv_pct: 30.82
+    se: 0.046704
+
+sigma:  # error model: proportional
+  PROP_ERR:
+    estimate: 0.159237
+    variance: 0.025356
+    type: proportional
+    cv_pct: 15.92
+    se: 0.008069
+
+covariance_matrix:
+  # optimizer parameterization: theta log-transformed when lower bound >= 0 (identity otherwise), sigma log-transformed, omega/kappa Cholesky-factored
+  parameters: [TVCL, TVV, TVKA, TVMTT, TVN, log_chol_ETA_CL, log_chol_ETA_V, PROP_ERR]
+  rows:
+    TVCL: [4.221016e-3, 5.000183e-5, -2.136883e-4, -1.238852e-4, 7.114619e-5, -2.105219e-3, -8.862797e-5, 1.136785e-4]
+    TVV: [5.000183e-5, 6.424504e-3, 2.175142e-3, 6.524270e-4, -3.056543e-4, 4.214590e-4, -7.839489e-3, 1.037696e-4]
+    TVKA: [-2.136883e-4, 2.175142e-3, 1.840528e-2, 7.935850e-3, -4.493851e-3, 1.208760e-3, -1.886372e-4, 2.338368e-4]
+    TVMTT: [-1.238852e-4, 6.524270e-4, 7.935850e-3, 3.870609e-3, -2.450256e-3, 3.160455e-4, -1.041275e-4, 1.585124e-4]
+    TVN: [7.114619e-5, -3.056543e-4, -4.493851e-3, -2.450256e-3, 1.859743e-3, -1.341376e-4, 7.248260e-5, -1.219169e-4]
+    log_chol_ETA_CL: [-2.105219e-3, 4.214590e-4, 1.208760e-3, 3.160455e-4, -1.341376e-4, 4.332983e-2, 5.553197e-5, -5.574886e-5]
+    log_chol_ETA_V: [-8.862797e-5, -7.839489e-3, -1.886372e-4, -1.041275e-4, 7.248260e-5, 5.553197e-5, 6.045262e-2, 1.794633e-5]
+    PROP_ERR: [1.136785e-4, 1.037696e-4, 2.338368e-4, 1.585124e-4, -1.219169e-4, -5.574886e-5, 1.794633e-5, 2.567852e-3]
+
+warnings:
+  - "mu-ref: ETA_CL, ETA_V"

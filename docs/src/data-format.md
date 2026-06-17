@@ -14,14 +14,55 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 
 | Column | Type | Default | Description |
 |--------|------|---------|-------------|
-| `EVID` | integer | 0 | Event ID: 0 = observation, 1 = dose, 2 = other event, 3 = system reset, 4 = reset + dose |
-| `AMT` | numeric | 0 | Dose amount (only for `EVID=1` or `EVID=4`) |
+| `EVID` | integer | 0 | Event ID: 0 = observation, 1 = dose, 2 = other event, 3 = system reset, 4 = reset + dose. If the column is omitted, the record type is inferred from `AMT` — see [Inferring doses without an `EVID` column](#inferring-doses-without-an-evid-column). |
+| `AMT` | numeric | 0 | Dose amount (for `EVID=1`/`EVID=4`; also the dose-inference signal when `EVID` is absent) |
 | `CMT` | integer | 1 | Compartment number (1-indexed) |
-| `RATE` | numeric | 0 | Infusion rate. 0 = bolus dose |
-| `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored |
+| `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM's coded value `-2` (modeled duration via a `D{cmt}` `$PK` parameter) is supported on ODE models; `-1` (modeled rate) is not yet supported — see [Infusion Doses](#infusion-doses). |
+| `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored (row excluded from the likelihood) |
 | `II` | numeric | 0 | Interdose interval for repeated dosing |
 | `SS` | integer | 0 | Steady-state flag. 1 = assume steady state |
 | `CENS` | integer | 0 | Censoring flag. 1 = observation is below LLOQ; `DV` carries the LLOQ value. Paired with `bloq_method = m3` in `[fit_options]` to enable likelihood-based handling — see [BLOQ example](examples/bloq.md). |
+
+> **Missing DV on observation rows.** An `EVID=0` row contributes to the
+> likelihood only when its `DV` is present. If the `DV` is missing
+> (`.`, `NA`, or blank), mark the row `MDV=1`. As a safety net, ferx also treats
+> an `EVID=0` row with a missing `DV` as `MDV=1` even when the flag is absent —
+> the row is skipped rather than scored as `DV=0` — and emits a single
+> `W_MISSING_DV` warning reporting how many rows were skipped. Set `MDV=1`
+> explicitly to silence it, or fix the data if the missing values are an error.
+
+## Inferring doses without an `EVID` column
+
+`EVID` is optional. When the column is **absent**, ferx infers the record type
+from `AMT`, exactly as NONMEM does: a row with a nonzero `AMT` is treated as a
+**dose** (`EVID=1`), and every other row as an **observation** (`EVID=0`). This
+lets legacy NONMEM datasets that omit `EVID` — marking dose rows only by a
+nonzero `AMT` (often with `MDV=1`) — administer their doses instead of silently
+dropping every `AMT` row and fitting a degenerate, dose-free model.
+
+```csv
+ID,TIME,DV,MDV,AMT
+1,0,.,1,100
+1,1,9.5,0,.
+1,2,7.3,0,.
+```
+
+Here the first row (`AMT=100`) is inferred as a dose; the others are
+observations. Inference keys on `AMT` only — a dose always carries a nonzero
+amount (for infusions, `AMT` is the amount and `RATE` the rate). When an `EVID`
+column **is** present, its values govern and nothing is inferred.
+
+Two non-fatal warnings (collected into the fit's warnings) guard against a
+silently dose-free fit:
+
+- **`W_AMT_NOT_DOSED`** — one or more **non-observation** rows carry `AMT != 0`
+  but were not treated as doses: an `EVID` column is present and codes a dose row
+  as something other than `1`/`4` (e.g. a dose row mistyped `EVID=0` with
+  `MDV=1`). Their `AMT` was ignored. A *scored* observation (`MDV=0`) that merely
+  carries a redundant or forward-filled `AMT` does **not** trigger this.
+- **`W_NO_DOSES`** — the dataset parsed **zero** dose events even though scored
+  observations are present (usually a missing `AMT`/`EVID`). Not emitted for
+  time-to-event/survival datasets, which legitimately have no PK doses.
 
 ## Occasion Column (IOV)
 
@@ -179,6 +220,37 @@ ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
 ```
 
 This administers 500 units at a rate of 50 units/hour (duration = 10 hours).
+
+### NONMEM coded `RATE` values
+
+NONMEM overloads the `RATE` column with negative codes that change its meaning:
+
+| `RATE` | NONMEM meaning | ferx-core |
+|--------|----------------|-----------|
+| `0`    | Bolus — route set by the dose compartment | ✅ supported |
+| `> 0`  | Constant-rate infusion (duration = `AMT/RATE`) | ✅ supported |
+| `-1`   | Infusion **rate** is *modeled* — defined by `R{cmt}` in `$PK` | ⛔ not yet supported (error) |
+| `-2`   | Infusion **duration** is *modeled* — defined by `D{cmt}` in `$PK` | ✅ supported on ODE models (#324) |
+
+`RATE = -2` makes the infusion **duration** a model parameter: declare an
+individual parameter `D{cmt}` (`D1` for a dose into compartment 1, etc.) and ferx
+infuses `AMT` over that duration — rate `AMT / D{cmt}`, evaluated per iteration
+and occasion. This is an **ODE-engine** feature (an `ode(...)` model); see
+[Modeled infusion duration](model-file/ode-models.md#modeled-infusion-duration-dn-rate-2)
+for the DSL and semantics. A `RATE=-2` dose with no matching `D{cmt}` parameter,
+or on an analytical model, is a **loud error** — never a silent bolus
+(analytical support is a tracked #324 follow-up).
+
+`RATE = -1` (modeled rate, `R{cmt}`) is not yet supported; convert such rows to
+an explicit positive `RATE`, or model the duration with `-2` instead. Any other
+negative or non-finite `RATE` on a dose row is also rejected. Earlier versions
+silently treated all coded forms as a bolus, producing wrong predictions with no
+warning (#324). Note `-1`/`-2` are driven by `$PK` parameters — **not** a
+separate `DURATION` data column.
+
+A runnable demo of the supported forms — a bolus (`RATE=0`) and a constant-rate
+infusion (`RATE>0`) mixed in one dataset — is in `examples/dose_rate.ferx`
+(data: `data/dose_rate.csv`).
 
 ## Steady-State Dosing
 

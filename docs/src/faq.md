@@ -291,3 +291,29 @@ output file includes an `exclusions:` section with record counts and the
 expressions that fired.  See [Data Selection](model-file/data-selection.md) for
 the full reference.
 
+## What about NONMEM's coded `RATE` values (`-1`, `-2`)?
+
+NONMEM overloads the `RATE` column. A positive value is a constant infusion
+rate, but negative values are *codes* that tell NONMEM to take the rate or
+duration from a `$PK` parameter rather than the data:
+
+| `RATE` | NONMEM meaning | ferx |
+|--------|----------------|------|
+| `0`    | Bolus — route set by the dose compartment | supported |
+| `> 0`  | Constant-rate infusion, duration = `AMT/RATE` | supported |
+| `-1`   | Infusion **rate** modeled — `R1` defined in `$PK` | rejected (error) |
+| `-2`   | Infusion **duration** modeled — `D1` defined in `$PK` | rejected (error) |
+
+ferx-core does not yet model the rate/duration from a parameter, so `-1`/`-2`
+(and any other negative or non-finite `RATE`) on a dose row produce an
+informative error rather than being silently misread as a bolus — the
+behaviour in versions before this fix (#324). To port such a model today,
+replace the coded `RATE` with an explicit positive infusion rate
+(`AMT` ÷ the intended duration). Both `-1` and `-2` are *parameter*-driven in
+NONMEM; neither reads a separate `DURATION` data column.
+
+`RATE=0` denotes a *bolus*, not specifically an *intravenous* dose: the route
+follows the dose compartment — a bolus into the central compartment is
+intravenous, while a bolus into a depot compartment with first-order absorption
+is extravascular (oral).
+

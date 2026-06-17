@@ -238,6 +238,11 @@ fn assigned_vars_in_order(stmts: &[Statement]) -> Vec<String> {
 /// Branch-local helpers (e.g. `SCALE = ...` inside an `if` body) are
 /// intentionally excluded: including them would corrupt the AD inner loop
 /// by placing the helper in a PK slot (typically overwriting CL at slot 0).
+///
+/// These names are *always* individual parameters. `indiv_var_names` is this
+/// set plus the subset of all-branch-assigned names that a downstream block
+/// actually consumes (see `unconditionally_assigned_vars` and the call site in
+/// `parse_full_model`, issue #357).
 fn top_level_assigned_vars(stmts: &[Statement]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for s in stmts {
@@ -248,6 +253,111 @@ fn top_level_assigned_vars(stmts: &[Statement]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Variable names that are *unconditionally* defined by the end of the block:
+/// every top-level assignment, PLUS any name assigned on EVERY branch of an
+/// `if`/`else` (recursively). Such a name has a definite value on all code
+/// paths, so it *can* be a genuine individual parameter — unlike a branch-local
+/// helper assigned in only some branches.
+///
+/// This is a SUPERSET of `top_level_assigned_vars`. The all-branch extras are
+/// only promoted to actual individual parameters at the call site when a
+/// downstream block consumes them (issue #357) — promoting *every* such name
+/// would slot throwaway intermediates into the PK array (silently hijacking the
+/// reserved F/lagtime slots, aliasing the CL slot in `pk_indices`, or
+/// exhausting the 16-slot layout). See `parse_full_model`.
+///
+/// Motivating case: a PK parameter written only inside symmetric `if`/`else`
+/// branches (the natural NONMEM-style `IF (cond) CL = ...` / `IF (!cond) CL =
+/// ...` construction) must still get a PK slot, be written back by
+/// `pk_param_fn`, and be visible to the `[odes]` RHS name resolver — but only
+/// because `[odes]` references it.
+///
+/// First-occurrence order, deduplicated. An `if` with no `else`, or one where
+/// some branch omits the name, does NOT contribute that name — it could be
+/// undefined on the missing path, so it stays branch-local (matching
+/// `top_level_assigned_vars` for that case).
+fn unconditionally_assigned_vars(stmts: &[Statement]) -> Vec<String> {
+    // `unconditional_names_in` already deduplicates (its `push` closure), so no
+    // second pass is needed here.
+    unconditional_names_in(stmts)
+}
+
+/// Recursive worker for `unconditionally_assigned_vars`. Returns the names
+/// definitely assigned within `stmts`, in first-occurrence order: top-level
+/// `Assign`s, plus the intersection of unconditional names across all branches
+/// of any `if`/`else` (requires an `else`; the intersection preserves the
+/// order in which names first appear in the leading branch).
+fn unconditional_names_in(stmts: &[Statement]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let push = |name: &str, out: &mut Vec<String>| {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    };
+    for s in stmts {
+        match s {
+            Statement::Assign(name, _) => push(name, &mut out),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                // Without an `else`, no name is guaranteed across all paths.
+                if let Some(eb) = else_body {
+                    let mut sets: Vec<Vec<String>> = branches
+                        .iter()
+                        .map(|(_, b)| unconditional_names_in(b))
+                        .collect();
+                    sets.push(unconditional_names_in(eb));
+                    if let Some((first, rest)) = sets.split_first() {
+                        for name in first {
+                            if rest.iter().all(|s| s.iter().any(|n| n == name)) {
+                                push(name, &mut out);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Collect every identifier-like token (`[A-Za-z_][A-Za-z0-9_]*`) appearing in
+/// `lines`, upper-cased, into `out`. Used to decide whether an all-branch
+/// individual parameter is actually *consumed* by a downstream block (issue
+/// #357): such a name is promoted to a PK-slotted individual parameter only if
+/// some block outside `[individual_parameters]` references it. A purely
+/// internal helper (used only to compute another param within
+/// `[individual_parameters]`) stays branch-local, preserving the pre-#357
+/// behaviour and avoiding spurious PK-slot allocation / reserved-slot hijack.
+///
+/// Deliberately crude (lexical, case-folded, no scope awareness): a false
+/// positive only over-promotes a name that genuinely appears downstream — the
+/// safe direction. Keywords / state names that happen to collide are harmless;
+/// they would only matter if the user *also* named an individual parameter
+/// identically, in which case promoting it is correct anyway. Matched
+/// case-insensitively to mirror the ODE/analytical name resolvers, which alias
+/// both cases.
+fn collect_referenced_identifiers(lines: &[String], out: &mut std::collections::HashSet<String>) {
+    for line in lines {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'_' || bytes[i].is_ascii_alphabetic() {
+                let start = i;
+                i += 1;
+                while i < bytes.len() && (bytes[i] == b'_' || bytes[i].is_ascii_alphanumeric()) {
+                    i += 1;
+                }
+                out.insert(line[start..i].to_ascii_uppercase());
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Union of eta indices touched by every assignment to `var_name` anywhere in
@@ -807,7 +917,13 @@ pub fn parse_model_string(content: &str) -> Result<CompiledModel, String> {
 
 /// Parse a full model string including all optional blocks.
 pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
-    let extracted = extract_blocks(content)?;
+    let mut extracted = extract_blocks(content)?;
+    // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
+    // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
+    // hand-written `ode(...)` form *before* anything else looks at the blocks, so
+    // the rest of this function — including ODE detection below — sees a normal
+    // ODE model with no special-casing.
+    apply_ode_template(&mut extracted)?;
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
@@ -930,12 +1046,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // full set registered as defined_vars so any in-block reference (forward
     // or backward) resolves as Variable rather than Covariate.
     //
-    // `indiv_var_names` contains only TOP-LEVEL assignments — these are the
-    // individual parameters that map to PK slots and the TV output vector.
-    // Branch-local helpers (assigned only inside if-bodies) are intentionally
-    // excluded to prevent them from corrupting the AD inner-loop slot layout.
-    // The ParseCtx still receives the full set (via assigned_vars_in_order) so
-    // branch-local names parse as Variable rather than Covariate.
+    // `indiv_var_names` — the names that map to PK slots and the TV output
+    // vector. Two tiers (issue #357):
+    //   1. Every top-level assignment is always an individual parameter.
+    //   2. A name assigned on *all* branches of an if/else is promoted ONLY
+    //      when a downstream block ([odes], [structural_model], [scaling],
+    //      [derived]) actually references it — i.e. it is consumed as a PK
+    //      parameter. This is what makes the NONMEM-style `IF (cond) CL = ...`
+    //      / `IF (!cond) CL = ...` construction work: CL appears in [odes], so
+    //      it earns a slot, is written back by pk_param_fn, and resolves in the
+    //      ODE RHS.
+    // Promoting *every* all-branch name (the naive fix) would slot throwaway
+    // intermediates into the PK array — silently hijacking the reserved
+    // F/lagtime slots, aliasing the CL slot in pk_indices, or exhausting the
+    // 16-slot layout. So a branch-only helper used purely to compute another
+    // param stays branch-local. The ParseCtx still receives the full set (via
+    // assigned_vars_in_order) so such helpers parse as Variable, not Covariate.
     let indiv_text = indiv_lines.join("\n");
     // NN-output lookup table for `TYPICAL_PK.CL`-style dot-access in
     // [individual_parameters]. Always present (empty when no [covariate_nn]
@@ -955,7 +1081,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let bare_ctx = ParseCtx::new(&theta_names, &eta_names, &[]).with_nn_specs(&nn_specs_for_ctx);
     let pre_stmts = parse_block_statements(&indiv_text, bare_ctx, StatementMode::Plain)?;
     let all_assigned = assigned_vars_in_order(&pre_stmts);
-    let indiv_var_names = top_level_assigned_vars(&pre_stmts);
+    // Tier 1 (always) + tier 2 (all-branch names referenced downstream). See
+    // the comment above for the rationale behind the downstream-consumption gate.
+    let top_level_names = top_level_assigned_vars(&pre_stmts);
+    let mut downstream_refs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for key in ["odes", "structural_model", "scaling", "derived"] {
+        if let Some(lines) = blocks.get(key) {
+            collect_referenced_identifiers(lines, &mut downstream_refs);
+        }
+    }
+    let indiv_var_names: Vec<String> = unconditionally_assigned_vars(&pre_stmts)
+        .into_iter()
+        .filter(|n| {
+            top_level_names.iter().any(|t| t == n)
+                || downstream_refs.contains(&n.to_ascii_uppercase())
+        })
+        .collect();
     let indiv_ctx =
         ParseCtx::new(&theta_names, &eta_names, &all_assigned).with_nn_specs(&nn_specs_for_ctx);
     let indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
@@ -964,6 +1105,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let is_ode = struct_lines
         .iter()
         .any(|l| l.starts_with("ode(") || l.starts_with("ode "));
+
+    // The error rule (#322 Phase 0b): an ODE-only absorption input-rate function
+    // (`transit`/`igd`/`weibull`) has no closed form, so it cannot ride on an
+    // analytical `pk ...` disposition. Reject the combination loudly, pointing at
+    // `ode_template`, rather than silently ignoring the [odes] block. An
+    // `ode_template`/`ode(...)` disposition sets `is_ode`, so this only fires for
+    // an analytical `pk` model that also carries an ODE-only absorption term.
+    if !is_ode {
+        if let Some(fname) = ode_only_absorption_fn_in_odes(blocks.get("odes")) {
+            return Err(format!(
+                "[structural_model]: `{fname}(...)` absorption requires an ODE disposition, but \
+                 the model uses an analytical `pk ...`. {fname}(...) has no closed form, so ferx \
+                 will not silently turn the analytical model into an ODE. Replace `pk NAME(...)` \
+                 with `ode_template NAME(...)` (ferx writes the disposition ODE) and keep \
+                 `{fname}(...)` in [odes]."
+            ));
+        }
+    }
 
     // For ODE models, map each individual parameter to a slot in the fixed
     // PkParams array (canonical names → their PK slot, others → free slots,
@@ -1100,6 +1259,45 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         #[cfg(feature = "nn")]
         &covariate_nns_for_closure,
     )?;
+
+    // Reject an analytical model that omits a required PK parameter for its
+    // structure (issue #309). Runs *after* build_pk_param_fn so the per-key
+    // validation (unknown key / undefined reference, #308) reports first; every
+    // surviving key is then a known PK name, so the canonical-slot set is exact
+    // and the `v`/`v1`, `q`/`q2` aliases satisfy their slot. An unmapped required
+    // slot would otherwise stay at `PkParams::default()` (0.0) and the fit would
+    // silently "converge" to a structurally broken optimum.
+    if !pk_param_map.is_empty() {
+        let mapped_slots: std::collections::HashSet<usize> = pk_param_map
+            .keys()
+            .filter_map(|k| PkParams::name_to_index(k))
+            .collect();
+        let missing: Vec<&str> = pk_model
+            .required_pk_params()
+            .iter()
+            .filter(|(slot, _)| !mapped_slots.contains(slot))
+            .map(|(_, name)| *name)
+            .collect();
+        if !missing.is_empty() {
+            let list = missing
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (verb, pron) = if missing.len() == 1 {
+                ("is", "it")
+            } else {
+                ("are", "them")
+            };
+            let first = missing[0];
+            let first_upper = first.to_uppercase();
+            return Err(format!(
+                "[structural_model] {} requires {list}, which {verb} not mapped. \
+                 Add {pron}, e.g. `{first}={first_upper}`.",
+                pk_model.canonical_name()
+            ));
+        }
+    }
 
     // Append NN-weight thetas (Phase A M1), then diffusion variances. Both
     // sit at the tail of the theta vector so existing user-declared theta
@@ -1445,6 +1643,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         referenced_covariates,
         gradient_method: GradientMethod::default(),
         parse_warnings: Vec::new(), // populated below
+        has_conditional_eta_params: false,
         eta_param_info,
         theta_transform,
         scaling: ScalingSpec::None,
@@ -1572,6 +1771,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         });
     }
 
+    // Bake the configured ODE solver tolerances from [fit_options] onto the
+    // OdeSpec so predict()/fit_from_files (which integrate the parsed spec
+    // as-is) use the requested accuracy. Callers that merge call-time `settings`
+    // into their own FitOptions (the R wrapper's ferx_fit) must re-apply
+    // sync_ode_solver_opts on the owned model for those overrides to win;
+    // ferx-core fit() takes &CompiledModel and does not. No-op for analytical.
+    model.sync_ode_solver_opts(&fit_options);
+
     // ── [scaling] block ──
     // Parsed after `parse_fit_options` so we can validate the
     // `ExpressionScale + gradient = ad` combination (which is rejected for
@@ -1607,11 +1814,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // `inner_optimizer::build_scale_array_for_ad`. The slice is
         // materialised once per gradient call from a subject-static pk
         // evaluation, so AD treats the scale as constant w.r.t. eta.
-        // That's exact for the common eta-independent scale (`WT/70`,
-        // `TVV/1000`, `V` reading the EBE value) and a documented
-        // approximation for the rare eta-dependent case — users who
-        // explicitly need eta-sensitive gradients should set
-        // `gradient = fd`.
+        // That's exact for an eta-independent scale (`WT/70`, `TVV/1000` -
+        // covariates/thetas only). An eta-dependent scale (e.g.
+        // `obs_scale = V` with `V = TVV*exp(ETA_V)`) is now auto-routed to
+        // FD by `inner_optimizer::analytical_ad_unsupported`
+        // (`ScalingSpec::breaks_ad_inner_gradient`), so the user gets a
+        // correct gradient without having to set `gradient = fd` by hand.
         //
         // Form C readouts (`OdeReadout::Single` / `PerCmt`) STILL force
         // FD: they only exist on ODE models, and the AD path requires
@@ -1698,14 +1906,41 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // assign the typical-value (TV*) unconditionally and only apply the
     // conditional inside the individual parameter expression.
     {
-        // Collect variables that appear inside if-branches but NOT at top level.
-        let conditional_only: Vec<&String> = all_assigned
-            .iter()
-            .filter(|n| !indiv_var_names.contains(n))
-            .collect();
-        // Also collect top-level vars that are assigned ONLY inside if-blocks
-        // (i.e. they appear in an If branch but have no top-level Assign).
-        // Union: any var in an if-branch that references an eta → warn.
+        // Does `var` receive an eta-bearing assignment anywhere inside an
+        // `if`/`else` body, at ANY nesting depth? A top-level (unconditional)
+        // assignment does not count — only ones reached through a branch. This
+        // recurses into nested ifs: a parameter assigned only inside a *nested*
+        // branch must still disable mu-referencing and route the inner loop to
+        // FD. The earlier single-level scan missed those, leaving such models on
+        // the analytical AD kernel they can't represent faithfully (#278/#280).
+        fn body_assigns_eta(body: &[Statement], var: &str, n_eta: usize) -> bool {
+            for bs in body {
+                match bs {
+                    Statement::Assign(name, expr) => {
+                        if name == var && extract_eta_indices(expr).iter().any(|&i| i < n_eta) {
+                            return true;
+                        }
+                    }
+                    Statement::If {
+                        branches,
+                        else_body,
+                    } => {
+                        for (_, b) in branches {
+                            if body_assigns_eta(b, var, n_eta) {
+                                return true;
+                            }
+                        }
+                        if let Some(eb) = else_body {
+                            if body_assigns_eta(eb, var, n_eta) {
+                                return true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
         fn any_if_branch_assigns_eta(stmts: &[Statement], var: &str, n_eta: usize) -> bool {
             for s in stmts {
                 if let Statement::If {
@@ -1714,49 +1949,35 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 } = s
                 {
                     for (_, body) in branches {
-                        for bs in body {
-                            if let Statement::Assign(name, expr) = bs {
-                                if name == var
-                                    && extract_eta_indices(expr).iter().any(|&i| i < n_eta)
-                                {
-                                    return true;
-                                }
-                            }
+                        if body_assigns_eta(body, var, n_eta) {
+                            return true;
                         }
                     }
                     if let Some(eb) = else_body {
-                        for bs in eb {
-                            if let Statement::Assign(name, expr) = bs {
-                                if name == var
-                                    && extract_eta_indices(expr).iter().any(|&i| i < n_eta)
-                                {
-                                    return true;
-                                }
-                            }
+                        if body_assigns_eta(eb, var, n_eta) {
+                            return true;
                         }
                     }
                 }
             }
             false
         }
+        // `all_assigned` is the deduped union of top-level and if-only
+        // assignments, so one pass flags both "assigned only inside an if" and
+        // "unconditional default + conditional eta override" with no
+        // double-counting. Order is the source-declaration order of
+        // `all_assigned`.
         let mut mu_ref_disabled: Vec<String> = Vec::new();
-        for var in &conditional_only {
+        for var in &all_assigned {
             if any_if_branch_assigns_eta(&indiv_stmts, var, n_eta) {
-                mu_ref_disabled.push((*var).clone());
-            }
-        }
-        // Also catch top-level vars whose only eta-bearing assignment is
-        // inside a nested if — these are in indiv_var_names but not mu_refs.
-        for var in &indiv_var_names {
-            if !model.mu_refs.contains_key(var)
-                && any_if_branch_assigns_eta(&indiv_stmts, var, n_eta)
-            {
-                if !mu_ref_disabled.contains(var) {
-                    mu_ref_disabled.push(var.clone());
-                }
+                mu_ref_disabled.push(var.clone());
             }
         }
         if !mu_ref_disabled.is_empty() {
+            // The analytical AD inner-gradient kernels can't represent an
+            // if-branch that assigns an eta-bearing parameter, so flag the model
+            // for `inner_optimizer::analytical_ad_unsupported` to route it to FD.
+            model.has_conditional_eta_params = true;
             model.parse_warnings.push(format!(
                 "Mu-referencing disabled for conditional parameter(s): {}. \
                  Assign TV* unconditionally and apply the if-block to the individual \
@@ -1874,6 +2095,137 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &event_model_used_etas,
     ));
 
+    // Warn about analytical PK parameters that are mapped but unused by the
+    // chosen model — e.g. `ka` on an IV model (no absorption compartment), or
+    // `q`/`v2` on a one-compartment model. They are set but have no effect
+    // (#309). `PkModel::consumes_pk_slot` is the single source of truth for what
+    // each model's closed form actually reads (`f` and `lagtime` apply to every
+    // model — `f` scales IV bolus/infusion doses too since #327). Sibling to the
+    // declared-but-unused check.
+    if !pk_param_map.is_empty() {
+        let mut unused: Vec<&str> = pk_param_map
+            .iter()
+            .filter_map(|(key, _)| {
+                let slot = PkParams::name_to_index(key)?;
+                (!pk_model.consumes_pk_slot(slot)).then_some(key.as_str())
+            })
+            .collect();
+        unused.sort_unstable();
+        if !unused.is_empty() {
+            let list = unused
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            model.parse_warnings.push(format!(
+                "[structural_model] {} does not use parameter(s) {list}; they are \
+                 mapped but have no effect on this model. Remove them, or use a model \
+                 that needs them.",
+                pk_model.canonical_name()
+            ));
+        }
+    }
+
+    // Warn about an individual parameter that is computed but never used: it has
+    // no effect because it is neither consumed by the structural model nor
+    // referenced in any other block — e.g. an analytical oral model that declares
+    // `F` to estimate bioavailability but forgets `f=F`, an ODE model that declares
+    // `KE` but never uses it in the `[odes]` RHS, or an unused intermediate like
+    // `ke = CL/V`. Implemented as a whole-identifier census over every model block:
+    // a declared parameter whose name appears exactly once — its own
+    // `[individual_parameters]` declaration — is dead. Over-counting (e.g. a name
+    // in a comment) only ever makes a parameter look *used*, so this never
+    // produces a false "unused" warning.
+    //
+    // Runs for analytical (`pk(...)`) and ODE models alike — the census already
+    // tokenizes `[odes]` (an unnamed block), so a parameter used in the RHS counts
+    // as used. The one ODE carve-out: parameters that `ode_param_slots` routes to
+    // the engine-reserved slots `PK_IDX_F` / `PK_IDX_LAGTIME` (named `f`/`lagtime`/
+    // `alag`) are applied to the dose by the engine without ever appearing in the
+    // RHS, so their textual absence does not make them dead (#315). Analytical
+    // models bind F/lagtime only via an explicit `pk(...)` mapping, which the
+    // census counts, so they need no carve-out there. Pure-TTE models (no `pk(...)`,
+    // no `[odes]`) are skipped: their params live in named `[event_model LABEL]`
+    // blocks, which the census deliberately does not tokenize (see below).
+    //
+    // A raw-text census (rather than resolving against the parsed ASTs) is the
+    // deliberate choice: it covers *every* block uniformly — including ones whose
+    // references aren't retained as walkable ASTs at this point (`[output]`,
+    // `[scaling]`, …) — so it cannot false-positive by overlooking a usage site.
+    // It iterates `blocks.values()` = the *unnamed* blocks only; this is safe
+    // because individual-parameter names are confined to unnamed blocks (named
+    // `[event_model LABEL]` / `[covariate_nn NAME]` blocks reference thetas/etas/
+    // covariates, never indiv params — so a param can't be "used" solely there).
+    if !pk_param_map.is_empty() || is_ode {
+        let mut token_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for lines in blocks.values() {
+            for line in lines {
+                for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+                    if tok.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+                        *token_counts.entry(tok.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+        let mut dead: Vec<String> = model
+            .indiv_param_names
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
+            // Exempt engine-applied slots on ODE models: bare `f`/`lagtime`/`alag`
+            // (routed to RESERVED_PK_SLOTS) and the compartment-indexed dose
+            // attributes `Fn`/`ALAGn` (issue #369) are applied to the dose by the
+            // engine without a textual RHS reference, so absence from `[odes]` does
+            // not make them dead. The bare case reuses `ode_param_slots`' own routing
+            // (`ode_slot_map`, parallel to `indiv_param_names`) so the exemption can't
+            // drift; the indexed case matches the same `from_indexed_name` predicate
+            // that built `dose_attr_map`. No-op for analytical models (`is_ode` false;
+            // their F/lagtime are bound via an explicit `pk(...)` mapping the census
+            // already counts).
+            .filter(|(i, name)| {
+                !(is_ode
+                    && (ode_slot_map
+                        .get(*i)
+                        .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot))
+                        || crate::types::DoseAttr::from_indexed_name(name).is_some()))
+            })
+            .map(|(_, name)| name.clone())
+            .collect();
+        dead.sort_unstable();
+        if !dead.is_empty() {
+            let list = dead
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (verb, subj, obj, aux) = if dead.len() == 1 {
+                ("is", "it", "it", "has")
+            } else {
+                ("are", "they", "them", "have")
+            };
+            // Shared scaffold; only the cause clause and the remediation hint
+            // differ between analytical (`pk(...)`) and ODE models.
+            let (cause, fix) = if is_ode {
+                (
+                    "not referenced in the [odes] RHS or any other block",
+                    format!(
+                        "Reference {obj} in [odes] (or [scaling]/[derived]/[output]) or remove {obj}."
+                    ),
+                )
+            } else {
+                (
+                    "not mapped into the `pk(...)` model and not referenced in any other block",
+                    format!("Map {obj} in [structural_model] (e.g. `f=F`) or remove {obj}."),
+                )
+            };
+            model.parse_warnings.push(format!(
+                "[individual_parameters] {list} {verb} computed but never used — {cause}, \
+                 so {subj} {aux} no effect. {fix}"
+            ));
+        }
+    }
+
     // Undeclared-covariate warning: checked here (after [event_model] parsing) so
     // that covariates used only in [event_model] expressions are included.
     if let Some(decls) = &covariate_decls {
@@ -1918,8 +2270,8 @@ pub(crate) const MAX_CMT_INDEX: usize = 255;
 
 /// Built-in sdtab column names that [derived] names must not clash with.
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
-    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
-    "CENS", "OCC", "CMT",
+    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EBE_OFV", "N_OBS",
+    "TAFD", "TAD", "CENS", "OCC", "CMT",
 ];
 
 /// Split a token slice at top-level commas (depth 0 inside parentheses).
@@ -2964,6 +3316,8 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         Ok(EstimationMethod::FoceI)
     } else if val == "foce" {
         Ok(EstimationMethod::Foce)
+    } else if val == "bayes" || val == "bayesian" || val == "mcmc" {
+        Ok(EstimationMethod::Bayes)
     } else {
         Err(format!("unknown estimation method: `{}`", token.trim()))
     }
@@ -3079,6 +3433,31 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "maxiter" => opts.outer_maxiter = parse_usize("maxiter")?,
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
+        "ode_reltol" => {
+            let v = parse_f64("ode_reltol")?;
+            if v <= 0.0 || !v.is_finite() {
+                return Err(format!(
+                    "ode_reltol must be a positive finite value, got {v}"
+                ));
+            }
+            opts.ode_reltol = v;
+        }
+        "ode_abstol" => {
+            let v = parse_f64("ode_abstol")?;
+            if v <= 0.0 || !v.is_finite() {
+                return Err(format!(
+                    "ode_abstol must be a positive finite value, got {v}"
+                ));
+            }
+            opts.ode_abstol = v;
+        }
+        "ode_max_steps" => {
+            let v = parse_usize("ode_max_steps")?;
+            if v == 0 {
+                return Err("ode_max_steps must be a positive integer".to_string());
+            }
+            opts.ode_max_steps = v;
+        }
         "covariance" => opts.run_covariance_step = parse_bool("covariance")?,
         "covariance_fallback" => {
             opts.covariance_fallback = match value.to_lowercase().as_str() {
@@ -3115,6 +3494,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.fd_hessian_step = v;
         }
+        "covariance_ofv_hessian" => {
+            opts.covariance_ofv_hessian = parse_bool("covariance_ofv_hessian")?
+        }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -3142,6 +3524,11 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "seed" | "saem_seed" => opts.saem_seed = parse_u64_opt("seed")?,
+        "bayes_warmup" => opts.bayes_warmup = parse_usize("bayes_warmup")?,
+        "bayes_iters" => opts.bayes_iters = parse_usize("bayes_iters")?,
+        "bayes_chains" => opts.bayes_chains = parse_usize("bayes_chains")?,
+        "bayes_thin" => opts.bayes_thin = parse_usize("bayes_thin")?,
+        "bayes_seed" => opts.bayes_seed = parse_u64_opt("bayes_seed")?,
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         "sir" => opts.sir = parse_bool("sir")?,
         "sir_samples" => opts.sir_samples = parse_usize("sir_samples")?,
@@ -3237,6 +3624,8 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.iscale_max = v;
         }
+        "npde_nsim" => opts.npde_nsim = parse_usize("npde_nsim")?,
+        "npde_seed" => opts.npde_seed = parse_u64_opt("npde_seed")?,
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
             opts.bloq_method = match value.to_lowercase().as_str() {
@@ -3308,6 +3697,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.reconverge_gradient_interval = parse_usize("reconverge_gradient_interval")?
         }
         "scale_params" => opts.scale_params = parse_bool("scale_params")?,
+        "parameter_scaling" => {
+            opts.parameter_scaling = match value.to_lowercase().as_str() {
+                "auto" => ParameterScaling::Auto,
+                "none" | "off" => ParameterScaling::None,
+                "abs" => ParameterScaling::Abs,
+                "rescale2" => ParameterScaling::Rescale2,
+                other => {
+                    return Err(format!(
+                        "fit option `parameter_scaling`: unknown value `{other}` — \
+                         expected auto/none/abs/rescale2"
+                    ));
+                }
+            };
+        }
         "max_unconverged_frac" => opts.max_unconverged_frac = parse_f64("max_unconverged_frac")?,
         "min_obs_for_convergence_check" => {
             opts.min_obs_for_convergence_check =
@@ -3855,6 +4258,199 @@ fn parse_scaling_block(
     Ok((scaling, readout))
 }
 
+// ── ode_template desugaring + the analytical+ODE-only-absorption error rule ──
+
+/// Built-in absorption input-rate functions with **no closed form**, which
+/// therefore require an ODE disposition (the error rule, #322 Phase 0b). The
+/// closed-form-capable functions (`first_order`, `zero_order`) are intentionally
+/// excluded — they can ride on an analytical `pk` model.
+///
+/// This lists only the functions that are **actually implemented** as input
+/// rates today (`transit`, #343). Each later absorption function adds its own
+/// name here in the same PR that implements it — Phase 1 `igd` (#347), Phase 2
+/// `weibull` — so the error rule never advertises a function the engine can't yet
+/// run (which would send the user to `ode_template` for a dead end, Ron #363).
+const ODE_ONLY_ABSORPTION_FNS: [&str; 1] = ["transit"];
+
+/// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
+/// the first such function name found. Drives the error rule that rejects an
+/// analytical `pk` disposition combined with an ODE-only absorption term.
+fn ode_only_absorption_fn_in_odes(odes: Option<&Vec<String>>) -> Option<&'static str> {
+    let lines = odes?;
+    for line in lines {
+        for &f in ODE_ONLY_ABSORPTION_FNS.iter() {
+            if find_word_call(line, f).is_some() {
+                return Some(f);
+            }
+        }
+    }
+    None
+}
+
+/// Desugar an `ode_template NAME(...)` directive in `[structural_model]` into the
+/// hand-written ODE form (#322 Phase 0b).
+///
+/// Generates the standard disposition ODE for the named model
+/// (`crate::pk::ode_template::generate`), then rewrites the `structural_model`,
+/// `odes`, and `scaling` blocks so the ordinary ODE pipeline takes over with no
+/// special-casing. **Override semantics** (Ron, 2026-06-14): a `d/dt(X)` declared
+/// by the user in `[odes]` *replaces* the generated equation for compartment `X`;
+/// compartments the user leaves undeclared keep the generated RHS (no `+=`
+/// append form). A no-op if `[structural_model]` has no `ode_template` line.
+fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
+    // Cheap pre-check so the common (non-`ode_template`) model pays no regex
+    // compilation: bail before any work unless `[structural_model]` actually
+    // contains an `ode_template` line.
+    let has_template = matches!(
+        extracted.unnamed.get("structural_model"),
+        Some(lines) if lines.iter().any(|l| l.starts_with("ode_template"))
+    );
+    if !has_template {
+        return Ok(());
+    }
+
+    // Detect the `ode_template NAME(params)` line (and reject mixing it with a
+    // `pk`/`ode(...)` disposition) in a scope that releases the immutable borrow
+    // before the block rewrites below.
+    let tmpl_re = Regex::new(r"^ode_template\s+(\w+)\s*\(([^)]*)\)\s*$").unwrap();
+    let (model_name, params_str) = {
+        let struct_lines = match extracted.unnamed.get("structural_model") {
+            Some(l) => l,
+            None => return Ok(()),
+        };
+        let mut found: Option<(String, String)> = None;
+        let mut has_other_disposition = false;
+        for line in struct_lines {
+            if let Some(caps) = tmpl_re.captures(line) {
+                if found.is_some() {
+                    return Err(
+                        "[structural_model]: more than one `ode_template` line; declare exactly one."
+                            .to_string(),
+                    );
+                }
+                found = Some((caps[1].to_string(), caps[2].to_string()));
+            } else if line.starts_with("pk ")
+                || line.starts_with("ode(")
+                || line.starts_with("ode ")
+            {
+                has_other_disposition = true;
+            }
+        }
+        match found {
+            // `has_template` was true (some line starts with `ode_template`), so a
+            // `None` here means that line did not match `ode_template NAME(...)` —
+            // a malformed directive. Reject it explicitly rather than silently
+            // falling through to a confusing "No PK model found" downstream (or,
+            // with a `transit()` in [odes], the error rule telling the user to
+            // "use ode_template" when they already are).
+            None => {
+                return Err(
+                    "[structural_model]: malformed `ode_template` line — expected \
+                     `ode_template NAME(role=VAR, ...)`, e.g. \
+                     `ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)`."
+                        .to_string(),
+                );
+            }
+            Some(_) if has_other_disposition => {
+                return Err(
+                    "[structural_model]: `ode_template` cannot be combined with a `pk ...` or \
+                     `ode(...)` disposition — choose one. `ode_template` already generates the \
+                     full disposition ODE; add absorption / custom terms via override `d/dt(...)` \
+                     lines in [odes]."
+                        .to_string(),
+                );
+            }
+            Some(x) => x,
+        }
+    };
+
+    // Parse `role=VAR` pairs through the same strict helper as `pk NAME(...)`
+    // (`parse_role_pairs`) so the two paths agree on malformed/duplicate handling.
+    let params = parse_role_pairs(&params_str, &format!("ode_template {model_name}"))?;
+
+    let generated = crate::pk::ode_template::generate(&model_name, &params)?;
+
+    // `ode_template` produces a concentration readout via the injected
+    // `obs_scale` (amount-based states / V), which the SDE/EKF path does not yet
+    // support (it runs in the unscaled observation space). Without this guard the
+    // injected `obs_scale` trips the generic SDE-scaling error downstream, which
+    // blames a `[scaling]` block the user never wrote. Reject the combination
+    // here with an accurate message instead.
+    if extracted.unnamed.contains_key("diffusion") {
+        return Err(
+            "[structural_model]: `ode_template` is not supported with a `[diffusion]` (SDE/EKF) \
+             model — it generates a concentration readout (`obs_scale`), which the EKF path does \
+             not yet handle. Write the disposition by hand with `ode(...)` in amount space instead."
+                .to_string(),
+        );
+    }
+
+    // --- Override merge into [odes] -----------------------------------------
+    // A **top-level** user `d/dt(X)` replaces the generated equation for X. Reuse
+    // `diffeq_state` (whitespace-insensitive, matching `build_ode_spec`'s token
+    // parser) so override detection can't drift from what the engine treats as a
+    // state equation. Only top-level equations count: a `d/dt(X)` nested inside an
+    // `if {...}` is a *conditional* tweak, so the generated unconditional equation
+    // is kept (the two coexist — the conditional one wins when its branch fires,
+    // the generated default applies otherwise). Suppressing the default for a
+    // conditional override would silently leave X with no derivative outside the
+    // branch. Brace depth is tracked across lines; an inline `if (..) { d/dt.. }`
+    // line never starts with `d/dt`, so it is naturally excluded.
+    let user_odes = extracted.unnamed.get("odes").cloned().unwrap_or_default();
+    let mut overridden: Vec<String> = Vec::new();
+    let mut brace_depth: i32 = 0;
+    for line in &user_odes {
+        if brace_depth == 0 {
+            if let Some(cmt) = diffeq_state(line) {
+                if !generated.states.iter().any(|s| s == &cmt) {
+                    return Err(format!(
+                        "[odes]: d/dt({cmt}) overrides a compartment not generated by \
+                         `ode_template {model_name}` (generated states: {}). Override only a \
+                         generated compartment, or use a hand-written `ode(...)` model instead.",
+                        generated.states.join(", ")
+                    ));
+                }
+                overridden.push(cmt);
+            }
+        }
+        brace_depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if brace_depth < 0 {
+            brace_depth = 0;
+        }
+    }
+    // User lines first (they may define helper vars used by their overrides),
+    // then the generated equations for every non-overridden compartment. The
+    // duplicate-`d/dt` check in `build_ode_spec` is the backstop against a merge
+    // bug ever letting two equations through for the same state.
+    let mut merged = user_odes;
+    for (state, line) in &generated.odes {
+        if !overridden.iter().any(|s| s == state) {
+            merged.push(line.clone());
+        }
+    }
+    extracted.unnamed.insert("odes".to_string(), merged);
+
+    // --- Rewrite [structural_model] to the synthesized ode(...) form --------
+    extracted.unnamed.insert(
+        "structural_model".to_string(),
+        vec![format!(
+            "ode(obs_cmt={}, states=[{}])",
+            generated.obs_cmt,
+            generated.states.join(", ")
+        )],
+    );
+
+    // --- Supply obs_scale via [scaling] unless the user wrote their own -----
+    // A user-provided [scaling] block wins (e.g. a Form C `y = <expr>` readout);
+    // otherwise inject the generated central-volume scale.
+    extracted
+        .unnamed
+        .entry("scaling".to_string())
+        .or_insert_with(|| vec![format!("obs_scale = {}", generated.obs_scale)]);
+
+    Ok(())
+}
+
 // ── [structural_model] ODE variant parser ───────────────────────────────────
 
 fn parse_ode_structural(lines: &[String]) -> Result<(Vec<String>, Option<String>), String> {
@@ -4172,7 +4768,7 @@ fn parse_covariate_nn_block(name: &str, lines: &[String]) -> Result<CovariateNnS
 /// (`build_pk_param_fn`) both consult this map, so a name binds to the same
 /// slot whether it is being written or read.
 fn ode_param_slots(names: &[String]) -> Result<Vec<usize>, String> {
-    let reserved = [PK_IDX_F, PK_IDX_LAGTIME];
+    let reserved = RESERVED_PK_SLOTS;
     let mut taken = [false; MAX_PK_PARAMS];
     let mut slots = vec![usize::MAX; names.len()];
 
@@ -4214,6 +4810,212 @@ fn ode_param_slots(names: &[String]) -> Result<Vec<usize>, String> {
     Ok(slots)
 }
 
+/// Find `name(` at a word boundary in `s` (ASCII), returning the index of `name`.
+fn find_word_call(s: &str, name: &str) -> Option<usize> {
+    let pat = format!("{name}(");
+    let b = s.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(&pat) {
+        let i = from + rel;
+        let before_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if before_ok {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// Given the index of a `(` in `s` (ASCII), return the inner text and the index
+/// just past the matching `)`. `None` if unbalanced.
+fn balanced_parens(s: &str, open: usize) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    if b.get(open) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    for i in open..b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((s[open + 1..i].to_string(), i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// State name `X` if `line` is a `d/dt(X) = …` equation, else `None`.
+///
+/// Whitespace-insensitive, matching the **token-based** `[odes]` statement
+/// parser ([`parse_statement`], which recognises `d/dt(NAME)` as the token
+/// sequence `Ident("d") Slash Ident("dt") LParen Ident RParen` regardless of
+/// spacing — so `d/dt (central)` and `d / dt(central)` are valid state
+/// equations there). A literal `strip_prefix("d/dt(")` would diverge from that
+/// and, in the `ode_template` override merge, miss a spaced override — leaving
+/// both the generated and the user equation in place for a misleading
+/// "duplicate d/dt" error. We collapse interior whitespace before matching so
+/// the two definitions can never drift apart.
+fn diffeq_state(line: &str) -> Option<String> {
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    let rest = compact.strip_prefix("d/dt(")?;
+    let close = rest.find(')')?;
+    Some(rest[..close].to_string())
+}
+
+/// True if the call spanning `[start, end)` in `line` (ASCII) is **not** a bare,
+/// positively-signed, top-level additive term — i.e. it is scaled (`*` `/` `^`),
+/// negated (a leading `-`), or grouped (`(` immediately before / `)` immediately
+/// after, which can hide an outer scale such as `(transit(...))/V`). The
+/// input-rate forcing is always injected as `+R_in`, unscaled, so only a bare
+/// `+ transit(...)` term is faithful; any other context would silently drop the
+/// sign or scale. Surrounding spaces are skipped; the faithful preceding chars
+/// are `=` (RHS start) and `+`, the faithful following chars are end-of-line,
+/// `+`, and `-` (each starts a new additive term).
+fn call_is_scaled_or_signed(line: &str, start: usize, end: usize) -> bool {
+    let b = line.as_bytes();
+    let mut i = start;
+    while i > 0 && b[i - 1] == b' ' {
+        i -= 1;
+    }
+    let before_bad = i > 0 && matches!(b[i - 1], b'*' | b'/' | b'^' | b'-' | b'(');
+    let mut j = end;
+    while j < b.len() && b[j] == b' ' {
+        j += 1;
+    }
+    let after_bad = j < b.len() && matches!(b[j], b'*' | b'/' | b'^' | b')');
+    before_bad || after_bad
+}
+
+/// Split a string on top-level commas (commas outside nested parentheses).
+fn split_args_on_commas(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut last = 0;
+    for (i, &c) in s.as_bytes().iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&s[last..i]);
+                last = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[last..]);
+    parts
+}
+
+/// Extract built-in absorption input-rate calls (currently `transit(...)`,
+/// design A) from the `[odes]` RHS lines. For each
+/// `d/dt(STATE) = … transit(n=P, mtt=Q) …`, records an [`InputRateForcing`]
+/// (`cmt` ← STATE index; `n`/`mtt` resolved to individual-parameter slots) and
+/// rewrites the call to `0` so the remaining RHS parses as a normal expression.
+/// Returns the cleaned lines and the collected forcing terms.
+///
+/// Validation (negative-tested): `transit(...)` must be the input rate of a
+/// top-level `d/dt(...)` equation; args are exactly `n` and `mtt`, each a
+/// declared individual parameter; a scaled call (`FR*transit(...)`) and more than
+/// one call per equation are rejected (parallel/biphasic comes with later models).
+fn extract_input_rate_terms(
+    rhs_lines: &[String],
+    state_names: &[String],
+    indiv_param_names: &[String],
+    indiv_param_slots: &[usize],
+) -> Result<(Vec<String>, Vec<crate::pk::absorption::InputRateForcing>), String> {
+    use crate::pk::absorption::{InputRateForcing, InputRateKind};
+    let resolve_slot = |val: &str, arg: &str| -> Result<usize, String> {
+        indiv_param_names
+            .iter()
+            .position(|p| p == val)
+            .map(|i| indiv_param_slots[i])
+            .ok_or_else(|| {
+                format!(
+                    "[odes]: transit({arg}={val}): `{val}` is not a declared individual parameter"
+                )
+            })
+    };
+
+    let mut forcings = Vec::new();
+    let mut cleaned = Vec::with_capacity(rhs_lines.len());
+    for raw in rhs_lines {
+        let Some(start) = find_word_call(raw, "transit") else {
+            cleaned.push(raw.clone());
+            continue;
+        };
+        let state = diffeq_state(raw).ok_or_else(|| {
+            format!(
+                "[odes]: transit(...) may only be the input rate of a `d/dt(...)` equation — \
+                 found it in `{}`",
+                raw.trim()
+            )
+        })?;
+        let cmt = state_names
+            .iter()
+            .position(|s| s == &state)
+            .ok_or_else(|| format!("[odes]: d/dt({state}): undeclared state"))?;
+
+        let open = start + "transit".len();
+        let (inner, end) = balanced_parens(raw, open).ok_or_else(|| {
+            format!(
+                "[odes]: transit(...): unbalanced parentheses in `{}`",
+                raw.trim()
+            )
+        })?;
+        if call_is_scaled_or_signed(raw, start, end) {
+            return Err(
+                "[odes]: transit(...) must be a standalone, positively-signed additive input \
+                 rate — it cannot be scaled (`* / ^`), negated (a leading `-`), or wrapped in \
+                 parentheses (e.g. `FR*transit(...)`, `-transit(...)`, `(transit(...))/V`), \
+                 since these silently drop the sign/scale. Write it as a bare `+ transit(...)` \
+                 term."
+                    .to_string(),
+            );
+        }
+
+        let mut n_slot = None;
+        let mut mtt_slot = None;
+        for part in split_args_on_commas(&inner) {
+            let (name, val) = part.split_once('=').ok_or_else(|| {
+                format!(
+                    "[odes]: transit(...) arguments must be `name=parameter`, got `{}`",
+                    part.trim()
+                )
+            })?;
+            let (name, val) = (name.trim(), val.trim());
+            match name {
+                "n" => n_slot = Some(resolve_slot(val, "n")?),
+                "mtt" => mtt_slot = Some(resolve_slot(val, "mtt")?),
+                other => {
+                    return Err(format!(
+                        "[odes]: transit(...) has no argument `{other}` (expected `n` and `mtt`)"
+                    ))
+                }
+            }
+        }
+        let n_slot = n_slot.ok_or("[odes]: transit(...) missing required argument `n`")?;
+        let mtt_slot = mtt_slot.ok_or("[odes]: transit(...) missing required argument `mtt`")?;
+
+        forcings.push(InputRateForcing {
+            cmt,
+            kind: InputRateKind::Transit,
+            arg_slots: vec![n_slot, mtt_slot],
+        });
+
+        let new_line = format!("{}0{}", &raw[..start], &raw[end..]);
+        if find_word_call(&new_line, "transit").is_some() {
+            return Err("[odes]: at most one transit(...) per d/dt equation (Phase 0)".to_string());
+        }
+        cleaned.push(new_line);
+    }
+    Ok((cleaned, forcings))
+}
+
 fn build_ode_spec(
     lines: &[String],
     state_names: &[String],
@@ -4251,6 +5053,22 @@ fn build_ode_spec(
         .cloned()
         .chain(indiv_param_names.iter().cloned())
         .collect();
+    // Names an init expression can resolve, mirroring the exact keys the
+    // `init_fn` closure seeds below: states (original + lowercase, bound to 0 at
+    // init time) and individual parameters (original + upper + lowercase). A
+    // `Variable` outside this set (the MACHEPS builtin aside — handled in the
+    // loop below) silently reads 0.0 via `eval_expression` (issue #314), so
+    // reject it at parse time.
+    let mut init_defined: HashMap<String, usize> = HashMap::new();
+    for n in state_names {
+        init_defined.insert(n.clone(), 0);
+        init_defined.insert(n.to_lowercase(), 0);
+    }
+    for n in indiv_param_names {
+        init_defined.insert(n.clone(), 0);
+        init_defined.insert(n.to_uppercase(), 0);
+        init_defined.insert(n.to_lowercase(), 0);
+    }
     let mut init_specs: Vec<(usize, Expression)> = Vec::new();
     let mut seen_init: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut rhs_lines: Vec<String> = Vec::with_capacity(lines.len());
@@ -4271,11 +5089,42 @@ fn build_ode_spec(
             let ctx = ParseCtx::ode(&init_ctx_defined);
             let expr = parse_scalar_expression(&expr_str, ctx)
                 .map_err(|e| format!("[odes] init({}): {}", name, e))?;
+            let mut undef: std::collections::HashSet<String> = std::collections::HashSet::new();
+            collect_undefined_vars(&expr, &init_defined, &mut undef);
+            // MACHEPS is a builtin constant that `eval_expression` resolves to
+            // f64::EPSILON case-insensitively, so accept any casing here (the
+            // exact-key `init_defined` carries only states/params, not MACHEPS).
+            undef.retain(|n| !n.eq_ignore_ascii_case("MACHEPS"));
+            if !undef.is_empty() {
+                let mut names: Vec<String> = undef.into_iter().collect();
+                names.sort();
+                let mut defined = init_ctx_defined.clone();
+                defined.sort();
+                return Err(format!(
+                    "[odes] init({}): references undefined name(s): {}. An init \
+                     expression may only reference declared states (0 at init \
+                     time), individual parameters, or the MACHEPS constant \
+                     (defined: {}).",
+                    name,
+                    names.join(", "),
+                    defined.join(", "),
+                ));
+            }
             init_specs.push((idx, expr));
         } else {
             rhs_lines.push(raw.clone());
         }
     }
+
+    // Design A: pull built-in input-rate calls (transit(...)) out of each d/dt RHS
+    // into forcing terms before expression parsing, so they never enter the
+    // expression AST / bytecode / symbolic-AD core (each call is rewritten to `0`).
+    let (rhs_lines, input_rate) = extract_input_rate_terms(
+        &rhs_lines,
+        state_names,
+        indiv_param_names,
+        indiv_param_slots,
+    )?;
 
     // For ODE RHS expressions, states + individual params get injected into the
     // `vars` map at eval time, so every bare identifier should resolve to a
@@ -4487,7 +5336,7 @@ fn build_ode_spec(
     // These names are reserved: reject any ODE state, individual parameter, or
     // intermediate that collides with a reserved slot so the injected solver-time
     // values are always reachable.
-    const RESERVED_ODE_NAMES: &[&str] = &["TIME", "T", "TAFD", "TAD"];
+    const RESERVED_ODE_NAMES: &[&str] = &["TIME", "T", "TAFD", "TAD", "MACHEPS"];
     for reserved in RESERVED_ODE_NAMES {
         let collides = state_names_owned
             .iter()
@@ -4496,9 +5345,9 @@ fn build_ode_spec(
             .any(|n| n.eq_ignore_ascii_case(reserved));
         if collides {
             return Err(format!(
-                "[odes] the name `{reserved}` is reserved for the solver-injected time \
-                 variable and cannot be used as a state, individual-parameter, or \
-                 intermediate name"
+                "[odes] the name `{reserved}` is reserved for a solver-injected builtin \
+                 (TIME/TAFD/TAD/MACHEPS) and cannot be used as a state, \
+                 individual-parameter, or intermediate name"
             ));
         }
     }
@@ -4506,6 +5355,7 @@ fn build_ode_spec(
     let time_slot = n_base_vars;
     let tafd_slot = n_base_vars + 1;
     let tad_slot = n_base_vars + 2;
+    let macheps_slot = n_base_vars + 3;
     // Forcefully assign reserved names (overwrite any accidental or_insert entry).
     var_idx.insert("TIME".to_string(), time_slot);
     var_idx.insert("time".to_string(), time_slot);
@@ -4515,7 +5365,46 @@ fn build_ode_spec(
     var_idx.insert("tafd".to_string(), tafd_slot);
     var_idx.insert("TAD".to_string(), tad_slot);
     var_idx.insert("tad".to_string(), tad_slot);
-    let n_vars_total = n_base_vars + 3;
+    // MACHEPS — machine epsilon, a compile-time constant. Matches its
+    // availability in `[derived]` and `init(...)` expressions.
+    var_idx.insert("MACHEPS".to_string(), macheps_slot);
+    var_idx.insert("macheps".to_string(), macheps_slot);
+    let n_vars_total = n_base_vars + 4;
+
+    // Reject undefined identifiers in ODE RHS expressions (issue #314). In the
+    // ODE parse context `fallback_covariate = false`, so a typo'd, omitted,
+    // theta-only, or covariate name becomes a plain `Variable` that
+    // `resolve_expr_indices` maps to the `usize::MAX` sentinel — the bytecode
+    // read then silently returns 0.0, producing a structurally-broken fit with
+    // no diagnostic. `var_idx` now holds every resolvable name (states,
+    // individual parameters, ODE-block intermediates, and the reserved
+    // TIME/TAFD/TAD slots), so any `Variable` whose name is not a key in it
+    // cannot resolve. (The covariate guard above only matches `Covariate`
+    // nodes, which this parse context never emits, so this is what actually
+    // surfaces the bug.)
+    let mut undefined_rhs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_undefined_vars_in_stmts(&stmts_owned, &var_idx, &mut undefined_rhs);
+    if !undefined_rhs.is_empty() {
+        let mut names: Vec<String> = undefined_rhs.into_iter().collect();
+        names.sort();
+        let mut defined: Vec<String> = state_names_owned
+            .iter()
+            .chain(indiv_names_owned.iter())
+            .chain(intermediates.iter())
+            .cloned()
+            .collect();
+        defined.sort();
+        return Err(format!(
+            "[odes]: RHS references undefined name(s): {}. An ODE RHS may only \
+             reference declared states, individual parameters, ODE-block \
+             intermediates, or the reserved TIME/TAFD/TAD/MACHEPS variables \
+             (defined: {}). If one of these is a covariate, pre-compute the \
+             covariate-dependent term in [individual_parameters] and reference \
+             that variable here instead.",
+            names.join(", "),
+            defined.join(", "),
+        ));
+    }
 
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
@@ -4609,6 +5498,11 @@ fn build_ode_spec(
                         .filter(|v| v.is_finite())
                         .map_or(f64::NAN, |last| t - last);
                 }
+                // MACHEPS — machine epsilon constant, available in every ODE
+                // expression (parallels its `[derived]`/`init` availability).
+                if let Some(dst) = scratch.rhs_vars.get_mut(macheps_slot) {
+                    *dst = f64::EPSILON;
+                }
 
                 // Reset du so a state without a firing d/dt this iteration
                 // (e.g. inside an untaken if-branch) gets 0.0 rather than
@@ -4676,6 +5570,31 @@ fn build_ode_spec(
         }))
     };
 
+    // Compartment-indexed dose attributes (NONMEM `Fn`/`ALAGn`; issue #369). An
+    // individual parameter named `F{c}` / `ALAG{c}` / `LAGTIME{c}` binds the
+    // bioavailability / lag for doses into compartment `c` (1-based); the bare
+    // `F`/`lagtime` (at PK_IDX_F/PK_IDX_LAGTIME) remain the all-compartment
+    // default, overridden per compartment by an indexed entry. The slot is the
+    // one `ode_param_slots` already assigned the name (parallel to
+    // `indiv_param_names`), so the RHS can still read the same value.
+    let mut dose_attr_map = crate::types::DoseAttrMap::default();
+    for (i, name) in indiv_param_names.iter().enumerate() {
+        if let Some((attr, cmt)) = crate::types::DoseAttr::from_indexed_name(name) {
+            if cmt > n_states {
+                return Err(format!(
+                    "[individual_parameters]: `{name}` is a compartment-indexed dose \
+                     attribute for compartment {cmt}, but the model has only {n_states} \
+                     compartment(s) {state_names:?}. Compartment indices are 1-based."
+                ));
+            }
+            // `indiv_param_slots` is parallel to `indiv_param_names` (asserted
+            // above), so the slot for `i` always exists — index directly, as the
+            // input-rate extractor (`extract_input_rate_terms`) already does.
+            let slot = indiv_param_slots[i];
+            dose_attr_map.insert(attr, cmt, slot);
+        }
+    }
+
     Ok(crate::ode::OdeSpec {
         rhs,
         n_states,
@@ -4683,6 +5602,13 @@ fn build_ode_spec(
         readout: crate::ode::OdeReadout::ObsCmt(obs_cmt_idx),
         diffusion_var: Vec::new(),
         init_fn,
+        // Default tolerances; overwritten from [fit_options] / settings by
+        // CompiledModel::sync_ode_solver_opts once fit options are merged.
+        solver_opts: crate::ode::OdeSolverOptions::default(),
+        // Built-in absorption forcing terms split out of the [odes] RHS above
+        // (design A); empty for models with no transit()/etc. input-rate call.
+        input_rate,
+        dose_attr_map,
     })
 }
 
@@ -5355,6 +6281,39 @@ fn build_omega_fixed(
 
 // --- Structural model parsing ---
 
+/// Parse a `role=VAR, role=VAR, …` list from a `pk NAME(...)` / `ode_template
+/// NAME(...)` parameter string into a `role(lowercased) → VAR` map.
+///
+/// **Strict and single-sourced** (Ron, #363): a pair that is not exactly
+/// `role=VAR` with both sides non-empty is a hard error, and a duplicate role is
+/// a hard error — for both the analytical `pk` and the `ode_template` paths, so
+/// the two can't drift in strictness (they used to: `pk` silently dropped
+/// malformed pairs and last-wins on duplicates). A trailing comma (empty pair) is
+/// tolerated. `ctx` is the directive prefix used in error messages, e.g.
+/// `"pk two_cpt_oral"` or `"ode_template two_cpt_oral"`.
+fn parse_role_pairs(params_str: &str, ctx: &str) -> Result<HashMap<String, String>, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    for pair in params_str.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = pair.split('=').map(str::trim).collect();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return Err(format!(
+                "{ctx}: malformed parameter `{pair}` (expected `role=VARNAME`)."
+            ));
+        }
+        if map
+            .insert(parts[0].to_lowercase(), parts[1].to_string())
+            .is_some()
+        {
+            return Err(format!("{ctx}: duplicate parameter `{}`.", parts[0]));
+        }
+    }
+    Ok(map)
+}
+
 fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, String>), String> {
     // pk model_name(param=VAR, param=VAR, ...)
     let pk_re = Regex::new(r"pk\s+(\w+)\(([^)]+)\)").unwrap();
@@ -5362,55 +6321,57 @@ fn parse_structural_model(lines: &[String]) -> Result<(PkModel, HashMap<String, 
     for line in lines {
         if let Some(caps) = pk_re.captures(line) {
             let model_name = &caps[1];
-            let pk_model = match model_name {
-                "one_cpt_iv" | "one_compartment_iv" => PkModel::OneCptIv,
-                "one_cpt_oral" | "one_compartment_oral" => PkModel::OneCptOral,
-                "two_cpt_iv" | "two_compartment_iv" => PkModel::TwoCptIv,
-                "two_cpt_oral" | "two_compartment_oral" => PkModel::TwoCptOral,
-                "three_cpt_iv" | "three_compartment_iv" => PkModel::ThreeCptIv,
-                "three_cpt_oral" | "three_compartment_oral" => PkModel::ThreeCptOral,
+            // Name → model is resolved through the shared `PkModel::from_name`
+            // (canonical + long-form aliases) so the `pk` and `ode_template` paths
+            // accept exactly the same set; retired and unknown names are handled
+            // here because they produce path-specific diagnostics, not a `PkModel`.
+            let pk_model = match PkModel::from_name(model_name) {
+                Some(m) => m,
                 // Retired names (issue #176): bolus and infusion are no longer
                 // separate model variants — the route is read per-dose from the
                 // RATE column. Emit a migration error so users update their
                 // model files explicitly rather than relying on a silent alias.
-                retired @ ("one_cpt_iv_bolus"
-                | "one_compartment_iv_bolus"
-                | "one_cpt_infusion"
-                | "one_compartment_infusion"
-                | "two_cpt_iv_bolus"
-                | "two_compartment_iv_bolus"
-                | "two_cpt_infusion"
-                | "two_compartment_infusion"
-                | "three_cpt_iv_bolus"
-                | "three_compartment_iv_bolus"
-                | "three_cpt_infusion"
-                | "three_compartment_infusion") => {
-                    let n = if retired.starts_with("one") {
-                        "one"
-                    } else if retired.starts_with("two") {
-                        "two"
-                    } else {
-                        "three"
-                    };
-                    return Err(format!(
-                        "`{retired}` was removed in #176; use `{n}_cpt_iv` instead. \
-                         Bolus and infusion administration are now driven by the \
-                         RATE column in the dataset (RATE=0 for bolus, RATE>0 for \
-                         infusion), so a single `{n}_cpt_iv` model handles either \
-                         or a mix of both within the same subject."
-                    ));
-                }
-                other => return Err(format!("Unknown PK model: {}", other)),
+                None => match model_name {
+                    retired @ ("one_cpt_iv_bolus"
+                    | "one_compartment_iv_bolus"
+                    | "one_cpt_infusion"
+                    | "one_compartment_infusion"
+                    | "two_cpt_iv_bolus"
+                    | "two_compartment_iv_bolus"
+                    | "two_cpt_infusion"
+                    | "two_compartment_infusion"
+                    | "three_cpt_iv_bolus"
+                    | "three_compartment_iv_bolus"
+                    | "three_cpt_infusion"
+                    | "three_compartment_infusion") => {
+                        let n = if retired.starts_with("one") {
+                            "one"
+                        } else if retired.starts_with("two") {
+                            "two"
+                        } else {
+                            "three"
+                        };
+                        return Err(format!(
+                            "`{retired}` was removed in #176; use `{n}_cpt_iv` instead. \
+                             Bolus and infusion administration are now driven by the \
+                             RATE column in the dataset (RATE=0 for bolus, RATE>0 for \
+                             infusion), so a single `{n}_cpt_iv` model handles either \
+                             or a mix of both within the same subject."
+                        ));
+                    }
+                    other => return Err(format!("Unknown PK model: {}", other)),
+                },
             };
 
-            let params_str = &caps[2];
-            let mut param_map = HashMap::new();
-            for pair in params_str.split(',') {
-                let parts: Vec<&str> = pair.split('=').map(|s| s.trim()).collect();
-                if parts.len() == 2 {
-                    param_map.insert(parts[0].to_lowercase(), parts[1].to_string());
-                }
-            }
+            // Strict, shared with `ode_template` (`parse_role_pairs`): a malformed
+            // or duplicate `role=VAR` pair is rejected rather than silently dropped.
+            let param_map = parse_role_pairs(&caps[2], &format!("pk {model_name}"))?;
+
+            // Structural-mapping validation (required params present, unused
+            // params, undefined references) is deferred to `parse_full_model`,
+            // which runs it *after* `build_pk_param_fn` so the per-key checks
+            // (unknown key / undefined reference, #308) report first and the
+            // required-completeness / unused checks (#309) layer cleanly on top.
 
             return Ok((pk_model, param_map));
         }
@@ -5729,19 +6690,61 @@ fn build_pk_param_fn(
     let vars_in_order = var_names.to_vec();
 
     // Pre-resolve pk_map → indexed (pk_slot, var_slot) pairs so the hot
-    // loop is two array reads instead of two HashMap probes.
-    let pk_assignment_mapping: Vec<(usize, usize)> = pk_param_map
-        .iter()
-        .filter_map(|(pk_name, var_name)| {
-            let pk_slot = PkParams::name_to_index(pk_name)?;
-            let var_slot = var_idx.get(var_name).copied().or_else(|| {
-                // Fall back to lowercase lookup — matches the previous
-                // `vars.get(var_name.to_lowercase())` compat behaviour.
-                var_idx.get(&var_name.to_lowercase()).copied()
-            })?;
-            Some((pk_slot, var_slot))
-        })
-        .collect();
+    // loop is two array reads instead of two HashMap probes. Each structural
+    // PK value is one of three things, in this precedence:
+    //   1. a defined [individual_parameters] variable → bound by slot;
+    //   2. a numeric literal (e.g. `ka=1.0`)           → bound as a constant;
+    //   3. neither                                     → hard parse error.
+    // The earlier `filter_map` silently `?`-dropped both the undefined-variable
+    // (3) and the literal (2) cases, leaving the slot at `PkParams::default()`
+    // (0.0 for everything but F). For an undefined reference that produced a
+    // structurally-broken model that still "converged" with every prediction
+    // floored to the log constant (#261); for a literal it silently meant the
+    // value 0.0. Both now resolve correctly or error.
+    //
+    // Iterate in sorted key order so a model with several bad bindings always
+    // reports the same one (HashMap iteration order is otherwise arbitrary).
+    let mut pk_entries: Vec<(&String, &String)> = pk_param_map.iter().collect();
+    pk_entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut pk_assignment_mapping: Vec<(usize, usize)> = Vec::with_capacity(pk_entries.len());
+    let mut pk_const_mapping: Vec<(usize, f64)> = Vec::new();
+    for (pk_name, var_name) in pk_entries {
+        let pk_slot = PkParams::name_to_index(pk_name).ok_or_else(|| {
+            format!(
+                "[structural_model] unknown PK parameter `{pk_name}`; valid names are \
+                 cl, v/v1, q/q2, v2, ka, f, q3, v3, lagtime/alag"
+            )
+        })?;
+        // Fall back to lowercase lookup — matches the previous
+        // `vars.get(var_name.to_lowercase())` compat behaviour.
+        let var_slot = var_idx
+            .get(var_name)
+            .copied()
+            .or_else(|| var_idx.get(&var_name.to_lowercase()).copied());
+        if let Some(var_slot) = var_slot {
+            pk_assignment_mapping.push((pk_slot, var_slot));
+        } else if let Ok(c) = var_name.parse::<f64>() {
+            // A numeric literal binds the slot to a constant — but `f64::from_str`
+            // also accepts `inf`/`nan`/`infinity`, which are never a meaningful PK
+            // value. Reject them rather than binding a silently-degenerate
+            // constant (the same silent-wrong default #261 set out to remove).
+            if !c.is_finite() {
+                return Err(format!(
+                    "[structural_model] parameter `{pk_name}` has non-finite constant value \
+                     `{var_name}`; use a finite number or a defined [individual_parameters] \
+                     variable"
+                ));
+            }
+            pk_const_mapping.push((pk_slot, c));
+        } else {
+            return Err(format!(
+                "[structural_model] parameter `{pk_name}` references variable `{var_name}`, \
+                 which is not defined in [individual_parameters] (defined: {}). \
+                 Define it, e.g. `{var_name} = ...`.",
+                var_names.join(", ")
+            ));
+        }
+    }
     let is_analytical_pk = !pk_param_map.is_empty();
 
     // ODE branch counterpart of the analytical pre-resolution: map each
@@ -5821,6 +6824,11 @@ fn build_pk_param_fn(
             if is_analytical_pk {
                 for &(pk_slot, var_slot) in &pk_assignment_mapping {
                     p.values[pk_slot] = vars[var_slot];
+                }
+                // Literal-valued slots (e.g. `ka=1.0`) are constants — no
+                // per-call evaluation, just write the parsed value.
+                for &(pk_slot, c) in &pk_const_mapping {
+                    p.values[pk_slot] = c;
                 }
             } else {
                 // ODE model: store each individual parameter at its
@@ -6000,148 +7008,167 @@ impl<'a> ParseCtx<'a> {
     }
 }
 
-/// Walk an expression tree and accumulate every covariate name it references.
-fn collect_covariates(expr: &Expression, out: &mut std::collections::HashSet<String>) {
+/// Pre-order walk over every node of an expression tree, invoking `f` on each.
+/// This single traversal backs the `collect_covariates`, `collect_undefined_vars`,
+/// and `collect_theta_eta` families below — each is a thin wrapper supplying a
+/// leaf-matching closure. Adding a name-bearing `Expression` variant therefore
+/// only requires updating this walker (plus `visit_condition_nodes` /
+/// `visit_stmt_nodes`), not every collector.
+fn visit_expr_nodes(expr: &Expression, f: &mut dyn FnMut(&Expression)) {
+    f(expr);
     match expr {
-        Expression::Covariate(name) => {
-            out.insert(name.clone());
-        }
         Expression::BinOp(lhs, _, rhs) => {
-            collect_covariates(lhs, out);
-            collect_covariates(rhs, out);
+            visit_expr_nodes(lhs, f);
+            visit_expr_nodes(rhs, f);
         }
-        Expression::UnaryFn(_, arg) => collect_covariates(arg, out),
+        Expression::UnaryFn(_, arg) => visit_expr_nodes(arg, f),
         Expression::Power(base, exp) => {
-            collect_covariates(base, out);
-            collect_covariates(exp, out);
+            visit_expr_nodes(base, f);
+            visit_expr_nodes(exp, f);
         }
         Expression::Conditional(cond, t, e) => {
-            collect_covariates_in_condition(cond, out);
-            collect_covariates(t, out);
-            collect_covariates(e, out);
+            visit_condition_nodes(cond, f);
+            visit_expr_nodes(t, f);
+            visit_expr_nodes(e, f);
         }
         _ => {}
     }
 }
 
-fn collect_covariates_in_condition(cond: &Condition, out: &mut std::collections::HashSet<String>) {
+/// Walk every expression embedded in a condition (see `visit_expr_nodes`).
+fn visit_condition_nodes(cond: &Condition, f: &mut dyn FnMut(&Expression)) {
     match cond {
         Condition::Compare(l, _, r) => {
-            collect_covariates(l, out);
-            collect_covariates(r, out);
+            visit_expr_nodes(l, f);
+            visit_expr_nodes(r, f);
         }
         Condition::And(l, r) | Condition::Or(l, r) => {
-            collect_covariates_in_condition(l, out);
-            collect_covariates_in_condition(r, out);
+            visit_condition_nodes(l, f);
+            visit_condition_nodes(r, f);
         }
-        Condition::Not(c) => collect_covariates_in_condition(c, out),
+        Condition::Not(c) => visit_condition_nodes(c, f),
     }
 }
 
-/// Walk a list of statements (assignments and if-blocks) and accumulate every
-/// covariate name they reference.
-fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
+/// Walk every expression in a statement list — assignment/diff-eq RHSs and the
+/// conditions + bodies of `if` blocks (see `visit_expr_nodes`). Bytecode
+/// variants carry no tree to walk (they only appear after
+/// `resolve_variable_indices`).
+fn visit_stmt_nodes(stmts: &[Statement], f: &mut dyn FnMut(&Expression)) {
     for s in stmts {
         match s {
             Statement::Assign(_, e)
             | Statement::AssignIdx(_, e)
             | Statement::DiffEq(_, e)
-            | Statement::DiffEqIdx(_, e) => collect_covariates(e, out),
-            Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {
-                // Bytecode variants only appear after `resolve_variable_indices`;
-                // any covariate reference was already resolved (or rejected
-                // for the ODE-RHS path) before compilation.
-            }
-            Statement::If {
-                branches,
-                else_body,
-            } => {
-                for (cond, body) in branches {
-                    collect_covariates_in_condition(cond, out);
-                    collect_covariates_in_stmts(body, out);
-                }
-                if let Some(eb) = else_body {
-                    collect_covariates_in_stmts(eb, out);
-                }
-            }
-        }
-    }
-}
-
-fn collect_theta_eta(
-    expr: &Expression,
-    thetas: &mut std::collections::HashSet<usize>,
-    etas: &mut std::collections::HashSet<usize>,
-) {
-    match expr {
-        Expression::Theta(i) => {
-            thetas.insert(*i);
-        }
-        Expression::Eta(i) => {
-            etas.insert(*i);
-        }
-        Expression::BinOp(lhs, _, rhs) => {
-            collect_theta_eta(lhs, thetas, etas);
-            collect_theta_eta(rhs, thetas, etas);
-        }
-        Expression::UnaryFn(_, arg) => collect_theta_eta(arg, thetas, etas),
-        Expression::Power(base, exp) => {
-            collect_theta_eta(base, thetas, etas);
-            collect_theta_eta(exp, thetas, etas);
-        }
-        Expression::Conditional(cond, t, e) => {
-            collect_theta_eta_in_condition(cond, thetas, etas);
-            collect_theta_eta(t, thetas, etas);
-            collect_theta_eta(e, thetas, etas);
-        }
-        _ => {}
-    }
-}
-
-fn collect_theta_eta_in_condition(
-    cond: &Condition,
-    thetas: &mut std::collections::HashSet<usize>,
-    etas: &mut std::collections::HashSet<usize>,
-) {
-    match cond {
-        Condition::Compare(l, _, r) => {
-            collect_theta_eta(l, thetas, etas);
-            collect_theta_eta(r, thetas, etas);
-        }
-        Condition::And(l, r) | Condition::Or(l, r) => {
-            collect_theta_eta_in_condition(l, thetas, etas);
-            collect_theta_eta_in_condition(r, thetas, etas);
-        }
-        Condition::Not(c) => collect_theta_eta_in_condition(c, thetas, etas),
-    }
-}
-
-fn collect_theta_eta_in_stmts(
-    stmts: &[Statement],
-    thetas: &mut std::collections::HashSet<usize>,
-    etas: &mut std::collections::HashSet<usize>,
-) {
-    for s in stmts {
-        match s {
-            Statement::Assign(_, e)
-            | Statement::AssignIdx(_, e)
-            | Statement::DiffEq(_, e)
-            | Statement::DiffEqIdx(_, e) => collect_theta_eta(e, thetas, etas),
+            | Statement::DiffEqIdx(_, e) => visit_expr_nodes(e, f),
             Statement::AssignBc(_, _) | Statement::DiffEqBc(_, _) => {}
             Statement::If {
                 branches,
                 else_body,
             } => {
                 for (cond, body) in branches {
-                    collect_theta_eta_in_condition(cond, thetas, etas);
-                    collect_theta_eta_in_stmts(body, thetas, etas);
+                    visit_condition_nodes(cond, f);
+                    visit_stmt_nodes(body, f);
                 }
                 if let Some(eb) = else_body {
-                    collect_theta_eta_in_stmts(eb, thetas, etas);
+                    visit_stmt_nodes(eb, f);
                 }
             }
         }
     }
+}
+
+/// Accumulate every covariate name referenced in an expression.
+fn collect_covariates(expr: &Expression, out: &mut std::collections::HashSet<String>) {
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if let Expression::Covariate(name) = e {
+            out.insert(name.clone());
+        }
+    });
+}
+
+/// Accumulate every covariate name referenced across a statement list.
+fn collect_covariates_in_stmts(stmts: &[Statement], out: &mut std::collections::HashSet<String>) {
+    visit_stmt_nodes(stmts, &mut |e: &Expression| {
+        if let Expression::Covariate(name) = e {
+            out.insert(name.clone());
+        }
+    });
+}
+
+/// Accumulate every `Variable(name)` in an expression whose name is not a key in
+/// `defined` — i.e. a name that would resolve to the `usize::MAX` "reads 0.0"
+/// sentinel in the ODE RHS bytecode (or `vars.get(name).unwrap_or(0.0)` in an
+/// `init` expression). Used to reject undefined references in the `[odes]` block
+/// before they silently corrupt the dynamics (issue #314). Membership is by
+/// exact key: the ODE var maps already carry lower/upper/original aliases for
+/// every resolvable name, so a name absent from `defined` genuinely cannot
+/// resolve.
+fn collect_undefined_vars(
+    expr: &Expression,
+    defined: &HashMap<String, usize>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if let Expression::Variable(name) = e {
+            if !defined.contains_key(name) {
+                out.insert(name.clone());
+            }
+        }
+    });
+}
+
+/// Accumulate undefined `Variable` names (see `collect_undefined_vars`) across a
+/// statement list — a d/dt RHS, an intermediate assignment, or an if-condition.
+fn collect_undefined_vars_in_stmts(
+    stmts: &[Statement],
+    defined: &HashMap<String, usize>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    visit_stmt_nodes(stmts, &mut |e: &Expression| {
+        if let Expression::Variable(name) = e {
+            if !defined.contains_key(name) {
+                out.insert(name.clone());
+            }
+        }
+    });
+}
+
+/// Accumulate the theta and eta indices referenced in an expression. Only the
+/// statement-level variant is used outside the `survival` feature, so this
+/// expression-level entry is gated to its sole caller (`parse_event_model_block`).
+#[cfg(feature = "survival")]
+fn collect_theta_eta(
+    expr: &Expression,
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    visit_expr_nodes(expr, &mut |e: &Expression| match e {
+        Expression::Theta(i) => {
+            thetas.insert(*i);
+        }
+        Expression::Eta(i) => {
+            etas.insert(*i);
+        }
+        _ => {}
+    });
+}
+
+/// Accumulate the theta and eta indices referenced across a statement list.
+fn collect_theta_eta_in_stmts(
+    stmts: &[Statement],
+    thetas: &mut std::collections::HashSet<usize>,
+    etas: &mut std::collections::HashSet<usize>,
+) {
+    visit_stmt_nodes(stmts, &mut |e: &Expression| match e {
+        Expression::Theta(i) => {
+            thetas.insert(*i);
+        }
+        Expression::Eta(i) => {
+            etas.insert(*i);
+        }
+        _ => {}
+    });
 }
 
 /// Collect the sigma names referenced in a `ParsedErrorModel` (before index resolution).
@@ -6533,11 +7560,11 @@ fn compile_bytecode(expr: &Expression) -> Bytecode {
 ///   Jump        :   0
 ///   JumpIfFalse :  -1
 ///
-/// The single linear scan returns an *upper bound* (not the exact peak):
-/// `Conditional` emits both then- and else-branches inline with a `Jump`
-/// between them, so the linear walk credits BOTH branches' pushes against
-/// running depth even though execution only takes one branch at runtime.
-/// That over-estimate is exactly what `eval_bytecode` wants for its
+/// A single linear scan ([`scan_stack_depth`]) returns an *upper bound* (not
+/// the exact peak): `Conditional` emits both then- and else-branches inline
+/// with a `Jump` between them, so the linear walk credits BOTH branches'
+/// pushes against running depth even though execution only takes one branch at
+/// runtime. That over-estimate is exactly what `eval_bytecode` wants for its
 /// `stack.reserve(max_stack)` call — under-estimating here would let the
 /// unchecked-write hot loop go OOB on the conservative-FD path. The
 /// `depth >= 0` and balanced-end debug asserts catch a future opcode
@@ -6547,6 +7574,30 @@ fn compile_bytecode(expr: &Expression) -> Bytecode {
 /// If backward jumps (e.g. for loops) are ever added, this linear-scan
 /// algorithm no longer holds — fixed-point iteration would be required.
 fn compute_max_stack(ops: &[Op]) -> usize {
+    let (peak, depth) = scan_stack_depth(ops);
+    // A well-formed *jump-free* expression leaves exactly one value on the
+    // stack (the result); this catches off-by-one push/pop emissions in any
+    // future `compile_expr_into` change. Bytecode with branches can't be
+    // checked this way (the linear scan walks both arms — see
+    // `bytecode_has_branch`), so the predicate exempts them. `peak` stays a
+    // safe over-estimate either way.
+    debug_assert!(
+        ends_at_expected_depth(ops, depth),
+        "compute_max_stack: bytecode ends at depth {depth}, expected 1",
+    );
+    peak.max(1) as usize
+}
+
+/// Single linear pass over `ops` returning `(peak, end_depth)`: the maximum
+/// running f64-stack depth and the depth left after the final op. Split out
+/// from [`compute_max_stack`] so the end-depth invariant can be checked on
+/// *real* compiled bytecode from a unit test (see
+/// `compute_max_stack_jumpfree_bytecode_ends_at_depth_one`) even under the
+/// `ci-test` profile, where the `debug_assert!` that normally guards it is
+/// compiled out. Returning `end_depth` — rather than only consuming it inside
+/// that `debug_assert!` — is what lets a future `compile_expr_into` off-by-one
+/// be caught in CI, not just under the local dev profile.
+fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
     let mut depth: i32 = 0;
     let mut peak: i32 = 0;
     for op in ops {
@@ -6597,14 +7648,32 @@ fn compute_max_stack(ops: &[Op]) -> usize {
             peak = depth;
         }
     }
-    // A well-formed expression bytecode leaves exactly one value on the
-    // stack (the result). Catch off-by-one push/pop emissions in any
-    // future compile_expr_into change.
-    debug_assert!(
-        depth == 1 || ops.is_empty(),
-        "compute_max_stack: bytecode ends at depth {depth}, expected 1",
-    );
-    peak.max(1) as usize
+    (peak, depth)
+}
+
+/// True if `ops` contains a branch (`Jump` / `JumpIfFalse`). The end-of-scan
+/// depth invariant in [`compute_max_stack`] only holds for branch-free
+/// bytecode: a `Conditional` emits both arms inline, so the linear walk ends
+/// above depth 1 even though execution takes one arm. Extracted (and
+/// unit-tested directly) so the branch check is exercised independently of the
+/// debug-only assertion that consumes it.
+fn bytecode_has_branch(ops: &[Op]) -> bool {
+    ops.iter()
+        .any(|op| matches!(op, Op::Jump(_) | Op::JumpIfFalse(_)))
+}
+
+/// Whether a completed linear scan of `ops` ending at `depth` satisfies the
+/// well-formed end-depth invariant: a jump-free expression must leave exactly
+/// one value on the stack. Branchy bytecode is exempt — a `Conditional` emits
+/// both arms inline, so the linear walk ends above depth 1 even though
+/// execution takes one arm (see [`bytecode_has_branch`]). The cheap `depth`
+/// check is tried first so the common jump-free path skips the O(n) scan.
+///
+/// Returned rather than inlined into the `debug_assert!` so the invariant is
+/// exercised even under the `ci-test` profile, where `debug_assert!` is
+/// compiled out and the assertion itself never runs.
+fn ends_at_expected_depth(ops: &[Op], depth: i32) -> bool {
+    depth == 1 || ops.is_empty() || bytecode_has_branch(ops)
 }
 
 fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
@@ -7706,9 +8775,18 @@ fn simplify_expr(expr: &Expression) -> Expression {
 #[allow(dead_code)] // no runtime consumer after #145; see struct doc.
 pub struct IndivParamPartials {
     /// Indiv-param names parallel to `d_d_theta` / `d_d_eta` outer Vec, in
-    /// `[individual_parameters]` source-declaration order. Equals the
-    /// top-level `Assign(name, _)` order, matching
-    /// `CompiledModel.indiv_param_names`.
+    /// `[individual_parameters]` source-declaration order — one row per
+    /// top-level `Assign(name, _)`.
+    ///
+    /// CAUTION (issue #357): this is a *subset* of
+    /// `CompiledModel.indiv_param_names`, not a positional twin. A parameter
+    /// assigned only inside `if`/`else` branches and promoted because a
+    /// downstream block references it (e.g. a conditional `CL`) appears in
+    /// `indiv_param_names` but has NO row here — `build_indiv_param_partials`
+    /// skips `Statement::If`, and a piecewise param has no single symbolic
+    /// partial anyway (the AD inner loop falls back to FD; see the `eta_map`
+    /// note in `parse_full_model`). A future AD consumer MUST look partials up
+    /// by name, never zip them positionally against `indiv_param_names`.
     pub(crate) names: Vec<String>,
     /// `d_d_theta[i][k]` = ∂P_i/∂θ_k. Inner Vec length = `n_theta_base`
     /// (user-declared θ count, NOT including NN-weight or diffusion θ which
@@ -8796,6 +9874,446 @@ fn parse_if_statement(
 mod tests {
     use super::*;
 
+    // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
+
+    /// Parse `src`, asserting it fails; returns the error message. (`ParsedModel`
+    /// is not `Debug`, so `unwrap_err()` can't be used directly.)
+    fn parse_err(src: &str) -> String {
+        match parse_full_model(src) {
+            Ok(_) => panic!("expected a parse error, but the model parsed"),
+            Err(e) => e,
+        }
+    }
+
+    /// Two-cpt-oral parameter header (CL/V1/Q/V2/KA) plus optional extra
+    /// individual params, used to build `ode_template` test models.
+    fn two_cpt_oral_model(structural: &str, extra_indiv: &str, odes: &str) -> String {
+        format!(
+            "[parameters]\n\
+             \x20 theta TVCL(3.0, 0.01, 100.0)\n\
+             \x20 theta TVV1(15.0, 1.0, 500.0)\n\
+             \x20 theta TVQ(3.0, 0.01, 100.0)\n\
+             \x20 theta TVV2(30.0, 1.0, 500.0)\n\
+             \x20 theta TVKA(1.1, 0.01, 50.0)\n\
+             \x20 omega ETA_CL ~ 0.09\n\
+             \x20 sigma PROP ~ 0.01 (sd)\n\n\
+             [individual_parameters]\n\
+             \x20 CL = TVCL * exp(ETA_CL)\n\
+             \x20 V1 = TVV1\n\
+             \x20 Q  = TVQ\n\
+             \x20 V2 = TVV2\n\
+             \x20 KA = TVKA\n{extra_indiv}\n\
+             [structural_model]\n  {structural}\n\n{odes}\
+             [error_model]\n  DV ~ proportional(PROP)\n"
+        )
+    }
+
+    #[test]
+    fn ode_template_desugars_to_ode_model() {
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "",
+            "",
+        );
+        let model = parse_full_model(&src)
+            .unwrap_or_else(|e| panic!("ode_template should parse: {e}"))
+            .model;
+        let ode = model
+            .ode_spec
+            .expect("ode_template must produce an ODE model");
+        assert_eq!(ode.state_names, vec!["depot", "central", "periph"]);
+        // Pure disposition — no built-in input-rate forcing without an override.
+        assert!(ode.input_rate.is_empty());
+        // Observed compartment is central (state index 1).
+        match ode.readout {
+            crate::ode::OdeReadout::ObsCmt(idx) => assert_eq!(idx, 1),
+            _ => panic!("expected an ObsCmt readout for ode_template"),
+        }
+    }
+
+    #[test]
+    fn ode_template_override_replaces_only_named_compartment() {
+        // Override the generated depot with a transit input; central & periph
+        // keep their generated equations (so the 3-state structure is intact and
+        // exactly one transit forcing lands on the depot, compartment 0).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
+        );
+        let model = parse_full_model(&src)
+            .unwrap_or_else(|e| panic!("override should parse: {e}"))
+            .model;
+        let ode = model.ode_spec.expect("ODE model");
+        assert_eq!(ode.state_names, vec!["depot", "central", "periph"]);
+        assert_eq!(ode.input_rate.len(), 1, "exactly one transit forcing");
+        assert_eq!(ode.input_rate[0].cmt, 0, "transit forces the depot (cmt 0)");
+    }
+
+    #[test]
+    fn ode_template_override_unknown_compartment_errors() {
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "",
+            "[odes]\n  d/dt(gut) = -KA*gut\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("d/dt(gut)") && err.contains("generated states"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_template_missing_required_role_errors() {
+        // Surfaced through the full-model parse, not just the generator.
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2)",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("requires `ka`"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_rejects_mixing_with_pk_or_ode() {
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)\n  pk one_cpt_iv(cl=CL, v=V1)",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("cannot be combined"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_malformed_arg_errors() {
+        let src = two_cpt_oral_model("ode_template one_cpt_iv(cl)", "", "");
+        let err = parse_err(&src);
+        assert!(err.contains("malformed parameter"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_missing_parens_errors_clearly() {
+        // A line that *looks* like an ode_template directive but doesn't match
+        // `NAME(...)` must produce a clear "malformed ode_template" error — not
+        // fall through to a confusing "No PK model found". Pair it with a
+        // transit() in [odes] (the worst case: the error rule would otherwise
+        // tell the user to "use ode_template" when they already are).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("malformed `ode_template`"),
+            "expected a clear malformed-ode_template error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_template_duplicate_arg_errors() {
+        let src = two_cpt_oral_model("ode_template one_cpt_iv(cl=CL, cl=V1)", "", "");
+        let err = parse_err(&src);
+        assert!(err.contains("duplicate parameter"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_multiple_lines_errors() {
+        let src = two_cpt_oral_model(
+            "ode_template one_cpt_iv(cl=CL, v=V1)\n  ode_template two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("more than one"), "got: {err}");
+    }
+
+    #[test]
+    fn error_rule_analytical_pk_plus_transit() {
+        // Analytical disposition + an ODE-only absorption function → hard error
+        // pointing at ode_template, never a silent analytical→ODE swap.
+        let src = two_cpt_oral_model(
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("ode_template"),
+            "should point at ode_template: {err}"
+        );
+        assert!(err.contains("transit"), "should name the function: {err}");
+    }
+
+    #[test]
+    fn ode_only_absorption_fn_detection() {
+        let transit = vec!["d/dt(depot) = transit(n=N, mtt=M) - KA*depot".to_string()];
+        assert_eq!(
+            ode_only_absorption_fn_in_odes(Some(&transit)),
+            Some("transit")
+        );
+        // The error rule only recognises functions that are actually implemented
+        // (Ron #363): `igd`/`weibull` are not yet input rates, so they must NOT be
+        // detected — otherwise the rule would point the user at `ode_template` for a
+        // function the engine can't run. Each phase adds its name here when it lands.
+        let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), None);
+        let weibull = vec!["d/dt(central) = weibull(td=TD, beta=B) - (CL/V)*central".to_string()];
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&weibull)), None);
+        // A plain disposition ODE has no ODE-only absorption call.
+        let plain = vec!["d/dt(central) = -(CL/V)*central".to_string()];
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&plain)), None);
+        assert_eq!(ode_only_absorption_fn_in_odes(None), None);
+    }
+
+    #[test]
+    fn ode_template_rejects_mixing_with_ode() {
+        // The `ode(...)` arm of the mixing guard (the `pk` arm is covered above).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)\n  \
+             ode(obs_cmt=central, states=[depot, central, periph])",
+            "",
+            "",
+        );
+        let err = parse_err(&src);
+        assert!(err.contains("cannot be combined"), "got: {err}");
+    }
+
+    #[test]
+    fn ode_template_trailing_comma_ok() {
+        // A trailing comma yields an empty `role=VAR` pair, which is skipped.
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, )",
+            "",
+            "",
+        );
+        assert!(
+            parse_full_model(&src).is_ok(),
+            "a trailing comma in the parameter list should be tolerated"
+        );
+    }
+
+    #[test]
+    fn ode_template_override_tolerates_whitespace_in_d_dt() {
+        // `build_ode_spec` recognises `d/dt(NAME)` at the token level, so spacing
+        // like `d/dt (central)` / `d / dt(central)` is a valid state equation
+        // there. Override detection must agree — otherwise the override is missed,
+        // the generated equation also survives, and the user gets a misleading
+        // "duplicate d/dt(central)" error instead of their override taking effect.
+        for lhs in ["d/dt (central)", "d / dt(central)", "d/dt(  central  )"] {
+            let src = two_cpt_oral_model(
+                "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+                "",
+                &format!("[odes]\n  {lhs} = KA*depot - (CL/V1 + Q/V1)*central + (Q/V2)*periph\n\n"),
+            );
+            let model = parse_full_model(&src)
+                .unwrap_or_else(|e| panic!("spaced override `{lhs}` should parse: {e}"))
+                .model;
+            // Override consumed the generated central → still exactly 3 states,
+            // and no duplicate-d/dt error fired.
+            assert_eq!(
+                model.ode_spec.expect("ODE model").state_names,
+                vec!["depot", "central", "periph"],
+                "override `{lhs}`"
+            );
+        }
+    }
+
+    #[test]
+    fn ode_template_rejected_with_diffusion_block() {
+        // ode_template injects obs_scale (a concentration readout), which the SDE
+        // path can't carry. Reject with a message that names the real cause
+        // (`ode_template` + `[diffusion]`), not the injected `[scaling]` block the
+        // user never wrote.
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "",
+            "[diffusion]\n  central ~ 0.1\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("ode_template") && err.contains("[diffusion]"),
+            "diffusion error should name ode_template + [diffusion]: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_template_transit_on_non_ddt_line_errors_with_pointer() {
+        // Under ode_template, a `transit(...)` that is not the input rate of a
+        // `d/dt(...)` equation (here a bare helper assignment) must not be silently
+        // retained as a dead term: the input-rate extractor catches it and points
+        // at the correct `d/dt(...)` form (Ron #363, finding 5 — confirmed already
+        // guarded, pinned here so it can't regress).
+        let src = two_cpt_oral_model(
+            "ode_template two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  NTR = 3.0\n  MTT = 1.0\n",
+            "[odes]\n  rate = transit(n=NTR, mtt=MTT)\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("d/dt"),
+            "a transit() off a d/dt line should point at the d/dt form, got: {err}"
+        );
+    }
+
+    // ── transit() input-rate parse-split (#322, design A) ────────────────────
+    #[test]
+    fn extract_transit_input_rate_basic() {
+        let lines = vec![
+            "d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot".to_string(),
+            "d/dt(central) = KA*depot - (CL/V)*central".to_string(),
+        ];
+        let states = vec!["depot".to_string(), "central".to_string()];
+        let names = vec![
+            "NTR".to_string(),
+            "MTT".to_string(),
+            "KA".to_string(),
+            "CL".to_string(),
+            "V".to_string(),
+        ];
+        let slots = vec![10, 11, 4, 0, 1];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        // transit(...) replaced by 0; the rest of the RHS is untouched.
+        assert_eq!(cleaned[0], "d/dt(depot) = 0 - KA*depot");
+        assert_eq!(cleaned[1], "d/dt(central) = KA*depot - (CL/V)*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].cmt, 0); // depot
+        assert!(matches!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::Transit
+        ));
+        assert_eq!(forcings[0].arg_slots, vec![10, 11]); // [n=NTR slot, mtt=MTT slot]
+    }
+
+    #[test]
+    fn extract_transit_input_rate_rejects_bad_specs() {
+        let states = vec!["depot".to_string()];
+        let names = vec!["NTR".to_string(), "MTT".to_string()];
+        let slots = vec![0, 1];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=ZZZ)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        assert!(go("d/dt(depot) = transit(n=NTR, foo=MTT)")
+            .unwrap_err()
+            .contains("no argument `foo`"));
+        assert!(go("d/dt(depot) = transit(n=NTR)")
+            .unwrap_err()
+            .contains("missing required argument `mtt`"));
+        assert!(go("x = transit(n=NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("d/dt"));
+        assert!(go("d/dt(depot) = FR*transit(n=NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("scaled"));
+        // Leading unary minus: the forcing is injected `+R_in`, so a negated call
+        // would silently flip the sign of the input rate. Must be rejected.
+        assert!(go("d/dt(depot) = -transit(n=NTR, mtt=MTT) - KA*depot")
+            .unwrap_err()
+            .contains("standalone"));
+        // Subtracted term (wrong sign) even without `*`/`/` scaling.
+        assert!(go("d/dt(depot) = KA*depot - transit(n=NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("standalone"));
+        // Parenthesised + scaled outside the group: the old adjacency check saw
+        // only the flanking `(`/`)`, so the `/V` was silently dropped — now rejected.
+        assert!(go("d/dt(depot) = (transit(n=NTR, mtt=MTT))/V")
+            .unwrap_err()
+            .contains("standalone"));
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT")
+            .unwrap_err()
+            .contains("unbalanced"));
+        assert!(go("d/dt(depot) = transit(NTR, mtt=MTT)")
+            .unwrap_err()
+            .contains("name=parameter"));
+        assert!(
+            go("d/dt(depot) = transit(n=NTR, mtt=MTT) + transit(n=NTR, mtt=MTT)")
+                .unwrap_err()
+                .contains("at most one")
+        );
+        // Nested parens in an arg value are split correctly, then rejected as a
+        // non-parameter (exercises the comma-splitter's paren-depth tracking).
+        assert!(go("d/dt(depot) = transit(n=foo(a,b), mtt=MTT)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        // A word *ending* in `transit` (e.g. `xtransit(`) is not a transit() call:
+        // left unchanged, no forcing recorded.
+        let (kept, none) = go("d/dt(depot) = xtransit(n=NTR, mtt=MTT) - depot").unwrap();
+        assert_eq!(kept[0], "d/dt(depot) = xtransit(n=NTR, mtt=MTT) - depot");
+        assert!(none.is_empty());
+        // No transit() → unchanged, no forcings.
+        let (cleaned, f) = go("d/dt(depot) = -KA*depot").unwrap();
+        assert_eq!(cleaned[0], "d/dt(depot) = -KA*depot");
+        assert!(f.is_empty());
+
+        // Positive controls for the tightened sign/scale guard: a bare additive
+        // `transit(...)` is accepted whether it is the only term, the first term
+        // before a `-` disposition term, or a later `+` term.
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT)").is_ok());
+        assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot").is_ok());
+        assert!(go("d/dt(depot) = -KA*depot + transit(n=NTR, mtt=MTT)").is_ok());
+    }
+
+    #[test]
+    fn pk_param_parser_is_strict_about_duplicates_and_malformed_pairs() {
+        // The analytical `pk NAME(...)` parser now shares the strict
+        // `parse_role_pairs` helper with `ode_template` (Ron #363, finding 2). It
+        // previously silently dropped malformed pairs and let a duplicate role
+        // last-win; both are now hard errors, single-sourced so the two paths can't
+        // drift in strictness again.
+
+        // Duplicate role → rejected (was: silent last-win, here `cl=V` would have
+        // shadowed `cl=CL` with no warning).
+        let dup = vec!["pk one_cpt_iv(cl=CL, cl=V)".to_string()];
+        let err = parse_structural_model(&dup).unwrap_err();
+        assert!(
+            err.contains("duplicate parameter") && err.contains("cl"),
+            "duplicate pk param should error: {err}"
+        );
+
+        // Malformed pairs (no `=`, double `=`, empty side) → rejected (was: silently
+        // dropped, then surfaced only as a confusing missing-required error later).
+        for bad in [
+            "pk one_cpt_iv(cl, v=V)",
+            "pk one_cpt_iv(cl=CL=X, v=V)",
+            "pk one_cpt_iv(=CL, v=V)",
+            "pk one_cpt_iv(cl=, v=V)",
+        ] {
+            let lines = vec![bad.to_string()];
+            let err = parse_structural_model(&lines).unwrap_err();
+            assert!(
+                err.contains("malformed parameter"),
+                "`{bad}` should be a malformed-parameter error, got: {err}"
+            );
+        }
+
+        // A well-formed list (incl. a tolerated trailing comma) still parses.
+        let ok = vec!["pk one_cpt_iv(cl=CL, v=V, )".to_string()];
+        let (model, params) = parse_structural_model(&ok).expect("well-formed pk must parse");
+        assert_eq!(model, PkModel::OneCptIv);
+        assert_eq!(params.get("cl").map(String::as_str), Some("CL"));
+        assert_eq!(params.get("v").map(String::as_str), Some("V"));
+    }
+
+    #[test]
+    fn unknown_pk_model_name_errors() {
+        // A model name that is neither a valid name/alias (`PkModel::from_name`)
+        // nor a retired #176 spelling falls through to the generic "Unknown PK
+        // model" error — the `None`/`other` arm of the name resolution.
+        let lines = vec!["pk four_cpt_iv(cl=CL, v=V)".to_string()];
+        let err = parse_structural_model(&lines).unwrap_err();
+        assert!(
+            err.contains("Unknown PK model") && err.contains("four_cpt_iv"),
+            "got: {err}"
+        );
+    }
+
     // Issue #176 retired the split `*_iv_bolus` / `*_infusion` model names
     // in favour of a single `*_iv` per compartment count. The parser must
     // reject the old names with a migration message rather than silently
@@ -8832,10 +10350,728 @@ mod tests {
             ("three_cpt_iv", PkModel::ThreeCptIv),
         ];
         for (name, expected) in cases {
+            // `parse_structural_model` only resolves the model name → variant;
+            // required-parameter completeness is checked later in `parse_full_model`.
             let lines = vec![format!("pk {}(cl=CL, v=V, q=Q, v2=V2, q2=Q2, v3=V3)", name)];
             let (pk_model, _) = parse_structural_model(&lines)
                 .unwrap_or_else(|e| panic!("`{name}` failed to parse: {e}"));
             assert_eq!(pk_model, expected, "wrong variant for `{name}`");
+        }
+    }
+
+    #[test]
+    fn canonical_name_round_trips_through_parser() {
+        // Every `PkModel::canonical_name()` must be a model name the parser
+        // accepts and maps back to the same variant — guards `canonical_name`
+        // (types.rs) against drifting from this name table.
+        for model in [
+            PkModel::OneCptIv,
+            PkModel::OneCptOral,
+            PkModel::TwoCptIv,
+            PkModel::TwoCptOral,
+            PkModel::ThreeCptIv,
+            PkModel::ThreeCptOral,
+        ] {
+            let lines = vec![format!("pk {}(cl=CL, v=V)", model.canonical_name())];
+            let (parsed, _) = parse_structural_model(&lines).unwrap_or_else(|e| {
+                panic!(
+                    "canonical_name `{}` did not parse: {e}",
+                    model.canonical_name()
+                )
+            });
+            assert_eq!(
+                parsed,
+                model,
+                "canonical_name `{}` did not round-trip",
+                model.canonical_name()
+            );
+        }
+    }
+
+    /// A complete analytical model wrapping `pk_line`, with every commonly
+    /// referenced individual parameter defined so `build_pk_param_fn`'s per-key
+    /// value validation passes and only the structural-mapping checks (required /
+    /// unused, run in `parse_full_model`) are exercised. Surplus declared params
+    /// just produce the usual declared-but-unused warnings, which don't affect
+    /// whether parsing succeeds.
+    fn structural_model_with(pk_line: &str) -> String {
+        format!(
+            "
+[parameters]
+  theta TVX(1.0, 0.001, 100.0)
+  omega ETA ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL   = TVX * exp(ETA)
+  V    = TVX
+  V1   = TVX
+  Q    = TVX
+  Q2   = TVX
+  V2   = TVX
+  Q3   = TVX
+  V3   = TVX
+  KA   = TVX
+  F    = TVX
+  TLAG = TVX
+
+[structural_model]
+  {pk_line}
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+        )
+    }
+
+    #[test]
+    fn test_missing_required_pk_param_errors() {
+        // Omitting a required structural parameter must be a hard parse error,
+        // not a silent default-to-0.0 broken fit (issue #309).
+
+        // Single missing param: exact message (matches the #309 acceptance text).
+        let err = expect_parse_err(&structural_model_with("pk one_cpt_oral(cl=CL, v=V)"));
+        assert_eq!(
+            err,
+            "[structural_model] one_cpt_oral requires `ka`, which is not mapped. \
+             Add it, e.g. `ka=KA`."
+        );
+
+        // Multiple missing params: plural grammar, names all of them.
+        let err = expect_parse_err(&structural_model_with("pk two_cpt_iv(cl=CL, v1=V1)"));
+        assert!(err.contains("`q`"), "should name q: {err}");
+        assert!(err.contains("`v2`"), "should name v2: {err}");
+        assert!(
+            err.contains("are not mapped") && err.contains("Add them"),
+            "plural grammar expected: {err}"
+        );
+
+        // `ka` omitted on a three-cpt oral model (every other slot present).
+        let err = expect_parse_err(&structural_model_with(
+            "pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)",
+        ));
+        assert!(err.contains("`ka`"), "should name ka: {err}");
+
+        // Supplying an *optional* parameter (`f`) must not mask a *missing*
+        // required one: `ka` is still reported even though `f` is present.
+        let err = expect_parse_err(&structural_model_with("pk one_cpt_oral(cl=CL, v=V, f=F)"));
+        assert!(err.contains("`ka`"), "should still name ka: {err}");
+    }
+
+    #[test]
+    fn test_required_params_present_parses_ok() {
+        // A model that maps every required slot parses without a structural error
+        // — including via the `v`/`v1` and `q`/`q2` aliases (canonical-slot check)
+        // and with optional `f`/`lagtime`/`alag` present. The required-
+        // completeness check runs after `build_pk_param_fn` (issue #309).
+        let ok_lines = [
+            "pk one_cpt_iv(cl=CL, v=V)",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+            // optional f + lagtime present alongside the required params:
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=TLAG)",
+            // `alag` alias for lagtime:
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=TLAG)",
+            "pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)",
+            // `q2` alias satisfies the `q` slot; `v` alias satisfies `v1`:
+            "pk two_cpt_iv(cl=CL, v=V1, q2=Q, v2=V2)",
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)",
+            "pk three_cpt_oral(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3, ka=KA)",
+        ];
+        for line in ok_lines {
+            assert!(
+                super::parse_full_model(&structural_model_with(line)).is_ok(),
+                "`{line}` should parse without a structural error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unused_pk_param_warns() {
+        // PK parameters mapped but not used by the chosen model parse Ok but warn
+        // (#309): on an IV model `ka` (no absorption) is flagged. `f`
+        // (bioavailability — applied to IV bolus/infusion since #327) and
+        // `lagtime` (applied to every dose) are both used, so neither is flagged.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  theta TVF(1.0, 0.01, 10.0)
+  theta TVLAG(0.5)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = TVKA
+  F   = TVF
+  LAG = TVLAG
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, ka=KA, f=F, lagtime=LAG)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str)
+            .expect("unused params are a warning, not a parse error");
+        let warn = parsed
+            .model
+            .parse_warnings
+            .iter()
+            .find(|w| w.contains("does not use"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected an unused-param warning, got: {:?}",
+                    parsed.model.parse_warnings
+                )
+            });
+        assert!(
+            warn.contains("`ka`"),
+            "ka should be flagged unused on IV: {warn}"
+        );
+        assert!(
+            !warn.contains("`f`"),
+            "f is applied to IV bolus/infusion (#327) and must not be flagged: {warn}"
+        );
+        assert!(
+            !warn.contains("`lagtime`"),
+            "lagtime is applied to every dose and must not be flagged: {warn}"
+        );
+    }
+
+    #[test]
+    fn test_f_lagtime_warning_matrix() {
+        // Pins the f/lagtime warning matrix (#309). Two distinct checks fire:
+        //  - "does not use" (`consumes_pk_slot`): a param mapped in `pk(...)` but
+        //    not consumed — `f` and `lagtime` are consumed by every model (#327),
+        //    so neither warns; an unused structural slot (e.g. `ka` on IV) does;
+        //  - "computed but never used": a param declared in [individual_parameters]
+        //    but never mapped or referenced anywhere.
+        // KA/F/LAG are literals so the helper declares no surplus thetas (which
+        // would otherwise add unrelated unused-theta warnings).
+        let model = |indiv: &str, pk: &str| -> String {
+            format!(
+                "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+{indiv}
+
+[structural_model]
+  {pk}
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+            )
+        };
+        let warns = |indiv: &str, pk: &str| -> Vec<String> {
+            super::parse_full_model(&model(indiv, pk))
+                .unwrap_or_else(|e| panic!("`{pk}` should parse: {e}"))
+                .model
+                .parse_warnings
+        };
+        let has = |ws: &[String], needle: &str| ws.iter().any(|w| w.contains(needle));
+        let clv = "  CL = TVCL * exp(ETA_CL)\n  V = TVV";
+
+        // (1) IV + `f` mapped → NOT flagged. F scales the bioavailable amount
+        // on every route — IV bolus and infusion included (#327) — so it is
+        // used, not inert, on IV models.
+        let ws = warns(
+            &format!("{clv}\n  F = 0.8"),
+            "pk one_cpt_iv(cl=CL, v=V, f=F)",
+        );
+        assert!(
+            !has(&ws, "does not use"),
+            "IV + mapped f must not warn now that F applies to IV doses (#327): {ws:?}"
+        );
+
+        // (2) IV + `lagtime` mapped → NOT flagged (every model applies lagtime).
+        let ws = warns(
+            &format!("{clv}\n  LAG = 0.5"),
+            "pk one_cpt_iv(cl=CL, v=V, lagtime=LAG)",
+        );
+        assert!(
+            !has(&ws, "does not use"),
+            "IV + lagtime must not warn: {ws:?}"
+        );
+
+        // (3) Oral + `f` mapped (defined) → no warning.
+        let ws = warns(
+            &format!("{clv}\n  KA = 1.0\n  F = 0.8"),
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)",
+        );
+        assert!(
+            !has(&ws, "does not use") && !has(&ws, "computed but never used"),
+            "oral + used f must not warn: {ws:?}"
+        );
+
+        // (4) Oral + `f` mapped to an UNDEFINED variable → parse error (#308).
+        assert!(
+            super::parse_full_model(&model(
+                "  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = 1.0",
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=FNOPE)",
+            ))
+            .is_err(),
+            "oral + undefined `f` reference must error"
+        );
+
+        // (5) Oral + `F` declared but NOT mapped → "computed but never used `F`".
+        let ws = warns(
+            &format!("{clv}\n  KA = 1.0\n  F = 0.8"),
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        );
+        assert!(
+            has(&ws, "computed but never used") && has(&ws, "`F`"),
+            "oral + declared-not-mapped F should warn dead: {ws:?}"
+        );
+
+        // (6) IV + `F` declared but NOT mapped → "computed but never used `F`".
+        let ws = warns(&format!("{clv}\n  F = 0.8"), "pk one_cpt_iv(cl=CL, v=V)");
+        assert!(
+            has(&ws, "computed but never used") && has(&ws, "`F`"),
+            "IV + declared-not-mapped F should warn dead: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn test_param_used_only_in_derived_not_flagged_dead() {
+        // An individual parameter referenced only in [derived] — not mapped into
+        // pk(...) and not used by another parameter — must NOT be flagged
+        // "computed but never used": the census tokenizes every block (#309).
+        let model = |derived: &str| -> String {
+            format!(
+                "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KA  = 1.0
+  KEL = CL / V
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+{derived}
+[error_model]
+  DV ~ proportional(EPS)
+"
+            )
+        };
+        // KEL is referenced in [derived] → used → no dead warning.
+        let p =
+            super::parse_full_model(&model("\n[derived]\n  RATE = KEL * 2\n")).expect("parse ok");
+        assert!(
+            !p.model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used")),
+            "KEL is used in [derived] and must not be flagged dead: {:?}",
+            p.model.parse_warnings
+        );
+        // Negative control: with no [derived] reference, KEL IS dead.
+        let p2 = super::parse_full_model(&model("")).expect("parse ok");
+        assert!(
+            p2.model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used") && w.contains("`KEL`")),
+            "without the [derived] use KEL must be flagged dead: {:?}",
+            p2.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_ode_dead_indiv_param_warns() {
+        // #315: an ODE [individual_parameters] entry never referenced in the
+        // [odes] RHS (and not engine-applied f/lagtime) is routed to a free slot,
+        // computed every evaluation, but never read — silently inert. The #310
+        // "computed but never used" census skipped ODE models; it now covers them.
+        let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKE(0.5, 0.001, 10.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_KE ~ 0.09
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KE = TVKE * exp(ETA_KE)   # never referenced in [odes]
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+        let ws = super::parse_full_model(content)
+            .expect("a dead ODE param is a warning, not an error")
+            .model
+            .parse_warnings;
+        let dead: Vec<&String> = ws
+            .iter()
+            .filter(|w| w.contains("computed but never used"))
+            .collect();
+        assert_eq!(
+            dead.len(),
+            1,
+            "exactly one dead-param warning expected, got: {ws:?}"
+        );
+        let w = dead[0];
+        assert!(w.contains("`KE`"), "warning must name KE: {w}");
+        // The params actually used in the RHS must not be flagged.
+        assert!(
+            !w.contains("`CL`") && !w.contains("`V`"),
+            "used params must not be flagged dead: {w}"
+        );
+        // ODE-flavored guidance points at [odes], not the analytical pk(...) map.
+        assert!(
+            w.contains("[odes]") && !w.contains("pk(...)"),
+            "ODE warning should reference [odes], not pk(...): {w}"
+        );
+    }
+
+    #[test]
+    fn test_ode_engine_applied_f_lagtime_not_flagged_dead() {
+        // #315 carve-out: F and lagtime on an ODE model are routed to the
+        // engine-reserved PK_IDX_F / PK_IDX_LAGTIME slots (`ode_param_slots`) and
+        // applied to the dose by the engine without ever appearing in the [odes]
+        // RHS, so their textual absence must NOT flag them dead. Mirrors
+        // examples/bioavailability_ode.ferx and examples/warfarin_ode_lagtime.ferx.
+        let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.001, 10.0)
+  theta THETA_F(0.0, -10.0, 10.0)
+  theta TVLAG(0.5, 0.001, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL)
+  V       = TVV
+  KA      = TVKA
+  F       = inv_logit(THETA_F)
+  LAGTIME = TVLAG
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+        let ws = super::parse_full_model(content)
+            .expect("engine-applied F/lagtime on an ODE model must parse")
+            .model
+            .parse_warnings;
+        assert!(
+            !ws.iter().any(|w| w.contains("computed but never used")),
+            "engine-applied F/LAGTIME on an ODE model must not be flagged dead: {ws:?}"
+        );
+    }
+
+    #[test]
+    fn test_ode_multiple_dead_params_use_plural_message() {
+        // #315: two+ dead ODE params share one warning and use the plural grammar
+        // ("are … they … them") in the ODE-flavored message. Locks the plural
+        // branch + name list for ODE (the singular case is covered above).
+        let content = r#"
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKE(0.5, 0.001, 10.0)
+  theta TVKE2(0.2, 0.001, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  KE  = TVKE      # never referenced in [odes]
+  KE2 = TVKE2     # never referenced in [odes]
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[error_model]
+  DV ~ proportional(EPS)
+"#;
+        let ws = super::parse_full_model(content)
+            .expect("dead ODE params are a warning, not an error")
+            .model
+            .parse_warnings;
+        let dead: Vec<&String> = ws
+            .iter()
+            .filter(|w| w.contains("computed but never used"))
+            .collect();
+        assert_eq!(
+            dead.len(),
+            1,
+            "both dead params share a single warning, got: {ws:?}"
+        );
+        let w = dead[0];
+        // Both names listed (sorted, comma-joined), neither used param flagged.
+        assert!(
+            w.contains("`KE`") && w.contains("`KE2`"),
+            "both dead params must be named: {w}"
+        );
+        assert!(
+            !w.contains("`CL`") && !w.contains("`V`"),
+            "used params not flagged: {w}"
+        );
+        // Plural grammar + ODE-flavored guidance.
+        assert!(
+            w.contains("are computed but never used") && w.contains("remove them"),
+            "plural ODE message expected: {w}"
+        );
+        assert!(
+            w.contains("[odes]") && !w.contains("pk(...)"),
+            "ODE plural warning should reference [odes], not pk(...): {w}"
+        );
+    }
+
+    #[test]
+    fn test_undeclared_name_in_derived_is_accepted_silently() {
+        // [derived] uses `fallback_covariate = false`: an unknown identifier
+        // becomes a Variable resolved at output time, not a covariate. So an
+        // undeclared name used only in [derived] parses without error and without
+        // any warning — unlike an ODE RHS (which rejects covariate references), or
+        // [individual_parameters] when a [covariates] block is present (strict
+        // mode, which warns on an undeclared covariate).
+        let src = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = 1.0
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[derived]
+  RATIO = MYSTERY_NAME / CL
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed =
+            super::parse_full_model(src).expect("undeclared name in [derived] should parse");
+        assert!(
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("MYSTERY_NAME")),
+            "undeclared name in [derived] is a silent Variable, no warning: {:?}",
+            parsed.model.parse_warnings
+        );
+    }
+
+    #[test]
+    fn test_pk_key_relevance_matrix() {
+        // Exhaustively pins every (model, PK key) cell, classified
+        // R(equired) / O(ptional, used) / U(nused) — hardcoded independently of
+        // `consumes_pk_slot`/`required_pk_params` so the test can't co-drift with
+        // the code it checks:
+        //   R → omitting the key is an error naming it;
+        //   O → mapping the key is silently accepted (no "does not use" warning);
+        //   U → mapping the key warns "does not use `key`".
+        // Keys use each model's canonical slot name (`v`/`v1`, `q`/`q2`), so the
+        // required-omission error (which echoes the canonical name) matches.
+        let matrix: &[(&str, [(&str, char); 9])] = &[
+            (
+                "one_cpt_iv",
+                [
+                    ("cl", 'R'),
+                    ("v", 'R'),
+                    ("q", 'U'),
+                    ("v2", 'U'),
+                    ("ka", 'U'),
+                    ("f", 'O'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "one_cpt_oral",
+                [
+                    ("cl", 'R'),
+                    ("v", 'R'),
+                    ("q", 'U'),
+                    ("v2", 'U'),
+                    ("ka", 'R'),
+                    ("f", 'O'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "two_cpt_iv",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'U'),
+                    ("f", 'O'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "two_cpt_oral",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'R'),
+                    ("f", 'O'),
+                    ("q3", 'U'),
+                    ("v3", 'U'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "three_cpt_iv",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q2", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'U'),
+                    ("f", 'O'),
+                    ("q3", 'R'),
+                    ("v3", 'R'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+            (
+                "three_cpt_oral",
+                [
+                    ("cl", 'R'),
+                    ("v1", 'R'),
+                    ("q2", 'R'),
+                    ("v2", 'R'),
+                    ("ka", 'R'),
+                    ("f", 'O'),
+                    ("q3", 'R'),
+                    ("v3", 'R'),
+                    ("lagtime", 'O'),
+                ],
+            ),
+        ];
+        // `cl` carries the theta/eta so [parameters] has no unused declarations;
+        // every other mapped key is a literal so there are no surplus declared
+        // individual parameters to flag as dead.
+        let build = |model: &str, keys: &[&str]| -> String {
+            let indiv: String = keys
+                .iter()
+                .map(|k| {
+                    let var = k.to_uppercase();
+                    if *k == "cl" {
+                        format!("  {var} = TVX * exp(ETA)\n")
+                    } else {
+                        format!("  {var} = 1.0\n")
+                    }
+                })
+                .collect();
+            let pk = keys
+                .iter()
+                .map(|k| format!("{k}={}", k.to_uppercase()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "
+[parameters]
+  theta TVX(1.0, 0.001, 100.0)
+  omega ETA ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+{indiv}
+[structural_model]
+  pk {model}({pk})
+
+[error_model]
+  DV ~ proportional(EPS)
+"
+            )
+        };
+        for entry in matrix {
+            let model = entry.0;
+            let cells = &entry.1;
+            let required: Vec<&str> = cells.iter().filter(|c| c.1 == 'R').map(|c| c.0).collect();
+            for cell in cells {
+                let key = cell.0;
+                match cell.1 {
+                    'R' => {
+                        // Map every required key EXCEPT this one → error naming it.
+                        let keys: Vec<&str> =
+                            required.iter().copied().filter(|k| *k != key).collect();
+                        let err = super::parse_full_model(&build(model, &keys))
+                            .err()
+                            .unwrap_or_else(|| {
+                                panic!("{model}: omitting required `{key}` must error")
+                            });
+                        assert!(
+                            err.contains(&format!("`{key}`")),
+                            "{model}: omitting `{key}` should name it, got: {err}"
+                        );
+                    }
+                    class @ ('O' | 'U') => {
+                        // Map every required key PLUS this one → warn iff unused.
+                        let mut keys: Vec<&str> = required.clone();
+                        keys.push(key);
+                        let parsed = super::parse_full_model(&build(model, &keys))
+                            .unwrap_or_else(|e| panic!("{model} + `{key}` should parse: {e}"));
+                        let warned =
+                            parsed.model.parse_warnings.iter().any(|w| {
+                                w.contains("does not use") && w.contains(&format!("`{key}`"))
+                            });
+                        assert_eq!(
+                            warned,
+                            class == 'U',
+                            "{model} `{key}` ({class}): unexpected warning state, got: {:?}",
+                            parsed.model.parse_warnings
+                        );
+                    }
+                    other => panic!("bad classification `{other}`"),
+                }
+            }
         }
     }
 
@@ -9034,6 +11270,77 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_fit_option_ode_solver_tolerances() {
+        let mut opts = FitOptions::default();
+        // Defaults match OdeSolverOptions::default() (engine default unchanged).
+        assert_eq!(opts.ode_reltol, 1e-4);
+        assert_eq!(opts.ode_abstol, 1e-6);
+        assert_eq!(opts.ode_max_steps, 10_000);
+
+        assert_eq!(apply_fit_option(&mut opts, "ode_reltol", "1e-10"), Ok(true));
+        assert_eq!(apply_fit_option(&mut opts, "ode_abstol", "1e-12"), Ok(true));
+        assert_eq!(
+            apply_fit_option(&mut opts, "ode_max_steps", "200000"),
+            Ok(true)
+        );
+        assert_eq!(opts.ode_reltol, 1e-10);
+        assert_eq!(opts.ode_abstol, 1e-12);
+        assert_eq!(opts.ode_max_steps, 200_000);
+
+        // Non-positive / non-finite / zero are rejected, and a failed apply
+        // must not mutate the previously-set value.
+        assert!(apply_fit_option(&mut opts, "ode_reltol", "0").is_err());
+        assert!(apply_fit_option(&mut opts, "ode_reltol", "-1e-9").is_err());
+        assert!(apply_fit_option(&mut opts, "ode_abstol", "nan").is_err());
+        assert!(apply_fit_option(&mut opts, "ode_max_steps", "0").is_err());
+        assert!(apply_fit_option(&mut opts, "ode_max_steps", "x").is_err());
+        assert_eq!(opts.ode_reltol, 1e-10);
+        assert_eq!(opts.ode_max_steps, 200_000);
+    }
+
+    #[test]
+    fn test_ode_reltol_from_fit_options_reaches_ode_spec() {
+        // [fit_options] ODE solver tolerances must be baked onto
+        // OdeSpec.solver_opts by the parser (via sync_ode_solver_opts) so the
+        // integrator - including predict(), which receives no fit options -
+        // uses the requested accuracy.
+        let base = r#"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0)
+  theta TVV(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        // Default: OdeSpec inherits OdeSolverOptions::default().
+        let def = parse_full_model(base).unwrap();
+        let s = def.model.ode_spec.as_ref().unwrap().solver_opts;
+        assert_eq!(s.reltol, 1e-4);
+        assert_eq!(s.abstol, 1e-6);
+        assert_eq!(s.max_steps, 10_000);
+
+        // Override via [fit_options].
+        let with_opts = format!(
+            "{base}\n[fit_options]\n  ode_reltol = 1e-9\n  ode_abstol = 1e-11\n  ode_max_steps = 50000\n"
+        );
+        let p = parse_full_model(&with_opts).unwrap();
+        let s2 = p.model.ode_spec.as_ref().unwrap().solver_opts;
+        assert_eq!(s2.reltol, 1e-9);
+        assert_eq!(s2.abstol, 1e-11);
+        assert_eq!(s2.max_steps, 50_000);
+    }
+
+    #[test]
     fn test_imp_method_and_is_options_parse() {
         // `methods = [focei, imp]` plus the four `is_*` keys must apply
         // cleanly and produce no `unsupported_keys_warnings`.
@@ -9174,6 +11481,19 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_fit_option_npde() {
+        let mut opts = FitOptions::default();
+        assert_eq!(opts.npde_nsim, 0, "NPDE is off by default");
+        assert_eq!(apply_fit_option(&mut opts, "npde_nsim", "1000"), Ok(true));
+        assert_eq!(opts.npde_nsim, 1000);
+        assert_eq!(apply_fit_option(&mut opts, "npde_seed", "12345"), Ok(true));
+        assert_eq!(opts.npde_seed, Some(12345));
+        // NULL/NA from R clears the seed back to the default.
+        assert_eq!(apply_fit_option(&mut opts, "npde_seed", "null"), Ok(true));
+        assert_eq!(opts.npde_seed, None);
+    }
+
+    #[test]
     fn test_apply_fit_option_threads_variants() {
         let mut opts = FitOptions::default();
         assert_eq!(apply_fit_option(&mut opts, "threads", "4"), Ok(true));
@@ -9253,7 +11573,12 @@ mod tests {
         for method in ["foce", "focei", "gn", "gn_hybrid", "saem"] {
             let opts = parse_fit_options(&[
                 format!("method = {method}"),
-                "covariance = false".to_string(),
+                "covariance = true".to_string(),
+                // The whole covariance family is framework-wide — none of these
+                // are method-specific, so none must warn under any method.
+                "covariance_method = s".to_string(),
+                "covariance_fallback = sir".to_string(),
+                "covariance_ofv_hessian = true".to_string(),
                 "verbose = false".to_string(),
                 "sir = true".to_string(),
                 "bloq_method = m3".to_string(),
@@ -9550,6 +11875,29 @@ mod tests {
         }
         // invalid
         assert!(parse_fit_options(&["covariance_method = bhhh".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_parse_parameter_scaling_and_ofv_hessian() {
+        use crate::types::ParameterScaling;
+        // Defaults: parameter_scaling = Auto, covariance_ofv_hessian = true.
+        let def = parse_fit_options(&[]).unwrap();
+        assert_eq!(def.parameter_scaling, ParameterScaling::Auto);
+        assert!(def.covariance_ofv_hessian);
+        // parameter_scaling keywords, case-insensitive.
+        for (input, expected) in [
+            ("auto", ParameterScaling::Auto),
+            ("none", ParameterScaling::None),
+            ("ABS", ParameterScaling::Abs),
+            ("rescale2", ParameterScaling::Rescale2),
+        ] {
+            let opts = parse_fit_options(&[format!("parameter_scaling = {input}")]).unwrap();
+            assert_eq!(opts.parameter_scaling, expected, "input `{input}`");
+        }
+        assert!(parse_fit_options(&["parameter_scaling = bogus".to_string()]).is_err());
+        // covariance_ofv_hessian bool.
+        let off = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap();
+        assert!(!off.covariance_ofv_hessian);
     }
 
     // ── mu-referencing pattern detection ─────────────────────────────────
@@ -10823,12 +13171,12 @@ mod tests {
     #[test]
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
-        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-4,
+        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-5,
         //   steihaug_max_iters = None (adaptive).
         let opts = FitOptions::default();
         assert_eq!(opts.optimizer, Optimizer::Bobyqa);
         assert_eq!(opts.inner_maxiter, 200);
-        assert!((opts.inner_tol - 1e-4).abs() < 1e-20);
+        assert!((opts.inner_tol - 1e-5).abs() < 1e-20);
         assert_eq!(opts.steihaug_max_iters, None);
     }
 
@@ -10884,6 +13232,46 @@ mod tests {
         assert_eq!(opts.steihaug_max_iters, Some(30));
         // Reject malformed (e.g. negative) value.
         assert!(apply_fit_option(&mut opts, "steihaug_max_iters", "-1").is_err());
+    }
+
+    #[test]
+    fn test_parse_method_token_bayes() {
+        assert_eq!(parse_method_token("bayes"), Ok(EstimationMethod::Bayes));
+        assert_eq!(parse_method_token("BAYES"), Ok(EstimationMethod::Bayes));
+        assert_eq!(parse_method_token("mcmc"), Ok(EstimationMethod::Bayes));
+        assert_eq!(EstimationMethod::Bayes.label(), "BAYES");
+    }
+
+    #[test]
+    fn test_apply_fit_option_bayes_keys() {
+        let mut opts = FitOptions::default();
+        assert_eq!(apply_fit_option(&mut opts, "bayes_warmup", "500"), Ok(true));
+        assert_eq!(opts.bayes_warmup, 500);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_iters", "2000"), Ok(true));
+        assert_eq!(opts.bayes_iters, 2000);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_chains", "2"), Ok(true));
+        assert_eq!(opts.bayes_chains, 2);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_thin", "5"), Ok(true));
+        assert_eq!(opts.bayes_thin, 5);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_seed", "42"), Ok(true));
+        assert_eq!(opts.bayes_seed, Some(42));
+        assert!(apply_fit_option(&mut opts, "bayes_warmup", "oops").is_err());
+
+        // All Bayes keys are recognised by method_specific_keys (no spurious
+        // "unsupported key" warning when method = bayes).
+        opts.method = EstimationMethod::Bayes;
+        for k in [
+            "bayes_warmup",
+            "bayes_iters",
+            "bayes_chains",
+            "bayes_thin",
+            "bayes_seed",
+        ] {
+            assert!(
+                crate::types::method_specific_keys(EstimationMethod::Bayes).contains(&k),
+                "method_specific_keys(Bayes) missing `{k}`"
+            );
+        }
     }
 
     #[test]
@@ -11578,6 +13966,71 @@ if (1 > 0) {
     }
 
     #[test]
+    fn test_unconditionally_assigned_vars_includes_all_branch_assignments() {
+        // V is assigned on BOTH branches → unconditionally defined → promoted.
+        // SCALE is assigned in only one branch → branch-local → excluded.
+        // (Issue #357: a param written on every branch must earn a PK slot.)
+        let block = "
+CL = 1.0
+if (1 > 0) {
+  SCALE = 2.0
+  V = SCALE * 3.0
+} else {
+  V = 4.0
+}
+";
+        let ctx = empty_ctx();
+        let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+        let uncond = unconditionally_assigned_vars(&stmts);
+        assert_eq!(
+            uncond,
+            vec!["CL", "V"],
+            "V is assigned on every branch and must be promoted; SCALE must not"
+        );
+        // top_level still excludes V (its only assignments are inside branches).
+        let top = top_level_assigned_vars(&stmts);
+        assert_eq!(top, vec!["CL"]);
+    }
+
+    #[test]
+    fn test_unconditionally_assigned_vars_branch_only_param() {
+        // The exact issue #357 shape: CL assigned only inside if/else, V at
+        // top level. CL must come first (leading-branch order), then V.
+        let block = "
+if (WT > 70) {
+  CL = TVCL * 1.5
+} else {
+  CL = TVCL
+}
+V = TVV
+";
+        let ctx = empty_ctx();
+        let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+        let uncond = unconditionally_assigned_vars(&stmts);
+        assert_eq!(uncond, vec!["CL", "V"]);
+    }
+
+    #[test]
+    fn test_unconditionally_assigned_vars_if_without_else_excludes() {
+        // No `else` → the name could be undefined on the fall-through path, so
+        // it stays branch-local (not promoted).
+        let block = "
+CL = 1.0
+if (WT > 70) {
+  V = 2.0
+}
+";
+        let ctx = empty_ctx();
+        let stmts = parse_block_statements(block, ctx, StatementMode::Plain).unwrap();
+        let uncond = unconditionally_assigned_vars(&stmts);
+        assert_eq!(
+            uncond,
+            vec!["CL"],
+            "V lacks an else branch — not unconditional"
+        );
+    }
+
+    #[test]
     fn test_duplicate_diffeq_in_same_scope_errors() {
         // Two d/dt(central) at top level must be rejected.
         let block_text = "d/dt(central) = -0.1 * central\nd/dt(central) = -0.2 * central";
@@ -11639,6 +14092,133 @@ if (1 > 0) {
     }
 
     #[test]
+    fn test_ode_rhs_undefined_name_errors() {
+        // #314: a name in an ODE RHS that is not a state, individual parameter,
+        // intermediate, or reserved time var must error — it would otherwise
+        // resolve to the `usize::MAX` sentinel and silently read 0.0, producing
+        // a structurally-broken fit. Here `central` is a state and `CL` is an
+        // individual parameter, but `V` is undeclared.
+        let ode_lines: Vec<String> = vec!["d/dt(central) = -(CL/V) * central".into()];
+        let state_names = vec!["central".to_string()];
+        let result = build_ode_spec(
+            &ode_lines,
+            &state_names,
+            Some("central"),
+            &["CL".to_string()],
+            &[0],
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("undefined RHS name `V` must error"),
+        };
+        assert!(
+            err.contains("undefined name(s): V."),
+            "error should name the undefined `V`, got: {err}"
+        );
+        // The defined names are listed to make the fix obvious.
+        assert!(
+            err.contains("CL") && err.contains("central"),
+            "error should list the defined names, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ode_rhs_undefined_name_walks_all_nodes() {
+        // Exercises every arm of the undefined-name walker: an intermediate
+        // assignment RHS, a block `if` condition, `&&`/`||`/`!` boolean
+        // operators, an inline conditional, `exp(...)`, and `^`. Every BAD*
+        // name is undefined; `k` (intermediate), `central` (state), `CL`
+        // (param), and `TIME` (reserved) must NOT be flagged.
+        let ode_lines: Vec<String> = vec![
+            "k = CL / V1".into(),
+            "if (BADIF > 0) {".into(),
+            "  d/dt(central) = exp(BADEXP) + BADPOW^2 - k * central + (if (BADAND1 > 0 && BADAND2 > 0) 1.0 else 0.0) + (if (BADOR1 > 0 || BADOR2 > 0) 1.0 else 0.0) + (if (!(BADNOT > 0)) 1.0 else 0.0)".into(),
+            "} else {".into(),
+            "  d/dt(central) = -k * central".into(),
+            "}".into(),
+        ];
+        let state_names = vec!["central".to_string()];
+        let result = build_ode_spec(
+            &ode_lines,
+            &state_names,
+            Some("central"),
+            &["CL".to_string()],
+            &[0],
+        );
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("undefined names in nested expressions must error"),
+        };
+        for bad in [
+            "V1", "BADIF", "BADEXP", "BADPOW", "BADAND1", "BADAND2", "BADOR1", "BADOR2", "BADNOT",
+        ] {
+            assert!(err.contains(bad), "error should name `{bad}`, got: {err}");
+        }
+    }
+
+    #[test]
+    fn test_ode_rhs_defined_names_ok() {
+        // Regression guard against false positives: an intermediate (`k`),
+        // individual parameters (`CL`, `V`), a state (`central`), and the
+        // reserved `TIME` variable must all resolve and parse cleanly.
+        let ode_lines: Vec<String> = vec![
+            "k = CL / V".into(),
+            "d/dt(central) = if (TIME < 24.0) -k * central else 0.0".into(),
+        ];
+        let state_names = vec!["central".to_string()];
+        let result = build_ode_spec(
+            &ode_lines,
+            &state_names,
+            Some("central"),
+            &["CL".to_string(), "V".to_string()],
+            &[0, 1],
+        );
+        assert!(
+            result.is_ok(),
+            "intermediate + params + TIME must parse, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_ode_rhs_macheps_resolves_to_epsilon() {
+        // MACHEPS is a reserved ODE builtin (machine epsilon): it must resolve
+        // to f64::EPSILON in an ODE RHS — not be flagged as undefined, and not
+        // silently read 0.0.
+        let ode_lines: Vec<String> = vec!["d/dt(central) = MACHEPS".into()];
+        let state_names = vec!["central".to_string()];
+        let spec = match build_ode_spec(&ode_lines, &state_names, Some("central"), &[], &[]) {
+            Ok(s) => s,
+            Err(e) => panic!("MACHEPS in an ODE RHS must parse, got: {e}"),
+        };
+        let params = vec![0.0; crate::types::MAX_PK_PARAMS + 2];
+        let mut du = vec![0.0_f64];
+        (spec.rhs)(&[0.0], &params, 0.0, &mut du);
+        assert_eq!(
+            du[0],
+            f64::EPSILON,
+            "d/dt(central) = MACHEPS must evaluate to machine epsilon"
+        );
+    }
+
+    #[test]
+    fn test_ode_reserved_builtin_name_collision_errors() {
+        // A state / individual parameter / intermediate may not reuse a reserved
+        // builtin name — `MACHEPS` is now reserved alongside TIME/TAFD/TAD.
+        let ode_lines: Vec<String> = vec!["d/dt(MACHEPS) = -MACHEPS".into()];
+        let state_names = vec!["MACHEPS".to_string()];
+        let result = build_ode_spec(&ode_lines, &state_names, Some("MACHEPS"), &[], &[]);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("a state named MACHEPS must collide with the reserved builtin"),
+        };
+        assert!(
+            err.contains("MACHEPS") && err.contains("reserved"),
+            "expected a reserved-name collision error, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_mu_ref_warning_for_conditional_param() {
         // A model where CL is assigned only inside an if-block should emit a
         // parse_warning about mu-referencing being disabled.
@@ -11672,6 +14252,41 @@ if (1 > 0) {
         assert!(
             w.contains("Mu-referencing disabled"),
             "warning should mention mu-referencing"
+        );
+    }
+
+    #[test]
+    fn nested_if_eta_param_sets_conditional_flag() {
+        // Regression for #278/#280: an eta-bearing parameter assigned inside a
+        // *nested* if-branch must still set `has_conditional_eta_params`, so the
+        // inner loop routes to FD instead of the analytical AD kernel (which
+        // cannot represent the branch). Detection previously looked only one
+        // level deep and silently missed nested conditionals, leaving the model
+        // on a wrong AD gradient — the exact failure class this gate prevents.
+        let plain = minimal_model_with_indiv(
+            "  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)",
+        );
+        assert!(
+            !plain.has_conditional_eta_params,
+            "an unconditional model must not be flagged conditional"
+        );
+
+        let nested = minimal_model_with_indiv(
+            "  CL = TVCL
+  V  = TVV * exp(ETA_V)
+  if (1 > 0) {
+    if (1 > 0) {
+      CL = TVCL * exp(ETA_CL)
+    } else {
+      CL = TVCL * exp(ETA_CL)
+    }
+  }",
+        );
+        assert!(
+            nested.has_conditional_eta_params,
+            "eta-bearing param assigned only inside a nested if must set \
+             has_conditional_eta_params"
         );
     }
 
@@ -12364,6 +14979,240 @@ if (1 > 0) {
     }
 
     #[test]
+    fn test_undefined_structural_param_errors() {
+        // #261: a [structural_model] PK value that names a variable not defined
+        // in [individual_parameters] must be a hard parse error, not silently
+        // defaulted to 0.0 (which yields a "converged" but structurally broken
+        // fit). Here `cl=CL` but only V, KE, KA are defined.
+        let model_str = "
+[parameters]
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKE(0.1, 0.001, 10.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  V  = TVV * exp(ETA_V)
+  KE = TVKE
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = expect_parse_err(model_str);
+        assert!(
+            err.contains("CL") && err.contains("not defined"),
+            "expected an undefined-variable error naming CL, got: {err}"
+        );
+        // The message should list the defined parameters to make the fix obvious.
+        assert!(
+            err.contains("KE"),
+            "error should list defined params: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_pk_param_key_errors() {
+        // Audit of the same silent-drop pattern on the key side: an unrecognized
+        // PK-parameter name (`clx` here, a typo for `cl`) previously dropped the
+        // binding, leaving cl at its 0.0 default. It must now error.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(clx=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = expect_parse_err(model_str);
+        assert!(
+            err.contains("clx") && err.contains("unknown PK parameter"),
+            "expected an unknown-PK-parameter error naming clx, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_literal_pk_param_binds_constant() {
+        // A numeric literal value (`ka=2.5`) is bound as a constant rather than
+        // silently dropped to 0.0. Companion to #261: the same filter_map that
+        // dropped undefined references also dropped literals. `cl=CL` (a defined
+        // variable) must still bind, confirming the two paths coexist.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=2.5)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed = super::parse_full_model(model_str).unwrap();
+        let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+        let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        assert_eq!(pk.ka(), 2.5, "literal ka should bind as the constant 2.5");
+        assert!(
+            pk.cl() > 0.0,
+            "cl should still bind to the defined variable, got {}",
+            pk.cl()
+        );
+    }
+
+    #[test]
+    fn test_valid_structural_param_still_parses() {
+        // #261 acceptance: the repro fixed by defining CL (= KE * V) parses
+        // without error and binds cl to a positive value.
+        let model_str = "
+[parameters]
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKE(0.1, 0.001, 10.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_V ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  V  = TVV * exp(ETA_V)
+  KE = TVKE
+  KA = TVKA
+  CL = KE * V
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let parsed =
+            super::parse_full_model(model_str).expect("model with CL defined should parse");
+        let theta: Vec<f64> = parsed.model.default_params.theta.clone();
+        let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
+        let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new());
+        assert!(pk.cl() > 0.0, "cl should bind to KE * V, got {}", pk.cl());
+    }
+
+    #[test]
+    fn test_non_finite_literal_pk_param_errors() {
+        // `f64::from_str` accepts "inf"/"nan", so a non-finite literal value
+        // must be rejected rather than silently bound as a degenerate constant
+        // (the same silent-wrong default #261 removes for undefined references).
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=inf)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = expect_parse_err(model_str);
+        assert!(
+            err.contains("non-finite") && err.contains("ka"),
+            "expected a non-finite-constant error naming ka, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_undefined_optional_pk_param_errors() {
+        // The undefined-reference guard (#261/#308) applies uniformly to the
+        // *optional* params too — `f`, `lagtime`, and the `alag` alias — not just
+        // the required ones. A typo'd / undefined optional reference must error,
+        // never silently default the slot. (#309 keeps `f`/`lagtime` *optional*,
+        // i.e. omitting them is fine; this is the orthogonal value-validation:
+        // if you DO map them, the referenced variable must exist.) All required
+        // params (cl/v/ka) are defined here so the model reaches value resolution.
+        let header = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, ";
+        let footer = ")
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        // (pk key, undefined variable) — one per optional slot, incl. the alias.
+        for (key, badvar) in [("f", "BADF"), ("lagtime", "BADLAG"), ("alag", "BADALAG")] {
+            let model_str = format!("{header}{key}={badvar}{footer}");
+            let err = expect_parse_err(&model_str);
+            assert!(
+                err.contains(badvar) && err.contains("not defined"),
+                "optional `{key}={badvar}` must error as an undefined reference, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_key_precedes_missing_required() {
+        // Precedence: when a key is unrecognized (a typo like `vx` for `v`) the
+        // error must name that bad key (#308), not report the now-unmapped slot
+        // as a missing required param (#309). The required-param check defers to
+        // the unknown-key check so the message points at the actual mistake.
+        let model_str = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVKA(1.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, vx=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = expect_parse_err(model_str);
+        assert!(
+            err.contains("vx") && err.contains("unknown PK parameter"),
+            "unknown key `vx` must be reported, not a missing-required error, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
         // Regression for the ODE-with-lagtime path. For ODE models there is
         // no [structural_model] pk= line, so pk_param_map is empty and
@@ -12665,6 +15514,49 @@ if (1 > 0) {
         let parsed = parse_full_model(&src).unwrap();
         let ode = parsed.model.ode_spec.as_ref().unwrap();
         assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![7.5]);
+    }
+
+    #[test]
+    fn test_init_undefined_name_errors() {
+        // #314: an init expression referencing a name that is neither a state
+        // nor an individual parameter must error rather than silently reading
+        // 0.0 via `eval_expression`. `KIN` is a declared parameter (must not be
+        // flagged); `BASE` is undeclared.
+        let src = turnover_ode_model("  init(response) = BASE * KIN");
+        let err = match parse_full_model(&src) {
+            Err(e) => e,
+            Ok(_) => panic!("expected undefined-name error for init(response)"),
+        };
+        assert!(
+            err.contains("init(response)"),
+            "error should reference init(response), got: {err}"
+        );
+        // Only BASE is flagged — KIN resolves to the declared parameter.
+        assert!(
+            err.contains("undefined name(s): BASE."),
+            "error should flag only BASE as undefined, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_init_macheps_resolves_to_epsilon() {
+        // MACHEPS is available in init expressions (eval_expression resolves it)
+        // — the undefined-name check must accept it, and it evaluates to EPSILON.
+        let src = turnover_ode_model("  init(response) = MACHEPS");
+        let parsed = parse_full_model(&src).unwrap();
+        let ode = parsed.model.ode_spec.as_ref().unwrap();
+        assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![f64::EPSILON]);
+    }
+
+    #[test]
+    fn test_init_macheps_is_case_insensitive() {
+        // `eval_expression` resolves MACHEPS case-insensitively, so a mixed-case
+        // spelling must not be rejected by the undefined-name check (regression:
+        // exact-key matching against init_defined would have flagged it).
+        let src = turnover_ode_model("  init(response) = MachEps");
+        let parsed = parse_full_model(&src).unwrap();
+        let ode = parsed.model.ode_spec.as_ref().unwrap();
+        assert_eq!(ode.initial_state(&[10.0, 2.0]), vec![f64::EPSILON]);
     }
 
     #[test]
@@ -13886,6 +16778,124 @@ if (1 > 0) {
     }
 
     #[test]
+    fn compute_max_stack_allows_branching_bytecode() {
+        // Regression: a `Conditional` compiles to
+        //   cond; JumpIfFalse(else); then; Jump(end); else
+        // so `compute_max_stack`'s linear scan walks BOTH arms and ends above
+        // depth 1 (one extra per branch). The end-depth assertion must be
+        // skipped when jumps are present; before the fix, `compile_bytecode`
+        // panicked here under debug-assertions ("bytecode ends at depth 2").
+        let expr = cond(cmp(lit(2.0), CmpOp::Lt, lit(3.0)), lit(1.0), lit(-1.0));
+        let bc = compile_bytecode(&expr); // would panic pre-fix
+        assert!(
+            bc.max_stack >= 1,
+            "max_stack must be >= 1, got {}",
+            bc.max_stack
+        );
+
+        // The reserved size must actually be sufficient to evaluate correctly:
+        // 2 < 3 ⇒ the `then` arm (1.0).
+        let nn: Vec<Vec<f64>> = Vec::new();
+        let mut stack: Vec<f64> = Vec::new();
+        let by = eval_bytecode(&bc, &[], &[], &[], &[], &nn, &mut stack);
+        assert_eq!(by.to_bits(), 1.0_f64.to_bits());
+
+        // Nested conditionals (deeper branch nesting) must also not trip it,
+        // and a deeper `peak` must still be returned.
+        let nested = cond(
+            cmp(lit(1.0), CmpOp::Gt, lit(0.0)),
+            cond(cmp(lit(2.0), CmpOp::Lt, lit(5.0)), lit(10.0), lit(20.0)),
+            lit(-1.0),
+        );
+        assert!(compute_max_stack(&compile_bytecode(&nested).ops) >= 1);
+
+        // The jump-free path is unchanged: `1 + 2` pushes two operands before
+        // `Add`, so the peak (the returned size) is 2 — and its end-depth of 1
+        // still satisfies the (retained) jump-free assertion.
+        assert_eq!(
+            compute_max_stack(&compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops),
+            2
+        );
+
+        // `bytecode_has_branch` (which gates the assertion) — true for
+        // conditional bytecode, false for a jump-free arithmetic expression.
+        assert!(bytecode_has_branch(&compile_bytecode(&expr).ops));
+        assert!(!bytecode_has_branch(
+            &compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops
+        ));
+
+        // `ends_at_expected_depth` — the returnable predicate the `debug_assert!`
+        // consumes. Exercised directly (with hard-coded depths) so its branching
+        // logic is covered even under the `ci-test` profile (debug-assertions
+        // off), where the assertion is compiled out and never runs. Branchy
+        // bytecode is exempt at any end depth; jump-free bytecode must end at
+        // depth 1. The depth real bytecode actually compiles to is pinned
+        // separately in `compute_max_stack_jumpfree_bytecode_ends_at_depth_one`.
+        let cond_ops = compile_bytecode(&expr).ops;
+        let addops = compile_bytecode(&binop(BinOp::Add, lit(1.0), lit(2.0))).ops;
+        assert!(ends_at_expected_depth(&cond_ops, 2)); // branchy: exempt even at depth 2
+        assert!(ends_at_expected_depth(&addops, 1)); // jump-free: depth 1 ok
+        assert!(!ends_at_expected_depth(&addops, 2)); // jump-free: depth 2 rejected
+        assert!(ends_at_expected_depth(&[], 0)); // empty: ok
+    }
+
+    #[test]
+    fn compute_max_stack_jumpfree_bytecode_ends_at_depth_one() {
+        // Closes the gap the sibling test leaves open. That one feeds
+        // `ends_at_expected_depth` HARD-CODED depths, so it pins the predicate's
+        // branching logic but never the depth a real expression compiles to — a
+        // future `compile_expr_into` off-by-one would slip past it. Here we scan
+        // REAL bytecode and assert the end-depth invariant directly.
+        //
+        // `scan_stack_depth` *returns* the end depth (rather than only feeding it
+        // to the `debug_assert!` in `compute_max_stack`), so these are plain
+        // value assertions that hold under every profile — including `ci-test`,
+        // where debug-assertions are off. That is what makes such a regression
+        // catchable in CI, not only under the local dev profile.
+        for expr in [
+            lit(3.0),
+            binop(BinOp::Add, lit(1.0), lit(2.0)),
+            binop(BinOp::Sub, binop(BinOp::Mul, lit(2.0), lit(3.0)), lit(4.0)),
+            unary("exp", lit(0.5)),
+            unary("ln", binop(BinOp::Div, lit(6.0), lit(2.0))),
+        ] {
+            let ops = compile_bytecode(&expr).ops;
+            assert!(
+                !bytecode_has_branch(&ops),
+                "expr must compile jump-free for this invariant: {ops:?}"
+            );
+            let (peak, end_depth) = scan_stack_depth(&ops);
+            // A well-formed expression leaves exactly one result on the stack.
+            assert_eq!(
+                end_depth, 1,
+                "jump-free expr must end at depth 1, got {end_depth}: {ops:?}"
+            );
+            // `peak` (the reserved stack size) never under-counts the end depth,
+            // and `compute_max_stack` returns exactly `peak.max(1)`.
+            assert!(
+                peak >= end_depth,
+                "peak {peak} < end_depth {end_depth}: {ops:?}"
+            );
+            assert_eq!(compute_max_stack(&ops), peak.max(1) as usize);
+        }
+
+        // Counterpart to the exemption: branchy bytecode genuinely ends ABOVE
+        // depth 1 (the linear scan walks both arms), which is exactly why
+        // `compute_max_stack` skips the end-depth assert when jumps are present.
+        let cond_ops = compile_bytecode(&cond(
+            cmp(lit(2.0), CmpOp::Lt, lit(3.0)),
+            lit(1.0),
+            lit(-1.0),
+        ))
+        .ops;
+        assert!(bytecode_has_branch(&cond_ops));
+        assert!(
+            scan_stack_depth(&cond_ops).1 > 1,
+            "conditional should end above depth 1 (both arms walked): {cond_ops:?}"
+        );
+    }
+
+    #[test]
     fn bytecode_matches_ast_on_arithmetic_and_literals() {
         let v = &[3.5, -2.0, 0.0];
         let t = &[10.0, 0.1];
@@ -15014,10 +18024,18 @@ method = foce
 "#
         );
         let parsed = parse_full_model(&src).expect("parse ok");
+        // `ke = CL/V` is itself an unused intermediate, now flagged by the
+        // computed-but-unused check (#309). This test's point is narrower: the
+        // thetas/etas it references (TVCL, TVV, ETA_CL, ETA_V) must NOT be falsely
+        // reported as unused.
         assert!(
-            parsed.model.parse_warnings.is_empty(),
-            "derived variable ke=CL/V must not trigger false positives; \
-             got: {:?}",
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("not referenced in any model expression")),
+            "thetas/etas used via the derived variable ke=CL/V must not be flagged \
+             unused; got: {:?}",
             parsed.model.parse_warnings
         );
     }
@@ -15553,6 +18571,181 @@ CL V KA WT
             let ctx2 = DerivedContext { tad: 1.0, ..ctx };
             assert_eq!(eval(&ctx2), 0.0, "TAD=1 should not be < MACHEPS");
         }
+    }
+
+    #[test]
+    fn ode_compartment_indexed_dose_attrs_populate_map() {
+        // `F2` / `ALAG2` in a 2-compartment ODE model must (a) parse without
+        // tripping the dead-parameter census — they are engine-applied dose
+        // attributes, not dead structural params — and (b) populate the
+        // `dose_attr_map` and enable `has_lagtime()` (#369).
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF2(0.6, 0.01, 1.0)
+  theta TVLAG2(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  F2 = TVF2
+  ALAG2 = TVLAG2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("parse ok");
+        let map = &parsed
+            .model
+            .ode_spec
+            .as_ref()
+            .expect("ode spec")
+            .dose_attr_map;
+        assert!(
+            map.indexed_slot(crate::types::DoseAttr::F, 2).is_some(),
+            "F2 must map for compartment 2"
+        );
+        assert!(
+            map.indexed_slot(crate::types::DoseAttr::Lag, 2).is_some(),
+            "ALAG2 must map for compartment 2"
+        );
+        // No compartment-1 override was declared.
+        assert!(map.indexed_slot(crate::types::DoseAttr::F, 1).is_none());
+        assert!(
+            parsed.model.has_lagtime(),
+            "ALAG2 must enable has_lagtime() so downstream lag handling runs"
+        );
+    }
+
+    #[test]
+    fn ode_dose_attr_compartment_out_of_range_errors() {
+        // `F3` references compartment 3, but the model has only 2 states — a loud
+        // parse error, never a silently-ignored spare slot (#369).
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF3(0.6, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  F3 = TVF3
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(src)
+            .err()
+            .expect("F3 with 2 compartments must error");
+        assert!(
+            err.contains("compartment 3") && err.contains("F3"),
+            "error must name the attribute and compartment, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_modeled_duration_param_populates_map() {
+        // A `D{n}` parameter (modeled infusion duration, RATE=-2; #324) in an ODE
+        // model must (a) parse without tripping the dead-parameter census — it is
+        // an engine-applied dose attribute, not a dead structural param — and
+        // (b) populate `dose_attr_map` as Duration for compartment 2.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVD2(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  D2 = TVD2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("D2 parses (engine-applied, not dead)");
+        let map = &parsed
+            .model
+            .ode_spec
+            .as_ref()
+            .expect("ode spec")
+            .dose_attr_map;
+        assert!(
+            map.indexed_slot(crate::types::DoseAttr::Duration, 2)
+                .is_some(),
+            "D2 must map as modeled duration for compartment 2"
+        );
+        // It bound nothing else (no D1, no F2).
+        assert!(map
+            .indexed_slot(crate::types::DoseAttr::Duration, 1)
+            .is_none());
+        assert!(map.indexed_slot(crate::types::DoseAttr::F, 2).is_none());
+    }
+
+    #[test]
+    fn ode_modeled_duration_out_of_range_compartment_errors() {
+        // `D5` references compartment 5 but the model has 2 states -> the same
+        // loud n_states guard that rejects `F3` (#324/#369), never a silently
+        // ignored spare slot.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVD5(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  D5 = TVD5
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(src)
+            .err()
+            .expect("D5 on a 2-state model must error");
+        assert!(
+            err.contains("compartment 5") && err.contains("D5"),
+            "error must name the attribute and compartment, got: {err}"
+        );
     }
 
     #[test]

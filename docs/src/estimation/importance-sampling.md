@@ -4,10 +4,12 @@
 
 The `imp` stage estimates the marginal log-likelihood
 
-\\[
+<div>
+\[
 -2 \\log L(\\theta) \\;=\\; -2 \\sum_i \\log p(y_i \\mid \\theta)
 \\;=\\; -2 \\sum_i \\log \\int p(y_i \\mid \\eta, \\theta)\\, p(\\eta \\mid \\theta)\\, d\\eta
-\\]
+\]
+</div>
 
 by Monte-Carlo importance sampling. The IS Monte-Carlo estimator of
 `p(yᵢ|θ)` is unbiased; the reported `−2 log L` carries a small Jensen
@@ -87,35 +89,43 @@ For each subject *i* with EBE η̂ᵢ and inner-loop Jacobian Jᵢ = ∂f/∂η 
    (multivariate Student-t).
 
 3. **Compute log importance weights:**
-   \\[
+<div>
+   \[
    \\log w_{ik} = \\log p(y_i \\mid \\eta_{ik}, \\theta)
                 + \\log p(\\eta_{ik} \\mid \\theta)
                 - \\log q(\\eta_{ik}).
-   \\]
+   \]
+</div>
 
 4. **Subject marginal LL** via log-sum-exp:
-   \\[
+<div>
+   \[
    \\log \\hat p(y_i \\mid \\theta)
    \\;=\\; \\operatorname{lse}_k \\log w_{ik} - \\log K.
-   \\]
+   \]
+</div>
 
 5. **Per-subject effective sample size:**
-   \\(\\mathrm{ESS}_i = 1 / \\sum_k \\tilde w_{ik}^2\\) (normalised weights).
+   \\(\\mathrm{ESS}\_i = 1 / \\sum\_k \\tilde w\_{ik}^2\\) (normalised weights).
    The result reports the across-subject min and median of ESS/K, plus
    any subjects below `is_low_ess_threshold` (default 10%).
 
 6. **Monte-Carlo standard error.** For a self-normalised IS estimator the
    asymptotic per-subject variance (Geweke 1989) is
-   \\[
+<div>
+   \[
    \\operatorname{Var}\\bigl(\\log \\hat p(y_i \\mid \\theta)\\bigr)
    \\;\\approx\\; \\frac{1}{K}\\left(\\frac{1}{\\mathrm{ESS}_i / K} - 1\\right).
-   \\]
+   \]
+</div>
    Aggregating across subjects (LL is a sum of independent per-subject
    log-marginals) and converting to the `−2 log L` scale,
-   \\[
+<div>
+   \[
    \\operatorname{SE}(-2 \\log L_{IS})
    \\;=\\; 2 \\sqrt{\\sum_i \\operatorname{Var}\\bigl(\\log \\hat p(y_i \\mid \\theta)\\bigr)}.
-   \\]
+   \]
+</div>
    Subjects with degenerate ESS (\\(\\mathrm{ESS}_i / K = 0\\) — complete
    proposal collapse) fall back to a per-subject variance of `1.0`, which
    produces a *finite* but inflated SE rather than a NaN. A separate

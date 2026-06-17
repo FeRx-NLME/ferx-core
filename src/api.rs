@@ -569,6 +569,8 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_iov_occasions(model, population));
+    diags.extend(check_absorption_dosing(model, population));
+    diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(validate_output_columns(model, population));
     diags
 }
@@ -594,6 +596,211 @@ fn check_iov_occasions(model: &CompiledModel, population: &Population) -> Vec<Di
          [fit_options] so that per-occasion kappas can be estimated.",
     )
     .with_block("fit_options")]
+}
+
+/// Built-in absorption input-rate models (e.g. `transit()`) are integrated
+/// through the standard ODE prediction paths. Two combinations are not yet
+/// supported and are rejected here — loudly — rather than silently mis-modeled:
+///   - a steady-state dose (`SS=1`) into an input-rate compartment: periodic
+///     steady state with an unfinished `R_in` tail needs dedicated treatment
+///     (a later phase of `plans/absorption-models.md`);
+///   - an input-rate model combined with a `[diffusion]` block (the SDE/EKF
+///     path), whose Kalman propagation does not carry the `R_in` forcing.
+fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let Some(ode) = &model.ode_spec else {
+        return Vec::new();
+    };
+    if ode.input_rate.is_empty() {
+        return Vec::new();
+    }
+    let mut diags = Vec::new();
+
+    // input-rate + [diffusion]/EKF (model-level): the EKF propagator does not
+    // apply the R_in forcing, so the absorption term would be silently dropped.
+    if !ode.diffusion_var.is_empty() {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_DIFFUSION",
+                "A built-in absorption input-rate model (e.g. transit()) cannot yet be \
+                 combined with a [diffusion] block (the SDE/EKF path): the EKF \
+                 propagation does not carry the input-rate forcing. Remove the \
+                 [diffusion] block or the absorption term.",
+            )
+            .with_block("odes"),
+        );
+    }
+
+    // SS=1 dose into an input-rate compartment (data-level): the steady-state
+    // equilibration applies the dose as a bolus pulse, not as R_in over the cycle.
+    use std::collections::BTreeSet;
+    let cmts: BTreeSet<usize> = ode.input_rate.iter().map(|f| f.cmt + 1).collect();
+    let has_ss = population.subjects.iter().any(|s| {
+        s.doses
+            .iter()
+            .any(|d| d.ss && d.ii > 0.0 && cmts.contains(&d.cmt))
+    });
+    if has_ss {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_SS",
+                "Steady-state dosing (SS=1) into a built-in absorption input-rate \
+                 compartment (e.g. transit()) is not yet supported. Expand the run-in \
+                 with explicit dosing records, or remove the absorption term.",
+            )
+            .with_block("odes"),
+        );
+    }
+
+    // Infusion (RATE>0) into an input-rate compartment (data-level): the dose
+    // would be delivered twice — once as the `+rate` infusion injection in the
+    // ODE RHS wrapper, and again as `R_in(tad)` superposed by the input-rate
+    // forcing — silently ~doubling exposure. A transit dose carries its mass
+    // through `R_in` from the bolus amount; an infusion rate on that record is
+    // undefined, so reject it loudly. RATE=-2 (modeled duration) is also an
+    // infusion (`is_infusion()` is true for it), so it is caught here too;
+    // RATE=-1 is rejected at the datareader.
+    let has_infusion = population.subjects.iter().any(|s| {
+        s.doses
+            .iter()
+            .any(|d| d.is_infusion() && cmts.contains(&d.cmt))
+    });
+    if has_infusion {
+        diags.push(
+            Diagnostic::error(
+                "E_ABSORPTION_RATE",
+                "An infusion (RATE>0) into a built-in absorption input-rate \
+                 compartment (e.g. transit()) is not supported: the dose mass is \
+                 delivered through the input-rate function R_in computed from the dose \
+                 amount, so an infusion rate would double-count it. Use a plain bolus \
+                 dose record (RATE=0) into the absorption compartment.",
+            )
+            .with_block("odes"),
+        );
+    }
+
+    // Parameter-domain validation (data-level): an out-of-domain or non-finite
+    // input-rate parameter (e.g. transit `mtt ≤ 0` or `n < 0`) would otherwise
+    // propagate as a NaN through the ODE RHS and surface only as an opaque fit
+    // failure. Evaluated on typical values (η = 0) per subject, so a covariate
+    // relationship that pushes a subject's typical `mtt`/`n` out of range is
+    // caught too. Reported once — a single fatal error already halts the fit.
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    'subjects: for subject in &population.subjects {
+        let pk = (model.pk_param_fn)(&model.default_params.theta, &zero_eta, &subject.covariates);
+        for forcing in &ode.input_rate {
+            if let Err(msg) = forcing.validate(&pk.values) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_ABSORPTION_DOMAIN",
+                        format!(
+                            "Built-in absorption input-rate parameter out of domain at typical \
+                             values (subject {}): {msg}. Constrain the parameter so it stays in \
+                             range (e.g. `MTT = TVMTT * exp(ETA_MTT)` keeps MTT > 0).",
+                            subject.id
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+                break 'subjects;
+            }
+        }
+    }
+
+    diags
+}
+
+/// NONMEM coded `RATE=-2` (modeled infusion duration → `D{cmt}`) needs two
+/// model-aware checks the datareader cannot make (it has no model). Both are
+/// fatal — never a silent fall-through to a bolus (the original #324 bug):
+///   - **ODE engine.** Modeled duration is ODE-only; the analytical engine has
+///     no spare-slot routing for a `D{n}` parameter yet (a tracked #324
+///     follow-up). A `RATE=-2` dose on an analytical model is rejected.
+///   - **Matching `D{cmt}` parameter.** A `RATE=-2` dose into compartment `n`
+///     requires a `D{n}` parameter (so `resolve_rate` has a slot to read);
+///     otherwise it is rejected.
+///
+/// Reported once per offending compartment (naming the first dose that hits it),
+/// so a dataset with many `RATE=-2` rows yields one actionable error per cause.
+/// (The `D{n}`-is-also-an-RHS-rate-constant name collision is handled the same
+/// way `F{n}` is — a documented reserved-name note in `docs/`, not a runtime
+/// check — see ode-models.md.)
+fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    use crate::types::{DoseAttr, RateMode};
+    let mut diags = Vec::new();
+    // De-dup by compartment so N identical RATE=-2 rows give one error, not N.
+    let mut reported: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for subject in &population.subjects {
+        for dose in &subject.doses {
+            if dose.rate_mode != RateMode::ModeledDuration || !reported.insert(dose.cmt) {
+                continue;
+            }
+            let cmt = dose.cmt;
+            match &model.ode_spec {
+                None => diags.push(
+                    Diagnostic::error(
+                        "E_MODELED_DURATION_ANALYTICAL",
+                        format!(
+                            "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
+                             compartment {cmt} is only supported for ODE models; analytical \
+                             support is a tracked follow-up to #324. Use an `ode(...)` model with \
+                             a `D{cmt}` parameter, or supply an explicit positive RATE \
+                             (= AMT/duration).",
+                            subject.id, dose.time
+                        ),
+                    )
+                    .with_block("structural_model"),
+                ),
+                Some(ode) => {
+                    if ode
+                        .dose_attr_map
+                        .indexed_slot(DoseAttr::Duration, cmt)
+                        .is_none()
+                    {
+                        diags.push(
+                            Diagnostic::error(
+                                "E_MODELED_DURATION_NO_PARAM",
+                                format!(
+                                    "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
+                                     compartment {cmt} requires a `D{cmt}` parameter in \
+                                     [individual_parameters], but none is declared. Add \
+                                     `D{cmt} = ...` (the modeled duration), or supply an explicit \
+                                     positive RATE.",
+                                    subject.id, dose.time
+                                ),
+                            )
+                            .with_block("individual_parameters"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    diags
+}
+
+/// Precondition shared by [`predict`] and the `simulate*` family: every
+/// modeled-`RATE` dose (#324, e.g. `RATE=-2` → `D{cmt}`) must be supported by
+/// the model (an ODE engine with the matching `D{cmt}` parameter).
+///
+/// `fit()` enforces this via [`first_error`] over the full [`check_model_data`],
+/// but `predict()` / `simulate()` deliberately skip that data-check (they assume
+/// a model the caller already validated, and run no other data validation). A
+/// modeled dose slipping through would otherwise hit one of two failure modes
+/// downstream that the per-path `debug_assert!` tripwires only catch in
+/// debug/test builds — silently in release: a 0-rate "infusion" on the
+/// analytical path, or [`DoseEvent::resolve_rate`]'s slot `.expect`. This gate
+/// turns both into a loud, actionable panic carrying the same diagnostic message
+/// `check_model_data` would have produced, reusing the single-source-of-truth
+/// [`check_modeled_dose_rates`]. It is O(doses) and runs once per public call
+/// (not in the inner loop), and is a no-op for the common all-`Fixed` dataset.
+pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: &Population) {
+    if let Err(msg) = first_error(&check_modeled_dose_rates(model, population)) {
+        panic!(
+            "predict()/simulate() received a dose the model cannot honour: {msg}\n\
+             (fit() reports this as an error rather than panicking; validate with \
+             `check_model_data` before predicting on untrusted input.)"
+        );
+    }
 }
 
 /// Model + estimation-option *compatibility* checks that don't depend on data:
@@ -778,14 +985,51 @@ pub fn check_model_data_warnings(
     }
 
     // SS=1 infusion with T_inf > II — overlapping pulses have no closed form;
-    // the SS pre-equilibration is skipped.
+    // the SS pre-equilibration is skipped. The effective infusion length is
+    // `d.duration` for an ordinary infusion, but for a modeled-duration dose
+    // (RATE=-2 → `D{cmt}`; #324) it is unresolved here (`rate`/`duration` are 0
+    // until `resolve_rate`), so resolve `D{cmt}` at the typical-value point.
+    //
+    // Resolution goes through the single-source-of-truth `DoseEvent::resolve_rate`
+    // (the same rule + `DURATION_FLOOR` clamp the integrator applies at runtime),
+    // not a hand-rolled slot read, so the warning's notion of "duration" can't
+    // drift from the integrator's. It is a *typical-value* heuristic: it uses
+    // init theta, eta = 0, and this subject's covariates, whereas runtime uses
+    // per-occasion eta/IOV — a modeled SS infusion whose duration crosses `II`
+    // only on some occasions may not be flagged here (and conversely a typical
+    // overlap may not occur on every occasion). The runtime SS-skip is the
+    // backstop; this catches the common typical-value / covariate-driven overlap.
+    // (Analytical models reject modeled doses upstream, so the `ode_spec`-less
+    // branch only sees `Fixed` doses.)
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    let effective_duration = |s: &Subject, d: &DoseEvent| -> f64 {
+        if d.is_fixed() {
+            return d.duration;
+        }
+        match &model.ode_spec {
+            // Guard the `D{cmt}` slot's existence: a modeled dose with no matching
+            // parameter is an *error* (`E_MODELED_DURATION_NO_PARAM`), but this
+            // warnings pass must stay panic-free if run on such a model rather than
+            // hit `resolve_rate`'s slot `.expect`.
+            Some(ode)
+                if ode
+                    .dose_attr_map
+                    .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
+                    .is_some() =>
+            {
+                let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates);
+                d.resolve_rate(&ode.dose_attr_map, &pk.values).duration
+            }
+            _ => 0.0,
+        }
+    };
     let n_ss_overlapping_inf = population
         .subjects
         .iter()
         .filter(|s| {
             s.doses
                 .iter()
-                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii)
+                .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && effective_duration(s, d) > d.ii)
         })
         .count();
     if n_ss_overlapping_inf > 0 {
@@ -801,6 +1045,51 @@ pub fn check_model_data_warnings(
                 n_ss_overlapping_inf
             ),
         ));
+    }
+
+    // Modeled infusion duration `D{cmt}` (RATE=-2; #324) that is non-positive at
+    // the initial typical-value point (eta = 0). `resolve_rate` clamps a transient
+    // `D ≤ 0` to `DURATION_FLOOR` so `AMT/D` stays finite mid-search, but a
+    // non-positive `D` *at the initial estimate* signals a misspecified
+    // parameterisation: every iteration then delivers `AMT` over ~`DURATION_FLOOR`
+    // — a bolus-like spike, not an infusion — and the fit can converge wrong with
+    // no other diagnostic. Flag it (analogous to W_NEGATIVE_LAGTIME) and point at
+    // a positive-link parameterisation. De-duped per compartment.
+    if let Some(ode) = &model.ode_spec {
+        use crate::types::{DoseAttr, DoseEvent};
+        let mut nonpos_cmts: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for s in &population.subjects {
+            let mut pk_at_init: Option<crate::types::PkParams> = None;
+            for d in &s.doses {
+                if d.is_fixed() {
+                    continue;
+                }
+                if let Some(slot) = ode.dose_attr_map.indexed_slot(DoseAttr::Duration, d.cmt) {
+                    let pk = pk_at_init.get_or_insert_with(|| {
+                        (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates)
+                    });
+                    if pk.values[slot] <= DoseEvent::DURATION_FLOOR {
+                        nonpos_cmts.insert(d.cmt);
+                    }
+                }
+            }
+        }
+        for cmt in nonpos_cmts {
+            diags.push(Diagnostic::warning(
+                "W_MODELED_DURATION_NONPOSITIVE",
+                format!(
+                    "Modeled infusion duration D{cmt} (RATE=-2 into compartment \
+                     {cmt}) evaluates to ≤ 0 at the initial typical-value point \
+                     (eta = 0). A non-positive duration is clamped to {floor:e} to \
+                     keep AMT/D finite, which delivers the dose as a bolus-like \
+                     spike rather than an infusion — the fit may converge to a \
+                     wrong optimum. Use a positive-link parameterisation \
+                     (e.g. D{cmt} = exp(...)).",
+                    cmt = cmt,
+                    floor = DoseEvent::DURATION_FLOOR,
+                ),
+            ));
+        }
     }
 
     // EVID=3/4 resets are not honoured on the EKF/SDE path.
@@ -840,6 +1129,32 @@ pub fn check_model_data_warnings(
                         pk.lagtime()
                     ),
                 ));
+            }
+            // Compartment-indexed `ALAGn` lags (issue #369) live in their own
+            // spare slots, so the bare check above never sees them — flag each one
+            // that is negative at the typical-value point. Ordered by compartment
+            // for deterministic diagnostics.
+            if let Some(ode) = &model.ode_spec {
+                for cmt in 1..=ode.n_states {
+                    let Some(slot) = ode
+                        .dose_attr_map
+                        .indexed_slot(crate::types::DoseAttr::Lag, cmt)
+                    else {
+                        continue;
+                    };
+                    let lag = pk.values.get(slot).copied().unwrap_or(0.0);
+                    if lag < 0.0 {
+                        diags.push(Diagnostic::warning(
+                            "W_NEGATIVE_LAGTIME",
+                            format!(
+                                "ALAG{cmt} (compartment-{cmt} lag) evaluates to {lag:.4} (< 0) \
+                                 at the initial typical-value point (eta = 0). Negative lagtimes \
+                                 are physically nonsensical and are not clamped — consider an \
+                                 exp() or other positive-link parameterisation."
+                            ),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1228,6 +1543,7 @@ pub fn fit(
     // path above). Here we always use the global pool for the outer par_iter.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
     let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
+    let base_bayes_seed: u64 = options.bayes_seed.unwrap_or(12345);
     let n = options.n_starts;
     let sigma = options.start_sigma;
 
@@ -1246,8 +1562,11 @@ pub fn fit(
         .map(|k| {
             let init_k = perturb_init(init_params, k, sigma, base_seed);
             // Per-start option overrides for k > 0:
-            // - saem_seed: derive from base so each start gets a different MH trajectory.
-            //   Start 0 keeps the user's seed for reproducibility of the unperturbed run.
+            // - saem_seed / bayes_seed: derive from base so each start gets a different
+            //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
+            //   perturbing it every start runs an identical RNG trajectory (differing
+            //   only by the perturbed init) — wasted compute and false multi-start
+            //   robustness. Start 0 keeps the user's seeds for reproducibility.
             // - global_search: CRS2-LM ignores the starting point and samples freely in
             //   [lower, upper], so running it on starts 1..n overrides the perturbation
             //   and makes multi-start a no-op for those starts. Only run it on start 0.
@@ -1257,6 +1576,7 @@ pub fn fit(
             } else {
                 opts_k_storage = FitOptions {
                     saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
+                    bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
                     global_search: false,
                     ..options.clone()
                 };
@@ -1357,8 +1677,8 @@ fn probe_nlopt_algorithms() -> Vec<String> {
 /// Mandatory sdtab column names that are always written — declaring them in
 /// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
 const OUTPUT_MANDATORY: &[&str] = &[
-    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV",
-    "N_OBS", "TAFD", "TAD",
+    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD",
+    "EBE_OFV", "N_OBS", "TAFD", "TAD",
 ];
 
 /// Validate `model.output_columns` against known quantities, emitting
@@ -1417,37 +1737,62 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
     diags
 }
 
-/// Compute TAFD (time after first dose) and TAD (time after last dose,
-/// SS-aware) for observation index `obs_idx` of `subject`.
-pub fn tafd_tad_for_subject(subject: &Subject, obs_idx: usize, lagtime: f64) -> (f64, f64) {
-    let obs_time = subject.obs_times[obs_idx];
+/// Time after the most recent **absorbed** dose at time `t` (SS-aware), shifting
+/// each dose by its own lag from `dose_lagtimes`. Missing entries — a slice
+/// shorter than `subject.doses`, or `&[]` — default to zero lag. Returns NaN when
+/// no dose has been absorbed by `t`. Shared by the per-observation TAD column and
+/// the model-based integral grid so both apply identical per-dose-lag logic.
+fn tad_at_time(subject: &Subject, t: f64, dose_lagtimes: &[f64]) -> f64 {
+    let last_dose_eff = subject
+        .doses
+        .iter()
+        .enumerate()
+        .filter_map(|(d, dose)| {
+            let lag = dose_lagtimes.get(d).copied().unwrap_or(0.0);
+            if dose.time + lag > t + 1e-12 {
+                return None;
+            }
+            let eff = if dose.ss && dose.ii > 0.0 {
+                let elapsed = t - (dose.time + lag);
+                t - elapsed.rem_euclid(dose.ii)
+            } else {
+                dose.time + lag
+            };
+            Some(eff)
+        })
+        .fold(f64::NEG_INFINITY, f64::max);
+    if last_dose_eff.is_finite() {
+        t - last_dose_eff
+    } else {
+        f64::NAN
+    }
+}
 
+/// Compute TAFD (time after first dose) and TAD (time after last dose, SS-aware)
+/// for observation index `obs_idx` of `subject`.
+///
+/// `dose_lagtimes[d]` is the absorption lag for dose `d`, evaluated with that
+/// dose's occasion kappa and covariate snapshot (see [`crate::pk::predict_iov`]).
+/// Each dose's effective arrival is `dose.time + dose_lagtimes[d]`, so under a lag
+/// that varies across doses — IOV on the lag, or a time-varying covariate — a dose
+/// given in one occasion is shifted by its *own* lag rather than the observation's,
+/// which matters for the most-recent-dose pick (e.g. BID dosing spanning two
+/// occasions). Missing entries default to zero lag, so callers with no lag can
+/// pass `&[]`. TAFD is unaffected — measured from the raw first-dose time, not the
+/// lagged arrival.
+pub fn tafd_tad_for_subject(
+    subject: &Subject,
+    obs_idx: usize,
+    dose_lagtimes: &[f64],
+) -> (f64, f64) {
+    let obs_time = subject.obs_times[obs_idx];
     let first_dose_time = subject.occasion_first_dose_time(obs_time);
     let tafd = if first_dose_time.is_finite() {
         obs_time - first_dose_time
     } else {
         f64::NAN
     };
-
-    let last_dose_eff = subject
-        .doses
-        .iter()
-        .filter(|d| d.time + lagtime <= obs_time + 1e-12)
-        .map(|d| {
-            if d.ss && d.ii > 0.0 {
-                let elapsed = obs_time - (d.time + lagtime);
-                obs_time - elapsed.rem_euclid(d.ii)
-            } else {
-                d.time + lagtime
-            }
-        })
-        .fold(f64::NEG_INFINITY, f64::max);
-    let tad = if last_dose_eff.is_finite() {
-        obs_time - last_dose_eff
-    } else {
-        f64::NAN
-    };
-
+    let tad = tad_at_time(subject, obs_time, dose_lagtimes);
     (tafd, tad)
 }
 
@@ -1486,6 +1831,7 @@ pub(crate) fn compute_extra_output_columns(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
+    kappas_per_subject: &[Vec<DVector<f64>>],
     subjects: &mut [SubjectResult],
 ) {
     use crate::types::{AggFunction, DerivedContext, DerivedKind, IntegralStep, IntegralWindow};
@@ -1501,18 +1847,85 @@ pub(crate) fn compute_extra_output_columns(
         let eta_hat = sr.eta.as_slice();
         let n_obs = sr.ipred.len();
 
+        // Per-observation full eta vector [BSV η … | occasion κ …].
+        //
+        // `eta_hat` (= `sr.eta`) is BSV-only (length `n_eta`); for IOV models
+        // (`n_kappa > 0`) `pk_param_fn` and `[derived]` expressions expect the
+        // full `n_eta + n_kappa` vector, with the kappas belonging to *this
+        // observation's occasion*. Mirror `pk::predict_iov`'s occasion→kappa
+        // selection exactly so the post-fit derived/diagnostic columns use the
+        // same per-occasion kappa as the predictions that drove the fit. Without
+        // this the kappa slots silently read 0 for every observation (issue #238).
+        let subj_kappas: &[DVector<f64>] = kappas_per_subject
+            .get(si)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+        let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(occ_groups.len());
+        for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
+            occ_to_k.insert(*occ_id, k);
+        }
+        let combined_for = |occ_id: u32| -> Vec<f64> {
+            let mut c = Vec::with_capacity(eta_hat.len() + model.n_kappa);
+            c.extend_from_slice(eta_hat);
+            if model.n_kappa > 0 {
+                match occ_to_k.get(&occ_id) {
+                    Some(&k) if k < subj_kappas.len() => {
+                        c.extend_from_slice(subj_kappas[k].as_slice())
+                    }
+                    _ => c.extend(std::iter::repeat_n(0.0, model.n_kappa)),
+                }
+            }
+            c
+        };
+        let per_obs_eta_full: Vec<Vec<f64>> = (0..n_obs)
+            .map(|j| combined_for(subject.occasions.get(j).copied().unwrap_or(0)))
+            .collect();
+
+        // Per-dose absorption lag, each evaluated with that dose's occasion kappa
+        // and covariate snapshot (mirrors predict_iov's per-dose PK params). TAD
+        // shifts every dose by its own lag, so a dose given in one occasion is not
+        // mis-shifted by the observation's lag — matters when the lag varies across
+        // doses (IOV on the lag, or a time-varying covariate) and dosing spans the
+        // differing values (e.g. BID across two occasions). Computed once per
+        // subject (dose-indexed). Skipped entirely when the model declares no lag:
+        // `dose_lagtimes` stays empty and `tad_at_time` falls back to zero lag,
+        // so the common no-lag case pays nothing for this per-dose pass.
+        let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
+            (0..subject.doses.len())
+                .map(|d| {
+                    let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
+                    let eta_d = combined_for(occ);
+                    let pk_d = (model.pk_param_fn)(theta, &eta_d, subject.dose_cov(d));
+                    // On ODE models the lag is keyed by dose compartment (`ALAGn`;
+                    // issue #369), so resolve through `dose_attr_map` — the same
+                    // single source of truth the prediction paths use — rather than
+                    // the bare `PK_IDX_LAGTIME` slot, which a model declaring only
+                    // `ALAG2` leaves at 0 (TAD would then ignore that route's lag).
+                    // The analytical engine has one fixed route → the bare lag.
+                    match &model.ode_spec {
+                        Some(ode) => ode
+                            .dose_attr_map
+                            .lagtime(subject.doses[d].cmt, &pk_d.values),
+                        None => pk_d.lagtime(),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Per-observation PK params, indiv maps, TAFD, TAD
         let mut per_obs_cov: Vec<&HashMap<String, f64>> = Vec::with_capacity(n_obs);
         let mut per_obs_indiv: Vec<HashMap<String, f64>> = Vec::with_capacity(n_obs);
         let mut per_obs_tafd: Vec<f64> = Vec::with_capacity(n_obs);
         let mut per_obs_tad: Vec<f64> = Vec::with_capacity(n_obs);
 
-        for j in 0..n_obs {
+        for (j, eta_full) in per_obs_eta_full.iter().enumerate() {
             let cov_j = subject.obs_cov(j);
-            let pk_j = (model.pk_param_fn)(theta, eta_hat, cov_j);
-            let lagtime = pk_j.lagtime();
+            let pk_j = (model.pk_param_fn)(theta, eta_full, cov_j);
             let indiv_j = build_indiv_map(&pk_j, &model.indiv_param_names, &model.pk_indices);
-            let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, lagtime);
+            let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, &dose_lagtimes);
             per_obs_cov.push(cov_j);
             per_obs_indiv.push(indiv_j);
             per_obs_tafd.push(tafd_j);
@@ -1644,7 +2057,7 @@ pub(crate) fn compute_extra_output_columns(
                             .collect();
                         let ctx = DerivedContext {
                             theta,
-                            eta: eta_hat,
+                            eta: &per_obs_eta_full[j],
                             indiv_params: &per_obs_indiv[j],
                             covariates: per_obs_cov[j],
                             ipred: sr.ipred[j],
@@ -1674,7 +2087,7 @@ pub(crate) fn compute_extra_output_columns(
                             .collect();
                         let ctx = DerivedContext {
                             theta,
-                            eta: eta_hat,
+                            eta: &per_obs_eta_full[j],
                             indiv_params: &per_obs_indiv[j],
                             covariates: per_obs_cov[j],
                             ipred: sr.ipred[j],
@@ -1752,7 +2165,7 @@ pub(crate) fn compute_extra_output_columns(
                                     .collect();
                                 let ctx = DerivedContext {
                                     theta,
-                                    eta: eta_hat,
+                                    eta: &per_obs_eta_full[j],
                                     indiv_params: &per_obs_indiv[j],
                                     covariates: per_obs_cov[j],
                                     ipred: sr.ipred[j],
@@ -1795,14 +2208,20 @@ pub(crate) fn compute_extra_output_columns(
                             })
                             .collect()
                     };
-                    let session_grid_lagtime: Vec<f64> = if use_obs {
+                    // Per-session representative full eta vector (BSV η + the κ of
+                    // the session's first observation's occasion). Mirrors the
+                    // first-obs approximation used for session_grid_cov/indiv, so a
+                    // model-based integral over an IOV session uses that occasion's
+                    // κ rather than κ=0 (issue #238).
+                    let session_grid_eta_full: Vec<&[f64]> = if use_obs {
                         vec![]
                     } else {
-                        session_grid_cov
+                        session_obs
                             .iter()
-                            .map(|cov| {
-                                let pk = (model.pk_param_fn)(theta, eta_hat, cov);
-                                pk.lagtime()
+                            .map(|g| {
+                                g.first()
+                                    .map(|&j| per_obs_eta_full[j].as_slice())
+                                    .unwrap_or(eta_hat)
                             })
                             .collect()
                     };
@@ -1828,8 +2247,8 @@ pub(crate) fn compute_extra_output_columns(
                     // expressions referencing TIME see the internal clock, not raw TIME.
                     let eval_integral_grid = |from: f64, to: f64, session_idx: usize| -> f64 {
                         let grid_cov = session_grid_cov[session_idx];
-                        let grid_lagtime = session_grid_lagtime[session_idx];
                         let indiv_s = &session_grid_indiv[session_idx];
+                        let grid_eta_full = session_grid_eta_full[session_idx];
                         let n_steps = match step {
                             IntegralStep::Fixed(s) => {
                                 let n = ((to - from) / s).ceil() as usize + 1;
@@ -1847,20 +2266,22 @@ pub(crate) fn compute_extra_output_columns(
                         // we evaluate the superposition formula at each grid point.
                         let grid_cmt_states: Vec<Vec<f64>> = if *uses_compartments {
                             if model.n_kappa > 0 {
-                                // IOV subjects: eta_hat is BSV-only (kappas zeroed); states
-                                // computed here would use kappa=0 regardless of the actual
-                                // occasion, producing finite but wrong values. Return empty
-                                // so every grid point evaluates to NaN, consistent with
-                                // per-obs compartment_states being empty for IOV subjects.
-                                // W_DERIVED_CMT_IOV_UNSUPPORTED explains why.
+                                // IOV subjects: a single fixed PK snapshot (one occasion's
+                                // kappa) cannot represent a dose history spanning multiple
+                                // occasions — the analytical superposition / single-pass
+                                // solve here would mix occasions and be silently wrong
+                                // (the same reason predict_iov uses the event-driven path).
+                                // Return empty so every grid point evaluates to NaN,
+                                // consistent with per-obs compartment_states being empty
+                                // for IOV subjects. W_DERIVED_CMT_IOV_UNSUPPORTED explains why.
                                 vec![]
                             } else if let Some(ref ode) = model.ode_spec {
-                                let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
+                                let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
                                 crate::ode::ode_dense_solve_states(
                                     ode,
                                     &pk_j.values,
                                     theta,
-                                    eta_hat,
+                                    grid_eta_full,
                                     subject,
                                     &grid_times,
                                 )
@@ -1881,7 +2302,7 @@ pub(crate) fn compute_extra_output_columns(
                                 // W_DERIVED_CMT_TV_ANALYTICAL warning.
                                 vec![]
                             } else {
-                                let pk_j = (model.pk_param_fn)(theta, eta_hat, grid_cov);
+                                let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
                                 crate::pk::analytical_state_at_times(
                                     model.pk_model,
                                     subject,
@@ -1905,26 +2326,11 @@ pub(crate) fn compute_extra_output_columns(
                                         f64::NAN
                                     }
                                 };
-                                let tad_k = {
-                                    let last_dose_eff = subject
-                                        .doses
-                                        .iter()
-                                        .filter(|d| d.time + grid_lagtime <= t + 1e-12)
-                                        .map(|d| {
-                                            if d.ss && d.ii > 0.0 {
-                                                let elapsed = t - (d.time + grid_lagtime);
-                                                t - elapsed.rem_euclid(d.ii)
-                                            } else {
-                                                d.time + grid_lagtime
-                                            }
-                                        })
-                                        .fold(f64::NEG_INFINITY, f64::max);
-                                    if last_dose_eff.is_finite() {
-                                        t - last_dose_eff
-                                    } else {
-                                        f64::NAN
-                                    }
-                                };
+                                // Same per-dose-lag TAD as the per-observation column
+                                // (shared `tad_at_time`), so a `[derived]` integral over
+                                // TAD agrees with the `sdtab` TAD column under IOV/TV-cov
+                                // lag — not the old session-representative scalar lag.
+                                let tad_k = tad_at_time(subject, t, &dose_lagtimes);
                                 // Nearest IPRED from this session's observations only.
                                 let nearest_ipred = session_obs[session_idx]
                                     .iter()
@@ -1961,7 +2367,7 @@ pub(crate) fn compute_extra_output_columns(
                                 };
                                 let ctx = DerivedContext {
                                     theta,
-                                    eta: eta_hat,
+                                    eta: grid_eta_full,
                                     indiv_params: indiv_s,
                                     covariates: grid_cov,
                                     ipred: nearest_ipred,
@@ -2339,6 +2745,13 @@ fn fit_inner(
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
         }
+        // Bayesian estimation reports posterior credible intervals, not a
+        // Hessian-based covariance matrix; the FD covariance / SIR steps are
+        // meaningless (and wasteful) for it.
+        if matches!(method, EstimationMethod::Bayes) {
+            stage_opts.run_covariance_step = false;
+            stage_opts.sir = false;
+        }
 
         if options.verbose && n_stages > 1 {
             eprintln!(
@@ -2402,6 +2815,7 @@ fn fit_inner(
                     final_gradient: None,
                     sir_fallback_proposal: None,
                     impmap_trace: None,
+                    bayes: None,
                 });
             }
             let prev = result.as_ref().expect(
@@ -2489,6 +2903,9 @@ fn fit_inner(
                 )
             }
             EstimationMethod::Imp => unreachable!("handled by the IMP branch above"),
+            EstimationMethod::Bayes => {
+                crate::estimation::bayes::run_bayes(model, population, &stage_params, &stage_opts)?
+            }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
 
@@ -2553,7 +2970,30 @@ fn fit_inner(
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
     // (with individual lagtime) for the mandatory TAD column in output.rs.
     if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_lagtime() {
-        compute_extra_output_columns(model, population, &result.params.theta, &mut subjects);
+        compute_extra_output_columns(
+            model,
+            population,
+            &result.params.theta,
+            &result.kappas,
+            &mut subjects,
+        );
+    }
+
+    // Post-fit: simulation-based NPDE / NPD diagnostics (issue #260). Opt-in via
+    // `[fit_options] npde_nsim`; skipped entirely when 0 so the common path pays
+    // nothing. Subjects are built in population order, so the zip aligns.
+    if options.npde_nsim > 0 {
+        let per_subj = crate::stats::npde::compute_npde_npd(
+            model,
+            population,
+            &result.params,
+            options.npde_nsim,
+            options.npde_seed,
+        );
+        for (sr, sn) in subjects.iter_mut().zip(per_subj) {
+            sr.npde = sn.npde;
+            sr.npd = sn.npd;
+        }
     }
 
     let n_obs = population.n_obs();
@@ -2709,36 +3149,18 @@ fn fit_inner(
 
     // SIR fallback: when the FD Hessian is non-PD and covariance_fallback = sir,
     // run SIR with the rectified |eigenvalue| proposal built inside compute_covariance.
-    let sir_fallback_result = if options.covariance_fallback == CovarianceFallback::Sir
-        && result.covariance_matrix.is_none()
-        && sir_result.is_none()
-        && !crate::cancel::is_cancelled(&options.cancel)
-    {
-        if let Some(ref proposal) = result.sir_fallback_proposal {
-            if options.verbose {
-                eprintln!("\nRunning SIR fallback (non-PD Hessian)...");
-            }
-            match crate::estimation::sir::run_sir_core(
-                model,
-                population,
-                &result.params,
-                &result.eta_hats,
-                proposal,
-                result.ofv,
-                options,
-            ) {
-                Ok(sir) => Some(sir),
-                Err(e) => {
-                    warnings.push(format!("SIR fallback failed: {}", e));
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let sir_fallback_result = resolve_sir_fallback(
+        options,
+        result.covariance_matrix.is_some(),
+        sir_result.is_some(),
+        result.sir_fallback_proposal.as_ref(),
+        model,
+        population,
+        &result.params,
+        &result.eta_hats,
+        result.ofv,
+        &mut warnings,
+    );
 
     // `final_method` reports the last *estimating* stage — IMP is a likelihood
     // evaluation and doesn't produce parameters, so a chain like `[saem, imp]`
@@ -2780,9 +3202,11 @@ fn fit_inner(
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
-    // Covariance status
+    // Covariance status. Bayesian fits report posterior credible intervals
+    // instead of a Hessian covariance, so the covariance step is never
+    // "requested" for them (reporting it as FAILED would be misleading).
     let covariance_status = resolve_covariance_status(
-        options.run_covariance_step,
+        options.run_covariance_step && result.bayes.is_none(),
         result.covariance_matrix.is_some(),
         sir_fallback_result.is_some(),
     );
@@ -2914,6 +3338,7 @@ fn fit_inner(
             .and_then(|s| s.resamples_packed.clone()),
         importance_sampling: is_result,
         impmap_trace: result.impmap_trace.clone(),
+        bayes: result.bayes.clone(),
         omega_iov: result.params.omega_iov.as_ref().map(|m| m.matrix.clone()),
         kappa_names: model.kappa_names.clone(),
         kappa_fixed: result.params.kappa_fixed.clone(),
@@ -2982,6 +3407,13 @@ fn fit_inner(
         saem_seed: options.saem_seed,
         sir_seed: options.sir_seed,
         is_seed: options.is_seed,
+        // Record the *resolved* NPDE seed (default included) so the diagnostic
+        // is reproducible from the output; `None` when NPDE did not run.
+        npde_seed: if options.npde_nsim > 0 {
+            Some(crate::stats::npde::effective_seed(options.npde_seed))
+        } else {
+            None
+        },
         bloq_method: model.bloq_method.label().to_string(),
         outer_maxiter: options.outer_maxiter,
         outer_gtol: options.outer_gtol,
@@ -3164,6 +3596,71 @@ fn resolve_covariance_status(
     }
 }
 
+/// Pure gate for the non-PD-Hessian SIR fallback: should it run? It fires only
+/// when the user opted in (`covariance_fallback = sir`), the FD-Hessian
+/// covariance did **not** succeed (`!has_covariance_matrix`), a normal
+/// `sir = true` run did **not** already produce intervals (`!normal_sir_ran`),
+/// and `compute_covariance` actually handed back a fallback proposal
+/// (`has_fallback_proposal`). Split out of [`resolve_sir_fallback`] so the
+/// decision is unit-testable without driving a fit to a non-PD Hessian (#264).
+fn should_run_sir_fallback(
+    fallback_is_sir: bool,
+    has_covariance_matrix: bool,
+    normal_sir_ran: bool,
+    has_fallback_proposal: bool,
+) -> bool {
+    fallback_is_sir && !has_covariance_matrix && !normal_sir_ran && has_fallback_proposal
+}
+
+/// Run the non-PD-Hessian SIR fallback when [`should_run_sir_fallback`] permits.
+///
+/// Returns `Some(SirResult)` when the fallback fired and SIR succeeded; `None`
+/// when the gate declined, the run was cancelled, or SIR itself failed (the
+/// failure case pushes a `"SIR fallback failed: …"` warning). Extracted from
+/// `fit_inner` so the gate → `run_sir_core` → warning wiring is exercised by a
+/// unit test with a controlled (tame) proposal, rather than relying on a real
+/// non-PD fit — which the optimizer's fixed warmup budget cannot reach and a
+/// degenerate fixture cannot reliably survive in SIR (#264).
+#[allow(clippy::too_many_arguments)]
+fn resolve_sir_fallback(
+    options: &FitOptions,
+    has_covariance_matrix: bool,
+    normal_sir_ran: bool,
+    fallback_proposal: Option<&DMatrix<f64>>,
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    ofv: f64,
+    warnings: &mut Vec<String>,
+) -> Option<crate::estimation::sir::SirResult> {
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return None;
+    }
+    if !should_run_sir_fallback(
+        options.covariance_fallback == CovarianceFallback::Sir,
+        has_covariance_matrix,
+        normal_sir_ran,
+        fallback_proposal.is_some(),
+    ) {
+        return None;
+    }
+    let proposal =
+        fallback_proposal.expect("should_run_sir_fallback guarantees a proposal is present");
+    if options.verbose {
+        eprintln!("\nRunning SIR fallback (non-PD Hessian)...");
+    }
+    match crate::estimation::sir::run_sir_core(
+        model, population, params, eta_hats, proposal, ofv, options,
+    ) {
+        Ok(sir) => Some(sir),
+        Err(e) => {
+            warnings.push(format!("SIR fallback failed: {}", e));
+            None
+        }
+    }
+}
+
 fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
     let cov = match cov {
         Some(m) => m,
@@ -3321,6 +3818,9 @@ fn compute_subject_results(
                 pred,
                 iwres,
                 cwres,
+                // Filled post-fit (only when npde_nsim > 0); see compute_npde_npd.
+                npde: vec![],
+                npd: vec![],
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
@@ -3508,6 +4008,8 @@ mod tests {
             pred: vec![0.0; n],
             iwres,
             cwres: vec![0.0; n],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n],
             n_obs: n,
@@ -3952,6 +4454,118 @@ pub fn simulate_with_seed(
     simulate_inner(model, population, params, n_sim, &mut rng)
 }
 
+/// Options controlling [`simulate_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct SimulateOptions {
+    /// Seed for reproducibility. `None` draws from entropy.
+    pub seed: Option<u64>,
+    /// When `true`, reassign each replicate's drawn etas to subjects by
+    /// **propensity-score matching** against the subjects' fitted (posthoc)
+    /// etas — optimal Mahalanobis matching under the model `Ω`. This restores
+    /// the design↔eta association present in adaptively-dosed real-world data
+    /// and corrects the resulting VPC bias (see [`crate::propensity_match`]).
+    ///
+    /// Requires `population` to be observed data: every subject must carry
+    /// observations so its posthoc eta can be computed. Has no effect for the
+    /// synthetic `[simulation]` block (no observed designs to match against).
+    pub propensity_match: bool,
+}
+
+/// Simulate observations, optionally with propensity-score matching.
+///
+/// With `opts.propensity_match == false` this is identical to
+/// [`simulate_with_seed`] (or [`simulate`] when `opts.seed` is `None`). With it
+/// `true`, the freshly drawn etas of each replicate are reassigned to subjects
+/// so each subject's observed design is paired with a drawn eta close (under the
+/// model `Ω` Mahalanobis metric) to that subject's fitted eta. The fitted
+/// (posthoc) etas are computed once from `params` + the observed `population`.
+///
+/// Returns `Err` if matching is requested but the population is empty or any
+/// subject has no observations.
+pub fn simulate_with_options(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+) -> Result<Vec<SimulationResult>, String> {
+    use rand::SeedableRng;
+    let mut rng: rand::rngs::StdRng = match opts.seed {
+        Some(s) => rand::rngs::StdRng::seed_from_u64(s),
+        None => rand::rngs::StdRng::from_entropy(),
+    };
+
+    // Guard the modeled-`RATE` dose precondition up front (#324). The
+    // non-propensity branch reaches it via the `simulate_inner_with_draw`
+    // chokepoint, but the propensity branch first runs a full inner EBE pass
+    // (`run_inner_loop_warm` below) that integrates every subject — on an
+    // unsupported config that would hit the per-path tripwire (silently in
+    // release) or `resolve_rate`'s opaque `.expect` *before* the chokepoint
+    // guard. Asserting here makes both branches fail with the same actionable
+    // diagnostic; it is a no-op O(doses) scan on the common all-`Fixed` dataset.
+    assert_modeled_doses_supported(model, population);
+
+    if !opts.propensity_match {
+        return Ok(simulate_inner_with_draw(
+            model, population, params, n_sim, 1, None, &mut rng,
+        ));
+    }
+
+    if population.subjects.is_empty() {
+        return Err(
+            "propensity-score matching requires a non-empty observed population".to_string(),
+        );
+    }
+    if let Some(s) = population
+        .subjects
+        .iter()
+        .find(|s| s.observations.is_empty())
+    {
+        return Err(format!(
+            "propensity-score matching requires observations for every subject \
+             (to compute posthoc etas); subject '{}' has none",
+            s.id
+        ));
+    }
+
+    // Fitted (posthoc) BSV etas depend only on the observed data + params, so
+    // compute them once and reuse across replicates. The inner-loop budget here
+    // is a self-contained MAP pass (this entry point takes no FitOptions); the
+    // tolerances only need to localize each EBE well enough to match on, not to
+    // reproduce a specific fit's inner settings.
+    let (eta_hats, _h, _stats, _kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+        model, population, params, 100, 1e-6, None, None, 1,
+    );
+
+    // A divergent EBE can come back non-finite (`find_ebe` only gates its
+    // `converged` flag on a finite nll, not the returned eta). A NaN/Inf eta
+    // would poison the Mahalanobis cost matrix and make the optimal-assignment
+    // solver spin forever (NaN compares false against every candidate), so fail
+    // loudly here instead.
+    if let Some((i, _)) = eta_hats
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.iter().any(|x| !x.is_finite()))
+    {
+        return Err(format!(
+            "propensity-score matching: the posthoc eta for subject '{}' is \
+             non-finite (its EBE did not converge); cannot match",
+            population.subjects[i].id
+        ));
+    }
+
+    let omega_inv = &params.omega.inv;
+    Ok(simulate_inner_with_draw(
+        model,
+        population,
+        params,
+        n_sim,
+        1,
+        Some((&eta_hats, omega_inv)),
+        &mut rng,
+    ))
+}
+
 fn simulate_inner<R: rand::Rng>(
     model: &CompiledModel,
     population: &Population,
@@ -3959,18 +4573,89 @@ fn simulate_inner<R: rand::Rng>(
     n_sim: usize,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
-    simulate_inner_with_draw(model, population, params, n_sim, 1, rng)
+    simulate_inner_with_draw(model, population, params, n_sim, 1, None, rng)
 }
 
+/// Emit all observation rows for one subject given a fully-formed `eta_slice`
+/// (length `n_eta + n_kappa`). Draws only residual epsilons from `rng`; the eta
+/// is supplied by the caller (freshly sampled, or propensity-matched).
+#[allow(clippy::too_many_arguments)]
+fn emit_subject_rows<R: rand::Rng>(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_slice: &[f64],
+    draw: usize,
+    sim: usize,
+    normal: rand_distr::Normal<f64>,
+    rng: &mut R,
+    results: &mut Vec<SimulationResult>,
+) {
+    // Compute individual parameters
+    let pk_params = (model.pk_param_fn)(&params.theta, eta_slice, &subject.covariates);
+
+    // Predict concentrations
+    let ipreds = model_preds(model, subject, &pk_params, &params.theta, eta_slice);
+
+    // Add residual error (Gaussian path)
+    for (j, &ipred) in ipreds.iter().enumerate() {
+        let var = model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
+        let eps: f64 = rng.sample(normal);
+        let value = ipred + var.sqrt() * eps;
+
+        results.push(SimulationResult {
+            draw,
+            sim,
+            id: subject.id.clone(),
+            // Raw data TIME (matches sdtab / input); `obs_times` may be
+            // the internal shifted clock for stacked reset occasions.
+            time: subject
+                .obs_raw_times
+                .get(j)
+                .copied()
+                .unwrap_or(subject.obs_times[j]),
+            cmt: subject.obs_cmts[j],
+            ipred,
+            outcome: SimOutcome::Continuous { value },
+        });
+    }
+
+    // TTE simulation path (requires survival feature)
+    #[cfg(feature = "survival")]
+    crate::survival::simulate_tte(
+        model,
+        subject,
+        &params.theta,
+        eta_slice,
+        draw,
+        sim,
+        rng,
+        results,
+    );
+}
+
+/// `matched`, when `Some((fitted_etas, omega_inv))`, reassigns each replicate's
+/// drawn etas to subjects by propensity-score matching against `fitted_etas`
+/// (optimal Mahalanobis matching under `omega_inv`; see `crate::propensity_match`).
+/// `None` is the standard per-subject independent draw and reproduces the
+/// previous behaviour byte-for-byte (same RNG draw order).
+#[allow(clippy::too_many_arguments)]
 fn simulate_inner_with_draw<R: rand::Rng>(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
     draw: usize,
+    matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>)>,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
+
+    // Single chokepoint for every `simulate*` variant (both `simulate_inner` and
+    // the propensity path funnel through here). Guard the modeled-`RATE` dose
+    // precondition once per call, as `predict()` does — `simulate()` runs no
+    // data-check otherwise. #324.
+    assert_modeled_doses_supported(model, population);
 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
@@ -3978,56 +4663,58 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     let mut results = Vec::new();
 
     for sim_idx in 0..n_sim {
-        for subject in &population.subjects {
-            // Sample eta from N(0, Omega); append zero kappas for IOV models.
-            let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
-            let z_vec = DVector::from_column_slice(&z);
-            let eta = &params.omega.chol * z_vec;
-            let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
-            eta_slice.resize(n_eta + model.n_kappa, 0.0);
-
-            // Compute individual parameters
-            let pk_params = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
-
-            // Predict concentrations
-            let ipreds = model_preds(model, subject, &pk_params, &params.theta, &eta_slice);
-
-            // Add residual error (Gaussian path)
-            for (j, &ipred) in ipreds.iter().enumerate() {
-                let var =
-                    model.residual_variance_at(subject.obs_cmts[j], ipred, &params.sigma.values);
-                let eps: f64 = rng.sample(normal);
-                let value = ipred + var.sqrt() * eps;
-
-                results.push(SimulationResult {
-                    draw,
-                    sim: sim_idx + 1,
-                    id: subject.id.clone(),
-                    // Raw data TIME (matches sdtab / input); `obs_times` may be
-                    // the internal shifted clock for stacked reset occasions.
-                    time: subject
-                        .obs_raw_times
-                        .get(j)
-                        .copied()
-                        .unwrap_or(subject.obs_times[j]),
-                    cmt: subject.obs_cmts[j],
-                    ipred,
-                    outcome: SimOutcome::Continuous { value },
-                });
+        let sim = sim_idx + 1;
+        match matched {
+            Some((fitted, omega_inv)) => {
+                // Draw a pool of one eta per subject for this replicate, then
+                // reassign the draws to subjects by matching them to the fitted
+                // (posthoc) etas. Each subject keeps its own observed design.
+                let n = population.subjects.len();
+                let pool: Vec<DVector<f64>> = (0..n)
+                    .map(|_| {
+                        let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                        &params.omega.chol * DVector::from_column_slice(&z)
+                    })
+                    .collect();
+                let assign =
+                    crate::propensity_match::match_draws_to_fitted(&pool, fitted, omega_inv);
+                for (i, subject) in population.subjects.iter().enumerate() {
+                    let mut eta_slice: Vec<f64> = pool[assign[i]].iter().copied().collect();
+                    eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                    emit_subject_rows(
+                        model,
+                        subject,
+                        params,
+                        &eta_slice,
+                        draw,
+                        sim,
+                        normal,
+                        rng,
+                        &mut results,
+                    );
+                }
             }
-
-            // TTE simulation path (requires survival feature)
-            #[cfg(feature = "survival")]
-            crate::survival::simulate_tte(
-                model,
-                subject,
-                &params.theta,
-                &eta_slice,
-                draw,
-                sim_idx + 1,
-                rng,
-                &mut results,
-            );
+            None => {
+                for subject in &population.subjects {
+                    // Sample eta from N(0, Omega); append zero kappas for IOV models.
+                    let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
+                    let z_vec = DVector::from_column_slice(&z);
+                    let eta = &params.omega.chol * z_vec;
+                    let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+                    eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                    emit_subject_rows(
+                        model,
+                        subject,
+                        params,
+                        &eta_slice,
+                        draw,
+                        sim,
+                        normal,
+                        rng,
+                        &mut results,
+                    );
+                }
+            }
         }
     }
 
@@ -4094,6 +4781,7 @@ pub fn simulate_with_uncertainty(
             params,
             opts.n_sim_per_draw,
             k + 1,
+            None,
             &mut rng,
         );
         results.append(&mut rows);
@@ -4137,6 +4825,11 @@ pub fn predict(
     population: &Population,
     params: &ModelParameters,
 ) -> Vec<PredictionResult> {
+    // `predict()` runs no data-check (unlike `fit()`); guard the one
+    // model-aware dose precondition so a modeled-`RATE` dose can't reach the
+    // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
+    assert_modeled_doses_supported(model, population);
+
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
 
@@ -4323,6 +5016,7 @@ mod iov_integration {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -5205,6 +5899,156 @@ mod tests_cov_diagnostics {
 }
 
 #[cfg(test)]
+mod tests_sir_fallback {
+    use super::*;
+    use std::path::Path;
+
+    // ── should_run_sir_fallback (pure gate, #264) ────────────────────────────
+
+    #[test]
+    fn sir_fallback_gate_fires_only_when_all_conditions_hold() {
+        // Opted in, no real covariance, no normal SIR, proposal present.
+        assert!(should_run_sir_fallback(true, false, false, true));
+    }
+
+    #[test]
+    fn sir_fallback_gate_blocked_by_each_condition() {
+        // Each single deviation from the firing case blocks the fallback.
+        assert!(!should_run_sir_fallback(false, false, false, true)); // covariance_fallback != sir
+        assert!(!should_run_sir_fallback(true, true, false, true)); // a real H⁻¹ covariance exists
+        assert!(!should_run_sir_fallback(true, false, true, true)); // a normal sir=true run already produced CIs
+        assert!(!should_run_sir_fallback(true, false, false, false)); // compute_covariance produced no proposal
+    }
+
+    // ── resolve_sir_fallback (gate + run_sir_core + status, #264) ─────────────
+
+    fn warfarin_fixture() -> (
+        CompiledModel,
+        Population,
+        ModelParameters,
+        Vec<DVector<f64>>,
+        DMatrix<f64>,
+    ) {
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let params = model.default_params.clone();
+        let eta_hats: Vec<DVector<f64>> = (0..pop.subjects.len())
+            .map(|_| DVector::zeros(params.omega.dim()))
+            .collect();
+        // Tame fallback-style proposal: small PD diagonal in packed space, so
+        // draws stay near valid parameters (positive θ/σ, PD Ω) and SIR yields
+        // finite weights. A real non-PD fixture risks a wide proposal whose draws
+        // overflow `exp(...)` → "all invalid weights" → status `Failed`.
+        let n_packed = crate::estimation::parameterization::pack_params(&params).len();
+        let proposal = DMatrix::from_diagonal(&DVector::from_element(n_packed, 0.01));
+        (model, pop, params, eta_hats, proposal)
+    }
+
+    /// `resolve_sir_fallback` short-circuits to `None` (without touching the SIR
+    /// machinery) when the gate declines — here because `covariance_fallback`
+    /// defaults to `none`. No warning is emitted for a simple decline.
+    #[test]
+    fn resolve_sir_fallback_is_none_when_option_off() {
+        let (model, pop, params, eta_hats, proposal) = warfarin_fixture();
+        let opts = FitOptions::default(); // covariance_fallback = None
+        let mut warnings = Vec::new();
+        let result = resolve_sir_fallback(
+            &opts,
+            false,
+            false,
+            Some(&proposal),
+            &model,
+            &pop,
+            &params,
+            &eta_hats,
+            0.0,
+            &mut warnings,
+        );
+        assert!(
+            result.is_none(),
+            "fallback must not fire when covariance_fallback = none"
+        );
+        assert!(
+            warnings.is_empty(),
+            "no warning when the gate simply declines: {warnings:?}"
+        );
+    }
+
+    /// End-to-end fallback wiring (#264): with `covariance_fallback = sir`, no
+    /// real covariance, and a tame PD proposal (the part a real non-PD fit can't
+    /// reliably deliver), `resolve_sir_fallback` runs SIR and returns a result
+    /// whose θ/Ω/σ credible intervals are populated and finite — and the status
+    /// the caller derives from it is `SirFallback`. Slow: a full SIR pass
+    /// (sampling + per-draw population likelihood).
+    #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: full SIR pass; opt in with --features slow-tests"
+    )]
+    fn resolve_sir_fallback_fires_and_yields_finite_cis() {
+        let (model, pop, params, eta_hats, proposal) = warfarin_fixture();
+        let mut opts = FitOptions::default();
+        opts.covariance_fallback = CovarianceFallback::Sir;
+        opts.verbose = false;
+        opts.sir_samples = 400;
+        opts.sir_resamples = 200;
+        // Own the determinism explicitly rather than leaning on run_sir_core's
+        // `None => fixed seed` fallback, so a future change to that fallback can't
+        // silently make this sampling test flaky.
+        opts.sir_seed = Some(20240612);
+
+        let mut warnings = Vec::new();
+        let result = resolve_sir_fallback(
+            &opts,
+            false,
+            false,
+            Some(&proposal),
+            &model,
+            &pop,
+            &params,
+            &eta_hats,
+            // ofv_hat cancels in the SIR log-sum-exp weight normalisation, so any
+            // finite value yields identical CIs — 0.0 keeps the fixture simple.
+            0.0,
+            &mut warnings,
+        );
+
+        // Derive the reported status from the actual outcome, *before* unwrapping,
+        // so this checks the real fire→status mapping rather than a constant.
+        assert_eq!(
+            resolve_covariance_status(true, false, result.is_some()),
+            CovarianceStatus::SirFallback
+        );
+        let sir = result.expect("fallback should fire and SIR should succeed with a tame proposal");
+
+        assert!(!sir.ci_theta.is_empty(), "theta CIs must be populated");
+        for (lo, hi) in sir
+            .ci_theta
+            .iter()
+            .chain(&sir.ci_omega)
+            .chain(&sir.ci_sigma)
+        {
+            assert!(
+                lo.is_finite() && hi.is_finite() && lo <= hi,
+                "SIR-fallback CI must be finite and ordered, got ({lo}, {hi})"
+            );
+        }
+        assert!(
+            sir.effective_sample_size.is_finite() && sir.effective_sample_size > 0.0,
+            "ESS must be finite and positive, got {}",
+            sir.effective_sample_size
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("SIR fallback failed")),
+            "no failure warning expected on the success path: {warnings:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests_param_corr {
     use super::compute_param_corr;
     use nalgebra::DMatrix;
@@ -5390,6 +6234,7 @@ mod simulate_with_uncertainty_tests {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -5484,6 +6329,7 @@ mod simulate_with_uncertainty_tests {
             sir_resamples_packed: None,
             importance_sampling: None,
             impmap_trace: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],
@@ -5537,6 +6383,7 @@ mod simulate_with_uncertainty_tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,
             outer_gtol: 0.0,
@@ -5586,6 +6433,44 @@ mod simulate_with_uncertainty_tests {
         let pop = tiny_population();
         let rows = simulate_with_seed(&model, &pop, &model.default_params, 2, 42);
         assert!(rows.iter().all(|r| r.draw == 1));
+    }
+
+    #[test]
+    fn compute_npde_npd_shapes_finite_and_reproducible() {
+        // Drives the full post-fit NPDE/NPD simulation path on a real (model,
+        // population, params). nsim > n_obs (3) so the decorrelated NPDE is
+        // non-NaN, and a fixed seed must reproduce bit-for-bit.
+        let model = tiny_model();
+        let pop = tiny_population();
+        let nsim = 200;
+
+        let a = crate::stats::npde::compute_npde_npd(
+            &model,
+            &pop,
+            &model.default_params,
+            nsim,
+            Some(7),
+        );
+        let b = crate::stats::npde::compute_npde_npd(
+            &model,
+            &pop,
+            &model.default_params,
+            nsim,
+            Some(7),
+        );
+
+        assert_eq!(a.len(), pop.subjects.len());
+        for (sn, subj) in a.iter().zip(pop.subjects.iter()) {
+            assert_eq!(sn.npd.len(), subj.observations.len());
+            assert_eq!(sn.npde.len(), subj.observations.len());
+            assert!(sn.npd.iter().all(|v| v.is_finite()), "NPD finite");
+            assert!(sn.npde.iter().all(|v| v.is_finite()), "NPDE finite");
+        }
+        // Reproducible across calls with the same seed.
+        for (sa, sb) in a.iter().zip(b.iter()) {
+            assert_eq!(sa.npd, sb.npd);
+            assert_eq!(sa.npde, sb.npde);
+        }
     }
 
     #[test]
@@ -6158,6 +7043,7 @@ mod tests_sdtab_tv_cov {
             referenced_covariates: vec!["WT".into()],
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -6365,6 +7251,7 @@ mod tests_derived_session_clock {
             referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::Fd,
             parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             #[cfg(feature = "nn")]
@@ -6420,6 +7307,8 @@ mod tests_derived_session_clock {
             pred: vec![1.0; n_obs],
             iwres: vec![0.0; n_obs],
             cwres: vec![0.0; n_obs],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
@@ -6455,7 +7344,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(6)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         let expected = vec![0.0, 1.0, 4.0, 0.0, 1.0, 4.0];
         for (j, (&got, &exp)) in col.iter().zip(expected.iter()).enumerate() {
@@ -6500,7 +7389,7 @@ mod tests_derived_session_clock {
         // ipred peak is at j=4 (shifted t=6, raw t=1) which should give tmax=1.
         sr.ipred = vec![1.0, 2.0, 1.5, 0.5, 3.0, 1.0];
         let mut subjects_results = vec![sr];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // All entries should be 1.0 (raw time of peak at j=4).
         for &v in col {
@@ -6544,7 +7433,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(6)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // Expected AUC = 8.0 for every row in each session.
         for (j, &v) in col.iter().enumerate() {
@@ -6595,7 +7484,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(6)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // All obs land in the raw-clock window [0,5); all three per-session
         // points contribute → AUC=8.0 for every row.
@@ -6655,7 +7544,7 @@ mod tests_derived_session_clock {
             warnings: Vec::new(),
         };
         let mut subjects_results = vec![sr_for(3)];
-        compute_extra_output_columns(&model, &population, &[], &mut subjects_results);
+        compute_extra_output_columns(&model, &population, &[], &[], &mut subjects_results);
         let col = &subjects_results[0].extra_columns[0].1;
         // AUC = trapezoid([(0,0),(1,1),(4,4)]) = 8.0
         for &v in col {
@@ -6664,5 +7553,598 @@ mod tests_derived_session_clock {
                 "Single-session AUC should be 8.0, got {v}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_derived_iov_kappa {
+    //! Regression tests for issue #238: `compute_extra_output_columns` must
+    //! thread each observation's **occasion** kappa into `pk_param_fn` and into
+    //! `DerivedContext.eta`, instead of silently using a BSV-only eta vector
+    //! (kappas → 0). Both the individual-parameter map (driving `[derived]`
+    //! expressions and `[output]` columns) and `ctx.eta` are checked.
+
+    use super::*;
+    use crate::types::{
+        BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, DoseEvent,
+        ErrorModel, ErrorSpec, GradientMethod, IndivParamPartials, ModelParameters, OmegaMatrix,
+        PkModel, PkParams, Population, ScalingSpec, SigmaVector, Subject, PK_IDX_LAGTIME,
+    };
+    use nalgebra::DVector;
+    use std::collections::HashMap;
+
+    /// 1-cpt IV model with one BSV eta (`ETA_CL`) and one IOV kappa
+    /// (`KAPPA_CL`). CL = 10 · exp(κ); the kappa is read from `eta[1]` with a
+    /// `.get(1)` guard, so the *broken* (BSV-only) path would read κ=0 → CL=10
+    /// for every observation, while the fix yields the per-occasion CL.
+    fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
+        CompiledModel {
+            name: "test_iov_kappa".into(),
+            pk_model: PkModel::OneCptIv,
+            error_model: ErrorModel::Additive,
+            error_spec: ErrorSpec::Single(ErrorModel::Additive),
+            pk_param_fn: Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
+                let kappa = eta.get(1).copied().unwrap_or(0.0);
+                let mut p = PkParams::default();
+                p.values[0] = 10.0 * kappa.exp(); // CL slot
+                p
+            }),
+            n_theta: 0,
+            n_eta: 1,
+            n_epsilon: 1,
+            n_kappa: 1,
+            kappa_names: vec!["KAPPA_CL".into()],
+            theta_names: Vec::new(),
+            eta_names: vec!["ETA_CL".into()],
+            indiv_param_names: vec!["CL".into()],
+            indiv_param_partials: IndivParamPartials::empty(),
+            default_params: ModelParameters {
+                theta: Vec::new(),
+                theta_names: Vec::new(),
+                theta_lower: Vec::new(),
+                theta_upper: Vec::new(),
+                theta_fixed: Vec::new(),
+                omega: OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]),
+                omega_fixed: vec![false],
+                sigma: SigmaVector {
+                    values: vec![0.1],
+                    names: vec!["ERR".into()],
+                },
+                sigma_fixed: vec![false],
+                omega_iov: Some(OmegaMatrix::from_diagonal(&[1.0], vec!["KAPPA_CL".into()])),
+                kappa_fixed: vec![false],
+            },
+            omega_init_as_sd: vec![false],
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: vec![false],
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: Some(Box::new(|_t, _c| vec![])),
+            pk_indices: vec![0],
+            eta_map: Vec::new(),
+            pk_idx_f64: Vec::new(),
+            sel_flat: Vec::new(),
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+            derived_exprs,
+            output_columns: Vec::new(),
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Subject with two occasions: obs 0,1 on occasion 1; obs 2,3 on occasion 2.
+    fn two_occasion_subject() -> Subject {
+        Subject {
+            id: "S1".into(),
+            doses: Vec::new(),
+            obs_times: vec![0.0, 1.0, 2.0, 3.0],
+            obs_raw_times: vec![0.0, 1.0, 2.0, 3.0],
+            observations: vec![1.0; 4],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    fn sr_iov(n_obs: usize) -> SubjectResult {
+        SubjectResult {
+            id: "S1".into(),
+            eta: DVector::from_vec(vec![0.0]), // BSV η = 0 so CL is driven purely by κ
+            ipred: vec![1.0; n_obs],
+            pred: vec![1.0; n_obs],
+            iwres: vec![0.0; n_obs],
+            cwres: vec![0.0; n_obs],
+            npde: vec![],
+            npd: vec![],
+            ofv_contribution: 0.0,
+            cens: vec![0; n_obs],
+            n_obs,
+            extra_columns: Vec::new(),
+            per_obs_tad: Vec::new(),
+            compartment_states: Vec::new(),
+        }
+    }
+
+    /// Both the indiv-param map (CL, via `pk_param_fn`) and `ctx.eta` must carry
+    /// the per-observation occasion kappa. With κ₁ = ln 2 (occasion 1) and
+    /// κ₂ = ln 3 (occasion 2), CL = 10·exp(κ) = [20, 20, 30, 30] and the kappa
+    /// exposed through `ctx.eta[1]` = [ln2, ln2, ln3, ln3]. The pre-fix code
+    /// produced CL = 10 for every row (κ silently 0).
+    #[test]
+    fn derived_and_indiv_use_per_occasion_kappa() {
+        let ln2 = 2.0_f64.ln();
+        let ln3 = 3.0_f64.ln();
+
+        let derived_exprs = vec![
+            // CL_OUT exercises the pk_param_fn call that builds per_obs_indiv.
+            DerivedExprSpec {
+                name: "CL_OUT".into(),
+                kind: DerivedKind::PerRow {
+                    eval: Box::new(|ctx: &DerivedContext| {
+                        ctx.indiv_params.get("CL").copied().unwrap_or(f64::NAN)
+                    }),
+                },
+                uses_compartments: false,
+            },
+            // K_OUT exercises DerivedContext.eta threading (eta[1] = occasion κ).
+            DerivedExprSpec {
+                name: "K_OUT".into(),
+                kind: DerivedKind::PerRow {
+                    eval: Box::new(|ctx: &DerivedContext| ctx.eta.get(1).copied().unwrap_or(-1.0)),
+                },
+                uses_compartments: false,
+            },
+        ];
+
+        let model = minimal_iov_model(derived_exprs);
+        let population = Population {
+            subjects: vec![two_occasion_subject()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        // ebe_kappas[subject][occasion]; occasion order matches split_obs_by_occasion
+        // (first-seen): occasion 1 → index 0 (κ=ln2), occasion 2 → index 1 (κ=ln3).
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
+            DVector::from_vec(vec![ln2]),
+            DVector::from_vec(vec![ln3]),
+        ]];
+        let mut subjects_results = vec![sr_iov(4)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let cols = &subjects_results[0].extra_columns;
+        let cl = &cols.iter().find(|(n, _)| n == "CL_OUT").unwrap().1;
+        let kout = &cols.iter().find(|(n, _)| n == "K_OUT").unwrap().1;
+
+        let expected_cl = [20.0, 20.0, 30.0, 30.0];
+        let expected_k = [ln2, ln2, ln3, ln3];
+        for (j, (&got, &exp)) in cl.iter().zip(expected_cl.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-9,
+                "CL_OUT[{j}] (occasion {}): got {got}, expected {exp}",
+                if j < 2 { 1 } else { 2 }
+            );
+        }
+        for (j, (&got, &exp)) in kout.iter().zip(expected_k.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-12,
+                "ctx.eta[1] at obs {j}: got {got}, expected occasion κ {exp}"
+            );
+        }
+    }
+
+    /// Defensive path: when a subject's kappa vector is missing (e.g. fewer
+    /// occasion entries than occasions seen), the kappa slots fall back to 0
+    /// rather than panicking — CL collapses to the κ=0 value (10).
+    #[test]
+    fn missing_kappa_falls_back_to_zero() {
+        let derived_exprs = vec![DerivedExprSpec {
+            name: "CL_OUT".into(),
+            kind: DerivedKind::PerRow {
+                eval: Box::new(|ctx: &DerivedContext| {
+                    ctx.indiv_params.get("CL").copied().unwrap_or(f64::NAN)
+                }),
+            },
+            uses_compartments: false,
+        }];
+        let model = minimal_iov_model(derived_exprs);
+        let population = Population {
+            subjects: vec![two_occasion_subject()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        // Empty kappas for the subject → every occasion lookup misses → κ=0.
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]];
+        let mut subjects_results = vec![sr_iov(4)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let cl = &subjects_results[0].extra_columns[0].1;
+        for (j, &v) in cl.iter().enumerate() {
+            assert!(
+                (v - 10.0).abs() < 1e-9,
+                "CL_OUT[{j}] with missing kappa should fall back to κ=0 → 10, got {v}"
+            );
+        }
+    }
+
+    /// Caller-level regression for the per-dose-occasion absorption lag
+    /// (follow-up to #238). `compute_extra_output_columns` must build TAD using
+    /// each *dose's* occasion lag, not the observation's. The model puts IOV on
+    /// the lag (`lag = 1.0 + κ`); a subject is dosed BID across two occasions:
+    ///   morning dose @0  (occasion 1, κ=0.0 → lag 1.0)
+    ///   evening dose @12 (occasion 2, κ=0.5 → lag 1.5)
+    /// with observations @2 (occ 1) and @13 (occ 2). At obs @13 the evening dose
+    /// arrives at 13.5 — not yet absorbed — so TAD counts from the morning dose's
+    /// arrival at 1.0 → 12.0. Applying the obs-occasion lag (1.5) to every dose,
+    /// as before this follow-up, would give 11.5.
+    #[test]
+    fn tad_uses_per_dose_occasion_lag() {
+        let mut model = minimal_iov_model(vec![]);
+        // Declare an absorption lag (ALAG → PK_IDX_LAGTIME) so `model.has_lagtime()`
+        // holds; compute_extra_output_columns only builds per-dose lags for models
+        // that declare a lag.
+        model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
+        model.pk_indices = vec![0, PK_IDX_LAGTIME];
+        // Drive the absorption lag (slot PK_IDX_LAGTIME) from the occasion kappa.
+        model.pk_param_fn = Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
+            let kappa = eta.get(1).copied().unwrap_or(0.0);
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = 1.0 + kappa;
+            p
+        });
+
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![2.0, 13.0],
+            obs_raw_times: vec![2.0, 13.0],
+            observations: vec![1.0, 1.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 2],
+            dose_occasions: vec![1, 2],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        // ebe_kappas in split_obs_by_occasion order: occ 1 → idx 0 (κ=0.0),
+        // occ 2 → idx 1 (κ=0.5).
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
+            DVector::from_vec(vec![0.0]),
+            DVector::from_vec(vec![0.5]),
+        ]];
+        let mut subjects_results = vec![sr_iov(2)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let tad = &subjects_results[0].per_obs_tad;
+        assert!(
+            (tad[0] - 1.0).abs() < 1e-9,
+            "obs@2 TAD: morning dose arrives @1.0 → 1.0, got {}",
+            tad[0]
+        );
+        assert!(
+            (tad[1] - 12.0).abs() < 1e-9,
+            "obs@13 TAD must be 12.0 (evening dose uses its own occ-2 lag 1.5 → arrives \
+             @13.5, excluded; counts from morning @1.0). The pre-follow-up obs-occasion \
+             lag would give 11.5. Got {}",
+            tad[1]
+        );
+    }
+
+    /// Regression for the per-compartment TAD lag (issue #369). On an ODE model
+    /// declaring `ALAGn`, the TAD column must anchor each dose on *its own*
+    /// compartment's lag — resolved through `dose_attr_map`, the same single
+    /// source of truth the prediction paths use — not the bare `PK_IDX_LAGTIME`
+    /// slot, which a model declaring only `ALAG2` leaves at 0. A dose into
+    /// compartment 2 at t=0 with `ALAG2 = 2` effectively arrives at t=2, so an
+    /// observation at t=3 has TAD = 1.0. The pre-fix code read the bare lag (0)
+    /// and reported TAD = 3.0.
+    #[test]
+    fn tad_uses_per_compartment_alag_on_ode_models() {
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAG2(2.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  ALAG2 = TVLAG2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+        assert!(model.has_lagtime(), "ALAG2 must enable has_lagtime()");
+
+        // Dose into compartment 2 (central) at t=0; observe cmt 2 at t=3.
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
+            obs_times: vec![3.0],
+            obs_raw_times: vec![3.0],
+            observations: vec![1.0],
+            obs_cmts: vec![2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let theta = model.default_params.theta.clone();
+        let kappas: Vec<Vec<DVector<f64>>> = Vec::new(); // no IOV
+        let mut subjects_results = vec![sr_iov(1)];
+
+        compute_extra_output_columns(&model, &population, &theta, &kappas, &mut subjects_results);
+
+        let tad = &subjects_results[0].per_obs_tad;
+        // 3 − (dose@0 + ALAG2=2) = 1.0; the pre-fix bare-lag path gives 3.0.
+        assert!((tad[0] - 1.0).abs() < 1e-9, "tad: {}", tad[0]);
+    }
+
+    /// Regression for issue #369: a negative compartment-indexed `ALAGn` must
+    /// raise `W_NEGATIVE_LAGTIME`. The bare-slot check alone never sees the
+    /// `ALAG2` spare slot, so a bad per-route lag would otherwise slip through.
+    #[test]
+    fn negative_alag_emits_negative_lagtime_warning() {
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAG2(-1.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  ALAG2 = TVLAG2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(src)
+            .expect("parse ok")
+            .model;
+
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
+            obs_times: vec![3.0],
+            obs_raw_times: vec![3.0],
+            observations: vec![1.0],
+            obs_cmts: vec![2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        let neg = diags
+            .iter()
+            .find(|d| d.code == "W_NEGATIVE_LAGTIME")
+            .expect("a negative ALAG2 must raise W_NEGATIVE_LAGTIME");
+        assert!(
+            neg.message.contains("ALAG2") && neg.message.contains("compartment-2"),
+            "warning must name the offending compartment-indexed lag, got: {}",
+            neg.message
+        );
+    }
+
+    /// The per-compartment negative-lag scan is ODE-only. An analytical model can
+    /// still report `has_lagtime()` (lag bound via `pk_indices`), so
+    /// `check_model_data_warnings` must take the `ode_spec == None` path: the bare
+    /// negative lag still warns, but no compartment-indexed `ALAGn` is emitted.
+    #[test]
+    fn negative_lag_scan_skips_analytical_models() {
+        let mut model = minimal_iov_model(vec![]);
+        // Analytical (ode_spec stays None); has_lagtime() via pk_indices carrying
+        // PK_IDX_LAGTIME; bare lag evaluates negative.
+        model.indiv_param_names = vec!["CL".into(), "LAGTIME".into()];
+        model.pk_indices = vec![0, PK_IDX_LAGTIME];
+        model.pk_param_fn = Box::new(|_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| {
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = -1.0;
+            p
+        });
+        assert!(model.has_lagtime() && model.ode_spec.is_none());
+
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0],
+            obs_raw_times: vec![1.0],
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+
+        let diags = check_model_data_warnings(&model, &population, &model.default_params);
+        assert!(
+            diags.iter().any(|d| d.code == "W_NEGATIVE_LAGTIME"),
+            "bare negative lag must still warn on an analytical model"
+        );
+        assert!(
+            !diags.iter().any(|d| d.message.contains("ALAG")),
+            "no compartment-indexed ALAGn warning for an analytical (non-ODE) model"
+        );
+    }
+
+    /// Caller-level regression: the per-dose lag uses each dose's *covariate*
+    /// snapshot (`dose_cov`), not the observation's — so a lag depending on a
+    /// time-varying covariate is shifted by conditions at dosing, matching
+    /// `predict_iov`. Lag = `LAGCOV`: the dose sees `LAGCOV=1` (lag 1.0), the
+    /// observation sees `LAGCOV=5` (lag 5.0). With a dose @0 and obs @3, the dose
+    /// covariate gives arrival @1.0 → TAD 2.0; the obs covariate would push arrival
+    /// to @5.0 (after the obs) → TAD NaN. Asserting TAD = 2.0 proves `dose_cov` is
+    /// used. (No IOV here — this isolates the covariate basis, not kappa.)
+    #[test]
+    fn tad_lag_uses_dose_covariate_not_obs() {
+        let mut model = minimal_iov_model(vec![]);
+        model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
+        model.pk_indices = vec![0, PK_IDX_LAGTIME];
+        // Lag = LAGCOV covariate (time-varying); independent of eta/kappa.
+        model.pk_param_fn = Box::new(|_theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
+            let mut p = PkParams::default();
+            p.values[PK_IDX_LAGTIME] = cov.get("LAGCOV").copied().unwrap_or(0.0);
+            p
+        });
+
+        let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
+        let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
+        let subject = Subject {
+            id: "S1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![3.0],
+            obs_raw_times: vec![3.0],
+            observations: vec![1.0],
+            obs_cmts: vec![1],
+            covariates: HashMap::new(),
+            dose_covariates: vec![cov_dose],
+            obs_covariates: vec![cov_obs],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: vec![1],
+            dose_occasions: vec![1],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["LAGCOV".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![DVector::from_vec(vec![0.0])]];
+        let mut subjects_results = vec![sr_iov(1)];
+
+        compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results);
+
+        let tad = &subjects_results[0].per_obs_tad;
+        assert!(
+            (tad[0] - 2.0).abs() < 1e-9,
+            "TAD must use the dose covariate (LAGCOV=1 → lag 1.0 → arrival @1.0 → TAD 2.0); \
+             the obs covariate (LAGCOV=5) would push arrival to @5.0 (after the obs) → NaN. \
+             Got {}",
+            tad[0]
+        );
     }
 }

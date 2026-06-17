@@ -2,12 +2,16 @@
 //!
 //! The estimator *math* is unit-tested in `outer_optimizer.rs`
 //! (`test_combine_covariance_*`). These tests exercise the full `fit()` path:
-//! that the per-subject score cross-product `S` assembles, that all three
-//! estimators produce finite positive SEs, and that the FOCE guard fires.
+//! that the per-subject score cross-product `S` assembles and that all three
+//! estimators produce finite positive SEs.
 //!
-//! `covariance_se_matches_nonmem_s_rsr` anchors the `s` / `rsr` SEs to a
-//! dedicated NONMEM 7.5.1 `$COV MATRIX=S` / `MATRIX=RSR` run (#266); the older
-//! `covariance_methods_produce_consistent_ses_on_warfarin` keeps the
+//! NONMEM anchors (NONMEM 7.5.1 `$COV MATRIX=S` / `MATRIX=RSR`):
+//!   - FOCEI (`$EST METHOD=1 INTER`) — `covariance_se_matches_nonmem_s_rsr` (#266)
+//!   - FOCE  (`$EST METHOD=1`)       — `covariance_se_matches_nonmem_foce_s_rsr` (#250)
+//! Both within ~10% of NONMEM; a factor-of-2 score-scale error would shift `s`
+//! SEs ~29–41% systematically, well outside the 20% band.
+//!
+//! The older `covariance_methods_produce_consistent_ses_on_warfarin` keeps the
 //! information-matrix sanity anchor (`R ≈ S` at the MLE) as a build-independent
 //! cross-check that the estimators assemble at all.
 
@@ -61,6 +65,35 @@ fn all_ses(r: &ferx_core::FitResult) -> Vec<f64> {
     v.extend(r.se_omega.as_ref().expect("omega SEs").iter().copied());
     v.extend(r.se_sigma.as_ref().expect("sigma SEs").iter().copied());
     v
+}
+
+/// Fast (not slow-gated) cross-check that the FOCEI `rsr` covariance assembles
+/// and returns finite positive SEs. This is the Tier-2 guard that runs in the
+/// per-PR fast job — where the NONMEM-anchored convergence tests below are
+/// `#[ignore]`d — so it exercises the score cross-product's `log|H̃|`
+/// EBE-response path (#335) and `compute_covariance`'s OFV-Hessian R stencil on
+/// every PR. Accuracy vs NONMEM is asserted by the slow tests; this guards that
+/// the assembly runs and the EBE-response term stays finite. A modest
+/// `outer_maxiter` keeps it fast (the covariance step still runs at the final
+/// point regardless of convergence).
+#[test]
+fn covariance_rsr_assembles_finite_ses_fast() {
+    let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
+    let pop =
+        read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
+    let mut opts = warfarin_focei_opts(CovarianceMethod::Sandwich);
+    opts.outer_maxiter = 60;
+    let r = fit(&model, &pop, &model.default_params, &opts).expect("FOCEI rsr fit must succeed");
+    assert_eq!(
+        r.covariance_status,
+        CovarianceStatus::Computed,
+        "rsr covariance must be Computed"
+    );
+    let ses = all_ses(&r);
+    assert!(
+        ses.iter().all(|s| s.is_finite() && *s > 0.0),
+        "all rsr SEs must be finite and positive, got {ses:?}"
+    );
 }
 
 #[test]
@@ -129,8 +162,16 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow + NONMEM-anchored s/rsr covariance SE cross-check (#266): opt in with --features slow-tests"
+    ignore = "slow + NONMEM-anchored FOCEI s/rsr covariance SE cross-check (#266/#335): opt in with --features slow-tests"
 )]
+// Re-enabled (#335): the regression was the analytical R-matrix's weakly-identified-θ
+// bias (it holds a=∂f/∂η fixed in the log|H̃| θ-gradient), which the tighter
+// inner_tol (#330) exposed and which propagated through the RSR sandwich
+// (R⁻¹SR⁻¹), pushing SE(TVKA) to ~24% (band 15%). Computing R from the OFV
+// second-difference stencil (`covariance_ofv_hessian = true`) recomputes `a` at
+// every perturbed point and matches a Richardson FD-of-OFV ground truth to <1%,
+// bringing the RSR back within band. The `s` (pure cross-product) estimator is a
+// 10-subject outer-product and is inherently noisier (20% band).
 fn covariance_se_matches_nonmem_s_rsr() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
     let pop =
@@ -149,7 +190,11 @@ fn covariance_se_matches_nonmem_s_rsr() {
     ];
 
     let ferx_ses = |m: CovarianceMethod| {
-        let r = fit(&model, &pop, &model.default_params, &warfarin_focei_opts(m))
+        // Build R from the OFV second-difference stencil so the weakly-identified
+        // θ curvature (warfarin TVKA) is captured exactly — see the note above.
+        let mut opts = warfarin_focei_opts(m);
+        opts.covariance_ofv_hessian = true;
+        let r = fit(&model, &pop, &model.default_params, &opts)
             .unwrap_or_else(|e| panic!("{m:?} fit failed: {e}"));
         assert_eq!(
             r.covariance_status,
@@ -180,38 +225,75 @@ fn covariance_se_matches_nonmem_s_rsr() {
     }
 }
 
+/// NONMEM-anchored `s` / `rsr` SE cross-check for FOCE (non-interaction) (#250).
+///
+/// Warfarin FOCE (`$EST METHOD=1`, no `INTER`) on `data/warfarin.csv`:
+///   - `$COVARIANCE MATRIX=S`   → `S⁻¹` SEs (`covariance_method = s`)
+///   - `$COVARIANCE MATRIX=RSR` → `R⁻¹SR⁻¹` SEs (`covariance_method = rsr`)
+///
+/// SEs are the `.ext` row at `ITERATION = -1000000001`, order
+/// [TVCL, TVV, TVKA, PROP_SD, ωCL, ωV, ωKA]; ω variance-scale, PROP_ERR SD-scale.
+///
+/// Bands: 20% for `s` (noisy outer-product estimator, ferx within ~10%); 15% for
+/// `rsr` (ferx within ~6%). A factor-of-2 score-scale error would shift `s` SEs
+/// ~29–41% off systematically — well outside the 20% band.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow: runs a FOCE fit to exercise the covariance_method guard; opt in with --features slow-tests"
+    ignore = "slow + NONMEM-anchored FOCE s/rsr covariance SE cross-check (#250): opt in with --features slow-tests"
 )]
-fn covariance_method_rsr_rejects_foce_without_interaction() {
-    // Sheiner–Beal FOCE (no interaction): the per-subject score omits the Ω prior,
-    // so S would be inconsistent with R. The covariance step must refuse rather
-    // than return a wrong matrix.
+fn covariance_se_matches_nonmem_foce_s_rsr() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
     let pop =
         read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
 
-    let mut opts = FitOptions::default();
-    opts.method = EstimationMethod::Foce;
-    opts.interaction = false;
-    opts.outer_maxiter = 300;
-    opts.run_covariance_step = true;
-    opts.covariance_method = CovarianceMethod::Sandwich;
-    opts.verbose = false;
+    // NONMEM 7.5.1 FOCE ($EST METHOD=1) SEs (.ext, ITER=-1000000001), order
+    // [TVCL, TVV, TVKA, PROP_SD, ωCL, ωV, ωKA].
+    let nm_s = [
+        8.38101e-3, 3.99649e-1, 1.49477e-1, 1.57334e-3, 1.77100e-2, 8.38719e-3, 2.33647e-1,
+    ];
+    let nm_rsr = [
+        7.56977e-3, 2.45704e-1, 1.32798e-1, 9.47247e-4, 1.09205e-2, 3.95710e-3, 1.54860e-1,
+    ];
+    let names = [
+        "TVCL", "TVV", "TVKA", "PROP_ERR", "omega_CL", "omega_V", "omega_KA",
+    ];
 
-    let r = fit(&model, &pop, &model.default_params, &opts).expect("FOCE fit runs");
-    assert_eq!(
-        r.covariance_status,
-        CovarianceStatus::Failed,
-        "rsr under non-interaction FOCE must fail the covariance step, not return a matrix"
-    );
-    assert!(
-        r.warnings
-            .iter()
-            .any(|w| w.contains("not yet validated for FOCE")),
-        "expected a `not yet validated for FOCE` covariance warning, got: {:?}",
-        r.warnings
-    );
+    let ferx_ses = |m: CovarianceMethod| {
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::Foce;
+        opts.interaction = false;
+        opts.outer_maxiter = 300;
+        opts.run_covariance_step = true;
+        opts.covariance_method = m;
+        opts.verbose = false;
+        let r = fit(&model, &pop, &model.default_params, &opts)
+            .unwrap_or_else(|e| panic!("{m:?} FOCE fit failed: {e}"));
+        assert_eq!(
+            r.covariance_status,
+            CovarianceStatus::Computed,
+            "{m:?}: covariance must be Computed"
+        );
+        let t = r.se_theta.expect("theta SEs");
+        let om = r.se_omega.expect("omega SEs");
+        let s = r.se_sigma.expect("sigma SEs");
+        [t[0], t[1], t[2], s[0], om[0], om[1], om[2]]
+    };
+
+    for (method, nm, tol) in [
+        (CovarianceMethod::CrossProduct, &nm_s, 0.20),
+        (CovarianceMethod::Sandwich, &nm_rsr, 0.15),
+    ] {
+        let ferx = ferx_ses(method);
+        for ((name, &f), &n) in names.iter().zip(ferx.iter()).zip(nm.iter()) {
+            let rel = (f - n).abs() / n;
+            assert!(
+                f.is_finite() && rel < tol,
+                "{method:?} FOCE SE({name}) = {f:.6e} vs NONMEM {n:.6e} — relative diff \
+                 {:.1}% exceeds {:.0}% band",
+                rel * 100.0,
+                tol * 100.0
+            );
+        }
+    }
 }

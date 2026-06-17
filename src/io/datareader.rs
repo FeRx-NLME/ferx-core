@@ -1,6 +1,7 @@
 use crate::io::filter_expr::{FilterClause, RowContext};
 use crate::types::{
-    CovariateDecl, CovariateRow, CovariateTable, DoseEvent, ExclusionSummary, Population, Subject,
+    CovariateDecl, CovariateRow, CovariateTable, DoseEvent, ExclusionSummary, Population, RateMode,
+    Subject,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -483,12 +484,10 @@ fn read_nonmem_csv_impl(
 
         if build_table {
             let time = parse_f64(fields.get(time_col).map(|s| s.as_str()).unwrap_or("0"));
-            // Mirror `parse_subject`'s EVID computation so the table's EVID
-            // agrees with how each row was classified.
-            let evid = evid_col
-                .and_then(|c| fields.get(c))
-                .map(|s| parse_evid(s))
-                .unwrap_or(0);
+            // Mirror `parse_subject`'s EVID computation (incl. AMT-based dose
+            // inference when EVID is absent) so the table's EVID agrees with how
+            // each row was classified. #262
+            let evid = effective_evid(&fields, evid_col, amt_col);
             let mut values = Vec::with_capacity(table_indices.len());
             for (name, idx) in &table_indices {
                 let cell = fields.get(*idx).map(|s| s.as_str()).unwrap_or("");
@@ -529,6 +528,10 @@ fn read_nonmem_csv_impl(
     // Build subjects, applying selection filter if present.
     let mut subjects = Vec::new();
     let mut total_occ_failures: usize = 0;
+    let mut total_missing_dv: usize = 0;
+    // Rows dropped despite a nonzero AMT, summed across subjects (#262).
+    let mut total_amt_ignored: usize = 0;
+    let mut subjects_with_amt_ignored: usize = 0;
     let mut population_warnings: Vec<String> = Vec::new();
     let n_records_total: usize = rows_by_id.iter().map(|(_, rows)| rows.len()).sum();
     let mut excl_summary = ExclusionSummary {
@@ -536,28 +539,34 @@ fn read_nonmem_csv_impl(
         ..Default::default()
     };
     for (id, rows) in &rows_by_id {
-        let (subject, occ_failures, subj_excl, subj_warnings) = parse_subject(
-            id,
-            rows,
-            time_col,
-            dv_col,
-            evid_col,
-            amt_col,
-            cmt_col,
-            rate_col,
-            mdv_col,
-            ii_col,
-            ss_col,
-            cens_col,
-            occ_col,
-            addl_col,
-            fremtype_col,
-            &cov_indices,
-            filter,
-            tte_cmts,
-            tentry_col,
-        )?;
+        let (subject, occ_failures, missing_dv, subj_excl, subj_warnings, amt_ignored) =
+            parse_subject(
+                id,
+                rows,
+                time_col,
+                dv_col,
+                evid_col,
+                amt_col,
+                cmt_col,
+                rate_col,
+                mdv_col,
+                ii_col,
+                ss_col,
+                cens_col,
+                occ_col,
+                addl_col,
+                fremtype_col,
+                &cov_indices,
+                filter,
+                tte_cmts,
+                tentry_col,
+            )?;
         total_occ_failures += occ_failures;
+        total_missing_dv += missing_dv;
+        total_amt_ignored += amt_ignored;
+        if amt_ignored > 0 {
+            subjects_with_amt_ignored += 1;
+        }
         population_warnings.extend(subj_warnings);
 
         // Accumulate filter statistics.
@@ -622,6 +631,50 @@ fn read_nonmem_csv_impl(
                  iov_column '{}'; these rows were assigned occasion=0 and may be grouped \
                  with valid occ=0 rows. Consider cleaning the dataset.",
                 total_occ_failures, name
+            ));
+        }
+    }
+
+    // Missing-DV summary (issue #258): scored observation rows (EVID=0, MDV=0)
+    // whose DV cell was missing were skipped rather than read as DV=0. Surfaced
+    // via FitResult.warnings and `ferx check` (data path).
+    if total_missing_dv > 0 {
+        population_warnings.push(format!(
+            "W_MISSING_DV: {} observation row(s) (EVID=0) had a missing DV (`.`/`NA`/blank) \
+             but were not marked MDV=1; they were skipped (not scored as DV=0). Set MDV=1 \
+             on intentionally-missing observations to silence this, or check for data errors.",
+            total_missing_dv
+        ));
+    }
+
+    // Dose-coverage warnings (#262), surfaced via FitResult.warnings. Most
+    // specific wins so a dataset never gets both: W_AMT_NOT_DOSED pinpoints AMT
+    // that was dropped; W_NO_DOSES is the generic "no doses parsed at all"
+    // backstop for datasets that carry no AMT signal to begin with.
+    if total_amt_ignored > 0 {
+        population_warnings.push(format!(
+            "W_AMT_NOT_DOSED: {} record(s) across {} subject(s) carry AMT != 0 but were not \
+             treated as dose events (EVID is not 1 or 4); their AMT was ignored. If the dataset \
+             has no EVID column, a dose row must carry a nonzero AMT to be inferred as a dose; \
+             otherwise code dose rows as EVID=1 (or EVID=4).",
+            total_amt_ignored, subjects_with_amt_ignored
+        ));
+    } else if subjects.iter().all(|s| s.doses.is_empty()) {
+        // Zero dose events across the whole population. Warn only when scored
+        // observations are present (an all-EVID=2 / covariate-only dataset is not
+        // a fit) and the dataset isn't TTE/survival (which legitimately has no PK
+        // doses) — otherwise this would be a noisy false positive.
+        let total_scored_obs: usize = subjects.iter().map(|s| s.observations.len()).sum();
+        #[cfg(feature = "survival")]
+        let any_tte = subjects.iter().any(|s| !s.obs_records.is_empty());
+        #[cfg(not(feature = "survival"))]
+        let any_tte = false;
+        if total_scored_obs > 0 && !any_tte {
+            population_warnings.push(format!(
+                "W_NO_DOSES: parsed zero dose events across all {} subject(s) although scored \
+                 observations are present. If this is a PK model, check that the dataset has an \
+                 AMT column with EVID=1/4 dose rows (or a nonzero AMT when EVID is absent).",
+                subjects.len()
             ));
         }
     }
@@ -699,6 +752,109 @@ fn parse_evid(s: &str) -> u32 {
     t.parse::<u32>().unwrap_or(0)
 }
 
+/// True for EVID values that administer a dose (1 = dose, 4 = reset + dose).
+/// Single source of truth for the dose test, shared by the dose-record arm, the
+/// data-selection exclusion tally, and the ignored-AMT counter.
+fn is_dose_evid(evid: u32) -> bool {
+    evid == 1 || evid == 4
+}
+
+/// True when an `AMT` value denotes an actual dose: **finite and nonzero**. A
+/// missing cell (or absent column) parses to `0.0` — not a dose. A literal
+/// `nan`/`inf`/`infinity` parses to a non-finite value (Rust's `f64::from_str`
+/// accepts those, and [`parse_f64`] does not route through `is_missing_cell`),
+/// which is malformed and is also rejected here — so a stray non-finite AMT
+/// never silently becomes an infinite/NaN-amount dose (#262).
+fn is_dosing_amt(amt: f64) -> bool {
+    amt.is_finite() && amt != 0.0
+}
+
+/// Classify (and validate) the `RATE` cell of a *dose* record into the
+/// [`RateMode`] its [`DoseEvent`] should carry.
+///
+/// NONMEM overloads `RATE` with coded values:
+///   - `0`  → bolus (route set by the dose compartment)
+///   - `>0` → constant-rate infusion (duration = `AMT/RATE`)
+///   - `-1` → infusion **rate** is *modeled* (a `$PK` `R{n}` parameter)
+///   - `-2` → infusion **duration** is *modeled* (a `$PK` `D{n}` parameter)
+///
+/// `-2` is accepted as [`RateMode::ModeledDuration`] (#324). The datareader has
+/// no model, so it cannot yet know whether a matching `D{cmt}` parameter exists
+/// or whether the model is an ODE model — those checks move to the model+data
+/// join ([`crate::api::check_model_data`]). `-1` (modeled rate, #324 Phase B),
+/// any other negative, and non-finite values are rejected here: they are
+/// unconditionally invalid regardless of the model. (Previously `-1`/`-2` fell
+/// through to `rate > 0.0` and were silently treated as boluses — #324.)
+fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String> {
+    if !rate.is_finite() {
+        return Err(format!(
+            "subject {id}, time {time}: RATE={rate} is not finite; expected 0 \
+             (bolus), a positive infusion rate, or -2 (modeled duration)"
+        ));
+    }
+    if rate >= 0.0 {
+        return Ok(RateMode::Fixed);
+    }
+    // rate < 0 → a NONMEM coded value, which is always an *exact negative
+    // integer*. Match on the integer form so the arms read as the codes they are
+    // and a new code is one more arm. A non-integer negative (e.g. -1.5) is not a
+    // code: `fract() != 0.0` rejects it rather than rounding it into one (`round()`
+    // would map -1.5 → -2 and silently accept it as modeled duration). Comparison
+    // against `0.0` is exempt from clippy::float_cmp; `rate as i64` saturates, so
+    // an out-of-range integer can't alias -1/-2.
+    let code = if rate.fract() == 0.0 {
+        Some(rate as i64)
+    } else {
+        None
+    };
+    let detail = match code {
+        Some(-2) => return Ok(RateMode::ModeledDuration),
+        Some(-1) => "RATE=-1 (NONMEM: infusion RATE modeled via R1 in $PK) is not yet \
+             supported (tracked in #324); use RATE=-2 (modeled duration) or an \
+             explicit positive RATE"
+            .to_string(),
+        _ => format!("RATE={rate} is a negative value that is not a recognised NONMEM code"),
+    };
+    Err(format!(
+        "subject {id}, time {time}: {detail}. Recognised RATE values are 0 \
+         (bolus), >0 (infusion rate), and -2 (modeled infusion duration)."
+    ))
+}
+
+/// Compute a record's effective EVID.
+///
+/// When an `EVID` column is present its value governs (a blank / `.` /
+/// unparseable cell is the documented NONMEM default of 0 = observation, via
+/// [`parse_evid`]).
+///
+/// When the `EVID` column is **absent**, NONMEM infers the record type from
+/// `AMT`: a row with a nonzero `AMT` is a dose (EVID 1); everything else is an
+/// observation (EVID 0). Without this, an EVID-less dataset silently drops every
+/// `AMT` row — it is neither a dose (needs EVID 1/4) nor an observation (needs
+/// EVID 0 and MDV 0, but dose rows carry MDV=1) — and fits a degenerate
+/// dose-free model (#262). Inference keys on `AMT` only: a NONMEM dose always
+/// carries a nonzero `AMT` (infusions too — `RATE` is the rate, `AMT` the
+/// amount), so a `RATE`-only row would just create a no-op zero-amount dose.
+///
+/// Only a finite, nonzero `AMT` infers a dose: a missing cell parses to `0.0`
+/// and a non-finite `nan`/`inf` is rejected, both via [`is_dosing_amt`].
+fn effective_evid(row: &[String], evid_col: Option<usize>, amt_col: Option<usize>) -> u32 {
+    match evid_col {
+        Some(c) => row.get(c).map(|s| parse_evid(s)).unwrap_or(0),
+        None => {
+            let amt = amt_col
+                .and_then(|c| row.get(c))
+                .map(|s| parse_f64(s))
+                .unwrap_or(0.0);
+            if is_dosing_amt(amt) {
+                1
+            } else {
+                0
+            }
+        }
+    }
+}
+
 /// Parse an occasion-column cell. Returns `None` for blank / `.` / NA / non-integer
 /// values so the caller can warn about silently dropped rows. NONMEM convention
 /// uses `.` for missing.
@@ -735,7 +891,7 @@ fn parse_subject(
     tte_cmts: &HashSet<usize>,
     // Column index of the TENTRY (left-truncation time) column, if present.
     tentry_col: Option<usize>,
-) -> Result<(Subject, usize, SubjectExclusion, Vec<String>), String> {
+) -> Result<(Subject, usize, usize, SubjectExclusion, Vec<String>, usize), String> {
     let mut doses = Vec::new();
     let mut obs_times = Vec::new();
     let mut obs_raw_times = Vec::new();
@@ -746,12 +902,20 @@ fn parse_subject(
     let mut dose_occasions: Vec<u32> = Vec::new();
     let mut fremtype: Vec<u16> = Vec::new();
     let mut occ_parse_failures: usize = 0;
+    // EVID=0/MDV=0 rows whose DV cell was missing and were skipped (issue #258).
+    let mut missing_dv_skipped: usize = 0;
     let mut excl_n_obs: usize = 0;
     let mut excl_n_dose: usize = 0;
     let mut excl_n_other: usize = 0;
     let mut excl_fired: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
+    // Rows that survived the data-selection filter, carry a nonzero AMT, yet
+    // were not classified as a dose (EVID not 1/4) — their AMT was silently
+    // dropped. Reported as a population summary so a degenerate dose-free fit
+    // can't pass unnoticed (#262). Counted post-filter so deliberately excluded
+    // dose rows don't trip the warning.
+    let mut amt_ignored_rows: usize = 0;
 
     // TTE state — only meaningful when tte_cmts is non-empty.
     // obs_records: finalised TTE observation records for this subject.
@@ -863,10 +1027,9 @@ fn parse_subject(
         }
 
         let time = parse_f64(row.get(time_col).map(|s| s.as_str()).unwrap_or("0"));
-        let evid = evid_col
-            .and_then(|c| row.get(c))
-            .map(|s| parse_evid(s))
-            .unwrap_or(0);
+        // Effective EVID: the column value if present, else inferred from AMT
+        // (NONMEM's rule for EVID-less datasets — see `effective_evid`). #262
+        let evid = effective_evid(row, evid_col, amt_col);
         let mdv = mdv_col
             .and_then(|c| row.get(c))
             .map(|s| parse_usize(s))
@@ -942,7 +1105,7 @@ fn parse_subject(
                 // Count by record type for the summary. The catch-all `other`
                 // bucket (EVID 2/3, missing-DV obs) ensures every excluded
                 // record is reflected in some counter.
-                if evid == 1 || evid == 4 {
+                if is_dose_evid(evid) {
                     excl_n_dose += 1;
                 } else if evid == 0 && mdv == 0 {
                     excl_n_obs += 1;
@@ -951,6 +1114,25 @@ fn parse_subject(
                 }
                 continue; // skip this row
             }
+        }
+
+        // AMT for this row (parsed once, post-filter; reused by the dose arm).
+        // A missing column or `.` cell parses to 0.0 (see `parse_f64`).
+        let row_amt = amt_col
+            .and_then(|c| row.get(c))
+            .map(|s| parse_f64(s))
+            .unwrap_or(0.0);
+        // Track AMT that won't be administered: a dose-like AMT (finite,
+        // nonzero) on a record that is neither a dose (EVID 1/4) nor a *scored*
+        // observation (`mdv != 0`). The `mdv != 0` gate is what keeps this from
+        // false-firing: a scored observation (MDV=0) that merely carries a
+        // redundant / forward-filled AMT is benign — a real dropped dose is a
+        // non-scored record (a NONMEM dose row is MDV=1). With no EVID column
+        // `effective_evid` already promoted dose rows to doses, so this fires
+        // mainly on an EVID-present dataset whose dose row was mistyped (e.g.
+        // EVID=0, MDV=1, AMT=5000). Surfaced as a population warning. #262
+        if is_dosing_amt(row_amt) && !is_dose_evid(evid) && mdv != 0 {
+            amt_ignored_rows += 1;
         }
 
         // Raw (unshifted) TIME for this row, preserved before the occasion
@@ -982,12 +1164,9 @@ fn parse_subject(
 
         if evid == 3 {
             // Pure system reset: no dose, no observation. Nothing else to do.
-        } else if evid == 1 || evid == 4 {
+        } else if is_dose_evid(evid) {
             // Dose record
-            let amt = amt_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s))
-                .unwrap_or(0.0);
+            let amt = row_amt;
             let cmt = cmt_col
                 .and_then(|c| row.get(c))
                 .and_then(|s| {
@@ -1003,6 +1182,13 @@ fn parse_subject(
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64(s))
                 .unwrap_or(0.0);
+            // Classify the RATE cell (#324): >=0 -> Fixed (data-driven rate),
+            // -2 -> ModeledDuration (the duration is a `D{cmt}` parameter,
+            // resolved at the model+data join); -1 / other negative / non-finite
+            // are rejected. Uses `raw_time` so the message names the value the
+            // user wrote, not the occasion-shifted engine time. `?` bubbles up
+            // through `parse_subject`.
+            let rate_mode = validate_dose_rate(rate, id, raw_time)?;
             let ii = ii_col
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64(s))
@@ -1012,7 +1198,10 @@ fn parse_subject(
                 .map(|s| parse_f64(s.trim()) >= 0.5)
                 .unwrap_or(false);
 
-            doses.push(DoseEvent::new(time, amt, cmt, rate, ss, ii));
+            doses.push(match rate_mode {
+                RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
+                RateMode::ModeledDuration => DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode),
+            });
             if occ_col.is_some() {
                 dose_occasions.push(occ);
             }
@@ -1199,7 +1388,18 @@ fn parse_subject(
                 // `survival` feature is off (callers pass `&HashSet::new()`), so this
                 // branch is never entered in that build. The dead cfg block was removed.
             } else {
-                // Gaussian path (unchanged)
+                // Gaussian path.
+                // Missing DV (`.` / `NA` / blank) on a scored observation row
+                // (EVID=0, MDV=0): NONMEM convention is to mark these MDV=1, but
+                // if the user didn't, `parse_f64` would coerce the cell to 0.0
+                // and inject a phantom zero observation into the likelihood.
+                // Treat a missing DV as MDV=1 — skip the row — and count it for a
+                // single summary warning (W_MISSING_DV; issue #258).
+                let dv_cell = row.get(dv_col).map(|s| s.as_str()).unwrap_or("");
+                if is_missing_cell(dv_cell) {
+                    missing_dv_skipped += 1;
+                    continue;
+                }
                 let cens_flag = cens_col
                     .and_then(|c| row.get(c))
                     .map(|s| parse_usize(s))
@@ -1299,6 +1499,7 @@ fn parse_subject(
             obs_records: tte_obs_records,
         },
         occ_parse_failures,
+        missing_dv_skipped,
         SubjectExclusion {
             n_obs_excluded: excl_n_obs,
             n_dose_excluded: excl_n_dose,
@@ -1306,6 +1507,7 @@ fn parse_subject(
             fired: excl_fired,
         },
         parse_warnings,
+        amt_ignored_rows,
     ))
 }
 
@@ -1320,6 +1522,86 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
+    }
+
+    // ── "no happy paths": malformed-input rejection ──────────────────────────
+    // The reader's validation surface — branches where a bug silently corrupts
+    // (or crashes on) real NONMEM datasets. All deterministic and fit-free:
+    // feed malformed CSV, assert the exact error or warning. These error paths
+    // are otherwise exercised only indirectly, if at all.
+
+    #[test]
+    fn missing_required_columns_are_rejected() {
+        // ID / TIME / DV are mandatory; each missing one is a hard error that
+        // names the absent column.
+        let f = write_csv("TIME,DV,EVID,AMT\n0,.,1,100\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("Missing ID column"), "{err}");
+
+        let f = write_csv("ID,DV,EVID,AMT\n1,.,1,100\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("Missing TIME column"), "{err}");
+
+        let f = write_csv("ID,TIME,EVID,AMT\n1,0,1,100\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("Missing DV column"), "{err}");
+    }
+
+    #[test]
+    fn unknown_iov_column_is_rejected() {
+        // A requested IOV column that isn't in the header is a hard error, not a
+        // silent "no occasions" — otherwise an IOV model would quietly collapse.
+        let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
+        let err = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap_err();
+        assert!(
+            err.contains("iov_column 'OCC'") && err.contains("not found"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn declared_covariate_column_missing_is_rejected() {
+        // `[covariates]` declares WT but the dataset has no WT column → hard
+        // error (a silently-vanished covariate would evaluate to nothing).
+        let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
+        assert!(err.contains(ERR_COV_MISSING_COLUMNS), "{err}");
+        assert!(err.contains("WT"), "missing column should be named: {err}");
+    }
+
+    #[test]
+    fn declared_covariate_non_numeric_value_is_rejected() {
+        // A declared covariate must be numerically coded; a text value is a hard
+        // error rather than a silent 0.0 that would bias the fit.
+        let f = write_csv("ID,TIME,DV,EVID,AMT,WT\n1,0,.,1,100,heavy\n1,1,5.0,0,.,heavy\n");
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let err = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap_err();
+        assert!(err.contains(ERR_COV_NON_NUMERIC), "{err}");
+        assert!(
+            err.contains("WT"),
+            "offending covariate should be named: {err}"
+        );
+    }
+
+    #[test]
+    fn unparseable_iov_occasion_values_warn_not_fail() {
+        // A non-numeric occasion value doesn't abort the read: the row is
+        // assigned occ=0 and surfaced as a W_IOV_OCC_MISSING population warning
+        // so the user can clean the data (a hard error here would be too brittle).
+        let f = write_csv("ID,TIME,DV,EVID,AMT,OCC\n1,0,.,1,100,x\n1,1,5.0,0,.,x\n");
+        let pop = read_nonmem_csv(f.path(), None, Some("OCC")).unwrap();
+        assert!(
+            pop.warnings.iter().any(|w| w.contains("W_IOV_OCC_MISSING")),
+            "expected an IOV-occasion warning, got {:?}",
+            pop.warnings
+        );
     }
 
     #[test]
@@ -1348,6 +1630,329 @@ mod tests {
         let pop = read_nonmem_csv(f.path(), None, None).unwrap();
         assert!(pop.subjects[0].occasions.is_empty());
         assert!(pop.subjects[0].dose_occasions.is_empty());
+    }
+
+    // ── #262: EVID-absent dose inference + dose-coverage warnings ─────────────
+
+    #[test]
+    fn no_evid_column_infers_dose_from_amt() {
+        // No EVID column: NONMEM infers a dose from a nonzero AMT. Dose rows here
+        // carry AMT>0 with MDV=1 (the #154 shape), which without inference are
+        // neither dose (needs EVID 1/4) nor obs (needs EVID 0 & MDV 0) — silently
+        // dropped. With inference they administer and the fit is non-degenerate.
+        let csv = "ID,TIME,DV,MDV,AMT\n\
+                   1,0,.,1,100\n\
+                   1,1,9.5,0,.\n\
+                   1,2,7.3,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(
+            subj.doses.len(),
+            1,
+            "AMT>0 row should be inferred as a dose"
+        );
+        assert_eq!(subj.doses[0].amt, 100.0);
+        assert_eq!(subj.observations, vec![9.5, 7.3]);
+        // The dataset "just works" — no dose-coverage warnings.
+        assert!(
+            !pop.warnings
+                .iter()
+                .any(|w| w.contains("W_AMT_NOT_DOSED") || w.contains("W_NO_DOSES")),
+            "inferred-dose dataset must not warn, got {:?}",
+            pop.warnings
+        );
+    }
+
+    #[test]
+    fn no_evid_column_infers_multiple_doses_across_subjects() {
+        // Two subjects, each with an AMT-coded dose and observations; no EVID.
+        let csv = "ID,TIME,DV,MDV,AMT\n\
+                   1,0,.,1,10000\n\
+                   1,1,4.2,0,.\n\
+                   2,0,.,1,5000\n\
+                   2,1,2.1,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert_eq!(pop.subjects.len(), 2);
+        assert_eq!(pop.subjects[0].doses.len(), 1);
+        assert_eq!(pop.subjects[0].doses[0].amt, 10000.0);
+        assert_eq!(pop.subjects[1].doses[0].amt, 5000.0);
+    }
+
+    #[test]
+    fn no_evid_zero_amt_all_observations_warns_no_doses() {
+        // No EVID column and no nonzero AMT anywhere: nothing to infer, so the
+        // population parses zero doses. With scored observations present this is
+        // almost always a data error — surface the generic W_NO_DOSES backstop.
+        let csv = "ID,TIME,DV,MDV,AMT\n\
+                   1,0,1.0,0,.\n\
+                   1,1,5.0,0,0\n\
+                   1,2,3.0,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.subjects[0].doses.is_empty());
+        assert_eq!(pop.subjects[0].observations.len(), 3);
+        assert!(
+            pop.warnings.iter().any(|w| w.contains("W_NO_DOSES")),
+            "zero-dose population with observations should warn, got {:?}",
+            pop.warnings
+        );
+        // Generic only — no AMT was ignored, so the specific warning stays silent.
+        assert!(!pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED")));
+    }
+
+    #[test]
+    fn evid_present_amt_on_nondose_row_warns_amt_not_dosed() {
+        // EVID column present (so no inference), but a dose row is mistyped
+        // EVID=0 with AMT=5000 and MDV=1 — dropped entirely (not dose, not obs).
+        // Its AMT is silently ignored; W_AMT_NOT_DOSED must catch it. The real
+        // EVID=1 dose still administers.
+        let csv = "ID,TIME,DV,EVID,AMT,MDV\n\
+                   1,0,.,1,100,1\n\
+                   1,0,.,0,5000,1\n\
+                   1,1,5.0,0,.,0\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(
+            subj.doses.len(),
+            1,
+            "the mistyped AMT=5000 row is not a dose"
+        );
+        assert_eq!(subj.doses[0].amt, 100.0);
+        assert!(
+            pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED")),
+            "ignored-AMT row should warn, got {:?}",
+            pop.warnings
+        );
+        // Specific wins — the generic backstop must not also fire.
+        assert!(!pop.warnings.iter().any(|w| w.contains("W_NO_DOSES")));
+    }
+
+    #[test]
+    fn wellformed_evid_dataset_emits_no_dose_warnings() {
+        // Regression: a normal EVID dataset (dose EVID=1, obs EVID=0) is wholly
+        // unaffected — neither dose-coverage warning fires.
+        let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,1,9.5,0,.\n\
+                   1,2,7.3,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert_eq!(pop.subjects[0].doses.len(), 1);
+        assert!(
+            !pop.warnings
+                .iter()
+                .any(|w| w.contains("W_AMT_NOT_DOSED") || w.contains("W_NO_DOSES")),
+            "well-formed EVID data must not warn, got {:?}",
+            pop.warnings
+        );
+    }
+
+    #[test]
+    fn no_evid_inference_mirrored_in_covariate_table() {
+        // The covariate table's per-row EVID must agree with how parse_subject
+        // classified the row, including AMT-based inference when EVID is absent.
+        let csv = "ID,TIME,DV,AMT,MDV,WT\n\
+                   1,0,.,100,1,70\n\
+                   1,1,5.0,.,0,70\n";
+        let f = write_csv(csv);
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let (pop, table) = read_nonmem_csv_with_covariates(f.path(), &decls, &[], None).unwrap();
+        assert_eq!(
+            pop.subjects[0].doses.len(),
+            1,
+            "dose inferred on table path too"
+        );
+        assert_eq!(table.rows[0].evid, 1, "AMT>0 row's table EVID should be 1");
+        assert_eq!(table.rows[1].evid, 0, "obs row's table EVID should be 0");
+    }
+
+    #[test]
+    fn amt_not_dosed_counted_after_data_selection_filter() {
+        // The AMT-ignored count is taken post-filter: a mistyped AMT row that the
+        // data-selection filter removes must NOT trip W_AMT_NOT_DOSED, while the
+        // same dataset read unfiltered does trip it. Locks the post-filter
+        // placement so deliberately excluded dose rows don't cause false alarms.
+        let csv = "ID,TIME,DV,EVID,AMT,MDV,STUDY\n\
+                   1,0,.,1,100,1,1\n\
+                   1,0,.,0,5000,1,2\n\
+                   1,1,5.0,0,.,0,1\n";
+        let f = write_csv(csv);
+
+        // Unfiltered: the EVID=0/AMT=5000 row is dropped and its AMT flagged.
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(
+            pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED")),
+            "unfiltered read should flag the ignored AMT, got {:?}",
+            pop.warnings
+        );
+
+        // Filtered to exclude that row (STUDY==2): nothing is silently dropped,
+        // so no warning.
+        let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
+        let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
+        assert!(
+            !pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED")),
+            "a filter-excluded AMT row must not warn, got {:?}",
+            pop.warnings
+        );
+        assert_eq!(pop.subjects[0].doses.len(), 1);
+    }
+
+    #[test]
+    fn scored_obs_carrying_amt_does_not_warn_amt_not_dosed() {
+        // A *scored* observation (EVID=0, MDV=0) that carries a nonzero AMT —
+        // e.g. a pipeline that forward-fills / LOCFs the AMT column across all
+        // rows — must NOT trip W_AMT_NOT_DOSED: it is a real observation, not a
+        // dropped dose (a NONMEM dose row is MDV=1). The EVID=1 dose administers
+        // and both observations are recorded.
+        let csv = "ID,TIME,DV,EVID,AMT,MDV\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,100,0\n\
+                   1,2,3.0,0,100,0\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.doses.len(), 1);
+        assert_eq!(subj.observations, vec![5.0, 3.0]);
+        assert!(
+            !pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED")),
+            "a scored obs carrying a forward-filled AMT must not warn, got {:?}",
+            pop.warnings
+        );
+    }
+
+    #[test]
+    fn nonfinite_amt_is_not_inferred_as_a_dose() {
+        // Robustness: a stray non-finite AMT ('inf'/'nan') must not become an
+        // infinite/NaN-amount dose. parse_f64 accepts 'inf' (Rust FromStr), so
+        // without the is_dosing_amt finiteness guard `amt != 0.0` would be true
+        // and the row would infer a bogus dose. With no EVID column it is
+        // instead rejected, leaving zero doses.
+        let csv = "ID,TIME,DV,MDV,AMT\n\
+                   1,0,.,1,inf\n\
+                   1,1,5.0,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(
+            pop.subjects[0].doses.is_empty(),
+            "a non-finite AMT must not be inferred as a dose, got {:?}",
+            pop.subjects[0].doses
+        );
+        // The non-finite AMT is also not counted as an ignored dose-like AMT.
+        assert!(!pop.warnings.iter().any(|w| w.contains("W_AMT_NOT_DOSED")));
+    }
+
+    // ── NONMEM coded RATE values (#324) ──────────────────────────────────────
+    // `RATE` is overloaded: 0 = bolus, >0 = infusion rate, -1 = modeled rate
+    // (R{n} in $PK), -2 = modeled duration (D{n} in $PK). `-2` is accepted as
+    // `ModeledDuration` (the D{cmt}/engine check happens later at the model+data
+    // join); `-1` and malformed values are still rejected loudly.
+    // `validate_dose_rate` is the unit under test.
+
+    #[test]
+    fn validate_dose_rate_classifies_coded_and_malformed_values() {
+        // -2 → modeled duration: accepted here; the D{cmt} existence / ODE-engine
+        // check happens later at the model+data join, where the model is known.
+        assert_eq!(
+            validate_dose_rate(-2.0, "7", 0.0).unwrap(),
+            RateMode::ModeledDuration
+        );
+
+        // -1 → modeled rate: not yet supported (#324 Phase B). The message names
+        // RATE=-1 and R1 so a NONMEM user recognises it, plus subject/time.
+        let e = validate_dose_rate(-1.0, "1", 2.5).unwrap_err();
+        assert!(e.contains("RATE=-1") && e.contains("R1"), "{e}");
+        assert!(e.contains("subject 1") && e.contains("time 2.5"), "{e}");
+
+        // Other negatives are not recognised NONMEM codes; the message echoes
+        // the offending value so the bad row is identifiable. `-1.5`/`-2.5` are
+        // the regression guard for the integer-match: a non-integer must NOT be
+        // rounded into the -1/-2 codes (it is rejected, not silently accepted as
+        // modeled duration).
+        for r in [-0.5, -1.5, -2.5, -3.0, -100.0] {
+            let e = validate_dose_rate(r, "1", 0.0).unwrap_err();
+            assert!(
+                e.contains(&format!("RATE={r}")) && e.contains("negative value"),
+                "r={r}: {e}"
+            );
+        }
+
+        // Non-finite RATE on a dose row is malformed.
+        for r in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let e = validate_dose_rate(r, "1", 0.0).unwrap_err();
+            assert!(e.contains("not finite"), "r={r}: {e}");
+        }
+
+        // Ordinary data-driven rates classify as Fixed.
+        assert_eq!(validate_dose_rate(0.0, "1", 0.0).unwrap(), RateMode::Fixed);
+        assert_eq!(validate_dose_rate(50.0, "1", 0.0).unwrap(), RateMode::Fixed);
+    }
+
+    #[test]
+    fn coded_rate_minus_one_on_dose_row_is_rejected() {
+        // End-to-end regression for the silent-bolus bug: a RATE=-1 dose must
+        // error at read time, naming the subject/time, not load as a bolus.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+                   1,0,.,1,100,1,-1,1\n\
+                   1,1,5.0,0,.,.,.,0\n";
+        let f = write_csv(csv);
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(
+            err.contains("RATE=-1") && err.contains("subject 1"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn positive_and_zero_rate_doses_still_parse() {
+        // Don't break normal infusions/boluses: RATE=50 → duration = amt/rate,
+        // RATE=0 → bolus (duration 0).
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+                   1,0,.,1,500,1,50,1\n\
+                   2,0,.,1,500,1,0,1\n\
+                   1,1,5.0,0,.,.,.,0\n\
+                   2,1,5.0,0,.,.,.,0\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let inf = &pop.subjects[0].doses[0];
+        assert!(inf.is_infusion() && (inf.duration - 10.0).abs() < 1e-12);
+        let bolus = &pop.subjects[1].doses[0];
+        assert!(!bolus.is_infusion() && bolus.duration == 0.0);
+    }
+
+    #[test]
+    fn coded_rate_on_observation_row_is_ignored() {
+        // NONMEM only interprets RATE on dose records. A coded RATE on an EVID=0
+        // observation row must not error (it is never administered).
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
+                   1,0,.,1,100,1,0,1\n\
+                   1,1,5.0,0,.,.,-1,0\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert_eq!(pop.subjects[0].doses.len(), 1);
+    }
+
+    #[test]
+    fn coded_rate_on_filtered_out_dose_row_does_not_error() {
+        // The RATE check runs in the dose arm, after the data-selection filter
+        // (`continue` on an excluded row). A coded RATE on a row the user IGNOREs
+        // must not error — only administered doses are validated.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,FLAG\n\
+                   1,0,.,1,100,1,0,1,1\n\
+                   1,0.5,.,1,100,1,-2,1,9\n\
+                   1,1,5.0,0,.,.,.,0,1\n";
+        let f = write_csv(csv);
+        let filter = SelectionFilter::from_opts(&["FLAG == 9".to_string()], &[], &[]).unwrap();
+        let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
+        // The coded-RATE dose row was filtered out; the normal dose survives.
+        assert_eq!(pop.subjects[0].doses.len(), 1);
+        assert!(!pop.subjects[0].doses[0].is_infusion());
     }
 
     #[test]
@@ -1740,6 +2345,146 @@ mod tests {
         assert!(subj.pk_only_covariates.is_empty());
     }
 
+    #[test]
+    fn test_missing_dv_obs_skipped_and_warned() {
+        // Issue #258: an EVID=0 row with a missing DV and no MDV=1 must be
+        // skipped (not scored as DV=0), and a single W_MISSING_DV warning fires.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,0,.,1,1,100,1\n\
+                   1,1,5.0,0,0,.,1\n\
+                   1,2,.,0,0,.,1\n\
+                   1,3,7.0,0,0,.,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        // Only the two valid observations are scored; the missing-DV row at t=2
+        // is skipped (no phantom 0.0 observation, no t=2 entry).
+        assert_eq!(subj.observations, vec![5.0, 7.0]);
+        assert_eq!(subj.obs_times, vec![1.0, 3.0]);
+
+        // Exactly one summary warning, reporting a single skipped row.
+        let warns: Vec<&String> = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_MISSING_DV"))
+            .collect();
+        assert_eq!(warns.len(), 1, "expected one W_MISSING_DV summary warning");
+        assert!(warns[0].contains("1 observation row"), "got: {}", warns[0]);
+    }
+
+    #[test]
+    fn test_missing_dv_with_mdv1_no_warning() {
+        // The same missing-DV row marked MDV=1 is the documented convention and
+        // must NOT trigger the W_MISSING_DV warning (it's already handled).
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,0,.,1,1,100,1\n\
+                   1,1,5.0,0,0,.,1\n\
+                   1,2,.,0,1,.,1\n\
+                   1,3,7.0,0,0,.,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.observations, vec![5.0, 7.0]);
+        assert!(
+            !pop.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
+            "MDV=1 missing-DV row should not warn"
+        );
+    }
+
+    #[test]
+    fn test_missing_dv_count_aggregates_across_subjects() {
+        // Issue #258: the per-subject missing-DV counts are summed into ONE
+        // population warning. Two subjects, one skipped row each → a single
+        // W_MISSING_DV reporting two rows (plural), not two warnings.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,0,.,1,1,100,1\n\
+                   1,1,.,0,0,.,1\n\
+                   1,2,7.0,0,0,.,1\n\
+                   2,0,.,1,1,100,1\n\
+                   2,1,5.0,0,0,.,1\n\
+                   2,2,.,0,0,.,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+
+        // Each subject keeps only its single valid observation.
+        assert_eq!(pop.subjects[0].observations, vec![7.0]);
+        assert_eq!(pop.subjects[1].observations, vec![5.0]);
+
+        let warns: Vec<&String> = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_MISSING_DV"))
+            .collect();
+        assert_eq!(warns.len(), 1, "expected one aggregated W_MISSING_DV");
+        assert!(
+            warns[0].contains("2 observation row"),
+            "expected aggregated count of 2, got: {}",
+            warns[0]
+        );
+    }
+
+    #[test]
+    fn test_missing_dv_recognizes_na_nan_and_blank_sentinels() {
+        // `is_missing_cell` treats `.`, `NA`/`na`, `NaN`/`nan`, and blank as
+        // missing — all of these on a scored obs row must be skipped and counted,
+        // not just the `.` sentinel exercised by the other tests.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,0,.,1,1,100,1\n\
+                   1,1,NA,0,0,.,1\n\
+                   1,2,nan,0,0,.,1\n\
+                   1,3,,0,0,.,1\n\
+                   1,4,6.0,0,0,.,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        // Only the single numeric observation survives.
+        assert_eq!(subj.observations, vec![6.0]);
+        assert_eq!(subj.obs_times, vec![4.0]);
+
+        let warns: Vec<&String> = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_MISSING_DV"))
+            .collect();
+        assert_eq!(warns.len(), 1);
+        assert!(
+            warns[0].contains("3 observation row"),
+            "expected 3 skipped (NA, nan, blank), got: {}",
+            warns[0]
+        );
+    }
+
+    #[test]
+    fn test_missing_dv_and_amt_not_dosed_warnings_coexist() {
+        // The missing-DV summary (#258) and the dose-coverage summary (#262) are
+        // independent population warnings and must both fire when a dataset trips
+        // both: a missing-DV scored obs row AND a nonzero-AMT row that is not a
+        // dose (EVID=2, MDV=1) so its AMT is ignored.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                   1,0,.,1,1,100,1\n\
+                   1,1,.,0,0,.,1\n\
+                   1,2,5.0,0,0,.,1\n\
+                   1,3,.,2,1,5000,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+
+        assert_eq!(pop.subjects[0].observations, vec![5.0]);
+        assert!(
+            pop.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
+            "missing-DV warning should fire; warnings: {:?}",
+            pop.warnings
+        );
+        assert!(
+            pop.warnings
+                .iter()
+                .any(|w| w.starts_with("W_AMT_NOT_DOSED")),
+            "AMT-not-dosed warning should fire; warnings: {:?}",
+            pop.warnings
+        );
+    }
+
     fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
         CovariateDecl {
             name: name.to_string(),
@@ -1912,5 +2657,70 @@ mod tests {
         );
         // Standard and IOV columns must not appear in covariate_names.
         assert_eq!(pop.covariate_names, vec!["WT"]);
+    }
+
+    #[test]
+    fn tte_aware_readers_route_through_gaussian_path_with_empty_tte_cmts() {
+        // `read_nonmem_csv_filtered_tte` / `_with_covariates_tte` (used by
+        // api::read_population_for for [event_model] models) are always compiled
+        // but only *called* on the TTE path, so they read as uncovered in the
+        // FD-only build. With an empty tte_cmts set they delegate to the Gaussian
+        // reader; drive them directly to cover the column-augmentation / union /
+        // delegation lines. (The cfg(survival) row-routing inside the impl is
+        // exercised by the survival job, not here.)
+        let no_tte = std::collections::HashSet::new();
+        let csv = "ID,TIME,DV,EVID,AMT,WT,STUDY,AGE\n\
+                   1,0,.,1,100,70,1,30\n\
+                   1,1,5.0,0,.,70,1,30\n\
+                   2,0,.,1,100,80,2,40\n\
+                   2,1,4.0,0,.,80,2,40\n";
+        let f = write_csv(csv);
+
+        // filtered_tte: explicit covariate list, augmented by a filter that
+        // references an out-of-list column (STUDY) — exercises the augmentation
+        // branch; the filter then drops STUDY==2 (subject 2).
+        let cols: &[&str] = &["WT"];
+        let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
+        let pop = read_nonmem_csv_filtered_tte(f.path(), Some(cols), None, Some(&filter), &no_tte)
+            .unwrap();
+        assert_eq!(
+            pop.subjects
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"],
+            "STUDY==2 subject should be filtered out via the augmented column"
+        );
+
+        // with_covariates_tte: declared WT + an undeclared `extra` (STUDY) + a
+        // filter referencing a *third* column (AGE) — exercises BOTH the
+        // extra-columns dedup loop and the filter-referenced-column merge, and
+        // *validates* the merge: AGE==40 can only drop subject 2 if AGE was
+        // actually pulled into the read union, so the assertion fails if the
+        // merge regresses.
+        let decls = vec![CovariateDecl {
+            name: "WT".to_string(),
+            kind: CovariateKind::Continuous,
+        }];
+        let extra = ["STUDY".to_string()];
+        let drop_age40 = SelectionFilter::from_opts(&["AGE == 40".to_string()], &[], &[]).unwrap();
+        let (pop2, _table) = read_nonmem_csv_with_covariates_tte(
+            f.path(),
+            &decls,
+            &extra,
+            None,
+            Some(&drop_age40),
+            &no_tte,
+        )
+        .unwrap();
+        // Subject 2 (AGE=40) is dropped via the merged AGE column; subject 1 remains.
+        assert_eq!(
+            pop2.subjects
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1"],
+            "AGE==40 must drop subject 2 — proving AGE was pulled into the read union"
+        );
     }
 }

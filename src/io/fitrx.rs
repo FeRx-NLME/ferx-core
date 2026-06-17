@@ -261,6 +261,8 @@ struct FitWire {
     sir_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     is_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    npde_seed: Option<u64>,
     #[serde(default)]
     bloq_method: String,
     #[serde(default)]
@@ -424,6 +426,7 @@ fn method_to_str(m: EstimationMethod) -> &'static str {
         EstimationMethod::Saem => "saem",
         EstimationMethod::Imp => "imp",
         EstimationMethod::Impmap => "impmap",
+        EstimationMethod::Bayes => "bayes",
     }
 }
 
@@ -436,6 +439,7 @@ fn method_from_str(s: &str) -> Result<EstimationMethod, FitrxError> {
         "foce_gn_hybrid" => EstimationMethod::FoceGnHybrid,
         "saem" => EstimationMethod::Saem,
         "imp" => EstimationMethod::Imp,
+        "bayes" => EstimationMethod::Bayes,
         _ => return Err(FitrxError::Corrupt(format!("unknown method {:?}", s))),
     })
 }
@@ -760,6 +764,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         saem_seed: r.saem_seed,
         sir_seed: r.sir_seed,
         is_seed: r.is_seed,
+        npde_seed: r.npde_seed,
         bloq_method: r.bloq_method.clone(),
         outer_maxiter: r.outer_maxiter,
         outer_gtol: r.outer_gtol,
@@ -833,8 +838,17 @@ fn write_predictions_csv<W: Write>(
 ) -> Result<(), FitrxError> {
     let any_cens = r.subjects.iter().any(|s| s.cens.iter().any(|&c| c != 0));
     let any_occ = p.subjects.iter().any(|s| !s.occasions.is_empty());
+    // NPDE/NPD are only present when the fit ran with npde_nsim > 0.
+    let any_npde = r
+        .subjects
+        .iter()
+        .any(|s| !s.npde.is_empty() || !s.npd.is_empty());
 
-    let mut header = String::from("ID,TIME,DV,PRED,IPRED,CWRES,IWRES,EBE_OFV,N_OBS");
+    let mut header = String::from("ID,TIME,DV,PRED,IPRED,CWRES,IWRES");
+    if any_npde {
+        header.push_str(",NPDE,NPD");
+    }
+    header.push_str(",EBE_OFV,N_OBS");
     if any_cens {
         header.push_str(",CENS");
     }
@@ -859,6 +873,12 @@ fn write_predictions_csv<W: Write>(
             row.push_str(&fmt_f64(sr.cwres[j]));
             row.push(',');
             row.push_str(&fmt_f64(sr.iwres[j]));
+            if any_npde {
+                row.push(',');
+                row.push_str(&fmt_f64(sr.npde.get(j).copied().unwrap_or(f64::NAN)));
+                row.push(',');
+                row.push_str(&fmt_f64(sr.npd.get(j).copied().unwrap_or(f64::NAN)));
+            }
             row.push(',');
             row.push_str(&fmt_f64(sr.ofv_contribution));
             row.push(',');
@@ -1076,6 +1096,8 @@ fn parse_subjects(
             pred: Vec::new(),
             iwres: Vec::new(),
             cwres: Vec::new(),
+            npde: Vec::new(),
+            npd: Vec::new(),
             ofv_contribution: ofv,
             cens: Vec::new(),
             n_obs,
@@ -1106,6 +1128,9 @@ fn parse_subjects(
     let ipred_i = require("IPRED")?;
     let cwres_i = require("CWRES")?;
     let iwres_i = require("IWRES")?;
+    // NPDE/NPD are optional — present only when the fit ran with npde_nsim > 0.
+    let npde_i = col.get("NPDE").copied();
+    let npd_i = col.get("NPD").copied();
     let cens_i = col.get("CENS").copied();
 
     let mut by_id: HashMap<String, usize> = HashMap::new();
@@ -1136,6 +1161,16 @@ fn parse_subjects(
         subjects[idx].ipred.push(parse_opt(&fields[ipred_i]));
         subjects[idx].cwres.push(parse_opt(&fields[cwres_i]));
         subjects[idx].iwres.push(parse_opt(&fields[iwres_i]));
+        if let Some(j) = npde_i {
+            subjects[idx]
+                .npde
+                .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
+        }
+        if let Some(j) = npd_i {
+            subjects[idx]
+                .npd
+                .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
+        }
         let c = match cens_i {
             Some(j) => fields
                 .get(j)
@@ -1555,6 +1590,7 @@ fn wire_to_fit_result(
         // `methods = [..., imp]` if the consumer needs the IS LL.
         importance_sampling: None,
         impmap_trace: None,
+        bayes: None,
         omega_iov,
         kappa_names,
         kappa_fixed,
@@ -1608,6 +1644,7 @@ fn wire_to_fit_result(
         saem_seed: w.saem_seed,
         sir_seed: w.sir_seed,
         is_seed: w.is_seed,
+        npde_seed: w.npde_seed,
         bloq_method: w.bloq_method,
         outer_maxiter: w.outer_maxiter,
         outer_gtol: w.outer_gtol,
@@ -1668,6 +1705,8 @@ mod tests {
             pred: (0..n_obs).map(|j| 1.5 + j as f64).collect(),
             iwres: (0..n_obs).map(|j| 0.01 * j as f64).collect(),
             cwres: (0..n_obs).map(|j| -0.02 * j as f64).collect(),
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 12.34,
             cens: vec![0; n_obs],
             n_obs,
@@ -1751,6 +1790,7 @@ mod tests {
             sir_resamples_packed: None,
             importance_sampling: None,
             impmap_trace: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],
@@ -1821,6 +1861,7 @@ mod tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 300,
             outer_gtol: 1e-4,
@@ -1873,6 +1914,85 @@ mod tests {
         assert_eq!(loaded.model_source, "model source\n");
         assert!(loaded.population.is_none());
         assert_eq!(loaded.manifest.format_version, FORMAT_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_preserves_npde_npd() {
+        // When the fit ran with npde_nsim > 0, the predictions.csv carries NPDE/NPD
+        // and the loader must restore them (regression for the silent-drop bug).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("npde.fitrx");
+        let mut r = minimal_fit_result();
+        r.subjects[0].npde = vec![0.1, -0.2, 0.3];
+        r.subjects[0].npd = vec![0.15, -0.25, 0.35];
+        r.subjects[1].npde = vec![-1.0, 1.0];
+        r.subjects[1].npd = vec![-0.9, 0.9];
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        for (a, b) in loaded.fit.subjects.iter().zip(r.subjects.iter()) {
+            assert_eq!(a.npde.len(), b.npde.len(), "subject {} npde len", a.id);
+            for (x, y) in a.npde.iter().zip(b.npde.iter()) {
+                assert!((x - y).abs() < 1e-6, "npde {x} vs {y}");
+            }
+            for (x, y) in a.npd.iter().zip(b.npd.iter()) {
+                assert!((x - y).abs() < 1e-6, "npd {x} vs {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn roundtrip_omits_npde_when_absent() {
+        // No NPDE/NPD computed → the columns are absent and load leaves them empty.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonpde.fitrx");
+        let r = minimal_fit_result(); // dummy subjects have empty npde/npd
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        for s in &loaded.fit.subjects {
+            assert!(s.npde.is_empty(), "npde must stay empty when not written");
+            assert!(s.npd.is_empty(), "npd must stay empty when not written");
+        }
+    }
+
+    #[test]
+    fn roundtrip_preserves_npde_seed() {
+        // The effective NPDE seed survives the save/load round-trip; `None`
+        // (NPDE did not run) round-trips as `None`.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+
+        let mut r = minimal_fit_result();
+        r.npde_seed = Some(20240601);
+        let with = dir.path().join("seed.fitrx");
+        save_fit(&r, &p, "src\n", &with, SaveFitOptions::default()).unwrap();
+        assert_eq!(load_fit(&with).unwrap().fit.npde_seed, Some(20240601));
+
+        let none = dir.path().join("noseed.fitrx");
+        let r0 = minimal_fit_result(); // npde_seed defaults to None
+        save_fit(&r0, &p, "src\n", &none, SaveFitOptions::default()).unwrap();
+        assert_eq!(load_fit(&none).unwrap().fit.npde_seed, None);
+    }
+
+    #[test]
+    fn method_str_roundtrips_every_variant() {
+        // Guards against a new EstimationMethod variant being added to
+        // method_to_str (write) but not method_from_str (read), which silently
+        // breaks .fitrx load for fits produced with that method (e.g. #380's
+        // `bayes`). Exhaustive over the enum so the compiler-style coverage is
+        // enforced at test time.
+        use crate::types::EstimationMethod::*;
+        for m in [Foce, FoceI, FoceGn, FoceGnHybrid, Saem, Imp, Impmap, Bayes] {
+            let s = method_to_str(m);
+            assert_eq!(
+                method_from_str(s).expect("method_from_str must accept method_to_str output"),
+                m,
+                "method round-trip failed for {s:?}"
+            );
+        }
     }
 
     #[test]

@@ -149,7 +149,7 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow + NONMEM-anchored LTBS covariance SE cross-check (#120/#223): opt in with --features slow-tests"
+    ignore = "slow + NONMEM-anchored LTBS covariance SE cross-check: opt in with --features slow-tests"
 )]
 fn ltbs_covariance_se_matches_nonmem() {
     let model = parse_model_file(Path::new("examples/warfarin_ltbs.ferx"))

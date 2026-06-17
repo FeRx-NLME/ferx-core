@@ -14,7 +14,9 @@ An **occasion** is a distinct time window during which the same kappa value appl
 
 **Kappa** (κ) is the IOV random effect, analogous to eta (η) for BSV. Each kappa is drawn independently per occasion:
 
-\\[ \kappa_{ik} \sim \mathcal{N}(0, \Omega_\text{IOV}) \\]
+<div>
+\[ \kappa_{ik} \sim \mathcal{N}(0, \Omega_\text{IOV}) \]
+</div>
 
 where *i* indexes subjects and *k* indexes occasions. The IOV omega matrix Ω_IOV is estimated alongside the BSV omega.
 
@@ -109,18 +111,22 @@ See `examples/warfarin_iov.ferx` for a complete runnable example.
 
 When a model has kappa declarations and the subject has occasion labels, the inner optimizer runs `find_ebe_iov` instead of the standard `find_ebe`. It jointly optimizes over:
 
-\\[ p = [\underbrace{\eta_1, \ldots, \eta_{n_\eta}}_{\text{BSV}},\ \underbrace{\kappa_{1,1}, \ldots, \kappa_{1,n_\kappa}}_{\text{occasion 1}},\ \ldots,\ \underbrace{\kappa_{K,1}, \ldots, \kappa_{K,n_\kappa}}_{\text{occasion K}}] \\]
+<div>
+\[ p = [\underbrace{\eta_1, \ldots, \eta_{n_\eta}}_{\text{BSV}},\ \underbrace{\kappa_{1,1}, \ldots, \kappa_{1,n_\kappa}}_{\text{occasion 1}},\ \ldots,\ \underbrace{\kappa_{K,1}, \ldots, \kappa_{K,n_\kappa}}_{\text{occasion K}}] \]
+</div>
 
 The joint negative log-posterior is:
 
-\\[
+<div>
+\[
 -\log p(p \mid y_i) = \frac{1}{2}\left[
   \eta^T \Omega^{-1} \eta + \log|\Omega|
   + \sum_{k=1}^{K} \kappa_k^T \Omega_\text{IOV}^{-1} \kappa_k
   + K \log|\Omega_\text{IOV}|
   + \sum_{j} \left(\frac{(y_{ij} - f_{ij}^{(k_j)})^2}{V_{ij}} + \log V_{ij}\right)
 \right]
-\\]
+\]
+</div>
 
 where \\( k_j \\) is the occasion of observation *j* and \\( f_{ij}^{(k)} = f(\theta, \eta_i, \kappa_{ik}) \\).
 
@@ -130,23 +136,29 @@ Optimization uses BFGS; the gradient is computed by finite differences (no AD pa
 
 The IOV omega is packed after the sigma block in the optimizer vector. For Option A (diagonal Ω_IOV) only the log-diagonal entries are appended; for Option B the full Cholesky lower triangle is appended (log-diagonals plus off-diagonals as-is), mirroring the BSV omega packing:
 
-\\[
+<div>
+\[
 x = [\log\theta,\ \text{chol}(\Omega_\text{BSV}),\ \log\sigma,\ \text{chol}(\Omega_\text{IOV})]
-\\]
+\]
+</div>
 
 The per-subject FOCE objective is a *proper augmented marginal*: the per-occasion kappas are integrated out through the linearised marginal exactly like the BSV etas. The random-effect vector is \\( b = [\eta,\ \kappa_1, \ldots, \kappa_K] \\) with block-diagonal prior covariance
 
-\\[
+<div>
+\[
 \Sigma_b = \text{blockdiag}(\Omega_\text{BSV},\ \Omega_\text{IOV},\ \ldots,\ \Omega_\text{IOV})
-\\]
+\]
+</div>
 
 (*K* copies of Ω_IOV), and the H-matrix is **augmented** with kappa columns,
 \\( H_\text{full} = [\,\partial f/\partial\eta \mid \partial f/\partial\kappa_1 \mid \cdots \mid \partial f/\partial\kappa_K\,] \\). Because \\( \kappa_k \\) enters only occasion-*k*'s predictions, its columns are non-zero only on that occasion's rows. The objective is then the ordinary Sheiner–Beal form
 
-\\[
+<div>
+\[
 \text{NLL}_i = \tfrac{1}{2}\left[(y - f_0)^T \tilde{R}^{-1} (y - f_0) + \log|\tilde{R}|\right],\qquad
 \tilde{R} = H_\text{full}\,\Sigma_b\,H_\text{full}^T + R
-\\]
+\]
+</div>
 
 with no separate kappa prior added (it is already folded into \\( \tilde{R} \\)). This reduces exactly to the BSV-only FOCE objective when there are no kappas.
 
@@ -158,7 +170,7 @@ For non-IOV models the outer optimizer uses a cheap analytical gradient with the
 
 For IOV models (`n_kappa > 0`) the outer gradient is therefore computed by **central finite differences that re-converge the inner loop at each perturbed point** (`reconverged_fd_gradient`). This restores the correct descent direction for the variance components at a cost of `2·n_free` inner-loop solves per gradient; it is gated to IOV so the non-IOV path is unaffected.
 
-In addition, on the **SLSQP** path IOV models auto-enable per-coordinate scaling. SLSQP applies a uniform gradient cap that rescales the whole gradient by its largest (theta) component; with the disparate-magnitude IOV parameters (block-diagonal omega + kappa) that cap otherwise starves the omega/Ω_IOV step and leaves the variances pinned at their initial values. Presenting O(1) scaled coordinates removes the starvation, so a *pure* FOCEI/SLSQP fit reaches the marginal minimum from a cold start. (This scaling is scoped to IOV + SLSQP: it is unnecessary for BFGS, which optimizes in unscaled space, and counter-productive for MMA — and the global `scale_params` default stays off to preserve the issue-#99 non-IOV behaviour.)
+In addition, on the **SLSQP** path IOV models auto-enable per-coordinate scaling. SLSQP applies a uniform gradient cap that rescales the whole gradient by its largest (theta) component; with the disparate-magnitude IOV parameters (block-diagonal omega + kappa) that cap otherwise starves the omega/Ω_IOV step and leaves the variances pinned at their initial values. Presenting O(1) scaled coordinates removes the starvation, so a *pure* FOCEI/SLSQP fit moves the variance components off their initial values and descends toward the marginal minimum from a cold start. It does not always *reach* it: the final descent is driven by a noisy re-converged FD gradient on a weakly-identified variance surface, and SLSQP can terminate a few OFV units high in a platform-dependent way (see [Limitations](#limitations)). The default **BOBYQA** optimizer and the `methods = [saem, focei]` chain reach the true minimum platform-independently. (This scaling is scoped to IOV + SLSQP: it is unnecessary for BFGS, which optimizes in unscaled space, and counter-productive for MMA — and the global `scale_params` default stays off to preserve the issue-#99 non-IOV behaviour.)
 
 ### Covariance step
 
@@ -184,6 +196,7 @@ When the dataset has occasion labels the sdtab CSV gains an `OCC` column (one ro
 
 - **Cross-occasion dose carryover.** Predictions are computed by `pk::predict_iov`, which builds per-event PK parameters carrying each event's occasion kappa and propagates the compartment amounts *continuously* across occasion boundaries (via the event-driven solver). A dose from an earlier occasion is therefore eliminated through a later occasion with the later occasion's clearance — matching NONMEM's integration model (this replaced the earlier "Option A" superposition, which used a single clearance for the whole dose history and biased no-washout designs; issue #104). On the warfarin IOV reference, ferx's population prediction now matches NONMEM's to 5 significant figures on every row. A ~17 OFV-unit gap versus NONMEM remains at matched parameters, but it is *not* a prediction difference — it is a cross-engine FOCEI marginal/EBE difference for this weakly-identified multi-random-effect model (and NONMEM's reference itself did not converge cleanly here). See `tests/warfarin_iov_nonmem.rs`.
 - **Local-optimizer convergence from a far-off cold start.** Pure FOCEI (SLSQP via the auto-scaling above, or BFGS) reaches the minimum from a *sensible* start, but the IOV variance surface is ill-conditioned and weakly identified, so a *far-off* start (e.g. a residual-error init off by more than ~2×) can still stall. Set a realistic `sigma` init (a too-small one drives early omega inflation). The most robust workflow remains **SAEM**, or a `methods = [saem, focei]` chain (SAEM finds the basin, FOCEI polishes to a strictly better marginal optimum). See `tests/iov_convergence.rs`.
+- **Platform-dependent pure-SLSQP cold-start termination.** Even from the model's cold default start, a *pure* FOCEI/SLSQP fit on `warfarin_iov` reaches a different point on different architectures: macOS arm64 lands at ≈307.8 (the minimum), while Linux x86_64 deterministically stalls at ≈314.7, ~7 OFV units high (issue #160). The descent direction near the minimum comes from a re-converged central-FD gradient whose floating-point summation order differs across architectures, and SLSQP's stagnation guard latches at whichever flat-looking point it reaches first. This affects only an explicit `optimizer = slsqp`; the default **BOBYQA** (derivative-free) and the SAEM→FOCEI chain reach ≈307.8 on both platforms. Prefer them for IOV fits — reserve pure SLSQP for a warm start already in the basin.
 - **ODE Form C output (`[scaling] y = <expr>`) cannot reference `KAPPA_*` directly** under IOV — the readout is evaluated once per observation with a single eta, so a direct kappa reference would see `kappa = 0`. The parser rejects it with a clear error (issue #107); put the occasion dependence in the structural parameters (e.g. `CL`) and reference those in the readout instead. The PK dynamics themselves are always occasion-correct.
 - **Automatic differentiation (AD) is not used** for IOV inner-loop gradients; finite differences are used instead. For large models this is slower than the AD path used for BSV-only models.
 - The occasion column must contain non-negative integers. Non-integer or negative values are silently treated as missing (`OCC = 0`) and a single summary warning is emitted.

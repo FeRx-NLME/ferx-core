@@ -96,7 +96,7 @@ pub struct FitOptions {
     pub outer_maxiter: usize,          // Default: 500
     pub outer_gtol: f64,               // Default: 1e-6
     pub inner_maxiter: usize,          // Default: 200
-    pub inner_tol: f64,                // Default: 1e-8
+    pub inner_tol: f64,                // Default: 1e-5
     pub run_covariance_step: bool,     // Default: true
     pub interaction: bool,             // FOCEI flag
     pub verbose: bool,                 // Default: true
