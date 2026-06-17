@@ -208,6 +208,12 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **IMPMAP** now responds to a cooperative cancellation (e.g. an R-session
+  interrupt) during an iteration's E-step, instead of only at iteration
+  boundaries. The importance-sampling pass — the dominant per-iteration cost on
+  large datasets — previously ran to completion before the cancel flag was
+  checked, so a kill request could appear to hang for minutes; the E-step now
+  polls per subject and the run aborts promptly (#273).
 - An individual parameter assigned only inside symmetric `if`/`else` branches in
   `[individual_parameters]` (the NONMEM-style `IF (cond) CL = ...` /
   `IF (!cond) CL = ...` construction) on an **ODE model** is no longer rejected
