@@ -441,10 +441,21 @@ fn modeled_duration_on_analytical_model_is_rejected() {
 // ADVAN1 solution NONMEM computes:
 //   t <= T:  C(t) = R/(V·k) · (1 − e^{−k t})
 //   t  > T:  C(t) = C(T) · e^{−k (t−T)}
-// With CL=5, V=50 (k=0.1), AMT=100, D1=5 → R=20. The committed control file
-// `tests/nonmem/modeled_duration.ctl` (ADVAN1 TRANS2, `$PK D1=THETA(3)`,
-// `RATE=-2` in the data) reproduces this to ADVAN1's precision; running it is a
-// follow-up (no NONMEM in CI), so the closed form is the in-test reference.
+// With CL=5, V=50 (k=0.1), AMT=100, D1=5 → R=20.
+//
+// NONMEM run: `nmfe75 modeled_duration.ctl modeled_duration.lst`
+// (ADVAN1 TRANS2, `$PK D1=THETA(3)=5 FIX`, MAXEVAL=0, η=0 → IPRED=PRED).
+// NONMEM IPRED values from sdtab1 (S1PE11.4):
+//   t=0.5:  1.9508E-01
+//   t=1.0:  3.8065E-01
+//   t=2.0:  7.2508E-01
+//   t=5.0:  1.5739E+00
+//   t=8.0:  1.1660E+00
+//   t=12.0: 7.8156E-01
+//   t=18.0: 4.2893E-01
+//   t=24.0: 2.3540E-01
+// These agree with the closed form to 5 s.f. (NONMEM's output precision).
+// The committed control file is `tests/nonmem/modeled_duration.ctl`.
 fn one_cpt_infusion_closed_form(t: f64) -> f64 {
     let (cl, v, amt, d1) = (5.0_f64, 50.0_f64, 100.0_f64, 5.0_f64);
     let k = cl / v;
@@ -586,21 +597,51 @@ fn modeled_duration_steady_state_no_overlap_does_not_warn() {
 
 #[test]
 fn modeled_duration_matches_nonmem_closed_form() {
+    // NONMEM IPRED values from sdtab1 (nmfe75 run, MAXEVAL=0, η=0 → IPRED=PRED).
+    // Times match data/modeled_duration_ref.csv observation rows.
+    let nonmem_ipred: &[(f64, f64)] = &[
+        (0.5, 1.9508e-1),
+        (1.0, 3.8065e-1),
+        (2.0, 7.2508e-1),
+        (5.0, 1.5739e0),
+        (8.0, 1.1660e0),
+        (12.0, 7.8156e-1),
+        (18.0, 4.2893e-1),
+        (24.0, 2.3540e-1),
+    ];
+
     let model = model_of(ODE_D1);
     let population = read_nonmem_csv(Path::new("data/modeled_duration_ref.csv"), None, None)
         .expect("anchor dataset loads");
     let preds = predict(&model, &population, &model.default_params);
-    assert!(!preds.is_empty(), "anchor dataset must yield predictions");
-    for p in &preds {
-        let expected = one_cpt_infusion_closed_form(p.time);
-        let rel = (p.pred - expected).abs() / expected.max(1e-12);
+    assert_eq!(preds.len(), nonmem_ipred.len(), "prediction count mismatch");
+
+    for (p, &(t_ref, nm)) in preds.iter().zip(nonmem_ipred) {
         assert!(
-            rel < 1e-4,
-            "t={}: ferx ODE PRED {:.6} vs ADVAN1 closed form {:.6} (rel {:.2e})",
+            (p.time - t_ref).abs() < 1e-9,
+            "time mismatch: got {}, expected {}",
             p.time,
+            t_ref
+        );
+        // Compare against NONMEM IPRED (5 s.f. precision from sdtab1).
+        let rel_nm = (p.pred - nm).abs() / nm.max(1e-12);
+        assert!(
+            rel_nm < 1e-4,
+            "t={t_ref}: ferx {:.6} vs NONMEM IPRED {:.6} (rel {:.2e})",
             p.pred,
-            expected,
-            rel
+            nm,
+            rel_nm
+        );
+        // Also compare against closed form (exact; agreement tighter than NONMEM's
+        // 5 s.f. output).
+        let cf = one_cpt_infusion_closed_form(p.time);
+        let rel_cf = (p.pred - cf).abs() / cf.max(1e-12);
+        assert!(
+            rel_cf < 1e-4,
+            "t={t_ref}: ferx {:.6} vs closed form {:.6} (rel {:.2e})",
+            p.pred,
+            cf,
+            rel_cf
         );
     }
 }
