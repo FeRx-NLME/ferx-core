@@ -20,11 +20,12 @@
 //!     matrix inversion ([`inverse_wishart_draw`], [`wishart_draw`]).
 
 use crate::estimation::outer_optimizer::OuterResult;
-use crate::estimation::saem::mh_steps;
+use crate::estimation::saem::{mh_kappa_steps, mh_steps};
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::individual_nll_into;
+use crate::stats::likelihood::{individual_nll_into, individual_nll_iov, split_obs_by_occasion};
 use crate::types::{
     BayesResult, CompiledModel, FitOptions, ModelParameters, OmegaMatrix, Population, SigmaVector,
+    Subject,
 };
 use nalgebra::{Cholesky, DMatrix, DVector};
 use rand::rngs::StdRng;
@@ -167,16 +168,45 @@ enum PopCoord {
     Sigma { idx: usize },
 }
 
+/// Per-subject negative log-likelihood, routing to the IOV-aware kernel when the
+/// subject carries per-occasion kappas (`kappas` non-empty) and the plain kernel
+/// otherwise. Centralizes the IOV/non-IOV branch so every sweep site stays
+/// consistent.
+#[allow(clippy::too_many_arguments)]
+fn subject_nll(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    kappas: &[Vec<f64>],
+    omega: &OmegaMatrix,
+    omega_iov: Option<&OmegaMatrix>,
+    sigma: &[f64],
+    scratch: &mut EventPkParams,
+) -> f64 {
+    if kappas.is_empty() {
+        individual_nll_into(model, subject, theta, eta, omega, sigma, scratch)
+    } else {
+        individual_nll_iov(model, subject, theta, eta, kappas, omega, omega_iov, sigma)
+    }
+}
+
 /// Full MCMC Bayesian estimation entry point (Path A: Gibbs-within-HMC).
 ///
-/// First cut: **BSV-only** (no IOV / `omega_iov`). Per sweep, per chain:
+/// Per sweep, per chain:
 ///   1. η block — `mh_steps` (block random-walk preconditioned by `chol(Ω)`),
-///      sampling `ηᵢ | θ, Ω, σ, y` for each subject;
+///      sampling `ηᵢ | θ, Ω, σ, κ, y` for each subject;
+///   1b. κ block (IOV models) — `mh_kappa_steps` sampling each per-occasion
+///      `κᵢₖ | η, θ, Ω, Ω_iov, y`;
 ///   2. Ω block — conjugate inverse-Wishart draw from `S = Σ ηᵢηᵢᵀ`, with the
 ///      structural `free_mask` / fixed entries re-imposed;
-///   3. (θ, σ) block — random-walk Metropolis in unconstrained space
-///      (log where the lower bound is ≥ 0), objective `Σᵢ individual_nll` with η
-///      and Ω held fixed (the η-prior term is then constant and cancels).
+///   2c. Ω_iov block (IOV) — conjugate inverse-Wishart draw from `Σᵢ Σₖ κᵢₖκᵢₖᵀ`;
+///   2b. mu-ref θ block — exact Gaussian full conditional (when every η is a
+///      non-fixed log mu-ref); 3. remaining (θ, σ) — componentwise + adaptive
+///      joint Metropolis, objective `Σᵢ individual_nll` (η, Ω, κ held fixed).
+///
+/// IOV (per-occasion κ) is supported for **zero-mean kappas** (`κ ~ N(0, Ω_iov)`,
+/// the `exp(η + κ)` form); kappa mu-references are rejected.
 ///
 /// Returns an [`OuterResult`] whose point estimate is the posterior mean and
 /// whose [`OuterResult::bayes`] carries the posterior summaries + diagnostics.
@@ -186,12 +216,24 @@ pub fn run_bayes(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
-    if init_params.omega_iov.is_some() || !model.kappa_names.is_empty() {
-        return Err(
-            "Bayesian estimation (method = bayes) does not yet support IOV (kappa) models \
-             — BSV-only in this first cut (see ferx-core#380)"
-                .to_string(),
-        );
+    let n_kappa = model.n_kappa;
+    // IOV (per-occasion kappa) is supported for zero-mean kappas only — i.e.
+    // κ ~ N(0, Ω_iov) added to an existing mu-reference (`exp(η + κ)`), the
+    // common form. Kappas that anchor to their own θ (kappa mu-refs) would
+    // need a θ-block extension; reject those for now.
+    if n_kappa > 0 {
+        if init_params.omega_iov.is_none() {
+            return Err(
+                "Bayesian estimation: model declares kappa but init has no omega_iov".to_string(),
+            );
+        }
+        if !model.kappa_mu_refs.is_empty() {
+            return Err(
+                "Bayesian estimation (method = bayes) supports zero-mean IOV kappas only \
+                 (κ ~ N(0, Ω_iov)); kappa mu-references are not yet supported"
+                    .to_string(),
+            );
+        }
     }
 
     let n_subjects = population.subjects.len();
@@ -279,6 +321,20 @@ pub fn run_bayes(
         param_names.push(format!("OMEGA({},{})", i + 1, j + 1));
     }
     param_names.extend(init_params.sigma.names.iter().cloned());
+    // Ω_iov (per-occasion kappa covariance) free lower-triangle, appended last.
+    let mut omega_iov_coords: Vec<(usize, usize)> = Vec::new();
+    if let Some(oi) = init_params.omega_iov.as_ref() {
+        for i in 0..n_kappa {
+            for j in 0..=i {
+                if oi.free_mask[(i, j)] {
+                    omega_iov_coords.push((i, j));
+                }
+            }
+        }
+    }
+    for &(i, j) in &omega_iov_coords {
+        param_names.push(format!("OMEGA_IOV({},{})", i + 1, j + 1));
+    }
     let n_params = param_names.len();
 
     // Prior scale Λ₀ and df ν₀ for the Ω inverse-Wishart full conditional.
@@ -286,6 +342,11 @@ pub fn run_bayes(
         (0..n_eta).all(|i| init_params.omega_fixed.get(i).copied().unwrap_or(false));
     let lambda0 = init_params.omega.matrix.clone();
     let nu0 = n_eta as f64 + 2.0;
+    // Same inverse-Wishart prior for Ω_iov (kappa covariance).
+    let omega_iov_all_fixed =
+        (0..n_kappa).all(|i| init_params.kappa_fixed.get(i).copied().unwrap_or(false));
+    let lambda0_iov = init_params.omega_iov.as_ref().map(|o| o.matrix.clone());
+    let nu0_iov = n_kappa as f64 + 2.0;
 
     // Per-chain recorded draws: draws_by_chain[c][param] = Vec over retained sweeps.
     let mut draws_by_chain: Vec<Vec<Vec<f64>>> = Vec::with_capacity(n_chains);
@@ -297,8 +358,11 @@ pub fn run_bayes(
     // analytical-PK subjects). Default n_leapfrog = 0 keeps the MH kernel.
     #[cfg(feature = "autodiff")]
     let n_leapfrog = options.saem_n_leapfrog;
+    // HMC is BSV-only (the AD gradient + kernel are kappa-unaware), so IOV
+    // models always use the MH eta kernel.
     #[cfg(feature = "autodiff")]
-    let using_hmc = n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some();
+    let using_hmc =
+        n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && n_kappa == 0;
 
     // Post-warmup HMC divergences across all chains (only the autodiff HMC
     // η-kernel can produce these; the MH kernel never mutates it, hence the
@@ -320,6 +384,25 @@ pub fn run_bayes(
             init_params.omega.diagonal,
         );
         let mut etas: Vec<Vec<f64>> = vec![vec![0.0; n_eta]; n_subjects];
+
+        // IOV state: per-subject, per-occasion kappa vectors (empty when no
+        // IOV, which routes `subject_nll` to the plain kernel). One occasion
+        // list per subject from the OCC column.
+        let mut kappas: Vec<Vec<Vec<f64>>> = (0..n_subjects)
+            .map(|i| {
+                let n_occ = if n_kappa > 0 {
+                    split_obs_by_occasion(&population.subjects[i]).len()
+                } else {
+                    0
+                };
+                vec![vec![0.0; n_kappa]; n_occ]
+            })
+            .collect();
+        let mut omega_iov_cur: Option<OmegaMatrix> = init_params.omega_iov.clone();
+        // Per-subject kappa-MH step scale (adapted in warmup).
+        let mut kappa_scale = 0.6_f64;
+        let mut acc_kappa = 0u64;
+        let mut prop_kappa = 0u64;
 
         // Unconstrained population vector + its prior centre.
         let pack = |theta: &[f64], sigma: &[f64]| -> Vec<f64> {
@@ -374,15 +457,17 @@ pub fn run_bayes(
 
         let total_sweeps = n_warmup + n_sample;
         for sweep in 0..total_sweeps {
-            // (re)compute the per-subject NLL at the current (θ, Ω, σ, η).
+            // (re)compute the per-subject NLL at the current (θ, Ω, σ, η, κ).
             let mut nll: Vec<f64> = (0..n_subjects)
                 .map(|i| {
-                    individual_nll_into(
+                    subject_nll(
                         model,
                         &population.subjects[i],
                         &theta,
                         &etas[i],
+                        &kappas[i],
                         &omega_cur,
+                        omega_iov_cur.as_ref(),
                         &sigma,
                         &mut scratch,
                     )
@@ -429,6 +514,8 @@ pub fn run_bayes(
                 let did_hmc = false;
 
                 if !did_hmc {
+                    // IOV: sample η | κ (kappas held fixed) via the IOV-aware NLL.
+                    let kappas_opt = omega_iov_cur.as_ref().map(|oi| (kappas[i].as_slice(), oi));
                     let (na, nll_new) = mh_steps(
                         &mut etas[i],
                         nll[i],
@@ -441,11 +528,35 @@ pub fn run_bayes(
                         &mut rng,
                         n_eta_mh,
                         &mut scratch,
-                        None,
+                        kappas_opt,
                     );
                     nll[i] = nll_new;
                     acc_eta += na as u64;
                     prop_eta += n_eta_mh as u64;
+                }
+            }
+
+            // ---- 1b. κ block: sample κ_ik | η, θ, Ω, Ω_iov, data (η fixed) ----
+            if n_kappa > 0 && !omega_iov_all_fixed {
+                if let Some(ref oi) = omega_iov_cur {
+                    for i in 0..n_subjects {
+                        let (na, np, nll_new) = mh_kappa_steps(
+                            &mut kappas[i],
+                            nll[i],
+                            &population.subjects[i],
+                            model,
+                            &theta,
+                            &etas[i],
+                            &omega_cur,
+                            oi,
+                            &sigma,
+                            kappa_scale,
+                            &mut rng,
+                        );
+                        nll[i] = nll_new;
+                        acc_kappa += na as u64;
+                        prop_kappa += np as u64;
+                    }
                 }
             }
 
@@ -488,6 +599,55 @@ pub fn run_bayes(
                     // η-block NLLs are now stale w.r.t. Ω; they are recomputed at
                     // the top of the next sweep, and the (θ,σ) block below
                     // recomputes its own proposal NLLs, so no refresh needed here.
+                }
+            }
+
+            // ---- 2c. Ω_iov block (conjugate inverse-Wishart over kappas) ----
+            // Posterior IW(ν0 + N_occ, Λ0_iov + Σᵢ Σₖ κᵢₖκᵢₖᵀ), with structural
+            // zeros / fixed kappa rows re-imposed and the diagonal floored
+            // (1e-8, matching SAEM's IOV floor).
+            if n_kappa > 0 && !omega_iov_all_fixed {
+                if let (Some(oi_ref), Some(lam)) =
+                    (init_params.omega_iov.as_ref(), lambda0_iov.as_ref())
+                {
+                    let mut s = DMatrix::<f64>::zeros(n_kappa, n_kappa);
+                    let mut n_occ_total = 0usize;
+                    for ks in &kappas {
+                        for kap in ks {
+                            let kv = DVector::from_column_slice(kap);
+                            s += &kv * kv.transpose();
+                            n_occ_total += 1;
+                        }
+                    }
+                    let psi_post = lam + s;
+                    if let Some(draw) =
+                        inverse_wishart_draw(nu0_iov + n_occ_total as f64, &psi_post, &mut rng)
+                    {
+                        let mut m = draw;
+                        for i in 0..n_kappa {
+                            for j in 0..n_kappa {
+                                if !oi_ref.free_mask[(i, j)] {
+                                    m[(i, j)] = 0.0;
+                                }
+                                let fi = init_params.kappa_fixed.get(i).copied().unwrap_or(false);
+                                let fj = init_params.kappa_fixed.get(j).copied().unwrap_or(false);
+                                if fi || fj {
+                                    m[(i, j)] = oi_ref.matrix[(i, j)];
+                                }
+                            }
+                        }
+                        for i in 0..n_kappa {
+                            if m[(i, i)] < 1e-8 {
+                                m[(i, i)] = 1e-8;
+                            }
+                        }
+                        omega_iov_cur = Some(OmegaMatrix::from_matrix_with_mask(
+                            m,
+                            oi_ref.eta_names.clone(),
+                            oi_ref.diagonal,
+                            oi_ref.free_mask.clone(),
+                        ));
+                    }
                 }
             }
 
@@ -567,12 +727,14 @@ pub fn run_bayes(
                     }
                     let nll_prop: Vec<f64> = (0..n_subjects)
                         .map(|i| {
-                            individual_nll_into(
+                            subject_nll(
                                 model,
                                 &population.subjects[i],
                                 &theta_prop,
                                 &etas[i],
+                                &kappas[i],
                                 &omega_cur,
+                                omega_iov_cur.as_ref(),
                                 &sigma_prop,
                                 &mut scratch,
                             )
@@ -615,12 +777,14 @@ pub fn run_bayes(
                     }
                     let nll_prop: Vec<f64> = (0..n_subjects)
                         .map(|i| {
-                            individual_nll_into(
+                            subject_nll(
                                 model,
                                 &population.subjects[i],
                                 &theta_prop,
                                 &etas[i],
+                                &kappas[i],
                                 &omega_cur,
+                                omega_iov_cur.as_ref(),
                                 &sigma_prop,
                                 &mut scratch,
                             )
@@ -705,6 +869,13 @@ pub fn run_bayes(
                 }
                 acc_eta = 0;
                 prop_eta = 0;
+                if prop_kappa > 0 {
+                    let r = acc_kappa as f64 / prop_kappa as f64;
+                    kappa_scale *= (r - 0.234).exp();
+                    kappa_scale = kappa_scale.clamp(1e-4, 100.0);
+                }
+                acc_kappa = 0;
+                prop_kappa = 0;
             }
 
             // ---- record retained draws ----
@@ -721,6 +892,12 @@ pub fn run_bayes(
                 for &s in &sigma {
                     chain_draws[p].push(s);
                     p += 1;
+                }
+                if let Some(ref oi) = omega_iov_cur {
+                    for &(i, j) in &omega_iov_coords {
+                        chain_draws[p].push(oi.matrix[(i, j)]);
+                        p += 1;
+                    }
                 }
                 for i in 0..n_subjects {
                     eta_sum[i] += DVector::from_column_slice(&etas[i]);
@@ -759,9 +936,11 @@ pub fn run_bayes(
             })
             .collect()
     };
+    let sig_start = n_theta + omega_coords.len();
     let theta_mean = mean_of(&|p| p < n_theta);
-    let omega_entries_mean = mean_of(&|p| p >= n_theta && p < n_theta + omega_coords.len());
-    let sigma_mean = mean_of(&|p| p >= n_theta + omega_coords.len());
+    let omega_entries_mean = mean_of(&|p| p >= n_theta && p < sig_start);
+    let sigma_mean = mean_of(&|p| p >= sig_start && p < sig_start + n_sigma);
+    let omega_iov_entries_mean = mean_of(&|p| p >= sig_start + n_sigma);
 
     let mut omega_mean_mat = init_params.omega.matrix.clone();
     for (slot, &(i, j)) in omega_coords.iter().enumerate() {
@@ -773,6 +952,22 @@ pub fn run_bayes(
         init_params.omega.eta_names.clone(),
         init_params.omega.diagonal,
     );
+
+    // Posterior-mean Ω_iov (kappa covariance), reassembled from the recorded
+    // free entries; preserves the structural free_mask.
+    let omega_iov_mean = init_params.omega_iov.as_ref().map(|oi_ref| {
+        let mut m = oi_ref.matrix.clone();
+        for (slot, &(i, j)) in omega_iov_coords.iter().enumerate() {
+            m[(i, j)] = omega_iov_entries_mean[slot];
+            m[(j, i)] = omega_iov_entries_mean[slot];
+        }
+        OmegaMatrix::from_matrix_with_mask(
+            m,
+            oi_ref.eta_names.clone(),
+            oi_ref.diagonal,
+            oi_ref.free_mask.clone(),
+        )
+    });
 
     let mean_params = ModelParameters {
         theta: theta_mean.clone(),
@@ -787,7 +982,7 @@ pub fn run_bayes(
             names: init_params.sigma.names.clone(),
         },
         sigma_fixed: init_params.sigma_fixed.clone(),
-        omega_iov: None,
+        omega_iov: omega_iov_mean.clone(),
         kappa_fixed: init_params.kappa_fixed.clone(),
     };
 
@@ -816,19 +1011,25 @@ pub fn run_bayes(
             0,
         );
 
-    // OFV at the posterior mean (2·Σ individual_nll). NOTE: this is the
-    // posterior-mean joint NLL ×2, NOT a FOCE/Laplace marginal OFV — it is
+    // OFV at the posterior mean (2·Σ individual_nll, IOV-aware). NOTE: this is
+    // the posterior-mean joint NLL ×2, NOT a FOCE/Laplace marginal OFV — it is
     // reported for a rough AIC-style comparison only.
+    let kappas_mean: Vec<Vec<Vec<f64>>> = kappas
+        .iter()
+        .map(|ks| ks.iter().map(|k| k.iter().copied().collect()).collect())
+        .collect();
     let mut scratch = EventPkParams::default();
     let ofv = 2.0
         * (0..n_subjects)
             .map(|i| {
-                individual_nll_into(
+                subject_nll(
                     model,
                     &population.subjects[i],
                     &theta_mean,
                     eta_hats[i].as_slice(),
+                    &kappas_mean[i],
                     &omega_mean,
+                    omega_iov_mean.as_ref(),
                     &sigma_mean,
                     &mut scratch,
                 )
@@ -1186,24 +1387,47 @@ mod tests {
         assert_eq!(res.eta_hats.len(), pop.subjects.len());
     }
 
-    /// IOV models are not supported in the first cut — must error clearly
-    /// rather than silently mis-sample.
+    /// IOV (per-occasion kappa) end-to-end: the warfarin IOV model has a
+    /// zero-mean KAPPA_CL. Asserts the sampler runs the kappa block + Ω_iov
+    /// draw, surfaces an OMEGA_IOV posterior on $bayes, and recovers a sane
+    /// fit (TVCL≈0.13, finite kappa variance, mixed chains).
     #[test]
-    fn run_bayes_rejects_iov() {
+    fn run_bayes_iov_warfarin() {
         use std::path::Path;
         let model =
-            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
-                .expect("warfarin model parses");
-        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
-            .expect("warfarin data loads");
-        let mut params = model.default_params.clone();
-        // Fake an IOV omega to trip the guard.
-        params.omega_iov = Some(params.omega.clone());
-        let opts = FitOptions::default();
-        let err = run_bayes(&model, &pop, &params, &opts)
-            .err()
-            .expect("IOV model should be rejected");
-        assert!(err.contains("IOV"), "expected IOV rejection, got: {err}");
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin_iov.ferx"))
+                .expect("warfarin_iov model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, None)
+            .expect("warfarin_iov data loads");
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 600;
+        opts.bayes_iters = 600;
+        opts.bayes_chains = 2;
+        opts.bayes_seed = Some(1);
+        opts.saem_n_mh_steps = 6;
+
+        let res = run_bayes(&model, &pop, &model.default_params, &opts).expect("IOV bayes runs");
+        let b = res.bayes.as_ref().expect("BayesResult present");
+        let get = |n: &str| b.summaries.iter().find(|s| s.name == n).expect(n);
+
+        // The IOV variance is surfaced as a posterior parameter.
+        let kiov = get("OMEGA_IOV(1,1)");
+        assert!(
+            kiov.mean.is_finite() && kiov.mean > 0.0,
+            "IOV var {}",
+            kiov.mean
+        );
+        assert!(kiov.q025 <= kiov.median && kiov.median <= kiov.q975);
+        // Population fit is sane.
+        assert!(
+            (0.10..0.18).contains(&get("TVCL").mean),
+            "TVCL {}",
+            get("TVCL").mean
+        );
+        assert!(b.max_rhat.is_finite());
+        // Per-occasion kappa EBEs are returned (one occasion list per subject).
+        assert_eq!(res.kappas.len(), pop.subjects.len());
     }
 
     #[test]

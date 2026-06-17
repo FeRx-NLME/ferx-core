@@ -28,7 +28,8 @@ section of the SDLC for the versioning policy).
   remaining θ/σ. Reports posterior summaries (mean/sd/2.5%/median/97.5%) with
   split-R̂, ESS, and MCSE per parameter on `FitResult.bayes` and in the
   `.fit.yaml` `bayes:` section. Options: `bayes_warmup`, `bayes_iters`,
-  `bayes_chains`, `bayes_thin`, `bayes_seed`. BSV-only in this first cut.
+  `bayes_chains`, `bayes_thin`, `bayes_seed`. Supports BSV and zero-mean IOV
+  (per-occasion `kappa`, with a conjugate inverse-Wishart `Omega_iov` draw).
   Validated against FOCEI and NONMEM `METHOD=BAYES` on warfarin (#380).
 - **Simulation-based NPDE / NPD diagnostics** in the `sdtab` output. Set
   `[fit_options] npde_nsim = 1000` (and optionally `npde_seed`) to add `NPDE`

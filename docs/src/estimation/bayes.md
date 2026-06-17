@@ -14,21 +14,30 @@ rather than returning a single point estimate. It targets parity with NONMEM
 reuses the per-subject HMC/MH kernels and the conjugate sufficient statistics
 the other estimators already build, so it needs no population-level gradient.
 
-> **Scope (first cut).** Between-subject variability (BSV) only — models with
-> inter-occasion variability (IOV / `kappa`) are rejected with a clear error.
+> **IOV.** Inter-occasion variability (per-occasion `kappa`) is supported for
+> **zero-mean kappas** — `κ ~ N(0, Ω_iov)` added to an existing mu-reference, the
+> `exp(η + κ)` form. Kappas that anchor to their own θ (kappa mu-references) are
+> rejected.
 
 ## The sampler
 
-Each sweep, for each chain, cycles four blocks:
+Each sweep, for each chain, cycles these blocks:
 
-1. **η block** — samples \\( \eta_i \mid \theta, \Omega, \Sigma, y \\) for every
-   subject with a \\( \mathrm{chol}(\Omega) \\)-preconditioned block
+1. **η block** — samples \\( \eta_i \mid \theta, \Omega, \Sigma, \kappa, y \\) for
+   every subject with a \\( \mathrm{chol}(\Omega) \\)-preconditioned block
    Metropolis kernel, or gradient-guided **HMC** when available (an autodiff
-   build, `n_leapfrog > 0`, and an analytical-PK subject).
+   build, `n_leapfrog > 0`, an analytical-PK subject, no IOV).
+
+1b. **κ block** (IOV models) — samples each per-occasion
+   \\( \kappa_{ik} \mid \eta, \theta, \Omega, \Omega_{iov}, y \\) holding η fixed.
 
 2. **Ω block** — a conjugate **inverse-Wishart** draw
    \\( \Omega \mid \{\eta_i\} \sim \mathcal{W}^{-1}(\nu_0 + N,\ \Lambda_0 + \textstyle\sum_i \eta_i\eta_i^\top) \\),
    with structural zeros / fixed entries re-imposed and the diagonal floored.
+
+2c. **Ω_iov block** (IOV) — the same conjugate inverse-Wishart draw from the
+   per-occasion kappa scatter \\( \textstyle\sum_i\sum_k \kappa_{ik}\kappa_{ik}^\top \\).
+   The posterior `OMEGA_IOV(i,j)` entries appear in the summaries.
 
 3. **mu-referenced θ block** — for `P_i = θ·exp(η_i)` the population mean
    \\( \mu = \log\theta \\) has the exact Gaussian full conditional

@@ -301,7 +301,7 @@ fn mh_steps_componentwise(
 ///
 /// Returns `(n_accepted, n_proposed, updated_nll)`.
 #[allow(clippy::too_many_arguments)]
-fn mh_kappa_steps(
+pub(crate) fn mh_kappa_steps(
     kappas: &mut [Vec<f64>],
     nll_current: f64,
     subject: &Subject,
