@@ -133,7 +133,9 @@ impl PreparedInputRate {
     /// Domain floor for `mtt` when clamping a transient mid-fit excursion (see
     /// [`Self::transit`]). Far below any realistic mean transit time, so it never
     /// perturbs a converged fit — it only keeps a transient `mtt ≤ 0` from
-    /// turning `ktr.ln()` into a `NaN`.
+    /// turning `ktr.ln()` into a `NaN`. The clamp itself is
+    /// [`crate::types::clamp_above_floor`], shared with the modeled-duration floor
+    /// ([`crate::types::DoseEvent::DURATION_FLOOR`]) so the two can't drift apart.
     const MIN_MTT: f64 = 1e-8;
 
     /// Precompute the transit constants for `(n, mtt)`.
@@ -152,11 +154,7 @@ impl PreparedInputRate {
     /// `NaN` inputs also fall to the floor (every `>`/`>=` is false for `NaN`).
     #[inline]
     fn transit(n: f64, mtt: f64) -> Self {
-        let mtt = if mtt > Self::MIN_MTT {
-            mtt
-        } else {
-            Self::MIN_MTT
-        };
+        let mtt = crate::types::clamp_above_floor(mtt, Self::MIN_MTT);
         let n = if n >= 0.0 { n } else { 0.0 };
         let ktr = (n + 1.0) / mtt;
         PreparedInputRate::Transit {

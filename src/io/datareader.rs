@@ -791,18 +791,25 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String
     if rate >= 0.0 {
         return Ok(RateMode::Fixed);
     }
-    // rate < 0 → NONMEM coded value. Tolerance rather than float `==`
-    // (clippy::float_cmp); the cell parses from text so -1/-2 are exact.
-    if (rate + 2.0).abs() < 1e-9 {
-        return Ok(RateMode::ModeledDuration);
-    }
-    let detail = if (rate + 1.0).abs() < 1e-9 {
-        "RATE=-1 (NONMEM: infusion RATE modeled via R1 in $PK) is not yet \
-         supported (tracked in #324); use RATE=-2 (modeled duration) or an \
-         explicit positive RATE"
-            .to_string()
+    // rate < 0 → a NONMEM coded value, which is always an *exact negative
+    // integer*. Match on the integer form so the arms read as the codes they are
+    // and a new code is one more arm. A non-integer negative (e.g. -1.5) is not a
+    // code: `fract() != 0.0` rejects it rather than rounding it into one (`round()`
+    // would map -1.5 → -2 and silently accept it as modeled duration). Comparison
+    // against `0.0` is exempt from clippy::float_cmp; `rate as i64` saturates, so
+    // an out-of-range integer can't alias -1/-2.
+    let code = if rate.fract() == 0.0 {
+        Some(rate as i64)
     } else {
-        format!("RATE={rate} is a negative value that is not a recognised NONMEM code")
+        None
+    };
+    let detail = match code {
+        Some(-2) => return Ok(RateMode::ModeledDuration),
+        Some(-1) => "RATE=-1 (NONMEM: infusion RATE modeled via R1 in $PK) is not yet \
+             supported (tracked in #324); use RATE=-2 (modeled duration) or an \
+             explicit positive RATE"
+            .to_string(),
+        _ => format!("RATE={rate} is a negative value that is not a recognised NONMEM code"),
     };
     Err(format!(
         "subject {id}, time {time}: {detail}. Recognised RATE values are 0 \
@@ -1850,8 +1857,11 @@ mod tests {
         assert!(e.contains("subject 1") && e.contains("time 2.5"), "{e}");
 
         // Other negatives are not recognised NONMEM codes; the message echoes
-        // the offending value so the bad row is identifiable.
-        for r in [-0.5, -3.0, -100.0] {
+        // the offending value so the bad row is identifiable. `-1.5`/`-2.5` are
+        // the regression guard for the integer-match: a non-integer must NOT be
+        // rounded into the -1/-2 codes (it is rejected, not silently accepted as
+        // modeled duration).
+        for r in [-0.5, -1.5, -2.5, -3.0, -100.0] {
             let e = validate_dose_rate(r, "1", 0.0).unwrap_err();
             assert!(
                 e.contains(&format!("RATE={r}")) && e.contains("negative value"),

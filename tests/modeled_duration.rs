@@ -21,7 +21,10 @@
 
 use ferx_core::api::{check_model_data, check_model_data_warnings};
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::{predict, read_nonmem_csv, simulate, CompiledModel, Population, Severity};
+use ferx_core::{
+    predict, read_nonmem_csv, simulate, simulate_with_options, CompiledModel, Population, Severity,
+    SimulateOptions,
+};
 use std::io::Write;
 use std::path::Path;
 use tempfile::NamedTempFile;
@@ -102,6 +105,38 @@ const ODE_D1_LAG1: &str = r#"
   V     = TVV
   D1    = TVD1
   ALAG1 = TVLAG1
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// `ODE_D1` but the modeled duration `D1` is non-positive at the initial typical
+/// value (`TVD1 = -1` with a `D1 = TVD1` identity link). `check_model_data` still
+/// accepts it (the `D1` parameter exists on an ODE model), but
+/// `check_model_data_warnings` must flag `W_MODELED_DURATION_NONPOSITIVE` (#324
+/// review #3): a `D ≤ 0` is clamped to a near-bolus spike, so the fit can converge
+/// wrong with no other diagnostic.
+const ODE_D1_NEG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(-1.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD1
 
 [structural_model]
   ode(states=[central])
@@ -549,6 +584,26 @@ fn simulate_on_analytical_model_with_modeled_dose_panics() {
 }
 
 #[test]
+#[should_panic(expected = "model cannot honour")]
+fn simulate_propensity_on_analytical_model_with_modeled_dose_panics() {
+    // Review #1: the propensity-match branch of `simulate_with_options` runs a
+    // full inner EBE pass (`run_inner_loop_warm`) — integrating every subject —
+    // BEFORE control reaches the `simulate_inner_with_draw` chokepoint guard. On
+    // an unsupported config that pass would degrade silently (analytical, release)
+    // or hit an opaque `.expect` first. The guard now also runs at the top of
+    // `simulate_with_options`, so the propensity path fails fast with the same
+    // actionable diagnostic as every other entrypoint.
+    let model = model_of(ANALYTICAL);
+    assert!(model.ode_spec.is_none(), "model must be analytical");
+    let pop = pop_of(&coded_csv());
+    let opts = SimulateOptions {
+        seed: Some(1),
+        propensity_match: true,
+    };
+    let _ = simulate_with_options(&model, &pop, &model.default_params, 1, &opts);
+}
+
+#[test]
 fn valid_modeled_dose_predicts_without_panicking() {
     // The guard is a no-op on a supported config: a RATE=-2 dose on an ODE model
     // with the matching `D1` predicts normally (the all-`Fixed` Ok path of the
@@ -573,6 +628,48 @@ fn modeled_duration_steady_state_overlap_warns() {
     assert!(
         diags.iter().any(|d| d.code == "W_STEADY_STATE_INFUSION"),
         "modeled SS infusion with D1=5 > II=4 must warn; got {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn modeled_duration_nonpositive_at_init_warns() {
+    // Review #3: a modeled duration `D1` that is ≤ 0 at the initial typical value
+    // (here TVD1 = -1 via a `D1 = TVD1` identity link) is accepted by
+    // `check_model_data` (the parameter exists) but flagged by
+    // `check_model_data_warnings` — `resolve_rate` would clamp it to a near-bolus
+    // spike, so the fit can converge wrong with no other diagnostic.
+    let model = model_of(ODE_D1_NEG);
+    let pop = pop_of(&coded_csv());
+    // No hard error — the parameter exists on an ODE model.
+    assert!(
+        check_model_data(&model, &pop)
+            .iter()
+            .all(|d| d.severity != Severity::Error),
+        "non-positive D is a warning, not an error"
+    );
+    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
+        "TVD1=-1 must warn; got {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn modeled_duration_positive_at_init_does_not_warn() {
+    // Converse: the default `ODE_D1` (TVD1 = 5 > 0) must NOT raise the
+    // non-positive-duration warning — a regression guard against a false positive.
+    let model = model_of(ODE_D1);
+    let pop = pop_of(&coded_csv());
+    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
+        "TVD1=5 must not warn; got {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
 }

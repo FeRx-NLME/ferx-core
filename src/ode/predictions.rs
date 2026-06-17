@@ -38,14 +38,26 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
 /// Resolve any modeled-`RATE` doses (#324, e.g. `RATE=-2` → modeled duration
 /// `D{cmt}`) in `subject` to concrete (`Fixed`) doses. `pk_for_dose(k)` supplies
 /// the per-dose `PkParams::values` slice used to evaluate dose `k`'s modeled
-/// parameter. Returns the subject **borrowed** (no allocation) when every dose
-/// is already `Fixed` (the common case — see [`Subject::all_doses_fixed`]), and
-/// an owned copy with resolved `doses` otherwise.
+/// parameter — pass a constant closure for the no-TV-covariate paths (see
+/// [`resolve_subject_doses`]) or `|k| &pk_at_dose[k].values` for the per-dose
+/// event-driven path. Returns the subject **borrowed** (no allocation) when every
+/// dose is already `Fixed` (the common case — see [`Subject::all_doses_fixed`]),
+/// and an owned copy with resolved `doses` otherwise.
 ///
 /// Single source of truth: every ODE entrypoint funnels its subject through this
-/// (via the two thin wrappers below) before building the dose timeline, so the
-/// integrator and SS helpers only ever see a concrete `rate`/`duration` and a
-/// coded `RATE=-2` cannot reach them unresolved.
+/// (or the thin [`resolve_subject_doses`] wrapper) before building the dose
+/// timeline, so the integrator and SS helpers only ever see a concrete
+/// `rate`/`duration` and a coded `RATE=-2` cannot reach them unresolved.
+///
+/// The owned branch clones the whole `Subject`, not just `doses`, because the
+/// downstream machinery ([`crate::pk::event_driven::EventSchedule::for_subject`],
+/// the SS pre-equilibration, the break-time timeline) consumes a unified
+/// `&Subject` and reads `obs_times` / `pk_only_times` / `reset_times` alongside
+/// the resolved `doses`. Cloning only `doses` would force every one of those deep
+/// helpers to take the resolved doses as a separate argument — the
+/// "thread the resolved doses through every helper" design that was deliberately
+/// rejected in favour of resolving once at the entrypoint. The clone is paid
+/// only on the (uncommon) modeled-`RATE` path; the all-`Fixed` path is borrowed.
 fn resolve_subject_doses_with<'a>(
     subject: &'a Subject,
     attr_map: &crate::types::DoseAttrMap,
@@ -63,26 +75,15 @@ fn resolve_subject_doses_with<'a>(
 
 /// Resolve modeled-`RATE` doses using `params` for **every** dose — the
 /// no-time-varying-covariate ODE paths, where the PK snapshot is constant across
-/// doses. See [`resolve_subject_doses_with`].
+/// doses. The event-driven / TV-covariate path calls
+/// [`resolve_subject_doses_with`] directly with a per-dose closure. See
+/// [`resolve_subject_doses_with`].
 fn resolve_subject_doses<'a>(
     subject: &'a Subject,
     attr_map: &crate::types::DoseAttrMap,
     params: &'a [f64],
 ) -> Cow<'a, Subject> {
     resolve_subject_doses_with(subject, attr_map, |_| params)
-}
-
-/// Resolve dose `k` with its own per-dose PK parameters `pk_at_dose[k]` — the
-/// time-varying-covariate / event-driven path, where each dose's modeled
-/// `D{cmt}` is evaluated at that dose's covariates/occasion. `pk_at_dose` is
-/// parallel to `subject.doses` (the callers assert equal lengths). See
-/// [`resolve_subject_doses_with`].
-fn resolve_subject_doses_per_dose<'a>(
-    subject: &'a Subject,
-    attr_map: &crate::types::DoseAttrMap,
-    pk_at_dose: &'a [PkParams],
-) -> Cow<'a, Subject> {
-    resolve_subject_doses_with(subject, attr_map, |k| &pk_at_dose[k].values)
 }
 
 /// Number of dosing cycles to simulate when pre-equilibrating an SS=1
@@ -967,7 +968,8 @@ pub fn ode_predictions_event_driven(
     // with its own per-dose PK snapshot `pk_at_dose[k]` (this is the event-driven
     // / time-varying-covariate path). Borrowed (no clone) for the common
     // all-`Fixed` dataset. Single source of truth — see `resolve_subject_doses`.
-    let resolved = resolve_subject_doses_per_dose(subject, &ode.dose_attr_map, pk_at_dose);
+    let resolved =
+        resolve_subject_doses_with(subject, &ode.dose_attr_map, |k| &pk_at_dose[k].values);
     let subject: &Subject = &resolved;
 
     let n = ode.n_states;
@@ -1280,9 +1282,13 @@ pub fn ode_predictions_ekf_with_diffusion(
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::ode::ekf::solve_ekf;
 
-    // Resolve modeled-RATE doses once (#324) so both the plain ODE pass and the
-    // EKF propagation (which reads `dose.duration`) see concrete rate/duration;
-    // borrowed (no clone) for the common all-`Fixed` dataset.
+    // Resolve modeled-RATE doses once (#324). This resolve is load-bearing for the
+    // `solve_ekf` call below, which reads `subject.doses` directly and so needs
+    // concrete rate/duration; it cannot be dropped in favour of the resolve inside
+    // `ode_predictions` (that one is internal and not visible here). The
+    // `ode_predictions` call then re-checks an already-`Fixed` subject — a cheap
+    // `all_doses_fixed()` scan that returns `Cow::Borrowed` (no second clone). The
+    // clone happens at most once, only on the modeled-`RATE` path.
     let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
     let subject: &Subject = &resolved;
 
@@ -1347,9 +1353,10 @@ pub fn ode_predictions_ekf(
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::ode::ekf::solve_ekf;
 
-    // Resolve modeled-RATE doses once (#324) so both the plain ODE pass and the
-    // EKF propagation (which reads `dose.duration`) see concrete rate/duration;
-    // borrowed (no clone) for the common all-`Fixed` dataset.
+    // Resolve modeled-RATE doses once (#324). Load-bearing for the `solve_ekf`
+    // call below (it reads `subject.doses` directly); the later `ode_predictions`
+    // call re-checks an already-`Fixed` subject (cheap scan, `Cow::Borrowed`, no
+    // second clone). See `ode_predictions_ekf_with_diffusion` for the rationale.
     let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
     let subject: &Subject = &resolved;
 

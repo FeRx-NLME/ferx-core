@@ -34,6 +34,26 @@ pub enum RateMode {
     ModeledDuration,
 }
 
+/// Clamp `x` to a lower `floor`: returns `x` when `x > floor`, otherwise `floor`.
+///
+/// The single home for the "pull a transient mid-fit excursion back off the
+/// domain wall" clamp shared by [`DoseEvent::DURATION_FLOOR`] (modeled infusion
+/// duration `D ≤ 0`) and [`crate::pk::absorption::PreparedInputRate::MIN_MTT`]
+/// (transit mean-transit-time `mtt ≤ 0`). Both keep a downstream `amt/D` /
+/// `ktr.ln()` finite at the wall so the optimiser can climb back to the interior
+/// without perturbing a converged (interior) fit. Centralising it keeps the
+/// `NaN`-falls-to-floor subtlety in one place — every `>` is false for `NaN`, so
+/// a `NaN` input also returns `floor`. Explicit comparison (not `f64::max`) so it
+/// stays usable from the autodiff-instrumented paths (see CLAUDE.md).
+#[inline]
+pub(crate) fn clamp_above_floor(x: f64, floor: f64) -> f64 {
+    if x > floor {
+        x
+    } else {
+        floor
+    }
+}
+
 /// A single dose event (bolus, infusion, or oral)
 #[derive(Debug, Clone)]
 pub struct DoseEvent {
@@ -120,11 +140,7 @@ impl DoseEvent {
                     .indexed_slot(DoseAttr::Duration, self.cmt)
                     .expect("modeled-duration dose slot validated by check_model_data");
                 let d_raw = params.get(slot).copied().unwrap_or(0.0);
-                let duration = if d_raw > Self::DURATION_FLOOR {
-                    d_raw
-                } else {
-                    Self::DURATION_FLOOR
-                };
+                let duration = clamp_above_floor(d_raw, Self::DURATION_FLOOR);
                 DoseEvent {
                     rate: self.amt / duration,
                     duration,
@@ -4464,6 +4480,35 @@ mod tests {
             assert_eq!(r.duration, DoseEvent::DURATION_FLOOR, "clamp at floor");
             assert!(r.rate.is_finite() && r.rate > 0.0, "rate finite");
         }
+    }
+
+    #[test]
+    fn clamp_above_floor_passes_through_or_clamps() {
+        // The shared clamp behind DURATION_FLOOR / MIN_MTT: > floor passes through,
+        // <= floor (and NaN — every `>` is false for NaN) returns the floor.
+        let floor = 1e-8;
+        assert_eq!(clamp_above_floor(5.0, floor), 5.0, "above floor passes");
+        assert_eq!(
+            clamp_above_floor(2e-8, floor),
+            2e-8,
+            "just above floor passes"
+        );
+        assert_eq!(
+            clamp_above_floor(floor, floor),
+            floor,
+            "at floor → floor (not >)"
+        );
+        assert_eq!(clamp_above_floor(0.0, floor), floor, "zero clamps to floor");
+        assert_eq!(
+            clamp_above_floor(-3.0, floor),
+            floor,
+            "negative clamps to floor"
+        );
+        assert_eq!(
+            clamp_above_floor(f64::NAN, floor),
+            floor,
+            "NaN clamps to floor"
+        );
     }
 
     #[test]
