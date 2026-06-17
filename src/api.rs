@@ -7579,6 +7579,7 @@ mod tests_derived_iov_kappa {
     /// for every observation, while the fix yields the per-occasion CL.
     fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
         CompiledModel {
+            frem_config: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
@@ -7649,6 +7650,7 @@ mod tests_derived_iov_kappa {
     /// Subject with two occasions: obs 0,1 on occasion 1; obs 2,3 on occasion 2.
     fn two_occasion_subject() -> Subject {
         Subject {
+            fremtype: Vec::new(),
             id: "S1".into(),
             doses: Vec::new(),
             obs_times: vec![0.0, 1.0, 2.0, 3.0],
@@ -7824,6 +7826,7 @@ mod tests_derived_iov_kappa {
         });
 
         let subject = Subject {
+            fremtype: Vec::new(),
             id: "S1".into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -7918,6 +7921,7 @@ mod tests_derived_iov_kappa {
 
         // Dose into compartment 2 (central) at t=0; observe cmt 2 at t=3.
         let subject = Subject {
+            fremtype: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
             obs_times: vec![3.0],
@@ -7988,6 +7992,7 @@ mod tests_derived_iov_kappa {
             .model;
 
         let subject = Subject {
+            fremtype: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
             obs_times: vec![3.0],
@@ -8046,6 +8051,7 @@ mod tests_derived_iov_kappa {
         assert!(model.has_lagtime() && model.ode_spec.is_none());
 
         let subject = Subject {
+            fremtype: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
@@ -8107,6 +8113,7 @@ mod tests_derived_iov_kappa {
         let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
         let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
         let subject = Subject {
+            fremtype: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![3.0],

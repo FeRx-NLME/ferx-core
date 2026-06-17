@@ -1712,6 +1712,7 @@ mod tests {
             BloqMethod::Drop,
             &[],
             None,
+            None,
         );
         let nll_override = foce_subject_nll_standard(
             &subject,
@@ -1723,6 +1724,7 @@ mod tests {
             &error_spec,
             BloqMethod::Drop,
             &[],
+            None,
             Some(&ipreds),
         );
 

@@ -1581,6 +1581,7 @@ mod tests {
             kappa_fixed: vec![],
         };
         let model = CompiledModel {
+            has_conditional_eta_params: false,
             name: "frem_jac_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
@@ -1997,6 +1998,7 @@ mod iov_tests {
             kappa_fixed: Vec::new(),
         };
         let model = CompiledModel {
+            frem_config: None,
             name: "noniov_mu".into(),
             has_conditional_eta_params: false,
             pk_model: PkModel::OneCptIv,
@@ -2048,6 +2050,7 @@ mod iov_tests {
             endpoints: std::collections::HashMap::new(),
         };
         let subject = Subject {
+            fremtype: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],

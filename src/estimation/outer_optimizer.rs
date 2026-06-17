@@ -4513,6 +4513,7 @@ mod tests {
             kappa_fixed: vec![true],
         };
         let model = CompiledModel {
+            frem_config: None,
             name: "iov_cov_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
@@ -4567,6 +4568,7 @@ mod tests {
         let n_subj = 6;
         let subjects = (0..n_subj)
             .map(|_| Subject {
+                fremtype: Vec::new(),
                 id: "S".into(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],

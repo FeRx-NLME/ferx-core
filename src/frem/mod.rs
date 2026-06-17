@@ -882,6 +882,7 @@ mod tests {
 
     fn make_test_model() -> CompiledModel {
         CompiledModel {
+            has_conditional_eta_params: false,
             name: "test".into(),
             pk_model: PkModel::OneCptOral,
             error_model: ErrorModel::Proportional,
