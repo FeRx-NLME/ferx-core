@@ -661,9 +661,15 @@ impl FlatDoseData {
         // routes any subject with a modeled dose to FD (the ODE engine has no AD
         // path; the analytical AD kernels can't carry `∂duration/∂η`), so the AD
         // path only ever sees `Fixed` doses. An unresolved one would snapshot a 0
-        // rate/duration and yield a silently wrong gradient (#317). Fail loudly in
-        // debug/tests instead.
-        debug_assert!(
+        // rate/duration and yield a silently wrong gradient (#317).
+        //
+        // A real `assert!` (not `debug_assert!`): now that analytical models can be
+        // BOTH AD-eligible AND carry a modeled dose (#383/#394), this path is
+        // genuinely reachable, and `debug_assert!` is compiled out of `autodiff`
+        // *release* builds — so only an `assert!` makes the FD-gate's invariant hold
+        // across every build config (debug/release × FD/AD). It is the backstop to
+        // the primary `resolve_gradient_method` gate, not the first line of defence.
+        assert!(
             subject.all_doses_fixed(),
             "modeled-RATE dose reached the AD path"
         );
