@@ -946,11 +946,15 @@ pub fn run_bayes(
 
             if verbose && (sweep + 1) % progress_every == 0 {
                 let phase = if sweep < n_warmup { "warmup" } else { "sample" };
+                // η-accept over the sweeps since the last progress line (a recent
+                // window, not cumulative — so it tracks the adapted rate).
                 let eta_acc = if prop_eta_disp > 0 {
                     100.0 * acc_eta_disp as f64 / prop_eta_disp as f64
                 } else {
                     0.0
                 };
+                acc_eta_disp = 0;
+                prop_eta_disp = 0;
                 eprintln!(
                     "  Bayes chain {}/{}  sweep {:>5}/{} [{}]  η-accept≈{:.0}%",
                     chain + 1,
