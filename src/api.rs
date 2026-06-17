@@ -1364,6 +1364,7 @@ pub fn fit(
     // path above). Here we always use the global pool for the outer par_iter.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
     let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
+    let base_bayes_seed: u64 = options.bayes_seed.unwrap_or(12345);
     let n = options.n_starts;
     let sigma = options.start_sigma;
 
@@ -1382,8 +1383,11 @@ pub fn fit(
         .map(|k| {
             let init_k = perturb_init(init_params, k, sigma, base_seed);
             // Per-start option overrides for k > 0:
-            // - saem_seed: derive from base so each start gets a different MH trajectory.
-            //   Start 0 keeps the user's seed for reproducibility of the unperturbed run.
+            // - saem_seed / bayes_seed: derive from base so each start gets a different
+            //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
+            //   perturbing it every start runs an identical RNG trajectory (differing
+            //   only by the perturbed init) — wasted compute and false multi-start
+            //   robustness. Start 0 keeps the user's seeds for reproducibility.
             // - global_search: CRS2-LM ignores the starting point and samples freely in
             //   [lower, upper], so running it on starts 1..n overrides the perturbation
             //   and makes multi-start a no-op for those starts. Only run it on start 0.
@@ -1393,6 +1397,7 @@ pub fn fit(
             } else {
                 opts_k_storage = FitOptions {
                     saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
+                    bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
                     global_search: false,
                     ..options.clone()
                 };

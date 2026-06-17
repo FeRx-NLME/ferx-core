@@ -22,7 +22,9 @@
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::saem::{mh_kappa_steps, mh_steps};
 use crate::pk::EventPkParams;
-use crate::stats::likelihood::{individual_nll_into, individual_nll_iov, split_obs_by_occasion};
+use crate::stats::likelihood::{
+    individual_nll_into_with_schedule, individual_nll_iov, split_obs_by_occasion,
+};
 use crate::types::{
     BayesResult, CompiledModel, FitOptions, ModelParameters, OmegaMatrix, Population, SigmaVector,
     Subject,
@@ -43,9 +45,8 @@ use rand_distr::{ChiSquared, Distribution, Gamma, StandardNormal};
 /// Posterior use: for a Normal residual with `n` observations, scatter
 /// `SS = Σ (y−f)²`, and conjugate prior `InvGamma(a₀, b₀)`, the full conditional
 /// of the residual variance is `InvGamma(a₀ + n/2, b₀ + SS/2)`.
-// Not yet used by run_bayes (σ is currently drawn by the RW-MH population block);
-// retained for the conjugate-σ optimization (ferx-core#380, Phase 2b).
-#[allow(dead_code)]
+// Used by the Ω block for the independent per-variance full conditional of a
+// diagonal Ω; also the basis for any future conjugate-σ draw (ferx-core#380).
 pub fn inverse_gamma_draw(shape: f64, scale: f64, rng: &mut impl Rng) -> f64 {
     debug_assert!(
         shape > 0.0 && scale > 0.0,
@@ -166,6 +167,10 @@ const OMEGA_DIAG_FLOOR: f64 = 1e-6;
 /// Positive-definite floor for the IOV Ω_iov diagonal (matches SAEM's IOV floor;
 /// looser than BSV because per-occasion variances are smaller).
 const OMEGA_IOV_DIAG_FLOOR: f64 = 1e-8;
+/// Max split-R̂ at or below which the fit is reported converged. Matches the
+/// guidance in `docs/src/estimation/bayes.md` (Vehtari et al. 2021); used for
+/// both the `converged` flag and the non-convergence warning.
+const RHAT_CONVERGENCE_THRESHOLD: f64 = 1.01;
 
 /// One coordinate of the population random-walk block.
 #[derive(Clone, Copy)]
@@ -189,9 +194,12 @@ fn subject_nll(
     omega_iov: Option<&OmegaMatrix>,
     sigma: &[f64],
     scratch: &mut EventPkParams,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> f64 {
     if kappas.is_empty() {
-        individual_nll_into(model, subject, theta, eta, omega, sigma, scratch)
+        individual_nll_into_with_schedule(
+            model, subject, theta, eta, omega, sigma, scratch, schedule,
+        )
     } else {
         individual_nll_iov(model, subject, theta, eta, kappas, omega, omega_iov, sigma)
     }
@@ -421,6 +429,33 @@ pub fn run_bayes(
     // Print ~10 progress lines per chain.
     let progress_every = ((n_warmup + n_sample) / 10).max(1);
 
+    // Pre-build each subject's event schedule once (it depends only on the
+    // subject's doses + the PK model, not on θ/η/σ) and reuse it across every
+    // NLL evaluation. Without this `subject_nll` rebuilds the dose/infusion
+    // schedule on every call — O(subjects · n_pop · sweeps · chains) times.
+    // Gating mirrors the FOCE inner loop (`inner_optimizer.rs`): only analytical
+    // event-driven subjects with TV covariates or resets, and only when no
+    // (possibly η-dependent) lagtime would make a baked-in schedule stale.
+    let schedules: Vec<Option<crate::pk::event_driven::EventSchedule>> = population
+        .subjects
+        .iter()
+        .map(|subject| {
+            if (subject.has_tv_covariates() || subject.has_resets())
+                && model.ode_spec.is_none()
+                && crate::pk::event_driven::supports_event_driven(model.pk_model)
+                && !model.has_lagtime()
+            {
+                Some(crate::pk::event_driven::EventSchedule::for_subject(
+                    subject,
+                    model.pk_model,
+                    &[],
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     for chain in 0..n_chains {
         let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
         let mut scratch = EventPkParams::default();
@@ -526,6 +561,7 @@ pub fn run_bayes(
                         omega_iov_cur.as_ref(),
                         &sigma,
                         &mut scratch,
+                        schedules[i].as_ref(),
                     )
                 })
                 .collect();
@@ -620,34 +656,61 @@ pub fn run_bayes(
                 }
             }
 
-            // ---- 2. Ω block (conjugate inverse-Wishart) ----
+            // ---- 2. Ω block (conjugate full conditional) ----
             if !omega_all_fixed {
-                let mut s = DMatrix::<f64>::zeros(n_eta, n_eta);
-                for e in &etas {
-                    let ev = DVector::from_column_slice(e);
-                    s += &ev * ev.transpose();
-                }
-                let psi_post = &lambda0 + s;
-                if let Some(draw) =
-                    inverse_wishart_draw(nu0 + n_subjects as f64, &psi_post, &mut rng)
-                {
-                    let mut m = draw;
-                    impose_omega_structure(
-                        &mut m,
-                        &init_params.omega.free_mask,
-                        &init_params.omega_fixed,
-                        &init_params.omega.matrix,
-                        OMEGA_DIAG_FLOOR,
-                    );
-                    omega_mat = m;
+                if init_params.omega.diagonal {
+                    // Diagonal Ω: each variance has an INDEPENDENT inverse-gamma
+                    // full conditional. Drawing a dense inverse-Wishart and then
+                    // zeroing the off-diagonals is wrong — the marginal of an IW
+                    // diagonal element carries df ν0−p+1, so the variance
+                    // posteriors are mis-scaled (bias grows with η-dimension and
+                    // small N). Using the IW diagonal-marginal IG((ν0−p+1)/2,
+                    // Λ0_jj/2) as the per-variance prior keeps the implied prior
+                    // identical to the dense path while giving each variance the
+                    // full N "observations" (η_ij ~ N(0, ω_j²)).
+                    let a0 = (nu0 - n_eta as f64 + 1.0) / 2.0;
+                    for j in 0..n_eta {
+                        if init_params.omega_fixed.get(j).copied().unwrap_or(false)
+                            || !init_params.omega.free_mask[(j, j)]
+                        {
+                            continue; // FIX-ed or structurally-absent variance.
+                        }
+                        let ss: f64 = etas.iter().map(|e| e[j] * e[j]).sum();
+                        let shape = a0 + n_subjects as f64 / 2.0;
+                        let scale = (lambda0[(j, j)] / 2.0 + ss / 2.0).max(TINY);
+                        omega_mat[(j, j)] =
+                            inverse_gamma_draw(shape, scale, &mut rng).max(OMEGA_DIAG_FLOOR);
+                    }
                     omega_cur = OmegaMatrix::from_matrix(
                         omega_mat.clone(),
                         init_params.omega.eta_names.clone(),
                         init_params.omega.diagonal,
                     );
-                    // η-block NLLs are now stale w.r.t. Ω; they are recomputed at
-                    // the top of the next sweep, and the (θ,σ) block below
-                    // recomputes its own proposal NLLs, so no refresh needed here.
+                } else {
+                    let mut s = DMatrix::<f64>::zeros(n_eta, n_eta);
+                    for e in &etas {
+                        let ev = DVector::from_column_slice(e);
+                        s += &ev * ev.transpose();
+                    }
+                    let psi_post = &lambda0 + s;
+                    if let Some(draw) =
+                        inverse_wishart_draw(nu0 + n_subjects as f64, &psi_post, &mut rng)
+                    {
+                        let mut m = draw;
+                        impose_omega_structure(
+                            &mut m,
+                            &init_params.omega.free_mask,
+                            &init_params.omega_fixed,
+                            &init_params.omega.matrix,
+                            OMEGA_DIAG_FLOOR,
+                        );
+                        omega_mat = m;
+                        omega_cur = OmegaMatrix::from_matrix(
+                            omega_mat.clone(),
+                            init_params.omega.eta_names.clone(),
+                            init_params.omega.diagonal,
+                        );
+                    }
                 }
             }
 
@@ -714,17 +777,60 @@ pub fn run_bayes(
                 let s: Vec<f64> = (0..n_eta)
                     .map(|j| eta_bar[j] + inv_sqrt_n * lz[j])
                     .collect();
+                // The η re-centering must subtract the shift *actually applied* to
+                // log θ, not the raw drawn shift `s`. When a θ bound clamps the
+                // move, the applied log-shift is smaller than `s[j]`; subtracting
+                // the full `s[j]` would break the logφ_i = log θ + η_i invariance,
+                // silently changing the data likelihood with no MH correction.
+                let mut s_applied = s.clone();
                 for j in 0..n_eta {
                     if let Some(ti) = mu_pairs[j] {
                         let lo = init_params.theta_lower.get(ti).copied().unwrap_or(f64::MIN);
                         let hi = init_params.theta_upper.get(ti).copied().unwrap_or(f64::MAX);
-                        theta[ti] = (theta[ti].max(TINY).ln() + s[j]).exp().clamp(lo, hi);
+                        // Clamp in log space (equivalent for positive θ) so the
+                        // applied shift is exact when no bound is active.
+                        let lo_ln = if lo > 0.0 { lo.ln() } else { f64::NEG_INFINITY };
+                        let hi_ln = if hi > 0.0 && hi.is_finite() {
+                            hi.ln()
+                        } else {
+                            f64::INFINITY
+                        };
+                        let old_ln = theta[ti].max(TINY).ln();
+                        let new_ln = (old_ln + s[j]).clamp(lo_ln, hi_ln);
+                        theta[ti] = new_ln.exp();
+                        s_applied[j] = new_ln - old_ln;
                     }
                 }
                 for e in etas.iter_mut() {
                     for j in 0..n_eta {
-                        e[j] -= s[j];
+                        e[j] -= s_applied[j];
                     }
+                }
+            }
+
+            // Refresh the cached per-subject NLL before the (θ,σ) block uses it
+            // as the Metropolis baseline. Blocks 2/2c/2b drew a new Ω / Ω_iov and
+            // (for mu-ref) re-centered (θ, η), so the cached `nll` still carries
+            // the pre-draw / pre-recenter η-prior, κ-prior, and log|Ω| terms.
+            // Block 3 recomputes only the *proposal* NLL, so a stale baseline
+            // leaves those terms uncancelled — a constant per-sweep offset δ on
+            // every θ/σ accept that biases σ and non-mu-ref θ. Recompute so the
+            // ratio is exact. (Unconditional when block 3 runs: cheaper to always
+            // refresh than to track which of the three blocks fired.)
+            if n_pop > 0 {
+                for i in 0..n_subjects {
+                    nll[i] = subject_nll(
+                        model,
+                        &population.subjects[i],
+                        &theta,
+                        &etas[i],
+                        &kappas[i],
+                        &omega_cur,
+                        omega_iov_cur.as_ref(),
+                        &sigma,
+                        &mut scratch,
+                        schedules[i].as_ref(),
+                    );
                 }
             }
 
@@ -757,25 +863,27 @@ pub fn run_bayes(
                     };
                     let u_new = u_old + rw_scales[c] * rng.sample::<f64, _>(StandardNormal);
 
-                    let mut theta_prop = theta.clone();
-                    let mut sigma_prop = sigma.clone();
+                    // Mutate the single coordinate in place (no full θ/σ vector
+                    // clone per move) and restore it on reject.
+                    let old_val = if is_theta { theta[idx] } else { sigma[idx] };
                     if is_theta {
-                        theta_prop[idx] = if log { u_new.exp() } else { u_new };
+                        theta[idx] = if log { u_new.exp() } else { u_new };
                     } else {
-                        sigma_prop[idx] = u_new.exp();
+                        sigma[idx] = u_new.exp();
                     }
                     let nll_prop: Vec<f64> = (0..n_subjects)
                         .map(|i| {
                             subject_nll(
                                 model,
                                 &population.subjects[i],
-                                &theta_prop,
+                                &theta,
                                 &etas[i],
                                 &kappas[i],
                                 &omega_cur,
                                 omega_iov_cur.as_ref(),
-                                &sigma_prop,
+                                &sigma,
                                 &mut scratch,
+                                schedules[i].as_ref(),
                             )
                         })
                         .collect();
@@ -784,10 +892,12 @@ pub fn run_bayes(
                     let d_nlp = 0.5 * ((u_new - u0[c]).powi(2) - (u_old - u0[c]).powi(2)) * inv_var;
                     prop_pop[c] += 1;
                     if rng.gen::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
-                        theta = theta_prop;
-                        sigma = sigma_prop;
                         nll = nll_prop;
                         acc_pop[c] += 1;
+                    } else if is_theta {
+                        theta[idx] = old_val;
+                    } else {
+                        sigma[idx] = old_val;
                     }
                 }
 
@@ -826,6 +936,7 @@ pub fn run_bayes(
                                 omega_iov_cur.as_ref(),
                                 &sigma_prop,
                                 &mut scratch,
+                                schedules[i].as_ref(),
                             )
                         })
                         .collect();
@@ -1097,6 +1208,7 @@ pub fn run_bayes(
                     omega_iov_mean.as_ref(),
                     &sigma_mean,
                     &mut scratch,
+                    schedules[i].as_ref(),
                 )
             })
             .sum::<f64>();
@@ -1114,11 +1226,19 @@ pub fn run_bayes(
     };
 
     let mut warnings = Vec::new();
-    if max_rhat > 1.1 {
+    if max_rhat > RHAT_CONVERGENCE_THRESHOLD {
         warnings.push(format!(
-            "Bayes: max split-R-hat = {max_rhat:.3} (> 1.1) — chains may not have converged; \
-             increase bayes_warmup / bayes_iters."
+            "Bayes: max split-R-hat = {max_rhat:.3} (> {RHAT_CONVERGENCE_THRESHOLD}) — chains may \
+             not have converged; increase bayes_warmup / bayes_iters."
         ));
+    }
+    if n_chains < 2 {
+        warnings.push(
+            "Bayes: bayes_chains = 1 — split-R̂ is computed by halving a single chain, so it \
+             cannot detect between-chain non-convergence; max_rhat near 1 here is weak evidence \
+             of convergence. Use bayes_chains >= 2."
+                .to_string(),
+        );
     }
     if partial_mu_ref {
         warnings.push(
@@ -1132,7 +1252,7 @@ pub fn run_bayes(
     Ok(OuterResult {
         params: mean_params,
         ofv,
-        converged: max_rhat.is_finite() && max_rhat < 1.1,
+        converged: max_rhat.is_finite() && max_rhat < RHAT_CONVERGENCE_THRESHOLD,
         n_iterations: n_warmup + n_sample,
         eta_hats,
         h_matrices,
@@ -1450,6 +1570,51 @@ mod tests {
         assert!(res.ofv.is_finite(), "OFV not finite");
         assert!(bayes.max_rhat.is_finite());
         assert_eq!(res.eta_hats.len(), pop.subjects.len());
+    }
+
+    /// Regression for the mu-ref θ bound clamp: with a tight `theta_upper` on a
+    /// log mu-ref θ, the conjugate Gibbs shift repeatedly hits the bound. The fix
+    /// subtracts the *actually applied* log-shift from η (not the raw drawn
+    /// shift), preserving logφ_i = log θ + η_i, and the clamp keeps θ inside the
+    /// bound. Asserts the whole posterior for TVCL stays at/below the active upper
+    /// bound and the summaries remain finite (the old code subtracted the full
+    /// shift, breaking the invariance and corrupting the likelihood). Also
+    /// exercises the otherwise-uncovered clamp branch.
+    #[test]
+    fn run_bayes_respects_active_theta_bound() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let mut params = model.default_params.clone();
+        // Truth is TVCL ≈ 0.133; pin the upper bound just below it so the mu-ref
+        // shift is clamped on most sweeps.
+        let bound = 0.12_f64;
+        params.theta[0] = 0.11; // start inside the bound
+        params.theta_upper[0] = bound;
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 100;
+        opts.bayes_iters = 200;
+        opts.bayes_chains = 2;
+        opts.bayes_seed = Some(1);
+        opts.saem_n_mh_steps = 4;
+
+        let res = run_bayes(&model, &pop, &params, &opts).expect("bayes runs");
+        let b = res.bayes.as_ref().expect("BayesResult present");
+        let tvcl = b.summaries.iter().find(|s| s.name == "TVCL").expect("TVCL");
+        // The entire recorded posterior must respect the active upper bound.
+        assert!(
+            tvcl.q975 <= bound + 1e-9,
+            "TVCL q975 {} exceeded active upper bound {bound}",
+            tvcl.q975
+        );
+        assert!(tvcl.mean.is_finite() && tvcl.mean > 0.0 && tvcl.mean <= bound + 1e-9);
+        for s in &b.summaries {
+            assert!(s.mean.is_finite() && s.sd.is_finite(), "{}", s.name);
+        }
     }
 
     /// IOV (per-occasion kappa) end-to-end: the warfarin IOV model has a

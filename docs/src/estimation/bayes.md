@@ -76,7 +76,11 @@ split-`rhat`, `ess_bulk` / `ess_tail`, and `mcse`; plus `n_chains`, `n_warmup`,
 are skipped (posterior credible intervals replace the Hessian covariance).
 
 A `max_rhat` above ~1.01 indicates the chains have not converged — increase
-`bayes_warmup` / `bayes_iters`.
+`bayes_warmup` / `bayes_iters`. This is also the threshold for the reported
+`converged` flag. Use **at least 2 chains** (`bayes_chains >= 2`): split-R̂ on a
+single chain only compares the two halves of one trajectory and cannot detect
+between-chain non-convergence, so a near-1 `max_rhat` from one chain is weak
+evidence; a single-chain run is warned about for this reason.
 
 ## Example
 
