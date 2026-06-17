@@ -293,9 +293,27 @@ ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
 > infusion duration even if you also reference it in the `[odes]` RHS — so don't
 > reuse `D1`, `D2`, … for an unrelated decay constant or rate term.
 
-This is an **ODE-engine** feature. On an **analytical** model a `RATE=-2` dose is
-rejected with a pointer to the follow-up that will add analytical support;
-`RATE=-1` (modeled *rate*, `R{n}`) is not yet supported on either engine.
+`RATE=-2` works on **both engines**. On an analytical model (`pk(...)`) declare
+the `D{n}` individual parameter and the closed-form infusion uses
+`rate = AMT / D{n}`. A `RATE=-2` dose still **requires** a matching `D{n}`
+parameter, or it is a loud error (never a silent bolus). The compartment index
+follows the analytical model's structure (e.g. `D2` for a dose into the central
+compartment of a `two_cpt_iv` model).
+
+The modeled duration just sets the *rate* of an otherwise ordinary infusion, so
+the **target compartment must be one the analytical engine can infuse into** —
+exactly the same set as for an explicit positive `RATE`: the central compartment
+for every model, and the peripheral compartment(s) for the 2-/3-cpt IV models.
+Infusing into an oral **depot** is not modelled by the closed forms (an oral
+model's depot only takes bolus input), so a `D{depot}` is no more supported than
+an explicit infusion into that depot would be — use an `ode(...)` model for a
+zero-order *into-depot* input. `RATE=-1` (modeled *rate*, `R{n}`) is not yet
+supported on either engine.
+
+> One subtlety: when a subject has any `RATE=-2` dose on an **analytical** model,
+> that subject's inner-loop gradient falls back to finite differences even under
+> `gradient = ad`, because the autodiff kernels cannot carry the duration's
+> `∂/∂η`. Results are unchanged; only the gradient route differs.
 
 ## Stochastic ODE Models (SDE)
 

@@ -20,6 +20,10 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `RATE=-2` (modeled infusion duration via a `D{cmt}` parameter) is now supported
+  on **analytical** PK models, not just ODE models — declare a `D{cmt}` individual
+  parameter and the closed-form infusion uses `rate = AMT / D{cmt}`, matching
+  NONMEM's `$PK D{n}` (#394, follow-up to #324).
 - **Full MCMC Bayesian estimation** (`method = bayes`, Gibbs-within-HMC, NONMEM
   `METHOD=BAYES` parity). Draws from the joint posterior `p(θ, Ω, Σ, {ηᵢ} | y)`:
   per-subject η block (block-MH, or gradient HMC on autodiff builds with

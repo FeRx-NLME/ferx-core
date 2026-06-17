@@ -410,18 +410,20 @@ pub fn event_driven_predictions(
     pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
 ) -> Vec<f64> {
-    // Defensive guard (#324): modeled-RATE doses (e.g. RATE=-2 -> D{cmt}) are
-    // ODE-only. Every public entrypoint that can see them rejects analytical
-    // models first — `fit()` / `ferx check` via `check_model_data`, and
-    // `predict()` / `simulate()` via `assert_modeled_doses_supported`. Reaching
-    // here with one means a path bypassed every gate (e.g. a direct caller of
-    // this `pub` fn). A real `assert!` (not `debug_assert!`) so release builds
-    // fail loudly too instead of silently mis-handling a 0-rate "infusion"; it is
-    // O(doses) and dwarfed by the per-interval event-driven evaluation.
+    // Defensive guard (#324/#394): modeled-RATE doses (e.g. RATE=-2 -> D{cmt})
+    // must be resolved to concrete `rate`/`duration` before this event-driven
+    // walker — the analytical dispatcher resolves them via the model's
+    // `dose_attr_map`, and the public entrypoints reject an unbacked modeled dose
+    // first (`fit()` / `ferx check` via `check_model_data`, `predict()` /
+    // `simulate()` via `assert_modeled_doses_supported`). Reaching here unresolved
+    // means a path forgot to resolve (e.g. a direct caller of this `pub` fn). A
+    // real `assert!` (not `debug_assert!`) so release builds fail loudly too
+    // instead of silently mis-handling a 0-rate "infusion"; it is O(doses) and
+    // dwarfed by the per-interval event-driven evaluation.
     assert!(
         subject.all_doses_fixed(),
         "modeled-RATE dose reached the analytical predictor unresolved \
-         (RATE=-2 is ODE-only; validate with check_model_data before predicting)"
+         (resolve via dose_attr_map, or validate with check_model_data, before predicting)"
     );
     let dose_lagtimes: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
     let schedule = EventSchedule::for_subject(subject, pk_model, &dose_lagtimes);

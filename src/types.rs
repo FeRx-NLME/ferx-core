@@ -126,9 +126,11 @@ impl DoseEvent {
     /// machinery downstream (so `F` is applied exactly once — `F·amt` delivered
     /// over `D`, matching NONMEM's `F·RATE` for an infusion).
     ///
-    /// f64-only / FD-only by construction: modeled doses are ODE-only (analytical
-    /// support is a follow-up) and ODE has no autodiff path, so no `Dual` twin is
-    /// needed. A transient `D ≤ 0` mid-search is clamped to [`Self::DURATION_FLOOR`].
+    /// f64-only / FD-only by construction. The ODE engine has no autodiff path,
+    /// and the analytical engine routes any subject with a modeled dose to FD
+    /// (see `resolve_gradient_method`, #394) precisely because resolving a duration
+    /// here would drop its `∂duration/∂η`, so no `Dual` twin is ever needed. A
+    /// transient `D ≤ 0` mid-search is clamped to [`Self::DURATION_FLOOR`].
     pub(crate) fn resolve_rate(&self, attr_map: &DoseAttrMap, params: &[f64]) -> DoseEvent {
         match self.rate_mode {
             RateMode::Fixed => self.clone(),
@@ -1076,6 +1078,24 @@ impl PkModel {
         }
     }
 
+    /// Number of (1-based) compartments a dose may target for this analytical
+    /// model — the upper bound used to validate a `D{cmt}` modeled-duration
+    /// parameter (`RATE=-2`, #324/#394). Mirrors NONMEM's ADVAN compartment
+    /// numbering: oral models add a depot at compartment 1 (central shifts to 2),
+    /// so a 1-cpt oral model has 2 compartments, etc. The analytical closed forms
+    /// route a dose by model *structure* (oral → depot, IV → central) rather than
+    /// by the `cmt` value, so this only bounds the declared `D{cmt}` index; a
+    /// `D{cmt}` whose compartment no dose actually targets is caught later by the
+    /// `check_modeled_dose_rates` data gate.
+    pub(crate) fn n_compartments(&self) -> usize {
+        match self {
+            PkModel::OneCptIv => 1,
+            PkModel::OneCptOral | PkModel::TwoCptIv => 2,
+            PkModel::TwoCptOral | PkModel::ThreeCptIv => 3,
+            PkModel::ThreeCptOral => 4,
+        }
+    }
+
     /// Resolve a `[structural_model]` model name (canonical or long-form alias,
     /// e.g. `one_cpt_iv` / `one_compartment_iv`) to its `PkModel`. `None` for any
     /// unrecognised name (including the retired `*_bolus` / `*_infusion` spellings,
@@ -1891,6 +1911,16 @@ pub struct CompiledModel {
     /// analytical PK equations. The `pk_param_fn` output is flattened and passed
     /// to the ODE RHS function as the parameter vector.
     pub ode_spec: Option<crate::ode::OdeSpec>,
+    /// Compartment-indexed modeled-dose attributes (`D{cmt}` for `RATE=-2`) for
+    /// **analytical** PK models (#324, #394). ODE models carry their own map on
+    /// [`crate::ode::OdeSpec::dose_attr_map`] and leave this `Default` (empty) —
+    /// the analytical dispatch paths read this field, the ODE paths read the
+    /// `OdeSpec` one. Empty for the common analytical model with no `RATE=-2`
+    /// dosing; populated by the parser when a `D{cmt}` individual parameter is
+    /// declared. Used by [`crate::pk::compute_predictions`] callers to resolve
+    /// modeled-duration doses to a concrete `rate`/`duration` before the
+    /// closed-form math (mirrors the ODE `resolve_subject_doses` step).
+    pub dose_attr_map: DoseAttrMap,
     /// Index of the first diffusion theta in the theta vector, and the parallel
     /// mapping from diffusion-theta index to ODE state index.
     /// `None` when no `[diffusion]` block is present.
@@ -3815,6 +3845,7 @@ pub(crate) mod test_helpers {
             } else {
                 None
             },
+            dose_attr_map: Default::default(),
             bloq_method: BloqMethod::Drop,
             referenced_covariates: vec![],
             gradient_method,

@@ -2706,6 +2706,7 @@ mod tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,

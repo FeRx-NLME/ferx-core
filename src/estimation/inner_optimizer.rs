@@ -262,6 +262,17 @@ pub(crate) fn resolve_gradient_method(
         if subject.has_ss_doses() {
             return InnerGradientMethod::Fd;
         }
+        // Modeled-`RATE` doses (RATE=-2 → `D{cmt}`; #324/#394): the analytical AD
+        // kernels snapshot each dose's concrete `rate`/`duration` into flat f64
+        // arrays and assert `all_doses_fixed()`. Resolving a modeled duration to a
+        // value (via `resolve_rate`) drops its `∂duration/∂η`, so an η-dependent
+        // `D{cmt}` would make the AD gradient disagree with the analytical
+        // (current-eta) objective the inner loop minimizes. Route to FD, which
+        // recomputes the duration at each perturbation. (The value path resolves
+        // these doses upstream; only the AD gradient path needs this guard.)
+        if !subject.all_doses_fixed() {
+            return InnerGradientMethod::Fd;
+        }
         // Oral models with a zero-order (infusion, RATE>0) dose: every AD oral
         // propagator — both the single-snapshot superposition (`ad_gradients`)
         // and the event-driven (`event_driven_ad`) path — is bolus-only. They
@@ -1645,6 +1656,7 @@ mod iov_tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -1763,6 +1775,7 @@ mod iov_tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -1864,6 +1877,7 @@ mod iov_tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,

@@ -218,6 +218,7 @@ fn build_warfarin_model() -> CompiledModel {
             v
         },
         ode_spec: None,
+        dose_attr_map: Default::default(),
         diffusion_theta_start: None,
         diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
@@ -338,6 +339,7 @@ fn generate_two_cpt_iv() {
             v
         },
         ode_spec: None,
+        dose_attr_map: Default::default(),
         diffusion_theta_start: None,
         diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
@@ -457,6 +459,7 @@ fn generate_two_cpt_oral_cov() {
             v
         },
         ode_spec: None,
+        dose_attr_map: Default::default(),
         diffusion_theta_start: None,
         diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,
@@ -642,6 +645,7 @@ fn generate_mm_oral() {
             v
         },
         ode_spec: Some(ode_spec),
+        dose_attr_map: Default::default(),
         diffusion_theta_start: None,
         diffusion_state_indices: Vec::new(),
         bloq_method: BloqMethod::Drop,

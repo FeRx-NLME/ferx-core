@@ -59,7 +59,13 @@ pub(crate) fn model_preds(
     let mut preds = if let Some(ref ode_spec) = model.ode_spec {
         pk::compute_predictions_ode(ode_spec, subject, &pk_params.values, theta, eta)
     } else {
-        pk::compute_predictions(model.pk_model, subject, pk_params)
+        // Resolve any modeled-`RATE` doses (#324/#394, e.g. `RATE=-2` → `D{cmt}`)
+        // to a concrete duration/rate before the analytical closed form — mirrors
+        // the ODE `resolve_subject_doses` step inside `compute_predictions_ode`.
+        // Borrowed (no allocation) for the all-`Fixed` common case.
+        let resolved =
+            crate::ode::resolve_subject_doses(subject, &model.dose_attr_map, &pk_params.values);
+        pk::compute_predictions(model.pk_model, &resolved, pk_params)
     };
     pk::apply_scaling(model, subject, theta, eta, &mut preds);
     pk::apply_log_transform(model, &mut preds);
@@ -708,15 +714,14 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     diags
 }
 
-/// NONMEM coded `RATE=-2` (modeled infusion duration → `D{cmt}`) needs two
-/// model-aware checks the datareader cannot make (it has no model). Both are
-/// fatal — never a silent fall-through to a bolus (the original #324 bug):
-///   - **ODE engine.** Modeled duration is ODE-only; the analytical engine has
-///     no spare-slot routing for a `D{n}` parameter yet (a tracked #324
-///     follow-up). A `RATE=-2` dose on an analytical model is rejected.
+/// NONMEM coded `RATE=-2` (modeled infusion duration → `D{cmt}`) needs a
+/// model-aware check the datareader cannot make (it has no model). It is fatal
+/// — never a silent fall-through to a bolus (the original #324 bug):
 ///   - **Matching `D{cmt}` parameter.** A `RATE=-2` dose into compartment `n`
 ///     requires a `D{n}` parameter (so `resolve_rate` has a slot to read);
-///     otherwise it is rejected.
+///     otherwise it is rejected. Supported on both engines: ODE models record
+///     the slot on `ode_spec.dose_attr_map`, analytical models (#394) on
+///     `model.dose_attr_map`.
 ///
 /// Reported once per offending compartment (naming the first dose that hits it),
 /// so a dataset with many `RATE=-2` rows yields one actionable error per cause.
@@ -734,43 +739,31 @@ fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> V
                 continue;
             }
             let cmt = dose.cmt;
-            match &model.ode_spec {
-                None => diags.push(
+            // A `RATE=-2` dose into compartment `cmt` requires a matching `D{cmt}`
+            // parameter so `resolve_rate` has a slot to read — for BOTH engines.
+            // ODE models record the slot on `ode_spec.dose_attr_map`; analytical
+            // models (#394) on `model.dose_attr_map`. Either way an absent slot is
+            // the same actionable error.
+            let has_slot = match &model.ode_spec {
+                Some(ode) => ode.dose_attr_map.indexed_slot(DoseAttr::Duration, cmt),
+                None => model.dose_attr_map.indexed_slot(DoseAttr::Duration, cmt),
+            }
+            .is_some();
+            if !has_slot {
+                diags.push(
                     Diagnostic::error(
-                        "E_MODELED_DURATION_ANALYTICAL",
+                        "E_MODELED_DURATION_NO_PARAM",
                         format!(
                             "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
-                             compartment {cmt} is only supported for ODE models; analytical \
-                             support is a tracked follow-up to #324. Use an `ode(...)` model with \
-                             a `D{cmt}` parameter, or supply an explicit positive RATE \
-                             (= AMT/duration).",
+                             compartment {cmt} requires a `D{cmt}` parameter in \
+                             [individual_parameters], but none is declared. Add \
+                             `D{cmt} = ...` (the modeled duration), or supply an explicit \
+                             positive RATE.",
                             subject.id, dose.time
                         ),
                     )
-                    .with_block("structural_model"),
-                ),
-                Some(ode) => {
-                    if ode
-                        .dose_attr_map
-                        .indexed_slot(DoseAttr::Duration, cmt)
-                        .is_none()
-                    {
-                        diags.push(
-                            Diagnostic::error(
-                                "E_MODELED_DURATION_NO_PARAM",
-                                format!(
-                                    "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
-                                     compartment {cmt} requires a `D{cmt}` parameter in \
-                                     [individual_parameters], but none is declared. Add \
-                                     `D{cmt} = ...` (the modeled duration), or supply an explicit \
-                                     positive RATE.",
-                                    subject.id, dose.time
-                                ),
-                            )
-                            .with_block("individual_parameters"),
-                        );
-                    }
-                }
+                    .with_block("individual_parameters"),
+                );
             }
         }
     }
@@ -4944,6 +4937,7 @@ mod iov_integration {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -6103,6 +6097,7 @@ mod simulate_with_uncertainty_tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -6907,6 +6902,7 @@ mod tests_sdtab_tv_cov {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -7113,6 +7109,7 @@ mod tests_derived_session_clock {
             pk_idx_f64: Vec::new(),
             sel_flat: Vec::new(),
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -7490,6 +7487,7 @@ mod tests_derived_iov_kappa {
             pk_idx_f64: Vec::new(),
             sel_flat: Vec::new(),
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
