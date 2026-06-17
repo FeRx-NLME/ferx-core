@@ -1,0 +1,51 @@
+# One-compartment oral PK, rate-constant parameterization, fit LTBS.
+# Port of Douglas Eleveld's NONMEM $PRED benchmark (FeRx-NLME discussion #179).
+#
+# NONMEM:
+#   V  = EXP(THETA(1) + ETA(1))
+#   KE = EXP(THETA(2) + ETA(2))
+#   KA = KE + EXP(THETA(3) + ETA(3))
+#   CP = (D*KA)/(V*(KA-KE)) * (EXP(-KE*T) - EXP(-KA*T)) * 100,  D = 100
+#   Y  = log(CP) + ERR(1)
+#
+# Two faithful-port choices are baked in:
+#   1. ferx thetas are log-transformed internally, so they must be positive.
+#      The NONMEM thetas are themselves on the log scale and go negative
+#      (-1.2, -0.7), so we move them to the natural scale: TV* = exp(THETA).
+#      exp(THETA+ETA) == exp(THETA)*exp(ETA), so this is exactly equivalent.
+#   2. The closed form carries an input mass of D*100 = 100*100 = 10000.
+#      We feed that as the dose amount (AMT=10000; see transform_eleveld.py)
+#      so the V/KE/KA estimates land on the same scale NONMEM reports.
+
+[parameters]
+  # natural-scale typical values = exp(NONMEM THETA); bounds = exp(NONMEM bounds)
+  theta TVV(29.964,      5.003,   60.340)   # exp(3.40);  [exp(1.61), exp(4.1)]
+  theta TVKE(0.30119,    0.01005,  2.0137)  # exp(-1.2);  [exp(-4.6), exp(0.7)]
+  theta TVKAINC(0.49659, 0.01005,  2.0137)  # exp(-0.7);  KA increment over KE
+
+  # OMEGA BLOCK(3): diagonal 1, off-diagonal 0.001 (order V, KE, KA)
+  block_omega (ETA_V, ETA_KE, ETA_KA) = [
+    1.0,
+    0.001, 1.0,
+    0.001, 0.001, 1.0
+  ]
+
+  sigma ADD_LOG ~ 1.0   # SIGMA 1 (variance on the log scale)
+
+[individual_parameters]
+  V     = TVV     * exp(ETA_V)
+  KE    = TVKE    * exp(ETA_KE)
+  KAINC = TVKAINC * exp(ETA_KA)
+  KA    = KE + KAINC          # KA = KE + EXP(...), keeps KA > KE (no flip-flop / singularity)
+  CL    = KE * V              # one_cpt_oral wants CL; KE = CL/V
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  log(DV) ~ additive(ADD_LOG)   # NONMEM Y = log(CP) + ERR(1)
+
+[fit_options]
+  method     = focei            # METHOD=1 INTERACT POSTHOC
+  maxiter    = 5000             # MAX=5000
+  covariance = true
