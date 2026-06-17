@@ -287,6 +287,7 @@ pub fn run_bayes(
     let n_chains = options.bayes_chains.max(1);
     let n_eta_mh = options.saem_n_mh_steps.max(1);
     let master_seed = options.bayes_seed.unwrap_or(0x6E_61_6D_63_62_61_79_65); // "bayesnam"
+    let verbose = options.verbose;
 
     // Mu-referenced (log) θ↔η map: mu_pairs[eta_idx] = Some(theta_idx) when that
     // η is the log-deviation of θ (`P_i = θ·exp(η_i)`). When EVERY η is a
@@ -407,6 +408,19 @@ pub fn run_bayes(
     #[allow(unused_mut)]
     let mut n_divergent_total = 0u64;
 
+    if verbose {
+        eprintln!(
+            "Starting Bayesian estimation (Gibbs-within-HMC): {} chain(s), \
+             {} warmup + {} sampling sweeps{}",
+            n_chains,
+            n_warmup,
+            n_sample,
+            if n_kappa > 0 { ", IOV" } else { "" }
+        );
+    }
+    // Print ~10 progress lines per chain.
+    let progress_every = ((n_warmup + n_sample) / 10).max(1);
+
     for chain in 0..n_chains {
         let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
         let mut scratch = EventPkParams::default();
@@ -471,6 +485,11 @@ pub fn run_bayes(
         let mut eta_scale = 0.6_f64;
         let mut acc_eta = 0u64;
         let mut prop_eta = 0u64;
+        // Cumulative η-accept counters for the progress display only (the
+        // adaptation counters above are reset every window, so they read ~0 right
+        // after a reset).
+        let mut acc_eta_disp = 0u64;
+        let mut prop_eta_disp = 0u64;
 
         // Adaptive-covariance (Haario 2001) proposal for the (θ,σ) block. A
         // Welford-accumulated covariance of the unconstrained pop vector seeds a
@@ -536,6 +555,8 @@ pub fn run_bayes(
                         nll[i] = new_nll;
                         acc_eta += accepted as u64;
                         prop_eta += 1;
+                        acc_eta_disp += accepted as u64;
+                        prop_eta_disp += 1;
                         // Count post-warmup divergences for the diagnostic.
                         if sweep >= n_warmup && divergent {
                             n_divergent_total += 1;
@@ -570,6 +591,8 @@ pub fn run_bayes(
                     nll[i] = nll_new;
                     acc_eta += na as u64;
                     prop_eta += n_eta_mh as u64;
+                    acc_eta_disp += na as u64;
+                    prop_eta_disp += n_eta_mh as u64;
                 }
             }
 
@@ -920,9 +943,31 @@ pub fn run_bayes(
                 }
                 eta_record_count += 1;
             }
+
+            if verbose && (sweep + 1) % progress_every == 0 {
+                let phase = if sweep < n_warmup { "warmup" } else { "sample" };
+                let eta_acc = if prop_eta_disp > 0 {
+                    100.0 * acc_eta_disp as f64 / prop_eta_disp as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "  Bayes chain {}/{}  sweep {:>5}/{} [{}]  η-accept≈{:.0}%",
+                    chain + 1,
+                    n_chains,
+                    sweep + 1,
+                    total_sweeps,
+                    phase,
+                    eta_acc
+                );
+            }
         }
 
         draws_by_chain.push(chain_draws);
+    }
+
+    if verbose {
+        eprintln!("Bayes sampling complete; computing posterior summaries + EBEs...");
     }
 
     // ----- summaries -----
