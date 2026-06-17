@@ -2194,8 +2194,8 @@ pub(crate) const MAX_CMT_INDEX: usize = 255;
 
 /// Built-in sdtab column names that [derived] names must not clash with.
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
-    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
-    "CENS", "OCC", "CMT",
+    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EBE_OFV", "N_OBS",
+    "TAFD", "TAD", "CENS", "OCC", "CMT",
 ];
 
 /// Split a token slice at top-level commas (depth 0 inside parentheses).
@@ -3524,6 +3524,8 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.impmap_low_ess_threshold = v;
         }
+        "npde_nsim" => opts.npde_nsim = parse_usize("npde_nsim")?,
+        "npde_seed" => opts.npde_seed = parse_u64_opt("npde_seed")?,
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
         "bloq_method" | "bloq" => {
             opts.bloq_method = match value.to_lowercase().as_str() {
@@ -11360,6 +11362,19 @@ mod tests {
         // `saem_seed` is accepted as an alias so R users can use either spelling.
         assert_eq!(apply_fit_option(&mut opts, "saem_seed", "99"), Ok(true));
         assert_eq!(opts.saem_seed, Some(99));
+    }
+
+    #[test]
+    fn test_apply_fit_option_npde() {
+        let mut opts = FitOptions::default();
+        assert_eq!(opts.npde_nsim, 0, "NPDE is off by default");
+        assert_eq!(apply_fit_option(&mut opts, "npde_nsim", "1000"), Ok(true));
+        assert_eq!(opts.npde_nsim, 1000);
+        assert_eq!(apply_fit_option(&mut opts, "npde_seed", "12345"), Ok(true));
+        assert_eq!(opts.npde_seed, Some(12345));
+        // NULL/NA from R clears the seed back to the default.
+        assert_eq!(apply_fit_option(&mut opts, "npde_seed", "null"), Ok(true));
+        assert_eq!(opts.npde_seed, None);
     }
 
     #[test]

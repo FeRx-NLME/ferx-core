@@ -73,6 +73,80 @@ pub fn log_normal_cdf(z: f64) -> f64 {
     }
 }
 
+/// Inverse standard normal CDF (quantile / probit function): the `z` such that
+/// `Φ(z) = p`, for `p ∈ (0, 1)`. Peter Acklam's rational approximation, with a
+/// maximum relative error of ~1.15e-9 over the open interval. Returns `-∞` at
+/// `p ≤ 0` and `+∞` at `p ≥ 1`.
+///
+/// (A Halley refinement step is intentionally omitted: it would have to evaluate
+/// the forward CDF, and our [`normal_cdf`] carries the A&S 7.1.26 error of
+/// ~1.5e-7, so refining against it degrades rather than improves the result.)
+///
+/// Used by the simulation-based NPDE/NPD diagnostics ([`crate::stats::npde`]) to
+/// inverse-normal-transform empirical CDF probabilities. Not on any AD path, so
+/// it is free to use `.ln()`/`.sqrt()` without the Enzyme-intrinsic caveat.
+pub fn normal_inv_cdf(p: f64) -> f64 {
+    if p <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
+
+    // Acklam coefficients.
+    const A: [f64; 6] = [
+        -3.969_683_028_665_376e1,
+        2.209_460_984_245_205e2,
+        -2.759_285_104_469_687e2,
+        1.383_577_518_672_690e2,
+        -3.066_479_806_614_716e1,
+        2.506_628_277_459_239,
+    ];
+    const B: [f64; 5] = [
+        -5.447_609_879_822_406e1,
+        1.615_858_368_580_409e2,
+        -1.556_989_798_598_866e2,
+        6.680_131_188_771_972e1,
+        -1.328_068_155_288_572e1,
+    ];
+    const C: [f64; 6] = [
+        -7.784_894_002_430_293e-3,
+        -3.223_964_580_411_365e-1,
+        -2.400_758_277_161_838,
+        -2.549_732_539_343_734,
+        4.374_664_141_464_968,
+        2.938_163_982_698_783,
+    ];
+    const D: [f64; 4] = [
+        7.784_695_709_041_462e-3,
+        3.224_671_290_700_398e-1,
+        2.445_134_137_142_996,
+        3.754_408_661_907_416,
+    ];
+
+    // Break-points between the central rational region and the two tails.
+    const P_LOW: f64 = 0.024_25;
+    const P_HIGH: f64 = 1.0 - P_LOW;
+
+    if p < P_LOW {
+        // Lower tail.
+        let q = (-2.0 * p.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if p <= P_HIGH {
+        // Central region.
+        let q = p - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        // Upper tail.
+        let q = (-2.0 * (1.0 - p).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    }
+}
+
 /// Natural log of the Gamma function, ln Γ(x), via the Lanczos approximation
 /// (g = 7, n = 9), accurate to ~1e-13 (relative) for x > 0.
 ///
@@ -160,6 +234,35 @@ mod tests {
         // Φ(1.96) ≈ 0.975 (classic) — allow A&S 1.5e-7 error.
         assert!((normal_cdf(1.96) - 0.975).abs() < 1e-5);
         assert!((normal_cdf(-1.96) - 0.025).abs() < 1e-5);
+    }
+
+    #[test]
+    fn normal_inv_cdf_known_quantiles() {
+        // Standard quantiles — Acklam's rational approximation, ~1.15e-9.
+        assert_relative_eq!(normal_inv_cdf(0.975), 1.959_963_98, epsilon = 1e-6);
+        assert_relative_eq!(normal_inv_cdf(0.025), -1.959_963_98, epsilon = 1e-6);
+        assert_relative_eq!(normal_inv_cdf(0.5), 0.0, epsilon = 1e-9);
+        assert_relative_eq!(normal_inv_cdf(0.9), 1.281_551_57, epsilon = 1e-6);
+        assert_relative_eq!(normal_inv_cdf(0.1), -1.281_551_57, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn normal_inv_cdf_inverts_normal_cdf() {
+        // Round-trip Φ⁻¹(Φ(z)) ≈ z across the central region and into the tails.
+        // The tolerance is set by normal_cdf's A&S error (~1.5e-7), amplified by
+        // 1/φ(z) in the tails — not by normal_inv_cdf, which is good to ~1e-9.
+        for &z in &[-3.5, -2.0, -0.7, 0.0, 0.4, 1.5, 3.0] {
+            let round = normal_inv_cdf(normal_cdf(z));
+            assert_relative_eq!(round, z, epsilon = 1e-4);
+        }
+    }
+
+    #[test]
+    fn normal_inv_cdf_edge_cases() {
+        assert_eq!(normal_inv_cdf(0.0), f64::NEG_INFINITY);
+        assert_eq!(normal_inv_cdf(1.0), f64::INFINITY);
+        assert_eq!(normal_inv_cdf(-0.1), f64::NEG_INFINITY);
+        assert_eq!(normal_inv_cdf(1.1), f64::INFINITY);
     }
 
     #[test]

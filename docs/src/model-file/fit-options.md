@@ -30,6 +30,8 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | `global_search` | `true`, `false` | `false` | Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a gradient-free global pre-search before the local optimizer. CRS2-LM samples within the parameter bounds; the local optimizer (e.g. `bobyqa`, `slsqp`) starts from the best point found. Useful for poorly-identified models — when the local optimizer can land in a degenerate basin (collapsed ETA, V/Q swap, parameters at bounds) from a far-from-truth start, the global pre-search usually escapes it. Adds the pre-search budget on top of the local optimisation, but typically more efficient than running multiple full fits from scratch. Requires a full NLopt build (e.g. `brew install nlopt` or `apt install libnlopt-dev`); a clear warning is emitted if CRS2-LM is unavailable. |
 | `global_maxeval` | integer | `200 * (n_params + 1)` | Maximum evaluations of the FOCE objective during the global pre-search. Each eval is a full inner-loop pass over all subjects, so this is the dominant cost of `global_search = true`. The default (`0` → auto) is empirically enough to escape bad basins on 10–20 parameter PK models without dominating the wall time of the subsequent local refine. |
 | `bloq_method` | `drop`, `m3` | `drop` | How to handle rows with `CENS=1`. `m3` enables Beal's M3 likelihood (see [BLOQ example](../examples/bloq.md)). |
+| `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde--npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. A typical value is `1000`. Cost scales linearly with the count. |
+| `npde_seed` | integer | — | RNG seed for the NPDE/NPD simulation, for reproducible diagnostics. Unset falls back to a fixed default. Only used when `npde_nsim > 0`. |
 | `mu_referencing` | `true`, `false` | `true` | Re-centre inner-loop ETA estimates on the current population mean (auto-detected from `[individual_parameters]`). See the [FAQ entry](../faq.md#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem--nlmixr2) for details. Set `false` to reproduce pre-automatic-mu behaviour. |
 | `iov_column` | string | — | Name of the occasion column in the dataset (e.g. `OCC`). Required when the model uses `kappa` or `block_kappa` declarations. The column must contain integer occasion indices. Case-insensitive. Only supported with `foce` / `focei` — not `saem`. See [IOV documentation](iov.md). |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
@@ -54,6 +56,97 @@ a valid NCA estimate.
 
 When `nca_sweep` is enabled but the fit fails to converge or the OFV looks
 suspiciously high, try `nca_ebe`.
+
+## Simulation-based diagnostics (NPDE / NPD)
+
+Setting `npde_nsim > 0` adds two simulation-based goodness-of-fit columns to the
+`sdtab` output: **NPD** (Normalized Prediction Discrepancies) and **NPDE**
+(Normalized Prediction Distribution Errors). Unlike CWRES — which linearises the
+model around the conditional mode and so inherits the bias of a first-order
+approximation — NPDE/NPD are built entirely from Monte-Carlo simulation under the
+fitted model, so they are robust to model nonlinearity and to non-Gaussian random
+effects (Brendel et al. 2006; Comets et al. 2008, the `npde` R package).
+
+```ini
+[fit_options]
+method = focei
+npde_nsim = 1000     # replicates per subject (off when 0, the default)
+npde_seed = 12345    # optional, for reproducibility
+```
+
+The **effective** seed actually used — the explicit `npde_seed` when given,
+otherwise the built-in default — is recorded as `model: npde_seed:` in the
+`{model}-fit.yaml` output (and round-trips through `.fitrx`), so the `NPDE`/`NPD`
+columns can always be regenerated from the saved fit, even when no seed was set
+in the model file. The line is omitted when NPDE did not run (`npde_nsim = 0`).
+
+For each observation `y_ij`, ferx simulates `K = npde_nsim` replicates under the
+fitted `θ/Ω/Σ` (sampling `η ~ N(0, Ω)` and the residual error), evaluated at the
+subject's own observation design:
+
+- **NPD** (no decorrelation): `pd_ij` is the empirical CDF of the simulated values
+  at observation `ij`, and `npd_ij = Φ⁻¹(pd_ij)`.
+- **NPDE** (decorrelated): within each subject the observed and simulated vectors
+  are decorrelated with the empirical mean and Cholesky factor of the simulated
+  covariance (the Brendel/Comets procedure) *before* the empirical CDF and inverse-
+  normal transform. This removes the within-subject correlation that NPD ignores.
+
+Empirical-CDF probabilities at 0 or 1 are clamped to `[1/(2K), 1 − 1/(2K)]` before
+`Φ⁻¹`, matching the `npde`-package convention, so the scores stay finite.
+
+**Under a correctly specified model, NPDE follows a standard normal distribution.**
+On the warfarin example (`examples/warfarin.ferx`, `data/warfarin.csv`), a converged
+FOCEI fit with `npde_nsim = 1000` gives the expected mean-zero, unit-variance
+distribution:
+
+| Diagnostic | mean | variance | reference |
+|------------|------|----------|-----------|
+| NPDE       | 0.006 | 1.02 | ≈ N(0, 1) |
+| NPD        | −0.002 | 0.88 | mean ≈ 0; variance < 1 because NPD retains within-subject correlation |
+
+This matches the `npde` R package's `autonpde()` (same Cholesky decorrelation and
+edge-clamping) to Monte-Carlo noise. See `tests/npde_validation.rs` for the
+engine-side check and an R reproduction recipe.
+
+### NONMEM cross-validation
+
+NONMEM has no native NPDE output; the reference pipeline is a NONMEM `$SIMULATION`
+post-processed by the `npde` R package. The same warfarin data was fit with NONMEM
+7.5.1 (`ADVAN2 TRANS2`, `METHOD=1 INTER`, proportional error) and the two fits
+agree, so any difference in the diagnostics is attributable to the NPDE
+computation rather than the fit:
+
+| Quantity | ferx (FOCEI) | NONMEM 7.5.1 |
+|----------|-------------|--------------|
+| TVCL     | 0.1328 | 0.1327 |
+| TVV      | 7.738  | 7.738  |
+| TVKA     | 0.817  | 0.811  |
+| OFV      | −286.0015 | −286.0042 |
+
+Feeding a 1000-replicate NONMEM `$SIMULATION` (under the NONMEM estimates) and the
+observed data to `npde::autonpde()` (Cholesky decorrelation, edge-clamping)
+reproduces ferx's NPDE/NPD on the same 110 observations:
+
+| Diagnostic | ferx mean | ferx var | npde-pkg mean | npde-pkg var |
+|------------|-----------|----------|---------------|--------------|
+| NPDE       |  0.005 | 1.09 |  0.036 | 1.04 |
+| NPD        | −0.009 | 0.91 | −0.004 | 0.91 |
+
+The NPD variance (the quantity that should sit below 1 because NPD retains the
+within-subject correlation) matches to three figures (0.91 vs 0.91); the small
+NPDE-variance gap is Monte-Carlo noise between two independent simulation draws.
+Both engines give NPDE ≈ N(0, 1) and a mean-zero NPD, as expected under this
+well-specified model.
+
+**Limitations.** M3/BLQ censored observations need the predictive-CDF variant and
+are out of scope: censored rows (`CENS != 0`) are emitted as empty/`NaN` (matching
+the CWRES/IWRES convention), and a subject's NPDE is `NaN` as a whole when it has
+any censored row, since the within-subject decorrelation would otherwise mix the
+LLOQ into the uncensored rows. NPDE also requires more replicates than a subject
+has observations (`npde_nsim > n_obs`) for a full-rank simulated covariance;
+otherwise that subject's NPDE is `NaN` (NPD is still computed). For IOV (`kappa`)
+models the simulation holds kappas at zero (the existing `simulate()` convention),
+so NPDE/NPD omit the inter-occasion component of the predictive variance.
 
 ## Estimation Methods
 

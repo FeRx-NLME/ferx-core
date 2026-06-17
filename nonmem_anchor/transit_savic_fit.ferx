@@ -1,0 +1,43 @@
+# Savic transit-compartment absorption (built-in transit()), fit on transit_oral.csv.
+# Identical structure to examples/transit_savic.ferx but WITHOUT the [simulation]
+# block, so it fits the external NONMEM-anchor dataset. Requires the #343 branch
+# (worktree-issue-322-phase0-transit), where transit() is implemented.
+#
+#   cargo run --release -- nonmem_anchor/transit_savic_fit.ferx --data nonmem_anchor/transit_oral.csv
+#
+# Compare the resulting {model}-fit.yaml OFV + theta estimates against NONMEM's
+# savic_transit.ctl run (see README.md).
+
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)   # typical clearance (L/h)
+  theta TVV(50.0,   5.0, 500.0)   # typical central volume (L)
+  theta TVKA(1.0,  0.05,  24.0)   # typical absorption rate constant (/h)
+  theta TVMTT(1.0, 0.05,  24.0)   # mean transit time (h); KTR = (N+1)/MTT
+  theta TVN(3.0,    0.1,  30.0)   # number of transit compartments (continuous)
+
+  omega ETA_CL ~ 0.09             # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09             # IIV on V  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)      # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  KA  = TVKA
+  MTT = TVMTT
+  NTR = TVN
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = transit(n=NTR, mtt=MTT) - KA*depot
+  d/dt(central) = KA*depot/V - CL/V*central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true

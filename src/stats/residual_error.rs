@@ -233,6 +233,8 @@ mod tests {
             pred: vec![0.0; iwres.len()],
             iwres,
             cwres: vec![],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![],
             n_obs: 0,

@@ -2158,6 +2158,13 @@ pub struct SubjectResult {
     pub pred: Vec<f64>,
     pub iwres: Vec<f64>,
     pub cwres: Vec<f64>,
+    /// Normalized prediction distribution errors (simulation-based, decorrelated
+    /// within subject). Empty unless `[fit_options] npde_nsim > 0`. Populated
+    /// post-fit by [`crate::stats::npde`]; emitted as the `NPDE` sdtab column.
+    pub npde: Vec<f64>,
+    /// Normalized prediction discrepancies (simulation-based, no decorrelation).
+    /// Empty unless `[fit_options] npde_nsim > 0`. Emitted as the `NPD` column.
+    pub npd: Vec<f64>,
     pub ofv_contribution: f64,
     pub cens: Vec<u8>,
     /// Number of observations for this subject (MDV=0 rows).
@@ -2764,6 +2771,12 @@ pub struct FitResult {
     /// Seed used for the importance-sampling Monte Carlo step.  `None` when IS
     /// was not run or no explicit seed was set.
     pub is_seed: Option<u64>,
+    /// Effective RNG seed used for the simulation-based NPDE/NPD diagnostics —
+    /// the value actually fed to the simulator, including the built-in default
+    /// when `[fit_options] npde_seed` was left unset, so the diagnostic is
+    /// reproducible from this field alone. `None` when NPDE did not run
+    /// (`npde_nsim = 0`).
+    pub npde_seed: Option<u64>,
     /// BLOQ handling method: "drop" (observations below LOQ are excluded) or
     /// "m3" (M3 likelihood for censored observations).
     pub bloq_method: String,
@@ -2996,6 +3009,15 @@ pub struct FitOptions {
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
     pub bloq_method: BloqMethod,
+    /// Number of Monte-Carlo replicates per subject used to compute the
+    /// simulation-based NPDE/NPD diagnostics after the fit. `0` (default)
+    /// disables the computation entirely — no `NPDE`/`NPD` columns are emitted.
+    /// A typical value is `1000` (the `npde`-package default). Cost scales
+    /// linearly with the replicate count. See [`crate::stats::npde`].
+    pub npde_nsim: usize,
+    /// RNG seed for the NPDE/NPD simulation. `None` falls back to a fixed
+    /// default so the diagnostic is reproducible across invocations.
+    pub npde_seed: Option<u64>,
     /// Maximum CG iterations for the Steihaug subproblem solver (trust-region only).
     /// `None` (default) uses a size-adaptive budget of `ceil(sqrt(n_params)).clamp(5, n_params)`,
     /// which is 5 for typical NLME problems (n_params ≈ 7–15) and grows with model size.
@@ -3220,6 +3242,8 @@ impl Default for FitOptions {
             impmap_averaging: 50,
             impmap_low_ess_threshold: 0.1,
             bloq_method: BloqMethod::Drop,
+            npde_nsim: 0,
+            npde_seed: None,
             steihaug_max_iters: None,
             mu_referencing: true,
             threads: None,
@@ -3488,6 +3512,8 @@ pub fn framework_keys() -> &'static [&'static str] {
         "sir_df",
         "bloq_method",
         "bloq",
+        "npde_nsim",
+        "npde_seed",
         "mu_referencing",
         "threads",
         "n_starts",

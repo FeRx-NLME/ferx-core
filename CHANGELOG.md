@@ -30,8 +30,23 @@ section of the SDLC for the versioning policy).
   `RATE=-2` dose with no matching `D{n}` parameter — or on an analytical model —
   is now a loud error rather than a silent bolus (the original #324 bug), both at
   the model+data join (`fit`/`ferx check`) and at the `predict()`/`simulate()`
-  entrypoints (which skip the full data-check). `RATE=-1` (modeled *rate*, `Rn`)
+  entrypoints (which skip the full data-check). A modeled `D{n}` that is
+  non-positive at the initial estimate is flagged with a `W_MODELED_DURATION_NONPOSITIVE`
+  warning (use a positive link such as `exp`). `RATE=-1` (modeled *rate*, `Rn`)
   and analytical-engine support remain tracked #324 follow-ups (#324).
+- **Simulation-based NPDE / NPD diagnostics** in the `sdtab` output. Set
+  `[fit_options] npde_nsim = 1000` (and optionally `npde_seed`) to add `NPDE`
+  (Normalized Prediction Distribution Errors, decorrelated within subject) and
+  `NPD` (Normalized Prediction Discrepancies) columns, computed post-fit by
+  Monte-Carlo simulation under the fitted model (Brendel et al. 2006; Comets et
+  al. 2008). Unlike CWRES, these are robust to model nonlinearity and non-Gaussian
+  random effects, and follow N(0,1) under a correctly specified model. Off by
+  default (`npde_nsim = 0`). The effective simulation seed (including the default
+  when `npde_seed` is unset) is recorded as `npde_seed` in `{model}-fit.yaml` and
+  the `.fitrx` archive, so the diagnostics are reproducible from the saved fit.
+  Validated against a NONMEM `$SIMULATION` + `npde` R-package reference on the
+  warfarin example. M3/BLQ censoring and IOV-kappa resampling are out of scope
+  (#260).
 - **Compartment-indexed bioavailability and lag for ODE models** — name an
   individual parameter `F{n}` or `ALAG{n}`/`LAGTIME{n}` (e.g. `F2`, `ALAG2`) to
   apply a per-route bioavailability/lag to doses into compartment `n`, mirroring

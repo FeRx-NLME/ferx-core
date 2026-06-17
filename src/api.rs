@@ -1611,8 +1611,8 @@ fn probe_nlopt_algorithms() -> Vec<String> {
 /// Mandatory sdtab column names that are always written — declaring them in
 /// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
 const OUTPUT_MANDATORY: &[&str] = &[
-    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV",
-    "N_OBS", "TAFD", "TAD",
+    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD",
+    "EBE_OFV", "N_OBS", "TAFD", "TAD",
 ];
 
 /// Validate `model.output_columns` against known quantities, emitting
@@ -2894,6 +2894,23 @@ fn fit_inner(
         );
     }
 
+    // Post-fit: simulation-based NPDE / NPD diagnostics (issue #260). Opt-in via
+    // `[fit_options] npde_nsim`; skipped entirely when 0 so the common path pays
+    // nothing. Subjects are built in population order, so the zip aligns.
+    if options.npde_nsim > 0 {
+        let per_subj = crate::stats::npde::compute_npde_npd(
+            model,
+            population,
+            &result.params,
+            options.npde_nsim,
+            options.npde_seed,
+        );
+        for (sr, sn) in subjects.iter_mut().zip(per_subj) {
+            sr.npde = sn.npde;
+            sr.npd = sn.npd;
+        }
+    }
+
     let n_obs = population.n_obs();
     let n_params = n_params_pre;
 
@@ -3301,6 +3318,13 @@ fn fit_inner(
         saem_seed: options.saem_seed,
         sir_seed: options.sir_seed,
         is_seed: options.is_seed,
+        // Record the *resolved* NPDE seed (default included) so the diagnostic
+        // is reproducible from the output; `None` when NPDE did not run.
+        npde_seed: if options.npde_nsim > 0 {
+            Some(crate::stats::npde::effective_seed(options.npde_seed))
+        } else {
+            None
+        },
         bloq_method: model.bloq_method.label().to_string(),
         outer_maxiter: options.outer_maxiter,
         outer_gtol: options.outer_gtol,
@@ -3705,6 +3729,9 @@ fn compute_subject_results(
                 pred,
                 iwres,
                 cwres,
+                // Filled post-fit (only when npde_nsim > 0); see compute_npde_npd.
+                npde: vec![],
+                npd: vec![],
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
@@ -3892,6 +3919,8 @@ mod tests {
             pred: vec![0.0; n],
             iwres,
             cwres: vec![0.0; n],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n],
             n_obs: n,
@@ -6136,6 +6165,7 @@ mod simulate_with_uncertainty_tests {
             saem_seed: None,
             sir_seed: None,
             is_seed: None,
+            npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 0,
             outer_gtol: 0.0,
@@ -6185,6 +6215,44 @@ mod simulate_with_uncertainty_tests {
         let pop = tiny_population();
         let rows = simulate_with_seed(&model, &pop, &model.default_params, 2, 42);
         assert!(rows.iter().all(|r| r.draw == 1));
+    }
+
+    #[test]
+    fn compute_npde_npd_shapes_finite_and_reproducible() {
+        // Drives the full post-fit NPDE/NPD simulation path on a real (model,
+        // population, params). nsim > n_obs (3) so the decorrelated NPDE is
+        // non-NaN, and a fixed seed must reproduce bit-for-bit.
+        let model = tiny_model();
+        let pop = tiny_population();
+        let nsim = 200;
+
+        let a = crate::stats::npde::compute_npde_npd(
+            &model,
+            &pop,
+            &model.default_params,
+            nsim,
+            Some(7),
+        );
+        let b = crate::stats::npde::compute_npde_npd(
+            &model,
+            &pop,
+            &model.default_params,
+            nsim,
+            Some(7),
+        );
+
+        assert_eq!(a.len(), pop.subjects.len());
+        for (sn, subj) in a.iter().zip(pop.subjects.iter()) {
+            assert_eq!(sn.npd.len(), subj.observations.len());
+            assert_eq!(sn.npde.len(), subj.observations.len());
+            assert!(sn.npd.iter().all(|v| v.is_finite()), "NPD finite");
+            assert!(sn.npde.iter().all(|v| v.is_finite()), "NPDE finite");
+        }
+        // Reproducible across calls with the same seed.
+        for (sa, sb) in a.iter().zip(b.iter()) {
+            assert_eq!(sa.npd, sb.npd);
+            assert_eq!(sa.npde, sb.npde);
+        }
     }
 
     #[test]
@@ -7015,6 +7083,8 @@ mod tests_derived_session_clock {
             pred: vec![1.0; n_obs],
             iwres: vec![0.0; n_obs],
             cwres: vec![0.0; n_obs],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
@@ -7382,6 +7452,8 @@ mod tests_derived_iov_kappa {
             pred: vec![1.0; n_obs],
             iwres: vec![0.0; n_obs],
             cwres: vec![0.0; n_obs],
+            npde: vec![],
+            npd: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
