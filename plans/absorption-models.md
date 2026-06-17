@@ -2,10 +2,20 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap, in progress. Prerequisite #324 safety net (PR #326) **merged
-2026-06-14**. **Phase 0a — built-in `transit()` absorption — implemented in PR #343 (open,
-2026-06-14)**; `ln_gamma` building block merged (#340). `ode_template` (Phase 0b) and the
-remaining models (Phases 1–3) not yet implemented. Multi-PR / phased.
+**Status:** approved roadmap, in progress (updated 2026-06-17).
+- **Prerequisite #324:** safety net (PR #326) and **modeled infusion duration
+  `Dn` / `RATE=-2`** (PR #384) **merged**; modeled rate `Rn` / `RATE=-1` plus
+  analytical-engine support remain, tracked in #383.
+- **Phase 0a — `transit()`** (PR #343) **and its NONMEM Savic anchor** (PR #385)
+  **merged**; `ln_gamma` building block merged (#340).
+- **Phase 0b — `ode_template` generation + the analytical-`pk`-plus-absorption
+  error rule** (PR #363) **merged**.
+- **Phase 1 — inverse-Gaussian `igd()`: implemented, PR #389 (open).**
+- **Phases 2–3 not yet implemented** — Phase 2 (Weibull + zero-order family);
+  Phase 3 (analytical incomplete-gamma, tracked in #386). Biphasic IG + the
+  shared input-rate fraction mechanism tracked in #388.
+
+Multi-PR / phased.
 
 ---
 
@@ -378,12 +388,13 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 
 - **Prerequisite — issue #324 (NONMEM coded `RATE`), standalone first.** Safety net **✅ MERGED**
   (PR #326, 2026-06-14: rejects coded/malformed `RATE` instead of a silent bolus). Faithful
-  support follows as a parameter-driven DSL feature: `RATE=-1` = rate modeled (`R1`-style),
-  `RATE=-2` = duration modeled (`D1`-style) — **no `DURATION` data column**. The
-  `RATE=-2`/`D1` modeled-duration path establishes the estimated-duration forcing that this
-  plan's Phase 2 zero-order family reuses. Independent of this plan's Phase 0/1, which can
-  start in parallel.
-- **Phase 0a — `transit()` input-rate function. ✅ IMPLEMENTED — PR #343 (open, 2026-06-14).**
+  support is a parameter-driven DSL feature: `RATE=-1` = rate modeled (`Rn`-style), `RATE=-2` =
+  duration modeled (`Dn`-style) — **no `DURATION` data column**. **Modeled duration `Dn` /
+  `RATE=-2` ✅ MERGED (PR #384, 2026-06-17, ODE models)** — establishes the estimated-duration
+  forcing that this plan's Phase 2 zero-order family reuses. Remaining on #324: modeled rate `Rn`
+  / `RATE=-1`, plus analytical-engine support for both (tracked in **#383**). Independent of this
+  plan's Phase 0/1, which proceeded in parallel.
+- **Phase 0a — `transit()` input-rate function. ✅ MERGED — PR #343 (2026-06-15).**
   Built-in `transit(n, mtt)` intrinsic in `[odes]`: log-domain Savic evaluator (`ln_gamma`
   shipped in #340), dose-context wiring, and the dose-routing rule — the dose feeds `R_in`, its
   bolus is **suppressed**, `∫R_in dt = F·Dose`. `R_in(tad)` is injected via the infusion
@@ -393,15 +404,26 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   loudly** (not silently mis-modeled): SS=1 into a transit compartment (`E_ABSORPTION_SS`) and
   `transit()` + a `[diffusion]` block (`E_ABSORPTION_DIFFUSION`). Validated by parameter recovery
   (`examples/transit_savic.ferx --simulate`: TVN 3.0→3.19, MTT 1.0→0.90) + the absorption-
-  independent **AUC∞ = Dose/CL** invariant. **NONMEM Savic anchor still TODO** — does not block
-  #343; flagged for a follow-up (or fold into Phase 3, which adds the analytical form to compare).
-- **Phase 0b — `ode_template` generation + the analytical-`pk`-plus-absorption error rule.**
-  DEFERRED out of #343 (not needed for the raw `[odes]` + `transit()` path that Phase 0a ships).
-  Generate the standard PK disposition ODEs from the codified analytical↔ODE transforms, and
-  reject an analytical `pk` disposition combined with an ODE-only absorption model, pointing the
-  user at `ode_template`. Reuses the undefined-name walker / "declared-but-unused" census.
-- **Phase 1 — inverse-Gaussian (Freijer & Post).** Single + sum-of-two IG; **numerical**
-  (no closed form). Anchor vs the Freijer & Post paper / a NONMEM `$DES` IG run.
+  independent **AUC∞ = Dose/CL** invariant. **NONMEM Savic anchor ✅ MERGED (PR #385):**
+  slow-tests-gated `tests/transit_nonmem_anchor.rs` asserts FOCEI OFV −1076.67 ± 2 vs NONMEM
+  −1077.13 with ODE tolerances pinned to `1e-9` (the key finding: loose default ODE tols inflate
+  the FOCEI ω² — tighten toward `1e-9` for variance-component accuracy on transit/stiff fits).
+- **Phase 0b — `ode_template` generation + the analytical-`pk`-plus-absorption error rule.
+  ✅ MERGED — PR #363 (2026-06-16).** `ode_template NAME(...)` in `[structural_model]` lowers
+  (pre-pass desugar) to a generated `[odes]` disposition from the codified analytical↔ODE
+  transforms, with user `d/dt(X)` overrides (top-level only) replacing a generated equation; an
+  analytical `pk` disposition combined with an ODE-only absorption model (`transit`) is a hard
+  error pointing at `ode_template`. Equivalence-tested (`ode_template` ≡ `pk` for all 6 models).
+  ferx-r follow-up merged (PR #169).
+- **Phase 1 — inverse-Gaussian (Freijer & Post). ✅ IMPLEMENTED — PR #389 (open, this PR).**
+  Single IG via the `igd(mat, cv2)` input-rate function (log-domain density, essential
+  singularity `tad→0 ⇒ R→0` for free, `f64`/FD-only like `transit`); **numerical** (no closed
+  form). Anchored vs a NONMEM `$DES` IG run (`tests/igd_nonmem_anchor.rs`) at the likelihood at
+  the shared optimum — a path-independent check, because default derivative-free BOBYQA stalls on
+  the flat mis-specified ridge while NONMEM's gradient FOCEI climbs `MAT`. The **biphasic
+  sum-of-two IG** is deferred to **#388** (no biphasic NONMEM run yet → would be an unanchored
+  happy path; its fraction-multiplier mechanism is shared with the planned parallel/mixed
+  `first_order`, so design it once).
 - **Phase 2 — Weibull + zero-order + sequential + parallel + mixed.** Round out the
   catalogue; each with a NONMEM anchor. **Closed-form** for zero-order/sequential/parallel/
   mixed (superpose existing solvers; the zero-order family reuses #324's estimated-duration
