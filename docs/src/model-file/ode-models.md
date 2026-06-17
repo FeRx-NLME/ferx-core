@@ -252,6 +252,51 @@ apply absorption lag.)
 > block (`obs_scale[CMT=n] = …` or `y[CMT=n] = …`), not via a reserved `Sn`
 > individual parameter.
 
+### Modeled infusion duration (`Dn`, `RATE=-2`)
+
+NONMEM's `RATE = -2` makes a zero-order infusion's **duration** a model parameter
+rather than a data value. Mirror it by naming an individual parameter `D{n}` for
+the dose compartment `n`, and coding `RATE = -2` on the dose row (`AMT` is still
+the amount). ferx then infuses `AMT` over the modeled duration `D{n}` — i.e. at
+rate `AMT / D{n}` — resolved **per iteration and occasion** from the parameter,
+so the duration can carry covariate effects and between-occasion variability:
+
+```text
+[parameters]
+  theta TVD1(2.0, 0.1, 24.0)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD1 * exp(ETA_D1)   # modeled duration for infusions into compartment 1
+```
+
+```text
+# dataset: a RATE=-2 dose of 100 units into compartment 1
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+1,0,.,1,100,1,-2,1
+```
+
+- A `RATE=-2` dose into compartment `n` **requires** a `D{n}` parameter; without
+  one it is a loud error at the model+data join (`ferx check` / `fit`), never a
+  silent bolus.
+- `D{n}` composes with the dose attributes above: bioavailability `F{n}` scales
+  the delivered amount **once** (`F·AMT` over `D{n}`, matching NONMEM's `F·RATE`),
+  and absorption lag `ALAG{n}` shifts the infusion window's start while `D{n}`
+  sets its length.
+- A transient `D{n} ≤ 0` during estimation is clamped to a tiny positive floor
+  (so `AMT / D{n}` stays finite); the converged optimum is interior, so reported
+  estimates are unaffected — the same guard the built-in absorption models use.
+
+> ⚠️ Like `F{n}` / `ALAG{n}`, `D{n}` is a **reserved name** when a `RATE=-2` dose
+> targets compartment `n` (as in NONMEM). It then denotes that compartment's
+> infusion duration even if you also reference it in the `[odes]` RHS — so don't
+> reuse `D1`, `D2`, … for an unrelated decay constant or rate term.
+
+This is an **ODE-engine** feature. On an **analytical** model a `RATE=-2` dose is
+rejected with a pointer to the follow-up that will add analytical support;
+`RATE=-1` (modeled *rate*, `R{n}`) is not yet supported on either engine.
+
 ## Stochastic ODE Models (SDE)
 
 To model within-subject system noise that accumulates between observations, add

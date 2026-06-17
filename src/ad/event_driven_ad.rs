@@ -156,6 +156,17 @@ impl FlatEventData {
     /// see the frozen lag. (The FOCEI inner loop routes eta-dependent lagtime
     /// to FD instead — see `inner_optimizer::resolve_gradient_method`.)
     pub fn from_subject(subject: &Subject, dose_lagtimes: &[f64]) -> Self {
+        // Tripwire (#324 / #281): the AD kernels snapshot `d.rate`/`d.duration`
+        // into flat f64 arrays below. A modeled-RATE dose (e.g. RATE=-2 -> D{cmt})
+        // must never reach the AD path — modeled doses are ODE-only and ODE has no
+        // AD path, and `resolve_gradient_method` FD-gates anything analytical that
+        // it can't differentiate. Reaching here with one would snapshot the
+        // *unresolved* rate/duration (0) and yield a silently-wrong gradient — the
+        // FD-only-CI failure mode of #317. Fail loudly in debug/tests instead.
+        debug_assert!(
+            subject.all_doses_fixed(),
+            "modeled-RATE dose reached the AD path"
+        );
         let events = build_sorted_events(subject, dose_lagtimes);
         let n_events = events.len();
         let lag = |k: usize| -> f64 { dose_lagtimes.get(k).copied().unwrap_or(0.0) };

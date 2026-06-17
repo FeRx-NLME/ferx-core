@@ -306,6 +306,15 @@ pub fn run_impmap(
             .par_iter()
             .enumerate()
             .map_init(EventPkParams::default, |scratch, (i, subject)| {
+                // Poll per subject: the inner-loop MAP + IS draws below are the
+                // dominant per-iteration cost, so without this a cancel set
+                // mid-iteration is not seen until the next iteration's top-of-loop
+                // check (line ~257) — minutes on a large dataset. Mirrors
+                // `run_importance_sampling`. The driver breaks right after the
+                // collect, so the placeholder draws never reach the M-step.
+                if crate::cancel::is_cancelled(cancel) {
+                    return crate::estimation::importance_sampling::SubjectDraws::cancelled(n_eta);
+                }
                 let h_post = compute_posterior_hessian(
                     model,
                     subject,
@@ -334,6 +343,15 @@ pub fn run_impmap(
                 )
             })
             .collect();
+
+        // If a cancel was observed inside the E-step, the `draws` are placeholders;
+        // break before the M-steps consume them. The post-loop check returns Err.
+        if crate::cancel::is_cancelled(cancel) {
+            if verbose {
+                eprintln!("IMPMAP: cancelled during E-step at iteration {}", k);
+            }
+            break;
+        }
 
         // ESS diagnostics + marginal log-likelihood for the trace.
         let mut ll = 0.0f64;

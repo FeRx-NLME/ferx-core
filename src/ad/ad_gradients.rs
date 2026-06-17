@@ -655,6 +655,16 @@ pub struct FlatDoseData {
 
 impl FlatDoseData {
     pub fn from_subject(subject: &Subject) -> Self {
+        // Tripwire (#324 / #281): this single-snapshot AD path freezes
+        // `d.rate`/`d.duration` into flat f64 arrays. A modeled-RATE dose
+        // (RATE=-2 -> D{cmt}) must never reach it — modeled doses are ODE-only
+        // (no AD path) and `resolve_gradient_method` FD-gates anything else; an
+        // unresolved one would snapshot a 0 rate/duration and yield a silently
+        // wrong gradient (#317). Fail loudly in debug/tests instead.
+        debug_assert!(
+            subject.all_doses_fixed(),
+            "modeled-RATE dose reached the AD path"
+        );
         Self {
             times: subject.doses.iter().map(|d| d.time).collect(),
             amts: subject.doses.iter().map(|d| d.amt).collect(),

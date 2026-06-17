@@ -569,6 +569,7 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
     diags.extend(check_per_cmt_error_model(model, population));
     diags.extend(check_iov_occasions(model, population));
     diags.extend(check_absorption_dosing(model, population));
+    diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(validate_output_columns(model, population));
     diags
 }
@@ -654,8 +655,9 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // ODE RHS wrapper, and again as `R_in(tad)` superposed by the input-rate
     // forcing — silently ~doubling exposure. A transit dose carries its mass
     // through `R_in` from the bolus amount; an infusion rate on that record is
-    // undefined, so reject it loudly. (Coded RATE=-1/-2 is already rejected at
-    // the datareader, so `is_infusion()` is the remaining case.)
+    // undefined, so reject it loudly. RATE=-2 (modeled duration) is also an
+    // infusion (`is_infusion()` is true for it), so it is caught here too;
+    // RATE=-1 is rejected at the datareader.
     let has_infusion = population.subjects.iter().any(|s| {
         s.doses
             .iter()
@@ -704,6 +706,100 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     }
 
     diags
+}
+
+/// NONMEM coded `RATE=-2` (modeled infusion duration → `D{cmt}`) needs two
+/// model-aware checks the datareader cannot make (it has no model). Both are
+/// fatal — never a silent fall-through to a bolus (the original #324 bug):
+///   - **ODE engine.** Modeled duration is ODE-only; the analytical engine has
+///     no spare-slot routing for a `D{n}` parameter yet (a tracked #324
+///     follow-up). A `RATE=-2` dose on an analytical model is rejected.
+///   - **Matching `D{cmt}` parameter.** A `RATE=-2` dose into compartment `n`
+///     requires a `D{n}` parameter (so `resolve_rate` has a slot to read);
+///     otherwise it is rejected.
+///
+/// Reported once per offending compartment (naming the first dose that hits it),
+/// so a dataset with many `RATE=-2` rows yields one actionable error per cause.
+/// (The `D{n}`-is-also-an-RHS-rate-constant name collision is handled the same
+/// way `F{n}` is — a documented reserved-name note in `docs/`, not a runtime
+/// check — see ode-models.md.)
+fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    use crate::types::{DoseAttr, RateMode};
+    let mut diags = Vec::new();
+    // De-dup by compartment so N identical RATE=-2 rows give one error, not N.
+    let mut reported: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for subject in &population.subjects {
+        for dose in &subject.doses {
+            if dose.rate_mode != RateMode::ModeledDuration || !reported.insert(dose.cmt) {
+                continue;
+            }
+            let cmt = dose.cmt;
+            match &model.ode_spec {
+                None => diags.push(
+                    Diagnostic::error(
+                        "E_MODELED_DURATION_ANALYTICAL",
+                        format!(
+                            "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
+                             compartment {cmt} is only supported for ODE models; analytical \
+                             support is a tracked follow-up to #324. Use an `ode(...)` model with \
+                             a `D{cmt}` parameter, or supply an explicit positive RATE \
+                             (= AMT/duration).",
+                            subject.id, dose.time
+                        ),
+                    )
+                    .with_block("structural_model"),
+                ),
+                Some(ode) => {
+                    if ode
+                        .dose_attr_map
+                        .indexed_slot(DoseAttr::Duration, cmt)
+                        .is_none()
+                    {
+                        diags.push(
+                            Diagnostic::error(
+                                "E_MODELED_DURATION_NO_PARAM",
+                                format!(
+                                    "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
+                                     compartment {cmt} requires a `D{cmt}` parameter in \
+                                     [individual_parameters], but none is declared. Add \
+                                     `D{cmt} = ...` (the modeled duration), or supply an explicit \
+                                     positive RATE.",
+                                    subject.id, dose.time
+                                ),
+                            )
+                            .with_block("individual_parameters"),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    diags
+}
+
+/// Precondition shared by [`predict`] and the `simulate*` family: every
+/// modeled-`RATE` dose (#324, e.g. `RATE=-2` → `D{cmt}`) must be supported by
+/// the model (an ODE engine with the matching `D{cmt}` parameter).
+///
+/// `fit()` enforces this via [`first_error`] over the full [`check_model_data`],
+/// but `predict()` / `simulate()` deliberately skip that data-check (they assume
+/// a model the caller already validated, and run no other data validation). A
+/// modeled dose slipping through would otherwise hit one of two failure modes
+/// downstream that the per-path `debug_assert!` tripwires only catch in
+/// debug/test builds — silently in release: a 0-rate "infusion" on the
+/// analytical path, or [`DoseEvent::resolve_rate`]'s slot `.expect`. This gate
+/// turns both into a loud, actionable panic carrying the same diagnostic message
+/// `check_model_data` would have produced, reusing the single-source-of-truth
+/// [`check_modeled_dose_rates`]. It is O(doses) and runs once per public call
+/// (not in the inner loop), and is a no-op for the common all-`Fixed` dataset.
+pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: &Population) {
+    if let Err(msg) = first_error(&check_modeled_dose_rates(model, population)) {
+        panic!(
+            "predict()/simulate() received a dose the model cannot honour: {msg}\n\
+             (fit() reports this as an error rather than panicking; validate with \
+             `check_model_data` before predicting on untrusted input.)"
+        );
+    }
 }
 
 /// Model + estimation-option *compatibility* checks that don't depend on data:
@@ -888,14 +984,51 @@ pub fn check_model_data_warnings(
     }
 
     // SS=1 infusion with T_inf > II — overlapping pulses have no closed form;
-    // the SS pre-equilibration is skipped.
+    // the SS pre-equilibration is skipped. The effective infusion length is
+    // `d.duration` for an ordinary infusion, but for a modeled-duration dose
+    // (RATE=-2 → `D{cmt}`; #324) it is unresolved here (`rate`/`duration` are 0
+    // until `resolve_rate`), so resolve `D{cmt}` at the typical-value point.
+    //
+    // Resolution goes through the single-source-of-truth `DoseEvent::resolve_rate`
+    // (the same rule + `DURATION_FLOOR` clamp the integrator applies at runtime),
+    // not a hand-rolled slot read, so the warning's notion of "duration" can't
+    // drift from the integrator's. It is a *typical-value* heuristic: it uses
+    // init theta, eta = 0, and this subject's covariates, whereas runtime uses
+    // per-occasion eta/IOV — a modeled SS infusion whose duration crosses `II`
+    // only on some occasions may not be flagged here (and conversely a typical
+    // overlap may not occur on every occasion). The runtime SS-skip is the
+    // backstop; this catches the common typical-value / covariate-driven overlap.
+    // (Analytical models reject modeled doses upstream, so the `ode_spec`-less
+    // branch only sees `Fixed` doses.)
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
+    let effective_duration = |s: &Subject, d: &DoseEvent| -> f64 {
+        if d.is_fixed() {
+            return d.duration;
+        }
+        match &model.ode_spec {
+            // Guard the `D{cmt}` slot's existence: a modeled dose with no matching
+            // parameter is an *error* (`E_MODELED_DURATION_NO_PARAM`), but this
+            // warnings pass must stay panic-free if run on such a model rather than
+            // hit `resolve_rate`'s slot `.expect`.
+            Some(ode)
+                if ode
+                    .dose_attr_map
+                    .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
+                    .is_some() =>
+            {
+                let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates);
+                d.resolve_rate(&ode.dose_attr_map, &pk.values).duration
+            }
+            _ => 0.0,
+        }
+    };
     let n_ss_overlapping_inf = population
         .subjects
         .iter()
         .filter(|s| {
             s.doses
                 .iter()
-                .any(|d| d.ss && d.ii > 0.0 && d.rate > 0.0 && d.duration > d.ii)
+                .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && effective_duration(s, d) > d.ii)
         })
         .count();
     if n_ss_overlapping_inf > 0 {
@@ -911,6 +1044,51 @@ pub fn check_model_data_warnings(
                 n_ss_overlapping_inf
             ),
         ));
+    }
+
+    // Modeled infusion duration `D{cmt}` (RATE=-2; #324) that is non-positive at
+    // the initial typical-value point (eta = 0). `resolve_rate` clamps a transient
+    // `D ≤ 0` to `DURATION_FLOOR` so `AMT/D` stays finite mid-search, but a
+    // non-positive `D` *at the initial estimate* signals a misspecified
+    // parameterisation: every iteration then delivers `AMT` over ~`DURATION_FLOOR`
+    // — a bolus-like spike, not an infusion — and the fit can converge wrong with
+    // no other diagnostic. Flag it (analogous to W_NEGATIVE_LAGTIME) and point at
+    // a positive-link parameterisation. De-duped per compartment.
+    if let Some(ode) = &model.ode_spec {
+        use crate::types::{DoseAttr, DoseEvent};
+        let mut nonpos_cmts: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        for s in &population.subjects {
+            let mut pk_at_init: Option<crate::types::PkParams> = None;
+            for d in &s.doses {
+                if d.is_fixed() {
+                    continue;
+                }
+                if let Some(slot) = ode.dose_attr_map.indexed_slot(DoseAttr::Duration, d.cmt) {
+                    let pk = pk_at_init.get_or_insert_with(|| {
+                        (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates)
+                    });
+                    if pk.values[slot] <= DoseEvent::DURATION_FLOOR {
+                        nonpos_cmts.insert(d.cmt);
+                    }
+                }
+            }
+        }
+        for cmt in nonpos_cmts {
+            diags.push(Diagnostic::warning(
+                "W_MODELED_DURATION_NONPOSITIVE",
+                format!(
+                    "Modeled infusion duration D{cmt} (RATE=-2 into compartment \
+                     {cmt}) evaluates to ≤ 0 at the initial typical-value point \
+                     (eta = 0). A non-positive duration is clamped to {floor:e} to \
+                     keep AMT/D finite, which delivers the dose as a bolus-like \
+                     spike rather than an infusion — the fit may converge to a \
+                     wrong optimum. Use a positive-link parameterisation \
+                     (e.g. D{cmt} = exp(...)).",
+                    cmt = cmt,
+                    floor = DoseEvent::DURATION_FLOOR,
+                ),
+            ));
+        }
     }
 
     // EVID=3/4 resets are not honoured on the EKF/SDE path.
@@ -4232,6 +4410,16 @@ pub fn simulate_with_options(
         None => rand::rngs::StdRng::from_entropy(),
     };
 
+    // Guard the modeled-`RATE` dose precondition up front (#324). The
+    // non-propensity branch reaches it via the `simulate_inner_with_draw`
+    // chokepoint, but the propensity branch first runs a full inner EBE pass
+    // (`run_inner_loop_warm` below) that integrates every subject — on an
+    // unsupported config that would hit the per-path tripwire (silently in
+    // release) or `resolve_rate`'s opaque `.expect` *before* the chokepoint
+    // guard. Asserting here makes both branches fail with the same actionable
+    // diagnostic; it is a no-op O(doses) scan on the common all-`Fixed` dataset.
+    assert_modeled_doses_supported(model, population);
+
     if !opts.propensity_match {
         return Ok(simulate_inner_with_draw(
             model, population, params, n_sim, 1, None, &mut rng,
@@ -4377,6 +4565,12 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     rng: &mut R,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
+
+    // Single chokepoint for every `simulate*` variant (both `simulate_inner` and
+    // the propensity path funnel through here). Guard the modeled-`RATE` dose
+    // precondition once per call, as `predict()` does — `simulate()` runs no
+    // data-check otherwise. #324.
+    assert_modeled_doses_supported(model, population);
 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
@@ -4546,6 +4740,11 @@ pub fn predict(
     population: &Population,
     params: &ModelParameters,
 ) -> Vec<PredictionResult> {
+    // `predict()` runs no data-check (unlike `fit()`); guard the one
+    // model-aware dose precondition so a modeled-`RATE` dose can't reach the
+    // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
+    assert_modeled_doses_supported(model, population);
+
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
 

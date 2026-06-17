@@ -70,6 +70,11 @@ pub fn inits_from_nca(
     population: &Population,
     method: NcaInit,
 ) -> SuggestedStart {
+    // Reached from `fit()` (which validates first) but also a standalone public
+    // entrypoint; the Sweep/Ebe strategies predict, so guard the modeled-`RATE`
+    // dose precondition here too — same loud-not-silent contract as
+    // `predict()`/`simulate()` (#324). No-op for the common all-`Fixed` dataset.
+    crate::api::assert_modeled_doses_supported(model, population);
     match method {
         NcaInit::Nca => nca_only(model, population),
         NcaInit::Sweep => nca_with_sweep(model, population),

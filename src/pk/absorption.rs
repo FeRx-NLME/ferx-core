@@ -192,7 +192,10 @@ impl PreparedInputRate {
     /// `mtt`; inverse-Gaussian `mat`, `cv2`) when clamping a transient mid-fit
     /// excursion (see [`Self::transit`], [`Self::inverse_gaussian`]). Far below
     /// any realistic value, so it never perturbs a converged fit — it only keeps
-    /// a transient `≤ 0` from turning a `.ln()` / `1/x` into a `NaN`/`∞`.
+    /// a transient `≤ 0` from turning a `.ln()` / `1/x` into a `NaN`/`∞`. The
+    /// clamp itself is [`crate::types::clamp_above_floor`], shared with the
+    /// modeled-duration floor ([`crate::types::DoseEvent::DURATION_FLOOR`]) so the
+    /// domain-wall clamps can't drift apart.
     const MIN_PARAM: f64 = 1e-8;
 
     /// Precompute the transit constants for `(n, mtt)`.
@@ -211,11 +214,7 @@ impl PreparedInputRate {
     /// `NaN` inputs also fall to the floor (every `>`/`>=` is false for `NaN`).
     #[inline]
     fn transit(n: f64, mtt: f64) -> Self {
-        let mtt = if mtt > Self::MIN_PARAM {
-            mtt
-        } else {
-            Self::MIN_PARAM
-        };
+        let mtt = crate::types::clamp_above_floor(mtt, Self::MIN_PARAM);
         let n = if n >= 0.0 { n } else { 0.0 };
         let ktr = (n + 1.0) / mtt;
         PreparedInputRate::Transit {
@@ -236,16 +235,8 @@ impl PreparedInputRate {
     /// estimates are unaffected. `NaN` inputs also fall to the floor.
     #[inline]
     fn inverse_gaussian(mat: f64, cv2: f64) -> Self {
-        let mat = if mat > Self::MIN_PARAM {
-            mat
-        } else {
-            Self::MIN_PARAM
-        };
-        let cv2 = if cv2 > Self::MIN_PARAM {
-            cv2
-        } else {
-            Self::MIN_PARAM
-        };
+        let mat = crate::types::clamp_above_floor(mat, Self::MIN_PARAM);
+        let cv2 = crate::types::clamp_above_floor(cv2, Self::MIN_PARAM);
         let two_pi = 2.0 * std::f64::consts::PI;
         PreparedInputRate::InverseGaussian {
             mat,

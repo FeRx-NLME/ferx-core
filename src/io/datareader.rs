@@ -1,6 +1,7 @@
 use crate::io::filter_expr::{FilterClause, RowContext};
 use crate::types::{
-    CovariateDecl, CovariateRow, CovariateTable, DoseEvent, ExclusionSummary, Population, Subject,
+    CovariateDecl, CovariateRow, CovariateTable, DoseEvent, ExclusionSummary, Population, RateMode,
+    Subject,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -764,49 +765,55 @@ fn is_dosing_amt(amt: f64) -> bool {
     amt.is_finite() && amt != 0.0
 }
 
-/// Validate the `RATE` cell of a *dose* record and return the value to hand to
-/// [`DoseEvent::new`].
+/// Classify (and validate) the `RATE` cell of a *dose* record into the
+/// [`RateMode`] its [`DoseEvent`] should carry.
 ///
 /// NONMEM overloads `RATE` with coded values:
 ///   - `0`  → bolus (route set by the dose compartment)
 ///   - `>0` → constant-rate infusion (duration = `AMT/RATE`)
-///   - `-1` → infusion **rate** is *modeled* (a `$PK` `R1` parameter)
-///   - `-2` → infusion **duration** is *modeled* (a `$PK` `D1` parameter)
+///   - `-1` → infusion **rate** is *modeled* (a `$PK` `R{n}` parameter)
+///   - `-2` → infusion **duration** is *modeled* (a `$PK` `D{n}` parameter)
 ///
-/// ferx-core does not yet support the modeled forms (`-1`/`-2`), and previously
-/// fell through to [`DoseEvent::is_infusion`]'s `rate > 0.0` test — silently
-/// turning them into boluses (wrong predictions, no warning). Reject them, and
-/// any other negative or non-finite `RATE`, with an informative error instead of
-/// producing a silently-wrong dose (#324). A NONMEM dataset that uses `-1`/`-2`
-/// without the matching `R1`/`D1` parameter is likewise an error in NONMEM, so
-/// failing here stays faithful rather than guessing.
-fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<f64, String> {
+/// `-2` is accepted as [`RateMode::ModeledDuration`] (#324). The datareader has
+/// no model, so it cannot yet know whether a matching `D{cmt}` parameter exists
+/// or whether the model is an ODE model — those checks move to the model+data
+/// join ([`crate::api::check_model_data`]). `-1` (modeled rate, #324 Phase B),
+/// any other negative, and non-finite values are rejected here: they are
+/// unconditionally invalid regardless of the model. (Previously `-1`/`-2` fell
+/// through to `rate > 0.0` and were silently treated as boluses — #324.)
+fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String> {
     if !rate.is_finite() {
         return Err(format!(
             "subject {id}, time {time}: RATE={rate} is not finite; expected 0 \
-             (bolus), a positive infusion rate, or a NONMEM coded value (-1/-2)"
+             (bolus), a positive infusion rate, or -2 (modeled duration)"
         ));
     }
     if rate >= 0.0 {
-        return Ok(rate);
+        return Ok(RateMode::Fixed);
     }
-    // rate < 0 → NONMEM coded value. Classify with a tolerance rather than a
-    // float `==` (clippy::float_cmp); the cell parses from text so `-1`/`-2` are
-    // exact, but the tolerance keeps clippy quiet and is harmless.
-    let detail = if (rate + 1.0).abs() < 1e-9 {
-        "RATE=-1 (NONMEM: infusion RATE modeled via R1 in $PK)".to_string()
-    } else if (rate + 2.0).abs() < 1e-9 {
-        "RATE=-2 (NONMEM: infusion DURATION modeled via D1 in $PK)".to_string()
+    // rate < 0 → a NONMEM coded value, which is always an *exact negative
+    // integer*. Match on the integer form so the arms read as the codes they are
+    // and a new code is one more arm. A non-integer negative (e.g. -1.5) is not a
+    // code: `fract() != 0.0` rejects it rather than rounding it into one (`round()`
+    // would map -1.5 → -2 and silently accept it as modeled duration). Comparison
+    // against `0.0` is exempt from clippy::float_cmp; `rate as i64` saturates, so
+    // an out-of-range integer can't alias -1/-2.
+    let code = if rate.fract() == 0.0 {
+        Some(rate as i64)
     } else {
-        // Echo the offending value so the bad row is identifiable, matching the
-        // -1/-2/non-finite branches.
-        format!("RATE={rate} (a negative value, not a recognised NONMEM code)")
+        None
+    };
+    let detail = match code {
+        Some(-2) => return Ok(RateMode::ModeledDuration),
+        Some(-1) => "RATE=-1 (NONMEM: infusion RATE modeled via R1 in $PK) is not yet \
+             supported (tracked in #324); use RATE=-2 (modeled duration) or an \
+             explicit positive RATE"
+            .to_string(),
+        _ => format!("RATE={rate} is a negative value that is not a recognised NONMEM code"),
     };
     Err(format!(
-        "subject {id}, time {time}: {detail} is not yet supported by ferx-core; \
-         it was previously (and silently) treated as a bolus. Supply an \
-         explicit positive RATE (= AMT/duration) before importing. Recognised \
-         RATE values are 0 (bolus), >0 (rate), -1, -2."
+        "subject {id}, time {time}: {detail}. Recognised RATE values are 0 \
+         (bolus), >0 (infusion rate), and -2 (modeled infusion duration)."
     ))
 }
 
@@ -1169,10 +1176,13 @@ fn parse_subject(
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64(s))
                 .unwrap_or(0.0);
-            // Reject NONMEM coded / malformed RATE on dose rows (#324). Uses
-            // `raw_time` so the message names the value the user wrote, not the
-            // occasion-shifted engine time. `?` bubbles up through `parse_subject`.
-            let rate = validate_dose_rate(rate, id, raw_time)?;
+            // Classify the RATE cell (#324): >=0 -> Fixed (data-driven rate),
+            // -2 -> ModeledDuration (the duration is a `D{cmt}` parameter,
+            // resolved at the model+data join); -1 / other negative / non-finite
+            // are rejected. Uses `raw_time` so the message names the value the
+            // user wrote, not the occasion-shifted engine time. `?` bubbles up
+            // through `parse_subject`.
+            let rate_mode = validate_dose_rate(rate, id, raw_time)?;
             let ii = ii_col
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64(s))
@@ -1182,7 +1192,10 @@ fn parse_subject(
                 .map(|s| parse_f64(s.trim()) >= 0.5)
                 .unwrap_or(false);
 
-            doses.push(DoseEvent::new(time, amt, cmt, rate, ss, ii));
+            doses.push(match rate_mode {
+                RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
+                RateMode::ModeledDuration => DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode),
+            });
             if occ_col.is_some() {
                 dose_occasions.push(occ);
             }
@@ -1823,24 +1836,32 @@ mod tests {
 
     // ── NONMEM coded RATE values (#324) ──────────────────────────────────────
     // `RATE` is overloaded: 0 = bolus, >0 = infusion rate, -1 = modeled rate
-    // (R1 in $PK), -2 = modeled duration (D1 in $PK). The modeled forms aren't
-    // supported yet and previously fell through to a silent bolus. They must
-    // now be rejected loudly. `validate_dose_rate` is the unit under test.
+    // (R{n} in $PK), -2 = modeled duration (D{n} in $PK). `-2` is accepted as
+    // `ModeledDuration` (the D{cmt}/engine check happens later at the model+data
+    // join); `-1` and malformed values are still rejected loudly.
+    // `validate_dose_rate` is the unit under test.
 
     #[test]
     fn validate_dose_rate_classifies_coded_and_malformed_values() {
-        // -1 → modeled rate (R1); message must name both so a NONMEM user sees it.
+        // -2 → modeled duration: accepted here; the D{cmt} existence / ODE-engine
+        // check happens later at the model+data join, where the model is known.
+        assert_eq!(
+            validate_dose_rate(-2.0, "7", 0.0).unwrap(),
+            RateMode::ModeledDuration
+        );
+
+        // -1 → modeled rate: not yet supported (#324 Phase B). The message names
+        // RATE=-1 and R1 so a NONMEM user recognises it, plus subject/time.
         let e = validate_dose_rate(-1.0, "1", 2.5).unwrap_err();
         assert!(e.contains("RATE=-1") && e.contains("R1"), "{e}");
         assert!(e.contains("subject 1") && e.contains("time 2.5"), "{e}");
 
-        // -2 → modeled duration (D1).
-        let e = validate_dose_rate(-2.0, "7", 0.0).unwrap_err();
-        assert!(e.contains("RATE=-2") && e.contains("D1"), "{e}");
-
         // Other negatives are not recognised NONMEM codes; the message echoes
-        // the offending value so the bad row is identifiable.
-        for r in [-0.5, -3.0, -100.0] {
+        // the offending value so the bad row is identifiable. `-1.5`/`-2.5` are
+        // the regression guard for the integer-match: a non-integer must NOT be
+        // rounded into the -1/-2 codes (it is rejected, not silently accepted as
+        // modeled duration).
+        for r in [-0.5, -1.5, -2.5, -3.0, -100.0] {
             let e = validate_dose_rate(r, "1", 0.0).unwrap_err();
             assert!(
                 e.contains(&format!("RATE={r}")) && e.contains("negative value"),
@@ -1854,9 +1875,9 @@ mod tests {
             assert!(e.contains("not finite"), "r={r}: {e}");
         }
 
-        // Happy paths still pass through unchanged.
-        assert_eq!(validate_dose_rate(0.0, "1", 0.0).unwrap(), 0.0);
-        assert_eq!(validate_dose_rate(50.0, "1", 0.0).unwrap(), 50.0);
+        // Ordinary data-driven rates classify as Fixed.
+        assert_eq!(validate_dose_rate(0.0, "1", 0.0).unwrap(), RateMode::Fixed);
+        assert_eq!(validate_dose_rate(50.0, "1", 0.0).unwrap(), RateMode::Fixed);
     }
 
     #[test]
