@@ -206,12 +206,18 @@ scope to **absorption first**.
 ### The error rule (analytical + ODE-only absorption ⇒ error)
 
 If a user writes an **analytical** `pk one/two/three_cpt_oral(...)` and *also* asks for an
-absorption model with no closed form (transit / IG / Weibull), ferx **errors** with a
-message pointing at `ode_template` — it does **not** silently (or even with a warning) build
-an ODE behind an analytical request. This is Ron's "avoid surprises":
+absorption model with no closed form (**Weibull only**, after Phase 3), ferx **errors** with
+a message pointing at `ode_template` — it does **not** silently (or even with a warning)
+build an ODE behind an analytical request. This is Ron's "avoid surprises":
 
-> *"transit absorption requires an ODE; replace `pk two_cpt_oral(...)` with
-> `ode_template two_cpt_oral(...)` and add `transit(...)` in `[odes]`."*
+> *"Weibull absorption requires an ODE; replace `pk two_cpt_oral(...)` with
+> `ode_template two_cpt_oral(...)` and add `weibull(...)` in `[odes]`."*
+
+Transit and IG both have closed-form convolutions with linear 1/2-cpt disposition (see
+Phase 3 and the closed-form table above), so after Phase 3 they are **not** subject to this
+error rule — they route to the analytical path instead. Until Phase 3 ships, the error rule
+applies to all three (transit / IG / Weibull), with the message pointing at `ode_template`
+for the interim ODE path.
 
 ### Dropped: the declarative `[absorption]` block
 
@@ -272,17 +278,21 @@ Everything else integrates.
 | `sequential` (0→1st) | yes (piecewise: zero-order fill, then first-order) | analytical |
 | `mixed` (0 + 1st) | yes (superpose zero-order + first-order) | analytical |
 | `transit` (Savic), **integer N** | yes (generalized Bateman / sum of N+1 terms) | analytical |
-| `transit` (Savic), **continuous N** | yes **iff** the lower incomplete gamma `P(a,x)` is implemented; else numerical | analytical (Phase 3) or numerical |
+| `transit` (Savic), **continuous N** | yes — exponential tilting of the Gamma distribution: `∫₀ᵗ R_in·e^(k·u)du = M(k)·P(n+1,(KTR−k)·t)` where P is the regularized incomplete gamma; condition `k < KTR` | analytical (Phase 3) |
 | `weibull` | **no** elementary closed form | numerical |
-| `inverse_gaussian` (Freijer & Post) | **no** elementary closed form (general multi-cpt) | numerical |
+| `inverse_gaussian` (Freijer & Post) | yes — exponential tilting of the IG distribution: `∫₀ᵗ f_IG(u;μ,λ)·e^(k·u)du = M(k)·F_IG(t;μ*,λ)` where `μ*=μ/√(1−2μ²k/λ)` and `M(k)=exp(λ/μ·(1−√(1−2μ²k/λ)))`; condition `k < λ/(2μ²)` | analytical (Phase 3) |
 
 The first-order / zero-order / parallel / sequential / mixed family and integer-N transit
 are superpositions of closed forms ferx already has (e.g. `parallel` = two `two_cpt_oral`
-evaluations weighted by `frac`); continuous-N transit gains a closed form once the
-incomplete-gamma special function lands (Phase 3). **Weibull** and **inverse-Gaussian** have
-no elementary closed-form convolution with a multi-compartment disposition and always
-integrate. The user-facing model is the ODE they wrote; any closed-form acceleration is an
-equivalence-tested optimization underneath it, not a different code path they can observe.
+evaluations weighted by `frac`). **Continuous-N transit** and **inverse-Gaussian** both have
+closed-form convolutions with 1/2-cpt disposition via the **exponential tilting property**:
+the Gamma and IG distributions are each closed under tilting by `e^(k·t)`, so the
+convolution integral reduces to the respective distribution's CDF evaluated at a shifted
+parameter — regularized incomplete gamma `P(a,x)` for transit, normal CDF `Φ` (via the
+known IG CDF) for IG. The `TiltedAbsorption` trait (see Engine below) captures both.
+**Weibull** alone has no elementary closed form and always integrates. The user-facing model
+is the ODE they wrote; any closed-form acceleration is an equivalence-tested optimization
+underneath it, not a different code path they can observe.
 
 ## Engine architecture
 
@@ -329,12 +339,13 @@ Decouple **input function** from **disposition**, reusing existing machinery:
    `N` is estimated continuously and transit `N` is commonly 1–10, where Stirling errs ~8% at
    N=1 / ~0.8% at N=10, enough to bias the absorption peak. IGD needs only `exp/sqrt`; Weibull
    needs `powf` — both already AD-safe.
-4. **Incomplete-gamma closed form for transit (Phase 3, promoted from optional):** because
-   keeping continuous-N transit analytical is now a goal (Ron's transparency concern),
-   implement the regularized lower incomplete gamma `P(a,x)` (AD-safe) in `special.rs` so
-   transit→1/2-cpt skips numerical integration. Sequence: ship transit on the numerical
-   fallback first to prove the pipeline, then add the closed form and assert the two agree
-   under the equivalence harness.
+4. **Analytical closed forms for transit and IG (Phase 3):** both use the **exponential
+   tilting property** of their respective distributions (Gamma for transit, IG for IG) — see
+   the `TiltedAbsorption` trait and `convolve_1cpt`/`convolve_2cpt` in the Phase 3 section
+   above. Special functions required: `regularized_gamma_p(a, x)` (transit; series + CF
+   expansion, AD-safe) and `normal_cdf(x)` (IG; via `erfc`), both in `special.rs`. Sequence:
+   ship each model on the numerical ODE path first (Phases 0/1) to prove the pipeline, then
+   add the closed form in Phase 3 and assert they agree under the equivalence harness.
 
 ## Robustness ("no happy paths") — explicit requirements
 
@@ -400,19 +411,67 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   Generate the standard PK disposition ODEs from the codified analytical↔ODE transforms, and
   reject an analytical `pk` disposition combined with an ODE-only absorption model, pointing the
   user at `ode_template`. Reuses the undefined-name walker / "declared-but-unused" census.
-- **Phase 1 — inverse-Gaussian (Freijer & Post).** Single + sum-of-two IG; **numerical**
-  (no closed form). Anchor vs the Freijer & Post paper / a NONMEM `$DES` IG run.
+- **Phase 1 — inverse-Gaussian (Freijer & Post).** Single + sum-of-two IG; ships as
+  **numerical** (ODE forcing), even though a closed form exists (see Phase 3) — the ODE
+  path is the same pipeline as transit and validates the forcing mechanism end-to-end before
+  the analytical fast path is added. Anchor vs the Freijer & Post paper / a NONMEM `$DES`
+  IG run.
 - **Phase 2 — Weibull + zero-order + sequential + parallel + mixed.** Round out the
   catalogue; each with a NONMEM anchor. **Closed-form** for zero-order/sequential/parallel/
   mixed (superpose existing solvers; the zero-order family reuses #324's estimated-duration
   forcing); **numerical** for Weibull (warned on an analytical disposition).
-- **Phase 3 — analytical incomplete-gamma closed form for transit** (1/2-cpt) so continuous-N
-  transit stays in the analytical engine; assert it matches the Phase-0 numerical form under
-  the equivalence harness. The speed win is twofold: it removes the adaptive ODE solve *and*
-  moves transit onto the AD-capable analytical `pk` path, dropping the FD-gradient multiplier
-  (ODE models fall back to finite differences — `(n_params+1)` solves per gradient — which is
-  also what forces the tight ODE tolerance). The NONMEM anchor (PR #385) quantified the gap:
-  ~89 s release at `ode_*tol=1e-9` vs NONMEM's ~16 s.
+- **Phase 3 — analytical closed forms for transit and IG** (1/2-cpt). Both are implemented
+  via the **`TiltedAbsorption` trait** in a new `src/pk/analytical_absorption.rs`:
+
+  ```rust
+  pub trait TiltedAbsorption {
+      fn mgf(&self, k: f64) -> f64;         // E[e^(k·X)]
+      fn tilted_cdf(&self, t: f64, k: f64) -> f64;  // CDF of the e^(k·t)-tilted distribution
+  }
+  ```
+
+  The generic convolution with 1-cpt or 2-cpt disposition is the same for both:
+
+  ```rust
+  pub fn convolve_1cpt<A: TiltedAbsorption>(abs: &A, t: f64, ke: f64, f_dose_over_v: f64) -> f64 {
+      f_dose_over_v * abs.mgf(ke) * (-ke * t).exp() * abs.tilted_cdf(t, ke)
+  }
+  pub fn convolve_2cpt<A: TiltedAbsorption>(
+      abs: &A, t: f64, alpha: f64, beta: f64, big_a: f64, big_b: f64, f_dose: f64,
+  ) -> f64 {
+      f_dose * (big_a * (-alpha*t).exp() * abs.mgf(alpha) * abs.tilted_cdf(t, alpha)
+              + big_b * (-beta*t).exp()  * abs.mgf(beta)  * abs.tilted_cdf(t, beta))
+  }
+  ```
+
+  **Transit** (`TransitAbsorption { n, mtt }`): Gamma is closed under exponential tilting.
+  `mgf(k) = (KTR/(KTR−k))^(n+1)`, `tilted_cdf(t,k) = P(n+1, (KTR−k)·t)` (regularized
+  incomplete gamma). Condition: `k < KTR = (n+1)/mtt`. Sanity check: n=0 recovers Bateman
+  exactly (since `P(1,x) = 1−e^(−x)`).
+
+  **IG** (`IgAbsorption { mat, lambda }` with `lambda = mat/cv2`): IG is closed under
+  exponential tilting. `mgf(k) = exp(λ/μ·(1−√(1−2μ²k/λ)))`,
+  `tilted_cdf(t,k) = F_IG(t; μ*, λ)` with `μ* = μ/√(1−2μ²k/λ)`, and F_IG expressed via
+  the normal CDF Φ (the known IG CDF formula). Condition: `k < λ/(2μ²) = 1/(2·MAT·CV²)` —
+  satisfied for virtually all PK parameters. Reference: the tilting identity is a standard
+  result; the IG closed form was identified by working through the issue #322 comment thread
+  (2026-06-17). The Hof & Bridge (2021) paper (doi:10.1007/s10928-020-09719-8) confirms the
+  analogous result for transit.
+
+  **Special functions needed** (`src/stats/special.rs`):
+  - `regularized_gamma_p(a, x)` — series for `x < a+1`, continued fraction for `x >= a+1`;
+    `ln_gamma` (Lanczos) already present.
+  - `normal_cdf(x)` — `0.5 * erfc(-x / sqrt(2))`.
+
+  **Error rule update:** after Phase 3 merges, the "analytical `pk` + absorption" hard error
+  no longer applies to transit or IG — they route to `convolve_1cpt`/`convolve_2cpt`
+  directly. Weibull remains an error (no closed form).
+
+  The speed win for transit is twofold: removes the adaptive ODE solve *and* moves transit
+  onto the AD-capable analytical `pk` path, dropping the FD-gradient multiplier. The NONMEM
+  anchor (PR #385) quantified the gap: ~89 s release at `ode_*tol=1e-9` vs NONMEM's ~16 s.
+  Assert both transit and IG closed forms match their Phase-0/1 numerical ODE forms under the
+  equivalence harness.
 
 ## ferx-r follow-up (per user-facing feature)
 
@@ -450,7 +509,7 @@ Per-phase mapping:
 | 0b | `ode_template` | yes | pin bump + example/docs + `NEWS.md` |
 | 1 | `igd()` | yes | pin bump + IG example/test + `NEWS.md` |
 | 2 | `weibull` / `zero_order` / `sequential` / `mixed` | yes | pin bump + examples + `NEWS.md` |
-| 3 | incomplete-gamma closed form | **no** (internal accel, numerically identical) | none — no API or behaviour change for R |
+| 3 | incomplete-gamma closed form (transit) + IG closed form | **no** (internal accel, numerically identical) | none — no API or behaviour change for R |
 
 #324's faithful `R1`/`D1` is a separate data-format feature (coded `RATE`), so its ferx-r
 follow-up — a pin bump plus any R-side dose-column docs — is tracked on #324, not here.
