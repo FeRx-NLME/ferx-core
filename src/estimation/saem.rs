@@ -1445,7 +1445,7 @@ pub fn run_saem(
                         // flag reported back for diagnostics.
                         #[cfg(feature = "autodiff")]
                         let did_hmc = if using_hmc {
-                            if let Some((new_eta, new_nll, accepted)) =
+                            if let Some((new_eta, new_nll, accepted, _divergent)) =
                                 crate::estimation::hmc::hmc_step(
                                     subject, &eta_work, nll, model, theta_ref, omega_ref,
                                     sigma_ref, scale, n_leapfrog, &mut rng,

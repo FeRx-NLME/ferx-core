@@ -116,7 +116,7 @@ pub fn inverse_wishart_draw(
 // `crate::stats::convergence` so any sampler can share them; only the
 // Bayes-specific `PosteriorSummary` assembly stays here.
 
-use crate::stats::convergence::{effective_sample_size, mean, quantile_sorted, split_rhat};
+use crate::stats::convergence::{ess_bulk, ess_tail, mean, quantile_sorted, split_rhat};
 use crate::types::PosteriorSummary;
 
 /// Build a [`PosteriorSummary`] for one parameter from its per-chain draws.
@@ -129,7 +129,8 @@ pub fn summarize_param(name: &str, chains: &[Vec<f64>]) -> PosteriorSummary {
         0.0
     };
     all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let ess = effective_sample_size(chains);
+    let bulk = ess_bulk(chains);
+    let tail = ess_tail(chains);
     PosteriorSummary {
         name: name.to_string(),
         mean: mean_v,
@@ -138,12 +139,11 @@ pub fn summarize_param(name: &str, chains: &[Vec<f64>]) -> PosteriorSummary {
         median: quantile_sorted(&all, 0.5),
         q975: quantile_sorted(&all, 0.975),
         rhat: split_rhat(chains),
-        // Bulk/tail ESS distinction (rank-normalized, folded) is a follow-up;
-        // the single autocorrelation-based estimate is reported for both for now.
-        ess_bulk: ess,
-        ess_tail: ess,
-        mcse: if ess > 0.0 {
-            sd_v / ess.sqrt()
+        ess_bulk: bulk,
+        ess_tail: tail,
+        // MCSE of the posterior mean uses the bulk ESS.
+        mcse: if bulk > 0.0 {
+            sd_v / bulk.sqrt()
         } else {
             f64::NAN
         },
@@ -300,6 +300,12 @@ pub fn run_bayes(
     #[cfg(feature = "autodiff")]
     let using_hmc = n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some();
 
+    // Post-warmup HMC divergences across all chains (only the autodiff HMC
+    // η-kernel can produce these; the MH kernel never mutates it, hence the
+    // allow on non-autodiff builds).
+    #[allow(unused_mut)]
+    let mut n_divergent_total = 0u64;
+
     for chain in 0..n_chains {
         let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
         let mut scratch = EventPkParams::default();
@@ -390,22 +396,28 @@ pub fn run_bayes(
             for i in 0..n_subjects {
                 #[cfg(feature = "autodiff")]
                 let did_hmc = if using_hmc {
-                    if let Some((new_eta, new_nll, accepted)) = crate::estimation::hmc::hmc_step(
-                        &population.subjects[i],
-                        &etas[i],
-                        nll[i],
-                        model,
-                        &theta,
-                        &omega_cur,
-                        &sigma,
-                        eta_scale,
-                        n_leapfrog,
-                        &mut rng,
-                    ) {
+                    if let Some((new_eta, new_nll, accepted, divergent)) =
+                        crate::estimation::hmc::hmc_step(
+                            &population.subjects[i],
+                            &etas[i],
+                            nll[i],
+                            model,
+                            &theta,
+                            &omega_cur,
+                            &sigma,
+                            eta_scale,
+                            n_leapfrog,
+                            &mut rng,
+                        )
+                    {
                         etas[i] = new_eta;
                         nll[i] = new_nll;
                         acc_eta += accepted as u64;
                         prop_eta += 1;
+                        // Count post-warmup divergences for the diagnostic.
+                        if sweep >= n_warmup && divergent {
+                            n_divergent_total += 1;
+                        }
                         true
                     } else {
                         false
@@ -828,7 +840,9 @@ pub fn run_bayes(
         n_chains,
         n_warmup,
         n_draws_per_chain,
-        n_divergent: 0, // MH eta block has no divergence concept; HMC count TBD
+        // Post-warmup HMC divergences (0 on the MH eta path, which has no
+        // divergence concept).
+        n_divergent: n_divergent_total as usize,
         max_rhat,
         draws: None,
     };
