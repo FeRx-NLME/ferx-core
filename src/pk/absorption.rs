@@ -229,7 +229,7 @@ impl PreparedInputRate {
     /// Precompute the inverse-Gaussian constants for `(mat, cv2)`.
     ///
     /// As with [`Self::transit`], the arguments are **clamped to the valid
-    /// domain** (`mat > 0`, `cv2 > 0`, floor [`Self::MIN_MTT`]) so a transient
+    /// domain** (`mat > 0`, `cv2 > 0`, floor [`Self::MIN_PARAM`]) so a transient
     /// mid-search excursion (additive `eta`, wide FD step) yields a finite
     /// `R_in` at the domain wall instead of a `NaN` (`ln`/`1/0`) that would
     /// poison the ODE RHS; the converged optimum is interior, so reported
