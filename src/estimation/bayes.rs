@@ -1495,6 +1495,60 @@ mod tests {
         assert_eq!(res.kappas.len(), pop.subjects.len());
     }
 
+    /// HMC eta-block end-to-end (autodiff only). With `saem_n_leapfrog > 0` on an
+    /// analytical-PK model with no IOV, `run_bayes` routes the η block through the
+    /// gradient-guided `hmc_step` instead of the random-walk kernel (the
+    /// `#[cfg(feature = "autodiff")]` branch at the top of the sweep). The default
+    /// (non-autodiff) coverage build compiles that branch out, so without this
+    /// test the Bayes→HMC routing has zero coverage in any CI job. Asserts the
+    /// HMC path yields finite, well-ordered summaries and a sane warfarin fit.
+    #[test]
+    #[cfg(feature = "autodiff")]
+    fn run_bayes_warfarin_hmc_eta_block() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let params = model.default_params.clone();
+
+        // Routing precondition for the HMC η block: analytical PK, no IOV.
+        assert!(model.ode_spec.is_none() && model.tv_fn.is_some() && model.n_kappa == 0);
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 200;
+        opts.bayes_iters = 200;
+        opts.bayes_chains = 2;
+        opts.bayes_seed = Some(1);
+        opts.saem_n_leapfrog = 3; // > 0 ⇒ HMC η block (vs random-walk default)
+
+        let res = run_bayes(&model, &pop, &params, &opts).expect("HMC bayes runs");
+        let bayes = res.bayes.as_ref().expect("BayesResult present");
+
+        assert!(!bayes.summaries.is_empty(), "expected posterior summaries");
+        for s in &bayes.summaries {
+            assert!(s.mean.is_finite(), "{}: mean not finite", s.name);
+            assert!(s.sd.is_finite() && s.sd >= 0.0, "{}: bad sd", s.name);
+            assert!(
+                s.q025 <= s.median && s.median <= s.q975,
+                "{}: quantiles out of order",
+                s.name
+            );
+            assert!(s.rhat.is_finite(), "{}: R-hat not finite", s.name);
+        }
+        // Sane population recovery from the HMC-sampled etas.
+        let tvcl = bayes
+            .summaries
+            .iter()
+            .find(|s| s.name == "TVCL")
+            .expect("TVCL summary");
+        assert!((0.10..0.20).contains(&tvcl.mean), "TVCL {}", tvcl.mean);
+        assert!(res.ofv.is_finite(), "OFV not finite");
+        assert!(bayes.max_rhat.is_finite());
+        assert_eq!(res.eta_hats.len(), pop.subjects.len());
+    }
+
     #[test]
     #[ignore = "exploratory: prints FOCEI vs Bayes posterior means"]
     fn bayes_vs_focei_print() {
