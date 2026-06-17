@@ -510,6 +510,18 @@ pub fn foce_subject_nll(
 /// `bloq_method == M3`, the dispatcher has already routed to the interaction
 /// Build per-observation R-diagonal overrides for FREM covariate pseudo-observations.
 /// Returns `None` when FREM is inactive (no config or empty fremtype).
+/// Overwrite the residual-variance diagonal at FREM covariate pseudo-observation
+/// rows with the per-row overrides built by [`build_frem_r_override`]. `None`
+/// entries (ordinary PK observations) are left untouched. Indices past the end
+/// of `r_diag` are skipped defensively.
+pub fn apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[Option<f64>]) {
+    for (j, ov) in overrides.iter().enumerate() {
+        if let (Some(v), true) = (ov, j < r_diag.len()) {
+            r_diag[j] = *v;
+        }
+    }
+}
+
 pub fn build_frem_r_override(
     frem_config: Option<&FremConfig>,
     fremtype: &[u16],
@@ -563,22 +575,16 @@ pub fn foce_subject_nll_standard(
         .map(|(j, &ip)| ip - h_eta[j])
         .collect();
 
-    // R diagonal at f0, with FREM overrides for covariate observations.
-    let mut r_diag = compute_r_diag(error_spec, &f0, &subject.obs_cmts, sigma_values);
-    if let Some(overrides) = frem_r_override {
-        for (j, ov) in overrides.iter().enumerate() {
-            if let Some(v) = ov {
-                if j < r_diag.len() {
-                    r_diag[j] = *v;
-                }
-            }
-        }
-    }
-    // R diagonal; inflate with EKF process-noise variance for SDE models.
+    // R diagonal; inflate with EKF process-noise variance for SDE models, then
+    // overwrite FREM covariate rows with their EPSCOV² overrides. The override
+    // must come last so it survives the r_pred_override re-evaluation of R.
     let r_eval: &[f64] = r_pred_override.unwrap_or(&f0);
     let mut r_diag = compute_r_diag(error_spec, r_eval, &subject.obs_cmts, sigma_values);
     for (j, r) in r_diag.iter_mut().enumerate() {
         *r += p_obs.get(j).copied().unwrap_or(0.0);
+    }
+    if let Some(overrides) = frem_r_override {
+        apply_frem_r_overrides(&mut r_diag, overrides);
     }
 
     // R_tilde = H * Omega * H' + diag(R)
@@ -1739,6 +1745,51 @@ mod tests {
             nll_f0 - nll_override > 20.0,
             "override must change the SB marginal (R evaluated at f(η=0), not f0): \
              nll_f0={nll_f0}, nll_override={nll_override}"
+        );
+    }
+
+    /// Regression for the FREM r_diag merge collision: `frem_r_override` must
+    /// reach the residual-variance diagonal that feeds R̃, even though
+    /// `r_pred_override` re-evaluates R afterward. Before the fix the override
+    /// loop ran on a `r_diag` that was immediately shadowed and discarded, so
+    /// FREM covariate rows silently used the PK error variance and the marginal
+    /// was identical with or without the override.
+    #[test]
+    fn foce_standard_applies_frem_r_override() {
+        let subject = make_simple_subject(); // 6 obs
+        let omega = make_omega(0.09);
+        let sigma = vec![0.2]; // proportional SD
+        let error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        let ipreds = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let eta_hat = DVector::from_vec(vec![1.0]);
+        let h_matrix = DMatrix::from_column_slice(6, 1, &[10.0, 5.0, 5.0, 5.0, 5.0, 5.0]);
+
+        let call = |frem: Option<&[Option<f64>]>| {
+            foce_subject_nll_standard(
+                &subject,
+                &ipreds,
+                &eta_hat,
+                &h_matrix,
+                &omega,
+                &sigma,
+                &error_spec,
+                BloqMethod::Drop,
+                &[],
+                frem,
+                None,
+            )
+        };
+
+        // Override the first row's residual variance with a value far from the
+        // PK error model's R(f0)[0] = (10·0.2)² = 4.
+        let overrides = [Some(250.0), None, None, None, None, None];
+        let nll_plain = call(None);
+        let nll_frem = call(Some(&overrides));
+
+        assert!(nll_plain.is_finite() && nll_frem.is_finite());
+        assert!(
+            (nll_plain - nll_frem).abs() > 1e-6,
+            "frem_r_override must change the marginal OFV (plain={nll_plain}, frem={nll_frem})"
         );
     }
 

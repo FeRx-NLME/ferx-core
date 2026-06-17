@@ -928,13 +928,7 @@ fn compute_joint_posterior_hessian(
         sigma,
     );
     if let Some(ref overrides) = frem_ov {
-        for (j, ov) in overrides.iter().enumerate() {
-            if let Some(v) = ov {
-                if j < r_diag.len() {
-                    r_diag[j] = *v;
-                }
-            }
-        }
+        crate::stats::likelihood::apply_frem_r_overrides(&mut r_diag, overrides);
     }
 
     // Build the full Jacobian via FD for kappa columns
@@ -1322,13 +1316,7 @@ pub(crate) fn compute_posterior_hessian(
         sigma,
     );
     if let Some(ref overrides) = frem_ov {
-        for (j, ov) in overrides.iter().enumerate() {
-            if let Some(v) = ov {
-                if j < r_diag.len() {
-                    r_diag[j] = *v;
-                }
-            }
-        }
+        crate::stats::likelihood::apply_frem_r_overrides(&mut r_diag, overrides);
     }
     let mut h_post = omega_inv.clone();
     for j in 0..n_obs {
