@@ -31,6 +31,20 @@ section of the SDLC for the versioning policy).
   `bayes_chains`, `bayes_thin`, `bayes_seed`. Supports BSV and zero-mean IOV
   (per-occasion `kappa`, with a conjugate inverse-Wishart `Omega_iov` draw).
   Validated against FOCEI and NONMEM `METHOD=BAYES` on warfarin (#380).
+- **Modeled infusion duration (`RATE=-2` → `Dn`) for ODE models** — NONMEM's
+  `RATE=-2` makes a zero-order infusion's *duration* a modeled parameter: name an
+  individual parameter `D{n}` for the dose compartment `n` and ferx infuses `AMT`
+  over that duration (rate `AMT/Dn`), resolved per iteration and occasion (so it
+  can carry covariate effects and IOV). Composes with `F{n}` (applied exactly
+  once — `F·AMT` over `Dn`) and `ALAG{n}` (shifts the window; `Dn` sets its
+  length), and works with steady state, multi-dose, and system resets. A
+  `RATE=-2` dose with no matching `D{n}` parameter — or on an analytical model —
+  is now a loud error rather than a silent bolus (the original #324 bug), both at
+  the model+data join (`fit`/`ferx check`) and at the `predict()`/`simulate()`
+  entrypoints (which skip the full data-check). A modeled `D{n}` that is
+  non-positive at the initial estimate is flagged with a `W_MODELED_DURATION_NONPOSITIVE`
+  warning (use a positive link such as `exp`). `RATE=-1` (modeled *rate*, `Rn`)
+  and analytical-engine support remain tracked #324 follow-ups (#324).
 - **Simulation-based NPDE / NPD diagnostics** in the `sdtab` output. Set
   `[fit_options] npde_nsim = 1000` (and optionally `npde_seed`) to add `NPDE`
   (Normalized Prediction Distribution Errors, decorrelated within subject) and
@@ -219,6 +233,12 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **IMPMAP** now responds to a cooperative cancellation (e.g. an R-session
+  interrupt) during an iteration's E-step, instead of only at iteration
+  boundaries. The importance-sampling pass — the dominant per-iteration cost on
+  large datasets — previously ran to completion before the cancel flag was
+  checked, so a kill request could appear to hang for minutes; the E-step now
+  polls per subject and the run aborts promptly (#273).
 - An individual parameter assigned only inside symmetric `if`/`else` branches in
   `[individual_parameters]` (the NONMEM-style `IF (cond) CL = ...` /
   `IF (!cond) CL = ...` construction) on an **ODE model** is no longer rejected

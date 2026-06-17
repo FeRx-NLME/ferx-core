@@ -534,6 +534,24 @@ pub(crate) struct SubjectDraws {
     pub second_moment: DMatrix<f64>,
 }
 
+impl SubjectDraws {
+    /// Cheap placeholder returned when a cancellation is observed mid-E-step, so
+    /// the rayon task exits immediately instead of running the inner loop /
+    /// importance sampling. The IMPMAP driver breaks out of the iteration right
+    /// after the `par_iter` collect, so these benign values never feed a real
+    /// M-step.
+    pub(crate) fn cancelled(n_eta: usize) -> Self {
+        SubjectDraws {
+            log_marginal: 0.0,
+            ess_fraction: 1.0,
+            etas: Vec::new(),
+            weights: Vec::new(),
+            mean: vec![0.0; n_eta],
+            second_moment: DMatrix::zeros(n_eta, n_eta),
+        }
+    }
+}
+
 /// Draw `K` importance samples for one subject from a proposal centered at the
 /// conditional mode `η̂` with first-order-variance scale `Σ = (H + λI)⁻¹`, and
 /// return the retained samples, self-normalized weights, and weighted second
@@ -1113,6 +1131,24 @@ pub(crate) fn compute_posterior_hessian(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subject_draws_cancelled_is_benign_and_correctly_shaped() {
+        // The placeholder returned when the IMPMAP E-step observes a cancel:
+        // zero samples/weights so it can't bias an (already-skipped) M-step, a
+        // zero second moment of the right dimension, and an ESS that does not
+        // count as low-ESS.
+        let n_eta = 3;
+        let d = SubjectDraws::cancelled(n_eta);
+        assert_eq!(d.log_marginal, 0.0);
+        assert_eq!(d.ess_fraction, 1.0);
+        assert!(d.etas.is_empty());
+        assert!(d.weights.is_empty());
+        assert_eq!(d.mean, vec![0.0; n_eta]);
+        assert_eq!(d.second_moment.nrows(), n_eta);
+        assert_eq!(d.second_moment.ncols(), n_eta);
+        assert!(d.second_moment.iter().all(|&x| x == 0.0));
+    }
 
     #[test]
     fn logsumexp_handles_extreme_spread() {

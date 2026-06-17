@@ -18555,6 +18555,91 @@ CL V KA WT
     }
 
     #[test]
+    fn ode_modeled_duration_param_populates_map() {
+        // A `D{n}` parameter (modeled infusion duration, RATE=-2; #324) in an ODE
+        // model must (a) parse without tripping the dead-parameter census — it is
+        // an engine-applied dose attribute, not a dead structural param — and
+        // (b) populate `dose_attr_map` as Duration for compartment 2.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVD2(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  D2 = TVD2
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("D2 parses (engine-applied, not dead)");
+        let map = &parsed
+            .model
+            .ode_spec
+            .as_ref()
+            .expect("ode spec")
+            .dose_attr_map;
+        assert!(
+            map.indexed_slot(crate::types::DoseAttr::Duration, 2)
+                .is_some(),
+            "D2 must map as modeled duration for compartment 2"
+        );
+        // It bound nothing else (no D1, no F2).
+        assert!(map
+            .indexed_slot(crate::types::DoseAttr::Duration, 1)
+            .is_none());
+        assert!(map.indexed_slot(crate::types::DoseAttr::F, 2).is_none());
+    }
+
+    #[test]
+    fn ode_modeled_duration_out_of_range_compartment_errors() {
+        // `D5` references compartment 5 but the model has 2 states -> the same
+        // loud n_states guard that rejects `F3` (#324/#369), never a silently
+        // ignored spare slot.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVD5(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  D5 = TVD5
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -CL/V * depot
+  d/dt(central) =  CL/V * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(src)
+            .err()
+            .expect("D5 on a 2-state model must error");
+        assert!(
+            err.contains("compartment 5") && err.contains("D5"),
+            "error must name the attribute and compartment, got: {err}"
+        );
+    }
+
+    #[test]
     fn derived_resolves_covariate_case_insensitively() {
         // Regression: a covariate carried in the dataset under an uppercase
         // header (`WT`) referenced as lowercase `wt` in a [derived] expression

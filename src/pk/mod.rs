@@ -998,6 +998,21 @@ pub fn compute_predictions_with_states(
 /// Uses analytical equations for standard PK models, or delegates to ODE solver
 /// when an OdeSpec is provided.
 pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
+    // Defensive guard (#324): modeled-RATE doses (RATE=-2 -> D{cmt}) are
+    // ODE-only and are rejected on analytical models by every public entrypoint
+    // first (`fit()` / `ferx check` via `check_model_data`, `predict()` /
+    // `simulate()` via `assert_modeled_doses_supported`). Reaching here with one
+    // means every gate was bypassed (e.g. a direct caller of this `pub` fn on an
+    // unvalidated `Population`). A modeled dose has `rate == 0` but reports
+    // `is_infusion()`, so it would route into the infusion closed form as a
+    // 0-rate "infusion" — silently 0/NaN, the exact #324 silent-bolus class.
+    // A real `assert!` (not `debug_assert!`) so release builds fail loudly too;
+    // it is O(doses) and dwarfed by the per-observation analytical evaluation.
+    assert!(
+        subject.all_doses_fixed(),
+        "modeled-RATE dose reached the analytical predictor unresolved \
+         (RATE=-2 is ODE-only; validate with check_model_data before predicting)"
+    );
     // Dose superposition cannot express a system reset (EVID=3/4): a reset
     // zeros the compartments mid-record, which is not a sum of independent
     // dose responses. Route reset-bearing subjects through the
@@ -1376,6 +1391,28 @@ mod tests {
         let preds = compute_predictions(PkModel::OneCptIv, &subj, &pk);
         assert!(preds[0] > 0.0);
         assert_relative_eq!(preds[1], 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    #[should_panic(expected = "modeled-RATE dose reached the analytical predictor")]
+    fn compute_predictions_panics_on_modeled_dose() {
+        // #324 / review #2: the analytical superposition predictor must reject a
+        // modeled-RATE (RATE=-2) dose loudly *in release too* — a real `assert!`,
+        // not the old `debug_assert!` that compiled out and let a 0-rate "infusion"
+        // silently produce 0/NaN. Direct call (bypassing the public entrypoints'
+        // gates) proves the predictor itself fails fast on an unvalidated subject.
+        use crate::types::RateMode;
+        let mut subj = make_subject_with_tv(HashMap::new(), Vec::new(), Vec::new(), 0, 1);
+        subj.doses = vec![DoseEvent::modeled(
+            0.0,
+            100.0,
+            1,
+            false,
+            0.0,
+            RateMode::ModeledDuration,
+        )];
+        let pk = make_pk_params(10.0, 100.0);
+        let _ = compute_predictions(PkModel::OneCptIv, &subj, &pk);
     }
 
     fn make_subject_with_tv(

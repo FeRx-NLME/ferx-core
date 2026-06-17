@@ -410,6 +410,19 @@ pub fn event_driven_predictions(
     pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
 ) -> Vec<f64> {
+    // Defensive guard (#324): modeled-RATE doses (e.g. RATE=-2 -> D{cmt}) are
+    // ODE-only. Every public entrypoint that can see them rejects analytical
+    // models first — `fit()` / `ferx check` via `check_model_data`, and
+    // `predict()` / `simulate()` via `assert_modeled_doses_supported`. Reaching
+    // here with one means a path bypassed every gate (e.g. a direct caller of
+    // this `pub` fn). A real `assert!` (not `debug_assert!`) so release builds
+    // fail loudly too instead of silently mis-handling a 0-rate "infusion"; it is
+    // O(doses) and dwarfed by the per-interval event-driven evaluation.
+    assert!(
+        subject.all_doses_fixed(),
+        "modeled-RATE dose reached the analytical predictor unresolved \
+         (RATE=-2 is ODE-only; validate with check_model_data before predicting)"
+    );
     let dose_lagtimes: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
     let schedule = EventSchedule::for_subject(subject, pk_model, &dose_lagtimes);
     event_driven_predictions_with_schedule(
@@ -1212,6 +1225,28 @@ mod tests {
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "modeled-RATE dose reached the analytical predictor")]
+    fn event_driven_predictions_panics_on_modeled_dose() {
+        // #324 / review #2: the analytical event-driven predictor must reject a
+        // modeled-RATE dose *loudly in release too* (a real `assert!`, not a
+        // `debug_assert!`). A modeled dose has rate == 0 but reports is_infusion(),
+        // so before the guard it routed into the infusion closed form as a 0-rate
+        // "infusion" — the #324 silent-bolus class. Direct call (bypassing the
+        // public-entrypoint gates) confirms the predictor itself fails fast.
+        use crate::types::RateMode;
+        let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
+        let subject = make_subject(vec![modeled], vec![1.0]);
+        let pk = pk_one(5.0, 50.0);
+        let _ = event_driven_predictions(
+            PkModel::OneCptIv,
+            &subject,
+            std::slice::from_ref(&pk),
+            std::slice::from_ref(&pk),
+            &[],
+        );
     }
 
     // ── F (bioavailability) & lagtime across RATE options (#324 follow-up) ──
