@@ -333,10 +333,16 @@ pub fn run_bayes(
         };
         let u0 = pack(&theta, &sigma);
 
-        let mut rw_scale = 0.1_f64;
+        // Per-coordinate random-walk step sizes for the (θ, σ) block. A single
+        // shared scalar mixed badly for parameters on very different scales or
+        // with very different identifiability (e.g. a weakly-identified 3-cpt
+        // peripheral volume vs a well-determined clearance); each coordinate now
+        // adapts its own scale and is updated componentwise.
+        let n_pop = pop_coords.len();
+        let mut rw_scales = vec![0.1_f64; n_pop];
+        let mut acc_pop = vec![0u64; n_pop];
+        let mut prop_pop = vec![0u64; n_pop];
         let mut eta_scale = 0.6_f64;
-        let mut acc_pop = 0u64;
-        let mut prop_pop = 0u64;
         let mut acc_eta = 0u64;
         let mut prop_eta = 0u64;
 
@@ -493,67 +499,82 @@ pub fn run_bayes(
                 }
             }
 
-            // ---- 3. (θ, σ) block (random-walk Metropolis) ----
-            if !pop_coords.is_empty() {
-                let u_cur = pack(&theta, &sigma);
-                let u_prop: Vec<f64> = u_cur
-                    .iter()
-                    .map(|&u| u + rw_scale * rng.sample::<f64, _>(StandardNormal))
-                    .collect();
-                let mut theta_prop = theta.clone();
-                let mut sigma_prop = sigma.clone();
-                for (c, &up) in pop_coords.iter().zip(&u_prop) {
-                    match *c {
-                        PopCoord::Theta { idx, log } => {
-                            theta_prop[idx] = if log { up.exp() } else { up };
+            // ---- 3. (θ, σ) block (componentwise random-walk Metropolis) ----
+            // Each non-conjugate population coordinate is proposed and
+            // accepted/rejected on its own, with its own adaptive scale. Moving
+            // one θ/σ changes every subject's likelihood (it's a population
+            // parameter), so each coordinate move recomputes the full per-subject
+            // NLL; η and Ω are fixed, so their prior terms cancel in the ratio.
+            if n_pop > 0 {
+                let inv_var = 1.0 / (POP_PRIOR_SD * POP_PRIOR_SD);
+                for c in 0..n_pop {
+                    let (idx, log, is_theta) = match pop_coords[c] {
+                        PopCoord::Theta { idx, log } => (idx, log, true),
+                        PopCoord::Sigma { idx } => (idx, true, false),
+                    };
+                    let u_old = if is_theta {
+                        if log {
+                            theta[idx].max(TINY).ln()
+                        } else {
+                            theta[idx]
                         }
-                        PopCoord::Sigma { idx } => {
-                            sigma_prop[idx] = up.exp();
-                        }
+                    } else {
+                        sigma[idx].max(TINY).ln()
+                    };
+                    let u_new = u_old + rw_scales[c] * rng.sample::<f64, _>(StandardNormal);
+
+                    let mut theta_prop = theta.clone();
+                    let mut sigma_prop = sigma.clone();
+                    if is_theta {
+                        theta_prop[idx] = if log { u_new.exp() } else { u_new };
+                    } else {
+                        sigma_prop[idx] = u_new.exp();
                     }
-                }
-                // Proposal population NLL (η, Ω fixed ⇒ η-prior term cancels).
-                let nll_prop: Vec<f64> = (0..n_subjects)
-                    .map(|i| {
-                        individual_nll_into(
-                            model,
-                            &population.subjects[i],
-                            &theta_prop,
-                            &etas[i],
-                            &omega_cur,
-                            &sigma_prop,
-                            &mut scratch,
-                        )
-                    })
-                    .collect();
-                let sum_cur: f64 = nll.iter().sum();
-                let sum_prop: f64 = nll_prop.iter().sum();
-                let nlp_cur = neg_log_prior(&u_cur, &u0);
-                let nlp_prop = neg_log_prior(&u_prop, &u0);
-                let log_alpha = (sum_cur + nlp_cur) - (sum_prop + nlp_prop);
-                prop_pop += 1;
-                if rng.gen::<f64>().ln() < log_alpha {
-                    theta = theta_prop;
-                    sigma = sigma_prop;
-                    nll = nll_prop;
-                    acc_pop += 1;
+                    let nll_prop: Vec<f64> = (0..n_subjects)
+                        .map(|i| {
+                            individual_nll_into(
+                                model,
+                                &population.subjects[i],
+                                &theta_prop,
+                                &etas[i],
+                                &omega_cur,
+                                &sigma_prop,
+                                &mut scratch,
+                            )
+                        })
+                        .collect();
+                    let sum_cur: f64 = nll.iter().sum();
+                    let sum_prop: f64 = nll_prop.iter().sum();
+                    // Gaussian prior delta on this coordinate only (independent
+                    // N(u0, POP_PRIOR_SD²) per coordinate).
+                    let d_nlp = 0.5 * ((u_new - u0[c]).powi(2) - (u_old - u0[c]).powi(2)) * inv_var;
+                    let log_alpha = (sum_cur - sum_prop) - d_nlp;
+                    prop_pop[c] += 1;
+                    if rng.gen::<f64>().ln() < log_alpha {
+                        theta = theta_prop;
+                        sigma = sigma_prop;
+                        nll = nll_prop;
+                        acc_pop[c] += 1;
+                    }
                 }
             }
 
-            // ---- warmup adaptation of the two step sizes ----
+            // ---- warmup adaptation of the step sizes ----
             if sweep < n_warmup && (sweep + 1) % 50 == 0 {
-                if prop_pop > 0 {
-                    let r = acc_pop as f64 / prop_pop as f64;
-                    rw_scale *= ((r - 0.234) * 1.0).exp();
-                    rw_scale = rw_scale.clamp(1e-4, 100.0);
+                for c in 0..n_pop {
+                    if prop_pop[c] > 0 {
+                        let r = acc_pop[c] as f64 / prop_pop[c] as f64;
+                        rw_scales[c] *= (r - 0.234).exp();
+                        rw_scales[c] = rw_scales[c].clamp(1e-4, 100.0);
+                        acc_pop[c] = 0;
+                        prop_pop[c] = 0;
+                    }
                 }
                 if prop_eta > 0 {
                     let r = acc_eta as f64 / prop_eta as f64;
-                    eta_scale *= ((r - 0.234) * 1.0).exp();
+                    eta_scale *= (r - 0.234).exp();
                     eta_scale = eta_scale.clamp(1e-4, 100.0);
                 }
-                acc_pop = 0;
-                prop_pop = 0;
                 acc_eta = 0;
                 prop_eta = 0;
             }
@@ -731,15 +752,6 @@ pub fn run_bayes(
         sir_fallback_proposal: None,
         bayes: Some(bayes),
     })
-}
-
-/// Negative log of the (unnormalized) Gaussian population prior on the
-/// unconstrained vector `u`, centred at `u0` with SD [`POP_PRIOR_SD`].
-fn neg_log_prior(u: &[f64], u0: &[f64]) -> f64 {
-    u.iter()
-        .zip(u0)
-        .map(|(&x, &m)| 0.5 * ((x - m) / POP_PRIOR_SD).powi(2))
-        .sum()
 }
 
 #[cfg(test)]
