@@ -69,6 +69,18 @@ section of the SDLC for the versioning policy).
   (`E_ABSORPTION_DIFFUSION`), and an out-of-domain `mtt`/`n` at typical values
   (`E_ABSORPTION_DOMAIN`). New example `examples/transit_savic.ferx` and docs
   page *Built-in Absorption Models* (#322).
+- Built-in **inverse-Gaussian (Freijer & Post) absorption** for ODE models via an
+  `igd(mat, cv2)` input-rate function in the `[odes]` block:
+  `R_in(tad) = F·Dose·√(MAT/(2π·CV2·tad³))·exp(−(tad−MAT)²/(2·CV2·MAT·tad))`, the
+  inverse-Gaussian density with mean absorption time `MAT` and relative dispersion
+  `CV2` (shape `λ = MAT/CV2`). Models the entire absorption delay and feeds the
+  central compartment directly (no first-order `ka`); `∫R_in dt = F·Dose`. Reuses
+  the same dose routing, `F`/lagtime, superposition, IOV, domain validation
+  (`mat>0`, `cv2>0`), and unsupported-combination guards as `transit()`; the
+  essential singularity at `tad→0` is handled (`R_in→0`). NONMEM-anchored against a
+  `$DES` IG run (`nonmem_anchor/freijer_ig.ctl`). New example
+  `examples/igd_inverse_gaussian.ferx`. The biphasic Freijer sum-of-two is a
+  planned follow-up (#347, #388).
 - Example `dose_rate.ferx` (+ `data/dose_rate.csv`) demonstrating the supported
   NONMEM `RATE` dosing forms — a bolus (`RATE=0`) and a constant-rate infusion
   (`RATE>0`) mixed in one dataset (#324).

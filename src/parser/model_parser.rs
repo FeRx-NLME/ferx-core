@@ -4152,11 +4152,11 @@ fn parse_scaling_block(
 /// excluded — they can ride on an analytical `pk` model.
 ///
 /// This lists only the functions that are **actually implemented** as input
-/// rates today (`transit`, #343). Each later absorption function adds its own
-/// name here in the same PR that implements it — Phase 1 `igd` (#347), Phase 2
-/// `weibull` — so the error rule never advertises a function the engine can't yet
-/// run (which would send the user to `ode_template` for a dead end, Ron #363).
-const ODE_ONLY_ABSORPTION_FNS: [&str; 1] = ["transit"];
+/// rates today (`transit`, #343; `igd`, #347). Each later absorption function
+/// adds its own name here in the same PR that implements it — Phase 2 `weibull` —
+/// so the error rule never advertises a function the engine can't yet run (which
+/// would send the user to `ode_template` for a dead end, Ron #363).
+const ODE_ONLY_ABSORPTION_FNS: [&str; 2] = ["transit", "igd"];
 
 /// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
 /// the first such function name found. Drives the error rule that rejects an
@@ -4797,46 +4797,79 @@ fn split_args_on_commas(s: &str) -> Vec<&str> {
     parts
 }
 
-/// Extract built-in absorption input-rate calls (currently `transit(...)`,
-/// design A) from the `[odes]` RHS lines. For each
-/// `d/dt(STATE) = … transit(n=P, mtt=Q) …`, records an [`InputRateForcing`]
-/// (`cmt` ← STATE index; `n`/`mtt` resolved to individual-parameter slots) and
-/// rewrites the call to `0` so the remaining RHS parses as a normal expression.
-/// Returns the cleaned lines and the collected forcing terms.
+/// Built-in absorption input-rate functions recognised in `[odes]` RHS lines
+/// (design A), each with its [`InputRateKind`] and the **ordered** named
+/// arguments it requires. Arguments are resolved to individual-parameter slots
+/// and stored in `arg_slots` in this order, so `src/pk/absorption.rs` reads them
+/// positionally. Each new model adds one row here in the PR that implements it
+/// (`transit`, #343; `igd`, #347).
+const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] = &[
+    (
+        "transit",
+        crate::pk::absorption::InputRateKind::Transit,
+        &["n", "mtt"],
+    ),
+    (
+        "igd",
+        crate::pk::absorption::InputRateKind::InverseGaussian,
+        &["mat", "cv2"],
+    ),
+];
+
+/// Extract built-in absorption input-rate calls ([`INPUT_RATE_FNS`] —
+/// `transit(...)`, `igd(...)`) from the `[odes]` RHS lines. For each
+/// `d/dt(STATE) = … fn(arg=P, …) …`, records an [`InputRateForcing`] (`cmt` ←
+/// STATE index; named args resolved to individual-parameter slots, in the
+/// function's declared order) and rewrites the call to `0` so the remaining RHS
+/// parses as a normal expression. Returns the cleaned lines and the forcings.
 ///
-/// Validation (negative-tested): `transit(...)` must be the input rate of a
-/// top-level `d/dt(...)` equation; args are exactly `n` and `mtt`, each a
-/// declared individual parameter; a scaled call (`FR*transit(...)`) and more than
-/// one call per equation are rejected (parallel/biphasic comes with later models).
+/// Validation (negative-tested): the call must be the input rate of a top-level
+/// `d/dt(...)` equation; its args are exactly the function's declared names, each
+/// a declared individual parameter; a scaled call (`FR*fn(...)`) and more than
+/// one input-rate call per equation are rejected (parallel/biphasic comes with
+/// later models).
 fn extract_input_rate_terms(
     rhs_lines: &[String],
     state_names: &[String],
     indiv_param_names: &[String],
     indiv_param_slots: &[usize],
 ) -> Result<(Vec<String>, Vec<crate::pk::absorption::InputRateForcing>), String> {
-    use crate::pk::absorption::{InputRateForcing, InputRateKind};
-    let resolve_slot = |val: &str, arg: &str| -> Result<usize, String> {
+    use crate::pk::absorption::InputRateForcing;
+    let resolve_slot = |fname: &str, val: &str, arg: &str| -> Result<usize, String> {
         indiv_param_names
             .iter()
             .position(|p| p == val)
             .map(|i| indiv_param_slots[i])
             .ok_or_else(|| {
                 format!(
-                    "[odes]: transit({arg}={val}): `{val}` is not a declared individual parameter"
+                    "[odes]: {fname}({arg}={val}): `{val}` is not a declared individual parameter"
                 )
             })
+    };
+    // "`a` and `b`" — for the unknown-/expected-argument error messages.
+    let arg_list = |args: &[&str]| -> String {
+        args.iter()
+            .map(|a| format!("`{a}`"))
+            .collect::<Vec<_>>()
+            .join(" and ")
     };
 
     let mut forcings = Vec::new();
     let mut cleaned = Vec::with_capacity(rhs_lines.len());
     for raw in rhs_lines {
-        let Some(start) = find_word_call(raw, "transit") else {
+        // Which built-in (if any) does this line call, and where? Table order
+        // breaks ties when a line names more than one (rejected just below).
+        let Some((fname, kind, arg_names, start)) = INPUT_RATE_FNS
+            .iter()
+            .find_map(|&(f, k, a)| find_word_call(raw, f).map(|s| (f, k, a, s)))
+        else {
             cleaned.push(raw.clone());
             continue;
         };
+
         let state = diffeq_state(raw).ok_or_else(|| {
             format!(
-                "[odes]: transit(...) may only be the input rate of a `d/dt(...)` equation — \
+                "[odes]: {fname}(...) may only be the input rate of a `d/dt(...)` equation — \
                  found it in `{}`",
                 raw.trim()
             )
@@ -4846,56 +4879,68 @@ fn extract_input_rate_terms(
             .position(|s| s == &state)
             .ok_or_else(|| format!("[odes]: d/dt({state}): undeclared state"))?;
 
-        let open = start + "transit".len();
+        let open = start + fname.len();
         let (inner, end) = balanced_parens(raw, open).ok_or_else(|| {
             format!(
-                "[odes]: transit(...): unbalanced parentheses in `{}`",
+                "[odes]: {fname}(...): unbalanced parentheses in `{}`",
                 raw.trim()
             )
         })?;
         if call_is_scaled_or_signed(raw, start, end) {
-            return Err(
-                "[odes]: transit(...) must be a standalone, positively-signed additive input \
+            return Err(format!(
+                "[odes]: {fname}(...) must be a standalone, positively-signed additive input \
                  rate — it cannot be scaled (`* / ^`), negated (a leading `-`), or wrapped in \
-                 parentheses (e.g. `FR*transit(...)`, `-transit(...)`, `(transit(...))/V`), \
-                 since these silently drop the sign/scale. Write it as a bare `+ transit(...)` \
+                 parentheses (e.g. `FR*{fname}(...)`, `-{fname}(...)`, `({fname}(...))/V`), \
+                 since these silently drop the sign/scale. Write it as a bare `+ {fname}(...)` \
                  term."
-                    .to_string(),
-            );
+            ));
         }
 
-        let mut n_slot = None;
-        let mut mtt_slot = None;
+        // Resolve each named arg into its declared slot position.
+        let mut slots: Vec<Option<usize>> = vec![None; arg_names.len()];
         for part in split_args_on_commas(&inner) {
             let (name, val) = part.split_once('=').ok_or_else(|| {
                 format!(
-                    "[odes]: transit(...) arguments must be `name=parameter`, got `{}`",
+                    "[odes]: {fname}(...) arguments must be `name=parameter`, got `{}`",
                     part.trim()
                 )
             })?;
             let (name, val) = (name.trim(), val.trim());
-            match name {
-                "n" => n_slot = Some(resolve_slot(val, "n")?),
-                "mtt" => mtt_slot = Some(resolve_slot(val, "mtt")?),
-                other => {
+            match arg_names.iter().position(|a| *a == name) {
+                Some(i) => slots[i] = Some(resolve_slot(fname, val, name)?),
+                None => {
                     return Err(format!(
-                        "[odes]: transit(...) has no argument `{other}` (expected `n` and `mtt`)"
+                        "[odes]: {fname}(...) has no argument `{name}` (expected {})",
+                        arg_list(arg_names)
                     ))
                 }
             }
         }
-        let n_slot = n_slot.ok_or("[odes]: transit(...) missing required argument `n`")?;
-        let mtt_slot = mtt_slot.ok_or("[odes]: transit(...) missing required argument `mtt`")?;
+        let mut arg_slots = Vec::with_capacity(arg_names.len());
+        for (i, slot) in slots.into_iter().enumerate() {
+            arg_slots.push(slot.ok_or_else(|| {
+                format!(
+                    "[odes]: {fname}(...) missing required argument `{}`",
+                    arg_names[i]
+                )
+            })?);
+        }
 
         forcings.push(InputRateForcing {
             cmt,
-            kind: InputRateKind::Transit,
-            arg_slots: vec![n_slot, mtt_slot],
+            kind,
+            arg_slots,
         });
 
         let new_line = format!("{}0{}", &raw[..start], &raw[end..]);
-        if find_word_call(&new_line, "transit").is_some() {
-            return Err("[odes]: at most one transit(...) per d/dt equation (Phase 0)".to_string());
+        if INPUT_RATE_FNS
+            .iter()
+            .any(|&(f, _, _)| find_word_call(&new_line, f).is_some())
+        {
+            return Err(
+                "[odes]: at most one absorption input-rate function per d/dt equation (Phase 1)"
+                    .to_string(),
+            );
         }
         cleaned.push(new_line);
     }
@@ -9941,12 +9986,14 @@ mod tests {
             ode_only_absorption_fn_in_odes(Some(&transit)),
             Some("transit")
         );
+        // `igd` is implemented as of #347, so the error rule now recognises it
+        // (routing an analytical `pk` + `igd()` to `ode_template`).
+        let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
+        assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), Some("igd"));
         // The error rule only recognises functions that are actually implemented
-        // (Ron #363): `igd`/`weibull` are not yet input rates, so they must NOT be
+        // (Ron #363): `weibull` is not yet an input rate, so it must NOT be
         // detected — otherwise the rule would point the user at `ode_template` for a
         // function the engine can't run. Each phase adds its name here when it lands.
-        let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
-        assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), None);
         let weibull = vec!["d/dt(central) = weibull(td=TD, beta=B) - (CL/V)*central".to_string()];
         assert_eq!(ode_only_absorption_fn_in_odes(Some(&weibull)), None);
         // A plain disposition ODE has no ODE-only absorption call.
@@ -10144,6 +10191,96 @@ mod tests {
         assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT)").is_ok());
         assert!(go("d/dt(depot) = transit(n=NTR, mtt=MTT) - KA*depot").is_ok());
         assert!(go("d/dt(depot) = -KA*depot + transit(n=NTR, mtt=MTT)").is_ok());
+    }
+
+    // ── igd() input-rate parse-split (#347, design A) ─────────────────────────
+    #[test]
+    fn extract_igd_input_rate_basic() {
+        // igd(mat, cv2) straight into central: forcing on the central cmt, args
+        // resolved to the [mat, cv2] slots in order; the rest of the RHS untouched.
+        let lines = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central".to_string()];
+        let states = vec!["depot".to_string(), "central".to_string()];
+        let names = vec![
+            "MAT".to_string(),
+            "CV2".to_string(),
+            "CL".to_string(),
+            "V".to_string(),
+        ];
+        let slots = vec![4, 5, 0, 1];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].cmt, 1); // central
+        assert!(matches!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::InverseGaussian
+        ));
+        assert_eq!(forcings[0].arg_slots, vec![4, 5]); // [mat=MAT slot, cv2=CV2 slot]
+    }
+
+    #[test]
+    fn extract_igd_input_rate_rejects_bad_specs() {
+        let states = vec!["central".to_string()];
+        let names = vec!["MAT".to_string(), "CV2".to_string()];
+        let slots = vec![4, 5];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        assert!(go("d/dt(central) = igd(mat=MAT, cv2=ZZZ)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        assert!(go("d/dt(central) = igd(mat=MAT, foo=CV2)")
+            .unwrap_err()
+            .contains("no argument `foo`"));
+        // Missing arg names the offender and lists the expected names generically.
+        let err = go("d/dt(central) = igd(mat=MAT)").unwrap_err();
+        assert!(
+            err.contains("missing required argument `cv2`"),
+            "got: {err}"
+        );
+        // Biphasic `FR*igd(...)` is a scaled call — rejected in Phase 1 (the shared
+        // fraction mechanism is a follow-up); the message names `igd`, not `transit`.
+        let scaled = go("d/dt(central) = FR*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(
+            scaled.contains("scaled") && scaled.contains("igd"),
+            "got: {scaled}"
+        );
+        assert!(go("d/dt(central) = igd(mat=MAT, cv2=CV2")
+            .unwrap_err()
+            .contains("unbalanced"));
+        assert!(go("d/dt(central) = igd(MAT, cv2=CV2)")
+            .unwrap_err()
+            .contains("name=parameter"));
+        // Two input-rate calls on one equation (biphasic sum) rejected for now.
+        assert!(
+            go("d/dt(central) = igd(mat=MAT, cv2=CV2) + igd(mat=MAT, cv2=CV2)")
+                .unwrap_err()
+                .contains("at most one")
+        );
+        // A word *ending* in `igd` (e.g. `xigd(`) is not an igd() call.
+        let (kept, none) = go("d/dt(central) = xigd(mat=MAT, cv2=CV2) - central").unwrap();
+        assert_eq!(kept[0], "d/dt(central) = xigd(mat=MAT, cv2=CV2) - central");
+        assert!(none.is_empty());
+        // Positive control: a bare additive igd() is accepted.
+        assert!(go("d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central").is_ok());
+    }
+
+    #[test]
+    fn extract_rejects_two_different_input_rate_fns_on_one_equation() {
+        // transit + igd on a single d/dt is rejected by the same one-call guard
+        // (mixed/parallel composition is a later phase).
+        let states = vec!["central".to_string()];
+        let names = vec![
+            "NTR".to_string(),
+            "MTT".to_string(),
+            "MAT".to_string(),
+            "CV2".to_string(),
+        ];
+        let slots = vec![10, 11, 4, 5];
+        let line = "d/dt(central) = transit(n=NTR, mtt=MTT) + igd(mat=MAT, cv2=CV2)".to_string();
+        let err = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap_err();
+        assert!(err.contains("at most one"), "got: {err}");
     }
 
     #[test]

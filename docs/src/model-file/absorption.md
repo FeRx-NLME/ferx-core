@@ -7,9 +7,9 @@ write a flexible absorption *shape* (transit-chain delay, etc.) as a single
 intrinsic in the `[odes]` block, rather than hand-coding a chain of physical
 transit compartments.
 
-Phase 0 ships the **transit-compartment** model; more input-rate models
-(inverse-Gaussian, Weibull, zero-order families) are planned — see
-`plans/absorption-models.md`.
+ferx ships the **transit-compartment** model (`transit`) and the **Freijer &
+Post inverse-Gaussian** model (`igd`); more input-rate models (Weibull,
+zero-order families) are planned — see `plans/absorption-models.md`.
 
 ## Transit-compartment absorption — `transit(n, mtt)`
 
@@ -133,6 +133,82 @@ codes the same idea as three **explicit** transit ODE states (fixed integer
 continuous `n`. See [Transit Absorption](../examples/transit-absorption.md) for
 the worked two-compartment example and diagnostics guidance.
 
+## Inverse-Gaussian absorption — `igd(mat, cv2)`
+
+The Freijer & Post (1997) convection–dispersion absorption model: the absorption
+time follows an **inverse-Gaussian distribution**, and the input rate is that
+density scaled by the dose, fed **straight into the central compartment** (no
+separate first-order `ka` step — the IG models the entire absorption delay):
+
+\\[
+R_\text{in}(t_\text{ad}) = \text{Dose}\;\sqrt{\frac{\text{MAT}}{2\pi\,\text{CV2}\,t_\text{ad}^{3}}}\;
+\exp\!\left(-\frac{(t_\text{ad}-\text{MAT})^2}{2\,\text{CV2}\,\text{MAT}\,t_\text{ad}}\right)
+\\]
+
+with mean absorption time `MAT` (the distribution mean μ) and relative dispersion
+`CV2` (= Var/mean², equivalently shape λ = MAT/CV2). Like `transit`, the input
+integrates to the full dose (`∫₀^∞ R_in dt = F·Dose`) and `R_in = 0` for
+`tad ≤ 0`; the essential singularity at `tad → 0` is finite (`R_in → 0`).
+
+### Syntax
+
+Add `igd(...)` to the **central** compartment's ODE. Because the input rate
+carries mass (not concentration), write the central state as an **amount** and
+convert to concentration in `[scaling]` — the NONMEM `A(2)` / `IPRED = A(2)/V`
+convention:
+
+```text
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  MAT = TVMAT          # mean absorption time (h)
+  CV2 = TVCV2          # relative dispersion (Var/mean²)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central
+
+[scaling]
+  y = central / V
+```
+
+- **Arguments are named**: `mat=<param>` and `cv2=<param>`, both declared
+  `[individual_parameters]` (so they fold in theta/eta/covariates and carry
+  IIV/IOV like any other parameter).
+- As with `transit`, `igd(...)` is a standalone, positively-signed input-rate
+  term: it may appear **once** per `d/dt` line and must not be scaled, negated, or
+  parenthesised. The biphasic Freijer sum-of-two
+  (`FR*igd(...) + (1-FR)*igd(...)`) needs a scaled-fraction mechanism and is a
+  planned follow-up ([#388](https://github.com/FeRx-NLME/ferx-core/issues/388)).
+
+### Shared behaviour
+
+`igd` reuses the same dose machinery as `transit`, so the rules are identical:
+
+- **Dose routing** — the dose feeds `igd` over time and is **not** also added as
+  a bolus; the dose record targets the `igd` compartment (here `central`). See
+  [Dose routing](#dose-routing--the-dose-feeds-the-function-not-a-bolus) above.
+- **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave
+  exactly as for `transit`. Do not multiply `igd(...)` by `F`.
+- **Parameter domains** `mat > 0`, `cv2 > 0` are validated at typical values
+  (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions — a
+  log-normal parameterisation avoids excursions and is recommended.
+- The same **not-yet-supported** combinations (an infusion `RATE>0`, `SS=1`, or a
+  `[diffusion]` block into the input-rate compartment) are rejected with a clear
+  error.
+
+### Worked example
+
+[`examples/igd_inverse_gaussian.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/igd_inverse_gaussian.ferx)
+is a complete one-compartment oral model with inverse-Gaussian absorption. Run it
+on simulated data:
+
+```bash
+cargo run --release -- examples/igd_inverse_gaussian.ferx --simulate
+```
+
 ## Numerical note
 
 The transit input is integrated numerically through the ODE solver (the same
@@ -142,6 +218,8 @@ function) is planned so 1-/2-compartment transit models can stay in the
 analytical engine — see `plans/absorption-models.md`.
 
 ## Verification against NONMEM
+
+### Savic transit (`transit`)
 
 The Savic transit model was validated against NONMEM (`ADVAN13 TOL=9`, FOCEI) on
 a 20-subject / 240-observation single-dose oral dataset simulated from the model
@@ -168,6 +246,36 @@ within sampling noise (n=20). The looser default tolerances (`ode_reltol=1e-4`,
 into the FOCEI Hessian that inflates the ω² estimates. **For accurate
 variance-component estimates on transit (and other stiff) ODE models, tighten
 `ode_reltol`/`ode_abstol` toward `1e-9`** via `[fit_options]`.
+
+### Freijer & Post inverse-Gaussian (`igd`)
+
+`igd(mat, cv2)` was cross-checked against a NONMEM `$DES` inverse-Gaussian run
+(`nonmem_anchor/freijer_ig.ctl`, `ADVAN13 TOL=9`, FOCEI) on the same 20-subject /
+240-observation dataset (re-keyed to one central compartment so the dose feeds
+the `igd` input — likelihood-equivalent to the control's inert depot + `PODO`).
+Because the data were simulated from a transit model, the IG fit is mildly
+mis-specified, so this is an **implementation** check (NONMEM-igd ≈ ferx-igd on
+identical data), not a parameter-recovery check.
+
+On the mis-specified objective the likelihood surface has a long flat ridge:
+NONMEM's gradient FOCEI climbs it to `MAT≈6.07`, whereas ferx's default
+derivative-free outer optimiser stalls partway up (full-fit OFV ≈ −881). The
+optimiser *path* on a flat surface is not the implementation check — the
+**objective at the optimum** is. (This stall is the ODE analogue of the
+fixed-EBE gradient bias that the analytic FOCE/FOCEI gradient work — issues #367
+/ #381 — removes for *analytical* models; extending that exact gradient to ODE
+models via sensitivity equations is the path to converging such fits.) Evaluating
+ferx's full FOCEI objective (inner EBEs + Laplace + ODE integration of the `igd`
+forcing) at NONMEM's reported optimum reproduces it:
+
+| Quantity | NONMEM | ferx (at NONMEM's optimum, `ode_reltol=ode_abstol=1e-9`) |
+|----------|--------|----------------------------------------------------------|
+| FOCEI objective | −899.38 | **−899.39** (Δ 0.02) |
+
+evaluated at `CL 5.612`, `V 33.95`, `MAT 6.071`, `CV2 1.868`. The 0.02-unit
+agreement confirms the `igd` density and its ODE machinery reproduce the NONMEM
+`$DES` inverse-Gaussian input (`nonmem_anchor/results/freijer_ig.ext`; the ferx
+anchor is `tests/igd_nonmem_anchor.rs`, gated behind `--features slow-tests`).
 
 ## Generating the disposition — `ode_template`
 
@@ -217,7 +325,7 @@ need a different compartment structure.
 
 ## The error rule — ODE-only absorption needs an ODE disposition
 
-`transit(...)` (and the planned `igd(...)` / `weibull(...)`) have **no closed
+`transit(...)` and `igd(...)` (and the planned `weibull(...)`) have **no closed
 form**, so they can only feed an ODE disposition. Combining one with an
 analytical `pk NAME(...)` is a **hard error**, not a silent conversion:
 
