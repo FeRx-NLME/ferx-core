@@ -160,6 +160,12 @@ pub fn summarize_param(name: &str, chains: &[Vec<f64>]) -> PosteriorSummary {
 const POP_PRIOR_SD: f64 = 10.0;
 /// Floor for variances / scales to keep logs and Cholesky factors finite.
 const TINY: f64 = 1e-12;
+/// Positive-definite floor for the BSV Ω diagonal after an inverse-Wishart draw
+/// (matches SAEM's `SAEM_OMEGA_DIAG_FLOOR`).
+const OMEGA_DIAG_FLOOR: f64 = 1e-6;
+/// Positive-definite floor for the IOV Ω_iov diagonal (matches SAEM's IOV floor;
+/// looser than BSV because per-occasion variances are smaller).
+const OMEGA_IOV_DIAG_FLOOR: f64 = 1e-8;
 
 /// One coordinate of the population random-walk block.
 #[derive(Clone, Copy)]
@@ -188,6 +194,37 @@ fn subject_nll(
         individual_nll_into(model, subject, theta, eta, omega, sigma, scratch)
     } else {
         individual_nll_iov(model, subject, theta, eta, kappas, omega, omega_iov, sigma)
+    }
+}
+
+/// Re-impose a covariance matrix's structural template onto a fresh draw `m`:
+/// zero structurally-absent entries (`free_mask` false), restore FIX-ed
+/// rows/columns from `original`, and floor the diagonal for positive-
+/// definiteness. Shared by the Ω and Ω_iov inverse-Wishart blocks.
+fn impose_omega_structure(
+    m: &mut DMatrix<f64>,
+    free_mask: &nalgebra::DMatrix<bool>,
+    fixed: &[bool],
+    original: &DMatrix<f64>,
+    diag_floor: f64,
+) {
+    let n = m.nrows();
+    for i in 0..n {
+        for j in 0..n {
+            if !free_mask[(i, j)] {
+                m[(i, j)] = 0.0;
+            }
+            let fi = fixed.get(i).copied().unwrap_or(false);
+            let fj = fixed.get(j).copied().unwrap_or(false);
+            if fi || fj {
+                m[(i, j)] = original[(i, j)];
+            }
+        }
+    }
+    for i in 0..n {
+        if m[(i, i)] < diag_floor {
+            m[(i, i)] = diag_floor;
+        }
     }
 }
 
@@ -572,24 +609,13 @@ pub fn run_bayes(
                     inverse_wishart_draw(nu0 + n_subjects as f64, &psi_post, &mut rng)
                 {
                     let mut m = draw;
-                    // Re-impose structural zeros and fixed rows/cols, then floor.
-                    for i in 0..n_eta {
-                        for j in 0..n_eta {
-                            if !init_params.omega.free_mask[(i, j)] {
-                                m[(i, j)] = 0.0;
-                            }
-                            let fi = init_params.omega_fixed.get(i).copied().unwrap_or(false);
-                            let fj = init_params.omega_fixed.get(j).copied().unwrap_or(false);
-                            if fi || fj {
-                                m[(i, j)] = init_params.omega.matrix[(i, j)];
-                            }
-                        }
-                    }
-                    for i in 0..n_eta {
-                        if m[(i, i)] < TINY {
-                            m[(i, i)] = TINY;
-                        }
-                    }
+                    impose_omega_structure(
+                        &mut m,
+                        &init_params.omega.free_mask,
+                        &init_params.omega_fixed,
+                        &init_params.omega.matrix,
+                        OMEGA_DIAG_FLOOR,
+                    );
                     omega_mat = m;
                     omega_cur = OmegaMatrix::from_matrix(
                         omega_mat.clone(),
@@ -603,9 +629,9 @@ pub fn run_bayes(
             }
 
             // ---- 2c. Ω_iov block (conjugate inverse-Wishart over kappas) ----
-            // Posterior IW(ν0 + N_occ, Λ0_iov + Σᵢ Σₖ κᵢₖκᵢₖᵀ), with structural
-            // zeros / fixed kappa rows re-imposed and the diagonal floored
-            // (1e-8, matching SAEM's IOV floor).
+            // Posterior IW(ν0 + N_occ, Λ0_iov + Σᵢ Σₖ κᵢₖκᵢₖᵀ); the structural
+            // template (free_mask, fixed rows, OMEGA_IOV_DIAG_FLOOR) is re-imposed
+            // via impose_omega_structure, the same helper the Ω block uses.
             if n_kappa > 0 && !omega_iov_all_fixed {
                 if let (Some(oi_ref), Some(lam)) =
                     (init_params.omega_iov.as_ref(), lambda0_iov.as_ref())
@@ -624,23 +650,13 @@ pub fn run_bayes(
                         inverse_wishart_draw(nu0_iov + n_occ_total as f64, &psi_post, &mut rng)
                     {
                         let mut m = draw;
-                        for i in 0..n_kappa {
-                            for j in 0..n_kappa {
-                                if !oi_ref.free_mask[(i, j)] {
-                                    m[(i, j)] = 0.0;
-                                }
-                                let fi = init_params.kappa_fixed.get(i).copied().unwrap_or(false);
-                                let fj = init_params.kappa_fixed.get(j).copied().unwrap_or(false);
-                                if fi || fj {
-                                    m[(i, j)] = oi_ref.matrix[(i, j)];
-                                }
-                            }
-                        }
-                        for i in 0..n_kappa {
-                            if m[(i, i)] < 1e-8 {
-                                m[(i, i)] = 1e-8;
-                            }
-                        }
+                        impose_omega_structure(
+                            &mut m,
+                            &oi_ref.free_mask,
+                            &init_params.kappa_fixed,
+                            &oi_ref.matrix,
+                            OMEGA_IOV_DIAG_FLOOR,
+                        );
                         omega_iov_cur = Some(OmegaMatrix::from_matrix_with_mask(
                             m,
                             oi_ref.eta_names.clone(),
