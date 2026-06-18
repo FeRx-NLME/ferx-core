@@ -206,6 +206,18 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- **`imp` is now a Monte-Carlo EM estimator by default** (NONMEM `METHOD=IMP`
+  parity): `method = imp` updates θ/Ω/σ instead of only evaluating the marginal
+  `−2 log L`. **Breaking:** model files that used `imp` (e.g. `[focei, imp]`)
+  purely to *score* a fit now re-estimate. Add `is_eval_only = true` (NONMEM
+  `EONLY=1`) to recover the previous evaluation-at-fixed-parameters behaviour.
+  New options `is_iterations` (default 200) and `is_averaging` (default 50)
+  control the MCEM loop; `is_proposal_df` now also accepts `normal`/`mvn`. The
+  estimating `imp` may lead or sit mid-chain; the evaluation-only `imp` must
+  still be terminal. Plain `imp` re-centers its proposal from the previous
+  iteration's sample moments and so is fragile on rich data (warm-start with
+  `[focei, imp]`, or use `impmap`); validated against NONMEM 7.5.1 `METHOD=IMP`
+  on warfarin (#402).
 - The analytical `pk NAME(...)` parameter list is now parsed strictly: a malformed
   `role=VAR` pair (no `=`, an empty side, or a stray extra `=`) or a duplicate role
   is a clear parse error instead of being silently dropped or last-winning. The

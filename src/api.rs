@@ -894,11 +894,12 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // IMP is a likelihood evaluation, not an estimator: it may appear at most
-    // once and must be the terminal stage. It may run standalone (as the only
-    // stage), in which case the EBEs/Hessians it consumes are evaluated at the
-    // initial parameters — IMP then reports the −2 log L at those parameters
-    // without estimating them.
+    // `imp` may appear at most once in a chain. By default it is an MCEM
+    // estimator (NONMEM `METHOD=IMP`) and may sit anywhere in the chain. With
+    // `is_eval_only = true` (NONMEM `IMP EONLY=1`) it instead evaluates the
+    // marginal −2 log L at fixed parameters and must be the terminal stage —
+    // placing an evaluator mid-chain would leave `FitResult.importance_sampling`
+    // computed at parameters the following stage then overwrites.
     if chain.iter().any(|&m| m == EstimationMethod::Imp) {
         let n_imp = chain
             .iter()
@@ -913,14 +914,15 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        if chain.last().copied() != Some(EstimationMethod::Imp) {
+        if options.is_eval_only && chain.last().copied() != Some(EstimationMethod::Imp) {
             diags.push(
                 Diagnostic::error(
                     "E_IMP_CHAIN",
-                    "method `imp` must be the final stage of the chain — placing it mid-chain \
-                     would leave `FitResult.importance_sampling` populated with a log-likelihood \
-                     computed at parameters that the following stage then overwrites. Move `imp` \
-                     to the end.",
+                    "method `imp` with `is_eval_only = true` must be the final stage of the chain \
+                     — placing the evaluator mid-chain would leave `FitResult.importance_sampling` \
+                     populated with a log-likelihood computed at parameters that the following \
+                     stage then overwrites. Move `imp` to the end, or drop `is_eval_only` to run \
+                     it as an estimator.",
                 )
                 .with_block("fit_options"),
             );
@@ -2759,11 +2761,13 @@ fn fit_inner(
             );
         }
 
-        // IMP stage: not an estimator. Consumes the previous stage's params /
-        // EBEs / Hessians, writes its result to `is_result`, and skips the
-        // params/result update at the bottom of the loop so the preceding
-        // stage's `OuterResult` continues to be the canonical one.
-        if method == EstimationMethod::Imp {
+        // IMP evaluation-only stage (`is_eval_only`, NONMEM `IMP EONLY=1`): not an
+        // estimator. Consumes the previous stage's params / EBEs / Hessians,
+        // writes its result to `is_result`, and skips the params/result update at
+        // the bottom of the loop so the preceding stage's `OuterResult` continues
+        // to be the canonical one. The default estimating IMP path is handled by
+        // the `EstimationMethod::Imp` arm of the `match method` below.
+        if method == EstimationMethod::Imp && stage_opts.is_eval_only {
             // Standalone IMP (no preceding estimator): evaluate the EBEs/Hessians
             // at the initial parameters so IMP can report the −2 log L there.
             // This synthetic stage also becomes the canonical `OuterResult` so
@@ -2898,7 +2902,20 @@ fn fit_inner(
                     &stage_opts,
                 )
             }
-            EstimationMethod::Imp => unreachable!("handled by the IMP branch above"),
+            EstimationMethod::Imp => {
+                // Estimating IMP (NONMEM `METHOD=IMP`). The evaluation-only path
+                // (`is_eval_only`) is handled by the IMP branch above and never
+                // reaches here. Warm-start from the preceding stage's EBEs when
+                // chained (e.g. [saem, imp]).
+                let warm = result.as_ref().map(|r| r.eta_hats.as_slice());
+                crate::estimation::impmap::run_imp(
+                    model,
+                    population,
+                    &stage_params,
+                    warm,
+                    &stage_opts,
+                )?
+            }
             EstimationMethod::Bayes => {
                 crate::estimation::bayes::run_bayes(model, population, &stage_params, &stage_opts)?
             }
@@ -3179,15 +3196,16 @@ fn fit_inner(
         &mut warnings,
     );
 
-    // `final_method` reports the last *estimating* stage — IMP is a likelihood
-    // evaluation and doesn't produce parameters, so a chain like `[saem, imp]`
-    // surfaces as `method = SAEM`. The full chain (including IMP) is preserved
-    // in `method_chain`.
+    // `final_method` reports the last *estimating* stage. An evaluation-only IMP
+    // (`is_eval_only`) doesn't produce parameters, so a chain like `[saem, imp]`
+    // surfaces as `method = SAEM`. Estimating IMP (the default) does produce
+    // parameters and is reported like any other estimator. The full chain is
+    // preserved in `method_chain`.
     let final_method = chain
         .iter()
         .rev()
         .copied()
-        .find(|&m| m != EstimationMethod::Imp)
+        .find(|&m| !(m == EstimationMethod::Imp && options.is_eval_only))
         .unwrap_or(*chain.last().expect("chain non-empty"));
     let grad_inner =
         crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, model);
@@ -3411,10 +3429,11 @@ fn fit_inner(
             EstimationMethod::Saem => "saem",
             EstimationMethod::FoceGn => "gn",
             EstimationMethod::FoceGnHybrid => "gn",
-            // IMPMAP never runs the outer optimizer — its M-step uses an internal
-            // BOBYQA regardless of `options.optimizer`, so report that rather than
-            // a setting that had no effect.
+            // IMP/IMPMAP never run the outer optimizer — their M-step uses an
+            // internal BOBYQA regardless of `options.optimizer`, so report that
+            // rather than a setting that had no effect.
             EstimationMethod::Impmap => "impmap-bobyqa",
+            EstimationMethod::Imp => "imp-bobyqa",
             _ => options.optimizer.label(),
         }
         .to_string(),
@@ -5272,6 +5291,9 @@ mod iov_integration {
         opts.methods = vec![EstimationMethod::Foce, EstimationMethod::Imp];
         opts.is_samples = 200; // keep the per-subject sampling cheap
         opts.is_seed = Some(42); // deterministic proposal draws
+                                 // The IS IOV branch is the evaluation-only path; the estimating IMP
+                                 // M-step does not yet support IOV (refused up front).
+        opts.is_eval_only = true;
         let result = fit(&model, &pop, &model.default_params, &opts);
         assert!(
             result.is_ok(),

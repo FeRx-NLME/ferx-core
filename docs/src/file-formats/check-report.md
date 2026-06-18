@@ -61,7 +61,7 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 | `E_DATA` | error | The `--data` file could not be read or parsed. |
 | `E_SDE_INCOMPATIBLE` | error | An SDE (`[diffusion]`) model used with an incompatible method (`saem`, `gn`, `gn_hybrid`) or `gradient_method = ad`. |
 | `E_AD_UNAVAILABLE` | error | `gradient_method = ad` requested, but the binary was built without the `autodiff` feature. Use `auto`/`fd`, or rebuild with the Enzyme toolchain. Only emitted by non-autodiff builds. |
-| `E_IMP_CHAIN` | error | `imp` is mis-placed in a method chain — repeated, or not the terminal stage. (`imp` alone is allowed: it evaluates the IS-LL at the initial parameters.) |
+| `E_IMP_CHAIN` | error | `imp` is mis-placed in a method chain — repeated, or (with `is_eval_only = true`) not the terminal stage. The estimating `imp` may sit anywhere; an evaluation-only `imp` must be terminal. |
 | `E_OPTIMIZER_IOV` | error | `optimizer = trust_region` used with an IOV model (`n_kappa > 0`). |
 | `W_STEADY_STATE_II` | warning | SS=1 doses with missing / non-positive `II` (treated as non-SS). |
 | `W_STEADY_STATE_INFUSION` | warning | SS=1 infusion with `T_inf > II` (overlapping pulses; SS skipped). |
