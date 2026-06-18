@@ -2935,6 +2935,54 @@ mod tests {
     }
 
     #[test]
+    fn ss_oral_depot_infusion_matches_many_dose_accumulation() {
+        // Steady-state (SS=1) zero-order input into the oral depot (#400) has no
+        // closed form, so validate the event-driven SS equilibration + the depot
+        // forced response together against the limit of a long explicit
+        // multi-dose accumulation (which converges to steady state). This is the
+        // SS analogue of the single-dose-vs-RK4 checks and the only test that
+        // exercises `equilibrate_ss_state_event_driven` on a depot infusion.
+        let (cl, v, ka, amt, ii, dur) = (2.0, 20.0, 1.5, 100.0, 24.0, 4.0);
+        let rate = amt / dur; // 25 units/h over 4 h, repeated every 24 h
+        let phases = [5.0_f64, 8.0, 12.0, 23.0]; // within-cycle, after infusion ends
+        let pk = pk_one_oral(cl, v, ka);
+
+        // SS prediction: a single SS=1 depot infusion.
+        let ss_dose = DoseEvent::new(0.0, amt, 1, rate, true, ii);
+        let ss_subj = make_subject(vec![ss_dose], phases.to_vec());
+        let ss_preds = event_driven_predictions(
+            PkModel::OneCptOral,
+            &ss_subj,
+            &vec![pk; 1],
+            &vec![pk; phases.len()],
+            &[],
+        );
+
+        // Reference: 50 explicit (non-SS) depot infusions spaced `ii`, read in the
+        // last cycle. ke = CL/V = 0.1 ⇒ per-cycle carryover e^{-0.1·24} ≈ 0.09, so
+        // 50 cycles leaves negligible (≈0.09^50) residual below steady state.
+        let n_doses = 50usize;
+        let last = (n_doses - 1) as f64 * ii;
+        let acc_doses: Vec<DoseEvent> = (0..n_doses)
+            .map(|k| DoseEvent::new(k as f64 * ii, amt, 1, rate, false, 0.0))
+            .collect();
+        let acc_times: Vec<f64> = phases.iter().map(|&p| last + p).collect();
+        let acc_subj = make_subject(acc_doses, acc_times.clone());
+        let acc_preds = event_driven_predictions(
+            PkModel::OneCptOral,
+            &acc_subj,
+            &vec![pk; n_doses],
+            &vec![pk; acc_times.len()],
+            &[],
+        );
+
+        for (j, &p) in phases.iter().enumerate() {
+            assert!(ss_preds[j] > 0.0, "phase {p}: SS pred must be nonzero");
+            assert_relative_eq!(ss_preds[j], acc_preds[j], max_relative = 1e-5);
+        }
+    }
+
+    #[test]
     fn oral_depot_infusion_mass_balance() {
         // A zero-order depot input delivers F·AMT into the system: at a long
         // observation the cumulative amount eliminated (∫ CL·C dt) plus the

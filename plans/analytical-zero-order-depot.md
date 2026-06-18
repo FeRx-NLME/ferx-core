@@ -156,5 +156,3 @@ predictions comparison in `docs/src/faq.md` (or the relevant estimation page).
 - Autodiff oral-infusion propagator arms (depot or central) — tracked separately.
 - Oral **peripheral** infusion (cmt ≥ 3) — still rejected.
 - `RATE=-1` modeled-rate (`R1`) into the depot — separate (#324 `R1` work).
-</content>
-</invoke>

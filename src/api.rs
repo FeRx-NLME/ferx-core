@@ -2296,6 +2296,15 @@ pub(crate) fn compute_extra_output_columns(
                                 // so every grid point evaluates to NaN, consistent with
                                 // W_DERIVED_CMT_TV_ANALYTICAL warning.
                                 vec![]
+                            } else if crate::pk::has_oral_depot_infusion(model.pk_model, subject) {
+                                // Analytical oral model + zero-order input into the depot
+                                // (#400): the superposition state helper models an oral
+                                // infusion as a depot bypass and cannot express a depot
+                                // zero-order input, so it would return silently-wrong finite
+                                // amounts. Return empty so every grid point evaluates to NaN,
+                                // matching the per-obs path in compute_predictions_with_states
+                                // and the W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL warning.
+                                vec![]
                             } else {
                                 let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
                                 crate::pk::analytical_state_at_times(
@@ -3073,11 +3082,10 @@ fn fit_inner(
         // (event-driven path), but per-obs compartment states return empty (→ NaN)
         // rather than report silently-wrong amounts.
         if model.ode_spec.is_none()
-            && model.pk_model.is_oral()
             && population
                 .subjects
                 .iter()
-                .any(|s| s.doses.iter().any(|d| d.cmt == 1 && d.is_infusion()))
+                .any(|s| crate::pk::has_oral_depot_infusion(model.pk_model, s))
         {
             warnings.push(
                 "W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL: analytical oral model \

@@ -1079,19 +1079,24 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
 }
 
 /// Whether `subject` has a zero-order infusion into the **depot** (cmt 1) of an
-/// oral model (#400) — i.e. a resolved infusion dose (`rate>0 && duration>0`)
-/// targeting compartment 1 on `one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`.
+/// oral model (#400) — a dose into compartment 1 of `one_cpt_oral` /
+/// `two_cpt_oral` / `three_cpt_oral` that [`DoseEvent::is_infusion`] reports as
+/// an infusion (an explicit positive `RATE`, or a still-modeled `RATE=-2` `D1`).
 ///
 /// Such doses have no closed form in the superposition path (which models the
 /// oral depot as bolus-only), so the dispatcher routes them through the
-/// event-driven propagator instead. IV models and oral **central** infusions
-/// (cmt 2, handled by the depot-bypass IV formula) return `false`.
+/// event-driven propagator instead, and their per-compartment states degrade to
+/// NaN. IV models and oral **central** infusions (cmt 2, handled by the
+/// depot-bypass IV formula) return `false`.
+///
+/// Uses `is_infusion()` rather than `rate > 0` so the predicate gives the same
+/// answer on the **raw** subject (modeled `RATE=-2` doses still read `rate == 0`)
+/// and the **resolved** subject (where it reduces to `rate > 0`). This is the
+/// single source of truth shared by the prediction dispatch, the compartment-
+/// state degradation, and the `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL`
+/// warning — so the three can never disagree about which subjects are affected.
 pub(crate) fn has_oral_depot_infusion(pk_model: PkModel, subject: &Subject) -> bool {
-    pk_model.is_oral()
-        && subject
-            .doses
-            .iter()
-            .any(|d| d.cmt == 1 && d.rate > 0.0 && d.duration > 0.0 && d.duration.is_finite())
+    pk_model.is_oral() && subject.doses.iter().any(|d| d.cmt == 1 && d.is_infusion())
 }
 
 /// Compute predictions using ODE integration.
