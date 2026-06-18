@@ -64,12 +64,18 @@ pub fn simulate_with_options(
 ) -> Result<Vec<SimulationResult>, String>
 
 pub struct SimulateOptions {
-    pub seed: Option<u64>,        // None draws from entropy
-    pub propensity_match: bool,   // default false
+    pub seed: Option<u64>,                  // None draws from entropy
+    pub match_method: Option<MatchMethod>,  // None disables matching
+}
+
+pub enum MatchMethod {
+    Optimal,   // global minimum total distance (linear assignment); recommended default
+    Nearest,   // greedy nearest-neighbour in subject order
+    Rank,      // pair by Mahalanobis-norm rank (k-th order statistic to k-th)
 }
 ```
 
-With `propensity_match = false` this is identical to `simulate_with_seed()` (or
+With `match_method = None` this is identical to `simulate_with_seed()` (or
 `simulate()` when `seed` is `None`).
 
 ### Why match?
@@ -83,12 +89,19 @@ can show spurious model misspecification even when the model is correct.
 Propensity-score matching restores the association. For each replicate:
 
 1. Draw a pool of `N` etas from \\( N(0, \Omega) \\) (`N` = number of subjects).
-2. **Optimally** match the `N` drawn etas 1:1 (without replacement) to the `N`
-   subjects' **fitted (posthoc) etas**, minimising the total **Mahalanobis**
-   distance under the model \\( \Omega \\):
+2. Match the `N` drawn etas 1:1 (without replacement) to the `N` subjects'
+   **fitted (posthoc) etas** under the **Mahalanobis** distance over the model
+   \\( \Omega \\):
    \\( d^2(a,b) = (a-b)^\top \Omega^{-1} (a-b) \\)
-   (a linear assignment problem; mirrors `MatchIt(method = "optimal",
-   distance = "mahalanobis")`).
+   using the chosen `MatchMethod`:
+   - **`Optimal`** — global minimum of the total matched distance (the linear
+     assignment problem); mirrors `MatchIt(method = "optimal", distance =
+     "mahalanobis")`. Best on average in simulation, the recommended default.
+   - **`Nearest`** — greedy nearest-neighbour in subject order; mirrors
+     `MatchIt(method = "nearest", distance = "mahalanobis")`.
+   - **`Rank`** — pair subjects and draws by the rank of their Mahalanobis norm
+     \\( \lVert \eta \rVert = \sqrt{\eta^\top \Omega^{-1} \eta} \\) (k-th order
+     statistic to k-th).
 3. Each subject keeps its own observed design but is simulated with the drawn
    eta that matched its fitted eta — so a high-clearance draw lands on a subject
    whose adaptive design reflects high clearance.
@@ -128,7 +141,7 @@ let fit = fit(&model, &pop, &model.default_params, &opts)?;
 let params = fitted_params_from_result(&fit, &model);
 let sims = simulate_with_options(
     &model, &pop, &params, 200,
-    &SimulateOptions { seed: Some(42), propensity_match: true },
+    &SimulateOptions { seed: Some(42), match_method: Some(MatchMethod::Optimal) },
 )?;
 // → 200 replicates; build the pmVPC from `sims` as usual.
 ```
