@@ -658,6 +658,45 @@ fn analytical_oral_depot_modeled_duration_matches_explicit_and_is_finite() {
     );
 }
 
+#[test]
+fn analytical_oral_depot_modeled_duration_matches_nonmem() {
+    // #400 NONMEM anchor: zero-order input into the oral depot (RATE=-2 D1) on
+    // an analytical one_cpt_oral model must reproduce NONMEM's ADVAN2 TRANS2
+    // closed form with a modeled D1 (the depot's zero-order infusion duration).
+    //
+    // Reference: NONMEM 7.5.1, MAXEVAL=0, all THETA FIX, OMEGA 0 FIX (eta=0):
+    //   CL=5, V=50, KA=1, D1=5 (so rate = AMT/D1 = 100/5 = 20 over 5 h), S2=V.
+    //   Dose: RATE=-2 AMT=100 into CMT=1 (depot); observations on CMT=2 (central).
+    //   $PK D1 = THETA(4); PRED read from the sdtab. Control file + data in
+    //   tests/nonmem/oral_depot_d1.ctl / .csv.
+    const NONMEM_PRED: &[(f64, f64)] = &[
+        (1.0, 0.14200),
+        (2.0, 0.42135),
+        (3.0, 0.72960),
+        (5.0, 1.30730),
+        (8.0, 1.27350),
+        (12.0, 0.86800),
+        (18.0, 0.47659),
+        (24.0, 0.26156),
+    ];
+    let obs_rows: String = NONMEM_PRED
+        .iter()
+        .map(|(t, _)| format!("1,{t},1,0,0,2,0,0\n"))
+        .collect();
+    let csv = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,-2,1\n{obs_rows}");
+
+    let model = model_of(ANALYTICAL_ORAL_DEPOT_D1);
+    let preds = preds_of(&model, &csv);
+    assert_eq!(preds.len(), NONMEM_PRED.len());
+    for (p, (t, want)) in preds.iter().zip(NONMEM_PRED) {
+        // NONMEM PRED is tabulated to 5 significant figures, so anchor to that.
+        assert!(
+            (p - want).abs() <= 1e-4 * want.max(1.0),
+            "t={t}: ferx {p} vs NONMEM PRED {want}"
+        );
+    }
+}
+
 // Analytical 1-cpt IV model with IOV (kappa on CL) AND a modeled duration `D1`.
 // Exercises the `predict_iov` dispatch path — distinct from the no-TV / TV
 // dispatchers — which must also resolve `RATE=-2` doses (#394 review).

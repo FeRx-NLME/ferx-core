@@ -323,3 +323,42 @@ follows the dose compartment — a bolus into the central compartment is
 intravenous, while a bolus into a depot compartment with first-order absorption
 is extravascular (oral).
 
+## Can I model zero-order absorption (zero-order input into the depot)?
+
+Yes — on the analytical engine, with no `ode(...)` block. A `RATE=-2` modeled
+duration `D1` (or an explicit positive `RATE`) into **compartment 1** of an
+analytical oral model (`pk one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`)
+releases the dose into the **depot** at a constant zero-order rate over `D1`,
+which is then absorbed first-order into central via `KA` — the standard
+zero-order-into-depot absorption model. This mirrors NONMEM's `ADVAN2` with a
+`$PK D1` (the depot is compartment 1 in both). `D2` into the same model is a
+depot-bypassing infusion straight into central.
+
+This stays on the closed form (it's a linear system with piecewise-constant
+forcing) — `ferx` does not silently rewrite it into an ODE. The one limitation:
+per-compartment amounts in `sdtab` / `[derived]` are not available for these
+subjects (predictions are exact; a `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL`
+warning notes it). Use an `ode(...)` model if you need the compartment amounts.
+
+### NONMEM comparison
+
+A `one_cpt_oral` model with `CL=5`, `V=50`, `KA=1`, and a modeled depot duration
+`D1=5` (so a 100-unit dose is released into the depot at rate 20 over 5 h), versus
+NONMEM 7.5.1 `ADVAN2 TRANS2` with `$PK D1=THETA(4)` (`MAXEVAL=0`, `eta=0`).
+Control file and data: `tests/nonmem/oral_depot_d1.ctl` / `.csv`.
+
+| time (h) | ferx `pk one_cpt_oral` | NONMEM `ADVAN2` PRED |
+|---------:|-----------------------:|---------------------:|
+| 1  | 0.14200 | 0.14200 |
+| 2  | 0.42135 | 0.42135 |
+| 3  | 0.72960 | 0.72960 |
+| 5  | 1.30730 | 1.30730 |
+| 8  | 1.27350 | 1.27350 |
+| 12 | 0.86800 | 0.86800 |
+| 18 | 0.47659 | 0.47659 |
+| 24 | 0.26156 | 0.26156 |
+
+ferx matches NONMEM to the 5 significant figures tabulated (the
+`analytical_oral_depot_modeled_duration_matches_nonmem` regression test asserts
+this).
+
