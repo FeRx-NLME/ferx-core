@@ -404,6 +404,10 @@ pub fn predict_iov(
     // this is the single log-wrap point for the IOV path — predictions are
     // logged exactly once.
     apply_log_transform(model, &mut preds);
+
+    // FREM override AFTER scaling and log-transform: covariate pseudo-observations
+    // are predicted as theta + eta (raw additive), regardless of the PK error model.
+    apply_frem_prediction_override(model, subject, theta, eta_bsv, &mut preds);
     preds
 }
 
@@ -1152,6 +1156,35 @@ pub fn compute_predictions_ode(
 ///   - **TV covariates + ODE PK**: per-event TV is wired through the ODE
 ///     segment loop (Phase 4 — until then this falls back to single
 ///     snapshot like the analytical-unsupported branch).
+/// Apply the FREM prediction override in place: for each FREMTYPE > 0
+/// observation, replace the structural PK prediction with `theta[k] + eta[m]`
+/// (the covariate pseudo-observation = typical value + FREM random effect),
+/// using the `(theta, eta)` indices declared by `frem_predictions`.
+///
+/// No-op when the model has no `[frem]` config. `eta` is the BSV eta vector
+/// (the FREM etas are between-subject effects), so callers on the IOV path pass
+/// the BSV slice, not the kappa-augmented vector. Single source of truth shared
+/// by the analytical and IOV/SAEM prediction paths.
+pub(crate) fn apply_frem_prediction_override(
+    model: &crate::types::CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    preds: &mut [f64],
+) {
+    if let Some(ref fc) = model.frem_config {
+        for (j, ft) in subject.fremtype.iter().enumerate() {
+            if *ft > 0 {
+                if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(ft) {
+                    if j < preds.len() {
+                        preds[j] = theta[theta_idx] + eta[eta_idx];
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn compute_predictions_with_tv(
     model: &crate::types::CompiledModel,
     subject: &Subject,
@@ -1279,6 +1312,12 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // via `OdeSpec::output_fn`, so `model.scaling` is `None` for those.
     apply_scaling(model, subject, theta, eta, &mut preds);
     apply_log_transform(model, &mut preds);
+
+    // FREM override AFTER log-transform and scaling: replace predictions for
+    // FREMTYPE > 0 observations with theta[k] + eta[m] (raw covariate values).
+    // Covariate pseudo-observations use an additive model (Y = theta + eta + eps)
+    // regardless of the PK error model, so the log-transform must not apply.
+    apply_frem_prediction_override(model, subject, theta, eta, &mut preds);
     preds
 }
 
@@ -1466,6 +1505,7 @@ mod tests {
             cens: vec![0; 2],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -1520,6 +1560,7 @@ mod tests {
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -1600,6 +1641,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 
@@ -1657,6 +1699,7 @@ mod tests {
             cens: vec![0; 4],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -1961,6 +2004,43 @@ mod tests {
         for (n, l) in natural.iter().zip(logged.iter()) {
             assert_relative_eq!(*l, n.max(LTBS_FLOOR).ln(), epsilon = 1e-9);
         }
+    }
+
+    #[test]
+    fn test_ltbs_frem_predictions_are_raw_not_logged() {
+        // Regression: FREM covariate predictions must be raw (theta + eta),
+        // NOT log-transformed, even when the PK error model uses log_additive.
+        // The override must happen AFTER apply_log_transform so the log does
+        // not corrupt covariate predictions.
+        let mut model = cl_from_cr_model();
+        model.log_transform = true; // LTBS (log-additive)
+        model.n_eta = 2;
+        model.eta_names = vec!["ETA_CL".into(), "ETA_COV".into()];
+        model.default_params.omega = crate::types::OmegaMatrix::from_diagonal(
+            &[0.1, 100.0],
+            vec!["ETA_CL".into(), "ETA_COV".into()],
+        );
+        // FREM config: FREMTYPE 100 -> (theta_idx=0 [TVCL], eta_idx=1 [ETA_COV])
+        let mut map = std::collections::HashMap::new();
+        map.insert(100u16, (0usize, 1usize));
+        model.frem_config = Some(crate::types::FremConfig {
+            fremtype_to_indices: map,
+            covariate_sigma_index: 0,
+        });
+
+        let theta = [1.0]; // TVCL = 1.0
+        let eta = [0.0, 5.0]; // ETA_COV = 5.0
+                              // Expected FREM prediction: theta[0] + eta[1] = 1.0 + 5.0 = 6.0 (raw, NOT logged)
+
+        // Subject with 2 obs: FREMTYPE 0 (PK) and FREMTYPE 100 (covariate)
+        let mut subj = one_subject_for_scaling(); // has 3 obs
+        subj.fremtype = vec![0, 100, 0];
+
+        let preds = compute_predictions_with_tv(&model, &subj, &theta, &eta);
+        // PK rows (0, 2) should be log-transformed
+        assert!(preds[0].is_finite());
+        // FREM row (1) must be raw: theta[0] + eta[1] = 6.0, not ln(6.0)
+        assert_relative_eq!(preds[1], 6.0, epsilon = 1e-10);
     }
 
     #[test]
@@ -2291,6 +2371,7 @@ mod tests {
             cens: vec![0; n_obs],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };

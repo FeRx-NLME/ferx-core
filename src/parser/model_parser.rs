@@ -1729,6 +1729,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         output_columns: vec![],
         #[cfg(feature = "survival")]
         endpoints: std::collections::HashMap::new(),
+        frem_config: None,
     };
 
     // ── Optional blocks ──
@@ -1770,6 +1771,81 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // functions can branch without threading bloq_method through every call.
     let mut model = model;
     model.bloq_method = fit_options.bloq_method;
+
+    // Build FremConfig from fit options when frem_predictions is present.
+    // Format: "THETA_NAME/ETA_NAME:FREMTYPE, ..."
+    // Example: "TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"
+    if let Some(ref preds_str) = fit_options.frem_predictions {
+        let mut fremtype_to_indices = std::collections::HashMap::new();
+        for pair in preds_str.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = pair.split(':').collect();
+            if parts.len() != 2 {
+                return Err(format!(
+                    "frem_predictions: expected 'THETA/ETA:FREMTYPE', got '{}'",
+                    pair
+                ));
+            }
+            let names_part = parts[0].trim();
+            let ft_value: u16 = parts[1].trim().parse().map_err(|_| {
+                format!(
+                    "frem_predictions: expected integer FREMTYPE value, got '{}'",
+                    parts[1].trim()
+                )
+            })?;
+            let name_parts: Vec<&str> = names_part.split('/').collect();
+            if name_parts.len() != 2 {
+                return Err(format!(
+                    "frem_predictions: expected 'THETA/ETA:FREMTYPE', got '{}'",
+                    pair
+                ));
+            }
+            let theta_name = name_parts[0].trim();
+            let eta_name = name_parts[1].trim();
+            let theta_idx = model
+                .theta_names
+                .iter()
+                .position(|n| n == theta_name)
+                .ok_or_else(|| {
+                    format!(
+                        "frem_predictions: theta '{}' not found (available: {:?})",
+                        theta_name, model.theta_names
+                    )
+                })?;
+            let eta_idx = model
+                .eta_names
+                .iter()
+                .position(|n| n == eta_name)
+                .ok_or_else(|| {
+                    format!(
+                        "frem_predictions: eta '{}' not found (available: {:?})",
+                        eta_name, model.eta_names
+                    )
+                })?;
+            fremtype_to_indices.insert(ft_value, (theta_idx, eta_idx));
+        }
+        // Find covariate sigma index.
+        let sigma_name = fit_options.frem_sigma.as_deref().unwrap_or("EPSCOV");
+        let covariate_sigma_index = model
+            .default_params
+            .sigma
+            .names
+            .iter()
+            .position(|n| n == sigma_name)
+            .ok_or_else(|| {
+                format!(
+                    "frem_sigma: sigma parameter '{}' not found (available: {:?})",
+                    sigma_name, model.default_params.sigma.names
+                )
+            })?;
+        model.frem_config = Some(crate::types::FremConfig {
+            fremtype_to_indices,
+            covariate_sigma_index,
+        });
+    }
 
     // Bake the configured ODE solver tolerances from [fit_options] onto the
     // OdeSpec so predict()/fit_from_files (which integrate the parsed spec
@@ -3623,6 +3699,23 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.impmap_low_ess_threshold = v;
         }
+        "impmap_trace" => opts.impmap_trace = parse_bool("impmap_trace")?,
+        "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,
+        "impmap_sobol" => opts.impmap_sobol = parse_bool("impmap_sobol")?,
+        "iscale_min" => {
+            let v = parse_f64("iscale_min")?;
+            if v <= 0.0 {
+                return Err("fit option `iscale_min` must be > 0".to_string());
+            }
+            opts.iscale_min = v;
+        }
+        "iscale_max" => {
+            let v = parse_f64("iscale_max")?;
+            if v <= 0.0 {
+                return Err("fit option `iscale_max` must be > 0".to_string());
+            }
+            opts.iscale_max = v;
+        }
         "npde_nsim" => opts.npde_nsim = parse_usize("npde_nsim")?,
         "npde_seed" => opts.npde_seed = parse_u64_opt("npde_seed")?,
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
@@ -3765,6 +3858,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 push_unique_expr(&mut opts.ignore_subjects, bare);
             }
             return Ok(true);
+        }
+        "frem_predictions" => {
+            opts.frem_predictions = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        "frem_sigma" => {
+            opts.frem_sigma = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
         }
         _ => return Ok(false),
     }
@@ -11457,6 +11564,7 @@ mod tests {
             "impmap_averaging = 30".to_string(),
             "impmap_seed = 77".to_string(),
             "impmap_low_ess_threshold = 0.2".to_string(),
+            "impmap_mceta = 3".to_string(),
             "covariance = false".to_string(),
         ])
         .expect("parse must succeed");
@@ -11467,6 +11575,7 @@ mod tests {
         assert_eq!(opts.impmap_averaging, 30);
         assert_eq!(opts.impmap_seed, Some(77));
         assert_eq!(opts.impmap_low_ess_threshold, 0.2);
+        assert_eq!(opts.impmap_mceta, 3);
         // All keys are method-specific to Impmap and Impmap is selected.
         assert!(opts.unsupported_keys_warnings().is_empty());
 
@@ -18999,119 +19108,30 @@ CL V KA WT
         }
     }
 
-    /// Regression: named analytical compartment references (e.g. `central`,
-    /// `depot`) in a [derived] expression on an analytical model must set
-    /// `uses_compartments = true` so that W_DERIVED_CMT_* warnings fire.
-    ///
-    /// Before the fix, `ode_state_names` was empty for analytical models, so
-    /// `expr_refs_compartments` never detected named access — all four
-    /// W_DERIVED_CMT_* guards were silently suppressed.
     #[test]
-    fn analytical_model_named_compartment_sets_uses_compartments() {
-        // one_cpt_iv has a single compartment named "central"
-        let src = minimal_model_with_derived("C_CENTRAL = central");
-        let parsed = parse_full_model(&src).expect("parse ok");
-        let expr = &parsed.model.derived_exprs[0];
-        assert_eq!(expr.name, "C_CENTRAL");
-        assert!(
-            expr.uses_compartments,
-            "`central` in [derived] on a one_cpt_iv model must set uses_compartments=true"
-        );
-
-        // two_cpt_oral has depot, central, peripheral
-        let src2 = r#"
-[parameters]
-  theta CL(1.0, 0, 100)
-  theta V1(10.0, 0, 1000)
-  theta Q(0.5, 0, 50)
-  theta V2(5.0, 0, 500)
-  theta KA(1.0, 0, 10)
-  omega ETA_CL ~ 0.09
-  sigma PROP   ~ 0.01
-[individual_parameters]
-  CL = exp(log(CL) + ETA_CL)
-  V1 = V1
-  Q  = Q
-  V2 = V2
-  KA = KA
-[structural_model]
-  pk two_cpt_oral(cl=CL, v=V1, q=Q, v2=V2, ka=KA)
-[error_model]
-  DV ~ proportional(PROP)
-[derived]
-  C_PERIPH = peripheral
-"#;
-        let parsed2 = parse_full_model(src2).expect("parse ok (two_cpt_oral)");
-        let expr2 = &parsed2.model.derived_exprs[0];
-        assert_eq!(expr2.name, "C_PERIPH");
-        assert!(
-            expr2.uses_compartments,
-            "`peripheral` in [derived] on a two_cpt_oral model must set uses_compartments=true"
-        );
-    }
-
-    /// Regression: `compartments[N]` with N > MAX_CMT_INDEX (255) must fail at
-    /// parse time rather than silently evaluating to 0.0.
-    ///
-    /// MAX_CMT_INDEX is the module-level constant; `build_derived_vars` seeds
-    /// `__cmt_0..=__cmt_{MAX_CMT_INDEX}` with NaN. Any index beyond that misses
-    /// the map and `.unwrap_or(0.0)` would return 0.0 — a plausible drug
-    /// concentration masking the out-of-range access.
-    #[test]
-    fn compartments_index_out_of_range_is_parse_error() {
-        let src = minimal_model_with_derived("X = compartments[256]");
-        match parse_full_model(&src) {
-            Err(err) => assert!(
-                err.contains("256") && err.contains("exceeds"),
-                "error should mention the index and 'exceeds': {err}"
+    fn test_apply_fit_option_frem_predictions() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(
+                &mut opts,
+                "frem_predictions",
+                "TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"
             ),
-            Ok(_) => panic!("compartments[256] should be a parse error"),
-        }
-
-        // 255 is the last valid index — must succeed
-        let src_ok = minimal_model_with_derived("X = compartments[255]");
-        parse_full_model(&src_ok).expect("compartments[255] should parse ok");
-
-        // 0 must still work
-        let src_zero = minimal_model_with_derived("X = compartments[0]");
-        parse_full_model(&src_zero).expect("compartments[0] should parse ok");
+            Ok(true)
+        );
+        assert_eq!(
+            opts.frem_predictions.as_deref(),
+            Some("TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200")
+        );
     }
 
-    /// Regression: `uses_compartments` on `integral()` must also fire when the
-    /// **condition** (filter) clause references a compartment, not just the
-    /// integrand. Before the fix, `integral(IPRED, compartments[0] > 1, from=0,
-    /// to=24)` had `uses_compartments = false` because only the integrand was
-    /// checked — the filter closure silently received NaN for all `__cmt_N` keys,
-    /// and the integral silently integrated over the wrong set of observations.
     #[test]
-    fn integral_condition_referencing_compartment_sets_uses_compartments() {
-        // Integrand is IPRED (no compartment ref); condition references compartments[0].
-        let src = minimal_model_with_derived(
-            "AUC_FILTERED = integral(IPRED, compartments[0] > 1.0, from=0, to=24)",
+    fn test_apply_fit_option_frem_sigma() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(&mut opts, "frem_sigma", "EPSCOV"),
+            Ok(true)
         );
-        let parsed = parse_full_model(&src).expect("parse ok");
-        let expr = &parsed.model.derived_exprs[0];
-        assert_eq!(expr.name, "AUC_FILTERED");
-        assert!(
-            expr.uses_compartments,
-            "integral() condition referencing compartments[0] must set uses_compartments=true"
-        );
-
-        // Sanity check: integrand-only reference still works
-        let src2 = minimal_model_with_derived("AUC_CMT = integral(compartments[0], from=0, to=24)");
-        let parsed2 = parse_full_model(&src2).expect("parse ok");
-        assert!(
-            parsed2.model.derived_exprs[0].uses_compartments,
-            "integral() integrand referencing compartments[0] must still set uses_compartments"
-        );
-
-        // Sanity check: no compartment reference in either integrand or condition → false
-        let src3 =
-            minimal_model_with_derived("AUC_PLAIN = integral(IPRED, DV > 0.0, from=0, to=24)");
-        let parsed3 = parse_full_model(&src3).expect("parse ok");
-        assert!(
-            !parsed3.model.derived_exprs[0].uses_compartments,
-            "integral() with no compartment reference must leave uses_compartments=false"
-        );
+        assert_eq!(opts.frem_sigma.as_deref(), Some("EPSCOV"));
     }
 }

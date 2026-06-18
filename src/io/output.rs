@@ -157,9 +157,9 @@ pub fn print_results(result: &FitResult) {
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            match &result.se_omega {
-                Some(se) if i < se.len() => format!("{:.6}", se[i]),
-                _ => "N/A".to_string(),
+            match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
+                Some(s) => format!("{:.6}", s),
+                None => "N/A".to_string(),
             }
         };
         if show_cv {
@@ -195,9 +195,14 @@ pub fn print_results(result: &FitResult) {
                             0.0
                         }
                     });
+                let se_cov = crate::types::omega_se_at(&result.se_omega, n_eta, i, j);
+                let se_str = match se_cov {
+                    Some(s) => format!("  SE = {:.6}", s),
+                    None => String::new(),
+                };
                 eprintln!(
-                    "  {} × {} = {:.6}  (param corr = {:.4})",
-                    name_i, name_j, cov, param_corr,
+                    "  {} × {} = {:.6}  (param corr = {:.4}){}",
+                    name_i, name_j, cov, param_corr, se_str,
                 );
             }
         }
@@ -1037,7 +1042,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let var = result.omega[(i, i)];
         let cv_pct = if var > 0.0 { var.sqrt() * 100.0 } else { 0.0 };
         let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
-        let se = result.se_omega.as_ref().and_then(|v| v.get(i).copied());
+        let se = crate::types::omega_se_at(&result.se_omega, n_eta, i, i);
         let key = result
             .eta_names
             .get(i)
@@ -1084,8 +1089,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                             0.0
                         }
                     });
+                let se_cov = crate::types::omega_se_at(&result.se_omega, n_eta, i, j);
                 writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
                 writeln!(f, "    covariance: {:.6}", cov).map_err(|e| e.to_string())?;
+                match se_cov {
+                    Some(s) => writeln!(f, "    se: {:.6}", s).map_err(|e| e.to_string())?,
+                    None => writeln!(f, "    se: ~").map_err(|e| e.to_string())?,
+                }
                 writeln!(f, "    correlation: {:.6}", param_corr).map_err(|e| e.to_string())?;
             }
         }
@@ -1456,6 +1466,7 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            impmap_trace: None,
             bayes: None,
             omega_iov: None,
             kappa_names: Vec::new(),
@@ -1744,6 +1755,7 @@ mod tests {
             cens: vec![0; n_obs],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -1788,6 +1800,7 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            impmap_trace: None,
             bayes: None,
             omega_iov: None,
             kappa_names: Vec::new(),

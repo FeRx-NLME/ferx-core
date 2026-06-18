@@ -37,6 +37,101 @@ use rayon::prelude::*;
 /// `2π` as `f64`.  Used in the Gaussian-prior log-density.
 const TWO_PI: f64 = std::f64::consts::TAU;
 
+// ---------------------------------------------------------------------------
+// Inverse normal CDF (Acklam rational approximation)
+// ---------------------------------------------------------------------------
+
+/// Inverse normal CDF (probit function): given u ∈ (0, 1), returns z such that
+/// Φ(z) = u. Uses the Acklam rational approximation with full f64 precision
+/// (~1.15e-9 relative error over the entire range).
+///
+/// Used to transform uniform Sobol quasi-random points to N(0,1) draws.
+fn inv_normal_cdf(u: f64) -> f64 {
+    let u = u.clamp(1e-15, 1.0 - 1e-15);
+
+    // Acklam (2003) rational approximation coefficients
+    const A: [f64; 6] = [
+        -3.969683028665376e+01,
+        2.209460984245205e+02,
+        -2.759285104469687e+02,
+        1.383577518672690e+02,
+        -3.066479806614716e+01,
+        2.506628277459239e+00,
+    ];
+    const B: [f64; 5] = [
+        -5.447609879822406e+01,
+        1.615858368580409e+02,
+        -1.556989798598866e+02,
+        6.680131188771972e+01,
+        -1.328068155288572e+01,
+    ];
+    const C: [f64; 6] = [
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e+00,
+        -2.549732539343734e+00,
+        4.374664141464968e+00,
+        2.938163982698783e+00,
+    ];
+    const D: [f64; 4] = [
+        7.784695709041462e-03,
+        3.224671290700398e-01,
+        2.445134137142996e+00,
+        3.754408661907416e+00,
+    ];
+
+    const P_LOW: f64 = 0.02425;
+    const P_HIGH: f64 = 1.0 - P_LOW;
+
+    if u < P_LOW {
+        // Lower tail
+        let q = (-2.0 * u.ln()).sqrt();
+        (((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    } else if u <= P_HIGH {
+        // Central region
+        let q = u - 0.5;
+        let r = q * q;
+        (((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5]) * q
+            / (((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0)
+    } else {
+        // Upper tail (symmetry)
+        let q = (-2.0 * (1.0 - u).ln()).sqrt();
+        -(((((C[0] * q + C[1]) * q + C[2]) * q + C[3]) * q + C[4]) * q + C[5])
+            / ((((D[0] * q + D[1]) * q + D[2]) * q + D[3]) * q + 1.0)
+    }
+}
+
+/// Generate `k_samples` quasi-random N(0,1) vectors of dimension `d` using
+/// Sobol sequences with Cranley-Patterson randomization.
+///
+/// Returns a Vec of k_samples vectors, each of length d.
+fn sobol_normal_draws(d: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
+    use sobol::params::JoeKuoD6;
+    use sobol::Sobol;
+
+    // Cranley-Patterson rotation: shift Sobol points by a uniform random vector
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x534F_424F_4C00_0000u64));
+    let shift: Vec<f64> = (0..d).map(|_| rand::Rng::gen::<f64>(&mut rng)).collect();
+
+    let params = JoeKuoD6::minimal(); // supports up to 100 dims
+    let sobol_seq = Sobol::<f64>::new(d, &params);
+
+    sobol_seq
+        .take(k_samples)
+        .map(|point| {
+            point
+                .iter()
+                .zip(shift.iter())
+                .map(|(&u, &s)| {
+                    let u_shifted = (u + s) % 1.0;
+                    inv_normal_cdf(u_shifted)
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// Estimate `−2 log L` by importance sampling. See module docstring for the
 /// algorithm and IOV caveats.
 pub fn run_importance_sampling(
@@ -292,6 +387,7 @@ pub fn run_importance_sampling(
                     nu,
                     subj_seed,
                     scratch,
+                    1.0, // iscale: no adaptive scaling for IMP EONLY
                 )
             }
         })
@@ -393,6 +489,7 @@ fn subject_is_estimate(
     nu: f64,
     seed: u64,
     scratch: &mut EventPkParams,
+    iscale: f64,
 ) -> SubjectIsOutput {
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -414,12 +511,15 @@ fn subject_is_estimate(
     let chi_sq = ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller");
 
     // Constant pieces of log q (Student-t) and log p_η (Gaussian) pulled out
-    // of the per-sample loop.
+    // of the per-sample loop. ISCALE adjusts the proposal: Σ_prop = iscale² · Σ.
     let half_d = 0.5 * d as f64;
+    let iscale_log_adj = -(d as f64) * iscale.ln();
+    let inv_iscale_sq = 1.0 / (iscale * iscale);
     let log_t_const = ln_gamma(0.5 * (nu + d as f64))
         - ln_gamma(0.5 * nu)
         - half_d * (nu * std::f64::consts::PI).ln()
-        + 0.5 * proposal.log_det_inv_scale; // −0.5 log|Σ| = +0.5 log|H_reg|
+        + 0.5 * proposal.log_det_inv_scale
+        + iscale_log_adj;
     let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
 
     // Preallocate every per-sample buffer once. With K typically in the
@@ -432,12 +532,12 @@ fn subject_is_estimate(
     let mut diff = vec![0.0_f64; d];
 
     for _ in 0..k_samples {
-        // Draw z ~ N(0, I_d) and c ~ χ²_ν; build η = η̂ + sqrt(ν/c) · L_Σ z.
+        // Draw z ~ N(0, I_d) and c ~ χ²_ν; build η = η̂ + iscale·sqrt(ν/c) · L_Σ z.
         for zi in z.iter_mut() {
             *zi = normal.sample(&mut rng);
         }
         let c: f64 = chi_sq.sample(&mut rng).max(1e-300);
-        let scale = (nu / c).sqrt();
+        let scale = (nu / c).sqrt() * iscale;
         // L_Σ z via the precomputed factor.
         proposal.apply_l_sigma(&z, &mut eta_sample, scale);
         for (j, e) in eta_sample.iter_mut().enumerate() {
@@ -461,16 +561,12 @@ fn subject_is_estimate(
         }
         let log_p_eta = log_p_eta_const - 0.5 * quad_form;
 
-        // log q(η): multivariate t at (η̂, Σ, ν).
-        // Fill the preallocated `diff` buffer in place — avoids a per-sample
-        // `Vec` allocation from the previous `.collect()` form.
+        // log q(η): multivariate t at (η̂, iscale²·Σ, ν).
         for (k, d_slot) in diff.iter_mut().enumerate() {
             *d_slot = eta_sample[k] - eta_hat[k];
         }
-        // (η-η̂)' H_reg (η-η̂) via the precomputed Cholesky of H_reg = L L'.
-        // Σ⁻¹ = H_reg, so the Mahalanobis term is ‖L'·diff‖².
         let mahal = proposal.mahalanobis(&diff);
-        let log_q = log_t_const - 0.5 * (nu + d as f64) * (1.0 + mahal / nu).ln();
+        let log_q = log_t_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln();
 
         log_w.push(log_p_y + log_p_eta - log_q);
     }
@@ -560,6 +656,13 @@ impl SubjectDraws {
 /// `nu = f64::INFINITY` selects a multivariate-normal proposal (NONMEM IMPMAP
 /// default); a finite `nu ≥ 1` selects a multivariate Student-t. The marginal-LL
 /// and weight math is otherwise identical to [`subject_is_estimate`].
+///
+/// `iscale` scales the proposal standard deviation: Σ_prop = iscale² · H⁻¹.
+/// Use 1.0 for unscaled (default). NONMEM ISCALE range is typically [0.1, 10.0].
+///
+/// `use_sobol`: when `true` **and** the proposal is MVN (ν = ∞), replace
+/// pseudo-random N(0,I) draws with Sobol quasi-random sequences
+/// (Cranley-Patterson randomized).  Falls back to pseudo-random for Student-t.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_is_draws(
     model: &CompiledModel,
@@ -575,6 +678,8 @@ pub(crate) fn subject_is_draws(
     nu: f64,
     seed: u64,
     scratch: &mut EventPkParams,
+    iscale: f64,
+    use_sobol: bool,
 ) -> SubjectDraws {
     let mvn = !nu.is_finite();
     let mut rng = StdRng::seed_from_u64(seed);
@@ -603,12 +708,19 @@ pub(crate) fn subject_is_draws(
 
     let half_d = 0.5 * d as f64;
     let log_p_eta_const = -half_d * TWO_PI.ln() - 0.5 * log_det_omega;
-    // Constant term of log q(η): MVN uses −d/2·log(2π)+½log|Σ⁻¹|; Student-t adds
-    // the Γ-ratio / ν-scaling pieces.
+
+    // Constant term of log q(η) with ISCALE adjustment.
+    // MVN: −d/2·log(2π) + ½log|Σ⁻¹| − d·log(iscale)
+    //   where the −d·log(iscale) accounts for det(s²Σ) = s^{2d}·det(Σ).
+    // Student-t: Γ-ratio + ½log|Σ⁻¹| − d·log(iscale) − d/2·log(ν·π).
+    let iscale_log_adj = -(d as f64) * iscale.ln();
+    let inv_iscale_sq = 1.0 / (iscale * iscale);
     let log_q_const = if mvn {
-        -half_d * TWO_PI.ln() + 0.5 * proposal.log_det_inv_scale
+        -half_d * TWO_PI.ln() + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
     } else {
-        ln_gamma(0.5 * (nu + d as f64)) - ln_gamma(0.5 * nu) + 0.5 * proposal.log_det_inv_scale
+        ln_gamma(0.5 * (nu + d as f64)) - ln_gamma(0.5 * nu)
+            + 0.5 * proposal.log_det_inv_scale
+            + iscale_log_adj
             - half_d * (nu * std::f64::consts::PI).ln()
     };
 
@@ -617,16 +729,28 @@ pub(crate) fn subject_is_draws(
     let mut z = vec![0.0_f64; d];
     let mut diff = vec![0.0_f64; d];
 
-    for _ in 0..k_samples {
-        for zi in z.iter_mut() {
-            *zi = normal.sample(&mut rng);
+    // Pre-generate Sobol quasi-random draws if requested and MVN.
+    let sobol_draws = if use_sobol && mvn {
+        Some(sobol_normal_draws(d, k_samples, seed))
+    } else {
+        None
+    };
+
+    for sample_idx in 0..k_samples {
+        if let Some(ref qr) = sobol_draws {
+            // Sobol quasi-random N(0,I) draws (MVN only)
+            z.copy_from_slice(&qr[sample_idx]);
+        } else {
+            for zi in z.iter_mut() {
+                *zi = normal.sample(&mut rng);
+            }
         }
         let scale = match &chi_sq {
             Some(c) => {
                 let cc: f64 = c.sample(&mut rng).max(1e-300);
-                (nu / cc).sqrt()
+                (nu / cc).sqrt() * iscale
             }
-            None => 1.0,
+            None => iscale,
         };
         let mut eta_sample = vec![0.0_f64; d];
         proposal.apply_l_sigma(&z, &mut eta_sample, scale);
@@ -652,9 +776,9 @@ pub(crate) fn subject_is_draws(
         }
         let mahal = proposal.mahalanobis(&diff);
         let log_q = if mvn {
-            log_q_const - 0.5 * mahal
+            log_q_const - 0.5 * inv_iscale_sq * mahal
         } else {
-            log_q_const - 0.5 * (nu + d as f64) * (1.0 + mahal / nu).ln()
+            log_q_const - 0.5 * (nu + d as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln()
         };
 
         log_w.push(log_p_y + log_p_eta - log_q);
@@ -695,6 +819,71 @@ pub(crate) fn subject_is_draws(
     }
 }
 
+/// Find the optimal ISCALE for a subject via pilot draws.
+///
+/// Tries a grid of log-spaced scale factors in `[iscale_min, iscale_max]`
+/// using `n_pilot` draws each, and returns the scale that maximises ESS.
+/// Returns 1.0 if ISCALE is disabled (min >= max or both == 1.0).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_optimal_iscale(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    iscale_min: f64,
+    iscale_max: f64,
+) -> f64 {
+    if iscale_min >= iscale_max || (iscale_min == 1.0 && iscale_max == 1.0) {
+        return 1.0;
+    }
+    // Grid of 7 log-spaced scale factors from iscale_min to iscale_max
+    let n_grid = 7;
+    let n_pilot = 50;
+    let log_min = iscale_min.ln();
+    let log_max = iscale_max.ln();
+    let mut best_scale = 1.0_f64;
+    let mut best_ess = f64::NEG_INFINITY;
+
+    for g in 0..n_grid {
+        let frac = g as f64 / (n_grid - 1) as f64;
+        let scale = (log_min + frac * (log_max - log_min)).exp();
+        // Use a different seed per scale to avoid correlations
+        let pilot_seed = seed
+            .wrapping_add(0x4953_4341_4C45_0000u64)
+            .wrapping_add(g as u64);
+        let draws = subject_is_draws(
+            model,
+            subject,
+            theta,
+            sigma,
+            eta_hat,
+            h,
+            omega_inv,
+            log_det_omega,
+            d,
+            n_pilot,
+            nu,
+            pilot_seed,
+            scratch,
+            scale,
+            false, // pilot draws don't need Sobol
+        );
+        if draws.ess_fraction > best_ess {
+            best_ess = draws.ess_fraction;
+            best_scale = scale;
+        }
+    }
+    best_scale
+}
+
 // ---------------------------------------------------------------------------
 // Joint (eta, kappa) sampling for IOV models
 // ---------------------------------------------------------------------------
@@ -731,8 +920,16 @@ fn compute_joint_posterior_hessian(
     let kappa_slices: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
     let ipreds = predict_iov(model, subject, theta, eta_hat.as_slice(), &kappa_slices);
 
-    // Compute residual variance
-    let r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    // Compute residual variance with FREM overrides
+    let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma,
+    );
+    if let Some(ref overrides) = frem_ov {
+        crate::stats::likelihood::apply_frem_r_overrides(&mut r_diag, overrides);
+    }
 
     // Build the full Jacobian via FD for kappa columns
     // eta columns come from jacobian_eta (already computed by inner loop)
@@ -1110,7 +1307,17 @@ pub(crate) fn compute_posterior_hessian(
     }
     let ipreds =
         compute_predictions_with_tv_into(model, subject, theta, eta_hat.as_slice(), scratch);
-    let r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    // Apply FREM R-diagonal overrides: covariate pseudo-observations use EPSCOV²
+    // instead of the PK error model variance.
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma,
+    );
+    if let Some(ref overrides) = frem_ov {
+        crate::stats::likelihood::apply_frem_r_overrides(&mut r_diag, overrides);
+    }
     let mut h_post = omega_inv.clone();
     for j in 0..n_obs {
         let rj = r_diag[j].max(1e-12);
@@ -1290,5 +1497,34 @@ mod tests {
         let ess_fraction = ess / (k as f64);
         let var = (1.0 / ess_fraction - 1.0) / (k as f64);
         assert!(var.abs() < 1e-12);
+    }
+
+    #[test]
+    fn inv_normal_cdf_known_quantiles() {
+        // Φ⁻¹(0.5) = 0
+        assert!(inv_normal_cdf(0.5).abs() < 1e-8);
+        // Φ⁻¹(0.975) ≈ 1.96
+        let q975 = inv_normal_cdf(0.975);
+        assert!((q975 - 1.96).abs() < 0.05, "Φ⁻¹(0.975) = {q975}");
+        // Φ⁻¹(0.025) ≈ -1.96
+        let q025 = inv_normal_cdf(0.025);
+        assert!((q025 + 1.96).abs() < 0.05, "Φ⁻¹(0.025) = {q025}");
+        // Φ⁻¹(0.84) ≈ 1.0
+        let q84 = inv_normal_cdf(0.84);
+        assert!((q84 - 1.0).abs() < 0.05, "Φ⁻¹(0.84) = {q84}");
+    }
+
+    #[test]
+    fn sobol_draws_have_correct_shape_and_near_zero_mean() {
+        let d = 5;
+        let k = 1000;
+        let draws = sobol_normal_draws(d, k, 42);
+        assert_eq!(draws.len(), k);
+        assert_eq!(draws[0].len(), d);
+        // Mean of each dimension should be near zero for a large sample
+        for dim in 0..d {
+            let mean: f64 = draws.iter().map(|v| v[dim]).sum::<f64>() / k as f64;
+            assert!(mean.abs() < 0.15, "dim {dim} mean = {mean}, expected ~0");
+        }
     }
 }

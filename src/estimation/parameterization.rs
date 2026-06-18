@@ -363,17 +363,24 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
     }
 
     // Omega Cholesky bounds
+    //
+    // Diagonal elements are stored as log(L_ii), so the bound constrains the
+    // Cholesky diagonal in [exp(lower), exp(upper)].  The previous upper of
+    // 4.0 (exp(4) ≈ 55, max variance ≈ 3 000) is too tight for FREM models
+    // whose covariate omega diagonals can reach 15 000+.  With 6.0 the cap
+    // is exp(6) ≈ 403, max variance ≈ 162 000 — sufficient for practical
+    // FREM covariate variances while still preventing runaway.
     if template.omega.diagonal {
         for _ in 0..n_eta {
             lower.push(-6.0); // exp(-6) ≈ 0.0025
-            upper.push(4.0); // exp(4) ≈ 55
+            upper.push(6.0); // exp(6) ≈ 403
         }
     } else {
         for j in 0..n_eta {
             for i in j..n_eta {
                 if i == j {
                     lower.push(-6.0);
-                    upper.push(4.0);
+                    upper.push(6.0);
                 } else {
                     lower.push(-10.0);
                     upper.push(10.0);
@@ -394,14 +401,14 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
         if iov.diagonal {
             for _ in 0..n {
                 lower.push(-6.0);
-                upper.push(4.0);
+                upper.push(6.0);
             }
         } else {
             for j in 0..n {
                 for i in j..n {
                     if i == j {
                         lower.push(-6.0);
-                        upper.push(4.0);
+                        upper.push(6.0);
                     } else {
                         lower.push(-10.0);
                         upper.push(10.0);
@@ -961,6 +968,7 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
         }
     }
 

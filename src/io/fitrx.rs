@@ -1589,6 +1589,7 @@ fn wire_to_fit_result(
         // .fitrx v1: importance_sampling is not serialised — re-run via
         // `methods = [..., imp]` if the consumer needs the IS LL.
         importance_sampling: None,
+        impmap_trace: None,
         bayes: None,
         omega_iov,
         kappa_names,
@@ -1734,6 +1735,7 @@ mod tests {
                 cens: vec![0; n_obs_each],
                 occasions: vec![],
                 dose_occasions: vec![],
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
@@ -1787,6 +1789,7 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            impmap_trace: None,
             bayes: None,
             omega_iov: None,
             kappa_names: vec![],

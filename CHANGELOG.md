@@ -20,6 +20,29 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- `impmap_mceta` fit option: multi-start MAP for IMPMAP (NONMEM `MCETA` equivalent),
+  improving IS efficiency in high-dimensional models (e.g. FREM with ≥5 ETAs).
+- Analytical Jacobian for FREM pseudo-observations: covariate rows in the FD
+  Jacobian are overwritten with exact ∂Y/∂η values (0 or 1), eliminating noise
+  that corrupted the IS proposal in high-dimensional FREM models.
+- `iscale_min` / `iscale_max` fit options: adaptive IS proposal scaling (NONMEM
+  `ISCALE_MIN`/`ISCALE_MAX` equivalent). Per-subject pilot search over log-spaced
+  scale factors selects the proposal width that maximises ESS. Defaults: 0.1–10.0.
+- `impmap_sobol` fit option: use Sobol quasi-random sequences (with Cranley-Patterson
+  randomization) for IMPMAP IS draws instead of pseudo-random, giving more uniform
+  coverage of the posterior. MVN proposals only; Student-t falls back to pseudo-random.
+- Full off-diagonal omega standard errors for block omega via multivariate delta
+  method on the Cholesky parameterization. `se_omega` is now the full lower
+  triangle (length n_eta*(n_eta+1)/2) instead of diagonal-only. Added
+  `omega_se_at()` helper for indexed lookup.
+- Per-iteration IMPMAP parameter trace (`FitResult.impmap_trace`), analogous to
+  NONMEM `.ext` file output. Opt-in via `impmap_trace = true` in `[fit_options]`.
+- FREM (Full Random Effects Model) covariate analysis: `prepare_frem()` API
+  transforms a base model + dataset into a FREM model with extended block omega,
+  covariate pseudo-observations, and FREMTYPE dispatch in the likelihood. The
+  covariates (and their continuous/categorical kind) are taken from the model's
+  `[covariates]` block; the `covariates` argument is an optional subset filter
+  over them (#194).
 - **Zero-order absorption into the oral depot on analytical models** — a `RATE=-2`
   modeled duration `D1` (or an explicit positive-`RATE` infusion) into compartment 1
   of an analytical oral model (`one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`)
@@ -411,6 +434,20 @@ section of the SDLC for the versioning policy).
 - `sdtab` no longer emits stray ETA columns (regression from #185).
 - `warfarin --simulate` works again, and the docs `verify-build` step is fixed
   (#199, #200).
+- FREM with `log_additive` error model: covariate pseudo-observation predictions
+  are no longer log-transformed. The FREM override (θ + η) now runs after the
+  LTBS log-transform, producing raw covariate predictions as NONMEM does. Without
+  this fix the OFV was inflated by ~10 orders of magnitude.
+- FREM with IMPMAP/IMP: the IS posterior Hessian now applies the FREM R-diagonal
+  override (EPSCOV² variance) for covariate pseudo-observations, matching the
+  FOCEI and SAEM code paths.
+- `frem_predictions` and `frem_sigma` fit options are now registered as framework
+  keys, suppressing spurious "not used by method" warnings on non-FOCEI chains.
+- FREM data generation: missing covariate values (default -99) are now excluded
+  from mean/variance computation and their pseudo-observation rows are omitted,
+  matching PsN/NONMEM behavior.
+- FREM data generation: records within each subject are now sorted by (time,
+  event priority) to prevent backwards-in-time sequences that NONMEM rejects.
 
 ### Performance
 - The covariance step is now built as a single parallel work-list over the

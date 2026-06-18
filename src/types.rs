@@ -544,6 +544,10 @@ pub struct Subject {
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
+    /// FREM observation type per observation (parallel to `obs_times`).
+    /// 0 = PK observation, 100/200/300/... = covariate observation.
+    /// Empty when FREMTYPE column is absent from the data.
+    pub fremtype: Vec<u16>,
     /// Non-Gaussian observation records (TTE events, discrete states, counts).
     /// Empty for all-Gaussian subjects. Populated by the data reader when the
     /// model declares a non-Gaussian endpoint for the row's CMT.
@@ -2021,6 +2025,25 @@ pub struct CompiledModel {
     /// Keyed by the CMT value declared in `[event_model]` / future blocks.
     #[cfg(feature = "survival")]
     pub endpoints: HashMap<usize, EndpointLikelihood>,
+    /// FREM configuration. When `Some`, the model uses FREMTYPE-based
+    /// observation dispatch: covariate pseudo-observations use individual
+    /// parameter values as predictions and a near-zero additive sigma.
+    pub frem_config: Option<FremConfig>,
+}
+
+/// FREM (Full Random Effects Model) configuration.
+///
+/// Maps FREMTYPE observation-type values to (theta_index, eta_index) pairs
+/// so the likelihood can compute covariate pseudo-observation predictions
+/// as `theta[theta_idx] + eta[eta_idx]` and use a near-zero additive sigma.
+#[derive(Debug, Clone)]
+pub struct FremConfig {
+    /// Maps FREMTYPE value (100, 200, ...) → (theta_index, eta_index).
+    /// For FREMTYPE observations, the prediction is
+    /// `theta[theta_idx] + eta[eta_idx]`.
+    pub fremtype_to_indices: HashMap<u16, (usize, usize)>,
+    /// Index into `sigma_values` for the covariate error sigma (EPSCOV).
+    pub covariate_sigma_index: usize,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -2405,6 +2428,38 @@ pub struct ImportanceSamplingResult {
     pub kappa_treatment: KappaTreatment,
 }
 
+/// One row of the IMPMAP per-iteration parameter trace.
+///
+/// Analogous to one line in NONMEM's `.ext` file for `METHOD=IMPMAP`.
+/// Positive `iteration` values are EM iterations; special negative values
+/// mark the final (averaged) estimate and standard errors.
+#[derive(Debug, Clone)]
+pub struct ImpmapTraceRow {
+    /// EM iteration number (1-based). Special values:
+    /// `-1_000_000_000` = final averaged estimate,
+    /// `-1_000_000_001` = standard errors (when covariance step ran).
+    pub iteration: i64,
+    pub theta: Vec<f64>,
+    /// Lower triangle of the omega matrix, row-major: `(0,0), (1,0), (1,1), …`
+    pub omega_lower_tri: Vec<f64>,
+    pub sigma: Vec<f64>,
+    /// Objective function value (−2·log-likelihood from importance sampling).
+    pub ofv: f64,
+}
+
+/// Per-iteration parameter trace from IMPMAP, analogous to NONMEM `.ext`.
+///
+/// Surfaced on `FitResult.impmap_trace` when the final estimating stage is
+/// IMPMAP. Column names follow NONMEM convention (`THETA1`, `OMEGA(1,1)`, …).
+#[derive(Debug, Clone, Default)]
+pub struct ImpmapTrace {
+    pub rows: Vec<ImpmapTraceRow>,
+    pub theta_names: Vec<String>,
+    /// e.g. `"OMEGA(1,1)"`, `"OMEGA(2,1)"`, `"OMEGA(2,2)"`, …
+    pub omega_names: Vec<String>,
+    pub sigma_names: Vec<String>,
+}
+
 /// Posterior summary for a single scalar parameter, computed across all
 /// post-warmup, post-thinning draws from every chain.
 #[derive(Debug, Clone)]
@@ -2687,6 +2742,12 @@ pub struct FitResult {
     pub error_model: ErrorModel,
     pub covariance_matrix: Option<DMatrix<f64>>,
     pub se_theta: Option<Vec<f64>>,
+    /// Standard errors for omega elements.
+    ///
+    /// - **Diagonal omega**: length = n_eta, one SE per variance.
+    /// - **Block omega**: length = n_eta·(n_eta+1)/2, column-major lower
+    ///   triangle (same layout as the packed Cholesky). Use
+    ///   [`omega_se_at`] to index by (i, j).
     pub se_omega: Option<Vec<f64>>,
     pub se_sigma: Option<Vec<f64>>,
     /// FIX flags carried through from the model so the output layer can
@@ -2731,6 +2792,9 @@ pub struct FitResult {
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
     pub importance_sampling: Option<ImportanceSamplingResult>,
+    /// Per-iteration IMPMAP parameter trace, analogous to NONMEM `.ext` file
+    /// output. `Some` when the final estimating stage was IMPMAP.
+    pub impmap_trace: Option<ImpmapTrace>,
     /// Full MCMC Bayesian result. `Some` when `method = bayes` was run;
     /// carries posterior summaries + convergence diagnostics. See [`BayesResult`].
     pub bayes: Option<BayesResult>,
@@ -2943,6 +3007,34 @@ pub struct FitResult {
     /// were active during the fit (or the caller supplied `ignore`/`accept`
     /// expressions).  `None` means no filtering was requested.
     pub exclusions: Option<ExclusionSummary>,
+}
+
+/// Look up the SE for omega element (i, j) from the `se_omega` vector.
+///
+/// `se_omega` may be diagonal-only (length = n_eta) or full lower-triangle
+/// (length = n_eta·(n_eta+1)/2, column-major).  Returns `None` when
+/// `se_omega` is `None`, the index is out of bounds, or the format is
+/// diagonal and an off-diagonal element is requested.
+pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize) -> Option<f64> {
+    let se = se_omega.as_ref()?;
+    let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
+    let n_lt = n_eta * (n_eta + 1) / 2;
+    if se.len() == n_lt && n_lt != n_eta {
+        // Full lower-triangle format (block omega).
+        let col_offset = if c == 0 {
+            0
+        } else {
+            c * n_eta - c * (c - 1) / 2
+        };
+        se.get(col_offset + (r - c)).copied()
+    } else {
+        // Diagonal-only format: only (i, i) is available.
+        if r == c {
+            se.get(r).copied()
+        } else {
+            None
+        }
+    }
 }
 
 /// Minimal per-NN metadata carried on `FitResult` so output writers can
@@ -3166,6 +3258,22 @@ pub struct FitOptions {
     /// Subjects whose normalized effective sample size (ESS / K) falls below
     /// this fraction are flagged as poorly-sampled. Default 0.1.
     pub impmap_low_ess_threshold: f64,
+    /// When `true`, IMPMAP collects per-iteration parameter values into
+    /// `FitResult.impmap_trace` (analogous to NONMEM `.ext` output). Default `false`.
+    pub impmap_trace: bool,
+    /// Number of additional random starting points for per-subject MAP
+    /// (analogous to NONMEM MCETA). 0 = single start (current behaviour).
+    pub impmap_mceta: usize,
+    /// Use Sobol quasi-random sequences for IS draws instead of pseudo-random.
+    /// Only applies to MVN proposals (impmap_proposal_df = normal). Default false.
+    pub impmap_sobol: bool,
+    /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
+    /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
+    /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
+    pub iscale_min: f64,
+    /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
+    /// Default 10.0.
+    pub iscale_max: f64,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -3322,6 +3430,11 @@ pub struct FitOptions {
     /// Subject IDs to exclude wholesale (syntactic sugar for `ignore = ID == X`).
     /// Compared as strings against `Subject::id`.
     pub ignore_subjects: Vec<String>,
+    /// FREM prediction map: `"TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"`.
+    /// Maps theta/eta pairs to FREMTYPE values.
+    pub frem_predictions: Option<String>,
+    /// FREM covariate sigma name (e.g. "EPSCOV").
+    pub frem_sigma: Option<String>,
 }
 
 impl Default for FitOptions {
@@ -3410,6 +3523,11 @@ impl Default for FitOptions {
             impmap_seed: None,
             impmap_averaging: 50,
             impmap_low_ess_threshold: 0.1,
+            impmap_trace: false,
+            impmap_mceta: 0,
+            impmap_sobol: false,
+            iscale_min: 0.1,
+            iscale_max: 10.0,
             bloq_method: BloqMethod::Drop,
             npde_nsim: 0,
             npde_seed: None,
@@ -3434,6 +3552,8 @@ impl Default for FitOptions {
             ignore_exprs: Vec::new(),
             accept_exprs: Vec::new(),
             ignore_subjects: Vec::new(),
+            frem_predictions: None,
+            frem_sigma: None,
         }
     }
 }
@@ -3715,6 +3835,8 @@ pub fn framework_keys() -> &'static [&'static str] {
         "max_unconverged_frac",
         "min_obs_for_convergence_check",
         "inits_from_nca",
+        "frem_predictions",
+        "frem_sigma",
     ]
 }
 
@@ -3771,6 +3893,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "is_eval_only",
             "inner_maxiter",
             "inner_tol",
+            "iscale_min",
+            "iscale_max",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -3781,6 +3905,11 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_seed",
             "impmap_averaging",
             "impmap_low_ess_threshold",
+            "impmap_trace",
+            "impmap_mceta",
+            "impmap_sobol",
+            "iscale_min",
+            "iscale_max",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",
@@ -3926,6 +4055,7 @@ pub(crate) mod test_helpers {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
+            frem_config: None,
         }
     }
 }
@@ -4760,6 +4890,7 @@ mod tests {
             cens: Vec::new(),
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         }

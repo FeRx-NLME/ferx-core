@@ -1285,6 +1285,7 @@ pub fn run_bayes(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal: None,
+        impmap_trace: None,
         bayes: Some(bayes),
     })
 }

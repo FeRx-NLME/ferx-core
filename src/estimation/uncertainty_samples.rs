@@ -364,6 +364,7 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            impmap_trace: None,
             bayes: None,
             omega_iov: None,
             kappa_names: vec![],

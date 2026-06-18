@@ -32,9 +32,9 @@
 //! the same reason `IMP` refuses them. Use SAEM or FOCEI for those.
 
 use crate::estimation::importance_sampling::{
-    compute_posterior_hessian, subject_is_draws, SubjectDraws,
+    compute_posterior_hessian, find_optimal_iscale, subject_is_draws, SubjectDraws,
 };
-use crate::estimation::inner_optimizer::run_inner_loop_warm;
+use crate::estimation::inner_optimizer::{find_ebe, EbeResult, InnerLoopStats};
 use crate::estimation::outer_optimizer::{
     compute_covariance, pop_nll, CovarianceStepResult, OuterResult,
 };
@@ -43,6 +43,9 @@ use crate::pk::EventPkParams;
 use crate::stats::likelihood::obs_nll_subject_into;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
 /// Floor the free Ω diagonal to keep the proposal/prior positive-definite.
@@ -69,6 +72,23 @@ const OMEGA_DIAG_FLOOR: f64 = 1e-6;
 /// and collapse the ESS (the very rich-data failure mode that motivates IMPMAP).
 const IMP_PROPOSAL_COV_FLOOR: f64 = 1e-10;
 
+/// How each MCEM iteration positions the per-subject importance-sampling
+/// proposal — the one piece that distinguishes IMP from IMPMAP. Everything else
+/// (M-step, sufficient statistics, averaging, ESS diagnostics, final objective)
+/// is shared by [`run_mcem`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProposalRecenter {
+    /// IMPMAP (NONMEM `METHOD=IMPMAP`): re-run the MAP inner loop **every**
+    /// iteration; proposal centered at the conditional mode with
+    /// first-order-variance scale `(JᵀR⁻¹J + Ω⁻¹)⁻¹`.
+    Map,
+    /// IMP (NONMEM `METHOD=IMP`): run the MAP inner loop on the **first**
+    /// iteration only (to seed the proposal); thereafter center at the previous
+    /// iteration's weighted posterior mean with scale = previous weighted
+    /// posterior covariance `Ŝ − m̂m̂ᵀ`.
+    SampleMoments,
+}
+
 /// Convert a weighted posterior covariance `Cov` into the proposal precision
 /// `Σ⁻¹ = Cov⁻¹` that [`subject_is_draws`]/`build_proposal` expects (it forms the
 /// proposal scale as `(Σ⁻¹ + λI)⁻¹`). Used only by the IMP (`SampleMoments`)
@@ -79,12 +99,11 @@ const IMP_PROPOSAL_COV_FLOOR: f64 = 1e-10;
 /// the prior term `−½ηᵀΩ⁻¹η` of the resulting far samples explodes the −2 log L
 /// and the next Ω M-step. We therefore **cap** the proposal-covariance diagonal
 /// at the prior `Ωᵢᵢ` — the conditional variance of a well-identified η is
-/// bounded above by its prior variance, so a sample covariance exceeding Ω is
-/// Monte-Carlo noise, not signal. The diagonal is floored only at a tiny absolute
-/// value to avoid a singular matrix (NOT at a fraction of Ω — see
-/// [`IMP_PROPOSAL_COV_FLOOR`]). If the result is still not Cholesky-invertible
-/// (e.g. a wild off-diagonal), a zero matrix is returned, which makes
-/// `build_proposal` take its Ω fallback — a broad but valid proposal.
+/// bounded above by its prior variance. The diagonal is floored only at a tiny
+/// absolute value to avoid a singular matrix (NOT at a fraction of Ω — see
+/// [`IMP_PROPOSAL_COV_FLOOR`]). If the result is still not Cholesky-invertible a
+/// zero matrix is returned, which makes `build_proposal` take its Ω fallback — a
+/// broad but valid proposal.
 fn covariance_to_proposal_hessian(
     cov: &DMatrix<f64>,
     omega: &DMatrix<f64>,
@@ -131,27 +150,97 @@ fn mu_ref_log_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
     pairs
 }
 
-/// How each MCEM iteration positions the per-subject importance-sampling
-/// proposal — the one piece that distinguishes IMP from IMPMAP. Everything else
-/// (M-step, sufficient statistics, averaging, ESS diagnostics, final objective)
-/// is shared by [`run_mcem`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ProposalRecenter {
-    /// IMPMAP (NONMEM `METHOD=IMPMAP`): re-run the FOCE inner loop **every**
-    /// iteration; proposal centered at the conditional mode with
-    /// first-order-variance scale `(JᵀR⁻¹J + Ω⁻¹)⁻¹`.
-    Map,
-    /// IMP (NONMEM `METHOD=IMP`): run the inner loop on the **first** iteration
-    /// only (to seed the proposal); thereafter center at the previous
-    /// iteration's weighted posterior mean with scale = previous weighted
-    /// posterior covariance `Ŝ − m̂m̂ᵀ`.
-    SampleMoments,
+/// Multi-start MAP: for each subject, run `find_ebe` with the warm-start (or
+/// cold-start) and then `mceta` additional random starting points drawn from
+/// N(0, Ω). The start with the lowest NLL wins. When `mceta == 0` this
+/// degrades to a single warm-start — identical to the previous behaviour.
+///
+/// Returns `(eta_hats, h_matrices, stats)`. Kappas are always empty because
+/// IMPMAP refuses IOV models.
+#[allow(clippy::too_many_arguments)]
+fn run_map_multistart(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    inner_maxiter: usize,
+    inner_tol: f64,
+    prev_etas: Option<&[DVector<f64>]>,
+    mu_k: &[f64],
+    mceta: usize,
+    seed: u64,
+    iteration: usize,
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, InnerLoopStats) {
+    let n_eta = model.n_eta;
+
+    // Cholesky of Ω for drawing random starts (computed once, outside the
+    // per-subject parallel loop).
+    let omega_chol = if mceta > 0 {
+        params.omega.matrix.clone().cholesky().map(|c| c.l())
+    } else {
+        None
+    };
+
+    let results: Vec<EbeResult> = population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .map(|(i, subject)| {
+            let warm = prev_etas.map(|pe| pe[i].as_slice());
+            let mu = Some(mu_k);
+
+            // Baseline: warm-start (or cold-start from η = 0).
+            let mut best = find_ebe(model, subject, params, inner_maxiter, inner_tol, warm, mu);
+
+            if let Some(ref l_omega) = omega_chol {
+                // Deterministic per-subject, per-iteration seed, separated from IS draws.
+                let subj_seed = seed
+                    .wrapping_add(i as u64)
+                    .wrapping_add((iteration as u64) << 32)
+                    .wrapping_add(0x4D43_4554_4100u64);
+                let mut rng = StdRng::seed_from_u64(subj_seed);
+
+                for _start in 0..mceta {
+                    // Draw z ~ N(0, I), compute eta_start = L_Ω · z.
+                    let z: Vec<f64> = (0..n_eta)
+                        .map(|_| StandardNormal.sample(&mut rng))
+                        .collect();
+                    let z_dv = DVector::from_vec(z);
+                    let eta_start = l_omega * &z_dv;
+                    let eta_slice: Vec<f64> = eta_start.iter().copied().collect();
+
+                    let candidate = find_ebe(
+                        model,
+                        subject,
+                        params,
+                        inner_maxiter,
+                        inner_tol,
+                        Some(&eta_slice),
+                        mu,
+                    );
+                    if candidate.nll < best.nll {
+                        best = candidate;
+                    }
+                }
+            }
+
+            best
+        })
+        .collect();
+
+    let stats = InnerLoopStats {
+        n_unconverged: results.iter().filter(|r| !r.converged).count(),
+        n_fallback: results.iter().filter(|r| r.used_fallback).count(),
+    };
+    let eta_hats: Vec<DVector<f64>> = results.iter().map(|r| r.eta.clone()).collect();
+    let h_matrices: Vec<DMatrix<f64>> = results.iter().map(|r| r.h_matrix.clone()).collect();
+
+    (eta_hats, h_matrices, stats)
 }
 
+/// Run IMPMAP. `warm_etas`, when supplied by a preceding chain stage, seed the
+/// first MAP inner loop; otherwise the inner loop cold-starts from η = 0.
 /// Run IMPMAP (NONMEM `METHOD=IMPMAP`). Thin wrapper over the shared MCEM core
 /// with mode re-centering on every iteration; resolves the `impmap_*` options.
-/// `warm_etas`, when supplied by a preceding chain stage, seed the first MAP
-/// inner loop; otherwise the inner loop cold-starts from η = 0.
 pub fn run_impmap(
     model: &CompiledModel,
     population: &Population,
@@ -159,6 +248,7 @@ pub fn run_impmap(
     warm_etas: Option<&[DVector<f64>]>,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
+    let nu = options.impmap_proposal_df;
     run_mcem(
         model,
         population,
@@ -170,17 +260,20 @@ pub fn run_impmap(
         "impmap_proposal_df",
         options.impmap_iterations,
         options.impmap_samples,
-        options.impmap_proposal_df,
+        nu,
         options.impmap_averaging,
         options.impmap_seed.unwrap_or(12345),
         options.impmap_low_ess_threshold,
+        options.impmap_mceta,
+        options.impmap_sobol && nu.is_infinite(),
+        options.impmap_trace,
     )
 }
 
 /// Run IMP as an estimator (NONMEM `METHOD=IMP`). Thin wrapper over the shared
 /// MCEM core with sample-moment re-centering (conditional mode found only on the
-/// first iteration); resolves the `is_*` options. This is the estimating path;
-/// the evaluation-only `is_eval_only` path lives in `importance_sampling.rs`.
+/// first iteration); resolves the `is_*` options. The evaluation-only
+/// `is_eval_only` path lives in `importance_sampling.rs`.
 pub fn run_imp(
     model: &CompiledModel,
     population: &Population,
@@ -203,12 +296,14 @@ pub fn run_imp(
         options.is_averaging,
         options.is_seed.unwrap_or(12345),
         options.is_low_ess_threshold,
+        0,     // mceta: no multi-start MAP for IMP
+        false, // use_sobol: IMP has no Sobol option
+        false, // collect_trace: IMP has no trace option
     )
 }
 
 /// Shared Monte-Carlo EM core for IMP and IMPMAP. The `recenter` strategy is the
-/// only behavioural difference between the two methods; `label` tags warnings and
-/// verbose output.
+/// only behavioural difference; `label`/`df_key` tag warnings and verbose output.
 #[allow(clippy::too_many_arguments)]
 fn run_mcem(
     model: &CompiledModel,
@@ -225,6 +320,9 @@ fn run_mcem(
     n_avg_opt: usize,
     seed: u64,
     threshold: f64,
+    mceta: usize,
+    use_sobol: bool,
+    collect_trace: bool,
 ) -> Result<OuterResult, String> {
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
@@ -283,9 +381,14 @@ fn run_mcem(
             ProposalRecenter::Map => "MAP recenter/iter",
             ProposalRecenter::SampleMoments => "sample-moment recenter",
         };
+        let mceta_msg = if mceta > 0 {
+            format!(", MCETA={}", mceta)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "{}: {} subjects, {} ETAs, {} iters, K={}/subject, {} proposal, {}, seed={}",
-            label, n_subjects, n_eta, n_iter, k_samples, prop, recenter_desc, seed
+            "{}: {} subjects, {} ETAs, {} iters, K={}/subject, {} proposal, {}, seed={}{}",
+            label, n_subjects, n_eta, n_iter, k_samples, prop, recenter_desc, seed, mceta_msg
         );
     }
 
@@ -391,10 +494,17 @@ fn run_mcem(
 
     let mut last_eta_hats: Vec<DVector<f64>> = Vec::new();
 
+    // ---- Trace: collect per-iteration parameters (analogous to NONMEM .ext) ----
+    let mut trace_rows: Vec<ImpmapTraceRow> = if collect_trace {
+        Vec::with_capacity(n_iter + 2)
+    } else {
+        Vec::new()
+    };
+
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             if verbose {
-                eprintln!("IMPMAP: cancelled at iteration {}", k);
+                eprintln!("{}: cancelled at iteration {}", label, k);
             }
             break;
         }
@@ -422,33 +532,37 @@ fn run_mcem(
             kappa_fixed: init_params.kappa_fixed.clone(),
         };
 
-        let omega_inv = params_k.omega.inv.clone();
-        let log_det_omega = params_k.omega.log_det;
-
         // ---- E-step A: position the proposal ----
-        // IMPMAP (`Map`) re-runs the FOCE inner loop every iteration. IMP
+        // IMPMAP (`Map`) re-runs the MAP inner loop every iteration. IMP
         // (`SampleMoments`) runs it only on the first iteration — when
         // `prev_draws` is still `None` — to seed the proposal, then recenters
-        // from the previous iteration's weighted moments below.
+        // from the previous iteration's weighted moments inside the draws loop.
         let run_inner = recenter == ProposalRecenter::Map || prev_draws.is_none();
         let (eta_hats, h_matrices) = if run_inner {
             let mu_k = compute_mu_k(model, &params_k.theta, options.mu_referencing);
-            let (e, h, _stats, _kappas) = run_inner_loop_warm(
+            let (e, h, _stats) = run_map_multistart(
                 model,
                 population,
                 &params_k,
                 options.inner_maxiter,
                 options.inner_tol,
                 prev_etas.as_deref(),
-                Some(&mu_k),
-                0,
+                &mu_k,
+                mceta,
+                seed,
+                k,
             );
             (e, h)
         } else {
             (Vec::new(), Vec::new())
         };
 
-        // ---- E-step B: importance sampling around each proposal centre ----
+        let omega_inv = params_k.omega.inv.clone();
+        let log_det_omega = params_k.omega.log_det;
+
+        // ---- E-step B: importance sampling around each mode ----
+        let iscale_min = options.iscale_min;
+        let iscale_max = options.iscale_max;
         let draws: Vec<_> = population
             .subjects
             .par_iter()
@@ -492,6 +606,23 @@ fn run_mcem(
                     );
                     (center, h_post)
                 };
+                let subj_seed = seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32);
+                let iscale = find_optimal_iscale(
+                    model,
+                    subject,
+                    &params_k.theta,
+                    &params_k.sigma.values,
+                    &center,
+                    &h_post,
+                    &omega_inv,
+                    log_det_omega,
+                    n_eta,
+                    nu,
+                    subj_seed,
+                    scratch,
+                    iscale_min,
+                    iscale_max,
+                );
                 subject_is_draws(
                     model,
                     subject,
@@ -504,8 +635,10 @@ fn run_mcem(
                     n_eta,
                     k_samples,
                     nu,
-                    seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32),
+                    subj_seed,
                     scratch,
+                    iscale,
+                    use_sobol,
                 )
             })
             .collect();
@@ -514,7 +647,7 @@ fn run_mcem(
         // break before the M-steps consume them. The post-loop check returns Err.
         if crate::cancel::is_cancelled(cancel) {
             if verbose {
-                eprintln!("IMPMAP: cancelled during E-step at iteration {}", k);
+                eprintln!("{}: cancelled during E-step at iteration {}", label, k);
             }
             break;
         }
@@ -529,6 +662,17 @@ fn run_mcem(
             }
         }
         let minus2ll = -2.0 * ll;
+
+        // Record this iteration's parameters for the trace (opt-in).
+        if collect_trace {
+            trace_rows.push(ImpmapTraceRow {
+                iteration: k as i64,
+                theta: theta_cur.clone(),
+                omega_lower_tri: lower_triangle(&omega_mat),
+                sigma: sigma_cur.clone(),
+                ofv: minus2ll,
+            });
+        }
 
         // ---- M-step Ω: weighted second moment, structurally masked + floored ----
         let mut new_omega = DMatrix::<f64>::zeros(n_eta, n_eta);
@@ -610,9 +754,9 @@ fn run_mcem(
         sigma_cur = log_sigma.iter().map(|&s| s.exp()).collect();
 
         // Warm-start next iteration's inner loop from this iteration's modes —
-        // only meaningful when we actually ran the inner loop this iteration
-        // (IMP skips it on iterations 2+, leaving the iter-1 modes in place for
-        // the final EBE pass).
+        // only when we actually ran the inner loop this iteration (IMP skips it
+        // on iterations 2+, leaving the iter-1 modes in place for the final EBE
+        // pass).
         if run_inner {
             prev_etas = Some(eta_hats.clone());
             last_eta_hats = eta_hats;
@@ -688,16 +832,19 @@ fn run_mcem(
         Some(last_eta_hats.as_slice())
     };
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-    let (eta_hats, h_matrices, _stats, final_kappas) = run_inner_loop_warm(
+    let (eta_hats, h_matrices, _stats) = run_map_multistart(
         model,
         population,
         &final_params,
         options.inner_maxiter,
         options.inner_tol,
         warm,
-        Some(&final_mu_k),
-        0,
+        &final_mu_k,
+        mceta,
+        seed,
+        n_iter + 1, // distinct iteration index for final EBEs
     );
+    let final_kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n_subjects];
 
     let ofv = 2.0
         * pop_nll(
@@ -746,6 +893,69 @@ fn run_mcem(
             None
         };
 
+    // ---- Finalize trace ----
+    let impmap_trace = if collect_trace {
+        // Append final (averaged) estimate row.
+        trace_rows.push(ImpmapTraceRow {
+            iteration: -1_000_000_000,
+            theta: final_params.theta.clone(),
+            omega_lower_tri: lower_triangle(&final_params.omega.matrix),
+            sigma: final_params.sigma.values.clone(),
+            ofv,
+        });
+        // Append SE row when the covariance step succeeded.
+        if let Some(ref cov) = covariance_matrix {
+            let se: Vec<f64> = (0..cov.nrows()).map(|i| cov[(i, i)].sqrt()).collect();
+            // Unpack SEs into theta / omega-LT / sigma segments, mirroring
+            // pack_params layout: [theta..., cholesky-omega..., sigma...].
+            let n_free_theta = final_params.theta.len();
+            let n_omega_lt = lower_triangle(&final_params.omega.matrix).len();
+            let n_free_sigma = final_params.sigma.values.len();
+            let se_theta: Vec<f64> = se.iter().take(n_free_theta).copied().collect();
+            let se_omega: Vec<f64> = se
+                .iter()
+                .skip(n_free_theta)
+                .take(n_omega_lt)
+                .copied()
+                .collect();
+            let se_sigma: Vec<f64> = se
+                .iter()
+                .skip(n_free_theta + n_omega_lt)
+                .take(n_free_sigma)
+                .copied()
+                .collect();
+            trace_rows.push(ImpmapTraceRow {
+                iteration: -1_000_000_001,
+                theta: se_theta,
+                omega_lower_tri: se_omega,
+                sigma: se_sigma,
+                ofv: 0.0,
+            });
+        }
+
+        // Build column names following NONMEM convention.
+        let theta_names: Vec<String> = (1..=n_theta).map(|i| format!("THETA{i}")).collect();
+        let omega_names: Vec<String> = {
+            let mut names = Vec::new();
+            for i in 0..n_eta {
+                for j in 0..=i {
+                    names.push(format!("OMEGA({},{})", i + 1, j + 1));
+                }
+            }
+            names
+        };
+        let sigma_names: Vec<String> = (1..=n_sigma).map(|i| format!("SIGMA({i},{i})")).collect();
+
+        Some(ImpmapTrace {
+            rows: trace_rows,
+            theta_names,
+            omega_names,
+            sigma_names,
+        })
+    } else {
+        None
+    };
+
     if verbose {
         eprintln!("{} completed. Final OFV (Laplace) = {:.4}", label, ofv);
     }
@@ -772,8 +982,22 @@ fn run_mcem(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        impmap_trace,
         bayes: None,
     })
+}
+
+/// Extract the lower triangle of a square matrix in row-major order:
+/// `(0,0), (1,0), (1,1), (2,0), (2,1), (2,2), …`
+fn lower_triangle(m: &DMatrix<f64>) -> Vec<f64> {
+    let n = m.nrows();
+    let mut out = Vec::with_capacity(n * (n + 1) / 2);
+    for i in 0..n {
+        for j in 0..=i {
+            out.push(m[(i, j)]);
+        }
+    }
+    out
 }
 
 /// Weighted θ/σ M-step: minimize the importance-weighted observation NLL
@@ -881,9 +1105,8 @@ mod tests {
 
     #[test]
     fn covariance_to_proposal_hessian_inverts_an_in_bounds_covariance() {
-        // A covariance comfortably inside [lo_frac·Ωii, Ωii] passes through
-        // unclamped, so the returned precision is its exact inverse and
-        // `build_proposal` reconstructs the same covariance as the scale.
+        // A covariance comfortably inside [floor, Ωii] passes through unclamped,
+        // so the returned precision is its exact inverse.
         let cov = DMatrix::from_row_slice(2, 2, &[0.25, 0.05, 0.05, 0.16]);
         let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[10.0, 10.0]));
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
@@ -892,9 +1115,7 @@ mod tests {
             for j in 0..2 {
                 assert!(
                     (recovered[(i, j)] - cov[(i, j)]).abs() < 1e-9,
-                    "inverse-of-inverse must recover cov at ({i},{j}): {} vs {}",
-                    recovered[(i, j)],
-                    cov[(i, j)]
+                    "inverse-of-inverse must recover cov at ({i},{j})"
                 );
             }
         }
@@ -902,8 +1123,8 @@ mod tests {
 
     #[test]
     fn covariance_to_proposal_hessian_floors_collapsed_diagonal() {
-        // A zero-variance dimension (collapsed ESS) is floored to lo_frac·Ωii
-        // rather than allowed to invert to a near-delta proposal.
+        // A zero-variance dimension (collapsed ESS) is floored to a tiny absolute
+        // value rather than inverting to a near-delta proposal.
         let cov = DMatrix::from_row_slice(2, 2, &[0.0, 0.0, 0.0, 0.2]);
         let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0, 1.0]));
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
@@ -911,11 +1132,10 @@ mod tests {
             h.iter().all(|v| v.is_finite()),
             "floored result must be finite"
         );
-        // The floored dimension has precision ≈ 1 / (lo_frac·Ωii).
-        let expected = 1.0 / (IMP_PROPOSAL_COV_FLOOR * 1.0);
+        let expected = 1.0 / IMP_PROPOSAL_COV_FLOOR;
         assert!(
             (h[(0, 0)] - expected).abs() / expected < 1e-9,
-            "floored precision should be ~1/(lo_frac·Ω), got {}",
+            "floored precision should be ~1/floor, got {}",
             h[(0, 0)]
         );
     }
@@ -923,21 +1143,18 @@ mod tests {
     #[test]
     fn covariance_to_proposal_hessian_caps_exploding_diagonal() {
         // A heavy-tailed-outlier-inflated covariance is capped at Ωii so the
-        // proposal can't drift broader than the prior (which would explode the
-        // prior term of far samples).
+        // proposal can't drift broader than the prior.
         let cov = DMatrix::from_row_slice(2, 2, &[1e14, 0.0, 0.0, 1e12]);
         let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[0.2, 0.3]));
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
-        // Capped at Ω ⇒ precision ≈ 1/Ωii on the diagonal.
         assert!((h[(0, 0)] - 1.0 / 0.2).abs() / (1.0 / 0.2) < 1e-9);
         assert!((h[(1, 1)] - 1.0 / 0.3).abs() / (1.0 / 0.3) < 1e-9);
     }
 
     #[test]
     fn covariance_to_proposal_hessian_falls_back_on_non_pd() {
-        // An indefinite covariance (off-diagonal not fixable by the diagonal
-        // clamp) is not Cholesky-invertible → zero matrix, signalling
-        // `build_proposal` to use its Ω fallback.
+        // An indefinite covariance is not Cholesky-invertible → zero matrix,
+        // signalling `build_proposal` to use its Ω fallback.
         let cov = DMatrix::from_row_slice(2, 2, &[1.0, 5.0, 5.0, 1.0]);
         let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0, 1.0]));
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
