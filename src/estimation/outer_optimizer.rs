@@ -2303,6 +2303,68 @@ fn combine_covariance(
 ///
 /// The result is `n_free × n_free`, ordered to match `free_idx`. Caller embeds it
 /// (or its inverse) back into the full packed space.
+/// Warning recorded when a cooperative cancel ([`crate::cancel::CancelFlag`])
+/// is observed mid-covariance-step. The step is gated at entry too (so a flag
+/// set before it starts skips it entirely); this message covers a flag flipped
+/// *during* the long finite-difference / score loops, which short-circuit and
+/// return [`CovarianceStepResult::Unusable`] so the fit still finishes (without
+/// standard errors) instead of running the cancelled work to completion.
+const COV_CANCELLED_MSG: &str =
+    "Covariance step cancelled before completion; standard errors not available.";
+
+/// Throttle stride for the covariance progress reporter: at most ~20 lines per
+/// loop, but always at least one (`max(1)` guards `total < 20`).
+fn cov_progress_step(total: usize) -> usize {
+    (total / 20).max(1)
+}
+
+/// Whether the `n`-th completed item (1-based) should emit a progress line:
+/// every `step` items, plus the final item so the loop always reports 100%.
+fn cov_progress_should_print(n: usize, total: usize, step: usize) -> bool {
+    n % step == 0 || n == total
+}
+
+/// Estimated seconds remaining, extrapolated from observed wall-clock
+/// throughput: `elapsed · (total − n) / n`. Returns 0 before any item finishes
+/// or before any wall-clock has elapsed (avoids a divide-by-zero / Inf ETA).
+fn cov_progress_eta(total: usize, n: usize, elapsed: f64) -> f64 {
+    if n > 0 && elapsed > 0.0 {
+        (total - n) as f64 * elapsed / n as f64
+    } else {
+        0.0
+    }
+}
+
+/// Wall-clock progress reporter for the covariance step's parallel loops.
+///
+/// Returns a closure to be called once per completed item from inside a rayon
+/// `par_iter().map(...)`. When `verbose`, it prints a throttled
+/// `n/total (~Ns left)` line to stderr (matching the existing
+/// `Computing covariance matrix...` style). The ETA extrapolates from observed
+/// wall-clock throughput, so it already absorbs the rayon speed-up rather than
+/// assuming serial per-item cost. Parallel out-of-order completion keeps the
+/// count monotone but makes the ETA noisy early; it tightens as the loop runs.
+///
+/// The returned closure is `Fn + Sync` (atomic counter + `Instant`), so it can
+/// be shared across the rayon worker threads.
+fn cov_progress(label: &'static str, total: usize, verbose: bool) -> impl Fn() + Sync {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let done = AtomicUsize::new(0);
+    let start = std::time::Instant::now();
+    let step = cov_progress_step(total);
+    move || {
+        if !verbose {
+            return;
+        }
+        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+        if !cov_progress_should_print(n, total, step) {
+            return;
+        }
+        let eta = cov_progress_eta(total, n, start.elapsed().as_secs_f64());
+        eprintln!("  [covariance] {label} {n}/{total} (~{eta:.0}s left)");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn assemble_score_cross_product(
     x_hat: &[f64],
@@ -2334,9 +2396,18 @@ fn assemble_score_cross_product(
     // FOCE (`!interaction`) uses the Sheiner–Beal gradient, which has no `log|H̃|`
     // term — applying this Laplace-form `tᵢ` to FOCE was tested and over-corrects
     // (warfarin FOCE RSR 1.3% → 9.8% vs NONMEM), so the correction is FOCEI-only.
+    let report = cov_progress("score matrix", n_subj, options.verbose);
     let scores: Vec<Vec<f64>> = (0..n_subj)
         .into_par_iter()
         .map(|i| {
+            // Cooperative cancel: skip the per-subject gradient and return a
+            // cheap zero score so the in-flight rayon queue drains fast. The
+            // caller (`compute_covariance`) re-checks the flag and discards this
+            // matrix before it is used, so the placeholder is never trusted.
+            if crate::cancel::is_cancelled(&options.cancel) {
+                report();
+                return vec![0.0; x_hat.len()];
+            }
             let kap_i = if i < kappas.len() {
                 kappas[i].as_slice()
             } else {
@@ -2372,6 +2443,7 @@ fn assemble_score_cross_product(
                     }
                 }
             }
+            report();
             gi
         })
         .collect();
@@ -2719,7 +2791,24 @@ pub(crate) fn compute_covariance(
                 [x_p, x_m]
             })
             .collect();
-        let point_grads: Vec<Vec<f64>> = pts.par_iter().map(|xv| point_grad(xv)).collect();
+        let report = cov_progress("Hessian", pts.len(), options.verbose);
+        let point_grads: Vec<Vec<f64>> = pts
+            .par_iter()
+            .map(|xv| {
+                // Cooperative cancel: skip this point's serial subject sweep and
+                // return a NaN gradient so the queue drains; bailed on below.
+                if crate::cancel::is_cancelled(&options.cancel) {
+                    report();
+                    return vec![f64::NAN; n];
+                }
+                let g = point_grad(xv);
+                report();
+                g
+            })
+            .collect();
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
+        }
         for (&(k, hk), pair) in specs.iter().zip(point_grads.chunks_exact(2)) {
             let (g_p, g_m) = (&pair[0], &pair[1]);
             for &j in &free_idx {
@@ -2831,9 +2920,16 @@ pub(crate) fn compute_covariance(
                 pairs.push((a, b));
             }
         }
+        let report = cov_progress("Hessian", specs.len(), options.verbose);
         let vals: Vec<f64> = specs
             .par_iter()
             .map(|p| {
+                // Cooperative cancel: skip this point's EBE reconvergence and
+                // return NaN so the queue drains; bailed on below.
+                if crate::cancel::is_cancelled(&options.cancel) {
+                    report();
+                    return f64::NAN;
+                }
                 let mut xv = x_hat.to_vec();
                 match *p {
                     Pert::Single { i, di } => xv[i] += di,
@@ -2842,9 +2938,14 @@ pub(crate) fn compute_covariance(
                         xv[j] += dj;
                     }
                 }
-                serial_ofv(&xv)
+                let v = serial_ofv(&xv);
+                report();
+                v
             })
             .collect();
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
+        }
         // Diagonal: (f(x+h) − 2f(x) + f(x−h)) / h².
         for a in 0..nf {
             let i = free_idx[a];
@@ -2981,6 +3082,9 @@ pub(crate) fn compute_covariance(
             x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
             &free_idx,
         );
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
+        }
         match combine_covariance(options.covariance_method, r_inv, &s_free) {
             Some(c) => c,
             None => {
@@ -3185,6 +3289,36 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    /// Covariance progress reporter math (the pure pieces behind `cov_progress`).
+    /// Stride caps output at ~20 lines but never zero; the print predicate fires
+    /// every `step` items plus the final one; the ETA extrapolates wall-clock
+    /// throughput and degrades to 0 (not Inf/NaN) before any item/elapsed.
+    #[test]
+    fn test_cov_progress_math() {
+        // Stride: total/20, floored at 1 for small loops.
+        assert_eq!(cov_progress_step(40), 2);
+        assert_eq!(cov_progress_step(100), 5);
+        assert_eq!(cov_progress_step(5), 1); // < 20 → every item
+        assert_eq!(cov_progress_step(0), 1); // never zero (no modulo-by-zero)
+
+        // Print predicate: every `step`, plus always the final item.
+        let step = cov_progress_step(40); // 2
+        assert!(cov_progress_should_print(2, 40, step));
+        assert!(!cov_progress_should_print(3, 40, step));
+        assert!(cov_progress_should_print(40, 40, step)); // final, even off-stride
+        assert!(cov_progress_should_print(39, 39, 2)); // final == total wins
+
+        // ETA = elapsed · (total − n) / n. Halfway through 100 items after 10 s
+        // ⇒ ~10 s remaining.
+        assert!((cov_progress_eta(100, 50, 10.0) - 10.0).abs() < 1e-9);
+        // Near the end the estimate shrinks.
+        assert!((cov_progress_eta(100, 99, 9.9) - 0.1).abs() < 1e-9);
+        // Degenerate inputs return 0, never Inf/NaN.
+        assert_eq!(cov_progress_eta(100, 0, 5.0), 0.0); // no item done yet
+        assert_eq!(cov_progress_eta(100, 10, 0.0), 0.0); // no wall-clock yet
+        assert_eq!(cov_progress_eta(40, 40, 8.0), 0.0); // done → 0 remaining
+    }
 
     /// `resolve_scaling` maps `Auto` to `Rescale2` for the gradient-based
     /// optimizers that benefit (incl. `Slsqp` — the #335 cold-start fix) and to
@@ -3630,6 +3764,117 @@ mod tests {
                 "message names the option: {msg}"
             );
         }
+    }
+
+    /// A cancel flag set during the covariance step short-circuits the
+    /// finite-difference Hessian loop and returns `Unusable` (cooperative abort)
+    /// instead of running the perturbed-point sweep to completion. `verbose` is
+    /// on so the drained points also exercise the progress reporter's closure.
+    #[test]
+    fn test_compute_covariance_cancelled() {
+        use crate::cancel::CancelFlag;
+        use crate::types::FitOptions;
+        let model = make_model();
+        // Same near-optimum synthetic data as the reconverged-FD test, so the
+        // base OFV is finite and the function reaches the (short-circuited)
+        // Hessian loop rather than failing earlier.
+        let mut population = make_population(8);
+        for s in &mut population.subjects {
+            s.observations = vec![1.80967, 1.34064, 0.89866];
+        }
+        let mut template = model.default_params.clone();
+        template.omega_fixed = vec![true];
+        template.sigma_fixed = vec![true];
+        let x = pack_params(&template);
+
+        let n_subj = 8;
+        let n_eta = 1;
+        let n_obs = 3;
+        let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
+        let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
+            .map(|_| DMatrix::from_element(n_obs, n_eta, 0.1))
+            .collect();
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
+
+        let flag = CancelFlag::new();
+        flag.cancel(); // pre-cancel: every perturbed point short-circuits
+
+        let mut options = FitOptions::default();
+        options.interaction = true; // FOCEI → analytical FD Hessian path
+        options.verbose = true; // also drive the progress reporter closure
+        options.cancel = Some(flag);
+
+        match compute_covariance(
+            &x,
+            &template,
+            &model,
+            &population,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &options,
+        ) {
+            CovarianceStepResult::Unusable(msg) => assert!(
+                msg.contains("cancelled"),
+                "cancelled covariance must report cancellation, got: {msg}"
+            ),
+            CovarianceStepResult::Success(_) => {
+                panic!("a cancelled covariance step must not return Success")
+            }
+            CovarianceStepResult::FailedNonPd { reason, .. } => {
+                panic!("cancelled covariance must be Unusable, got FailedNonPd: {reason}")
+            }
+        }
+    }
+
+    /// `assemble_score_cross_product` honours the cancel flag: each subject's
+    /// score short-circuits to a zero vector, so the assembled S-matrix is
+    /// all-zero and finite (no panic). The caller discards it via the
+    /// post-assembly cancel bail in `compute_covariance`.
+    #[test]
+    fn test_assemble_score_cross_product_cancelled() {
+        use crate::cancel::CancelFlag;
+        use crate::types::FitOptions;
+        let model = make_model();
+        let population = make_population(4);
+        let template = model.default_params.clone();
+        let x = pack_params(&template);
+        let bounds = compute_bounds(&template);
+
+        let n_subj = 4;
+        let n_eta = 1;
+        let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
+        let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
+            .map(|_| DMatrix::identity(n_eta, n_eta))
+            .collect();
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
+        let free_idx: Vec<usize> = (0..x.len()).collect();
+
+        let flag = CancelFlag::new();
+        flag.cancel();
+        let mut options = FitOptions::default();
+        options.cancel = Some(flag);
+
+        let s = assemble_score_cross_product(
+            &x,
+            &template,
+            &model,
+            &population,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &bounds,
+            &options,
+            &free_idx,
+        );
+        assert!(
+            s.iter().all(|v| v.is_finite()),
+            "cancelled S must be finite"
+        );
+        assert!(
+            s.iter().all(|v| *v == 0.0),
+            "cancelled S must be all-zero (per-subject scores short-circuited)"
+        );
     }
 
     /// Empty matrix is a valid zero-dimensional input (all-FIX parameter

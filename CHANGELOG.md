@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Covariance step progress reporting** — under `verbose`, the covariance step
+  now prints throttled per-loop progress (Hessian finite-difference points and
+  the score cross-product) with a wall-clock ETA, e.g.
+  `[covariance] Hessian 12/40 (~8s left)`, so long covariance computations are
+  no longer silent.
+- **Cancellable covariance step** — a `CancelFlag` tripped *during* the
+  covariance step (not just before it) now cooperatively aborts the
+  finite-difference Hessian and score-matrix loops and finishes the fit without
+  standard errors (recording a warning), instead of running the cancelled work
+  to completion.
 - `impmap_mceta` fit option: multi-start MAP for IMPMAP (NONMEM `MCETA` equivalent),
   improving IS efficiency in high-dimensional models (e.g. FREM with ≥5 ETAs).
 - Analytical Jacobian for FREM pseudo-observations: covariate rows in the FD
