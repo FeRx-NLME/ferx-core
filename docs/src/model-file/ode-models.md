@@ -303,11 +303,17 @@ compartment of a `two_cpt_iv` model, `D2` for its peripheral compartment).
 The modeled duration just sets the *rate* of an otherwise ordinary infusion, so
 the **target compartment must be one the analytical engine can infuse into** —
 exactly the same set as for an explicit positive `RATE`: the central compartment
-for every model, and the peripheral compartment(s) for the 2-/3-cpt IV models.
-Infusing into an oral **depot** is not modelled by the closed forms (an oral
-model's depot only takes bolus input), so a `D{depot}` (or any other
-non-infusable compartment) is **rejected at parse time** — use an `ode(...)`
-model for a zero-order *into-depot* input. `RATE=-1` (modeled *rate*, `R{n}`) is not yet
+for every model, the peripheral compartment(s) for the 2-/3-cpt IV models, and —
+since #400 — the **oral depot** (compartment 1) of `one_cpt_oral` /
+`two_cpt_oral` / `three_cpt_oral`. A `D1` into the oral depot is a **zero-order
+absorption** model: drug is released into the depot at a constant rate over the
+modeled duration, then absorbed first-order into central via `KA`. This stays on
+the closed-form engine — no `ode(...)` block needed. (Per-compartment amounts in
+`sdtab`/`[derived]` are not available for those subjects — the predictions are
+exact; use an `ode(...)` model if you need the compartment amounts.) Infusing
+into an oral **peripheral** compartment is still not modelled by the closed forms,
+so a `D{periph}` (or any other non-infusable compartment) is **rejected at parse
+time** — use an `ode(...)` model. `RATE=-1` (modeled *rate*, `R{n}`) is not yet
 supported on either engine.
 
 > One subtlety: when a subject has any `RATE=-2` dose on an **analytical** model,

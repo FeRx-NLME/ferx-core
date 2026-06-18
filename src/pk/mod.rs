@@ -1004,7 +1004,19 @@ pub fn compute_predictions_with_states(
                 model.active_dose_attr_map(),
                 &pk.values,
             );
-            predict_all_states(model.pk_model, &resolved, &pk)
+            if has_oral_depot_infusion(model.pk_model, &resolved) {
+                // The superposition state helper (`single_dose_states`) models an
+                // oral infusion as a depot-bypassing input into central, so it
+                // cannot express a zero-order input into the **depot** (#400) —
+                // it would report silently-wrong compartment amounts. The
+                // event-driven path (used for `ipred` above) has no states
+                // variant yet, so return outer-empty → NaN compartments, matching
+                // the reset/TV-analytical convention. ipred stays correct;
+                // sdtab/`[derived]` compartment amounts degrade to NaN.
+                vec![]
+            } else {
+                predict_all_states(model.pk_model, &resolved, &pk)
+            }
         };
         (ipred, states)
     }
@@ -1038,7 +1050,16 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
     // state-propagating event-driven analytical path instead, replicating
     // the (constant) `pk_params` across every event slot — the same uniform
     // fill the no-TV dispatcher branch uses.
-    if subject.has_resets() && event_driven::supports_event_driven(pk_model) {
+    //
+    // The same routing applies to a zero-order input into the oral **depot**
+    // (cmt 1, #400): the superposition closed forms (`one_cpt_oral` etc.) treat
+    // an oral dose as a depot bolus + a depot-bypassing central infusion and
+    // have no depot-infusion form, so a `D{depot}` infusion would be silently
+    // mishandled. The event-driven propagator implements the depot zero-order
+    // forced response, so route depot-infusion subjects there too.
+    if (subject.has_resets() || has_oral_depot_infusion(pk_model, subject))
+        && event_driven::supports_event_driven(pk_model)
+    {
         let pk_dose = vec![*pk_params; subject.doses.len()];
         let pk_obs = vec![*pk_params; subject.obs_times.len()];
         let pk_pk_only = vec![*pk_params; subject.pk_only_times.len()];
@@ -1055,6 +1076,22 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
         .iter()
         .map(|&t| predict_concentration(pk_model, &subject.doses, t, pk_params))
         .collect()
+}
+
+/// Whether `subject` has a zero-order infusion into the **depot** (cmt 1) of an
+/// oral model (#400) — i.e. a resolved infusion dose (`rate>0 && duration>0`)
+/// targeting compartment 1 on `one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`.
+///
+/// Such doses have no closed form in the superposition path (which models the
+/// oral depot as bolus-only), so the dispatcher routes them through the
+/// event-driven propagator instead. IV models and oral **central** infusions
+/// (cmt 2, handled by the depot-bypass IV formula) return `false`.
+pub(crate) fn has_oral_depot_infusion(pk_model: PkModel, subject: &Subject) -> bool {
+    pk_model.is_oral()
+        && subject
+            .doses
+            .iter()
+            .any(|d| d.cmt == 1 && d.rate > 0.0 && d.duration > 0.0 && d.duration.is_finite())
 }
 
 /// Compute predictions using ODE integration.

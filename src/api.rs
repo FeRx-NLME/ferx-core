@@ -3067,6 +3067,28 @@ fn fit_inner(
                     .to_string(),
             );
         }
+        // Analytical oral model with a zero-order input into the depot (#400):
+        // the superposition state helper models an oral infusion as a depot
+        // bypass, so it cannot express a depot zero-order input. ipred is exact
+        // (event-driven path), but per-obs compartment states return empty (→ NaN)
+        // rather than report silently-wrong amounts.
+        if model.ode_spec.is_none()
+            && model.pk_model.is_oral()
+            && population
+                .subjects
+                .iter()
+                .any(|s| s.doses.iter().any(|d| d.cmt == 1 && d.is_infusion()))
+        {
+            warnings.push(
+                "W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL: analytical oral model \
+                 with a zero-order input into the depot (RATE=-2 D1 / infusion into \
+                 compartment 1) — compartment states are not available for those \
+                 subjects (predictions are exact); [derived] expressions that \
+                 reference compartments[i] evaluate to NaN for them. Use an ODE model \
+                 if depot/central compartment amounts are required."
+                    .to_string(),
+            );
+        }
     }
 
     // Report detected mu-referencing relationships (only when feature is enabled)
@@ -5443,6 +5465,103 @@ mod iov_integration {
                 sr.id,
                 sr.ipred.len(),
                 sr.compartment_states.len()
+            );
+        }
+    }
+
+    /// #400: an analytical oral model with a zero-order input into the depot
+    /// (an infusion into cmt 1) cannot have its compartment states expressed by
+    /// the superposition state helper (which models an oral infusion as a depot
+    /// bypass). So `compartment_states` is left empty (→ NaN compartments) and
+    /// `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` makes that explicit, just
+    /// like the reset/IOV/TV cases. Predictions themselves stay exact.
+    #[test]
+    fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
+        use crate::parser::model_parser::parse_full_model;
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let mut model = parse_full_model(src).expect("model parses").model;
+        assert!(model.ode_spec.is_none(), "model must be analytical");
+        // Inject a derived expression that references compartments[0] so the
+        // warning is gated on (mirrors a parsed `[derived] cmt0 = compartments[0]`).
+        model.derived_exprs.push(DerivedExprSpec {
+            name: "cmt0".into(),
+            kind: DerivedKind::PerRow {
+                eval: Box::new(|ctx| ctx.compartments.first().copied().unwrap_or(f64::NAN)),
+            },
+            uses_compartments: true,
+        });
+
+        // One subject with an explicit zero-order infusion into the depot (cmt 1):
+        // rate 25 over AMT/rate = 4 h, then first-order KA absorption.
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 4.0, 8.0, 12.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.8, 1.4, 1.6, 0.9, 0.4],
+            obs_cmts: vec![2; 5],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 5],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let pop = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        let result =
+            fit(&model, &pop, &model.default_params.clone(), &opts).expect("fit must succeed");
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL")),
+            "expected W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL warning; got: {:?}",
+            result.warnings
+        );
+        // Predictions must still be finite (the event-driven path computed them);
+        // only the compartment states degrade.
+        for sr in &result.subjects {
+            assert!(
+                sr.compartment_states.is_empty(),
+                "depot-infusion subject must have empty compartment_states (got {})",
+                sr.compartment_states.len()
+            );
+            assert!(
+                sr.ipred.iter().all(|p| p.is_finite()),
+                "predictions must be finite"
             );
         }
     }

@@ -1092,20 +1092,22 @@ impl PkModel {
     /// truth, kept in lockstep with the infusion-routing `match (pk_model, d.cmt)`
     /// in [`crate::pk::event_driven`] (and the equivalent superposition dispatch):
     /// the **central** compartment for every model, plus the **peripheral**
-    /// compartment(s) for the 2-/3-cpt IV models. Notably this EXCLUDES the oral
-    /// **depot** (an oral model's depot only takes bolus input — a zero-order
-    /// into-depot input needs an `ode(...)` model) and oral peripherals, which the
-    /// closed forms cannot infuse into. A `D{cmt}` outside this set is rejected at
-    /// parse time rather than silently mis-routed (no-TV path) or panicking
-    /// (event-driven path).
+    /// compartment(s) for the 2-/3-cpt IV models, and — since #400 — the oral
+    /// **depot** (cmt 1), a zero-order release into the depot followed by
+    /// first-order `ka` absorption into central. Notably this still EXCLUDES oral
+    /// peripherals, which the closed forms cannot infuse into. A `D{cmt}` outside
+    /// this set is rejected at parse time rather than silently mis-routed (no-TV
+    /// path) or panicking (event-driven path).
     pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
         match self {
             PkModel::OneCptIv => &[1],
-            PkModel::OneCptOral => &[2],
+            // Oral: cmt 1 = depot (zero-order-into-depot, #400), cmt 2 = central
+            // (depot-bypassing infusion).
+            PkModel::OneCptOral => &[1, 2],
             PkModel::TwoCptIv => &[1, 2],
-            PkModel::TwoCptOral => &[2],
+            PkModel::TwoCptOral => &[1, 2],
             PkModel::ThreeCptIv => &[1, 2, 3],
-            PkModel::ThreeCptOral => &[2],
+            PkModel::ThreeCptOral => &[1, 2],
         }
     }
 

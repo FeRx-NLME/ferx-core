@@ -19,10 +19,15 @@
 //! ADVAN2/ADVAN4 convention), and the observation read-out reads the
 //! *central* compartment (state slot 1, not 0).
 //!
-//! Infusion support (`rate > 0`) is restricted to inputs into the
-//! central compartment for IV models and into the depot for oral
-//! models (cmt=1 in both cases). Infusion into peripheral compartments
-//! still panics — that's a rare clinical setup tracked as a follow-up.
+//! Infusion support (`rate > 0`):
+//!   - IV models: into the central compartment (cmt 1), plus the
+//!     peripheral compartment(s) for 2-/3-cpt IV.
+//!   - Oral models: into the **central** compartment (cmt 2, a
+//!     depot-bypassing infusion) AND into the **depot** (cmt 1, #400) —
+//!     a zero-order release into the depot, then first-order `ka`
+//!     absorption into central.
+//! Infusion into an oral peripheral compartment still panics — a rare
+//! clinical setup tracked as a follow-up.
 
 use crate::types::{DoseEvent, PkModel, PkParams, Subject};
 
@@ -662,6 +667,10 @@ fn propagate_with_bounds(
         let mut rate_central = 0.0;
         let mut rate_periph1 = 0.0;
         let mut rate_periph2 = 0.0;
+        // Zero-order input into the oral **depot** (cmt 1, #400) — a zero-order
+        // release into the depot followed by first-order `ka` absorption into
+        // central. Distinct channel from `rate_central` (cmt 2, depot bypass).
+        let mut rate_depot = 0.0;
         // F multiplies infusion rate so a dur→0 infusion limits to a bolus
         // of amount F·AMT — same convention as the EventKind::Dose arm above.
         for (k, d) in doses.iter().enumerate() {
@@ -676,19 +685,22 @@ fn propagate_with_bounds(
                 let r = pk.bioavailable_rate(d.rate);
                 match (pk_model, d.cmt) {
                     (PkModel::OneCptIv, 1) => rate_central += r,
+                    (PkModel::OneCptOral, 1) => rate_depot += r,
                     (PkModel::OneCptOral, 2) => rate_central += r,
                     (PkModel::TwoCptIv, 1) => rate_central += r,
                     (PkModel::TwoCptIv, 2) => rate_periph1 += r,
+                    (PkModel::TwoCptOral, 1) => rate_depot += r,
                     (PkModel::TwoCptOral, 2) => rate_central += r,
                     (PkModel::ThreeCptIv, 1) => rate_central += r,
                     (PkModel::ThreeCptIv, 2) => rate_periph1 += r,
                     (PkModel::ThreeCptIv, 3) => rate_periph2 += r,
+                    (PkModel::ThreeCptOral, 1) => rate_depot += r,
                     (PkModel::ThreeCptOral, 2) => rate_central += r,
                     _ => panic!(
                         "event-driven PK: infusion into compartment {} not supported \
-                         for model {:?}. Supported: central for all models; periph1/2 \
-                         for 2- and 3-cpt IV models. Oral peripheral infusion is a \
-                         tracked follow-up.",
+                         for model {:?}. Supported: central for all models; depot (cmt 1) \
+                         for oral models; periph1/2 for 2- and 3-cpt IV models. Oral \
+                         peripheral infusion is a tracked follow-up.",
                         d.cmt, pk_model
                     ),
                 }
@@ -700,19 +712,19 @@ fn propagate_with_bounds(
                 propagate_one_cpt(state, dt, pk, rate_central);
             }
             PkModel::OneCptOral => {
-                propagate_one_cpt_oral(state, dt, pk, rate_central);
+                propagate_one_cpt_oral(state, dt, pk, rate_central, rate_depot);
             }
             PkModel::TwoCptIv => {
                 propagate_two_cpt(state, dt, pk, rate_central, rate_periph1);
             }
             PkModel::TwoCptOral => {
-                propagate_two_cpt_oral(state, dt, pk, rate_central);
+                propagate_two_cpt_oral(state, dt, pk, rate_central, rate_depot);
             }
             PkModel::ThreeCptIv => {
                 propagate_three_cpt(state, dt, pk, rate_central, rate_periph1, rate_periph2);
             }
             PkModel::ThreeCptOral => {
-                propagate_three_cpt_oral(state, dt, pk, rate_central);
+                propagate_three_cpt_oral(state, dt, pk, rate_central, rate_depot);
             }
         }
     }
@@ -824,8 +836,16 @@ fn propagate_two_cpt(
 /// drains into the central compartment via the absorption rate `ka`.
 /// `rate_central` is a constant zero-order input into the central compartment
 /// over this sub-interval — a depot-bypassing infusion (RATE>0 into cmt 2) —
-/// added by linear superposition. The depot is untouched.
-fn propagate_one_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_central: f64) {
+/// added by linear superposition. `rate_depot` is a constant zero-order input
+/// into the **depot** (RATE>0 into cmt 1, #400): zero-order release into the
+/// depot, then first-order `ka` absorption into central.
+fn propagate_one_cpt_oral(
+    state: &mut [f64],
+    dt: f64,
+    pk: &PkParams,
+    rate_central: f64,
+    rate_depot: f64,
+) {
     let cl = pk.cl();
     let v = pk.v();
     let ka = pk.ka();
@@ -860,12 +880,38 @@ fn propagate_one_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_centra
         propagate_one_cpt(&mut inflow, dt, pk, rate_central);
         state[1] += inflow[0];
     }
+
+    // Constant zero-order input into the depot (#400). Forced response from a
+    // zero initial state, added by linearity:
+    //   depot:   A_d_forced(dt) = (R/ka)·(1 − e_ka)
+    //   central: drive ka·A_d_forced = R·(1 − e^{−ka t}) convolved with the
+    //            central impulse response e^{−ke t} gives
+    //            R/ke·(1 − e_ke) − R·(e_ka − e_ke)/(ke − ka),
+    //            with the L'Hôpital limit R·dt·e_ke as ka → ke.
+    if rate_depot > 0.0 {
+        state[0] += (rate_depot / ka) * (1.0 - e_ka);
+        let central_forced = if (ka - ke).abs() < 1e-9 {
+            rate_depot / ke * (1.0 - e_ke) - rate_depot * dt * e_ke
+        } else {
+            rate_depot / ke * (1.0 - e_ke) - rate_depot * (e_ka - e_ke) / (ke - ka)
+        };
+        state[1] += central_forced;
+    }
 }
 
 /// 2-cpt oral propagator. State = `[A_depot, A_central, A_periph]`.
 /// `rate_central` is a constant zero-order input into the central compartment
 /// (depot-bypassing infusion, RATE>0 into cmt 2), added by linear superposition.
-fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_central: f64) {
+/// `rate_depot` is a constant zero-order input into the **depot** (RATE>0 into
+/// cmt 1, #400): zero-order release into the depot, then first-order `ka`
+/// absorption into central.
+fn propagate_two_cpt_oral(
+    state: &mut [f64],
+    dt: f64,
+    pk: &PkParams,
+    rate_central: f64,
+    rate_depot: f64,
+) {
     let cl = pk.cl();
     let v1 = pk.v();
     let q = pk.q();
@@ -947,6 +993,30 @@ fn propagate_two_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_centra
         propagate_two_cpt(&mut inflow, dt, pk, rate_central, 0.0);
         state[1] += inflow[0];
         state[2] += inflow[1];
+    }
+
+    // Constant zero-order input into the depot (#400). The forced response from
+    // a zero initial state is `x_ss − e^{A·dt}·x_ss`, where `x_ss` is the full
+    // steady state under constant depot input R. At steady state the depot holds
+    // R/ka and delivers ka·(R/ka)=R into central, so the central/peripheral SS
+    // equals a 2-cpt IV infusion of rate R into central:
+    //   central_ss = R/k10,  periph_ss = k12·R/(k21·k10).
+    // `e^{A·dt}·x_ss` is exactly this propagator's homogeneous evolution, reused
+    // by recursing with zero rates (depth 1; no further recursion).
+    if rate_depot > 0.0 {
+        let r = rate_depot;
+        let denom_ss = k21 * k10;
+        let (c_ss, p_ss) = if denom_ss > 1e-30 {
+            (r / k10, k12 * r / denom_ss)
+        } else {
+            (0.0, 0.0)
+        };
+        let d_ss = r / ka;
+        let mut xss = [d_ss, c_ss, p_ss];
+        propagate_two_cpt_oral(&mut xss, dt, pk, 0.0, 0.0);
+        state[0] += d_ss - xss[0];
+        state[1] += c_ss - xss[1];
+        state[2] += p_ss - xss[2];
     }
 }
 
@@ -1099,8 +1169,16 @@ fn propagate_three_cpt(
 /// the 3-cpt homogeneous evolution plus a depot-driven particular solution
 /// of the form `(A, B, C)·exp(-ka·t)`. `rate_central` is a constant zero-order
 /// input into the central compartment (depot-bypassing infusion, RATE>0 into
-/// cmt 2), added by linear superposition.
-fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_central: f64) {
+/// cmt 2), added by linear superposition. `rate_depot` is a constant zero-order
+/// input into the **depot** (RATE>0 into cmt 1, #400): zero-order release into
+/// the depot, then first-order `ka` absorption into central.
+fn propagate_three_cpt_oral(
+    state: &mut [f64],
+    dt: f64,
+    pk: &PkParams,
+    rate_central: f64,
+    rate_depot: f64,
+) {
     let cl = pk.cl();
     let v1 = pk.v();
     let q2 = pk.q();
@@ -1112,6 +1190,7 @@ fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_cent
         return;
     }
     let (alpha, beta, gamma, k21, k31) = macro_rates_three(cl, v1, q2, v2, q3, v3);
+    let k10 = cl / v1;
     let k12 = q2 / v1;
     let k13 = q3 / v1;
 
@@ -1180,6 +1259,29 @@ fn propagate_three_cpt_oral(state: &mut [f64], dt: f64, pk: &PkParams, rate_cent
         state[1] += inflow[0];
         state[2] += inflow[1];
         state[3] += inflow[2];
+    }
+
+    // Constant zero-order input into the depot (#400). Forced response from a
+    // zero initial state = `x_ss − e^{A·dt}·x_ss`. At steady state the depot
+    // holds R/ka and delivers R into central, so central/peripheral SS equals a
+    // 3-cpt IV infusion of rate R into central:
+    //   central_ss = R/k10,  p1_ss = k12·R/(k21·k10),  p2_ss = k13·R/(k31·k10).
+    // `e^{A·dt}·x_ss` is this propagator's homogeneous evolution, reused by
+    // recursing with zero rates (depth 1).
+    if rate_depot > 0.0 {
+        let r = rate_depot;
+        let (c_ss, p1_ss, p2_ss) = if k10 > 1e-30 && k21 > 1e-30 && k31 > 1e-30 {
+            (r / k10, k12 * r / (k21 * k10), k13 * r / (k31 * k10))
+        } else {
+            (0.0, 0.0, 0.0)
+        };
+        let d_ss = r / ka;
+        let mut xss = [d_ss, c_ss, p1_ss, p2_ss];
+        propagate_three_cpt_oral(&mut xss, dt, pk, 0.0, 0.0);
+        state[0] += d_ss - xss[0];
+        state[1] += c_ss - xss[1];
+        state[2] += p1_ss - xss[2];
+        state[3] += p2_ss - xss[3];
     }
 }
 
@@ -2649,5 +2751,222 @@ mod tests {
         for (j, &(_t, pred)) in nonmem.iter().enumerate() {
             assert_relative_eq!(preds[j], pred, max_relative = 1e-4);
         }
+    }
+
+    // ── Zero-order input into the oral depot (cmt 1, #400) ────────────────
+    // The analytical oral propagators gained a `rate_depot` forced response:
+    // zero-order release into the depot, then first-order `ka` absorption into
+    // central. Validate each against a fine fixed-step RK4 integration of the
+    // same depot-infusion ODE — the ground truth the closed form must match.
+
+    /// RK4 integrate `y' = f(t, y)` from 0 to `t_end` with `n` steps; return y(t_end).
+    fn rk4<const D: usize>(
+        f: impl Fn(f64, &[f64; D]) -> [f64; D],
+        t_end: f64,
+        n: usize,
+    ) -> [f64; D] {
+        let h = t_end / n as f64;
+        let mut y = [0.0_f64; D];
+        let mut t = 0.0;
+        let add = |a: &[f64; D], b: &[f64; D], s: f64| {
+            let mut o = [0.0; D];
+            for i in 0..D {
+                o[i] = a[i] + s * b[i];
+            }
+            o
+        };
+        for _ in 0..n {
+            let k1 = f(t, &y);
+            let k2 = f(t + 0.5 * h, &add(&y, &k1, 0.5 * h));
+            let k3 = f(t + 0.5 * h, &add(&y, &k2, 0.5 * h));
+            let k4 = f(t + h, &add(&y, &k3, h));
+            for i in 0..D {
+                y[i] += h / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
+            }
+            t += h;
+        }
+        y
+    }
+
+    #[test]
+    fn one_cpt_oral_depot_infusion_matches_numerical_ode() {
+        let (cl, v, ka, amt, dur) = (5.0, 50.0, 1.2, 100.0, 3.0);
+        let ke = cl / v;
+        let rate = amt / dur; // RATE=-2 resolves to amt/duration
+        let obs_times = vec![0.5, 1.5, 3.0, 4.0, 6.0, 10.0, 16.0];
+        let dose = DoseEvent::new(0.0, amt, 1, rate, false, 0.0); // cmt 1 = depot
+        let subj = make_subject(vec![dose], obs_times.clone());
+        let pk = pk_one_oral(cl, v, ka);
+
+        let preds = event_driven_predictions(
+            PkModel::OneCptOral,
+            &subj,
+            &vec![pk; 1],
+            &vec![pk; obs_times.len()],
+            &[],
+        );
+
+        for (j, &t) in obs_times.iter().enumerate() {
+            // ODE: A_d' = R·[t<dur] − ka·A_d ;  A_c' = ka·A_d − ke·A_c
+            let y = rk4::<2>(
+                |tt, s| {
+                    let inp = if tt < dur { rate } else { 0.0 };
+                    [inp - ka * s[0], ka * s[0] - ke * s[1]]
+                },
+                t,
+                40_000,
+            );
+            let expected = y[1] / v;
+            assert!(expected > 0.0);
+            assert_relative_eq!(preds[j], expected, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn one_cpt_oral_depot_infusion_ka_equals_ke_branch() {
+        // ka == ke hits the L'Hôpital branch of the central forced term.
+        let (cl, v, amt, dur) = (5.0, 50.0, 100.0, 4.0);
+        let ke = cl / v;
+        let ka = ke; // force the singular branch
+        let rate = amt / dur;
+        let obs_times = vec![0.5, 2.0, 4.0, 7.0, 12.0];
+        let dose = DoseEvent::new(0.0, amt, 1, rate, false, 0.0);
+        let subj = make_subject(vec![dose], obs_times.clone());
+        let pk = pk_one_oral(cl, v, ka);
+
+        let preds = event_driven_predictions(
+            PkModel::OneCptOral,
+            &subj,
+            &vec![pk; 1],
+            &vec![pk; obs_times.len()],
+            &[],
+        );
+        for (j, &t) in obs_times.iter().enumerate() {
+            let y = rk4::<2>(
+                |tt, s| {
+                    let inp = if tt < dur { rate } else { 0.0 };
+                    [inp - ka * s[0], ka * s[0] - ke * s[1]]
+                },
+                t,
+                40_000,
+            );
+            assert_relative_eq!(preds[j], y[1] / v, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn two_cpt_oral_depot_infusion_matches_numerical_ode() {
+        let (cl, v1, q, v2, ka, amt, dur) = (4.0, 30.0, 6.0, 60.0, 0.9, 120.0, 5.0);
+        let k10 = cl / v1;
+        let k12 = q / v1;
+        let k21 = q / v2;
+        let rate = amt / dur;
+        let obs_times = vec![0.5, 2.0, 5.0, 7.0, 10.0, 16.0, 24.0];
+        let dose = DoseEvent::new(0.0, amt, 1, rate, false, 0.0); // depot
+        let subj = make_subject(vec![dose], obs_times.clone());
+        let pk = pk_two_oral(cl, v1, q, v2, ka);
+
+        let preds = event_driven_predictions(
+            PkModel::TwoCptOral,
+            &subj,
+            &vec![pk; 1],
+            &vec![pk; obs_times.len()],
+            &[],
+        );
+        for (j, &t) in obs_times.iter().enumerate() {
+            // [A_d, A_c, A_p]
+            let y = rk4::<3>(
+                |tt, s| {
+                    let inp = if tt < dur { rate } else { 0.0 };
+                    [
+                        inp - ka * s[0],
+                        ka * s[0] - (k10 + k12) * s[1] + k21 * s[2],
+                        k12 * s[1] - k21 * s[2],
+                    ]
+                },
+                t,
+                60_000,
+            );
+            assert!(y[1] / v1 > 0.0);
+            assert_relative_eq!(preds[j], y[1] / v1, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn three_cpt_oral_depot_infusion_matches_numerical_ode() {
+        let (cl, v1, q2, v2, q3, v3, ka, amt, dur) =
+            (4.0, 30.0, 6.0, 60.0, 3.0, 120.0, 0.8, 150.0, 6.0);
+        let k10 = cl / v1;
+        let k12 = q2 / v1;
+        let k21 = q2 / v2;
+        let k13 = q3 / v1;
+        let k31 = q3 / v3;
+        let rate = amt / dur;
+        let obs_times = vec![0.5, 2.0, 6.0, 8.0, 12.0, 20.0, 36.0];
+        let dose = DoseEvent::new(0.0, amt, 1, rate, false, 0.0); // depot
+        let subj = make_subject(vec![dose], obs_times.clone());
+        let pk = pk_three_oral(cl, v1, q2, v2, q3, v3, ka);
+
+        let preds = event_driven_predictions(
+            PkModel::ThreeCptOral,
+            &subj,
+            &vec![pk; 1],
+            &vec![pk; obs_times.len()],
+            &[],
+        );
+        for (j, &t) in obs_times.iter().enumerate() {
+            // [A_d, A_c, A_p1, A_p2]
+            let y = rk4::<4>(
+                |tt, s| {
+                    let inp = if tt < dur { rate } else { 0.0 };
+                    [
+                        inp - ka * s[0],
+                        ka * s[0] - (k10 + k12 + k13) * s[1] + k21 * s[2] + k31 * s[3],
+                        k12 * s[1] - k21 * s[2],
+                        k13 * s[1] - k31 * s[3],
+                    ]
+                },
+                t,
+                80_000,
+            );
+            assert!(y[1] / v1 > 0.0);
+            assert_relative_eq!(preds[j], y[1] / v1, max_relative = 1e-4);
+        }
+    }
+
+    #[test]
+    fn oral_depot_infusion_mass_balance() {
+        // A zero-order depot input delivers F·AMT into the system: at a long
+        // observation the cumulative amount eliminated (∫ CL·C dt) plus the
+        // amount still resident must equal AMT. Easier proxy: the AUC over a
+        // very long horizon equals AMT / CL (total clearance of the full dose),
+        // independent of how it was absorbed. Compare a depot infusion's AUC to
+        // a depot bolus of the same AMT — both must clear the same total.
+        let (cl, v, ka, amt) = (5.0, 50.0, 1.0, 100.0);
+        let pk = pk_one_oral(cl, v, ka);
+        // Dense grid out to a long horizon for a trapezoidal AUC.
+        let obs_times: Vec<f64> = (0..=4000).map(|i| i as f64 * 0.05).collect();
+
+        let auc = |dose: DoseEvent| -> f64 {
+            let subj = make_subject(vec![dose], obs_times.clone());
+            let c = event_driven_predictions(
+                PkModel::OneCptOral,
+                &subj,
+                &vec![pk; 1],
+                &vec![pk; obs_times.len()],
+                &[],
+            );
+            obs_times
+                .windows(2)
+                .zip(c.windows(2))
+                .map(|(t, cc)| 0.5 * (t[1] - t[0]) * (cc[0] + cc[1]))
+                .sum()
+        };
+
+        let auc_inf = auc(DoseEvent::new(0.0, amt, 1, amt / 4.0, false, 0.0)); // 4 h depot infusion
+        let auc_bolus = auc(DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0)); // depot bolus
+                                                                           // Both deliver the same AMT; AUC = AMT/CL regardless of absorption shape.
+        assert_relative_eq!(auc_inf, amt / cl, max_relative = 2e-3);
+        assert_relative_eq!(auc_inf, auc_bolus, max_relative = 2e-3);
     }
 }

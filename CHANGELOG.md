@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Zero-order absorption into the oral depot on analytical models** — a `RATE=-2`
+  modeled duration `D1` (or an explicit positive-`RATE` infusion) into compartment 1
+  of an analytical oral model (`one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`)
+  now models zero-order release into the depot followed by first-order `KA`
+  absorption into central, all on the closed-form engine — no `ode(...)` block
+  needed (previously rejected at parse time). Validated against the ODE
+  transcription across 1-/2-/3-cpt oral models. Per-compartment amounts in
+  `sdtab`/`[derived]` are not available for those subjects (predictions are exact;
+  a `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` warning flags it) (#400).
 - `RATE=-2` (modeled infusion duration via a `D{cmt}` parameter) is now supported
   on **analytical** PK models, not just ODE models — declare a `D{cmt}` individual
   parameter and the closed-form infusion uses `rate = AMT / D{cmt}`, matching

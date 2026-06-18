@@ -241,6 +241,17 @@ models; see
 for the DSL and semantics. A `RATE=-2` dose with no matching `D{cmt}` parameter
 (on either engine) is a **loud error** — never a silent bolus.
 
+On an analytical **oral** model (`pk one_cpt_oral` / `two_cpt_oral` /
+`three_cpt_oral`), a `D1` into the **depot** (compartment 1) gives a **zero-order
+absorption** model: drug is released into the depot at a constant rate over `D1`,
+then absorbed first-order into central via `KA` (#400). `D2` into the same model
+is a depot-bypassing infusion straight into central. Both stay on the closed-form
+analytical engine — no `ode(...)` block needed. (Compartment amounts in
+`sdtab`/`[derived]` are not available for analytical depot-zero-order subjects;
+the predictions themselves are exact — use an `ode(...)` model if you need the
+per-compartment amounts.) Infusion into an oral **peripheral** compartment is
+still unsupported and needs an `ode(...)` model.
+
 `RATE = -1` (modeled rate, `R{cmt}`) is not yet supported; convert such rows to
 an explicit positive `RATE`, or model the duration with `-2` instead. Any other
 negative or non-finite `RATE` on a dose row is also rejected. Earlier versions

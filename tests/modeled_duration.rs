@@ -582,6 +582,82 @@ fn analytical_modeled_duration_matches_nonmem_closed_form() {
     }
 }
 
+// One-compartment ANALYTICAL ORAL model with a zero-order input into the DEPOT
+// (cmt 1) via a modeled duration `D1` (#400): zero-order release into the depot,
+// then first-order `ka` absorption into central. Stays analytical (closed form,
+// `pk one_cpt_oral`) — no `ode(...)` block. `D1` defaults to 5.0, so with
+// `AMT=100` the depot is filled at rate 20 over a 5 h window.
+const ANALYTICAL_ORAL_DEPOT_D1: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  D1 = TVD1
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+// Observations on the CENTRAL compartment (CMT=2) for the oral model.
+const ORAL_OBS_ROWS: &str = "1,1,0,0,0,2,0,0\n\
+                             1,3,0,0,0,2,0,0\n\
+                             1,5,0,0,0,2,0,0\n\
+                             1,8,0,0,0,2,0,0\n\
+                             1,12,0,0,0,2,0,0\n\
+                             1,18,0,0,0,2,0,0\n\
+                             1,24,0,0,0,2,0,0\n";
+
+// Depot dose (CMT=1) with a modeled duration (RATE=-2) vs the explicit infusion
+// it resolves to (RATE = AMT/D1 = 100/5 = 20).
+fn oral_depot_coded_csv() -> String {
+    format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,-2,1\n{ORAL_OBS_ROWS}")
+}
+fn oral_depot_explicit_csv() -> String {
+    format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,20,1\n{ORAL_OBS_ROWS}")
+}
+
+#[test]
+fn analytical_oral_depot_modeled_duration_matches_explicit_and_is_finite() {
+    // #400 on the public `predict()` boundary: a `RATE=-2` zero-order input into
+    // the oral DEPOT (cmt 1) of an analytical `one_cpt_oral` model must (a) parse
+    // and stay analytical, (b) resolve to the explicit `RATE = AMT/D1 = 20`
+    // infusion through the same closed form, and (c) produce finite, nonzero
+    // central concentrations — no parse error, no runtime panic. This is the
+    // regression for the lifted `infusable_compartments()` gate.
+    let model = model_of(ANALYTICAL_ORAL_DEPOT_D1);
+    assert!(
+        model.ode_spec.is_none(),
+        "model must stay analytical (no ode_spec)"
+    );
+    let coded = preds_of(&model, &oral_depot_coded_csv());
+    let explicit = preds_of(&model, &oral_depot_explicit_csv());
+    assert_close(
+        &coded,
+        &explicit,
+        1e-9,
+        "oral depot RATE=-2 D1=5 vs explicit RATE=20",
+    );
+    assert!(
+        coded.iter().all(|c| c.is_finite()),
+        "central concentrations must be finite"
+    );
+    assert!(
+        coded.iter().any(|&c| c > 0.01),
+        "central concentrations should be nonzero after a depot zero-order input"
+    );
+}
+
 // Analytical 1-cpt IV model with IOV (kappa on CL) AND a modeled duration `D1`.
 // Exercises the `predict_iov` dispatch path — distinct from the no-TV / TV
 // dispatchers — which must also resolve `RATE=-2` doses (#394 review).

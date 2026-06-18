@@ -18827,11 +18827,12 @@ CL V KA WT
     }
 
     #[test]
-    fn analytical_modeled_duration_into_oral_depot_is_rejected() {
-        // `D1` on a `one_cpt_oral` model targets the DEPOT (cmt 1), which the
-        // analytical closed forms cannot infuse into (infusable = {2}, the central
-        // compartment). It must be a loud parse error — not silently routed into
-        // central (no-TV path) or a runtime panic (event-driven path). #394 review.
+    fn analytical_modeled_duration_into_oral_depot_parses() {
+        // `D1` on a `one_cpt_oral` model targets the DEPOT (cmt 1): a zero-order
+        // release into the depot, then first-order `ka` absorption into central
+        // (#400). Since the analytical oral propagators gained the depot
+        // forced response, the depot is now an infusable compartment — this must
+        // parse and bind `D1` as a modeled Duration for compartment 1.
         let src = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
@@ -18853,11 +18854,54 @@ CL V KA WT
 [error_model]
   DV ~ proportional(PROP)
 "#;
+        let parsed = parse_full_model(src).expect("D1 into the oral depot must parse (#400)");
+        assert!(
+            parsed.model.ode_spec.is_none(),
+            "model must stay analytical (no ode_spec)"
+        );
+        parsed
+            .model
+            .dose_attr_map
+            .indexed_slot(crate::types::DoseAttr::Duration, 1)
+            .expect("D1 must map as modeled duration for the depot (compartment 1)");
+    }
+
+    #[test]
+    fn analytical_modeled_duration_into_oral_peripheral_is_rejected() {
+        // `D3` on a `two_cpt_oral` model targets a PERIPHERAL (cmt 3), which the
+        // analytical oral closed forms still cannot infuse into (infusable =
+        // {1 depot, 2 central}). It must be a loud parse error pointing at
+        // `ode(...)` — not silently routed or a runtime panic (#400).
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 1.0, 500.0)
+  theta TVQ(5.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVD3(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+  D3 = TVD3
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
         let err = parse_full_model(src)
             .err()
-            .expect("D1 (oral depot) on an analytical oral model must error");
+            .expect("D3 (oral peripheral) on an analytical oral model must error");
         assert!(
-            err.contains("compartment 1") && err.contains("D1") && err.contains("ode("),
+            err.contains("compartment 3") && err.contains("D3") && err.contains("ode("),
             "error must name the compartment, the param, and point to ode(...): {err}"
         );
     }
