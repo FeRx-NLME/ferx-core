@@ -241,6 +241,11 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **Bayesian estimation** (`method = bayes`) now responds to a cooperative
+  cancellation (e.g. an R-session interrupt): the Gibbs sampler polls the cancel
+  flag at each sweep boundary and aborts within one sweep, returning
+  `cancelled by user` instead of running every chain to completion. Previously a
+  Bayes run could not be stopped once started (#393).
 - **IMPMAP** now responds to a cooperative cancellation (e.g. an R-session
   interrupt) during an iteration's E-step, instead of only at iteration
   boundaries. The importance-sampling pass — the dominant per-iteration cost on

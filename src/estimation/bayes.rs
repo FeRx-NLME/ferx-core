@@ -456,7 +456,7 @@ pub fn run_bayes(
         })
         .collect();
 
-    for chain in 0..n_chains {
+    'chains: for chain in 0..n_chains {
         let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
         let mut scratch = EventPkParams::default();
 
@@ -548,6 +548,19 @@ pub fn run_bayes(
 
         let total_sweeps = n_warmup + n_sample;
         for sweep in 0..total_sweeps {
+            // Cooperative cancel: a Gibbs sweep (the η/κ/pop/Ω moves below) is the
+            // dominant per-chain cost, so poll the flag at the sweep boundary so an
+            // interrupt set from the host (e.g. R) takes effect within one sweep
+            // rather than running every chain to completion. `break 'chains` drops
+            // straight to the post-loop check, which returns Err before the
+            // (now-partial) draws reach the summary stage.
+            if crate::cancel::is_cancelled(&options.cancel) {
+                if verbose {
+                    eprintln!("Bayes: cancelled at chain {} sweep {}", chain, sweep);
+                }
+                break 'chains;
+            }
+
             // (re)compute the per-subject NLL at the current (θ, Ω, σ, η, κ).
             let mut nll: Vec<f64> = (0..n_subjects)
                 .map(|i| {
@@ -1081,6 +1094,12 @@ pub fn run_bayes(
         draws_by_chain.push(chain_draws);
     }
 
+    // A cancel observed inside the sweep loop drops here via `break 'chains` with
+    // partial/empty draws; bail before the summary stage indexes into them.
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return Err("cancelled by user".to_string());
+    }
+
     if verbose {
         eprintln!("Bayes sampling complete; computing posterior summaries + EBEs...");
     }
@@ -1570,6 +1589,35 @@ mod tests {
         assert!(res.ofv.is_finite(), "OFV not finite");
         assert!(bayes.max_rhat.is_finite());
         assert_eq!(res.eta_hats.len(), pop.subjects.len());
+    }
+
+    /// A cancel flag set before the run aborts at the first sweep boundary and
+    /// returns Err("cancelled by user") instead of running all chains to
+    /// completion (regression for #393: a Bayes run could not be stopped).
+    #[test]
+    fn run_bayes_cancel_returns_err() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let params = model.default_params.clone();
+
+        let cancel = crate::cancel::CancelFlag::new();
+        cancel.cancel(); // already requested before the loop starts
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 1000;
+        opts.bayes_iters = 1000;
+        opts.bayes_chains = 4;
+        opts.bayes_seed = Some(1);
+        opts.cancel = Some(cancel);
+
+        match run_bayes(&model, &pop, &params, &opts) {
+            Err(e) => assert_eq!(e, "cancelled by user"),
+            Ok(_) => panic!("expected cancel to abort the run"),
+        }
     }
 
     /// Regression for the mu-ref θ bound clamp: with a tight `theta_upper` on a
