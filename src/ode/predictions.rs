@@ -63,7 +63,11 @@ pub(crate) fn resolve_subject_doses_with<'a>(
     attr_map: &crate::types::DoseAttrMap,
     pk_for_dose: impl Fn(usize) -> &'a [f64],
 ) -> Cow<'a, Subject> {
-    if subject.all_doses_fixed() {
+    // Fast path: with no compartment-indexed attribute there can be no modeled
+    // dose to resolve, so skip the per-dose `all_doses_fixed()` scan entirely —
+    // the overwhelmingly common case (no `D{cmt}`). A modeled dose cannot reach
+    // here with an empty map: it would have been rejected by the data gate first.
+    if attr_map.is_empty() || subject.all_doses_fixed() {
         return Cow::Borrowed(subject);
     }
     let mut owned = subject.clone();

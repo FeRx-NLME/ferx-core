@@ -63,8 +63,11 @@ pub(crate) fn model_preds(
         // to a concrete duration/rate before the analytical closed form — mirrors
         // the ODE `resolve_subject_doses` step inside `compute_predictions_ode`.
         // Borrowed (no allocation) for the all-`Fixed` common case.
-        let resolved =
-            crate::ode::resolve_subject_doses(subject, &model.dose_attr_map, &pk_params.values);
+        let resolved = crate::ode::resolve_subject_doses(
+            subject,
+            model.active_dose_attr_map(),
+            &pk_params.values,
+        );
         pk::compute_predictions(model.pk_model, &resolved, pk_params)
     };
     pk::apply_scaling(model, subject, theta, eta, &mut preds);
@@ -741,14 +744,13 @@ fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> V
             let cmt = dose.cmt;
             // A `RATE=-2` dose into compartment `cmt` requires a matching `D{cmt}`
             // parameter so `resolve_rate` has a slot to read — for BOTH engines.
-            // ODE models record the slot on `ode_spec.dose_attr_map`; analytical
-            // models (#394) on `model.dose_attr_map`. Either way an absent slot is
-            // the same actionable error.
-            let has_slot = match &model.ode_spec {
-                Some(ode) => ode.dose_attr_map.indexed_slot(DoseAttr::Duration, cmt),
-                None => model.dose_attr_map.indexed_slot(DoseAttr::Duration, cmt),
-            }
-            .is_some();
+            // `active_dose_attr_map()` returns the engine-correct map (the
+            // `OdeSpec`'s for ODE models, the analytical field otherwise, #394), so
+            // an absent slot is the same actionable error on either engine.
+            let has_slot = model
+                .active_dose_attr_map()
+                .indexed_slot(DoseAttr::Duration, cmt)
+                .is_some();
             if !has_slot {
                 diags.push(
                     Diagnostic::error(

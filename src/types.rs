@@ -319,6 +319,14 @@ impl DoseAttrMap {
         self.indexed.insert((attr, cmt), slot);
     }
 
+    /// `true` when no compartment-indexed attribute is recorded — the common
+    /// case (bare-`F`/`lagtime` model, no `D{cmt}`). Lets the dose-resolution
+    /// step short-circuit before scanning a subject's doses: with no indexed
+    /// slot there can be no modeled-`RATE` dose to resolve.
+    pub fn is_empty(&self) -> bool {
+        self.indexed.is_empty()
+    }
+
     /// The PkParams slot holding `attr` for compartment `cmt`, if the model
     /// declared a compartment-indexed parameter for it.
     pub fn indexed_slot(&self, attr: DoseAttr, cmt: usize) -> Option<usize> {
@@ -2070,6 +2078,18 @@ impl CompiledModel {
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
+    }
+
+    /// The compartment-indexed dose-attribute map (`D{cmt}` for `RATE=-2`, …) for
+    /// **this model's engine**: the `OdeSpec`'s map for ODE models, the analytical
+    /// `dose_attr_map` field otherwise. Single source of truth for "which map
+    /// applies", so a caller cannot accidentally read the empty analytical default
+    /// on an ODE model (or vice versa) and silently resolve nothing (#383/#394).
+    pub(crate) fn active_dose_attr_map(&self) -> &DoseAttrMap {
+        match &self.ode_spec {
+            Some(ode) => &ode.dose_attr_map,
+            None => &self.dose_attr_map,
+        }
     }
 
     /// Copy the configured ODE solver tolerances from `opts` onto this model's

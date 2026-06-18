@@ -358,9 +358,10 @@ pub fn predict_iov(
         // (The ODE arm above resolves internally via `ode.dose_attr_map`; this arm
         // reads the analytical model's `dose_attr_map`.) Borrowed no-op when every
         // dose is already `Fixed`.
-        let resolved = crate::ode::resolve_subject_doses_with(subject, &model.dose_attr_map, |k| {
-            &dose_params[k].values
-        });
+        let resolved =
+            crate::ode::resolve_subject_doses_with(subject, model.active_dose_attr_map(), |k| {
+                &dose_params[k].values
+            });
         event_driven::event_driven_predictions(
             model.pk_model,
             &resolved,
@@ -998,8 +999,11 @@ pub fn compute_predictions_with_states(
         } else {
             let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
             // Resolve modeled-`RATE` doses (#394) before the superposition states.
-            let resolved =
-                crate::ode::resolve_subject_doses(subject, &model.dose_attr_map, &pk.values);
+            let resolved = crate::ode::resolve_subject_doses(
+                subject,
+                model.active_dose_attr_map(),
+                &pk.values,
+            );
             predict_all_states(model.pk_model, &resolved, &pk)
         };
         (ipred, states)
@@ -1186,38 +1190,44 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         // concrete duration/rate using each dose's per-event PK snapshot, before the
         // event-driven walker builds its infusion bounds. Borrowed (no allocation)
         // for the all-`Fixed` common case.
-        let resolved = crate::ode::resolve_subject_doses_with(subject, &model.dose_attr_map, |k| {
-            &scratch.dose[k].values
-        });
+        let resolved =
+            crate::ode::resolve_subject_doses_with(subject, model.active_dose_attr_map(), |k| {
+                &scratch.dose[k].values
+            });
         // A cached `EventSchedule` was built from the *unresolved* subject, whose
         // modeled-duration infusions still read `duration == 0`; reuse it only when
         // nothing was resolved (the borrowed case). Otherwise rebuild from the
         // resolved subject — modeled duration is η-dependent, so a cached schedule
         // could not be reused across iterations anyway.
-        match (&resolved, schedule) {
-            (std::borrow::Cow::Borrowed(_), Some(sched)) => {
-                event_driven::event_driven_predictions_with_schedule(
-                    model.pk_model,
-                    &resolved,
-                    sched,
-                    &scratch.dose,
-                    &scratch.obs,
-                    &scratch.pk_only,
-                )
-            }
-            _ => event_driven::event_driven_predictions(
+        if let (std::borrow::Cow::Borrowed(_), Some(sched)) = (&resolved, schedule) {
+            // Nothing was resolved (all doses already `Fixed`) → the cached schedule
+            // is valid, reuse it.
+            event_driven::event_driven_predictions_with_schedule(
+                model.pk_model,
+                &resolved,
+                sched,
+                &scratch.dose,
+                &scratch.obs,
+                &scratch.pk_only,
+            )
+        } else {
+            // A modeled dose was resolved (or no cache) → rebuild the schedule from
+            // the resolved subject (a cache built from the unresolved subject reads
+            // `duration == 0`, and modeled duration is η-dependent anyway).
+            event_driven::event_driven_predictions(
                 model.pk_model,
                 &resolved,
                 &scratch.dose,
                 &scratch.obs,
                 &scratch.pk_only,
-            ),
+            )
         }
     } else {
         // No-TV fast path (or TV with unsupported model — see docstring).
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
         // Resolve any modeled-`RATE` doses (#394) before the closed-form math.
-        let resolved = crate::ode::resolve_subject_doses(subject, &model.dose_attr_map, &pk.values);
+        let resolved =
+            crate::ode::resolve_subject_doses(subject, model.active_dose_attr_map(), &pk.values);
         compute_predictions(model.pk_model, &resolved, &pk)
     };
 
