@@ -352,9 +352,19 @@ pub fn predict_iov(
             &pk_only_params,
         )
     } else if event_driven::supports_event_driven(model.pk_model) {
+        // Resolve modeled-`RATE` doses (#324/#394) using each dose's per-occasion
+        // PK snapshot before the analytical event-driven walker — the IOV analogue
+        // of the resolve step in `compute_predictions_with_tv_into_with_schedule`.
+        // (The ODE arm above resolves internally via `ode.dose_attr_map`; this arm
+        // reads the analytical model's `dose_attr_map`.) Borrowed no-op when every
+        // dose is already `Fixed`.
+        let resolved =
+            crate::ode::resolve_subject_doses_with(subject, model.active_dose_attr_map(), |k| {
+                &dose_params[k].values
+            });
         event_driven::event_driven_predictions(
             model.pk_model,
-            subject,
+            &resolved,
             &dose_params,
             &obs_params,
             &pk_only_params,
@@ -992,7 +1002,25 @@ pub fn compute_predictions_with_states(
             vec![]
         } else {
             let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-            predict_all_states(model.pk_model, subject, &pk)
+            // Resolve modeled-`RATE` doses (#394) before the superposition states.
+            let resolved = crate::ode::resolve_subject_doses(
+                subject,
+                model.active_dose_attr_map(),
+                &pk.values,
+            );
+            if has_oral_depot_infusion(model.pk_model, &resolved) {
+                // The superposition state helper (`single_dose_states`) models an
+                // oral infusion as a depot-bypassing input into central, so it
+                // cannot express a zero-order input into the **depot** (#400) —
+                // it would report silently-wrong compartment amounts. The
+                // event-driven path (used for `ipred` above) has no states
+                // variant yet, so return outer-empty → NaN compartments, matching
+                // the reset/TV-analytical convention. ipred stays correct;
+                // sdtab/`[derived]` compartment amounts degrade to NaN.
+                vec![]
+            } else {
+                predict_all_states(model.pk_model, &resolved, &pk)
+            }
         };
         (ipred, states)
     }
@@ -1002,20 +1030,23 @@ pub fn compute_predictions_with_states(
 /// Uses analytical equations for standard PK models, or delegates to ODE solver
 /// when an OdeSpec is provided.
 pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkParams) -> Vec<f64> {
-    // Defensive guard (#324): modeled-RATE doses (RATE=-2 -> D{cmt}) are
-    // ODE-only and are rejected on analytical models by every public entrypoint
-    // first (`fit()` / `ferx check` via `check_model_data`, `predict()` /
-    // `simulate()` via `assert_modeled_doses_supported`). Reaching here with one
-    // means every gate was bypassed (e.g. a direct caller of this `pub` fn on an
-    // unvalidated `Population`). A modeled dose has `rate == 0` but reports
-    // `is_infusion()`, so it would route into the infusion closed form as a
-    // 0-rate "infusion" — silently 0/NaN, the exact #324 silent-bolus class.
-    // A real `assert!` (not `debug_assert!`) so release builds fail loudly too;
-    // it is O(doses) and dwarfed by the per-observation analytical evaluation.
+    // Defensive guard (#324/#394): modeled-RATE doses (RATE=-2 -> D{cmt}) must be
+    // resolved to a concrete (`Fixed`) rate/duration *before* reaching this closed
+    // form. The analytical dispatch paths do exactly that (`api::model_preds` and
+    // `compute_predictions_with_tv_into_with_schedule` resolve via the model's
+    // `dose_attr_map`), and the public entrypoints reject an unbacked modeled dose
+    // up front (`fit()` / `ferx check` via `check_model_data`, `predict()` /
+    // `simulate()` via `assert_modeled_doses_supported`). Reaching here unresolved
+    // means a path forgot to resolve (e.g. a direct caller of this `pub` fn on a
+    // raw `Population`). A modeled dose has `rate == 0` but reports `is_infusion()`,
+    // so it would route into the infusion closed form as a 0-rate "infusion" —
+    // silently 0/NaN, the exact #324 silent-bolus class. A real `assert!` (not
+    // `debug_assert!`) so release builds fail loudly too; it is O(doses) and
+    // dwarfed by the per-observation analytical evaluation.
     assert!(
         subject.all_doses_fixed(),
         "modeled-RATE dose reached the analytical predictor unresolved \
-         (RATE=-2 is ODE-only; validate with check_model_data before predicting)"
+         (resolve via dose_attr_map, or validate with check_model_data, before predicting)"
     );
     // Dose superposition cannot express a system reset (EVID=3/4): a reset
     // zeros the compartments mid-record, which is not a sum of independent
@@ -1023,7 +1054,16 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
     // state-propagating event-driven analytical path instead, replicating
     // the (constant) `pk_params` across every event slot — the same uniform
     // fill the no-TV dispatcher branch uses.
-    if subject.has_resets() && event_driven::supports_event_driven(pk_model) {
+    //
+    // The same routing applies to a zero-order input into the oral **depot**
+    // (cmt 1, #400): the superposition closed forms (`one_cpt_oral` etc.) treat
+    // an oral dose as a depot bolus + a depot-bypassing central infusion and
+    // have no depot-infusion form, so a `D{depot}` infusion would be silently
+    // mishandled. The event-driven propagator implements the depot zero-order
+    // forced response, so route depot-infusion subjects there too.
+    if (subject.has_resets() || has_oral_depot_infusion(pk_model, subject))
+        && event_driven::supports_event_driven(pk_model)
+    {
         let pk_dose = vec![*pk_params; subject.doses.len()];
         let pk_obs = vec![*pk_params; subject.obs_times.len()];
         let pk_pk_only = vec![*pk_params; subject.pk_only_times.len()];
@@ -1040,6 +1080,27 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
         .iter()
         .map(|&t| predict_concentration(pk_model, &subject.doses, t, pk_params))
         .collect()
+}
+
+/// Whether `subject` has a zero-order infusion into the **depot** (cmt 1) of an
+/// oral model (#400) — a dose into compartment 1 of `one_cpt_oral` /
+/// `two_cpt_oral` / `three_cpt_oral` that [`DoseEvent::is_infusion`] reports as
+/// an infusion (an explicit positive `RATE`, or a still-modeled `RATE=-2` `D1`).
+///
+/// Such doses have no closed form in the superposition path (which models the
+/// oral depot as bolus-only), so the dispatcher routes them through the
+/// event-driven propagator instead, and their per-compartment states degrade to
+/// NaN. IV models and oral **central** infusions (cmt 2, handled by the
+/// depot-bypass IV formula) return `false`.
+///
+/// Uses `is_infusion()` rather than `rate > 0` so the predicate gives the same
+/// answer on the **raw** subject (modeled `RATE=-2` doses still read `rate == 0`)
+/// and the **resolved** subject (where it reduces to `rate > 0`). This is the
+/// single source of truth shared by the prediction dispatch, the compartment-
+/// state degradation, and the `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL`
+/// warning — so the three can never disagree about which subjects are affected.
+pub(crate) fn has_oral_depot_infusion(pk_model: PkModel, subject: &Subject) -> bool {
+    pk_model.is_oral() && subject.doses.iter().any(|d| d.cmt == 1 && d.is_infusion())
 }
 
 /// Compute predictions using ODE integration.
@@ -1200,19 +1261,37 @@ pub fn compute_predictions_with_tv_into_with_schedule(
         && event_driven::supports_event_driven(model.pk_model)
     {
         compute_event_pk_params_into(model, subject, theta, eta, scratch);
-        if let Some(sched) = schedule {
+        // Resolve modeled-`RATE` doses (#324/#394, e.g. `RATE=-2` → `D{cmt}`) to
+        // concrete duration/rate using each dose's per-event PK snapshot, before the
+        // event-driven walker builds its infusion bounds. Borrowed (no allocation)
+        // for the all-`Fixed` common case.
+        let resolved =
+            crate::ode::resolve_subject_doses_with(subject, model.active_dose_attr_map(), |k| {
+                &scratch.dose[k].values
+            });
+        // A cached `EventSchedule` was built from the *unresolved* subject, whose
+        // modeled-duration infusions still read `duration == 0`; reuse it only when
+        // nothing was resolved (the borrowed case). Otherwise rebuild from the
+        // resolved subject — modeled duration is η-dependent, so a cached schedule
+        // could not be reused across iterations anyway.
+        if let (std::borrow::Cow::Borrowed(_), Some(sched)) = (&resolved, schedule) {
+            // Nothing was resolved (all doses already `Fixed`) → the cached schedule
+            // is valid, reuse it.
             event_driven::event_driven_predictions_with_schedule(
                 model.pk_model,
-                subject,
+                &resolved,
                 sched,
                 &scratch.dose,
                 &scratch.obs,
                 &scratch.pk_only,
             )
         } else {
+            // A modeled dose was resolved (or no cache) → rebuild the schedule from
+            // the resolved subject (a cache built from the unresolved subject reads
+            // `duration == 0`, and modeled duration is η-dependent anyway).
             event_driven::event_driven_predictions(
                 model.pk_model,
-                subject,
+                &resolved,
                 &scratch.dose,
                 &scratch.obs,
                 &scratch.pk_only,
@@ -1221,7 +1300,10 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     } else {
         // No-TV fast path (or TV with unsupported model — see docstring).
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-        compute_predictions(model.pk_model, subject, &pk)
+        // Resolve any modeled-`RATE` doses (#394) before the closed-form math.
+        let resolved =
+            crate::ode::resolve_subject_doses(subject, model.active_dose_attr_map(), &pk.values);
+        compute_predictions(model.pk_model, &resolved, &pk)
     };
 
     // `[scaling]` post-multiply. Single insertion point covers FOCE/FOCEI,
@@ -1538,6 +1620,7 @@ mod tests {
             pk_idx_f64: vec![],
             sel_flat: vec![],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,

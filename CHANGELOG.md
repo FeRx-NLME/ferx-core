@@ -43,6 +43,20 @@ section of the SDLC for the versioning policy).
   covariates (and their continuous/categorical kind) are taken from the model's
   `[covariates]` block; the `covariates` argument is an optional subset filter
   over them (#194).
+- **Zero-order absorption into the oral depot on analytical models** — a `RATE=-2`
+  modeled duration `D1` (or an explicit positive-`RATE` infusion) into compartment 1
+  of an analytical oral model (`one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`)
+  now models zero-order release into the depot followed by first-order `KA`
+  absorption into central, all on the closed-form engine — no `ode(...)` block
+  needed (previously rejected at parse time). Validated against NONMEM 7.5.1
+  `ADVAN2` (`$PK D1`) and against the ODE transcription across 1-/2-/3-cpt oral
+  models. Per-compartment amounts in
+  `sdtab`/`[derived]` are not available for those subjects (predictions are exact;
+  a `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` warning flags it) (#400).
+- `RATE=-2` (modeled infusion duration via a `D{cmt}` parameter) is now supported
+  on **analytical** PK models, not just ODE models — declare a `D{cmt}` individual
+  parameter and the closed-form infusion uses `rate = AMT / D{cmt}`, matching
+  NONMEM's `$PK D{n}` (#394, follow-up to #324).
 - **Full MCMC Bayesian estimation** (`method = bayes`, Gibbs-within-HMC, NONMEM
   `METHOD=BAYES` parity). Draws from the joint posterior `p(θ, Ω, Σ, {ηᵢ} | y)`:
   per-subject η block (block-MH, or gradient HMC on autodiff builds with
@@ -148,13 +162,17 @@ section of the SDLC for the versioning policy).
   wall-clock cost (both stencils parallelise over perturbation points). Default
   `true`; set `false` to force the faster analytical-gradient stencil (#335).
 - Propensity-score-matched simulation: `simulate_with_options()` with a new
-  `SimulateOptions { seed, propensity_match }`. When `propensity_match` is set,
-  each replicate's drawn etas are reassigned to subjects by optimal Mahalanobis
-  matching (under the model Ω) against the subjects' fitted (posthoc) etas, so a
-  subject's observed dosing/sampling design is paired with a similar drawn eta.
-  This corrects VPC bias from treatment adaptation in real-world data (longer
-  intervals for high-clearance patients, etc.). Operates on observed data;
-  returns the usual simulation rows for the caller to build the VPC (#288).
+  `SimulateOptions { seed, match_method }`. When `match_method` is `Some(..)`,
+  each replicate's drawn etas are reassigned to subjects by Mahalanobis matching
+  (under the model Ω) against the subjects' fitted (posthoc) etas, so a subject's
+  observed dosing/sampling design is paired with a similar drawn eta. This
+  corrects VPC bias from treatment adaptation in real-world data (longer
+  intervals for high-clearance patients, etc.). Three methods are offered via
+  `MatchMethod`: `Optimal` (global linear-assignment minimum; best on average in
+  simulation, recommended default), `Nearest` (greedy nearest-neighbour,
+  `MatchIt(method="nearest", distance="mahalanobis")`), and `Rank` (pair by the
+  rank of the Mahalanobis norm). Operates on observed data; returns the usual
+  simulation rows for the caller to build the VPC (#288, #396).
 - New `importance_sampling_map` (alias `impmap`) estimation method: a Monte-Carlo
   EM estimator equivalent to NONMEM `METHOD=IMPMAP`. Each iteration re-centers a
   per-subject importance-sampling proposal on the conditional mode (MAP) and
@@ -256,6 +274,11 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **Bayesian estimation** (`method = bayes`) now responds to a cooperative
+  cancellation (e.g. an R-session interrupt): the Gibbs sampler polls the cancel
+  flag at each sweep boundary and aborts within one sweep, returning
+  `cancelled by user` instead of running every chain to completion. Previously a
+  Bayes run could not be stopped once started (#393).
 - **IMPMAP** now responds to a cooperative cancellation (e.g. an R-session
   interrupt) during an iteration's E-step, instead of only at iteration
   boundaries. The importance-sampling pass — the dominant per-iteration cost on

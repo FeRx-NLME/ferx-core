@@ -9,6 +9,7 @@ use crate::io::datareader::{
     ERR_COV_NON_NUMERIC,
 };
 use crate::pk;
+use crate::propensity_match::MatchMethod;
 use crate::stats::likelihood::{compute_cwres, foce_subject_nll, foce_subject_nll_iov};
 use crate::stats::residual_error::{compute_iwres, iwres_autocorrelation};
 use crate::types::*;
@@ -59,7 +60,16 @@ pub(crate) fn model_preds(
     let mut preds = if let Some(ref ode_spec) = model.ode_spec {
         pk::compute_predictions_ode(ode_spec, subject, &pk_params.values, theta, eta)
     } else {
-        pk::compute_predictions(model.pk_model, subject, pk_params)
+        // Resolve any modeled-`RATE` doses (#324/#394, e.g. `RATE=-2` → `D{cmt}`)
+        // to a concrete duration/rate before the analytical closed form — mirrors
+        // the ODE `resolve_subject_doses` step inside `compute_predictions_ode`.
+        // Borrowed (no allocation) for the all-`Fixed` common case.
+        let resolved = crate::ode::resolve_subject_doses(
+            subject,
+            model.active_dose_attr_map(),
+            &pk_params.values,
+        );
+        pk::compute_predictions(model.pk_model, &resolved, pk_params)
     };
     pk::apply_scaling(model, subject, theta, eta, &mut preds);
     pk::apply_log_transform(model, &mut preds);
@@ -709,15 +719,14 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     diags
 }
 
-/// NONMEM coded `RATE=-2` (modeled infusion duration → `D{cmt}`) needs two
-/// model-aware checks the datareader cannot make (it has no model). Both are
-/// fatal — never a silent fall-through to a bolus (the original #324 bug):
-///   - **ODE engine.** Modeled duration is ODE-only; the analytical engine has
-///     no spare-slot routing for a `D{n}` parameter yet (a tracked #324
-///     follow-up). A `RATE=-2` dose on an analytical model is rejected.
+/// NONMEM coded `RATE=-2` (modeled infusion duration → `D{cmt}`) needs a
+/// model-aware check the datareader cannot make (it has no model). It is fatal
+/// — never a silent fall-through to a bolus (the original #324 bug):
 ///   - **Matching `D{cmt}` parameter.** A `RATE=-2` dose into compartment `n`
 ///     requires a `D{n}` parameter (so `resolve_rate` has a slot to read);
-///     otherwise it is rejected.
+///     otherwise it is rejected. Supported on both engines: ODE models record
+///     the slot on `ode_spec.dose_attr_map`, analytical models (#394) on
+///     `model.dose_attr_map`.
 ///
 /// Reported once per offending compartment (naming the first dose that hits it),
 /// so a dataset with many `RATE=-2` rows yields one actionable error per cause.
@@ -735,43 +744,30 @@ fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> V
                 continue;
             }
             let cmt = dose.cmt;
-            match &model.ode_spec {
-                None => diags.push(
+            // A `RATE=-2` dose into compartment `cmt` requires a matching `D{cmt}`
+            // parameter so `resolve_rate` has a slot to read — for BOTH engines.
+            // `active_dose_attr_map()` returns the engine-correct map (the
+            // `OdeSpec`'s for ODE models, the analytical field otherwise, #394), so
+            // an absent slot is the same actionable error on either engine.
+            let has_slot = model
+                .active_dose_attr_map()
+                .indexed_slot(DoseAttr::Duration, cmt)
+                .is_some();
+            if !has_slot {
+                diags.push(
                     Diagnostic::error(
-                        "E_MODELED_DURATION_ANALYTICAL",
+                        "E_MODELED_DURATION_NO_PARAM",
                         format!(
                             "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
-                             compartment {cmt} is only supported for ODE models; analytical \
-                             support is a tracked follow-up to #324. Use an `ode(...)` model with \
-                             a `D{cmt}` parameter, or supply an explicit positive RATE \
-                             (= AMT/duration).",
+                             compartment {cmt} requires a `D{cmt}` parameter in \
+                             [individual_parameters], but none is declared. Add \
+                             `D{cmt} = ...` (the modeled duration), or supply an explicit \
+                             positive RATE.",
                             subject.id, dose.time
                         ),
                     )
-                    .with_block("structural_model"),
-                ),
-                Some(ode) => {
-                    if ode
-                        .dose_attr_map
-                        .indexed_slot(DoseAttr::Duration, cmt)
-                        .is_none()
-                    {
-                        diags.push(
-                            Diagnostic::error(
-                                "E_MODELED_DURATION_NO_PARAM",
-                                format!(
-                                    "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
-                                     compartment {cmt} requires a `D{cmt}` parameter in \
-                                     [individual_parameters], but none is declared. Add \
-                                     `D{cmt} = ...` (the modeled duration), or supply an explicit \
-                                     positive RATE.",
-                                    subject.id, dose.time
-                                ),
-                            )
-                            .with_block("individual_parameters"),
-                        );
-                    }
-                }
+                    .with_block("individual_parameters"),
+                );
             }
         }
     }
@@ -2301,6 +2297,15 @@ pub(crate) fn compute_extra_output_columns(
                                 // so every grid point evaluates to NaN, consistent with
                                 // W_DERIVED_CMT_TV_ANALYTICAL warning.
                                 vec![]
+                            } else if crate::pk::has_oral_depot_infusion(model.pk_model, subject) {
+                                // Analytical oral model + zero-order input into the depot
+                                // (#400): the superposition state helper models an oral
+                                // infusion as a depot bypass and cannot express a depot
+                                // zero-order input, so it would return silently-wrong finite
+                                // amounts. Return empty so every grid point evaluates to NaN,
+                                // matching the per-obs path in compute_predictions_with_states
+                                // and the W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL warning.
+                                vec![]
                             } else {
                                 let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
                                 crate::pk::analytical_state_at_times(
@@ -3077,6 +3082,27 @@ fn fit_inner(
                  are not available for subjects with resets; [derived] expressions \
                  that reference compartments[i] evaluate to NaN for those subjects. \
                  Use an ODE model if compartment states across resets are required."
+                    .to_string(),
+            );
+        }
+        // Analytical oral model with a zero-order input into the depot (#400):
+        // the superposition state helper models an oral infusion as a depot
+        // bypass, so it cannot express a depot zero-order input. ipred is exact
+        // (event-driven path), but per-obs compartment states return empty (→ NaN)
+        // rather than report silently-wrong amounts.
+        if model.ode_spec.is_none()
+            && population
+                .subjects
+                .iter()
+                .any(|s| crate::pk::has_oral_depot_infusion(model.pk_model, s))
+        {
+            warnings.push(
+                "W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL: analytical oral model \
+                 with a zero-order input into the depot (RATE=-2 D1 / infusion into \
+                 compartment 1) — compartment states are not available for those \
+                 subjects (predictions are exact); [derived] expressions that \
+                 reference compartments[i] evaluate to NaN for them. Use an ODE model \
+                 if depot/central compartment amounts are required."
                     .to_string(),
             );
         }
@@ -4459,26 +4485,28 @@ pub fn simulate_with_seed(
 pub struct SimulateOptions {
     /// Seed for reproducibility. `None` draws from entropy.
     pub seed: Option<u64>,
-    /// When `true`, reassign each replicate's drawn etas to subjects by
+    /// When `Some(method)`, reassign each replicate's drawn etas to subjects by
     /// **propensity-score matching** against the subjects' fitted (posthoc)
-    /// etas — optimal Mahalanobis matching under the model `Ω`. This restores
-    /// the design↔eta association present in adaptively-dosed real-world data
-    /// and corrects the resulting VPC bias (see [`crate::propensity_match`]).
+    /// etas — Mahalanobis matching under the model `Ω` via the chosen
+    /// [`MatchMethod`]. This restores the design↔eta association present in
+    /// adaptively-dosed real-world data and corrects the resulting VPC bias
+    /// (see [`crate::propensity_match`]). `None` disables matching.
     ///
     /// Requires `population` to be observed data: every subject must carry
     /// observations so its posthoc eta can be computed. Has no effect for the
     /// synthetic `[simulation]` block (no observed designs to match against).
-    pub propensity_match: bool,
+    pub match_method: Option<MatchMethod>,
 }
 
 /// Simulate observations, optionally with propensity-score matching.
 ///
-/// With `opts.propensity_match == false` this is identical to
-/// [`simulate_with_seed`] (or [`simulate`] when `opts.seed` is `None`). With it
-/// `true`, the freshly drawn etas of each replicate are reassigned to subjects
-/// so each subject's observed design is paired with a drawn eta close (under the
-/// model `Ω` Mahalanobis metric) to that subject's fitted eta. The fitted
-/// (posthoc) etas are computed once from `params` + the observed `population`.
+/// With `opts.match_method == None` this is identical to
+/// [`simulate_with_seed`] (or [`simulate`] when `opts.seed` is `None`). With a
+/// `Some(method)`, the freshly drawn etas of each replicate are reassigned to
+/// subjects so each subject's observed design is paired with a drawn eta close
+/// (under the model `Ω` Mahalanobis metric) to that subject's fitted eta. The
+/// fitted (posthoc) etas are computed once from `params` + the observed
+/// `population`.
 ///
 /// Returns `Err` if matching is requested but the population is empty or any
 /// subject has no observations.
@@ -4505,11 +4533,14 @@ pub fn simulate_with_options(
     // diagnostic; it is a no-op O(doses) scan on the common all-`Fixed` dataset.
     assert_modeled_doses_supported(model, population);
 
-    if !opts.propensity_match {
-        return Ok(simulate_inner_with_draw(
-            model, population, params, n_sim, 1, None, &mut rng,
-        ));
-    }
+    let method = match opts.match_method {
+        Some(m) => m,
+        None => {
+            return Ok(simulate_inner_with_draw(
+                model, population, params, n_sim, 1, None, &mut rng,
+            ));
+        }
+    };
 
     if population.subjects.is_empty() {
         return Err(
@@ -4561,7 +4592,7 @@ pub fn simulate_with_options(
         params,
         n_sim,
         1,
-        Some((&eta_hats, omega_inv)),
+        Some((&eta_hats, omega_inv, method)),
         &mut rng,
     ))
 }
@@ -4634,11 +4665,12 @@ fn emit_subject_rows<R: rand::Rng>(
     );
 }
 
-/// `matched`, when `Some((fitted_etas, omega_inv))`, reassigns each replicate's
-/// drawn etas to subjects by propensity-score matching against `fitted_etas`
-/// (optimal Mahalanobis matching under `omega_inv`; see `crate::propensity_match`).
-/// `None` is the standard per-subject independent draw and reproduces the
-/// previous behaviour byte-for-byte (same RNG draw order).
+/// `matched`, when `Some((fitted_etas, omega_inv, method))`, reassigns each
+/// replicate's drawn etas to subjects by propensity-score matching against
+/// `fitted_etas` (Mahalanobis matching under `omega_inv` via `method`; see
+/// `crate::propensity_match`). `None` is the standard per-subject independent
+/// draw and reproduces the previous behaviour byte-for-byte (same RNG draw
+/// order).
 #[allow(clippy::too_many_arguments)]
 fn simulate_inner_with_draw<R: rand::Rng>(
     model: &CompiledModel,
@@ -4646,7 +4678,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     params: &ModelParameters,
     n_sim: usize,
     draw: usize,
-    matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>)>,
+    matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
@@ -4665,7 +4697,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         match matched {
-            Some((fitted, omega_inv)) => {
+            Some((fitted, omega_inv, method)) => {
                 // Draw a pool of one eta per subject for this replicate, then
                 // reassign the draws to subjects by matching them to the fitted
                 // (posthoc) etas. Each subject keeps its own observed design.
@@ -4676,8 +4708,9 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         &params.omega.chol * DVector::from_column_slice(&z)
                     })
                     .collect();
-                let assign =
-                    crate::propensity_match::match_draws_to_fitted(&pool, fitted, omega_inv);
+                let assign = crate::propensity_match::match_draws_to_fitted(
+                    &pool, fitted, omega_inv, method,
+                );
                 for (i, subject) in population.subjects.iter().enumerate() {
                     let mut eta_slice: Vec<f64> = pool[assign[i]].iter().copied().collect();
                     eta_slice.resize(n_eta + model.n_kappa, 0.0);
@@ -5010,6 +5043,7 @@ mod iov_integration {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -5507,6 +5541,103 @@ mod iov_integration {
                 sr.id,
                 sr.ipred.len(),
                 sr.compartment_states.len()
+            );
+        }
+    }
+
+    /// #400: an analytical oral model with a zero-order input into the depot
+    /// (an infusion into cmt 1) cannot have its compartment states expressed by
+    /// the superposition state helper (which models an oral infusion as a depot
+    /// bypass). So `compartment_states` is left empty (→ NaN compartments) and
+    /// `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` makes that explicit, just
+    /// like the reset/IOV/TV cases. Predictions themselves stay exact.
+    #[test]
+    fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
+        use crate::parser::model_parser::parse_full_model;
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let mut model = parse_full_model(src).expect("model parses").model;
+        assert!(model.ode_spec.is_none(), "model must be analytical");
+        // Inject a derived expression that references compartments[0] so the
+        // warning is gated on (mirrors a parsed `[derived] cmt0 = compartments[0]`).
+        model.derived_exprs.push(DerivedExprSpec {
+            name: "cmt0".into(),
+            kind: DerivedKind::PerRow {
+                eval: Box::new(|ctx| ctx.compartments.first().copied().unwrap_or(f64::NAN)),
+            },
+            uses_compartments: true,
+        });
+
+        // One subject with an explicit zero-order infusion into the depot (cmt 1):
+        // rate 25 over AMT/rate = 4 h, then first-order KA absorption.
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 4.0, 8.0, 12.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.8, 1.4, 1.6, 0.9, 0.4],
+            obs_cmts: vec![2; 5],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 5],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let pop = Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        let result =
+            fit(&model, &pop, &model.default_params.clone(), &opts).expect("fit must succeed");
+
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL")),
+            "expected W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL warning; got: {:?}",
+            result.warnings
+        );
+        // Predictions must still be finite (the event-driven path computed them);
+        // only the compartment states degrade.
+        for sr in &result.subjects {
+            assert!(
+                sr.compartment_states.is_empty(),
+                "depot-infusion subject must have empty compartment_states (got {})",
+                sr.compartment_states.len()
+            );
+            assert!(
+                sr.ipred.iter().all(|p| p.is_finite()),
+                "predictions must be finite"
             );
         }
     }
@@ -6228,6 +6359,7 @@ mod simulate_with_uncertainty_tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -7037,6 +7169,7 @@ mod tests_sdtab_tv_cov {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -7245,6 +7378,7 @@ mod tests_derived_session_clock {
             pk_idx_f64: Vec::new(),
             sel_flat: Vec::new(),
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -7626,6 +7760,7 @@ mod tests_derived_iov_kappa {
             pk_idx_f64: Vec::new(),
             sel_flat: Vec::new(),
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,

@@ -1,5 +1,5 @@
 //! Tier-2 integration tests for **modeled infusion duration** (`RATE=-2` →
-//! `D{cmt}`) on ODE models (#324).
+//! `D{cmt}`) on ODE models (#324) and analytical PK models (#394).
 //!
 //! NONMEM's `RATE=-2` makes the infusion *duration* a `$PK` parameter `D{n}`
 //! (the rate is then `AMT / D{n}`). These tests exercise the public
@@ -12,8 +12,10 @@
 //!     `D` sets its length);
 //!   * **steady state** (`SS=1`) equilibrates with the modeled duration;
 //!   * **per-compartment** binding (`D1` vs `D2`);
-//!   * **loud rejection** of the unsupported / misconfigured cases (no `D{cmt}`
-//!     parameter; `RATE=-2` on an analytical model);
+//!   * the **analytical engine** honours `RATE=-2` identically (coded vs explicit
+//!     `RATE = AMT/D1`, plus the NONMEM-anchored closed form), given a `D{cmt}`;
+//!   * **loud rejection** of the misconfigured case (a `RATE=-2` dose with no
+//!     matching `D{cmt}` parameter — on either engine);
 //!   * a **NONMEM-anchored closed form** for a one-compartment infusion.
 //!
 //! All return immediately (`predict` with fixed params / a `check_model_data`
@@ -432,38 +434,23 @@ fn modeled_duration_without_matching_param_is_rejected() {
 }
 
 #[test]
-fn modeled_duration_on_analytical_model_is_rejected() {
-    // Modeled duration is ODE-only in this release; a `RATE=-2` dose on an
-    // analytical model is rejected with a pointer to the follow-up, not silently
-    // mis-modeled.
-    let analytical = r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 5.0, 500.0)
-  omega ETA_CL ~ 0.0
-  sigma PROP ~ 0.01 (sd)
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP)
-"#;
-    let model = model_of(analytical);
+fn modeled_duration_on_analytical_model_without_param_is_rejected() {
+    // Analytical models now support `RATE=-2` (#394) — but only with a matching
+    // `D{cmt}` parameter. An analytical model with NO `D1` and a `RATE=-2` dose
+    // into CMT=1 has no slot to resolve against, so it is rejected with the same
+    // actionable `E_MODELED_DURATION_NO_PARAM` error the ODE-no-param case gives —
+    // never a silent fall-through to a bolus.
+    let model = model_of(ANALYTICAL);
     assert!(model.ode_spec.is_none(), "model must be analytical");
     let pop = pop_of(&coded_csv());
     let diags = check_model_data(&model, &pop);
     let d = diags
         .iter()
-        .find(|d| d.code == "E_MODELED_DURATION_ANALYTICAL")
-        .expect("RATE=-2 on an analytical model must be rejected");
+        .find(|d| d.code == "E_MODELED_DURATION_NO_PARAM")
+        .expect("RATE=-2 with no D1 on an analytical model must be rejected");
     assert_eq!(d.severity, Severity::Error);
     assert!(
-        d.message.contains("ODE") && d.message.contains("#324"),
+        d.message.contains("D1") && d.message.contains("[individual_parameters]"),
         "{}",
         d.message
     );
@@ -503,8 +490,9 @@ fn one_cpt_infusion_closed_form(t: f64) -> f64 {
     }
 }
 
-// One-compartment analytical (non-ODE) model: modeled duration is unsupported
-// here, so a `RATE=-2` dose must be rejected at the public boundaries too.
+// One-compartment analytical (non-ODE) model with NO `D1`: a `RATE=-2` dose has
+// no slot to resolve against, so it must be rejected (E_MODELED_DURATION_NO_PARAM)
+// at the public boundaries too — never silently treated as a bolus.
 const ANALYTICAL: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -522,6 +510,310 @@ const ANALYTICAL: &str = r#"
 [error_model]
   DV ~ proportional(PROP)
 "#;
+
+// One-compartment analytical (non-ODE) IV model WITH a modeled infusion duration
+// `D1` (#394). Same structure / parameters as `ODE_D1` but using the closed-form
+// `one_cpt_iv` engine instead of an `ode(...)` block — so `RATE=-2` resolves to
+// `rate = AMT/D1` and feeds the analytical infusion solution. `D1` defaults to
+// 5.0, so with `AMT=100` the infusion is rate 20 over a 5 h window.
+const ANALYTICAL_D1: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD1
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+#[test]
+fn analytical_modeled_duration_matches_explicit_infusion() {
+    // Core #394 invariant on the ANALYTICAL engine: `RATE=-2` with `D1=5` is
+    // numerically equal to an explicit `RATE = AMT/5 = 20` infusion through the
+    // closed-form `one_cpt_iv` solution. Proves the dose-resolution step is wired
+    // into the analytical predict path, not just the ODE one.
+    let model = model_of(ANALYTICAL_D1);
+    assert!(model.ode_spec.is_none(), "model must be analytical");
+    let coded = preds_of(&model, &coded_csv());
+    let explicit = preds_of(&model, &explicit_csv());
+    assert_close(
+        &coded,
+        &explicit,
+        1e-9,
+        "analytical RATE=-2 D1=5 vs explicit RATE=20",
+    );
+    assert!(
+        coded.iter().any(|&c| c > 0.1),
+        "analytical predictions should be nonzero"
+    );
+}
+
+#[test]
+fn analytical_modeled_duration_matches_nonmem_closed_form() {
+    // The analytical `RATE=-2` predictions match the NONMEM-anchored ADVAN1
+    // closed form (see `one_cpt_infusion_closed_form` and the committed
+    // `tests/nonmem/modeled_duration.ctl`) to the same tolerance the ODE path
+    // is checked against — a direct NONMEM parity check for the analytical engine.
+    let model = model_of(ANALYTICAL_D1);
+    let pop = pop_of(&coded_csv());
+    // Observation times in OBS_ROWS: 1, 3, 5, 8, 12, 18, 24.
+    let times = [1.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0];
+    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
+        .into_iter()
+        .map(|p| p.pred)
+        .collect();
+    assert_eq!(preds.len(), times.len(), "one prediction per observation");
+    for (p, t) in preds.iter().zip(times) {
+        let want = one_cpt_infusion_closed_form(t);
+        assert!(
+            (p - want).abs() <= 1e-6 * want.max(1.0),
+            "t={t}: analytical {p} vs closed form {want}"
+        );
+    }
+}
+
+// One-compartment ANALYTICAL ORAL model with a zero-order input into the DEPOT
+// (cmt 1) via a modeled duration `D1` (#400): zero-order release into the depot,
+// then first-order `ka` absorption into central. Stays analytical (closed form,
+// `pk one_cpt_oral`) — no `ode(...)` block. `D1` defaults to 5.0, so with
+// `AMT=100` the depot is filled at rate 20 over a 5 h window.
+const ANALYTICAL_ORAL_DEPOT_D1: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  D1 = TVD1
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+// Observations on the CENTRAL compartment (CMT=2) for the oral model.
+const ORAL_OBS_ROWS: &str = "1,1,0,0,0,2,0,0\n\
+                             1,3,0,0,0,2,0,0\n\
+                             1,5,0,0,0,2,0,0\n\
+                             1,8,0,0,0,2,0,0\n\
+                             1,12,0,0,0,2,0,0\n\
+                             1,18,0,0,0,2,0,0\n\
+                             1,24,0,0,0,2,0,0\n";
+
+// Depot dose (CMT=1) with a modeled duration (RATE=-2) vs the explicit infusion
+// it resolves to (RATE = AMT/D1 = 100/5 = 20).
+fn oral_depot_coded_csv() -> String {
+    format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,-2,1\n{ORAL_OBS_ROWS}")
+}
+fn oral_depot_explicit_csv() -> String {
+    format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,20,1\n{ORAL_OBS_ROWS}")
+}
+
+#[test]
+fn analytical_oral_depot_modeled_duration_matches_explicit_and_is_finite() {
+    // #400 on the public `predict()` boundary: a `RATE=-2` zero-order input into
+    // the oral DEPOT (cmt 1) of an analytical `one_cpt_oral` model must (a) parse
+    // and stay analytical, (b) resolve to the explicit `RATE = AMT/D1 = 20`
+    // infusion through the same closed form, and (c) produce finite, nonzero
+    // central concentrations — no parse error, no runtime panic. This is the
+    // regression for the lifted `infusable_compartments()` gate.
+    let model = model_of(ANALYTICAL_ORAL_DEPOT_D1);
+    assert!(
+        model.ode_spec.is_none(),
+        "model must stay analytical (no ode_spec)"
+    );
+    let coded = preds_of(&model, &oral_depot_coded_csv());
+    let explicit = preds_of(&model, &oral_depot_explicit_csv());
+    assert_close(
+        &coded,
+        &explicit,
+        1e-9,
+        "oral depot RATE=-2 D1=5 vs explicit RATE=20",
+    );
+    assert!(
+        coded.iter().all(|c| c.is_finite()),
+        "central concentrations must be finite"
+    );
+    assert!(
+        coded.iter().any(|&c| c > 0.01),
+        "central concentrations should be nonzero after a depot zero-order input"
+    );
+}
+
+#[test]
+fn analytical_oral_depot_modeled_duration_matches_nonmem() {
+    // #400 NONMEM anchor: zero-order input into the oral depot (RATE=-2 D1) on
+    // an analytical one_cpt_oral model must reproduce NONMEM's ADVAN2 TRANS2
+    // closed form with a modeled D1 (the depot's zero-order infusion duration).
+    //
+    // Reference: NONMEM 7.5.1, MAXEVAL=0, all THETA FIX, OMEGA 0 FIX (eta=0):
+    //   CL=5, V=50, KA=1, D1=5 (so rate = AMT/D1 = 100/5 = 20 over 5 h), S2=V.
+    //   Dose: RATE=-2 AMT=100 into CMT=1 (depot); observations on CMT=2 (central).
+    //   $PK D1 = THETA(4); PRED read from the sdtab. Control file + data in
+    //   tests/nonmem/oral_depot_d1.ctl / .csv.
+    const NONMEM_PRED: &[(f64, f64)] = &[
+        (1.0, 0.14200),
+        (2.0, 0.42135),
+        (3.0, 0.72960),
+        (5.0, 1.30730),
+        (8.0, 1.27350),
+        (12.0, 0.86800),
+        (18.0, 0.47659),
+        (24.0, 0.26156),
+    ];
+    let obs_rows: String = NONMEM_PRED
+        .iter()
+        .map(|(t, _)| format!("1,{t},1,0,0,2,0,0\n"))
+        .collect();
+    let csv = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,-2,1\n{obs_rows}");
+
+    let model = model_of(ANALYTICAL_ORAL_DEPOT_D1);
+    let preds = preds_of(&model, &csv);
+    assert_eq!(preds.len(), NONMEM_PRED.len());
+    for (p, (t, want)) in preds.iter().zip(NONMEM_PRED) {
+        // NONMEM PRED is tabulated to 5 significant figures, so anchor to that.
+        assert!(
+            (p - want).abs() <= 1e-4 * want.max(1.0),
+            "t={t}: ferx {p} vs NONMEM PRED {want}"
+        );
+    }
+}
+
+// Analytical 1-cpt IV model with IOV (kappa on CL) AND a modeled duration `D1`.
+// Exercises the `predict_iov` dispatch path — distinct from the no-TV / TV
+// dispatchers — which must also resolve `RATE=-2` doses (#394 review).
+const ANALYTICAL_D1_IOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.0
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+  D1 = TVD1
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  iov_column = OCC
+"#;
+
+#[test]
+fn analytical_iov_modeled_duration_predicts_and_matches_explicit() {
+    // Regression (#394 review): the analytical IOV prediction path `predict_iov`
+    // must resolve modeled-`RATE` doses before the event-driven walker. Before the
+    // fix it passed the *raw* subject and `event_driven_predictions`'s
+    // `assert!(all_doses_fixed())` panicked mid-fit for an otherwise-valid
+    // analytical IOV + `RATE=-2` model. Assert (a) no panic and (b) the coded dose
+    // matches the explicit `RATE = AMT/D1 = 20` infusion through the same path.
+    let model = model_of(ANALYTICAL_D1_IOV);
+    assert!(model.ode_spec.is_none(), "model must be analytical");
+    assert!(model.n_kappa >= 1, "model must declare an IOV kappa");
+
+    // OCC column drives occasions; two occasions, a RATE=-2 dose, some samples.
+    let coded = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,OCC\n\
+                 1,0,.,1,100,1,-2,1,1\n\
+                 1,1,0,0,0,1,0,0,1\n\
+                 1,5,0,0,0,1,0,0,1\n\
+                 1,8,0,0,0,1,0,0,2\n";
+    let explicit = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,OCC\n\
+                    1,0,.,1,100,1,20,1,1\n\
+                    1,1,0,0,0,1,0,0,1\n\
+                    1,5,0,0,0,1,0,0,1\n\
+                    1,8,0,0,0,1,0,0,2\n";
+    let read = |csv: &str| {
+        let f = write_csv(csv);
+        read_nonmem_csv(f.path(), None, Some("OCC")).expect("dataset with OCC loads")
+    };
+    let pop_c = read(coded);
+    let pop_e = read(explicit);
+    let theta = &model.default_params.theta;
+    let eta = vec![0.0; model.n_eta];
+    // Zero IOV (more groups than occasions present — extra entries ignored).
+    let kappas = vec![vec![0.0; model.n_kappa]; 8];
+    let coded_p = ferx_core::pk::predict_iov(&model, &pop_c.subjects[0], theta, &eta, &kappas);
+    let expl_p = ferx_core::pk::predict_iov(&model, &pop_e.subjects[0], theta, &eta, &kappas);
+    assert_close(
+        &coded_p,
+        &expl_p,
+        1e-9,
+        "analytical IOV RATE=-2 vs explicit",
+    );
+    assert!(
+        coded_p.iter().any(|&c| c > 0.1),
+        "IOV predictions should be nonzero"
+    );
+}
+
+#[test]
+fn analytical_modeled_duration_resolves_per_compartment_d2() {
+    // A 2-cpt IV analytical model dosed `RATE=-2` into the PERIPHERAL compartment
+    // (CMT=2 for `two_cpt_iv`; central is CMT=1) resolves through `D2`. Equivalent
+    // to the explicit `RATE = AMT/D2` infusion. (Peripheral infusion is in the
+    // analytical infusable set for IV models — see `infusable_compartments`.)
+    let two_cpt = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(2.0, 0.1, 50.0)
+  theta TVV2(80.0, 5.0, 500.0)
+  theta TVD2(8.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  D2 = TVD2
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+    let model = model_of(two_cpt);
+    assert!(model.ode_spec.is_none(), "model must be analytical");
+    // Dose into CMT=2 (D2=8) -> explicit RATE = 100/8 = 12.5.
+    let coded =
+        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,2,-2,1\n1,2,0,0,0,2,0,0\n1,6,0,0,0,2,0,0\n";
+    let expl =
+        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,2,12.5,1\n1,2,0,0,0,2,0,0\n1,6,0,0,0,2,0,0\n";
+    assert_close(
+        &preds_of(&model, coded),
+        &preds_of(&model, expl),
+        1e-9,
+        "analytical CMT=2 -> D2",
+    );
+}
 
 // ODE model with NO `D1` parameter — a `RATE=-2` dose into CMT=1 has no slot to
 // resolve against, the join error `E_MODELED_DURATION_NO_PARAM`.
@@ -552,10 +844,11 @@ const ODE_NO_D1: &str = r#"
 #[test]
 #[should_panic(expected = "model cannot honour")]
 fn predict_on_analytical_model_with_modeled_dose_panics() {
-    // `predict()` runs no `check_model_data`, so before #384's entrypoint guard a
-    // RATE=-2 dose on an analytical model reached the predictor and silently
-    // degraded to a 0-rate "infusion" in release (the `debug_assert` is a no-op).
-    // The guard now turns it into a loud panic carrying the diagnostic.
+    // `predict()` runs no `check_model_data`, so a `RATE=-2` dose on an analytical
+    // model with NO matching `D1` would otherwise reach the predictor and silently
+    // degrade to a 0-rate "infusion" in release (the `debug_assert` is a no-op).
+    // The entrypoint guard (`assert_modeled_doses_supported`) turns it into a loud
+    // panic carrying the `E_MODELED_DURATION_NO_PARAM` diagnostic.
     let model = model_of(ANALYTICAL);
     assert!(model.ode_spec.is_none(), "model must be analytical");
     let pop = pop_of(&coded_csv());
@@ -598,7 +891,7 @@ fn simulate_propensity_on_analytical_model_with_modeled_dose_panics() {
     let pop = pop_of(&coded_csv());
     let opts = SimulateOptions {
         seed: Some(1),
-        propensity_match: true,
+        match_method: Some(ferx_core::MatchMethod::Optimal),
     };
     let _ = simulate_with_options(&model, &pop, &model.default_params, 1, &opts);
 }

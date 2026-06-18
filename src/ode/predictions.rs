@@ -58,12 +58,16 @@ pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
 /// "thread the resolved doses through every helper" design that was deliberately
 /// rejected in favour of resolving once at the entrypoint. The clone is paid
 /// only on the (uncommon) modeled-`RATE` path; the all-`Fixed` path is borrowed.
-fn resolve_subject_doses_with<'a>(
+pub(crate) fn resolve_subject_doses_with<'a>(
     subject: &'a Subject,
     attr_map: &crate::types::DoseAttrMap,
     pk_for_dose: impl Fn(usize) -> &'a [f64],
 ) -> Cow<'a, Subject> {
-    if subject.all_doses_fixed() {
+    // Fast path: with no compartment-indexed attribute there can be no modeled
+    // dose to resolve, so skip the per-dose `all_doses_fixed()` scan entirely —
+    // the overwhelmingly common case (no `D{cmt}`). A modeled dose cannot reach
+    // here with an empty map: it would have been rejected by the data gate first.
+    if attr_map.is_empty() || subject.all_doses_fixed() {
         return Cow::Borrowed(subject);
     }
     let mut owned = subject.clone();
@@ -78,7 +82,7 @@ fn resolve_subject_doses_with<'a>(
 /// doses. The event-driven / TV-covariate path calls
 /// [`resolve_subject_doses_with`] directly with a per-dose closure. See
 /// [`resolve_subject_doses_with`].
-fn resolve_subject_doses<'a>(
+pub(crate) fn resolve_subject_doses<'a>(
     subject: &'a Subject,
     attr_map: &crate::types::DoseAttrMap,
     params: &'a [f64],

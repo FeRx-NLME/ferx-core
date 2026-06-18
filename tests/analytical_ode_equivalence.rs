@@ -389,20 +389,24 @@ fn run_family(f: &Family) {
         ACCUM_RTOL,
     );
 
-    // infusion (IV only - infusion into a depot is not a standard combo)
-    if !f.is_oral {
-        assert_equiv(
-            &format!("{}/infusion", f.label),
-            &an,
-            &ode,
-            &population(
-                vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)],
-                obs.clone(),
-                oc,
-            ),
-            RTOL,
-        );
-    }
+    // infusion: into central (cmt 1) for IV, into the depot (cmt 1) for oral.
+    // The oral case (#400) is a zero-order release into the depot followed by
+    // first-order `ka` absorption — its analytical closed form must match the
+    // hand-transcribed ODE (whose depot state is forced by the same zero-order
+    // input) just as the IV case does. `ACCUM_RTOL` for oral: the depot adds an
+    // extra exponential, so the ODE solver's per-step error accumulates a touch
+    // more than the single-compartment IV infusion.
+    assert_equiv(
+        &format!("{}/infusion", f.label),
+        &an,
+        &ode,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)],
+            obs.clone(),
+            oc,
+        ),
+        if f.is_oral { ACCUM_RTOL } else { RTOL },
+    );
 
     // -- lag time -----------------------------------------------------------
     let (an_l, ode_l) = build_pair(f, true, false);
@@ -440,23 +444,21 @@ fn run_family(f: &Family) {
         RTOL,
     );
 
-    // Infusion F (IV families only — infusion into a depot is not a standard
-    // combo, mirroring the base-infusion case above). F scales the infusion
-    // rate; the duration is preserved, matching NONMEM's F1 on a modeled-rate
-    // infusion.
-    if !f.is_oral {
-        assert_equiv(
-            &format!("{}/bioavailability_infusion", f.label),
-            &an_f,
-            &ode_f,
-            &population(
-                vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)],
-                obs.clone(),
-                oc,
-            ),
-            RTOL,
-        );
-    }
+    // Infusion F: F scales the infusion rate; the duration is preserved,
+    // matching NONMEM's F1 on a modeled-rate infusion. Runs for every route now
+    // that the oral depot accepts a zero-order infusion (#400) — F multiplies the
+    // depot fill rate exactly as it does the IV/central infusion rate.
+    assert_equiv(
+        &format!("{}/bioavailability_infusion", f.label),
+        &an_f,
+        &ode_f,
+        &population(
+            vec![DoseEvent::new(0.0, 100.0, dc, 50.0, false, 0.0)],
+            obs.clone(),
+            oc,
+        ),
+        if f.is_oral { ACCUM_RTOL } else { RTOL },
+    );
 }
 
 /// One `#[test]` per model family, so a regression names the offending model

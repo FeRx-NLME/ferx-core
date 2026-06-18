@@ -13,9 +13,20 @@
 //! Hughes).
 //!
 //! The metric is the Mahalanobis distance under the model `Ω`,
-//! `d²(a,b) = (a−b)ᵀ Ω⁻¹ (a−b)`, and matching is **optimal** (global minimum of
-//! the total matched distance, i.e. the linear assignment problem) and 1:1
-//! without replacement, mirroring `MatchIt(method = "optimal")`.
+//! `d²(a,b) = (a−b)ᵀ Ω⁻¹ (a−b)`. Three 1:1-without-replacement matching methods
+//! are offered (see [`MatchMethod`]):
+//!
+//! - **optimal** — global minimum of the total matched distance (the linear
+//!   assignment problem), mirroring `MatchIt(method = "optimal")`. Simulation
+//!   studies found this best on average, so it is the recommended default.
+//! - **nearest** — greedy nearest-neighbour in subject order, mirroring
+//!   `MatchIt(method = "nearest", distance = "mahalanobis")`.
+//! - **rank** — pair subjects and draws by the rank of their Mahalanobis norm
+//!   `‖eta‖ = √(etaᵀ Ω⁻¹ eta)` (k-th order statistic to k-th), greedily on rank
+//!   distance.
+//!
+//! "optimal" was best on average in simulation, but other methods can win on
+//! particular datasets, hence all three are exposed (#396).
 
 use nalgebra::{DMatrix, DVector};
 
@@ -129,8 +140,100 @@ pub fn optimal_assignment(cost: &DMatrix<f64>) -> Vec<usize> {
     assign
 }
 
-/// For each subject (indexed by `fitted`), pick the drawn pool index whose eta
-/// optimally matches the subject's fitted eta under the `Ω⁻¹` metric.
+/// Greedy 1:1 assignment without replacement: for each row in index order,
+/// pick the still-available column with least cost (ties → smallest column
+/// index). `cost` must be square `n × n`; the return value `assign` has length
+/// `n` and is a permutation of `0..n`.
+///
+/// Unlike [`optimal_assignment`] this minimises greedily, not globally — the
+/// total matched cost can exceed the optimum. It mirrors the greedy nearest-
+/// neighbour matching of `MatchIt(method = "nearest")`.
+pub fn greedy_assignment(cost: &DMatrix<f64>) -> Vec<usize> {
+    let n = cost.nrows();
+    assert_eq!(
+        cost.ncols(),
+        n,
+        "greedy_assignment requires a square matrix"
+    );
+    let mut used = vec![false; n];
+    let mut assign = vec![0usize; n];
+    for i in 0..n {
+        // n − i ≥ 1 columns remain free when processing row i, so this always
+        // finds a candidate; an all-NaN row would leave best_j unset, hence the
+        // debug_assert below mirrors `optimal_assignment`'s finiteness contract.
+        let mut best_j = usize::MAX;
+        let mut best_c = f64::INFINITY;
+        for j in 0..n {
+            if !used[j] && cost[(i, j)] < best_c {
+                best_c = cost[(i, j)];
+                best_j = j;
+            }
+        }
+        debug_assert!(best_j != usize::MAX, "greedy_assignment: no free column");
+        used[best_j] = true;
+        assign[i] = best_j;
+    }
+    assign
+}
+
+/// Mahalanobis norm of a single eta from the origin: `√(etaᵀ Ω⁻¹ eta)`.
+fn mahalanobis_norm(a: &[f64], omega_inv: &DMatrix<f64>) -> f64 {
+    mahalanobis_sq(a, &vec![0.0; a.len()], omega_inv).sqrt()
+}
+
+/// Dense rank of each eta by its Mahalanobis norm, ascending. Returns a vector
+/// of rank positions `0..n` (ties broken by index, so a stable permutation).
+fn ranks_by_norm(etas: &[DVector<f64>], omega_inv: &DMatrix<f64>) -> Vec<f64> {
+    let scores: Vec<f64> = etas
+        .iter()
+        .map(|e| mahalanobis_norm(e.as_slice(), omega_inv))
+        .collect();
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|&a, &b| {
+        scores[a]
+            .partial_cmp(&scores[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+    let mut rank = vec![0.0f64; scores.len()];
+    for (r, &idx) in order.iter().enumerate() {
+        rank[idx] = r as f64;
+    }
+    rank
+}
+
+/// Squared-Mahalanobis cost matrix: rows = subjects (`fitted`), columns = drawn
+/// `pool`. `cost[(i, j)] = d²(fitted[i], pool[j])` under `Ω⁻¹`.
+fn mahalanobis_cost(
+    pool: &[DVector<f64>],
+    fitted: &[DVector<f64>],
+    omega_inv: &DMatrix<f64>,
+) -> DMatrix<f64> {
+    let n = fitted.len();
+    let mut cost = DMatrix::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n {
+            cost[(i, j)] = mahalanobis_sq(fitted[i].as_slice(), pool[j].as_slice(), omega_inv);
+        }
+    }
+    cost
+}
+
+/// How drawn etas are reassigned to subjects per replicate. See the module docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchMethod {
+    /// Global minimum total Mahalanobis distance (linear assignment).
+    /// `MatchIt(method = "optimal")`. Recommended default.
+    Optimal,
+    /// Greedy nearest-neighbour in subject order, 1:1 without replacement.
+    /// `MatchIt(method = "nearest", distance = "mahalanobis")`.
+    Nearest,
+    /// Pair by Mahalanobis-norm rank (k-th order statistic to k-th).
+    Rank,
+}
+
+/// For each subject (indexed by `fitted`), pick the drawn pool index that
+/// matches the subject's fitted eta under the `Ω⁻¹` metric, using `method`.
 ///
 /// `pool` and `fitted` must have equal length `n`; the return value `assign`
 /// has length `n` with `assign[i]` the `pool` index assigned to subject `i`
@@ -139,17 +242,29 @@ pub fn match_draws_to_fitted(
     pool: &[DVector<f64>],
     fitted: &[DVector<f64>],
     omega_inv: &DMatrix<f64>,
+    method: MatchMethod,
 ) -> Vec<usize> {
     let n = fitted.len();
     assert_eq!(pool.len(), n, "pool and fitted must have equal length");
-    // Rows = subjects (fitted), columns = drawn pool.
-    let mut cost = DMatrix::zeros(n, n);
-    for i in 0..n {
-        for j in 0..n {
-            cost[(i, j)] = mahalanobis_sq(fitted[i].as_slice(), pool[j].as_slice(), omega_inv);
+    match method {
+        MatchMethod::Optimal => optimal_assignment(&mahalanobis_cost(pool, fitted, omega_inv)),
+        MatchMethod::Nearest => greedy_assignment(&mahalanobis_cost(pool, fitted, omega_inv)),
+        MatchMethod::Rank => {
+            // Pair on the rank of each eta's Mahalanobis norm: greedily assign
+            // the pool draw whose rank is closest to the subject's. With a
+            // complete pool (distinct ranks 0..n) this reduces to matching the
+            // k-th order statistic to the k-th, independent of subject order.
+            let rank_fitted = ranks_by_norm(fitted, omega_inv);
+            let rank_pool = ranks_by_norm(pool, omega_inv);
+            let mut cost = DMatrix::zeros(n, n);
+            for i in 0..n {
+                for j in 0..n {
+                    cost[(i, j)] = (rank_fitted[i] - rank_pool[j]).abs();
+                }
+            }
+            greedy_assignment(&cost)
         }
     }
-    optimal_assignment(&cost)
 }
 
 #[cfg(test)]
@@ -253,13 +368,75 @@ mod tests {
             DVector::from_vec(vec![-2.0, 1.0]),
         ];
         let pool = fitted.clone();
-        let assign = match_draws_to_fitted(&pool, &fitted, &omega_inv);
-        assert_eq!(assign, vec![0, 1, 2]);
+        for method in [
+            MatchMethod::Optimal,
+            MatchMethod::Nearest,
+            MatchMethod::Rank,
+        ] {
+            let assign = match_draws_to_fitted(&pool, &fitted, &omega_inv, method);
+            assert_eq!(assign, vec![0, 1, 2], "method {method:?}");
+        }
     }
 
     #[test]
     fn empty_assignment() {
         let cost = DMatrix::<f64>::zeros(0, 0);
         assert!(optimal_assignment(&cost).is_empty());
+        assert!(greedy_assignment(&cost).is_empty());
+    }
+
+    #[test]
+    fn greedy_picks_least_cost_per_row_in_order() {
+        // Row 0's cheapest is col 1; once taken, row 1 must fall back to col 0.
+        let cost = DMatrix::from_row_slice(2, 2, &[5.0, 1.0, 2.0, 3.0]);
+        assert_eq!(greedy_assignment(&cost), vec![1, 0]);
+    }
+
+    #[test]
+    fn greedy_can_be_suboptimal_vs_optimal() {
+        // Greedy in row order takes (0->0, cost 0) then is forced into (1->1,
+        // cost 10): total 10. The optimum is the anti-diagonal: total 2.
+        let cost = DMatrix::from_row_slice(2, 2, &[0.0, 1.0, 1.0, 10.0]);
+        assert_eq!(greedy_assignment(&cost), vec![0, 1]);
+        assert_eq!(total_cost(&cost, &greedy_assignment(&cost)), 10.0);
+        assert_eq!(total_cost(&cost, &optimal_assignment(&cost)), 2.0);
+    }
+
+    #[test]
+    fn greedy_returns_valid_permutation() {
+        let n = 6;
+        let mut cost = DMatrix::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                cost[(i, j)] = ((i * 5 + j * 2 + (i + j) % 3) % 7) as f64;
+            }
+        }
+        let a = greedy_assignment(&cost);
+        let mut seen = vec![false; n];
+        for &j in &a {
+            assert!(!seen[j], "column {j} used twice");
+            seen[j] = true;
+        }
+    }
+
+    #[test]
+    fn rank_pairs_by_mahalanobis_norm_order_statistics() {
+        // Identity Ω⁻¹ ⇒ norm is Euclidean length. Fitted norms ascending:
+        // idx2 (0) < idx0 (1) < idx1 (2). Pool norms: idx1 (0.5) < idx2 (1.5)
+        // < idx0 (3). Rank-matching pairs the k-th smallest fitted with the
+        // k-th smallest pool: fitted2->pool1, fitted0->pool2, fitted1->pool0.
+        let omega_inv = DMatrix::identity(1, 1);
+        let fitted = vec![
+            DVector::from_vec(vec![1.0]),  // rank 1
+            DVector::from_vec(vec![-2.0]), // rank 2 (norm 2)
+            DVector::from_vec(vec![0.0]),  // rank 0
+        ];
+        let pool = vec![
+            DVector::from_vec(vec![3.0]),  // rank 2
+            DVector::from_vec(vec![0.5]),  // rank 0
+            DVector::from_vec(vec![-1.5]), // rank 1 (norm 1.5)
+        ];
+        let assign = match_draws_to_fitted(&pool, &fitted, &omega_inv, MatchMethod::Rank);
+        assert_eq!(assign, vec![2, 0, 1]);
     }
 }

@@ -655,13 +655,21 @@ pub struct FlatDoseData {
 
 impl FlatDoseData {
     pub fn from_subject(subject: &Subject) -> Self {
-        // Tripwire (#324 / #281): this single-snapshot AD path freezes
+        // Tripwire (#324 / #281 / #394): this single-snapshot AD path freezes
         // `d.rate`/`d.duration` into flat f64 arrays. A modeled-RATE dose
-        // (RATE=-2 -> D{cmt}) must never reach it — modeled doses are ODE-only
-        // (no AD path) and `resolve_gradient_method` FD-gates anything else; an
-        // unresolved one would snapshot a 0 rate/duration and yield a silently
-        // wrong gradient (#317). Fail loudly in debug/tests instead.
-        debug_assert!(
+        // (RATE=-2 -> D{cmt}) must never reach it — `resolve_gradient_method`
+        // routes any subject with a modeled dose to FD (the ODE engine has no AD
+        // path; the analytical AD kernels can't carry `∂duration/∂η`), so the AD
+        // path only ever sees `Fixed` doses. An unresolved one would snapshot a 0
+        // rate/duration and yield a silently wrong gradient (#317).
+        //
+        // A real `assert!` (not `debug_assert!`): now that analytical models can be
+        // BOTH AD-eligible AND carry a modeled dose (#383/#394), this path is
+        // genuinely reachable, and `debug_assert!` is compiled out of `autodiff`
+        // *release* builds — so only an `assert!` makes the FD-gate's invariant hold
+        // across every build config (debug/release × FD/AD). It is the backstop to
+        // the primary `resolve_gradient_method` gate, not the first line of defence.
+        assert!(
             subject.all_doses_fixed(),
             "modeled-RATE dose reached the AD path"
         );
