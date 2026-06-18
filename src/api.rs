@@ -5603,6 +5603,7 @@ mod iov_integration {
             cens: vec![0; 5],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };

@@ -926,6 +926,7 @@ mod tests {
             eta_map: vec![0, 1, 2],
             pk_idx_f64: vec![0.0, 1.0, 4.0],
             sel_flat: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            dose_attr_map: Default::default(),
             ode_spec: None,
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),

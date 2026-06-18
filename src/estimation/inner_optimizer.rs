@@ -1639,6 +1639,7 @@ mod tests {
             dv_pre_logged: false,
             derived_exprs: vec![],
             output_columns: vec![],
+            dose_attr_map: Default::default(),
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
             frem_config: Some(crate::types::FremConfig {
