@@ -666,9 +666,9 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // ODE RHS wrapper, and again as `R_in(tad)` superposed by the input-rate
     // forcing — silently ~doubling exposure. A transit dose carries its mass
     // through `R_in` from the bolus amount; an infusion rate on that record is
-    // undefined, so reject it loudly. RATE=-2 (modeled duration) is also an
-    // infusion (`is_infusion()` is true for it), so it is caught here too;
-    // RATE=-1 is rejected at the datareader.
+    // undefined, so reject it loudly. Both modeled coded-RATE forms (RATE=-2
+    // duration, RATE=-1 rate) are also infusions (`is_infusion()` is true for
+    // them), so they are caught here too.
     let has_infusion = population.subjects.iter().any(|s| {
         s.doses
             .iter()

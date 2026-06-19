@@ -2,12 +2,14 @@
 //! boundary (`read_nonmem_csv`); #324.
 //!
 //! Before #324 a coded `RATE` (`-1`/`-2`) on a dose row silently loaded as a
-//! bolus (wrong predictions, no warning). Now: `-2` (modeled infusion *duration*)
-//! is accepted and carried as [`ferx_core::RateMode::ModeledDuration`] (the
-//! `D{cmt}`/engine check happens later at the model+data join, exercised in
-//! `modeled_duration.rs`); `-1` (modeled *rate*, #324 Phase B) is still rejected
-//! at import. These return immediately (a read-time error / a single parse, no
-//! convergence loop), so they need no `slow-tests` gate and run in the PR job.
+//! bolus (wrong predictions, no warning). Now both are accepted and carried as a
+//! [`ferx_core::RateMode`] variant — `-2` (modeled infusion *duration*) as
+//! [`ferx_core::RateMode::ModeledDuration`] and `-1` (modeled infusion *rate*) as
+//! [`ferx_core::RateMode::ModeledRate`] — with the `D{cmt}`/`R{cmt}` existence +
+//! engine check happening later at the model+data join (exercised in
+//! `modeled_duration.rs` / `modeled_rate.rs`). These return immediately (a single
+//! parse, no convergence loop), so they need no `slow-tests` gate and run in the
+//! PR job.
 
 use ferx_core::read_nonmem_csv;
 use std::io::Write;
@@ -21,15 +23,21 @@ fn write_csv(contents: &str) -> NamedTempFile {
 }
 
 #[test]
-fn coded_rate_minus_one_is_rejected_via_public_reader() {
-    // RATE=-1 = NONMEM "infusion rate modeled (R1)"; unsupported → hard error.
+fn coded_rate_minus_one_reads_as_modeled_rate_via_public_reader() {
+    // RATE=-1 = NONMEM "infusion rate modeled (R{cmt})". As of #324 this is
+    // accepted at read time and carried as ModeledRate; the R{cmt} existence +
+    // engine check happens later at the model+data join (see modeled_rate.rs).
+    // The dose reports as an infusion (its concrete rate/duration are resolved
+    // per iteration from the model parameter), never a silent bolus.
     let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n\
                1,0,.,1,100,1,-1,1\n\
                1,1,5.0,0,.,1,.,0\n";
     let f = write_csv(csv);
-    let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
-    assert!(err.contains("RATE=-1") && err.contains("R1"), "{err}");
-    assert!(err.contains("subject 1"), "{err}");
+    let pop = read_nonmem_csv(f.path(), None, None).expect("RATE=-1 reads (modeled rate)");
+    let dose = &pop.subjects[0].doses[0];
+    assert_eq!(dose.rate_mode, ferx_core::RateMode::ModeledRate);
+    assert!(dose.is_infusion(), "a modeled-rate dose is an infusion");
+    assert_eq!(dose.amt, 100.0);
 }
 
 #[test]
