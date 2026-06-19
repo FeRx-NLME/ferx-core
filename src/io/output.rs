@@ -157,9 +157,9 @@ pub fn print_results(result: &FitResult) {
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            match &result.se_omega {
-                Some(se) if i < se.len() => format!("{:.6}", se[i]),
-                _ => "N/A".to_string(),
+            match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
+                Some(s) => format!("{:.6}", s),
+                None => "N/A".to_string(),
             }
         };
         if show_cv {
@@ -195,9 +195,14 @@ pub fn print_results(result: &FitResult) {
                             0.0
                         }
                     });
+                let se_cov = crate::types::omega_se_at(&result.se_omega, n_eta, i, j);
+                let se_str = match se_cov {
+                    Some(s) => format!("  SE = {:.6}", s),
+                    None => String::new(),
+                };
                 eprintln!(
-                    "  {} × {} = {:.6}  (param corr = {:.4})",
-                    name_i, name_j, cov, param_corr,
+                    "  {} × {} = {:.6}  (param corr = {:.4}){}",
+                    name_i, name_j, cov, param_corr, se_str,
                 );
             }
         }
@@ -356,6 +361,28 @@ pub fn print_results(result: &FitResult) {
                     .map(|(id, frac)| format!("{}={:.2}", id, frac))
                     .collect::<Vec<_>>()
                     .join(", ")
+            );
+        }
+    }
+
+    // Bayesian posterior
+    if let Some(ref b) = result.bayes {
+        eprintln!("\n--- Bayesian posterior (Gibbs-within-HMC) ---");
+        eprintln!(
+            "  chains = {}, warmup = {}, draws/chain = {}, max R-hat = {:.3}",
+            b.n_chains, b.n_warmup, b.n_draws_per_chain, b.max_rhat
+        );
+        if b.n_divergent > 0 {
+            eprintln!("  divergent transitions: {}", b.n_divergent);
+        }
+        eprintln!(
+            "  {:<14} {:>10} {:>10} {:>10} {:>10} {:>6} {:>8}",
+            "param", "mean", "sd", "2.5%", "97.5%", "Rhat", "ESS"
+        );
+        for s in &b.summaries {
+            eprintln!(
+                "  {:<14} {:>10.4} {:>10.4} {:>10.4} {:>10.4} {:>6.3} {:>8.0}",
+                s.name, s.mean, s.sd, s.q025, s.q975, s.rhat, s.ess_bulk
             );
         }
     }
@@ -1015,7 +1042,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let var = result.omega[(i, i)];
         let cv_pct = if var > 0.0 { var.sqrt() * 100.0 } else { 0.0 };
         let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
-        let se = result.se_omega.as_ref().and_then(|v| v.get(i).copied());
+        let se = crate::types::omega_se_at(&result.se_omega, n_eta, i, i);
         let key = result
             .eta_names
             .get(i)
@@ -1062,8 +1089,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                             0.0
                         }
                     });
+                let se_cov = crate::types::omega_se_at(&result.se_omega, n_eta, i, j);
                 writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
                 writeln!(f, "    covariance: {:.6}", cov).map_err(|e| e.to_string())?;
+                match se_cov {
+                    Some(s) => writeln!(f, "    se: {:.6}", s).map_err(|e| e.to_string())?,
+                    None => writeln!(f, "    se: ~").map_err(|e| e.to_string())?,
+                }
                 writeln!(f, "    correlation: {:.6}", param_corr).map_err(|e| e.to_string())?;
             }
         }
@@ -1208,6 +1240,29 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 writeln!(f, "    - id: \"{}\"", id).map_err(|e| e.to_string())?;
                 writeln!(f, "      ess_fraction: {:.4}", frac).map_err(|e| e.to_string())?;
             }
+        }
+    }
+
+    // Bayesian posterior section
+    if let Some(ref b) = result.bayes {
+        writeln!(f, "\nbayes:").map_err(|e| e.to_string())?;
+        writeln!(f, "  n_chains: {}", b.n_chains).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_warmup: {}", b.n_warmup).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_draws_per_chain: {}", b.n_draws_per_chain).map_err(|e| e.to_string())?;
+        writeln!(f, "  n_divergent: {}", b.n_divergent).map_err(|e| e.to_string())?;
+        writeln!(f, "  max_rhat: {:.4}", b.max_rhat).map_err(|e| e.to_string())?;
+        writeln!(f, "  parameters:").map_err(|e| e.to_string())?;
+        for s in &b.summaries {
+            writeln!(f, "    - name: \"{}\"", s.name).map_err(|e| e.to_string())?;
+            writeln!(f, "      mean: {:.6}", s.mean).map_err(|e| e.to_string())?;
+            writeln!(f, "      sd: {:.6}", s.sd).map_err(|e| e.to_string())?;
+            writeln!(f, "      q025: {:.6}", s.q025).map_err(|e| e.to_string())?;
+            writeln!(f, "      median: {:.6}", s.median).map_err(|e| e.to_string())?;
+            writeln!(f, "      q975: {:.6}", s.q975).map_err(|e| e.to_string())?;
+            writeln!(f, "      rhat: {:.4}", s.rhat).map_err(|e| e.to_string())?;
+            writeln!(f, "      ess_bulk: {:.1}", s.ess_bulk).map_err(|e| e.to_string())?;
+            writeln!(f, "      ess_tail: {:.1}", s.ess_tail).map_err(|e| e.to_string())?;
+            writeln!(f, "      mcse: {:.6}", s.mcse).map_err(|e| e.to_string())?;
         }
     }
 
@@ -1411,6 +1466,8 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            impmap_trace: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),
@@ -1698,6 +1755,7 @@ mod tests {
             cens: vec![0; n_obs],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -1742,6 +1800,8 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            impmap_trace: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: Vec::new(),
             kappa_fixed: Vec::new(),
@@ -2246,6 +2306,26 @@ mod tests {
         // 2 theta + 3 omega (full 2×2) + 2 sigma + 3 kappa (full 2×2) = 10
         r.covariance_matrix = Some(DMatrix::identity(10, 10));
         r.warnings = vec!["example warning".into()];
+        r.bayes = Some(crate::types::BayesResult {
+            summaries: vec![crate::types::PosteriorSummary {
+                name: "CL".into(),
+                mean: 2.0,
+                sd: 0.2,
+                q025: 1.6,
+                median: 2.0,
+                q975: 2.4,
+                rhat: 1.01,
+                ess_bulk: 1500.0,
+                ess_tail: 1400.0,
+                mcse: 0.005,
+            }],
+            n_chains: 4,
+            n_warmup: 1000,
+            n_draws_per_chain: 1000,
+            n_divergent: 0,
+            max_rhat: 1.01,
+            draws: None,
+        });
         r
     }
 
@@ -2274,6 +2354,10 @@ mod tests {
         assert!(yaml.contains("\nimportance_sampling:"));
         assert!(yaml.contains("  kappa_treatment: fixed_at_mode"));
         assert!(yaml.contains("  low_ess_subjects:") && yaml.contains("- id: \"S3\""));
+        // Bayesian posterior block.
+        assert!(yaml.contains("\nbayes:"));
+        assert!(yaml.contains("  max_rhat: 1.0100"));
+        assert!(yaml.contains("  parameters:") && yaml.contains("    - name: \"CL\""));
         // SIR section with all three CI blocks.
         assert!(yaml.contains("\nsir:"));
         assert!(

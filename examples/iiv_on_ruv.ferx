@@ -1,0 +1,48 @@
+# One-compartment oral PK with IIV on the residual error.
+#
+# NONMEM equivalent (issue #409):
+#   Y = IPRED + EPS(1) * EXP(ETA(4))     ; $OMEGA <var>  ; IIV on RUV
+#
+# Each subject gets a log-normally scaled residual SD: the residual variance
+# of every observation is multiplied by exp(2*ETA_RUV_i). Declare the random
+# effect as an ordinary `omega` and reference it from [error_model] via
+# `iiv_on_ruv = NAME`. The eta is NOT used in any individual parameter.
+#
+# Requires an interaction or Monte-Carlo method (focei / imp / impmap / saem) —
+# `Y = IPRED + EPS*EXP(ETA)` is an INTERACTION model.
+
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.05      # IIV on residual error (no individual-parameter use)
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+
+[fit_options]
+  method     = focei
+  maxiter    = 300
+  covariance = true
+
+[simulation]
+  n_subjects = 30
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0, 96.0, 120.0]
+  seed       = 1

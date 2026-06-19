@@ -293,9 +293,33 @@ ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
 > infusion duration even if you also reference it in the `[odes]` RHS — so don't
 > reuse `D1`, `D2`, … for an unrelated decay constant or rate term.
 
-This is an **ODE-engine** feature. On an **analytical** model a `RATE=-2` dose is
-rejected with a pointer to the follow-up that will add analytical support;
-`RATE=-1` (modeled *rate*, `R{n}`) is not yet supported on either engine.
+`RATE=-2` works on **both engines**. On an analytical model (`pk(...)`) declare
+the `D{n}` individual parameter and the closed-form infusion uses
+`rate = AMT / D{n}`. A `RATE=-2` dose still **requires** a matching `D{n}`
+parameter, or it is a loud error (never a silent bolus). The compartment index
+follows the analytical model's compartment numbering (e.g. `D1` for the central
+compartment of a `two_cpt_iv` model, `D2` for its peripheral compartment).
+
+The modeled duration just sets the *rate* of an otherwise ordinary infusion, so
+the **target compartment must be one the analytical engine can infuse into** —
+exactly the same set as for an explicit positive `RATE`: the central compartment
+for every model, the peripheral compartment(s) for the 2-/3-cpt IV models, and —
+since #400 — the **oral depot** (compartment 1) of `one_cpt_oral` /
+`two_cpt_oral` / `three_cpt_oral`. A `D1` into the oral depot is a **zero-order
+absorption** model: drug is released into the depot at a constant rate over the
+modeled duration, then absorbed first-order into central via `KA`. This stays on
+the closed-form engine — no `ode(...)` block needed. (Per-compartment amounts in
+`sdtab`/`[derived]` are not available for those subjects — the predictions are
+exact; use an `ode(...)` model if you need the compartment amounts.) Infusing
+into an oral **peripheral** compartment is still not modelled by the closed forms,
+so a `D{periph}` (or any other non-infusable compartment) is **rejected at parse
+time** — use an `ode(...)` model. `RATE=-1` (modeled *rate*, `R{n}`) is not yet
+supported on either engine.
+
+> One subtlety: when a subject has any `RATE=-2` dose on an **analytical** model,
+> that subject's inner-loop gradient falls back to finite differences even under
+> `gradient = ad`, because the autodiff kernels cannot carry the duration's
+> `∂/∂η`. Results are unchanged; only the gradient route differs.
 
 ## Stochastic ODE Models (SDE)
 

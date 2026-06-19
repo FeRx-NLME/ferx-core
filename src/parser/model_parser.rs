@@ -992,12 +992,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     if error_lines_opt.is_none() && !is_tte_only {
         return Err("Missing [error_model] block".to_string());
     }
-    let (parsed_error_model, ltbs_flags) = if let Some(error_lines) = error_lines_opt {
-        parse_error_model(error_lines)?
-    } else {
-        // TTE-only model: no Gaussian error model — empty per-CMT spec.
-        (ParsedErrorModel::PerCmt(vec![]), LtbsFlags::default())
-    };
+    let (parsed_error_model, ltbs_flags, iiv_on_ruv_name) =
+        if let Some(error_lines) = error_lines_opt {
+            parse_error_model(error_lines)?
+        } else {
+            // TTE-only model: no Gaussian error model — empty per-CMT spec.
+            (ParsedErrorModel::PerCmt(vec![]), LtbsFlags::default(), None)
+        };
     // LTBS log-transforms the structural prediction, which is incompatible with
     // the SDE/EKF measurement model (the extended Kalman filter assumes a
     // natural-scale additive/proportional observation). Reject the combination.
@@ -1025,6 +1026,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let n_eta = eta_names_bsv.len(); // BSV-only count
     let n_kappa = kappa_info.names_ordered.len();
     let n_epsilon = sigma_names.len();
+
+    // Resolve `iiv_on_ruv = NAME` to a BSV eta index. The named eta must be a
+    // declared `omega` (BSV), not a kappa (IOV residual scaling is out of scope).
+    let residual_error_eta: Option<usize> = match &iiv_on_ruv_name {
+        Some(name) => {
+            let idx = eta_names_bsv
+                .iter()
+                .position(|e| e == name)
+                .ok_or_else(|| {
+                    format!(
+                        "[error_model] iiv_on_ruv = {name}: no `omega {name} ~ ...` declared in \
+                     [parameters] (the residual-error random effect must be a declared omega)"
+                    )
+                })?;
+            Some(idx)
+        }
+        None => None,
+    };
 
     // Extended eta context: BSV etas followed by kappa names.
     // This lets [individual_parameters] expressions like `ETA_CL + KAPPA_CL`
@@ -1249,11 +1268,84 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // `eta` slice the closure consumes (BSV η + kappa). Both feed the
     // Tier 4a milestone-2 partial-derivative builder.
     let n_eta_extended_for_partials = eta_names.len();
+
+    // Compartment-indexed modeled-dose duration (`D{cmt}` for `RATE=-2`; #324/#394)
+    // for ANALYTICAL models. ODE models build their `dose_attr_map` inside
+    // `build_ode_spec` (routing `D{cmt}` through `ode_param_slots`); analytical
+    // models route only canonical PK names into `PkParams`, so a `D{cmt}`
+    // individual parameter would otherwise be evaluated and discarded. Route each
+    // into a free `PkParams` slot — the spare region above the canonical PK slots
+    // (`PK_IDX_LAGTIME + 1 ..= MAX_PK_PARAMS - 1`), which analytical models never
+    // touch — and record `(Duration, cmt) -> slot` so the analytical predictor can
+    // resolve the modeled duration via `DoseEvent::resolve_rate`, exactly as the
+    // ODE path does. `analytical_dur_slots` carries `(var_name, slot)` into
+    // `build_pk_param_fn` so its closure writes the value alongside the canonical
+    // PK assignments. Empty (and the map stays `Default`) for ODE models and for
+    // the common analytical model with no `RATE=-2` dosing.
+    let mut analytical_dose_attr_map = crate::types::DoseAttrMap::default();
+    let mut analytical_dur_slots: Vec<(String, usize)> = Vec::new();
+    if !is_ode {
+        let mut next_slot = crate::types::PK_IDX_LAGTIME + 1;
+        for name in &indiv_var_names {
+            // Only modeled *duration* (`D{cmt}`) is routed here. `F{cmt}`/`ALAG{cmt}`
+            // collapse to the single analytical dose route (the bare `PK_IDX_F` /
+            // `PK_IDX_LAGTIME` slots), so although `from_indexed_name` recognises
+            // them they are not routed for analytical models. `R{cmt}` (RATE=-1) is
+            // not recognised at all yet (Phase B).
+            let Some((attr, cmt)) = crate::types::DoseAttr::from_indexed_name(name) else {
+                continue;
+            };
+            if attr != crate::types::DoseAttr::Duration {
+                continue;
+            }
+            // Reject a `D{cmt}` whose compartment the analytical engine cannot
+            // infuse into — the central compartment for every model, plus the
+            // peripheral compartment(s) of the 2-/3-cpt IV models, but NOT an oral
+            // depot or oral peripheral (see `PkModel::infusable_compartments`). A
+            // looser bound (e.g. raw compartment count) would let a `RATE=-2` into
+            // an oral depot pass parse + the data gate, then either silently route
+            // into central (no-TV superposition) or panic in the event-driven
+            // walker — the silent/abrupt failure class this feature exists to
+            // prevent. Caught here at parse time with an actionable message.
+            let infusable = pk_model.infusable_compartments();
+            if !infusable.contains(&cmt) {
+                let supported = infusable
+                    .iter()
+                    .map(|c| format!("`D{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(format!(
+                    "[individual_parameters]: `{name}` is a modeled infusion duration \
+                     (RATE=-2) for compartment {cmt}, but the analytical `{}` model can \
+                     only infuse into compartment(s) {:?} ({supported}). A zero-order \
+                     input into another compartment (e.g. an oral depot) needs an \
+                     `ode(...)` model.",
+                    pk_model.canonical_name(),
+                    infusable,
+                ));
+            }
+            // `infusable_compartments()` has ≤ 3 entries, so at most 3 distinct
+            // `D{cmt}` parameters are routed — comfortably inside the 9..16 spare
+            // region. A debug assertion documents that invariant without a
+            // permanently-dead user-facing error arm.
+            debug_assert!(
+                next_slot < crate::types::MAX_PK_PARAMS,
+                "modeled-duration slot {next_slot} exceeds MAX_PK_PARAMS; \
+                 infusable_compartments() should have bounded the D{{cmt}} count"
+            );
+            let slot = next_slot;
+            next_slot += 1;
+            analytical_dose_attr_map.insert(attr, cmt, slot);
+            analytical_dur_slots.push((name.clone(), slot));
+        }
+    }
+
     let (pk_param_fn, referenced_covariates, indiv_param_partials) = build_pk_param_fn(
         indiv_stmts.clone(),
         &pk_param_map,
         &indiv_var_names,
         &ode_slot_map,
+        &analytical_dur_slots,
         thetas.len(),
         n_eta_extended_for_partials,
         #[cfg(feature = "nn")]
@@ -1631,6 +1723,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         pk_idx_f64,
         sel_flat,
         ode_spec,
+        // Analytical models carry their modeled-dose (`D{cmt}`) map here; ODE
+        // models keep theirs on `ode_spec.dose_attr_map` and leave this empty.
+        dose_attr_map: analytical_dose_attr_map,
         diffusion_theta_start: if diffusion_state_indices.is_empty() {
             None
         } else {
@@ -1653,6 +1748,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         output_columns: vec![],
         #[cfg(feature = "survival")]
         endpoints: std::collections::HashMap::new(),
+        frem_config: None,
+        residual_error_eta,
     };
 
     // ── Optional blocks ──
@@ -1694,6 +1791,81 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // functions can branch without threading bloq_method through every call.
     let mut model = model;
     model.bloq_method = fit_options.bloq_method;
+
+    // Build FremConfig from fit options when frem_predictions is present.
+    // Format: "THETA_NAME/ETA_NAME:FREMTYPE, ..."
+    // Example: "TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"
+    if let Some(ref preds_str) = fit_options.frem_predictions {
+        let mut fremtype_to_indices = std::collections::HashMap::new();
+        for pair in preds_str.split(',') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = pair.split(':').collect();
+            if parts.len() != 2 {
+                return Err(format!(
+                    "frem_predictions: expected 'THETA/ETA:FREMTYPE', got '{}'",
+                    pair
+                ));
+            }
+            let names_part = parts[0].trim();
+            let ft_value: u16 = parts[1].trim().parse().map_err(|_| {
+                format!(
+                    "frem_predictions: expected integer FREMTYPE value, got '{}'",
+                    parts[1].trim()
+                )
+            })?;
+            let name_parts: Vec<&str> = names_part.split('/').collect();
+            if name_parts.len() != 2 {
+                return Err(format!(
+                    "frem_predictions: expected 'THETA/ETA:FREMTYPE', got '{}'",
+                    pair
+                ));
+            }
+            let theta_name = name_parts[0].trim();
+            let eta_name = name_parts[1].trim();
+            let theta_idx = model
+                .theta_names
+                .iter()
+                .position(|n| n == theta_name)
+                .ok_or_else(|| {
+                    format!(
+                        "frem_predictions: theta '{}' not found (available: {:?})",
+                        theta_name, model.theta_names
+                    )
+                })?;
+            let eta_idx = model
+                .eta_names
+                .iter()
+                .position(|n| n == eta_name)
+                .ok_or_else(|| {
+                    format!(
+                        "frem_predictions: eta '{}' not found (available: {:?})",
+                        eta_name, model.eta_names
+                    )
+                })?;
+            fremtype_to_indices.insert(ft_value, (theta_idx, eta_idx));
+        }
+        // Find covariate sigma index.
+        let sigma_name = fit_options.frem_sigma.as_deref().unwrap_or("EPSCOV");
+        let covariate_sigma_index = model
+            .default_params
+            .sigma
+            .names
+            .iter()
+            .position(|n| n == sigma_name)
+            .ok_or_else(|| {
+                format!(
+                    "frem_sigma: sigma parameter '{}' not found (available: {:?})",
+                    sigma_name, model.default_params.sigma.names
+                )
+            })?;
+        model.frem_config = Some(crate::types::FremConfig {
+            fremtype_to_indices,
+            covariate_sigma_index,
+        });
+    }
 
     // Bake the configured ODE solver tolerances from [fit_options] onto the
     // OdeSpec so predict()/fit_from_files (which integrate the parsed spec
@@ -3240,6 +3412,8 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
         Ok(EstimationMethod::FoceI)
     } else if val == "foce" {
         Ok(EstimationMethod::Foce)
+    } else if val == "bayes" || val == "bayesian" || val == "mcmc" {
+        Ok(EstimationMethod::Bayes)
     } else {
         Err(format!("unknown estimation method: `{}`", token.trim()))
     }
@@ -3446,6 +3620,11 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "adapt_interval" => opts.saem_adapt_interval = parse_usize("adapt_interval")?,
         "omega_burnin" => opts.saem_omega_burnin = parse_usize("omega_burnin")?,
         "seed" | "saem_seed" => opts.saem_seed = parse_u64_opt("seed")?,
+        "bayes_warmup" => opts.bayes_warmup = parse_usize("bayes_warmup")?,
+        "bayes_iters" => opts.bayes_iters = parse_usize("bayes_iters")?,
+        "bayes_chains" => opts.bayes_chains = parse_usize("bayes_chains")?,
+        "bayes_thin" => opts.bayes_thin = parse_usize("bayes_thin")?,
+        "bayes_seed" => opts.bayes_seed = parse_u64_opt("bayes_seed")?,
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         "sir" => opts.sir = parse_bool("sir")?,
         "sir_samples" => opts.sir_samples = parse_usize("sir_samples")?,
@@ -3467,11 +3646,18 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.is_samples = v;
         }
         "is_proposal_df" => {
-            let v = parse_f64("is_proposal_df")?;
-            if v < 1.0 {
-                return Err(format!("is_proposal_df must be >= 1.0, got {v}"));
+            let tok = value.trim();
+            if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
+                opts.is_proposal_df = f64::INFINITY;
+            } else {
+                let v = parse_f64("is_proposal_df")?;
+                if v < 1.0 {
+                    return Err(format!(
+                        "is_proposal_df must be >= 1.0 or `normal`, got {v}"
+                    ));
+                }
+                opts.is_proposal_df = v;
             }
-            opts.is_proposal_df = v;
         }
         "is_seed" => opts.is_seed = parse_u64_opt("is_seed")?,
         "is_low_ess_threshold" => {
@@ -3483,6 +3669,15 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.is_low_ess_threshold = v;
         }
+        "is_iterations" => {
+            let v = parse_usize("is_iterations")?;
+            if v < 1 {
+                return Err(format!("is_iterations must be >= 1, got {v}"));
+            }
+            opts.is_iterations = v;
+        }
+        "is_averaging" => opts.is_averaging = parse_usize("is_averaging")?,
+        "is_eval_only" => opts.is_eval_only = parse_bool("is_eval_only")?,
         "impmap_iterations" => {
             let v = parse_usize("impmap_iterations")?;
             if v < 1 {
@@ -3523,6 +3718,23 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 ));
             }
             opts.impmap_low_ess_threshold = v;
+        }
+        "impmap_trace" => opts.impmap_trace = parse_bool("impmap_trace")?,
+        "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,
+        "impmap_sobol" => opts.impmap_sobol = parse_bool("impmap_sobol")?,
+        "iscale_min" => {
+            let v = parse_f64("iscale_min")?;
+            if v <= 0.0 {
+                return Err("fit option `iscale_min` must be > 0".to_string());
+            }
+            opts.iscale_min = v;
+        }
+        "iscale_max" => {
+            let v = parse_f64("iscale_max")?;
+            if v <= 0.0 {
+                return Err("fit option `iscale_max` must be > 0".to_string());
+            }
+            opts.iscale_max = v;
         }
         "npde_nsim" => opts.npde_nsim = parse_usize("npde_nsim")?,
         "npde_seed" => opts.npde_seed = parse_u64_opt("npde_seed")?,
@@ -3666,6 +3878,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 push_unique_expr(&mut opts.ignore_subjects, bare);
             }
             return Ok(true);
+        }
+        "frem_predictions" => {
+            opts.frem_predictions = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
+        "frem_sigma" => {
+            opts.frem_sigma = if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
         }
         _ => return Ok(false),
     }
@@ -6340,7 +6566,9 @@ struct LtbsFlags {
     dv_pre_logged: bool,
 }
 
-fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), String> {
+fn parse_error_model(
+    lines: &[String],
+) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
     // Single-endpoint:
     //   DV ~ proportional(SIGMA_NAME)
     //   DV ~ additive(SIGMA_NAME)
@@ -6360,10 +6588,22 @@ fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), 
     // singles carry the per-line LTBS flags so the chosen single can stamp them.
     let mut singles: Vec<(ErrorModel, Vec<String>, LtbsFlags)> = Vec::new();
     let mut per_cmt: Vec<(usize, ErrorModel, Vec<String>)> = Vec::new();
+    // IIV on residual error: `iiv_on_ruv = ETA_NAME` (NONMEM `Y=IPRED+EPS*EXP(ETA)`).
+    let iiv_re = Regex::new(r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$").unwrap();
+    let mut iiv_on_ruv: Option<String> = None;
 
     for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        // `iiv_on_ruv = ETA_NAME` declares a random effect on the residual error.
+        if let Some(c) = iiv_re.captures(trimmed) {
+            if iiv_on_ruv.is_some() {
+                return Err("[error_model] has more than one `iiv_on_ruv = ...` entry".to_string());
+            }
+            iiv_on_ruv = Some(c[1].to_string());
             continue;
         }
 
@@ -6472,11 +6712,22 @@ fn parse_error_model(lines: &[String]) -> Result<(ParsedErrorModel, LtbsFlags), 
                 ));
             }
         }
-        return Ok((ParsedErrorModel::PerCmt(per_cmt), LtbsFlags::default()));
+        if iiv_on_ruv.is_some() {
+            return Err("[error_model] `iiv_on_ruv` is not supported with per-CMT \
+                        (multi-endpoint) error models"
+                .to_string());
+        }
+        return Ok((
+            ParsedErrorModel::PerCmt(per_cmt),
+            LtbsFlags::default(),
+            None,
+        ));
     }
 
     match singles.into_iter().next() {
-        Some((model, names, flags)) => Ok((ParsedErrorModel::Single(model, names), flags)),
+        Some((model, names, flags)) => {
+            Ok((ParsedErrorModel::Single(model, names), flags, iiv_on_ruv))
+        }
         None => Err("No error model found in [error_model] block".to_string()),
     }
 }
@@ -6571,6 +6822,11 @@ fn build_pk_param_fn(
     pk_param_map: &HashMap<String, String>,
     var_names: &[String],
     ode_slot_map: &[usize],
+    // Analytical modeled-duration (`D{cmt}`, RATE=-2) parameters as
+    // `(var_name, PkParams slot)`; the closure writes each value into its
+    // reserved spare slot in the analytical arm. Empty for ODE models and for
+    // analytical models with no `RATE=-2` dosing. See #324/#394.
+    analytical_dur_slots: &[(String, usize)],
     n_theta_base: usize,
     n_eta_extended: usize,
     #[cfg(feature = "nn")] covariate_nns: &[crate::nn::CovariateNn],
@@ -6682,6 +6938,22 @@ fn build_pk_param_fn(
     }
     let is_analytical_pk = !pk_param_map.is_empty();
 
+    // Resolve each analytical modeled-duration parameter's value slot once, to
+    // `(PkParams write slot, var slot)`, so the hot closure is two array reads.
+    // Empty unless this is an analytical model with `D{cmt}` (RATE=-2) declared.
+    // A name with no matching var slot is dropped (defensive — it would have
+    // errored earlier as an undefined reference).
+    let analytical_extra_mapping: Vec<(usize, usize)> = analytical_dur_slots
+        .iter()
+        .filter_map(|(var_name, pk_slot)| {
+            let var_slot = var_idx
+                .get(var_name)
+                .copied()
+                .or_else(|| var_idx.get(&var_name.to_lowercase()).copied())?;
+            Some((*pk_slot, var_slot))
+        })
+        .collect();
+
     // ODE branch counterpart of the analytical pre-resolution: map each
     // top-level individual parameter to (write_slot, var_slot). `write_slot`
     // is the parameter's `ode_param_slots` slot in `PkParams.values` (canonical
@@ -6764,6 +7036,12 @@ fn build_pk_param_fn(
                 // per-call evaluation, just write the parsed value.
                 for &(pk_slot, c) in &pk_const_mapping {
                     p.values[pk_slot] = c;
+                }
+                // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write each
+                // duration parameter into its reserved spare slot so the analytical
+                // dose-resolution step (`DoseEvent::resolve_rate`) can read it.
+                for &(pk_slot, var_slot) in &analytical_extra_mapping {
+                    p.values[pk_slot] = vars[var_slot];
                 }
             } else {
                 // ODE model: store each individual parameter at its
@@ -11401,8 +11679,46 @@ mod tests {
         assert!(apply_fit_option(&mut opts, "is_proposal_df", "0.5").is_err()); // < 1
         assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "1.5").is_err()); // > 1
         assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "-0.1").is_err()); // < 0
-                                                                                       // Defaults preserved after a failed apply.
+        assert!(apply_fit_option(&mut opts, "is_iterations", "0").is_err()); // < 1
+                                                                             // Defaults preserved after a failed apply.
         assert_eq!(opts.is_samples, 1000);
+    }
+
+    #[test]
+    fn test_imp_estimator_options_parse() {
+        // The estimating-IMP controls and the eval-only switch apply cleanly.
+        let opts = parse_fit_options(&[
+            "method = imp".to_string(),
+            "is_iterations = 80".to_string(),
+            "is_averaging = 20".to_string(),
+            "is_eval_only = true".to_string(),
+            "is_proposal_df = normal".to_string(),
+        ])
+        .expect("parse must succeed");
+        assert_eq!(opts.method, EstimationMethod::Imp);
+        assert_eq!(opts.is_iterations, 80);
+        assert_eq!(opts.is_averaging, 20);
+        assert!(opts.is_eval_only);
+        assert!(opts.is_proposal_df.is_infinite());
+        assert!(opts.unsupported_keys_warnings().is_empty());
+    }
+
+    #[test]
+    fn test_is_proposal_df_accepts_normal_token() {
+        for kw in ["normal", "mvn", "NORMAL"] {
+            let mut o = FitOptions::default();
+            assert!(apply_fit_option(&mut o, "is_proposal_df", kw).is_ok());
+            assert!(o.is_proposal_df.is_infinite(), "`{kw}` must select MVN");
+        }
+    }
+
+    #[test]
+    fn test_imp_method_token_defaults_to_estimator() {
+        // `imp` alone must not flip the eval-only switch — the default is the
+        // NONMEM METHOD=IMP estimator.
+        let opts = parse_fit_options(&["method = imp".to_string()]).expect("parse must succeed");
+        assert_eq!(opts.method, EstimationMethod::Imp);
+        assert!(!opts.is_eval_only);
     }
 
     #[test]
@@ -11434,6 +11750,7 @@ mod tests {
             "impmap_averaging = 30".to_string(),
             "impmap_seed = 77".to_string(),
             "impmap_low_ess_threshold = 0.2".to_string(),
+            "impmap_mceta = 3".to_string(),
             "covariance = false".to_string(),
         ])
         .expect("parse must succeed");
@@ -11444,6 +11761,7 @@ mod tests {
         assert_eq!(opts.impmap_averaging, 30);
         assert_eq!(opts.impmap_seed, Some(77));
         assert_eq!(opts.impmap_low_ess_threshold, 0.2);
+        assert_eq!(opts.impmap_mceta, 3);
         // All keys are method-specific to Impmap and Impmap is selected.
         assert!(opts.unsupported_keys_warnings().is_empty());
 
@@ -13260,6 +13578,46 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_method_token_bayes() {
+        assert_eq!(parse_method_token("bayes"), Ok(EstimationMethod::Bayes));
+        assert_eq!(parse_method_token("BAYES"), Ok(EstimationMethod::Bayes));
+        assert_eq!(parse_method_token("mcmc"), Ok(EstimationMethod::Bayes));
+        assert_eq!(EstimationMethod::Bayes.label(), "BAYES");
+    }
+
+    #[test]
+    fn test_apply_fit_option_bayes_keys() {
+        let mut opts = FitOptions::default();
+        assert_eq!(apply_fit_option(&mut opts, "bayes_warmup", "500"), Ok(true));
+        assert_eq!(opts.bayes_warmup, 500);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_iters", "2000"), Ok(true));
+        assert_eq!(opts.bayes_iters, 2000);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_chains", "2"), Ok(true));
+        assert_eq!(opts.bayes_chains, 2);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_thin", "5"), Ok(true));
+        assert_eq!(opts.bayes_thin, 5);
+        assert_eq!(apply_fit_option(&mut opts, "bayes_seed", "42"), Ok(true));
+        assert_eq!(opts.bayes_seed, Some(42));
+        assert!(apply_fit_option(&mut opts, "bayes_warmup", "oops").is_err());
+
+        // All Bayes keys are recognised by method_specific_keys (no spurious
+        // "unsupported key" warning when method = bayes).
+        opts.method = EstimationMethod::Bayes;
+        for k in [
+            "bayes_warmup",
+            "bayes_iters",
+            "bayes_chains",
+            "bayes_thin",
+            "bayes_seed",
+        ] {
+            assert!(
+                crate::types::method_specific_keys(EstimationMethod::Bayes).contains(&k),
+                "method_specific_keys(Bayes) missing `{k}`"
+            );
+        }
+    }
+
+    #[test]
     fn test_apply_fit_option_inner_maxiter_and_tol() {
         let mut opts = FitOptions::default();
         assert_eq!(apply_fit_option(&mut opts, "inner_maxiter", "75"), Ok(true));
@@ -14675,6 +15033,86 @@ if (WT > 70) {
             model.error_spec,
             ErrorSpec::Single(ErrorModel::Proportional)
         ));
+    }
+
+    // ── IIV on residual error (`iiv_on_ruv`, #409) ──────────────────────────
+    fn iiv_ruv_model_str(error_block: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_RUV ~ 0.05
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+{}
+",
+            error_block
+        )
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_resolves_eta_index() {
+        let model = parse_full_model(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV",
+        ))
+        .unwrap()
+        .model;
+        // ETA_RUV is the 2nd declared omega → eta index 1.
+        assert_eq!(model.residual_error_eta, Some(1));
+        // The residual-error eta is NOT a structural/individual-parameter eta.
+        assert!(
+            !model.eta_param_info.iter().any(|e| e.eta_name == "ETA_RUV"),
+            "ETA_RUV must not carry an EtaParamInfo entry"
+        );
+        // The scale factor is exp(2·η) at that index, 1.0 elsewhere.
+        assert!((model.residual_var_scale(&[0.0, 0.0]) - 1.0).abs() < 1e-12);
+        assert!((model.residual_var_scale(&[0.3, 0.5]) - (2.0_f64 * 0.5).exp()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_absent_is_none() {
+        let model = parse_full_model(&iiv_ruv_model_str("  DV ~ proportional(PROP_ERR)"))
+            .unwrap()
+            .model;
+        assert_eq!(model.residual_error_eta, None);
+        assert!((model.residual_var_scale(&[0.7, 0.9]) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_unknown_eta_rejected() {
+        let err = expect_parse_err(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = NOPE",
+        ));
+        assert!(
+            err.contains("iiv_on_ruv") && err.contains("NOPE"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_duplicate_rejected() {
+        let err = expect_parse_err(&iiv_ruv_model_str(
+            "  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n  iiv_on_ruv = ETA_CL",
+        ));
+        assert!(err.contains("more than one"), "got: {err}");
+    }
+
+    #[test]
+    fn test_iiv_on_ruv_rejected_with_per_cmt() {
+        let err = expect_parse_err(&pkpd_model_str(
+            "  CMT=1: DV ~ proportional(PROP_ERR_PK)\n  CMT=2: DV ~ additive(ADD_ERR_PD)\n  iiv_on_ruv = ETA_CL",
+        ));
+        assert!(err.contains("per-CMT"), "got: {err}");
     }
 
     #[test]
@@ -18734,6 +19172,170 @@ CL V KA WT
     }
 
     #[test]
+    fn analytical_modeled_duration_param_populates_map() {
+        // A `D1` parameter (modeled infusion duration, RATE=-2) in an ANALYTICAL
+        // model (#394) must (a) parse, and (b) populate `CompiledModel.dose_attr_map`
+        // (NOT an `ode_spec` — analytical models have none) as Duration for
+        // compartment 1, routed to a spare PkParams slot above the canonical slots.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D1 = TVD1
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("D1 parses on analytical model");
+        assert!(
+            parsed.model.ode_spec.is_none(),
+            "model must be analytical (no ode_spec)"
+        );
+        let slot = parsed
+            .model
+            .dose_attr_map
+            .indexed_slot(crate::types::DoseAttr::Duration, 1)
+            .expect("D1 must map as modeled duration for compartment 1");
+        // Routed to the spare region above the canonical PK slots, never aliasing
+        // a canonical slot or the engine-reserved F / lagtime slots.
+        assert!(
+            slot > crate::types::PK_IDX_LAGTIME && slot < crate::types::MAX_PK_PARAMS,
+            "D1 must land in a spare slot ({} < slot < {}), got {slot}",
+            crate::types::PK_IDX_LAGTIME,
+            crate::types::MAX_PK_PARAMS
+        );
+        // Nothing else bound.
+        assert!(parsed
+            .model
+            .dose_attr_map
+            .indexed_slot(crate::types::DoseAttr::Duration, 2)
+            .is_none());
+    }
+
+    #[test]
+    fn analytical_modeled_duration_out_of_range_compartment_errors() {
+        // `D2` on a 1-cpt IV analytical model is not an infusable compartment
+        // (infusable = {1} for one_cpt_iv) — a loud parse error, never a
+        // silently-ignored slot (#394).
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVD2(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  D2 = TVD2
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(src)
+            .err()
+            .expect("D2 on a 1-compartment analytical model must error");
+        assert!(
+            err.contains("compartment 2") && err.contains("D2"),
+            "error must name the attribute and compartment, got: {err}"
+        );
+    }
+
+    #[test]
+    fn analytical_modeled_duration_into_oral_depot_parses() {
+        // `D1` on a `one_cpt_oral` model targets the DEPOT (cmt 1): a zero-order
+        // release into the depot, then first-order `ka` absorption into central
+        // (#400). Since the analytical oral propagators gained the depot
+        // forced response, the depot is now an infusable compartment — this must
+        // parse and bind `D1` as a modeled Duration for compartment 1.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  D1 = TVD1
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("D1 into the oral depot must parse (#400)");
+        assert!(
+            parsed.model.ode_spec.is_none(),
+            "model must stay analytical (no ode_spec)"
+        );
+        parsed
+            .model
+            .dose_attr_map
+            .indexed_slot(crate::types::DoseAttr::Duration, 1)
+            .expect("D1 must map as modeled duration for the depot (compartment 1)");
+    }
+
+    #[test]
+    fn analytical_modeled_duration_into_oral_peripheral_is_rejected() {
+        // `D3` on a `two_cpt_oral` model targets a PERIPHERAL (cmt 3), which the
+        // analytical oral closed forms still cannot infuse into (infusable =
+        // {1 depot, 2 central}). It must be a loud parse error pointing at
+        // `ode(...)` — not silently routed or a runtime panic (#400).
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(50.0, 1.0, 500.0)
+  theta TVQ(5.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVD3(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+  D3 = TVD3
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(src)
+            .err()
+            .expect("D3 (oral peripheral) on an analytical oral model must error");
+        assert!(
+            err.contains("compartment 3") && err.contains("D3") && err.contains("ode("),
+            "error must name the compartment, the param, and point to ode(...): {err}"
+        );
+    }
+
+    #[test]
     fn derived_resolves_covariate_case_insensitively() {
         // Regression: a covariate carried in the dataset under an uppercase
         // header (`WT`) referenced as lowercase `wt` in a [derived] expression
@@ -18772,119 +19374,30 @@ CL V KA WT
         }
     }
 
-    /// Regression: named analytical compartment references (e.g. `central`,
-    /// `depot`) in a [derived] expression on an analytical model must set
-    /// `uses_compartments = true` so that W_DERIVED_CMT_* warnings fire.
-    ///
-    /// Before the fix, `ode_state_names` was empty for analytical models, so
-    /// `expr_refs_compartments` never detected named access — all four
-    /// W_DERIVED_CMT_* guards were silently suppressed.
     #[test]
-    fn analytical_model_named_compartment_sets_uses_compartments() {
-        // one_cpt_iv has a single compartment named "central"
-        let src = minimal_model_with_derived("C_CENTRAL = central");
-        let parsed = parse_full_model(&src).expect("parse ok");
-        let expr = &parsed.model.derived_exprs[0];
-        assert_eq!(expr.name, "C_CENTRAL");
-        assert!(
-            expr.uses_compartments,
-            "`central` in [derived] on a one_cpt_iv model must set uses_compartments=true"
-        );
-
-        // two_cpt_oral has depot, central, peripheral
-        let src2 = r#"
-[parameters]
-  theta CL(1.0, 0, 100)
-  theta V1(10.0, 0, 1000)
-  theta Q(0.5, 0, 50)
-  theta V2(5.0, 0, 500)
-  theta KA(1.0, 0, 10)
-  omega ETA_CL ~ 0.09
-  sigma PROP   ~ 0.01
-[individual_parameters]
-  CL = exp(log(CL) + ETA_CL)
-  V1 = V1
-  Q  = Q
-  V2 = V2
-  KA = KA
-[structural_model]
-  pk two_cpt_oral(cl=CL, v=V1, q=Q, v2=V2, ka=KA)
-[error_model]
-  DV ~ proportional(PROP)
-[derived]
-  C_PERIPH = peripheral
-"#;
-        let parsed2 = parse_full_model(src2).expect("parse ok (two_cpt_oral)");
-        let expr2 = &parsed2.model.derived_exprs[0];
-        assert_eq!(expr2.name, "C_PERIPH");
-        assert!(
-            expr2.uses_compartments,
-            "`peripheral` in [derived] on a two_cpt_oral model must set uses_compartments=true"
-        );
-    }
-
-    /// Regression: `compartments[N]` with N > MAX_CMT_INDEX (255) must fail at
-    /// parse time rather than silently evaluating to 0.0.
-    ///
-    /// MAX_CMT_INDEX is the module-level constant; `build_derived_vars` seeds
-    /// `__cmt_0..=__cmt_{MAX_CMT_INDEX}` with NaN. Any index beyond that misses
-    /// the map and `.unwrap_or(0.0)` would return 0.0 — a plausible drug
-    /// concentration masking the out-of-range access.
-    #[test]
-    fn compartments_index_out_of_range_is_parse_error() {
-        let src = minimal_model_with_derived("X = compartments[256]");
-        match parse_full_model(&src) {
-            Err(err) => assert!(
-                err.contains("256") && err.contains("exceeds"),
-                "error should mention the index and 'exceeds': {err}"
+    fn test_apply_fit_option_frem_predictions() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(
+                &mut opts,
+                "frem_predictions",
+                "TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"
             ),
-            Ok(_) => panic!("compartments[256] should be a parse error"),
-        }
-
-        // 255 is the last valid index — must succeed
-        let src_ok = minimal_model_with_derived("X = compartments[255]");
-        parse_full_model(&src_ok).expect("compartments[255] should parse ok");
-
-        // 0 must still work
-        let src_zero = minimal_model_with_derived("X = compartments[0]");
-        parse_full_model(&src_zero).expect("compartments[0] should parse ok");
+            Ok(true)
+        );
+        assert_eq!(
+            opts.frem_predictions.as_deref(),
+            Some("TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200")
+        );
     }
 
-    /// Regression: `uses_compartments` on `integral()` must also fire when the
-    /// **condition** (filter) clause references a compartment, not just the
-    /// integrand. Before the fix, `integral(IPRED, compartments[0] > 1, from=0,
-    /// to=24)` had `uses_compartments = false` because only the integrand was
-    /// checked — the filter closure silently received NaN for all `__cmt_N` keys,
-    /// and the integral silently integrated over the wrong set of observations.
     #[test]
-    fn integral_condition_referencing_compartment_sets_uses_compartments() {
-        // Integrand is IPRED (no compartment ref); condition references compartments[0].
-        let src = minimal_model_with_derived(
-            "AUC_FILTERED = integral(IPRED, compartments[0] > 1.0, from=0, to=24)",
+    fn test_apply_fit_option_frem_sigma() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(&mut opts, "frem_sigma", "EPSCOV"),
+            Ok(true)
         );
-        let parsed = parse_full_model(&src).expect("parse ok");
-        let expr = &parsed.model.derived_exprs[0];
-        assert_eq!(expr.name, "AUC_FILTERED");
-        assert!(
-            expr.uses_compartments,
-            "integral() condition referencing compartments[0] must set uses_compartments=true"
-        );
-
-        // Sanity check: integrand-only reference still works
-        let src2 = minimal_model_with_derived("AUC_CMT = integral(compartments[0], from=0, to=24)");
-        let parsed2 = parse_full_model(&src2).expect("parse ok");
-        assert!(
-            parsed2.model.derived_exprs[0].uses_compartments,
-            "integral() integrand referencing compartments[0] must still set uses_compartments"
-        );
-
-        // Sanity check: no compartment reference in either integrand or condition → false
-        let src3 =
-            minimal_model_with_derived("AUC_PLAIN = integral(IPRED, DV > 0.0, from=0, to=24)");
-        let parsed3 = parse_full_model(&src3).expect("parse ok");
-        assert!(
-            !parsed3.model.derived_exprs[0].uses_compartments,
-            "integral() with no compartment reference must leave uses_compartments=false"
-        );
+        assert_eq!(opts.frem_sigma.as_deref(), Some("EPSCOV"));
     }
 }

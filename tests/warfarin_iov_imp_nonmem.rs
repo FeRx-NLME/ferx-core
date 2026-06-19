@@ -107,6 +107,7 @@ fn imp_at_nonmem_focei_mle_is_close_to_focei_at_same_point() {
     opts.verbose = false;
     opts.is_samples = 3000;
     opts.is_seed = Some(2026);
+    opts.is_eval_only = true; // IS IOV scoring path; estimating IMP refuses IOV
 
     let result = fit(&model, &pop, &model.default_params, &opts)
         .expect("fixed-param FOCEI → IMP must succeed");
@@ -178,6 +179,7 @@ fn imp_free_fit_matches_nonmem_reference() {
     ];
     opts.is_samples = 3000;
     opts.is_seed = Some(2026);
+    opts.is_eval_only = true; // IS IOV scoring path; estimating IMP refuses IOV
 
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("warfarin_iov SAEM → FOCEI → IMP must succeed");

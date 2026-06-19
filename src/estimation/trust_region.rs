@@ -451,6 +451,8 @@ pub fn optimize_trust_region(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        impmap_trace: None,
+        bayes: None,
     }
 }
 

@@ -46,6 +46,7 @@ pub fn subject(
         cens: vec![0; n],
         occasions: vec![],
         dose_occasions: vec![],
+        fremtype: vec![],
         #[cfg(feature = "survival")]
         obs_records: vec![],
     }

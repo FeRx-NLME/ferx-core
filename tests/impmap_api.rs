@@ -77,6 +77,68 @@ fn focei_then_impmap_chain_runs() {
     assert!(result.ofv.is_finite());
 }
 
+/// FOCEI → IMPMAP → IMP chain: the EONLY-equivalent workflow.
+/// IMPMAP should compute covariance (it is the last *estimating* stage),
+/// and IMP should produce an IS-likelihood evaluation at IMPMAP's parameters.
+#[test]
+fn focei_impmap_imp_chain_produces_covariance_and_is_result() {
+    let (model, population, mut opts) = warfarin_setup();
+    opts.methods = vec![
+        EstimationMethod::FoceI,
+        EstimationMethod::Impmap,
+        EstimationMethod::Imp,
+    ];
+    opts.outer_maxiter = 25;
+    opts.run_covariance_step = true;
+    opts.is_samples = 200;
+    opts.is_proposal_df = 5.0;
+    // `imp` is an estimator by default now; this workflow scores IMPMAP's fit, so
+    // run the terminal `imp` in evaluation-only mode (NONMEM EONLY=1).
+    opts.is_eval_only = true;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("focei → impmap → imp chain must produce a fit");
+
+    // IMPMAP is the last estimator; IMP is evaluation-only.
+    assert_eq!(result.method, EstimationMethod::Impmap);
+    assert_eq!(
+        result.method_chain,
+        vec![
+            EstimationMethod::FoceI,
+            EstimationMethod::Impmap,
+            EstimationMethod::Imp,
+        ]
+    );
+    assert!(result.ofv.is_finite());
+
+    // Covariance must be present (computed by IMPMAP, the last estimating stage).
+    assert!(
+        matches!(
+            result.covariance_status,
+            ferx_core::CovarianceStatus::Computed | ferx_core::CovarianceStatus::SirFallback
+        ),
+        "covariance should succeed when IMPMAP precedes IMP, got {:?}",
+        result.covariance_status
+    );
+
+    // IS result must be populated (from the IMP evaluation stage).
+    assert!(
+        result.importance_sampling.is_some(),
+        "importance_sampling result should be populated from IMP stage"
+    );
+    let is = result.importance_sampling.as_ref().unwrap();
+    assert!(
+        is.minus2_log_likelihood.is_finite(),
+        "IS -2LL should be finite, got {}",
+        is.minus2_log_likelihood
+    );
+
+    // SE should be present (extracted from covariance).
+    assert!(
+        result.se_theta.as_ref().map_or(false, |v| !v.is_empty()),
+        "SE(theta) should be available from IMPMAP covariance"
+    );
+}
+
 #[test]
 fn impmap_rejects_iov_models() {
     let model = parse_model_file(Path::new("examples/warfarin_iov.ferx"))
@@ -126,6 +188,63 @@ fn impmap_converges_with_mu_referencing_off() {
         r.omega[(0, 0)] < 0.10,
         "ω²(ETA_CL) should be ~0.03, not inflated ~0.19, got {}",
         r.omega[(0, 0)]
+    );
+}
+
+#[test]
+fn impmap_trace_collected_when_enabled() {
+    let (model, population, mut opts) = warfarin_setup();
+    opts.method = EstimationMethod::Impmap;
+    opts.impmap_trace = true;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("impmap with trace must produce a fit");
+
+    let trace = result
+        .impmap_trace
+        .as_ref()
+        .expect("impmap_trace should be Some when impmap_trace = true");
+
+    // 12 iteration rows + 1 final row (no covariance → no SE row).
+    assert_eq!(
+        trace.rows.len(),
+        13,
+        "expected 12 iter rows + 1 final row, got {}",
+        trace.rows.len()
+    );
+    assert_eq!(trace.rows[0].iteration, 1);
+    assert_eq!(trace.rows[11].iteration, 12);
+    assert_eq!(trace.rows[12].iteration, -1_000_000_000);
+
+    // Column name counts.
+    assert_eq!(trace.theta_names.len(), 3); // TVCL, TVV, TVKA
+    assert_eq!(trace.sigma_names.len(), 1); // proportional sigma
+                                            // 3 etas → 6 lower-triangle elements: (1,1),(2,1),(2,2),(3,1),(3,2),(3,3)
+    assert_eq!(trace.omega_names.len(), 6);
+
+    // Every row has the right shape and finite values.
+    for row in &trace.rows {
+        assert!(
+            row.ofv.is_finite(),
+            "OFV must be finite at iter {}",
+            row.iteration
+        );
+        assert_eq!(row.theta.len(), 3);
+        assert_eq!(row.omega_lower_tri.len(), 6);
+        assert_eq!(row.sigma.len(), 1);
+    }
+}
+
+#[test]
+fn impmap_trace_absent_when_disabled() {
+    let (model, population, mut opts) = warfarin_setup();
+    opts.method = EstimationMethod::Impmap;
+    // impmap_trace defaults to false
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("impmap without trace must produce a fit");
+
+    assert!(
+        result.impmap_trace.is_none(),
+        "impmap_trace should be None when impmap_trace = false"
     );
 }
 

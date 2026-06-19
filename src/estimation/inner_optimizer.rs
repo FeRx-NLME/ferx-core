@@ -216,6 +216,14 @@ pub(crate) fn analytical_ad_unsupported(model: &CompiledModel) -> Option<&'stati
     if model.has_tte() {
         return Some("time-to-event ([event_model]) hazard likelihood");
     }
+    // IIV on residual error (`Y = IPRED + EPS*EXP(ETA)`). The analytical AD
+    // kernels build the residual variance from σ alone and have no rule for the
+    // per-subject `exp(2·η_ruv)` scaling; the EBE search must see the scaled
+    // variance, so route these models to FD (which differences the real
+    // `individual_nll`, where the scale is applied). See #409.
+    if model.residual_error_eta.is_some() {
+        return Some("IIV on residual error (iiv_on_ruv)");
+    }
     None
 }
 
@@ -260,6 +268,17 @@ pub(crate) fn resolve_gradient_method(
         // gradients (computed against the single-dose response) would not
         // match the SS-aware predictions from `predict_concentration`.
         if subject.has_ss_doses() {
+            return InnerGradientMethod::Fd;
+        }
+        // Modeled-`RATE` doses (RATE=-2 → `D{cmt}`; #324/#394): the analytical AD
+        // kernels snapshot each dose's concrete `rate`/`duration` into flat f64
+        // arrays and assert `all_doses_fixed()`. Resolving a modeled duration to a
+        // value (via `resolve_rate`) drops its `∂duration/∂η`, so an η-dependent
+        // `D{cmt}` would make the AD gradient disagree with the analytical
+        // (current-eta) objective the inner loop minimizes. Route to FD, which
+        // recomputes the duration at each perturbation. (The value path resolves
+        // these doses upstream; only the AD gradient path needs this guard.)
+        if !subject.all_doses_fixed() {
             return InnerGradientMethod::Fd;
         }
         // Oral models with a zero-order (infusion, RATE>0) dose: every AD oral
@@ -1017,6 +1036,21 @@ fn compute_jacobian_fd_iov(
         }
     }
 
+    // Overwrite FREM pseudo-observation rows with exact analytical Jacobian.
+    if let Some(ref fc) = model.frem_config {
+        if !subject.fremtype.is_empty() {
+            for (i, &ft) in subject.fremtype.iter().enumerate() {
+                if ft > 0 {
+                    if let Some(&(_theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
+                        for j in 0..n_eta {
+                            h[(i, j)] = if j == eta_idx { 1.0 } else { 0.0 };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     h
 }
 
@@ -1377,6 +1411,25 @@ fn compute_jacobian_fd(
         eta_pert[j] = eta[j];
     }
 
+    // Overwrite FREM pseudo-observation rows with exact analytical Jacobian.
+    // For FREMTYPE > 0 observations, prediction = theta[k] + eta[m], so
+    // ∂Y/∂η_j = 1 if j == m, 0 otherwise. The FD values for these rows
+    // are noisy (esp. cross-terms that should be exactly 0) and corrupt
+    // the posterior Hessian used by the IS proposal.
+    if let Some(ref fc) = model.frem_config {
+        if !subject.fremtype.is_empty() {
+            for (i, &ft) in subject.fremtype.iter().enumerate() {
+                if ft > 0 {
+                    if let Some(&(_theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&ft) {
+                        for j in 0..n_eta {
+                            h[(i, j)] = if j == eta_idx { 1.0 } else { 0.0 };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     h
 }
 
@@ -1519,6 +1572,136 @@ mod tests {
     }
 
     #[test]
+    fn test_frem_jacobian_overrides_fd_with_exact_values() {
+        use crate::types::{
+            DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel, PkParams, SigmaVector,
+        };
+        use std::collections::HashMap;
+
+        // Build a minimal model with 3 etas: CL, V, COV_WT(FREM)
+        let omega = OmegaMatrix::from_diagonal(
+            &[0.09, 0.09, 100.0],
+            vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
+        );
+        let default_params = crate::types::ModelParameters {
+            theta: vec![10.0, 100.0, 90.0],
+            theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
+            theta_lower: vec![0.01, 1.0, 0.0],
+            theta_upper: vec![100.0, 500.0, 200.0],
+            theta_fixed: vec![false, false, true],
+            omega,
+            omega_fixed: vec![false, false, false],
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["RUV".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+        };
+        let model = CompiledModel {
+            has_conditional_eta_params: false,
+            name: "frem_jac_test".into(),
+            pk_model: PkModel::OneCptIv,
+            error_model: ErrorModel::Additive,
+            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Additive),
+            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                p.values[0] = theta[0] * eta[0].exp(); // CL
+                p.values[1] = theta[1] * eta[1].exp(); // V
+                p
+            }),
+            n_theta: 3,
+            n_eta: 3,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: vec![],
+            theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
+            eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
+            indiv_param_names: vec!["CL".into(), "V".into(), "COV_WT".into()],
+            indiv_param_partials: crate::types::IndivParamPartials::empty(),
+            default_params,
+            omega_init_as_sd: vec![false; 3],
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: vec![],
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0, 1, 2],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: crate::types::BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::default(),
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: crate::types::ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
+            dose_attr_map: Default::default(),
+            #[cfg(feature = "survival")]
+            endpoints: std::collections::HashMap::new(),
+            frem_config: Some(crate::types::FremConfig {
+                fremtype_to_indices: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(100u16, (2usize, 2usize)); // TV_WT / ETA_WT_FREM
+                    m
+                },
+                covariate_sigma_index: 0,
+            }),
+            residual_error_eta: None,
+        };
+
+        // Subject: 2 PK obs + 1 FREM obs
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 0.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![5.0, 3.0, 90.0],
+            obs_cmts: vec![1, 1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: vec![0, 0, 100], // last obs is FREM
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        let theta = [10.0, 100.0, 90.0];
+        let eta = [0.1, -0.05, 2.5];
+
+        let mut scratch = pk::EventPkParams::default();
+        let jac = compute_jacobian_fd(&model, &subject, &theta, &eta, &mut scratch, None);
+
+        // Row 2 (FREM obs) must be exactly [0, 0, 1]
+        assert_eq!(jac[(2, 0)], 0.0, "FREM row: ∂Y/∂η_CL must be exactly 0");
+        assert_eq!(jac[(2, 1)], 0.0, "FREM row: ∂Y/∂η_V must be exactly 0");
+        assert_eq!(jac[(2, 2)], 1.0, "FREM row: ∂Y/∂η_COV must be exactly 1");
+
+        // PK rows should be non-zero for at least CL (row 0, col 0)
+        assert!(
+            jac[(0, 0)].abs() > 1e-10,
+            "PK row: ∂Y/∂η_CL should be nonzero"
+        );
+    }
+
+    #[test]
     fn test_nelder_mead_nan_objective_does_not_panic() {
         // Regression for issue #97: when a simplex vertex evaluates to a NaN
         // objective (e.g. an ODE prediction blowing up during the EBE search),
@@ -1645,6 +1828,7 @@ mod iov_tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -1663,6 +1847,8 @@ mod iov_tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -1683,6 +1869,7 @@ mod iov_tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -1763,6 +1950,7 @@ mod iov_tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -1781,6 +1969,8 @@ mod iov_tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
         };
         let subject = Subject {
             id: "1".into(),
@@ -1798,6 +1988,7 @@ mod iov_tests {
             cens: vec![0; 3],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -1832,6 +2023,8 @@ mod iov_tests {
             kappa_fixed: Vec::new(),
         };
         let model = CompiledModel {
+            frem_config: None,
+            residual_error_eta: None,
             name: "noniov_mu".into(),
             has_conditional_eta_params: false,
             pk_model: PkModel::OneCptIv,
@@ -1864,6 +2057,7 @@ mod iov_tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -1883,6 +2077,7 @@ mod iov_tests {
             endpoints: std::collections::HashMap::new(),
         };
         let subject = Subject {
+            fremtype: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
@@ -2167,6 +2362,16 @@ mod iov_tests {
         };
         assert!(analytical_ad_unsupported(&model).is_some());
         model.scaling = crate::types::ScalingSpec::ScalarScale(1000.0);
+        assert!(analytical_ad_unsupported(&model).is_none());
+
+        // IIV on residual error (#409): forces FD (AD kernels lack the variance
+        // scaling rule).
+        model.residual_error_eta = Some(0);
+        assert_eq!(
+            analytical_ad_unsupported(&model),
+            Some("IIV on residual error (iiv_on_ruv)")
+        );
+        model.residual_error_eta = None;
         assert!(analytical_ad_unsupported(&model).is_none());
     }
 }

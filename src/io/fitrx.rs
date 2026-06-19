@@ -426,6 +426,7 @@ fn method_to_str(m: EstimationMethod) -> &'static str {
         EstimationMethod::Saem => "saem",
         EstimationMethod::Imp => "imp",
         EstimationMethod::Impmap => "impmap",
+        EstimationMethod::Bayes => "bayes",
     }
 }
 
@@ -438,6 +439,7 @@ fn method_from_str(s: &str) -> Result<EstimationMethod, FitrxError> {
         "foce_gn_hybrid" => EstimationMethod::FoceGnHybrid,
         "saem" => EstimationMethod::Saem,
         "imp" => EstimationMethod::Imp,
+        "bayes" => EstimationMethod::Bayes,
         _ => return Err(FitrxError::Corrupt(format!("unknown method {:?}", s))),
     })
 }
@@ -1587,6 +1589,8 @@ fn wire_to_fit_result(
         // .fitrx v1: importance_sampling is not serialised — re-run via
         // `methods = [..., imp]` if the consumer needs the IS LL.
         importance_sampling: None,
+        impmap_trace: None,
+        bayes: None,
         omega_iov,
         kappa_names,
         kappa_fixed,
@@ -1731,6 +1735,7 @@ mod tests {
                 cens: vec![0; n_obs_each],
                 occasions: vec![],
                 dose_occasions: vec![],
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
@@ -1784,6 +1789,8 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            impmap_trace: None,
+            bayes: None,
             omega_iov: None,
             kappa_names: vec![],
             kappa_fixed: vec![],
@@ -1968,6 +1975,24 @@ mod tests {
         let r0 = minimal_fit_result(); // npde_seed defaults to None
         save_fit(&r0, &p, "src\n", &none, SaveFitOptions::default()).unwrap();
         assert_eq!(load_fit(&none).unwrap().fit.npde_seed, None);
+    }
+
+    #[test]
+    fn method_str_roundtrips_every_variant() {
+        // Guards against a new EstimationMethod variant being added to
+        // method_to_str (write) but not method_from_str (read), which silently
+        // breaks .fitrx load for fits produced with that method (e.g. #380's
+        // `bayes`). Exhaustive over the enum so the compiler-style coverage is
+        // enforced at test time.
+        use crate::types::EstimationMethod::*;
+        for m in [Foce, FoceI, FoceGn, FoceGnHybrid, Saem, Imp, Impmap, Bayes] {
+            let s = method_to_str(m);
+            assert_eq!(
+                method_from_str(s).expect("method_from_str must accept method_to_str output"),
+                m,
+                "method round-trip failed for {s:?}"
+            );
+        }
     }
 
     #[test]

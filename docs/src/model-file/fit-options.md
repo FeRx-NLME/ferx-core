@@ -197,37 +197,58 @@ See [SIR documentation](../estimation/sir.md) for details.
 
 ## Importance Sampling (IMP)
 
-The `imp` stage estimates the marginal log-likelihood by Monte-Carlo
-importance sampling, giving a lower-bias `−2 log L` than the FOCE/Laplace
-OFV when subject posteriors of η are non-Gaussian (e.g. sparsely-sampled
-PK). Use it as a final chain stage:
+By **default** `imp` is a Monte-Carlo EM **estimator** (NONMEM `METHOD=IMP`):
+it maximises the importance-sampled marginal likelihood, updating θ/Ω/σ each
+iteration. Set `is_eval_only = true` (NONMEM `EONLY=1`) to instead *evaluate*
+the marginal `−2 log L` at the fixed input parameters — a lower-bias `−2 log L`
+than the FOCE/Laplace OFV when subject posteriors of η are non-Gaussian (e.g.
+sparsely-sampled PK).
+
+> **Behaviour change:** `imp` previously only *evaluated* `−2 log L`. It now
+> estimates by default. Add `is_eval_only = true` to recover the old behaviour.
 
 ```
 [fit_options]
-  method        = [focei, imp]
+  method        = imp            # estimate (NONMEM METHOD=IMP)
+  is_iterations = 200
   is_samples    = 1000
-  is_proposal_df = 5
+  is_averaging  = 50
+  is_proposal_df = 5             # or `normal` for a multivariate-normal proposal
   is_seed       = 12345
 ```
 
+```
+[fit_options]
+  method        = [focei, imp]   # evaluate FOCEI's fit (NONMEM EONLY=1)
+  is_eval_only  = true
+```
+
+> On **rich** data prefer [`impmap`](#impmap-importance_sampling_map) or
+> warm-start with `[focei, imp]`; plain `imp`'s one-iteration-lagged proposal
+> can collapse the ESS on a sharp posterior. See the
+> [IMP documentation](../estimation/importance-sampling.md#rich-data-prefer-impmap-or-warm-start).
+
 | Key | Default | Description |
 |-----|---------|-------------|
+| `is_eval_only` | `false` | `true` ⇒ evaluate `−2 log L` at fixed parameters (NONMEM `EONLY=1`); must be the terminal chain stage. `false` ⇒ estimate (NONMEM `METHOD=IMP`). |
+| `is_iterations` | `200` | MCEM iterations (estimator only). |
+| `is_averaging` | `50` | Terminal iterations averaged into the reported estimate (estimator only). |
 | `is_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |
-| `is_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1). Lower = heavier tails. |
-| `is_seed` | `42` | RNG seed. Same seed → identical `−2 log L`. |
+| `is_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1), or `normal`/`mvn` for a multivariate-normal proposal. Lower = heavier tails. |
+| `is_seed` | `12345` | RNG seed. Same seed → identical result. |
 | `is_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction get flagged in the result. Set `0` to silence. |
 
 See [Importance Sampling documentation](../estimation/importance-sampling.md)
-for the algorithm, IOV caveats, and tuning guidance.
+for the algorithm, the NONMEM mapping, IOV caveats, and tuning guidance.
 
 ## IMPMAP (`importance_sampling_map`)
 
-Unlike `imp` (which only *evaluates* the marginal likelihood), `impmap` is a
-full **estimator** — a Monte-Carlo EM loop equivalent to NONMEM
-`METHOD=IMPMAP`. Each iteration re-centers a per-subject importance-sampling
-proposal at the freshly-computed conditional mode (MAP) and updates θ/Ω/σ from
-the importance-weighted posterior moments. It runs standalone or as a chain
-stage:
+Like the estimating `imp`, `impmap` is a Monte-Carlo EM **estimator** —
+equivalent to NONMEM `METHOD=IMPMAP`. The difference is the proposal: `impmap`
+re-centers at the freshly-computed conditional mode (MAP) **every** iteration
+(robust on rich data), whereas `imp` re-centers from the previous iteration's
+sample moments (cheaper, but fragile on rich data). Both update θ/Ω/σ from the
+importance-weighted posterior moments. It runs standalone or as a chain stage:
 
 ```
 [fit_options]
@@ -246,6 +267,11 @@ stage:
 | `impmap_averaging` | `50` | Final iterations whose parameters are averaged into the reported estimate (Monte-Carlo variance reduction). |
 | `impmap_seed` | `12345` | RNG seed. Same seed → identical estimates. |
 | `impmap_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction are flagged as poorly sampled. |
+| `impmap_trace` | `false` | When `true`, collect per-iteration parameter values into `FitResult.impmap_trace` — analogous to NONMEM `.ext` output for traceplots. |
+| `impmap_mceta` | `0` | Number of additional random starting points for per-subject MAP optimization (analogous to NONMEM `MCETA`). Each start draws η from N(0, Ω). The start with the lowest individual NLL wins. `0` = single warm-start (default). `3` is a good choice for high-dimensional models (e.g. FREM with ≥ 5 ETAs). |
+| `impmap_sobol` | `false` | Use Sobol quasi-random sequences (with Cranley-Patterson randomization) for IS draws instead of pseudo-random. Gives more uniform posterior coverage with fewer samples. Only applies to MVN proposals (`impmap_proposal_df = normal`); Student-t falls back to pseudo-random. |
+| `iscale_min` | `0.1` | Minimum proposal scaling factor for adaptive IS (NONMEM `ISCALE_MIN`). The IS proposal covariance is multiplied by `s²` where `s` is chosen from `[iscale_min, iscale_max]` to maximise per-subject ESS. Set both to `1.0` to disable. |
+| `iscale_max` | `10.0` | Maximum proposal scaling factor (NONMEM `ISCALE_MAX`). |
 
 `impmap` reuses `inner_maxiter` / `inner_tol` for the per-iteration MAP step.
 Inter-occasion variability (`[iov]` / `kappa`) and SDE (`[diffusion]`) models

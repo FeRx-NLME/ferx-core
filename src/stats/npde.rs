@@ -110,9 +110,14 @@ pub fn compute_npde_npd(
                 let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
                 let ipreds = model_preds(model, subject, &pk, &params.theta, &eta_slice);
 
+                // IIV on residual error (#409): the simulated eta draw includes
+                // the residual-error eta, so scale the residual variance by
+                // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
+                let ruv_scale = model.residual_var_scale(&eta_slice);
                 for (j, &ip) in ipreds.iter().enumerate() {
                     let var =
-                        model.residual_variance_at(subject.obs_cmts[j], ip, &params.sigma.values);
+                        model.residual_variance_at(subject.obs_cmts[j], ip, &params.sigma.values)
+                            * ruv_scale;
                     let eps: f64 = normal.sample(&mut rng);
                     sims[(j, k)] = ip + var.sqrt() * eps;
                 }

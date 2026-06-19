@@ -126,9 +126,11 @@ impl DoseEvent {
     /// machinery downstream (so `F` is applied exactly once — `F·amt` delivered
     /// over `D`, matching NONMEM's `F·RATE` for an infusion).
     ///
-    /// f64-only / FD-only by construction: modeled doses are ODE-only (analytical
-    /// support is a follow-up) and ODE has no autodiff path, so no `Dual` twin is
-    /// needed. A transient `D ≤ 0` mid-search is clamped to [`Self::DURATION_FLOOR`].
+    /// f64-only / FD-only by construction. The ODE engine has no autodiff path,
+    /// and the analytical engine routes any subject with a modeled dose to FD
+    /// (see `resolve_gradient_method`, #394) precisely because resolving a duration
+    /// here would drop its `∂duration/∂η`, so no `Dual` twin is ever needed. A
+    /// transient `D ≤ 0` mid-search is clamped to [`Self::DURATION_FLOOR`].
     pub(crate) fn resolve_rate(&self, attr_map: &DoseAttrMap, params: &[f64]) -> DoseEvent {
         match self.rate_mode {
             RateMode::Fixed => self.clone(),
@@ -315,6 +317,14 @@ impl DoseAttrMap {
     /// Record that compartment `cmt`'s `attr` is held in PkParams `slot`.
     pub fn insert(&mut self, attr: DoseAttr, cmt: usize, slot: usize) {
         self.indexed.insert((attr, cmt), slot);
+    }
+
+    /// `true` when no compartment-indexed attribute is recorded — the common
+    /// case (bare-`F`/`lagtime` model, no `D{cmt}`). Lets the dose-resolution
+    /// step short-circuit before scanning a subject's doses: with no indexed
+    /// slot there can be no modeled-`RATE` dose to resolve.
+    pub fn is_empty(&self) -> bool {
+        self.indexed.is_empty()
     }
 
     /// The PkParams slot holding `attr` for compartment `cmt`, if the model
@@ -534,6 +544,10 @@ pub struct Subject {
     /// Occasion index per dose event (parallel to `doses`).
     /// Empty when no IOV column is present in the data.
     pub dose_occasions: Vec<u32>,
+    /// FREM observation type per observation (parallel to `obs_times`).
+    /// 0 = PK observation, 100/200/300/... = covariate observation.
+    /// Empty when FREMTYPE column is absent from the data.
+    pub fremtype: Vec<u16>,
     /// Non-Gaussian observation records (TTE events, discrete states, counts).
     /// Empty for all-Gaussian subjects. Populated by the data reader when the
     /// model declares a non-Gaussian endpoint for the row's CMT.
@@ -1073,6 +1087,31 @@ impl PkModel {
             PkModel::TwoCptOral => "two_cpt_oral",
             PkModel::ThreeCptIv => "three_cpt_iv",
             PkModel::ThreeCptOral => "three_cpt_oral",
+        }
+    }
+
+    /// The (1-based) compartments the **analytical** engine can deliver a
+    /// zero-order infusion into — i.e. the only compartments a modeled infusion
+    /// *duration* `D{cmt}` (`RATE=-2`, #324/#394) may target. Single source of
+    /// truth, kept in lockstep with the infusion-routing `match (pk_model, d.cmt)`
+    /// in [`crate::pk::event_driven`] (and the equivalent superposition dispatch):
+    /// the **central** compartment for every model, plus the **peripheral**
+    /// compartment(s) for the 2-/3-cpt IV models, and — since #400 — the oral
+    /// **depot** (cmt 1), a zero-order release into the depot followed by
+    /// first-order `ka` absorption into central. Notably this still EXCLUDES oral
+    /// peripherals, which the closed forms cannot infuse into. A `D{cmt}` outside
+    /// this set is rejected at parse time rather than silently mis-routed (no-TV
+    /// path) or panicking (event-driven path).
+    pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
+        match self {
+            PkModel::OneCptIv => &[1],
+            // Oral: cmt 1 = depot (zero-order-into-depot, #400), cmt 2 = central
+            // (depot-bypassing infusion).
+            PkModel::OneCptOral => &[1, 2],
+            PkModel::TwoCptIv => &[1, 2],
+            PkModel::TwoCptOral => &[1, 2],
+            PkModel::ThreeCptIv => &[1, 2, 3],
+            PkModel::ThreeCptOral => &[1, 2],
         }
     }
 
@@ -1891,6 +1930,16 @@ pub struct CompiledModel {
     /// analytical PK equations. The `pk_param_fn` output is flattened and passed
     /// to the ODE RHS function as the parameter vector.
     pub ode_spec: Option<crate::ode::OdeSpec>,
+    /// Compartment-indexed modeled-dose attributes (`D{cmt}` for `RATE=-2`) for
+    /// **analytical** PK models (#324, #394). ODE models carry their own map on
+    /// [`crate::ode::OdeSpec::dose_attr_map`] and leave this `Default` (empty) —
+    /// the analytical dispatch paths read this field, the ODE paths read the
+    /// `OdeSpec` one. Empty for the common analytical model with no `RATE=-2`
+    /// dosing; populated by the parser when a `D{cmt}` individual parameter is
+    /// declared. Used by [`crate::pk::compute_predictions`] callers to resolve
+    /// modeled-duration doses to a concrete `rate`/`duration` before the
+    /// closed-form math (mirrors the ODE `resolve_subject_doses` step).
+    pub dose_attr_map: DoseAttrMap,
     /// Index of the first diffusion theta in the theta vector, and the parallel
     /// mapping from diffusion-theta index to ODE state index.
     /// `None` when no `[diffusion]` block is present.
@@ -1976,6 +2025,33 @@ pub struct CompiledModel {
     /// Keyed by the CMT value declared in `[event_model]` / future blocks.
     #[cfg(feature = "survival")]
     pub endpoints: HashMap<usize, EndpointLikelihood>,
+    /// FREM configuration. When `Some`, the model uses FREMTYPE-based
+    /// observation dispatch: covariate pseudo-observations use individual
+    /// parameter values as predictions and a near-zero additive sigma.
+    pub frem_config: Option<FremConfig>,
+    /// IIV on residual error (NONMEM `Y = IPRED + EPS*EXP(ETA)`). When `Some(k)`,
+    /// eta index `k` is a random effect that scales the residual standard
+    /// deviation per subject: the residual variance for every observation is
+    /// multiplied by `exp(2*eta[k])`. The eta is declared as an ordinary
+    /// `omega` in `[parameters]` and wired here via `iiv_on_ruv = NAME` in
+    /// `[error_model]`; it is NOT referenced by any individual parameter, so it
+    /// carries no `EtaParamInfo` entry and the PK closure ignores it. See #409.
+    pub residual_error_eta: Option<usize>,
+}
+
+/// FREM (Full Random Effects Model) configuration.
+///
+/// Maps FREMTYPE observation-type values to (theta_index, eta_index) pairs
+/// so the likelihood can compute covariate pseudo-observation predictions
+/// as `theta[theta_idx] + eta[eta_idx]` and use a near-zero additive sigma.
+#[derive(Debug, Clone)]
+pub struct FremConfig {
+    /// Maps FREMTYPE value (100, 200, ...) → (theta_index, eta_index).
+    /// For FREMTYPE observations, the prediction is
+    /// `theta[theta_idx] + eta[eta_idx]`.
+    pub fremtype_to_indices: HashMap<u16, (usize, usize)>,
+    /// Index into `sigma_values` for the covariate error sigma (EPSCOV).
+    pub covariate_sigma_index: usize,
 }
 
 /// Inner-loop (per-subject EBE) gradient method.
@@ -2035,6 +2111,18 @@ impl CompiledModel {
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
+    }
+
+    /// The compartment-indexed dose-attribute map (`D{cmt}` for `RATE=-2`, …) for
+    /// **this model's engine**: the `OdeSpec`'s map for ODE models, the analytical
+    /// `dose_attr_map` field otherwise. Single source of truth for "which map
+    /// applies", so a caller cannot accidentally read the empty analytical default
+    /// on an ODE model (or vice versa) and silently resolve nothing (#383/#394).
+    pub(crate) fn active_dose_attr_map(&self) -> &DoseAttrMap {
+        match &self.ode_spec {
+            Some(ode) => &ode.dose_attr_map,
+            None => &self.dose_attr_map,
+        }
     }
 
     /// Copy the configured ODE solver tolerances from `opts` onto this model's
@@ -2117,6 +2205,27 @@ impl CompiledModel {
     /// that already hold the `&CompiledModel`.
     pub fn residual_variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         self.error_spec.variance_at(cmt, f_pred, sigma)
+    }
+
+    /// Multiplicative factor applied to the residual *variance* for a subject
+    /// whose random-effect vector is `eta`, from the IIV-on-RUV term
+    /// (`Y = IPRED + EPS*EXP(ETA)`). Returns `exp(2*eta[k])` when
+    /// `residual_error_eta == Some(k)` and `k` is in range, else `1.0`.
+    ///
+    /// Because every residual-error model writes the variance as
+    /// `(scale·σ)²` terms summed, multiplying the whole variance by
+    /// `exp(2*eta_k)` is exactly equivalent to scaling the residual SD by
+    /// `exp(eta_k)` — i.e. `EPS·EXP(ETA)` — for additive, proportional, and
+    /// combined alike.
+    #[inline]
+    pub fn residual_var_scale(&self, eta: &[f64]) -> f64 {
+        match self.residual_error_eta {
+            Some(k) => match eta.get(k) {
+                Some(&e) => (2.0 * e).exp(),
+                None => 1.0,
+            },
+            None => 1.0,
+        }
     }
 
     /// Canonical compartment names for analytical models, used in `[derived]` expressions.
@@ -2346,6 +2455,88 @@ pub struct ImportanceSamplingResult {
     pub ess_median: f64,
     /// Treatment of per-occasion kappa random effects.  See [`KappaTreatment`].
     pub kappa_treatment: KappaTreatment,
+}
+
+/// One row of the IMPMAP per-iteration parameter trace.
+///
+/// Analogous to one line in NONMEM's `.ext` file for `METHOD=IMPMAP`.
+/// Positive `iteration` values are EM iterations; special negative values
+/// mark the final (averaged) estimate and standard errors.
+#[derive(Debug, Clone)]
+pub struct ImpmapTraceRow {
+    /// EM iteration number (1-based). Special values:
+    /// `-1_000_000_000` = final averaged estimate,
+    /// `-1_000_000_001` = standard errors (when covariance step ran).
+    pub iteration: i64,
+    pub theta: Vec<f64>,
+    /// Lower triangle of the omega matrix, row-major: `(0,0), (1,0), (1,1), …`
+    pub omega_lower_tri: Vec<f64>,
+    pub sigma: Vec<f64>,
+    /// Objective function value (−2·log-likelihood from importance sampling).
+    pub ofv: f64,
+}
+
+/// Per-iteration parameter trace from IMPMAP, analogous to NONMEM `.ext`.
+///
+/// Surfaced on `FitResult.impmap_trace` when the final estimating stage is
+/// IMPMAP. Column names follow NONMEM convention (`THETA1`, `OMEGA(1,1)`, …).
+#[derive(Debug, Clone, Default)]
+pub struct ImpmapTrace {
+    pub rows: Vec<ImpmapTraceRow>,
+    pub theta_names: Vec<String>,
+    /// e.g. `"OMEGA(1,1)"`, `"OMEGA(2,1)"`, `"OMEGA(2,2)"`, …
+    pub omega_names: Vec<String>,
+    pub sigma_names: Vec<String>,
+}
+
+/// Posterior summary for a single scalar parameter, computed across all
+/// post-warmup, post-thinning draws from every chain.
+#[derive(Debug, Clone)]
+pub struct PosteriorSummary {
+    /// Parameter name (e.g. `TVCL`, `OMEGA(1,1)`, `SIGMA(1)`).
+    pub name: String,
+    pub mean: f64,
+    pub sd: f64,
+    /// 2.5% posterior quantile (lower 95% credible bound).
+    pub q025: f64,
+    pub median: f64,
+    /// 97.5% posterior quantile (upper 95% credible bound).
+    pub q975: f64,
+    /// Split-R̂ convergence diagnostic. Values near 1.0 indicate the chains
+    /// have mixed; `> 1.01` flags non-convergence.
+    pub rhat: f64,
+    /// Bulk effective sample size (mixing of the centre of the distribution).
+    pub ess_bulk: f64,
+    /// Tail effective sample size (mixing of the 5%/95% quantiles).
+    pub ess_tail: f64,
+    /// Monte-Carlo standard error of the posterior mean.
+    pub mcse: f64,
+}
+
+/// Result of a full MCMC Bayesian fit (`EstimationMethod::Bayes`). Surfaced on
+/// [`FitResult::bayes`]. Carries posterior summaries + convergence diagnostics
+/// instead of a single point estimate; the optimizer-style fields on
+/// `FitResult` (theta/omega/sigma) are populated with the posterior means so
+/// downstream consumers that expect a point estimate still work.
+#[derive(Debug, Clone)]
+pub struct BayesResult {
+    /// Per-parameter posterior summaries, ordered θ, then Ω entries, then Σ.
+    pub summaries: Vec<PosteriorSummary>,
+    /// Number of independent chains run.
+    pub n_chains: usize,
+    /// Warmup sweeps per chain (discarded from the posterior).
+    pub n_warmup: usize,
+    /// Retained sampling draws per chain (post-warmup, post-thinning).
+    pub n_draws_per_chain: usize,
+    /// Total divergent HMC transitions across all chains. Non-zero counts
+    /// indicate posterior geometry the sampler could not traverse reliably.
+    pub n_divergent: usize,
+    /// Worst (largest) split-R̂ across all parameters; convenience for a
+    /// single-number convergence check.
+    pub max_rhat: f64,
+    /// Raw posterior draws, row-major `[chain][draw][param]` flattened, retained
+    /// only when the caller requests them (large). `None` otherwise.
+    pub draws: Option<Vec<f64>>,
 }
 
 /// Outcome of the post-estimation covariance step.
@@ -2580,6 +2771,12 @@ pub struct FitResult {
     pub error_model: ErrorModel,
     pub covariance_matrix: Option<DMatrix<f64>>,
     pub se_theta: Option<Vec<f64>>,
+    /// Standard errors for omega elements.
+    ///
+    /// - **Diagonal omega**: length = n_eta, one SE per variance.
+    /// - **Block omega**: length = n_eta·(n_eta+1)/2, column-major lower
+    ///   triangle (same layout as the packed Cholesky). Use
+    ///   [`omega_se_at`] to index by (i, j).
     pub se_omega: Option<Vec<f64>>,
     pub se_sigma: Option<Vec<f64>>,
     /// FIX flags carried through from the model so the output layer can
@@ -2624,6 +2821,12 @@ pub struct FitResult {
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
     pub importance_sampling: Option<ImportanceSamplingResult>,
+    /// Per-iteration IMPMAP parameter trace, analogous to NONMEM `.ext` file
+    /// output. `Some` when the final estimating stage was IMPMAP.
+    pub impmap_trace: Option<ImpmapTrace>,
+    /// Full MCMC Bayesian result. `Some` when `method = bayes` was run;
+    /// carries posterior summaries + convergence diagnostics. See [`BayesResult`].
+    pub bayes: Option<BayesResult>,
     // IOV results (present when kappa declarations exist in the model)
     pub omega_iov: Option<DMatrix<f64>>,
     pub kappa_names: Vec<String>,
@@ -2835,6 +3038,34 @@ pub struct FitResult {
     pub exclusions: Option<ExclusionSummary>,
 }
 
+/// Look up the SE for omega element (i, j) from the `se_omega` vector.
+///
+/// `se_omega` may be diagonal-only (length = n_eta) or full lower-triangle
+/// (length = n_eta·(n_eta+1)/2, column-major).  Returns `None` when
+/// `se_omega` is `None`, the index is out of bounds, or the format is
+/// diagonal and an off-diagonal element is requested.
+pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize) -> Option<f64> {
+    let se = se_omega.as_ref()?;
+    let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
+    let n_lt = n_eta * (n_eta + 1) / 2;
+    if se.len() == n_lt && n_lt != n_eta {
+        // Full lower-triangle format (block omega).
+        let col_offset = if c == 0 {
+            0
+        } else {
+            c * n_eta - c * (c - 1) / 2
+        };
+        se.get(col_offset + (r - c)).copied()
+    } else {
+        // Diagonal-only format: only (i, i) is available.
+        if r == c {
+            se.get(r).copied()
+        } else {
+            None
+        }
+    }
+}
+
 /// Minimal per-NN metadata carried on `FitResult` so output writers can
 /// summarise NN weights without re-walking `theta_names` to detect them.
 #[cfg(feature = "nn")]
@@ -2964,6 +3195,22 @@ pub struct FitOptions {
     /// A positive value (e.g. `3`) enables HMC; requires the `autodiff`
     /// feature and an analytical PK model — falls back to MH otherwise.
     pub saem_n_leapfrog: usize,
+    // Bayes (Gibbs-within-HMC) options — see EstimationMethod::Bayes.
+    /// Number of warmup (burn-in + adaptation) sweeps per chain, discarded from
+    /// the reported posterior. HMC step size / leapfrog count adapt during this
+    /// phase. Default 1000.
+    pub bayes_warmup: usize,
+    /// Number of post-warmup sampling sweeps retained per chain (before
+    /// thinning). Default 1000.
+    pub bayes_iters: usize,
+    /// Number of independent chains (run with distinct seeds; used for
+    /// split-R̂ / cross-chain diagnostics). Default 4.
+    pub bayes_chains: usize,
+    /// Keep every `bayes_thin`-th sampling draw. `1` (default) keeps all draws.
+    pub bayes_thin: usize,
+    /// Base RNG seed for the Bayes sampler. Chain `c` uses a seed derived from
+    /// this. `None` draws a nondeterministic seed.
+    pub bayes_seed: Option<u64>,
     /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
     pub gn_lambda: f64,
     // SIR options
@@ -2981,15 +3228,22 @@ pub struct FitOptions {
     /// (omega variances, constrained thetas). Default 5.0 follows Dosne (2017).
     /// Set to a large value (e.g. 100.0) to recover near-normal behaviour.
     pub sir_df: f64,
-    // Importance-sampling marginal log-likelihood options (consumed by the
-    // `Imp` chain stage; ignored otherwise). The Imp stage estimates
-    // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` by Monte Carlo with a
-    // Student-t proposal centred on each subject's EBE.
+    // Importance-sampling options (consumed by the `Imp` chain stage; ignored
+    // otherwise). By default `imp` is a Monte-Carlo EM **estimator** matching
+    // NONMEM `METHOD=IMP`: the conditional mode + first-order variance are found
+    // only on the first iteration, then the proposal is re-centered from the
+    // previous iteration's importance-sample mean/covariance, and θ/Ω/σ are
+    // updated from the importance-weighted posterior moments each iteration. Set
+    // `is_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
+    // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` at the fixed input parameters
+    // without updating them.
     /// Number of importance samples per subject. Default 1000. Recommended
     /// 2000–5000 for publication-quality MC SE (cost scales linearly).
     pub is_samples: usize,
     /// Degrees of freedom for the Student-t proposal. Default 5.0 (heavy-tailed
-    /// — robust to mild proposal misspecification). Must be ≥ 1.
+    /// — robust to mild proposal misspecification). Must be ≥ 1. The token
+    /// `normal` (parsed to `f64::INFINITY`) selects a multivariate-normal
+    /// proposal.
     pub is_proposal_df: f64,
     /// RNG seed for the IS sampling. `None` falls back to a fixed default so
     /// runs are reproducible across invocations.
@@ -2998,6 +3252,18 @@ pub struct FitOptions {
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
     pub is_low_ess_threshold: f64,
+    /// Number of MCEM iterations for the estimating `imp` path (ignored when
+    /// `is_eval_only`). Default 200.
+    pub is_iterations: usize,
+    /// Number of terminal iterations whose parameters are averaged to form the
+    /// reported estimate (Monte-Carlo variance reduction). Default 50. Ignored
+    /// when `is_eval_only`.
+    pub is_averaging: usize,
+    /// When `true`, `imp` evaluates `−2 log L` at the fixed input parameters and
+    /// does not estimate (NONMEM `IMP EONLY=1`); it must then be the terminal
+    /// chain stage. When `false` (default), `imp` is an MCEM estimator
+    /// (NONMEM `METHOD=IMP`).
+    pub is_eval_only: bool,
     // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
     // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
     // loop: each iteration re-centers a per-subject importance-sampling proposal
@@ -3021,6 +3287,22 @@ pub struct FitOptions {
     /// Subjects whose normalized effective sample size (ESS / K) falls below
     /// this fraction are flagged as poorly-sampled. Default 0.1.
     pub impmap_low_ess_threshold: f64,
+    /// When `true`, IMPMAP collects per-iteration parameter values into
+    /// `FitResult.impmap_trace` (analogous to NONMEM `.ext` output). Default `false`.
+    pub impmap_trace: bool,
+    /// Number of additional random starting points for per-subject MAP
+    /// (analogous to NONMEM MCETA). 0 = single start (current behaviour).
+    pub impmap_mceta: usize,
+    /// Use Sobol quasi-random sequences for IS draws instead of pseudo-random.
+    /// Only applies to MVN proposals (impmap_proposal_df = normal). Default false.
+    pub impmap_sobol: bool,
+    /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
+    /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
+    /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
+    pub iscale_min: f64,
+    /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
+    /// Default 10.0.
+    pub iscale_max: f64,
     /// How BLOQ (Below Limit of Quantification) observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -3177,6 +3459,11 @@ pub struct FitOptions {
     /// Subject IDs to exclude wholesale (syntactic sugar for `ignore = ID == X`).
     /// Compared as strings against `Subject::id`.
     pub ignore_subjects: Vec<String>,
+    /// FREM prediction map: `"TV_WT/ETA_WT_FREM:100, TV_AGE/ETA_AGE_FREM:200"`.
+    /// Maps theta/eta pairs to FREMTYPE values.
+    pub frem_predictions: Option<String>,
+    /// FREM covariate sigma name (e.g. "EPSCOV").
+    pub frem_sigma: Option<String>,
 }
 
 impl Default for FitOptions {
@@ -3240,6 +3527,11 @@ impl Default for FitOptions {
             saem_omega_burnin: 20,
             saem_seed: None,
             saem_n_leapfrog: 0,
+            bayes_warmup: 1000,
+            bayes_iters: 1000,
+            bayes_chains: 4,
+            bayes_thin: 1,
+            bayes_seed: None,
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -3251,12 +3543,20 @@ impl Default for FitOptions {
             is_proposal_df: 5.0,
             is_seed: None,
             is_low_ess_threshold: 0.1,
+            is_iterations: 200,
+            is_averaging: 50,
+            is_eval_only: false,
             impmap_iterations: 200,
             impmap_samples: 300,
             impmap_proposal_df: f64::INFINITY,
             impmap_seed: None,
             impmap_averaging: 50,
             impmap_low_ess_threshold: 0.1,
+            impmap_trace: false,
+            impmap_mceta: 0,
+            impmap_sobol: false,
+            iscale_min: 0.1,
+            iscale_max: 10.0,
             bloq_method: BloqMethod::Drop,
             npde_nsim: 0,
             npde_seed: None,
@@ -3281,6 +3581,8 @@ impl Default for FitOptions {
             ignore_exprs: Vec::new(),
             accept_exprs: Vec::new(),
             ignore_subjects: Vec::new(),
+            frem_predictions: None,
+            frem_sigma: None,
         }
     }
 }
@@ -3402,19 +3704,36 @@ pub enum EstimationMethod {
     FoceGn,
     FoceGnHybrid,
     Saem,
-    /// Importance-sampling marginal log-likelihood. Not an estimator — does not
-    /// update parameters. Must follow another stage in `methods` (consumes that
-    /// stage's params + EBEs + per-subject Hessians as the proposal centre /
-    /// scale) and is typically terminal. Reports `−2 log L_IS` on
-    /// `FitResult.importance_sampling`, distinct from the Laplace OFV on `ofv`.
+    /// Importance Sampling (NONMEM `METHOD=IMP`). By **default an estimator**: a
+    /// Monte-Carlo EM loop that finds each subject's conditional mode and
+    /// first-order variance only on the first iteration, then re-centers the
+    /// importance-sampling proposal from the previous iteration's
+    /// importance-sample mean/covariance, updating θ/Ω/σ from the
+    /// importance-weighted posterior moments each iteration. Reports the IS
+    /// `−2 log L` on `FitResult.importance_sampling` and a Laplace OFV on `ofv`.
+    ///
+    /// With `is_eval_only = true` (NONMEM `IMP EONLY=1`) it instead *evaluates*
+    /// `−2 log L_IS` at the fixed input parameters without updating them; in that
+    /// mode it must be the terminal chain stage (it consumes the prior stage's
+    /// params + EBEs + per-subject Hessians, or evaluates at the initial
+    /// parameters when standalone). Contrast [`Impmap`](Self::Impmap), which
+    /// re-evaluates the mode/variance *every* iteration (more robust, costlier).
     Imp,
     /// Importance Sampling assisted by Mode A Posteriori (NONMEM `METHOD=IMPMAP`).
-    /// Unlike [`Imp`](Self::Imp), this *is* an estimator: a Monte-Carlo EM loop
-    /// whose E-step re-evaluates each subject's conditional mode and first-order
-    /// variance every iteration (as in FOCE/ITS) to center a multivariate-normal
-    /// importance-sampling proposal, and whose M-step updates θ/Ω/σ from the
+    /// Like estimating [`Imp`](Self::Imp) this *is* an estimator, but its E-step
+    /// re-evaluates each subject's conditional mode and first-order variance
+    /// *every* iteration (as in FOCE/ITS) to center a multivariate-normal
+    /// importance-sampling proposal — more robust than `Imp` on high-dimensional,
+    /// rich-data problems — and its M-step updates θ/Ω/σ from the
     /// importance-weighted posterior moments.
     Impmap,
+    /// Full MCMC Bayesian estimation (Path A — Gibbs-within-HMC, NONMEM
+    /// `METHOD=BAYES` parity). Draws from the joint posterior
+    /// `p(θ, Ω, Σ, {ηᵢ} | y)` by alternating a per-subject η block (reusing the
+    /// SAEM HMC / MH kernel) with conjugate population draws (Ω: inverse-Wishart,
+    /// σ²: inverse-gamma, mu-referenced θ: normal). Reports posterior summaries +
+    /// convergence diagnostics on `FitResult.bayes`, not a point estimate.
+    Bayes,
 }
 
 impl EstimationMethod {
@@ -3427,6 +3746,7 @@ impl EstimationMethod {
             EstimationMethod::Saem => "SAEM",
             EstimationMethod::Imp => "IMP",
             EstimationMethod::Impmap => "IMPMAP",
+            EstimationMethod::Bayes => "BAYES",
         }
     }
 }
@@ -3544,6 +3864,8 @@ pub fn framework_keys() -> &'static [&'static str] {
         "max_unconverged_frac",
         "min_obs_for_convergence_check",
         "inits_from_nca",
+        "frem_predictions",
+        "frem_sigma",
     ]
 }
 
@@ -3595,6 +3917,13 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "is_proposal_df",
             "is_seed",
             "is_low_ess_threshold",
+            "is_iterations",
+            "is_averaging",
+            "is_eval_only",
+            "inner_maxiter",
+            "inner_tol",
+            "iscale_min",
+            "iscale_max",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -3605,6 +3934,22 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_seed",
             "impmap_averaging",
             "impmap_low_ess_threshold",
+            "impmap_trace",
+            "impmap_mceta",
+            "impmap_sobol",
+            "iscale_min",
+            "iscale_max",
+        ],
+        EstimationMethod::Bayes => &[
+            "inner_maxiter",
+            "inner_tol",
+            "n_mh_steps",
+            "n_leapfrog",
+            "bayes_warmup",
+            "bayes_iters",
+            "bayes_chains",
+            "bayes_thin",
+            "bayes_seed",
         ],
     }
 }
@@ -3722,6 +4067,7 @@ pub(crate) mod test_helpers {
             } else {
                 None
             },
+            dose_attr_map: Default::default(),
             bloq_method: BloqMethod::Drop,
             referenced_covariates: vec![],
             gradient_method,
@@ -3738,6 +4084,8 @@ pub(crate) mod test_helpers {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
         }
     }
 }
@@ -4572,6 +4920,7 @@ mod tests {
             cens: Vec::new(),
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         }

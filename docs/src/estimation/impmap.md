@@ -7,9 +7,13 @@ estimator**, equivalent to NONMEM `$EST METHOD=IMPMAP`. It estimates the
 population parameters θ/Ω/σ by maximizing the importance-sampled marginal
 likelihood.
 
-It is the estimating counterpart to the [`imp`](importance-sampling.md) stage:
-`imp` only *evaluates* `−2 log L` at fixed parameters, whereas `impmap` *updates*
-the parameters each iteration.
+Both [`imp`](importance-sampling.md) and `impmap` are MCEM estimators; they
+differ only in how the proposal is re-centered. `impmap` re-derives each
+subject's conditional mode and first-order variance **every** iteration (robust
+on rich data), whereas `imp` re-centers from the previous iteration's sample
+moments after the first iteration (cheaper, but can stall on rich data).
+`imp` can also run in evaluation-only mode (`is_eval_only = true`), which
+`impmap` has no equivalent of.
 
 > **NONMEM's description.** *"Sometimes for highly dimensioned PK/PD problems
 > with very rich data the importance sampling method does not advance the
@@ -122,6 +126,25 @@ cross-engine margin. This comparison is asserted by the gated
 companion `impmap_converges_to_focei_on_warfarin` test checks agreement with
 ferx's own FOCEI.
 
+## Multi-start MAP (`impmap_mceta`)
+
+In high-dimensional models (e.g. FREM with many covariates, ≥ 5 ETAs) the
+per-subject MAP optimization can converge to a local mode, degrading
+importance-sampling efficiency (low ESS) and biasing the M-step. The
+`impmap_mceta` option (analogous to NONMEM `MCETA`) adds random starting
+points drawn from N(0, Ω) and keeps the start with the lowest individual NLL:
+
+```
+[fit_options]
+  method        = impmap
+  impmap_mceta  = 3       # 1 warm-start + 3 random starts per subject
+```
+
+The default is `0` (single warm-start, matching previous behaviour).
+`impmap_mceta = 3` is a good choice for FREM models. The cost is roughly
+`(1 + mceta) ×` the MAP step per iteration, but since E-step B (IS draws)
+dominates, the total wall-time increase is typically 15–40%.
+
 ## Cost
 
 Per iteration ≈ one MAP inner loop (parallel over subjects) plus
@@ -139,7 +162,8 @@ evaluation. Everything is parallelized over subjects via the shared Rayon pool.
 
 ## See also
 
-- [Importance Sampling (IMP)](importance-sampling.md) — the evaluation-only
-  marginal-likelihood stage that shares IMPMAP's per-subject IS kernel.
+- [Importance Sampling (IMP)](importance-sampling.md) — the sample-moment
+  re-centered sibling estimator (and its evaluation-only mode) that shares
+  IMPMAP's per-subject IS kernel and M-step.
 - [SAEM](saem.md) — the other sampling-based estimator; a common warm-start
   (`methods = [saem, impmap]`).

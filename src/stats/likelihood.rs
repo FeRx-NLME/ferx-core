@@ -149,9 +149,30 @@ pub fn individual_nll_into_with_schedule(
     } else {
         Vec::new()
     };
+    // IIV on residual error: per-subject scale on the residual *variance*
+    // (`EPS·EXP(ETA)` → V·exp(2·η_ruv)). 1.0 when no `iiv_on_ruv` is set.
+    // Does not touch FREM covariate pseudo-observations (handled below before
+    // this factor is applied) or the EKF process noise `p_obs`.
+    let ruv_scale = model.residual_var_scale(eta);
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        let v_resid = model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values);
+        // FREM dispatch: covariate pseudo-observations use theta+eta as
+        // prediction and a near-zero additive sigma.
+        let fremtype_val = subject.fremtype.get(j).copied().unwrap_or(0);
+        if fremtype_val > 0 {
+            if let Some(ref fc) = model.frem_config {
+                if let Some(&(theta_idx, eta_idx)) = fc.fremtype_to_indices.get(&fremtype_val) {
+                    let frem_pred = theta[theta_idx] + eta[eta_idx];
+                    let frem_sigma = sigma_values[fc.covariate_sigma_index];
+                    let frem_v = (frem_sigma * frem_sigma).max(1e-12);
+                    let resid = y - frem_pred;
+                    data_ll += resid * resid / frem_v + frem_v.ln();
+                    continue;
+                }
+            }
+        }
+        let v_resid =
+            model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values) * ruv_scale;
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if is_m3_bloq(model, subject, j) {
             // y carries LLOQ on CENS=1 rows.
@@ -223,12 +244,21 @@ pub(crate) fn obs_nll_subject_into(
 ) -> f64 {
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
     let preds = pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+    // FREM covariate rows use EPSCOV, not the PK residual error (see
+    // build_frem_r_override); FREM covariate rows are never BLOQ.
+    let frem_ov =
+        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
+    // IIV on residual error: scale the PK residual variance by exp(2·η_ruv).
+    // FREM covariate rows keep their own (unscaled) EPSCOV variance.
+    let ruv_scale = model.residual_var_scale(eta);
     let mut nll = 0.0;
     for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let f = f.max(1e-12);
-        let v = model
-            .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
-            .max(1e-12);
+        let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
+            Some(vv) => vv.max(1e-12),
+            None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale)
+                .max(1e-12),
+        };
         if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
             let z = (y - f) / v.sqrt();
             nll += -crate::stats::special::log_normal_cdf(z);
@@ -351,6 +381,19 @@ fn omega_log_det(omega: &OmegaMatrix) -> f64 {
 /// `log Φ(·)` BLOQ term produces inconsistent OFVs near the LLOQ boundary, so we
 /// promote the whole subject to FOCEI — which is what NONMEM LAPLACE+M3 does in
 /// practice.
+///
+/// Multiplicative factor on the residual variance from an IIV-on-RUV eta
+/// (`Y = IPRED + EPS·EXP(ETA)`): `exp(2·eta[k])` for `Some(k)` in range, else
+/// `1.0`. Mirrors [`CompiledModel::residual_var_scale`] for call sites that
+/// hold the eta slice and the index but not the `&CompiledModel`.
+#[inline]
+pub(crate) fn ruv_scale_from(eta: &[f64], residual_error_eta: Option<usize>) -> f64 {
+    match residual_error_eta {
+        Some(k) => eta.get(k).map(|&e| (2.0 * e).exp()).unwrap_or(1.0),
+        None => 1.0,
+    }
+}
+
 pub fn foce_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -370,6 +413,12 @@ pub fn foce_subject_nll(
     } else {
         Vec::new()
     };
+
+    // FREM R-diagonal override: for FREMTYPE > 0, use covariate sigma^2 instead
+    // of the PK error model variance. Built once and passed through; None when
+    // no FREM config is active.
+    let frem_r_override =
+        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
 
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
 
@@ -431,6 +480,7 @@ pub fn foce_subject_nll(
             // Promote to interaction when M3 BLOQ is active, matching the
             // non-TTE branch below so M3 subjects always get the CᵀC correction.
             interaction || m3_active,
+            model.residual_error_eta,
         );
     }
 
@@ -445,6 +495,8 @@ pub fn foce_subject_nll(
             &model.error_spec,
             model.bloq_method,
             &p_obs,
+            frem_r_override.as_deref(),
+            model.residual_error_eta,
         )
     } else {
         // FOCE (no interaction): evaluate the residual variance R at the
@@ -471,6 +523,7 @@ pub fn foce_subject_nll(
             &model.error_spec,
             model.bloq_method,
             &p_obs,
+            frem_r_override.as_deref(),
             pop_preds.as_deref(),
         )
     }
@@ -478,6 +531,44 @@ pub fn foce_subject_nll(
 
 /// Standard FOCE (no interaction). When any CENS rows are present AND
 /// `bloq_method == M3`, the dispatcher has already routed to the interaction
+/// Build per-observation R-diagonal overrides for FREM covariate pseudo-observations.
+/// Returns `None` when FREM is inactive (no config or empty fremtype).
+/// Overwrite the residual-variance diagonal at FREM covariate pseudo-observation
+/// rows with the per-row overrides built by [`build_frem_r_override`]. `None`
+/// entries (ordinary PK observations) are left untouched. Indices past the end
+/// of `r_diag` are skipped defensively.
+pub fn apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[Option<f64>]) {
+    for (j, ov) in overrides.iter().enumerate() {
+        if let (Some(v), true) = (ov, j < r_diag.len()) {
+            r_diag[j] = *v;
+        }
+    }
+}
+
+pub fn build_frem_r_override(
+    frem_config: Option<&FremConfig>,
+    fremtype: &[u16],
+    sigma_values: &[f64],
+) -> Option<Vec<Option<f64>>> {
+    let fc = frem_config?;
+    if fremtype.is_empty() {
+        return None;
+    }
+    Some(
+        fremtype
+            .iter()
+            .map(|&ft| {
+                if ft > 0 && fc.fremtype_to_indices.contains_key(&ft) {
+                    let s = sigma_values[fc.covariate_sigma_index];
+                    Some(if s * s > 1e-12 { s * s } else { 1e-12 })
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    )
+}
+
 /// path — so inside this function the only case we need to handle is
 /// `bloq_method == Drop` (treat CENS rows as ordinary obs) or no CENS at all.
 pub fn foce_subject_nll_standard(
@@ -490,6 +581,7 @@ pub fn foce_subject_nll_standard(
     error_spec: &ErrorSpec,
     _bloq_method: BloqMethod,
     p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
     // When `Some`, evaluate the residual variance R at these predictions
     // instead of the SB-linearized f0. Used to evaluate R at the population
     // prediction f(η=0) — NONMEM's no-interaction semantics — which is always
@@ -506,11 +598,16 @@ pub fn foce_subject_nll_standard(
         .map(|(j, &ip)| ip - h_eta[j])
         .collect();
 
-    // R diagonal; inflate with EKF process-noise variance for SDE models.
+    // R diagonal; inflate with EKF process-noise variance for SDE models, then
+    // overwrite FREM covariate rows with their EPSCOV² overrides. The override
+    // must come last so it survives the r_pred_override re-evaluation of R.
     let r_eval: &[f64] = r_pred_override.unwrap_or(&f0);
     let mut r_diag = compute_r_diag(error_spec, r_eval, &subject.obs_cmts, sigma_values);
     for (j, r) in r_diag.iter_mut().enumerate() {
         *r += p_obs.get(j).copied().unwrap_or(0.0);
+    }
+    if let Some(overrides) = frem_r_override {
+        apply_frem_r_overrides(&mut r_diag, overrides);
     }
 
     // R_tilde = H * Omega * H' + diag(R)
@@ -594,8 +691,13 @@ pub fn foce_subject_nll_interaction(
     error_spec: &ErrorSpec,
     bloq_method: BloqMethod,
     p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>,
+    // IIV-on-RUV eta index, or `None`. The per-subject residual-variance scale
+    // `exp(2·η̂_ruv)` and the extra `c̃` column are derived from `eta_hat`.
+    residual_error_eta: Option<usize>,
 ) -> f64 {
     let n_eta = eta_hat.len();
+    let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
     let Some(g) = gaussian_foce_accum(
         subject,
         ipreds,
@@ -605,10 +707,14 @@ pub fn foce_subject_nll_interaction(
         bloq_method,
         p_obs,
         n_eta,
+        frem_r_override,
+        residual_error_eta,
+        ruv_scale,
     ) else {
         return 1e20;
     };
 
+    // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
     // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.  log|H̃| via Cholesky.
     let htilde = g.hrh + 0.5 * g.ctc + &omega.inv;
@@ -644,11 +750,13 @@ fn foce_subject_nll_interaction_with_tte(
     error_spec: &ErrorSpec,
     bloq_method: BloqMethod,
     p_obs: &[f64],
-    tte_data_nll: f64,         // sum of raw TTE NLLs at η̂ (one per TTE CMT)
-    tte_hessian: DMatrix<f64>, // FD Hessian of the raw TTE NLL w.r.t. η
-    interaction: bool,         // include the ½·CᵀC interaction term (FOCEI) or not (FOCE)
+    tte_data_nll: f64,                 // sum of raw TTE NLLs at η̂ (one per TTE CMT)
+    tte_hessian: DMatrix<f64>,         // FD Hessian of the raw TTE NLL w.r.t. η
+    interaction: bool,                 // include the ½·CᵀC interaction term (FOCEI) or not (FOCE)
+    residual_error_eta: Option<usize>, // IIV-on-RUV eta index (or None)
 ) -> f64 {
     let n_eta = eta_hat.len();
+    let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
     let Some(g) = gaussian_foce_accum(
         subject,
         ipreds,
@@ -658,6 +766,9 @@ fn foce_subject_nll_interaction_with_tte(
         bloq_method,
         p_obs,
         n_eta,
+        None, // TTE path does not support FREM R-override
+        residual_error_eta,
+        ruv_scale,
     ) else {
         return 1e20;
     };
@@ -713,6 +824,12 @@ fn gaussian_foce_accum(
     bloq_method: BloqMethod,
     p_obs: &[f64],
     n_eta: usize,
+    frem_r_override: Option<&[Option<f64>]>,
+    // IIV on residual error (`Y = IPRED + EPS·EXP(ETA)`). `residual_error_eta`
+    // is the eta index that scales the residual SD; `ruv_scale = exp(2·η̂_ruv)`
+    // multiplies R. `(None, 1.0)` reproduces the no-IIV-on-RUV behaviour.
+    residual_error_eta: Option<usize>,
+    ruv_scale: f64,
 ) -> Option<GaussianFoceTerms> {
     let n_obs = subject.observations.len();
 
@@ -730,7 +847,17 @@ fn gaussian_foce_accum(
     let mut ctc = DMatrix::<f64>::zeros(n_eta, n_eta);
     for &j in &quant_idx {
         let f = ipreds[j];
-        let v_resid = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
+        // FREM override: use covariate sigma^2 for FREMTYPE > 0 observations.
+        // FREM covariate pseudo-observations are NOT scaled by the residual-error
+        // eta (it acts on the PK residual only), so apply `ruv_scale` and the
+        // residual-eta c̃ column only on ordinary PK rows.
+        let frem_ov = frem_r_override.and_then(|o| o.get(j)).and_then(|v| *v);
+        let is_pk_row = frem_ov.is_none();
+        let v_resid = if let Some(v) = frem_ov {
+            v
+        } else {
+            error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale
+        };
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if !(v.is_finite() && v > 0.0) {
             return None;
@@ -738,19 +865,31 @@ fn gaussian_foce_accum(
         let r = subject.observations[j] - f;
         data_ll += r * r / v + v.ln();
 
-        // a_j = row j of H (∂f_j/∂η); c̃_j = (∂R_j/∂f_j)·a_j / R_j.
+        // a_j = row j of H (∂f_j/∂η); c̃_{j,k} = (∂R_j/∂η_k)/R_j.
+        // For a PK eta: (∂R/∂f)·a / R; scaling R by exp(2η_ruv) multiplies both
+        // ∂R/∂f and R, so the factor cancels — hence scale dvar_df too.
+        // For the residual eta: ∂R/∂η_ruv = 2·R, so the column is the constant 2.
         let aj = h_matrix.row(j);
-        let dvar_df = error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values);
+        let dvar_df = if is_pk_row {
+            error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values) * ruv_scale
+        } else {
+            0.0 // FREM rows: additive near-zero sigma, ∂R/∂f = 0
+        };
         let c_scale = dvar_df / v;
         let inv_v = 1.0 / v;
-        let cs2 = c_scale * c_scale;
+        let c_ruv = |k: usize| -> f64 {
+            if is_pk_row && Some(k) == residual_error_eta {
+                2.0
+            } else {
+                c_scale * aj[k]
+            }
+        };
         for a in 0..n_eta {
             let aa = aj[a];
+            let ca = c_ruv(a);
             for b in 0..n_eta {
-                let ab = aj[b];
-                let outer = aa * ab;
-                hrh[(a, b)] += outer * inv_v;
-                ctc[(a, b)] += outer * cs2;
+                hrh[(a, b)] += aa * aj[b] * inv_v;
+                ctc[(a, b)] += ca * c_ruv(b);
             }
         }
     }
@@ -760,7 +899,7 @@ fn gaussian_foce_accum(
     for &j in &bloq_idx {
         let lloq = subject.observations[j];
         let f = ipreds[j];
-        let v = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values);
+        let v = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale;
         if !(v.is_finite() && v > 0.0) {
             return None;
         }
@@ -940,67 +1079,12 @@ pub fn foce_subject_nll_iov(
     } else {
         Vec::new()
     };
-
-    // TTE Laplace correction for IOV subjects: mirrors foce_subject_nll but
-    // the TTE Hessian is in the BSV block only (kappas don't enter the hazard)
-    // and is embedded in the top-left n_eta×n_eta corner of the n_b×n_b matrix.
-    #[cfg(feature = "survival")]
-    if !subject.obs_records.is_empty() {
-        use crate::survival::{data_term_hessian_fd, shi_step_sizes, tte_data_term};
-        use crate::types::EndpointLikelihood;
-
-        let mut tte_nll_at_mode = 0.0_f64;
-        let mut tte_h_bsv = DMatrix::<f64>::zeros(n_eta, n_eta);
-
-        for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard } = endpoint {
-                let records_for_cmt: Vec<crate::types::ObsRecord> = subject
-                    .obs_records
-                    .iter()
-                    .filter(
-                        |r| matches!(r, crate::types::ObsRecord::Event { cmt: c, .. } if c == cmt),
-                    )
-                    .cloned()
-                    .collect();
-                if records_for_cmt.is_empty() {
-                    continue;
-                }
-                let covariates = &subject.covariates;
-                let tte_fn = |eta_eval: &[f64]| -> f64 {
-                    tte_data_term(&records_for_cmt, hazard, theta, eta_eval, covariates)
-                };
-                tte_nll_at_mode += tte_fn(eta_hat.as_slice());
-                if n_eta > 0 {
-                    let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
-                    tte_h_bsv += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
-                }
-            }
-        }
-
-        // Embed the n_eta × n_eta BSV Hessian into the top-left block of the
-        // n_b × n_b augmented Hessian (kappa rows/cols remain zero).
-        let mut tte_h = DMatrix::<f64>::zeros(n_b, n_b);
-        if n_eta > 0 {
-            tte_h.view_mut((0, 0), (n_eta, n_eta)).copy_from(&tte_h_bsv);
-        }
-
-        return foce_subject_nll_interaction_with_tte(
-            subject,
-            &ipreds,
-            &b_hat,
-            &h_full,
-            &sigma_b,
-            sigma_values,
-            &model.error_spec,
-            model.bloq_method,
-            &p_obs_iov,
-            tte_nll_at_mode,
-            tte_h,
-            // Promote to interaction when M3 BLOQ is active (same as non-TTE path).
-            interaction || m3_active,
-        );
+    // IOV + FREM is unsupported: the augmented b̂ vector and block-diagonal
+    // Σ_b are not set up for FREM R-overrides.  Return a sentinel NLL so the
+    // optimizer steers away from this region rather than silently ignoring FREM.
+    if model.frem_config.is_some() && subject.fremtype.iter().any(|&ft| ft > 0) {
+        return 1e18;
     }
-
     if interaction || m3_active {
         foce_subject_nll_interaction(
             subject,
@@ -1012,6 +1096,8 @@ pub fn foce_subject_nll_iov(
             &model.error_spec,
             model.bloq_method,
             &p_obs_iov,
+            None, // IOV + FREM unsupported (guarded above)
+            model.residual_error_eta,
         )
     } else {
         // FOCE (no interaction): evaluate R at the population prediction with
@@ -1044,6 +1130,7 @@ pub fn foce_subject_nll_iov(
             &model.error_spec,
             model.bloq_method,
             &p_obs_iov,
+            None,
             pop_preds.as_deref(),
         )
     }
@@ -1131,6 +1218,9 @@ pub fn compute_cwres(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
     error_spec: &ErrorSpec,
+    // IIV-on-RUV eta index (or None). Scales the residual diagonal `R` by
+    // exp(2·η̂_ruv) so CWRES uses the subject's actual residual SD (#409).
+    residual_error_eta: Option<usize>,
 ) -> Vec<f64> {
     let n_obs = subject.observations.len();
 
@@ -1143,7 +1233,16 @@ pub fn compute_cwres(
         .collect();
 
     // R_tilde
-    let r_diag = compute_r_diag(error_spec, &f0, &subject.obs_cmts, sigma_values);
+    let mut r_diag = compute_r_diag(error_spec, &f0, &subject.obs_cmts, sigma_values);
+    let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
+    if ruv_scale != 1.0 {
+        for (j, v) in r_diag.iter_mut().enumerate() {
+            // FREM covariate pseudo-obs carry no PK residual error; leave them.
+            if subject.fremtype.get(j).copied().unwrap_or(0) == 0 {
+                *v *= ruv_scale;
+            }
+        }
+    }
     let r_tilde = compute_r_tilde(h_matrix, &omega.matrix, &r_diag);
 
     // CWRES_j = (y_j - f0_j) / sqrt(R_tilde_jj), or NaN if censored.
@@ -1268,9 +1367,21 @@ pub fn individual_nll_iov(
     // Data NLL — single continuous prediction with per-event occasion kappa
     // (proper cross-occasion carryover; issue #104).
     let preds = pk::predict_iov(model, subject, theta, eta, kappas);
+    // FREM covariate pseudo-observations use the covariate sigma (EPSCOV), not
+    // the PK residual error, so the FREM etas are sampled against the right
+    // variance (mirrors the FOCE paths and the non-IOV individual_nll).
+    let frem_ov =
+        build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
+    // IIV on residual error (#409): η_ruv is a BSV eta, indexed into `eta`.
+    let ruv_scale = model.residual_var_scale(eta);
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        let v = model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values);
+        let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
+            Some(vv) => vv,
+            None => {
+                model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values) * ruv_scale
+            }
+        };
         if is_m3_bloq(model, subject, j) {
             let z = (y - f_pred) / v.sqrt();
             data_ll += -2.0 * log_normal_cdf(z);
@@ -1334,6 +1445,7 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
@@ -1386,6 +1498,7 @@ mod tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -1409,6 +1522,8 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -1671,6 +1786,7 @@ mod tests {
             BloqMethod::Drop,
             &[],
             None,
+            None,
         );
         let nll_override = foce_subject_nll_standard(
             &subject,
@@ -1682,6 +1798,7 @@ mod tests {
             &error_spec,
             BloqMethod::Drop,
             &[],
+            None,
             Some(&ipreds),
         );
 
@@ -1696,6 +1813,51 @@ mod tests {
             nll_f0 - nll_override > 20.0,
             "override must change the SB marginal (R evaluated at f(η=0), not f0): \
              nll_f0={nll_f0}, nll_override={nll_override}"
+        );
+    }
+
+    /// Regression for the FREM r_diag merge collision: `frem_r_override` must
+    /// reach the residual-variance diagonal that feeds R̃, even though
+    /// `r_pred_override` re-evaluates R afterward. Before the fix the override
+    /// loop ran on a `r_diag` that was immediately shadowed and discarded, so
+    /// FREM covariate rows silently used the PK error variance and the marginal
+    /// was identical with or without the override.
+    #[test]
+    fn foce_standard_applies_frem_r_override() {
+        let subject = make_simple_subject(); // 6 obs
+        let omega = make_omega(0.09);
+        let sigma = vec![0.2]; // proportional SD
+        let error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        let ipreds = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let eta_hat = DVector::from_vec(vec![1.0]);
+        let h_matrix = DMatrix::from_column_slice(6, 1, &[10.0, 5.0, 5.0, 5.0, 5.0, 5.0]);
+
+        let call = |frem: Option<&[Option<f64>]>| {
+            foce_subject_nll_standard(
+                &subject,
+                &ipreds,
+                &eta_hat,
+                &h_matrix,
+                &omega,
+                &sigma,
+                &error_spec,
+                BloqMethod::Drop,
+                &[],
+                frem,
+                None,
+            )
+        };
+
+        // Override the first row's residual variance with a value far from the
+        // PK error model's R(f0)[0] = (10·0.2)² = 4.
+        let overrides = [Some(250.0), None, None, None, None, None];
+        let nll_plain = call(None);
+        let nll_frem = call(Some(&overrides));
+
+        assert!(nll_plain.is_finite() && nll_frem.is_finite());
+        assert!(
+            (nll_plain - nll_frem).abs() > 1e-6,
+            "frem_r_override must change the marginal OFV (plain={nll_plain}, frem={nll_frem})"
         );
     }
 
@@ -1762,6 +1924,8 @@ mod tests {
             &espec,
             BloqMethod::Drop,
             &[],
+            None,
+            None,
         );
 
         // Hand-compute the Laplace value with c̃ ≡ 0 (additive R).
@@ -1786,6 +1950,160 @@ mod tests {
             focei,
             expected,
             focei - expected,
+        );
+    }
+
+    /// IIV on residual error (#409): with a *dedicated* residual-error eta and
+    /// additive error, predictions do not depend on that eta (so its `H`/`a`
+    /// column is zero), but the FOCEI marginal must (a) scale R by exp(2·η̂_ruv)
+    /// in the data term and (b) add the constant `c̃_{j,ruv}=2` column to the
+    /// `½·c̃'·c̃` curvature, giving `H̃ = 0.5·(4·n_obs) + Ω⁻¹ = 2·n_obs + 1/ω`.
+    /// We hand-compute the whole marginal and assert bit-for-bit agreement.
+    #[test]
+    fn test_focei_iiv_on_ruv_matches_handcomputed() {
+        let subj = make_simple_subject();
+        let n_obs = subj.observations.len();
+        // Residual-error eta only: its prediction-Jacobian column is zero.
+        let eta = 0.2_f64;
+        let eta_hat = nalgebra::DVector::from_vec(vec![eta]);
+        let omega_var = 0.05_f64;
+        let omega = OmegaMatrix::from_diagonal(&[omega_var], vec!["ETA_RUV".into()]);
+        let sigma = vec![2.0_f64];
+        let espec = ErrorSpec::Single(ErrorModel::Additive);
+        // Arbitrary predictions; the residual eta does not enter them.
+        let ipreds = vec![48.0, 38.0, 32.0, 44.0, 36.0, 26.0];
+        let h = DMatrix::<f64>::zeros(n_obs, 1); // ∂f/∂η_ruv ≡ 0
+
+        let focei = foce_subject_nll_interaction(
+            &subj,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma,
+            &espec,
+            BloqMethod::Drop,
+            &[],
+            None,    // no FREM override
+            Some(0), // ETA_RUV is eta index 0
+        );
+
+        // Hand-computed marginal.
+        let s = (2.0 * eta).exp();
+        let r = sigma[0] * sigma[0] * s; // additive R, scaled
+        let mut data_ll = 0.0;
+        for j in 0..n_obs {
+            let res = subj.observations[j] - ipreds[j];
+            data_ll += res * res / r + r.ln();
+        }
+        let eta_prior = eta * eta / omega_var;
+        // H̃ = hrh(0) + 0.5·ctc + Ω⁻¹; ctc(ruv,ruv) = Σ_j 2² = 4·n_obs.
+        let htilde = 0.5 * (4.0 * n_obs as f64) + 1.0 / omega_var;
+        let expected = 0.5 * (data_ll + eta_prior + omega.log_det + htilde.ln());
+
+        assert!(
+            (focei - expected).abs() < 1e-9,
+            "FOCEI IIV-on-RUV marginal ({focei}) must equal hand-computed ({expected}); \
+             diff = {}",
+            focei - expected
+        );
+
+        // Sanity: passing `None` (no residual eta) drops both the scaling and the
+        // c̃ column, so the marginal must differ.
+        let focei_none = foce_subject_nll_interaction(
+            &subj,
+            &ipreds,
+            &eta_hat,
+            &h,
+            &omega,
+            &sigma,
+            &espec,
+            BloqMethod::Drop,
+            &[],
+            None,
+            None,
+        );
+        assert!(
+            (focei - focei_none).abs() > 1e-6,
+            "residual-eta marginal must differ from the no-RUV-eta marginal"
+        );
+    }
+
+    /// IIV on residual error (#409): `individual_nll` must multiply the residual
+    /// variance by exp(2·η_ruv). At η_ruv = 0 the scale is 1 (bit-identical to no
+    /// IIV-on-RUV); at η_ruv ≠ 0 the value must change, and by exactly the
+    /// closed-form amount for additive error.
+    #[test]
+    fn test_individual_nll_scales_residual_variance() {
+        let subj = make_simple_subject();
+        let mut model = make_model();
+        model.error_model = ErrorModel::Additive;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Additive);
+        let theta = vec![5.0, 50.0];
+        let omega = make_omega(0.09);
+        let sigma = vec![2.0];
+
+        // η_ruv = 0 → scale 1 → identical to the no-RUV-eta model.
+        let eta0 = vec![0.0];
+        let base0 = individual_nll(&model, &subj, &theta, &eta0, &omega, &sigma);
+        model.residual_error_eta = Some(0);
+        let ruv0 = individual_nll(&model, &subj, &theta, &eta0, &omega, &sigma);
+        assert!(
+            (base0 - ruv0).abs() < 1e-12,
+            "η_ruv=0 must give scale 1 (base {base0}, ruv {ruv0})"
+        );
+
+        // η_ruv = 0.3 → variance ×exp(0.6). Difference vs the unscaled model is
+        // 0.5·Σ_j[(1/s − 1)·res²/σ² + ln s] (prior/|Ω| terms cancel).
+        let eta = vec![0.3];
+        model.residual_error_eta = None;
+        let base = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma);
+        model.residual_error_eta = Some(0);
+        let scaled = individual_nll(&model, &subj, &theta, &eta, &omega, &sigma);
+        let s = (2.0_f64 * 0.3).exp();
+        let preds = pk::compute_predictions_with_tv(&model, &subj, &theta, &eta);
+        let sig2 = sigma[0] * sigma[0];
+        let mut delta = 0.0;
+        for (j, &f) in preds.iter().enumerate() {
+            let res = subj.observations[j] - f;
+            delta += (1.0 / s - 1.0) * (res * res / sig2) + s.ln();
+        }
+        let expected = base + 0.5 * delta;
+        assert!(
+            (scaled - expected).abs() < 1e-9,
+            "individual_nll IIV-on-RUV scaling mismatch: got {scaled}, expected {expected}"
+        );
+    }
+
+    /// `obs_nll_subject_into` (the IS/IMPMAP/SAEM data term) must apply the same
+    /// exp(2·η_ruv) variance scaling.
+    #[test]
+    fn test_obs_nll_subject_into_scales_residual_variance() {
+        let subj = make_simple_subject();
+        let mut model = make_model();
+        model.error_model = ErrorModel::Additive;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Additive);
+        let theta = vec![5.0, 50.0];
+        let sigma = vec![2.0];
+        let eta = vec![0.4];
+        let mut scratch = pk::EventPkParams::with_capacity_for(&subj);
+
+        let base = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        model.residual_error_eta = Some(0);
+        let scaled = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+
+        let s = (2.0_f64 * 0.4).exp();
+        let preds = pk::compute_predictions_with_tv(&model, &subj, &theta, &eta);
+        let sig2 = sigma[0] * sigma[0];
+        let mut expected = 0.0;
+        for (j, &f) in preds.iter().enumerate() {
+            let f = f.max(1e-12);
+            let v = (sig2 * s).max(1e-12);
+            expected += 0.5 * (v.ln() + (subj.observations[j] - f).powi(2) / v);
+        }
+        assert!(
+            (scaled - expected).abs() < 1e-9,
+            "obs_nll IIV-on-RUV scaling mismatch: got {scaled}, expected {expected}, base {base}"
         );
     }
 
@@ -1839,6 +2157,8 @@ mod tests {
             &espec_combined,
             BloqMethod::Drop,
             &[],
+            None,
+            None,
         );
         let focei_additive = foce_subject_nll_interaction(
             &subj,
@@ -1850,6 +2170,8 @@ mod tests {
             &espec_additive,
             BloqMethod::Drop,
             &[],
+            None,
+            None,
         );
         let gap = focei_combined - focei_additive;
         assert!(

@@ -88,9 +88,10 @@ pub fn gradient_method_outer(
     optimizer: Optimizer,
 ) -> GradientMethodKind {
     match method {
-        EstimationMethod::Saem | EstimationMethod::Imp | EstimationMethod::Impmap => {
-            GradientMethodKind::NotApplicable
-        }
+        EstimationMethod::Saem
+        | EstimationMethod::Imp
+        | EstimationMethod::Impmap
+        | EstimationMethod::Bayes => GradientMethodKind::NotApplicable,
         EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
             GradientMethodKind::FiniteDifferences
         }

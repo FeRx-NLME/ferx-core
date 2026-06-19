@@ -19,7 +19,8 @@ use crate::estimation::outer_optimizer::{compute_covariance, CovarianceStepResul
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
 use crate::stats::likelihood::{
-    chol_log_det, compute_r_tilde, foce_subject_nll_interaction, foce_subject_nll_standard,
+    build_frem_r_override, chol_log_det, compute_r_tilde, foce_subject_nll_interaction,
+    foce_subject_nll_standard,
 };
 use crate::stats::residual_error::compute_r_diag;
 use crate::types::*;
@@ -420,6 +421,8 @@ pub fn run_foce_gn(
             total_ebe_fallbacks: 0,
             final_gradient,
             sir_fallback_proposal,
+            impmap_trace: None,
+            bayes: None,
         };
     }
 
@@ -534,6 +537,8 @@ pub fn run_foce_gn(
         total_ebe_fallbacks: 0,
         final_gradient,
         sir_fallback_proposal,
+        impmap_trace: None,
+        bayes: None,
     }
 }
 
@@ -1618,7 +1623,13 @@ pub(crate) fn subject_nll_pop_grad(
     //     forward-FD on `pk::compute_predictions_with_tv` — which itself
     //     dispatches to the ODE solver for ODE models. So Laplace can run on
     //     ODE + PerCmt models too; the only blockers are M3 and IOV.
-    let common_ok = !matches!(model.bloq_method, BloqMethod::M3) && kappas.is_empty();
+    // IIV on residual error (#409): the closed-form SB/Laplace gradients build
+    // R and ∂R/∂σ from σ alone and carry no `exp(2·η_ruv)` scaling nor the extra
+    // residual-eta c̃ column that `foce_subject_nll_interaction` now adds. Fall
+    // back to central FD over `subject_nll_at` (which holds the correct scaled
+    // marginal) so the gradient stays consistent with the objective.
+    let no_ruv_eta = model.residual_error_eta.is_none();
+    let common_ok = !matches!(model.bloq_method, BloqMethod::M3) && kappas.is_empty() && no_ruv_eta;
     let sb_ok =
         common_ok && model.ode_spec.is_none() && matches!(model.error_spec, ErrorSpec::Single(_));
     let laplace_ok = common_ok;
@@ -1773,7 +1784,11 @@ pub(crate) fn subject_nll_pop_grad_with_cache(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> (f64, Vec<f64>, Option<LaplaceGradCache>) {
-    let laplace_ok = !matches!(model.bloq_method, BloqMethod::M3) && kappas.is_empty();
+    // IIV on residual error (#409) is not handled by the analytical Laplace
+    // gradient/cache — route to the FD `subject_nll_pop_grad` (see there).
+    let laplace_ok = !matches!(model.bloq_method, BloqMethod::M3)
+        && kappas.is_empty()
+        && model.residual_error_eta.is_none();
     if options.interaction && laplace_ok {
         if let Some((nll, grad, cache)) = subject_nll_pop_grad_analytical_laplace_cached(
             x, template, model, population, subj_idx, eta_hat, h_matrix, bounds, options,
@@ -1907,6 +1922,13 @@ fn subject_nll_at(
 
     let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
 
+    // FREM R-diagonal override for covariate pseudo-observations.
+    let frem_r_override = build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        &params.sigma.values,
+    );
+
     if options.interaction || m3_active {
         foce_subject_nll_interaction(
             subject,
@@ -1918,6 +1940,8 @@ fn subject_nll_at(
             &model.error_spec,
             model.bloq_method,
             &[],
+            frem_r_override.as_deref(),
+            model.residual_error_eta,
         )
     } else {
         // FOCE (no interaction): evaluate R at the population prediction f(η=0)
@@ -1945,6 +1969,7 @@ fn subject_nll_at(
             &model.error_spec,
             model.bloq_method,
             &[],
+            frem_r_override.as_deref(),
             pop_preds.as_deref(),
         )
     }
@@ -2011,6 +2036,7 @@ mod tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -2029,6 +2055,8 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -2050,6 +2078,7 @@ mod tests {
                 cens: vec![0, 0, 0],
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
+                fremtype: Vec::new(),
                 #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
@@ -2971,6 +3000,7 @@ mod tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -2989,6 +3019,8 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
         };
 
         let template = &model.default_params;
@@ -3249,6 +3281,7 @@ mod tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -3267,6 +3300,8 @@ mod tests {
             output_columns: vec![],
             #[cfg(feature = "survival")]
             endpoints: std::collections::HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
         }
     }
 
@@ -3287,6 +3322,7 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };

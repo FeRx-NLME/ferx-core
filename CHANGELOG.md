@@ -20,6 +20,71 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **IIV on residual error (`iiv_on_ruv`)** — a random effect can now scale the
+  residual error per subject (NONMEM `Y = IPRED + EPS*EXP(ETA)`). Declare an
+  `omega` and reference it from `[error_model]` with `iiv_on_ruv = NAME`; the
+  residual variance of every observation is multiplied by `exp(2*ETA_i)`.
+  Supported under FOCEI, IMP, IMPMAP, and SAEM (non-interaction FOCE is rejected
+  with a clear error). Previously such a random effect was silently dropped on
+  import (#409).
+- **Covariance step progress reporting** — under `verbose`, the covariance step
+  now prints throttled per-loop progress (Hessian finite-difference points and
+  the score cross-product) with a wall-clock ETA, e.g.
+  `[covariance] Hessian 12/40 (~8s left)`, so long covariance computations are
+  no longer silent.
+- **Cancellable covariance step** — a `CancelFlag` tripped *during* the
+  covariance step (not just before it) now cooperatively aborts the
+  finite-difference Hessian and score-matrix loops and finishes the fit without
+  standard errors (recording a warning), instead of running the cancelled work
+  to completion.
+- `impmap_mceta` fit option: multi-start MAP for IMPMAP (NONMEM `MCETA` equivalent),
+  improving IS efficiency in high-dimensional models (e.g. FREM with ≥5 ETAs).
+- Analytical Jacobian for FREM pseudo-observations: covariate rows in the FD
+  Jacobian are overwritten with exact ∂Y/∂η values (0 or 1), eliminating noise
+  that corrupted the IS proposal in high-dimensional FREM models.
+- `iscale_min` / `iscale_max` fit options: adaptive IS proposal scaling (NONMEM
+  `ISCALE_MIN`/`ISCALE_MAX` equivalent). Per-subject pilot search over log-spaced
+  scale factors selects the proposal width that maximises ESS. Defaults: 0.1–10.0.
+- `impmap_sobol` fit option: use Sobol quasi-random sequences (with Cranley-Patterson
+  randomization) for IMPMAP IS draws instead of pseudo-random, giving more uniform
+  coverage of the posterior. MVN proposals only; Student-t falls back to pseudo-random.
+- Full off-diagonal omega standard errors for block omega via multivariate delta
+  method on the Cholesky parameterization. `se_omega` is now the full lower
+  triangle (length n_eta*(n_eta+1)/2) instead of diagonal-only. Added
+  `omega_se_at()` helper for indexed lookup.
+- Per-iteration IMPMAP parameter trace (`FitResult.impmap_trace`), analogous to
+  NONMEM `.ext` file output. Opt-in via `impmap_trace = true` in `[fit_options]`.
+- FREM (Full Random Effects Model) covariate analysis: `prepare_frem()` API
+  transforms a base model + dataset into a FREM model with extended block omega,
+  covariate pseudo-observations, and FREMTYPE dispatch in the likelihood. The
+  covariates (and their continuous/categorical kind) are taken from the model's
+  `[covariates]` block; the `covariates` argument is an optional subset filter
+  over them (#194).
+- **Zero-order absorption into the oral depot on analytical models** — a `RATE=-2`
+  modeled duration `D1` (or an explicit positive-`RATE` infusion) into compartment 1
+  of an analytical oral model (`one_cpt_oral` / `two_cpt_oral` / `three_cpt_oral`)
+  now models zero-order release into the depot followed by first-order `KA`
+  absorption into central, all on the closed-form engine — no `ode(...)` block
+  needed (previously rejected at parse time). Validated against NONMEM 7.5.1
+  `ADVAN2` (`$PK D1`) and against the ODE transcription across 1-/2-/3-cpt oral
+  models. Per-compartment amounts in
+  `sdtab`/`[derived]` are not available for those subjects (predictions are exact;
+  a `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` warning flags it) (#400).
+- `RATE=-2` (modeled infusion duration via a `D{cmt}` parameter) is now supported
+  on **analytical** PK models, not just ODE models — declare a `D{cmt}` individual
+  parameter and the closed-form infusion uses `rate = AMT / D{cmt}`, matching
+  NONMEM's `$PK D{n}` (#394, follow-up to #324).
+- **Full MCMC Bayesian estimation** (`method = bayes`, Gibbs-within-HMC, NONMEM
+  `METHOD=BAYES` parity). Draws from the joint posterior `p(θ, Ω, Σ, {ηᵢ} | y)`:
+  per-subject η block (block-MH, or gradient HMC on autodiff builds with
+  `n_leapfrog > 0`), conjugate inverse-Wishart Ω block, exact Gaussian
+  full-conditional draw for mu-referenced θ, and a random-walk block for the
+  remaining θ/σ. Reports posterior summaries (mean/sd/2.5%/median/97.5%) with
+  split-R̂, ESS, and MCSE per parameter on `FitResult.bayes` and in the
+  `.fit.yaml` `bayes:` section. Options: `bayes_warmup`, `bayes_iters`,
+  `bayes_chains`, `bayes_thin`, `bayes_seed`. Supports BSV and zero-mean IOV
+  (per-occasion `kappa`, with a conjugate inverse-Wishart `Omega_iov` draw).
+  Validated against FOCEI and NONMEM `METHOD=BAYES` on warfarin (#380).
 - **Modeled infusion duration (`RATE=-2` → `Dn`) for ODE models** — NONMEM's
   `RATE=-2` makes a zero-order infusion's *duration* a modeled parameter: name an
   individual parameter `D{n}` for the dose compartment `n` and ferx infuses `AMT`
@@ -126,13 +191,17 @@ section of the SDLC for the versioning policy).
   wall-clock cost (both stencils parallelise over perturbation points). Default
   `true`; set `false` to force the faster analytical-gradient stencil (#335).
 - Propensity-score-matched simulation: `simulate_with_options()` with a new
-  `SimulateOptions { seed, propensity_match }`. When `propensity_match` is set,
-  each replicate's drawn etas are reassigned to subjects by optimal Mahalanobis
-  matching (under the model Ω) against the subjects' fitted (posthoc) etas, so a
-  subject's observed dosing/sampling design is paired with a similar drawn eta.
-  This corrects VPC bias from treatment adaptation in real-world data (longer
-  intervals for high-clearance patients, etc.). Operates on observed data;
-  returns the usual simulation rows for the caller to build the VPC (#288).
+  `SimulateOptions { seed, match_method }`. When `match_method` is `Some(..)`,
+  each replicate's drawn etas are reassigned to subjects by Mahalanobis matching
+  (under the model Ω) against the subjects' fitted (posthoc) etas, so a subject's
+  observed dosing/sampling design is paired with a similar drawn eta. This
+  corrects VPC bias from treatment adaptation in real-world data (longer
+  intervals for high-clearance patients, etc.). Three methods are offered via
+  `MatchMethod`: `Optimal` (global linear-assignment minimum; best on average in
+  simulation, recommended default), `Nearest` (greedy nearest-neighbour,
+  `MatchIt(method="nearest", distance="mahalanobis")`), and `Rank` (pair by the
+  rank of the Mahalanobis norm). Operates on observed data; returns the usual
+  simulation rows for the caller to build the VPC (#288, #396).
 - New `importance_sampling_map` (alias `impmap`) estimation method: a Monte-Carlo
   EM estimator equivalent to NONMEM `METHOD=IMPMAP`. Each iteration re-centers a
   per-subject importance-sampling proposal on the conditional mode (MAP) and
@@ -189,6 +258,18 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- **`imp` is now a Monte-Carlo EM estimator by default** (NONMEM `METHOD=IMP`
+  parity): `method = imp` updates θ/Ω/σ instead of only evaluating the marginal
+  `−2 log L`. **Breaking:** model files that used `imp` (e.g. `[focei, imp]`)
+  purely to *score* a fit now re-estimate. Add `is_eval_only = true` (NONMEM
+  `EONLY=1`) to recover the previous evaluation-at-fixed-parameters behaviour.
+  New options `is_iterations` (default 200) and `is_averaging` (default 50)
+  control the MCEM loop; `is_proposal_df` now also accepts `normal`/`mvn`. The
+  estimating `imp` may lead or sit mid-chain; the evaluation-only `imp` must
+  still be terminal. Plain `imp` re-centers its proposal from the previous
+  iteration's sample moments and so is fragile on rich data (warm-start with
+  `[focei, imp]`, or use `impmap`); validated against NONMEM 7.5.1 `METHOD=IMP`
+  on warfarin (#402).
 - The analytical `pk NAME(...)` parameter list is now parsed strictly: a malformed
   `role=VAR` pair (no `=`, an empty side, or a stray extra `=`) or a duplicate role
   is a clear parse error instead of being silently dropped or last-winning. The
@@ -234,6 +315,11 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **Bayesian estimation** (`method = bayes`) now responds to a cooperative
+  cancellation (e.g. an R-session interrupt): the Gibbs sampler polls the cancel
+  flag at each sweep boundary and aborts within one sweep, returning
+  `cancelled by user` instead of running every chain to completion. Previously a
+  Bayes run could not be stopped once started (#393).
 - **IMPMAP** now responds to a cooperative cancellation (e.g. an R-session
   interrupt) during an iteration's E-step, instead of only at iteration
   boundaries. The importance-sampling pass — the dominant per-iteration cost on
@@ -377,6 +463,20 @@ section of the SDLC for the versioning policy).
 - `sdtab` no longer emits stray ETA columns (regression from #185).
 - `warfarin --simulate` works again, and the docs `verify-build` step is fixed
   (#199, #200).
+- FREM with `log_additive` error model: covariate pseudo-observation predictions
+  are no longer log-transformed. The FREM override (θ + η) now runs after the
+  LTBS log-transform, producing raw covariate predictions as NONMEM does. Without
+  this fix the OFV was inflated by ~10 orders of magnitude.
+- FREM with IMPMAP/IMP: the IS posterior Hessian now applies the FREM R-diagonal
+  override (EPSCOV² variance) for covariate pseudo-observations, matching the
+  FOCEI and SAEM code paths.
+- `frem_predictions` and `frem_sigma` fit options are now registered as framework
+  keys, suppressing spurious "not used by method" warnings on non-FOCEI chains.
+- FREM data generation: missing covariate values (default -99) are now excluded
+  from mean/variance computation and their pseudo-observation rows are omitted,
+  matching PsN/NONMEM behavior.
+- FREM data generation: records within each subject are now sorted by (time,
+  event priority) to prevent backwards-in-time sequences that NONMEM rejects.
 
 ### Performance
 - The covariance step is now built as a single parallel work-list over the

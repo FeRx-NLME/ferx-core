@@ -16,6 +16,11 @@ use rand::Rng;
 #[cfg(feature = "autodiff")]
 use rand_distr::StandardNormal;
 
+/// Leapfrog energy-error magnitude above which an HMC transition is flagged
+/// divergent (matches Stan's `Δ_max`).
+#[cfg(feature = "autodiff")]
+const HMC_DIVERGENCE_THRESHOLD: f64 = 1000.0;
+
 // ---------------------------------------------------------------------------
 // Leapfrog integrator (no autodiff dependency)
 // ---------------------------------------------------------------------------
@@ -91,7 +96,7 @@ pub fn leapfrog(
 /// `(model, theta, omega, sigma_values)`, matching the interface of
 /// `mh_steps`.
 ///
-/// Returns `Some((new_eta, new_nll, accepted))` when the AD gradient path is
+/// Returns `Some((new_eta, new_nll, accepted, divergent))` when the AD gradient path is
 /// available.  Returns `None` when HMC cannot be applied — caller must fall
 /// back to `mh_steps` in that case.  HMC is unavailable when:
 ///   - the model uses an ODE (`model.ode_spec.is_some()`)
@@ -120,7 +125,7 @@ pub fn hmc_step(
     step_size: f64,
     n_leapfrog: usize,
     rng: &mut impl Rng,
-) -> Option<(Vec<f64>, f64, bool)> {
+) -> Option<(Vec<f64>, f64, bool, bool)> {
     use crate::ad::ad_gradients::{compute_nll_gradient_ad, FlatDoseData};
     use crate::ad::event_driven_ad;
     use crate::types::BloqMethod;
@@ -270,11 +275,18 @@ pub fn hmc_step(
     let kinetic_prop = 0.5 * p_prop.iter().map(|&x| x * x).sum::<f64>();
     let delta_h = nll_current + kinetic_curr - nll_prop - kinetic_prop;
 
+    // A divergence: the leapfrog energy error blew up (the integrator could not
+    // follow the Hamiltonian flow — typically sharp posterior curvature). A
+    // non-finite or large |ΔH| flags it; many divergences mean the chain is
+    // failing to explore part of the posterior, so they are surfaced as a
+    // diagnostic. Threshold matches Stan's Δ_max.
+    let divergent = !delta_h.is_finite() || delta_h.abs() > HMC_DIVERGENCE_THRESHOLD;
+
     let log_u: f64 = rng.gen::<f64>().ln();
     if log_u < delta_h {
-        Some((eta_prop, nll_prop, true)) // accepted: advance to proposal
+        Some((eta_prop, nll_prop, true, divergent)) // accepted: advance to proposal
     } else {
-        Some((eta.to_vec(), nll_current, false)) // rejected: stay put
+        Some((eta.to_vec(), nll_current, false, divergent)) // rejected: stay put
     }
 }
 

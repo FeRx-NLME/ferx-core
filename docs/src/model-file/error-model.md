@@ -201,9 +201,64 @@ Combined error:
   DV ~ combined(PROP_ERR, ADD_ERR)
 ```
 
+## IIV on residual error (`iiv_on_ruv`)
+
+NONMEM models often place an **inter-individual random scaling on the residual
+error** — each subject gets a log-normally scaled residual SD:
+
+```
+Y = IPRED + EPS(1) * EXP(ETA(4))     ; $OMEGA <var>   ; IIV on RUV
+```
+
+ferx supports this with an `iiv_on_ruv` line in `[error_model]`. Declare the
+random effect as an ordinary `omega` (it is **not** referenced by any individual
+parameter), then name it:
+
+```
+[parameters]
+  ...
+  omega ETA_RUV ~ 0.05      # IIV on residual error
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+```
+
+The per-subject residual **variance** of every observation is multiplied by
+`exp(2 · ETA_RUV_i)` — equivalently, the residual SD is scaled by
+`exp(ETA_RUV_i)`. This applies uniformly to additive, proportional, and combined
+error (it scales the whole variance), matching `EPS * EXP(ETA)` for the common
+single-EPS case. The extra random effect is reported like any other omega
+(`ETA_RUV` appears in the omega matrix and eta names).
+
+Notes and constraints:
+
+- **Requires an interaction or Monte-Carlo method**: use `method = focei`, `imp`,
+  `impmap`, or `saem`. `Y = IPRED + EPS*EXP(ETA)` makes the residual variance
+  η-dependent, so non-interaction FOCE cannot represent it — ferx rejects that
+  combination with a clear error.
+- The named eta must be a dedicated `omega` not shared with a structural
+  individual parameter.
+- Not supported with per-CMT (multi-endpoint) error models.
+- Models with `iiv_on_ruv` are routed to finite-difference gradients (the
+  analytical autodiff/Laplace kernels do not carry the variance-scaling rule).
+
+**Identifiability.** A residual-error random effect is a *variance-of-variance*
+term and is only weakly identified when the data carry little per-subject
+residual-scale signal (few observations per subject, or a small true variance).
+In that regime the marginal correctly shrinks the estimate toward zero. Strong
+or well-sampled signals are recovered well. When the FOCEI estimate looks
+collapsed, prefer the Monte-Carlo estimators (`imp` / `impmap` / `saem`), which
+do not rely on the Laplace approximation.
+
+See `examples/iiv_on_ruv.ferx`.
+
 ## Impact on Estimation
 
 The error model affects:
-- **Individual weighted residuals (IWRES)**: `(DV - IPRED) / sqrt(Var)`
+- **Individual weighted residuals (IWRES)**: `(DV - IPRED) / sqrt(Var)` — with
+  `iiv_on_ruv`, `Var` includes the per-subject `exp(2·ETA_RUV)` scale at the EBE.
 - **Conditional weighted residuals (CWRES)**: Accounts for uncertainty in random effect estimates
 - **Objective function value (OFV)**: The likelihood includes `log(Var)` terms, so the error model structure directly influences parameter estimates

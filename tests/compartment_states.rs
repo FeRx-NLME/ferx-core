@@ -2020,6 +2020,112 @@ fn analytical_tv_covariate_integral_of_compartment_is_nan() {
     }
 }
 
+/// Regression for #400: integral grid path for an analytical oral model with a
+/// zero-order input into the depot must return NaN (not a silently-wrong finite
+/// approximation).
+///
+/// The superposition state helper (`single_dose_states`) models an oral infusion
+/// as a depot-bypassing central infusion, so without a guard the grid path in
+/// `eval_integral_grid` (api.rs) fell through to `analytical_state_at_times` and
+/// produced finite-but-wrong compartment amounts — contradicting both the
+/// per-observation `compartments[i]` (correctly NaN) and the
+/// `W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL` warning's "evaluate to NaN".
+#[test]
+fn analytical_oral_depot_infusion_integral_of_compartment_is_nan() {
+    const MODEL: &str = "
+[parameters]
+  theta CL(5.0, 0.01, 50.0)
+  theta V(50.0, 0.1, 500.0)
+  theta KA(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP   ~ 0.01
+
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V  = V
+  KA = KA
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[derived]
+  cmt0     = compartments[0]
+  AUC_cmt0 = integral(compartments[0], from=0, to=24)
+
+[fit_options]
+  method   = foce
+  maxiter  = 2
+  gradient = fd
+";
+    let model = parse_model_string(MODEL).expect("model must parse");
+    // One subject with an explicit zero-order infusion into the depot (cmt 1):
+    // rate 25 over AMT/rate = 4 h, then first-order KA absorption.
+    let obs_times = vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
+    let n = obs_times.len();
+    let pop = Population {
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)],
+            obs_times,
+            vec![0.8, 1.4, 1.6, 0.9, 0.5, 0.2],
+            vec![2; n],
+        )],
+    };
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit must not error");
+
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL")),
+        "expected W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL; got: {:?}",
+        result.warnings
+    );
+
+    for sr in &result.subjects {
+        // Per-observation column: compartments[0] → NaN.
+        let cmt0_col = sr
+            .extra_columns
+            .iter()
+            .find(|(name, _)| name == "cmt0")
+            .map(|(_, vals)| vals.as_slice())
+            .unwrap_or(&[]);
+        for (j, &v) in cmt0_col.iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "subject {}: cmt0[{j}] = {v} — expected NaN for oral depot-infusion analytical",
+                sr.id
+            );
+        }
+        // Integral grid path: integral(compartments[0]) must also be NaN — this is
+        // the path that previously returned a finite wrong AUC (the #400 grid guard).
+        let auc_col = sr
+            .extra_columns
+            .iter()
+            .find(|(name, _)| name == "AUC_cmt0")
+            .map(|(_, vals)| vals.as_slice())
+            .unwrap_or(&[]);
+        for (j, &v) in auc_col.iter().enumerate() {
+            assert!(
+                v.is_nan(),
+                "subject {}: AUC_cmt0[{j}] = {v} — integral(compartments[0]) must be NaN \
+                 for an oral depot-infusion analytical subject (the #400 grid guard)",
+                sr.id
+            );
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Bug regression: IOV model + integral(compartments[i]) → NaN, not finite wrong
 // Before Fix 3 (eval_integral_grid IOV guard), analytical IOV subjects without

@@ -10,13 +10,17 @@ ferx-core separates two orthogonal choices: the **statistical method** (how rand
 
 - **[SAEM](saem.md)** — Stochastic Approximation Expectation-Maximization. Uses MCMC sampling for random effects, providing more robust convergence on complex models with many random effects.
 
+- **[Importance Sampling (IMP)](importance-sampling.md)** — Monte-Carlo EM estimator (NONMEM `METHOD=IMP`) that maximises the importance-sampled marginal likelihood. Re-centers the proposal from the previous iteration's sample moments (cheaper than IMPMAP, but fragile on rich data — warm-start with `[focei, imp]` or use IMPMAP there). Set `is_eval_only = true` (NONMEM `EONLY=1`) to evaluate `−2 log L` at fixed parameters instead of estimating.
+
 - **[IMPMAP](impmap.md)** — Importance Sampling assisted by Mode A Posteriori (NONMEM `METHOD=IMPMAP`). A Monte-Carlo EM estimator that re-centers a per-subject importance-sampling proposal on the conditional mode every iteration. Targets high-dimensional, rich-data models where a non-MAP importance-sampling EM stalls. Runs standalone (`method = impmap`) or chained (`methods = [focei, impmap]`).
+
+- **[Bayesian (MCMC)](bayes.md)** — Full posterior sampling (`method = bayes`, Gibbs-within-HMC, NONMEM `METHOD=BAYES` parity). Reports posterior means, credible intervals, and convergence diagnostics (split-R̂, ESS) instead of a point estimate. BSV-only in this first cut.
 
 ## Post-estimation steps
 
 These chain after a primary method via `methods = [...]` and refine the result rather than re-estimating from scratch:
 
-- **[Importance Sampling (IMP)](importance-sampling.md)** — Monte-Carlo marginal likelihood estimate (`−2 log L`) that is more accurate than the Laplace approximation. Useful for model comparison when FOCE OFV may be biased (sparse data, complex random effect structure). Chain as `methods = [saem, imp]` or `methods = [focei, imp]`.
+- **Importance Sampling (IMP), evaluation-only** (`method = [..., imp]` with `is_eval_only = true`) — a Monte-Carlo marginal likelihood estimate (`−2 log L`) more accurate than the Laplace approximation, for model comparison when the FOCE OFV may be biased (sparse data, complex random-effect structure). This is the post-estimation *scoring* use of [IMP](importance-sampling.md); without `is_eval_only` the same `imp` token *estimates* instead (see Statistical methods above).
 
 - **[SIR](sir.md)** — Sampling Importance Resampling. Provides non-parametric 95% CIs for all parameters, more robust than the asymptotic covariance matrix. Appended automatically when `sir = true` in `[fit_options]`.
 

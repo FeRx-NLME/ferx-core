@@ -1,15 +1,22 @@
 //! Integration tests for propensity-score-matched simulation
-//! (`simulate_with_options` with `propensity_match = true`).
+//! (`simulate_with_options` with `match_method = Some(..)`).
 //!
-//! The matching *math* (Mahalanobis + optimal assignment) is unit-tested in
-//! `src/propensity_match.rs`; these tests exercise the public-API wiring on a
-//! real compiled model: shape, finiteness, the error path, reproducibility of
-//! the unmatched path, and that the matched path is actually distinct.
+//! The matching *math* (Mahalanobis + the assignment algorithms) is unit-tested
+//! in `src/propensity_match.rs`; these tests exercise the public-API wiring on a
+//! real compiled model for every [`MatchMethod`]: shape, finiteness, the error
+//! path, reproducibility of the unmatched path, and that each matched method is
+//! actually distinct from the unmatched draw.
 
 use ferx_core::{
-    parse_model_string, simulate_with_options, simulate_with_seed, DoseEvent, Population,
-    SimulateOptions, Subject,
+    parse_model_string, simulate_with_options, simulate_with_seed, DoseEvent, MatchMethod,
+    Population, SimulateOptions, Subject,
 };
+
+const ALL_METHODS: [MatchMethod; 3] = [
+    MatchMethod::Optimal,
+    MatchMethod::Nearest,
+    MatchMethod::Rank,
+];
 
 mod common;
 
@@ -81,54 +88,68 @@ fn matched_simulation_has_expected_shape_and_finite_dvs() {
     let n_sim = 4;
     let n_obs: usize = pop.subjects.iter().map(|s| s.obs_times.len()).sum();
 
-    let opts = SimulateOptions {
-        seed: Some(2024),
-        propensity_match: true,
-    };
-    let rows = simulate_with_options(&model, &pop, &model.default_params, n_sim, &opts)
-        .expect("matched simulation succeeds");
+    for method in ALL_METHODS {
+        let opts = SimulateOptions {
+            seed: Some(2024),
+            match_method: Some(method),
+        };
+        let rows = simulate_with_options(&model, &pop, &model.default_params, n_sim, &opts)
+            .unwrap_or_else(|e| panic!("matched simulation ({method:?}) succeeds: {e}"));
 
-    assert_eq!(rows.len(), n_obs * n_sim, "one row per obs per replicate");
-    assert!(rows
-        .iter()
-        .all(|r| r.outcome.continuous_value().is_finite()));
-    // Replicate indices span 1..=n_sim.
-    let mut sims: Vec<usize> = rows.iter().map(|r| r.sim).collect();
-    sims.sort_unstable();
-    sims.dedup();
-    assert_eq!(sims, (1..=n_sim).collect::<Vec<_>>());
+        assert_eq!(
+            rows.len(),
+            n_obs * n_sim,
+            "one row per obs per replicate ({method:?})"
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r.outcome.continuous_value().is_finite()));
+        // Replicate indices span 1..=n_sim.
+        let mut sims: Vec<usize> = rows.iter().map(|r| r.sim).collect();
+        sims.sort_unstable();
+        sims.dedup();
+        assert_eq!(sims, (1..=n_sim).collect::<Vec<_>>());
+    }
 }
 
 #[test]
 fn matched_simulation_is_reproducible_and_distinct_from_unmatched() {
     let model = parse_model_string(MODEL).expect("model parses");
     let pop = observed_population(&model, 10);
-
-    let matched = SimulateOptions {
-        seed: Some(7),
-        propensity_match: true,
-    };
-    let a = simulate_with_options(&model, &pop, &model.default_params, 3, &matched).unwrap();
-    let b = simulate_with_options(&model, &pop, &model.default_params, 3, &matched).unwrap();
     let dv = |rs: &[ferx_core::SimulationResult]| {
         rs.iter()
             .map(|r| r.outcome.continuous_value())
             .collect::<Vec<_>>()
     };
-    assert_eq!(
-        dv(&a),
-        dv(&b),
-        "matched path must be reproducible under a seed"
-    );
 
-    // The matched path takes a different branch (pool draw + reassignment), so
-    // its output must differ from the unmatched path on the same seed.
+    // The unmatched path on the same seed, for the distinctness check below.
     let unmatched = SimulateOptions {
         seed: Some(7),
-        propensity_match: false,
+        match_method: None,
     };
     let c = simulate_with_options(&model, &pop, &model.default_params, 3, &unmatched).unwrap();
-    assert_ne!(dv(&a), dv(&c), "matched should differ from unmatched");
+
+    for method in ALL_METHODS {
+        let matched = SimulateOptions {
+            seed: Some(7),
+            match_method: Some(method),
+        };
+        let a = simulate_with_options(&model, &pop, &model.default_params, 3, &matched).unwrap();
+        let b = simulate_with_options(&model, &pop, &model.default_params, 3, &matched).unwrap();
+        assert_eq!(
+            dv(&a),
+            dv(&b),
+            "matched path ({method:?}) must be reproducible under a seed"
+        );
+
+        // The matched path takes a different branch (pool draw + reassignment),
+        // so its output must differ from the unmatched path on the same seed.
+        assert_ne!(
+            dv(&a),
+            dv(&c),
+            "matched ({method:?}) should differ from unmatched"
+        );
+    }
 }
 
 #[test]
@@ -138,7 +159,7 @@ fn unmatched_options_path_equals_simulate_with_seed() {
 
     let opts = SimulateOptions {
         seed: Some(99),
-        propensity_match: false,
+        match_method: None,
     };
     let via_opts = simulate_with_options(&model, &pop, &model.default_params, 2, &opts).unwrap();
     let via_seed = simulate_with_seed(&model, &pop, &model.default_params, 2, 99);
@@ -177,7 +198,7 @@ fn matching_requires_observations() {
 
     let opts = SimulateOptions {
         seed: Some(1),
-        propensity_match: true,
+        match_method: Some(MatchMethod::Optimal),
     };
     let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
         .expect_err("matching without observations must error");

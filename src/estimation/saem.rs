@@ -83,20 +83,24 @@ struct SaemState {
     nll_cache: Vec<f64>,
     /// Per-subject MH step sizes (for the block eta kernel)
     step_scales: Vec<f64>,
-    /// Per-subject step sizes for the componentwise eta kernel (Kuhn-Lavielle
-    /// kernel 2). Adapted separately from `step_scales` because the optimal
-    /// 1-D scaling differs from the d-dimensional block scaling.
-    cw_step_scales: Vec<f64>,
+    /// Per-subject, per-eta step sizes for the componentwise eta kernel
+    /// (Kuhn-Lavielle kernel 2).  Adapted independently for each coordinate
+    /// so that etas with vastly different posterior precision (e.g. FREM
+    /// covariate etas vs PK etas) can converge to their individual optima.
+    /// Indexed `[subject][eta]`.
+    cw_step_scales: Vec<Vec<f64>>,
     /// Per-subject kappa MH step sizes.  Empty when `n_kappa == 0`.
     kappa_step_scales: Vec<f64>,
     /// Per-subject acceptance counts since last adaptation
     accept_counts: Vec<usize>,
     /// Per-subject proposal counts since last adaptation (1 for HMC, n_mh_steps for MH)
     proposal_counts: Vec<usize>,
-    /// Per-subject componentwise-kernel acceptance counts since last adaptation.
-    cw_accept_counts: Vec<usize>,
-    /// Per-subject componentwise-kernel proposal counts since last adaptation.
-    cw_proposal_counts: Vec<usize>,
+    /// Per-subject, per-eta componentwise-kernel acceptance counts since last
+    /// adaptation.  Indexed `[subject][eta]`.
+    cw_accept_counts: Vec<Vec<usize>>,
+    /// Per-subject, per-eta componentwise-kernel proposal counts since last
+    /// adaptation.  Indexed `[subject][eta]`.
+    cw_proposal_counts: Vec<Vec<usize>>,
     /// Per-subject kappa acceptance counts since last adaptation.
     kappa_accept_counts: Vec<usize>,
     /// Per-subject kappa proposal counts since last adaptation.
@@ -136,7 +140,7 @@ struct SaemState {
 /// `log(CL_i) − log(TVCL)`, while `mu_k = log(TVCL)`, so the model evaluated
 /// `CL = TVCL · exp(log TVCL) = TVCL²` for every accepted exploration step.
 #[allow(clippy::too_many_arguments)]
-fn mh_steps(
+pub(crate) fn mh_steps(
     eta: &mut [f64],
     nll_current: f64,
     subject: &Subject,
@@ -237,7 +241,11 @@ fn mh_steps_componentwise(
     theta: &[f64],
     omega: &OmegaMatrix,
     sigma_values: &[f64],
-    step_scale: f64,
+    // Per-eta step scales — each coordinate adapts its own scale independently
+    // so that etas with vastly different posterior precision (e.g. near-
+    // deterministic FREM covariate etas vs broad PK etas) can each reach
+    // their optimal acceptance rate.
+    step_scales: &[f64],
     // Per-coordinate proposal SD = √(marginal variance), precomputed once per
     // iteration from Ω's diagonal (it is identical across subjects) and floored
     // to match the Ω diagonal floor so a collapsing diagonal can't shrink the
@@ -247,16 +255,16 @@ fn mh_steps_componentwise(
     n_sweeps: usize,
     pk_scratch: &mut EventPkParams,
     kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
-) -> (usize, usize, f64) {
+) -> (Vec<usize>, usize, f64) {
     let n_eta = eta.len();
     let mut nll = nll_current;
-    let mut n_accepted = 0;
+    let mut per_eta_accepted = vec![0usize; n_eta];
 
     for _ in 0..n_sweeps {
         for j in 0..n_eta {
             let z: f64 = rng.sample(StandardNormal);
             let old_j = eta[j];
-            eta[j] = old_j + step_scale * cw_sd[j] * z;
+            eta[j] = old_j + step_scales[j] * cw_sd[j] * z;
 
             let nll_prop = if let Some((kappas, omega_iov)) = kappas_opt {
                 individual_nll_iov(
@@ -277,14 +285,14 @@ fn mh_steps_componentwise(
             let log_u: f64 = rng.gen::<f64>().ln();
             if log_u < nll - nll_prop {
                 nll = nll_prop;
-                n_accepted += 1;
+                per_eta_accepted[j] += 1;
             } else {
                 eta[j] = old_j; // reject — restore
             }
         }
     }
 
-    (n_accepted, n_eta * n_sweeps, nll)
+    (per_eta_accepted, n_eta * n_sweeps, nll)
 }
 
 // ---------------------------------------------------------------------------
@@ -301,7 +309,7 @@ fn mh_steps_componentwise(
 ///
 /// Returns `(n_accepted, n_proposed, updated_nll)`.
 #[allow(clippy::too_many_arguments)]
-fn mh_kappa_steps(
+pub(crate) fn mh_kappa_steps(
     kappas: &mut [Vec<f64>],
     nll_current: f64,
     subject: &Subject,
@@ -385,15 +393,28 @@ fn obs_nll_subject_into_iov(
     // consistent. `_pk_scratch` is retained for signature stability but unused
     // (predict_iov manages its own per-event params).
     let preds = crate::pk::predict_iov(model, subject, theta, eta, kappas);
+    // FREM covariate pseudo-observations (FREMTYPE > 0) use the covariate sigma
+    // (EPSCOV), not the PK residual error — otherwise their near-zero residuals
+    // drag PROP/ADD toward zero. See build_frem_r_override.
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma_values,
+    );
+    // IIV on residual error (#409): scale the PK residual variance by
+    // exp(2·η_ruv); FREM rows keep their own variance.
+    let ruv_scale = model.residual_var_scale(eta);
     let mut total_nll = 0.0_f64;
     for j in 0..subject.observations.len() {
         // Floors protect log(0) in the M-step objective. individual_nll_iov
         // (the E-step evaluator) does not floor — see obs_nll_subject_grad_iov
         // for why the asymmetry is intentional.
         let f = preds[j].max(1e-12);
-        let v = model
-            .residual_variance_at(subject.obs_cmts[j], f, sigma_values)
-            .max(1e-12);
+        let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
+            Some(vv) => vv.max(1e-12),
+            None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale)
+                .max(1e-12),
+        };
         if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
             let z = (subject.observations[j] - f) / v.sqrt();
             total_nll += -log_normal_cdf(z);
@@ -504,22 +525,46 @@ fn obs_nll_subject_grad_iov(
     // Non-M3 path: continuous per-occasion-aware base predictions (issue #104).
     let n_obs = subject.observations.len();
     let preds = crate::pk::predict_iov(model, subject, theta, eta, kappas);
+    // FREM covariate rows use EPSCOV, not the PK residual error (see
+    // build_frem_r_override); their variance is η-independent so dvar_df = 0.
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma_values,
+    );
+    // IIV on residual error (#409): per-subject `exp(2·η_ruv)` scale on the PK
+    // residual variance (FREM rows excluded). η_ruv is a BSV eta, indexed into
+    // `eta`.  See the non-IOV `obs_nll_subject_grad` for the score-consistency
+    // argument behind scaling V, dV/df, and dV/dlogσ together.
+    let ruv_scale = model.residual_var_scale(eta);
+
     let mut nll_base = 0.0_f64;
     let mut all_preds_base = vec![0.0f64; n_obs];
     let mut residuals = vec![0.0f64; n_obs];
     let mut variances = vec![0.0f64; n_obs];
     let mut d_nll_d_f = vec![0.0f64; n_obs];
+    let mut obs_var_scale = vec![1.0f64; n_obs];
 
     for j in 0..n_obs {
         let cmt = subject.obs_cmts[j];
         let f = preds[j].max(1e-12);
-        let v = model.residual_variance_at(cmt, f, sigma_values).max(1e-12);
+        let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
+        obs_var_scale[j] = s;
+        let v = match frem_vj {
+            Some(vv) => vv.max(1e-12),
+            None => (model.residual_variance_at(cmt, f, sigma_values) * s).max(1e-12),
+        };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
         all_preds_base[j] = f;
         residuals[j] = resid;
         variances[j] = v;
-        let dv_df = model.error_spec.dvar_df(cmt, f, sigma_values);
+        let dv_df = if frem_vj.is_some() {
+            0.0
+        } else {
+            model.error_spec.dvar_df(cmt, f, sigma_values) * s
+        };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
 
@@ -565,7 +610,8 @@ fn obs_nll_subject_grad_iov(
                 let ratio =
                     model
                         .error_spec
-                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values);
+                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values)
+                        * obs_var_scale[j];
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -862,21 +908,46 @@ fn obs_nll_subject_grad(
     let mut nll_base = 0.0f64;
     let n_obs = subject.observations.len();
 
-    // per-obs residual, variance, d(obs_nll)/d(f_j)
+    // FREM covariate rows use EPSCOV, not the PK residual error (see
+    // build_frem_r_override); their variance is η-independent so dvar_df = 0.
+    let frem_ov = crate::stats::likelihood::build_frem_r_override(
+        model.frem_config.as_ref(),
+        &subject.fremtype,
+        sigma_values,
+    );
+
+    // IIV on residual error (#409): per-subject scale on the PK residual
+    // variance (`exp(2·η_ruv)`). FREM covariate rows are not scaled, so we hold
+    // a per-obs scale and apply it consistently to V, dV/df, and dV/dlogσ so the
+    // analytical score stays exact.
+    let ruv_scale = model.residual_var_scale(eta);
+
+    // per-obs residual, variance, d(obs_nll)/d(f_j), and the variance scale used.
     let mut residuals = vec![0.0f64; n_obs];
     let mut variances = vec![0.0f64; n_obs];
     let mut d_nll_d_f = vec![0.0f64; n_obs];
+    let mut obs_var_scale = vec![1.0f64; n_obs];
 
     for j in 0..n_obs {
         let cmt = subject.obs_cmts[j];
         let f = preds_base[j].max(1e-12);
-        let v = model.residual_variance_at(cmt, f, sigma_values).max(1e-12);
+        let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
+        obs_var_scale[j] = s;
+        let v = match frem_vj {
+            Some(vv) => vv.max(1e-12),
+            None => (model.residual_variance_at(cmt, f, sigma_values) * s).max(1e-12),
+        };
         let resid = subject.observations[j] - f;
         nll_base += 0.5 * (v.ln() + resid * resid / v);
         residuals[j] = resid;
         variances[j] = v;
         // d(obs_nll_j)/d(f_j) = -resid/V + 0.5 * (dV/df) * (1/V - resid²/V²)
-        let dv_df = model.error_spec.dvar_df(cmt, f, sigma_values);
+        let dv_df = if frem_vj.is_some() {
+            0.0
+        } else {
+            model.error_spec.dvar_df(cmt, f, sigma_values) * s
+        };
         d_nll_d_f[j] = -resid / v + 0.5 * dv_df * (1.0 / v - resid * resid / (v * v));
     }
 
@@ -927,7 +998,8 @@ fn obs_nll_subject_grad(
                 let ratio =
                     model
                         .error_spec
-                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values);
+                        .dvar_dlogsigma(subject.obs_cmts[j], k, f, sigma_values)
+                        * obs_var_scale[j];
                 0.5 * ratio * (1.0 / v - resid * resid / (v * v))
             })
             .sum();
@@ -1034,9 +1106,15 @@ pub(crate) fn saem_sampler_summary(model: &CompiledModel, options: &FitOptions) 
     // HMC is BSV-only (`hmc_step` and the AD NLL/gradient are kappa-unaware), so
     // it is disabled for IOV models (`n_kappa > 0`); those subjects use the MH
     // kernels, whose acceptance targets the IOV conditional p(η | κ, θ, data).
+    // IIV on residual error (#409) also disables HMC: the autodiff kernel has no
+    // `exp(2·η_ruv)` variance-scaling rule, so these models fall back to MH (same
+    // gate as [`run_saem`]).
     #[cfg(feature = "autodiff")]
-    let using_hmc =
-        n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && model.n_kappa == 0;
+    let using_hmc = n_leapfrog > 0
+        && model.ode_spec.is_none()
+        && model.tv_fn.is_some()
+        && model.n_kappa == 0
+        && model.residual_error_eta.is_none();
     #[cfg(not(feature = "autodiff"))]
     let using_hmc = {
         let _ = model;
@@ -1094,10 +1172,21 @@ pub fn run_saem(
     // `n_leapfrog > 0` would propose eta against the kappa-free posterior and
     // hand a BSV-only NLL to the componentwise kernel as its (mismatched)
     // acceptance baseline.
+    //
+    // IIV on residual error (#409): the autodiff NLL/gradient kernels build the
+    // residual variance from σ alone and carry no `exp(2·η_ruv)` scaling rule,
+    // so an HMC E-step would sample η against the unscaled conditional — η_ruv
+    // sees no data curvature and collapses toward the prior. Disable HMC for
+    // these models so the (correctly-scaled) MH kernels run instead (mirrors
+    // `inner_optimizer::analytical_ad_unsupported`).
     let using_hmc: bool = {
         #[cfg(feature = "autodiff")]
         {
-            n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && n_kappa == 0
+            n_leapfrog > 0
+                && model.ode_spec.is_none()
+                && model.tv_fn.is_some()
+                && n_kappa == 0
+                && model.residual_error_eta.is_none()
         }
         #[cfg(not(feature = "autodiff"))]
         false
@@ -1122,6 +1211,9 @@ pub fn run_saem(
         // keys on it to tag this as an Info/gradient_fallback warning.
         let reason = if n_kappa > 0 {
             "HMC is unavailable for IOV models (it is kappa-unaware)"
+        } else if model.residual_error_eta.is_some() {
+            "HMC is unavailable with IIV on residual error (iiv_on_ruv) — the autodiff \
+             kernel has no exp(2·η_ruv) variance-scaling rule"
         } else {
             "HMC is unavailable (requires `autodiff` feature and analytical PK model)"
         };
@@ -1138,13 +1230,55 @@ pub fn run_saem(
     let s2 = omega_cur.clone();
 
     let etas: Vec<Vec<f64>> = (0..n_subjects)
-        .map(|_| get_eta_init(n_eta, None, None))
+        .map(|si| {
+            let mut eta = get_eta_init(n_eta, None, None);
+            // For FREM models, initialise covariate etas at their
+            // conditional mode: eta_j = DV_cov - theta_k.  The posterior
+            // for these etas is extremely peaked (EPSCOV ≈ 1e-6), so
+            // starting at 0 leaves the chain far from the mode and
+            // virtually every MH proposal gets rejected.
+            if let Some(ref fc) = model.frem_config {
+                let subj = &population.subjects[si];
+                if !subj.fremtype.is_empty() {
+                    for (&ft, &(theta_idx, eta_idx)) in &fc.fremtype_to_indices {
+                        // Find the first observation with this FREMTYPE
+                        if let Some(pos) = subj.fremtype.iter().position(|&f| f == ft) {
+                            let dv = subj.observations[pos];
+                            let tv = theta_cur[theta_idx];
+                            eta[eta_idx] = dv - tv;
+                        }
+                    }
+                }
+            }
+            eta
+        })
         .collect();
     let step_scales = vec![0.3; n_subjects];
     // Componentwise kernel scales η'_j by √Ω_jj (a marginal SD), so a multiplier
     // near 1 is already a sensible 1-D step; start higher than the block kernel
     // and let adaptation climb toward the ~2.4 optimum.
-    let cw_step_scales = vec![1.0; n_subjects];
+    //
+    // For FREM covariate etas the posterior is near-deterministic (EPSCOV
+    // ≈ 1e-6) so the optimal CW step is orders of magnitude below the
+    // prior SD.  Pre-compute: step_scale_j ≈ √(EPSCOV) / √(Ω_jj) so
+    // that `step_scale_j · √Ω_jj ≈ √EPSCOV`.  This avoids thousands of
+    // adaptation iterations to shrink from 1.0 down to ~1e-5.
+    let cw_init = {
+        let mut v = vec![1.0_f64; n_eta];
+        if let Some(ref fc) = model.frem_config {
+            let epscov = init_params.sigma.values[fc.covariate_sigma_index];
+            for &(_theta_idx, eta_idx) in fc.fremtype_to_indices.values() {
+                if eta_idx < n_eta {
+                    let omega_jj = init_params.omega.matrix[(eta_idx, eta_idx)].max(1e-10);
+                    // Target proposal SD = √EPSCOV; CW multiplies by √Ω_jj,
+                    // so step_scale = √EPSCOV / √Ω_jj.  Floor at 1e-6.
+                    v[eta_idx] = (epscov.sqrt() / omega_jj.sqrt()).max(1e-6);
+                }
+            }
+        }
+        v
+    };
+    let cw_step_scales = vec![cw_init; n_subjects];
 
     // Guard: the parser must guarantee omega_iov is present whenever kappas
     // are declared; if this fires, the caller wired up a broken ModelParameters.
@@ -1295,8 +1429,8 @@ pub fn run_saem(
         kappa_step_scales,
         accept_counts: vec![0; n_subjects],
         proposal_counts: vec![0; n_subjects],
-        cw_accept_counts: vec![0; n_subjects],
-        cw_proposal_counts: vec![0; n_subjects],
+        cw_accept_counts: vec![vec![0usize; n_eta]; n_subjects],
+        cw_proposal_counts: vec![vec![0usize; n_eta]; n_subjects],
         kappa_accept_counts: vec![0; n_subjects],
         kappa_proposal_counts: vec![0; n_subjects],
         steps_since_adapt: 0,
@@ -1392,7 +1526,6 @@ pub fn run_saem(
             let theta_ref = &state.theta;
             let sigma_ref = &state.sigma_vals;
             let omega_ref = &omega_k;
-            let cw_scales = &state.cw_step_scales;
             // Per-coordinate componentwise proposal SDs — computed once here (Ω's
             // diagonal is shared across subjects) rather than per subject inside
             // the parallel kernel. Floored to match the Ω diagonal floor.
@@ -1407,12 +1540,13 @@ pub fn run_saem(
             let omega_iov_for_eta_mh: Option<&OmegaMatrix> = omega_iov_cur_opt.as_ref();
 
             // Returns (eta_new, nll_after, n_acc_primary, n_prop_primary,
-            //          n_acc_cw, n_prop_cw, used_hmc)
-            let results: Vec<(Vec<f64>, f64, usize, usize, usize, usize, bool)> = state
+            //          per_eta_acc_cw, n_sweeps_cw, used_hmc)
+            let results: Vec<(Vec<f64>, f64, usize, usize, Vec<usize>, usize, bool)> = state
                 .etas
                 .par_iter()
                 .zip(state.nll_cache.par_iter())
                 .zip(state.step_scales.par_iter())
+                .zip(state.cw_step_scales.par_iter())
                 .zip(state.kappas.par_iter())
                 .enumerate()
                 // Per-rayon-worker `EventPkParams` scratch: allocated
@@ -1423,7 +1557,7 @@ pub fn run_saem(
                 // with it, n_workers × N_iter ≈ 10 × N_iter.
                 .map_init(
                     EventPkParams::default,
-                    |pk_scratch, (i, (((eta, &nll), &scale), kappas_i))| {
+                    |pk_scratch, (i, ((((eta, &nll), &scale), cw_sc_i), kappas_i))| {
                         let subject = &population.subjects[i];
                         let mut rng = StdRng::seed_from_u64(
                             master_seed
@@ -1445,7 +1579,7 @@ pub fn run_saem(
                         // flag reported back for diagnostics.
                         #[cfg(feature = "autodiff")]
                         let did_hmc = if using_hmc {
-                            if let Some((new_eta, new_nll, accepted)) =
+                            if let Some((new_eta, new_nll, accepted, _divergent)) =
                                 crate::estimation::hmc::hmc_step(
                                     subject, &eta_work, nll, model, theta_ref, omega_ref,
                                     sigma_ref, scale, n_leapfrog, &mut rng,
@@ -1486,7 +1620,7 @@ pub fn run_saem(
                         }
 
                         // ---- Kernel 2: componentwise decorrelating sweep ----
-                        let (n_acc_cw, n_prop_cw, nll_cw) = mh_steps_componentwise(
+                        let (per_eta_acc_cw, n_prop_cw, nll_cw) = mh_steps_componentwise(
                             &mut eta_work,
                             nll_cur,
                             subject,
@@ -1494,7 +1628,7 @@ pub fn run_saem(
                             theta_ref,
                             omega_ref,
                             sigma_ref,
-                            cw_scales[i],
+                            cw_sc_i,
                             cw_sd_ref,
                             &mut rng,
                             n_cw_sweeps,
@@ -1507,7 +1641,7 @@ pub fn run_saem(
                             nll_cw,
                             n_acc_primary,
                             n_prop_primary,
-                            n_acc_cw,
+                            per_eta_acc_cw,
                             n_prop_cw,
                             did_hmc,
                         )
@@ -1515,15 +1649,18 @@ pub fn run_saem(
                 )
                 .collect();
 
-            for (i, (eta_new, nll_new, n_acc, n_prop, n_acc_cw, n_prop_cw, used_hmc)) in
+            for (i, (eta_new, nll_new, n_acc, n_prop, per_eta_acc_cw, _n_prop_cw, used_hmc)) in
                 results.into_iter().enumerate()
             {
                 state.etas[i] = eta_new;
                 state.nll_cache[i] = nll_new;
                 state.accept_counts[i] += n_acc;
                 state.proposal_counts[i] += n_prop;
-                state.cw_accept_counts[i] += n_acc_cw;
-                state.cw_proposal_counts[i] += n_prop_cw;
+                // Accumulate per-eta CW acceptance counts
+                for j in 0..n_eta {
+                    state.cw_accept_counts[i][j] += per_eta_acc_cw[j];
+                    state.cw_proposal_counts[i][j] += n_cw_sweeps;
+                }
                 hmc_subjects[i] |= used_hmc;
             }
         }
@@ -1884,19 +2021,28 @@ pub fn run_saem(
                 }
                 state.accept_counts[i] = 0;
                 state.proposal_counts[i] = 0;
-                // Adapt the componentwise kernel scale toward the 1-D optimum
-                // (~0.44 acceptance, Roberts & Rosenthal 2001). Independent of
-                // the block scale above.
+                // Adapt per-eta componentwise kernel scales toward the 1-D
+                // optimum (~0.44 acceptance, Roberts & Rosenthal 2001).
+                // Each eta adapts independently so that etas with very
+                // different posterior precision (e.g. FREM covariate etas
+                // with near-deterministic data vs broad PK etas) can each
+                // reach their optimal step size.  The floor is 1e-6 (not
+                // 0.01) to accommodate near-deterministic etas whose
+                // posterior SD may be orders of magnitude below √Ω_jj.
                 if n_cw_sweeps > 0 {
-                    let cw_total = state.cw_proposal_counts[i].max(1);
-                    let cw_rate = state.cw_accept_counts[i] as f64 / cw_total as f64;
-                    if cw_rate > CW_TARGET_ACCEPT {
-                        state.cw_step_scales[i] = (state.cw_step_scales[i] * 1.1).min(5.0);
-                    } else {
-                        state.cw_step_scales[i] = (state.cw_step_scales[i] * 0.9).max(0.01);
+                    for j in 0..n_eta {
+                        let cw_total = state.cw_proposal_counts[i][j].max(1);
+                        let cw_rate = state.cw_accept_counts[i][j] as f64 / cw_total as f64;
+                        if cw_rate > CW_TARGET_ACCEPT {
+                            state.cw_step_scales[i][j] =
+                                (state.cw_step_scales[i][j] * 1.1).min(5.0);
+                        } else {
+                            state.cw_step_scales[i][j] =
+                                (state.cw_step_scales[i][j] * 0.9).max(1e-6);
+                        }
+                        state.cw_accept_counts[i][j] = 0;
+                        state.cw_proposal_counts[i][j] = 0;
                     }
-                    state.cw_accept_counts[i] = 0;
-                    state.cw_proposal_counts[i] = 0;
                 }
                 // Adapt kappa step sizes (target 40% for MH on kappas).
                 if n_kappa > 0 {
@@ -2086,6 +2232,8 @@ pub fn run_saem(
         total_ebe_fallbacks: 0,
         final_gradient: None,
         sir_fallback_proposal,
+        impmap_trace: None,
+        bayes: None,
     })
 }
 
@@ -2338,6 +2486,7 @@ mod tests {
             cens: vec![0],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -2452,6 +2601,7 @@ mod tests {
             cens: vec![0, 0],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -2549,6 +2699,7 @@ mod tests {
             cens: vec![0, 0, 0],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -2705,6 +2856,7 @@ mod tests {
             pk_idx_f64: vec![0.0, 1.0],
             sel_flat: vec![1.0, 0.0],
             ode_spec: None,
+            dose_attr_map: Default::default(),
             diffusion_theta_start: None,
             diffusion_state_indices: Vec::new(),
             bloq_method: BloqMethod::Drop,
@@ -2723,6 +2875,8 @@ mod tests {
             output_columns: Vec::new(),
             #[cfg(feature = "survival")]
             endpoints: HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
         };
 
         // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.
@@ -2745,6 +2899,7 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         };
@@ -2900,6 +3055,7 @@ mod tests {
             cens: vec![0; 6],
             occasions: vec![],
             dose_occasions: vec![],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };
@@ -3012,6 +3168,7 @@ mod tests {
             cens: vec![0; 4],
             occasions: vec![1u32, 1, 2, 2],
             dose_occasions: vec![1u32],
+            fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
         };

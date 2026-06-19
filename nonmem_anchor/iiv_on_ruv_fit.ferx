@@ -1,0 +1,37 @@
+# IIV on residual error (ferx #409) — anchor fit model.
+# Matches nonmem_anchor/iiv_on_ruv.ctl (ADVAN2 TRANS2, FOCEI INTER).
+# Data: nonmem_anchor/iiv_on_ruv.csv (50 subjects, simulated by
+# tests/gen_iiv_anchor.rs with true ETA_RUV variance = 0.30).
+#
+# NOTE: the on-disk CSV labels observations CMT=2 for NONMEM ADVAN2 (depot=1,
+# central=2). ferx's one_cpt_oral observes central as its own CMT 1, so to fit
+# this file with ferx directly, relabel observation rows CMT 2 -> 1, or use the
+# in-memory population the generator builds.
+
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.30
+
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+
+[fit_options]
+  method     = focei
+  covariance = true
