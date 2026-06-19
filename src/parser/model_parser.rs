@@ -2277,22 +2277,37 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .iter()
             .enumerate()
             .filter(|(_, name)| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
-            // Exempt engine-applied slots on ODE models: bare `f`/`lagtime`/`alag`
-            // (routed to RESERVED_PK_SLOTS) and the compartment-indexed dose
-            // attributes `Fn`/`ALAGn` (issue #369) are applied to the dose by the
-            // engine without a textual RHS reference, so absence from `[odes]` does
-            // not make them dead. The bare case reuses `ode_param_slots`' own routing
-            // (`ode_slot_map`, parallel to `indiv_param_names`) so the exemption can't
-            // drift; the indexed case matches the same `from_indexed_name` predicate
-            // that built `dose_attr_map`. No-op for analytical models (`is_ode` false;
-            // their F/lagtime are bound via an explicit `pk(...)` mapping the census
-            // already counts).
+            // Exempt parameters the *engine* applies to a dose without a textual
+            // reference, so their absence from the RHS / `pk(...)` mapping does not
+            // make them dead:
+            //  * ODE models: bare `f`/`lagtime`/`alag` (routed to RESERVED_PK_SLOTS)
+            //    and every compartment-indexed dose attribute `Fn`/`ALAGn`/`Dn`/`Rn`
+            //    (#369/#324) — the bare case reuses `ode_param_slots`' own routing
+            //    (`ode_slot_map`) so the exemption can't drift; the indexed case
+            //    matches the same `from_indexed_name` predicate that built
+            //    `dose_attr_map`.
+            //  * analytical models: only `Dn`/`Rn` (modeled duration / rate,
+            //    RATE=-2/-1), which the parser routes to spare `PkParams` slots and
+            //    which are consulted solely via coded-`RATE` *data* — they have no
+            //    textual reference, so the census would otherwise tell the user to
+            //    delete a load-bearing modeled-infusion parameter. `Fn`/`ALAGn` are
+            //    NOT exempt here: the analytical engine binds F/lag only via an
+            //    explicit `pk(...)` mapping (which the census counts), so an
+            //    unmapped `F1` really is dead.
             .filter(|(i, name)| {
-                !(is_ode
-                    && (ode_slot_map
+                use crate::types::DoseAttr;
+                let exempt = if is_ode {
+                    ode_slot_map
                         .get(*i)
                         .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot))
-                        || crate::types::DoseAttr::from_indexed_name(name).is_some()))
+                        || DoseAttr::from_indexed_name(name).is_some()
+                } else {
+                    matches!(
+                        DoseAttr::from_indexed_name(name),
+                        Some((DoseAttr::Duration | DoseAttr::Rate, _))
+                    )
+                };
+                !exempt
             })
             .map(|(_, name)| name.clone())
             .collect();
@@ -19477,6 +19492,74 @@ CL V KA WT
         ode.dose_attr_map
             .indexed_slot(crate::types::DoseAttr::Rate, 1)
             .expect("R1 must map as modeled rate for compartment 1 in the ode_spec");
+    }
+
+    #[test]
+    fn analytical_modeled_dose_param_not_flagged_as_dead() {
+        // Regression: an ANALYTICAL `R{n}` (RATE=-1) / `D{n}` (RATE=-2) parameter
+        // is routed to a spare `PkParams` slot and consulted only via coded-`RATE`
+        // *data*, so it has no textual reference. The dead-parameter census must
+        // NOT flag it as "computed but never used" — that message tells the user
+        // to delete a load-bearing modeled-infusion parameter. (R1 was newly
+        // recognised in #324; D1 was the same latent miss from #395.)
+        let rate_src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVR1(20.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R1 = TVR1
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(rate_src).expect("R1 parses");
+        assert!(
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("never used") && w.contains("R1")),
+            "analytical R1 must not be flagged as dead: {:?}",
+            parsed.model.parse_warnings
+        );
+
+        // Same for the duration form `D1`.
+        let dur_src = rate_src.replace("TVR1", "TVD1").replace("R1 =", "D1 =");
+        let parsed = parse_full_model(&dur_src).expect("D1 parses");
+        assert!(
+            !parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("never used") && w.contains("D1")),
+            "analytical D1 must not be flagged as dead: {:?}",
+            parsed.model.parse_warnings
+        );
+
+        // Guard against over-exemption: a genuinely unused analytical parameter
+        // (here `JUNK`, neither mapped into `pk(...)` nor referenced elsewhere)
+        // must STILL be flagged. This proves the new analytical exemption is
+        // scoped to `Dn`/`Rn` and did not silence the census wholesale.
+        let dead_src = rate_src.replace("  R1 = TVR1\n", "  R1 = TVR1\n  JUNK = TVCL * 2.0\n");
+        let parsed = parse_full_model(&dead_src).expect("parses");
+        assert!(
+            parsed
+                .model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("never used") && w.contains("JUNK")),
+            "a genuinely unused analytical param must still be flagged: {:?}",
+            parsed.model.parse_warnings
+        );
     }
 
     #[test]
