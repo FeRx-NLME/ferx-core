@@ -42,8 +42,8 @@ pub enum RateMode {
 ///
 /// The single home for the "pull a transient mid-fit excursion back off the
 /// domain wall" clamp shared by [`DoseEvent::DURATION_FLOOR`] (modeled infusion
-/// duration `D ≤ 0`) and [`crate::pk::absorption::PreparedInputRate::MIN_MTT`]
-/// (transit mean-transit-time `mtt ≤ 0`). Both keep a downstream `amt/D` /
+/// duration `D ≤ 0`) and [`crate::pk::absorption::PreparedInputRate::MIN_PARAM`]
+/// (transit `mtt`, inverse-Gaussian `mat`/`cv2` ≤ 0). Both keep a downstream `amt/D` /
 /// `ktr.ln()` finite at the wall so the optimiser can climb back to the interior
 /// without perturbing a converged (interior) fit. Centralising it keeps the
 /// `NaN`-falls-to-floor subtlety in one place — every `>` is false for `NaN`, so
@@ -109,7 +109,7 @@ impl DoseEvent {
 
     /// Domain floor for a modeled infusion `duration` when clamping a transient
     /// mid-fit excursion (see [`Self::resolve_rate`]). Mirrors
-    /// [`crate::pk::absorption::PreparedInputRate::MIN_MTT`]: far below any
+    /// [`crate::pk::absorption::PreparedInputRate::MIN_PARAM`]: far below any
     /// realistic duration, so it never perturbs a converged fit — it only keeps
     /// a transient `D ≤ 0` (or `NaN`) from turning `amt / D` into a non-finite
     /// rate. `NaN` falls to the floor (every `>` is false for `NaN`).
@@ -3309,8 +3309,11 @@ pub struct FitOptions {
     /// Larger K reduces Monte-Carlo noise in the M-step at linear cost.
     pub impmap_samples: usize,
     /// Proposal degrees of freedom. `f64::INFINITY` selects a multivariate
-    /// normal proposal (NONMEM's IMPMAP default; parsed from `normal`); a finite
-    /// value selects a heavier-tailed Student-t. Default `INFINITY` (MVN).
+    /// normal proposal (parsed from `normal`); a finite value selects a
+    /// heavier-tailed Student-t. Default `4.0` (Student-t). A Gaussian proposal
+    /// (`= normal`, NONMEM's IMPMAP default) has lighter tails than the posterior
+    /// of weakly-identified parameters, so importance weights blow up in the tail
+    /// and bias the M-step moments; the heavier-tailed t default avoids that.
     pub impmap_proposal_df: f64,
     /// RNG seed for the IMPMAP sampling. `None` falls back to a fixed default so
     /// runs are reproducible across invocations.
@@ -3330,6 +3333,23 @@ pub struct FitOptions {
     /// Use Sobol quasi-random sequences for IS draws instead of pseudo-random.
     /// Only applies to MVN proposals (impmap_proposal_df = normal). Default false.
     pub impmap_sobol: bool,
+    /// FREM only: Rao-Blackwellise the covariate ETAs (integrate them analytically,
+    /// sample only the PK ETAs) in IMP/IMPMAP importance sampling. Default `true`
+    /// — strongly recommended, since brute-force sampling of the near-singular
+    /// covariate dimensions has very poor ESS. Set `false` only to diagnose the
+    /// RB path against the full-dimensional sampler.
+    pub frem_rao_blackwell: bool,
+    /// Adaptive importance-sample count for IMP (NONMEM `AUTO`/`STDOBJ`). When
+    /// `true` (the default), `is_samples` is the *starting* count and is ramped
+    /// up (×2 per iteration, capped at 10000) whenever the objective's Monte-Carlo
+    /// standard deviation exceeds 1.0, so high-dimensional / FREM fits reach a
+    /// low-noise objective automatically instead of carrying a sample-count-
+    /// dependent M-step bias. Low-dimensional, well-sampled fits never trip the
+    /// threshold, so there is no cost there. Set `false` to pin the sample count.
+    pub is_auto: bool,
+    /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
+    /// [`FitOptions::is_auto`] but ramps `impmap_samples`. Default `true`.
+    pub impmap_auto: bool,
     /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
     /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
     /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
@@ -3582,13 +3602,16 @@ impl Default for FitOptions {
             is_eval_only: false,
             impmap_iterations: 200,
             impmap_samples: 300,
-            impmap_proposal_df: f64::INFINITY,
+            impmap_proposal_df: 4.0,
             impmap_seed: None,
             impmap_averaging: 50,
             impmap_low_ess_threshold: 0.1,
             impmap_trace: false,
             impmap_mceta: 0,
             impmap_sobol: false,
+            frem_rao_blackwell: true,
+            is_auto: true,
+            impmap_auto: true,
             iscale_min: 0.1,
             iscale_max: 10.0,
             bloq_method: BloqMethod::Drop,
@@ -3958,6 +3981,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "iscale_min",
             "iscale_max",
+            "frem_rao_blackwell",
+            "is_auto",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -3973,6 +3998,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "impmap_sobol",
             "iscale_min",
             "iscale_max",
+            "frem_rao_blackwell",
+            "impmap_auto",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",
@@ -4853,7 +4880,7 @@ mod tests {
     #[test]
     fn dose_event_resolve_rate_clamps_nonpositive_duration() {
         // A transient D <= 0 (or NaN) mid-search clamps to DURATION_FLOOR so
-        // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_MTT).
+        // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_PARAM).
         let mut map = DoseAttrMap::default();
         map.insert(DoseAttr::Duration, 1, 9);
         let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
@@ -4917,7 +4944,7 @@ mod tests {
 
     #[test]
     fn clamp_above_floor_passes_through_or_clamps() {
-        // The shared clamp behind DURATION_FLOOR / MIN_MTT: > floor passes through,
+        // The shared clamp behind DURATION_FLOOR / MIN_PARAM: > floor passes through,
         // <= floor (and NaN — every `>` is false for NaN) returns the floor.
         let floor = 1e-8;
         assert_eq!(clamp_above_floor(5.0, floor), 5.0, "above floor passes");
@@ -4982,6 +5009,17 @@ mod tests {
              for the basin-trap and block-Ω-collapse regression rationale \
              before adjusting."
         );
+    }
+
+    #[test]
+    fn impmap_proposal_df_default_is_finite_t() {
+        // IMPMAP defaults to a Student-t proposal (df = 4), not a Gaussian: the
+        // MVN tails are too light for weakly-identified posteriors and bias the
+        // M-step moments (absorption-param drift, #411). Do not revert to ∞
+        // without re-checking that regression.
+        let opts = FitOptions::default();
+        assert_eq!(opts.impmap_proposal_df, 4.0);
+        assert!(opts.impmap_proposal_df.is_finite());
     }
 
     // ── small pure helpers ───────────────────────────────────────────────────

@@ -64,6 +64,21 @@ fn floor_omega_diagonal(omega_mat: &mut DMatrix<f64>, omega_fixed: &[bool], floo
 /// Positive-definite floor for free Ω diagonals (matches the SAEM constant).
 const OMEGA_DIAG_FLOOR: f64 = 1e-6;
 
+/// Adaptive-sampling (`auto`) target for the **per-subject** objective Monte-Carlo
+/// standard error, in −2 log L units: `total_MC_SE / √N`. NONMEM's `AUTO` `STDOBJ`
+/// targets the *total* objective SE, which grows as √N, so a large but perfectly
+/// well-sampled dataset would ramp purely because it has more subjects. The
+/// per-subject normalization makes the criterion N-independent (it tracks the
+/// average per-subject sampling adequacy, which is what biases the M-step). The
+/// value `0.05` reproduces NONMEM's effective stopping point on the FREM workshop
+/// model (its `STDOBJ = 1.0` total target at N≈475 ⇒ 1.0/√475 ≈ 0.046): the count
+/// still ramps 300→~10000 there, while a rich low-dim fit (e.g. warfarin, total
+/// SE ≈ 0.07) never trips it.
+const AUTO_STDOBJ_TARGET: f64 = 0.05;
+
+/// Hard cap on the adaptive per-subject sample count (NONMEM `ISAMPEND` default).
+const AUTO_SAMPLES_MAX: usize = 10_000;
+
 /// Absolute lower bound on the IMP proposal-covariance diagonal — a numerical
 /// guard against a literally-zero (degenerate-ESS) variance, NOT a statistical
 /// floor. It must stay well below any real conditional variance: with rich data
@@ -148,6 +163,35 @@ fn mu_ref_log_pairs(model: &CompiledModel) -> Vec<(usize, usize)> {
         }
     }
     pairs
+}
+
+/// Names of non-fixed thetas that have **no associated ETA** (are not the target
+/// of any mu-reference). Under IMP/IMPMAP such fixed-effect-only parameters are
+/// estimated solely through the importance-weighted θ M-step, which carries an
+/// IS-weight bias for weakly-identified parameters and can converge to the wrong
+/// value (issue #406: the FREM `FRD1` absorption-fraction drove to 0.90 vs a
+/// FOCEI/NONMEM value of ~0.4). NONMEM's IMP methods require every estimated
+/// parameter to carry a random effect; ferx applies mu-referencing
+/// automatically, so the user only needs to add the ETA.
+pub(crate) fn non_fixed_thetas_without_eta(
+    model: &CompiledModel,
+    theta_fixed: &[bool],
+) -> Vec<String> {
+    use std::collections::HashSet;
+    let with_eta: HashSet<&str> = model
+        .mu_refs
+        .values()
+        .map(|m| m.theta_name.as_str())
+        .collect();
+    model
+        .theta_names
+        .iter()
+        .enumerate()
+        .filter(|(i, name)| {
+            !theta_fixed.get(*i).copied().unwrap_or(false) && !with_eta.contains(name.as_str())
+        })
+        .map(|(_, name)| name.clone())
+        .collect()
 }
 
 /// Multi-start MAP: for each subject, run `find_ebe` with the warm-start (or
@@ -249,7 +293,11 @@ pub fn run_impmap(
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
     let nu = options.impmap_proposal_df;
-    run_mcem(
+    // Sobol quasi-random draws are only implemented for the multivariate-normal
+    // (`impmap_proposal_df = normal`) proposal; the Student-t default makes the
+    // option a silent no-op, so flag the mismatch rather than ignore it.
+    let use_sobol = options.impmap_sobol && nu.is_infinite();
+    let mut result = run_mcem(
         model,
         population,
         init_params,
@@ -265,9 +313,19 @@ pub fn run_impmap(
         options.impmap_seed.unwrap_or(12345),
         options.impmap_low_ess_threshold,
         options.impmap_mceta,
-        options.impmap_sobol && nu.is_infinite(),
+        use_sobol,
         options.impmap_trace,
-    )
+        options.impmap_auto,
+    )?;
+    if options.impmap_sobol && !use_sobol {
+        result.warnings.push(
+            "IMPMAP: `impmap_sobol = true` is ignored because the proposal is a Student-t \
+             (`impmap_proposal_df` is finite). Sobol draws apply only to the multivariate-normal \
+             proposal — set `impmap_proposal_df = normal` to use them."
+                .to_string(),
+        );
+    }
+    Ok(result)
 }
 
 /// Run IMP as an estimator (NONMEM `METHOD=IMP`). Thin wrapper over the shared
@@ -299,6 +357,7 @@ pub fn run_imp(
         0,     // mceta: no multi-start MAP for IMP
         false, // use_sobol: IMP has no Sobol option
         false, // collect_trace: IMP has no trace option
+        options.is_auto,
     )
 }
 
@@ -323,6 +382,7 @@ fn run_mcem(
     mceta: usize,
     use_sobol: bool,
     collect_trace: bool,
+    auto: bool,
 ) -> Result<OuterResult, String> {
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
@@ -357,7 +417,9 @@ fn run_mcem(
     }
 
     let n_iter = n_iter_opt.max(1);
-    let k_samples = k_opt.max(2);
+    // `k_samples` is mutable so the adaptive (`auto`) path can ramp it up between
+    // iterations when the objective is too Monte-Carlo-noisy (NONMEM `AUTO`).
+    let mut k_samples = k_opt.max(2);
     // `INFINITY` selects the multivariate-normal proposal; any finite value must
     // be a valid Student-t DoF (>= 1). Guard here so a programmatic caller that
     // bypasses the parser's range check can't reach the `ChiSquared::new(nu)`
@@ -463,8 +525,57 @@ fn run_mcem(
     // governs inner-loop `compute_mu_k` centering, a separate concern). NONMEM's
     // EM methods likewise require mu-referencing.
     let mut warnings: Vec<String> = Vec::new();
+
+    // STRONG warning: any estimated (non-fixed) θ without an associated ETA is
+    // handled only by the weighted M-step, which is biased for such parameters
+    // under importance sampling. ferx mu-references automatically, so the user
+    // only needs to attach a random effect.
+    let thetas_without_eta = non_fixed_thetas_without_eta(model, &init_params.theta_fixed);
+    if !thetas_without_eta.is_empty() {
+        warnings.push(format!(
+            "{label}: estimated parameter(s) [{}] have NO associated ETA. NONMEM's \
+             IMP/IMPMAP require every estimated parameter to carry a random effect; a \
+             fixed-effect-only parameter is estimated solely through the importance-weighted \
+             M-step, which is biased for weakly-identified parameters and may converge to the \
+             wrong value. STRONGLY add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with a small, \
+             optionally FIX, omega — ferx applies mu-referencing automatically), or hold the \
+             parameter FIX, or use FOCEI.",
+            thetas_without_eta.join(", ")
+        ));
+    }
+
     let mu_ref_pairs = mu_ref_log_pairs(model);
-    let use_closed_form = !mu_ref_pairs.is_empty();
+    // A log-mu-referenced typical value is updated only through the closed-form
+    // `log θ += mean(η)` shift. When its paired η carries negligible IIV (a tiny,
+    // often `FIX`ed ω — e.g. a structural parameter given a dummy random effect
+    // so it can be mu-referenced), that population mean is ≈ 0 and the typical
+    // value would be frozen at its initial value (#411). Route those pairs to the
+    // weighted-likelihood M-step instead (the same channel that estimates σ and
+    // non-mu-ref θ), where the data can actually move them. Decided once from the
+    // initial Ω so a parameter never toggles channels between iterations.
+    const WEAK_IIV_VAR: f64 = 1e-3;
+    let weak_mu_ref: std::collections::HashSet<usize> = mu_ref_pairs
+        .iter()
+        .filter(|&&(_t, e)| init_params.omega.matrix[(e, e)] < WEAK_IIV_VAR)
+        .map(|&(t, _e)| t)
+        .collect();
+    if !weak_mu_ref.is_empty() {
+        let mut names: Vec<&str> = weak_mu_ref
+            .iter()
+            .map(|&t| model.theta_names.get(t).map(String::as_str).unwrap_or("?"))
+            .collect();
+        names.sort_unstable();
+        warnings.push(format!(
+            "{label}: typical value(s) {} are log-mu-referenced but their random effect has \
+             negligible variance (ω < {WEAK_IIV_VAR:.0e}); the mu-ref mean-shift carries no \
+             information, so they are estimated through the weighted M-step instead.",
+            names.join(", ")
+        ));
+    }
+    // Closed-form mu-ref shift is used as long as at least one pair has real IIV.
+    let use_closed_form = mu_ref_pairs
+        .iter()
+        .any(|&(t, _e)| !weak_mu_ref.contains(&t));
     if !use_closed_form {
         // No log-mu-ref parameter: every typical value goes through the weighted
         // M-step, which cannot resolve the θ/η-mean confounding on its own. Flag
@@ -494,12 +605,37 @@ fn run_mcem(
 
     let mut last_eta_hats: Vec<DVector<f64>> = Vec::new();
 
+    // ---- FREM Rao-Blackwellisation (issue #406) ----
+    // For FREM models, integrate the covariate etas analytically and importance
+    // sample only the PK etas (a well-conditioned low-dim problem with near-unit
+    // ESS) instead of all n_eta etas (~1–2% ESS). Partition is model-static;
+    // per-subject covariate deviations are computed inside the E-step. `None` for
+    // non-FREM models → the full-dimensional path is used unchanged.
+    let frem_rb: Option<(Vec<usize>, Vec<usize>)> = if !options.frem_rao_blackwell {
+        None
+    } else {
+        model
+            .frem_config
+            .as_ref()
+            .map(|fc| crate::estimation::importance_sampling::frem_pk_cov_partition(fc, n_eta))
+            .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
+    };
+
     // ---- Trace: collect per-iteration parameters (analogous to NONMEM .ext) ----
     let mut trace_rows: Vec<ImpmapTraceRow> = if collect_trace {
         Vec::with_capacity(n_iter + 2)
     } else {
         Vec::new()
     };
+
+    // ESS state from the final completed E-step, used to flag importance-sampling
+    // moment bias (which scales as 1/(K·ESS) and is severe in high dimensions).
+    let mut final_ess_median = 1.0_f64;
+    let mut final_n_collapsed = 0usize;
+    // Effective (possibly ramped) sample count and the final objective MC SE,
+    // for the post-fit under-sampling warning.
+    let mut final_k_samples = k_samples;
+    let mut final_mc_se = 0.0_f64;
 
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
@@ -607,6 +743,49 @@ fn run_mcem(
                     (center, h_post)
                 };
                 let subj_seed = seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32);
+
+                // FREM: Rao-Blackwellised low-dimensional PK sampling. The
+                // conditional PK proposal is well matched, so the per-subject
+                // ISCALE pilot search (a full-dimensional ESS rescue) is skipped.
+                if let Some((ref pk_idx, ref cov_idx)) = frem_rb {
+                    if let Some(fc) = model.frem_config.as_ref() {
+                        if let Some((sampled, observed, d)) =
+                            crate::estimation::importance_sampling::subject_frem_partition(
+                                subject,
+                                &params_k.theta,
+                                fc,
+                                pk_idx,
+                                cov_idx,
+                            )
+                        {
+                            if let Some(rb) =
+                                crate::estimation::importance_sampling::subject_is_draws_frem_rb(
+                                    model,
+                                    subject,
+                                    &params_k.theta,
+                                    &params_k.sigma.values,
+                                    &center,
+                                    &h_post,
+                                    &omega_inv,
+                                    &params_k.omega.matrix,
+                                    &sampled,
+                                    &observed,
+                                    &d,
+                                    n_eta,
+                                    k_samples,
+                                    nu,
+                                    subj_seed,
+                                    scratch,
+                                    1.0,
+                                    use_sobol,
+                                )
+                            {
+                                return rb;
+                            }
+                        }
+                    }
+                }
+
                 let iscale = find_optimal_iscale(
                     model,
                     subject,
@@ -655,13 +834,49 @@ fn run_mcem(
         // ESS diagnostics + marginal log-likelihood for the trace.
         let mut ll = 0.0f64;
         let mut n_low_ess = 0usize;
+        let mut ess_fracs: Vec<f64> = Vec::with_capacity(draws.len());
         for d in &draws {
             ll += d.log_marginal;
             if d.ess_fraction < threshold {
                 n_low_ess += 1;
             }
+            ess_fracs.push(d.ess_fraction);
         }
         let minus2ll = -2.0 * ll;
+        // Objective Monte-Carlo standard error from the self-normalized ESS
+        // (Geweke: Var(log p̂ᵢ) ≈ (1/ESS_frac − 1)/K; degenerate subjects get a
+        // finite fallback). −2 log L scales this by 2.
+        let var_ll: f64 = ess_fracs
+            .iter()
+            .map(|&f| {
+                if f > 1e-6 {
+                    ((1.0 / f) - 1.0).max(0.0) / k_samples as f64
+                } else {
+                    1.0
+                }
+            })
+            .sum();
+        let mc_se = 2.0 * var_ll.sqrt();
+        // Per-subject objective SE (N-independent): see AUTO_STDOBJ_TARGET.
+        let mc_se_per_subject = mc_se / (ess_fracs.len().max(1) as f64).sqrt();
+        final_mc_se = mc_se_per_subject;
+        final_k_samples = k_samples;
+        // Adaptive sampling (NONMEM `AUTO`): ramp K up (×2, capped) while the
+        // objective is too MC-noisy, so the M-step is driven by signal not noise.
+        if auto && mc_se_per_subject > AUTO_STDOBJ_TARGET && k_samples < AUTO_SAMPLES_MAX {
+            let new_k = (k_samples.saturating_mul(2)).min(AUTO_SAMPLES_MAX);
+            if verbose {
+                eprintln!(
+                    "{label}: auto-sampling — per-subject objective MC SE {mc_se_per_subject:.3} \
+                     > {AUTO_STDOBJ_TARGET:.2}, raising K {k_samples} → {new_k}"
+                );
+            }
+            k_samples = new_k;
+        }
+        // Track the final E-step's ESS health for the post-fit bias warning.
+        final_n_collapsed = ess_fracs.iter().filter(|&&f| f <= 1e-6).count();
+        ess_fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        final_ess_median = ess_fracs.get(ess_fracs.len() / 2).copied().unwrap_or(1.0);
 
         // Record this iteration's parameters for the trace (opt-in).
         if collect_trace {
@@ -702,6 +917,11 @@ fn run_mcem(
         let mut mstep_theta_upper = log_theta_upper.clone();
         if use_closed_form {
             for &(t, _e) in &mu_ref_pairs {
+                // Weak-IIV mu-ref θ are estimated by this M-step, not the shift,
+                // so leave their bounds free here.
+                if weak_mu_ref.contains(&t) {
+                    continue;
+                }
                 mstep_theta_lower[t] = log_theta[t];
                 mstep_theta_upper[t] = log_theta[t];
             }
@@ -737,6 +957,11 @@ fn run_mcem(
                 *acc /= n_subjects as f64;
             }
             for &(t, e) in &mu_ref_pairs {
+                // Weak-IIV mu-ref θ were already updated by the weighted M-step;
+                // their η-mean shift is ≈ 0 and uninformative — skip it.
+                if weak_mu_ref.contains(&t) {
+                    continue;
+                }
                 log_theta[t] =
                     (log_theta[t] + eta_bar[e]).clamp(log_theta_lower[t], log_theta_upper[t]);
             }
@@ -791,6 +1016,71 @@ fn run_mcem(
 
     if crate::cancel::is_cancelled(cancel) {
         return Err("cancelled by user".to_string());
+    }
+
+    // ---- Importance-sampling bias warning ----
+    // Self-normalized IS moment estimates carry a finite-sample bias that drives
+    // the M-step. For a fixed proposal quality it scales as ≈ 1/K, but the
+    // constant grows with the sampling dimension, so a sample count that is ample
+    // in low dimensions becomes badly under-sampled for a high-dimensional (e.g.
+    // FREM) model. Empirically the absorption typical value on the FREM workshop
+    // model (13 ETAs) drifts from ~2.6 (FOCEI/NONMEM) to ~4.6 at K=300 and
+    // recovers toward ~2.8 at K=6000 — while the *median* ESS stays ~0.8 the
+    // whole time, so ESS alone does not flag it. Use the per-dimension sample
+    // density K / n_eta as the trigger (≥ ~100 keeps the bias small here), plus
+    // any fully-collapsed subjects. Skip for eval-only IS (no M-step to bias).
+    // Triggers, using the *effective* (possibly auto-ramped) sample count:
+    //  - too few samples for the dimension (a fast proxy that catches the common
+    //    case before the MC SE is even trustworthy), or
+    //  - the objective is still MC-noisy at the end (the direct measure — also
+    //    fires when `auto` ramped to the cap and could not reach the target), or
+    //  - a subject's proposal fully collapsed.
+    const MIN_SAMPLES_PER_ETA: usize = 100;
+    // The dimension heuristic only applies when `auto` is off — with `auto` on,
+    // a low starting count is fine because it ramps when (and only when) the
+    // objective is actually noisy, so the direct MC-SE check is the only trigger.
+    let under_sampled = !auto && n_eta > 0 && final_k_samples < MIN_SAMPLES_PER_ETA * n_eta;
+    let noisy = final_mc_se > 2.0 * AUTO_STDOBJ_TARGET;
+    if !options.is_eval_only && (under_sampled || noisy || final_n_collapsed > 0) {
+        let (sample_opt, auto_opt) = if recenter == ProposalRecenter::Map {
+            ("impmap_samples", "impmap_auto")
+        } else {
+            ("is_samples", "is_auto")
+        };
+        let collapse = if final_n_collapsed > 0 {
+            format!(
+                " {} subject(s) had a fully collapsed proposal (ESS ≈ 0), whose moments \
+                 are unreliable regardless of sample count — check their EBE/Hessian quality.",
+                final_n_collapsed
+            )
+        } else {
+            String::new()
+        };
+        let advice = if auto {
+            format!(
+                "`{auto_opt}` is enabled but the sample count {} (cap {AUTO_SAMPLES_MAX}) \
+                 was not enough to reach the MC-SE target.",
+                final_k_samples
+            )
+        } else {
+            format!(
+                "Raise `{sample_opt}` (high-dimensional / FREM models typically need several \
+                 thousand) or set `{auto_opt} = true` to ramp it automatically."
+            )
+        };
+        warnings.push(format!(
+            "{label}: {} importance samples for a {}-ETA model give a noisy objective \
+             (per-subject MC SE = {:.3}, target {:.2}; median ESS/K = {:.2}). The weighted M-step \
+             moments then carry a finite-sample bias — typical-value and Ω estimates may be off, \
+             and it shrinks only as the sample count grows. {}{}",
+            final_k_samples,
+            n_eta,
+            final_mc_se,
+            AUTO_STDOBJ_TARGET,
+            final_ess_median,
+            advice,
+            collapse
+        ));
     }
 
     // ---- Final (averaged) parameters ----
@@ -1102,6 +1392,69 @@ fn theta_sigma_weighted_mstep(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flags_non_fixed_theta_without_eta() {
+        // CL/V have ETAs (mu-referenced); FRAC is an estimated theta with no ETA;
+        // TVFIX is FIX. Only FRAC should be flagged.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.0)
+  theta TVV(10.0, 0.0)
+  theta FRAC(0.5, 0.0, 1.0)
+  theta TVFIX(2.0, FIX)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.1
+  sigma PROP ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = FRAC + TVFIX
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let fixed = &model.default_params.theta_fixed;
+        let flagged = non_fixed_thetas_without_eta(&model, fixed);
+        assert!(
+            flagged.contains(&"FRAC".to_string()),
+            "FRAC flagged: {flagged:?}"
+        );
+        assert!(!flagged.contains(&"TVCL".to_string()), "TVCL has ETA");
+        assert!(!flagged.contains(&"TVV".to_string()), "TVV has ETA");
+        assert!(!flagged.contains(&"TVFIX".to_string()), "TVFIX is FIX");
+    }
+
+    #[test]
+    fn no_flag_when_all_thetas_have_eta() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.0)
+  theta TVV(10.0, 0.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V  ~ 0.1
+  sigma PROP ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let fixed = &model.default_params.theta_fixed;
+        let flagged = non_fixed_thetas_without_eta(&model, fixed);
+        assert!(flagged.is_empty(), "expected no flags, got {flagged:?}");
+    }
 
     #[test]
     fn covariance_to_proposal_hessian_inverts_an_in_bounds_covariance() {

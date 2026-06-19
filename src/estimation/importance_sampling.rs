@@ -280,6 +280,19 @@ pub fn run_importance_sampling(
         );
     }
 
+    // FREM: Rao-Blackwellise (integrate covariate etas, sample only PK etas) when
+    // a clean PK/cov partition exists. `None` → full-dimensional IS (unchanged).
+    let frem_rb: Option<(Vec<usize>, Vec<usize>)> = if !options.frem_rao_blackwell {
+        None
+    } else {
+        model
+            .frem_config
+            .as_ref()
+            .filter(|_| model.n_kappa == 0)
+            .map(|fc| frem_pk_cov_partition(fc, n_eta))
+            .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
+    };
+
     let per_subject: Vec<SubjectIsOutput> = population
         .subjects
         .par_iter()
@@ -373,6 +386,48 @@ pub fn run_importance_sampling(
                     n_eta,
                     scratch,
                 );
+                // FREM Rao-Blackwellised estimate (low-dim PK IS). Reuse the
+                // draws routine and keep only its marginal-LL / ESS diagnostics.
+                if let Some((ref pk_idx, ref cov_idx)) = frem_rb {
+                    if let Some(fc) = model.frem_config.as_ref() {
+                        if let Some((sampled, observed, d)) =
+                            subject_frem_partition(subject, &params.theta, fc, pk_idx, cov_idx)
+                        {
+                            if let Some(rb) = subject_is_draws_frem_rb(
+                                model,
+                                subject,
+                                &params.theta,
+                                &params.sigma.values,
+                                eta_hat,
+                                &h_post,
+                                &omega_inv,
+                                &params.omega.matrix,
+                                &sampled,
+                                &observed,
+                                &d,
+                                n_eta,
+                                k_samples,
+                                nu,
+                                subj_seed,
+                                scratch,
+                                1.0,
+                                false,
+                            ) {
+                                let ess_fraction = rb.ess_fraction;
+                                let var_log_marginal = if ess_fraction > 0.0 {
+                                    (1.0 / ess_fraction - 1.0) / (k_samples as f64)
+                                } else {
+                                    1.0
+                                };
+                                return SubjectIsOutput {
+                                    log_marginal: rb.log_marginal,
+                                    var_log_marginal,
+                                    ess_fraction,
+                                };
+                            }
+                        }
+                    }
+                }
                 subject_is_estimate(
                     model,
                     subject,
@@ -646,6 +701,354 @@ impl SubjectDraws {
             second_moment: DMatrix::zeros(n_eta, n_eta),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rao-Blackwellised FREM importance sampling (issue #406)
+// ---------------------------------------------------------------------------
+//
+// On a FREM model the covariate pseudo-observations pin their etas to the
+// (essentially noise-free, EPSCOV²≈0) data value `dₖ = cov_obsₖ − TVₖ`, while
+// the PK observations depend only on the PK etas. Sampling all n_eta etas by
+// importance sampling is then a high-dimensional, extreme multi-scale problem
+// with ~1–2% ESS even when the mode is correct. Instead we integrate the
+// covariate etas analytically (Rao-Blackwellisation): fix η_c = d and importance
+// sample **only the n_pk PK etas** from the conditional posterior
+//
+//   p(η_p | y_pk, d) ∝ p_pk(y_pk | η_p) · N(η_p; μ_{p|c}, Σ_{p|c}),
+//
+// where the conditional Gaussian prior comes directly from the joint precision
+// P = Ω⁻¹ partitioned into PK/cov blocks:
+//
+//   Σ_{p|c}⁻¹ = P_pp,            μ_{p|c} = −P_pp⁻¹ P_pc d.
+//
+// The PK proposal is the pp-block of the full posterior Hessian
+// `h_post_pp = J_pk' R⁻¹ J_pk + P_pp` (the covariate rows have zero PK Jacobian,
+// so this block is exactly the conditional PK posterior precision). The IS is
+// then a well-conditioned n_pk-dimensional problem with near-unit ESS.
+//
+// Reconstructed for the M-step: η_c = d is exact, so the per-subject Ω
+// sufficient statistic is `[[Σ w η_p η_p', (Σ w η_p) d'], [d (Σ w η_p)', d d']]`
+// — the cc-block `d d'` summed over subjects is precisely the FREM covariate
+// sample covariance. The covariate data marginal `log N(d; 0, Ω_cc + R)` is
+// added to each subject's marginal log-likelihood as a closed-form constant.
+
+/// PK vs covariate eta index partition for a FREM model. Covariate etas are the
+/// eta indices that appear as FREMTYPE pseudo-observation targets; PK etas are
+/// the rest. Returns `(pk_idx, cov_idx)`, each ascending.
+pub(crate) fn frem_pk_cov_partition(fc: &FremConfig, n_eta: usize) -> (Vec<usize>, Vec<usize>) {
+    let mut is_cov = vec![false; n_eta];
+    for &(_t, e) in fc.fremtype_to_indices.values() {
+        if e < n_eta {
+            is_cov[e] = true;
+        }
+    }
+    let pk_idx = (0..n_eta).filter(|&i| !is_cov[i]).collect();
+    let cov_idx = (0..n_eta).filter(|&i| is_cov[i]).collect();
+    (pk_idx, cov_idx)
+}
+
+/// Per-subject Rao-Blackwell partition for a FREM model with possibly-missing
+/// covariates. Splits the covariate etas into:
+///   - **observed** (a FREMTYPE pseudo-observation row exists): pinned at their
+///     data value `dₖ = cov_obsₖ − TVₖ` and integrated analytically, and
+///   - **missing** (no pseudo-obs row — the FREM data omits rows for missing
+///     covariate values): latent, so they are sampled together with the PK etas
+///     (the omega correlation structure imputes them, matching NONMEM).
+///
+/// Returns `(sampled_idx, observed_idx, d)` where `sampled_idx = pk_idx ∪
+/// missing-covariate etas` (ascending) and `observed_idx` / `d` are aligned. The
+/// precision-form conditional prior in [`subject_is_draws_frem_rb`] is exact for
+/// this split because *all* of `observed_idx` is conditioned on and *everything
+/// else* is sampled. Returns `None` when no covariate is observed for the
+/// subject, or when any covariate has more than one pseudo-obs row (→ caller
+/// falls back to full-dimensional IS).
+pub(crate) fn subject_frem_partition(
+    subject: &Subject,
+    theta: &[f64],
+    fc: &FremConfig,
+    pk_idx: &[usize],
+    cov_idx: &[usize],
+) -> Option<(Vec<usize>, Vec<usize>, Vec<f64>)> {
+    // eta_idx → (fremtype, theta_idx)
+    let mut eta_to_ft: std::collections::HashMap<usize, (u16, usize)> =
+        std::collections::HashMap::new();
+    for (&ft, &(t, e)) in fc.fremtype_to_indices.iter() {
+        eta_to_ft.insert(e, (ft, t));
+    }
+    let mut observed = Vec::with_capacity(cov_idx.len());
+    let mut d = Vec::with_capacity(cov_idx.len());
+    let mut missing = Vec::new();
+    for &e in cov_idx {
+        match eta_to_ft.get(&e) {
+            Some(&(ft, t)) => {
+                // The Rao-Blackwell marginal pins this covariate eta at a single
+                // deviation `d` and subtracts a single `0.5·ln(R)` constant per
+                // covariate. A covariate with >1 pseudo-obs row (a time-varying
+                // covariate, or a duplicate) would have its extra rows scored by
+                // `obs_nll` at the pinned eta with a non-zero residual that the
+                // constant does not cancel, silently corrupting the weights. The
+                // RB split is only exact for one row per FREMTYPE — bail to the
+                // full-dimensional sampler (which scores every row consistently).
+                if subject.fremtype.iter().filter(|&&x| x == ft).count() > 1 {
+                    return None;
+                }
+                match subject.fremtype.iter().position(|&x| x == ft) {
+                    Some(row) => match subject.observations.get(row) {
+                        Some(&obs) => {
+                            observed.push(e);
+                            d.push(obs - theta.get(t).copied().unwrap_or(0.0));
+                        }
+                        None => missing.push(e),
+                    },
+                    None => missing.push(e),
+                }
+            }
+            None => missing.push(e),
+        }
+    }
+    if observed.is_empty() {
+        return None;
+    }
+    let mut sampled: Vec<usize> = pk_idx.iter().chain(missing.iter()).copied().collect();
+    sampled.sort_unstable();
+    Some((sampled, observed, d))
+}
+
+/// Extract the sub-matrix `m[rows, cols]`.
+fn submatrix(m: &DMatrix<f64>, rows: &[usize], cols: &[usize]) -> DMatrix<f64> {
+    let mut out = DMatrix::zeros(rows.len(), cols.len());
+    for (a, &r) in rows.iter().enumerate() {
+        for (b, &c) in cols.iter().enumerate() {
+            out[(a, b)] = m[(r, c)];
+        }
+    }
+    out
+}
+
+/// Rao-Blackwellised FREM E-step for one subject. See the module section above.
+///
+/// `pk_idx` is the **sampled** eta set (PK etas plus any missing-covariate etas,
+/// from [`subject_frem_partition`]) and `cov_idx` / `d` are the **observed**
+/// covariate etas pinned at their data deviations. The precision-form conditional
+/// prior is exact for this split: all of `cov_idx` is conditioned on and
+/// everything in `pk_idx` is sampled. Returns `None` if the conditioning is
+/// degenerate (caller then falls back to the full-dimensional [`subject_is_draws`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn subject_is_draws_frem_rb(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta_hat: &DVector<f64>,
+    h_post: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    omega_matrix: &DMatrix<f64>,
+    pk_idx: &[usize],
+    cov_idx: &[usize],
+    d: &[f64],
+    n_eta: usize,
+    k_samples: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    iscale: f64,
+    use_sobol: bool,
+) -> Option<SubjectDraws> {
+    let np = pk_idx.len();
+    let nc = cov_idx.len();
+    if np == 0 || nc == 0 || d.len() != nc {
+        return None;
+    }
+    let fc = model.frem_config.as_ref()?;
+    let mvn = !nu.is_finite();
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // Conditional PK prior: precision P_pp, mean μ = −P_pp⁻¹ P_pc d.
+    let p_pp = submatrix(omega_inv, pk_idx, pk_idx);
+    let p_pc = submatrix(omega_inv, pk_idx, cov_idx);
+    let p_pp_chol = p_pp.clone().cholesky()?;
+    let logdet_p_pp = 2.0 * (0..np).map(|i| p_pp_chol.l()[(i, i)].ln()).sum::<f64>();
+    let dvec = DVector::from_column_slice(d);
+    let mu_pc = p_pp_chol.solve(&(-(&p_pc * &dvec))); // np
+
+    // PK proposal: pp-block of the full posterior Hessian (= conditional PK
+    // posterior precision), centred at the PK sub-vector of the mode.
+    let h_pp = submatrix(h_post, pk_idx, pk_idx);
+    let proposal = build_proposal(&h_pp, &p_pp, np)?;
+    let eta_hat_pk: Vec<f64> = pk_idx.iter().map(|&i| eta_hat[i]).collect();
+
+    // Covariate data marginal log p(d) = log N(d; 0, Ω_cc + R), R = EPSCOV²·I.
+    let r_cov = {
+        let s = sigma[fc.covariate_sigma_index];
+        (s * s).max(1e-12)
+    };
+    let mut occ = submatrix(omega_matrix, cov_idx, cov_idx);
+    for i in 0..nc {
+        occ[(i, i)] += r_cov;
+    }
+    let occ_chol = occ.cholesky()?;
+    let logdet_occ = 2.0 * (0..nc).map(|i| occ_chol.l()[(i, i)].ln()).sum::<f64>();
+    let occ_inv_d = occ_chol.solve(&dvec);
+    let quad_cov = dvec.dot(&occ_inv_d);
+    // Covariate data marginal log N(d; 0, Ω_cc + R). The covariate pseudo-obs
+    // are *observations*, so their 2π normalizer (nc·ln2π) must be dropped to
+    // match the rest of the OFV, which omits the per-obs 2π constant (see
+    // `obs_nll_subject_into`) — i.e. NONMEM's "OBJECTIVE FUNCTION WITHOUT
+    // CONSTANT" convention. Including it inflated the RB marginal by
+    // Σ nc·ln2π (≈ n_covariate_obs · ln2π).
+    let log_p_d = -0.5 * (logdet_occ + quad_cov);
+
+    // Constants. The covariate observation rows contribute a fixed
+    // 0.5·Σ ln(R) to obs_nll (their residual is ≈0 at η_c = d); subtract it so
+    // `log p_pk` is the PK-only observation log-likelihood.
+    let cov_obs_const = 0.5 * nc as f64 * r_cov.ln();
+    let half_np = 0.5 * np as f64;
+    let log_prior_const = -half_np * TWO_PI.ln() + 0.5 * logdet_p_pp;
+    let iscale_log_adj = -(np as f64) * iscale.ln();
+    let inv_iscale_sq = 1.0 / (iscale * iscale);
+    let log_q_const = if mvn {
+        -half_np * TWO_PI.ln() + 0.5 * proposal.log_det_inv_scale + iscale_log_adj
+    } else {
+        ln_gamma(0.5 * (nu + np as f64)) - ln_gamma(0.5 * nu)
+            + 0.5 * proposal.log_det_inv_scale
+            + iscale_log_adj
+            - half_np * (nu * std::f64::consts::PI).ln()
+    };
+
+    let normal = StandardNormal;
+    let chi_sq = if mvn {
+        None
+    } else {
+        Some(ChiSquared::new(nu).expect("ChiSquared requires nu > 0; checked by caller"))
+    };
+    let sobol_draws = if use_sobol && mvn {
+        Some(sobol_normal_draws(np, k_samples, seed))
+    } else {
+        None
+    };
+
+    let mut log_w: Vec<f64> = Vec::with_capacity(k_samples);
+    let mut etas: Vec<Vec<f64>> = Vec::with_capacity(k_samples);
+    let mut eta_p_samples: Vec<Vec<f64>> = Vec::with_capacity(k_samples);
+    let mut z = vec![0.0_f64; np];
+    let mut eta_p = vec![0.0_f64; np];
+    let mut diff_q = vec![0.0_f64; np];
+
+    for s_idx in 0..k_samples {
+        if let Some(ref qr) = sobol_draws {
+            z.copy_from_slice(&qr[s_idx]);
+        } else {
+            for zi in z.iter_mut() {
+                *zi = normal.sample(&mut rng);
+            }
+        }
+        let scale = match &chi_sq {
+            Some(c) => (nu / c.sample(&mut rng).max(1e-300)).sqrt() * iscale,
+            None => iscale,
+        };
+        proposal.apply_l_sigma(&z, &mut eta_p, scale);
+        for (j, e) in eta_p.iter_mut().enumerate() {
+            *e += eta_hat_pk[j];
+        }
+
+        // Reconstruct full η: PK sample at pk_idx, fixed d at cov_idx.
+        let mut full_eta = vec![0.0_f64; n_eta];
+        for (a, &i) in pk_idx.iter().enumerate() {
+            full_eta[i] = eta_p[a];
+        }
+        for (b, &i) in cov_idx.iter().enumerate() {
+            full_eta[i] = d[b];
+        }
+
+        let obs_nll = obs_nll_subject_into(model, subject, theta, sigma, &full_eta, scratch);
+        let log_p_y = -(obs_nll - cov_obs_const); // PK-only obs log-likelihood
+
+        // Conditional prior log N(η_p; μ, P_pp): (η_p−μ)' P_pp (η_p−μ).
+        let mut quad = 0.0_f64;
+        for i in 0..np {
+            let mut row = 0.0_f64;
+            for j in 0..np {
+                row += p_pp[(i, j)] * (eta_p[j] - mu_pc[j]);
+            }
+            quad += row * (eta_p[i] - mu_pc[i]);
+        }
+        let log_prior = log_prior_const - 0.5 * quad;
+
+        // Proposal log q over η_p (centred at η̂_pk).
+        for (j, dq) in diff_q.iter_mut().enumerate() {
+            *dq = eta_p[j] - eta_hat_pk[j];
+        }
+        let mahal = proposal.mahalanobis(&diff_q);
+        let log_q = if mvn {
+            log_q_const - 0.5 * inv_iscale_sq * mahal
+        } else {
+            log_q_const - 0.5 * (nu + np as f64) * (1.0 + inv_iscale_sq * mahal / nu).ln()
+        };
+
+        log_w.push(log_p_y + log_prior - log_q);
+        eta_p_samples.push(eta_p.clone());
+        etas.push(full_eta);
+    }
+
+    let (lse, weights) = logsumexp_with_normalised(&log_w);
+    let log_marginal = lse - (k_samples as f64).ln() + log_p_d;
+    let ess = {
+        let sum_sq: f64 = weights.iter().map(|w| w * w).sum();
+        if sum_sq > 0.0 {
+            1.0 / sum_sq
+        } else {
+            0.0
+        }
+    };
+    let ess_fraction = ess / (k_samples as f64);
+
+    // Reconstruct full-η weighted moments. η_p moments from the samples; η_c = d
+    // exact, so the cc-block is d d' and the cross-block is (Σ w η_p) d'.
+    let mut mean_p = vec![0.0_f64; np];
+    let mut sm_pp = DMatrix::<f64>::zeros(np, np);
+    for (w, ep) in weights.iter().zip(eta_p_samples.iter()) {
+        for i in 0..np {
+            mean_p[i] += w * ep[i];
+            for j in 0..np {
+                sm_pp[(i, j)] += w * ep[i] * ep[j];
+            }
+        }
+    }
+    let mut mean = vec![0.0_f64; n_eta];
+    let mut second_moment = DMatrix::<f64>::zeros(n_eta, n_eta);
+    for (a, &i) in pk_idx.iter().enumerate() {
+        mean[i] = mean_p[a];
+    }
+    for (b, &i) in cov_idx.iter().enumerate() {
+        mean[i] = d[b];
+    }
+    for (a, &i) in pk_idx.iter().enumerate() {
+        for (b, &j) in pk_idx.iter().enumerate() {
+            second_moment[(i, j)] = sm_pp[(a, b)];
+        }
+    }
+    for (a, &i) in pk_idx.iter().enumerate() {
+        for (b, &j) in cov_idx.iter().enumerate() {
+            let v = mean_p[a] * d[b];
+            second_moment[(i, j)] = v;
+            second_moment[(j, i)] = v;
+        }
+    }
+    for (a, &i) in cov_idx.iter().enumerate() {
+        for (b, &j) in cov_idx.iter().enumerate() {
+            second_moment[(i, j)] = d[a] * d[b];
+        }
+    }
+
+    Some(SubjectDraws {
+        log_marginal,
+        ess_fraction,
+        etas,
+        weights,
+        mean,
+        second_moment,
+    })
 }
 
 /// Draw `K` importance samples for one subject from a proposal centered at the
@@ -1225,10 +1628,17 @@ impl Proposal {
 
 /// Build the IS proposal scale matrix from a per-subject inner-loop Hessian.
 ///
-/// Strategy: Cholesky(H + λI), with λ = max(1e−6 · trace(H)/d, 1e−10). If H
-/// is so degenerate that even the jittered matrix isn't positive-definite,
-/// fall back to Σ = Ω (the prior covariance) — a broad proposal that won't
-/// give a sharp likelihood estimate but stays well-defined.
+/// Strategy: Cholesky(H + Λ) with a **per-dimension** relative jitter
+/// `Λᵢᵢ = max(1e−6·|Hᵢᵢ|, 1e−10)`. A single global `λ = 1e−6·trace(H)/d`
+/// (the previous strategy) is dominated by the sharpest dimensions: on a FREM
+/// model the covariate pseudo-obs dims (~1e6) and near-fixed dims (~1e10) push
+/// `λ` to ~1e3, which then swamps the well-conditioned PK dims (~1e2) and
+/// collapses their proposal width 5–10×, hurting ESS even when the mode is
+/// correct (issue #406). The per-dimension form regularizes each dimension
+/// proportionally to its own curvature, leaving every dimension's proposal
+/// width intact. If H is so degenerate that even the jittered matrix isn't
+/// positive-definite, fall back to Σ = Ω (the prior covariance) — a broad
+/// proposal that won't give a sharp likelihood estimate but stays well-defined.
 ///
 /// Returns `None` only when `d == 0`.
 fn build_proposal(h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize) -> Option<Proposal> {
@@ -1238,11 +1648,9 @@ fn build_proposal(h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize) -> Optio
     debug_assert_eq!(h.nrows(), d);
     debug_assert_eq!(h.ncols(), d);
 
-    let trace = (0..d).map(|i| h[(i, i)]).sum::<f64>();
-    let lambda = (1e-6 * trace / d as f64).max(1e-10);
     let mut h_reg = h.clone();
     for i in 0..d {
-        h_reg[(i, i)] += lambda;
+        h_reg[(i, i)] += (1e-6 * h[(i, i)].abs()).max(1e-10);
     }
     if let Some(chol) = h_reg.clone().cholesky() {
         let l = chol.l();
@@ -1630,6 +2038,104 @@ mod tests {
         let ess_fraction = ess / (k as f64);
         let var = (1.0 / ess_fraction - 1.0) / (k as f64);
         assert!(var.abs() < 1e-12);
+    }
+
+    #[test]
+    fn frem_partition_splits_pk_and_cov_etas() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(100u16, (5usize, 1usize)); // cov eta at index 1
+        map.insert(200u16, (6usize, 3usize)); // cov eta at index 3
+        let fc = FremConfig {
+            fremtype_to_indices: map,
+            covariate_sigma_index: 0,
+        };
+        let (pk, cov) = frem_pk_cov_partition(&fc, 4);
+        assert_eq!(pk, vec![0, 2]);
+        assert_eq!(cov, vec![1, 3]);
+    }
+
+    /// Build a Subject carrying only the fields `subject_frem_partition` reads.
+    fn frem_subject(fremtype: Vec<u16>, observations: Vec<f64>) -> Subject {
+        Subject {
+            id: "t".into(),
+            doses: Vec::new(),
+            obs_times: Vec::new(),
+            obs_raw_times: Vec::new(),
+            observations,
+            obs_cmts: Vec::new(),
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: Vec::new(),
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype,
+            #[cfg(feature = "survival")]
+            obs_records: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn frem_partition_bails_on_duplicate_covariate_rows() {
+        // One eta (idx 1) mapped to FREMTYPE 100; pk = {0}, cov = {1}.
+        let mut map = std::collections::HashMap::new();
+        map.insert(100u16, (0usize, 1usize)); // (theta_idx, eta_idx)
+        let fc = FremConfig {
+            fremtype_to_indices: map,
+            covariate_sigma_index: 0,
+        };
+        let theta = [0.0_f64];
+        // Single covariate row → RB split is exact → Some.
+        let single = frem_subject(vec![0, 100], vec![5.0, 1.2]);
+        assert!(subject_frem_partition(&single, &theta, &fc, &[0], &[1]).is_some());
+        // Two rows of the same FREMTYPE (time-varying / duplicate) → the
+        // cov_obs_const cancellation breaks → must bail to full-dim IS (None).
+        let dup = frem_subject(vec![100, 0, 100], vec![1.2, 5.0, 1.3]);
+        assert!(
+            subject_frem_partition(&dup, &theta, &fc, &[0], &[1]).is_none(),
+            "duplicate covariate rows must disable the RB partition"
+        );
+    }
+
+    #[test]
+    fn rb_conditional_prior_matches_covariance_form() {
+        // The RB draws path takes the conditional PK prior from the joint
+        // precision: precision = P_pp, mean = −P_pp⁻¹ P_pc d. Verify this equals
+        // the textbook covariance-form conditioning Σ = Ω_pp − Ω_pc Ω_cc⁻¹ Ω_cp,
+        // μ = Ω_pc Ω_cc⁻¹ d. (pk = {0,1}, cov = {2}.)
+        let omega = DMatrix::from_row_slice(3, 3, &[2.0, 0.3, 0.5, 0.3, 1.0, 0.2, 0.5, 0.2, 3.0]);
+        let p = omega.clone().try_inverse().unwrap();
+        let pk = [0usize, 1];
+        let cov = [2usize];
+        let d = DVector::from_column_slice(&[0.7]);
+
+        // Precision form (what subject_is_draws_frem_rb uses).
+        let p_pp = submatrix(&p, &pk, &pk);
+        let p_pc = submatrix(&p, &pk, &cov);
+        let p_pp_inv = p_pp.clone().try_inverse().unwrap();
+        let mu_prec = &p_pp_inv * &(-(&p_pc * &d));
+        let sigma_prec = p_pp_inv;
+
+        // Covariance form (textbook).
+        let o_pp = submatrix(&omega, &pk, &pk);
+        let o_pc = submatrix(&omega, &pk, &cov);
+        let o_cc = submatrix(&omega, &cov, &cov);
+        let o_cc_inv = o_cc.try_inverse().unwrap();
+        let mu_cov = &o_pc * &o_cc_inv * &d;
+        let sigma_cov = &o_pp - &o_pc * &o_cc_inv * o_pc.transpose();
+
+        for i in 0..2 {
+            assert!((mu_prec[i] - mu_cov[i]).abs() < 1e-10, "mu[{i}]");
+            for j in 0..2 {
+                assert!(
+                    (sigma_prec[(i, j)] - sigma_cov[(i, j)]).abs() < 1e-10,
+                    "sigma[{i},{j}]"
+                );
+            }
+        }
     }
 
     #[test]

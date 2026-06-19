@@ -172,6 +172,11 @@ const OMEGA_IOV_DIAG_FLOOR: f64 = 1e-8;
 /// both the `converged` flag and the non-convergence warning.
 const RHAT_CONVERGENCE_THRESHOLD: f64 = 1.01;
 
+#[inline]
+fn should_sample_kappa_block(n_kappa: usize, omega_iov: Option<&OmegaMatrix>) -> bool {
+    n_kappa > 0 && omega_iov.is_some()
+}
+
 /// One coordinate of the population random-walk block.
 #[derive(Clone, Copy)]
 enum PopCoord {
@@ -646,26 +651,27 @@ pub fn run_bayes(
             }
 
             // ---- 1b. κ block: sample κ_ik | η, θ, Ω, Ω_iov, data (η fixed) ----
-            if n_kappa > 0 && !omega_iov_all_fixed {
-                if let Some(ref oi) = omega_iov_cur {
-                    for i in 0..n_subjects {
-                        let (na, np, nll_new) = mh_kappa_steps(
-                            &mut kappas[i],
-                            nll[i],
-                            &population.subjects[i],
-                            model,
-                            &theta,
-                            &etas[i],
-                            &omega_cur,
-                            oi,
-                            &sigma,
-                            kappa_scale,
-                            &mut rng,
-                        );
-                        nll[i] = nll_new;
-                        acc_kappa += na as u64;
-                        prop_kappa += np as u64;
-                    }
+            if should_sample_kappa_block(n_kappa, omega_iov_cur.as_ref()) {
+                let oi = omega_iov_cur
+                    .as_ref()
+                    .expect("should_sample_kappa_block requires OMEGA_IOV");
+                for i in 0..n_subjects {
+                    let (na, np, nll_new) = mh_kappa_steps(
+                        &mut kappas[i],
+                        nll[i],
+                        &population.subjects[i],
+                        model,
+                        &theta,
+                        &etas[i],
+                        &omega_cur,
+                        oi,
+                        &sigma,
+                        kappa_scale,
+                        &mut rng,
+                    );
+                    nll[i] = nll_new;
+                    acc_kappa += na as u64;
+                    prop_kappa += np as u64;
                 }
             }
 
@@ -1293,6 +1299,34 @@ pub fn run_bayes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kappa_block_sampled_iff_iov_present() {
+        let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
+
+        // The gate depends ONLY on (n_kappa > 0) and OMEGA_IOV being present —
+        // NOT on whether OMEGA_IOV is FIX-ed. A fixed OMEGA_IOV still defines the
+        // kappa prior variance, so kappas must keep being sampled (regression for
+        // the all-FIX case where the old `!omega_iov_all_fixed` gate wrongly
+        // skipped the whole block).
+        assert!(
+            should_sample_kappa_block(1, Some(&omega_iov)),
+            "OMEGA_IOV present with n_kappa > 0 must enable kappa sampling, fixed or not"
+        );
+
+        // No OMEGA_IOV → no kappa prior → nothing to sample.
+        assert!(
+            !should_sample_kappa_block(1, None),
+            "without OMEGA_IOV there is no kappa prior, so the block must be skipped"
+        );
+
+        // No kappas → block is irrelevant regardless of OMEGA_IOV.
+        assert!(
+            !should_sample_kappa_block(0, Some(&omega_iov)),
+            "with n_kappa == 0 there are no kappas to sample"
+        );
+        assert!(!should_sample_kappa_block(0, None));
+    }
 
     /// InvGamma(a, b) has mean b/(a−1). Check the sample mean converges.
     #[test]

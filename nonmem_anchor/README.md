@@ -107,12 +107,45 @@ For Savic, also check parameter **recovery** vs the truths above (the data were
 simulated from this model). For IG, recovery is not meaningful (mis-specified vs
 the transit DGP); the test there is **NONMEM-igd ≈ ferx-igd**, not recovery.
 
-### Freijer & Post IG — PENDING
+### Freijer & Post IG — RESULT (FOCEI, 20 subj / 240 obs)
 
-NONMEM run is done (`results/freijer_ig.*`), but `igd()` is not yet implemented
-in ferx ([#347](https://github.com/FeRx-NLME/ferx-core/issues/347)), so there is
-no ferx side to compare. Fill this table in once #347 lands and a
-`freijer_igd_fit.ferx` exists.
+NONMEM run: `results/freijer_ig.*` (ferx `nmfe75`; final estimates in
+`results/freijer_ig.ext`, MINIMIZATION SUCCESSFUL, `#OBJV = −899.38`). ferx anchor:
+`tests/igd_nonmem_anchor.rs` on `data/igd_oral.csv` (the shared dataset re-keyed to
+a 1-compartment layout — every record on CMT 1 — so the dose feeds the `igd()`
+compartment directly; see the dose-routing note below).
+
+**The check is NONMEM-igd ≈ ferx-igd at the same parameters.** Recovery is *not*
+meaningful here: the data were simulated from the Savic transit model, so the IG
+fit is mildly mis-specified (both engines fit the same approximate shape). On that
+mis-specified objective the likelihood surface has a long flat ridge — NONMEM's
+gradient FOCEI climbs it from `MAT≈2` to `MAT≈6.07` over ~30 iterations, while
+ferx's default derivative-free outer optimiser (BOBYQA) takes small steps and
+stalls partway up (full-fit OFV ≈ −881). The optimiser *path* on a flat surface is
+not the implementation check; the **objective at the optimum** is. (The stall is
+the ODE analogue of the fixed-EBE gradient bias the analytic FOCE/FOCEI gradient
+work — ferx-core #367 / #381 — removes for analytical models; an exact ODE
+gradient via sensitivity equations is the path to converging such fits.) Evaluating
+ferx's full FOCEI objective (inner EBEs + Laplace + ODE integration of the `igd`
+forcing) at NONMEM's reported optimum, at NONMEM-equivalent ODE accuracy
+(`ode_reltol = ode_abstol = 1e-9`, matching `TOL=9`):
+
+| Quantity | NONMEM | ferx (at NONMEM's optimum) |
+|----------|--------|----------------------------|
+| FOCEI objective | −899.38 | **−899.39** (Δ 0.02) |
+
+evaluated at `CL 5.612`, `V 33.95`, `MAT 6.071`, `CV2 1.868`, `ω²(CL) 0.0401`,
+`ω²(V) 0.0484`, `σ²(prop) 0.0583`. Agreement to **0.02 units** confirms the `igd()`
+density and its ODE machinery (forcing, dose routing, bolus suppression,
+superposition) reproduce the NONMEM `$DES` inverse-Gaussian input.
+
+**Dose routing.** NONMEM doses CMT 1 (an inert depot, `F1=0`) and drives `R_in`
+into central (CMT 2) from `PODO`. ferx instead keys the dose to the `igd()`
+compartment (the plan's dose-routing rule: the dose feeds the function on its
+`d/dt` line), so `data/igd_oral.csv` re-keys the central observations to CMT 1 —
+a single central compartment carrying both the IG-driven dose and the
+observations. The two are likelihood-identical (NONMEM's depot is inert), so they
+share the same objective.
 
 ## Implementation notes (why the streams look the way they do)
 

@@ -631,8 +631,8 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
         diags.push(
             Diagnostic::error(
                 "E_ABSORPTION_DIFFUSION",
-                "A built-in absorption input-rate model (e.g. transit()) cannot yet be \
-                 combined with a [diffusion] block (the SDE/EKF path): the EKF \
+                "A built-in absorption input-rate model (e.g. transit() or igd()) cannot yet \
+                 be combined with a [diffusion] block (the SDE/EKF path): the EKF \
                  propagation does not carry the input-rate forcing. Remove the \
                  [diffusion] block or the absorption term.",
             )
@@ -654,8 +654,8 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             Diagnostic::error(
                 "E_ABSORPTION_SS",
                 "Steady-state dosing (SS=1) into a built-in absorption input-rate \
-                 compartment (e.g. transit()) is not yet supported. Expand the run-in \
-                 with explicit dosing records, or remove the absorption term.",
+                 compartment (e.g. transit() or igd()) is not yet supported. Expand the \
+                 run-in with explicit dosing records, or remove the absorption term.",
             )
             .with_block("odes"),
         );
@@ -679,7 +679,7 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             Diagnostic::error(
                 "E_ABSORPTION_RATE",
                 "An infusion (RATE>0) into a built-in absorption input-rate \
-                 compartment (e.g. transit()) is not supported: the dose mass is \
+                 compartment (e.g. transit() or igd()) is not supported: the dose mass is \
                  delivered through the input-rate function R_in computed from the dose \
                  amount, so an infusion rate would double-count it. Use a plain bolus \
                  dose record (RATE=0) into the absorption compartment.",
@@ -689,11 +689,12 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     }
 
     // Parameter-domain validation (data-level): an out-of-domain or non-finite
-    // input-rate parameter (e.g. transit `mtt ≤ 0` or `n < 0`) would otherwise
-    // propagate as a NaN through the ODE RHS and surface only as an opaque fit
-    // failure. Evaluated on typical values (η = 0) per subject, so a covariate
-    // relationship that pushes a subject's typical `mtt`/`n` out of range is
-    // caught too. Reported once — a single fatal error already halts the fit.
+    // input-rate parameter (e.g. transit `mtt ≤ 0` / `n < 0`, or igd `mat`/`cv2
+    // ≤ 0`) would otherwise propagate as a NaN through the ODE RHS and surface
+    // only as an opaque fit failure. Evaluated on typical values (η = 0) per
+    // subject, so a covariate relationship that pushes a subject's typical
+    // parameter out of range is caught too. Reported once — a single fatal
+    // error already halts the fit.
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     'subjects: for subject in &population.subjects {
         let pk = (model.pk_param_fn)(&model.default_params.theta, &zero_eta, &subject.covariates);
@@ -704,8 +705,9 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
                         "E_ABSORPTION_DOMAIN",
                         format!(
                             "Built-in absorption input-rate parameter out of domain at typical \
-                             values (subject {}): {msg}. Constrain the parameter so it stays in \
-                             range (e.g. `MTT = TVMTT * exp(ETA_MTT)` keeps MTT > 0).",
+                             values (subject {}): {msg}. Constrain the parameter so it stays \
+                             positive (e.g. a log-normal `P = TVP * exp(ETA_P)` \
+                             parameterisation).",
                             subject.id
                         ),
                     )
@@ -3025,6 +3027,50 @@ fn fit_inner(
             });
         }
         result = Some(stage_result);
+
+        // NONMEM-comparable IMP / IMPMAP objective. The reported `OuterResult.ofv`
+        // is a final FOCE *Laplace* pass (kept for cross-method AIC/BIC
+        // comparability, like SAEM). NONMEM `METHOD=IMP` instead reports the
+        // importance-sampling Monte-Carlo *marginal* −2 log L (the `.ext` #OBJV).
+        // Evaluate that marginal at the final estimates and surface it alongside
+        // on `FitResult.importance_sampling`, so callers comparing to NONMEM read
+        // the matching number. Best-effort: a failure (e.g. SDE, IOV without
+        // Ω_iov, n_eta = 0) leaves the field unset with a warning, never aborts.
+        if is_last && matches!(method, EstimationMethod::Imp | EstimationMethod::Impmap) {
+            let r = result.as_ref().expect("stage result was just set");
+            let mut marg_opts = stage_opts.clone();
+            // `run_importance_sampling` reads the `is_*` knobs; for IMPMAP map the
+            // `impmap_*` knobs onto them so the final eval mirrors the method's
+            // own sample count / proposal df / seed.
+            if method == EstimationMethod::Impmap {
+                marg_opts.is_samples = stage_opts.impmap_samples;
+                marg_opts.is_seed = stage_opts.impmap_seed;
+                marg_opts.is_low_ess_threshold = stage_opts.impmap_low_ess_threshold;
+                // A Gaussian IMPMAP proposal (`impmap_proposal_df = ∞`, opt-in)
+                // cannot be sampled by the finite-t IS evaluator. The marginal is
+                // proposal-independent in expectation, so fall back to a finite-t
+                // eval proposal (heavier tails ⇒ bounded weights). The default
+                // `impmap_proposal_df = 4` passes through unchanged.
+                let df = stage_opts.impmap_proposal_df;
+                marg_opts.is_proposal_df = if df.is_finite() && df >= 1.0 { df } else { 5.0 };
+            }
+            match crate::estimation::importance_sampling::run_importance_sampling(
+                model,
+                population,
+                &r.params,
+                &r.eta_hats,
+                &r.h_matrices,
+                &r.kappas,
+                &marg_opts,
+            ) {
+                Ok(is) => is_result = Some(is),
+                Err(e) => accumulated_warnings.push(if n_stages > 1 {
+                    format!("[{}] marginal −2 log L eval skipped: {}", method.label(), e)
+                } else {
+                    format!("marginal −2 log L eval skipped: {}", e)
+                }),
+            }
+        }
     }
 
     if crate::cancel::is_cancelled(&options.cancel) {

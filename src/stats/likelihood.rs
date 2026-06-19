@@ -253,8 +253,15 @@ pub(crate) fn obs_nll_subject_into(
     let ruv_scale = model.residual_var_scale(eta);
     let mut nll = 0.0;
     for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        let f = f.max(1e-12);
-        let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
+        let frem_var = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+        // FREM covariate pseudo-observations predict a covariate *value* (any
+        // real: centered/standardized/log-scale covariates are routinely ≤ 0),
+        // not a concentration — do NOT clamp them to 1e-12. Clamping a negative
+        // covariate prediction up to 1e-12 fabricates a huge residual and, on the
+        // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
+        // (#406). Ordinary PK rows keep the positivity clamp.
+        let f = if frem_var.is_some() { f } else { f.max(1e-12) };
+        let v = match frem_var {
             Some(vv) => vv.max(1e-12),
             None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale)
                 .max(1e-12),

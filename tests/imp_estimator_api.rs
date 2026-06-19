@@ -115,6 +115,24 @@ fn imp_standalone_is_an_estimator_and_moves_parameters() {
             "omega[{i},{i}] must be finite > 0, got {w}"
         );
     }
+
+    // Estimating IMP now surfaces the importance-sampling Monte-Carlo marginal
+    // −2 log L (the NONMEM `METHOD=IMP` #OBJV), evaluated at the final estimates,
+    // alongside the Laplace `ofv`. Previously populated only by the eval-only path.
+    let is = result
+        .importance_sampling
+        .as_ref()
+        .expect("estimating imp must surface the marginal −2 log L on importance_sampling");
+    assert!(
+        is.minus2_log_likelihood.is_finite(),
+        "marginal −2 log L must be finite, got {}",
+        is.minus2_log_likelihood
+    );
+    assert!(
+        is.mc_standard_error.is_finite() && is.mc_standard_error >= 0.0,
+        "marginal MC SE must be finite & non-negative, got {}",
+        is.mc_standard_error
+    );
 }
 
 #[test]

@@ -206,6 +206,107 @@ fn frem_dataset_row_count() {
     assert_eq!(ft_200_count, 10, "should have 10 AGE pseudo-obs");
 }
 
+/// IMPMAP on a FREM model exercises the Rao-Blackwellised E-step
+/// (`subject_is_draws_frem_rb`): the covariate etas are integrated analytically
+/// and only the PK etas are importance-sampled (#406). A few iterations must
+/// produce a finite OFV, a 5x5 omega, and the covariate-omega cc-block ≈ the
+/// covariate sample covariance (which RB reconstructs exactly as `d dᵀ`).
+#[test]
+fn frem_impmap_rao_blackwell_runs_finite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = setup_frem(tmp.path());
+
+    let model = parse_model_file(&result.model_path).unwrap();
+    let pop = read_nonmem_csv(&result.data_path, None, None).unwrap();
+
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Impmap;
+    opts.impmap_iterations = 3; // fast — just exercise the RB E-step + M-step
+    opts.impmap_samples = 200;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+
+    let fit_result =
+        fit(&model, &pop, &model.default_params, &opts).expect("FREM IMPMAP fit should not error");
+
+    assert!(
+        fit_result.ofv.is_finite(),
+        "IMPMAP OFV should be finite, got {}",
+        fit_result.ofv
+    );
+    let omega = &fit_result.omega;
+    assert_eq!(omega.nrows(), 5);
+    assert_eq!(omega.ncols(), 5);
+    for i in 0..5 {
+        assert!(
+            omega[(i, i)] > 0.0 && omega[(i, i)].is_finite(),
+            "omega[{i},{i}] should be positive finite, got {}",
+            omega[(i, i)]
+        );
+    }
+    // Covariate cc-block ≈ sample covariance (WT var ≈ 111.6, AGE var ≈ 99.4);
+    // RB sets it from d dᵀ so it stays in the right ballpark even after 3 iters.
+    assert!(
+        omega[(3, 3)] > 50.0 && omega[(4, 4)] > 50.0,
+        "covariate omega diagonals should be near the sample variances, got {} / {}",
+        omega[(3, 3)],
+        omega[(4, 4)]
+    );
+}
+
+/// The Rao-Blackwellised marginal and the full-dimensional (brute-force) sampler
+/// estimate the *same* integral, so at a fixed parameter point they must agree
+/// up to Monte-Carlo noise. A regression guard for the FREM covariate-marginal
+/// 2π bookkeeping: `log_p_d` once included the covariate-obs `nc·ln(2π)`
+/// normalizer that the rest of the OFV (and NONMEM's "without constant") drops,
+/// inflating the RB marginal by `Σ nc·ln(2π)`. Here that offset would be
+/// 2 covariates × 10 subjects × ln(2π) ≈ 36.8 — far above the MC tolerance.
+#[test]
+fn frem_rao_blackwell_marginal_matches_full_dim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = setup_frem(tmp.path());
+    let model = parse_model_file(&result.model_path).unwrap();
+    let pop = read_nonmem_csv(&result.data_path, None, None).unwrap();
+
+    // Evaluate the IS marginal at the fixed initial params (no estimation), so
+    // both paths score the identical point.
+    let mut base = FitOptions::default();
+    base.method = ferx_core::EstimationMethod::Imp;
+    base.is_eval_only = true;
+    base.is_samples = 6000;
+    base.is_seed = Some(20240619);
+    base.run_covariance_step = false;
+    base.verbose = false;
+
+    let mut opts_rb = base.clone();
+    opts_rb.frem_rao_blackwell = true;
+    let rb = fit(&model, &pop, &model.default_params, &opts_rb)
+        .expect("RB eval should not error")
+        .importance_sampling
+        .expect("eval-only IMP must populate importance_sampling")
+        .minus2_log_likelihood;
+
+    let mut opts_full = base;
+    opts_full.frem_rao_blackwell = false;
+    let full = fit(&model, &pop, &model.default_params, &opts_full)
+        .expect("full-dim eval should not error")
+        .importance_sampling
+        .expect("eval-only IMP must populate importance_sampling")
+        .minus2_log_likelihood;
+
+    assert!(
+        rb.is_finite() && full.is_finite(),
+        "both marginals must be finite, got RB={rb}, full={full}"
+    );
+    // Tolerance comfortably below the ~36.8 bug offset, above MC noise at K=6000.
+    assert!(
+        (rb - full).abs() < 12.0,
+        "RB marginal {rb} and full-dim marginal {full} must agree (Δ={}) — \
+         the covariate-marginal 2π term must be dropped in both",
+        (rb - full).abs()
+    );
+}
+
 /// FREM fit completes (fast, 3 outer iterations) with finite OFV and correct omega size.
 #[test]
 fn frem_fit_completes_with_finite_ofv() {

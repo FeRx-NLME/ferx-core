@@ -1,0 +1,68 @@
+# Inverse-Gaussian (Freijer & Post) absorption — built-in `igd()` input rate
+#
+# One-compartment oral disposition with a Freijer & Post (1997)
+# inverse-Gaussian absorption-time distribution, expressed with the built-in
+# `igd()` input-rate function. Unlike a transit chain, the IG density models the
+# *entire* absorption delay and feeds the central compartment directly (no
+# downstream first-order `ka`):
+#
+#   R_in(tad) = F·Dose · sqrt(MAT / (2π·CV2·tad³)) · exp(−(tad−MAT)² / (2·CV2·MAT·tad))
+#
+# the standard inverse-Gaussian density with mean absorption time MAT and
+# relative dispersion CV2 (= Var/mean², shape λ = MAT/CV2). The whole dose is
+# delivered through `igd()` over time (∫ R_in dt = F·Dose) and is NOT also added
+# as a bolus — the same dose-into-the-input-rate-compartment convention as
+# `transit()` (see examples/transit_savic.ferx).
+#
+# ── Unit convention (Form C: amount ODE + [scaling]) ─────────────────────────
+#   CMT=1  central  — drug AMOUNT (mg); receives R_in(tad), elimination CL/V
+#   observation y   — concentration (mg/L) = central / V, via the [scaling] block
+#
+# Self-contained: run it with no data file
+#   cargo run --release -- examples/igd_inverse_gaussian.ferx --simulate
+# which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
+# fits it back. True simulation parameters: TVCL=5, TVV=50, TVMAT=2, TVCV2=0.3,
+#   omega_CL=omega_V=0.09, sigma_prop=0.15.
+
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)    # typical clearance (L/h)
+  theta TVV(50.0,   5.0, 500.0)    # typical central volume (L)
+  theta TVMAT(2.0, 0.05,  24.0)    # mean absorption time (h)
+  theta TVCV2(0.3, 0.001, 10.0)    # relative dispersion of absorption time (Var/mean²)
+
+  omega ETA_CL ~ 0.09              # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09              # IIV on V  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)       # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL  = TVCL  * exp(ETA_CL)
+  V   = TVV   * exp(ETA_V)
+  MAT = TVMAT
+  CV2 = TVCV2
+
+[structural_model]
+  ode(states=[central])            # no obs_cmt — Form C provides the observable
+
+[odes]
+  # central holds drug AMOUNT (mg); igd() delivers F·Dose over time as the
+  # inverse-Gaussian density, then first-order elimination CL/V.
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central
+
+[scaling]
+  y = central / V                  # observable = concentration (mg/L)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7

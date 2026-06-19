@@ -14,6 +14,12 @@
 
 use crate::stats::special::ln_gamma;
 
+/// `ln(2π)` — the inverse-Gaussian log-density normalisation constant. A literal
+/// (rather than a runtime `(2.0 * PI).ln()`) since `f64::ln` is not `const`; the
+/// `igd_matches_direct_density_formula` test pins it to the textbook density to
+/// 1e-12, so a typo here cannot pass unnoticed.
+const LN_2PI: f64 = 1.837_877_066_409_345_5;
+
 /// Savic et al. (2007) transit-compartment input rate into the **depot**, for a
 /// *continuous* number of transit compartments `n`:
 ///
@@ -53,11 +59,56 @@ pub fn validate_transit(n: f64, mtt: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// Freijer & Post (1997) inverse-Gaussian (convection–dispersion) absorption
+/// input rate into the **central** compartment, for mean absorption time `mat`
+/// and relative dispersion `cv2`:
+///
+/// ```text
+/// R_in(tad) = dose · √(MAT / (2π·CV²·tad³)) · exp(−(tad−MAT)² / (2·CV²·MAT·tad)).
+/// ```
+///
+/// This is the standard inverse-Gaussian density scaled by the dose, with mean
+/// `μ = MAT` and shape `λ = MAT/CV²` (`CV²` = relative dispersion, Var/mean²);
+/// unlike `transit`, it models the *entire* absorption delay and feeds central
+/// directly (no downstream `ka`). `∫₀^∞ R_in dt = dose`. Returns `0` for
+/// `tad ≤ 0` and for a non-positive `dose`.
+///
+/// Domain: `mat > 0`, `cv2 > 0` (enforce upstream with [`validate_igd`]).
+/// Evaluated in the log domain for stability: the essential singularity at
+/// `tad → 0` collapses to `R_in → 0` because the `−(tad−MAT)²/(2·CV²·MAT·tad)`
+/// term diverges like `−MAT/(2·CV²·tad)`, dominating the `−1.5·ln tad` term.
+///
+/// This is the readable reference form (used by tests and one-shot callers); the
+/// ODE hot path goes through [`InputRateForcing::prepare`] +
+/// [`PreparedInputRate::rate`], which hoist the dose-invariant constants
+/// (`c0`, `1/(2·CV²·MAT)`) out of the per-dose superposition loop.
+pub fn inverse_gaussian_input_rate(tad: f64, mat: f64, cv2: f64, dose: f64) -> f64 {
+    PreparedInputRate::inverse_gaussian(mat, cv2).rate(tad, dose)
+}
+
+/// Validate inverse-Gaussian parameters: `mat` and `cv2` strictly positive.
+/// The negated comparisons also reject `NaN`.
+pub fn validate_igd(mat: f64, cv2: f64) -> Result<(), String> {
+    if !(mat > 0.0) {
+        return Err(format!(
+            "igd: mat (mean absorption time) must be > 0, got {mat}"
+        ));
+    }
+    if !(cv2 > 0.0) {
+        return Err(format!(
+            "igd: cv2 (relative dispersion) must be > 0, got {cv2}"
+        ));
+    }
+    Ok(())
+}
+
 /// Which built-in absorption input-rate model a forcing term uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputRateKind {
     /// Savic transit-compartment chain — `transit(n, mtt)`.
     Transit,
+    /// Freijer & Post inverse-Gaussian density — `igd(mat, cv2)`.
+    InverseGaussian,
 }
 
 /// A built-in absorption input-rate term attached to one ODE compartment.
@@ -66,7 +117,8 @@ pub enum InputRateKind {
 /// out of the `[odes]` RHS at parse time and evaluated here with dose context,
 /// rather than threaded through the expression AST / bytecode VM / symbolic-AD
 /// machinery. `arg_slots` index the flat individual-parameter vector for this
-/// model's parameters — for [`InputRateKind::Transit`], `[n, mtt]`.
+/// model's parameters — for [`InputRateKind::Transit`], `[n, mtt]`; for
+/// [`InputRateKind::InverseGaussian`], `[mat, cv2]`.
 #[derive(Debug, Clone)]
 pub struct InputRateForcing {
     /// 0-based ODE compartment that receives `R_in`.
@@ -98,6 +150,10 @@ impl InputRateForcing {
             InputRateKind::Transit => {
                 PreparedInputRate::transit(self.arg(params, 0, 0.0), self.arg(params, 1, 1.0))
             }
+            InputRateKind::InverseGaussian => PreparedInputRate::inverse_gaussian(
+                self.arg(params, 0, 1.0),
+                self.arg(params, 1, 1.0),
+            ),
         }
     }
 
@@ -110,6 +166,9 @@ impl InputRateForcing {
         match self.kind {
             InputRateKind::Transit => {
                 validate_transit(self.arg(params, 0, 0.0), self.arg(params, 1, 1.0))
+            }
+            InputRateKind::InverseGaussian => {
+                validate_igd(self.arg(params, 0, 1.0), self.arg(params, 1, 1.0))
             }
         }
     }
@@ -127,16 +186,23 @@ pub enum PreparedInputRate {
         n: f64,
         ln_gamma_np1: f64,
     },
+    /// Inverse-Gaussian constants: the mean `mat`, the dose-invariant log
+    /// prefactor `c0 = ½·(ln mat − ln 2π − ln cv2)`, and `inv_2cv2mat
+    /// = 1/(2·cv2·mat)`. (`cv2` is folded into `c0`/`inv_2cv2mat`, so it is not
+    /// stored separately.)
+    InverseGaussian { mat: f64, c0: f64, inv_2cv2mat: f64 },
 }
 
 impl PreparedInputRate {
-    /// Domain floor for `mtt` when clamping a transient mid-fit excursion (see
-    /// [`Self::transit`]). Far below any realistic mean transit time, so it never
-    /// perturbs a converged fit — it only keeps a transient `mtt ≤ 0` from
-    /// turning `ktr.ln()` into a `NaN`. The clamp itself is
-    /// [`crate::types::clamp_above_floor`], shared with the modeled-duration floor
-    /// ([`crate::types::DoseEvent::DURATION_FLOOR`]) so the two can't drift apart.
-    const MIN_MTT: f64 = 1e-8;
+    /// Domain floor for the strictly-positive input-rate parameters (transit
+    /// `mtt`; inverse-Gaussian `mat`, `cv2`) when clamping a transient mid-fit
+    /// excursion (see [`Self::transit`], [`Self::inverse_gaussian`]). Far below
+    /// any realistic value, so it never perturbs a converged fit — it only keeps
+    /// a transient `≤ 0` from turning a `.ln()` / `1/x` into a `NaN`/`∞`. The
+    /// clamp itself is [`crate::types::clamp_above_floor`], shared with the
+    /// modeled-duration floor ([`crate::types::DoseEvent::DURATION_FLOOR`]) so the
+    /// domain-wall clamps can't drift apart.
+    const MIN_PARAM: f64 = 1e-8;
 
     /// Precompute the transit constants for `(n, mtt)`.
     ///
@@ -154,7 +220,7 @@ impl PreparedInputRate {
     /// `NaN` inputs also fall to the floor (every `>`/`>=` is false for `NaN`).
     #[inline]
     fn transit(n: f64, mtt: f64) -> Self {
-        let mtt = crate::types::clamp_above_floor(mtt, Self::MIN_MTT);
+        let mtt = crate::types::clamp_above_floor(mtt, Self::MIN_PARAM);
         let n = if n >= 0.0 { n } else { 0.0 };
         let ktr = (n + 1.0) / mtt;
         PreparedInputRate::Transit {
@@ -162,6 +228,25 @@ impl PreparedInputRate {
             ln_ktr: ktr.ln(),
             n,
             ln_gamma_np1: ln_gamma(n + 1.0),
+        }
+    }
+
+    /// Precompute the inverse-Gaussian constants for `(mat, cv2)`.
+    ///
+    /// As with [`Self::transit`], the arguments are **clamped to the valid
+    /// domain** (`mat > 0`, `cv2 > 0`, floor [`Self::MIN_PARAM`]) so a transient
+    /// mid-search excursion (additive `eta`, wide FD step) yields a finite
+    /// `R_in` at the domain wall instead of a `NaN` (`ln`/`1/0`) that would
+    /// poison the ODE RHS; the converged optimum is interior, so reported
+    /// estimates are unaffected. `NaN` inputs also fall to the floor.
+    #[inline]
+    fn inverse_gaussian(mat: f64, cv2: f64) -> Self {
+        let mat = crate::types::clamp_above_floor(mat, Self::MIN_PARAM);
+        let cv2 = crate::types::clamp_above_floor(cv2, Self::MIN_PARAM);
+        PreparedInputRate::InverseGaussian {
+            mat,
+            c0: 0.5 * (mat.ln() - LN_2PI - cv2.ln()),
+            inv_2cv2mat: 1.0 / (2.0 * cv2 * mat),
         }
     }
 
@@ -184,6 +269,19 @@ impl PreparedInputRate {
             } => {
                 let x = ktr * tad; // > 0 (tad > 0, ktr > 0 for valid params)
                 (dose.ln() + ln_ktr + n * x.ln() - x - ln_gamma_np1).exp()
+            }
+            // ln R_in = ln dose + ½(ln mat − ln 2π − ln cv2) − 1.5·ln tad
+            //           − (tad − mat)² / (2·cv2·mat·tad).
+            // tad > 0 here. As tad → 0⁺ the last term → −mat/(2·cv2·tad) = −∞,
+            // dominating the +∞ from −1.5·ln tad, so R_in → 0 (the essential
+            // singularity); large tad underflows the same way.
+            PreparedInputRate::InverseGaussian {
+                mat,
+                c0,
+                inv_2cv2mat,
+            } => {
+                let d = tad - mat;
+                (dose.ln() + c0 - 1.5 * tad.ln() - d * d * inv_2cv2mat / tad).exp()
             }
         }
     }
@@ -330,5 +428,190 @@ mod tests {
         let mut bad_n = ok.clone();
         bad_n[6] = -2.0; // n < 0
         assert!(forcing.validate(&bad_n).unwrap_err().contains("n "));
+    }
+
+    // ── Inverse-Gaussian (Freijer & Post) `igd(mat, cv2)` ────────────────────
+
+    /// Direct (non-log-domain) inverse-Gaussian density × dose, the independent
+    /// reference the log-domain [`inverse_gaussian_input_rate`] is checked against.
+    fn ig_density_ref(tad: f64, mat: f64, cv2: f64, dose: f64) -> f64 {
+        if tad <= 0.0 || dose <= 0.0 {
+            return 0.0;
+        }
+        dose * (mat / (std::f64::consts::TAU * cv2 * tad.powi(3))).sqrt()
+            * (-(tad - mat).powi(2) / (2.0 * cv2 * mat * tad)).exp()
+    }
+
+    /// Inverse-Gaussian mode (peak of the density): `μ·(√(1+(1.5·CV²)²) − 1.5·CV²)`.
+    fn ig_mode(mat: f64, cv2: f64) -> f64 {
+        let k = 1.5 * cv2;
+        mat * ((1.0 + k * k).sqrt() - k)
+    }
+
+    /// Coarse trapezoidal `∫₀^upper R_in dt` for the mass-balance invariant.
+    fn integrate_ig(mat: f64, cv2: f64, dose: f64, upper: f64, dt: f64) -> f64 {
+        let steps = (upper / dt) as usize;
+        let mut sum = 0.0;
+        let mut prev = inverse_gaussian_input_rate(0.0, mat, cv2, dose);
+        for i in 1..=steps {
+            let t = i as f64 * dt;
+            let cur = inverse_gaussian_input_rate(t, mat, cv2, dose);
+            sum += 0.5 * (prev + cur) * dt;
+            prev = cur;
+        }
+        sum
+    }
+
+    #[test]
+    fn igd_matches_direct_density_formula() {
+        // The log-domain evaluation must agree with the textbook density form to
+        // machine precision — guards the algebra of the `c0` / `inv_2cv2mat` hoist.
+        let dose = 100.0;
+        for &(mat, cv2) in &[(2.0, 0.3), (6.0, 1.87), (1.0, 0.5), (4.0, 0.2)] {
+            for &tad in &[0.05, 0.5, 1.0, 2.0, 5.0, 12.0, 30.0] {
+                assert_relative_eq!(
+                    inverse_gaussian_input_rate(tad, mat, cv2, dose),
+                    ig_density_ref(tad, mat, cv2, dose),
+                    max_relative = 1e-12
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn igd_mass_balance_integrates_to_dose() {
+        // ∫₀^∞ R_in dt = dose: the inverse-Gaussian is a proper density (mean MAT),
+        // so the dose is fully delivered. `upper`/`dt` are sized per case from the
+        // mean and SD (= MAT·√CV²) to capture the right-skewed tail.
+        for &(mat, cv2) in &[
+            (2.0_f64, 0.3_f64),
+            (6.0, 1.87),
+            (1.0, 0.5),
+            (4.0, 0.2),
+            (3.0, 1.0),
+        ] {
+            let dose = 100.0;
+            let sd = mat * cv2.sqrt();
+            let upper = mat + 40.0 * sd;
+            let dt = (ig_mode(mat, cv2).min(sd)) / 400.0;
+            let mass = integrate_ig(mat, cv2, dose, upper, dt);
+            assert_relative_eq!(mass, dose, max_relative = 2e-3);
+        }
+    }
+
+    #[test]
+    fn igd_peaks_at_the_ig_mode() {
+        // The density peaks at its mode; flanks at half / 1.5× the mode are lower.
+        for &(mat, cv2) in &[(2.0, 0.3), (6.0, 1.0), (4.0, 0.2)] {
+            let mode = ig_mode(mat, cv2);
+            let peak = inverse_gaussian_input_rate(mode, mat, cv2, 100.0);
+            assert!(peak > inverse_gaussian_input_rate(mode * 0.5, mat, cv2, 100.0));
+            assert!(peak > inverse_gaussian_input_rate(mode * 1.5, mat, cv2, 100.0));
+        }
+    }
+
+    #[test]
+    fn igd_zero_before_dose_and_for_zero_dose() {
+        assert_eq!(inverse_gaussian_input_rate(0.0, 2.0, 0.3, 100.0), 0.0);
+        assert_eq!(inverse_gaussian_input_rate(-1.0, 2.0, 0.3, 100.0), 0.0);
+        assert_eq!(inverse_gaussian_input_rate(1.0, 2.0, 0.3, 0.0), 0.0);
+    }
+
+    #[test]
+    fn igd_essential_singularity_vanishes_at_tiny_tad() {
+        // The essential singularity at tad → 0⁺ collapses to R_in → 0 (not NaN/∞):
+        // values must be finite, non-negative, and far below the peak as tad shrinks.
+        let (mat, cv2) = (2.0, 0.3);
+        let peak = inverse_gaussian_input_rate(ig_mode(mat, cv2), mat, cv2, 100.0);
+        for &tad in &[1e-2, 1e-4, 1e-6, 1e-10, 1e-300] {
+            let r = inverse_gaussian_input_rate(tad, mat, cv2, 100.0);
+            assert!(
+                r.is_finite() && r >= 0.0,
+                "R_in must be finite ≥ 0, got {r}"
+            );
+            assert!(
+                r < peak,
+                "R_in at tiny tad={tad} ({r}) must stay below the peak"
+            );
+        }
+        assert_eq!(inverse_gaussian_input_rate(1e-300, mat, cv2, 100.0), 0.0);
+    }
+
+    #[test]
+    fn validate_igd_domain() {
+        assert!(validate_igd(2.0, 0.3).is_ok());
+        assert!(validate_igd(0.0, 0.3).is_err());
+        assert!(validate_igd(-1.0, 0.3).is_err());
+        assert!(validate_igd(2.0, 0.0).is_err());
+        assert!(validate_igd(2.0, -0.3).is_err());
+        assert!(validate_igd(f64::NAN, 0.3).is_err());
+        assert!(validate_igd(2.0, f64::NAN).is_err());
+    }
+
+    /// A transient domain excursion (`mat ≤ 0`, `cv2 ≤ 0`, or `NaN`) must yield a
+    /// finite, non-negative `R_in` (the clamp in `PreparedInputRate::inverse_gaussian`),
+    /// never a `NaN`/`∞` poisoning the ODE RHS — the IG analogue of the transit guard.
+    #[test]
+    fn igd_rate_is_finite_for_domain_excursions() {
+        for &(mat, cv2) in &[
+            (0.0, 0.3),
+            (-1.0, 0.3),
+            (2.0, 0.0),
+            (2.0, -0.3),
+            (f64::NAN, 0.3),
+            (2.0, f64::NAN),
+        ] {
+            for &tad in &[0.5, 2.0, 10.0] {
+                let r = inverse_gaussian_input_rate(tad, mat, cv2, 100.0);
+                assert!(
+                    r.is_finite() && r >= 0.0,
+                    "R_in must be finite & non-negative at mat={mat}, cv2={cv2}, tad={tad}, got {r}"
+                );
+            }
+        }
+    }
+
+    /// `prepare(...).rate(...)` must agree bit-for-bit with the reference
+    /// `inverse_gaussian_input_rate`, and read `mat`/`cv2` from the right slots.
+    #[test]
+    fn prepared_igd_rate_matches_reference_and_reads_slots() {
+        let forcing = InputRateForcing {
+            cmt: 1,
+            kind: InputRateKind::InverseGaussian,
+            arg_slots: vec![4, 5], // mat @ 4, cv2 @ 5
+        };
+        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
+        params[4] = 2.0; // mat
+        params[5] = 0.3; // cv2
+        let prepared = forcing.prepare(&params);
+        for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
+            assert_eq!(
+                prepared.rate(tad, 100.0),
+                inverse_gaussian_input_rate(tad, 2.0, 0.3, 100.0)
+            );
+        }
+    }
+
+    /// `InputRateForcing::validate` reads `mat`/`cv2` from the right slots for the
+    /// IG kind and surfaces the domain error.
+    #[test]
+    fn forcing_validate_igd_reads_slots_and_flags_domain() {
+        let forcing = InputRateForcing {
+            cmt: 1,
+            kind: InputRateKind::InverseGaussian,
+            arg_slots: vec![4, 5],
+        };
+        let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
+        ok[4] = 2.0;
+        ok[5] = 0.3;
+        assert!(forcing.validate(&ok).is_ok());
+
+        let mut bad_mat = ok.clone();
+        bad_mat[4] = -1.0;
+        assert!(forcing.validate(&bad_mat).unwrap_err().contains("mat"));
+
+        let mut bad_cv2 = ok.clone();
+        bad_cv2[5] = 0.0;
+        assert!(forcing.validate(&bad_cv2).unwrap_err().contains("cv2"));
     }
 }

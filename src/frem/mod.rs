@@ -40,6 +40,9 @@ pub struct FremPrepareResult {
     pub covariate_variances: Vec<(String, f64)>,
     pub fremtype_map: Vec<(String, u16)>,
     pub n_total_etas: usize,
+    /// Advisory messages surfaced at conversion time (e.g. estimated parameters
+    /// without a random effect, which IMP/IMPMAP estimate poorly — see #406).
+    pub warnings: Vec<String>,
 }
 
 /// Information about how a categorical covariate is expanded into indicators.
@@ -534,6 +537,31 @@ pub fn generate_frem_model(
     }
     model.push('\n');
 
+    // ── Structural-companion blocks carried over verbatim ──
+    // [scaling] and [odes] describe the structural prediction and are NOT
+    // reconstructed elsewhere; dropping them silently changes the model the
+    // FREM run fits. Notably, omitting `[scaling] obs_scale` (e.g. NONMEM's
+    // `CP = A*1000/V`) rescales every prediction, which the estimator then
+    // compensates by collapsing a PK typical value (TVCL drove to ~1e-2 instead
+    // of ~7 on the workshop FREM model). Copy each block as-is when present.
+    for block_name in ["scaling", "odes"] {
+        if let Some(block_lines) = blocks.get(block_name) {
+            if block_lines
+                .iter()
+                .any(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+            {
+                model.push_str(&format!("[{}]\n", block_name));
+                for line in block_lines {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        model.push_str(&format!("  {}\n", trimmed));
+                    }
+                }
+                model.push('\n');
+            }
+        }
+    }
+
     // ── [error_model] block ──
     model.push_str("[error_model]\n");
     if let Some(err_lines) = blocks.get("error_model") {
@@ -770,6 +798,27 @@ pub fn prepare_frem(
 
     let n_total = base_model.n_eta + frem_info.covariate_names.len();
 
+    // Conversion-time advisory: estimated parameters with no random effect are
+    // estimated poorly by IMP/IMPMAP (the importance-weighted M-step is biased for
+    // weakly-identified fixed effects — see #406). Flag them now so the user can
+    // add an ETA before fitting; ferx mu-references automatically.
+    let mut warnings: Vec<String> = Vec::new();
+    let no_eta = crate::estimation::impmap::non_fixed_thetas_without_eta(
+        base_model,
+        &base_model.default_params.theta_fixed,
+    );
+    if !no_eta.is_empty() {
+        warnings.push(format!(
+            "FREM conversion: estimated parameter(s) [{}] have no associated ETA. When fitting \
+             this model with IMP/IMPMAP, a fixed-effect-only parameter is estimated solely through \
+             the importance-weighted M-step, which is biased for weakly-identified parameters and \
+             may converge to the wrong value. Add an ETA to each (e.g. `P = TVP * exp(ETA_P)` with \
+             a small, optionally FIX, omega — ferx mu-references automatically), hold it FIX, or \
+             fit with FOCEI.",
+            no_eta.join(", ")
+        ));
+    }
+
     Ok(FremPrepareResult {
         model_path: out_model.to_path_buf(),
         data_path: out_data.to_path_buf(),
@@ -787,6 +836,7 @@ pub fn prepare_frem(
             .collect(),
         fremtype_map: frem_info.fremtype_map.clone(),
         n_total_etas: n_total,
+        warnings,
     })
 }
 
@@ -1127,6 +1177,149 @@ mod tests {
             .filter(|s| !s.trim().is_empty())
             .count();
         assert_eq!(n_values, 10); // 4*(4+1)/2
+    }
+
+    #[test]
+    fn test_generate_frem_model_preserves_scaling_block() {
+        // Regression (#406): the base model's `[scaling] obs_scale` block must be
+        // carried into the generated FREM model. Dropping it rescales every
+        // prediction (here NONMEM's CP = A*1000/V), which the estimator then
+        // compensates by collapsing a PK typical value (TVCL → ~1e-2).
+        let base_text = r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[scaling]
+  obs_scale = 0.001
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+        let pop = make_test_population();
+        let model = make_test_model();
+        let covs = vec!["WT".to_string()];
+        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
+
+        let model_text =
+            generate_frem_model(base_text, &model, &info, Path::new("test.csv")).unwrap();
+
+        assert!(
+            model_text.contains("[scaling]"),
+            "generated FREM model dropped the [scaling] block:\n{model_text}"
+        );
+        assert!(
+            model_text.contains("obs_scale = 0.001"),
+            "generated FREM model dropped obs_scale:\n{model_text}"
+        );
+        // The generated model must still parse (block placement is valid).
+        crate::parser::model_parser::parse_model_string(&model_text)
+            .expect("generated FREM model parses");
+    }
+
+    #[test]
+    fn frem_partition_samples_missing_covariate_etas() {
+        // Regression (#406): a subject missing a covariate pseudo-obs row (the
+        // FREM data omits rows for missing covariate values) must NOT bail to the
+        // unstable full-dimensional IS. subject_frem_partition puts the missing
+        // covariate eta into the *sampled* set (with the PK etas) and pins only
+        // the observed covariate eta at its data deviation.
+        let mut map = std::collections::HashMap::new();
+        map.insert(100u16, (0usize, 1usize)); // FREMTYPE 100 -> (theta 0, eta 1) OBSERVED
+        map.insert(300u16, (0usize, 3usize)); // FREMTYPE 300 -> (theta 0, eta 3) MISSING
+        let fc = FremConfig {
+            fremtype_to_indices: map,
+            covariate_sigma_index: 0,
+        };
+        let mut subj = make_test_population().subjects.remove(0);
+        subj.obs_times = vec![1.0, 1.0];
+        subj.obs_raw_times = vec![1.0, 1.0];
+        subj.observations = vec![5.0, 7.0]; // row1 = PK obs, row2 = FREMTYPE 100 cov obs
+        subj.obs_cmts = vec![1, 1];
+        subj.cens = vec![0, 0];
+        subj.fremtype = vec![0, 100]; // FREMTYPE 300 (eta 3) has NO row -> missing
+
+        let theta = vec![0.2, 10.0, 1.5];
+        let (sampled, observed, d) =
+            crate::estimation::importance_sampling::subject_frem_partition(
+                &subj,
+                &theta,
+                &fc,
+                &[0, 2], // pk etas
+                &[1, 3], // covariate etas
+            )
+            .expect("Some when at least one covariate observed");
+
+        assert_eq!(
+            sampled,
+            vec![0, 2, 3],
+            "missing cov eta 3 joins the sampled PK set"
+        );
+        assert_eq!(observed, vec![1], "only eta 1 (FREMTYPE 100) is observed");
+        assert_eq!(d.len(), 1);
+        assert!((d[0] - (7.0 - 0.2)).abs() < 1e-12, "d = cov_obs - TV");
+    }
+
+    #[test]
+    fn obs_nll_does_not_clamp_negative_covariate_pseudo_obs() {
+        // Regression (#406): a FREM covariate pseudo-observation predicts a
+        // covariate *value* (TV+eta), which can be ≤ 0 for centered/standardized/
+        // log-scale covariates. obs_nll_subject_into must NOT clamp that prediction
+        // to 1e-12 (which would fabricate a huge residual and corrupt the
+        // Rao-Blackwellised IS marginal/weights). Here the covariate obs is -5.0
+        // and eta is chosen so the prediction is exactly -5.0 (residual 0), so the
+        // row must contribute only 0.5·ln(R). Without the fix the clamped
+        // prediction (1e-12) gives residual ≈ -5 and obs_nll ≈ 0.5·(25/R) ≈ 3.1e4.
+        let mut model = make_test_model();
+        let mut map = std::collections::HashMap::new();
+        map.insert(100u16, (0usize, 1usize)); // FREMTYPE 100 -> (theta TVCL idx 0, eta idx 1)
+        model.frem_config = Some(FremConfig {
+            fremtype_to_indices: map,
+            covariate_sigma_index: 0, // sigma[0] = 0.02 -> R = 4e-4
+        });
+
+        let mut subj = make_test_population().subjects.remove(0);
+        subj.obs_times = vec![1.0];
+        subj.obs_raw_times = vec![1.0];
+        subj.observations = vec![-5.0]; // negative covariate pseudo-obs
+        subj.obs_cmts = vec![1];
+        subj.cens = vec![0];
+        subj.fremtype = vec![100];
+
+        let theta = model.default_params.theta.clone(); // [0.2, 10.0, 1.5]
+                                                        // pred(cov row) = theta[0] + eta[1] = 0.2 + eta[1]; want -5.0 -> eta[1] = -5.2
+        let eta = vec![0.0, -5.2, 0.0];
+        let sigma = model.default_params.sigma.values.clone();
+        let mut scratch = crate::pk::EventPkParams::with_capacity_for(&subj);
+
+        let nll = crate::stats::likelihood::obs_nll_subject_into(
+            &model,
+            &subj,
+            &theta,
+            &sigma,
+            &eta,
+            &mut scratch,
+        );
+        assert!(nll.is_finite(), "obs_nll should be finite, got {nll}");
+        // R = 0.02² = 4e-4; with residual 0 the row contributes 0.5·ln(4e-4) ≈ -3.9.
+        assert!(
+            nll < 1.0,
+            "negative covariate pseudo-obs with residual 0 should give a small \
+             obs_nll (~-3.9), not the clamped ~3.1e4; got {nll}"
+        );
     }
 
     #[test]
