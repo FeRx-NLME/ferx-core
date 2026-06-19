@@ -330,8 +330,8 @@ pub fn run_impmap(
 
 /// Run IMP as an estimator (NONMEM `METHOD=IMP`). Thin wrapper over the shared
 /// MCEM core with sample-moment re-centering (conditional mode found only on the
-/// first iteration); resolves the `is_*` options. The evaluation-only
-/// `is_eval_only` path lives in `importance_sampling.rs`.
+/// first iteration); resolves the `imp_*` options. The evaluation-only
+/// `imp_eval_only` path lives in `importance_sampling.rs`.
 pub fn run_imp(
     model: &CompiledModel,
     population: &Population,
@@ -347,17 +347,17 @@ pub fn run_imp(
         options,
         ProposalRecenter::SampleMoments,
         "IMP",
-        "is_proposal_df",
-        options.is_iterations,
-        options.is_samples,
-        options.is_proposal_df,
-        options.is_averaging,
-        options.is_seed.unwrap_or(12345),
-        options.is_low_ess_threshold,
+        "imp_proposal_df",
+        options.imp_iterations,
+        options.imp_samples,
+        options.imp_proposal_df,
+        options.imp_averaging,
+        options.imp_seed.unwrap_or(12345),
+        options.imp_low_ess_threshold,
         0,     // mceta: no multi-start MAP for IMP
         false, // use_sobol: IMP has no Sobol option
         false, // collect_trace: IMP has no trace option
-        options.is_auto,
+        options.imp_auto,
     )
 }
 
@@ -1041,11 +1041,11 @@ fn run_mcem(
     // objective is actually noisy, so the direct MC-SE check is the only trigger.
     let under_sampled = !auto && n_eta > 0 && final_k_samples < MIN_SAMPLES_PER_ETA * n_eta;
     let noisy = final_mc_se > 2.0 * AUTO_STDOBJ_TARGET;
-    if !options.is_eval_only && (under_sampled || noisy || final_n_collapsed > 0) {
+    if !options.imp_eval_only && (under_sampled || noisy || final_n_collapsed > 0) {
         let (sample_opt, auto_opt) = if recenter == ProposalRecenter::Map {
             ("impmap_samples", "impmap_auto")
         } else {
-            ("is_samples", "is_auto")
+            ("imp_samples", "imp_auto")
         };
         let collapse = if final_n_collapsed > 0 {
             format!(

@@ -12,7 +12,7 @@
 //! (sparse-data PK, strong nonlinearity).
 //!
 //! The kernel is rayon-parallel over subjects; per-subject RNGs are seeded
-//! from `options.is_seed.wrapping_add(i as u64)` so the result is
+//! from `options.imp_seed.wrapping_add(i as u64)` so the result is
 //! deterministic for a given seed.
 //!
 //! ## IOV (v2: joint sampling)
@@ -24,9 +24,9 @@
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
-use crate::stats::likelihood::{obs_nll_subject_into, split_obs_by_occasion};
+use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into, split_obs_by_occasion};
 use crate::stats::residual_error::compute_r_diag;
-use crate::stats::special::{ln_gamma, log_normal_cdf};
+use crate::stats::special::ln_gamma;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
@@ -227,17 +227,17 @@ pub fn run_importance_sampling(
     }
 
     let n_eta = model.n_eta;
-    let k_samples = options.is_samples;
-    let nu = options.is_proposal_df;
-    let seed = options.is_seed.unwrap_or(42);
-    let threshold = options.is_low_ess_threshold;
+    let k_samples = options.imp_samples;
+    let nu = options.imp_proposal_df;
+    let seed = options.imp_seed.unwrap_or(42);
+    let threshold = options.imp_low_ess_threshold;
     let cancel = &options.cancel;
 
     if k_samples < 2 {
-        return Err(format!("IS: is_samples must be >= 2, got {}", k_samples));
+        return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
     }
     if nu < 1.0 {
-        return Err(format!("IS: is_proposal_df must be >= 1.0, got {}", nu));
+        return Err(format!("IS: imp_proposal_df must be >= 1.0, got {}", nu));
     }
 
     let kappa_treatment = if model.n_kappa > 0 {
@@ -1516,9 +1516,9 @@ fn subject_is_estimate_joint(
             let f = f.max(1e-12);
             let v =
                 (model.residual_variance_at(subject.obs_cmts[j], f, sigma) * ruv_scale).max(1e-12);
-            if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
-                let z = (y - f) / v.sqrt();
-                obs_nll += -log_normal_cdf(z);
+            let cens = subject.cens.get(j).copied().unwrap_or(0);
+            if m3 && cens != 0 {
+                obs_nll += -m3_logcdf(y, f, v.sqrt(), cens);
             } else {
                 obs_nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
             }

@@ -266,11 +266,11 @@ fn focei_impmap_imp_chain_produces_covariance_and_is_result() {
     ];
     opts.outer_maxiter = 25;
     opts.run_covariance_step = true;
-    opts.is_samples = 200;
-    opts.is_proposal_df = 5.0;
+    opts.imp_samples = 200;
+    opts.imp_proposal_df = 5.0;
     // `imp` is an estimator by default now; this workflow scores IMPMAP's fit, so
     // run the terminal `imp` in evaluation-only mode (NONMEM EONLY=1).
-    opts.is_eval_only = true;
+    opts.imp_eval_only = true;
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("focei → impmap → imp chain must produce a fit");
 

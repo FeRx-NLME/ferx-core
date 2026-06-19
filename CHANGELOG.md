@@ -32,8 +32,12 @@ section of the SDLC for the versioning policy).
   (consistent with `RATE>0` infusions) while NONMEM scales the duration for
   rate-defined infusions — same total exposure, different shape; reconciliation
   is tracked separately.
-- `is_auto` / `impmap_auto` fit options (NONMEM `AUTO`), **on by default**:
-  adaptive importance-sample count. `is_samples` / `impmap_samples` is the
+- M3 likelihood now supports above-LOQ/right-censored observations via `CENS=-1`,
+  with `DV` carrying the ULOQ value (#297). A `CENS` value other than `-1`, `0`,
+  or `1` now raises a `W_CENS_UNEXPECTED` data warning instead of being silently
+  scored as censored.
+- `imp_auto` / `impmap_auto` fit options (NONMEM `AUTO`), **on by default**:
+  adaptive importance-sample count. `imp_samples` / `impmap_samples` is the
   *starting* count and is ramped up (×2 per iteration, capped at 10000) whenever
   the objective's Monte-Carlo standard deviation exceeds 1.0 (NONMEM `STDOBJ`),
   so high-dimensional / FREM fits reach a low-noise objective automatically
@@ -47,7 +51,7 @@ section of the SDLC for the versioning policy).
   (ESS ≈ 0). The self-normalized M-step moments carry a finite-sample bias that
   grows with dimension, so high-dimensional / FREM fits at the default sample
   count can converge to biased typical-value and Ω estimates; the warning
-  recommends raising `impmap_samples` / `is_samples` (#411).
+  recommends raising `impmap_samples` / `imp_samples` (#411).
 - `frem_rao_blackwell` fit option (default `true`): toggle the Rao-Blackwellised
   FREM covariate-ETA integration in IMP/IMPMAP. Set `false` only to diagnose the
   RB path against the full-dimensional importance sampler (#406).
@@ -289,6 +293,12 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- IMP fit options now use the `imp_*` prefix (`imp_samples`,
+  `imp_eval_only`, `imp_auto`, etc.) instead of the older `is_*` names. The
+  old names are not retained as aliases because IMP support is still new.
+- SAEM no longer automatically runs a FOCEI polish when a combined-error
+  additive sigma collapses; it now leaves the SAEM estimate unchanged and records
+  a warning that the additive component hit its lower bound (#420).
 - **IMPMAP default proposal is now a Student-t** (`impmap_proposal_df = 4`)
   instead of a multivariate normal. A Gaussian proposal's tails are lighter than
   the posterior of weakly-identified parameters, so importance weights blow up in
@@ -317,10 +327,10 @@ section of the SDLC for the versioning policy).
 - **`imp` is now a Monte-Carlo EM estimator by default** (NONMEM `METHOD=IMP`
   parity): `method = imp` updates θ/Ω/σ instead of only evaluating the marginal
   `−2 log L`. **Breaking:** model files that used `imp` (e.g. `[focei, imp]`)
-  purely to *score* a fit now re-estimate. Add `is_eval_only = true` (NONMEM
+  purely to *score* a fit now re-estimate. Add `imp_eval_only = true` (NONMEM
   `EONLY=1`) to recover the previous evaluation-at-fixed-parameters behaviour.
-  New options `is_iterations` (default 200) and `is_averaging` (default 50)
-  control the MCEM loop; `is_proposal_df` now also accepts `normal`/`mvn`. The
+  New options `imp_iterations` (default 200) and `imp_averaging` (default 50)
+  control the MCEM loop; `imp_proposal_df` now also accepts `normal`/`mvn`. The
   estimating `imp` may lead or sit mid-chain; the evaluation-only `imp` must
   still be terminal. Plain `imp` re-centers its proposal from the previous
   iteration's sample moments and so is fragile on rich data (warm-start with
@@ -380,7 +390,7 @@ section of the SDLC for the versioning policy).
   row broke the closed-form covariate-likelihood cancellation in the RB marginal;
   such subjects now use the full-dimensional sampler, which scores every row
   consistently (#406).
-- **Adaptive-sampling (`is_auto`/`impmap_auto`) trigger is now per-subject.** It
+- **Adaptive-sampling (`imp_auto`/`impmap_auto`) trigger is now per-subject.** It
   used the total-objective Monte-Carlo SE, which grows as √N, so a large but
   well-sampled dataset could ramp the sample count to the cap purely from subject
   count. The trigger now normalizes by √N (per-subject objective SE), making it

@@ -132,7 +132,7 @@ pub fn compute_npde_npd(
 
 /// Per-observation empirical-CDF normal scores, without decorrelation. Censored
 /// rows and rows with a non-finite observed value yield `NaN`.
-fn npd_scores(observed: &[f64], cens: &[u8], sims: &DMatrix<f64>) -> Vec<f64> {
+fn npd_scores(observed: &[f64], cens: &[i8], sims: &DMatrix<f64>) -> Vec<f64> {
     (0..observed.len())
         .map(|j| {
             if cens.get(j).copied().unwrap_or(0) != 0 {
@@ -149,7 +149,7 @@ fn npd_scores(observed: &[f64], cens: &[u8], sims: &DMatrix<f64>) -> Vec<f64> {
 /// rank-deficient (`K <= n_obs`), when it stays non-PD after jitter, or when the
 /// subject has any censored observation (decorrelation would mix the LLOQ into
 /// the uncensored rows).
-fn npde_scores(observed: &[f64], cens: &[u8], sims: &DMatrix<f64>) -> Vec<f64> {
+fn npde_scores(observed: &[f64], cens: &[i8], sims: &DMatrix<f64>) -> Vec<f64> {
     let n = observed.len();
     let k = sims.ncols();
     if n == 0 {

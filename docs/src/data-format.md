@@ -21,7 +21,7 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 | `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored (row excluded from the likelihood) |
 | `II` | numeric | 0 | Interdose interval for repeated dosing |
 | `SS` | integer | 0 | Steady-state flag. 1 = assume steady state |
-| `CENS` | integer | 0 | Censoring flag. 1 = observation is below LLOQ; `DV` carries the LLOQ value. Paired with `bloq_method = m3` in `[fit_options]` to enable likelihood-based handling — see [BLOQ example](examples/bloq.md). |
+| `CENS` | integer | 0 | Censoring flag. `1` = below LLOQ and `DV` carries the LLOQ; `-1` = above ULOQ and `DV` carries the ULOQ; `0` = quantified. Paired with `bloq_method = m3` in `[fit_options]` to enable likelihood-based handling — see [BLOQ example](examples/bloq.md). |
 
 > **Missing DV on observation rows.** An `EVID=0` row contributes to the
 > likelihood only when its `DV` is present. If the `DV` is missing

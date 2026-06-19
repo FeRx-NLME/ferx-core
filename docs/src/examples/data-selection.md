@@ -88,4 +88,4 @@ Excluded rows do not contribute to the OFV, EBE optimisation, or sdtab output. D
 - **Column names are case-insensitive** — `ignore = dv < 1.0` and `ignore = DV < 1.0` are equivalent.
 - **Combine with `[data_selection]` for study-design subsets**: `accept = OCC == 1` restricts the fit to the first occasion without touching the data file.
 - **Dose rows are protected**: the engine never excludes EVID=1 rows, so PK history is always complete even when observations are filtered.
-- **BLOQ observations**: if you use the M3 method (`[fit_options] bloq = m3`) alongside `[data_selection]`, set the filter so BLOQ-flagged rows (CENS=1) are *not* excluded — the M3 likelihood uses them. Use a tighter filter or remove the `ignore` entirely and rely on M3 alone.
+- **LOQ-censored observations**: if you use the M3 method (`[fit_options] bloq = m3`) alongside `[data_selection]`, set the filter so censored rows (`CENS != 0`) are *not* excluded — the M3 likelihood uses them. Use a tighter filter or remove the `ignore` entirely and rely on M3 alone.

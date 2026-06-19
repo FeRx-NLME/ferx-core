@@ -49,9 +49,14 @@ fn model_predictions_into_with_schedule(
     )
 }
 
-/// True when observation `j` of `subject` is censored AND the model requests M3.
-fn is_m3_bloq(model: &CompiledModel, subject: &Subject, j: usize) -> bool {
-    matches!(model.bloq_method, BloqMethod::M3) && subject.cens.get(j).copied().unwrap_or(0) != 0
+#[inline]
+pub(crate) fn m3_logcdf(limit: f64, f: f64, sd: f64, cens: i8) -> f64 {
+    let z = if cens < 0 {
+        (f - limit) / sd
+    } else {
+        (limit - f) / sd
+    };
+    log_normal_cdf(z)
 }
 
 /// Compute individual negative log-likelihood for EBE estimation (inner loop objective).
@@ -60,8 +65,8 @@ fn is_m3_bloq(model: &CompiledModel, subject: &Subject, j: usize) -> bool {
 ///                             + sum_j( term_j )]
 /// where term_j is:
 ///   - `(y_j - f_j)² / V_j + log(V_j)` for quantified observations, or
-///   - `-2·log Φ((LLOQ_j - f_j)/√V_j)` for M3-censored observations (CENS=1)
-///     with LLOQ_j carried in `observations[j]`.
+///   - `-2·log Φ((LLOQ_j - f_j)/√V_j)` for M3 left-censored rows (CENS=1), or
+///   - `-2·log Φ((f_j - ULOQ_j)/√V_j)` for M3 right-censored rows (CENS=-1).
 pub fn individual_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -174,10 +179,9 @@ pub fn individual_nll_into_with_schedule(
         let v_resid =
             model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values) * ruv_scale;
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
-        if is_m3_bloq(model, subject, j) {
-            // y carries LLOQ on CENS=1 rows.
-            let z = (y - f_pred) / v.sqrt();
-            data_ll += -2.0 * log_normal_cdf(z);
+        let cens = subject.cens.get(j).copied().unwrap_or(0);
+        if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
+            data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
         } else {
             let resid = y - f_pred;
             data_ll += resid * resid / v + v.ln();
@@ -232,8 +236,8 @@ pub fn individual_nll_into_with_schedule(
 /// Returns the data term `−log p(y_i | η, θ, σ)` (no prior, no |Ω| term) — the
 /// piece that participates in the SAEM M-step gradient and the IS-LL numerator.
 ///
-/// Under M3, CENS=1 rows contribute `−log Φ((LLOQ − f)/√V)` instead of the
-/// Gaussian residual term.
+/// Under M3, censored rows contribute the matching normal-tail likelihood
+/// instead of the Gaussian residual term.
 pub(crate) fn obs_nll_subject_into(
     model: &CompiledModel,
     subject: &Subject,
@@ -266,9 +270,9 @@ pub(crate) fn obs_nll_subject_into(
             None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale)
                 .max(1e-12),
         };
-        if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
-            let z = (y - f) / v.sqrt();
-            nll += -crate::stats::special::log_normal_cdf(z);
+        let cens = subject.cens.get(j).copied().unwrap_or(0);
+        if m3 && cens != 0 {
+            nll += -m3_logcdf(y, f, v.sqrt(), cens);
         } else {
             nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
         }
@@ -383,9 +387,9 @@ fn omega_log_det(omega: &OmegaMatrix) -> f64 {
 ///   where f0 = f(eta_hat) - H * eta_hat  (linearized population prediction)
 ///         R_tilde = H * Omega * H' + R(f0)
 ///
-/// When M3 BLOQ is active and the subject has any CENS=1 row, we route through
+/// When M3 censoring is active and the subject has any CENS!=0 row, we route through
 /// the interaction path: mixing a linearized Gaussian term with a non-linearized
-/// `log Φ(·)` BLOQ term produces inconsistent OFVs near the LLOQ boundary, so we
+/// `log Φ(·)` censored term produces inconsistent OFVs near the LOQ boundary, so we
 /// promote the whole subject to FOCEI — which is what NONMEM LAPLACE+M3 does in
 /// practice.
 ///
@@ -427,7 +431,8 @@ pub fn foce_subject_nll(
     let frem_r_override =
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
 
-    let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
+    let m3_active =
+        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
 
     // TTE Laplace correction: when the subject has TTE obs_records, we compute
     // the FD Hessian of the TTE data term w.r.t. η and add it to hrh inside
@@ -484,7 +489,7 @@ pub fn foce_subject_nll(
             &p_obs,
             tte_nll_at_mode,
             tte_h,
-            // Promote to interaction when M3 BLOQ is active, matching the
+            // Promote to interaction when M3 censoring is active, matching the
             // non-TTE branch below so M3 subjects always get the CᵀC correction.
             interaction || m3_active,
             model.residual_error_eta,
@@ -685,9 +690,9 @@ pub fn foce_subject_nll_standard(
 /// small (the negative-EPS-shrinkage symptom on jasmine peds vanco). See
 /// `[[focei-laplace-not-sheiner-beal]]` memory.
 ///
-/// With `bloq_method == M3`, BLOQ observations are dropped from the
+/// With `bloq_method == M3`, censored observations are dropped from the
 /// Gaussian residual sum and the H̃ accumulation, and instead contribute
-/// `−2·log Φ((LLOQ − f)/√V)` evaluated at η̂.
+/// the matching normal-tail likelihood evaluated at η̂.
 pub fn foce_subject_nll_interaction(
     subject: &Subject,
     ipreds: &[f64],
@@ -804,13 +809,13 @@ fn foce_subject_nll_interaction_with_tte(
 
 /// Output of [`gaussian_foce_accum`].
 struct GaussianFoceTerms {
-    /// Σⱼ [rⱼ²/Vⱼ + ln Vⱼ] over quantified (non-BLOQ) observations.
+    /// Σⱼ [rⱼ²/Vⱼ + ln Vⱼ] over quantified observations.
     data_ll: f64,
     /// Σⱼ aⱼ'aⱼ/Vⱼ — Jacobian outer-product / variance (H̃ numerator).
     hrh: DMatrix<f64>,
     /// Σⱼ c̃ⱼ'c̃ⱼ — INTER curvature; multiplied by ½ and added for FOCEI.
     ctc: DMatrix<f64>,
-    /// Σⱼ −2·log Φ((LLOQ−f)/√V) over BLOQ observations (M3 method).
+    /// Σⱼ censored normal-tail terms (M3 method).
     bloq_term: f64,
 }
 
@@ -840,7 +845,7 @@ fn gaussian_foce_accum(
 ) -> Option<GaussianFoceTerms> {
     let n_obs = subject.observations.len();
 
-    // Partition observation indices into quantified vs BLOQ (M3 only).
+    // Partition observation indices into quantified vs censored (M3 only).
     let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
         !(matches!(bloq_method, BloqMethod::M3) && subject.cens.get(j).copied().unwrap_or(0) != 0)
     });
@@ -901,17 +906,17 @@ fn gaussian_foce_accum(
         }
     }
 
-    // BLOQ contributions: −2·log Φ((lloq − f)/√V) at η̂ (ipred-based variance).
+    // Censored contributions at η̂ (ipred-based variance).
     let mut bloq_term = 0.0;
     for &j in &bloq_idx {
-        let lloq = subject.observations[j];
+        let limit = subject.observations[j];
         let f = ipreds[j];
         let v = error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale;
         if !(v.is_finite() && v > 0.0) {
             return None;
         }
-        let z = (lloq - f) / v.sqrt();
-        bloq_term += -2.0 * log_normal_cdf(z);
+        let cens = subject.cens.get(j).copied().unwrap_or(0);
+        bloq_term += -2.0 * m3_logcdf(limit, f, v.sqrt(), cens);
     }
 
     Some(GaussianFoceTerms {
@@ -1080,7 +1085,8 @@ pub fn foce_subject_nll_iov(
     // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
     // integrated out through R̃ exactly like η, so no separate κ prior is
     // added (doing so would double-count the random-effect penalty).
-    let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
+    let m3_active =
+        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let p_obs_iov = if model.is_sde() {
         ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
     } else {
@@ -1215,7 +1221,7 @@ pub fn foce_population_nll(
 }
 
 /// Compute CWRES (Conditional Weighted Residuals) for a subject.
-/// BLOQ observations get `NaN` since a weighted Gaussian residual is undefined
+/// Censored observations get `NaN` since a weighted Gaussian residual is undefined
 /// when the observed value is censored.
 pub fn compute_cwres(
     subject: &Subject,
@@ -1389,9 +1395,9 @@ pub fn individual_nll_iov(
                 model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values) * ruv_scale
             }
         };
-        if is_m3_bloq(model, subject, j) {
-            let z = (y - f_pred) / v.sqrt();
-            data_ll += -2.0 * log_normal_cdf(z);
+        let cens = subject.cens.get(j).copied().unwrap_or(0);
+        if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
+            data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
         } else {
             let resid = y - f_pred;
             data_ll += resid * resid / v + v.ln();
@@ -1532,6 +1538,28 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
         }
+    }
+
+    #[test]
+    fn m3_logcdf_uses_upper_tail_for_negative_cens() {
+        let sd = 2.0;
+        let f = 12.0;
+        let uloq = 10.0;
+        let lloq = 14.0;
+
+        let upper = m3_logcdf(uloq, f, sd, -1);
+        let lower = m3_logcdf(lloq, f, sd, 1);
+
+        assert!((upper - log_normal_cdf(1.0)).abs() < 1e-12);
+        assert!((lower - log_normal_cdf(1.0)).abs() < 1e-12);
+
+        // NONMEM 7.5.1 anchor in tests/nonmem/right_censored_m3.{ctl,csv,lst}:
+        // two identical CENS=-1 rows with z=(12-10)/2=1 give OFV
+        // 0.69101514210943182. ferx uses the A&S CDF approximation, so compare
+        // within a numerical tolerance rather than bit-for-bit.
+        let nonmem_ofv = 0.691_015_142_109_431_8;
+        let ferx_ofv = -4.0 * upper;
+        assert!((ferx_ofv - nonmem_ofv).abs() < 1e-6);
     }
 
     #[test]

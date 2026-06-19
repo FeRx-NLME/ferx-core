@@ -61,14 +61,17 @@ pub fn run_foce_gn(
     let mut warnings = Vec::new();
 
     // BHHH Information-matrix approximation degrades as the censoring fraction
-    // grows — each BLOQ row contributes less Fisher information than its
+    // grows — each censored row contributes less Fisher information than its
     // Gaussian counterpart, biasing the outer-product Hessian small-sample.
     if matches!(model.bloq_method, BloqMethod::M3)
-        && population.subjects.iter().any(|s| s.has_bloq())
+        && population
+            .subjects
+            .iter()
+            .any(|s| s.has_censored_observation())
     {
         warnings.push(
-            "Gauss-Newton (BHHH) approximation may be inaccurate with M3 BLOQ handling; \
-             consider method=foce_i for heavy BLOQ fractions (>20%)."
+            "Gauss-Newton (BHHH) approximation may be inaccurate with M3 censoring; \
+             consider method=foce_i for heavy censoring fractions (>20%)."
                 .to_string(),
         );
     }
@@ -1920,7 +1923,8 @@ fn subject_nll_at(
     let ipreds =
         crate::pk::compute_predictions_with_tv(model, subject, &params.theta, eta_hat.as_slice());
 
-    let m3_active = matches!(model.bloq_method, BloqMethod::M3) && subject.has_bloq();
+    let m3_active =
+        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
 
     // FREM R-diagonal override for covariate pseudo-observations.
     let frem_r_override = build_frem_r_override(

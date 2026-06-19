@@ -85,10 +85,10 @@ fn ferx_imp_matches_nonmem_on_warfarin() {
     opts.run_covariance_step = false;
     opts.outer_maxiter = 300;
     opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
-    opts.is_iterations = 100;
-    opts.is_samples = 1000;
-    opts.is_averaging = 30;
-    opts.is_seed = Some(12345);
+    opts.imp_iterations = 100;
+    opts.imp_samples = 1000;
+    opts.imp_averaging = 30;
+    opts.imp_seed = Some(12345);
     let r = fit(&model, &population, &model.default_params, &opts)
         .expect("FOCEI → estimating IMP fit must succeed");
 

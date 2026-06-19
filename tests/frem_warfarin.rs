@@ -272,9 +272,9 @@ fn frem_rao_blackwell_marginal_matches_full_dim() {
     // both paths score the identical point.
     let mut base = FitOptions::default();
     base.method = ferx_core::EstimationMethod::Imp;
-    base.is_eval_only = true;
-    base.is_samples = 6000;
-    base.is_seed = Some(20240619);
+    base.imp_eval_only = true;
+    base.imp_samples = 6000;
+    base.imp_seed = Some(20240619);
     base.run_covariance_step = false;
     base.verbose = false;
 

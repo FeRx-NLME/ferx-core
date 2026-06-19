@@ -14,7 +14,7 @@
 //! therefore exercised for convergence in its robust regime: sparse data, or
 //! warm-started from FOCEI where the per-iteration steps are tiny.
 //!
-//! The evaluation-only path (`is_eval_only = true`, NONMEM `EONLY=1`) is covered
+//! The evaluation-only path (`imp_eval_only = true`, NONMEM `EONLY=1`) is covered
 //! in `importance_sampling_api.rs`.
 
 use ferx_core::parser::model_parser::parse_model_file;
@@ -60,17 +60,17 @@ fn sparse_opts() -> FitOptions {
     let mut opts = FitOptions::default();
     opts.verbose = false;
     opts.run_covariance_step = false;
-    opts.is_iterations = 30;
-    opts.is_samples = 300;
-    opts.is_averaging = 10;
-    opts.is_seed = Some(7);
+    opts.imp_iterations = 30;
+    opts.imp_samples = 300;
+    opts.imp_averaging = 10;
+    opts.imp_seed = Some(7);
     opts.inner_maxiter = 30;
     opts
 }
 
 #[test]
 fn imp_standalone_is_an_estimator_and_moves_parameters() {
-    // Default `imp` (no is_eval_only) is an MCEM estimator: it updates θ/Ω/σ.
+    // Default `imp` (no imp_eval_only) is an MCEM estimator: it updates θ/Ω/σ.
     // On sparse data it is stable from a cold start, so the move off the initial
     // values is genuine estimation, not divergence.
     let (model, mut population) = warfarin();
@@ -137,13 +137,13 @@ fn imp_standalone_is_an_estimator_and_moves_parameters() {
 
 #[test]
 fn imp_eval_only_leaves_parameters_unchanged() {
-    // The contrast case: `is_eval_only = true` evaluates −2 log L at the fixed
+    // The contrast case: `imp_eval_only = true` evaluates −2 log L at the fixed
     // input parameters and must not move them (NONMEM `EONLY=1`).
     let (model, mut population) = warfarin();
     downsample(&mut population, 2);
     let mut opts = sparse_opts();
     opts.method = EstimationMethod::Imp;
-    opts.is_eval_only = true;
+    opts.imp_eval_only = true;
 
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("eval-only imp must produce a fit");
@@ -210,7 +210,7 @@ fn imp_estimator_rejects_iov_models() {
     opts.verbose = false;
     opts.run_covariance_step = false;
     opts.method = EstimationMethod::Imp;
-    opts.is_iterations = 3;
+    opts.imp_iterations = 3;
 
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
@@ -223,15 +223,15 @@ fn imp_estimator_rejects_iov_models() {
 
 #[test]
 fn imp_estimator_rejects_invalid_proposal_df() {
-    // A programmatic caller can set is_proposal_df directly, bypassing the
+    // A programmatic caller can set imp_proposal_df directly, bypassing the
     // parser's range check. A finite df < 1 must return a clean Err, not panic.
     let (model, population) = warfarin();
     let mut opts = sparse_opts();
     opts.method = EstimationMethod::Imp;
-    opts.is_proposal_df = 0.0;
+    opts.imp_proposal_df = 0.0;
     let err = fit(&model, &population, &model.default_params, &opts)
         .err()
-        .expect("is_proposal_df = 0 must be rejected");
+        .expect("imp_proposal_df = 0 must be rejected");
     assert!(
         err.contains("proposal_df"),
         "expected proposal_df error, got: {err}"
@@ -263,10 +263,10 @@ fn imp_estimator_refines_focei_on_warfarin() {
     imp.run_covariance_step = false;
     imp.outer_maxiter = 300;
     imp.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
-    imp.is_iterations = 80;
-    imp.is_samples = 1000;
-    imp.is_averaging = 30;
-    imp.is_seed = Some(12345);
+    imp.imp_iterations = 80;
+    imp.imp_samples = 1000;
+    imp.imp_averaging = 30;
+    imp.imp_seed = Some(12345);
     let r_imp = fit(&model, &population, &model.default_params, &imp)
         .expect("FOCEI → estimating IMP fit must succeed");
 

@@ -29,7 +29,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | `ode_max_steps` | integer | `10000` | Max RK45 steps per integration segment. ODE models only. Raise (e.g. `1000000`) if a tight `ode_reltol` exhausts the step budget on stiff multi-compartment systems. |
 | `global_search` | `true`, `false` | `false` | Run NLopt CRS2-LM (Controlled Random Search with Local Mutation) as a gradient-free global pre-search before the local optimizer. CRS2-LM samples within the parameter bounds; the local optimizer (e.g. `bobyqa`, `slsqp`) starts from the best point found. Useful for poorly-identified models — when the local optimizer can land in a degenerate basin (collapsed ETA, V/Q swap, parameters at bounds) from a far-from-truth start, the global pre-search usually escapes it. Adds the pre-search budget on top of the local optimisation, but typically more efficient than running multiple full fits from scratch. Requires a full NLopt build (e.g. `brew install nlopt` or `apt install libnlopt-dev`); a clear warning is emitted if CRS2-LM is unavailable. |
 | `global_maxeval` | integer | `200 * (n_params + 1)` | Maximum evaluations of the FOCE objective during the global pre-search. Each eval is a full inner-loop pass over all subjects, so this is the dominant cost of `global_search = true`. The default (`0` → auto) is empirically enough to escape bad basins on 10–20 parameter PK models without dominating the wall time of the subsequent local refine. |
-| `bloq_method` | `drop`, `m3` | `drop` | How to handle rows with `CENS=1`. `m3` enables Beal's M3 likelihood (see [BLOQ example](../examples/bloq.md)). |
+| `bloq_method` | `drop`, `m3` | `drop` | How to handle rows with `CENS=1` (below LLOQ) or `CENS=-1` (above ULOQ). `m3` enables Beal's M3 likelihood (see [BLOQ example](../examples/bloq.md)). |
 | `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde--npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. A typical value is `1000`. Cost scales linearly with the count. |
 | `npde_seed` | integer | — | RNG seed for the NPDE/NPD simulation, for reproducible diagnostics. Unset falls back to a fixed default. Only used when `npde_nsim > 0`. |
 | `mu_referencing` | `true`, `false` | `true` | Re-centre inner-loop ETA estimates on the current population mean (auto-detected from `[individual_parameters]`). See the [FAQ entry](../faq.md#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem--nlmixr2) for details. Set `false` to reproduce pre-automatic-mu behaviour. |
@@ -199,28 +199,28 @@ See [SIR documentation](../estimation/sir.md) for details.
 
 By **default** `imp` is a Monte-Carlo EM **estimator** (NONMEM `METHOD=IMP`):
 it maximises the importance-sampled marginal likelihood, updating θ/Ω/σ each
-iteration. Set `is_eval_only = true` (NONMEM `EONLY=1`) to instead *evaluate*
+iteration. Set `imp_eval_only = true` (NONMEM `EONLY=1`) to instead *evaluate*
 the marginal `−2 log L` at the fixed input parameters — a lower-bias `−2 log L`
 than the FOCE/Laplace OFV when subject posteriors of η are non-Gaussian (e.g.
 sparsely-sampled PK).
 
 > **Behaviour change:** `imp` previously only *evaluated* `−2 log L`. It now
-> estimates by default. Add `is_eval_only = true` to recover the old behaviour.
+> estimates by default. Add `imp_eval_only = true` to recover the old behaviour.
 
 ```
 [fit_options]
   method        = imp            # estimate (NONMEM METHOD=IMP)
-  is_iterations = 200
-  is_samples    = 1000
-  is_averaging  = 50
-  is_proposal_df = 5             # or `normal` for a multivariate-normal proposal
-  is_seed       = 12345
+  imp_iterations = 200
+  imp_samples    = 1000
+  imp_averaging  = 50
+  imp_proposal_df = 5             # or `normal` for a multivariate-normal proposal
+  imp_seed       = 12345
 ```
 
 ```
 [fit_options]
   method        = [focei, imp]   # evaluate FOCEI's fit (NONMEM EONLY=1)
-  is_eval_only  = true
+  imp_eval_only  = true
 ```
 
 > On **rich** data prefer [`impmap`](#impmap-importance_sampling_map) or
@@ -230,14 +230,14 @@ sparsely-sampled PK).
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `is_eval_only` | `false` | `true` ⇒ evaluate `−2 log L` at fixed parameters (NONMEM `EONLY=1`); must be the terminal chain stage. `false` ⇒ estimate (NONMEM `METHOD=IMP`). |
-| `is_iterations` | `200` | MCEM iterations (estimator only). |
-| `is_averaging` | `50` | Terminal iterations averaged into the reported estimate (estimator only). |
-| `is_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |
-| `is_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1), or `normal`/`mvn` for a multivariate-normal proposal. Lower = heavier tails. |
-| `is_auto` | `true` | Adaptive sample count (NONMEM `AUTO`). When `true`, `is_samples` is the *starting* count and is ramped up (×2/iteration, cap 10000) while the objective's Monte-Carlo SE exceeds 1.0. Recommended for high-dimensional / FREM models, where a fixed count biases the M-step. |
-| `is_seed` | `12345` | RNG seed. Same seed → identical result. |
-| `is_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction get flagged in the result. Set `0` to silence. |
+| `imp_eval_only` | `false` | `true` ⇒ evaluate `−2 log L` at fixed parameters (NONMEM `EONLY=1`); must be the terminal chain stage. `false` ⇒ estimate (NONMEM `METHOD=IMP`). |
+| `imp_iterations` | `200` | MCEM iterations (estimator only). |
+| `imp_averaging` | `50` | Terminal iterations averaged into the reported estimate (estimator only). |
+| `imp_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |
+| `imp_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1), or `normal`/`mvn` for a multivariate-normal proposal. Lower = heavier tails. |
+| `imp_auto` | `true` | Adaptive sample count (NONMEM `AUTO`). When `true`, `imp_samples` is the *starting* count and is ramped up (×2/iteration, cap 10000) while the objective's Monte-Carlo SE exceeds 1.0. Recommended for high-dimensional / FREM models, where a fixed count biases the M-step. |
+| `imp_seed` | `12345` | RNG seed. Same seed → identical result. |
+| `imp_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction get flagged in the result. Set `0` to silence. |
 
 See [Importance Sampling documentation](../estimation/importance-sampling.md)
 for the algorithm, the NONMEM mapping, IOV caveats, and tuning guidance.

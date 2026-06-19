@@ -277,7 +277,7 @@ pub struct RowContext<'a> {
     pub cmt: usize,
     pub rate: f64,
     pub mdv: u32,
-    pub cens: u8,
+    pub cens: i8,
     pub ii: f64,
     pub ss: bool,
     /// Covariate values for this row, keyed by the original CSV header name

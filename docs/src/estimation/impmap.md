@@ -12,7 +12,7 @@ differ only in how the proposal is re-centered. `impmap` re-derives each
 subject's conditional mode and first-order variance **every** iteration (robust
 on rich data), whereas `imp` re-centers from the previous iteration's sample
 moments after the first iteration (cheaper, but can stall on rich data).
-`imp` can also run in evaluation-only mode (`is_eval_only = true`), which
+`imp` can also run in evaluation-only mode (`imp_eval_only = true`), which
 `impmap` has no equivalent of.
 
 > **NONMEM's description.** *"Sometimes for highly dimensioned PK/PD problems

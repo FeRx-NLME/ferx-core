@@ -58,11 +58,11 @@ pub fn individual_nll_ad(
     dose_durations: &[f64],
     obs_times: &[f64],
     observations: &[f64],
-    cens_f64: &[f64],      // per-observation censoring flag; > 0.5 ⇒ BLOQ (M3)
-    pk_idx_f64: &[f64],    // PK parameter indices as f64 (cast to usize inside)
-    sel_flat: &[f64],      // n_tv × n_eta row-major one-hot eta selector
+    cens_f64: &[f64], // per-observation censoring flag; +1 left-censored, -1 right-censored
+    pk_idx_f64: &[f64], // PK parameter indices as f64 (cast to usize inside)
+    sel_flat: &[f64], // n_tv × n_eta row-major one-hot eta selector
     pk_and_err_model: f64, // pk_model_id * 10 + error_model_id (+100 ⇒ LTBS)
-    obs_scale: &[f64],     // per-observation divisor (len = n_obs). All-ones = no-op.
+    obs_scale: &[f64], // per-observation divisor (len = n_obs). All-ones = no-op.
 ) -> f64 {
     let n_eta = eta.len();
     let n_tv = tv.len();
@@ -148,9 +148,13 @@ pub fn individual_nll_ad(
         }
 
         let v = residual_variance_ad(error_model_id, conc, sigma_values);
-        if cens_f64[obs_idx] > 0.5 {
-            // BLOQ under M3: observations[j] carries LLOQ.
-            let z = (observations[obs_idx] - conc) / v.sqrt();
+        let cens = cens_f64[obs_idx];
+        if cens > 0.5 || cens < -0.5 {
+            let z = if cens < -0.5 {
+                (conc - observations[obs_idx]) / v.sqrt()
+            } else {
+                (observations[obs_idx] - conc) / v.sqrt()
+            };
             data_ll += -2.0 * log_normal_cdf_ad(z);
         } else {
             let resid = observations[obs_idx] - conc;
@@ -688,7 +692,7 @@ impl FlatDoseData {
 /// `tv_adjusted` = covariate-adjusted typical values, length n_tv
 /// (parallel to `pk_idx_f64` and `sel_flat`'s row dimension — not n_eta;
 /// one entry per `[individual_parameters]` assignment).
-/// `cens_f64` = per-observation censoring flags (0 or 1 as f64); pass all
+/// `cens_f64` = per-observation censoring flags (0, 1, or -1 as f64); pass all
 /// zeros when M3 is disabled.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_nll_gradient_ad(

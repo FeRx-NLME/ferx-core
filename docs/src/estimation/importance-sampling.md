@@ -4,7 +4,7 @@
 
 `imp` is, **by default, a Monte-Carlo EM estimator** — the equivalent of
 NONMEM `$EST METHOD=IMP`. It maximises the importance-sampled marginal
-likelihood, updating θ/Ω/σ each iteration. Set `is_eval_only = true`
+likelihood, updating θ/Ω/σ each iteration. Set `imp_eval_only = true`
 (NONMEM `EONLY=1`) to instead *evaluate* the marginal log-likelihood
 
 <div>
@@ -17,16 +17,16 @@ likelihood, updating θ/Ω/σ each iteration. Set `is_eval_only = true`
 at the **fixed** input parameters without estimating them.
 
 > **⚠️ Behaviour change.** Before this release `imp` only *evaluated*
-> `−2 log L` at fixed parameters (the `is_eval_only` behaviour). It is now an
+> `−2 log L` at fixed parameters (the `imp_eval_only` behaviour). It is now an
 > estimator by default. If you used `method = imp` (or `[focei, imp]`) purely to
-> *score* a fit, add `is_eval_only = true` to keep the old behaviour.
+> *score* a fit, add `imp_eval_only = true` to keep the old behaviour.
 
 ### Mapping to NONMEM
 
 | ferx | NONMEM |
 |------|--------|
 | `method = imp` (default) | `$EST METHOD=IMP` (estimator) |
-| `method = imp` + `is_eval_only = true` | `$EST METHOD=IMP EONLY=1` (evaluate) |
+| `method = imp` + `imp_eval_only = true` | `$EST METHOD=IMP EONLY=1` (evaluate) |
 | `method = impmap` | `$EST METHOD=IMPMAP` (estimator) |
 
 The IS Monte-Carlo estimator of `p(yᵢ|θ)` is unbiased; the reported `−2 log L`
@@ -51,7 +51,7 @@ IMP is a Monte-Carlo EM (MCEM) loop sharing all of its machinery with
 Each iteration's M-step updates θ/Ω/σ from the importance-weighted posterior
 moments (closed-form Ω and log-mu-referenced θ; a small BOBYQA step for σ and
 non-mu-ref θ), exactly as in IMPMAP. The reported estimate is the running mean
-of the parameter vector over the final `is_averaging` iterations, and `ofv` is
+of the parameter vector over the final `imp_averaging` iterations, and `ofv` is
 a final FOCE Laplace pass for AIC/BIC comparability.
 
 > **Which number matches NONMEM's reported OFV?** NONMEM `METHOD=IMP` reports the
@@ -81,11 +81,11 @@ steps are small and the lagged proposal stays overlapped. IMP is well-suited to
 ```
 [fit_options]
   method        = imp            # estimate by importance-sampling MCEM
-  is_iterations = 200            # MCEM iterations
-  is_samples    = 1000           # K, samples per subject per iteration
-  is_averaging  = 50             # terminal iterations to average
-  is_proposal_df = 5             # ν, Student-t tail weight (or `normal` → MVN)
-  is_seed       = 12345
+  imp_iterations = 200            # MCEM iterations
+  imp_samples    = 1000           # K, samples per subject per iteration
+  imp_averaging  = 50             # terminal iterations to average
+  imp_proposal_df = 5             # ν, Student-t tail weight (or `normal` → MVN)
+  imp_seed       = 12345
 ```
 
 ```
@@ -93,9 +93,9 @@ steps are small and the lagged proposal stays overlapped. IMP is well-suited to
   method = [focei, imp]          # robust on rich data: warm-start IMP from FOCEI
 ```
 
-## Evaluation-only mode (`is_eval_only = true`)
+## Evaluation-only mode (`imp_eval_only = true`)
 
-With `is_eval_only = true`, `imp` does **not** estimate: it evaluates the IS
+With `imp_eval_only = true`, `imp` does **not** estimate: it evaluates the IS
 `−2 log L` at the fixed input parameters and reports it on
 `FitResult.importance_sampling` (handy for scoring imported / fixed parameter
 sets, or comparing models on a lower-bias likelihood than the Laplace OFV).
@@ -112,25 +112,25 @@ over-parameterised models; the IS `−2 log L` is much lower-bias.
 ```
 [fit_options]
   method        = [focei, imp]   # estimate with FOCEI, then score the IS-LL
-  is_eval_only  = true
-  is_samples    = 2000
-  is_proposal_df = 5
+  imp_eval_only  = true
+  imp_samples    = 2000
+  imp_proposal_df = 5
 ```
 
 ```
 [fit_options]
   method       = imp             # standalone: IS-LL at the initial parameters
-  is_eval_only = true
+  imp_eval_only = true
 ```
 
 Rules for the **evaluation-only** mode:
 
-- **Standalone is allowed.** `method = imp` + `is_eval_only` evaluates the IS-LL
+- **Standalone is allowed.** `method = imp` + `imp_eval_only` evaluates the IS-LL
   at the **initial parameters** — deriving the EBEs/Jacobian (the proposal
   centre/scale) there via a FOCE inner loop. When chained after an estimator
   (`[focei, imp]`), it uses that stage's EBEs/Jacobian instead.
 - **Must appear at most once** (true for both modes).
-- **Must be terminal.** `methods = [imp, focei]` with `is_eval_only` is rejected
+- **Must be terminal.** `methods = [imp, focei]` with `imp_eval_only` is rejected
   — a following stage would overwrite the parameters and make the IS result
   meaningless. (The *estimating* `imp` has no such restriction; it may lead or
   sit mid-chain like any estimator.)
@@ -183,7 +183,7 @@ iteration / in evaluation-only mode) and inner-loop Jacobian Jᵢ = ∂f/∂η a
 5. **Per-subject effective sample size:**
    \\(\\mathrm{ESS}\_i = 1 / \\sum\_k \\tilde w\_{ik}^2\\) (normalised weights).
    The result reports the across-subject min and median of ESS/K, plus
-   any subjects below `is_low_ess_threshold` (default 10%).
+   any subjects below `imp_low_ess_threshold` (default 10%).
 
 6. **Monte-Carlo standard error.** For a self-normalised IS estimator the
    asymptotic per-subject variance (Geweke 1989) is
@@ -213,15 +213,15 @@ iteration / in evaluation-only mode) and inner-loop Jacobian Jᵢ = ∂f/∂η a
 
 ## Tuning
 
-- **`is_iterations` / `is_averaging`** (estimator only) set the number of MCEM
+- **`imp_iterations` / `imp_averaging`** (estimator only) set the number of MCEM
   iterations and how many terminal iterations are averaged into the reported
   estimate. Defaults 200 / 50. Under-running shows up as estimates still drifting
-  with the MC noise; raise `is_iterations` if the trace hasn't stabilised.
-- **K = `is_samples`** controls accuracy. The MC SE scales as
+  with the MC noise; raise `imp_iterations` if the trace hasn't stabilised.
+- **K = `imp_samples`** controls accuracy. The MC SE scales as
   \\(1/\\sqrt{K}\\); halve it by quadrupling K.
   Default 1000 is fine for a smoke test; bump to 2000–5000 for any
   reported LL.
-- **ν = `is_proposal_df`** controls the proposal tails. The default of 5
+- **ν = `imp_proposal_df`** controls the proposal tails. The default of 5
   is robust to mild proposal misspecification (Geweke 1989); raise
   toward 30+ to recover a near-Gaussian proposal when the posterior is
   known to be light-tailed.
@@ -230,10 +230,10 @@ iteration / in evaluation-only mode) and inner-loop Jacobian Jᵢ = ∂f/∂η a
   Hessian was near-singular. The IS estimate is still unbiased, just
   noisier. Investigate by re-running with a tighter `inner_tol` or
   inspecting the `FitResult.subjects[i]` diagnostics.
-- **Reproducibility.** `is_seed` defaults to `42` when unset (so two
-  fits with the same `is_samples` and `is_proposal_df` produce identical
+- **Reproducibility.** `imp_seed` defaults to `42` when unset (so two
+  fits with the same `imp_samples` and `imp_proposal_df` produce identical
   `−2 log L`). Set it explicitly to vary the RNG stream. The full set of
-  `is_*` defaults is listed in the
+  `imp_*` defaults is listed in the
   [`[fit_options]` reference](../model-file/fit-options.md#importance-sampling-imp).
 
 ## SDE / [diffusion] models (not supported)
@@ -246,7 +246,7 @@ Laplace OFV on SDE models; IMP for SDE is tracked as a follow-up.
 
 ## IOV (inter-occasion variability)
 
-> IOV is supported only in **evaluation-only** mode (`is_eval_only = true`). The
+> IOV is supported only in **evaluation-only** mode (`imp_eval_only = true`). The
 > estimating `imp` (like `impmap`) refuses IOV models for now — the κ M-step is
 > a planned follow-up. Use SAEM or FOCEI to *estimate* IOV models, then score
 > with an evaluation-only `imp`.

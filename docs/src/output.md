@@ -31,7 +31,7 @@ A CSV file with per-observation diagnostics, one row per observation per subject
 | `ID` | Subject identifier |
 | `TIME` | Observation time |
 | `DV` | Observed value |
-| `CENS` | Censoring flag (0/1); omitted when no censored observations |
+| `CENS` | Censoring flag (`0`, `1`, or `-1`); omitted when no censored observations |
 | `OCC` | Occasion label; omitted when model has no IOV block |
 | `CMT` | Observation compartment; omitted for single-compartment models |
 | `PRED` | Population prediction (eta = 0) |

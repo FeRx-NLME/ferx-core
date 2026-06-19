@@ -15,7 +15,7 @@ ferx-core is a high-performance Nonlinear Mixed Effects (NLME) modeling engine w
 - **Multiple error models** -- Additive, proportional, combined, and log-transform-both-sides (LTBS); per-CMT multi-endpoint models for joint PK/PD
 - **Inter-occasion variability (IOV)** -- `kappa` random effects with FOCE/FOCEI and SAEM support
 - **Lagtime / ALAG** -- Absorption lag for analytical, AD, and ODE paths
-- **BLOQ handling** -- Beal M3 method for below-LLOQ observations
+- **LOQ censoring** -- Beal M3 method for below-LLOQ and above-ULOQ observations
 - **NCA-based starting values** -- `inits_from_nca` for automatic theta initialization from the data
 - **Simple model DSL** -- Declarative `.ferx` model files that read like equations
 - **NONMEM-compatible data** -- Reads standard NONMEM CSV datasets directly

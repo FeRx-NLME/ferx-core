@@ -524,9 +524,14 @@ pub fn individual_nll_event_driven_ad(
         };
 
         let v_resid = residual_variance_ad(error_model_id, conc, sigma_values);
-        let cens_active = if cens_f64[obs_idx] > 0.5 { 1.0 } else { 0.0 };
+        let cens = cens_f64[obs_idx];
+        let cens_active = if cens > 0.5 || cens < -0.5 { 1.0 } else { 0.0 };
         let resid = observations[obs_idx] - conc;
-        let z = resid / v_resid.sqrt();
+        let z = if cens < -0.5 {
+            (conc - observations[obs_idx]) / v_resid.sqrt()
+        } else {
+            resid / v_resid.sqrt()
+        };
         let bloq_term = -2.0 * log_normal_cdf_ad(z);
         let gaussian_term = resid * resid / v_resid + v_resid.ln();
         let obs_term = cens_active * bloq_term + (1.0 - cens_active) * gaussian_term;

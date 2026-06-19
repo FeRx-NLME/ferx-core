@@ -132,7 +132,7 @@ fn is_missing_cell(s: &str) -> bool {
 /// EVID: 0=observation, 1=dose, 2=other event (covariate change),
 ///       3=system reset (zero all compartments), 4=reset + dose
 /// MDV: 1=missing dependent variable
-/// CENS: 1=observation is below LLOQ (DV carries the LLOQ value); 0 otherwise
+/// CENS: 1=observation is below LLOQ (DV carries LLOQ), -1=above ULOQ (DV carries ULOQ); 0 otherwise
 ///
 /// `iov_column`: when `Some(name)`, that column is read as the occasion index
 /// (integer) and stored in `Subject::occasions` / `Subject::dose_occasions`.
@@ -741,6 +741,15 @@ fn parse_usize(s: &str) -> usize {
     s.parse::<usize>().unwrap_or(0)
 }
 
+fn parse_cens(s: &str) -> i8 {
+    let t = s.trim();
+    if is_missing_cell(t) {
+        0
+    } else {
+        t.parse::<i8>().unwrap_or(0)
+    }
+}
+
 /// Parse an EVID cell. A missing / blank / unparseable value maps to 0
 /// (observation) — NONMEM's documented default. (`parse_usize` defaults to 1,
 /// which would mislabel a blank-EVID observation row as a dose.)
@@ -910,6 +919,7 @@ fn parse_subject(
     let mut excl_fired: Vec<String> = Vec::new();
     let mut parse_warnings: Vec<String> = Vec::new();
     let mut addl_missing_ii_warned = false;
+    let mut cens_invalid_warned = false;
     // Rows that survived the data-selection filter, carry a nonzero AMT, yet
     // were not classified as a dose (EVID not 1/4) — their AMT was silently
     // dropped. Reported as a population summary so a degenerate dose-free fit
@@ -1079,7 +1089,7 @@ fn parse_subject(
                 .unwrap_or(false);
             let cens_for_ctx = cens_col
                 .and_then(|c| row.get(c))
-                .map(|s| parse_usize(s))
+                .map(|s| parse_cens(s))
                 .unwrap_or(0);
             let ctx = RowContext {
                 id,
@@ -1090,7 +1100,7 @@ fn parse_subject(
                 cmt: cmt_for_ctx,
                 rate: rate_for_ctx,
                 mdv: mdv as u32,
-                cens: if cens_for_ctx > 0 { 1u8 } else { 0u8 },
+                cens: cens_for_ctx,
                 ii: ii_for_ctx,
                 ss: ss_for_ctx,
                 covariates: &locf_state,
@@ -1404,13 +1414,25 @@ fn parse_subject(
                 }
                 let cens_flag = cens_col
                     .and_then(|c| row.get(c))
-                    .map(|s| parse_usize(s))
+                    .map(|s| parse_cens(s))
                     .unwrap_or(0);
                 obs_times.push(time);
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
                 obs_cmts.push(cmt);
-                cens.push(if cens_flag > 0 { 1u8 } else { 0u8 });
+                // Only -1 (above ULOQ), 0 (quantified), and 1 (below LLOQ) are
+                // meaningful. Any other value is coerced to left-censored by the
+                // M3 likelihood (`m3_logcdf` treats every nonzero as a tail), so
+                // flag it rather than silently mis-scoring the row.
+                if !matches!(cens_flag, -1 | 0 | 1) && !cens_invalid_warned {
+                    parse_warnings.push(format!(
+                        "W_CENS_UNEXPECTED subject {}: CENS={} is not -1, 0, or 1; \
+                         treated as censored (left tail) under M3",
+                        id, cens_flag
+                    ));
+                    cens_invalid_warned = true;
+                }
+                cens.push(cens_flag);
                 if occ_col.is_some() {
                     occasions.push(occ);
                 }
@@ -2397,6 +2419,48 @@ mod tests {
             !pop.warnings.iter().any(|w| w.starts_with("W_MISSING_DV")),
             "MDV=1 missing-DV row should not warn"
         );
+    }
+
+    #[test]
+    fn test_cens_negative_one_preserved_and_missing_defaults_zero() {
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+                   1,0,.,1,1,100,1,.\n\
+                   1,1,5.0,0,0,.,1,-1\n\
+                   1,2,7.0,0,0,.,1,\n\
+                   1,3,9.0,0,0,.,1,1\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        assert_eq!(subj.observations, vec![5.0, 7.0, 9.0]);
+        assert_eq!(subj.cens, vec![-1, 0, 1]);
+        assert!(subj.has_censored_observation());
+        assert!(
+            !pop.warnings
+                .iter()
+                .any(|w| w.starts_with("W_CENS_UNEXPECTED")),
+            "valid CENS values (-1/0/1) must not warn"
+        );
+    }
+
+    #[test]
+    fn test_cens_unexpected_value_warns_once() {
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,CENS\n\
+                   1,0,.,1,1,100,1,0\n\
+                   1,1,5.0,0,0,.,1,2\n\
+                   1,2,7.0,0,0,.,1,3\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+
+        // Value is preserved verbatim (no silent coercion in the reader)...
+        assert_eq!(pop.subjects[0].cens, vec![2, 3]);
+        // ...but the out-of-range flag is reported exactly once per subject.
+        let n = pop
+            .warnings
+            .iter()
+            .filter(|w| w.starts_with("W_CENS_UNEXPECTED"))
+            .count();
+        assert_eq!(n, 1, "expected one W_CENS_UNEXPECTED per subject");
     }
 
     #[test]

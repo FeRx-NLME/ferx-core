@@ -569,9 +569,9 @@ pub struct Subject {
     /// state-propagating path. Resets break dose superposition, so a subject
     /// with any reset is forced onto the event-driven analytical / ODE path.
     pub reset_times: Vec<f64>,
-    /// Censoring flag per observation (0 = quantified, 1 = below LLOQ).
-    /// When `cens[j] == 1`, `observations[j]` holds the LLOQ value (NONMEM convention).
-    pub cens: Vec<u8>,
+    /// Censoring flag per observation (0 = quantified, 1 = below LLOQ, -1 = above ULOQ).
+    /// On censored rows, `observations[j]` holds the corresponding LOQ limit.
+    pub cens: Vec<i8>,
     /// Occasion index per observation row (parallel to `obs_times`).
     /// Empty when no IOV column is present in the data.
     pub occasions: Vec<u32>,
@@ -590,7 +590,7 @@ pub struct Subject {
 }
 
 impl Subject {
-    pub fn has_bloq(&self) -> bool {
+    pub fn has_censored_observation(&self) -> bool {
         self.cens.iter().any(|&c| c != 0)
     }
 
@@ -1408,6 +1408,29 @@ impl ErrorSpec {
             ErrorSpec::PerCmt(map) => map
                 .values()
                 .any(|ep| !matches!(ep.error_model, ErrorModel::Additive)),
+        }
+    }
+
+    /// Global `sigma.values` indices of the additive component of every
+    /// `Combined` endpoint (the second sigma slot). De-duplicated; empty when
+    /// no endpoint is combined.
+    pub fn combined_additive_sigma_indices(&self) -> Vec<usize> {
+        match self {
+            ErrorSpec::Single(ErrorModel::Combined) => vec![1],
+            ErrorSpec::Single(_) => Vec::new(),
+            ErrorSpec::PerCmt(map) => {
+                let mut out = Vec::new();
+                for endpoint in map.values() {
+                    if matches!(endpoint.error_model, ErrorModel::Combined) {
+                        if let Some(&idx) = endpoint.sigma_idx.get(1) {
+                            if !out.contains(&idx) {
+                                out.push(idx);
+                            }
+                        }
+                    }
+                }
+                out
+            }
         }
     }
 
@@ -2325,7 +2348,7 @@ pub struct SubjectResult {
     /// Empty unless `[fit_options] npde_nsim > 0`. Emitted as the `NPD` column.
     pub npd: Vec<f64>,
     pub ofv_contribution: f64,
-    pub cens: Vec<u8>,
+    pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).
     pub n_obs: usize,
     /// Extra sdtab columns from [derived] and [output] blocks, computed
@@ -2472,15 +2495,15 @@ pub struct ImportanceSamplingResult {
     /// to the FOCE OFV.
     pub minus2_log_likelihood: f64,
     /// Monte-Carlo standard error on `minus2_log_likelihood`. Scales with
-    /// `1/sqrt(n_samples)`; halve by quadrupling `is_samples`.
+    /// `1/sqrt(n_samples)`; halve by quadrupling `imp_samples`.
     pub mc_standard_error: f64,
     /// `(subject_id, ESS/K)` for every subject whose normalized effective sample
-    /// size fraction fell below `FitOptions::is_low_ess_threshold`. Empty list
+    /// size fraction fell below `FitOptions::imp_low_ess_threshold`. Empty list
     /// means every subject's proposal matched its posterior well.
     pub low_ess_subjects: Vec<(String, f64)>,
-    /// Number of importance samples drawn per subject (`FitOptions::is_samples`).
+    /// Number of importance samples drawn per subject (`FitOptions::imp_samples`).
     pub n_samples: usize,
-    /// Student-t proposal degrees of freedom (`FitOptions::is_proposal_df`).
+    /// Student-t proposal degrees of freedom (`FitOptions::imp_proposal_df`).
     pub proposal_df: f64,
     /// Minimum across-subject normalized ESS fraction (ESS / K). 1.0 = ideal,
     /// near 0 = degenerate proposal for at least one subject.
@@ -2716,7 +2739,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // Experimental-feature notices (issue #175): SDE and neural-network
         // components emit a runtime warning so results are applied with caution.
         (WarningSeverity::Warning, "experimental")
-    } else if lower.contains("m3 bloq") || lower.contains("bloq handling") {
+    } else if lower.contains("m3 bloq")
+        || lower.contains("bloq handling")
+        || lower.contains("m3 censoring")
+        || lower.contains("censoring handling")
+    {
         (WarningSeverity::Warning, "bloq_method")
     } else if lower.contains("sir failed") || lower.contains("sir requested") {
         (WarningSeverity::Warning, "sir")
@@ -3023,14 +3050,14 @@ pub struct FitResult {
     pub sir_seed: Option<u64>,
     /// Seed used for the importance-sampling Monte Carlo step.  `None` when IS
     /// was not run or no explicit seed was set.
-    pub is_seed: Option<u64>,
+    pub imp_seed: Option<u64>,
     /// Effective RNG seed used for the simulation-based NPDE/NPD diagnostics —
     /// the value actually fed to the simulator, including the built-in default
     /// when `[fit_options] npde_seed` was left unset, so the diagnostic is
     /// reproducible from this field alone. `None` when NPDE did not run
     /// (`npde_nsim = 0`).
     pub npde_seed: Option<u64>,
-    /// BLOQ handling method: "drop" (observations below LOQ are excluded) or
+    /// LOQ censoring handling method: "drop" (treat CENS rows as ordinary) or
     /// "m3" (M3 likelihood for censored observations).
     pub bloq_method: String,
     /// Maximum number of outer optimizer iterations allowed.
@@ -3268,36 +3295,36 @@ pub struct FitOptions {
     // only on the first iteration, then the proposal is re-centered from the
     // previous iteration's importance-sample mean/covariance, and θ/Ω/σ are
     // updated from the importance-weighted posterior moments each iteration. Set
-    // `is_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
+    // `imp_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
     // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` at the fixed input parameters
     // without updating them.
     /// Number of importance samples per subject. Default 1000. Recommended
     /// 2000–5000 for publication-quality MC SE (cost scales linearly).
-    pub is_samples: usize,
+    pub imp_samples: usize,
     /// Degrees of freedom for the Student-t proposal. Default 5.0 (heavy-tailed
     /// — robust to mild proposal misspecification). Must be ≥ 1. The token
     /// `normal` (parsed to `f64::INFINITY`) selects a multivariate-normal
     /// proposal.
-    pub is_proposal_df: f64,
+    pub imp_proposal_df: f64,
     /// RNG seed for the IS sampling. `None` falls back to a fixed default so
     /// runs are reproducible across invocations.
-    pub is_seed: Option<u64>,
+    pub imp_seed: Option<u64>,
     /// Subjects with normalized effective sample size below this fraction
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
-    pub is_low_ess_threshold: f64,
+    pub imp_low_ess_threshold: f64,
     /// Number of MCEM iterations for the estimating `imp` path (ignored when
-    /// `is_eval_only`). Default 200.
-    pub is_iterations: usize,
+    /// `imp_eval_only`). Default 200.
+    pub imp_iterations: usize,
     /// Number of terminal iterations whose parameters are averaged to form the
     /// reported estimate (Monte-Carlo variance reduction). Default 50. Ignored
-    /// when `is_eval_only`.
-    pub is_averaging: usize,
+    /// when `imp_eval_only`.
+    pub imp_averaging: usize,
     /// When `true`, `imp` evaluates `−2 log L` at the fixed input parameters and
     /// does not estimate (NONMEM `IMP EONLY=1`); it must then be the terminal
     /// chain stage. When `false` (default), `imp` is an MCEM estimator
     /// (NONMEM `METHOD=IMP`).
-    pub is_eval_only: bool,
+    pub imp_eval_only: bool,
     // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
     // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
     // loop: each iteration re-centers a per-subject importance-sampling proposal
@@ -3340,15 +3367,15 @@ pub struct FitOptions {
     /// RB path against the full-dimensional sampler.
     pub frem_rao_blackwell: bool,
     /// Adaptive importance-sample count for IMP (NONMEM `AUTO`/`STDOBJ`). When
-    /// `true` (the default), `is_samples` is the *starting* count and is ramped
+    /// `true` (the default), `imp_samples` is the *starting* count and is ramped
     /// up (×2 per iteration, capped at 10000) whenever the objective's Monte-Carlo
     /// standard deviation exceeds 1.0, so high-dimensional / FREM fits reach a
     /// low-noise objective automatically instead of carrying a sample-count-
     /// dependent M-step bias. Low-dimensional, well-sampled fits never trip the
     /// threshold, so there is no cost there. Set `false` to pin the sample count.
-    pub is_auto: bool,
+    pub imp_auto: bool,
     /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
-    /// [`FitOptions::is_auto`] but ramps `impmap_samples`. Default `true`.
+    /// [`FitOptions::imp_auto`] but ramps `impmap_samples`. Default `true`.
     pub impmap_auto: bool,
     /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
     /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
@@ -3357,7 +3384,7 @@ pub struct FitOptions {
     /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
     /// Default 10.0.
     pub iscale_max: f64,
-    /// How BLOQ (Below Limit of Quantification) observations are handled.
+    /// How LOQ-censored observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
     pub bloq_method: BloqMethod,
@@ -3593,13 +3620,13 @@ impl Default for FitOptions {
             sir_seed: None,
             sir_keep_samples: false,
             sir_df: 5.0,
-            is_samples: 1000,
-            is_proposal_df: 5.0,
-            is_seed: None,
-            is_low_ess_threshold: 0.1,
-            is_iterations: 200,
-            is_averaging: 50,
-            is_eval_only: false,
+            imp_samples: 1000,
+            imp_proposal_df: 5.0,
+            imp_seed: None,
+            imp_low_ess_threshold: 0.1,
+            imp_iterations: 200,
+            imp_averaging: 50,
+            imp_eval_only: false,
             impmap_iterations: 200,
             impmap_samples: 300,
             impmap_proposal_df: 4.0,
@@ -3610,7 +3637,7 @@ impl Default for FitOptions {
             impmap_mceta: 0,
             impmap_sobol: false,
             frem_rao_blackwell: true,
-            is_auto: true,
+            imp_auto: true,
             impmap_auto: true,
             iscale_min: 0.1,
             iscale_max: 10.0,
@@ -3644,15 +3671,15 @@ impl Default for FitOptions {
     }
 }
 
-/// BLOQ (Below Limit of Quantification) handling.
+/// LOQ censoring handling.
 ///
 /// `Drop` — CENS rows are kept as ordinary observations (no special treatment). If
 /// the dataset has no CENS column, every row is treated as quantified and this is
 /// equivalent to the pre-M3 behavior.
 ///
-/// `M3` — Beal's M3 method: each BLOQ observation contributes
-/// `P(y < LLOQ | θ,η) = Φ((LLOQ - f)/√V)` to the likelihood instead of a
-/// Gaussian residual term. LLOQ is read from DV on CENS=1 rows (NONMEM convention).
+/// `M3` — Beal's M3 method: each censored observation contributes a normal-tail
+/// probability instead of a Gaussian residual term. LLOQ is read from DV on
+/// CENS=1 rows; ULOQ is read from DV on CENS=-1 rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BloqMethod {
     Drop,
@@ -3769,7 +3796,7 @@ pub enum EstimationMethod {
     /// importance-weighted posterior moments each iteration. Reports the IS
     /// `−2 log L` on `FitResult.importance_sampling` and a Laplace OFV on `ofv`.
     ///
-    /// With `is_eval_only = true` (NONMEM `IMP EONLY=1`) it instead *evaluates*
+    /// With `imp_eval_only = true` (NONMEM `IMP EONLY=1`) it instead *evaluates*
     /// `−2 log L_IS` at the fixed input parameters without updating them; in that
     /// mode it must be the terminal chain stage (it consumes the prior stage's
     /// params + EBEs + per-subject Hessians, or evaluates at the initial
@@ -3970,19 +3997,19 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_seed",
         ],
         EstimationMethod::Imp => &[
-            "is_samples",
-            "is_proposal_df",
-            "is_seed",
-            "is_low_ess_threshold",
-            "is_iterations",
-            "is_averaging",
-            "is_eval_only",
+            "imp_samples",
+            "imp_proposal_df",
+            "imp_seed",
+            "imp_low_ess_threshold",
+            "imp_iterations",
+            "imp_averaging",
+            "imp_eval_only",
             "inner_maxiter",
             "inner_tol",
             "iscale_min",
             "iscale_max",
             "frem_rao_blackwell",
-            "is_auto",
+            "imp_auto",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -4267,6 +4294,48 @@ mod tests {
     }
 
     #[test]
+    fn combined_additive_sigma_indices_picks_second_slot() {
+        use std::collections::HashMap;
+        // Single combined: additive component is sigma index 1.
+        assert_eq!(
+            ErrorSpec::Single(ErrorModel::Combined).combined_additive_sigma_indices(),
+            vec![1]
+        );
+        // Non-combined single specs have no additive-combined slot.
+        assert!(ErrorSpec::Single(ErrorModel::Additive)
+            .combined_additive_sigma_indices()
+            .is_empty());
+        assert!(ErrorSpec::Single(ErrorModel::Proportional)
+            .combined_additive_sigma_indices()
+            .is_empty());
+
+        let ep = |em: ErrorModel, idx: Vec<usize>| EndpointError {
+            error_model: em,
+            sigma_idx: idx,
+        };
+
+        // PerCmt: returns the global index of each combined endpoint's
+        // second sigma slot, de-duplicated; non-combined endpoints contribute
+        // nothing.
+        let mut map = HashMap::new();
+        map.insert(1usize, ep(ErrorModel::Proportional, vec![0]));
+        map.insert(2usize, ep(ErrorModel::Combined, vec![1, 3]));
+        let mut got = ErrorSpec::PerCmt(map).combined_additive_sigma_indices();
+        got.sort_unstable();
+        assert_eq!(got, vec![3]);
+
+        // Two combined endpoints that share the same additive sigma index
+        // collapse to a single entry.
+        let mut shared = HashMap::new();
+        shared.insert(1usize, ep(ErrorModel::Combined, vec![0, 2]));
+        shared.insert(2usize, ep(ErrorModel::Combined, vec![1, 2]));
+        assert_eq!(
+            ErrorSpec::PerCmt(shared).combined_additive_sigma_indices(),
+            vec![2]
+        );
+    }
+
+    #[test]
     fn classify_warning_convergence_is_critical() {
         let w = classify_warning("Outer optimization did not converge");
         assert_eq!(w.severity, WarningSeverity::Critical);
@@ -4389,7 +4458,7 @@ mod tests {
                 "dw_autocorrelation",
             ),
             (
-                "M3 BLOQ handling requires FOCEI semantics",
+                "M3 censoring handling requires FOCEI semantics",
                 Warning,
                 "bloq_method",
             ),
@@ -5054,12 +5123,14 @@ mod tests {
     }
 
     #[test]
-    fn subject_has_bloq_reflects_cens_flags() {
+    fn subject_has_censored_observation_reflects_cens_flags() {
         let mut s = bare_subject("1");
         s.cens = vec![0, 0];
-        assert!(!s.has_bloq());
+        assert!(!s.has_censored_observation());
         s.cens = vec![0, 1];
-        assert!(s.has_bloq());
+        assert!(s.has_censored_observation());
+        s.cens = vec![-1, 0];
+        assert!(s.has_censored_observation());
     }
 
     #[test]

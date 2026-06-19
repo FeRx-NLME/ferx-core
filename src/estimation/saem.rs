@@ -386,7 +386,7 @@ fn obs_nll_subject_into_iov(
     kappas: &[Vec<f64>],
     _pk_scratch: &mut crate::pk::EventPkParams,
 ) -> f64 {
-    use crate::stats::special::log_normal_cdf;
+    use crate::stats::likelihood::m3_logcdf;
     let m3 = matches!(model.bloq_method, BloqMethod::M3);
     // Continuous per-occasion-aware prediction (issue #104) — same model the
     // E-step (`individual_nll_iov`) and FOCEI use, so E and M steps stay
@@ -415,9 +415,9 @@ fn obs_nll_subject_into_iov(
             None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale)
                 .max(1e-12),
         };
-        if m3 && subject.cens.get(j).copied().unwrap_or(0) != 0 {
-            let z = (subject.observations[j] - f) / v.sqrt();
-            total_nll += -log_normal_cdf(z);
+        let cens = subject.cens.get(j).copied().unwrap_or(0);
+        if m3 && cens != 0 {
+            total_nll += -m3_logcdf(subject.observations[j], f, v.sqrt(), cens);
         } else {
             total_nll += 0.5 * (v.ln() + (subject.observations[j] - f).powi(2) / v);
         }
@@ -1011,9 +1011,9 @@ fn obs_nll_subject_grad(
 
 /// Sum of observation log-likelihoods with ETAs held fixed.
 ///
-/// Under M3, CENS=1 rows contribute `-log Φ((LLOQ - f)/√V)` instead of the
-/// Gaussian residual term. Without this branch, the SAEM M-step would optimize
-/// θ/σ as if censored observations were exact Gaussians at the LLOQ value,
+/// Under M3, censored rows contribute the matching normal-tail likelihood
+/// instead of the Gaussian residual term. Without this branch, the SAEM M-step
+/// would optimize θ/σ as if censored observations were exact Gaussians at the limit,
 /// producing silently-biased population estimates.
 ///
 /// Uses rayon's `map_init` so each worker thread allocates one
@@ -1065,6 +1065,32 @@ fn obs_nll_sum_iov(
             )
         })
         .sum()
+}
+
+/// True when a free (non-`FIX`) additive component of a `Combined` endpoint has
+/// collapsed onto its optimizer lower bound.
+///
+/// Sigma is optimized in log space with a lower bound of `exp(-8) ≈ 3.35e-4`
+/// (see `parameterization.rs`) and is carried here on the standard-deviation
+/// scale. `SIGMA_FLOOR_NEAR = 1e-3` is the detection band just above that hard
+/// bound: a value at or below it means the additive term pinned to the floor
+/// rather than identifying a genuine non-zero additive error.
+fn combined_additive_sigma_at_floor(model: &CompiledModel, params: &ModelParameters) -> bool {
+    const SIGMA_FLOOR_NEAR: f64 = 1.0e-3;
+    model
+        .error_spec
+        .combined_additive_sigma_indices()
+        .into_iter()
+        .any(|idx| {
+            !params.sigma_fixed.get(idx).copied().unwrap_or(false)
+                && params
+                    .sigma
+                    .values
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(f64::INFINITY)
+                    <= SIGMA_FLOOR_NEAR
+        })
 }
 
 /// Build (theta_idx, eta_idx) pairs for log-transformed mu-references only.
@@ -1484,7 +1510,6 @@ pub fn run_saem(
         } else {
             gamma
         };
-
         // Rebuild omega for this iteration
         let omega_k = OmegaMatrix::from_matrix(
             state.omega_mat.clone(),
@@ -2130,6 +2155,11 @@ pub fn run_saem(
         kappa_fixed: init_params.kappa_fixed.clone(),
     };
 
+    if combined_additive_sigma_at_floor(model, &final_params) {
+        warnings
+            .push("SAEM combined-error additive sigma collapsed to its lower bound.".to_string());
+    }
+
     // ---- Final EBEs via inner loop (warm-started from SAEM etas) ----
     let warm_etas: Vec<DVector<f64>> = state
         .etas
@@ -2267,6 +2297,38 @@ mod tests {
             "MSTEP_NLOPT_ALGORITHM changed — see comment above this test \
              for the Emax-Hill identifiability rationale before adjusting."
         );
+    }
+
+    /// `combined_additive_sigma_at_floor` flags only a free additive component
+    /// (sigma index 1) sitting at/below the near-floor band, and ignores
+    /// non-combined specs and FIXed sigmas.
+    #[test]
+    fn combined_additive_sigma_at_floor_detects_collapsed_free_additive() {
+        let mut model = analytical_model(GradientMethod::Fd);
+        model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+
+        let mut params = model.default_params.clone();
+        params.sigma = SigmaVector {
+            values: vec![0.1, 0.5],
+            names: vec!["PROP".into(), "ADD".into()],
+        };
+        params.sigma_fixed = vec![false, false];
+
+        // Healthy additive term well above the floor band.
+        assert!(!combined_additive_sigma_at_floor(&model, &params));
+
+        // Additive term collapsed onto the floor → flagged.
+        params.sigma.values[1] = 5.0e-4;
+        assert!(combined_additive_sigma_at_floor(&model, &params));
+
+        // A FIXed additive at the floor is intentional, not a collapse.
+        params.sigma_fixed[1] = true;
+        assert!(!combined_additive_sigma_at_floor(&model, &params));
+
+        // Non-combined specs never flag, even with a tiny second sigma.
+        params.sigma_fixed[1] = false;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        assert!(!combined_additive_sigma_at_floor(&model, &params));
     }
 
     #[test]

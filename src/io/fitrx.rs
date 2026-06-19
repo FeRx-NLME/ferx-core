@@ -260,7 +260,7 @@ struct FitWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sir_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    is_seed: Option<u64>,
+    imp_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     npde_seed: Option<u64>,
     #[serde(default)]
@@ -763,7 +763,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         multi_start_seed: r.multi_start_seed,
         saem_seed: r.saem_seed,
         sir_seed: r.sir_seed,
-        is_seed: r.is_seed,
+        imp_seed: r.imp_seed,
         npde_seed: r.npde_seed,
         bloq_method: r.bloq_method.clone(),
         outer_maxiter: r.outer_maxiter,
@@ -1174,7 +1174,7 @@ fn parse_subjects(
         let c = match cens_i {
             Some(j) => fields
                 .get(j)
-                .and_then(|v| v.parse::<u8>().ok())
+                .and_then(|v| v.parse::<i8>().ok())
                 .unwrap_or(0),
             None => 0,
         };
@@ -1643,7 +1643,7 @@ fn wire_to_fit_result(
         multi_start_seed: w.multi_start_seed,
         saem_seed: w.saem_seed,
         sir_seed: w.sir_seed,
-        is_seed: w.is_seed,
+        imp_seed: w.imp_seed,
         npde_seed: w.npde_seed,
         bloq_method: w.bloq_method,
         outer_maxiter: w.outer_maxiter,
@@ -1860,7 +1860,7 @@ mod tests {
             multi_start_seed: None,
             saem_seed: None,
             sir_seed: None,
-            is_seed: None,
+            imp_seed: None,
             npde_seed: None,
             bloq_method: "drop".to_string(),
             outer_maxiter: 300,

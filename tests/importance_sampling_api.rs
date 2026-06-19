@@ -1,11 +1,11 @@
-//! Integration tests for the **evaluation-only** IMP stage (`is_eval_only = true`,
+//! Integration tests for the **evaluation-only** IMP stage (`imp_eval_only = true`,
 //! NONMEM `IMP EONLY=1`): `[fit_options] methods = [..., imp]` with the evaluator
 //! flag set.
 //!
 //! Covers validation (an eval-only Imp must be terminal; not duplicated) and the
 //! happy-path wire-up (the IS result lands on `FitResult.importance_sampling`
 //! with a plausible relationship to the FOCEI Laplace OFV on a real model). The
-//! estimating IMP path (default, `is_eval_only = false`) is covered in
+//! estimating IMP path (default, `imp_eval_only = false`) is covered in
 //! `imp_estimator_api.rs`.
 //!
 //! All fits here cap iterations aggressively — convergence quality is not what
@@ -28,9 +28,9 @@ fn warfarin_setup() -> (
     opts.verbose = false;
     opts.run_covariance_step = false;
     opts.outer_maxiter = 40;
-    opts.is_samples = 200; // fast — accuracy is checked in Tier 3
-    opts.is_seed = Some(7);
-    opts.is_eval_only = true; // this suite exercises the NONMEM EONLY=1 path
+    opts.imp_samples = 200; // fast — accuracy is checked in Tier 3
+    opts.imp_seed = Some(7);
+    opts.imp_eval_only = true; // this suite exercises the NONMEM EONLY=1 path
     (model, population, opts)
 }
 
@@ -159,9 +159,9 @@ fn imp_after_focei_handles_fixed_theta_omega_sigma() {
     opts.verbose = false;
     opts.run_covariance_step = false;
     opts.outer_maxiter = 40;
-    opts.is_samples = 200;
-    opts.is_seed = Some(11);
-    opts.is_eval_only = true;
+    opts.imp_samples = 200;
+    opts.imp_seed = Some(11);
+    opts.imp_eval_only = true;
     opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
 
     let result = fit(&model, &population, &model.default_params, &opts)

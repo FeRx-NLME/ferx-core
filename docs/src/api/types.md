@@ -47,7 +47,7 @@ pub struct Subject {
     pub covariates: HashMap<String, f64>,                  // Subject-static fallback (first values)
     pub dose_covariates: Vec<HashMap<String, f64>>,        // Per-dose LOCF snapshot (empty if no TV cov)
     pub obs_covariates: Vec<HashMap<String, f64>>,         // Per-obs LOCF snapshot (empty if no TV cov)
-    pub cens: Vec<u8>,
+    pub cens: Vec<i8>,                                      // 0 quantified, 1 below LLOQ, -1 above ULOQ
     pub occasions: Vec<u32>,
     pub dose_occasions: Vec<u32>,
 }

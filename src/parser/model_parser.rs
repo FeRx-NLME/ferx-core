@@ -3661,46 +3661,46 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.sir_df = v;
         }
-        "is_samples" => {
-            let v = parse_usize("is_samples")?;
+        "imp_samples" => {
+            let v = parse_usize("imp_samples")?;
             if v < 2 {
-                return Err(format!("is_samples must be >= 2, got {v}"));
+                return Err(format!("imp_samples must be >= 2, got {v}"));
             }
-            opts.is_samples = v;
+            opts.imp_samples = v;
         }
-        "is_proposal_df" => {
+        "imp_proposal_df" => {
             let tok = value.trim();
             if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
-                opts.is_proposal_df = f64::INFINITY;
+                opts.imp_proposal_df = f64::INFINITY;
             } else {
-                let v = parse_f64("is_proposal_df")?;
+                let v = parse_f64("imp_proposal_df")?;
                 if v < 1.0 {
                     return Err(format!(
-                        "is_proposal_df must be >= 1.0 or `normal`, got {v}"
+                        "imp_proposal_df must be >= 1.0 or `normal`, got {v}"
                     ));
                 }
-                opts.is_proposal_df = v;
+                opts.imp_proposal_df = v;
             }
         }
-        "is_seed" => opts.is_seed = parse_u64_opt("is_seed")?,
-        "is_low_ess_threshold" => {
-            let v = parse_f64("is_low_ess_threshold")?;
+        "imp_seed" => opts.imp_seed = parse_u64_opt("imp_seed")?,
+        "imp_low_ess_threshold" => {
+            let v = parse_f64("imp_low_ess_threshold")?;
             if !(0.0..=1.0).contains(&v) {
                 return Err(format!(
-                    "is_low_ess_threshold must be in [0.0, 1.0], got {v}"
+                    "imp_low_ess_threshold must be in [0.0, 1.0], got {v}"
                 ));
             }
-            opts.is_low_ess_threshold = v;
+            opts.imp_low_ess_threshold = v;
         }
-        "is_iterations" => {
-            let v = parse_usize("is_iterations")?;
+        "imp_iterations" => {
+            let v = parse_usize("imp_iterations")?;
             if v < 1 {
-                return Err(format!("is_iterations must be >= 1, got {v}"));
+                return Err(format!("imp_iterations must be >= 1, got {v}"));
             }
-            opts.is_iterations = v;
+            opts.imp_iterations = v;
         }
-        "is_averaging" => opts.is_averaging = parse_usize("is_averaging")?,
-        "is_eval_only" => opts.is_eval_only = parse_bool("is_eval_only")?,
+        "imp_averaging" => opts.imp_averaging = parse_usize("imp_averaging")?,
+        "imp_eval_only" => opts.imp_eval_only = parse_bool("imp_eval_only")?,
         "impmap_iterations" => {
             let v = parse_usize("impmap_iterations")?;
             if v < 1 {
@@ -3746,7 +3746,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "impmap_mceta" => opts.impmap_mceta = parse_usize("impmap_mceta")?,
         "impmap_sobol" => opts.impmap_sobol = parse_bool("impmap_sobol")?,
         "frem_rao_blackwell" => opts.frem_rao_blackwell = parse_bool("frem_rao_blackwell")?,
-        "is_auto" => opts.is_auto = parse_bool("is_auto")?,
+        "imp_auto" => opts.imp_auto = parse_bool("imp_auto")?,
         "impmap_auto" => opts.impmap_auto = parse_bool("impmap_auto")?,
         "iscale_min" => {
             let v = parse_f64("iscale_min")?;
@@ -11672,15 +11672,15 @@ mod tests {
     }
 
     #[test]
-    fn test_imp_method_and_is_options_parse() {
-        // `methods = [focei, imp]` plus the four `is_*` keys must apply
+    fn test_imp_method_and_imp_options_parse() {
+        // `methods = [focei, imp]` plus the `imp_*` keys must apply
         // cleanly and produce no `unsupported_keys_warnings`.
         let opts = parse_fit_options(&[
             "method = [focei, imp]".to_string(),
-            "is_samples = 500".to_string(),
-            "is_proposal_df = 4.0".to_string(),
-            "is_seed = 99".to_string(),
-            "is_low_ess_threshold = 0.2".to_string(),
+            "imp_samples = 500".to_string(),
+            "imp_proposal_df = 4.0".to_string(),
+            "imp_seed = 99".to_string(),
+            "imp_low_ess_threshold = 0.2".to_string(),
             "covariance = false".to_string(),
             "verbose = false".to_string(),
         ])
@@ -11689,25 +11689,25 @@ mod tests {
             opts.methods,
             vec![EstimationMethod::FoceI, EstimationMethod::Imp]
         );
-        assert_eq!(opts.is_samples, 500);
-        assert_eq!(opts.is_proposal_df, 4.0);
-        assert_eq!(opts.is_seed, Some(99));
-        assert_eq!(opts.is_low_ess_threshold, 0.2);
+        assert_eq!(opts.imp_samples, 500);
+        assert_eq!(opts.imp_proposal_df, 4.0);
+        assert_eq!(opts.imp_seed, Some(99));
+        assert_eq!(opts.imp_low_ess_threshold, 0.2);
         // No "ignored option" warnings — keys are method-specific to Imp,
         // and Imp is in the chain.
         assert!(opts.unsupported_keys_warnings().is_empty());
     }
 
     #[test]
-    fn test_is_options_validate_ranges() {
+    fn test_imp_options_validate_ranges() {
         let mut opts = FitOptions::default();
-        assert!(apply_fit_option(&mut opts, "is_samples", "1").is_err()); // < 2
-        assert!(apply_fit_option(&mut opts, "is_proposal_df", "0.5").is_err()); // < 1
-        assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "1.5").is_err()); // > 1
-        assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "-0.1").is_err()); // < 0
-        assert!(apply_fit_option(&mut opts, "is_iterations", "0").is_err()); // < 1
-                                                                             // Defaults preserved after a failed apply.
-        assert_eq!(opts.is_samples, 1000);
+        assert!(apply_fit_option(&mut opts, "imp_samples", "1").is_err()); // < 2
+        assert!(apply_fit_option(&mut opts, "imp_proposal_df", "0.5").is_err()); // < 1
+        assert!(apply_fit_option(&mut opts, "imp_low_ess_threshold", "1.5").is_err()); // > 1
+        assert!(apply_fit_option(&mut opts, "imp_low_ess_threshold", "-0.1").is_err()); // < 0
+        assert!(apply_fit_option(&mut opts, "imp_iterations", "0").is_err()); // < 1
+                                                                              // Defaults preserved after a failed apply.
+        assert_eq!(opts.imp_samples, 1000);
     }
 
     #[test]
@@ -11715,26 +11715,26 @@ mod tests {
         // The estimating-IMP controls and the eval-only switch apply cleanly.
         let opts = parse_fit_options(&[
             "method = imp".to_string(),
-            "is_iterations = 80".to_string(),
-            "is_averaging = 20".to_string(),
-            "is_eval_only = true".to_string(),
-            "is_proposal_df = normal".to_string(),
+            "imp_iterations = 80".to_string(),
+            "imp_averaging = 20".to_string(),
+            "imp_eval_only = true".to_string(),
+            "imp_proposal_df = normal".to_string(),
         ])
         .expect("parse must succeed");
         assert_eq!(opts.method, EstimationMethod::Imp);
-        assert_eq!(opts.is_iterations, 80);
-        assert_eq!(opts.is_averaging, 20);
-        assert!(opts.is_eval_only);
-        assert!(opts.is_proposal_df.is_infinite());
+        assert_eq!(opts.imp_iterations, 80);
+        assert_eq!(opts.imp_averaging, 20);
+        assert!(opts.imp_eval_only);
+        assert!(opts.imp_proposal_df.is_infinite());
         assert!(opts.unsupported_keys_warnings().is_empty());
     }
 
     #[test]
-    fn test_is_proposal_df_accepts_normal_token() {
+    fn test_imp_proposal_df_accepts_normal_token() {
         for kw in ["normal", "mvn", "NORMAL"] {
             let mut o = FitOptions::default();
-            assert!(apply_fit_option(&mut o, "is_proposal_df", kw).is_ok());
-            assert!(o.is_proposal_df.is_infinite(), "`{kw}` must select MVN");
+            assert!(apply_fit_option(&mut o, "imp_proposal_df", kw).is_ok());
+            assert!(o.imp_proposal_df.is_infinite(), "`{kw}` must select MVN");
         }
     }
 
@@ -11744,7 +11744,28 @@ mod tests {
         // NONMEM METHOD=IMP estimator.
         let opts = parse_fit_options(&["method = imp".to_string()]).expect("parse must succeed");
         assert_eq!(opts.method, EstimationMethod::Imp);
-        assert!(!opts.is_eval_only);
+        assert!(!opts.imp_eval_only);
+    }
+
+    #[test]
+    fn test_legacy_is_prefixed_imp_options_are_not_accepted() {
+        for key in [
+            "is_samples",
+            "is_proposal_df",
+            "is_seed",
+            "is_low_ess_threshold",
+            "is_iterations",
+            "is_averaging",
+            "is_eval_only",
+            "is_auto",
+        ] {
+            let mut opts = FitOptions::default();
+            assert_eq!(
+                apply_fit_option(&mut opts, key, "1"),
+                Ok(false),
+                "`{key}` must not remain a parser alias for the renamed `imp_*` options"
+            );
+        }
     }
 
     #[test]
@@ -11836,9 +11857,9 @@ mod tests {
     #[test]
     fn test_apply_fit_option_adaptive_sampling_flags() {
         let mut opts = FitOptions::default();
-        assert!(opts.is_auto && opts.impmap_auto, "default on");
-        assert_eq!(apply_fit_option(&mut opts, "is_auto", "false"), Ok(true));
-        assert!(!opts.is_auto);
+        assert!(opts.imp_auto && opts.impmap_auto, "default on");
+        assert_eq!(apply_fit_option(&mut opts, "imp_auto", "false"), Ok(true));
+        assert!(!opts.imp_auto);
         assert_eq!(apply_fit_option(&mut opts, "impmap_auto", "no"), Ok(true));
         assert!(!opts.impmap_auto);
     }
