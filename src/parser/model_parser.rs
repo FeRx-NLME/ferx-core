@@ -4155,8 +4155,10 @@ fn parse_scaling_block(
 /// rates today (`transit`, #343; `igd`, #347). Each later absorption function
 /// adds its own name here in the same PR that implements it — Phase 2 `weibull` —
 /// so the error rule never advertises a function the engine can't yet run (which
-/// would send the user to `ode_template` for a dead end, Ron #363).
-const ODE_ONLY_ABSORPTION_FNS: [&str; 2] = ["transit", "igd"];
+/// would send the user to `ode_template` for a dead end, Ron #363). A slice (not
+/// a fixed-size array) so a new entry needs no length-annotation bump, matching
+/// [`INPUT_RATE_FNS`].
+const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd"];
 
 /// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
 /// the first such function name found. Drives the error rule that rejects an
@@ -4938,7 +4940,9 @@ fn extract_input_rate_terms(
             .any(|&(f, _, _)| find_word_call(&new_line, f).is_some())
         {
             return Err(
-                "[odes]: at most one absorption input-rate function per d/dt equation (Phase 1)"
+                "[odes]: at most one absorption input-rate function per d/dt equation — \
+                 parallel/biphasic absorption (two input-rate terms on one compartment) is \
+                 not yet supported"
                     .to_string(),
             );
         }

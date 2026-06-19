@@ -14,6 +14,12 @@
 
 use crate::stats::special::ln_gamma;
 
+/// `ln(2π)` — the inverse-Gaussian log-density normalisation constant. A literal
+/// (rather than a runtime `(2.0 * PI).ln()`) since `f64::ln` is not `const`; the
+/// `igd_matches_direct_density_formula` test pins it to the textbook density to
+/// 1e-12, so a typo here cannot pass unnoticed.
+const LN_2PI: f64 = 1.837_877_066_409_345_5;
+
 /// Savic et al. (2007) transit-compartment input rate into the **depot**, for a
 /// *continuous* number of transit compartments `n`:
 ///
@@ -237,10 +243,9 @@ impl PreparedInputRate {
     fn inverse_gaussian(mat: f64, cv2: f64) -> Self {
         let mat = crate::types::clamp_above_floor(mat, Self::MIN_PARAM);
         let cv2 = crate::types::clamp_above_floor(cv2, Self::MIN_PARAM);
-        let two_pi = 2.0 * std::f64::consts::PI;
         PreparedInputRate::InverseGaussian {
             mat,
-            c0: 0.5 * (mat.ln() - two_pi.ln() - cv2.ln()),
+            c0: 0.5 * (mat.ln() - LN_2PI - cv2.ln()),
             inv_2cv2mat: 1.0 / (2.0 * cv2 * mat),
         }
     }
@@ -433,8 +438,7 @@ mod tests {
         if tad <= 0.0 || dose <= 0.0 {
             return 0.0;
         }
-        let two_pi = 2.0 * std::f64::consts::PI;
-        dose * (mat / (two_pi * cv2 * tad.powi(3))).sqrt()
+        dose * (mat / (std::f64::consts::TAU * cv2 * tad.powi(3))).sqrt()
             * (-(tad - mat).powi(2) / (2.0 * cv2 * mat * tad)).exp()
     }
 
