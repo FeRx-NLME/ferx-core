@@ -3626,11 +3626,18 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.is_samples = v;
         }
         "is_proposal_df" => {
-            let v = parse_f64("is_proposal_df")?;
-            if v < 1.0 {
-                return Err(format!("is_proposal_df must be >= 1.0, got {v}"));
+            let tok = value.trim();
+            if tok.eq_ignore_ascii_case("normal") || tok.eq_ignore_ascii_case("mvn") {
+                opts.is_proposal_df = f64::INFINITY;
+            } else {
+                let v = parse_f64("is_proposal_df")?;
+                if v < 1.0 {
+                    return Err(format!(
+                        "is_proposal_df must be >= 1.0 or `normal`, got {v}"
+                    ));
+                }
+                opts.is_proposal_df = v;
             }
-            opts.is_proposal_df = v;
         }
         "is_seed" => opts.is_seed = parse_u64_opt("is_seed")?,
         "is_low_ess_threshold" => {
@@ -3642,6 +3649,15 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.is_low_ess_threshold = v;
         }
+        "is_iterations" => {
+            let v = parse_usize("is_iterations")?;
+            if v < 1 {
+                return Err(format!("is_iterations must be >= 1, got {v}"));
+            }
+            opts.is_iterations = v;
+        }
+        "is_averaging" => opts.is_averaging = parse_usize("is_averaging")?,
+        "is_eval_only" => opts.is_eval_only = parse_bool("is_eval_only")?,
         "impmap_iterations" => {
             let v = parse_usize("impmap_iterations")?;
             if v < 1 {
@@ -11477,8 +11493,46 @@ mod tests {
         assert!(apply_fit_option(&mut opts, "is_proposal_df", "0.5").is_err()); // < 1
         assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "1.5").is_err()); // > 1
         assert!(apply_fit_option(&mut opts, "is_low_ess_threshold", "-0.1").is_err()); // < 0
-                                                                                       // Defaults preserved after a failed apply.
+        assert!(apply_fit_option(&mut opts, "is_iterations", "0").is_err()); // < 1
+                                                                             // Defaults preserved after a failed apply.
         assert_eq!(opts.is_samples, 1000);
+    }
+
+    #[test]
+    fn test_imp_estimator_options_parse() {
+        // The estimating-IMP controls and the eval-only switch apply cleanly.
+        let opts = parse_fit_options(&[
+            "method = imp".to_string(),
+            "is_iterations = 80".to_string(),
+            "is_averaging = 20".to_string(),
+            "is_eval_only = true".to_string(),
+            "is_proposal_df = normal".to_string(),
+        ])
+        .expect("parse must succeed");
+        assert_eq!(opts.method, EstimationMethod::Imp);
+        assert_eq!(opts.is_iterations, 80);
+        assert_eq!(opts.is_averaging, 20);
+        assert!(opts.is_eval_only);
+        assert!(opts.is_proposal_df.is_infinite());
+        assert!(opts.unsupported_keys_warnings().is_empty());
+    }
+
+    #[test]
+    fn test_is_proposal_df_accepts_normal_token() {
+        for kw in ["normal", "mvn", "NORMAL"] {
+            let mut o = FitOptions::default();
+            assert!(apply_fit_option(&mut o, "is_proposal_df", kw).is_ok());
+            assert!(o.is_proposal_df.is_infinite(), "`{kw}` must select MVN");
+        }
+    }
+
+    #[test]
+    fn test_imp_method_token_defaults_to_estimator() {
+        // `imp` alone must not flip the eval-only switch — the default is the
+        // NONMEM METHOD=IMP estimator.
+        let opts = parse_fit_options(&["method = imp".to_string()]).expect("parse must succeed");
+        assert_eq!(opts.method, EstimationMethod::Imp);
+        assert!(!opts.is_eval_only);
     }
 
     #[test]

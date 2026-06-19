@@ -7,9 +7,13 @@ estimator**, equivalent to NONMEM `$EST METHOD=IMPMAP`. It estimates the
 population parameters θ/Ω/σ by maximizing the importance-sampled marginal
 likelihood.
 
-It is the estimating counterpart to the [`imp`](importance-sampling.md) stage:
-`imp` only *evaluates* `−2 log L` at fixed parameters, whereas `impmap` *updates*
-the parameters each iteration.
+Both [`imp`](importance-sampling.md) and `impmap` are MCEM estimators; they
+differ only in how the proposal is re-centered. `impmap` re-derives each
+subject's conditional mode and first-order variance **every** iteration (robust
+on rich data), whereas `imp` re-centers from the previous iteration's sample
+moments after the first iteration (cheaper, but can stall on rich data).
+`imp` can also run in evaluation-only mode (`is_eval_only = true`), which
+`impmap` has no equivalent of.
 
 > **NONMEM's description.** *"Sometimes for highly dimensioned PK/PD problems
 > with very rich data the importance sampling method does not advance the
@@ -158,7 +162,8 @@ evaluation. Everything is parallelized over subjects via the shared Rayon pool.
 
 ## See also
 
-- [Importance Sampling (IMP)](importance-sampling.md) — the evaluation-only
-  marginal-likelihood stage that shares IMPMAP's per-subject IS kernel.
+- [Importance Sampling (IMP)](importance-sampling.md) — the sample-moment
+  re-centered sibling estimator (and its evaluation-only mode) that shares
+  IMPMAP's per-subject IS kernel and M-step.
 - [SAEM](saem.md) — the other sampling-based estimator; a common warm-start
   (`methods = [saem, impmap]`).

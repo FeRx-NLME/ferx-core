@@ -3199,15 +3199,22 @@ pub struct FitOptions {
     /// (omega variances, constrained thetas). Default 5.0 follows Dosne (2017).
     /// Set to a large value (e.g. 100.0) to recover near-normal behaviour.
     pub sir_df: f64,
-    // Importance-sampling marginal log-likelihood options (consumed by the
-    // `Imp` chain stage; ignored otherwise). The Imp stage estimates
-    // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` by Monte Carlo with a
-    // Student-t proposal centred on each subject's EBE.
+    // Importance-sampling options (consumed by the `Imp` chain stage; ignored
+    // otherwise). By default `imp` is a Monte-Carlo EM **estimator** matching
+    // NONMEM `METHOD=IMP`: the conditional mode + first-order variance are found
+    // only on the first iteration, then the proposal is re-centered from the
+    // previous iteration's importance-sample mean/covariance, and θ/Ω/σ are
+    // updated from the importance-weighted posterior moments each iteration. Set
+    // `is_eval_only = true` (NONMEM `EONLY=1`) to instead evaluate
+    // `−2 log L = −2 Σᵢ log ∫ p(yᵢ|η,θ)p(η|θ) dη` at the fixed input parameters
+    // without updating them.
     /// Number of importance samples per subject. Default 1000. Recommended
     /// 2000–5000 for publication-quality MC SE (cost scales linearly).
     pub is_samples: usize,
     /// Degrees of freedom for the Student-t proposal. Default 5.0 (heavy-tailed
-    /// — robust to mild proposal misspecification). Must be ≥ 1.
+    /// — robust to mild proposal misspecification). Must be ≥ 1. The token
+    /// `normal` (parsed to `f64::INFINITY`) selects a multivariate-normal
+    /// proposal.
     pub is_proposal_df: f64,
     /// RNG seed for the IS sampling. `None` falls back to a fixed default so
     /// runs are reproducible across invocations.
@@ -3216,6 +3223,18 @@ pub struct FitOptions {
     /// (ESS / K) are flagged in the result. Default 0.1. Set to 0 to silence
     /// the flag entirely.
     pub is_low_ess_threshold: f64,
+    /// Number of MCEM iterations for the estimating `imp` path (ignored when
+    /// `is_eval_only`). Default 200.
+    pub is_iterations: usize,
+    /// Number of terminal iterations whose parameters are averaged to form the
+    /// reported estimate (Monte-Carlo variance reduction). Default 50. Ignored
+    /// when `is_eval_only`.
+    pub is_averaging: usize,
+    /// When `true`, `imp` evaluates `−2 log L` at the fixed input parameters and
+    /// does not estimate (NONMEM `IMP EONLY=1`); it must then be the terminal
+    /// chain stage. When `false` (default), `imp` is an MCEM estimator
+    /// (NONMEM `METHOD=IMP`).
+    pub is_eval_only: bool,
     // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
     // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
     // loop: each iteration re-centers a per-subject importance-sampling proposal
@@ -3495,6 +3514,9 @@ impl Default for FitOptions {
             is_proposal_df: 5.0,
             is_seed: None,
             is_low_ess_threshold: 0.1,
+            is_iterations: 200,
+            is_averaging: 50,
+            is_eval_only: false,
             impmap_iterations: 200,
             impmap_samples: 300,
             impmap_proposal_df: f64::INFINITY,
@@ -3653,17 +3675,27 @@ pub enum EstimationMethod {
     FoceGn,
     FoceGnHybrid,
     Saem,
-    /// Importance-sampling marginal log-likelihood. Not an estimator — does not
-    /// update parameters. Must follow another stage in `methods` (consumes that
-    /// stage's params + EBEs + per-subject Hessians as the proposal centre /
-    /// scale) and is typically terminal. Reports `−2 log L_IS` on
-    /// `FitResult.importance_sampling`, distinct from the Laplace OFV on `ofv`.
+    /// Importance Sampling (NONMEM `METHOD=IMP`). By **default an estimator**: a
+    /// Monte-Carlo EM loop that finds each subject's conditional mode and
+    /// first-order variance only on the first iteration, then re-centers the
+    /// importance-sampling proposal from the previous iteration's
+    /// importance-sample mean/covariance, updating θ/Ω/σ from the
+    /// importance-weighted posterior moments each iteration. Reports the IS
+    /// `−2 log L` on `FitResult.importance_sampling` and a Laplace OFV on `ofv`.
+    ///
+    /// With `is_eval_only = true` (NONMEM `IMP EONLY=1`) it instead *evaluates*
+    /// `−2 log L_IS` at the fixed input parameters without updating them; in that
+    /// mode it must be the terminal chain stage (it consumes the prior stage's
+    /// params + EBEs + per-subject Hessians, or evaluates at the initial
+    /// parameters when standalone). Contrast [`Impmap`](Self::Impmap), which
+    /// re-evaluates the mode/variance *every* iteration (more robust, costlier).
     Imp,
     /// Importance Sampling assisted by Mode A Posteriori (NONMEM `METHOD=IMPMAP`).
-    /// Unlike [`Imp`](Self::Imp), this *is* an estimator: a Monte-Carlo EM loop
-    /// whose E-step re-evaluates each subject's conditional mode and first-order
-    /// variance every iteration (as in FOCE/ITS) to center a multivariate-normal
-    /// importance-sampling proposal, and whose M-step updates θ/Ω/σ from the
+    /// Like estimating [`Imp`](Self::Imp) this *is* an estimator, but its E-step
+    /// re-evaluates each subject's conditional mode and first-order variance
+    /// *every* iteration (as in FOCE/ITS) to center a multivariate-normal
+    /// importance-sampling proposal — more robust than `Imp` on high-dimensional,
+    /// rich-data problems — and its M-step updates θ/Ω/σ from the
     /// importance-weighted posterior moments.
     Impmap,
     /// Full MCMC Bayesian estimation (Path A — Gibbs-within-HMC, NONMEM
@@ -3856,6 +3888,11 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "is_proposal_df",
             "is_seed",
             "is_low_ess_threshold",
+            "is_iterations",
+            "is_averaging",
+            "is_eval_only",
+            "inner_maxiter",
+            "inner_tol",
             "iscale_min",
             "iscale_max",
         ],
