@@ -3804,7 +3804,7 @@ mod tests {
         options.verbose = true; // also drive the progress reporter closure
         options.cancel = Some(flag);
 
-        match compute_covariance(
+        let result = compute_covariance(
             &x,
             &template,
             &model,
@@ -3813,18 +3813,14 @@ mod tests {
             &h_matrices,
             &kappas,
             &options,
-        ) {
-            CovarianceStepResult::Unusable(msg) => assert!(
-                msg.contains("cancelled"),
-                "cancelled covariance must report cancellation, got: {msg}"
-            ),
-            CovarianceStepResult::Success(_) => {
-                panic!("a cancelled covariance step must not return Success")
-            }
-            CovarianceStepResult::FailedNonPd { reason, .. } => {
-                panic!("cancelled covariance must be Unusable, got FailedNonPd: {reason}")
-            }
-        }
+        );
+        // A cancelled step must be `Unusable` and name the cancellation — never
+        // `Success`/`FailedNonPd`. A single `matches!` assertion keeps the
+        // not-supposed-to-happen variants from becoming dead (uncoverable) arms.
+        assert!(
+            matches!(&result, CovarianceStepResult::Unusable(msg) if msg.contains("cancelled")),
+            "cancelled covariance must be Unusable(cancelled)"
+        );
     }
 
     /// `assemble_score_cross_product` honours the cancel flag: each subject's
@@ -3874,6 +3870,116 @@ mod tests {
         assert!(
             s.iter().all(|v| *v == 0.0),
             "cancelled S must be all-zero (per-subject scores short-circuited)"
+        );
+    }
+
+    /// Build the near-optimum synthetic inputs shared by the analytical
+    /// gradient-FD covariance tests: 8 subjects, fixed Ω/Σ, EBEs at zero.
+    /// `covariance_ofv_hessian = false` + `interaction = true` + non-IOV routes
+    /// `compute_covariance` through the analytical `point_grad` Hessian stencil
+    /// (`use_analytical = true`), distinct from the OFV second-difference path
+    /// the `_cancelled` test above exercises.
+    #[allow(clippy::type_complexity)]
+    fn analytical_cov_fixture() -> (
+        CompiledModel,
+        Population,
+        ModelParameters,
+        Vec<f64>,
+        Vec<DVector<f64>>,
+        Vec<DMatrix<f64>>,
+        Vec<Vec<DVector<f64>>>,
+    ) {
+        let model = make_model();
+        let mut population = make_population(8);
+        for s in &mut population.subjects {
+            s.observations = vec![1.80967, 1.34064, 0.89866];
+        }
+        let mut template = model.default_params.clone();
+        template.omega_fixed = vec![true];
+        template.sigma_fixed = vec![true];
+        let x = pack_params(&template);
+
+        let (n_subj, n_eta, n_obs) = (8, 1, 3);
+        let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
+        let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
+            .map(|_| DMatrix::from_element(n_obs, n_eta, 0.1))
+            .collect();
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
+        (model, population, template, x, eta_hats, h_matrices, kappas)
+    }
+
+    /// Analytical gradient-FD Hessian path runs the perturbed-point sweep to
+    /// completion (no cancel): exercises `cov_progress("Hessian", …)` and the
+    /// `point_grad` map that the default OFV-Hessian path skips. The fixed-Ω/Σ
+    /// near-optimum fixture yields a usable (PD) free-block, so the result is
+    /// `Success` with a finite covariance matrix.
+    #[test]
+    fn test_compute_covariance_analytical_path() {
+        use crate::types::FitOptions;
+        let (model, population, template, x, eta_hats, h_matrices, kappas) =
+            analytical_cov_fixture();
+
+        let mut options = FitOptions::default();
+        options.interaction = true; // FOCEI
+        options.covariance_ofv_hessian = false; // → analytical `point_grad` stencil
+        options.verbose = true; // drive the progress reporter closure
+
+        let result = compute_covariance(
+            &x,
+            &template,
+            &model,
+            &population,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &options,
+        );
+        // The fixed-Ω/Σ near-optimum yields a PD free-block, so the analytical
+        // stencil returns a finite `Success`. A single `matches!` keeps the
+        // other variants from becoming dead (uncoverable) arms.
+        assert!(
+            matches!(
+                &result,
+                CovarianceStepResult::Success(out) if out.matrix.iter().all(|v| v.is_finite())
+            ),
+            "analytical-path covariance must be a finite Success"
+        );
+    }
+
+    /// As `test_compute_covariance_cancelled`, but on the analytical
+    /// `point_grad` path (`covariance_ofv_hessian = false`): a pre-set cancel
+    /// flag short-circuits every perturbed point (each returns a NaN gradient
+    /// via the in-loop cancel check) and the post-loop bail returns
+    /// `Unusable(cancelled)` rather than inverting a NaN-laden Hessian.
+    #[test]
+    fn test_compute_covariance_analytical_cancelled() {
+        use crate::cancel::CancelFlag;
+        use crate::types::FitOptions;
+        let (model, population, template, x, eta_hats, h_matrices, kappas) =
+            analytical_cov_fixture();
+
+        let flag = CancelFlag::new();
+        flag.cancel(); // pre-cancel: every perturbed point short-circuits
+
+        let mut options = FitOptions::default();
+        options.interaction = true;
+        options.covariance_ofv_hessian = false; // → analytical `point_grad` stencil
+        options.verbose = true;
+        options.cancel = Some(flag);
+
+        let result = compute_covariance(
+            &x,
+            &template,
+            &model,
+            &population,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            &options,
+        );
+        assert!(
+            matches!(&result, CovarianceStepResult::Unusable(msg) if msg.contains("cancelled")),
+            "cancelled analytical-path covariance must be Unusable(cancelled)"
         );
     }
 
