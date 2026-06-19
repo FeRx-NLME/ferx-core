@@ -20,6 +20,18 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Modeled infusion rate (`RATE=-1` → `R{cmt}`)** — NONMEM's coded `RATE=-1`
+  now makes the infusion *rate* a `$PK`-style individual parameter `R{cmt}`
+  (duration = `AMT/R{cmt}`), the mirror of the modeled-duration `RATE=-2`/`D{cmt}`
+  support. Works on both the analytical `pk(...)` engine and `ode(...)` models;
+  resolves per iteration/occasion and composes with `F`/lag/SS. A `RATE=-1` dose
+  with no matching `R{cmt}` is a loud `E_MODELED_RATE_NO_PARAM` error (never a
+  silent bolus), and a non-positive `R{cmt}` at the initial estimate warns
+  (`W_MODELED_RATE_NONPOSITIVE`). This completes NONMEM coded-`RATE` support
+  (#324). Note: under bioavailability `F ≠ 1`, ferx scales the infusion rate
+  (consistent with `RATE>0` infusions) while NONMEM scales the duration for
+  rate-defined infusions — same total exposure, different shape; reconciliation
+  is tracked separately.
 - **IIV on residual error (`iiv_on_ruv`)** — a random effect can now scale the
   residual error per subject (NONMEM `Y = IPRED + EPS*EXP(ETA)`). Declare an
   `omega` and reference it from `[error_model]` with `iiv_on_ruv = NAME`; the

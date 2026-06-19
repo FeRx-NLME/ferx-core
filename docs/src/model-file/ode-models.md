@@ -313,13 +313,51 @@ the closed-form engine — no `ode(...)` block needed. (Per-compartment amounts 
 exact; use an `ode(...)` model if you need the compartment amounts.) Infusing
 into an oral **peripheral** compartment is still not modelled by the closed forms,
 so a `D{periph}` (or any other non-infusable compartment) is **rejected at parse
-time** — use an `ode(...)` model. `RATE=-1` (modeled *rate*, `R{n}`) is not yet
-supported on either engine.
+time** — use an `ode(...)` model.
 
-> One subtlety: when a subject has any `RATE=-2` dose on an **analytical** model,
-> that subject's inner-loop gradient falls back to finite differences even under
-> `gradient = ad`, because the autodiff kernels cannot carry the duration's
-> `∂/∂η`. Results are unchanged; only the gradient route differs.
+> One subtlety: when a subject has any modeled-`RATE` dose (`RATE=-2` or `-1`) on
+> an **analytical** model, that subject's inner-loop gradient falls back to finite
+> differences even under `gradient = ad`, because the autodiff kernels cannot
+> carry the duration/rate's `∂/∂η`. Results are unchanged; only the gradient route
+> differs.
+
+### Modeled infusion rate (`Rn`, `RATE=-1`)
+
+NONMEM's `RATE = -1` is the mirror of `-2`: it makes the infusion **rate** a model
+parameter rather than a data value. Name an individual parameter `R{n}` for the
+dose compartment `n` and code `RATE = -1` on the dose row; ferx then infuses `AMT`
+at the modeled rate `R{n}` — i.e. over duration `AMT / R{n}` — resolved **per
+iteration and occasion**, so the rate can carry covariate effects and
+between-occasion variability:
+
+```text
+[individual_parameters]
+  R1 = TVR1 * exp(ETA_R1)   # modeled rate for infusions into compartment 1
+```
+
+```text
+# dataset: a RATE=-1 dose of 100 units into compartment 1
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+1,0,.,1,100,1,-1,1
+```
+
+Everything said about `D{n}` applies symmetrically: a `RATE=-1` dose **requires** a
+matching `R{n}` (else a loud `E_MODELED_RATE_NO_PARAM` error, never a silent
+bolus); `R{n}` is a **reserved name** when a `RATE=-1` dose targets compartment
+`n`; it works on **both engines** over the same infusable compartments; a transient
+`R{n} ≤ 0` is clamped to a tiny positive floor (and warned via
+`W_MODELED_RATE_NONPOSITIVE` if non-positive at the initial estimate); and a
+modeled-rate dose routes its analytical gradient to finite differences. Internally,
+`RATE=-1 R{n}=r` resolves to exactly the explicit `RATE = r` infusion.
+
+> ⚠️ **Bioavailability `F ≠ 1`.** ferx applies `F` by scaling the infusion *rate*
+> (over the duration `AMT/R{n}`), so a `RATE=-1` dose behaves identically to its
+> explicit `RATE = R{n}` twin — exact at `F = 1` (the usual case, and the
+> NONMEM-anchored one). NONMEM instead keeps the rate at `R{n}` and scales the
+> *duration* to `F·AMT/R{n}` for rate-defined infusions; total exposure (`F·AMT`)
+> agrees but the infusion shape differs when `F ≠ 1`. Aligning rate-defined
+> infusions (`RATE>0` and `RATE=-1`) with NONMEM's duration-scaling under `F ≠ 1`
+> is a tracked follow-up.
 
 ## Stochastic ODE Models (SDE)
 

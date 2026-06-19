@@ -1269,74 +1269,82 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Tier 4a milestone-2 partial-derivative builder.
     let n_eta_extended_for_partials = eta_names.len();
 
-    // Compartment-indexed modeled-dose duration (`D{cmt}` for `RATE=-2`; #324/#394)
-    // for ANALYTICAL models. ODE models build their `dose_attr_map` inside
-    // `build_ode_spec` (routing `D{cmt}` through `ode_param_slots`); analytical
-    // models route only canonical PK names into `PkParams`, so a `D{cmt}`
-    // individual parameter would otherwise be evaluated and discarded. Route each
-    // into a free `PkParams` slot — the spare region above the canonical PK slots
+    // Compartment-indexed modeled-dose attributes (`D{cmt}` for `RATE=-2`
+    // duration, `R{cmt}` for `RATE=-1` rate; #324) for ANALYTICAL models. ODE
+    // models build their `dose_attr_map` inside `build_ode_spec` (routing
+    // `D{cmt}`/`R{cmt}` through `ode_param_slots`); analytical models route only
+    // canonical PK names into `PkParams`, so a `D{cmt}`/`R{cmt}` individual
+    // parameter would otherwise be evaluated and discarded. Route each into a
+    // free `PkParams` slot — the spare region above the canonical PK slots
     // (`PK_IDX_LAGTIME + 1 ..= MAX_PK_PARAMS - 1`), which analytical models never
-    // touch — and record `(Duration, cmt) -> slot` so the analytical predictor can
-    // resolve the modeled duration via `DoseEvent::resolve_rate`, exactly as the
-    // ODE path does. `analytical_dur_slots` carries `(var_name, slot)` into
+    // touch — and record `(attr, cmt) -> slot` so the analytical predictor can
+    // resolve the modeled dose via `DoseEvent::resolve_rate`, exactly as the ODE
+    // path does. `analytical_modeled_slots` carries `(var_name, slot)` into
     // `build_pk_param_fn` so its closure writes the value alongside the canonical
     // PK assignments. Empty (and the map stays `Default`) for ODE models and for
-    // the common analytical model with no `RATE=-2` dosing.
+    // the common analytical model with no `RATE=-1`/`-2` dosing.
     let mut analytical_dose_attr_map = crate::types::DoseAttrMap::default();
-    let mut analytical_dur_slots: Vec<(String, usize)> = Vec::new();
+    let mut analytical_modeled_slots: Vec<(String, usize)> = Vec::new();
     if !is_ode {
         let mut next_slot = crate::types::PK_IDX_LAGTIME + 1;
         for name in &indiv_var_names {
-            // Only modeled *duration* (`D{cmt}`) is routed here. `F{cmt}`/`ALAG{cmt}`
-            // collapse to the single analytical dose route (the bare `PK_IDX_F` /
-            // `PK_IDX_LAGTIME` slots), so although `from_indexed_name` recognises
-            // them they are not routed for analytical models. `R{cmt}` (RATE=-1) is
-            // not recognised at all yet (Phase B).
+            // Only the modeled-`RATE` attributes (`D{cmt}` duration, `R{cmt}`
+            // rate) are routed here. `F{cmt}`/`ALAG{cmt}` collapse to the single
+            // analytical dose route (the bare `PK_IDX_F` / `PK_IDX_LAGTIME`
+            // slots), so although `from_indexed_name` recognises them they are not
+            // routed for analytical models.
             let Some((attr, cmt)) = crate::types::DoseAttr::from_indexed_name(name) else {
                 continue;
             };
-            if attr != crate::types::DoseAttr::Duration {
-                continue;
-            }
-            // Reject a `D{cmt}` whose compartment the analytical engine cannot
-            // infuse into — the central compartment for every model, plus the
-            // peripheral compartment(s) of the 2-/3-cpt IV models, but NOT an oral
-            // depot or oral peripheral (see `PkModel::infusable_compartments`). A
-            // looser bound (e.g. raw compartment count) would let a `RATE=-2` into
-            // an oral depot pass parse + the data gate, then either silently route
-            // into central (no-TV superposition) or panic in the event-driven
-            // walker — the silent/abrupt failure class this feature exists to
-            // prevent. Caught here at parse time with an actionable message.
+            // NONMEM-faithful display of the attribute for diagnostics: the DSL
+            // parameter prefix, the RATE code that drives it, and the noun. `F`/
+            // `Lag` are not modeled-dose attributes on the analytical engine.
+            let (param_prefix, rate_code, kind) = match attr {
+                crate::types::DoseAttr::Duration => ("D", "-2", "duration"),
+                crate::types::DoseAttr::Rate => ("R", "-1", "rate"),
+                crate::types::DoseAttr::F | crate::types::DoseAttr::Lag => continue,
+            };
+            // Reject a `D{cmt}`/`R{cmt}` whose compartment the analytical engine
+            // cannot infuse into — the central compartment for every model, plus
+            // the peripheral compartment(s) of the 2-/3-cpt IV models, but NOT an
+            // oral depot or oral peripheral (see `PkModel::infusable_compartments`).
+            // A looser bound (e.g. raw compartment count) would let a coded `RATE`
+            // into an oral depot pass parse + the data gate, then either silently
+            // route into central (no-TV superposition) or panic in the
+            // event-driven walker — the silent/abrupt failure class this feature
+            // exists to prevent. Caught here at parse time with an actionable
+            // message.
             let infusable = pk_model.infusable_compartments();
             if !infusable.contains(&cmt) {
                 let supported = infusable
                     .iter()
-                    .map(|c| format!("`D{c}`"))
+                    .map(|c| format!("`{param_prefix}{c}`"))
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(format!(
-                    "[individual_parameters]: `{name}` is a modeled infusion duration \
-                     (RATE=-2) for compartment {cmt}, but the analytical `{}` model can \
-                     only infuse into compartment(s) {:?} ({supported}). A zero-order \
+                    "[individual_parameters]: `{name}` is a modeled infusion {kind} \
+                     (RATE={rate_code}) for compartment {cmt}, but the analytical `{}` model \
+                     can only infuse into compartment(s) {:?} ({supported}). A zero-order \
                      input into another compartment (e.g. an oral depot) needs an \
                      `ode(...)` model.",
                     pk_model.canonical_name(),
                     infusable,
                 ));
             }
-            // `infusable_compartments()` has ≤ 3 entries, so at most 3 distinct
-            // `D{cmt}` parameters are routed — comfortably inside the 9..16 spare
+            // `infusable_compartments()` has ≤ 3 entries and at most one `D` and
+            // one `R` per compartment, so at most 6 distinct modeled-dose
+            // parameters are routed — comfortably inside the 9..16 (7-slot) spare
             // region. A debug assertion documents that invariant without a
             // permanently-dead user-facing error arm.
             debug_assert!(
                 next_slot < crate::types::MAX_PK_PARAMS,
-                "modeled-duration slot {next_slot} exceeds MAX_PK_PARAMS; \
-                 infusable_compartments() should have bounded the D{{cmt}} count"
+                "modeled-dose slot {next_slot} exceeds MAX_PK_PARAMS; \
+                 infusable_compartments() should have bounded the D{{cmt}}/R{{cmt}} count"
             );
             let slot = next_slot;
             next_slot += 1;
             analytical_dose_attr_map.insert(attr, cmt, slot);
-            analytical_dur_slots.push((name.clone(), slot));
+            analytical_modeled_slots.push((name.clone(), slot));
         }
     }
 
@@ -1345,7 +1353,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         &pk_param_map,
         &indiv_var_names,
         &ode_slot_map,
-        &analytical_dur_slots,
+        &analytical_modeled_slots,
         thetas.len(),
         n_eta_extended_for_partials,
         #[cfg(feature = "nn")]
@@ -6773,11 +6781,11 @@ fn build_pk_param_fn(
     pk_param_map: &HashMap<String, String>,
     var_names: &[String],
     ode_slot_map: &[usize],
-    // Analytical modeled-duration (`D{cmt}`, RATE=-2) parameters as
-    // `(var_name, PkParams slot)`; the closure writes each value into its
-    // reserved spare slot in the analytical arm. Empty for ODE models and for
-    // analytical models with no `RATE=-2` dosing. See #324/#394.
-    analytical_dur_slots: &[(String, usize)],
+    // Analytical modeled-dose (`D{cmt}` RATE=-2 duration, `R{cmt}` RATE=-1 rate)
+    // parameters as `(var_name, PkParams slot)`; the closure writes each value
+    // into its reserved spare slot in the analytical arm. Empty for ODE models
+    // and for analytical models with no `RATE=-1`/`-2` dosing. See #324.
+    analytical_modeled_slots: &[(String, usize)],
     n_theta_base: usize,
     n_eta_extended: usize,
     #[cfg(feature = "nn")] covariate_nns: &[crate::nn::CovariateNn],
@@ -6889,12 +6897,12 @@ fn build_pk_param_fn(
     }
     let is_analytical_pk = !pk_param_map.is_empty();
 
-    // Resolve each analytical modeled-duration parameter's value slot once, to
+    // Resolve each analytical modeled-dose parameter's value slot once, to
     // `(PkParams write slot, var slot)`, so the hot closure is two array reads.
-    // Empty unless this is an analytical model with `D{cmt}` (RATE=-2) declared.
-    // A name with no matching var slot is dropped (defensive — it would have
-    // errored earlier as an undefined reference).
-    let analytical_extra_mapping: Vec<(usize, usize)> = analytical_dur_slots
+    // Empty unless this is an analytical model with `D{cmt}`/`R{cmt}` (RATE=-2/-1)
+    // declared. A name with no matching var slot is dropped (defensive — it would
+    // have errored earlier as an undefined reference).
+    let analytical_extra_mapping: Vec<(usize, usize)> = analytical_modeled_slots
         .iter()
         .filter_map(|(var_name, pk_slot)| {
             let var_slot = var_idx
@@ -19192,6 +19200,129 @@ CL V KA WT
             err.contains("compartment 3") && err.contains("D3") && err.contains("ode("),
             "error must name the compartment, the param, and point to ode(...): {err}"
         );
+    }
+
+    #[test]
+    fn analytical_modeled_rate_param_populates_map() {
+        // Mirror of `analytical_modeled_duration_param_populates_map` for the
+        // modeled-*rate* form: an `R1` parameter (RATE=-1) in an ANALYTICAL model
+        // (#324) must parse and bind `(Rate, 1)` in `CompiledModel.dose_attr_map`,
+        // routed to a spare PkParams slot above the canonical slots.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVR1(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R1 = TVR1
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("R1 parses on analytical model");
+        assert!(
+            parsed.model.ode_spec.is_none(),
+            "model must be analytical (no ode_spec)"
+        );
+        let slot = parsed
+            .model
+            .dose_attr_map
+            .indexed_slot(crate::types::DoseAttr::Rate, 1)
+            .expect("R1 must map as modeled rate for compartment 1");
+        assert!(
+            slot > crate::types::PK_IDX_LAGTIME && slot < crate::types::MAX_PK_PARAMS,
+            "R1 must land in a spare slot ({} < slot < {}), got {slot}",
+            crate::types::PK_IDX_LAGTIME,
+            crate::types::MAX_PK_PARAMS
+        );
+        // It is a Rate, not a Duration.
+        assert!(parsed
+            .model
+            .dose_attr_map
+            .indexed_slot(crate::types::DoseAttr::Duration, 1)
+            .is_none());
+    }
+
+    #[test]
+    fn analytical_modeled_rate_out_of_range_compartment_errors() {
+        // `R2` on a 1-cpt IV analytical model is not an infusable compartment
+        // (infusable = {1}) — a loud parse error naming the rate attribute and
+        // RATE=-1, never a silently-ignored slot (#324). Mirrors the duration case.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVR2(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R2 = TVR2
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(src)
+            .err()
+            .expect("R2 on a 1-compartment analytical model must error");
+        assert!(
+            err.contains("compartment 2")
+                && err.contains("R2")
+                && err.contains("rate")
+                && err.contains("-1"),
+            "error must name the attribute, compartment, and RATE=-1, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ode_modeled_rate_param_populates_map() {
+        // The ODE engine routes `R{cmt}` through the same `from_indexed_name`
+        // gate as `D{cmt}` (no engine-specific code), so an `R1` parameter on an
+        // ODE model must bind `(Rate, 1)` in the `ode_spec`'s `dose_attr_map`.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVR1(10.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  R1 = TVR1
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V)*central
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let parsed = parse_full_model(src).expect("R1 parses on ODE model");
+        let ode = parsed
+            .model
+            .ode_spec
+            .as_ref()
+            .expect("model must be an ODE model");
+        ode.dose_attr_map
+            .indexed_slot(crate::types::DoseAttr::Rate, 1)
+            .expect("R1 must map as modeled rate for compartment 1 in the ode_spec");
     }
 
     #[test]

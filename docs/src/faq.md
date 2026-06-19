@@ -301,22 +301,25 @@ duration from a `$PK` parameter rather than the data:
 |--------|----------------|------|
 | `0`    | Bolus — route set by the dose compartment | supported |
 | `> 0`  | Constant-rate infusion, duration = `AMT/RATE` | supported |
-| `-1`   | Infusion **rate** modeled — `R1` defined in `$PK` | rejected (error) |
+| `-1`   | Infusion **rate** modeled — `R1` defined in `$PK` | supported, both engines (#324) |
 | `-2`   | Infusion **duration** modeled — `D1` defined in `$PK` | supported, both engines (#324, #394) |
 
-`RATE = -2` is supported on both the analytical `pk(...)` engine and `ode(...)`
-models: declare a `D{cmt}` individual parameter and ferx infuses `AMT` over that
-modeled duration (rate `AMT / D{cmt}`), evaluated per iteration and occasion —
-matching NONMEM's `$PK D{n}`. A `RATE=-2` dose with no matching `D{cmt}`
-parameter is a loud error, never a silent bolus.
+`RATE = -2` (duration) and `RATE = -1` (rate) are both supported on the analytical
+`pk(...)` engine and `ode(...)` models. Declare the matching `$PK`-style parameter
+— `D{cmt}` for `-2` (ferx infuses `AMT` over that duration, rate `AMT / D{cmt}`)
+or `R{cmt}` for `-1` (ferx infuses at that rate, duration `AMT / R{cmt}`) —
+evaluated per iteration and occasion, matching NONMEM's `$PK D{n}` / `R{n}`. A
+coded `RATE` with no matching parameter is a loud error
+(`E_MODELED_DURATION_NO_PARAM` / `E_MODELED_RATE_NO_PARAM`), never a silent bolus.
+Both codes are *parameter*-driven; neither reads a separate `DURATION` data column.
+Any other negative or non-finite `RATE` is rejected — earlier versions silently
+misread the coded forms as a bolus (#324).
 
-`RATE = -1` (modeled *rate*, `R{cmt}`) is not yet supported, so `-1` (and any
-other negative or non-finite `RATE`) on a dose row produces an informative error
-rather than being silently misread as a bolus — the behaviour in versions before
-#324. To port such a model today, replace `-1` with an explicit positive infusion
-rate (`AMT` ÷ the intended duration), or model the duration with `-2` instead.
-Both codes are *parameter*-driven in NONMEM; neither reads a separate `DURATION`
-data column.
+For bioavailability `F ≠ 1` on a `RATE=-1` infusion, ferx scales the rate (so a
+`RATE=-1` dose behaves exactly like its explicit `RATE = R{cmt}` twin); NONMEM
+instead scales the duration. Total exposure (`F·AMT`) agrees; the infusion shape
+differs only when `F ≠ 1` on a rate-defined infusion (a tracked follow-up). At
+`F = 1`, ferx and NONMEM coincide.
 
 `RATE=0` denotes a *bolus*, not specifically an *intravenous* dose: the route
 follows the dose compartment — a bolus into the central compartment is

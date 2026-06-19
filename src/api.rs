@@ -736,32 +736,51 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
 fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     use crate::types::{DoseAttr, RateMode};
     let mut diags = Vec::new();
-    // De-dup by compartment so N identical RATE=-2 rows give one error, not N.
-    let mut reported: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    // De-dup by (attribute, compartment) so N identical coded-RATE rows give one
+    // error, not N — and a `D{cmt}` and an `R{cmt}` dose into the same compartment
+    // are reported independently rather than masking each other.
+    let mut reported: std::collections::HashSet<(DoseAttr, usize)> =
+        std::collections::HashSet::new();
     for subject in &population.subjects {
         for dose in &subject.doses {
-            if dose.rate_mode != RateMode::ModeledDuration || !reported.insert(dose.cmt) {
+            // Map the modeled mode to its dose attribute + NONMEM-faithful naming
+            // (the `RATE` code, the noun, the `$PK` parameter letter, and the
+            // engine-agnostic error code). `Fixed` doses need no slot.
+            let (attr, code, kind, err_code, param) = match dose.rate_mode {
+                RateMode::Fixed => continue,
+                RateMode::ModeledDuration => (
+                    DoseAttr::Duration,
+                    "-2",
+                    "duration",
+                    "E_MODELED_DURATION_NO_PARAM",
+                    "D",
+                ),
+                RateMode::ModeledRate => {
+                    (DoseAttr::Rate, "-1", "rate", "E_MODELED_RATE_NO_PARAM", "R")
+                }
+            };
+            if !reported.insert((attr, dose.cmt)) {
                 continue;
             }
             let cmt = dose.cmt;
-            // A `RATE=-2` dose into compartment `cmt` requires a matching `D{cmt}`
-            // parameter so `resolve_rate` has a slot to read — for BOTH engines.
-            // `active_dose_attr_map()` returns the engine-correct map (the
-            // `OdeSpec`'s for ODE models, the analytical field otherwise, #394), so
-            // an absent slot is the same actionable error on either engine.
+            // A coded-`RATE` dose into compartment `cmt` requires a matching
+            // `D{cmt}`/`R{cmt}` parameter so `resolve_rate` has a slot to read — for
+            // BOTH engines. `active_dose_attr_map()` returns the engine-correct map
+            // (the `OdeSpec`'s for ODE models, the analytical field otherwise,
+            // #324), so an absent slot is the same actionable error on either engine.
             let has_slot = model
                 .active_dose_attr_map()
-                .indexed_slot(DoseAttr::Duration, cmt)
+                .indexed_slot(attr, cmt)
                 .is_some();
             if !has_slot {
                 diags.push(
                     Diagnostic::error(
-                        "E_MODELED_DURATION_NO_PARAM",
+                        err_code,
                         format!(
-                            "subject {}, time {}: RATE=-2 (modeled infusion duration) into \
-                             compartment {cmt} requires a `D{cmt}` parameter in \
+                            "subject {}, time {}: RATE={code} (modeled infusion {kind}) into \
+                             compartment {cmt} requires a `{param}{cmt}` parameter in \
                              [individual_parameters], but none is declared. Add \
-                             `D{cmt} = ...` (the modeled duration), or supply an explicit \
+                             `{param}{cmt} = ...` (the modeled {kind}), or supply an explicit \
                              positive RATE.",
                             subject.id, dose.time
                         ),
@@ -775,8 +794,9 @@ fn check_modeled_dose_rates(model: &CompiledModel, population: &Population) -> V
 }
 
 /// Precondition shared by [`predict`] and the `simulate*` family: every
-/// modeled-`RATE` dose (#324, e.g. `RATE=-2` → `D{cmt}`) must be supported by
-/// the model (an ODE engine with the matching `D{cmt}` parameter).
+/// modeled-`RATE` dose (#324: `RATE=-2` → `D{cmt}` duration, `RATE=-1` → `R{cmt}`
+/// rate) must be supported by the model — the matching `D{cmt}`/`R{cmt}`
+/// parameter exists and infuses an infusable compartment, on either engine.
 ///
 /// `fit()` enforces this via [`first_error`] over the full [`check_model_data`],
 /// but `predict()` / `simulate()` deliberately skip that data-check (they assume
@@ -984,41 +1004,39 @@ pub fn check_model_data_warnings(
 
     // SS=1 infusion with T_inf > II — overlapping pulses have no closed form;
     // the SS pre-equilibration is skipped. The effective infusion length is
-    // `d.duration` for an ordinary infusion, but for a modeled-duration dose
-    // (RATE=-2 → `D{cmt}`; #324) it is unresolved here (`rate`/`duration` are 0
-    // until `resolve_rate`), so resolve `D{cmt}` at the typical-value point.
+    // `d.duration` for an ordinary infusion, but for a modeled dose (RATE=-2 →
+    // `D{cmt}` duration, or RATE=-1 → `R{cmt}` rate; #324) it is unresolved here
+    // (`rate`/`duration` are 0 until `resolve_rate`), so resolve it at the
+    // typical-value point through the engine-correct `active_dose_attr_map()`.
     //
     // Resolution goes through the single-source-of-truth `DoseEvent::resolve_rate`
-    // (the same rule + `DURATION_FLOOR` clamp the integrator applies at runtime),
-    // not a hand-rolled slot read, so the warning's notion of "duration" can't
-    // drift from the integrator's. It is a *typical-value* heuristic: it uses
-    // init theta, eta = 0, and this subject's covariates, whereas runtime uses
+    // (the same rule + floor clamps the integrator applies at runtime), not a
+    // hand-rolled slot read, so the warning's notion of "duration" can't drift
+    // from the integrator's. It is a *typical-value* heuristic: it uses init
+    // theta, eta = 0, and this subject's covariates, whereas runtime uses
     // per-occasion eta/IOV — a modeled SS infusion whose duration crosses `II`
     // only on some occasions may not be flagged here (and conversely a typical
     // overlap may not occur on every occasion). The runtime SS-skip is the
     // backstop; this catches the common typical-value / covariate-driven overlap.
-    // (Analytical models reject modeled doses upstream, so the `ode_spec`-less
-    // branch only sees `Fixed` doses.)
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let effective_duration = |s: &Subject, d: &DoseEvent| -> f64 {
-        if d.is_fixed() {
-            return d.duration;
-        }
-        match &model.ode_spec {
-            // Guard the `D{cmt}` slot's existence: a modeled dose with no matching
-            // parameter is an *error* (`E_MODELED_DURATION_NO_PARAM`), but this
-            // warnings pass must stay panic-free if run on such a model rather than
-            // hit `resolve_rate`'s slot `.expect`.
-            Some(ode)
-                if ode
-                    .dose_attr_map
-                    .indexed_slot(crate::types::DoseAttr::Duration, d.cmt)
-                    .is_some() =>
-            {
-                let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates);
-                d.resolve_rate(&ode.dose_attr_map, &pk.values).duration
-            }
-            _ => 0.0,
+        use crate::types::{DoseAttr, RateMode};
+        // The dose attribute whose slot holds this modeled dose's value.
+        let attr = match d.rate_mode {
+            RateMode::Fixed => return d.duration,
+            RateMode::ModeledDuration => DoseAttr::Duration,
+            RateMode::ModeledRate => DoseAttr::Rate,
+        };
+        // Guard the slot's existence: a modeled dose with no matching parameter is
+        // an upstream *error* (`E_MODELED_DURATION_NO_PARAM` / `E_MODELED_RATE_NO_PARAM`),
+        // but this warnings pass must stay panic-free if run on such a model rather
+        // than hit `resolve_rate`'s slot `.expect`.
+        let attr_map = model.active_dose_attr_map();
+        if attr_map.indexed_slot(attr, d.cmt).is_some() {
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates);
+            d.resolve_rate(attr_map, &pk.values).duration
+        } else {
+            0.0
         }
     };
     let n_ss_overlapping_inf = population
@@ -1045,34 +1063,44 @@ pub fn check_model_data_warnings(
         ));
     }
 
-    // Modeled infusion duration `D{cmt}` (RATE=-2; #324) that is non-positive at
-    // the initial typical-value point (eta = 0). `resolve_rate` clamps a transient
-    // `D ≤ 0` to `DURATION_FLOOR` so `AMT/D` stays finite mid-search, but a
-    // non-positive `D` *at the initial estimate* signals a misspecified
-    // parameterisation: every iteration then delivers `AMT` over ~`DURATION_FLOOR`
-    // — a bolus-like spike, not an infusion — and the fit can converge wrong with
-    // no other diagnostic. Flag it (analogous to W_NEGATIVE_LAGTIME) and point at
-    // a positive-link parameterisation. De-duped per compartment.
-    if let Some(ode) = &model.ode_spec {
-        use crate::types::{DoseAttr, DoseEvent};
-        let mut nonpos_cmts: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    // Modeled coded-RATE parameters (`D{cmt}` for RATE=-2 duration, `R{cmt}` for
+    // RATE=-1 rate; #324) that are non-positive at the initial typical-value point
+    // (eta = 0). `resolve_rate` clamps a transient `D ≤ 0` / `R ≤ 0` to its floor
+    // so `AMT/D` / `AMT/R` stays finite mid-search, but a non-positive value *at
+    // the initial estimate* signals a misspecified parameterisation — a `D ≤ 0`
+    // delivers the dose as a bolus-like spike, an `R ≤ 0` as a near-zero trickle
+    // over a near-infinite duration — and the fit can converge wrong with no other
+    // diagnostic. Flag it (analogous to W_NEGATIVE_LAGTIME) and point at a
+    // positive-link parameterisation. Engine-agnostic via `active_dose_attr_map()`
+    // (covers analytical models too, #394/#395). De-duped per compartment per kind.
+    {
+        use crate::types::{DoseAttr, DoseEvent, RateMode};
+        let attr_map = model.active_dose_attr_map();
+        let mut nonpos_dur: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mut nonpos_rate: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         for s in &population.subjects {
             let mut pk_at_init: Option<crate::types::PkParams> = None;
             for d in &s.doses {
-                if d.is_fixed() {
-                    continue;
-                }
-                if let Some(slot) = ode.dose_attr_map.indexed_slot(DoseAttr::Duration, d.cmt) {
+                let (attr, floor) = match d.rate_mode {
+                    RateMode::Fixed => continue,
+                    RateMode::ModeledDuration => (DoseAttr::Duration, DoseEvent::DURATION_FLOOR),
+                    RateMode::ModeledRate => (DoseAttr::Rate, DoseEvent::RATE_FLOOR),
+                };
+                if let Some(slot) = attr_map.indexed_slot(attr, d.cmt) {
                     let pk = pk_at_init.get_or_insert_with(|| {
                         (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates)
                     });
-                    if pk.values[slot] <= DoseEvent::DURATION_FLOOR {
-                        nonpos_cmts.insert(d.cmt);
+                    if pk.values[slot] <= floor {
+                        match attr {
+                            DoseAttr::Duration => nonpos_dur.insert(d.cmt),
+                            DoseAttr::Rate => nonpos_rate.insert(d.cmt),
+                            DoseAttr::F | DoseAttr::Lag => unreachable!("only D/R reach here"),
+                        };
                     }
                 }
             }
         }
-        for cmt in nonpos_cmts {
+        for cmt in nonpos_dur {
             diags.push(Diagnostic::warning(
                 "W_MODELED_DURATION_NONPOSITIVE",
                 format!(
@@ -1085,6 +1113,22 @@ pub fn check_model_data_warnings(
                      (e.g. D{cmt} = exp(...)).",
                     cmt = cmt,
                     floor = DoseEvent::DURATION_FLOOR,
+                ),
+            ));
+        }
+        for cmt in nonpos_rate {
+            diags.push(Diagnostic::warning(
+                "W_MODELED_RATE_NONPOSITIVE",
+                format!(
+                    "Modeled infusion rate R{cmt} (RATE=-1 into compartment \
+                     {cmt}) evaluates to ≤ 0 at the initial typical-value point \
+                     (eta = 0). A non-positive rate is clamped to {floor:e} to keep \
+                     the implied duration AMT/R finite, which delivers the dose as a \
+                     near-zero trickle over a near-infinite duration — the fit may \
+                     converge to a wrong optimum. Use a positive-link \
+                     parameterisation (e.g. R{cmt} = exp(...)).",
+                    cmt = cmt,
+                    floor = DoseEvent::RATE_FLOOR,
                 ),
             ));
         }

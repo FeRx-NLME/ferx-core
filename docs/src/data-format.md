@@ -17,7 +17,7 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 | `EVID` | integer | 0 | Event ID: 0 = observation, 1 = dose, 2 = other event, 3 = system reset, 4 = reset + dose. If the column is omitted, the record type is inferred from `AMT` — see [Inferring doses without an `EVID` column](#inferring-doses-without-an-evid-column). |
 | `AMT` | numeric | 0 | Dose amount (for `EVID=1`/`EVID=4`; also the dose-inference signal when `EVID` is absent) |
 | `CMT` | integer | 1 | Compartment number (1-indexed) |
-| `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM's coded value `-2` (modeled duration via a `D{cmt}` `$PK` parameter) is supported on both analytical and ODE models; `-1` (modeled rate) is not yet supported — see [Infusion Doses](#infusion-doses). |
+| `RATE` | numeric | 0 | Infusion rate. `0` = bolus, `>0` = constant-rate infusion (duration = `AMT/RATE`). NONMEM's coded values `-1` (modeled rate via an `R{cmt}` `$PK` parameter) and `-2` (modeled duration via a `D{cmt}` `$PK` parameter) are supported on both analytical and ODE models — see [Infusion Doses](#infusion-doses). |
 | `MDV` | integer | 0 | Missing DV flag. 1 = DV should be ignored (row excluded from the likelihood) |
 | `II` | numeric | 0 | Interdose interval for repeated dosing |
 | `SS` | integer | 0 | Steady-state flag. 1 = assume steady state |
@@ -229,7 +229,7 @@ NONMEM overloads the `RATE` column with negative codes that change its meaning:
 |--------|----------------|-----------|
 | `0`    | Bolus — route set by the dose compartment | ✅ supported |
 | `> 0`  | Constant-rate infusion (duration = `AMT/RATE`) | ✅ supported |
-| `-1`   | Infusion **rate** is *modeled* — defined by `R{cmt}` in `$PK` | ⛔ not yet supported (error) |
+| `-1`   | Infusion **rate** is *modeled* — defined by `R{cmt}` in `$PK` | ✅ supported on ODE and analytical models (#324) |
 | `-2`   | Infusion **duration** is *modeled* — defined by `D{cmt}` in `$PK` | ✅ supported on ODE and analytical models (#324, #394) |
 
 `RATE = -2` makes the infusion **duration** a model parameter: declare an
@@ -252,11 +252,28 @@ the predictions themselves are exact — use an `ode(...)` model if you need the
 per-compartment amounts.) Infusion into an oral **peripheral** compartment is
 still unsupported and needs an `ode(...)` model.
 
-`RATE = -1` (modeled rate, `R{cmt}`) is not yet supported; convert such rows to
-an explicit positive `RATE`, or model the duration with `-2` instead. Any other
-negative or non-finite `RATE` on a dose row is also rejected. Earlier versions
-silently treated all coded forms as a bolus, producing wrong predictions with no
-warning (#324). Note `-1`/`-2` are driven by `$PK` parameters — **not** a
+`RATE = -1` makes the infusion **rate** a model parameter: declare an individual
+parameter `R{cmt}` (`R1` for a dose into compartment 1, etc.) and ferx infuses
+`AMT` at that rate — duration `AMT / R{cmt}`, evaluated per iteration and
+occasion (the mirror of `-2`). Supported on both engines; a `RATE=-1` dose with
+no matching `R{cmt}` is the same loud `E_MODELED_RATE_NO_PARAM` error as the
+duration case. `R{cmt}`/`D{cmt}` are recognised compartment-indexed parameter
+names (like NONMEM's reserved `$PK` names); recognising one only reserves it when
+a coded `RATE` actually targets that compartment.
+
+> **Bioavailability and `RATE=-1` (`F ≠ 1`).** ferx applies `F` by scaling the
+> infusion **rate** over the (data- or model-defined) duration, so a `RATE=-1`
+> dose behaves exactly like its explicit `RATE = R{cmt}` twin. This is exact at
+> `F = 1` (the usual case for IV/SC infusions, and the NONMEM-anchored case). For
+> a *rate*-defined infusion with `F ≠ 1`, NONMEM instead keeps the rate at
+> `R{cmt}` and scales the **duration** to `F·AMT/R{cmt}` — same total exposure
+> `F·AMT`, different infusion shape. ferx's uniform rate-scaling (shared with
+> `RATE>0` infusions, #327) is the current behaviour; aligning rate-defined
+> infusions with NONMEM's duration-scaling under `F ≠ 1` is a tracked follow-up.
+
+Any other negative or non-finite `RATE` on a dose row is rejected. Earlier
+versions silently treated all coded forms as a bolus, producing wrong predictions
+with no warning (#324). Note `-1`/`-2` are driven by `$PK` parameters — **not** a
 separate `DURATION` data column.
 
 A runnable demo of the supported forms — a bolus (`RATE=0`) and a constant-rate
