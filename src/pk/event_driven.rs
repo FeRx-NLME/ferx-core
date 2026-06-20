@@ -521,16 +521,17 @@ pub fn event_driven_predictions(
     let dose_lagtimes: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
     // Bioavailability-adjusted doses: `F` reshapes a rate-defined infusion by
     // scaling its duration (#419), which moves the infusion-end break time. Build
-    // the schedule from these so the (non-cached, per-call) break times track `F`.
-    // `_with_schedule` recomputes the same adjusted doses for the propagation; the
+    // the schedule from these so the (non-cached, per-call) break times track `F`,
+    // and hand the same `eff_doses` to the walk so they are built only once (the
     // cached fast path stays correct because it only caches when `F` cannot reshape
-    // a window (see `inner_optimizer`/`bayes` schedule gating).
+    // a window — see `inner_optimizer`/`bayes` schedule gating).
     let eff_doses: Vec<DoseEvent> = bioavailable_doses(subject, pk_at_dose);
     let schedule = EventSchedule::for_subject(subject, pk_model, &eff_doses, &dose_lagtimes);
-    event_driven_predictions_with_schedule(
+    event_driven_predictions_run(
         pk_model,
         subject,
         &schedule,
+        &eff_doses,
         pk_at_dose,
         pk_at_obs,
         pk_at_pk_only,
@@ -551,28 +552,49 @@ pub fn event_driven_predictions_with_schedule(
     pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
 ) -> Vec<f64> {
-    if !profile_enabled() {
-        return event_driven_predictions_with_schedule_impl(
-            pk_model,
-            subject,
-            schedule,
-            pk_at_dose,
-            pk_at_obs,
-            pk_at_pk_only,
-        );
-    }
-    let t0 = std::time::Instant::now();
-    let r = event_driven_predictions_with_schedule_impl(
+    // `eff_doses` are built here (once) and threaded into the walk so the
+    // bioavailability adjustment is not recomputed per call (#419).
+    let eff_doses = bioavailable_doses(subject, pk_at_dose);
+    event_driven_predictions_run(
         pk_model,
         subject,
         schedule,
+        &eff_doses,
+        pk_at_dose,
+        pk_at_obs,
+        pk_at_pk_only,
+    )
+}
+
+/// Profiling wrapper around [`event_driven_predictions_with_schedule_impl`],
+/// taking the pre-built bioavailability-adjusted `eff_doses` so both entry points
+/// ([`event_driven_predictions`] and [`event_driven_predictions_with_schedule`])
+/// build them exactly once (#419).
+#[allow(clippy::too_many_arguments)]
+fn event_driven_predictions_run(
+    pk_model: PkModel,
+    subject: &Subject,
+    schedule: &EventSchedule,
+    eff_doses: &[DoseEvent],
+    pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams],
+) -> Vec<f64> {
+    let t0 = profile_enabled().then(std::time::Instant::now);
+    let preds = event_driven_predictions_with_schedule_impl(
+        pk_model,
+        subject,
+        schedule,
+        eff_doses,
         pk_at_dose,
         pk_at_obs,
         pk_at_pk_only,
     );
-    PROFILE_PRED_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    PROFILE_PRED_CALLS.fetch_add(1, Ordering::Relaxed);
-    r
+    if let Some(t0) = t0 {
+        PROFILE_PRED_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        PROFILE_PRED_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    preds
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -580,6 +602,14 @@ fn event_driven_predictions_with_schedule_impl(
     pk_model: PkModel,
     subject: &Subject,
     schedule: &EventSchedule,
+    // Bioavailability-adjusted doses (`F` applied once, up front; #419). Every
+    // infusion site below reads these instead of `subject.doses`, so the injected
+    // rate and the infusion window already carry `F`. A bolus is unchanged here
+    // and gets `F` on its amount via `bioavailable_amount`. The passed `schedule`'s
+    // break times must match these durations: the non-cached path built it from the
+    // same adjusted doses, and the cached path only caches when `F` cannot reshape a
+    // rate-defined window. Built once by the caller (`event_driven_predictions_run`).
+    eff_doses: &[DoseEvent],
     pk_at_dose: &[PkParams],
     pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
@@ -587,15 +617,7 @@ fn event_driven_predictions_with_schedule_impl(
     assert_eq!(pk_at_dose.len(), subject.doses.len());
     assert_eq!(pk_at_obs.len(), subject.obs_times.len());
     assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
-
-    // Bioavailability-adjusted doses (`F` applied once, up front; #419). Every
-    // infusion site below reads these instead of `subject.doses`, so the injected
-    // rate and the infusion window already carry `F`. A bolus is unchanged here
-    // and gets `F` on its amount via `bioavailable_amount`. The passed `schedule`'s
-    // break times must match these durations: the non-cached path built it from
-    // the same adjusted doses, and the cached path only caches when `F` cannot
-    // reshape a rate-defined window.
-    let eff_doses: Vec<DoseEvent> = bioavailable_doses(subject, pk_at_dose);
+    debug_assert_eq!(eff_doses.len(), subject.doses.len());
 
     let n_obs = subject.obs_times.len();
     let mut preds = vec![0.0_f64; n_obs];
@@ -649,7 +671,7 @@ fn event_driven_predictions_with_schedule_impl(
                 bounds,
                 &pk_now,
                 pk_model,
-                &eff_doses,
+                eff_doses,
                 &schedule.dose_lagtimes,
                 reset_floor,
                 &mut eigen,
