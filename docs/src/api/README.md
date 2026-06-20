@@ -6,7 +6,7 @@ ferx-core can be used as a Rust library for embedding population PK estimation i
 
 ```toml
 [dependencies]
-ferx-core = { path = "../ferx-core", features = ["autodiff"] }
+ferx-core = { path = "../ferx-core" }
 ```
 
 ## Quick Example

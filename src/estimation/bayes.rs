@@ -405,19 +405,16 @@ pub fn run_bayes(
     let mut eta_sum: Vec<DVector<f64>> = (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
     let mut eta_record_count: u64 = 0;
 
-    // HMC eta-block routing (autodiff builds only; opt-in via n_leapfrog > 0,
-    // analytical-PK subjects). Default n_leapfrog = 0 keeps the MH kernel.
-    #[cfg(feature = "autodiff")]
+    // HMC eta-block routing (opt-in via n_leapfrog > 0, analytical-PK subjects).
+    // Default n_leapfrog = 0 keeps the MH kernel. The gradient is the Dual2 analytic
+    // `∂NLL/∂η` (no autodiff). HMC is BSV-only (kappa-unaware), so IOV models always
+    // use the MH eta kernel.
     let n_leapfrog = options.saem_n_leapfrog;
-    // HMC is BSV-only (the AD gradient + kernel are kappa-unaware), so IOV
-    // models always use the MH eta kernel.
-    #[cfg(feature = "autodiff")]
     let using_hmc =
         n_leapfrog > 0 && model.ode_spec.is_none() && model.tv_fn.is_some() && n_kappa == 0;
 
-    // Post-warmup HMC divergences across all chains (only the autodiff HMC
-    // η-kernel can produce these; the MH kernel never mutates it, hence the
-    // allow on non-autodiff builds).
+    // Post-warmup HMC divergences across all chains (only the HMC η-kernel
+    // produces these; the MH kernel never mutates it).
     #[allow(unused_mut)]
     let mut n_divergent_total = 0u64;
 
@@ -587,11 +584,10 @@ pub fn run_bayes(
                 .collect();
 
             // ---- 1. η block ----
-            // HMC (gradient-guided) when available + opt-in (n_leapfrog > 0 on
-            // an autodiff build, analytical-PK subject); otherwise the
+            // HMC (gradient-guided, on the analytic Dual2 η-gradient) when opted in
+            // (n_leapfrog > 0, analytical-PK subject); otherwise the
             // chol(Ω)-preconditioned block random walk. Same routing as SAEM.
             for i in 0..n_subjects {
-                #[cfg(feature = "autodiff")]
                 let did_hmc = if using_hmc {
                     if let Some((new_eta, new_nll, accepted, divergent)) =
                         crate::estimation::hmc::hmc_step(
@@ -624,8 +620,6 @@ pub fn run_bayes(
                 } else {
                     false
                 };
-                #[cfg(not(feature = "autodiff"))]
-                let did_hmc = false;
 
                 if !did_hmc {
                     // IOV: sample η | κ (kappas held fixed) via the IOV-aware NLL.
@@ -1035,7 +1029,13 @@ pub fn run_bayes(
                 }
                 if prop_eta > 0 {
                     let r = acc_eta as f64 / prop_eta as f64;
-                    eta_scale *= (r - 0.234).exp();
+                    // Target acceptance differs by kernel: ~0.234 is optimal for the
+                    // random-walk block move, but HMC wants a much higher rate
+                    // (~0.7); adapting the HMC leapfrog step toward 0.234 inflates it
+                    // until trajectories diverge (over-dispersing η, biasing σ). Same
+                    // split SAEM uses for its η scale.
+                    let target = if using_hmc { 0.7 } else { 0.234 };
+                    eta_scale *= (r - target).exp();
                     eta_scale = eta_scale.clamp(1e-4, 100.0);
                 }
                 acc_eta = 0;
@@ -1745,15 +1745,20 @@ mod tests {
         assert_eq!(res.kappas.len(), pop.subjects.len());
     }
 
-    /// HMC eta-block end-to-end (autodiff only). With `saem_n_leapfrog > 0` on an
-    /// analytical-PK model with no IOV, `run_bayes` routes the η block through the
-    /// gradient-guided `hmc_step` instead of the random-walk kernel (the
-    /// `#[cfg(feature = "autodiff")]` branch at the top of the sweep). The default
-    /// (non-autodiff) coverage build compiles that branch out, so without this
-    /// test the Bayes→HMC routing has zero coverage in any CI job. Asserts the
-    /// HMC path yields finite, well-ordered summaries and a sane warfarin fit.
+    /// HMC eta-block end-to-end. With `saem_n_leapfrog > 0` on an analytical-PK
+    /// model with no IOV, `run_bayes` routes the η block through the gradient-guided
+    /// `hmc_step`, whose `∂NLL/∂η` is the Dual2 analytic gradient (no autodiff).
+    /// Asserts the HMC path yields finite, well-ordered summaries and a sane
+    /// warfarin fit — the end-to-end check that the Dual2 HMC gradient works.
+    ///
+    /// Tier-3 (runs to convergence over ~2000 MCMC sweeps): gated to the nightly
+    /// slow-tests job. The fast `run_bayes_warfarin_hmc_smoke` below keeps the
+    /// HMC-on-Dual2 wiring covered on every PR.
     #[test]
-    #[cfg(feature = "autodiff")]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: opt in with --features slow-tests"
+    )]
     fn run_bayes_warfarin_hmc_eta_block() {
         use std::path::Path;
         let model =
@@ -1767,8 +1772,11 @@ mod tests {
         assert!(model.ode_spec.is_none() && model.tv_fn.is_some() && model.n_kappa == 0);
 
         let mut opts = FitOptions::default();
-        opts.bayes_warmup = 200;
-        opts.bayes_iters = 200;
+        // Warmup long enough for the HMC leapfrog step-size adaptation to settle
+        // (a too-short warmup leaves the step over-sized → η over-dispersion → σ
+        // inflation; see the PROP_ERR guard below).
+        opts.bayes_warmup = 600;
+        opts.bayes_iters = 400;
         opts.bayes_chains = 2;
         opts.bayes_seed = Some(1);
         opts.saem_n_leapfrog = 3; // > 0 ⇒ HMC η block (vs random-walk default)
@@ -1793,10 +1801,67 @@ mod tests {
             .iter()
             .find(|s| s.name == "TVCL")
             .expect("TVCL summary");
+        // Short HMC run (200+200 sweeps, 2 chains): a sanity range around the
+        // warfarin TVCL, not a convergence assertion.
         assert!((0.10..0.20).contains(&tvcl.mean), "TVCL {}", tvcl.mean);
+        // Guard the HMC η-block step-size tuning: an HMC leapfrog step adapted to
+        // the random-walk target (0.234 instead of ~0.7) over-disperses η and
+        // inflates the residual error — PROP_ERR ballooned to ~0.05 (vs the FOCEI
+        // value ~0.011) with R̂ > 2. Pin it near the truth.
+        let prop = bayes
+            .summaries
+            .iter()
+            .find(|s| s.name == "PROP_ERR")
+            .expect("PROP_ERR summary");
+        assert!(
+            prop.mean < 0.02,
+            "PROP_ERR {} — HMC η over-dispersing?",
+            prop.mean
+        );
         assert!(res.ofv.is_finite(), "OFV not finite");
         assert!(bayes.max_rhat.is_finite());
         assert_eq!(res.eta_hats.len(), pop.subjects.len());
+    }
+
+    /// Fast PR-tier smoke for the HMC-on-Dual2 η block: a handful of sweeps with
+    /// `saem_n_leapfrog > 0` must run the gradient-guided sampler end-to-end and
+    /// produce finite summaries (no convergence assertion — that is the gated
+    /// `run_bayes_warfarin_hmc_eta_block` above). Guards the wiring/crash surface.
+    #[test]
+    fn run_bayes_warfarin_hmc_smoke() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
+                .expect("warfarin model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+            .expect("warfarin data loads");
+        let params = model.default_params.clone();
+
+        let mut opts = FitOptions::default();
+        opts.bayes_warmup = 20;
+        opts.bayes_iters = 20;
+        opts.bayes_chains = 1;
+        opts.bayes_seed = Some(1);
+        opts.saem_n_leapfrog = 2; // > 0 ⇒ exercise the HMC η block
+
+        // The startup banner must report HMC (proves the Dual2 route is selected).
+        let summary = crate::estimation::saem::saem_sampler_summary(&model, &opts);
+        assert!(
+            summary.starts_with("HMC"),
+            "expected HMC sampler, got: {summary}"
+        );
+
+        let res = run_bayes(&model, &pop, &params, &opts).expect("HMC bayes runs");
+        let bayes = res.bayes.as_ref().expect("BayesResult present");
+        assert!(!bayes.summaries.is_empty());
+        for s in &bayes.summaries {
+            assert!(
+                s.mean.is_finite() && s.sd.is_finite(),
+                "{}: non-finite",
+                s.name
+            );
+        }
+        assert!(res.ofv.is_finite(), "OFV not finite");
     }
 
     #[test]

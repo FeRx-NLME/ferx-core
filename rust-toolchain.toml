@@ -1,2 +1,4 @@
 [toolchain]
-channel = "enzyme"
+# The Enzyme autodiff path was retired (Dual2 analytic sensitivities replace it),
+# so a stock nightly toolchain is sufficient — no custom Enzyme channel needed.
+channel = "nightly"

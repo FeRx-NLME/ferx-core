@@ -63,19 +63,19 @@ When `n_leapfrog` is set to a positive integer (e.g. `3`), one HMC proposal repl
 
 with momentum \\( p \sim N(0, I) \\) and a standard velocity Störmer-Verlet (leapfrog) integrator. Acceptance is on \\( \Delta H \\), targeting ~65% acceptance.
 
-**Requirements**: `autodiff` feature enabled (default) and an analytical PK model (no ODE). A warning is emitted if `n_leapfrog > 0` but the `autodiff` feature is absent.
+**Requirements**: an analytical PK model (no ODE). The HMC gradient is the exact analytic `Dual2` η-gradient (the same one FOCEI uses) — no autodiff. A warning is emitted if `n_leapfrog > 0` but the model is out of the analytic provider's scope.
 
 **Per-subject fallback to MH**: `hmc_step` silently falls back to MH for a subject when any of the following conditions hold:
 - The model uses an ODE (`[odes]` block present)
 - The model has no analytical PK path (no `tv_fn` — pure ODE-only models)
 - The Ω matrix has a non-finite log-determinant (degenerate variance)
-- The subject has time-varying covariates and either the PK model does not support the event-driven AD path or the model has a lag time
+- The model is outside the analytic gradient's scope (time-varying covariates, oral infusion, SS+reset, expression scaling)
 
 In a single run with `n_leapfrog > 0`, different subjects can therefore use different samplers. The acceptance rate reported in verbose output and the optimizer trace is an aggregate across all subjects; in mixed HMC/MH runs the target (65% for HMC, 40% for MH) may not be meaningful for the aggregate. The `n_mh_steps` option governs the number of proposals for MH-fallback subjects even when `n_leapfrog > 0`.
 
 The E-step sampling is parallelized across subjects using Rayon.
 
-The startup banner reports the resolved E-step kernel on a `sampler:` line, e.g. `sampler:  Metropolis-Hastings random walk` or `sampler:  HMC (3 leapfrog steps, autodiff gradients)`. If `n_leapfrog > 0` but HMC is unavailable (no `autodiff` build, or an ODE model), the line says so and reflects the MH fallback. Because SAEM is sampling-based rather than gradient-driven, it does not print the `gradient:` line that FOCE/FOCEI use — the `gradient_method` option only governs the inner EBE/Hessian step (used for diagnostics, and consumed by a following `imp` stage), not the SAEM iterations themselves.
+The startup banner reports the resolved E-step kernel on a `sampler:` line, e.g. `sampler:  Metropolis-Hastings random walk` or `sampler:  HMC (3 leapfrog steps, Dual2 analytic gradients)`. If `n_leapfrog > 0` but HMC is unavailable (an ODE model, or one outside the analytic gradient's scope), the line says so and reflects the MH fallback. Because SAEM is sampling-based rather than gradient-driven, it does not print the `gradient:` line that FOCE/FOCEI use — the `gradient_method` option only governs the inner EBE/Hessian step (used for diagnostics, and consumed by a following `imp` stage), not the SAEM iterations themselves.
 
 ### 2. Stochastic Approximation Update
 

@@ -871,16 +871,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-        if options.gradient_method == crate::types::GradientMethod::Ad {
-            diags.push(
-                Diagnostic::error(
-                    "E_SDE_INCOMPATIBLE",
-                    "gradient_method = ad is not compatible with a [diffusion] block. \
-                     Set gradient_method = fd (or leave it unset — fd is selected automatically).",
-                )
-                .with_block("fit_options"),
-            );
-        }
+        // `gradient_method = ad` is rejected unconditionally below (E_AD_RETIRED),
+        // so it needs no SDE-specific case here.
     }
 
     // IMPMAP does not yet support inter-occasion variability (κ / [iov]); the κ
@@ -898,20 +890,18 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // Explicit `gradient_method = ad` on a build compiled WITHOUT the `autodiff`
-    // feature: AD is unavailable, so the inner loop would silently fall back to
-    // FD and run a different method than the user asked for. Reject it instead.
-    // `auto` (defined to fall back) and `fd` are unaffected.
-    #[cfg(not(feature = "autodiff"))]
+    // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired in
+    // favour of the hand-rolled `Dual2` analytic sensitivities. Reject it rather
+    // than silently running a different method. `auto` (analytic where in scope,
+    // else FD) and `fd` are unaffected.
     if options.gradient_method == crate::types::GradientMethod::Ad {
         diags.push(
             Diagnostic::error(
-                "E_AD_UNAVAILABLE",
-                "gradient_method = ad was requested, but this build was compiled without the \
-                 `autodiff` feature, so automatic differentiation is unavailable — the fit would \
-                 silently use finite differences. Rebuild with the Enzyme toolchain \
-                 (`--features autodiff`), or set gradient_method = auto (falls back to FD \
-                 automatically) or fd.",
+                "E_AD_RETIRED",
+                "gradient_method = ad is no longer supported: the Enzyme automatic-differentiation \
+                 path was retired in favour of the analytic `Dual2` sensitivities. Set \
+                 gradient_method = auto (uses the exact analytic gradient where it is in scope and \
+                 falls back to finite differences otherwise) or fd.",
             )
             .with_block("fit_options"),
         );
@@ -1004,8 +994,12 @@ pub fn check_model_data_warnings(
         ));
     }
 
-    // SS=1 infusion with T_inf > II — overlapping pulses have no closed form;
-    // the SS pre-equilibration is skipped. The effective infusion length is
+    // SS=1 infusion with T_inf > II (overlapping pulses). The analytical 1-/2-/3-
+    // cpt closed forms now superpose the overlapping past pulse train (#379), so
+    // these are handled exactly. Only ODE models — and subjects that route to the
+    // event-driven walker (EVID 3/4 resets) — still skip SS pre-equilibration.
+    let analytic_handles_overlap = model.ode_spec.is_none();
+    // The effective infusion length is
     // `d.duration` for an ordinary infusion, but for a modeled dose (RATE=-2 →
     // `D{cmt}` duration, or RATE=-1 → `R{cmt}` rate; #324) it is unresolved here
     // (`rate`/`duration` are 0 until `resolve_rate`), so resolve it at the
@@ -1045,9 +1039,11 @@ pub fn check_model_data_warnings(
         .subjects
         .iter()
         .filter(|s| {
-            s.doses
+            let overlapping = s
+                .doses
                 .iter()
-                .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && effective_duration(s, d) > d.ii)
+                .any(|d| d.ss && d.ii > 0.0 && d.is_infusion() && effective_duration(s, d) > d.ii);
+            overlapping && (!analytic_handles_overlap || s.has_resets())
         })
         .count();
     if n_ss_overlapping_inf > 0 {
@@ -1055,11 +1051,12 @@ pub fn check_model_data_warnings(
             "W_STEADY_STATE_INFUSION",
             format!(
                 "{} subject(s) have SS=1 infusions with T_inf > II (overlapping \
-                 pulses). No closed form or pulse-expansion scheme covers this \
-                 case — the SS pre-equilibration is skipped and the dose is \
-                 applied as a single (non-SS) infusion, so the system is not at \
-                 steady state at the dose time. Use a shorter infusion (T_inf \
-                 ≤ II) or remove the SS flag.",
+                 pulses) on a model path that does not pre-equilibrate steady \
+                 state (ODE model, or EVID=3/4 resets routing to the event-driven \
+                 walker) — the dose is applied as a single (non-SS) infusion, so \
+                 the system is not at steady state at the dose time. The analytical \
+                 1-/2-/3-cpt closed forms do handle this case; use a shorter \
+                 infusion (T_inf ≤ II) or remove the SS flag otherwise.",
                 n_ss_overlapping_inf
             ),
         ));
@@ -1480,6 +1477,10 @@ pub fn fit(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // Apply the fit-scoped inner-loop optimizer choice before any EBE solve runs.
+    // `Auto` (the default) reproduces the historical size-based dispatch, so this
+    // is a no-op unless the user pinned `inner_optimizer`.
+    crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
     // enforces these for `.ferx` models, but a Rust caller could otherwise set
     // `log_transform = true` together with a proportional/combined error or a
@@ -2737,6 +2738,29 @@ fn fit_inner(
     // by read_nonmem_csv into population.warnings.
     accumulated_warnings.extend(population.warnings.iter().cloned());
 
+    // Inner-gradient FD-fallback notice for the gradient-driven methods: if some
+    // (but not all) subjects fall outside the analytic provider's scope, surface
+    // it through warnings (not just the startup banner) per the CLAUDE.md rule.
+    if chain.iter().any(|m| {
+        matches!(
+            m,
+            EstimationMethod::Foce
+                | EstimationMethod::FoceI
+                | EstimationMethod::FoceGn
+                | EstimationMethod::FoceGnHybrid
+                | EstimationMethod::Imp
+                | EstimationMethod::Impmap
+        )
+    }) {
+        if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning(
+            model,
+            population,
+            &init_params.theta,
+        ) {
+            accumulated_warnings.push(w);
+        }
+    }
+
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
 
@@ -3355,6 +3379,7 @@ fn fit_inner(
         &crate::build_info::BUILD_INFO,
         final_method,
         options.optimizer,
+        model,
     );
 
     // Flush and close the trace file; capture path for FitResult.
@@ -3616,7 +3641,7 @@ fn fit_inner(
     };
 
     if time_gradients {
-        let (ad_c, ad_n, fd_c, fd_n, jac_ad_c, jac_ad_n, jac_fd_c, jac_fd_n) =
+        let (an_c, an_n, fd_c, fd_n, jac_an_c, jac_an_n, jac_fd_c, jac_fd_n) =
             crate::estimation::inner_optimizer::GRADIENT_TIMINGS.snapshot();
         let ms = |n: u64| (n as f64) / 1_000_000.0;
         let avg_us = |n: u64, c: u64| {
@@ -3628,25 +3653,25 @@ fn fit_inner(
         };
         eprintln!("--- Gradient timings (FERX_TIME_GRADIENTS=1) ---");
         eprintln!(
-            "  BFGS (AD):  {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
-            ad_c,
-            ms(ad_n),
-            avg_us(ad_n, ad_c)
+            "  BFGS (analytic): {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
+            an_c,
+            ms(an_n),
+            avg_us(an_n, an_c)
         );
         eprintln!(
-            "  BFGS (FD):  {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
+            "  BFGS (FD):       {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
             fd_c,
             ms(fd_n),
             avg_us(fd_n, fd_c)
         );
         eprintln!(
-            "  Jac  (AD):  {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
-            jac_ad_c,
-            ms(jac_ad_n),
-            avg_us(jac_ad_n, jac_ad_c)
+            "  Jac  (analytic): {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
+            jac_an_c,
+            ms(jac_an_n),
+            avg_us(jac_an_n, jac_an_c)
         );
         eprintln!(
-            "  Jac  (FD):  {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
+            "  Jac  (FD):       {:>8} calls, {:>10.2} ms total, {:>8.2} µs/call",
             jac_fd_c,
             ms(jac_fd_n),
             avg_us(jac_fd_n, jac_fd_c)
@@ -5637,11 +5662,10 @@ mod iov_integration {
         assert!(d.is_error() && d.message.contains("inter-occasion"));
     }
 
-    // On a build without the `autodiff` feature, explicitly requesting AD must
-    // error rather than silently running FD. `auto`/`fd` must still pass.
-    #[cfg(not(feature = "autodiff"))]
+    // The Enzyme AD path was retired, so explicitly requesting AD must error
+    // rather than silently running a different method. `auto`/`fd` must still pass.
     #[test]
-    fn ad_requested_without_autodiff_feature_errors() {
+    fn ad_requested_errors_now_that_ad_is_retired() {
         let model = make_iov_model();
         let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
 
@@ -5650,8 +5674,8 @@ mod iov_integration {
         assert!(
             diags
                 .iter()
-                .any(|d| d.code == "E_AD_UNAVAILABLE" && d.is_error()),
-            "explicit gradient_method=ad on a non-autodiff build must error, got: {diags:?}"
+                .any(|d| d.code == "E_AD_RETIRED" && d.is_error()),
+            "explicit gradient_method=ad must error now that AD is retired, got: {diags:?}"
         );
 
         for gm in [
@@ -5662,8 +5686,8 @@ mod iov_integration {
             assert!(
                 !super::check_model_options(&model, &opts)
                     .iter()
-                    .any(|d| d.code == "E_AD_UNAVAILABLE"),
-                "gradient_method={gm:?} must not trigger E_AD_UNAVAILABLE"
+                    .any(|d| d.code == "E_AD_RETIRED"),
+                "gradient_method={gm:?} must not trigger E_AD_RETIRED"
             );
         }
     }

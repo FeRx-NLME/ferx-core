@@ -1157,7 +1157,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let (
         pk_model,
         pk_param_map,
-        ode_spec,
+        mut ode_spec,
         diffusion_theta_names,
         diffusion_theta_inits,
         diffusion_theta_fixed,
@@ -1268,9 +1268,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // `eta` slice the closure consumes (BSV η + kappa). Both feed the
     // Tier 4a milestone-2 partial-derivative builder.
     let n_eta_extended_for_partials = eta_names.len();
-
     // Compartment-indexed modeled-dose attributes (`D{cmt}` for `RATE=-2`
-    // duration, `R{cmt}` for `RATE=-1` rate; #324) for ANALYTICAL models. ODE
+    // duration, `R{cmt}` for `RATE=-1` rate; #324/#394) for ANALYTICAL models. ODE
     // models build their `dose_attr_map` inside `build_ode_spec` (routing
     // `D{cmt}`/`R{cmt}` through `ode_param_slots`); analytical models route only
     // canonical PK names into `PkParams`, so a `D{cmt}`/`R{cmt}` individual
@@ -1348,17 +1347,27 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
-    let (pk_param_fn, referenced_covariates, indiv_param_partials) = build_pk_param_fn(
-        indiv_stmts.clone(),
-        &pk_param_map,
-        &indiv_var_names,
-        &ode_slot_map,
-        &analytical_modeled_slots,
-        thetas.len(),
-        n_eta_extended_for_partials,
-        #[cfg(feature = "nn")]
-        &covariate_nns_for_closure,
-    )?;
+    let (pk_param_fn, referenced_covariates, mut indiv_param_partials, indiv_param_program) =
+        build_pk_param_fn(
+            indiv_stmts.clone(),
+            &pk_param_map,
+            &indiv_var_names,
+            &ode_slot_map,
+            &analytical_modeled_slots,
+            thetas.len(),
+            n_eta_extended_for_partials,
+            #[cfg(feature = "nn")]
+            &covariate_nns_for_closure,
+        )?;
+
+    // Attach the individual-parameter program to the ODE spec (if any) for the
+    // analytic-sensitivity η/θ chain (issue #367). The analytical PK provider
+    // reads its copy from `indiv_param_partials` (ODE models route to the ODE
+    // provider, so the partials copy is unused there — a single parse-time clone).
+    indiv_param_partials.indiv_param_program = Some(indiv_param_program.clone());
+    if let Some(ode_spec) = ode_spec.as_mut() {
+        ode_spec.indiv_param_program = Some(indiv_param_program);
+    }
 
     // Reject an analytical model that omits a required PK parameter for its
     // structure (issue #309). Runs *after* build_pk_param_fn so the per-key
@@ -1899,7 +1908,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .unwrap_or_default();
         let is_ode_model = model.ode_spec.is_some();
 
-        let (scaling, output_fn) = parse_scaling_block(
+        let (scaling, output_fn, output_program) = parse_scaling_block(
             scaling_lines,
             &theta_names_for_scaling,
             &eta_names_for_scaling,
@@ -1912,43 +1921,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
         // AD compatibility check (Phase 2.5):
         //
-        // ScalingSpec — None / ScalarScale / ExpressionScale / PerCmt —
-        // all support AD now via the per-observation `obs_scale: &[f64]`
-        // slice threaded into the four AD entry points and built by
-        // `inner_optimizer::build_scale_array_for_ad`. The slice is
-        // materialised once per gradient call from a subject-static pk
-        // evaluation, so AD treats the scale as constant w.r.t. eta.
-        // That's exact for an eta-independent scale (`WT/70`, `TVV/1000` -
-        // covariates/thetas only). An eta-dependent scale (e.g.
-        // `obs_scale = V` with `V = TVV*exp(ETA_V)`) is now auto-routed to
-        // FD by `inner_optimizer::analytical_ad_unsupported`
-        // (`ScalingSpec::breaks_ad_inner_gradient`), so the user gets a
-        // correct gradient without having to set `gradient = fd` by hand.
-        //
-        // Form C readouts (`OdeReadout::Single` / `PerCmt`) STILL force
-        // FD: they only exist on ODE models, and the AD path requires
-        // `tv_fn.is_some()` which is only set for analytical models. The
-        // runtime check would silently demote `gradient = ad` to FD; the
-        // parse-time guard here surfaces it as a loud error so the user
-        // knows AD isn't actually doing anything for their Form C model.
-        let ad_explicit = fit_options.gradient_method == GradientMethod::Ad;
-        let ad_auto_likely = fit_options.gradient_method == GradientMethod::Auto
-            && model.tv_fn.is_some()
-            && cfg!(feature = "autodiff");
-        let readout_needs_fd = output_fn.as_ref().map(|r| r.requires_fd()).unwrap_or(false);
-        if readout_needs_fd && (ad_explicit || ad_auto_likely) {
-            let kind = match output_fn.as_ref() {
-                Some(crate::ode::OdeReadout::PerCmt(_)) => "per-CMT `y[CMT=N]` (Form C)",
-                Some(crate::ode::OdeReadout::Single(_)) => "`y = <expr>` (Form C)",
-                _ => unreachable!("readout_needs_fd implies output_fn is Some(Single | PerCmt)"),
-            };
-            return Err(format!(
-                "[scaling]: {} is not supported with AD gradients (Form C readouts only \
-                 exist on ODE models, and AD requires the analytical PK path). \
-                 Add `gradient = fd` to [fit_options].",
-                kind
-            ));
-        }
+        // (`gradient = ad` no longer needs a Form-C-specific guard here: it is
+        // retired and rejected unconditionally by `check_model_options`.)
 
         // Form C wiring: replace the ODE readout (which was set to the
         // `NEEDS_FORM_C = usize::MAX` sentinel by `build_ode_spec` if the
@@ -1956,6 +1930,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         if let Some(new_readout) = output_fn {
             let ode_spec = model.ode_spec.as_mut().expect("guarded by is_ode_model");
             ode_spec.readout = new_readout;
+            // Form C sensitivity program (issue #367); `None` for per-CMT.
+            ode_spec.readout_program = output_program;
         }
 
         model.scaling = scaling;
@@ -3620,7 +3596,11 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
                 "slsqp" => Optimizer::Slsqp,
-                "lbfgs" | "nlopt_lbfgs" => Optimizer::NloptLbfgs,
+                // `lbfgs` is the built-in limited-memory L-BFGS (analytic gradient,
+                // Eq. 48 warm EBEs, no SLSQP polish). The NLopt L-BFGS + SLSQP-polish
+                // path is still reachable explicitly via `nlopt_lbfgs`.
+                "lbfgs" => Optimizer::Lbfgs,
+                "nlopt_lbfgs" => Optimizer::NloptLbfgs,
                 "mma" => Optimizer::Mma,
                 "bfgs" => Optimizer::Bfgs,
                 "bobyqa" => Optimizer::Bobyqa,
@@ -3629,6 +3609,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                     return Err(format!(
                         "fit option `optimizer`: unknown value `{other}` — expected \
                          slsqp/lbfgs/nlopt_lbfgs/mma/bfgs/bobyqa/trust_region"
+                    ));
+                }
+            };
+        }
+        "inner_optimizer" => {
+            opts.inner_optimizer = match value.to_lowercase().as_str() {
+                "auto" => crate::types::InnerOptimizer::Auto,
+                "bfgs" => crate::types::InnerOptimizer::Bfgs,
+                "lbfgs" => crate::types::InnerOptimizer::Lbfgs,
+                "nelder_mead" | "neldermead" => crate::types::InnerOptimizer::NelderMead,
+                other => {
+                    return Err(format!(
+                        "fit option `inner_optimizer`: unknown value `{other}` — expected \
+                         auto/bfgs/lbfgs/nelder_mead"
                     ));
                 }
             };
@@ -4036,6 +4030,40 @@ fn build_obs_scale_spec(
         .enumerate()
         .map(|(i, name)| (name.clone(), pk_indices.get(i).copied().unwrap_or(i)))
         .collect();
+    // Differentiable scale program (issue #367): compile the same expression to
+    // bytecode over (θ, η, individual-parameter vars, covariates) so the analytic
+    // sensitivity provider can differentiate `f / scale` exactly instead of
+    // finite-differencing the opaque closure. `Variable(name)` (an individual
+    // parameter) → var slot `i` (flat PK slot `pk_indices[i]`); covariates → cov
+    // slots; θ/η are read directly from the seed duals.
+    let deriv = {
+        let mut e = expr.clone();
+        let var_idx: HashMap<String, usize> = indiv_var_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
+        let var_to_pk_slot: Vec<usize> = (0..indiv_var_names.len())
+            .map(|i| pk_indices.get(i).copied().unwrap_or(i))
+            .collect();
+        let mut cov_set = std::collections::HashSet::new();
+        collect_covariates(&e, &mut cov_set);
+        let mut cov_names: Vec<String> = cov_set.into_iter().collect();
+        cov_names.sort();
+        let cov_idx: HashMap<String, usize> = cov_names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i))
+            .collect();
+        resolve_expr_indices(&mut e, &var_idx, &cov_idx);
+        Some(ScaleDerivProgram {
+            bc: compile_bytecode(&e),
+            n_theta: theta_names.len(),
+            n_eta: eta_names.len(),
+            var_to_pk_slot,
+            cov_names,
+        })
+    };
     let scale_fn: ScaleFn = Box::new(
         move |theta: &[f64],
               eta: &[f64],
@@ -4052,7 +4080,7 @@ fn build_obs_scale_spec(
             eval_expression(&expr, theta, eta, covariates, &vars, &empty_nn)
         },
     );
-    Ok(ScalingSpec::ExpressionScale { scale_fn })
+    Ok(ScalingSpec::ExpressionScale { scale_fn, deriv })
 }
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
@@ -4065,7 +4093,7 @@ fn build_y_output_fn(
     pk_indices: &[usize],
     state_names: &[String],
     kappa_names: &[String],
-) -> Result<crate::ode::OdeOutputFn, String> {
+) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
     let mut defined: Vec<String> = state_names.to_vec();
@@ -4152,6 +4180,24 @@ fn build_y_output_fn(
     resolve_expr_indices(&mut expr, &var_idx, &cov_idx);
     let bc = compile_bytecode(&expr);
 
+    // Snapshot the readout as an `OdeOutputProgram` for the analytic-sensitivity
+    // path (issue #367): same bytecode + layout, evaluated over `Dual2<N>`. It is
+    // `simple` (dual-evaluable with empty θ/η/cov) when the expression references
+    // only states / individual parameters / constants.
+    let output_simple = !bc.ops.iter().any(|op| {
+        matches!(
+            op,
+            Op::PushTheta(_) | Op::PushEta(_) | Op::PushCov(_) | Op::PushNnOutput(_, _)
+        )
+    });
+    let output_program = OdeOutputProgram {
+        bc: bc.clone(),
+        n_states,
+        n_indiv,
+        indiv_to_pk: indiv_to_pk.clone(),
+        simple: output_simple,
+    };
+
     // Per-thread scratch for the y readout vars + covariate slice + bytecode
     // f64 stack comes from the shared `FERX_SCRATCH` (see `FerxThreadScratch`).
     // The y-readout fields are kept separate from rhs_vars because the two are
@@ -4213,7 +4259,7 @@ fn build_y_output_fn(
             })
         },
     );
-    Ok(out_fn)
+    Ok((out_fn, output_program))
 }
 
 /// Parsed contents of a `[scaling]` block.
@@ -4251,7 +4297,14 @@ fn parse_scaling_block(
     state_names: &[String],
     is_ode: bool,
     kappa_names: &[String],
-) -> Result<(ScalingSpec, Option<crate::ode::OdeReadout>), String> {
+) -> Result<
+    (
+        ScalingSpec,
+        Option<crate::ode::OdeReadout>,
+        Option<OdeOutputProgram>,
+    ),
+    String,
+> {
     // Accumulate uniform and per-CMT entries separately, then assemble at
     // the end. Mixing the two forms within the same group (obs_scale or y)
     // is rejected — keeps the semantic clean and matches NONMEM's
@@ -4260,6 +4313,9 @@ fn parse_scaling_block(
     let mut obs_scale_per_cmt: HashMap<usize, ScalingSpec> = HashMap::new();
     let mut y_uniform: Option<crate::ode::OdeOutputFn> = None;
     let mut y_per_cmt: HashMap<usize, crate::ode::OdeOutputFn> = HashMap::new();
+    // Sensitivity program for the uniform `y = <expr>` readout (issue #367); the
+    // per-CMT form is out of the analytic-sensitivity scope, so it carries none.
+    let mut y_uniform_program: Option<OdeOutputProgram> = None;
 
     for line in lines {
         let trimmed = line.trim();
@@ -4339,7 +4395,7 @@ fn parse_scaling_block(
                          use `obs_scale = <expr>` for analytical PK"
                         .into());
                 }
-                let out_fn = build_y_output_fn(
+                let (out_fn, out_program) = build_y_output_fn(
                     value,
                     theta_names,
                     eta_names,
@@ -4359,6 +4415,7 @@ fn parse_scaling_block(
                                 .into());
                         }
                         y_uniform = Some(out_fn);
+                        y_uniform_program = Some(out_program);
                     }
                     Some(cmt) => {
                         if y_uniform.is_some() {
@@ -4393,7 +4450,13 @@ fn parse_scaling_block(
     } else {
         None
     };
-    Ok((scaling, readout))
+    // The output program accompanies the uniform `Single` readout only.
+    let readout_program = if readout.is_some() {
+        y_uniform_program
+    } else {
+        None
+    };
+    Ok((scaling, readout, readout_program))
 }
 
 // ── ode_template desugaring + the analytical+ODE-only-absorption error rule ──
@@ -5627,6 +5690,20 @@ fn build_ode_spec(
     // `vec.clear(); vec.resize(n, 0.0)` re-zeros the buffer cheaply (no realloc
     // once the capacity grows), so intermediate slots in untaken if-branches
     // still read 0 just like the old per-call `vec![0.0; n]` path.
+    // Snapshot the resolved RHS program for the analytic-sensitivity path
+    // (issue #367) before the f64 closure moves `stmts_owned`. Same statements,
+    // same var layout — evaluated over `Dual2<N>` by `eval_rhs_dual`.
+    let rhs_program = OdeRhsProgram {
+        stmts: stmts_owned.clone(),
+        n_vars_total,
+        state_count,
+        indiv_to_params_slot: indiv_to_params_slot.clone(),
+        time_slot,
+        tafd_slot,
+        tad_slot,
+        macheps_slot,
+    };
+
     let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
         Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
             // The integrator always passes a `u` whose length matches the
@@ -5795,6 +5872,11 @@ fn build_ode_spec(
         // Built-in absorption forcing terms split out of the [odes] RHS above
         // (design A); empty for models with no transit()/etc. input-rate call.
         input_rate,
+        rhs_program: Some(rhs_program),
+        // Form C readout + individual-parameter programs are attached later, when
+        // `[scaling]` / `[individual_parameters]` are parsed (see the wiring).
+        readout_program: None,
+        indiv_param_program: None,
         dose_attr_map,
     })
 }
@@ -6856,7 +6938,15 @@ fn build_pk_param_fn(
     n_theta_base: usize,
     n_eta_extended: usize,
     #[cfg(feature = "nn")] covariate_nns: &[crate::nn::CovariateNn],
-) -> Result<(PkParamFn, Vec<String>, IndivParamPartials), String> {
+) -> Result<
+    (
+        PkParamFn,
+        Vec<String>,
+        IndivParamPartials,
+        IndivParamProgram,
+    ),
+    String,
+> {
     // Covariates referenced anywhere in the block (including inside if-bodies
     // and condition expressions). Sorted for deterministic error messages.
     let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -7001,6 +7091,24 @@ fn build_pk_param_fn(
 
     let cov_names_for_lookup = referenced_covariates.clone();
 
+    // Snapshot the resolved individual-parameter program for the analytic
+    // sensitivity chain (issue #367) before the f64 `pk_param_fn` closure moves
+    // `stmts_owned` / the mappings. `pk_var_slots` is `(pk_slot, var_slot)` per
+    // individual parameter; ODE models use `ode_assignment_mapping`, analytical
+    // models `pk_assignment_mapping` (both are `(pk_slot, var_slot)`).
+    let indiv_param_program = IndivParamProgram {
+        stmts: stmts_owned.clone(),
+        n_vars,
+        pk_var_slots: if is_analytical_pk {
+            pk_assignment_mapping.clone()
+        } else {
+            ode_assignment_mapping.clone()
+        },
+        n_theta: n_theta_base,
+        n_eta: n_eta_extended,
+        cov_names: cov_names_for_lookup.clone(),
+    };
+
     // Snapshot the NN handles into the closure. Empty when no
     // `[covariate_nn]` blocks are present, in which case the per-call
     // forward-pass loop below is a no-op (just an empty `Vec<Vec<f64>>`
@@ -7080,7 +7188,12 @@ fn build_pk_param_fn(
             p
         },
     );
-    Ok((pk_param_fn, referenced_covariates, indiv_partials))
+    Ok((
+        pk_param_fn,
+        referenced_covariates,
+        indiv_partials,
+        indiv_param_program,
+    ))
 }
 
 // --- Simple expression AST and evaluator ---
@@ -8245,6 +8358,228 @@ fn eval_bytecode(
     }
 }
 
+/// Generic counterpart to [`eval_bytecode`] for the analytic-sensitivity path:
+/// the same `Bytecode`, evaluated over any [`PkNum`] `T` so a single program
+/// serves both the scalar value (`T = f64`) and its exact PK-parameter
+/// derivatives (`T = Dual2<N>`). Only `vars` carries `T` — that slice holds the
+/// ODE state and individual parameters, the things seeded as dual variables.
+/// `theta`/`eta`/`covariates`/`nn_outputs` are lifted as constants (we do not
+/// differentiate w.r.t. them here; η/θ enter through the provider's outer chain).
+///
+/// **This is a second evaluator and must stay semantically identical to
+/// [`eval_bytecode`]'s `f64` path** — the smooth ops route through `PkNum`, the
+/// guards (`Div`/`Mod`/`Ln`/`Sqrt`) and value-based ops (`Cmp*`/`Logic*`/`Mod`/
+/// `Floor`/`Ceil`/`Round`/jumps) branch on `.val()` exactly as the scalar path
+/// branches on the `f64`. The `bytecode_g_matches_f64_*` tests pin `T::val()` to
+/// `eval_bytecode` so the two cannot drift.
+// Wired into the `Dual2`-state ODE integrator in Phase 3 of #367; until then it
+// has only test callers, so the non-test build sees it as unused.
+#[allow(dead_code)]
+fn eval_bytecode_g<T: crate::sens::num::PkNum>(
+    bc: &Bytecode,
+    theta: &[T],
+    eta: &[T],
+    covariates: &[f64],
+    vars: &[T],
+    nn_outputs: &[Vec<f64>],
+    stack: &mut Vec<T>,
+) -> T {
+    stack.clear();
+    stack.reserve(bc.max_stack);
+    let mut pc: usize = 0;
+    let ops = bc.ops.as_slice();
+    let consts = bc.constants.as_slice();
+    let k = T::from_f64;
+
+    macro_rules! push {
+        ($v:expr) => {
+            stack.push($v)
+        };
+    }
+    macro_rules! pop {
+        () => {
+            stack.pop().unwrap_or_else(|| {
+                debug_assert!(false, "eval_bytecode_g stack underflow at pc={pc}");
+                k(0.0)
+            })
+        };
+    }
+
+    while pc < ops.len() {
+        match ops[pc] {
+            Op::PushConst(i) => push!(k(consts[i as usize])),
+            Op::PushTheta(i) => push!(theta.get(i as usize).copied().unwrap_or_else(|| k(0.0))),
+            Op::PushEta(i) => push!(eta.get(i as usize).copied().unwrap_or_else(|| k(0.0))),
+            Op::PushVar(i) => push!(*vars.get(i as usize).unwrap_or(&k(0.0))),
+            Op::PushCov(i) => push!(k(covariates.get(i as usize).copied().unwrap_or(0.0))),
+            Op::PushNnOutput(nn_i, out_i) => {
+                let v = nn_outputs
+                    .get(nn_i as usize)
+                    .and_then(|v| v.get(out_i as usize))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        debug_assert!(
+                            false,
+                            "Op::PushNnOutput nn_idx={nn_i} output_idx={out_i} out of bounds"
+                        );
+                        0.0
+                    });
+                push!(k(v));
+            }
+            Op::Add => {
+                let b = pop!();
+                let a = pop!();
+                push!(a + b);
+            }
+            Op::Sub => {
+                let b = pop!();
+                let a = pop!();
+                push!(a - b);
+            }
+            Op::Mul => {
+                let b = pop!();
+                let a = pop!();
+                push!(a * b);
+            }
+            Op::Div => {
+                let b = pop!();
+                let a = pop!();
+                push!(if b.val().abs() < 1e-30 { k(0.0) } else { a / b });
+            }
+            Op::Pow => {
+                let e = pop!();
+                let b = pop!();
+                push!(b.pow(e));
+            }
+            Op::Mod => {
+                let b = pop!();
+                let a = pop!();
+                // Non-differentiable: compute on values, lift as a constant.
+                push!(if b.val().abs() < 1e-30 {
+                    k(0.0)
+                } else {
+                    k(a.val().rem_euclid(b.val()))
+                });
+            }
+            Op::Exp => {
+                let v = pop!();
+                push!(v.exp());
+            }
+            Op::Ln => {
+                let v = pop!();
+                push!(v.guard_floor(1e-30).ln());
+            }
+            Op::Sqrt => {
+                let v = pop!();
+                push!(v.guard_floor(0.0).sqrt());
+            }
+            Op::Abs => {
+                let v = pop!();
+                push!(v.abs());
+            }
+            Op::Floor => {
+                let v = pop!();
+                push!(k(v.val().floor()));
+            }
+            Op::Ceil => {
+                let v = pop!();
+                push!(k(v.val().ceil()));
+            }
+            Op::Round => {
+                let v = pop!();
+                push!(k(v.val().round()));
+            }
+            Op::InvLogit => {
+                let v = pop!();
+                push!(v.inv_logit());
+            }
+            Op::Logit => {
+                let v = pop!();
+                // Match the scalar path's clamp to (0,1); the clamped region is
+                // flat (zero jet for duals).
+                let r = if v.val() <= 1e-15 {
+                    k((1e-15_f64 / (1.0 - 1e-15)).ln())
+                } else if v.val() >= 1.0 - 1e-15 {
+                    k(((1.0 - 1e-15_f64) / 1e-15).ln())
+                } else {
+                    v.logit()
+                };
+                push!(r);
+            }
+            Op::CmpLt => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() < r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::CmpLe => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() <= r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::CmpGt => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() > r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::CmpGe => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() >= r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::CmpEq => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() == r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::CmpNe => {
+                let r = pop!();
+                let l = pop!();
+                push!(k(if l.val() != r.val() { 1.0 } else { 0.0 }));
+            }
+            Op::LogicAnd => {
+                let b = pop!();
+                let a = pop!();
+                push!(k(if a.val() != 0.0 && b.val() != 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }));
+            }
+            Op::LogicOr => {
+                let b = pop!();
+                let a = pop!();
+                push!(k(if a.val() != 0.0 || b.val() != 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }));
+            }
+            Op::LogicNot => {
+                let v = pop!();
+                push!(k(if v.val() == 0.0 { 1.0 } else { 0.0 }));
+            }
+            Op::JumpIfFalse(target) => {
+                let v = pop!();
+                if v.val() == 0.0 {
+                    pc = target as usize;
+                    continue;
+                }
+            }
+            Op::Jump(target) => {
+                pc = target as usize;
+                continue;
+            }
+        }
+        pc += 1;
+    }
+    debug_assert!(
+        stack.len() == 1,
+        "eval_bytecode_g: bytecode finished at stack depth {}, expected 1",
+        stack.len()
+    );
+    stack.pop().unwrap_or_else(|| k(0.0))
+}
+
 /// Indexed-form evaluator: `vars` is a `Vec<f64>` indexed by parse-time
 /// variable slot; `covariates` is a `Vec<f64>` aligned to
 /// `CompiledModel.referenced_covariates`. Hot-path replacement for the
@@ -8506,6 +8841,399 @@ fn eval_statements_indexed_with_stack(
             // rewrites them. Silently skip if one slips through.
             Statement::Assign(_, _) | Statement::DiffEq(_, _) => {}
         }
+    }
+}
+
+/// [`eval_statements_indexed_with_stack`] generic over `T: PkNum`, for the ODE
+/// sensitivity RHS (`T = Dual2<N>`). The resolved ODE RHS only ever contains
+/// `AssignBc`/`DiffEqBc`/`If`, so the smooth assignments route through
+/// [`eval_bytecode_g`] and `If` conditions — value-based branch decisions —
+/// evaluate on a `.val()` view via the existing scalar [`eval_condition_indexed`]
+/// (theta/eta/cov/nn are empty in the ODE RHS). Mirrors the f64 evaluator
+/// statement-for-statement; the `eval_statements_g_*` tests pin it to that path.
+// Wired into the `Dual2`-state ODE RHS in Phase 3 of #367; test-only caller so far.
+#[allow(dead_code)]
+fn eval_statements_g<T: crate::sens::num::PkNum>(
+    stmts: &[Statement],
+    theta: &[T],
+    eta: &[T],
+    cov: &[f64],
+    vars: &mut [T],
+    du: Option<&mut [T]>,
+    bc_stack: &mut Vec<T>,
+) {
+    let empty_nn: Vec<Vec<f64>> = Vec::new();
+    let mut du_opt = du;
+    for s in stmts {
+        match s {
+            Statement::AssignBc(idx, bc) => {
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
+                if let Some(slot) = vars.get_mut(*idx) {
+                    *slot = v;
+                }
+            }
+            Statement::DiffEqBc(state_idx, bc) => {
+                let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
+                if let Some(buf) = du_opt.as_deref_mut() {
+                    if let Some(slot) = buf.get_mut(*state_idx) {
+                        *slot = v;
+                    }
+                }
+            }
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                // Conditions are value-based; evaluate on `.val()` views.
+                let theta_val: Vec<f64> = theta.iter().map(|v| v.val()).collect();
+                let eta_val: Vec<f64> = eta.iter().map(|v| v.val()).collect();
+                let vars_val: Vec<f64> = vars.iter().map(|v| v.val()).collect();
+                let mut taken = false;
+                for (cond, body) in branches {
+                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, &empty_nn)
+                    {
+                        eval_statements_g::<T>(
+                            body,
+                            theta,
+                            eta,
+                            cov,
+                            vars,
+                            du_opt.as_deref_mut(),
+                            bc_stack,
+                        );
+                        taken = true;
+                        break;
+                    }
+                }
+                if !taken {
+                    if let Some(eb) = else_body {
+                        eval_statements_g::<T>(
+                            eb,
+                            theta,
+                            eta,
+                            cov,
+                            vars,
+                            du_opt.as_deref_mut(),
+                            bc_stack,
+                        );
+                    }
+                }
+            }
+            Statement::AssignIdx(_, _)
+            | Statement::DiffEqIdx(_, _)
+            | Statement::Assign(_, _)
+            | Statement::DiffEq(_, _) => {}
+        }
+    }
+}
+
+/// Compiled ODE RHS program + var layout, exposed so the analytic-sensitivity
+/// provider can evaluate the same RHS over `Dual2<N>` (issue #367, Option A).
+/// Carries exactly what the f64 `rhs` closure binds, so [`eval_rhs_dual`]
+/// reproduces that binding but seeds the individual parameters as dual variables.
+///
+/// [`eval_rhs_dual`]: OdeRhsProgram::eval_rhs_dual
+///
+/// `pub` only so it can appear in the (public) [`OdeSpec`](crate::ode::OdeSpec)
+/// field; all fields are private, so it is opaque outside the crate and can be
+/// produced only by the parser.
+pub struct OdeRhsProgram {
+    stmts: Vec<Statement>,
+    n_vars_total: usize,
+    state_count: usize,
+    /// Per individual parameter `i`, the slot in the flat `params` vector it is
+    /// read from (its PK slot). Same plan the f64 `rhs` closure uses.
+    indiv_to_params_slot: Vec<usize>,
+    time_slot: usize,
+    tafd_slot: usize,
+    tad_slot: usize,
+    macheps_slot: usize,
+}
+
+impl OdeRhsProgram {
+    /// Evaluate `du = f(u, p, t)` over `Dual2<N>`. `u` is the current state;
+    /// `params` is the flat PK-parameter vector with the differentiated slots
+    /// already seeded as dual variables (so individual parameter `i`, read from
+    /// `params[indiv_to_params_slot[i]]`, carries its derivative); `tafd`/`tad`
+    /// are the time-after-first/last-dose anchors (constants w.r.t. the
+    /// parameters, lifted as such). `vars`/`stack` are caller-owned scratch
+    /// reused across RK stages. Writes `du` (length `state_count`). Mirrors the
+    /// f64 binding in the `rhs` closure statement-for-statement.
+    pub(crate) fn eval_rhs_dual<const N: usize>(
+        &self,
+        u: &[crate::sens::dual2::Dual2<N>],
+        params: &[crate::sens::dual2::Dual2<N>],
+        t: f64,
+        tafd: f64,
+        tad: f64,
+        du: &mut [crate::sens::dual2::Dual2<N>],
+        vars: &mut Vec<crate::sens::dual2::Dual2<N>>,
+        stack: &mut Vec<crate::sens::dual2::Dual2<N>>,
+    ) {
+        use crate::sens::dual2::Dual2;
+        vars.clear();
+        vars.resize(self.n_vars_total, Dual2::<N>::constant(0.0));
+        let copy_n = self.state_count.min(u.len());
+        vars[..copy_n].copy_from_slice(&u[..copy_n]);
+        for (i, &slot) in self.indiv_to_params_slot.iter().enumerate() {
+            if let (Some(dst), Some(&val)) = (vars.get_mut(self.state_count + i), params.get(slot))
+            {
+                *dst = val;
+            }
+        }
+        if let Some(d) = vars.get_mut(self.time_slot) {
+            *d = Dual2::constant(t);
+        }
+        if let Some(d) = vars.get_mut(self.tafd_slot) {
+            *d = Dual2::constant(tafd);
+        }
+        if let Some(d) = vars.get_mut(self.tad_slot) {
+            *d = Dual2::constant(tad);
+        }
+        if let Some(d) = vars.get_mut(self.macheps_slot) {
+            *d = Dual2::constant(f64::EPSILON);
+        }
+        for d in du.iter_mut() {
+            *d = Dual2::constant(0.0);
+        }
+        // The ODE RHS references states/indiv-params (in `vars`) only, not
+        // θ/η/cov directly — so those are empty here.
+        eval_statements_g::<Dual2<N>>(&self.stmts, &[], &[], &[], vars, Some(du), stack);
+    }
+}
+
+/// Compiled `[individual_parameters]` block + var layout, exposed so the
+/// analytic-sensitivity provider can obtain `∂p/∂η`, `∂p/∂θ` (and second order)
+/// **analytically** — by evaluating the same statements over `Dual2<M>` seeded on
+/// (θ, η) — instead of finite-differencing `pk_param_fn` (issue #367). Mirrors the
+/// f64 binding in the `pk_param_fn` closure.
+#[derive(Debug, Clone)]
+pub struct IndivParamProgram {
+    stmts: Vec<Statement>,
+    n_vars: usize,
+    /// `(pk_slot, var_slot)` per individual parameter, in declaration order
+    /// (parallel to `CompiledModel.pk_indices`).
+    pk_var_slots: Vec<(usize, usize)>,
+    /// User-declared θ count the individual parameters can reference.
+    n_theta: usize,
+    /// η count the `pk_param_fn` consumes (BSV + IOV kappa).
+    n_eta: usize,
+    /// Covariate names in `referenced_covariates` order (for the cov slice).
+    cov_names: Vec<String>,
+}
+
+impl IndivParamProgram {
+    /// Dual width needed to seed every (θ, η) axis: `n_theta + n_eta`.
+    pub(crate) fn n_axes(&self) -> usize {
+        self.n_theta + self.n_eta
+    }
+    /// User-declared θ count the individual parameters reference (the dual seed
+    /// dimension of η axis `k` is `n_theta_axis() + k`).
+    pub(crate) fn n_theta_axis(&self) -> usize {
+        self.n_theta
+    }
+    /// η count the individual parameters reference (BSV + IOV kappa).
+    pub(crate) fn n_eta_axis(&self) -> usize {
+        self.n_eta
+    }
+
+    /// The PK slot each row of [`eval_param_duals`](Self::eval_param_duals) /
+    /// [`pd_from_program`](crate::sens::ode_provider::pd_from_program) corresponds
+    /// to, in the program's own (analytical: alphabetical-by-PK-name; ODE:
+    /// declaration) order. The analytical provider uses this to pair each `∂p/∂·`
+    /// row with the right slot of the 8-slot PK gradient — `pk_var_slots` order is
+    /// NOT `CompiledModel.pk_indices` (declaration) order.
+    pub(crate) fn pk_slots(&self) -> Vec<usize> {
+        self.pk_var_slots.iter().map(|&(slot, _)| slot).collect()
+    }
+
+    /// Evaluate the individual parameters over `Dual2<M>` seeded on (θ, η):
+    /// `θ_m → var(·, m)`, `η_k → var(·, n_theta + k)`. Returns one `Dual2<M>` per
+    /// individual parameter (declaration order), whose `grad`/`hess` are the exact
+    /// `∂p/∂(θ,η)` / `∂²p/∂(θ,η)²`. Requires `M ≥ n_axes()`.
+    pub(crate) fn eval_param_duals<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Vec<crate::sens::dual2::Dual2<M>> {
+        use crate::sens::dual2::Dual2;
+        let theta_d: Vec<Dual2<M>> = theta
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                if m < M {
+                    Dual2::var(v, m)
+                } else {
+                    Dual2::constant(v)
+                }
+            })
+            .collect();
+        let eta_d: Vec<Dual2<M>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                let dim = self.n_theta + k;
+                if dim < M {
+                    Dual2::var(v, dim)
+                } else {
+                    Dual2::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![Dual2::<M>::constant(0.0); self.n_vars];
+        let mut stack: Vec<Dual2<M>> = Vec::new();
+        eval_statements_g::<Dual2<M>>(
+            &self.stmts,
+            &theta_d,
+            &eta_d,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+        );
+        self.pk_var_slots
+            .iter()
+            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual2::constant(0.0)))
+            .collect()
+    }
+}
+
+/// Compiled Form C ODE output expression (`[scaling] y = <expr>`) + var layout,
+/// exposed so the analytic-sensitivity provider can evaluate the readout
+/// (e.g. `central / V1`) over `Dual2<N>` — turning the integrated dual state and
+/// the dual PK parameters into the scaled observable with exact derivatives
+/// (issue #367, Option A). Mirrors the f64 readout closure in `build_y_output_fn`.
+pub struct OdeOutputProgram {
+    bc: Bytecode,
+    n_states: usize,
+    n_indiv: usize,
+    /// Per individual parameter `i`, its slot in the flat PK-parameter vector.
+    indiv_to_pk: Vec<usize>,
+    /// True when the expression references only states / individual parameters /
+    /// constants (no θ/η/covariate/NN terms) — the case the dual readout can
+    /// evaluate with empty θ/η/cov inputs.
+    simple: bool,
+}
+
+impl OdeOutputProgram {
+    /// See [`OdeOutputProgram::simple`].
+    pub(crate) fn is_simple(&self) -> bool {
+        self.simple
+    }
+
+    /// Evaluate the output expression over `Dual2<N>`. `state` is the integrated
+    /// dual state; `params` is the flat PK-parameter vector with the
+    /// differentiated slots seeded as dual variables (so `V1`'s derivative flows
+    /// into `central / V1`). `vars`/`stack` are caller-owned scratch. Only valid
+    /// when [`is_simple`](Self::is_simple) holds.
+    pub(crate) fn eval_output_dual<const N: usize>(
+        &self,
+        state: &[crate::sens::dual2::Dual2<N>],
+        params: &[crate::sens::dual2::Dual2<N>],
+        vars: &mut Vec<crate::sens::dual2::Dual2<N>>,
+        stack: &mut Vec<crate::sens::dual2::Dual2<N>>,
+    ) -> crate::sens::dual2::Dual2<N> {
+        use crate::sens::dual2::Dual2;
+        vars.clear();
+        vars.resize(self.n_states + self.n_indiv, Dual2::<N>::constant(0.0));
+        let copy_n = self.n_states.min(state.len());
+        vars[..copy_n].copy_from_slice(&state[..copy_n]);
+        for (i, &slot) in self.indiv_to_pk.iter().enumerate() {
+            if let (Some(dst), Some(&v)) = (vars.get_mut(self.n_states + i), params.get(slot)) {
+                *dst = v;
+            }
+        }
+        let empty_nn: Vec<Vec<f64>> = Vec::new();
+        eval_bytecode_g::<Dual2<N>>(&self.bc, &[], &[], &[], vars, &empty_nn, stack)
+    }
+}
+
+/// Differentiable form of an `obs_scale = <expr>` scaling expression (issue #367).
+/// Holds the scale expression compiled to bytecode plus the layout to evaluate it
+/// over `Dual2<M>` seeded on (θ, η): θ/η references read the seed duals directly;
+/// individual-parameter references read `vars[i]`, where var slot `i` is fed by
+/// the provider as a dual for flat PK slot `var_to_pk_slot[i]` (value + ∂p/∂(θ,η));
+/// covariates are constants. This lets the analytic sensitivity provider
+/// differentiate the scaled prediction `f / scale` exactly instead of falling back
+/// to finite differences for `ExpressionScale` models. Mirrors [`OdeOutputProgram`].
+pub struct ScaleDerivProgram {
+    bc: Bytecode,
+    n_theta: usize,
+    n_eta: usize,
+    /// `vars` slot `i` (the bytecode's `PushVar(i)`) → flat PK slot whose value
+    /// and `∂/∂(θ,η)` the provider feeds in. Parallel to the individual-parameter
+    /// declaration order.
+    var_to_pk_slot: Vec<usize>,
+    cov_names: Vec<String>,
+}
+
+impl ScaleDerivProgram {
+    /// Dual width needed to seed every (θ, η) axis.
+    pub(crate) fn n_axes(&self) -> usize {
+        self.n_theta + self.n_eta
+    }
+    pub(crate) fn n_theta_axis(&self) -> usize {
+        self.n_theta
+    }
+    pub(crate) fn n_eta_axis(&self) -> usize {
+        self.n_eta
+    }
+    /// `vars` slot → flat PK slot (so the provider knows which PK params to seed).
+    pub(crate) fn var_to_pk_slot(&self) -> &[usize] {
+        &self.var_to_pk_slot
+    }
+
+    /// Evaluate the scale over `Dual2<M>` seeded on (θ, η): `θ_m → var(·, m)`,
+    /// `η_k → var(·, n_theta + k)`. `var_duals[i]` is the dual for the individual
+    /// parameter at PK slot `var_to_pk_slot[i]` (value + `∂/∂(θ,η)`). Returns the
+    /// scale's value, gradient `∂scale/∂(θ,η)`, and Hessian. Requires `M ≥ n_axes()`.
+    pub(crate) fn eval_scale_dual<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        cov: &HashMap<String, f64>,
+        var_duals: &[crate::sens::dual2::Dual2<M>],
+    ) -> crate::sens::dual2::Dual2<M> {
+        use crate::sens::dual2::Dual2;
+        let theta_d: Vec<Dual2<M>> = theta
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                if m < M {
+                    Dual2::var(v, m)
+                } else {
+                    Dual2::constant(v)
+                }
+            })
+            .collect();
+        let eta_d: Vec<Dual2<M>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                let dim = self.n_theta + k;
+                if dim < M {
+                    Dual2::var(v, dim)
+                } else {
+                    Dual2::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| cov.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let empty_nn: Vec<Vec<f64>> = Vec::new();
+        let mut stack: Vec<Dual2<M>> = Vec::new();
+        eval_bytecode_g::<Dual2<M>>(
+            &self.bc, &theta_d, &eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
+        )
     }
 }
 
@@ -9036,6 +9764,15 @@ pub struct IndivParamPartials {
     /// n_eta_bsv..n_eta_bsv+n_kappa). Matches the `eta` slice the
     /// `pk_param_fn` closure consumes.
     pub(crate) d_d_eta: Vec<Vec<Expression>>,
+    /// The compiled individual-parameter program, so the analytical PK
+    /// sensitivity provider can obtain exact `∂p/∂(θ,η)` by evaluating it over
+    /// `Dual2` seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
+    /// θ chain and the log-normal-only `sel` η chain (issue #367). Unlike the
+    /// `d_d_theta`/`d_d_eta` symbolic partials (reserved, no runtime consumer),
+    /// this field IS consumed at runtime by `sens::provider`. `None` for
+    /// hand-built fixtures and when no `[individual_parameters]` block exists;
+    /// the ODE provider reads its own copy from `ode_spec`.
+    pub(crate) indiv_param_program: Option<IndivParamProgram>,
 }
 
 impl IndivParamPartials {
@@ -9048,6 +9785,7 @@ impl IndivParamPartials {
             names: Vec::new(),
             d_d_theta: Vec::new(),
             d_d_eta: Vec::new(),
+            indiv_param_program: None,
         }
     }
 }
@@ -9142,6 +9880,9 @@ fn build_indiv_param_partials(
         names,
         d_d_theta,
         d_d_eta,
+        // Attached by the caller (`build_pk_param_fn` site) after the program is
+        // compiled; the symbolic-partials builder itself doesn't produce it.
+        indiv_param_program: None,
     }
 }
 
@@ -11910,11 +12651,37 @@ mod tests {
     #[test]
     fn test_apply_fit_option_optimizer_and_bloq() {
         let mut opts = FitOptions::default();
+        // `lbfgs` resolves to the built-in limited-memory L-BFGS; the NLopt
+        // L-BFGS + SLSQP-polish path keeps the explicit `nlopt_lbfgs` keyword.
         assert_eq!(apply_fit_option(&mut opts, "optimizer", "lbfgs"), Ok(true));
+        assert_eq!(opts.optimizer, Optimizer::Lbfgs);
+        assert_eq!(
+            apply_fit_option(&mut opts, "optimizer", "nlopt_lbfgs"),
+            Ok(true)
+        );
         assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
 
         assert_eq!(apply_fit_option(&mut opts, "bloq", "m3"), Ok(true));
         assert_eq!(opts.bloq_method, BloqMethod::M3);
+    }
+
+    #[test]
+    fn test_apply_fit_option_inner_optimizer() {
+        use crate::types::InnerOptimizer;
+        let mut opts = FitOptions::default();
+        // Default is Auto (size-based dispatch).
+        assert_eq!(opts.inner_optimizer, InnerOptimizer::Auto);
+        for (s, want) in [
+            ("auto", InnerOptimizer::Auto),
+            ("bfgs", InnerOptimizer::Bfgs),
+            ("lbfgs", InnerOptimizer::Lbfgs),
+            ("nelder_mead", InnerOptimizer::NelderMead),
+            ("neldermead", InnerOptimizer::NelderMead),
+        ] {
+            assert_eq!(apply_fit_option(&mut opts, "inner_optimizer", s), Ok(true));
+            assert_eq!(opts.inner_optimizer, want, "inner_optimizer = {s}");
+        }
+        assert!(apply_fit_option(&mut opts, "inner_optimizer", "nope").is_err());
     }
 
     // ── Warn on options that don't apply to the selected estimation method.
@@ -12027,6 +12794,23 @@ mod tests {
         }
         // And it uses the new phrasing, not the old "Available options".
         assert!(w.contains("Method-specific options"), "got: {w}");
+    }
+
+    #[test]
+    fn test_inner_optimizer_under_focei_does_not_warn() {
+        // `inner_optimizer` drives the per-subject EBE loop, which FOCEI uses —
+        // it must be in the method's recognized keys and not flagged "ignored".
+        let opts = parse_fit_options(&[
+            "method = focei".to_string(),
+            "inner_optimizer = lbfgs".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(opts.inner_optimizer, crate::types::InnerOptimizer::Lbfgs);
+        let warnings = opts.unsupported_keys_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.contains("inner_optimizer")),
+            "inner_optimizer should not warn under FOCEI, got: {warnings:?}"
+        );
     }
 
     #[test]
@@ -16682,7 +17466,7 @@ if (WT > 70) {
         let src = analytical_model_with_scaling(Some("  obs_scale = TVV / 10\n"));
         let model = parse_model_string(&src).expect("expression scaling parses");
         match model.scaling {
-            ScalingSpec::ExpressionScale { ref scale_fn } => {
+            ScalingSpec::ExpressionScale { ref scale_fn, .. } => {
                 // TVV = 50 (the parsed default), so scale = 50/10 = 5.
                 let theta = vec![1.0, 50.0]; // [TVCL, TVV]
                 let eta = vec![0.0];
@@ -16696,11 +17480,106 @@ if (WT > 70) {
     }
 
     #[test]
+    fn scale_deriv_program_matches_fd() {
+        // The differentiable scale program's `∂scale/∂(θ,η)` must match FD of the
+        // scale closure composed with `pk_param_fn` (issue #367). `obs_scale =
+        // 1000 / V`, V = TVV·exp(ETA_V) — so the scale depends on θ (via TVV) and
+        // η (via ETA_V) through the individual parameter V.
+        use crate::sens::dual2::Dual2;
+        let src = "\
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 0.20
+  sigma PROP ~ 0.05
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP)
+[scaling]
+  obs_scale = 1000 / V
+";
+        let model = parse_model_string(src).expect("scaling model parses");
+        let (scale_fn, prog) = match &model.scaling {
+            ScalingSpec::ExpressionScale {
+                scale_fn,
+                deriv: Some(p),
+            } => (scale_fn, p),
+            other => panic!("expected ExpressionScale with deriv, got {:?}", other),
+        };
+        assert_eq!(prog.n_theta_axis(), 3);
+        assert_eq!(prog.n_eta_axis(), 3);
+        assert_eq!(prog.n_axes(), 6);
+
+        const M: usize = 6; // n_theta(3) + n_eta(3)
+        let theta = vec![0.13, 8.0, 1.0];
+        let eta = vec![0.1, -0.05, 0.2];
+        let cov: HashMap<String, f64> = HashMap::new();
+
+        // Individual-parameter duals over (θ, η) from the same program the
+        // provider uses, mapped to the scale program's var slots.
+        let ipp = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("indiv param program");
+        let pk_duals = ipp.eval_param_duals::<M>(&theta, &eta, &cov);
+        let pk_slots = ipp.pk_slots();
+        let mut slot_dual: HashMap<usize, Dual2<M>> = HashMap::new();
+        for (i, &s) in pk_slots.iter().enumerate() {
+            slot_dual.insert(s, pk_duals[i]);
+        }
+        let pk_vals = (model.pk_param_fn)(&theta, &eta, &cov);
+        let var_duals: Vec<Dual2<M>> = prog
+            .var_to_pk_slot()
+            .iter()
+            .map(|&s| {
+                slot_dual
+                    .get(&s)
+                    .copied()
+                    .unwrap_or_else(|| Dual2::constant(pk_vals.values[s]))
+            })
+            .collect();
+        let scale = prog.eval_scale_dual::<M>(&theta, &eta, &cov, &var_duals);
+
+        // Reference: scale as a function of (θ, η) through pk_param_fn.
+        let g = |th: &[f64], et: &[f64]| -> f64 {
+            let pk = (model.pk_param_fn)(th, et, &cov);
+            scale_fn(th, et, &cov, &pk)
+        };
+        approx::assert_relative_eq!(scale.value, g(&theta, &eta), max_relative = 1e-12);
+        let h = 1e-6;
+        for m in 0..3 {
+            let mut tp = theta.clone();
+            tp[m] += h;
+            let mut tm = theta.clone();
+            tm[m] -= h;
+            let fd = (g(&tp, &eta) - g(&tm, &eta)) / (2.0 * h);
+            approx::assert_relative_eq!(scale.grad[m], fd, max_relative = 1e-5, epsilon = 1e-9);
+        }
+        for k in 0..3 {
+            let mut ep = eta.clone();
+            ep[k] += h;
+            let mut em = eta.clone();
+            em[k] -= h;
+            let fd = (g(&theta, &ep) - g(&theta, &em)) / (2.0 * h);
+            approx::assert_relative_eq!(scale.grad[3 + k], fd, max_relative = 1e-5, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
     fn test_parse_scaling_expression_uses_covariate() {
         let src = analytical_model_with_scaling(Some("  obs_scale = WT / 70\n"));
         let model = parse_model_string(&src).expect("covariate scaling parses");
         match model.scaling {
-            ScalingSpec::ExpressionScale { ref scale_fn } => {
+            ScalingSpec::ExpressionScale { ref scale_fn, .. } => {
                 let theta = vec![1.0, 50.0];
                 let eta = vec![0.0];
                 let mut cov = HashMap::new();
@@ -16723,7 +17602,7 @@ if (WT > 70) {
         let src = analytical_model_with_scaling(Some("  obs_scale = 1000 / V\n"));
         let model = parse_model_string(&src).expect("indiv-param ref in obs_scale parses");
         match model.scaling {
-            ScalingSpec::ExpressionScale { ref scale_fn } => {
+            ScalingSpec::ExpressionScale { ref scale_fn, .. } => {
                 let theta = vec![1.0, 50.0]; // [TVCL, TVV]
                 let eta = vec![0.0];
                 let cov = HashMap::new();
@@ -17189,35 +18068,28 @@ if (WT > 70) {
     }
 
     #[test]
-    fn test_parse_scaling_y_form_c_rejects_ad() {
-        // Regression for Copilot review on PR #84: the original guard only
-        // checked `ScalingSpec::requires_fd()`, missing Form C readouts
-        // (which live on `OdeSpec.readout`, not `model.scaling`). A Form C
-        // model with `gradient = ad` silently fell back to FD via
-        // `model.tv_fn.is_none()` at runtime; now the parser errors loudly.
+    fn test_parse_scaling_y_form_c_with_ad_parses() {
+        // `gradient = ad` is retired and now rejected uniformly by
+        // `check_model_options` (`E_AD_RETIRED`), so the old Form-C-specific
+        // *parse-time* guard was removed. A Form C model with `gradient = ad`
+        // therefore parses; the rejection happens at model-options validation
+        // (covered by `api::ad_requested_errors_now_that_ad_is_retired`).
         let src_per_cmt = ode_model_with_scaling(
             "ode(states=[depot, central])",
             Some("  y[CMT=1] = central / V\n  y[CMT=2] = central / V * 1000\n"),
         )
         .replace("gradient = fd", "gradient = ad");
-        let err = parse_model_string(&src_per_cmt)
-            .expect_err("per-CMT y + gradient = ad must be rejected");
         assert!(
-            err.contains("per-CMT `y[CMT=N]`") && err.contains("gradient = fd"),
-            "expected per-CMT Form C + AD rejection, got: {}",
-            err
+            parse_model_string(&src_per_cmt).is_ok(),
+            "Form C + gradient = ad should parse (rejected later at check_model_options)"
         );
 
-        // Single Form C (uniform `y = <expr>`) gets the same treatment.
         let src_single =
             ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V\n"))
                 .replace("gradient = fd", "gradient = ad");
-        let err = parse_model_string(&src_single)
-            .expect_err("single Form C + gradient = ad must be rejected");
         assert!(
-            err.contains("`y = <expr>` (Form C)") && err.contains("gradient = fd"),
-            "expected single Form C + AD rejection, got: {}",
-            err
+            parse_model_string(&src_single).is_ok(),
+            "single Form C + gradient = ad should parse (rejected later)"
         );
     }
 
@@ -17255,6 +18127,240 @@ if (WT > 70) {
     }
     fn cmp(l: Expression, op: CmpOp, r: Expression) -> Condition {
         Condition::Compare(l, op, r)
+    }
+
+    // ── Generic bytecode VM (`eval_bytecode_g`) ──────────────────────────────
+    //
+    // The Dual2 analytic-sensitivity path reuses the same `Bytecode` through
+    // `eval_bytecode_g`. These tests pin it to the scalar evaluator: the `f64`
+    // monomorphization must be bit-identical to `eval_bytecode`, and the
+    // `Dual2<2>` value/grad/Hessian must match the f64 path and its finite
+    // differences — so the second evaluator cannot silently drift.
+
+    fn varidx(i: usize) -> Expression {
+        Expression::VariableIdx(i)
+    }
+    fn power_expr(b: Expression, e: Expression) -> Expression {
+        Expression::Power(Box::new(b), Box::new(e))
+    }
+    fn close(a: f64, b: f64, rel: f64, eps: f64) -> bool {
+        let d = (a - b).abs();
+        d <= eps || d <= rel * a.abs().max(b.abs())
+    }
+
+    fn bc_g_f64_matches(expr: &Expression, vars: &[f64]) {
+        let nn: Vec<Vec<f64>> = Vec::new();
+        let bc = compile_bytecode(expr);
+        let mut s1: Vec<f64> = Vec::new();
+        let f = eval_bytecode(&bc, &[], &[], &[], vars, &nn, &mut s1);
+        let mut s2: Vec<f64> = Vec::new();
+        let g = eval_bytecode_g::<f64>(&bc, &[], &[], &[], vars, &nn, &mut s2);
+        assert_eq!(
+            f.to_bits(),
+            g.to_bits(),
+            "f64 generic VM drift: expr={expr:?} f={f} g={g}"
+        );
+    }
+
+    /// Vars 0 and 1 are seeded as `Dual2<2>` variables; check value/grad/Hessian
+    /// against the f64 evaluator and its central finite differences.
+    fn bc_g_dual2_fd(expr: &Expression, x: f64, y: f64, gtol: f64, htol: f64) {
+        use crate::sens::dual2::Dual2;
+        let nn: Vec<Vec<f64>> = Vec::new();
+        let bc = compile_bytecode(expr);
+        let vd = [Dual2::<2>::var(x, 0), Dual2::<2>::var(y, 1)];
+        let mut sd: Vec<Dual2<2>> = Vec::new();
+        let d = eval_bytecode_g::<Dual2<2>>(&bc, &[], &[], &[], &vd, &nn, &mut sd);
+        let v = |a: f64, b: f64| {
+            let mut s: Vec<f64> = Vec::new();
+            eval_bytecode(&bc, &[], &[], &[], &[a, b], &nn, &mut s)
+        };
+        assert!(close(d.value, v(x, y), 1e-12, 1e-12), "value: {expr:?}");
+        let h = 1e-5;
+        let gx = (v(x + h, y) - v(x - h, y)) / (2.0 * h);
+        let gy = (v(x, y + h) - v(x, y - h)) / (2.0 * h);
+        assert!(
+            close(d.grad[0], gx, gtol, 1e-7),
+            "grad0 {:?}: {} vs {}",
+            expr,
+            d.grad[0],
+            gx
+        );
+        assert!(
+            close(d.grad[1], gy, gtol, 1e-7),
+            "grad1 {:?}: {} vs {}",
+            expr,
+            d.grad[1],
+            gy
+        );
+        let hh = 1e-4;
+        let hxx = (v(x + hh, y) - 2.0 * v(x, y) + v(x - hh, y)) / (hh * hh);
+        let hyy = (v(x, y + hh) - 2.0 * v(x, y) + v(x, y - hh)) / (hh * hh);
+        let hxy = (v(x + hh, y + hh) - v(x + hh, y - hh) - v(x - hh, y + hh) + v(x - hh, y - hh))
+            / (4.0 * hh * hh);
+        assert!(
+            close(d.hess[0][0], hxx, htol, 1e-4),
+            "hxx {:?}: {} vs {}",
+            expr,
+            d.hess[0][0],
+            hxx
+        );
+        assert!(
+            close(d.hess[1][1], hyy, htol, 1e-4),
+            "hyy {:?}: {} vs {}",
+            expr,
+            d.hess[1][1],
+            hyy
+        );
+        assert!(
+            close(d.hess[0][1], hxy, htol, 1e-4),
+            "hxy {:?}: {} vs {}",
+            expr,
+            d.hess[0][1],
+            hxy
+        );
+        assert!(
+            close(d.hess[0][1], d.hess[1][0], 1e-12, 1e-12),
+            "hess symmetry"
+        );
+    }
+
+    #[test]
+    fn bytecode_g_f64_bit_identical() {
+        let vars = [1.7_f64, 0.8];
+        let exprs = [
+            binop(BinOp::Add, varidx(0), varidx(1)),
+            binop(BinOp::Sub, varidx(0), varidx(1)),
+            binop(BinOp::Mul, varidx(0), varidx(1)),
+            binop(BinOp::Div, varidx(0), varidx(1)),
+            binop(BinOp::Mod, varidx(0), lit(0.5)),
+            power_expr(varidx(0), lit(2.5)),
+            power_expr(varidx(0), varidx(1)),
+            unary("exp", binop(BinOp::Sub, lit(0.0), varidx(0))),
+            unary("ln", binop(BinOp::Mul, varidx(0), varidx(1))),
+            unary("sqrt", binop(BinOp::Add, varidx(0), varidx(1))),
+            unary("abs", binop(BinOp::Sub, varidx(0), varidx(1))),
+            unary("inv_logit", binop(BinOp::Sub, varidx(0), varidx(1))),
+            unary("logit", binop(BinOp::Mul, lit(0.3), varidx(1))),
+            unary("floor", varidx(0)),
+            unary("ceil", varidx(0)),
+            unary("round", varidx(0)),
+            cond(cmp(varidx(0), CmpOp::Gt, varidx(1)), lit(1.0), lit(2.0)),
+        ];
+        for e in &exprs {
+            bc_g_f64_matches(e, &vars);
+        }
+        // Guard branches: zero divisor, ln/sqrt of a non-positive argument.
+        bc_g_f64_matches(&binop(BinOp::Div, varidx(0), lit(0.0)), &vars);
+        bc_g_f64_matches(&unary("ln", binop(BinOp::Sub, lit(0.0), varidx(0))), &vars);
+        bc_g_f64_matches(
+            &unary("sqrt", binop(BinOp::Sub, lit(0.0), varidx(0))),
+            &vars,
+        );
+    }
+
+    #[test]
+    fn eval_statements_g_matches_f64_and_fd() {
+        use crate::sens::dual2::Dual2;
+        // vars: slot0=u (state), slot1=k (param), slot2=tmp (intermediate).
+        //   tmp = k·u ;  d/dt(u) = −tmp.
+        let stmts = vec![
+            Statement::AssignBc(
+                2,
+                compile_bytecode(&binop(BinOp::Mul, varidx(1), varidx(0))),
+            ),
+            Statement::DiffEqBc(0, compile_bytecode(&binop(BinOp::Sub, lit(0.0), varidx(2)))),
+        ];
+
+        let mut vf = vec![2.0_f64, 0.3, 0.0];
+        let mut duf = vec![0.0_f64];
+        let mut sf: Vec<f64> = Vec::new();
+        eval_statements_indexed_with_stack(
+            &stmts,
+            &[],
+            &[],
+            &[],
+            &mut vf,
+            Some(&mut duf),
+            &[],
+            &mut sf,
+        );
+
+        // Seed k (slot 1) as the differentiated variable.
+        let mut vd = vec![
+            Dual2::<1>::constant(2.0),
+            Dual2::<1>::var(0.3, 0),
+            Dual2::<1>::constant(0.0),
+        ];
+        let mut dud = vec![Dual2::<1>::constant(0.0)];
+        let mut sd: Vec<Dual2<1>> = Vec::new();
+        eval_statements_g::<Dual2<1>>(&stmts, &[], &[], &[], &mut vd, Some(&mut dud), &mut sd);
+
+        assert!(close(dud[0].value, duf[0], 1e-12, 1e-12), "value vs f64");
+        // du[0] = −k·u = −0.6; ∂/∂k = −u = −2; ∂²/∂k² = 0.
+        assert!(close(dud[0].value, -0.6, 1e-12, 1e-12));
+        assert!(close(dud[0].grad[0], -2.0, 1e-9, 1e-9));
+        assert!(close(dud[0].hess[0][0], 0.0, 1e-9, 1e-9));
+    }
+
+    #[test]
+    fn bytecode_g_dual2_matches_fd() {
+        bc_g_dual2_fd(
+            &unary("ln", binop(BinOp::Mul, varidx(0), varidx(1))),
+            1.7,
+            0.8,
+            1e-6,
+            1e-3,
+        );
+        bc_g_dual2_fd(&power_expr(varidx(0), lit(2.5)), 1.7, 0.8, 1e-6, 1e-3);
+        bc_g_dual2_fd(&power_expr(varidx(0), varidx(1)), 1.7, 0.8, 1e-6, 2e-3);
+        bc_g_dual2_fd(
+            &unary("sqrt", binop(BinOp::Add, varidx(0), varidx(1))),
+            1.7,
+            0.8,
+            1e-6,
+            1e-3,
+        );
+        bc_g_dual2_fd(
+            &unary("inv_logit", binop(BinOp::Sub, varidx(0), varidx(1))),
+            0.6,
+            0.2,
+            1e-6,
+            1e-3,
+        );
+        bc_g_dual2_fd(
+            &unary(
+                "abs",
+                binop(
+                    BinOp::Sub,
+                    binop(BinOp::Mul, varidx(0), varidx(0)),
+                    varidx(1),
+                ),
+            ),
+            2.0,
+            1.0,
+            1e-6,
+            1e-3,
+        );
+        // 1-cpt IV-bolus shape: (1/V)·exp(−(CL/V)). vars: 0=CL, 1=V.
+        bc_g_dual2_fd(
+            &binop(
+                BinOp::Mul,
+                binop(BinOp::Div, lit(1.0), varidx(1)),
+                unary(
+                    "exp",
+                    binop(
+                        BinOp::Sub,
+                        lit(0.0),
+                        binop(BinOp::Div, varidx(0), varidx(1)),
+                    ),
+                ),
+            ),
+            3.0,
+            5.0,
+            1e-6,
+            1e-3,
+        );
     }
 
     #[test]

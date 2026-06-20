@@ -158,8 +158,8 @@ ferx examples/warfarin.ferx --simulate
 
 ```bash
 # Build the ferx binary
-cargo build --release --features autodiff
+cargo build --release
 
 # Run directly via cargo
-cargo run --release --features autodiff --bin ferx -- model.ferx --data data.csv
+cargo run --release --bin ferx -- model.ferx --data data.csv
 ```

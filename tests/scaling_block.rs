@@ -353,16 +353,9 @@ fn per_cmt_scaling_works_with_ad_gradient() {
         "PerCmt + AD OFV must be finite, got {}",
         res.ofv
     );
-    // The inner-loop gradient should report Enzyme AD when the autodiff
-    // feature is on. Under `--features ci` (no autodiff) it falls back to
-    // FD and the check below is skipped; we want the explicit assertion
-    // when CI runs the autodiff feature in a separate job.
-    #[cfg(feature = "autodiff")]
-    assert_eq!(
-        res.gradient_method_inner, "Enzyme AD",
-        "expected inner-loop AD, got {}",
-        res.gradient_method_inner
-    );
+    // `gradient = ad` is retired (`E_AD_RETIRED` at the option level; a model that
+    // hardcodes it in source falls through to the analytic/FD inner route). The
+    // point of this test is that a PerCmt-scaling model still parses and fits.
 }
 
 #[test]
@@ -386,11 +379,5 @@ fn form_b_expression_scaling_works_with_ad_gradient() {
         res.ofv.is_finite(),
         "ExpressionScale + AD OFV must be finite, got {}",
         res.ofv
-    );
-    #[cfg(feature = "autodiff")]
-    assert_eq!(
-        res.gradient_method_inner, "Enzyme AD",
-        "expected inner-loop AD, got {}",
-        res.gradient_method_inner
     );
 }

@@ -7,18 +7,15 @@
 //!   - Velocity Störmer-Verlet (leapfrog) integrates the dynamics
 //!   - Metropolis accept/reject on ΔH
 //!
-//! `leapfrog` has no autodiff dependency and can be unit-tested without the
-//! Enzyme toolchain.  `hmc_step` is gated on `#[cfg(feature = "autodiff")]`
-//! because the gradient uses `compute_nll_gradient_ad`.
+//! The η-gradient comes from the hand-rolled `Dual2` analytic sensitivities
+//! ([`crate::estimation::inner_optimizer::analytic_eta_nll_gradient`]) — the same
+//! exact gradient the FOCEI inner loop uses — so HMC needs no autodiff.
 
-#[cfg(feature = "autodiff")]
 use rand::Rng;
-#[cfg(feature = "autodiff")]
 use rand_distr::StandardNormal;
 
 /// Leapfrog energy-error magnitude above which an HMC transition is flagged
 /// divergent (matches Stan's `Δ_max`).
-#[cfg(feature = "autodiff")]
 const HMC_DIVERGENCE_THRESHOLD: f64 = 1000.0;
 
 // ---------------------------------------------------------------------------
@@ -87,32 +84,21 @@ pub fn leapfrog(
 }
 
 // ---------------------------------------------------------------------------
-// HMC step (requires autodiff)
+// HMC step
 // ---------------------------------------------------------------------------
 
-/// One HMC proposal for a single SAEM subject.
+/// One HMC proposal for a single SAEM/Bayes subject, matching the interface of
+/// `mh_steps`. The leapfrog gradient is the exact `Dual2` analytic `∂NLL/∂η`
+/// ([`crate::estimation::inner_optimizer::analytic_eta_nll_gradient`]) — no autodiff.
 ///
-/// Builds all AD helpers internally from the current SAEM state
-/// `(model, theta, omega, sigma_values)`, matching the interface of
-/// `mh_steps`.
-///
-/// Returns `Some((new_eta, new_nll, accepted, divergent))` when the AD gradient path is
-/// available.  Returns `None` when HMC cannot be applied — caller must fall
-/// back to `mh_steps` in that case.  HMC is unavailable when:
-///   - the model uses an ODE (`model.ode_spec.is_some()`)
-///   - the model has no analytical PK path (`model.tv_fn.is_none()`)
-///   - `omega.log_det` is non-finite (degenerate variance matrix)
-///   - [`crate::estimation::inner_optimizer::resolve_gradient_method`] resolves
-///     the subject to `Fd` (no AD path consistent with the analytical
-///     objective): SS doses,
-///     an oral model with a zero-order infusion dose, eta-dependent lagtime, or
-///     a TV-covariate / reset subject on a PK model the event-driven AD path
-///     doesn't support.
-///
-/// Reset (EVID=3/4), TV-covariate, and lagtime subjects take the event-driven
-/// AD path; plain subjects take the single-snapshot path — the same routing as
-/// the FOCEI inner loop.
-#[cfg(feature = "autodiff")]
+/// Returns `Some((new_eta, new_nll, accepted, divergent))`, or `None` when HMC
+/// cannot be applied (caller falls back to `mh_steps`):
+///   - the model uses an ODE (`model.ode_spec.is_some()`),
+///   - it has no analytical PK path (`model.tv_fn.is_none()`),
+///   - `omega.log_det` is non-finite (degenerate variance matrix), or
+///   - the Dual2 light provider can't differentiate the subject (time-varying
+///     covariates, oral infusion, SS+reset, expression scaling) — then there is no
+///     gradient consistent with the analytical objective.
 #[allow(clippy::too_many_arguments)]
 pub fn hmc_step(
     subject: &crate::types::Subject,
@@ -126,148 +112,59 @@ pub fn hmc_step(
     n_leapfrog: usize,
     rng: &mut impl Rng,
 ) -> Option<(Vec<f64>, f64, bool, bool)> {
-    use crate::ad::ad_gradients::{compute_nll_gradient_ad, FlatDoseData};
-    use crate::ad::event_driven_ad;
-    use crate::types::BloqMethod;
+    use crate::estimation::inner_optimizer::analytic_eta_nll_gradient;
+    use crate::stats::likelihood::individual_nll;
     use std::cell::Cell;
 
-    // AD requires an analytical PK path.
-    if model.ode_spec.is_some() || model.tv_fn.is_none() {
+    if model.ode_spec.is_some() || model.tv_fn.is_none() || !omega.log_det.is_finite() {
         return None;
     }
-    if !omega.log_det.is_finite() {
-        return None;
-    }
+    // HMC needs the exact `∂NLL/∂η`. The Dual2 light provider supplies it for the
+    // analytical models in scope; for anything it can't differentiate (TV
+    // covariates, oral infusion, SS+reset, expression scaling) there is no
+    // consistent gradient, so return `None` and let the caller fall back to its
+    // gradient-free MH sampler. Scope is model-level, so one probe at `eta`
+    // settles it for the whole trajectory.
+    analytic_eta_nll_gradient(model, subject, theta, eta, omega, sigma_values)?;
 
     let n_eta = eta.len();
 
-    // Flatten Ω⁻¹ (row-major) for the AD kernel.
-    let omega_inv = &omega.inv;
-    let mut omega_inv_flat = Vec::with_capacity(n_eta * n_eta);
-    for i in 0..n_eta {
-        for j in 0..n_eta {
-            omega_inv_flat.push(omega_inv[(i, j)]);
-        }
-    }
-    let log_det_omega = omega.log_det;
-
-    // Censoring flags for M3.
-    let cens_f64: Vec<f64> = if matches!(model.bloq_method, BloqMethod::M3) {
-        subject.cens.iter().map(|&c| c as f64).collect()
-    } else {
-        vec![0.0; subject.observations.len()]
-    };
-
-    // `last_nll` is written by the grad closure on every call so that after
-    // leapfrog, `last_nll.get()` == NLL(η_proposal) without an extra AD call.
+    // `last_nll` carries NLL(η_proposal) out of the leapfrog without a second
+    // evaluation. NLL is computed by the same `individual_nll` the caller used for
+    // `nll_current`, so the Metropolis ratio is exact.
     let last_nll = Cell::new(nll_current);
-
-    // Route by the SAME policy as the FOCEI inner loop
-    // (`inner_optimizer::resolve_gradient_method`) so the two estimators stay
-    // consistent: reset / TV-covariate / lagtime subjects take the event-driven
-    // AD path, and subjects where AD would be inconsistent with the analytical
-    // objective (SS doses, oral + zero-order infusion, eta-dependent lagtime,
-    // unsupported models) resolve to `Fd` — for which HMC has no path, so we
-    // return `None` and the caller falls back to its non-gradient sampler.
-    use crate::estimation::inner_optimizer::{resolve_gradient_method, InnerGradientMethod};
-
-    // Build the gradient closure for leapfrog, dispatching on the resolved route.
-    let (p_init, eta_prop, p_prop, nll_prop) = match resolve_gradient_method(model, subject) {
-        InnerGradientMethod::Fd => return None,
-        InnerGradientMethod::AdEventDriven => {
-            // Per-dose lagtimes (eta-independent part) baked into the event
-            // timeline — same source as `find_ebe`. Empty for non-lagtime models.
-            let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
-                let zeros = vec![0.0; n_eta];
-                crate::pk::compute_event_pk_params(model, subject, theta, &zeros)
-                    .dose
-                    .iter()
-                    .map(|p| p.lagtime())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let event_data = event_driven_ad::FlatEventData::from_subject(subject, &dose_lagtimes);
-            let tv_per_event =
-                event_driven_ad::FlatEventTv::from_subject(model, subject, theta, &dose_lagtimes);
-            let obs = subject.observations.clone();
-
-            let grad_fn = |q: &[f64]| -> Vec<f64> {
-                // Per-event scale array — q is the eta proposal, matches the
-                // pattern in `inner_optimizer::find_ebe`.
-                let event_scale =
-                    crate::estimation::inner_optimizer::build_event_scale_array_for_ad(
-                        model,
-                        subject,
-                        &event_data,
-                        theta,
-                        q,
-                    );
-                let (nll, g) = event_driven_ad::compute_nll_gradient_event_driven_ad(
-                    q,
-                    &tv_per_event,
-                    &omega_inv_flat,
-                    log_det_omega,
-                    sigma_values,
-                    &event_data,
-                    &obs,
-                    &cens_f64,
-                    model.pk_model,
-                    model.error_model,
-                    &model.pk_idx_f64,
-                    &model.sel_flat,
-                    &event_scale,
-                    model.log_transform,
-                );
-                last_nll.set(nll);
-                g
-            };
-
-            let p_init: Vec<f64> = (0..n_eta).map(|_| rng.sample(StandardNormal)).collect();
-            let (qp, pp) = leapfrog(eta, &p_init, &grad_fn, step_size, n_leapfrog);
-            let nll_p = last_nll.get();
-            (p_init, qp, pp, nll_p)
-        }
-        InnerGradientMethod::AdSingleSnapshot => {
-            // Single-snapshot AD path — no TV covariates, no resets.
-            let tv_fn = model.tv_fn.as_ref().unwrap();
-            let tv_adjusted = tv_fn(theta, &subject.covariates);
-            let dose_data = FlatDoseData::from_subject(subject);
-            let obs = subject.observations.clone();
-            let obs_times = subject.obs_times.clone();
-
-            let grad_fn = |q: &[f64]| -> Vec<f64> {
-                // Per-observation scale array (single-snapshot AD path).
-                let obs_scale = crate::estimation::inner_optimizer::build_scale_array_for_ad(
-                    model, subject, theta, q,
-                );
-                let (nll, g) = compute_nll_gradient_ad(
-                    q,
-                    &tv_adjusted,
-                    &omega_inv_flat,
-                    log_det_omega,
-                    sigma_values,
-                    &dose_data,
-                    &obs_times,
-                    &obs,
-                    &cens_f64,
-                    model.pk_model,
-                    model.error_model,
-                    &model.pk_idx_f64,
-                    &model.sel_flat,
-                    &obs_scale,
-                    model.log_transform,
-                );
-                last_nll.set(nll);
-                g
-            };
-
-            let p_init: Vec<f64> = (0..n_eta).map(|_| rng.sample(StandardNormal)).collect();
-            let (qp, pp) = leapfrog(eta, &p_init, &grad_fn, step_size, n_leapfrog);
-            let nll_p = last_nll.get();
-            (p_init, qp, pp, nll_p)
+    // The model-level scope probe above only settles `eta`; a leapfrog step can
+    // still reach a point the provider can't differentiate (e.g. a residual
+    // variance `v <= 0`). If that happens mid-trajectory, a zero gradient would
+    // turn the step into momentum-only free-flight and the frozen proposal could
+    // be accepted on a finite ΔH — so flag it and treat the whole transition as a
+    // failed/divergent move (reject, stay put) rather than silently biasing.
+    let grad_failed = Cell::new(false);
+    let grad_fn = |q: &[f64]| -> Vec<f64> {
+        last_nll.set(individual_nll(
+            model,
+            subject,
+            theta,
+            q,
+            omega,
+            sigma_values,
+        ));
+        match analytic_eta_nll_gradient(model, subject, theta, q, omega, sigma_values) {
+            Some(g) => g,
+            None => {
+                grad_failed.set(true);
+                vec![0.0; n_eta]
+            }
         }
     };
+
+    let p_init: Vec<f64> = (0..n_eta).map(|_| rng.sample(StandardNormal)).collect();
+    let (eta_prop, p_prop) = leapfrog(eta, &p_init, &grad_fn, step_size, n_leapfrog);
+    if grad_failed.get() {
+        // Trajectory left the differentiable region — reject and flag divergent.
+        return Some((eta.to_vec(), nll_current, false, true));
+    }
+    let nll_prop = last_nll.get();
 
     // Metropolis accept/reject on ΔH = H_curr − H_prop.
     // H = NLL(η) + ½‖p‖²  (identity mass matrix).

@@ -25,8 +25,9 @@ Each sweep, for each chain, cycles these blocks:
 
 1. **η block** — samples \\( \eta_i \mid \theta, \Omega, \Sigma, \kappa, y \\) for
    every subject with a \\( \mathrm{chol}(\Omega) \\)-preconditioned block
-   Metropolis kernel, or gradient-guided **HMC** when available (an autodiff
-   build, `n_leapfrog > 0`, an analytical-PK subject, no IOV).
+   Metropolis kernel, or gradient-guided **HMC** when available (`n_leapfrog > 0`,
+   an analytical-PK subject, no IOV). The HMC gradient is the exact analytic
+   `Dual2` η-gradient — the same one FOCEI uses — so no autodiff is required.
 
 1b. **κ block** (IOV models) — samples each per-occasion
    \\( \kappa_{ik} \mid \eta, \theta, \Omega, \Omega_{iov}, y \\) holding η fixed.
@@ -64,7 +65,7 @@ draws are thinned by `bayes_thin` and summarized.
 | `bayes_chains` | 4 | Independent chains (distinct seeds; used for split-R̂). |
 | `bayes_thin`   | 1 | Keep every `bayes_thin`-th sampling draw. |
 | `bayes_seed`   | — | Base RNG seed; chain `c` derives its own. |
-| `n_leapfrog`   | 0 | Leapfrog steps for the HMC η kernel (autodiff builds; `0` ⇒ block MH). |
+| `n_leapfrog`   | 0 | Leapfrog steps for the HMC η kernel (analytical-PK models; `0` ⇒ block MH). |
 
 ## Output
 

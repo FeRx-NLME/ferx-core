@@ -244,8 +244,8 @@ When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption 
 | `model_name` | Name from the `.ferx` file (or `"Unnamed"`) |
 | `ferx_version` | Version of ferx-core that produced the result |
 | `wall_time_secs` | Wall-clock time for the complete fit (seconds) |
-| `gradient_method_inner` | Gradient method used in the inner (EBE) loop, e.g. `FiniteDifference` |
-| `gradient_method_outer` | Gradient method used in the outer loop, e.g. `FiniteDifference` or `AutoDiff` |
+| `gradient_method_inner` | Gradient method used in the inner (EBE) loop, e.g. `analytic (Dual2)` or `finite differences` |
+| `gradient_method_outer` | Gradient method used in the outer loop, e.g. `finite differences` |
 | `uses_ode_solver` | `true` if the model uses the ODE solver, `false` for analytical PK |
 | `n_threads_used` | Number of Rayon threads used during estimation |
 | `nlopt_missing_algorithms` | NLopt algorithms that were requested but unavailable in this build (empty when all available) |

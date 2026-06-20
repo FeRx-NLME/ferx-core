@@ -1,0 +1,32 @@
+[parameters]
+  theta TVV1(6, 0.1, 25)
+  theta TVV2(20, 1, 60)
+  theta TVV3(200, 50, 1000)
+  theta TVCL(2, 0.1, 6)
+  theta TVQ2(1, 0.1, 4)
+  theta TVQ3(0.5, 0.1, 3)
+
+  omega ETA_V1 ~ 0.1
+  omega ETA_V2 ~ 0.1
+  omega ETA_CL ~ 0.1
+  omega ETA_Q2 ~ 0.1
+
+  sigma PROP_ERR ~ 0.1
+
+[individual_parameters]
+  V1 = TVV1 * (WT/70.) * exp(ETA_V1)
+  V2 = TVV2 * (WT/70.) * exp(ETA_V2)
+  V3 = TVV3 * (WT/70.)
+  CL = TVCL * (WT/70.)^0.75 * exp(ETA_CL)
+  Q2 = TVQ2 * (WT/70.)^0.75 * exp(ETA_Q2)
+  Q3 = TVQ3 * (WT/70.)^0.75
+
+[structural_model]
+  pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method        = focei
+  optimizer     = lbfgs

@@ -54,14 +54,13 @@ behave identically to the pre-feature path.
 
 `lagtime` is supported on:
 
-- the analytical superposition path,
-- the autodiff (single-snapshot) path used during `fit()`,
+- the analytical superposition path (predictions),
+- the analytic `Dual2` sensitivity gradient used during `fit()`,
 - the ODE path.
 
 In the niche case of a time-varying-covariate subject combined with a
-lagtime-bearing model, ferx-core silently falls back from the event-driven
-autodiff path to finite differences — correctness is preserved at a small
-performance cost.
+lagtime-bearing model, ferx-core silently falls back from the analytic gradient
+to finite differences — correctness is preserved at a small performance cost.
 
 ## NONMEM equivalence
 

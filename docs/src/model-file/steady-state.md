@@ -213,12 +213,14 @@ dose time, so don't interpret the fit as a steady-state fit.
   The SS branch is gated on `dose.ii > 0`, so the dose falls through
   to the single-dose path. Set `II` in the dataset or remove the
   `SS=1` flag.
-- **`SS=1` infusion with `T_inf > II`** (overlapping pulses) — no
-  closed-form solution or pulse-expansion scheme covers this. The SS
-  pre-equilibration returns a zero preload and the dose is then
-  applied as a single infusion. Use a shorter infusion (`T_inf ≤ II`)
-  or model overlapping infusions with an `[odes]` block and explicit
-  periodic dose records (without `SS=1`).
+- **`SS=1` infusion with `T_inf > II`** (overlapping pulses) — handled
+  for the analytical 1-/2-/3-compartment models: the steady-state
+  concentration superposes the infinite past pulse train (several
+  infusions simultaneously active). Only **ODE** models, and analytical
+  subjects whose timeline routes to the event-driven walker (EVID=3/4
+  resets), still skip SS pre-equilibration here and emit the warning;
+  for those, model the overlapping infusions with an `[odes]` block and
+  explicit periodic dose records (without `SS=1`).
 
 ### `SS=2`
 

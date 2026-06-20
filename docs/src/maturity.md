@@ -12,7 +12,7 @@ in a banner at the top, e.g.:
 > **Maturity: beta** — see [Feature Maturity](maturity.md) for what this means.
 
 The table below is the authoritative list; a few features documented inside a
-shared reference page (e.g. autodiff under [Fit Options](model-file/fit-options.md))
+shared reference page (e.g. the gradient method under [Fit Options](model-file/fit-options.md))
 or only in an example carry their label here rather than in a per-page banner.
 
 ## Maturity levels

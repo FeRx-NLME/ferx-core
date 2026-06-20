@@ -320,9 +320,8 @@ time** — use an `ode(...)` model.
 
 > One subtlety: when a subject has any modeled-`RATE` dose (`RATE=-2` or `-1`) on
 > an **analytical** model, that subject's inner-loop gradient falls back to finite
-> differences even under `gradient = ad`, because the autodiff kernels cannot
-> carry the duration/rate's `∂/∂η`. Results are unchanged; only the gradient route
-> differs.
+> differences, because the analytic sensitivity kernels cannot carry the modeled
+> duration/rate's `∂/∂η`. Results are unchanged; only the gradient route differs.
 
 ### Modeled infusion rate (`Rn`, `RATE=-1`)
 
@@ -372,7 +371,7 @@ with sigma and omega.
 ## Limitations
 
 - The observable compartment contains the amount (not concentration). Divide by volume in the ODE equations if needed
-- SDE (`[diffusion]`) is not compatible with SAEM or the autodiff gradient path
+- SDE (`[diffusion]`) is not compatible with SAEM or the analytic gradient path (uses FD)
 
 Steady-state (`SS=1`) is supported for ODE models via numerical
 pulse-expansion equilibration — see [Steady-State Doses](steady-state.md)

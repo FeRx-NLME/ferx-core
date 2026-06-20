@@ -629,6 +629,23 @@ pub struct OdeSpec {
     /// that injects `+rate` for infusions. Empty for models with no built-in
     /// `transit()`/etc. input-rate term (the historical default).
     pub input_rate: Vec<crate::pk::absorption::InputRateForcing>,
+    /// Compiled RHS program for the analytic-sensitivity path (issue #367,
+    /// Option A): lets the sensitivity provider evaluate the same RHS over
+    /// `Dual2<N>` to obtain exact PK-parameter derivatives. `None` for
+    /// hand-built specs (tests, EKF) and any model outside the ODE-sensitivity
+    /// scope gate; those fall back to the gradient-free path.
+    pub rhs_program: Option<crate::parser::model_parser::OdeRhsProgram>,
+    /// Compiled Form C readout (`[scaling] y = <expr>`) for the analytic-
+    /// sensitivity path (issue #367): lets the provider evaluate the scaled
+    /// observable (e.g. `central / V1`) over `Dual2<N>`. `None` for `ObsCmt`
+    /// readouts (read the state directly), per-CMT Form C, and hand-built specs.
+    pub readout_program: Option<crate::parser::model_parser::OdeOutputProgram>,
+    /// Compiled `[individual_parameters]` program for the analytic-sensitivity
+    /// η/θ chain (issue #367): lets the provider compute `∂p/∂η`, `∂p/∂θ`
+    /// **analytically** over `Dual2`, instead of finite-differencing `pk_param_fn`.
+    /// Attached after `[individual_parameters]` is parsed; `None` for hand-built
+    /// specs.
+    pub indiv_param_program: Option<crate::parser::model_parser::IndivParamProgram>,
     /// Compartment-indexed dose attributes (NONMEM `Fn`/`ALAGn`). Maps
     /// `(attribute, 1-based compartment) -> PkParams slot` for any `F{c}` /
     /// `ALAG{c}` / `LAGTIME{c}` individual parameter the model declares;
@@ -2028,6 +2045,9 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
             dose_attr_map: Default::default(),
             init_fn: None,
         }
@@ -2080,6 +2100,9 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
             dose_attr_map: map,
             init_fn: None,
         }
@@ -2238,6 +2261,9 @@ mod tests {
             diffusion_var: vec![0.1],
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
             dose_attr_map: Default::default(),
             init_fn: None,
         };
@@ -2263,6 +2289,9 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
             dose_attr_map: Default::default(),
             init_fn: Some(Box::new(|p: &[f64]| {
                 let (kin, kout) = (p[0], p[1]);
@@ -2301,6 +2330,9 @@ mod tests {
                 arg_slots: vec![6, 7],
             }],
             init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
             dose_attr_map: Default::default(),
         }
     }
@@ -2810,6 +2842,9 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
             dose_attr_map: Default::default(),
             init_fn: None,
         }
@@ -3251,6 +3286,9 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
             dose_attr_map: Default::default(),
             init_fn: None,
         }
@@ -3386,6 +3424,9 @@ mod tests {
             diffusion_var: Vec::new(),
             solver_opts: OdeSolverOptions::default(),
             input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
             dose_attr_map: Default::default(),
             init_fn: None,
         };

@@ -111,7 +111,7 @@ Time-varying covariates are supported for **all** analytical structural models a
 
 For oral models, the bolus dose into compartment 1 is interpreted as the depot (NONMEM ADVAN2/ADVAN4/ADVAN12 convention) and observation read-out reads the central compartment.
 
-The autodiff (Enzyme) gradient fast path is also event-driven for all analytical models — TV-cov subjects keep AD-accelerated gradients *and* an AD-accelerated H-matrix Jacobian (forward-mode), so neither the inner-loop gradient nor the per-iteration Jacobian falls back to finite-differences.
+The analytic `Dual2` gradient path is event-driven for all analytical models; time-varying-covariate subjects fall back to finite differences for both the inner-loop gradient and the H-matrix Jacobian (a planned analytic-sensitivity extension).
 
 Infusion routing on the event-driven path:
 
@@ -186,7 +186,7 @@ recent dose). The monotonic shift is purely internal to the prediction engine.
 Notes:
 
 - Resets force the [event-driven analytical / ODE prediction path](../estimation/foce.md) — dose superposition cannot express a mid-record reset — so any analytical or ODE model supports them with no configuration.
-- Under `gradient_method = ad`, reset-bearing subjects fall back to finite-difference gradients (the autodiff propagators do not yet carry a reset event); results are unaffected, only the gradient method.
+- Reset-bearing subjects use the analytic gradient where in scope and otherwise fall back to finite-difference gradients; results are unaffected, only the gradient method.
 - Resets are **not** supported on the EKF/SDE path (`[diffusion]` models). A reset row on an SDE model emits a warning and is ignored.
 
 ## Example Dataset

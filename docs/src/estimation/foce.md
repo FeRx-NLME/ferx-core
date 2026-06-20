@@ -25,17 +25,17 @@ For each subject, the inner loop finds the empirical Bayes estimate (EBE) of the
 
 The inner loop uses BFGS, falling back to Nelder-Mead simplex if BFGS fails.
 
-### Gradient route (AD vs FD)
+### Gradient route (analytic vs FD)
 
-The BFGS gradient is computed by reverse-mode **automatic differentiation (AD)** when available, and by central **finite differences (FD)** otherwise. AD requires the crate built with the `autodiff` feature (the Enzyme toolchain) *and* an analytical PK model; it is resolved **per subject**, so individual subjects fall back to FD for ODE models, steady-state (SS) doses, system resets (EVID 3/4), or time-varying covariates on a model the event-driven AD path doesn't yet support. AD is the default (`gradient_method = auto`) and is typically on par with FD on small models and faster as the parameter count grows.
+The BFGS gradient is the **exact analytic η-gradient** computed from hand-rolled forward sensitivities (the `Dual2` type over the closed-form PK solutions) when the model is in scope, and central **finite differences (FD)** otherwise. The analytic route requires an analytical PK model and is resolved **per subject**, so individual subjects fall back to FD for ODE models, log-transform-both-sides (LTBS), expression-based scaling, or time-varying covariates. It is the default (`gradient_method = auto`); one provider evaluation replaces FD's `~2·n_eta+1` predictions per inner step, so it is exact and faster as the parameter count grows. (`gradient = ad` — the retired Enzyme path — now errors; use `auto` or `fd`.)
 
-The startup banner reports the route **actually resolved** across the population — not just the requested setting — so a silent AD→FD fallback is visible:
+The startup banner reports the route **actually resolved** across the population — not just the requested setting — so a silent analytic→FD fallback is visible:
 
 ```
-  gradient: AD (single-snapshot)  [requested: auto]
+  gradient: analytic (Dual2)  [requested: auto]
 ```
 
-When the population splits across routes, the banner shows per-route subject counts, e.g. `AD (event-driven) ×118, FD ×3`. A build without the `autodiff` feature always reads `FD  [requested: auto; autodiff not compiled in]`.
+When the population splits across routes, the banner shows per-route subject counts, e.g. `analytic (Dual2) ×118, FD ×3`.
 
 This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and for `imp`, which reuses the EBE Hessian built via the same route. SAEM is sampling-based and reports its E-step kernel on a `sampler:` line instead — see [SAEM](saem.md).
 
@@ -168,7 +168,7 @@ and **FOCE** (`$EST METHOD=1`, no `INTER`), where ferx's OFV/estimates already m
 | ω²(V)     | 0.00454 | 0.00430   | +5.7% |
 | ω²(KA)    | 0.1510  | 0.1607    | −6.1% |
 
-(autodiff build; the FD-Jacobian build agrees to within ~10% on the ω block.) Both methods are guarded by `tests/warfarin_covariance_nonmem.rs` within a 20% band.
+(Analytic-Jacobian route; the FD-Jacobian fallback agrees to within ~10% on the ω block.) Both are guarded by `tests/warfarin_covariance_nonmem.rs` within a 20% band.
 
 ### Covariance estimator: R, S, or sandwich
 

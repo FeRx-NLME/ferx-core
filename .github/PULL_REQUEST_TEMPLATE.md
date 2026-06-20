@@ -91,7 +91,7 @@
 
 ## Checklist
 - [ ] `cargo clippy` clean
-- [ ] `cargo check --features autodiff` still compiles (if touching AD-reachable code)
+- [ ] Functions on the `Dual2` sensitivity path (`sens/`, `pk/` `*_g<T: PkNum>`) stay differentiable (if touching gradient-reachable code)
 - [ ] `Cargo.toml` version bumped if breaking
 
 ## Docs & examples
@@ -106,7 +106,7 @@
 
 ### Example execution (run locally before marking ready for review)
 - [ ] Rebuilt ferx-core: `cargo build --release`
-- [ ] Rebuilt ferx-r against updated ferx-core: `cd ../ferx-r && FERX_NO_AUTODIFF=1 R CMD INSTALL .`
+- [ ] Rebuilt ferx-r against updated ferx-core: `cd ../ferx-r && R CMD INSTALL .`
 - [ ] All affected `examples/*.ferx` run cleanly via CLI: `cargo run --release -- examples/<model>.ferx --data data/<data>.csv`
 - [ ] All affected ferx-site example `.qmd` pages render cleanly: `quarto render examples/<page>.qmd`
 - [ ] All affected ferx-book chapters render cleanly: `quarto render chapters/<chapter>.qmd`

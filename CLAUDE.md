@@ -33,9 +33,6 @@ cargo build
 # Build (release, with fat LTO)
 cargo build --release
 
-# Build with autodiff feature
-cargo build --release --features autodiff
-
 # Run CLI with data file
 cargo run --release -- examples/warfarin.ferx --data data/warfarin.csv
 
@@ -135,7 +132,7 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | `estimation/parameterization.rs` | Pack/unpack optimizer vector (log-theta, Cholesky-omega, log-sigma) |
 | `stats/likelihood.rs` | Individual, FOCE, and FOCEI negative log-likelihood computations |
 | `stats/residual_error.rs` | Additive, proportional, combined error models; IWRES/CWRES |
-| `ad/` | Forward-mode automatic differentiation via dual numbers (behind `autodiff` feature) |
+| `sens/` | Hand-rolled `Dual2` analytic sensitivities (`∂f/∂η`, `∂f/∂θ`) over the `PkNum` trait — the exact gradients FOCE/FOCEI/HMC use |
 | `io/datareader.rs` | NONMEM-format CSV reader (ID, TIME, DV, EVID, AMT, CMT, RATE, MDV, II, SS) |
 
 ### Model File Format (.ferx)
@@ -144,7 +141,7 @@ Models are defined in a custom DSL with blocks: `[parameters]`, `[individual_par
 
 ### PK Parameter Convention
 
-PK parameters use a fixed-size array `[f64; 8]` with indices: CL=0, V/V1=1, Q=2, V2=3, KA=4, F=5. This fixed layout enables automatic differentiation without dynamic allocation.
+PK parameters use a fixed-size array `[f64; 8]` with indices: CL=0, V/V1=1, Q=2, V2=3, KA=4, F=5. The fixed layout keeps the closed forms allocation-free, including under the `Dual2` sensitivity type.
 
 ### Parameterization
 
@@ -154,37 +151,21 @@ The optimizer works in a transformed space: theta and sigma are log-transformed,
 
 Warnings and non-fatal issues should be collected into `FitResult.warnings` (a `Vec<String>`), not printed directly to stderr. The CLI layer (`output::print_results`) handles display. This keeps the library quiet for non-verbose callers and ensures warnings appear in both console and YAML output.
 
-### Autodiff-Safe Code in `ad/` Module
+### Analytic Sensitivities (`sens/` over `PkNum`)
 
-Any function that is autodiff-instrumented (i.e., called from code under `#[autodiff_forward]` / `#[autodiff_reverse]` macros, or reachable from `single_dose_ad` / `individual_nll_ad` / `predict_all_ad`) **must not use `f64::max()` or `f64::min()`**.
+The exact `∂f/∂η` and `∂f/∂θ` gradients used by FOCE/FOCEI (outer + inner) and the
+SAEM/Bayes HMC sampler come from hand-rolled forward sensitivities, not autodiff.
+The closed-form PK solutions and event-driven propagators are written **once** as
+generic `*_g<T: PkNum>` functions (`sens/`, `pk/event_driven.rs`); instantiating
+`T = f64` gives gradient-less predictions and `T = Dual2<M>` gives the sensitivities.
+There is no second copy of any formula to keep in sync — edit the generic version.
 
-Recent rustc (2025+) lowers these methods to the LLVM intrinsics `llvm.maximumnum.f64` and `llvm.minimumnum.f64`. Enzyme does not yet have differentiation rules for these intrinsics and will fail at compile time with:
-
-```
-error: Enzyme: cannot handle (forward) unknown intrinsic llvm.maximumnum
-```
-
-**Do this instead** — use explicit comparisons:
-
-```rust
-// Bad (in AD-instrumented code):
-let alpha = lambda0.max(lambda1).max(lambda2);
-let disc = (s * s - 4.0 * d).max(0.0).sqrt();
-
-// Good:
-let alpha = if lambda0 >= lambda1 && lambda0 >= lambda2 {
-    lambda0
-} else if lambda1 >= lambda2 {
-    lambda1
-} else {
-    lambda2
-};
-let disc = { let x = s * s - 4.0 * d; if x > 0.0 { x.sqrt() } else { 0.0 } };
-```
-
-The same restriction applies to any helper the AD code calls transitively — `macro_rates`, `macro_rates_three_cpt_ad`, etc. The analytical PK functions in `pk/` are fine to use `.max()`/`.min()` because they're called from the non-AD path; only the inlined AD duplicates (in `ad/ad_gradients.rs`) need this care.
-
-This restriction will go away once Enzyme upstream adds rules for the newer intrinsics — track at https://github.com/EnzymeAD/Enzyme/issues. When removing the workaround, re-enable a representative test under CI with the `autodiff` feature to catch regressions.
+> The Enzyme autodiff path (`ad/` module, `autodiff` Cargo feature, the `enzyme`
+> toolchain pin) was **retired** in favour of this approach. `gradient = ad` now
+> errors (`E_AD_RETIRED`); use `gradient = auto` (analytic where in scope, FD
+> otherwise) or `gradient = fd`. The `.max()/.min()` Enzyme-intrinsic restriction
+> that used to apply to AD-instrumented code no longer exists — `Dual2` handles
+> `max`/`min` via ordinary comparisons.
 
 ## Changelog
 

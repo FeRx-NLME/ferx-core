@@ -621,6 +621,9 @@ fn generate_mm_oral() {
         init_fn: None,
         solver_opts: ferx_core::ode::OdeSolverOptions::default(),
         input_rate: Vec::new(),
+        rhs_program: None,
+        readout_program: None,
+        indiv_param_program: None,
         dose_attr_map: Default::default(),
     };
     let model = CompiledModel {

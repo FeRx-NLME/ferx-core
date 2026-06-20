@@ -5,12 +5,11 @@ fn main() {
         .as_secs();
     println!("cargo:rustc-env=FERX_BUILD_TIMESTAMP={}", timestamp);
 
-    let has_autodiff = std::env::var("CARGO_FEATURE_AUTODIFF").is_ok();
-    let has_ci = std::env::var("CARGO_FEATURE_CI").is_ok();
-    let variant = match (has_autodiff, has_ci) {
-        (true, _) => "autodiff",
-        (false, true) => "ci",
-        (false, false) => "unknown",
+    // The Enzyme autodiff variant was retired; `ci` remains as a no-op feature.
+    let variant = if std::env::var("CARGO_FEATURE_CI").is_ok() {
+        "ci"
+    } else {
+        "default"
     };
     println!("cargo:rustc-env=FERX_BUILD_VARIANT={}", variant);
 
@@ -37,7 +36,6 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.toml");
     // Re-run when any input we read above changes, so the embedded metadata
     // does not go stale across feature/profile/toolchain switches.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_AUTODIFF");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CI");
     println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-env-changed=RUSTC");

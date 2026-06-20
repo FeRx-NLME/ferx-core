@@ -65,7 +65,7 @@ This is the contents of [`examples/warfarin_sde.ferx`](https://github.com/FeRx-N
 
 The `[diffusion]` block declares `central ~ 0.01`, meaning the initial variance estimate for the diffusion coefficient on the `central` compartment is 0.01 (variance scale, not SD). The EKF propagates this uncertainty forward in time between observations.
 
-**Important**: SDE is incompatible with Enzyme autodiff. `gradient_method = fd` (finite differences) is required. This makes SDE fits slower than equivalent analytical models; the EKF evaluation itself is also more expensive than a plain ODE step.
+**Important**: SDE uses finite-difference gradients (`gradient_method = fd`); the analytic `Dual2` sensitivity path does not cover the EKF. This makes SDE fits slower than equivalent analytical models; the EKF evaluation itself is also more expensive than a plain ODE step.
 
 ## Running the fit
 

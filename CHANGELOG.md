@@ -20,6 +20,163 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic sensitivities for oral infusion** on the analytical 1-/2-/3-cpt
+  models: a depot-bypass infusion into the central compartment (RATE>0 into cmt 2,
+  #350) and a zero-order input into the oral depot (RATE>0 into cmt 1, #400) are
+  now carried through the second-order-dual event-driven walk (`rate_central`/
+  `rate_depot` forced responses), so these subjects drive the exact analytic
+  FOCE/FOCEI gradient instead of falling back to finite differences. Validated
+  against finite differences of the production predictor across 1-/2-/3-cpt and
+  both infusion compartments (#367).
+- **Analytic sensitivities for expression output scaling** (`[scaling] obs_scale =
+  <expr>`) on analytical PK models. An `obs_scale` expression that references
+  individual parameters, θ, or covariates (e.g. `1000 / V`, `WT / 70`) is now
+  compiled to a `Dual2`-differentiable program, so the analytic FOCE/FOCEI outer
+  gradient differentiates the scaled prediction `f / scale` exactly (quotient
+  rule) instead of falling back to finite differences. Validated against finite
+  differences of the production predictor and against a NONMEM reference (#367).
+
+### Changed
+- **FOCE/FOCEI and SAEM/Bayes HMC gradients now come from hand-rolled analytic
+  `Dual2` sensitivities** rather than Enzyme automatic differentiation. The inner
+  EBE gradient, the outer θ/Ω/Σ gradient, and the SAEM/Bayes HMC η-sampler all use
+  the same exact closed-form sensitivity provider; models outside its scope (ODE,
+  LTBS, expression scaling, time-varying covariates, SDE) fall back to finite
+  differences. The HMC sampler (`saem_n_leapfrog > 0`) no longer requires an
+  autodiff build — it matches the FOCEI point estimate on warfarin with R̂ ≈ 1.00
+  (#367).
+
+### Removed
+- **The Enzyme automatic-differentiation path is retired** — the `ad/` module, the
+  `autodiff` Cargo feature, and the custom `enzyme` toolchain pin are removed.
+  ferx-core now builds on a stock nightly toolchain with `cargo build` (no
+  from-source compiler, no `RUSTFLAGS="-Z autodiff=Enable"`). `gradient_method = ad`
+  now returns an `E_AD_RETIRED` error; use `gradient = auto` (the exact analytic
+  gradient where it is in scope, finite differences otherwise) or `gradient = fd`
+  (#367).
+
+### Fixed
+- **SAEM/Bayes HMC step-size adaptation** targeted the random-walk acceptance rate
+  (≈0.234) for the gradient-guided HMC η-kernel, which over-inflated the leapfrog
+  step until trajectories diverged — over-dispersing η and biasing the residual
+  error (a warfarin Bayes-HMC run gave `PROP_ERR` ≈ 0.05 / R̂ > 2 vs the correct
+  ≈ 0.011). The HMC kernel now adapts toward ≈0.7, matching the SAEM split (#367).
+- **Overlapping steady-state infusions (`T_inf > II`)** are now solved exactly for
+  the analytical 1-/2-/3-compartment models instead of being skipped. Previously
+  the closed form returned 0 and the dose was applied as a single (non-SS)
+  infusion (with a `W_STEADY_STATE_INFUSION` warning); the steady-state
+  concentration now superposes the infinite past pulse train (several pulses
+  simultaneously active), validated against explicit superposition. The analytic
+  FOCE/FOCEI sensitivity provider carries the same closed form, so these subjects
+  no longer fall back to finite differences. The warning now fires only for model
+  paths that still skip SS pre-equilibration (ODE models, or EVID=3/4 resets)
+  (#379).
+
+### Added
+- **Analytic sensitivities for dose lagtime (ALAG)** on analytical PK models: a
+  declared `LAGTIME`/`alag` parameter is now differentiated exactly by the
+  sensitivity provider — it enters every dose through the elapsed-time argument
+  (`∂elapsed/∂lagtime = −1`, seeded as its own dual axis), including the
+  steady-state pre-arrival tail. Lagtime models therefore drive the analytic
+  FOCE/FOCEI outer gradient and the analytic inner EBE gradient instead of
+  falling back to finite differences. Validated against finite differences of the
+  production predictor (value, ∂/∂η, ∂²/∂η², ∂/∂θ, ∂²/∂η∂θ) and as a full packed
+  outer gradient (#367).
+- **Analytic M3 (BLOQ) outer gradient for both FOCE and FOCEI** on analytical PK
+  models: the exact closed-form marginal gradient now covers M3-censored subjects.
+  Under FOCEI a censored row enters the Almquist Laplace assembly as a data term
+  `−logΦ((LLOQ−f)/√V)` plus its true-inner-Hessian curvature, excluded from
+  `H̃`/`log|H̃|`. Under FOCE it leaves the Sheiner–Beal marginal (`R̃` and the
+  quadratic form are built over the quantified rows only) and re-enters as
+  `−logΦ((LLOQ−f̂)/√R⁰)` with the population variance. Both match ferx's M3
+  objective and are validated against reconverged finite differences (~1e-6 on
+  every θ/Ω/σ packed parameter) and against NONMEM (`METHOD=1 LAPLACE` with and
+  without INTER) to <1% on the structural parameters (#367).
+- **Analytic M3 (BLOQ) inner EBE gradient** for analytical PK models: the
+  per-subject EBE optimiser now has an exact closed-form η-gradient for the M3
+  censored term `−logΦ((LLOQ−f)/√V)` (inverse-Mills-ratio coefficient), replacing
+  the finite-difference inner gradient on `bloq_method = m3` fits (#367).
+- **Analytic FOCE and FOCEI outer gradient** for analytical 1-/2-/3-compartment
+  models (IV bolus/infusion, oral, and steady state): the gradient-based outer
+  optimizers (`bfgs`, `lbfgs`, `nlopt_lbfgs`, `slsqp`) now drive both FOCEI and
+  FOCE with an exact closed-form marginal gradient (Almquist et al. 2015), evaluated
+  through hand-rolled second-order dual numbers — no finite differences and no
+  Enzyme. FOCEI differentiates the Laplace marginal (Eq. 23); FOCE differentiates
+  ferx's Sheiner–Beal linearized marginal — both carry the exact EBE response
+  (Eq. 46) on every θ/Ω/σ block, share an exact inner-loop Jacobian, and use an
+  EBE warm-start predictor (Eq. 48). Estimates and OFV are unchanged, but the
+  gradient is exact: it carries the EBE response in closed form, so `lbfgs`/
+  `nlopt_lbfgs` reach the true optimum where the previous fixed-EBE FD gradient
+  stalls short (warfarin FOCEI: −286.00 vs −281.83) — and do so ~13× faster than
+  the only FD setting that also converges (`reconverge_gradient_interval = 1`:
+  0.30 s vs 4.11 s). Validated against NONMEM on warfarin (FOCE OFV −280.36,
+  FOCEI −286.00 — both matching to ~4–5 significant figures).
+  Models outside the analytical scope (ODE models, steady-state edges) transparently
+  fall back to the existing finite-difference gradient (#367).
+- **Analytic FOCE/FOCEI outer gradient for time-varying covariates** on the
+  analytical 1-/2-/3-compartment models. A covariate that changes within a subject
+  (e.g. an allometric `(WT/70)^θ` on CL with a time-varying weight) makes the PK
+  parameters switch mid-decay, which dose superposition cannot express; these
+  subjects now route through the second-order-dual event-driven walk, with each
+  event's PK-parameter derivatives evaluated at that event's covariate snapshot.
+  The walk handles covariate breakpoints carried by EVID=2 records between
+  observations, combined with EVID 3/4 resets, with **steady-state dosing** (each
+  occasion's SS state is equilibrated at the dose's covariate snapshot), with a
+  **constant `obs_scale` divisor**, and with **inter-occasion variability (IOV)**
+  (the covariate and κ both switch the individual parameters across occasions).
+  The result is the standard `(η, θ)` jet, so the exact θ/Ω/σ packed gradient
+  (incl. the covariate coefficients and the EBE response) is assembled unchanged.
+  Validated against reconverged finite differences (~1e-6 on every packed
+  parameter, FOCEI and FOCE), against finite differences of the production
+  predictor across 1-/2-/3-cpt (incl. SS, the constant scale, and the IOV+covariate
+  merge with an EVID=2 breakpoint), and end-to-end on a simulated WT-on-CL dataset.
+  Requires a gradient-based outer optimizer (`lbfgs`/`bfgs`/`slsqp`); the analytic
+  *inner* EBE gradient still uses finite differences for these subjects. Time-varying
+  covariates combined with **dose lagtime** or with **expression-based output
+  scaling** (`obs_scale = <expr>` referencing parameters/covariates) still fall back
+  to the finite-difference gradient (#367).
+- **Analytic FOCE/FOCEI outer gradient for inter-occasion variability (IOV)** on
+  the analytical 1-/2-/3-compartment models. The exact closed-form marginal
+  gradient now covers κ (kappa) random effects: the EBE response, inner Jacobian,
+  and θ/Ω/σ packed blocks are assembled over the stacked random-effects vector
+  `[η_bsv, κ_occasion₁, …, κ_occasion_K]` with the block-diagonal prior
+  `Ω_bsv ⊕ K·Ω_iov` (the shared per-occasion κ-variance). Cross-occasion carryover
+  is differentiated exactly through a second-order-dual event-driven walk (no
+  superposition approximation, no finite differences). **EVID 3/4 resets /
+  washout occasions** are supported on the IOV path as well: the walk zeros the
+  state at each reset and rebuilds the following occasion. Validated against
+  reconverged finite differences (~1e-6 on every packed parameter, FOCEI and
+  FOCE) and against NONMEM on the warfarin IOV model (FOCEI OFV 307.8 vs 308.8,
+  structural parameters within ~1%). Requires a gradient-based outer optimizer
+  (`lbfgs`/`bfgs`/`slsqp`); IOV fits with steady-state doses still fall back to
+  finite differences (#367).
+- **Analytic gradient now covers log-transform-both-sides (LTBS) and constant
+  output scaling** for the analytical PK models: the sensitivity provider applies
+  the `g = ln(f)` jet transform (value, gradient, and Hessian via
+  `∂²g/∂x∂y = f_xy/f − f_x·f_y/f²`) and the constant `obs_scale` divisor in closed
+  form, so `log(DV) ~ additive(...)` and `[scaling] obs_scale = k` fits run on the
+  exact analytic FOCE/FOCEI gradient instead of falling back to finite
+  differences. Validated against NONMEM on the warfarin LTBS model: the
+  gradient-based L-BFGS path reaches OFV −675.302 and recovers NONMEM's MLE to
+  ~4 significant figures (#367).
+- **`inner_optimizer` fit option** (`auto` | `bfgs` | `lbfgs` | `nelder_mead`)
+  to pin the inner EBE optimizer explicitly. `auto` (default) preserves the prior
+  behaviour (dense BFGS, switching to L-BFGS above 32 random effects); the other
+  values force a single algorithm with no automatic switching (#367).
+- **Analytic FOCE/FOCEI gradient for user-specified `[odes]` models** (issue #367,
+  Option A): the same exact closed-form marginal gradient now covers hand-written
+  ODE models, not just the analytical PK solutions. The compiled `[odes]` RHS is
+  evaluated over hand-rolled second-order dual numbers through a generic bytecode
+  VM, and a dual-state RK45 (value-based step control) propagates the exact
+  PK-parameter sensitivities through the integration — no Enzyme, no finite
+  differences of the integrator. Supported scope: IV **bolus and infusion** doses,
+  **bioavailability F** (including estimated, any parameterization — log-normal,
+  logit-normal, additive), `obs_cmt` or simple Form C (`y = central/V1`) readouts,
+  static covariates, **EVID 3/4 resets / multi-occasion**, **non-zero `init(...)`
+  initial conditions**, and up to 12 individual parameters. Models outside this
+  scope (steady-state dosing, lagtime, built-in input-rate absorption, IOV, SDE,
+  `obs_scale`/LTBS transforms, time-varying covariates) transparently fall back
+  to the finite-difference gradient (#367).
 - **Modeled infusion rate (`RATE=-1` → `R{cmt}`)** — NONMEM's coded `RATE=-1`
   now makes the infusion *rate* a `$PK`-style individual parameter `R{cmt}`
   (duration = `AMT/R{cmt}`), the mirror of the modeled-duration `RATE=-2`/`D{cmt}`
@@ -110,8 +267,8 @@ section of the SDLC for the versioning policy).
   NONMEM's `$PK D{n}` (#394, follow-up to #324).
 - **Full MCMC Bayesian estimation** (`method = bayes`, Gibbs-within-HMC, NONMEM
   `METHOD=BAYES` parity). Draws from the joint posterior `p(θ, Ω, Σ, {ηᵢ} | y)`:
-  per-subject η block (block-MH, or gradient HMC on autodiff builds with
-  `n_leapfrog > 0`), conjugate inverse-Wishart Ω block, exact Gaussian
+  per-subject η block (block-MH, or gradient HMC on the analytic `Dual2` gradient
+  with `n_leapfrog > 0`), conjugate inverse-Wishart Ω block, exact Gaussian
   full-conditional draw for mu-referenced θ, and a random-walk block for the
   remaining θ/σ. Reports posterior summaries (mean/sd/2.5%/median/97.5%) with
   split-R̂, ESS, and MCSE per parameter on `FitResult.bayes` and in the
@@ -300,8 +457,22 @@ section of the SDLC for the versioning policy).
   infusion **shape** changes, and only for an existing `RATE>0`/`RATE=-1` infusion
   with `F ≠ 1`. Predictions, simulations, and fits for such models will differ;
   models with `F = 1`, bolus, oral-depot, or `RATE=-2` dosing are unaffected. This
-  aligns all engines (analytical superposition, event-driven, ODE, autodiff) with
-  NONMEM's `RATE`/`F` convention (#419, follow-up to #327/#324).
+  aligns all engines (analytical superposition, event-driven, ODE, analytic
+  sensitivities) with NONMEM's `RATE`/`F` convention (#419, follow-up to #327/#324).
+- **`method = foce` with M3 BLOQ no longer promotes censored subjects to FOCEI.**
+  Previously a subject with any `CENS=1` row was silently evaluated with
+  η-interaction (mixing a Sheiner–Beal FOCE objective with a FOCEI censored term).
+  Plain FOCE now keeps a consistent Sheiner–Beal objective for the whole subject,
+  with censored rows entering as `−logΦ((LLOQ−f̂)/√R⁰)` (population variance,
+  excluded from `R̃`). FOCE-M3 and FOCEI-M3 are genuinely different optima — on
+  warfarin BLOQ, FOCE TVKA ≈ 0.71 vs FOCEI ≈ 0.81, each matching the corresponding
+  NONMEM `METHOD=1 LAPLACE` (with/without INTER) fit. M3 fits that relied on the
+  old auto-promotion should set `method = focei` explicitly (#367).
+- Bumped `nalgebra` to 0.35 (from 0.34). The `argmin-math` dependency now uses
+  its `vec` feature instead of `nalgebra_latest`, since the argmin trust-region
+  path operates on `Vec` params and never on `nalgebra` types — this avoids
+  pulling a second, conflicting `nalgebra` version into the graph. Downstream
+  Rust consumers (e.g. `ferx-r`) must move to `nalgebra` 0.35 in lockstep.
 - IMP fit options now use the `imp_*` prefix (`imp_samples`,
   `imp_eval_only`, `imp_auto`, etc.) instead of the older `is_*` names. The
   old names are not retained as aliases because IMP support is still new.
@@ -390,6 +561,17 @@ section of the SDLC for the versioning policy).
   fitting to a structurally broken optimum (#309).
 
 ### Fixed
+- **M3 BLOQ fits with a gradient-based optimizer no longer stall above the true
+  minimum.** Previously the analytic outer gradient declined on censored subjects
+  and the fixed-EBE finite-difference fallback was biased there, so on warfarin
+  BLOQ a gradient optimizer settled at TVKA ≈ 1.10 / OFV ≈ −213.8 while the
+  derivative-free BOBYQA reached the true TVKA ≈ 0.81 / OFV ≈ −217.2. FOCEI now
+  has an **exact closed-form M3 censored gradient** (see Added), and plain FOCE
+  with M3 forces the EBE-reconverging gradient automatically (as IOV already
+  does), so every optimizer reaches the minimum and matches a NONMEM 7.5.1 LAPLACE
+  M3 reference (TVCL 0.1328, TVV 7.731, TVKA 0.810, to ~4 significant figures). The
+  `docs/src/examples/bloq.md` expected results, which showed the stalled point,
+  are corrected (#367).
 - **IMPMAP warns instead of silently ignoring `impmap_sobol` under a Student-t
   proposal.** Sobol draws apply only to the multivariate-normal proposal; with
   the Student-t default `impmap_sobol = true` was a no-op. It now emits a warning
@@ -633,6 +815,15 @@ section of the SDLC for the versioning policy).
   event priority) to prevent backwards-in-time sequences that NONMEM rejects.
 
 ### Performance
+- The inner EBE optimizer now selects between dense BFGS and L-BFGS by the inner
+  problem dimension: dense BFGS (full inverse-Hessian, Newton-fast and cheap at
+  low dimension) for the usual `n_eta ≲ 8` PK case, and L-BFGS (two-loop
+  recursion, `O(m·n)` per step) once the inner dimension is large enough that the
+  dense `O(n²)` update dominates — high-dimensional IOV (`n_eta + K·n_kappa`).
+  Converges to the same EBEs (estimates and OFV unchanged); the crossover keeps
+  small problems on the faster dense solver while making large random-effect
+  inner problems scale (benchmarked: L-BFGS ~2× faster at dim 64, ~17× at 256)
+  (#367).
 - The covariance step is now built as a single parallel work-list over the
   finite-difference points (subjects iterated serially within each point) instead
   of firing a per-subject parallel reduction at every perturbed point. This removes

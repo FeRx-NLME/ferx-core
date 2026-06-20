@@ -1,82 +1,45 @@
+use crate::sens::two_cpt::{
+    two_cpt_infusion_g, two_cpt_infusion_ss_g, two_cpt_iv_bolus_g, two_cpt_iv_bolus_ss_g,
+    two_cpt_oral_g, two_cpt_oral_ss_g,
+};
 use crate::types::DoseEvent;
 
-/// Compute macro-rate constants (alpha, beta) from micro-constants.
-/// Uses Vieta's formula for beta to avoid catastrophic cancellation
-/// when s >> sqrt(s^2 - 4d).
+// The 2-cpt single-dose concentration closed forms are the single source of truth
+// in `crate::sens::two_cpt` (generic over `PkNum`); these f64 entry points delegate
+// to the generic `*_g` at `T = f64` (issue #408 / Ron review #9). `#[inline]` keeps
+// the hot path identical. The peripheral-amount helpers (`*_peripheral`) and the
+// local `macro_rates` they share have no concentration analogue and stay here.
+
+/// Compute macro-rate constants (alpha, beta, k21) from micro-constants —
+/// delegates to the single generic source `sens::two_cpt::macro_rates_g` at
+/// `T = f64` (the peripheral-amount helpers below are the only remaining f64
+/// callers).
+#[inline]
 fn macro_rates(cl: f64, v1: f64, q: f64, v2: f64) -> (f64, f64, f64) {
-    let k10 = cl / v1;
-    let k12 = q / v1;
-    let k21 = q / v2;
-    let s = k10 + k12 + k21;
-    let d = k10 * k21;
-    let disc = {
-        let x = s * s - 4.0 * d;
-        if x > 0.0 {
-            x.sqrt()
-        } else {
-            0.0
-        }
-    };
-    let alpha = (s + disc) / 2.0;
-    // Vieta's formula: alpha * beta = d, so beta = d / alpha
-    // This avoids subtracting two nearly-equal large numbers.
-    let beta = if alpha > 1e-30 { d / alpha } else { 0.0 };
-    (alpha, beta, k21)
+    crate::sens::two_cpt::macro_rates_g::<f64>(cl, v1, q, v2)
 }
 
 /// Two-compartment IV bolus
 /// C(t) = A*exp(-alpha*t) + B*exp(-beta*t)
+#[inline]
 pub fn two_cpt_iv_bolus(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 {
-        return 0.0;
-    }
-
-    let a = (dose.amt / v1) * (alpha - k21) / diff;
-    let b = (dose.amt / v1) * (k21 - beta) / diff;
-
-    a * (-alpha * t).exp() + b * (-beta * t).exp()
+    two_cpt_iv_bolus_g::<f64>(dose.amt, t, cl, v1, q, v2)
 }
 
 /// Two-compartment infusion
+#[inline]
 pub fn two_cpt_infusion(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 || alpha.abs() < 1e-12 || beta.abs() < 1e-12 {
-        return 0.0;
-    }
-
-    let rate = dose.rate;
-    let dur = dose.duration;
-    if dur <= 0.0 {
-        return two_cpt_iv_bolus(dose, t, cl, v1, q, v2);
-    }
-
-    let a_coeff = (rate / v1) * (alpha - k21) / (diff * alpha);
-    let b_coeff = (rate / v1) * (k21 - beta) / (diff * beta);
-
-    if t <= dur {
-        a_coeff * (1.0 - (-alpha * t).exp()) + b_coeff * (1.0 - (-beta * t).exp())
-    } else {
-        let dt = t - dur;
-        a_coeff * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp()
-            + b_coeff * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp()
-    }
+    two_cpt_infusion_g::<f64>(dose.rate, dose.duration, dose.amt, t, cl, v1, q, v2)
 }
 
 /// Two-compartment oral absorption
 /// C(t) = P*exp(-alpha*t) + Q*exp(-beta*t) + R*exp(-ka*t)
+#[inline]
 pub fn two_cpt_oral(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64, ka: f64) -> f64 {
     two_cpt_oral_f(dose, t, cl, v1, q, v2, ka, 1.0)
 }
 
+#[inline]
 pub fn two_cpt_oral_f(
     dose: &DoseEvent,
     t: f64,
@@ -87,42 +50,7 @@ pub fn two_cpt_oral_f(
     ka: f64,
     f_bio: f64,
 ) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || ka <= 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 {
-        return 0.0;
-    }
-
-    let d = f_bio * dose.amt * ka / v1;
-
-    // Standard formula:
-    //   C(t) = d * [ (k21-α)/((ka-α)(β-α)) · e^{-αt}
-    //              + (k21-β)/((ka-β)(α-β)) · e^{-βt}
-    //              + (k21-ka)/((α-ka)(β-ka)) · e^{-ka·t} ]
-    //
-    // Handle singularities when ka ≈ alpha or ka ≈ beta via L'Hopital limits.
-    let p = if (ka - alpha).abs() < 1e-6 {
-        d * (alpha - k21) / diff * t * (-alpha * t).exp()
-    } else {
-        d * (k21 - alpha) / ((ka - alpha) * (beta - alpha)) * (-alpha * t).exp()
-    };
-
-    let q_val = if (ka - beta).abs() < 1e-6 {
-        d * (k21 - beta) / diff * t * (-beta * t).exp()
-    } else {
-        d * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-beta * t).exp()
-    };
-
-    let r = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 {
-        0.0
-    } else {
-        d * (k21 - ka) / ((alpha - ka) * (beta - ka)) * (-ka * t).exp()
-    };
-
-    p + q_val + r
+    two_cpt_oral_g::<f64>(dose.amt, t, cl, v1, q, v2, ka, f_bio)
 }
 
 /// Predict concentration from a single dose at elapsed time t using 2-cmt model.
@@ -166,72 +94,30 @@ fn ss_coeff(lambda: f64, ii: f64) -> f64 {
 }
 
 /// Two-compartment IV bolus at steady state.
+#[inline]
 pub fn two_cpt_iv_bolus_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q < 0.0 || dose.ii <= 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 {
-        return 0.0;
-    }
-    let ii = dose.ii;
-    let a = (dose.amt / v1) * (alpha - k21) / diff;
-    let b = (dose.amt / v1) * (k21 - beta) / diff;
-    a * (-alpha * t).exp() * ss_coeff(alpha, ii) + b * (-beta * t).exp() * ss_coeff(beta, ii)
+    two_cpt_iv_bolus_ss_g::<f64>(dose.amt, t, dose.ii, cl, v1, q, v2)
 }
 
-/// Two-compartment infusion at steady state.
-///
-/// Closed form requires `T_inf ≤ II` (non-overlapping infusions); returns 0.0
-/// otherwise. The `api.rs` warning catches this case for users.
+/// Two-compartment infusion at steady state, for any `T_inf` — including
+/// overlapping pulses (`T_inf > II`). Evaluated at phase `t ∈ [0, II)`.
+#[inline]
 pub fn two_cpt_infusion_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q < 0.0 || dose.ii <= 0.0 {
-        return 0.0;
-    }
-    let dur = dose.duration;
-    if dur <= 0.0 {
-        return two_cpt_iv_bolus_ss(dose, t, cl, v1, q, v2);
-    }
-    if dur > dose.ii {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 || alpha.abs() < 1e-12 || beta.abs() < 1e-12 {
-        return 0.0;
-    }
-    let ii = dose.ii;
-    let rate = dose.rate;
-    let a_coeff = (rate / v1) * (alpha - k21) / (diff * alpha);
-    let b_coeff = (rate / v1) * (k21 - beta) / (diff * beta);
-
-    // Past-pulses contribution (n ≥ 1): always "after-infusion".
-    let exp_neg_a_ii = (-alpha * ii).exp();
-    let exp_neg_b_ii = (-beta * ii).exp();
-    let past_a = a_coeff
-        * (1.0 - (-alpha * dur).exp())
-        * (-alpha * (t - dur)).exp()
-        * exp_neg_a_ii
-        * ss_coeff(alpha, ii);
-    let past_b = b_coeff
-        * (1.0 - (-beta * dur).exp())
-        * (-beta * (t - dur)).exp()
-        * exp_neg_b_ii
-        * ss_coeff(beta, ii);
-    if t <= dur {
-        // Current pulse is during infusion.
-        a_coeff * (1.0 - (-alpha * t).exp()) + b_coeff * (1.0 - (-beta * t).exp()) + past_a + past_b
-    } else {
-        // Current pulse is after — all pulses are "after"; combine with the
-        // past-pulses tail by replacing the (n ≥ 1) sum with (n ≥ 0).
-        let dt = t - dur;
-        a_coeff * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() * ss_coeff(alpha, ii)
-            + b_coeff * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp() * ss_coeff(beta, ii)
-    }
+    two_cpt_infusion_ss_g::<f64>(
+        dose.rate,
+        dose.duration,
+        dose.amt,
+        t,
+        dose.ii,
+        cl,
+        v1,
+        q,
+        v2,
+    )
 }
 
 /// Two-compartment oral absorption at steady state (with bioavailability).
+#[inline]
 pub fn two_cpt_oral_f_ss(
     dose: &DoseEvent,
     t: f64,
@@ -242,51 +128,11 @@ pub fn two_cpt_oral_f_ss(
     ka: f64,
     f_bio: f64,
 ) -> f64 {
-    if t < 0.0 || v1 <= 0.0 || cl <= 0.0 || ka <= 0.0 || v2 <= 0.0 || q < 0.0 || dose.ii <= 0.0 {
-        return 0.0;
-    }
-    let (alpha, beta, k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.abs() < 1e-12 {
-        return 0.0;
-    }
-    let ii = dose.ii;
-    let d = f_bio * dose.amt * ka / v1;
-
-    // Standard 2-cpt oral with per-eigenvalue SS geometric-series factor.
-    // L'Hopital limits apply when ka ≈ α or ka ≈ β; the SS sum of
-    // (τ + n·II)·exp(-λ·(τ + n·II)) closed form is
-    //   exp(-λ·τ) · [τ/(1-x) + II·x/(1-x)²]  with x = exp(-λ·ii).
-    fn lhopital_ss_sum(tau: f64, lambda: f64, ii: f64) -> f64 {
-        let x = (-lambda * ii).exp();
-        let one_minus_x = 1.0 - x;
-        if one_minus_x <= 0.0 {
-            return 0.0;
-        }
-        (-lambda * tau).exp() * (tau / one_minus_x + ii * x / (one_minus_x * one_minus_x))
-    }
-
-    let p = if (ka - alpha).abs() < 1e-6 {
-        d * (alpha - k21) / diff * lhopital_ss_sum(t, alpha, ii)
-    } else {
-        d * (k21 - alpha) / ((ka - alpha) * (beta - alpha))
-            * (-alpha * t).exp()
-            * ss_coeff(alpha, ii)
-    };
-    let q_val = if (ka - beta).abs() < 1e-6 {
-        d * (k21 - beta) / diff * lhopital_ss_sum(t, beta, ii)
-    } else {
-        d * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-beta * t).exp() * ss_coeff(beta, ii)
-    };
-    let r = if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 {
-        0.0
-    } else {
-        d * (k21 - ka) / ((alpha - ka) * (beta - ka)) * (-ka * t).exp() * ss_coeff(ka, ii)
-    };
-    p + q_val + r
+    two_cpt_oral_ss_g::<f64>(dose.amt, t, dose.ii, cl, v1, q, v2, ka, f_bio)
 }
 
 /// Two-compartment oral absorption at steady state (F = 1).
+#[inline]
 pub fn two_cpt_oral_ss(
     dose: &DoseEvent,
     t: f64,
@@ -680,6 +526,50 @@ mod tests {
     }
 
     #[test]
+    fn test_oral_lhopital_matches_nonsingular_limit_independent() {
+        // Independent (non-self-referential) check for the ka≈α / ka≈β L'Hôpital
+        // limits. At ka = λ the singular branch must equal the limit of the
+        // NON-singular formula as ka → λ — and the non-singular branch never
+        // touches the L'Hôpital code, so it is independent truth (the prior tests
+        // built "truth" from the same singular branch and so missed the bug).
+        // Central average cancels the O(δ) term. Regression-guards the ~14% defect
+        // (true ≈ 8.309 vs buggy ≈ 9.504) from the PR #381 review.
+        let (cl, v1, q, v2, amt) = (10.0, 50.0, 15.0, 100.0, 1000.0);
+        let (alpha, beta, _) = macro_rates(cl, v1, q, v2);
+        let single = bolus_dose(amt);
+        let delta = 1e-3;
+        for &lambda in &[alpha, beta] {
+            for &t in &[0.5, 2.0, 6.0] {
+                let c_sing = two_cpt_oral(&single, t, cl, v1, q, v2, lambda);
+                let c_lo = two_cpt_oral(&single, t, cl, v1, q, v2, lambda - delta);
+                let c_hi = two_cpt_oral(&single, t, cl, v1, q, v2, lambda + delta);
+                let truth = 0.5 * (c_lo + c_hi);
+                assert_relative_eq!(c_sing, truth, max_relative = 2e-4, epsilon = 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn test_ss_oral_lhopital_matches_nonsingular_limit_independent() {
+        // SS analog of the independent continuity check: the singular SS branch at
+        // ka = λ must match the non-singular SS formula limit as ka → λ.
+        let ii: f64 = 24.0;
+        let (cl, v1, q, v2, amt) = (10.0, 50.0, 15.0, 100.0, 500.0);
+        let (alpha, beta, _) = macro_rates(cl, v1, q, v2);
+        let dose = ss_bolus_dose(amt, ii);
+        let delta = 1e-3;
+        for &lambda in &[alpha, beta] {
+            for &t in &[0.5, 2.0, 12.0] {
+                let c_sing = two_cpt_oral_ss(&dose, t, cl, v1, q, v2, lambda);
+                let c_lo = two_cpt_oral_ss(&dose, t, cl, v1, q, v2, lambda - delta);
+                let c_hi = two_cpt_oral_ss(&dose, t, cl, v1, q, v2, lambda + delta);
+                let truth = 0.5 * (c_lo + c_hi);
+                assert_relative_eq!(c_sing, truth, max_relative = 2e-4, epsilon = 1e-9);
+            }
+        }
+    }
+
+    #[test]
     fn test_ss_infusion_during_matches_numerical_sum() {
         let ii: f64 = 24.0;
         let rate = 100.0; // dur=10
@@ -714,10 +604,26 @@ mod tests {
     }
 
     #[test]
-    fn test_ss_infusion_with_t_inf_gt_ii_returns_zero() {
-        // amt=1000, rate=500 → duration=2; ii=1 → t_inf > ii.
-        let dose = DoseEvent::new(0.0, 1000.0, 1, 500.0, true, 1.0);
-        assert_eq!(two_cpt_infusion_ss(&dose, 0.5, CL, V1, Q, V2), 0.0);
+    fn test_ss_infusion_overlapping_matches_numerical_sum() {
+        // Overlapping infusions (T_inf > II) must equal the explicit pulse-train
+        // superposition (#379). amt=1000/rate=500 → duration=2, ii=1 (2 overlap);
+        // amt=900/rate=300 → duration=3, ii=2.
+        // A 2-cpt terminal eigenvalue can be small (≈0.016 here), so the past
+        // pulse train decays slowly — sum far more pulses than `ss_numerical_sum`
+        // for a converged reference.
+        let big_sum = |t: f64, ii: f64, c_single: &dyn Fn(f64) -> f64| -> f64 {
+            (0..50_000).map(|n| c_single(t + (n as f64) * ii)).sum()
+        };
+        for &(rate, amt, ii) in &[(500.0_f64, 1000.0_f64, 1.0_f64), (300.0, 900.0, 2.0)] {
+            let dose = ss_infusion_dose(amt, rate, ii);
+            let single = infusion_dose(amt, rate);
+            assert!(dose.duration > ii, "fixture must overlap");
+            for &t in &[0.0, 0.3 * ii, 0.5 * ii, 0.9 * ii, 0.999 * ii] {
+                let cf = two_cpt_infusion_ss(&dose, t, CL, V1, Q, V2);
+                let num = big_sum(t, ii, &|tt| two_cpt_infusion(&single, tt, CL, V1, Q, V2));
+                assert_relative_eq!(cf, num, epsilon = 1e-6, max_relative = 1e-6);
+            }
+        }
     }
 
     #[test]

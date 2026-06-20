@@ -238,6 +238,190 @@ pub fn solve_ode(
     results
 }
 
+/// Generic solution point for the [`solve_ode_g`] sensitivity path.
+#[derive(Debug, Clone)]
+pub struct SolPointG<T> {
+    pub t: f64,
+    pub u: Vec<T>,
+}
+
+/// [`solve_ode`] generic over the state scalar `T: PkNum`, for the analytic
+/// PK-parameter sensitivity path (`T = Dual2<N>`): the same Dormand-Prince
+/// stepper, but every Butcher combination is a `T` operation so the dual numbers
+/// carry `∂u/∂p` and `∂²u/∂p²` through the integration. `params` holds the PK
+/// parameters seeded as dual variables.
+///
+/// **Step-size control reads `.val()` only** — the accept/reject decision and
+/// `dt` adaptation depend on values, never on derivatives, so the derivative
+/// flows through a *fixed* step sequence. (Adapting on a derivative norm would
+/// make the sensitivity inconsistent with the prediction.) This is the
+/// derivative-carrying sibling of [`solve_ode`]; the f64 path is left untouched.
+pub fn solve_ode_g<T: crate::sens::num::PkNum>(
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    u0: &[T],
+    t_span: (f64, f64),
+    params: &[T],
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+) -> Vec<SolPointG<T>> {
+    let n = u0.len();
+    let (t0, tf) = t_span;
+    let zero = T::from_f64(0.0);
+
+    if (tf - t0).abs() < 1e-15 {
+        return saveat
+            .iter()
+            .map(|&t| SolPointG { t, u: u0.to_vec() })
+            .collect();
+    }
+
+    let mut u = u0.to_vec();
+    let mut t = t0;
+    let mut dt = opts.initial_dt.min((tf - t0) / 10.0).max(opts.min_dt);
+
+    let mut k1 = vec![zero; n];
+    let mut k2 = vec![zero; n];
+    let mut k3 = vec![zero; n];
+    let mut k4 = vec![zero; n];
+    let mut k5 = vec![zero; n];
+    let mut k6 = vec![zero; n];
+    let mut k7 = vec![zero; n];
+    let mut u_tmp = vec![zero; n];
+    let mut u5 = vec![zero; n];
+
+    let mut results: Vec<SolPointG<T>> = Vec::with_capacity(saveat.len());
+    let mut save_idx = 0;
+    let mut have_k1 = false;
+    const I_EXP: f64 = 1.0 / 5.0;
+
+    // Scalar-weighted combination `u[i] + dt·Σ wⱼ·kⱼ[i]` lifted to `T`.
+    let comb = |base: T, dt_eff: f64, terms: &[(f64, T)]| -> T {
+        let mut acc = base;
+        for &(w, kij) in terms {
+            acc = acc + kij * T::from_f64(dt_eff * w);
+        }
+        acc
+    };
+
+    for _step in 0..opts.max_steps {
+        if t >= tf - 1e-15 {
+            break;
+        }
+
+        let mut dt_eff = dt.min(tf - t);
+        if save_idx < saveat.len() && t + dt_eff > saveat[save_idx] + 1e-15 {
+            dt_eff = (saveat[save_idx] - t).max(opts.min_dt);
+        }
+
+        if !have_k1 {
+            rhs(&u, params, t, &mut k1);
+            have_k1 = true;
+        }
+
+        for i in 0..n {
+            u_tmp[i] = comb(u[i], dt_eff, &[(B21, k1[i])]);
+        }
+        rhs(&u_tmp, params, t + A2 * dt_eff, &mut k2);
+
+        for i in 0..n {
+            u_tmp[i] = comb(u[i], dt_eff, &[(B31, k1[i]), (B32, k2[i])]);
+        }
+        rhs(&u_tmp, params, t + A3 * dt_eff, &mut k3);
+
+        for i in 0..n {
+            u_tmp[i] = comb(u[i], dt_eff, &[(B41, k1[i]), (B42, k2[i]), (B43, k3[i])]);
+        }
+        rhs(&u_tmp, params, t + A4 * dt_eff, &mut k4);
+
+        for i in 0..n {
+            u_tmp[i] = comb(
+                u[i],
+                dt_eff,
+                &[(B51, k1[i]), (B52, k2[i]), (B53, k3[i]), (B54, k4[i])],
+            );
+        }
+        rhs(&u_tmp, params, t + A5 * dt_eff, &mut k5);
+
+        for i in 0..n {
+            u_tmp[i] = comb(
+                u[i],
+                dt_eff,
+                &[
+                    (B61, k1[i]),
+                    (B62, k2[i]),
+                    (B63, k3[i]),
+                    (B64, k4[i]),
+                    (B65, k5[i]),
+                ],
+            );
+        }
+        rhs(&u_tmp, params, t + dt_eff, &mut k6);
+
+        for i in 0..n {
+            u5[i] = comb(
+                u[i],
+                dt_eff,
+                &[
+                    (B71, k1[i]),
+                    (B73, k3[i]),
+                    (B74, k4[i]),
+                    (B75, k5[i]),
+                    (B76, k6[i]),
+                ],
+            );
+        }
+
+        rhs(&u5, params, t + dt_eff, &mut k7);
+
+        // Error norm on values only (step control must not see derivatives).
+        let mut err_norm = 0.0;
+        for i in 0..n {
+            let err_i = dt_eff
+                * (E1 * k1[i].val()
+                    + E3 * k3[i].val()
+                    + E4 * k4[i].val()
+                    + E5 * k5[i].val()
+                    + E6 * k6[i].val()
+                    + E7 * k7[i].val());
+            let scale = opts.abstol + opts.reltol * u5[i].val().abs().max(u[i].val().abs());
+            err_norm += (err_i / scale) * (err_i / scale);
+        }
+        err_norm = (err_norm / n as f64).sqrt();
+
+        if err_norm <= 1.0 || dt_eff <= opts.min_dt {
+            t += dt_eff;
+            u.copy_from_slice(&u5);
+            std::mem::swap(&mut k1, &mut k7);
+            while save_idx < saveat.len() && (t - saveat[save_idx]).abs() < 1e-12 {
+                results.push(SolPointG {
+                    t: saveat[save_idx],
+                    u: u.clone(),
+                });
+                save_idx += 1;
+            }
+        }
+
+        let safety = 0.9;
+        let factor = if err_norm > 1e-15 {
+            safety * err_norm.powf(-I_EXP)
+        } else {
+            5.0
+        };
+        dt = dt_eff * factor.clamp(0.2, 5.0);
+        dt = dt.max(opts.min_dt);
+    }
+
+    while save_idx < saveat.len() {
+        results.push(SolPointG {
+            t: saveat[save_idx],
+            u: u.clone(),
+        });
+        save_idx += 1;
+    }
+
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +491,56 @@ mod tests {
         let result = solve_ode(&rhs, &[42.0], (5.0, 5.0), &[], &saveat, &opts);
         assert_eq!(result.len(), 1);
         assert_relative_eq!(result[0].u[0], 42.0, epsilon = 1e-12);
+    }
+
+    /// `solve_ode_g` over `Dual2` must reproduce the closed-form sensitivities of
+    /// `du/dt = −k·u`, `u(0)=1` ⇒ `u(t)=e^{−kt}`, `∂u/∂k=−t·e^{−kt}`,
+    /// `∂²u/∂k²=t²·e^{−kt}`.
+    #[test]
+    fn solve_ode_g_sensitivity_matches_closed_form() {
+        use crate::sens::dual2::Dual2;
+        let rhs = |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+            du[0] = -(p[0] * u[0]);
+        };
+        let opts = OdeSolverOptions {
+            abstol: 1e-10,
+            reltol: 1e-9,
+            ..OdeSolverOptions::default()
+        };
+        let k = Dual2::<1>::var(0.1, 0);
+        let u0 = [Dual2::<1>::constant(1.0)];
+        let res = solve_ode_g(&rhs, &u0, (0.0, 2.0), &[k], &[2.0], &opts);
+        let u = &res[0].u[0];
+        let e = (-0.2_f64).exp();
+        assert_relative_eq!(u.value, e, max_relative = 1e-6);
+        assert_relative_eq!(u.grad[0], -2.0 * e, max_relative = 1e-5);
+        assert_relative_eq!(u.hess[0][0], 4.0 * e, max_relative = 1e-5);
+    }
+
+    /// The `Dual2` integration's value must track the scalar `solve_ode`.
+    #[test]
+    fn solve_ode_g_value_matches_scalar() {
+        use crate::sens::dual2::Dual2;
+        let rhs_d = |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+            du[0] = -(p[0] * u[0]);
+        };
+        let rhs_f = |u: &[f64], p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -p[0] * u[0];
+        };
+        let opts = OdeSolverOptions::default();
+        let saveat = [1.0, 5.0, 10.0];
+        let rd = solve_ode_g(
+            &rhs_d,
+            &[Dual2::<1>::constant(1.0)],
+            (0.0, 10.0),
+            &[Dual2::<1>::var(0.1, 0)],
+            &saveat,
+            &opts,
+        );
+        let rf = solve_ode(&rhs_f, &[1.0], (0.0, 10.0), &[0.1], &saveat, &opts);
+        for (a, b) in rd.iter().zip(rf.iter()) {
+            assert_relative_eq!(a.u[0].value, b.u[0], max_relative = 1e-9, epsilon = 1e-12);
+        }
     }
 
     #[test]

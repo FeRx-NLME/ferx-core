@@ -1,0 +1,39 @@
+# Warfarin with a constant output scale (obs_scale = 10) and ADDITIVE error —
+# the rigorous analytic-provider cross-check for [scaling]. The provider divides
+# the concentration prediction (and its η/θ jet) by 10 in closed form; NONMEM
+# reproduces this with S2 = V*10 (tests/nonmem/warfarin_scaled.ctl).
+#
+# Additive error is deliberate: a proportional model is invariant to a constant
+# output scale, so it cannot detect a scaling bug. Fit against
+# tests/nonmem/warfarin_scaled.csv (warfarin DV divided by 10) so the scaled
+# prediction and the data share a scale.
+
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVV(7.7, 0.1, 500.0)
+  theta TVKA(0.8, 0.01, 50.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma ADD ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[scaling]
+  obs_scale = 10
+
+[error_model]
+  DV ~ additive(ADD)
+
+[fit_options]
+  method     = focei
+  maxiter    = 300
+  covariance = false

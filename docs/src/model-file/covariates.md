@@ -66,6 +66,34 @@ declared column that is absent (`E_MISSING_COVARIATE`) or non-numeric
 (`E_COVARIATE_NOT_NUMERIC`), or a referenced covariate missing from the data, is
 reported at check time rather than only failing once the fit starts.
 
+## Time-varying covariates
+
+A covariate may change **within** a subject — e.g. body weight measured at each
+visit, or a creatinine clearance that drifts over an admission. ferx detects this
+per subject: when a covariate column holds more than one value across a subject's
+records, that subject carries a **per-record covariate snapshot** (last
+observation carried forward, LOCF) instead of a single subject-static value, and
+the structural model is evaluated at each event's snapshot. A subject whose
+covariates are constant keeps the cheap static path.
+
+For the analytical 1-/2-/3-compartment models this is handled **exactly**: a
+time-varying covariate makes the individual PK parameters switch part-way through
+a dose's decay (e.g. `CL = TVCL*(WT/70)^THETA_WT*exp(ETA_CL)` with a changing
+`WT`), and the predictions flow through a state-propagating event-driven solver
+that carries the amounts across each covariate change. Under a **gradient-based
+outer optimizer** (`lbfgs`, `bfgs`, or `slsqp`) these subjects also drive the
+**exact analytic FOCE/FOCEI gradient** (each event's parameter derivatives are
+taken at that event's covariate snapshot), rather than falling back to finite
+differences. Covariate changes carried by EVID=2 records between observations are
+supported, as are combinations with EVID 3/4 resets, **steady-state dosing**, a
+**constant `obs_scale` divisor**, and **inter-occasion variability (IOV)** (the
+covariate and κ both switch the individual parameters across occasions). Two
+combinations still fall back to the finite-difference gradient: time-varying
+covariates with **dose lagtime**, and time-varying covariates with
+**expression-based output scaling** (`obs_scale = <expr>` that references
+parameters or covariates). (See [FOCE/FOCEI](../estimation/foce.md) for the
+optimizer/gradient interaction.)
+
 ## Covariate table
 
 When a `[covariates]` block is present and the fit is launched from a data file,

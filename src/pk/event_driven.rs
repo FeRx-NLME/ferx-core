@@ -30,6 +30,42 @@
 //! clinical setup tracked as a follow-up.
 
 use crate::types::{DoseEvent, PkModel, PkParams, Subject};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+// ── Lightweight profiling / A-B toggles (measurement only) ────────────
+//
+// `FERX_PROFILE=1` accumulates the count and wall-time of the f64 event-driven
+// prediction across the whole fit (printed by the CLI via [`profile_report`]).
+
+static PROFILE_PRED_CALLS: AtomicU64 = AtomicU64::new(0);
+static PROFILE_PRED_NANOS: AtomicU64 = AtomicU64::new(0);
+
+fn profile_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        std::env::var("FERX_PROFILE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Print the accumulated f64-prediction profile (no-op unless `FERX_PROFILE=1`).
+pub fn profile_report() {
+    if !profile_enabled() {
+        return;
+    }
+    let c = PROFILE_PRED_CALLS.load(Ordering::Relaxed);
+    let n = PROFILE_PRED_NANOS.load(Ordering::Relaxed);
+    if c > 0 {
+        eprintln!(
+            "[profile] event-driven f64 predictions: {} calls, {:.3}s total, {:.1} ns/call",
+            c,
+            n as f64 / 1e9,
+            n as f64 / c as f64
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
@@ -337,6 +373,8 @@ fn equilibrate_ss_state_event_driven(
         vec![0.0, dose.ii]
     };
 
+    // Constant params across all SS-equilibration cycles → one eigendata solve.
+    let mut eigen = crate::sens::propagate::EigenCacheG::default();
     for _ in 0..EVENT_DRIVEN_SS_EQUILIBRATION_CYCLES {
         if !is_inf {
             // Bolus pulse: instantaneous amount jump (with F).
@@ -350,6 +388,7 @@ fn equilibrate_ss_state_event_driven(
             &synthetic_dose,
             &synthetic_lagtimes,
             f64::NEG_INFINITY,
+            &mut eigen,
         );
     }
 
@@ -383,6 +422,7 @@ fn ss_state_at_phase_event_driven(
     }
 
     let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
+    let mut eigen = crate::sens::propagate::EigenCacheG::default();
     if is_inf {
         let t_inf = dose.duration;
         // Clone so the `F`-reshaped `(rate, duration)` survive (see
@@ -407,6 +447,7 @@ fn ss_state_at_phase_event_driven(
             &synthetic_dose,
             &synthetic_lagtimes,
             f64::NEG_INFINITY,
+            &mut eigen,
         );
     } else {
         state[cmt_idx] += pk.bioavailable_amount(dose.amt);
@@ -418,6 +459,7 @@ fn ss_state_at_phase_event_driven(
             &[],
             &[],
             f64::NEG_INFINITY,
+            &mut eigen,
         );
     }
     state
@@ -509,6 +551,39 @@ pub fn event_driven_predictions_with_schedule(
     pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
 ) -> Vec<f64> {
+    if !profile_enabled() {
+        return event_driven_predictions_with_schedule_impl(
+            pk_model,
+            subject,
+            schedule,
+            pk_at_dose,
+            pk_at_obs,
+            pk_at_pk_only,
+        );
+    }
+    let t0 = std::time::Instant::now();
+    let r = event_driven_predictions_with_schedule_impl(
+        pk_model,
+        subject,
+        schedule,
+        pk_at_dose,
+        pk_at_obs,
+        pk_at_pk_only,
+    );
+    PROFILE_PRED_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    PROFILE_PRED_CALLS.fetch_add(1, Ordering::Relaxed);
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn event_driven_predictions_with_schedule_impl(
+    pk_model: PkModel,
+    subject: &Subject,
+    schedule: &EventSchedule,
+    pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams],
+    pk_at_pk_only: &[PkParams],
+) -> Vec<f64> {
     assert_eq!(pk_at_dose.len(), subject.doses.len());
     assert_eq!(pk_at_obs.len(), subject.obs_times.len());
     assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
@@ -539,6 +614,12 @@ pub fn event_driven_predictions_with_schedule(
     // same way it zeros the compartments). `NEG_INFINITY` until the first
     // reset means every infusion is eligible.
     let mut reset_floor = f64::NEG_INFINITY;
+
+    // Per-walk eigendata memo: for a subject without time-varying covariates the
+    // disposition params are constant across every interval, so the 2-/3-cpt
+    // eigenvalue solve runs once and is reused (the Schnider speedup). A TV-cov
+    // change is a cache miss that recomputes transparently.
+    let mut eigen = crate::sens::propagate::EigenCacheG::default();
 
     for (i, ev) in schedule.events.iter().enumerate() {
         // EVID=3 / EVID=4 reset: zero every compartment. Any drug carried
@@ -571,6 +652,7 @@ pub fn event_driven_predictions_with_schedule(
                 &eff_doses,
                 &schedule.dose_lagtimes,
                 reset_floor,
+                &mut eigen,
             );
             cur_t = ev.time;
         }
@@ -709,6 +791,7 @@ fn pk_for(
 /// `f64::NEG_INFINITY` when none has happened. Infusions whose (lagged) start
 /// is strictly before `reset_floor` are treated as turned off — a reset stops
 /// ongoing infusions, just as it zeros the compartments.
+#[allow(clippy::too_many_arguments)]
 fn propagate_with_bounds(
     state: &mut [f64],
     bounds: &[f64],
@@ -717,6 +800,7 @@ fn propagate_with_bounds(
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     reset_floor: f64,
+    eigen: &mut crate::sens::propagate::EigenCacheG,
 ) {
     for w in bounds.windows(2) {
         let s0 = w[0];
@@ -771,6 +855,14 @@ fn propagate_with_bounds(
             }
         }
 
+        // 2-/3-cpt dispatch goes through the per-walk eigendata memo (`eigen`) and
+        // the single-source `*_core_g` propagators: the `sqrt`/`acos` eigenvalue
+        // solve runs once per distinct param set and is reused across the walk's
+        // intervals (the Schnider speedup), with the formula living once in `sens`.
+        use crate::sens::propagate::{
+            propagate_three_cpt_core_g, propagate_three_cpt_oral_core_g, propagate_two_cpt_core_g,
+            propagate_two_cpt_oral_core_g,
+        };
         match pk_model {
             PkModel::OneCptIv => {
                 propagate_one_cpt(state, dt, pk, rate_central);
@@ -779,16 +871,47 @@ fn propagate_with_bounds(
                 propagate_one_cpt_oral(state, dt, pk, rate_central, rate_depot);
             }
             PkModel::TwoCptIv => {
-                propagate_two_cpt(state, dt, pk, rate_central, rate_periph1);
+                if let Some(e) = eigen.two_cpt(pk.cl(), pk.v(), pk.q(), pk.v2()) {
+                    propagate_two_cpt_core_g::<f64>(state, dt, &e, rate_central, rate_periph1);
+                }
             }
             PkModel::TwoCptOral => {
-                propagate_two_cpt_oral(state, dt, pk, rate_central, rate_depot);
+                if let Some(e) = eigen.two_cpt(pk.cl(), pk.v(), pk.q(), pk.v2()) {
+                    propagate_two_cpt_oral_core_g::<f64>(
+                        state,
+                        dt,
+                        &e,
+                        pk.ka(),
+                        rate_central,
+                        rate_depot,
+                    );
+                }
             }
             PkModel::ThreeCptIv => {
-                propagate_three_cpt(state, dt, pk, rate_central, rate_periph1, rate_periph2);
+                if let Some(e) = eigen.three_cpt(pk.cl(), pk.v(), pk.q(), pk.v2(), pk.q3(), pk.v3())
+                {
+                    propagate_three_cpt_core_g::<f64>(
+                        state,
+                        dt,
+                        &e,
+                        rate_central,
+                        rate_periph1,
+                        rate_periph2,
+                    );
+                }
             }
             PkModel::ThreeCptOral => {
-                propagate_three_cpt_oral(state, dt, pk, rate_central, rate_depot);
+                if let Some(e) = eigen.three_cpt(pk.cl(), pk.v(), pk.q(), pk.v2(), pk.q3(), pk.v3())
+                {
+                    propagate_three_cpt_oral_core_g::<f64>(
+                        state,
+                        dt,
+                        &e,
+                        pk.ka(),
+                        rate_central,
+                        rate_depot,
+                    );
+                }
             }
         }
     }
@@ -796,101 +919,12 @@ fn propagate_with_bounds(
 
 /// 1-cpt linear propagator with constant input `rate` into central:
 ///   A(t+dt) = exp(-ke·dt)·A(t) + (rate/ke)·(1 - exp(-ke·dt))
-fn propagate_one_cpt(state: &mut [f64], dt: f64, pk: &PkParams, rate: f64) {
-    let cl = pk.cl();
-    let v = pk.v();
-    if v <= 0.0 || cl <= 0.0 {
-        // Degenerate params; skip propagation rather than blow up. The
-        // outer optimizer will see a poor OFV and step away.
-        return;
-    }
-    let ke = cl / v;
-    let exp_term = (-ke * dt).exp();
-    state[0] = exp_term * state[0] + (rate / ke) * (1.0 - exp_term);
-}
-
-/// 2-cpt linear propagator with constant input rates into central and
-/// peripheral compartments. Uses eigendecomposition of the rate matrix
-/// (eigenvalues -α, -β from `macro_rates`-style derivation).
-fn propagate_two_cpt(
-    state: &mut [f64],
-    dt: f64,
-    pk: &PkParams,
-    rate_central: f64,
-    rate_periph: f64,
-) {
-    let cl = pk.cl();
-    let v1 = pk.v();
-    let q = pk.q();
-    let v2 = pk.v2();
-    if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q <= 0.0 {
-        return;
-    }
-    let k10 = cl / v1;
-    let k12 = q / v1;
-    let k21 = q / v2;
-    let s = k10 + k12 + k21;
-    let d = k10 * k21;
-    let disc = {
-        let x = s * s - 4.0 * d;
-        if x > 0.0 {
-            x.sqrt()
-        } else {
-            0.0
-        }
-    };
-    let alpha = (s + disc) / 2.0;
-    // Vieta: alpha * beta = d (avoids cancellation).
-    let beta = if alpha > 1e-30 { d / alpha } else { 0.0 };
-
-    // Steady-state amounts under constant input b = (rate_central, rate_periph).
-    //   A_ss = -K^{-1} b = (1/(k21·k10)) * [k21·b1 + k21·b2,
-    //                                       k12·b1 + (k10+k12)·b2]
-    // Special-cased for our two input channels.
-    let denom_ss = k21 * k10;
-    let (a_ss_1, a_ss_2) = if denom_ss > 1e-30 {
-        (
-            (k21 * rate_central + k21 * rate_periph) / denom_ss,
-            (k12 * rate_central + (k10 + k12) * rate_periph) / denom_ss,
-        )
-    } else {
-        (0.0, 0.0)
-    };
-
-    let h1_0 = state[0] - a_ss_1;
-    let h2_0 = state[1] - a_ss_2;
-
-    // Decompose homogeneous (h1_0, h2_0) into eigenmodes:
-    //   eigenvectors u_α = (k21 - α, k12),  u_β = (k21 - β, k12)
-    //   h(t) = c1·u_α·exp(-α·t) + c2·u_β·exp(-β·t)
-    let denom = beta - alpha;
-    let (c1, c2) = if k12.abs() < 1e-30 {
-        // No central→peripheral transfer: 1-cpt-equivalent. Treat A1 and A2
-        // as decoupled, with A1 having rate k10 and A2 having rate k21.
-        // This branch is defensive — k12 == 0 implies q == 0 (already
-        // guarded). Leave both modes balanced to avoid NaN.
-        (0.0, 0.0)
-    } else if denom.abs() < 1e-30 {
-        // alpha ≈ beta — degenerate (only happens if discriminant ≈ 0,
-        // i.e. (k10+k12-k21)^2 + 4·k12·k21 → 0 which requires k12=k21=0).
-        // Fall back to splitting the homogeneous part evenly.
-        let s_homog = h2_0 / k12;
-        (s_homog * 0.5, s_homog * 0.5)
-    } else {
-        let s_homog = h2_0 / k12;
-        let c1 = (h1_0 - s_homog * (k21 - beta)) / denom;
-        let c2 = s_homog - c1;
-        (c1, c2)
-    };
-
-    let e_alpha = (-alpha * dt).exp();
-    let e_beta = (-beta * dt).exp();
-
-    let h1_dt = c1 * (k21 - alpha) * e_alpha + c2 * (k21 - beta) * e_beta;
-    let h2_dt = (c1 * e_alpha + c2 * e_beta) * k12;
-
-    state[0] = h1_dt + a_ss_1;
-    state[1] = h2_dt + a_ss_2;
+///
+/// Delegates to the single generic source `sens::propagate::propagate_one_cpt_g`
+/// at `T = f64` — the gradient-less instantiation of the same analytical solution
+/// the `Dual2` sensitivity walk uses. There is no separate f64 formula to drift.
+pub(crate) fn propagate_one_cpt(state: &mut [f64], dt: f64, pk: &PkParams, rate: f64) {
+    crate::sens::propagate::propagate_one_cpt_g::<f64>(state, dt, pk.cl(), pk.v(), rate);
 }
 
 // ─── Oral models ─────────────────────────────────────────────────────
@@ -903,451 +937,25 @@ fn propagate_two_cpt(
 /// added by linear superposition. `rate_depot` is a constant zero-order input
 /// into the **depot** (RATE>0 into cmt 1, #400): zero-order release into the
 /// depot, then first-order `ka` absorption into central.
-fn propagate_one_cpt_oral(
+pub(crate) fn propagate_one_cpt_oral(
     state: &mut [f64],
     dt: f64,
     pk: &PkParams,
     rate_central: f64,
     rate_depot: f64,
 ) {
-    let cl = pk.cl();
-    let v = pk.v();
-    let ka = pk.ka();
-    if v <= 0.0 || cl <= 0.0 || ka <= 0.0 {
-        return;
-    }
-    let ke = cl / v;
-    let e_ka = (-ka * dt).exp();
-    let e_ke = (-ke * dt).exp();
-
-    let a_d_0 = state[0];
-    let a_c_0 = state[1];
-
-    // Depot decays exponentially (decoupled).
-    state[0] = a_d_0 * e_ka;
-
-    // Central compartment: homogeneous decay of A_c(0) plus depot-driven
-    // contribution. Bateman form, with L'Hôpital fallback when ka ≈ ke.
-    if (ka - ke).abs() < 1e-9 {
-        state[1] = a_c_0 * e_ke + ka * a_d_0 * dt * e_ke;
-    } else {
-        state[1] = a_c_0 * e_ke + (ka * a_d_0 / (ke - ka)) * (e_ka - e_ke);
-    }
-
-    // Constant infusion into central (depot bypass). By linearity its forced
-    // response is the IV propagator's input term from a zero initial state, so
-    // reuse `propagate_one_cpt` to avoid duplicating the closed form (#327
-    // follow-up: the event-driven path previously dropped this input on oral
-    // models).
-    if rate_central > 0.0 {
-        let mut inflow = [0.0_f64];
-        propagate_one_cpt(&mut inflow, dt, pk, rate_central);
-        state[1] += inflow[0];
-    }
-
-    // Constant zero-order input into the depot (#400). Forced response from a
-    // zero initial state, added by linearity:
-    //   depot:   A_d_forced(dt) = (R/ka)·(1 − e_ka)
-    //   central: drive ka·A_d_forced = R·(1 − e^{−ka t}) convolved with the
-    //            central impulse response e^{−ke t} gives
-    //            R/ke·(1 − e_ke) − R·(e_ka − e_ke)/(ke − ka),
-    //            with the L'Hôpital limit R·dt·e_ke as ka → ke.
-    if rate_depot > 0.0 {
-        state[0] += (rate_depot / ka) * (1.0 - e_ka);
-        let central_forced = if (ka - ke).abs() < 1e-9 {
-            rate_depot / ke * (1.0 - e_ke) - rate_depot * dt * e_ke
-        } else {
-            rate_depot / ke * (1.0 - e_ke) - rate_depot * (e_ka - e_ke) / (ke - ka)
-        };
-        state[1] += central_forced;
-    }
-}
-
-/// 2-cpt oral propagator. State = `[A_depot, A_central, A_periph]`.
-/// `rate_central` is a constant zero-order input into the central compartment
-/// (depot-bypassing infusion, RATE>0 into cmt 2), added by linear superposition.
-/// `rate_depot` is a constant zero-order input into the **depot** (RATE>0 into
-/// cmt 1, #400): zero-order release into the depot, then first-order `ka`
-/// absorption into central.
-fn propagate_two_cpt_oral(
-    state: &mut [f64],
-    dt: f64,
-    pk: &PkParams,
-    rate_central: f64,
-    rate_depot: f64,
-) {
-    let cl = pk.cl();
-    let v1 = pk.v();
-    let q = pk.q();
-    let v2 = pk.v2();
-    let ka = pk.ka();
-    if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q <= 0.0 || ka <= 0.0 {
-        return;
-    }
-    let k10 = cl / v1;
-    let k12 = q / v1;
-    let k21 = q / v2;
-    let s = k10 + k12 + k21;
-    let d_eig = k10 * k21;
-    let disc = {
-        let x = s * s - 4.0 * d_eig;
-        if x > 0.0 {
-            x.sqrt()
-        } else {
-            0.0
-        }
-    };
-    let alpha = (s + disc) * 0.5;
-    let beta = if alpha > 1e-30 { d_eig / alpha } else { 0.0 };
-
-    let a_d_0 = state[0];
-    let a_c_0 = state[1];
-    let a_p_0 = state[2];
-
-    let e_ka = (-ka * dt).exp();
-    let e_alpha = (-alpha * dt).exp();
-    let e_beta = (-beta * dt).exp();
-
-    // Depot drains independently.
-    state[0] = a_d_0 * e_ka;
-
-    // Particular solution amplitudes for the depot-driven input
-    // ka·A_d(t) = ka·A_d(0)·exp(-ka·t) into the central compartment.
-    // Assumes (A, B)·exp(-ka·t) form; substitute into the (A_c, A_p)
-    // ODE and solve. See derivation in the module docs / commit history.
-    let denom_depot = (ka - alpha) * (ka - beta);
-    let (cap_a, cap_b) = if denom_depot.abs() < 1e-12 {
-        // ka coincides with α or β: would need L'Hôpital. The Bateman
-        // singularity is rare in practice; fall back to no depot
-        // contribution (preserves homogeneous evolution).
-        (0.0, 0.0)
-    } else {
-        let a = ka * a_d_0 * (k21 - ka) / denom_depot;
-        let b = ka * a_d_0 * k12 / denom_depot;
-        (a, b)
-    };
-
-    // Homogeneous initial conditions = state - particular_at_t0.
-    let h_c_0 = a_c_0 - cap_a;
-    let h_p_0 = a_p_0 - cap_b;
-
-    // Decompose into the 2-cpt (α, β) eigenmodes (eigenvectors
-    // u_α = (k21 - α, k12),  u_β = (k21 - β, k12)).
-    let denom = beta - alpha;
-    let (c1, c2) = if k12.abs() < 1e-30 || denom.abs() < 1e-30 {
-        let s_homog = h_p_0 / k12.max(1e-30);
-        (s_homog * 0.5, s_homog * 0.5)
-    } else {
-        let s_homog = h_p_0 / k12;
-        let c1 = (h_c_0 - s_homog * (k21 - beta)) / denom;
-        let c2 = s_homog - c1;
-        (c1, c2)
-    };
-
-    let h_c_dt = c1 * (k21 - alpha) * e_alpha + c2 * (k21 - beta) * e_beta;
-    let h_p_dt = (c1 * e_alpha + c2 * e_beta) * k12;
-
-    state[1] = h_c_dt + cap_a * e_ka;
-    state[2] = h_p_dt + cap_b * e_ka;
-
-    // Constant infusion into central (depot bypass) — see propagate_one_cpt_oral.
-    // Reuse the 2-cpt IV propagator's forced response from a zero initial state.
-    if rate_central > 0.0 {
-        let mut inflow = [0.0_f64, 0.0];
-        propagate_two_cpt(&mut inflow, dt, pk, rate_central, 0.0);
-        state[1] += inflow[0];
-        state[2] += inflow[1];
-    }
-
-    // Constant zero-order input into the depot (#400). The forced response from
-    // a zero initial state is `x_ss − e^{A·dt}·x_ss`, where `x_ss` is the full
-    // steady state under constant depot input R. At steady state the depot holds
-    // R/ka and delivers ka·(R/ka)=R into central, so the central/peripheral SS
-    // equals a 2-cpt IV infusion of rate R into central:
-    //   central_ss = R/k10,  periph_ss = k12·R/(k21·k10).
-    // `e^{A·dt}·x_ss` is exactly this propagator's homogeneous evolution, reused
-    // by recursing with zero rates (depth 1; no further recursion).
-    if rate_depot > 0.0 {
-        let r = rate_depot;
-        let denom_ss = k21 * k10;
-        let (c_ss, p_ss) = if denom_ss > 1e-30 {
-            (r / k10, k12 * r / denom_ss)
-        } else {
-            (0.0, 0.0)
-        };
-        let d_ss = r / ka;
-        let mut xss = [d_ss, c_ss, p_ss];
-        propagate_two_cpt_oral(&mut xss, dt, pk, 0.0, 0.0);
-        state[0] += d_ss - xss[0];
-        state[1] += c_ss - xss[1];
-        state[2] += p_ss - xss[2];
-    }
+    crate::sens::propagate::propagate_one_cpt_oral_g::<f64>(
+        state,
+        dt,
+        pk.cl(),
+        pk.v(),
+        pk.ka(),
+        rate_central,
+        rate_depot,
+    );
 }
 
 // ─── 3-compartment models ────────────────────────────────────────────
-
-/// Three-compartment macro-rate constants and the auxiliary (k21, k31).
-/// Returns `(α, β, γ, k21, k31)` with the convention `α > β > γ > 0`.
-/// Mirrors `pk::three_compartment::macro_rates_three_cpt` (kept private
-/// there) — duplicated to avoid making it `pub`.
-fn macro_rates_three(
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
-) -> (f64, f64, f64, f64, f64) {
-    let k10 = cl / v1;
-    let k12 = q2 / v1;
-    let k21 = q2 / v2;
-    let k13 = q3 / v1;
-    let k31 = q3 / v3;
-    let s2 = k10 + k12 + k13 + k21 + k31;
-    let s1 = k10 * k21 + k10 * k31 + k21 * k31 + k12 * k31 + k13 * k21;
-    let s0 = k10 * k21 * k31;
-    let h = s2 / 3.0;
-    let p = s1 - s2 * s2 / 3.0;
-    let q = s1 * s2 / 3.0 - 2.0 * s2 * s2 * s2 / 27.0 - s0;
-    let p_safe = p.min(-1e-30);
-    let m = 2.0 * (-p_safe / 3.0).sqrt();
-    let arg = (3.0 * q / (p_safe * m)).clamp(-1.0, 1.0);
-    let phi = arg.acos() / 3.0;
-    let pi23 = 2.0 * std::f64::consts::FRAC_PI_3;
-    let l0 = m * phi.cos() + h;
-    let l1 = m * (phi - pi23).cos() + h;
-    let l2 = m * (phi - 2.0 * pi23).cos() + h;
-    let alpha = l0.max(l1).max(l2);
-    let gamma = l0.min(l1).min(l2);
-    let beta = s2 - alpha - gamma;
-    (alpha, beta, gamma, k21, k31)
-}
-
-/// Spectral propagation of one 3-cpt eigenmode `μ` applied to state vector
-/// `(c, p1, p2)`. Returns the mode's contribution to the new state at +dt.
-///
-/// Uses the *robust* eigenvector normalisation that stays well-defined
-/// even when an eigenvalue happens to be close to one of the structural
-/// rate constants (`k21` or `k31`) — common in 3-cpt models where the
-/// slowest eigenvalue γ is dominated by the slowest peripheral rate:
-///
-///   v_μ = ((k21-μ)(k31-μ),  k12·(k31-μ),  k13·(k21-μ))
-///   w_μ = ((k21-μ)(k31-μ),  k21·(k31-μ),  k31·(k21-μ))
-///
-/// Spectral projector: `P_μ = v_μ wᵀ_μ / (w_μ · v_μ)`.
-#[allow(clippy::too_many_arguments)]
-fn three_cpt_mode(
-    mu: f64,
-    c: f64,
-    p1: f64,
-    p2: f64,
-    k12: f64,
-    k13: f64,
-    k21: f64,
-    k31: f64,
-    dt: f64,
-) -> (f64, f64, f64) {
-    let d21 = k21 - mu;
-    let d31 = k31 - mu;
-    let v_c = d21 * d31;
-    let v_p1 = k12 * d31;
-    let v_p2 = k13 * d21;
-    let w_c = d21 * d31;
-    let w_p1 = k21 * d31;
-    let w_p2 = k31 * d21;
-    let norm = v_c * w_c + v_p1 * w_p1 + v_p2 * w_p2;
-    if norm.abs() < 1e-30 {
-        return (0.0, 0.0, 0.0);
-    }
-    let proj = w_c * c + w_p1 * p1 + w_p2 * p2;
-    let coef = proj / norm;
-    let exp_term = (-mu * dt).exp();
-    (
-        coef * v_c * exp_term,
-        coef * v_p1 * exp_term,
-        coef * v_p2 * exp_term,
-    )
-}
-
-/// 3-cpt linear propagator (IV models). State = `[A_central, A_p1, A_p2]`.
-/// Spectral decomposition along (α, β, γ) eigenmodes. Constant infusion
-/// `(rate_central, rate_periph1, rate_periph2)` into the three slots is
-/// handled via the steady-state + homogeneous decomposition pattern.
-///
-/// Steady-state per input channel (linear superposition):
-///   - Channel 1 (central):   `A_ss = (r·v1/cl, r·v2/cl, r·v3/cl)`
-///   - Channel 2 (periph 1):  `A_ss[0] = r·v1/cl,
-///                             A_ss[1] = r·(cl+q2)·v2/(cl·q2),
-///                             A_ss[2] = r·v3/cl`
-///   - Channel 3 (periph 2):  `A_ss[0] = r·v1/cl,
-///                             A_ss[1] = r·v2/cl,
-///                             A_ss[2] = r·(cl+q3)·v3/(cl·q3)`
-/// Combined `A_ss` is the sum across channels.
-fn propagate_three_cpt(
-    state: &mut [f64],
-    dt: f64,
-    pk: &PkParams,
-    rate_central: f64,
-    rate_periph1: f64,
-    rate_periph2: f64,
-) {
-    let cl = pk.cl();
-    let v1 = pk.v();
-    let q2 = pk.q();
-    let v2 = pk.v2();
-    let q3 = pk.q3();
-    let v3 = pk.v3();
-    if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q2 <= 0.0 || v3 <= 0.0 || q3 <= 0.0 {
-        return;
-    }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three(cl, v1, q2, v2, q3, v3);
-    let k12 = q2 / v1;
-    let k13 = q3 / v1;
-
-    // Combined steady-state amounts under inputs (r_c, r_p1, r_p2).
-    // Central slot: total input divided by k10 = (r_c+r_p1+r_p2)·v1/cl.
-    // Peripheral slots get the central contribution + their own
-    // direct-input correction.
-    let r_total = rate_central + rate_periph1 + rate_periph2;
-    let a_ss_c = r_total * v1 / cl;
-    let a_ss_p1 =
-        (rate_central + rate_periph2) * v2 / cl + rate_periph1 * (cl + q2) * v2 / (cl * q2);
-    let a_ss_p2 =
-        (rate_central + rate_periph1) * v3 / cl + rate_periph2 * (cl + q3) * v3 / (cl * q3);
-
-    let h_c = state[0] - a_ss_c;
-    let h_p1 = state[1] - a_ss_p1;
-    let h_p2 = state[2] - a_ss_p2;
-
-    let (ca, p1a, p2a) = three_cpt_mode(alpha, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
-    let (cb, p1b, p2b) = three_cpt_mode(beta, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
-    let (cg, p1g, p2g) = three_cpt_mode(gamma, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
-
-    state[0] = ca + cb + cg + a_ss_c;
-    state[1] = p1a + p1b + p1g + a_ss_p1;
-    state[2] = p2a + p2b + p2g + a_ss_p2;
-}
-
-/// 3-cpt oral propagator. State = `[A_depot, A_central, A_p1, A_p2]`.
-/// Depot decays independently; the central+peripheral subsystem follows
-/// the 3-cpt homogeneous evolution plus a depot-driven particular solution
-/// of the form `(A, B, C)·exp(-ka·t)`. `rate_central` is a constant zero-order
-/// input into the central compartment (depot-bypassing infusion, RATE>0 into
-/// cmt 2), added by linear superposition. `rate_depot` is a constant zero-order
-/// input into the **depot** (RATE>0 into cmt 1, #400): zero-order release into
-/// the depot, then first-order `ka` absorption into central.
-fn propagate_three_cpt_oral(
-    state: &mut [f64],
-    dt: f64,
-    pk: &PkParams,
-    rate_central: f64,
-    rate_depot: f64,
-) {
-    let cl = pk.cl();
-    let v1 = pk.v();
-    let q2 = pk.q();
-    let v2 = pk.v2();
-    let q3 = pk.q3();
-    let v3 = pk.v3();
-    let ka = pk.ka();
-    if v1 <= 0.0 || cl <= 0.0 || v2 <= 0.0 || q2 <= 0.0 || v3 <= 0.0 || q3 <= 0.0 || ka <= 0.0 {
-        return;
-    }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three(cl, v1, q2, v2, q3, v3);
-    let k10 = cl / v1;
-    let k12 = q2 / v1;
-    let k13 = q3 / v1;
-
-    let a_d_0 = state[0];
-    let a_c_0 = state[1];
-    let a_p1_0 = state[2];
-    let a_p2_0 = state[3];
-
-    let e_ka = (-ka * dt).exp();
-
-    // Depot decays.
-    state[0] = a_d_0 * e_ka;
-
-    // Particular solution `X·exp(-ka·t)` for the depot-driven input
-    // `(ka·A_d(0), 0, 0)·exp(-ka·t)` into the central compartment. Solving
-    // `(K + ka·I) X = -(ka·A_d(0), 0, 0)` via Cramer's rule:
-    //
-    //   X1 = -ka·A_d(0)·(k21-ka)·(k31-ka) / [(ka-α)(ka-β)(ka-γ)]
-    //   X2 = k12·X1 / (k21-ka)
-    //   X3 = k13·X1 / (k31-ka)
-    //
-    // The leading negative sign comes from the odd-degree characteristic
-    // polynomial of K (3-cpt has a cubic; 2-cpt's quadratic gives the
-    // opposite sign — see `propagate_two_cpt_oral`). To stay robust when
-    // ka coincides with k21 or k31, use the X3-form
-    //   X3 = k13·(-ka·A_d(0)·d21·d31/denom) / d31
-    //      = -k13·ka·A_d(0)·d21 / denom
-    // which cancels the d31 cleanly.
-    let cap_a;
-    let cap_b;
-    let cap_c;
-    let denom_depot = (ka - alpha) * (ka - beta) * (ka - gamma);
-    let d21 = k21 - ka;
-    let d31 = k31 - ka;
-    if denom_depot.abs() < 1e-12 {
-        // ka coincides with α/β/γ — eigenvalue resonance, would need
-        // L'Hôpital. Rare in practice; fall back to no contribution.
-        cap_a = 0.0;
-        cap_b = 0.0;
-        cap_c = 0.0;
-    } else {
-        let scale = -ka * a_d_0 / denom_depot;
-        cap_a = scale * d21 * d31;
-        cap_b = scale * k12 * d31;
-        cap_c = scale * k13 * d21;
-    }
-
-    // Homogeneous initial conditions = state - particular_at_t0.
-    let h_c = a_c_0 - cap_a;
-    let h_p1 = a_p1_0 - cap_b;
-    let h_p2 = a_p2_0 - cap_c;
-
-    let (ca, p1a, p2a) = three_cpt_mode(alpha, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
-    let (cb, p1b, p2b) = three_cpt_mode(beta, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
-    let (cg, p1g, p2g) = three_cpt_mode(gamma, h_c, h_p1, h_p2, k12, k13, k21, k31, dt);
-
-    state[1] = ca + cb + cg + cap_a * e_ka;
-    state[2] = p1a + p1b + p1g + cap_b * e_ka;
-    state[3] = p2a + p2b + p2g + cap_c * e_ka;
-
-    // Constant infusion into central (depot bypass) — see propagate_one_cpt_oral.
-    // Reuse the 3-cpt IV propagator's forced response from a zero initial state.
-    if rate_central > 0.0 {
-        let mut inflow = [0.0_f64, 0.0, 0.0];
-        propagate_three_cpt(&mut inflow, dt, pk, rate_central, 0.0, 0.0);
-        state[1] += inflow[0];
-        state[2] += inflow[1];
-        state[3] += inflow[2];
-    }
-
-    // Constant zero-order input into the depot (#400). Forced response from a
-    // zero initial state = `x_ss − e^{A·dt}·x_ss`. At steady state the depot
-    // holds R/ka and delivers R into central, so central/peripheral SS equals a
-    // 3-cpt IV infusion of rate R into central:
-    //   central_ss = R/k10,  p1_ss = k12·R/(k21·k10),  p2_ss = k13·R/(k31·k10).
-    // `e^{A·dt}·x_ss` is this propagator's homogeneous evolution, reused by
-    // recursing with zero rates (depth 1).
-    if rate_depot > 0.0 {
-        let r = rate_depot;
-        let (c_ss, p1_ss, p2_ss) = if k10 > 1e-30 && k21 > 1e-30 && k31 > 1e-30 {
-            (r / k10, k12 * r / (k21 * k10), k13 * r / (k31 * k10))
-        } else {
-            (0.0, 0.0, 0.0)
-        };
-        let d_ss = r / ka;
-        let mut xss = [d_ss, c_ss, p1_ss, p2_ss];
-        propagate_three_cpt_oral(&mut xss, dt, pk, 0.0, 0.0);
-        state[0] += d_ss - xss[0];
-        state[1] += c_ss - xss[1];
-        state[2] += p1_ss - xss[2];
-        state[3] += p2_ss - xss[3];
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -60,7 +60,7 @@ Optional fields are omitted entirely when absent (not emitted as `null`).
 | `E_PER_CMT_ERROR_MODEL` | error | An observed compartment lacks a per-CMT `[error_model]` entry. |
 | `E_DATA` | error | The `--data` file could not be read or parsed. |
 | `E_SDE_INCOMPATIBLE` | error | An SDE (`[diffusion]`) model used with an incompatible method (`saem`, `gn`, `gn_hybrid`) or `gradient_method = ad`. |
-| `E_AD_UNAVAILABLE` | error | `gradient_method = ad` requested, but the binary was built without the `autodiff` feature. Use `auto`/`fd`, or rebuild with the Enzyme toolchain. Only emitted by non-autodiff builds. |
+| `E_AD_RETIRED` | error | `gradient_method = ad` requested, but the Enzyme autodiff path was retired in favour of the analytic `Dual2` sensitivities. Use `auto` (analytic where in scope, else FD) or `fd`. |
 | `E_IMP_CHAIN` | error | `imp` is mis-placed in a method chain — repeated, or (with `imp_eval_only = true`) not the terminal stage. The estimating `imp` may sit anywhere; an evaluation-only `imp` must be terminal. |
 | `E_OPTIMIZER_IOV` | error | `optimizer = trust_region` used with an IOV model (`n_kappa > 0`). |
 | `W_STEADY_STATE_II` | warning | SS=1 doses with missing / non-positive `II` (treated as non-SS). |

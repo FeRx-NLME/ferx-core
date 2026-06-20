@@ -307,17 +307,16 @@ Docs are an [mdBook](https://rust-lang.github.io/mdBook/) under `docs/`.
 > rule above. The intent is **not** to commit built output — fix the template
 > so the two agree.
 
-### 8.6 Build portability (Enzyme / FD fallback)
+### 8.6 Build portability (stock nightly)
 
-ferx-r's autodiff uses the **Enzyme** Rust fork, but the build auto-probes for
-it and **falls back to finite-difference gradients** (`FERX_NO_AUTODIFF=1`) when
-it is absent. Standard-Rust users (Mac / Linux / Windows) and CI rely on this FD
-path to install and run ferx at all.
+ferx-core builds on a **stock nightly** toolchain — no custom compiler. The exact
+FOCE/FOCEI and HMC gradients come from hand-rolled analytic `Dual2` sensitivities
+(`sens/`), and models outside the provider's scope fall back to finite differences.
+The Enzyme autodiff path that used to require a from-source toolchain was retired.
 
-- **Never silently break or degrade the no-autodiff / FD path.** If a change
-  would, stop and warn. This covers `src/Makevars` (autodiff detection / feature
-  flags), `R/zzz.R`, and any `lib.rs` / `Cargo.toml` / CI change that assumes
-  the Enzyme toolchain is present.
+- **Keep the build toolchain-light.** Standard-Rust users (Mac / Linux / Windows)
+  and CI install ferx with `cargo build` alone. Do not reintroduce a dependency on
+  a custom compiler or a non-default Cargo feature for the core gradient path.
 
 ---
 
@@ -367,7 +366,7 @@ ferx-core change by rebuilding the R package:
 
 ```bash
 cargo build --release                       # ferx-core
-cd ../ferx-r && FERX_NO_AUTODIFF=1 R CMD INSTALL .
+cd ../ferx-r && R CMD INSTALL .
 ```
 
 > **Never commit a `Cargo.toml` that flips the ferx-core dep to a path
@@ -404,8 +403,9 @@ A bare `cargo update` unpins the patch and CI fails with
   releases — 4.7, 4.8 — supersede 4.6 under the same rule.)_
 - **Pre-commit hook:** `git config core.hooksPath .githooks` after cloning
   (blocks commits failing `rustfmt`).
-- **AD-reachable code:** never use `f64::max`/`min` in autodiff-instrumented
-  paths — see the autodiff section of `CLAUDE.md`.
+- **Sensitivity-reachable code:** keep functions on the `Dual2` path (the `*_g<T:
+  PkNum>` closed forms and propagators) differentiable — use `if`/`else` rather than
+  `f64::max`/`min` where it matters; see "Analytic Sensitivities" in `CLAUDE.md`.
 
 ---
 
@@ -421,7 +421,7 @@ A change is done only when **all** of the following hold:
 - [ ] Docs updated (`docs/src/**`, examples) for any user-visible change.
 - [ ] ferx-core ↔ ferx-r in sync (R package compiles; `Cargo.lock` bumped if needed).
 - [ ] R-side (if touched): `man/` regenerated & committed, `R/*.R` pure ASCII,
-      no-autodiff/FD build path still installs.
+      the package still installs with a stock `cargo build`.
 - [ ] Deferred/remaining work logged as new Issues.
 - [ ] Manually tested on an example fit (ideally real / novel data).
 
@@ -464,10 +464,9 @@ coordination via Google Chat ([§3](#3-communication)).
 ## 14. Security & dependencies
 
 FeRx is a numerical library, not a network service, so its attack surface is
-small — but it ships native code (FFI via extendr), an unusual toolchain (the
-Enzyme Rust fork), and a tree of crate / R dependencies, all of which need
-hygiene. We aim for a lightweight **DevSecOps** posture: push these checks into
-CI rather than bolt them on later.
+small — but it ships native code (FFI via extendr) and a tree of crate / R
+dependencies, all of which need hygiene. We aim for a lightweight **DevSecOps**
+posture: push these checks into CI rather than bolt them on later.
 
 **Dependency hygiene.** Keep dependencies current and watch for advisories:
 
@@ -476,8 +475,8 @@ CI rather than bolt them on later.
   demand).
 - **Dependabot** (`.github/dependabot.yml`) opens weekly `cargo` and
   `github-actions` update PRs for ferx-core. *(ferx-r: still to add.)*
-- Treat the **Enzyme toolchain** as supply-chain surface: pin it, and never let
-  a toolchain change silently break the FD-fallback path
+- Pin the nightly toolchain (`rust-toolchain.toml`) and bump it deliberately;
+  a toolchain roll should not silently change numerical behaviour
   ([§8](#8-cicd-and-quality-gates)).
 
 **Native / unsafe code.** Review any `unsafe` and the **extendr FFI boundary**

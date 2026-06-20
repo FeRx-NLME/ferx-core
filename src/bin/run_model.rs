@@ -88,6 +88,10 @@ fn main() {
             // prints it — language bindings (e.g. ferx-r's print.ferx_fit) are the
             // single source of truth for formatted summaries (see issue #60).
             ferx_core::io::output::print_results(&fit_result);
+            // Measurement only (no-op unless FERX_PROFILE=1).
+            ferx_core::pk::event_driven::profile_report();
+            ferx_core::sens::provider::profile_report();
+            ferx_core::estimation::inner_optimizer::profile_report();
 
             // Derive model name from model file path
             let model_name = std::path::Path::new(model_path)

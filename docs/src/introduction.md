@@ -11,10 +11,10 @@ ferx-core is a high-performance Nonlinear Mixed Effects (NLME) modeling engine w
 - **Analytical PK solutions** -- Built-in one-, two-, and three-compartment models (IV bolus, oral, infusion) with numerical stability guarantees
 - **ODE solver** -- Dormand-Prince RK45 adaptive integrator for custom kinetic models (e.g. Michaelis-Menten)
 - **SDE / diffusion models** -- Extended Kalman Filter path for stochastic differential equations via the `[diffusion]` block
-- **Automatic differentiation** -- Enzyme-based AD for fast, exact gradients
+- **Analytic sensitivities** -- Hand-rolled `Dual2` forward sensitivities for fast, exact FOCE/FOCEI and HMC gradients (no autodiff toolchain required)
 - **Multiple error models** -- Additive, proportional, combined, and log-transform-both-sides (LTBS); per-CMT multi-endpoint models for joint PK/PD
 - **Inter-occasion variability (IOV)** -- `kappa` random effects with FOCE/FOCEI and SAEM support
-- **Lagtime / ALAG** -- Absorption lag for analytical, AD, and ODE paths
+- **Lagtime / ALAG** -- Absorption lag for analytical and ODE paths
 - **LOQ censoring** -- Beal M3 method for below-LLOQ and above-ULOQ observations
 - **NCA-based starting values** -- `inits_from_nca` for automatic theta initialization from the data
 - **Simple model DSL** -- Declarative `.ferx` model files that read like equations
@@ -32,7 +32,7 @@ ferx-core is a high-performance Nonlinear Mixed Effects (NLME) modeling engine w
 | SAEM | Yes | No | Yes | Yes |
 | Analytical PK | Yes | Yes | Yes | Yes |
 | ODE models | Yes | Yes | Yes | Yes |
-| Auto-diff | Yes (Enzyme) | No | No | Yes (ForwardDiff) |
+| Exact gradients | Yes (analytic sensitivities) | No | No | Yes (ForwardDiff) |
 | Open source | Yes | No | No | No |
 
 ## Architecture Overview
@@ -56,7 +56,7 @@ src/
   estimation/       -- FOCE/FOCEI, SAEM, Gauss-Newton, IMP, SIR, trust-region
   stats/            -- Likelihood and residual computations
   io/               -- Data reading and output writing
-  ad/               -- Automatic differentiation (Enzyme)
+  sens/             -- Analytic Dual2 sensitivities (PkNum) for exact gradients
   nn/               -- Neural network components (DCM / NODE)
   bin/run_model.rs  -- CLI binary
 ```

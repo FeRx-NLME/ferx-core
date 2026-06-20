@@ -496,7 +496,13 @@ pub fn foce_subject_nll(
         );
     }
 
-    if interaction || m3_active {
+    // M3 no longer force-promotes to interaction: plain FOCE keeps a consistent
+    // FOCE (Sheiner–Beal) objective for the whole subject, with the censored rows
+    // entering the standard path as `−logΦ` terms (excluded from R̃). FOCEI still
+    // takes the interaction path. This matches NONMEM `METHOD=1 LAPLACE` with vs
+    // without INTER (FOCE-M3 and FOCEI-M3 are genuinely different optima).
+    let _ = m3_active;
+    if interaction {
         foce_subject_nll_interaction(
             subject,
             &ipreds,
@@ -591,7 +597,7 @@ pub fn foce_subject_nll_standard(
     omega: &OmegaMatrix,
     sigma_values: &[f64],
     error_spec: &ErrorSpec,
-    _bloq_method: BloqMethod,
+    bloq_method: BloqMethod,
     p_obs: &[f64],
     frem_r_override: Option<&[Option<f64>]>,
     // When `Some`, evaluate the residual variance R at these predictions
@@ -622,33 +628,61 @@ pub fn foce_subject_nll_standard(
         apply_frem_r_overrides(&mut r_diag, overrides);
     }
 
-    // R_tilde = H * Omega * H' + diag(R)
-    let r_tilde = compute_r_tilde(h_matrix, &omega.matrix, &r_diag);
+    // M3 BLOQ under FOCE: the censored rows leave the Sheiner–Beal marginal (R̃ and
+    // the quadratic form are built over the quantified rows only) and re-enter as
+    // `−logΦ((LLOQ − f(η̂))/√R⁰)` — the univariate marginal CDF, with R at the
+    // population η (no interaction). Mirrors the FOCEI handling, where censored
+    // rows are excluded from H̃ and added to the data term.
+    let m3 = matches!(bloq_method, BloqMethod::M3) && subject.has_censored_observation();
+    let quant: Vec<usize> = if m3 {
+        (0..n_obs)
+            .filter(|&j| subject.cens.get(j).copied().unwrap_or(0) == 0)
+            .collect()
+    } else {
+        (0..n_obs).collect()
+    };
 
-    // Cholesky of R_tilde
+    let mut bloq_term = 0.0;
+    if m3 {
+        for j in 0..n_obs {
+            if subject.cens.get(j).copied().unwrap_or(0) != 0 {
+                let z = (subject.observations[j] - ipreds[j]) / r_diag[j].sqrt();
+                bloq_term += -2.0 * log_normal_cdf(z);
+            }
+        }
+    }
+
+    // R_tilde = H_q * Omega * H_q' + diag(R_q) over the quantified rows; quad form
+    // and log|R̃| over the same submatrix. (Non-M3: quant = all rows, unchanged.)
+    let nq = quant.len();
+    let h_q = if m3 {
+        DMatrix::from_fn(nq, model_n_eta(h_matrix), |i, k| h_matrix[(quant[i], k)])
+    } else {
+        h_matrix.clone()
+    };
+    let r_diag_q: Vec<f64> = quant.iter().map(|&j| r_diag[j]).collect();
+    let r_tilde = compute_r_tilde(&h_q, &omega.matrix, &r_diag_q);
+
     let chol = match r_tilde.clone().cholesky() {
         Some(c) => c,
         None => return 1e20,
     };
 
-    // Residuals: y - f0
-    let residuals: DVector<f64> = DVector::from_iterator(
-        n_obs,
-        subject
-            .observations
-            .iter()
-            .zip(f0.iter())
-            .map(|(&y, &f)| y - f),
-    );
+    // Residuals: y - f0 over the quantified rows.
+    let residuals: DVector<f64> =
+        DVector::from_iterator(nq, quant.iter().map(|&j| subject.observations[j] - f0[j]));
 
-    // (y - f0)' * R_tilde_inv * (y - f0)
     let solved = chol.solve(&residuals);
     let quad_form = residuals.dot(&solved);
-
-    // log|R_tilde|
     let log_det_r = chol_log_det(&chol.l());
 
-    0.5 * (quad_form + log_det_r)
+    0.5 * (quad_form + log_det_r + bloq_term)
+}
+
+/// Number of η columns in the inner-Jacobian `h_matrix`.
+#[inline]
+fn model_n_eta(h_matrix: &DMatrix<f64>) -> usize {
+    h_matrix.ncols()
 }
 
 /// FOCEI INTER per-subject −2·log marginal — Almquist 2015 Laplace form.

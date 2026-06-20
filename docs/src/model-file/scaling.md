@@ -109,19 +109,20 @@ All `[scaling]` variants on the **analytical PK path** support both
 | Scalar `obs_scale = K` | ✓ exact | ✓ exact | The constant threads as a `Const` slice (one entry per obs). |
 | Expression `obs_scale = <expr>` | ✓ subject-static | ✓ exact | See subject-static caveat below. |
 | Per-CMT `obs_scale[CMT=N]` | ✓ subject-static | ✓ exact | One per-obs scale entry per observation, dispatched by `subject.obs_cmts[i]`. |
-| Form C `y[…] = <expr>` (ODE only) | ✗ — forces `gradient = fd` | ✓ | Form C only exists on ODE models, where the AD path is not available regardless of scaling. |
+| Form C `y[…] = <expr>` (ODE only) | ✗ — forces `gradient = fd` | ✓ | Form C only exists on ODE models, where the analytic gradient is not available regardless of scaling. |
 
-**Subject-static caveat (Expression / per-CMT under AD).** The
-per-observation scale array passed to the AD entry points is
-materialised from a single subject-static `pk_param_fn` evaluation —
-the same simplification documented for the FD path's `apply_scaling`.
-This means AD treats the scale as constant w.r.t. eta. For the common
-eta-independent scale (`WT/70`, `TVV/1000`, or `V` reading the EBE
-value) the AD and FD gradients are identical. For the rare case of a
-scale expression that explicitly references eta (e.g.
-`obs_scale = exp(ETA_V)`), the AD gradient ignores that dependence
-while FD captures it numerically — set `gradient = fd` if you need the
-eta sensitivity in the gradient.
+**Analytic outer gradient handles expression scaling exactly.** The analytic
+sensitivity provider that drives the gradient-based outer optimizers (`bfgs`,
+`lbfgs`, `slsqp`, …) on analytical 1-/2-/3-compartment models compiles an
+`obs_scale` *expression* to a `Dual2`-differentiable program and differentiates
+the scaled prediction `f / scale` **exactly** — including its η and θ dependence.
+So an η-dependent scale like `1000 / V` is handled exactly by the analytic
+FOCE/FOCEI outer gradient with no `gradient = fd` needed.
+
+**Inner EBE loop uses FD for expression scaling.** The light inner-gradient
+provider does not carry the scale quotient-rule, so the per-subject inner EBE
+loop falls back to finite differences for expression/per-CMT scaling (matching
+the LTBS choice). Correctness is preserved; only the inner route differs.
 
 ## Interaction with SDE / `[diffusion]`
 

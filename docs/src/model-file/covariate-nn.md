@@ -43,7 +43,7 @@ FOCEI loop runs exactly as it does for an analytical model. This is the
 Behind the `nn` cargo feature (off by default). Build with:
 
 ```sh
-RUSTFLAGS="-Z autodiff=Enable" cargo build --release --features nn
+cargo build --release --features nn
 ```
 
 A full runnable example lives at [`examples/warfarin_dcm.ferx`][ex] —
@@ -107,8 +107,9 @@ on the natural scale, no log transform. Biases initialise to 0.
 | `softplus`         | `f(x) = ln(1 + exp(x))`   | **Recommended output for PK params** — guarantees positivity, no exp blow-up |
 | `exp`              | `f(x) = exp(x)`           | Strictly positive, but unbounded; prefer `softplus` |
 
-All activations use `if`/`else` instead of `f64::max`/`f64::min` for AD
-safety (see [CLAUDE.md] → "Autodiff-Safe Code in `ad/` Module").
+All activations use `if`/`else` instead of `f64::max`/`f64::min` so they remain
+differentiable under the `Dual2` sensitivity type (see [CLAUDE.md] →
+"Analytic Sensitivities").
 
 [CLAUDE.md]: https://github.com/FeRx-NLME/ferx-core/blob/main/CLAUDE.md
 

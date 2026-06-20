@@ -76,21 +76,28 @@ ferx examples/warfarin_bloq.ferx --data data/warfarin_bloq.csv
 
 ```
 --- Objective Function ---
-OFV:  -213.9104
+OFV:  -217.1841
 
 --- THETA Estimates ---
-TVCL                 0.126263
-TVV                  7.629401
-TVKA                 1.083302
+TVCL                 0.132811
+TVV                  7.732354
+TVKA                 0.811661
 
 --- OMEGA Estimates ---
-  OMEGA(1,1) = 0.031381  (CV% = 17.7)
-  OMEGA(2,2) = 0.009723  (CV% = 9.9)
-  OMEGA(3,3) = 0.419327  (CV% = 64.8)
+  OMEGA(1,1) = 0.029021  (CV% = 17.0)
+  OMEGA(2,2) = 0.009557  (CV% = 9.8)
+  OMEGA(3,3) = 0.338106  (CV% = 58.1)
 
 --- SIGMA Estimates ---
-  SIGMA(1) = 0.010766
+  SIGMA(1) = 0.010761
 ```
+
+These match a NONMEM 7.5.1 LAPLACE M3 reference (`tests/nonmem/warfarin_bloq.{ctl,lst}`)
+to ~4 significant figures on the structural and variance parameters (TVCL 0.132801,
+TVV 7.73139, TVKA 0.809824, PROP 0.010760, ω 0.028849 / 0.009544 / 0.335772). The
+NONMEM objective uses the F_FLAG likelihood convention for censored rows, which
+carries a different additive constant than ferx's M3 term, so the OFV is not directly
+comparable (the MLE is).
 
 The diagnostic table (`warfarin_bloq-sdtab.csv`) gains a `CENS` column, and the
 `IWRES` / `CWRES` cells for censored rows are written as empty (a weighted
@@ -99,15 +106,19 @@ Gaussian residual is undefined when the observed value is censored).
 ## Method Notes
 
 - **Activation requires both pieces**: the `CENS` column in the data file *and*
-  `bloq_method = m3` in `[fit_options]`. Without the option, `CENS=1` and
-  `CENS=-1` rows are treated as ordinary observations at the `DV` limit value,
-  which biases the fit.
-- **FOCE is auto-promoted to FOCEI on affected subjects.** Mixing linearized
-  Gaussian residuals with non-linearized `log Φ` terms produces inconsistent
-  OFVs near the LLOQ boundary, so when `method = foce` and a subject has any
-  censored row, that subject is evaluated with η-interaction. A notice is
-  written to `FitResult.warnings`; set `method = focei` explicitly to silence
-  it.
+  `bloq_method = m3` in `[fit_options]`. Without the option, `CENS=1` (below
+  LLOQ) and `CENS=-1` (above ULOQ) rows are treated as ordinary observations at
+  the `DV` limit value, which biases the fit.
+- **FOCE and FOCEI give different M3 optima.** `method = foce` keeps a consistent
+  Sheiner–Beal objective: censored rows leave the linearized marginal and re-enter
+  as `−log Φ((LLOQ − f̂)/√R⁰)` (and the `ULOQ` mirror for `CENS=-1`) with the
+  population (η=0) variance, matching NONMEM `METHOD=1 LAPLACE` *without* INTER.
+  `method = focei` evaluates the censored term at the conditional variance (NONMEM
+  with INTER). Both have exact analytic gradients. On warfarin BLOQ the two land at
+  meaningfully different `TVKA` (FOCE ≈ 0.71, FOCEI ≈ 0.81), exactly as the
+  corresponding NONMEM runs do — pick the method to match your reference fit.
+  (Earlier versions silently promoted censored subjects to FOCEI under
+  `method = foce`.)
 - **Gauss-Newton caveat.** With `method = gn` or `gn_hybrid`, the BHHH
   information-matrix approximation degrades as the BLOQ fraction grows (each
   censored row carries less Fisher information than its Gaussian counterpart).
