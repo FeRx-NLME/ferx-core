@@ -4765,6 +4765,33 @@ mod tests {
     }
 
     #[test]
+    fn has_bioavailability_detects_f_on_either_engine() {
+        // Baseline test models declare no F → false on both engines.
+        assert!(!test_helpers::analytical_model(GradientMethod::Auto).has_bioavailability());
+        assert!(!test_helpers::ode_model(GradientMethod::Auto).has_bioavailability());
+
+        // Analytical route: `f=` on `[structural_model]` puts PK_IDX_F in pk_indices.
+        let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+        m.pk_indices = vec![PK_IDX_F];
+        assert!(m.has_bioavailability());
+
+        // Either engine: a bare `F` (any case) in `[individual_parameters]`.
+        let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+        m.indiv_param_names = vec!["CL".into(), "f".into()];
+        assert!(m.has_bioavailability());
+
+        // ODE engine only: a compartment-indexed `Fn` routes via the DoseAttrMap.
+        let mut m = test_helpers::ode_model(GradientMethod::Auto);
+        m.indiv_param_names = vec!["CL".into(), "F1".into()];
+        assert!(m.has_bioavailability());
+
+        // The same `F1` on the analytical engine is not bioavailability (no ode_spec).
+        let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+        m.indiv_param_names = vec!["CL".into(), "F1".into()];
+        assert!(!m.has_bioavailability());
+    }
+
+    #[test]
     fn error_spec_single_ignores_cmt() {
         let spec = ErrorSpec::Single(ErrorModel::Proportional);
         // Proportional: V = (f * sigma)^2 = (10 * 0.1)^2 = 1.0, regardless of CMT.
@@ -5252,6 +5279,38 @@ mod tests {
         assert!(!s.has_ss_doses());
         s.doses.push(dose(true));
         assert!(s.has_ss_doses());
+    }
+
+    #[test]
+    fn subject_has_rate_defined_infusion_distinguishes_infusion_modes() {
+        let mut s = bare_subject("1");
+        // No doses → false.
+        assert!(!s.has_rate_defined_infusion());
+
+        // Bolus (RATE=0) is not an infusion → false.
+        s.doses = vec![dose(false)];
+        assert!(!s.has_rate_defined_infusion());
+
+        // Duration-defined infusion (RATE=-2 → D{cmt}): it *is* an infusion, but F
+        // scales its rate, not its window, so it must not count (#419).
+        s.doses = vec![DoseEvent::modeled(
+            0.0,
+            100.0,
+            1,
+            false,
+            0.0,
+            RateMode::ModeledDuration,
+        )];
+        assert!(s.doses[0].is_infusion());
+        assert!(!s.has_rate_defined_infusion());
+
+        // Rate-defined infusion (RATE>0 data) → true.
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0)];
+        assert!(s.has_rate_defined_infusion());
+
+        // A rate-defined infusion alongside a bolus still trips it.
+        s.doses = vec![dose(false), DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0)];
+        assert!(s.has_rate_defined_infusion());
     }
 
     #[test]
