@@ -8,30 +8,29 @@
 //!   * the **core invariant**: a `RATE=-1` dose with `R{cmt} = r` is identical to
 //!     an explicit `RATE = r` infusion (the cleanest correctness proof);
 //!   * **composition** with bioavailability `F{cmt}` — applied exactly once;
-//!   * the **F≠1 characterisation** (see below): under `F`, `RATE=-1 R=r` is
-//!     identical to the equivalent `RATE=-2 D=AMT/r` dose, because ferx scales the
-//!     infusion *rate* (keeping the data/modeled duration) for every infusion;
+//!   * the **F!=1 behaviour** (see below): under `F`, `RATE=-1 R=r` holds the rate
+//!     and scales the *duration* to `F·AMT/r` (NONMEM-faithful, #419), so it now
+//!     DIFFERS from the `RATE=-2 D=AMT/r` dose (which holds the duration and scales
+//!     the rate);
 //!   * **loud rejection** of the misconfigured case (`RATE=-1` with no matching
 //!     `R{cmt}` — on either engine);
 //!   * the **analytical engine** honours `RATE=-1` identically (coded vs explicit
 //!     `RATE = r`, plus the NONMEM-anchored closed form), given an `R{cmt}`;
 //!   * the **non-positive-rate warning** at the typical-value point.
 //!
-//! ## F≠1 and NONMEM faithfulness (read before changing the F tests)
+//! ## F!=1 and NONMEM faithfulness (read before changing the F tests)
 //!
-//! ferx applies bioavailability by scaling the infusion **rate** (`F·rate`) over
-//! the data/modeled duration — see `PkParams::bioavailable_rate`. That is exactly
-//! NONMEM for `RATE=-2` (duration fixed at `D`, rate `= F·AMT/D`). But for a
-//! *rate-defined* infusion (`RATE>0` data **and** `RATE=-1`), NONMEM keeps the
-//! rate at `R` and scales the **duration** to `F·AMT/R`. So with `F≠1`, ferx and
-//! NONMEM agree on total exposure (`F·AMT`) but differ in infusion *shape* for
-//! `RATE=-1`. This is **pre-existing** (#327 chose rate-scaling for every
-//! infusion); `RATE=-1` inherits it, which is why a `RATE=-1` dose equals its
-//! explicit twin exactly. `modeled_rate_under_f_matches_duration_equivalent` pins
-//! this behaviour so it can't change silently; the NONMEM reconciliation for all
-//! rate-defined infusions is tracked separately (see the PR / follow-up issue).
-//! At `F=1` — the usual case for IV/SC infusions — there is no divergence, and
-//! `analytical_modeled_rate_matches_nonmem_closed_form` anchors it.
+//! ferx applies bioavailability to an infusion the NONMEM way (#419): for a
+//! *rate-defined* infusion (`RATE>0` data **and** `RATE=-1`) it holds the rate at
+//! `R` and scales the **duration** to `F·AMT/R`; for a *duration-defined* infusion
+//! (`RATE=-2`) it holds the duration at `D` and scales the **rate** to `F·AMT/D`.
+//! Total exposure is `F·AMT` either way; the infusion *shape* differs between the
+//! two modes only when `F != 1`. So under `F != 1` a `RATE=-1 R=r` dose now
+//! DIFFERS from the `RATE=-2 D=AMT/r` dose (it used to match, when ferx scaled the
+//! rate for both - the bug #419 fixed). `modeled_rate_under_f_scales_duration`
+//! anchors the rate-defined case against the duration-scaled ADVAN1 closed form
+//! (= NONMEM IPRED) and pins the divergence from `RATE=-2`. At `F=1` both modes
+//! coincide, anchored by `analytical_modeled_rate_matches_nonmem_closed_form`.
 //!
 //! All return immediately (`predict` with fixed params / a `check_model_data`
 //! pass — no convergence loop), so they need no `slow-tests` gate.
@@ -325,26 +324,53 @@ fn modeled_rate_composes_with_bioavailability_once() {
 }
 
 #[test]
-fn modeled_rate_under_f_matches_duration_equivalent() {
-    // CHARACTERISATION of the inherited rate-scaling (#327): under F1=0.5, the
-    // modeled-rate dose `RATE=-1 R1=20` is identical to the modeled-duration dose
-    // `RATE=-2 D1=5` — both resolve to (rate 20, duration 5), and ferx scales the
-    // *rate* by F (→ rate 10 over 5 h) for both. NONMEM would instead keep the rate
-    // at 20 and scale the duration to F·AMT/R = 2.5 h for the RATE=-1 case, so the
-    // infusion *shape* differs at F≠1 (total exposure F·AMT is identical). This
-    // pins ferx's current behaviour so the divergence can't change silently; the
-    // NONMEM reconciliation for rate-defined infusions is a tracked follow-up.
+fn modeled_rate_under_f_scales_duration() {
+    // #419: under F1=0.5 the modeled-RATE dose `RATE=-1 R1=20` is rate-defined, so
+    // NONMEM (and now ferx) hold the rate at 20 and scale the DURATION to
+    // F·AMT/R = 0.5·100/20 = 2.5 h. This is the duration-scaled ADVAN1 closed form
+    // (= NONMEM IPRED) and DIFFERS from the duration-defined `RATE=-2 D1=5` dose
+    // (which holds D=5 h and scales the rate to F·AMT/D = 10). Total exposure
+    // F·AMT is identical; only the infusion shape differs (it used to match, when
+    // ferx scaled the rate for both - the bug #419 fixed).
     let rate_model = model_of(ODE_R1_F1);
-    let dur_model = model_of(ODE_D1_F1);
-    // ODE_D1_F1 takes the same RATE=-2 dataset shape but with code -2.
-    let dur_coded = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,-2,1\n{OBS_ROWS}");
     let rate_preds = preds_of(&rate_model, &coded_csv());
-    let dur_preds = preds_of(&dur_model, &dur_coded);
+
+    // (a) Anchor against the duration-scaled closed form. CL=5, V=50 (k=0.1),
+    //     AMT=100, R1=20, F1=0.5 -> rate 20 over T_F = 2.5 h, plateau R/(V·k)=4.
+    let (cl, v, amt, r1, f1) = (5.0_f64, 50.0, 100.0, 20.0, 0.5);
+    let k = cl / v;
+    let t_f = f1 * amt / r1; // F-scaled duration
+    let plateau = r1 / (v * k);
+    let times = [1.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0];
+    let expected: Vec<f64> = times
+        .iter()
+        .map(|&t| {
+            if t <= t_f {
+                plateau * (1.0 - (-k * t).exp())
+            } else {
+                plateau * (1.0 - (-k * t_f).exp()) * (-k * (t - t_f)).exp()
+            }
+        })
+        .collect();
+    // ODE-engine vs the exact closed form: 1e-4 covers the solver tolerance and
+    // still decisively rejects the old rate-scaling (which differs by >0.1 here).
     assert_close(
         &rate_preds,
-        &dur_preds,
-        1e-9,
-        "RATE=-1 R1=20 + F ≡ RATE=-2 D1=5 + F (ferx scales the rate for both)",
+        &expected,
+        1e-4,
+        "RATE=-1 R1=20 + F1=0.5 holds rate, scales duration to 2.5 h (NONMEM)",
+    );
+
+    // (b) Must now DIFFER from the duration-defined RATE=-2 dose under the same F.
+    let dur_model = model_of(ODE_D1_F1);
+    let dur_coded = format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,-2,1\n{OBS_ROWS}");
+    let dur_preds = preds_of(&dur_model, &dur_coded);
+    assert!(
+        rate_preds
+            .iter()
+            .zip(dur_preds.iter())
+            .any(|(r, d)| (r - d).abs() > 1e-3),
+        "RATE=-1 (rate-defined) and RATE=-2 (duration-defined) must differ under F!=1 (#419)",
     );
 }
 

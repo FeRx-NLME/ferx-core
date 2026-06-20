@@ -464,15 +464,18 @@ pub fn predict_concentration(
 }
 
 /// External bioavailability multiplier for the analytical superposition closed
-/// forms. Same `F`-on-every-route rule as [`PkParams::bioavailable_amount`], but
-/// expressed as a post-multiply: the oral-depot bolus forms (`*_oral_f`) bake `F`
-/// in internally, so they take the `1.0` branch to avoid double-application;
-/// every other route — IV bolus, and infusions (which bypass the depot even on
-/// oral models) — uses an `F`-agnostic closed form that is linear in the dose, so
-/// `F` is applied by scaling the result. Matches the event-driven path and
-/// NONMEM's `F1` on IV/infusion doses (#327).
+/// forms, applied as a post-multiply. Only an **IV bolus** uses it: its
+/// `F`-agnostic closed form is linear in the dose, so `F` post-multiplies the
+/// result. Every other route returns `1.0`:
+/// * oral-depot bolus forms (`*_oral_f`) bake `F` in internally;
+/// * infusions carry `F` in their `(rate, duration)` via
+///   [`DoseEvent::with_bioavailable_infusion`] before the closed form runs, so
+///   `F` is already applied (a rate-defined window cannot be expressed as a
+///   post-multiply once `F` reshapes its duration; #419).
+///
+/// Matches the event-driven path and NONMEM's `F1` (#327, #419).
 fn route_f_scale(pk_model: PkModel, infusion: bool, p: &PkParams) -> f64 {
-    if pk_model.is_oral() && !infusion {
+    if infusion || pk_model.is_oral() {
         1.0
     } else {
         p.f_bio()
@@ -497,6 +500,13 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
     let v = p.v();
     let infusion = dose.is_infusion();
     let f_scale = route_f_scale(pk_model, infusion, p);
+
+    // Bake bioavailability `F` into the infusion `(rate, duration)` so the
+    // F-agnostic closed forms see the reshaped infusion (#419). A bolus is
+    // unchanged here (its `F` rides `f_scale` for IV, or is baked into the
+    // `*_oral_f` form for the depot). Shadowing `dose` routes every closed-form
+    // call below through the reshaped copy.
+    let dose = &dose.with_bioavailable_infusion(p.f_bio());
 
     let raw = if dose.ss && dose.ii > 0.0 {
         match pk_model {
@@ -641,11 +651,14 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
     let v = p.v();
     let infusion = dose.is_infusion();
 
-    // The states are linear in the dose, so bioavailability is applied by
-    // scaling the raw state vector once at the end (see `route_f_scale`). The
-    // oral-depot arms bake F into the depot/central closed forms and so take the
-    // `f_scale == 1.0` branch, leaving the scale a no-op there.
+    // Bioavailability handling mirrors `single_dose_concentration` (#419):
+    // * IV bolus - states are linear in the dose, so `F` post-multiplies the raw
+    //   state vector once at the end via `f_scale`;
+    // * oral-depot - the depot/central closed forms bake `F` in (`f_scale == 1.0`);
+    // * infusion - `F` is baked into the `(rate, duration)` below, so `f_scale`
+    //   is `1.0` and the reshaped window is what the closed forms integrate.
     let f_scale = route_f_scale(pk_model, infusion, p);
+    let dose = &dose.with_bioavailable_infusion(p.f_bio());
 
     // SS early-exit: mirrors single_dose_concentration's top-level guard.
     //
@@ -847,7 +860,9 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
         }
     };
 
-    // Apply bioavailability uniformly (no-op for oral-depot where f_scale == 1.0).
+    // Post-multiply bioavailability for the IV-bolus route; a no-op
+    // (`f_scale == 1.0`) for oral-depot and for infusions (whose `F` is already
+    // baked into the reshaped `(rate, duration)`; #419).
     for s in &mut state {
         *s *= f_scale;
     }
@@ -1340,22 +1355,23 @@ mod tests {
 
     #[test]
     fn iv_bolus_and_infusion_apply_f_matching_nonmem_closed_form() {
-        // NONMEM anchor for #327. With bioavailability F1 on an IV dose, NONMEM
-        // delivers F1·AMT, so for a 1-cpt model (ADVAN1/TRANS2, `F1 = THETA(3)`
-        // in $PK) the closed forms are:
+        // NONMEM anchor for #327/#419. With bioavailability F1 on an IV dose,
+        // NONMEM delivers F1·AMT, so for a 1-cpt model (ADVAN1/TRANS2,
+        // `F1 = THETA(3)` in $PK) the closed forms are:
         //   bolus:    C(t) = F·Dose/V · exp(-k·t)
-        //   infusion: C(t) = F·R/CL · (1 − exp(-k·t))                 (t ≤ T_inf)
-        //             C(t) = F·R/CL · (1 − exp(-k·T)) · exp(-k·(t−T)) (t > T_inf)
-        // F scales the infusion *rate* with the duration T = AMT/R preserved —
-        // identical to NONMEM, where F changes the bioavailable amount (F·AMT)
-        // but the RATE-derived duration is unchanged. The analytical
-        // superposition path (`predict_concentration`) must reproduce these.
+        //   infusion: rate held at R, duration scaled to T_F = F·AMT/R (#419):
+        //             C(t) = R/CL · (1 − exp(-k·t))                   (t ≤ T_F)
+        //             C(t) = R/CL · (1 − exp(-k·T_F)) · exp(-k·(t−T_F)) (t > T_F)
+        // For a *rate-defined* infusion NONMEM keeps the rate and scales the
+        // duration (total exposure still F·AMT), so there is no amplitude factor
+        // on the rate. The analytical superposition path (`predict_concentration`)
+        // must reproduce these.
         let (cl, v, f) = (5.0_f64, 50.0_f64, 0.4_f64);
         let k = cl / v;
         let mut pk = make_pk_params(cl, v);
         pk.values[crate::types::PK_IDX_F] = f;
 
-        // IV bolus.
+        // IV bolus: F scales the amount (unchanged by #419).
         let amt = 100.0;
         let doses = vec![bolus_dose(0.0, amt)];
         for &t in &[0.25_f64, 1.0, 4.0, 12.0] {
@@ -1364,16 +1380,17 @@ mod tests {
             assert_relative_eq!(got, want, max_relative = 1e-12);
         }
 
-        // IV infusion: R=25 over T = AMT/R = 4 h.
+        // IV infusion: R=25, raw T = AMT/R = 4 h; under F the duration scales to
+        // T_F = F·AMT/R = 1.6 h with the rate held at R.
         let rate = 25.0;
-        let t_inf = amt / rate;
+        let t_inf = f * amt / rate;
         let doses = vec![DoseEvent::new(0.0, amt, 1, rate, false, 0.0)];
         for &t in &[1.0_f64, 4.0, 8.0] {
             let got = predict_concentration(PkModel::OneCptIv, &doses, t, &pk);
             let want = if t <= t_inf {
-                f * rate / cl * (1.0 - (-k * t).exp())
+                rate / cl * (1.0 - (-k * t).exp())
             } else {
-                f * rate / cl * (1.0 - (-k * t_inf).exp()) * (-k * (t - t_inf)).exp()
+                rate / cl * (1.0 - (-k * t_inf).exp()) * (-k * (t - t_inf)).exp()
             };
             assert_relative_eq!(got, want, max_relative = 1e-12);
         }
@@ -2674,7 +2691,6 @@ mod tests {
         let tau = 6.0_f64;
         let ii = 12.0_f64;
         let amt = 100.0_f64;
-        let rate = 40.0_f64; // 2.5 h infusion (< ii, so a valid SS infusion)
 
         // Full structural params for up to three compartments; F set per call.
         let params = |f_bio: f64| {
@@ -2700,12 +2716,16 @@ mod tests {
             PkModel::ThreeCptIv,
             PkModel::ThreeCptOral,
         ];
-        // bolus / infusion, each non-SS and SS, all dosed into compartment 1.
+        // Bolus into compartment 1, non-SS and SS. `F` scales the bioavailable
+        // AMOUNT (`F·AMT` into central, or the oral depot load), so it scales
+        // every compartment's state uniformly. Infusions are excluded here: for a
+        // rate-defined infusion `F` scales the *duration* (#419), which reshapes
+        // the profile rather than scaling it - that path is anchored by
+        // `iv_bolus_and_infusion_apply_f_matching_nonmem_closed_form` and the
+        // cross-path equality tests instead.
         let doses = [
             ("bolus", DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0)),
-            ("infusion", DoseEvent::new(0.0, amt, 1, rate, false, 0.0)),
             ("SS bolus", DoseEvent::new(0.0, amt, 1, 0.0, true, ii)),
-            ("SS infusion", DoseEvent::new(0.0, amt, 1, rate, true, ii)),
         ];
 
         for model in models {

@@ -165,7 +165,7 @@ The solver automatically adapts step sizes based on local error estimates.
 ## Dose Handling
 
 - **Bolus doses**: Applied as instantaneous state changes at dose times. The dose amount, scaled by bioavailability (`F · AMT`), is added to the target compartment (the state at `CMT − 1`, since `CMT` is 1-based — see indexing below)
-- **Infusion doses** (`RATE > 0`): Treated as a continuous zero-order input. The integrator's timeline is broken at the infusion's end (`time + amt/rate`), and `F · RATE` is added to the target compartment's derivative for every segment fully spanned by the infusion. Overlapping infusions on the same compartment sum their rates
+- **Infusion doses** (`RATE > 0`): Treated as a continuous zero-order input. A `RATE>0` (or `RATE=-1`) infusion is *rate-defined*, so bioavailability holds the rate and scales the **duration** (#419): the integrator's timeline is broken at the `F`-scaled end `time + F·AMT/RATE`, and the unscaled `RATE` is added to the target compartment's derivative for every fully-spanned segment. (A `RATE=-2` modeled-duration infusion is instead *duration-defined* — the window is `time + D{cmt}` and the rate is scaled to `F·AMT/D{cmt}`.) Overlapping infusions on the same compartment sum their rates
 - **Compartment indexing**: Compartments are 1-indexed in the data file (`CMT=1` corresponds to the first state in the `states` list)
 - **Multiple doses**: The ODE is integrated in segments between dose events, with state discontinuities at each bolus
 - **Built-in absorption input rates**: A dose can instead be delivered as a dose-driven appearance rate `R_in(tad)` (e.g. transit-compartment absorption) added into the depot over time — see [Built-in Absorption Models](absorption.md)
@@ -173,9 +173,12 @@ The solver automatically adapts step sizes based on local error estimates.
 ### Bioavailability
 
 If your `[individual_parameters]` block declares an `F` parameter, the ODE engine
-applies it **when the dose enters the compartment** — the dosing compartment is
-loaded with `F · AMT` (and an infusion rate with `F · RATE`) — exactly like
-NONMEM's `F1` and like ferx's analytical PK functions. Write the depot's
+applies it **when the dose enters the compartment** — a bolus loads the dosing
+compartment with `F · AMT`, and an infusion delivers a total of `F · AMT` (a
+rate-defined infusion holds its rate and scales the duration to `F·AMT/RATE`; a
+duration-defined `RATE=-2` infusion holds its duration and scales the rate to
+`F·AMT/D{cmt}`; #419) — exactly like NONMEM's `F1` and like ferx's analytical PK
+functions. Write the depot's
 elimination as the plain `KA · depot` and **do not** multiply by `F` anywhere in
 the right-hand side, or bioavailability is applied twice. `F` defaults to `1.0`
 when not declared, so IV and non-bioavailability models are unaffected.

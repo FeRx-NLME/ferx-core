@@ -140,7 +140,10 @@ fn equilibrate_ss_state(
     let f_bio = ode.dose_attr_map.f_bio(dose.cmt, pk_params_flat);
 
     let is_inf = is_real_infusion(dose);
-    let t_inf = dose.duration;
+    // Mode-aware bioavailability (#419): a rate-defined infusion keeps its rate
+    // and `F` scales the duration; a duration-defined infusion (`RATE=-2`) keeps
+    // its duration and `F` scales the rate. Total input is `F·AMT` either way.
+    let (inf_rate, t_inf) = dose.bioavailable_infusion(f_bio);
     if is_inf && t_inf > dose.ii {
         // Overlapping infusions; no closed-form / simple equilibration.
         return u;
@@ -150,7 +153,7 @@ fn equilibrate_ss_state(
         if is_inf {
             // Active-infusion window: wrapped RHS injects rate into the
             // dosing compartment.
-            let rate = f_bio * dose.rate;
+            let rate = inf_rate;
             let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
                 (ode.rhs)(y, p, t, dy);
                 if cmt_idx < dy.len() {
@@ -240,8 +243,8 @@ fn ss_state_at_phase(
     let f_bio = ode.dose_attr_map.f_bio(dose.cmt, pk_params_flat);
 
     if is_real_infusion(dose) {
-        let rate = f_bio * dose.rate;
-        let t_inf = dose.duration;
+        // Mode-aware bioavailability (#419): see `equilibrate_ss_state`.
+        let (rate, t_inf) = dose.bioavailable_infusion(f_bio);
         let active = phase.min(t_inf);
         let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
             (ode.rhs)(y, p, t, dy);
@@ -288,9 +291,13 @@ fn ss_state_at_phase(
 /// `dose_lagtimes[k]` shifts dose `k`'s active window. Parallel to `doses`.
 /// An empty slice means "no lagtime" (all zeros).
 ///
-/// `dose_f_bio[k]` is the bioavailability F applied to dose `k`'s infusion rate
-/// (NONMEM's F·RATE convention, mirroring the bolus F·AMT applied at dose
-/// entry). Parallel to `doses`; a missing entry defaults to 1.0.
+/// `dose_f_bio[k]` is the bioavailability F applied to dose `k`'s infusion under
+/// the mode-aware rule (#419): a rate-defined infusion (`RATE>0`, `RATE=-1`)
+/// keeps its rate and `F` scales the active window to `F·AMT/rate`; a
+/// duration-defined infusion (`RATE=-2`) keeps its window and `F` scales the rate.
+/// Parallel to `doses`; a missing entry defaults to 1.0. The caller's break-time
+/// list must split at the same `F`-scaled infusion ends so each segment is fully
+/// active or inactive.
 pub(crate) fn active_infusions(
     doses: &[DoseEvent],
     t_start: f64,
@@ -302,18 +309,26 @@ pub(crate) fn active_infusions(
     doses
         .iter()
         .enumerate()
-        .filter(|(k, d)| {
-            let lag = dose_lagtimes.get(*k).copied().unwrap_or(0.0);
+        .filter_map(|(k, d)| {
+            if !is_real_infusion(d) {
+                return None;
+            }
+            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+            let f_bio = dose_f_bio.get(k).copied().unwrap_or(1.0);
+            // `F`-reshaped rate and window (#419).
+            let (rate_eff, dur_eff) = d.bioavailable_infusion(f_bio);
+            let start = d.time + lag;
+            let end = start + dur_eff;
             // Infusions started before the most recent system reset (EVID=3/4)
             // are turned off, the same way the reset zeros the compartments.
-            is_real_infusion(d)
-                && d.time + lag >= reset_floor
-                && d.time + lag <= t_start + INFUSION_EPS
-                && d.time + lag + d.duration >= t_end - INFUSION_EPS
-        })
-        .map(|(k, d)| {
-            let f_bio = dose_f_bio.get(k).copied().unwrap_or(1.0);
-            (d.cmt.saturating_sub(1), f_bio * d.rate)
+            if start >= reset_floor
+                && start <= t_start + INFUSION_EPS
+                && end >= t_end - INFUSION_EPS
+            {
+                Some((d.cmt.saturating_sub(1), rate_eff))
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -375,7 +390,11 @@ fn gated_infusions(
             if cmt >= n_states {
                 return None;
             }
-            Some((cmt, dose.rate * dose_f_bio[di], t_start_inf, t_end_inf))
+            // Mode-aware bioavailability rate (#419); the `(t_start_inf, t_end_inf)`
+            // window already carries the `F`-scaled duration from the caller's
+            // break-time list.
+            let (rate_eff, _) = dose.bioavailable_infusion(dose_f_bio[di]);
+            Some((cmt, rate_eff, t_start_inf, t_end_inf))
         })
         .collect()
 }
@@ -748,7 +767,11 @@ pub fn ode_predictions(
         let lag = dose_lagtimes[i];
         break_times.push(dose.time + lag);
         if is_real_infusion(dose) {
-            break_times.push(dose.time + lag + dose.duration);
+            // F-scaled infusion end (#419): a rate-defined infusion's window is
+            // `F·duration`. Must match `active_infusions`'s window so each segment
+            // is fully inside or outside every infusion.
+            let (_, dur_eff) = dose.bioavailable_infusion(dose_f_bio[i]);
+            break_times.push(dose.time + lag + dur_eff);
         }
         // SS + lagtime: break at the dose *record* time too, so we can seed
         // the previous-interval steady-state tail there before the lagged
@@ -1089,7 +1112,9 @@ pub fn ode_predictions_event_driven(
         let lag = dose_lagtimes[k];
         timeline.push((d.time + lag, Kind::Dose, k));
         if is_real_infusion(d) {
-            timeline.push((d.time + lag + d.duration, Kind::InfusionEnd, k));
+            // F-scaled infusion end (#419): rate-defined -> F·duration window.
+            let (_, dur_eff) = d.bioavailable_infusion(dose_f_bio[k]);
+            timeline.push((d.time + lag + dur_eff, Kind::InfusionEnd, k));
         }
     }
     for (j, &t) in subject.obs_times.iter().enumerate() {
@@ -1485,7 +1510,9 @@ pub fn ode_predictions_with_states(
         let lag = dose_lagtimes[i];
         break_times.push(dose.time + lag);
         if is_real_infusion(dose) {
-            break_times.push(dose.time + lag + dose.duration);
+            // F-scaled infusion end (#419): rate-defined -> F·duration window.
+            let (_, dur_eff) = dose.bioavailable_infusion(dose_f_bio[i]);
+            break_times.push(dose.time + lag + dur_eff);
         }
         if lag > 0.0 && dose.ss && dose.ii > 0.0 {
             break_times.push(dose.time);
@@ -1537,7 +1564,9 @@ pub fn ode_predictions_with_states(
                     // (transit/etc.) and is delivered as R_in over time by the
                     // wrapped RHS below — no bolus here (would double-count).
                 } else {
-                    let end_t = t_eff + dose.duration;
+                    // F-scaled infusion end (#419), matching the break-time list.
+                    let (_, dur_eff) = dose.bioavailable_infusion(f);
+                    let end_t = t_eff + dur_eff;
                     active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
                     active_infusions.push((dose_idx, t_eff, end_t));
                 }
@@ -1797,7 +1826,9 @@ pub fn ode_dense_solve_states(
         let lag = dose_lagtimes[i];
         break_times.push(dose.time + lag);
         if is_real_infusion(dose) {
-            break_times.push(dose.time + lag + dose.duration);
+            // F-scaled infusion end (#419): rate-defined -> F·duration window.
+            let (_, dur_eff) = dose.bioavailable_infusion(dose_f_bio[i]);
+            break_times.push(dose.time + lag + dur_eff);
         }
         if lag > 0.0 && dose.ss && dose.ii > 0.0 {
             break_times.push(dose.time);
@@ -1860,7 +1891,9 @@ pub fn ode_dense_solve_states(
                     // (transit/etc.) and is delivered as R_in over time by the
                     // wrapped RHS below — no bolus here (would double-count).
                 } else {
-                    let end_t = t_eff + dose.duration;
+                    // F-scaled infusion end (#419), matching the break-time list.
+                    let (_, dur_eff) = dose.bioavailable_infusion(f);
+                    let end_t = t_eff + dur_eff;
                     active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
                     active_infusions.push((dose_idx, t_eff, end_t));
                 }
@@ -2422,17 +2455,31 @@ mod tests {
 
     #[test]
     fn gated_infusions_resolves_rate_and_drops_unaddressable() {
-        // (dose_idx, t_start, t_end) → (cmt_idx, F·rate, t_start, t_end); a CMT=0
-        // dose and a compartment beyond the state vector are dropped.
+        // (dose_idx, t_start, t_end) -> (cmt_idx, rate_eff, t_start, t_end) with
+        // the mode-aware bioavailability rate (#419): a rate-defined infusion
+        // holds its rate (F scales the duration, carried by the window), while a
+        // duration-defined infusion (RATE=-2) gets F·rate. CMT=0 and compartments
+        // beyond the state vector are dropped.
+        let mut dur_defined = DoseEvent::new(0.0, 0.0, 1, 4.0, false, 0.0);
+        dur_defined.infusion_def = crate::types::InfusionDef::DurationDefined;
         let doses = vec![
-            DoseEvent::new(0.0, 0.0, 1, 4.0, false, 0.0), // CMT 1 → state 0
-            DoseEvent::new(0.0, 0.0, 0, 9.0, false, 0.0), // CMT 0 → dropped
-            DoseEvent::new(0.0, 0.0, 5, 9.0, false, 0.0), // CMT 5 → state 4 ≥ n → dropped
+            DoseEvent::new(0.0, 0.0, 1, 4.0, false, 0.0), // rate-defined: rate held
+            DoseEvent::new(0.0, 0.0, 0, 9.0, false, 0.0), // CMT 0 -> dropped
+            DoseEvent::new(0.0, 0.0, 5, 9.0, false, 0.0), // CMT 5 -> state 4 >= n -> dropped
+            dur_defined,                                  // duration-defined: F·rate
         ];
-        let f_bio = vec![0.5, 1.0, 1.0];
-        let active = vec![(0usize, 1.0, 3.0), (1, 1.0, 3.0), (2, 1.0, 3.0)];
+        let f_bio = vec![0.5, 1.0, 1.0, 0.5];
+        let active = vec![
+            (0usize, 1.0, 3.0),
+            (1, 1.0, 3.0),
+            (2, 1.0, 3.0),
+            (3, 1.0, 3.0),
+        ];
         let gated = gated_infusions(&active, &doses, &f_bio, 1);
-        assert_eq!(gated, vec![(0usize, 4.0 * 0.5, 1.0, 3.0)]);
+        assert_eq!(
+            gated,
+            vec![(0usize, 4.0, 1.0, 3.0), (0usize, 4.0 * 0.5, 1.0, 3.0)]
+        );
     }
 
     #[test]
@@ -3408,33 +3455,32 @@ mod tests {
 
     #[test]
     fn ode_applies_f_bio_to_infusion() {
-        // F scales an infusion rate (F·RATE), so halving F halves predictions
-        // for a zero-order input into the depot, just like a bolus.
+        // A rate-defined infusion under F holds the rate and scales the duration
+        // (#419): F=0.5 on (AMT=100, rate=50, T=2h) delivers rate 50 over 1h -
+        // identical to a full-F infusion of F·AMT=50 at rate 50, NOT 0.5x the F=1
+        // curve.
         let ode = one_cpt_oral_ode_spec();
         let rate = 50.0;
-        let amt = 100.0; // duration = 2 h
-        let doses = vec![DoseEvent::new(0.0, amt, 1, rate, false, 0.0)];
         let obs_times = vec![1.0, 2.0, 4.0, 8.0];
-        let subj = make_subject(doses, obs_times);
-
-        let full = ode_predictions(
-            &ode,
-            &pk_oral_f(5.0, 50.0, 1.5, 1.0).values,
-            &[],
-            &[],
-            &subj,
-        );
-        let half = ode_predictions(
-            &ode,
-            &pk_oral_f(5.0, 50.0, 1.5, 0.5).values,
-            &[],
-            &[],
-            &subj,
-        );
-        for (f, h) in full.iter().zip(half.iter()) {
+        let preds = |amt: f64, f: f64| {
+            let doses = vec![DoseEvent::new(0.0, amt, 1, rate, false, 0.0)];
+            let subj = make_subject(doses, obs_times.clone());
+            ode_predictions(&ode, &pk_oral_f(5.0, 50.0, 1.5, f).values, &[], &[], &subj)
+        };
+        let full = preds(100.0, 1.0);
+        let half_f = preds(100.0, 0.5);
+        let equiv = preds(50.0, 1.0); // F=1, F·AMT delivered at the same rate
+        for ((f, hf), e) in full.iter().zip(half_f.iter()).zip(equiv.iter()) {
             assert!(*f > 0.0, "expected positive prediction");
-            assert_relative_eq!(*h, 0.5 * *f, epsilon = 1e-9, max_relative = 1e-6);
+            assert_relative_eq!(*hf, *e, epsilon = 1e-9, max_relative = 1e-6);
         }
+        assert!(
+            half_f
+                .iter()
+                .zip(full.iter())
+                .any(|(h, f)| (*h - 0.5 * *f).abs() > 1e-6),
+            "rate-defined infusion under F must reshape, not scale"
+        );
     }
 
     #[test]

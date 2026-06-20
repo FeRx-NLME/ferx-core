@@ -28,10 +28,9 @@ section of the SDLC for the versioning policy).
   with no matching `R{cmt}` is a loud `E_MODELED_RATE_NO_PARAM` error (never a
   silent bolus), and a non-positive `R{cmt}` at the initial estimate warns
   (`W_MODELED_RATE_NONPOSITIVE`). This completes NONMEM coded-`RATE` support
-  (#324). Note: under bioavailability `F ≠ 1`, ferx scales the infusion rate
-  (consistent with `RATE>0` infusions) while NONMEM scales the duration for
-  rate-defined infusions — same total exposure, different shape; reconciliation
-  is tracked separately.
+  (#324). Under bioavailability `F ≠ 1` it holds the rate and scales the duration
+  to `F·AMT/R{cmt}`, matching NONMEM for rate-defined infusions (#419, see
+  **Changed**).
 - M3 likelihood now supports above-LOQ/right-censored observations via `CENS=-1`,
   with `DV` carrying the ULOQ value (#297). A `CENS` value other than `-1`, `0`,
   or `1` now raises a `W_CENS_UNEXPECTED` data warning instead of being silently
@@ -293,6 +292,16 @@ section of the SDLC for the versioning policy).
   the dose without appearing in the RHS, are exempt (#315).
 
 ### Changed
+- **Bioavailability `F` now reshapes a rate-defined infusion the NONMEM way**
+  (`RATE>0` data and `RATE=-1` → `R{cmt}`): `F` holds the rate and scales the
+  **duration** to `F·AMT/RATE`, instead of scaling the rate over a fixed duration.
+  A duration-defined infusion (`RATE=-2` → `D{cmt}`) is unchanged — `F` still
+  scales its rate. Total exposure (`F·AMT`) is unchanged in both cases; only the
+  infusion **shape** changes, and only for an existing `RATE>0`/`RATE=-1` infusion
+  with `F ≠ 1`. Predictions, simulations, and fits for such models will differ;
+  models with `F = 1`, bolus, oral-depot, or `RATE=-2` dosing are unaffected. This
+  aligns all engines (analytical superposition, event-driven, ODE, autodiff) with
+  NONMEM's `RATE`/`F` convention (#419, follow-up to #327/#324).
 - IMP fit options now use the `imp_*` prefix (`imp_samples`,
   `imp_eval_only`, `imp_auto`, etc.) instead of the older `is_*` names. The
   old names are not retained as aliases because IMP support is still new.

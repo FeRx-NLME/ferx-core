@@ -315,11 +315,12 @@ Both codes are *parameter*-driven; neither reads a separate `DURATION` data colu
 Any other negative or non-finite `RATE` is rejected — earlier versions silently
 misread the coded forms as a bolus (#324).
 
-For bioavailability `F ≠ 1` on a `RATE=-1` infusion, ferx scales the rate (so a
-`RATE=-1` dose behaves exactly like its explicit `RATE = R{cmt}` twin); NONMEM
-instead scales the duration. Total exposure (`F·AMT`) agrees; the infusion shape
-differs only when `F ≠ 1` on a rate-defined infusion (a tracked follow-up). At
-`F = 1`, ferx and NONMEM coincide.
+For bioavailability `F ≠ 1`, ferx reshapes an infusion the NONMEM way (#419): a
+*rate-defined* infusion (`RATE>0` data and `RATE=-1` → `R{cmt}`) holds the rate and
+scales the **duration** to `F·AMT/RATE`, while a *duration-defined* infusion
+(`RATE=-2` → `D{cmt}`) holds the duration and scales the **rate** to `F·AMT/D{cmt}`.
+Total exposure (`F·AMT`) is identical; only the infusion shape differs between the
+two modes, and only when `F ≠ 1`. At `F = 1` they coincide.
 
 `RATE=0` denotes a *bolus*, not specifically an *intravenous* dose: the route
 follows the dose compartment — a bolus into the central compartment is

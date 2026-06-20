@@ -108,7 +108,27 @@ impl EventSchedule {
     /// `dose_lagtimes` must be length `subject.doses.len()` (or empty,
     /// which is treated as all zeros for backward compatibility with the
     /// no-lagtime fast path).
-    pub fn for_subject(subject: &Subject, _pk_model: PkModel, dose_lagtimes: &[f64]) -> Self {
+    ///
+    /// `doses` is the per-dose `(rate, duration)` the schedule's infusion break
+    /// times are built from. Pass the **bioavailability-adjusted** doses (see
+    /// [`DoseEvent::with_bioavailable_infusion`], #419) so the infusion-end break
+    /// at `start + duration` reflects `F`'s reshaping of a rate-defined window;
+    /// pass `&subject.doses` when `F` is `1`/absent or cannot reshape a window (the
+    /// cached fast path only caches in that case). Must be parallel to
+    /// `subject.doses` (same length/order; only `rate`/`duration` may differ).
+    pub fn for_subject(
+        subject: &Subject,
+        _pk_model: PkModel,
+        doses: &[DoseEvent],
+        dose_lagtimes: &[f64],
+    ) -> Self {
+        assert_eq!(
+            doses.len(),
+            subject.doses.len(),
+            "doses length {} does not match subject.doses.len() {}",
+            doses.len(),
+            subject.doses.len()
+        );
         assert!(
             dose_lagtimes.is_empty() || dose_lagtimes.len() == subject.doses.len(),
             "dose_lagtimes length {} does not match subject.doses.len() {}",
@@ -126,7 +146,7 @@ impl EventSchedule {
         let mut events: Vec<Event> = Vec::with_capacity(
             subject.doses.len() + subject.obs_times.len() + subject.pk_only_times.len(),
         );
-        for (k, d) in subject.doses.iter().enumerate() {
+        for (k, d) in doses.iter().enumerate() {
             events.push(Event {
                 time: d.time + get_lag(k),
                 kind: EventKind::Dose,
@@ -173,7 +193,7 @@ impl EventSchedule {
             bounds_per_interval.push(compute_propagation_bounds(
                 w[0].time,
                 w[1].time,
-                &subject.doses,
+                doses,
                 &stored_lagtimes,
             ));
         }
@@ -297,11 +317,16 @@ fn equilibrate_ss_state_event_driven(
 
     // Synthetic single-dose at t=0 inside each cycle; propagate over
     // [0, T_inf, II] for infusions (so the bounds split at the infusion
-    // end) or [0, II] for boluses.
+    // end) or [0, II] for boluses. Clone `dose` (not `DoseEvent::new`) so the
+    // bioavailability-reshaped `(rate, duration)` it already carries survive -
+    // `::new` would recompute `duration = amt/rate` and drop `F` (#419).
     let synthetic_dose = if is_inf {
-        vec![DoseEvent::new(
-            0.0, dose.amt, dose.cmt, dose.rate, false, 0.0,
-        )]
+        vec![DoseEvent {
+            time: 0.0,
+            ss: false,
+            ii: 0.0,
+            ..dose.clone()
+        }]
     } else {
         Vec::new()
     };
@@ -360,9 +385,14 @@ fn ss_state_at_phase_event_driven(
     let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
     if is_inf {
         let t_inf = dose.duration;
-        let synthetic_dose = vec![DoseEvent::new(
-            0.0, dose.amt, dose.cmt, dose.rate, false, 0.0,
-        )];
+        // Clone so the `F`-reshaped `(rate, duration)` survive (see
+        // `equilibrate_ss_state_event_driven`; #419).
+        let synthetic_dose = vec![DoseEvent {
+            time: 0.0,
+            ss: false,
+            ii: 0.0,
+            ..dose.clone()
+        }];
         let synthetic_lagtimes = vec![0.0];
         let bounds: Vec<f64> = if phase > t_inf {
             vec![0.0, t_inf, phase]
@@ -395,6 +425,22 @@ fn ss_state_at_phase_event_driven(
 
 // `is_oral` was a helper for the previous infusion dispatcher; the
 // per-model `match (pk_model, d.cmt)` now subsumes it.
+
+/// Per-dose bioavailability-adjusted copies for the event-driven walker: each
+/// dose's `(rate, duration)` is replaced by [`DoseEvent::bioavailable_infusion`]
+/// using the dose-time bioavailability `F` (`pk_at_dose[k].f_bio()`), so `F` is
+/// applied exactly once, up front, for every infusion (#419) - rate-defined doses
+/// get an `F`-scaled duration, duration-defined doses an `F`-scaled rate.
+/// Boluses are returned unchanged (`(0, 0)`); their `F` is applied to the amount
+/// via [`PkParams::bioavailable_amount`] in the walk. Parallel to `subject.doses`.
+fn bioavailable_doses(subject: &Subject, pk_at_dose: &[PkParams]) -> Vec<DoseEvent> {
+    subject
+        .doses
+        .iter()
+        .zip(pk_at_dose)
+        .map(|(d, p)| d.with_bioavailable_infusion(p.f_bio()))
+        .collect()
+}
 
 /// Compute predictions by walking events in time order and propagating the
 /// compartment-amount state with per-event PK parameters.
@@ -431,7 +477,14 @@ pub fn event_driven_predictions(
          (resolve via dose_attr_map, or validate with check_model_data, before predicting)"
     );
     let dose_lagtimes: Vec<f64> = pk_at_dose.iter().map(|p| p.lagtime()).collect();
-    let schedule = EventSchedule::for_subject(subject, pk_model, &dose_lagtimes);
+    // Bioavailability-adjusted doses: `F` reshapes a rate-defined infusion by
+    // scaling its duration (#419), which moves the infusion-end break time. Build
+    // the schedule from these so the (non-cached, per-call) break times track `F`.
+    // `_with_schedule` recomputes the same adjusted doses for the propagation; the
+    // cached fast path stays correct because it only caches when `F` cannot reshape
+    // a window (see `inner_optimizer`/`bayes` schedule gating).
+    let eff_doses: Vec<DoseEvent> = bioavailable_doses(subject, pk_at_dose);
+    let schedule = EventSchedule::for_subject(subject, pk_model, &eff_doses, &dose_lagtimes);
     event_driven_predictions_with_schedule(
         pk_model,
         subject,
@@ -459,6 +512,15 @@ pub fn event_driven_predictions_with_schedule(
     assert_eq!(pk_at_dose.len(), subject.doses.len());
     assert_eq!(pk_at_obs.len(), subject.obs_times.len());
     assert_eq!(pk_at_pk_only.len(), subject.pk_only_times.len());
+
+    // Bioavailability-adjusted doses (`F` applied once, up front; #419). Every
+    // infusion site below reads these instead of `subject.doses`, so the injected
+    // rate and the infusion window already carry `F`. A bolus is unchanged here
+    // and gets `F` on its amount via `bioavailable_amount`. The passed `schedule`'s
+    // break times must match these durations: the non-cached path built it from
+    // the same adjusted doses, and the cached path only caches when `F` cannot
+    // reshape a rate-defined window.
+    let eff_doses: Vec<DoseEvent> = bioavailable_doses(subject, pk_at_dose);
 
     let n_obs = subject.obs_times.len();
     let mut preds = vec![0.0_f64; n_obs];
@@ -506,7 +568,7 @@ pub fn event_driven_predictions_with_schedule(
                 bounds,
                 &pk_now,
                 pk_model,
-                &subject.doses,
+                &eff_doses,
                 &schedule.dose_lagtimes,
                 reset_floor,
             );
@@ -515,7 +577,7 @@ pub fn event_driven_predictions_with_schedule(
 
         match ev.kind {
             EventKind::Dose => {
-                let d = &subject.doses[ev.orig_idx];
+                let d = &eff_doses[ev.orig_idx];
                 // Steady-state (SS=1): reset state and load with the SS
                 // amount from the infinite-past pulse train before the SS
                 // dose's own pulse is applied through the normal flow.
@@ -548,11 +610,11 @@ pub fn event_driven_predictions_with_schedule(
                     }
                 }
                 // Infusion: handled inside `propagate` via the active-input
-                // lookup — F is applied to the rate there (see
-                // propagate_with_bounds), preserving the user-specified
-                // duration. This matches NONMEM's `rate = AMT/DUR` convention
-                // when both are supplied, and keeps F-modulated infusions
-                // bit-for-bit equal to the bolus path on the limit dur→0.
+                // lookup. `F` is already baked into `eff_doses` (rate-defined ->
+                // scaled duration, duration-defined -> scaled rate; #419), so the
+                // window and injected rate both carry it. Total bioavailable input
+                // is `F·AMT` either way, so a dur->0 infusion still limits to the
+                // bolus path's `F·AMT` jump.
             }
             EventKind::Obs => {
                 let v = pk_now.v();
@@ -580,7 +642,7 @@ pub fn event_driven_predictions_with_schedule(
     // tail of the prior pulse; recompute them from the SS phase. Matches the
     // analytical (`predict_concentration`) and ODE (`ss_state_at_phase`)
     // paths, verified against NONMEM ALAG1 + SS=1.
-    for (k, d) in subject.doses.iter().enumerate() {
+    for (k, d) in eff_doses.iter().enumerate() {
         let lag = schedule.dose_lagtimes.get(k).copied().unwrap_or(0.0);
         if !(d.ss && d.ii > 0.0 && lag > 0.0) {
             continue;
@@ -671,8 +733,10 @@ fn propagate_with_bounds(
         // release into the depot followed by first-order `ka` absorption into
         // central. Distinct channel from `rate_central` (cmt 2, depot bypass).
         let mut rate_depot = 0.0;
-        // F multiplies infusion rate so a dur→0 infusion limits to a bolus
-        // of amount F·AMT — same convention as the EventKind::Dose arm above.
+        // `doses` are the bioavailability-adjusted (`eff_doses`) copies, so
+        // `d.rate`/`d.duration` already carry `F` (#419): the rate is injected
+        // as-is and the window `[t_start, t_start + d.duration]` is the
+        // `F`-reshaped one. A dur->0 infusion still limits to the `F·AMT` bolus.
         for (k, d) in doses.iter().enumerate() {
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
             let t_start = d.time + lag;
@@ -682,7 +746,7 @@ fn propagate_with_bounds(
                 continue;
             }
             if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
-                let r = pk.bioavailable_rate(d.rate);
+                let r = d.rate;
                 match (pk_model, d.cmt) {
                     (PkModel::OneCptIv, 1) => rate_central += r,
                     (PkModel::OneCptOral, 1) => rate_depot += r,
@@ -1354,49 +1418,76 @@ mod tests {
         );
     }
 
-    // ── F (bioavailability) & lagtime across RATE options (#324 follow-up) ──
-    // The active (event-driven) path must apply F and lagtime correctly to
-    // BOTH dose forms reachable via the RATE column: bolus (RATE=0) and
-    // infusion (RATE>0). NONMEM scales the bolus *amount* and the infusion
-    // *rate* by F (duration unchanged), so concentrations are linear in F; and
-    // a lagtime L shifts the whole curve later by L. (Coded RATE -1/-2 never
-    // reach here — they are rejected by the datareader, see #324.)
+    // ── F (bioavailability) across RATE options (#324 / #419) ──
+    // The active (event-driven) path applies F per NONMEM: a bolus (RATE=0) gets
+    // F on the *amount* (so the curve is linear in F), while a rate-defined
+    // infusion (RATE>0) holds the *rate* and F scales the *duration* (#419) - so
+    // its curve is reshaped, not uniformly scaled. (Coded RATE -1/-2 never reach
+    // here - they are rejected by the datareader, see #324.)
 
     #[test]
-    fn f_bioavailability_scales_bolus_and_infusion_linearly() {
+    fn f_bioavailability_scales_bolus_amount_linearly() {
         let (cl, v, amt) = (5.0, 50.0, 100.0);
         let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
-        // rate=0 → bolus; rate=25 → infusion (duration = amt/rate = 4 h).
-        for &rate in &[0.0_f64, 25.0] {
-            let dose = DoseEvent::new(0.0, amt, 1, rate, false, 0.0);
-            let subj = make_subject(vec![dose], obs_times.clone());
-
-            let mut pk_full = pk_one(cl, v);
-            pk_full.values[crate::types::PK_IDX_F] = 1.0;
-            let mut pk_half = pk_one(cl, v);
-            pk_half.values[crate::types::PK_IDX_F] = 0.5;
-
-            let full = event_driven_predictions(
+        let dose = DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0); // bolus
+        let subj = make_subject(vec![dose], obs_times.clone());
+        let preds = |f: f64| {
+            let mut pk = pk_one(cl, v);
+            pk.values[crate::types::PK_IDX_F] = f;
+            event_driven_predictions(
                 PkModel::OneCptIv,
                 &subj,
-                &vec![pk_full; 1],
-                &vec![pk_full; obs_times.len()],
+                &vec![pk; 1],
+                &vec![pk; obs_times.len()],
                 &[],
-            );
-            let half = event_driven_predictions(
-                PkModel::OneCptIv,
-                &subj,
-                &vec![pk_half; 1],
-                &vec![pk_half; obs_times.len()],
-                &[],
-            );
-
-            for (j, (&f, &h)) in full.iter().zip(half.iter()).enumerate() {
-                assert!(f > 0.0, "rate={rate}: expected nonzero conc at obs {j}");
-                // F=0.5 must halve every concentration (linear in F).
-                assert_relative_eq!(h, 0.5 * f, max_relative = 1e-9);
-            }
+            )
+        };
+        let full = preds(1.0);
+        let half = preds(0.5);
+        for (j, (&f, &h)) in full.iter().zip(half.iter()).enumerate() {
+            assert!(f > 0.0, "expected nonzero conc at obs {j}");
+            // Bolus amount scales linearly: F=0.5 halves every concentration.
+            assert_relative_eq!(h, 0.5 * f, max_relative = 1e-9);
         }
+    }
+
+    #[test]
+    fn f_bioavailability_reshapes_rate_defined_infusion_duration() {
+        // Rate-defined infusion under F (#419): NONMEM holds the rate and scales
+        // the duration to F·AMT/rate. So F=0.5 on (AMT=100, rate=25, T=4h) gives
+        // rate 25 over 2h - identical to a *full-F* infusion delivering F·AMT=50
+        // at rate 25 (also 2h), and NOT a uniform halving of the F=1 curve.
+        let (cl, v) = (5.0, 50.0);
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
+        let preds = |amt: f64, f: f64| {
+            let dose = DoseEvent::new(0.0, amt, 1, 25.0, false, 0.0);
+            let subj = make_subject(vec![dose], obs_times.clone());
+            let mut pk = pk_one(cl, v);
+            pk.values[crate::types::PK_IDX_F] = f;
+            event_driven_predictions(
+                PkModel::OneCptIv,
+                &subj,
+                &vec![pk; 1],
+                &vec![pk; obs_times.len()],
+                &[],
+            )
+        };
+        let half_f = preds(100.0, 0.5); // F=0.5, AMT=100 -> rate 25 over 2 h
+        let equiv_full = preds(50.0, 1.0); // F=1, AMT=50 -> rate 25 over 2 h (same)
+        for (j, (&a, &b)) in half_f.iter().zip(equiv_full.iter()).enumerate() {
+            assert_relative_eq!(a, b, max_relative = 1e-9);
+            assert!(a > 0.0, "expected nonzero conc at obs {j}");
+        }
+        // The reshaped curve must NOT equal the old linear-in-F halving.
+        let full = preds(100.0, 1.0);
+        let differs = half_f
+            .iter()
+            .zip(full.iter())
+            .any(|(&h, &f)| (h - 0.5 * f).abs() > 1e-6);
+        assert!(
+            differs,
+            "rate-defined infusion under F must reshape the curve, not halve it"
+        );
     }
 
     #[test]
@@ -1525,34 +1616,37 @@ mod tests {
     }
 
     #[test]
-    fn f_bioavailability_scales_oral_infusion_on_superposition() {
-        // #327: an infusion on an oral model bypasses the depot and enters
-        // central directly, so the analytical superposition path must scale it
-        // by F. Cross-checking against the event-driven path is deferred —
-        // that path currently drops infusion input on oral models entirely (a
-        // separate bug). Here we assert F is applied and linear on the
-        // superposition path, which is the path that ran F-blind before #327.
+    fn f_bioavailability_reshapes_oral_infusion_on_superposition() {
+        // #327/#419: an infusion on an oral model bypasses the depot and enters
+        // central directly, so the analytical superposition path must apply F.
+        // For a rate-defined infusion F holds the rate and scales the duration
+        // (#419), so F=0.4 on AMT=100 at rate 25 (4 h) gives rate 25 over 1.6 h -
+        // identical to a full-F infusion of F·AMT=40 at rate 25, and NOT 0.4x the
+        // F=1 curve.
         let obs_times = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
-        // rate=25 → 4 h infusion into central (cmt 2) on a 1-cpt oral model.
-        let dose = DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0);
-        let subj = make_subject(vec![dose], obs_times.to_vec());
-
-        let mut pk_full = pk_one_oral(5.0, 50.0, 1.2);
-        pk_full.values[crate::types::PK_IDX_F] = 1.0;
-        let mut pk_half = pk_one_oral(5.0, 50.0, 1.2);
-        pk_half.values[crate::types::PK_IDX_F] = 0.4;
-
-        for &t in &obs_times {
-            let full =
-                crate::pk::predict_concentration(PkModel::OneCptOral, &subj.doses, t, &pk_full);
-            let half =
-                crate::pk::predict_concentration(PkModel::OneCptOral, &subj.doses, t, &pk_half);
-            assert!(
-                full > 0.0,
-                "oral infusion should give nonzero conc at t={t}"
-            );
-            assert_relative_eq!(half, 0.4 * full, max_relative = 1e-12);
+        let preds = |amt: f64, f: f64| -> Vec<f64> {
+            let doses = vec![DoseEvent::new(0.0, amt, 2, 25.0, false, 0.0)];
+            let mut pk = pk_one_oral(5.0, 50.0, 1.2);
+            pk.values[crate::types::PK_IDX_F] = f;
+            obs_times
+                .iter()
+                .map(|&t| crate::pk::predict_concentration(PkModel::OneCptOral, &doses, t, &pk))
+                .collect()
+        };
+        let full = preds(100.0, 1.0);
+        let half_f = preds(100.0, 0.4);
+        let equiv_full = preds(40.0, 1.0);
+        for ((&fu, &hf), &ef) in full.iter().zip(half_f.iter()).zip(equiv_full.iter()) {
+            assert!(fu > 0.0, "oral infusion should give nonzero conc");
+            assert_relative_eq!(hf, ef, max_relative = 1e-12);
         }
+        assert!(
+            half_f
+                .iter()
+                .zip(full.iter())
+                .any(|(&h, &f)| (h - 0.4 * f).abs() > 1e-6),
+            "rate-defined oral infusion under F must reshape, not scale"
+        );
     }
 
     #[test]
@@ -2063,19 +2157,14 @@ mod tests {
 
     #[test]
     fn event_driven_applies_f_bio_to_infusion() {
-        // Companion to the bolus test above. `propagate_with_bounds`
-        // multiplies `f_bio` into the infusion rate (rate-scaled
-        // convention), so a dur→0 infusion limits to a bolus of amount
-        // F·AMT.
-        //
-        // Note: the analytical IV/Infusion paths in `pk/mod.rs` do *not*
-        // apply F (only the `_f` oral variants do), so we don't compare
-        // event-driven to the analytical reference here. We assert two
-        // weaker invariants that the fix should satisfy:
+        // Companion to the bolus test above. A rate-defined infusion under `F`
+        // holds the rate and scales the duration (#419), so a dur->0 infusion
+        // still limits to a bolus of amount F·AMT. Two invariants:
         //   1. At F=1 the event-driven prediction matches the analytical
-        //      (regression for the unrelated infusion path).
-        //   2. Predictions scale linearly with F (the bolus fix's
-        //      contract extended to infusions).
+        //      superposition reference (regression for the infusion path).
+        //   2. F=0.4 reshapes the infusion to F·AMT delivered at the same rate -
+        //      i.e. the (F=0.4, AMT) curve equals the (F=1, F·AMT) curve, not a
+        //      uniform 0.4x scaling of the F=1 curve.
         let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0)];
         let obs_times = vec![0.5, 1.0, 2.0, 4.0, 8.0];
         let subj = make_subject(doses, obs_times.clone());
@@ -2101,9 +2190,30 @@ mod tests {
         let pk_obs_f = vec![pk_f; obs_times.len()];
         let preds_f =
             event_driven_predictions(PkModel::OneCptIv, &subj, &pk_dose_f, &pk_obs_f, &[]);
-        for (a_f, a_1) in preds_f.iter().zip(preds_unit.iter()) {
-            assert_relative_eq!(*a_f, 0.4 * *a_1, epsilon = 1e-9, max_relative = 1e-9);
+        // (2) F=0.4 holds the rate (500) and scales the duration, so it equals a
+        // full-F infusion of F·AMT = 400 at the same rate (#419) - not 0.4x.
+        let subj_scaled = make_subject(
+            vec![DoseEvent::new(0.0, 400.0, 1, 500.0, false, 0.0)],
+            obs_times.clone(),
+        );
+        let preds_scaled = event_driven_predictions(
+            PkModel::OneCptIv,
+            &subj_scaled,
+            &pk_dose_unit,
+            &pk_obs_unit,
+            &[],
+        );
+        for (a_f, a_s) in preds_f.iter().zip(preds_scaled.iter()) {
+            assert_relative_eq!(*a_f, *a_s, epsilon = 1e-9, max_relative = 1e-9);
         }
+        // And it must NOT be the old uniform 0.4x scaling.
+        assert!(
+            preds_f
+                .iter()
+                .zip(preds_unit.iter())
+                .any(|(a_f, a_1)| (*a_f - 0.4 * *a_1).abs() > 1e-6),
+            "rate-defined infusion under F must reshape, not scale"
+        );
     }
 
     #[test]
@@ -2195,7 +2305,9 @@ mod tests {
                 assert_relative_eq!(e, s, epsilon = 1e-9, max_relative = 1e-7);
             }
 
-            // (2) Linear in F (the infusion rate is scaled by f_bio).
+            // (2) F=0.4 reshapes the rate-defined infusion (#419): it holds the
+            // rate and scales the duration, so the (F=0.4, AMT=100) curve equals
+            // the (F=1, AMT=40) curve at the same rate - not 0.4x the F=1 curve.
             let mut pkf = base;
             pkf.values[crate::types::PK_IDX_F] = 0.4;
             let ed_f = event_driven_predictions(
@@ -2205,8 +2317,19 @@ mod tests {
                 &vec![pkf; obs_times.len()],
                 &[],
             );
-            for (a_f, a_1) in ed_f.iter().zip(ed.iter()) {
-                assert_relative_eq!(*a_f, 0.4 * *a_1, max_relative = 1e-9);
+            let subj_scaled = make_subject(
+                vec![DoseEvent::new(0.0, 40.0, 2, 25.0, false, 0.0)],
+                obs_times.clone(),
+            );
+            let ed_scaled = event_driven_predictions(
+                model,
+                &subj_scaled,
+                &vec![pk1; 1],
+                &vec![pk1; obs_times.len()],
+                &[],
+            );
+            for (a_f, a_s) in ed_f.iter().zip(ed_scaled.iter()) {
+                assert_relative_eq!(*a_f, *a_s, max_relative = 1e-9);
             }
 
             // (3) Cross-path agreement at F≠1: the superposition reference must
@@ -2275,7 +2398,9 @@ mod tests {
                 assert_relative_eq!(e, s, epsilon = 1e-9, max_relative = 2e-3);
             }
 
-            // F-linearity (exact — the infusion rate is scaled by f_bio).
+            // F=0.4 reshapes the SS rate-defined infusion (#419): it holds the
+            // rate and scales the duration, so the (F=0.4, AMT=100) SS curve
+            // equals the (F=1, AMT=40) SS curve at the same rate - not 0.4x.
             let mut pkf = base;
             pkf.values[crate::types::PK_IDX_F] = 0.4;
             let ed_f = event_driven_predictions(
@@ -2285,8 +2410,19 @@ mod tests {
                 &vec![pkf; obs_times.len()],
                 &[],
             );
-            for (a_f, a_1) in ed_f.iter().zip(ed.iter()) {
-                assert_relative_eq!(*a_f, 0.4 * *a_1, max_relative = 1e-9);
+            let subj_scaled = make_subject(
+                vec![DoseEvent::new(0.0, 40.0, 2, 25.0, true, 24.0)],
+                obs_times.clone(),
+            );
+            let ed_scaled = event_driven_predictions(
+                model,
+                &subj_scaled,
+                &vec![pk1; 1],
+                &vec![pk1; obs_times.len()],
+                &[],
+            );
+            for (a_f, a_s) in ed_f.iter().zip(ed_scaled.iter()) {
+                assert_relative_eq!(*a_f, *a_s, max_relative = 1e-9);
             }
 
             // Cross-path agreement at F≠1 (looser SS tolerance, as for F=1):
@@ -2570,7 +2706,7 @@ mod tests {
         let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
         let obs_times = vec![0.0, 1.0]; // first obs at t=0, same as dose
         let subj = make_subject(doses, obs_times);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &[]);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &[]);
 
         assert_eq!(schedule.events.len(), 3);
         assert!(matches!(schedule.events[0].kind, EventKind::Dose));
@@ -2587,7 +2723,7 @@ mod tests {
         let doses = vec![DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 2.0)];
         let obs_times = vec![10.0];
         let subj = make_subject(doses, obs_times);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &[]);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &[]);
 
         // Two events (dose at 0, obs at 10) → one interval (0, 10).
         assert_eq!(schedule.bounds_per_interval.len(), 1);
@@ -2626,7 +2762,7 @@ mod tests {
         }
 
         let direct = event_driven_predictions(PkModel::TwoCptIv, &subj, &pk_dose, &pk_obs, &[]);
-        let schedule = EventSchedule::for_subject(&subj, PkModel::TwoCptIv, &[]);
+        let schedule = EventSchedule::for_subject(&subj, PkModel::TwoCptIv, &subj.doses, &[]);
         let with_sched = event_driven_predictions_with_schedule(
             PkModel::TwoCptIv,
             &subj,

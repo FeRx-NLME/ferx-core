@@ -141,6 +141,41 @@ fn scaling_expression_ad_matches_fd() {
     assert_ad_matches_fd("eta-dependent obs_scale", &src, "data/one_cpt_iv.csv");
 }
 
+/// Rate-defined IV infusion with bioavailability `F` carrying an ETA (#419). The
+/// AD twin now applies `F` to the infusion *duration* (`dur = f_bio*dur`) for a
+/// rate-defined infusion, so `d/d eta_F` flows through the (moving) infusion-end
+/// breakpoint and the `(1 - exp(-k*dur))` term - a genuinely new differentiated
+/// path. This case is AD-supported (log-normal ETA + proportional error,
+/// analytical IV, `RATE>0` data infusion), so the AD path runs for real and must
+/// agree with FD: the regression guard for the new duration-scaling gradient.
+#[test]
+fn iv_infusion_bioavailability_eta_ad_matches_fd() {
+    let src = "
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVF(0.8, 0.05, 1.5)
+  omega ETA_CL ~ 0.09
+  omega ETA_F ~ 0.05
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  F  = TVF * exp(ETA_F)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, f=F)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = foce
+";
+    assert_ad_matches_fd(
+        "IV infusion + bioavailability ETA (#419)",
+        src,
+        "data/one_cpt_infusion.csv",
+    );
+}
+
 /// TTE hazard (`[event_model]`) — the analytical AD kernel computes the PK NLL,
 /// not the hazard likelihood, so the eta-gradient through the hazard shape is
 /// wrong; gated AD->FD. weibull/gompertz diverged ~2-5 OFV before the gate

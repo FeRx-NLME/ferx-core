@@ -228,15 +228,50 @@ fn modeled_duration_matches_explicit_infusion() {
 
 #[test]
 fn modeled_duration_composes_with_bioavailability_once() {
-    // F1 must scale the resolved rate exactly ONCE: `RATE=-2` (D1=5) with F1=0.5
-    // equals explicit `RATE=20` with the same F1=0.5. A double-application of F
-    // in `resolve_rate` would scale the coded case by F again (0.25 vs 0.5) and
-    // the two would diverge by a factor of F.
+    // #419: `RATE=-2` is duration-defined, so under F1=0.5 NONMEM (and now ferx)
+    // hold the duration at D1=5 and scale the RATE to F·AMT/D = 0.5·100/5 = 10 (F
+    // applied exactly once; a double application would give rate 5). This is the
+    // rate-scaled ADVAN1 closed form, and it now DIFFERS from the explicit
+    // `RATE=20` twin - which is rate-defined and instead scales the duration.
     let model = model_of(ODE_D1_F1);
     let coded = preds_of(&model, &coded_csv());
+
+    // (a) Anchor against the rate-scaled closed form: rate 10 over D=5 h.
+    let (cl, v, amt, d1, f1) = (5.0_f64, 50.0, 100.0, 5.0, 0.5);
+    let k = cl / v;
+    let rate = f1 * amt / d1; // F-scaled rate = 10
+    let plateau = rate / (v * k); // 2.0
+    let times = [1.0, 3.0, 5.0, 8.0, 12.0, 18.0, 24.0];
+    let expected: Vec<f64> = times
+        .iter()
+        .map(|&t| {
+            if t <= d1 {
+                plateau * (1.0 - (-k * t).exp())
+            } else {
+                plateau * (1.0 - (-k * d1).exp()) * (-k * (t - d1)).exp()
+            }
+        })
+        .collect();
+    // ODE engine vs exact closed form: 1e-4 covers solver tolerance and rejects a
+    // double-applied F (rate 5, ~half these values).
+    assert_close(
+        &coded,
+        &expected,
+        1e-4,
+        "RATE=-2 D1=5 + F1=0.5 holds duration, scales rate to 10 (NONMEM)",
+    );
+
+    // (b) Must now DIFFER from the explicit (rate-defined) RATE=20 twin under F.
     let explicit = preds_of(&model, &explicit_csv());
-    assert_close(&coded, &explicit, 1e-9, "F1 + RATE=-2 vs F1 + explicit");
-    // Sanity: F1=0.5 halves exposure vs the no-F model (so F is actually applied).
+    assert!(
+        coded
+            .iter()
+            .zip(explicit.iter())
+            .any(|(c, e)| (c - e).abs() > 1e-3),
+        "RATE=-2 (duration-defined) and explicit RATE=20 (rate-defined) must differ under F!=1 (#419)",
+    );
+
+    // (c) Sanity: F1=0.5 reduces exposure vs the no-F model (so F is applied).
     let no_f = preds_of(&model_of(ODE_D1), &coded_csv());
     assert!(
         coded[2] < 0.75 * no_f[2],

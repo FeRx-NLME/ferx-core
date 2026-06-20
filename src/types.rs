@@ -38,6 +38,34 @@ pub enum RateMode {
     ModeledRate,
 }
 
+/// How an infusion's `(rate, duration)` was *specified*, which fixes how
+/// bioavailability `F` reshapes it (NONMEM convention; issue #419).
+///
+/// `F` always delivers the same total exposure `F·amt`, but for `F ≠ 1` it keeps
+/// one of `(rate, duration)` fixed and scales the other:
+///   - [`Self::RateDefined`] (`RATE>0` data **and** `RATE=-1` → `R{cmt}`): hold
+///     the rate, scale the duration to `F·amt/rate`.
+///   - [`Self::DurationDefined`] (`RATE=-2` → `D{cmt}`): hold the duration, scale
+///     the rate to `F·amt/duration` (ferx's original behaviour for every infusion,
+///     correct only for this case).
+///
+/// Unlike [`RateMode`], this tag is **persistent** — it is *not* consumed by
+/// [`DoseEvent::resolve_rate`] (which collapses the mode to [`RateMode::Fixed`]),
+/// because the `F` rule is applied downstream, after resolution. It is the single
+/// piece of state that lets [`DoseEvent::bioavailable_infusion`] stay the one
+/// source of truth across every prediction path. Only meaningful for infusions; a
+/// bolus never reads it. Defaults to [`Self::RateDefined`] — the NONMEM default and
+/// the correct value for every `RATE>0` dose and every synthetic infusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InfusionDef {
+    /// Rate-specified: `RATE>0` (data) and `RATE=-1` (`R{cmt}`). `F` scales the
+    /// duration.
+    #[default]
+    RateDefined,
+    /// Duration-specified: `RATE=-2` (`D{cmt}`). `F` scales the rate.
+    DurationDefined,
+}
+
 /// Clamp `x` to a lower `floor`: returns `x` when `x > floor`, otherwise `floor`.
 ///
 /// The single home for the "pull a transient mid-fit excursion back off the
@@ -72,6 +100,10 @@ pub struct DoseEvent {
     /// (data-driven) doses; a modeled variant for a NONMEM coded `RATE`, which
     /// is resolved per iteration by [`Self::resolve_rate`].
     pub rate_mode: RateMode,
+    /// How this infusion was *specified*, which fixes how bioavailability `F`
+    /// reshapes it (see [`InfusionDef`] and [`Self::bioavailable_infusion`], #419).
+    /// Persistent across [`Self::resolve_rate`]. Only read for infusions.
+    pub infusion_def: InfusionDef,
 }
 
 impl DoseEvent {
@@ -86,6 +118,9 @@ impl DoseEvent {
             ss,
             ii,
             rate_mode: RateMode::Fixed,
+            // A data-driven dose is rate-specified (`RATE>0`); a bolus never reads
+            // this. Either way `RateDefined` is the correct default (#419).
+            infusion_def: InfusionDef::RateDefined,
         }
     }
 
@@ -95,6 +130,13 @@ impl DoseEvent {
     /// filled in by [`Self::resolve_rate`]; until then [`Self::is_infusion`]
     /// still reports `true` from the mode.
     pub fn modeled(time: f64, amt: f64, cmt: usize, ss: bool, ii: f64, mode: RateMode) -> Self {
+        // The definition tag mirrors the coded mode and persists past
+        // `resolve_rate` (which clears `rate_mode` to `Fixed`): `RATE=-1`/`R{cmt}`
+        // is rate-specified, `RATE=-2`/`D{cmt}` is duration-specified (#419).
+        let infusion_def = match mode {
+            RateMode::ModeledDuration => InfusionDef::DurationDefined,
+            RateMode::Fixed | RateMode::ModeledRate => InfusionDef::RateDefined,
+        };
         Self {
             time,
             amt,
@@ -104,6 +146,7 @@ impl DoseEvent {
             ss,
             ii,
             rate_mode: mode,
+            infusion_def,
         }
     }
 
@@ -201,6 +244,43 @@ impl DoseEvent {
     /// of across every dose-application site.
     pub fn is_fixed(&self) -> bool {
         matches!(self.rate_mode, RateMode::Fixed)
+    }
+
+    /// Bioavailable `(rate, duration)` for this **resolved** infusion under
+    /// bioavailability `f_bio` (issue #419).
+    ///
+    /// **Single source of truth** for the mode-aware `F`-on-infusion rule. NONMEM
+    /// keeps the *specified* quantity and scales the other so total exposure is
+    /// `F·amt` either way:
+    ///   - [`InfusionDef::RateDefined`] (`RATE>0`, `RATE=-1`): `(rate, F·duration)`.
+    ///   - [`InfusionDef::DurationDefined`] (`RATE=-2`): `(F·rate, duration)`.
+    ///
+    /// Every prediction path derives its infusion `F` handling from this: the
+    /// injected/closed-form rate is the returned `rate`, and the infusion window /
+    /// break-time end is the returned `duration`. A bolus uses
+    /// [`PkParams::bioavailable_amount`] instead (`F·amt`); the oral depot bakes `F`
+    /// in (so the analytical path passes the `1.0` branch of `route_f_scale`). The
+    /// autodiff twin (`ad/ad_gradients.rs`) inlines this rule on flat scalars and
+    /// must mirror any change here. At `F = 1` both arms are the no-op identity, so
+    /// every infusion is unchanged.
+    pub(crate) fn bioavailable_infusion(&self, f_bio: f64) -> (f64, f64) {
+        match self.infusion_def {
+            InfusionDef::RateDefined => (self.rate, f_bio * self.duration),
+            InfusionDef::DurationDefined => (f_bio * self.rate, self.duration),
+        }
+    }
+
+    /// A clone of this infusion with `rate`/`duration` replaced by the
+    /// bioavailable pair from [`Self::bioavailable_infusion`]. Lets the analytical
+    /// superposition closed forms (which read `dose.rate`/`dose.duration`) consume
+    /// the `F`-reshaped infusion without an extra post-multiply (#419).
+    pub(crate) fn with_bioavailable_infusion(&self, f_bio: f64) -> DoseEvent {
+        let (rate, duration) = self.bioavailable_infusion(f_bio);
+        DoseEvent {
+            rate,
+            duration,
+            ..self.clone()
+        }
     }
 }
 
@@ -428,28 +508,26 @@ impl PkParams {
         self.values[PK_IDX_F]
     }
 
-    /// Bioavailable dose amount: `F · amount`. `F` scales the input on **every**
-    /// route — IV bolus, infusion, and oral depot alike — matching NONMEM's `F1`
-    /// (#327).
+    /// Bioavailable dose **amount**: `F · amount`. `F` scales the input on every
+    /// instantaneous route — IV bolus and oral-depot load alike — matching NONMEM's
+    /// `F1` (#327).
     ///
-    /// This pair is the single source of truth for the F-on-dose rule. The three
-    /// prediction paths derive their `F` handling from it:
-    /// * event-driven (`pk/event_driven.rs`) calls these directly;
-    /// * the analytical superposition path (`pk/mod.rs`) applies the same rule as
-    ///   a post-multiply via `route_f_scale` — the oral-depot closed forms bake
-    ///   `F` in, so they take the `1.0` branch;
-    /// * the autodiff path (`ad/ad_gradients.rs`) inlines `f_bio * amt` /
-    ///   `f_bio * rate` once, because under `#[autodiff]` it works on flat scalars
-    ///   and cannot call `&self` methods.
+    /// Single source of truth for `F` on a *bolus/amount*. The infusion *shape*
+    /// rule (which of rate/duration `F` scales) lives in
+    /// [`DoseEvent::bioavailable_infusion`] (#419); together they cover every route.
+    /// The three prediction paths derive their `F` handling from these:
+    /// * event-driven (`pk/event_driven.rs`) calls them directly;
+    /// * the analytical superposition path (`pk/mod.rs`) applies the amount rule as
+    ///   a post-multiply via `route_f_scale` (oral-depot closed forms bake `F` in,
+    ///   so they take the `1.0` branch) and feeds the infusion rule in via
+    ///   [`DoseEvent::with_bioavailable_infusion`];
+    /// * the autodiff path (`ad/ad_gradients.rs`) inlines `f_bio * amt` (bolus) and
+    ///   the infusion rule once, because under `#[autodiff]` it works on flat
+    ///   scalars and cannot call `&self` methods.
     ///
-    /// A change to the rule must be mirrored in those sites.
+    /// A change to either rule must be mirrored in those sites.
     pub(crate) fn bioavailable_amount(&self, amount: f64) -> f64 {
         self.f_bio() * amount
-    }
-
-    /// Bioavailable infusion rate: `F · rate`. See [`Self::bioavailable_amount`].
-    pub(crate) fn bioavailable_rate(&self, rate: f64) -> f64 {
-        self.f_bio() * rate
     }
     pub fn q3(&self) -> f64 {
         self.values[PK_IDX_Q3]
@@ -627,6 +705,20 @@ impl Subject {
     /// (#324 / #383): a future coded variant changes "resolved" in one place.
     pub fn all_doses_fixed(&self) -> bool {
         self.doses.iter().all(|d| d.is_fixed())
+    }
+
+    /// True when any dose is a *rate-defined* infusion (`RATE>0` data or
+    /// `RATE=-1` → `R{cmt}`), i.e. one whose infusion *window* bioavailability
+    /// `F` reshapes (NONMEM scales the duration to `F·amt/rate`; #419). A
+    /// duration-defined infusion (`RATE=-2`) is excluded — `F` scales its rate,
+    /// not its window. Used to decide whether a cached
+    /// [`crate::pk::event_driven::EventSchedule`] (whose break times bake in the
+    /// window) would go stale as `F` varies across the inner search - the same
+    /// reason [`CompiledModel::has_lagtime`] gates that cache.
+    pub fn has_rate_defined_infusion(&self) -> bool {
+        self.doses
+            .iter()
+            .any(|d| d.is_infusion() && matches!(d.infusion_def, InfusionDef::RateDefined))
     }
 
     /// Time of the first dose of the reset-occasion containing `obs_time`,
@@ -2254,6 +2346,26 @@ impl CompiledModel {
                 || u == "ALAG"
                 || (self.ode_spec.is_some()
                     && matches!(DoseAttr::from_indexed_name(n), Some((DoseAttr::Lag, _))))
+        })
+    }
+
+    /// True when the model wires in a bioavailability `F`/`Fn` parameter (on
+    /// either engine). Mirrors [`Self::has_lagtime`]: the analytical route puts
+    /// [`PK_IDX_F`] in `pk_indices` (from `f=` on the `[structural_model]`
+    /// line), while both engines may instead name it `F` (any case) in
+    /// `[individual_parameters]`; a compartment-indexed `Fn` routes on the ODE
+    /// engine only. Used with [`Subject::has_rate_defined_infusion`] to skip the
+    /// event-driven [`crate::pk::event_driven::EventSchedule`] cache when `F`
+    /// could reshape an infusion window across the inner search (#419).
+    pub fn has_bioavailability(&self) -> bool {
+        if self.pk_indices.iter().any(|&i| i == PK_IDX_F) {
+            return true;
+        }
+        self.indiv_param_names.iter().any(|n| {
+            let u = n.to_uppercase();
+            u == "F"
+                || (self.ode_spec.is_some()
+                    && matches!(DoseAttr::from_indexed_name(n), Some((DoseAttr::F, _))))
         })
     }
 

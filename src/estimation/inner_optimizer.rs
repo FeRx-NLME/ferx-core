@@ -591,14 +591,22 @@ pub fn find_ebe(
     // Reset-bearing subjects (EVID=3/4) also take the event-driven analytical
     // path, so they benefit from a cached schedule too — the schedule now
     // includes reset events.
+    // Also skip the cache when bioavailability `F` could reshape a rate-defined
+    // infusion window: `F` scales such an infusion's *duration* (#419), which
+    // moves the baked-in break times as the inner BFGS varies eta (the same
+    // staleness reason as `has_lagtime`). The non-cached path rebuilds per call
+    // with the current `F`. Duration-defined infusions keep the cache (`F` scales
+    // their rate, not the window).
     let schedule = if (subject.has_tv_covariates() || subject.has_resets())
         && model.ode_spec.is_none()
         && pk::event_driven::supports_event_driven(model.pk_model)
         && !model.has_lagtime()
+        && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
     {
         Some(pk::event_driven::EventSchedule::for_subject(
             subject,
             model.pk_model,
+            &subject.doses,
             &[],
         ))
     } else {

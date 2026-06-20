@@ -261,15 +261,19 @@ duration case. `R{cmt}`/`D{cmt}` are recognised compartment-indexed parameter
 names (like NONMEM's reserved `$PK` names); recognising one only reserves it when
 a coded `RATE` actually targets that compartment.
 
-> **Bioavailability and `RATE=-1` (`F ≠ 1`).** ferx applies `F` by scaling the
-> infusion **rate** over the (data- or model-defined) duration, so a `RATE=-1`
-> dose behaves exactly like its explicit `RATE = R{cmt}` twin. This is exact at
-> `F = 1` (the usual case for IV/SC infusions, and the NONMEM-anchored case). For
-> a *rate*-defined infusion with `F ≠ 1`, NONMEM instead keeps the rate at
-> `R{cmt}` and scales the **duration** to `F·AMT/R{cmt}` — same total exposure
-> `F·AMT`, different infusion shape. ferx's uniform rate-scaling (shared with
-> `RATE>0` infusions, #327) is the current behaviour; aligning rate-defined
-> infusions with NONMEM's duration-scaling under `F ≠ 1` is a tracked follow-up.
+> **Bioavailability and infusion shape (`F ≠ 1`).** ferx applies `F` to an
+> infusion the NONMEM way (#419), holding whichever quantity you specified and
+> scaling the other so total exposure is `F·AMT` either way:
+>
+> - **rate-defined** (`RATE>0` data **and** `RATE=-1` → `R{cmt}`): the rate is held
+>   and the **duration** is scaled to `F·AMT/RATE`. So a `RATE=-1` dose behaves
+>   exactly like its explicit `RATE = R{cmt}` twin.
+> - **duration-defined** (`RATE=-2` → `D{cmt}`): the duration is held at `D{cmt}`
+>   and the **rate** is scaled to `F·AMT/D{cmt}`.
+>
+> The two modes therefore produce a different infusion *shape* under `F ≠ 1` (same
+> total exposure). At `F = 1` they coincide. (Earlier versions scaled the rate for
+> every infusion, which diverged from NONMEM for rate-defined infusions; #419.)
 
 Any other negative or non-finite `RATE` on a dose row is rejected. Earlier
 versions silently treated all coded forms as a bolus, producing wrong predictions

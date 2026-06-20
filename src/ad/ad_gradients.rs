@@ -44,6 +44,7 @@ fn ad_type_fence(x: f64) -> f64 {
     Const,
     Const,
     Const,
+    Const,
     Active
 )]
 pub fn individual_nll_ad(
@@ -56,6 +57,7 @@ pub fn individual_nll_ad(
     dose_amts: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
+    dose_rate_defined: &[f64], // 1.0 rate-defined / 0.0 duration-defined (#419)
     obs_times: &[f64],
     observations: &[f64],
     cens_f64: &[f64], // per-observation censoring flag; +1 left-censored, -1 right-censored
@@ -120,6 +122,7 @@ pub fn individual_nll_ad(
                 dose_amts[d],
                 dose_rates[d],
                 dose_durations[d],
+                dose_rate_defined[d],
                 pk[PK_IDX_CL],
                 pk[PK_IDX_V],
                 pk[PK_IDX_Q],
@@ -219,6 +222,7 @@ fn log_normal_cdf_ad(z: f64) -> f64 {
     Const,
     Const,
     Const,
+    Const,
     Dual
 )]
 pub fn predict_all_ad(
@@ -228,6 +232,7 @@ pub fn predict_all_ad(
     dose_amts: &[f64],
     dose_rates: &[f64],
     dose_durations: &[f64],
+    dose_rate_defined: &[f64], // 1.0 rate-defined / 0.0 duration-defined (#419)
     obs_times: &[f64],
     pk_idx_f64: &[f64], // PK parameter indices as f64 (cast to usize inside)
     sel_flat: &[f64],   // n_tv × n_eta row-major one-hot eta selector
@@ -271,6 +276,7 @@ pub fn predict_all_ad(
                 dose_amts[d],
                 dose_rates[d],
                 dose_durations[d],
+                dose_rate_defined[d],
                 pk[PK_IDX_CL],
                 pk[PK_IDX_V],
                 pk[PK_IDX_Q],
@@ -306,6 +312,7 @@ fn single_dose_ad(
     amt: f64,
     rate: f64,
     dur: f64,
+    rate_defined: f64,
     cl: f64,
     v: f64,
     q: f64,
@@ -319,12 +326,19 @@ fn single_dose_ad(
         return 0.0;
     }
 
-    // Bioavailability F scales the bioavailable amount/rate on every route — IV
-    // included (#327) — matching the superposition path's `route_f_scale` and the
-    // event-driven path's `PkParams::bioavailable_amount`/`bioavailable_rate`.
-    // Applied once here (rather than per-arm) because this `#[autodiff]` function
-    // works on flat scalars and cannot call those `&self` helpers. All six arms
-    // below read the pre-scaled `amt`; only the IV arms read the pre-scaled `rate`.
+    // Bioavailability F. The bolus amount is always F·amt (matching
+    // `PkParams::bioavailable_amount`). For an infusion the mode-aware rule
+    // (`DoseEvent::bioavailable_infusion`, #419) holds the *specified* quantity and
+    // scales the other so total exposure is F·amt either way:
+    //   rate-defined  (RATE>0, RATE=-1): hold rate, scale duration to F·dur;
+    //   duration-defined (RATE=-2):      hold duration, scale rate to F·rate.
+    // Inlined here (not via the `&self` helpers) because this `#[autodiff]`
+    // function works on flat scalars. `rate_defined` is a per-dose constant
+    // (1.0 / 0.0) carried as f64. The blend is **branchless** on purpose: a phi
+    // node merging the two differentiated `(rate, dur)` pairs would defeat
+    // Enzyme's reverse-mode type analysis (same failure mode as the `if has_eta`
+    // form retired in `individual_nll_ad`). `f_bio` is the only active factor; at
+    // F=1 both expressions are the identity.
     //
     // The oral arms (ids 1/3/5) evaluate only the bolus Bateman form — they ignore
     // `rate`/`dur`, so they are wrong for an oral *infusion* dose (which the value
@@ -334,7 +348,9 @@ fn single_dose_ad(
     // `estimation/inner_optimizer.rs`), so these arms only ever see bolus doses. If
     // that guard is removed, make the oral arms infusion-aware first (#349 review).
     let amt = f_bio * amt;
-    let rate = f_bio * rate;
+    let rd = rate_defined; // 1.0 rate-defined, 0.0 duration-defined
+    let rate = rate * (rd + (1.0 - rd) * f_bio); // rd=1 -> rate; rd=0 -> f_bio*rate
+    let dur = dur * ((1.0 - rd) + rd * f_bio); // rd=0 -> dur; rd=1 -> f_bio*dur
 
     // Per issue #176, IV variants no longer split by administration type at
     // the model level. Each IV branch below handles bolus and infusion via
@@ -655,6 +671,12 @@ pub struct FlatDoseData {
     pub amts: Vec<f64>,
     pub rates: Vec<f64>,
     pub durations: Vec<f64>,
+    /// Per-dose bioavailability mode (#419), `1.0` for a rate-defined infusion
+    /// (`RATE>0`, `RATE=-1`) and `0.0` for a duration-defined one (`RATE=-2`),
+    /// carried as `f64` across the autodiff FFI boundary (like `pk_idx_f64`).
+    /// Tells `single_dose_ad` whether `F` scales the duration (rate-defined) or
+    /// the rate (duration-defined).
+    pub rate_defined: Vec<f64>,
 }
 
 impl FlatDoseData {
@@ -682,6 +704,14 @@ impl FlatDoseData {
             amts: subject.doses.iter().map(|d| d.amt).collect(),
             rates: subject.doses.iter().map(|d| d.rate).collect(),
             durations: subject.doses.iter().map(|d| d.duration).collect(),
+            rate_defined: subject
+                .doses
+                .iter()
+                .map(|d| match d.infusion_def {
+                    crate::types::InfusionDef::RateDefined => 1.0,
+                    crate::types::InfusionDef::DurationDefined => 0.0,
+                })
+                .collect(),
         }
     }
 }
@@ -732,6 +762,7 @@ pub fn compute_nll_gradient_ad(
         &dose_data.amts,
         &dose_data.rates,
         &dose_data.durations,
+        &dose_data.rate_defined,
         obs_times,
         observations,
         cens_f64,
@@ -781,6 +812,7 @@ pub fn compute_jacobian_ad(
             &dose_data.amts,
             &dose_data.rates,
             &dose_data.durations,
+            &dose_data.rate_defined,
             obs_times,
             pk_idx_f64,
             sel_flat,

@@ -449,10 +449,12 @@ pub fn run_bayes(
                 && model.ode_spec.is_none()
                 && crate::pk::event_driven::supports_event_driven(model.pk_model)
                 && !model.has_lagtime()
+                && !(model.has_bioavailability() && subject.has_rate_defined_infusion())
             {
                 Some(crate::pk::event_driven::EventSchedule::for_subject(
                     subject,
                     model.pk_model,
+                    &subject.doses,
                     &[],
                 ))
             } else {
