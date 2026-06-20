@@ -298,7 +298,7 @@ Everything else integrates.
 | `mixed` (0 + 1st) | yes (superpose zero-order + first-order) | analytical |
 | `transit` (Savic), **integer N** | yes (generalized Bateman / sum of N+1 terms) | analytical |
 | `transit` (Savic), **continuous N** | yes — exponential tilting of the Gamma distribution: `∫₀ᵗ R_in·e^(k·u)du = M(k)·P(n+1,(KTR−k)·t)` where P is the regularized incomplete gamma; condition `k < KTR` | analytical (Phase 3) |
-| `weibull` | **no** elementary closed form | numerical |
+| `weibull` | **no** elementary closed form | numerical (analytic ∂ only via the `PkNum`-generic forcing — see Engine §) |
 | `inverse_gaussian` (Freijer & Post) | yes — exponential tilting of the IG distribution: `∫₀ᵗ f_IG(u;μ,λ)·e^(k·u)du = M(k)·F_IG(t;μ*,λ)` where `μ*=μ/√(1−2μ²k/λ)` and `M(k)=exp(λ/μ·(1−√(1−2μ²k/λ)))`; condition `k < λ/(2μ²)` | analytical (Phase 3) |
 
 The first-order / zero-order / parallel / sequential / mixed family and integer-N transit
@@ -377,16 +377,21 @@ Decouple **input function** from **disposition**, reusing existing machinery:
 
 ### Analytic sensitivities for the ODE forcing (post-Enzyme follow-up)
 
-With the Enzyme retirement, ODE models now get **analytic** `Dual2` sensitivities through
-`src/sens/ode_provider.rs` (state integrated as `Dual2<N>` over the generic RK45). Built-in
-input-rate absorption is on that provider's explicit *not-yet-supported → FD fallback* list, so
-`transit()`/`igd()` models are currently the only ODE models that still differentiate by FD.
-Closing this is a self-contained follow-up: make `PreparedInputRate::rate` (and the `ln_gamma`
-it calls) generic over `PkNum`, so the compiled RHS can be evaluated over the dual numbers the
-provider already propagates. This is **independent of** the Phase 3 closed forms (which give the
-analytic *disposition*); it gives the numerical-ODE path exact *forcing* sensitivities in the
-meantime. Scope/feasibility to be confirmed against the provider's `MAX_ODE_SENS_DIM`
-monomorphisation budget.
+**Roadmap item — [#430](https://github.com/FeRx-NLME/ferx-core/issues/430).** With the Enzyme retirement, ODE models now get **analytic**
+`Dual2` sensitivities through `src/sens/ode_provider.rs` (state integrated as `Dual2<N>` over the
+generic RK45). Built-in input-rate absorption is on that provider's explicit *not-yet-supported →
+FD fallback* list, so `transit()`/`igd()`/`weibull()` are currently the only ODE models that still
+differentiate by FD. The fix: make `PreparedInputRate::rate` generic over `PkNum` (the `sens/`
+`*_g<T>` convention) **plus** `Dual2` 1st/2nd-order rules for the special functions each model calls
+(`ln_gamma` for transit, `exp`/`sqrt` for IG, `powf` for Weibull) — then the compiled RHS evaluates
+over the dual numbers the provider already propagates, and absorption comes off the FD-fallback list.
+
+This is **not just a transit/IG interim:** it is the **only** analytic-gradient route for **Weibull**,
+which has no closed form (see the closed-form table and Phase 2) and so is *permanently* on the
+numerical ODE path. For transit/IG it gives exact gradients in the interim before the Phase 3
+analytical closed forms (#386) land, and is **independent of** Phase 3 (which replaces the ODE
+*disposition*; this makes the ODE *forcing* differentiable). Scope/feasibility to be confirmed against
+the provider's `MAX_ODE_SENS_DIM` monomorphisation budget.
 
 ## Robustness ("no happy paths") — explicit requirements
 
@@ -472,7 +477,9 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 - **Phase 2 — Weibull + zero-order + sequential + parallel + mixed.** Round out the
   catalogue; each with a NONMEM anchor. **Closed-form** for zero-order/sequential/parallel/
   mixed (superpose existing solvers; the zero-order family reuses #324's estimated-duration
-  forcing); **numerical** for Weibull (warned on an analytical disposition).
+  forcing); **numerical** for Weibull (warned on an analytical disposition). Weibull has no closed
+  form, so its exact gradients come *only* via the `PkNum`-generic forcing route (see §"Analytic
+  sensitivities for the ODE forcing"), never Phase 3.
 - **Phase 3 — analytical closed forms for transit and IG** (1/2-cpt). Both are implemented
   via the **`TiltedAbsorption` trait** in a new `src/pk/analytical_absorption.rs`:
 
