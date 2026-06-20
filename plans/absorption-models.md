@@ -2,20 +2,29 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap, in progress (updated 2026-06-17).
-- **Prerequisite #324:** safety net (PR #326) and **modeled infusion duration
-  `Dn` / `RATE=-2`** (PR #384) **merged**; modeled rate `Rn` / `RATE=-1` plus
-  analytical-engine support remain, tracked in #383.
+**Status:** approved roadmap, in progress (updated 2026-06-20).
+- **Prerequisite #324:** safety net (PR #326), **modeled infusion duration `Dn` /
+  `RATE=-2`** (PR #384), and **modeled rate `Rn` / `RATE=-1` on both engines**
+  (PR #418) **merged**; see #383 for any residual analytical-engine items.
 - **Phase 0a — `transit()`** (PR #343) **and its NONMEM Savic anchor** (PR #385)
   **merged**; `ln_gamma` building block merged (#340).
 - **Phase 0b — `ode_template` generation + the analytical-`pk`-plus-absorption
   error rule** (PR #363) **merged**.
-- **Phase 1 — inverse-Gaussian `igd()`: implemented, PR #389 (open).**
+- **Phase 1 — inverse-Gaussian `igd()`** (PR #389) **merged**.
 - **Phases 2–3 not yet implemented** — Phase 2 (Weibull + zero-order family);
-  Phase 3 (analytical incomplete-gamma, tracked in #386). Biphasic IG + the
-  shared input-rate fraction mechanism tracked in #388.
+  Phase 3 (analytical incomplete-gamma / exponential tilting, tracked in #386).
+  Biphasic IG + the shared input-rate fraction mechanism tracked in #388.
 
 Multi-PR / phased.
+
+> **Autodiff landscape (2026-06):** the Enzyme autodiff path (`src/ad/`, the `autodiff`
+> Cargo feature) was **retired** (#367/#381) in favour of hand-rolled forward sensitivities in
+> `src/sens/` over the `PkNum` trait — closed forms and ODE RHS are written **once** as
+> `*_g<T: PkNum>` generics (`T = f64` → predictions, `T = Dual2<M>` → exact 1st/2nd-order
+> `∂/∂η`, `∂/∂θ`). This plan's original AD notes — written against Enzyme — are updated
+> throughout to the `sens/`/`Dual2` model. `gradient = auto` (analytic where in scope, else FD)
+> is the default; `gradient = ad` now errors (`E_AD_RETIRED`); the `.max()/.min()`
+> Enzyme-intrinsic restriction no longer applies (`Dual2` handles `max`/`min` by comparison).
 
 ---
 
@@ -308,21 +317,28 @@ underneath it, not a different code path they can observe.
 
 Decouple **input function** from **disposition**, reusing existing machinery:
 
-1. **Input function (new `src/pk/absorption.rs`):** `R_in(tad; θ)` per model. `src/ad/dual.rs`'s
-   `Dual` already implements `exp`/`ln`/`sqrt`/`powf`, so the input functions can be written
-   once over a small numeric trait that both `f64` and `Dual` satisfy — sharing one body across
-   the plain-f64, dual-number, and Enzyme (concrete-f64) paths. This needs a **new** shared
-   trait (today's AD path uses hand-written `_ad` duplicates, not generics) plus a `Dual` impl
-   of `ln_gamma`; if either proves awkward, fall back to the existing duplicate-function
-   pattern. Honor the `ad/` rule: **no `f64::max`/`min`** — use explicit comparisons (see
-   CLAUDE.md). Each model also exposes `validate(θ) -> Result` and the analytic mass
-   `∫R_in = F·Dose` (test invariant).
-   - **Phase 0a finding:** the shared numeric trait was **not needed** for transit. ODE models
-     always differentiate via **finite differences** (`model.tv_fn` is `None` for any ODE model,
-     so `gradient = ad` falls back to FD — see `OdeReadout::requires_fd`), and the forcing is
-     evaluated only on the FD/forward path, so no `Dual`/Enzyme path is reachable.
-     `transit_input_rate` is plain `f64` (still kept `max`/`min`-free). Revisit the trait only
-     if/when an autodiff ODE path is added.
+1. **Input function (`src/pk/absorption.rs`):** `R_in(tad; θ)` per model. Today these are plain
+   `f64` (`transit_input_rate`, `inverse_gaussian_input_rate`, and the hoisted
+   `PreparedInputRate::rate`), each exposing `validate(θ) -> Result` and satisfying the analytic
+   mass `∫R_in = F·Dose` (the mass-balance test invariant). The numeric building blocks are only
+   `+ − * /`, `.ln()`, `.exp()`, `.sqrt()`, `ln_gamma` — nothing autodiff-hostile (the old "no
+   `f64::max`/`min`" Enzyme rule is gone; `Dual2` handles `max`/`min` by comparison).
+   - **Sensitivities (post-Enzyme):** the shared-numeric-trait idea is now realised by the
+     `PkNum` trait in `src/sens/` — the closed-form PK solutions and ODE RHS are written once as
+     `*_g<T: PkNum>` generics (`T = f64` → predictions, `T = Dual2<M>` → exact 1st/2nd-order
+     sensitivities); there is no second `_ad` copy to keep in sync. The absorption input
+     functions are **not yet** `PkNum`-generic, so a model that uses `transit()`/`igd()` falls
+     back to FD (see the Phase 0a finding). Lifting `PreparedInputRate::rate` (and the `ln_gamma`
+     it calls) to `PkNum` is the concrete way to give the ODE forcing exact sensitivities — see
+     "Analytic sensitivities for the ODE forcing" below.
+   - **Phase 0a finding (updated):** transit shipped `f64`-only, and a `transit()` model
+     differentiates via **finite differences** — but the *reason* has changed. An **analytic ODE
+     sensitivity path now exists** (`src/sens/ode_provider.rs`: state integrated as `Dual2<N>`
+     through the generic RK45, yielding `∂f/∂p`, `∂²f/∂p²`), so it is no longer true that ODE
+     models "always differentiate via FD". Built-in input-rate absorption is on that provider's
+     explicit *not-yet-supported → FD fallback* list, so transit/igd are currently the lone ODE
+     holdouts dropping to FD. The `f64`-only forcing is thus an FD **fallback**, not an
+     impossibility; making it `PkNum`-generic (above) removes it.
 2. **Forcing into the user's ODE.** `R_in(tad)` is added into the dosing compartment of the
    disposition the user supplied (`ode(...)` or the `ode_template`-generated states) via the
    **same RHS-wrapper mechanism that already injects `+rate` for infusions**
@@ -344,18 +360,33 @@ Decouple **input function** from **disposition**, reusing existing machinery:
    - **`ode_template` generation:** the named-model → ODE transform (states, micro-constant
      RHS, `obs_scale`) is codified once from `ode-analytical-equivalence.md`; the absorption
      term is appended to the generated depot/dosing compartment.
-3. **Special functions (`src/stats/special.rs`):** add `ln_gamma` via a **Lanczos** rational
-   approximation (AD-safe, following the existing `erf` A&S precedent) — **not** bare Stirling:
-   `N` is estimated continuously and transit `N` is commonly 1–10, where Stirling errs ~8% at
-   N=1 / ~0.8% at N=10, enough to bias the absorption peak. IGD needs only `exp/sqrt`; Weibull
-   needs `powf` — both already AD-safe.
+3. **Special functions (`src/stats/special.rs`):** `ln_gamma` via a **Lanczos** rational
+   approximation (merged in #340), **not** bare Stirling: `N` is estimated continuously and
+   transit `N` is commonly 1–10, where Stirling errs ~8% at N=1 / ~0.8% at N=10, enough to bias
+   the absorption peak. IGD needs only `exp`/`sqrt`; Weibull needs `powf`. For exact analytic
+   sensitivities (rather than FD) these must be available over `PkNum`/`Dual2` (1st- and
+   2nd-order chain rules), not just `f64` — that is the gate for the §4 closed forms below.
 4. **Analytical closed forms for transit and IG (Phase 3):** both use the **exponential
    tilting property** of their respective distributions (Gamma for transit, IG for IG) — see
    the `TiltedAbsorption` trait and `convolve_1cpt`/`convolve_2cpt` in the Phase 3 section
-   above. Special functions required: `regularized_gamma_p(a, x)` (transit; series + CF
-   expansion, AD-safe) and `normal_cdf(x)` (IG; via `erfc`), both in `special.rs`. Sequence:
-   ship each model on the numerical ODE path first (Phases 0/1) to prove the pipeline, then
-   add the closed form in Phase 3 and assert they agree under the equivalence harness.
+   below. Special functions required: `regularized_gamma_p(a, x)` (transit; series + CF
+   expansion) and `normal_cdf(x)` (IG; via `erfc`), both in `special.rs`, written over `PkNum`
+   so the closed forms inherit exact `Dual2` sensitivities (else FD for those params). Sequence:
+   ship each model on the numerical ODE path first (Phases 0/1) to prove the pipeline, then add
+   the closed form in Phase 3 and assert they agree under the equivalence harness.
+
+### Analytic sensitivities for the ODE forcing (post-Enzyme follow-up)
+
+With the Enzyme retirement, ODE models now get **analytic** `Dual2` sensitivities through
+`src/sens/ode_provider.rs` (state integrated as `Dual2<N>` over the generic RK45). Built-in
+input-rate absorption is on that provider's explicit *not-yet-supported → FD fallback* list, so
+`transit()`/`igd()` models are currently the only ODE models that still differentiate by FD.
+Closing this is a self-contained follow-up: make `PreparedInputRate::rate` (and the `ln_gamma`
+it calls) generic over `PkNum`, so the compiled RHS can be evaluated over the dual numbers the
+provider already propagates. This is **independent of** the Phase 3 closed forms (which give the
+analytic *disposition*); it gives the numerical-ODE path exact *forcing* sensitivities in the
+meantime. Scope/feasibility to be confirmed against the provider's `MAX_ODE_SENS_DIM`
+monomorphisation budget.
 
 ## Robustness ("no happy paths") — explicit requirements
 
@@ -373,9 +404,10 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   error** (dose route ambiguous).
 - **Mass-balance invariant** `∫R_in dt = F·Dose` as a unit test per model (catches a wrong
   normalization constant — the classic transit/IGD bug).
-- **AD-safety:** no `f64::max`/`min` anywhere reachable from the AD path; re-enable a
-  representative absorption test under the `autodiff` feature (per CLAUDE.md / issue #281
-  CI work).
+- **Sensitivity parity:** for any absorption param whose model is on the analytic path (the
+  Phase 3 closed forms), a unit test asserting the analytic `Dual2` gradient matches central FD
+  on a small fixture — in the **default** `--features ci` build (no separate autodiff job; the
+  old `.max()/.min()` Enzyme-intrinsic rule no longer applies).
 
 ## Files (representative, not exhaustive)
 
@@ -465,6 +497,11 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   }
   ```
 
+  > **`PkNum`-generic, not `f64`:** the signatures are shown over `f64` for readability, but
+  > `mgf` / `tilted_cdf` / `convolve_*` are written over `T: PkNum` (the `sens/` `*_g`
+  > convention) so the closed forms inherit exact `Dual2` 1st/2nd-order sensitivities — the
+  > whole point of moving transit/IG off the FD-only ODE path.
+
   **Transit** (`TransitAbsorption { n, mtt }`): Gamma is closed under exponential tilting.
   `mgf(k) = (KTR/(KTR−k))^(n+1)`, `tilted_cdf(t,k) = P(n+1, (KTR−k)·t)` (regularized
   incomplete gamma). Condition: `k < KTR = (n+1)/mtt`. Sanity check: n=0 recovers Bateman
@@ -489,7 +526,8 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   directly. Weibull remains an error (no closed form).
 
   The speed win for transit is twofold: removes the adaptive ODE solve *and* moves transit
-  onto the AD-capable analytical `pk` path, dropping the FD-gradient multiplier. The NONMEM
+  onto the analytic `pk` path, whose sensitivities come from `sens/`'s `Dual2` (the `*_conc_g`
+  generics) — dropping the FD-gradient multiplier without any autodiff feature/CI. The NONMEM
   anchor (PR #385) quantified the gap: ~89 s release at `ode_*tol=1e-9` vs NONMEM's ~16 s.
   Assert both transit and IG closed forms match their Phase-0/1 numerical ODE forms under the
   equivalence harness.
@@ -546,13 +584,13 @@ follow-up — a pin bump plus any R-side dose-column docs — is tracked on #324
   `cfg_attr(not(feature="slow-tests"), ignore)`).
 - **NONMEM comparison** (required for numeric features): transit & IG estimates/OFV vs
   equivalent NONMEM models, documented in the example pages or PR descriptions.
-- **Gradient agreement (AD ≡ FD):** per model, a unit test asserting the AD/`Dual` gradient
-  of `individual_nll` w.r.t. the absorption params matches the central-FD gradient to
-  tolerance on a small fixture. It compiles/runs under **both** the default `--features ci`
-  (FD) job and the `--features autodiff` (Enzyme) job — the FD job is the per-PR backstop;
-  the `autodiff` job (#281 cadence) is where the AD path is actually exercised. This is the
-  bridge that stops an AD-only regression (e.g. a wrong `ln_gamma` dual rule) slipping past
-  FD-only PR CI — the #317 failure mode.
+- **Gradient agreement (analytic ≡ FD):** for absorption models on the analytic path (Phase 3),
+  a unit test asserting the analytic `Dual2` gradient of `individual_nll` w.r.t. the absorption
+  params matches the central-FD gradient to tolerance on a small fixture. Because `Dual2` is the
+  default `gradient = auto` path, this runs **per-PR in the default `--features ci` build** — no
+  separate autodiff job or special cadence. It still catches an analytic-only regression (e.g. a
+  wrong `ln_gamma` / `regularized_gamma_p` `Dual2` rule) that an FD-only check would miss — the
+  #317 failure mode, now guarded in default CI.
 
 ## Verification
 
@@ -561,9 +599,9 @@ follow-up — a pin bump plus any R-side dose-column docs — is tracked on #324
   patch ≥90% on each PR's diff.
 - End-to-end smoke per phase: `ferx examples/transit_savic.ferx --data data/transit_2cpt.csv`
   → converges, `converged: true`, MTT/N estimates near the data-generating values.
-- Per-PR `--features ci` (FD) verifies the FD gradient path; the `--features autodiff` job
-  (#281 cadence) verifies the AD path. Mass-balance and the AD≡FD gradient-agreement test are
-  the fast regression backstop and the bridge between the two.
+- The default per-PR `--features ci` build verifies **both** the FD path and the analytic
+  `Dual2` path (both compile under `--features ci`; there is no separate autodiff job). The
+  mass-balance and analytic≡FD gradient-agreement tests are the fast regression backstop.
 
 ## Resolved decisions
 
@@ -588,8 +626,10 @@ No open questions outstanding.
 
 - **Speed:** ODE-forcing is slower than closed forms; acceptable baseline, Phase 3 mitigates
   transit. Quantify on warfarin-sized data.
-- **AD through `ln_gamma` / `powf`:** must verify Enzyme handles them (the `autodiff` CI from
-  issue #281 is the gate); fall back to FD for the absorption params if needed.
+- **`Dual2` rules for `ln_gamma` / `regularized_gamma_p` / `powf` / `erfc`:** the Phase 3
+  analytic forms need exact 1st- **and** 2nd-order dual rules for these (the FOCEI/Bayes Hessian
+  uses `Dual2`); where a rule is missing or awkward, the model falls back to FD for those params
+  (correct, just slower). This replaces the retired "verify Enzyme handles them" risk.
 - **DSL ergonomics for multi-pathway** (`pathway = {...}`): a new inline-record sub-grammar
   with no DSL precedent — deferred in favour of repeated scalar keys for the ≤2-pathway case
   (see DSL surface).
