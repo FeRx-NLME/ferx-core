@@ -457,9 +457,10 @@ pub fn subject_sensitivities_iov(
         return None;
     }
     // #419: decline a rate-defined infusion under `F ≠ 1` to the FD gradient — the
-    // Dual2 walk's `route_f_scale` post-multiply can't represent the `F`-scaled
-    // infusion window (see the non-IOV `subject_sensitivities_impl` for the full
-    // rationale).
+    // Dual2 walk applies `F` as an inline magnitude scale on the rate
+    // (`propagate.rs`: `pk.f * rate`) over the unscaled window, so it can't
+    // represent the `F`-scaled window (see `subject_sensitivities_impl` for the
+    // full rationale).
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
         return None;
     }
@@ -1604,12 +1605,13 @@ fn subject_sensitivities_impl(
     }
     // #419: a rate-defined infusion (`RATE>0`, `RATE=-1`) under bioavailability
     // `F ≠ 1` *reshapes* the infusion — the rate is held and the window is scaled
-    // to `F·dur` — rather than scaling its magnitude. The Dual2 walk applies `F`
-    // as a `route_f_scale` post-multiply (exact only when the concentration is
-    // linear in `F`), so it cannot represent the reshaped window. Route such
-    // subjects to the FD gradient, whose `event_driven_predictions` already
-    // applies the #419 rule. (A duration-defined `RATE=-2` infusion is unaffected:
-    // `F` scales its rate, a magnitude the post-multiply handles.)
+    // to `F·dur` — rather than scaling its magnitude. The analytic paths apply `F`
+    // only as a magnitude scale (the superposition kernels via `route_f_scale`, the
+    // Dual2 walk via an inline `pk.f * rate`), which is exact only when the
+    // concentration is linear in `F`; neither can represent the reshaped window.
+    // Route such subjects to the FD gradient, whose `event_driven_predictions`
+    // already applies the #419 rule. (A duration-defined `RATE=-2` infusion is
+    // unaffected: `F` scales its rate, a magnitude both mechanisms handle.)
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
         return None;
     }
