@@ -6,11 +6,16 @@
 //! dose); per-dose contributions are superposed by the caller.
 //!
 //! These are the inherently-numerical absorption models that feed an explicit
-//! ODE disposition (see `plans/absorption-models.md`). They are AD/Enzyme-safe
-//! (only `+ − * /`, `.ln()`, `.exp()`; no `f64::max`/`min` intrinsics — see
-//! CLAUDE.md). Written for `f64` for now; a shared numeric trait for the
-//! `Dual`/Enzyme paths follows when these are wired into the autodiff ODE
-//! gradient (the roadmap's escape hatch — duplicate-free generics later).
+//! ODE disposition (see `plans/absorption-models.md`). They use only
+//! `+ − * /`, `.ln()`, `.exp()`, `.sqrt()`, and `ln_gamma`. Written for `f64`:
+//! a `transit()`/`igd()` model currently differentiates by finite differences,
+//! because the built-in input-rate forcing is on `sens/ode_provider.rs`'s
+//! not-yet-supported list and falls back to FD (rather than being evaluated
+//! over `Dual2`). Making `PreparedInputRate::rate` (and the `ln_gamma` it calls)
+//! generic over the `PkNum` trait — the `sens/` `*_g<T>` convention — would let
+//! the ODE forcing inherit exact analytic sensitivities. (The Enzyme `autodiff`
+//! path these once targeted was retired in #367/#381; `Dual2` handles `max`/`min`
+//! by comparison, so the old `f64::max`/`min` restriction no longer applies.)
 
 use crate::stats::special::ln_gamma;
 
