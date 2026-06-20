@@ -2828,6 +2828,35 @@ mod tests {
     }
 
     #[test]
+    fn ss_state_at_phase_event_driven_infusion_matches_analytical() {
+        use crate::pk::one_cpt_infusion_ss;
+        // Directly exercise the SS-phase reconstruction's infusion branch (the
+        // #419 synthetic-dose clone), which the SS+lagtime walk uses to fill
+        // pre-arrival samples. For a 1-cpt IV infusion at steady state, the
+        // central amount at a given phase divided by V must equal the analytical
+        // SS closed form at that phase. Covers both the mid-infusion
+        // (phase ≤ t_inf) and post-infusion (phase > t_inf) sub-cases.
+        let cl = 5.0;
+        let v = 80.0;
+        let amt = 1000.0;
+        let rate = 250.0; // t_inf = amt/rate = 4 h
+        let ii = 24.0;
+        let dose = DoseEvent::new(0.0, amt, 1, rate, true, ii);
+        let pk = pk_one(cl, v);
+
+        for &phase in &[2.0_f64, 8.0] {
+            let st = ss_state_at_phase_event_driven(PkModel::OneCptIv, &pk, &dose, phase);
+            let conc = st[0] / v;
+            let expected = one_cpt_infusion_ss(&dose, phase, cl, v);
+            assert!(
+                conc > 0.0,
+                "central amount must be positive at phase {phase}"
+            );
+            assert_relative_eq!(conc, expected, epsilon = 1e-9, max_relative = 1e-7);
+        }
+    }
+
+    #[test]
     fn event_driven_ss_oral_matches_analytical_ss() {
         use crate::pk::one_cpt_oral_ss;
         let cl = 2.0;
