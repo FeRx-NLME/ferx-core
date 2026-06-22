@@ -1730,7 +1730,9 @@ mod tests {
     };
     use crate::parser::model_parser::parse_model_string;
     use crate::sens::provider::{subject_sensitivities, subject_sensitivities_cov};
-    use crate::types::{CompiledModel, DoseEvent, ModelParameters, OmegaMatrix, Subject};
+    use crate::types::{
+        BloqMethod, CompiledModel, DoseEvent, ModelParameters, OmegaMatrix, Subject,
+    };
     use std::collections::HashMap;
 
     /// The new third-order error scalars α'' = ∂²α/∂f² and β' = ∂²p/∂f² (and the
@@ -2591,5 +2593,38 @@ mod tests {
         );
         assert!(max_abs < 2e-3, "analytic vs FD max Δ {max_abs:.2e}");
         assert!(ta < tf, "analytic ({ta:.4}s) should beat FD ({tf:.4}s)");
+    }
+
+    /// Safety gate: the per-subject analytic covariance Hessian (both FOCEI and
+    /// FOCE entry points) must return `None` for out-of-derivation-scope models, so
+    /// `compute_covariance` drops the whole population back to the finite-difference
+    /// covariance. A `None` from any subject is what makes the fallback total. Here
+    /// LTBS (`log_transform`) and M3/BLOQ censoring are exercised; both decline.
+    #[test]
+    fn analytic_cov_hessian_gates_out_of_scope() {
+        let mut model = parse_model_string(WARFARIN).expect("parse");
+        let theta = vec![0.2, 10.0, 1.5];
+        let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta.clone();
+        let eta = precise_ebe(&model, &subject, &params);
+        let x = pack_params(&params);
+
+        // In scope (plain analytical Gaussian): both methods produce a Hessian.
+        assert!(subject_packed_cov_hessian(&model, &subject, &params, &x, &eta).is_some());
+        assert!(subject_packed_cov_hessian_foce(&model, &subject, &params, &x, &eta).is_some());
+
+        // LTBS (log-transform-both-sides) is out of scope → both decline.
+        model.log_transform = true;
+        assert!(subject_packed_cov_hessian(&model, &subject, &params, &x, &eta).is_none());
+        assert!(subject_packed_cov_hessian_foce(&model, &subject, &params, &x, &eta).is_none());
+        model.log_transform = false;
+
+        // M3/BLOQ censoring is out of scope (the inner term is −logΦ, not Gaussian).
+        model.bloq_method = BloqMethod::M3;
+        let mut subj_cens = subject.clone();
+        subj_cens.cens[3] = 1;
+        assert!(subject_packed_cov_hessian(&model, &subj_cens, &params, &x, &eta).is_none());
+        assert!(subject_packed_cov_hessian_foce(&model, &subj_cens, &params, &x, &eta).is_none());
     }
 }
