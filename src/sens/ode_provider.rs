@@ -219,6 +219,75 @@ pub(crate) fn pd_from_program<const M: usize>(
     }
 }
 
+/// Third-order individual-parameter sensitivities for the analytic covariance
+/// Hessian (#436): `∂³p/∂η³` and `∂³p/∂η²∂θ`. Computed only on the covariance
+/// path (the fit never needs third order), so it lives in its own struct rather
+/// than bloating [`ParamDerivs`].
+pub(crate) struct ParamDerivs3 {
+    /// `∂³p_i/∂η_k∂η_l∂η_m`.
+    pub(crate) d3p_deta3: Vec<Vec<Vec<Vec<f64>>>>,
+    /// `∂³p_i/∂η_k∂η_l∂θ_m`.
+    pub(crate) d3p_deta2_dtheta: Vec<Vec<Vec<Vec<f64>>>>,
+}
+
+/// [`param_derivatives_from_prog`]'s third-order companion: evaluate the
+/// individual-parameter program over `Dual3<M>` and read the `∂³p/∂η³` /
+/// `∂³p/∂η²∂θ` slices. Same axis/dispatch gating as the second-order path.
+pub(crate) fn param_derivatives3_from_prog(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<ParamDerivs3> {
+    if prog.n_theta_axis() != model.n_theta || prog.n_eta_axis() != model.n_eta {
+        return None;
+    }
+    macro_rules! disp {
+        ($($mm:literal),+) => {
+            match prog.n_axes() {
+                $($mm => Some(pd3_from_program::<$mm>(prog, model, &subject.covariates, theta, eta)),)+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+}
+
+/// Pack `∂³p/∂η³` and `∂³p/∂η²∂θ` from the `Dual3<M>` individual parameters
+/// (dual axis `m < n_theta` is `θ_m`, `n_theta + k` is `η_k`).
+pub(crate) fn pd3_from_program<const M: usize>(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    model: &CompiledModel,
+    cov: &std::collections::HashMap<String, f64>,
+    theta: &[f64],
+    eta: &[f64],
+) -> ParamDerivs3 {
+    let p = prog.eval_param_duals3::<M>(theta, eta, cov);
+    let nt = model.n_theta;
+    let ne = model.n_eta;
+    let ni = model.pk_indices.len();
+    let mut d3p_deta3 = vec![vec![vec![vec![0.0; ne]; ne]; ne]; ni];
+    let mut d3p_deta2_dtheta = vec![vec![vec![vec![0.0; nt]; ne]; ne]; ni];
+    for i in 0..ni {
+        let t = &p[i].d3;
+        for k in 0..ne {
+            for l in 0..ne {
+                for m in 0..ne {
+                    d3p_deta3[i][k][l][m] = t[nt + k][nt + l][nt + m];
+                }
+                for m in 0..nt {
+                    d3p_deta2_dtheta[i][k][l][m] = t[nt + k][nt + l][m];
+                }
+            }
+        }
+    }
+    ParamDerivs3 {
+        d3p_deta3,
+        d3p_deta2_dtheta,
+    }
+}
+
 /// The `Dual2<N>` initial state from a model's `init(...)` directives, seeding
 /// each compartment's value **and its PK-parameter derivatives** by central FD of
 /// the f64 `init_fn` over the differentiated PK slots. `init_fn` is a cheap
@@ -950,6 +1019,83 @@ mod tests {
                     max_relative = 1e-3,
                     epsilon = 1e-6
                 );
+            }
+        }
+    }
+
+    /// Third-order param derivatives (`Dual3` path) vs central FD of the exact
+    /// `Dual2` second derivatives (#436 M2/M3 foundation): `∂³p/∂η³` is the
+    /// η-derivative of `∂²p/∂η²`, and `∂³p/∂η²∂θ` its θ-derivative. Validates that
+    /// `eval_param_duals3` flows through the real bytecode VM correctly — log-normal
+    /// etas on CL/V1, a WT covariate, and θ on every parameter.
+    #[test]
+    fn pd3_matches_fd_of_pd2() {
+        let model = parse_model_string(TWOCPT_ODE_COV).expect("parse");
+        let subject = bolus_subject_wt(&[1.0], 90.0);
+        let prog = model
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .indiv_param_program
+            .as_ref()
+            .unwrap();
+        let theta = vec![4.0, 12.0, 2.0, 25.0];
+        let eta = vec![0.12, -0.08];
+        let nt = model.n_theta;
+        let ne = model.n_eta;
+        let ni = model.pk_indices.len();
+
+        let pd3 = param_derivatives3_from_prog(prog, &model, &subject, &theta, &eta)
+            .expect("3rd-order param derivs supported");
+        let d2p = |e: &[f64], th: &[f64]| {
+            param_derivatives_from_prog(prog, &model, &subject, th, e)
+                .unwrap()
+                .d2p_deta2
+        };
+        let h = 1e-4;
+
+        // ∂³p/∂η³ = ∂(∂²p/∂η²)/∂η_m
+        for m in 0..ne {
+            let mut ep = eta.clone();
+            ep[m] += h;
+            let mut em = eta.clone();
+            em[m] -= h;
+            let (dp, dm) = (d2p(&ep, &theta), d2p(&em, &theta));
+            for i in 0..ni {
+                for k in 0..ne {
+                    for l in 0..ne {
+                        let fd = (dp[i][k][l] - dm[i][k][l]) / (2.0 * h);
+                        approx::assert_relative_eq!(
+                            pd3.d3p_deta3[i][k][l][m],
+                            fd,
+                            max_relative = 1e-3,
+                            epsilon = 1e-6
+                        );
+                    }
+                }
+            }
+        }
+
+        // ∂³p/∂η²∂θ = ∂(∂²p/∂η²)/∂θ_m
+        for m in 0..nt {
+            let s = h * (1.0 + theta[m].abs());
+            let mut tp = theta.clone();
+            tp[m] += s;
+            let mut tm = theta.clone();
+            tm[m] -= s;
+            let (dp, dm) = (d2p(&eta, &tp), d2p(&eta, &tm));
+            for i in 0..ni {
+                for k in 0..ne {
+                    for l in 0..ne {
+                        let fd = (dp[i][k][l] - dm[i][k][l]) / (2.0 * s);
+                        approx::assert_relative_eq!(
+                            pd3.d3p_deta2_dtheta[i][k][l][m],
+                            fd,
+                            max_relative = 1e-3,
+                            epsilon = 1e-6
+                        );
+                    }
+                }
             }
         }
     }

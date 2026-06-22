@@ -9108,6 +9108,65 @@ impl IndivParamProgram {
             .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual2::constant(0.0)))
             .collect()
     }
+
+    /// Third-order companion to [`eval_param_duals`]: evaluate the individual
+    /// parameters over [`Dual3<M>`](crate::sens::dual3::Dual3), seeded identically
+    /// (dual axis `m < n_theta` is `θ_m`; `n_theta + k` is `η_k`), so the caller
+    /// can read `∂³p/∂η³` and `∂³p/∂η²∂θ` for the analytic covariance Hessian
+    /// (#436). The bytecode VM (`eval_statements_g`) is generic over `PkNum`, so
+    /// this reuses the exact same program — no second copy of the parameter
+    /// algebra. Covariance-step only (third order is never needed by the fit).
+    pub(crate) fn eval_param_duals3<const M: usize>(
+        &self,
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+    ) -> Vec<crate::sens::dual3::Dual3<M>> {
+        use crate::sens::dual3::Dual3;
+        let theta_d: Vec<Dual3<M>> = theta
+            .iter()
+            .enumerate()
+            .map(|(m, &v)| {
+                if m < M {
+                    Dual3::var(v, m)
+                } else {
+                    Dual3::constant(v)
+                }
+            })
+            .collect();
+        let eta_d: Vec<Dual3<M>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| {
+                let dim = self.n_theta + k;
+                if dim < M {
+                    Dual3::var(v, dim)
+                } else {
+                    Dual3::constant(v)
+                }
+            })
+            .collect();
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| covariates.get(n).copied().unwrap_or(0.0))
+            .collect();
+        let mut vars = vec![Dual3::<M>::constant(0.0); self.n_vars];
+        let mut stack: Vec<Dual3<M>> = Vec::new();
+        eval_statements_g::<Dual3<M>>(
+            &self.stmts,
+            &theta_d,
+            &eta_d,
+            &cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+        );
+        self.pk_var_slots
+            .iter()
+            .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual3::constant(0.0)))
+            .collect()
+    }
 }
 
 /// Compiled Form C ODE output expression (`[scaling] y = <expr>`) + var layout,
