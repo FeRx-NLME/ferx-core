@@ -1365,4 +1365,106 @@ mod tests {
         params.theta = theta;
         check_full_natural(&model, &subject, &params);
     }
+
+    /// Speed & accuracy report for the analytic covariance Hessian (#436): the
+    /// exact `M2 + M3` natural Hessian vs the finite-difference path it replaces,
+    /// on warfarin (1-cpt, dim = 7). Prints with `--nocapture`. The analytic side
+    /// is one forward pass per subject; the FD side reconverges the EBE and
+    /// evaluates the analytic natural gradient at `2·dim` perturbed points (the
+    /// cheapest FD variant in production — the OFV-Hessian path is costlier).
+    #[test]
+    fn cov_hessian_speed_and_accuracy_report() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let theta = vec![0.2, 10.0, 1.5];
+        let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta;
+        let eta = precise_ebe(&model, &subject, &params);
+        let n_theta = params.theta.len();
+        let entries = omega_entries(params.omega.diagonal, model.n_eta);
+        let n_omega = entries.len();
+        let n_sigma = params.sigma.values.len();
+        let dim = n_theta + n_omega + n_sigma;
+        let base_val = |p: usize| -> f64 {
+            if p < n_theta {
+                params.theta[p]
+            } else if p < n_theta + n_omega {
+                let (r, c) = entries[p - n_theta];
+                params.omega.matrix[(r, c)]
+            } else {
+                params.sigma.values[p - n_theta - n_omega]
+            }
+        };
+
+        // Accuracy: analytic vs reconverged precise-EBE FD of the full gradient.
+        let sens = subject_sensitivities_cov(&model, &subject, &params.theta, &eta).unwrap();
+        let prep = prepare(&model, &subject, &params, &sens).unwrap();
+        let analytic = subject_cov_hessian_natural(&model, &subject, &params, &sens, &prep, &eta);
+        let mut fd = DMatrix::zeros(dim, dim);
+        for col in 0..dim {
+            let h = 1e-6 * (1.0 + base_val(col).abs());
+            let gp = full_natural_grad(
+                &model,
+                &subject,
+                &perturb_natural(&params, n_theta, &entries, col, h),
+            );
+            let gm = full_natural_grad(
+                &model,
+                &subject,
+                &perturb_natural(&params, n_theta, &entries, col, -h),
+            );
+            for row in 0..dim {
+                fd[(row, col)] = (gp[row] - gm[row]) / (2.0 * h);
+            }
+        }
+        let mut max_abs = 0.0_f64;
+        for r in 0..dim {
+            for c in 0..dim {
+                max_abs = max_abs.max((analytic[(r, c)] - fd[(r, c)]).abs());
+            }
+        }
+
+        // Speed: analytic (Dual3 sens + prepare + assembly) vs FD-of-gradient
+        // (2·dim reconverged-EBE analytic natural gradients).
+        let n_iter = 30;
+        let t0 = Instant::now();
+        for _ in 0..n_iter {
+            let s = subject_sensitivities_cov(&model, &subject, &params.theta, &eta).unwrap();
+            let p = prepare(&model, &subject, &params, &s).unwrap();
+            black_box(subject_cov_hessian_natural(
+                &model, &subject, &params, &s, &p, &eta,
+            ));
+        }
+        let ta = t0.elapsed().as_secs_f64() / n_iter as f64;
+        let t1 = Instant::now();
+        for _ in 0..n_iter {
+            for col in 0..dim {
+                let h = 1e-6 * (1.0 + base_val(col).abs());
+                for &sgn in &[1.0_f64, -1.0] {
+                    let pp = perturb_natural(&params, n_theta, &entries, col, sgn * h);
+                    let e =
+                        find_ebe(&model, &subject, &pp, 30, 1e-8, Some(eta.as_slice()), None).eta;
+                    let es: Vec<f64> = e.iter().copied().collect();
+                    black_box(subject_theta_gradient(&model, &subject, &pp, &es));
+                    black_box(subject_omega_gradient(&model, &subject, &pp, &es));
+                    black_box(subject_sigma_gradient(&model, &subject, &pp, &es));
+                }
+            }
+        }
+        let tf = t1.elapsed().as_secs_f64() / n_iter as f64;
+
+        eprintln!(
+            "\n=== #436 covariance Hessian — speed & accuracy (warfarin 1-cpt, dim={dim}, debug) ===\n\
+             accuracy : max |analytic - reconverged-FD| = {:.2e}  (analytic noise-free; no fd_hessian_step)\n\
+             speed/subj: analytic {:.3} ms   FD-of-gradient {:.3} ms   -> {:.1}x faster\n",
+            max_abs,
+            ta * 1e3,
+            tf * 1e3,
+            tf / ta
+        );
+        assert!(max_abs < 2e-3, "analytic vs FD max Δ {max_abs:.2e}");
+        assert!(ta < tf, "analytic ({ta:.4}s) should beat FD ({tf:.4}s)");
+    }
 }
