@@ -55,6 +55,16 @@ pub struct ObsSens {
     pub df_dtheta: Vec<f64>,
     /// `∂²f/∂η_k∂θ_m`, row-major `n_eta × n_theta`.
     pub d2f_deta_dtheta: Vec<f64>,
+    /// Covariance-Hessian-only third-order extras (#436), **empty** on the
+    /// gradient path. Filled only by [`subject_sensitivities_cov`], which the
+    /// analytic covariance step calls once at the optimum.
+    ///
+    /// `∂²f/∂θ_m∂θ_n`, row-major `n_theta × n_theta`.
+    pub d2f_dtheta2: Vec<f64>,
+    /// `∂³f/∂η_k∂η_l∂η_m`, row-major `n_eta³`.
+    pub d3f_deta3: Vec<f64>,
+    /// `∂³f/∂η_k∂η_l∂θ_m`, row-major `n_eta·n_eta·n_theta`.
+    pub d3f_deta2_dtheta: Vec<f64>,
 }
 
 /// All observations' sensitivities for one subject, parallel to
@@ -841,6 +851,9 @@ fn run_obs_iov<const M: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            d2f_dtheta2: Vec::new(),
+            d3f_deta3: Vec::new(),
+            d3f_deta2_dtheta: Vec::new(),
         });
     }
     Some(SubjectSens { obs: obs_out })
@@ -1109,6 +1122,9 @@ fn run_obs_tvcov<const M: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            d2f_dtheta2: Vec::new(),
+            d3f_deta3: Vec::new(),
+            d3f_deta2_dtheta: Vec::new(),
         });
     }
     Some(SubjectSens { obs: obs_out })
@@ -1447,6 +1463,86 @@ pub fn subject_sensitivities(
     );
     PROFILE_SENS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     r
+}
+
+/// Third-order sensitivities for the analytic covariance Hessian (#436): the same
+/// per-observation `(f, ∂f/∂η, ∂²f/∂η², ∂f/∂θ, ∂²f/∂η∂θ)` as
+/// [`subject_sensitivities`], **plus** the covariance-only extras `∂²f/∂θ²`,
+/// `∂³f/∂η³`, `∂³f/∂η²∂θ` (the `ObsSens` third-order fields).
+///
+/// Scoped to the plain analytical Gaussian case for now: declines (→ `None`, FD
+/// fallback) on ODE, scaling, LTBS, time-varying covariates, oral-infusion,
+/// resets, IOV, or any subject the second-order provider would route to a
+/// special path. The error-model / scaling / LTBS third-order extensions land in
+/// later #436 sub-units. Requires the exact `[individual_parameters]` program
+/// (so `∂³p/∂η³` is available); declines if it is absent.
+pub fn subject_sensitivities_cov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<SubjectSens> {
+    use crate::sens::ode_provider::{param_derivatives3_from_prog, param_derivatives_from_prog};
+
+    // Scope gate: only the plain analytical Gaussian path (the extras for the
+    // scaling/LTBS/tvcov/IOV transforms are deferred #436 sub-units).
+    if model.ode_spec.is_some()
+        || !analytical_supported(model)
+        || !matches!(model.scaling, ScalingSpec::None)
+        || model.log_transform
+        || model.n_kappa > 0
+        || subject.has_tv_covariates()
+        || subject_has_oral_infusion(model, subject)
+        || subject.has_resets()
+        || !subject.all_doses_fixed()
+        || (model.has_bioavailability() && subject.has_rate_defined_infusion())
+    {
+        return None;
+    }
+
+    let n_eta = model.n_eta;
+    let n_theta = model.n_theta;
+    let oral = matches!(
+        model.pk_model,
+        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+    );
+    let two_cpt = matches!(model.pk_model, PkModel::TwoCptIv | PkModel::TwoCptOral);
+    let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
+
+    // Require the explicit individual-parameter program (the third-order `∂³p/∂η³`
+    // path), with its PK-slot count matching the model — same filter as the
+    // second-order provider's program branch.
+    let prog = model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .filter(|p| p.pk_slots().len() == model.pk_indices.len())?;
+    let pd = param_derivatives_from_prog(prog, model, subject, theta, eta)?;
+    let pd3 = param_derivatives3_from_prog(prog, model, subject, theta, eta)?;
+    let slots = prog.pk_slots();
+
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let mut seed_dim: [Option<usize>; N_PK] = [None; N_PK];
+    for (i, &slot) in slots.iter().enumerate() {
+        if slot < N_PK {
+            seed_dim[slot] = Some(i);
+        }
+    }
+
+    macro_rules! disp {
+        ($($n:literal),+) => {
+            match slots.len() {
+                $($n => Some(SubjectSens {
+                    obs: run_obs_cov::<$n>(
+                        &seed_dim, &pk, oral, two_cpt, three_cpt, subject, &pd, &pd3,
+                        n_eta, n_theta,
+                    ),
+                }),)+
+                _ => None,
+            }
+        };
+    }
+    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9)
 }
 
 /// Apply an `ExpressionScale` divisor `s(θ, η)` to a subject's already-computed
@@ -2013,6 +2109,215 @@ fn run_obs<const N: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            d2f_dtheta2: Vec::new(),
+            d3f_deta3: Vec::new(),
+            d3f_deta2_dtheta: Vec::new(),
+        });
+    }
+    out
+}
+
+/// Covariance-Hessian variant of [`run_obs`] (#436): evaluates the dose
+/// superposition over [`Dual3<N>`](crate::sens::dual3::Dual3) (so it carries
+/// `∂³f/∂pk³` as well), then chains pk→(η,θ) **one order higher** to fill the
+/// third-order `ObsSens` extras `d2f_dtheta2`, `d3f_deta3`, `d3f_deta2_dtheta`
+/// (plus the usual base fields, computed from the same pass so they stay
+/// consistent). Always uses the generic kernels — the explicit (`Jet`) kernels
+/// are second-order only. Called once per subject by the analytic covariance
+/// step, never on the fit hot path.
+#[allow(clippy::too_many_arguments)]
+fn run_obs_cov<const N: usize>(
+    seed_dim: &[Option<usize>; N_PK],
+    pk: &crate::types::PkParams,
+    oral: bool,
+    two_cpt: bool,
+    three_cpt: bool,
+    subject: &Subject,
+    pd: &crate::sens::ode_provider::ParamDerivs,
+    pd3: &crate::sens::ode_provider::ParamDerivs3,
+    n_eta: usize,
+    n_theta: usize,
+) -> Vec<ObsSens> {
+    use crate::sens::dual3::Dual3;
+    let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
+        pk.cl(),
+        pk.v(),
+        pk.q(),
+        pk.v2(),
+        pk.ka(),
+        pk.f_bio(),
+        pk.q3(),
+        pk.v3(),
+    );
+    let mut out = Vec::with_capacity(subject.obs_times.len());
+    for &t_obs in subject.obs_times.iter() {
+        let reset_floor = subject
+            .reset_times
+            .iter()
+            .copied()
+            .filter(|&r| r <= t_obs)
+            .fold(f64::NEG_INFINITY, f64::max);
+
+        let dv = |slot: usize, value: f64| -> Dual3<N> {
+            match seed_dim[slot] {
+                Some(k) => Dual3::<N>::var(value, k),
+                None => Dual3::<N>::constant(value),
+            }
+        };
+        let cl_d = dv(PK_IDX_CL, cl);
+        let v1_d = dv(PK_IDX_V, v1);
+        let q_d = dv(PK_IDX_Q, q);
+        let v2_d = dv(PK_IDX_V2, v2);
+        let ka_d = dv(PK_IDX_KA, ka);
+        let f_d = dv(PK_IDX_F, f_bio);
+        let q3_d = dv(PK_IDX_Q3, q3);
+        let v3_d = dv(PK_IDX_V3, v3);
+        let lag_val = pk.lagtime();
+        let lag_d = dv(PK_IDX_LAGTIME, lag_val);
+
+        let mut fd = Dual3::<N>::constant(0.0);
+        for dose in &subject.doses {
+            if dose.time + lag_val < reset_floor {
+                continue;
+            }
+            let Some(elapsed) = lagged_elapsed(dose, t_obs, lag_val, lag_d) else {
+                continue;
+            };
+            let c = if three_cpt {
+                three_cpt_conc_g(
+                    dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
+                )
+            } else if two_cpt {
+                two_cpt_conc_g(dose, elapsed, cl_d, v1_d, q_d, v2_d, ka_d, f_d, oral)
+            } else {
+                one_cpt_conc_g(dose, elapsed, cl_d, v1_d, ka_d, f_d, oral)
+            };
+            fd = fd + c;
+        }
+
+        // Match production's `conc.max(0.0)` clamp: below zero the objective uses
+        // `f = 0`, so all derivatives are zero too (cf. `run_obs`).
+        let (fval, g, h, t) = if fd.value < 0.0 {
+            (0.0, [0.0; N], [[0.0; N]; N], [[[0.0; N]; N]; N])
+        } else {
+            (fd.value, fd.grad, fd.hess, fd.d3)
+        };
+
+        let dpe = &pd.dp_deta;
+        let dpt = &pd.dp_dtheta;
+        let d2pe = &pd.d2p_deta2;
+        let d2pet = &pd.d2p_detadtheta;
+
+        // ── Base quantities (identical chain to `run_obs`, kept consistent). ──
+        let mut df_deta = vec![0.0; n_eta];
+        let mut df_dtheta = vec![0.0; n_theta];
+        for i in 0..N {
+            for k in 0..n_eta {
+                df_deta[k] += g[i] * dpe[i][k];
+            }
+            for m in 0..n_theta {
+                df_dtheta[m] += g[i] * dpt[i][m];
+            }
+        }
+        let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
+        for k in 0..n_eta {
+            for l in 0..n_eta {
+                let mut acc = 0.0;
+                for i in 0..N {
+                    for j in 0..N {
+                        acc += h[i][j] * dpe[i][k] * dpe[j][l];
+                    }
+                    acc += g[i] * d2pe[i][k][l];
+                }
+                d2f_deta2[k * n_eta + l] = acc;
+            }
+        }
+        let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
+        for k in 0..n_eta {
+            for m in 0..n_theta {
+                let mut acc = 0.0;
+                for i in 0..N {
+                    for j in 0..N {
+                        acc += h[i][j] * dpe[i][k] * dpt[j][m];
+                    }
+                    acc += g[i] * d2pet[i][k][m];
+                }
+                d2f_deta_dtheta[k * n_theta + m] = acc;
+            }
+        }
+
+        // ── Third-order extras (one-order-up Faà di Bruno; see #436). ──
+        // ∂²f/∂θ_m∂θ_n.
+        let mut d2f_dtheta2 = vec![0.0; n_theta * n_theta];
+        for m in 0..n_theta {
+            for nn in 0..n_theta {
+                let mut acc = 0.0;
+                for i in 0..N {
+                    for j in 0..N {
+                        acc += h[i][j] * dpt[i][m] * dpt[j][nn];
+                    }
+                    acc += g[i] * pd3.d2p_dtheta2[i][m][nn];
+                }
+                d2f_dtheta2[m * n_theta + nn] = acc;
+            }
+        }
+        // ∂³f/∂η_k∂η_l∂η_m:
+        //   Σ tᵢⱼₙ pᵢ,k pⱼ,l pₙ,m
+        // + Σ hᵢⱼ (pᵢ,km pⱼ,l + pᵢ,k pⱼ,lm + pᵢ,kl pⱼ,m)
+        // + Σ gᵢ pᵢ,klm
+        let mut d3f_deta3 = vec![0.0; n_eta * n_eta * n_eta];
+        for k in 0..n_eta {
+            for l in 0..n_eta {
+                for m in 0..n_eta {
+                    let mut acc = 0.0;
+                    for i in 0..N {
+                        for j in 0..N {
+                            for nidx in 0..N {
+                                acc += t[i][j][nidx] * dpe[i][k] * dpe[j][l] * dpe[nidx][m];
+                            }
+                            acc += h[i][j]
+                                * (d2pe[i][k][m] * dpe[j][l]
+                                    + dpe[i][k] * d2pe[j][l][m]
+                                    + d2pe[i][k][l] * dpe[j][m]);
+                        }
+                        acc += g[i] * pd3.d3p_deta3[i][k][l][m];
+                    }
+                    d3f_deta3[(k * n_eta + l) * n_eta + m] = acc;
+                }
+            }
+        }
+        // ∂³f/∂η_k∂η_l∂θ_m (the third differentiation is w.r.t. θ_m).
+        let mut d3f_deta2_dtheta = vec![0.0; n_eta * n_eta * n_theta];
+        for k in 0..n_eta {
+            for l in 0..n_eta {
+                for m in 0..n_theta {
+                    let mut acc = 0.0;
+                    for i in 0..N {
+                        for j in 0..N {
+                            for nidx in 0..N {
+                                acc += t[i][j][nidx] * dpe[i][k] * dpe[j][l] * dpt[nidx][m];
+                            }
+                            acc += h[i][j]
+                                * (d2pet[i][k][m] * dpe[j][l]
+                                    + dpe[i][k] * d2pet[j][l][m]
+                                    + d2pe[i][k][l] * dpt[j][m]);
+                        }
+                        acc += g[i] * pd3.d3p_deta2_dtheta[i][k][l][m];
+                    }
+                    d3f_deta2_dtheta[(k * n_eta + l) * n_theta + m] = acc;
+                }
+            }
+        }
+
+        out.push(ObsSens {
+            f: fval,
+            df_deta,
+            d2f_deta2,
+            df_dtheta,
+            d2f_deta_dtheta,
+            d2f_dtheta2,
+            d3f_deta3,
+            d3f_deta2_dtheta,
         });
     }
     out
@@ -2632,6 +2937,106 @@ mod tests {
         let eta_or = vec![0.12, -0.08, 0.2];
         let oral_s = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), &times);
         check_provider_vs_production(&oral_m, &oral_s, &theta_or, &eta_or);
+    }
+
+    /// Covariance third-order extras (`subject_sensitivities_cov`, #436) vs central
+    /// FD of the exact second-order `subject_sensitivities`:
+    ///   `∂³f/∂η³`     = ∂(∂²f/∂η²)/∂η,
+    ///   `∂³f/∂η²∂θ`   = ∂(∂²f/∂η²)/∂θ,
+    ///   `∂²f/∂θ²`     = ∂(∂f/∂θ)/∂θ.
+    /// This is the end-to-end (kernel `∂³f/∂pk³` + pk→η→θ chain) M2/M3 foundation.
+    fn check_cov_third_order(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
+        let ne = model.n_eta;
+        let nt = model.n_theta;
+        let cov = subject_sensitivities_cov(model, subject, theta, eta).expect("cov supported");
+        let base = |e: &[f64], th: &[f64]| subject_sensitivities(model, subject, th, e).unwrap();
+        let h = 1e-5;
+        for (oi, o) in cov.obs.iter().enumerate() {
+            // ∂³f/∂η³ vs ∂(∂²f/∂η²)/∂η_m
+            for m in 0..ne {
+                let mut ep = eta.to_vec();
+                ep[m] += h;
+                let mut em = eta.to_vec();
+                em[m] -= h;
+                let dp = base(&ep, theta).obs[oi].d2f_deta2.clone();
+                let dm = base(&em, theta).obs[oi].d2f_deta2.clone();
+                for k in 0..ne {
+                    for l in 0..ne {
+                        let fd = (dp[k * ne + l] - dm[k * ne + l]) / (2.0 * h);
+                        approx::assert_relative_eq!(
+                            o.d3f_deta3[(k * ne + l) * ne + m],
+                            fd,
+                            max_relative = 1e-3,
+                            epsilon = 1e-6
+                        );
+                    }
+                }
+            }
+            // ∂³f/∂η²∂θ vs ∂(∂²f/∂η²)/∂θ_m
+            for m in 0..nt {
+                let s = h * (1.0 + theta[m].abs());
+                let mut tp = theta.to_vec();
+                tp[m] += s;
+                let mut tm = theta.to_vec();
+                tm[m] -= s;
+                let dp = base(eta, &tp).obs[oi].d2f_deta2.clone();
+                let dm = base(eta, &tm).obs[oi].d2f_deta2.clone();
+                for k in 0..ne {
+                    for l in 0..ne {
+                        let fd = (dp[k * ne + l] - dm[k * ne + l]) / (2.0 * s);
+                        approx::assert_relative_eq!(
+                            o.d3f_deta2_dtheta[(k * ne + l) * nt + m],
+                            fd,
+                            max_relative = 1e-3,
+                            epsilon = 1e-6
+                        );
+                    }
+                }
+            }
+            // ∂²f/∂θ² vs ∂(∂f/∂θ)/∂θ_n
+            for nn in 0..nt {
+                let s = h * (1.0 + theta[nn].abs());
+                let mut tp = theta.to_vec();
+                tp[nn] += s;
+                let mut tm = theta.to_vec();
+                tm[nn] -= s;
+                let dp = base(eta, &tp).obs[oi].df_dtheta.clone();
+                let dm = base(eta, &tm).obs[oi].df_dtheta.clone();
+                for m in 0..nt {
+                    let fd = (dp[m] - dm[m]) / (2.0 * s);
+                    approx::assert_relative_eq!(
+                        o.d2f_dtheta2[m * nt + nn],
+                        fd,
+                        max_relative = 1e-3,
+                        epsilon = 1e-6
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cov_third_order_matches_fd_1cpt_2cpt() {
+        // 1-cpt oral (warfarin).
+        let m1 = parse_model_string(WARFARIN).expect("parse");
+        let s1 = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_cov_third_order(&m1, &s1, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+
+        // 2-cpt IV bolus.
+        let times = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
+        let m2 = parse_model_string(TWOCPT_IV).expect("parse");
+        let s2 = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), &times);
+        check_cov_third_order(&m2, &s2, &[10.0, 50.0, 15.0, 100.0], &[0.12, -0.08]);
+
+        // 2-cpt oral.
+        let m2o = parse_model_string(TWOCPT_ORAL).expect("parse");
+        let s2o = subject_with_dose(DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), &times);
+        check_cov_third_order(
+            &m2o,
+            &s2o,
+            &[10.0, 50.0, 15.0, 100.0, 1.0],
+            &[0.12, -0.08, 0.2],
+        );
     }
 
     /// Regression: bioavailability `F` on an IV bolus / infusion must be applied

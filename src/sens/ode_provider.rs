@@ -224,6 +224,9 @@ pub(crate) fn pd_from_program<const M: usize>(
 /// path (the fit never needs third order), so it lives in its own struct rather
 /// than bloating [`ParamDerivs`].
 pub(crate) struct ParamDerivs3 {
+    /// `∂²p_i/∂θ_m∂θ_n` — the θθ block the gradient never needs (so it is not on
+    /// [`ParamDerivs`]); read here from the same `Dual3` Hessian.
+    pub(crate) d2p_dtheta2: Vec<Vec<Vec<f64>>>,
     /// `∂³p_i/∂η_k∂η_l∂η_m`.
     pub(crate) d3p_deta3: Vec<Vec<Vec<Vec<f64>>>>,
     /// `∂³p_i/∂η_k∂η_l∂θ_m`.
@@ -267,10 +270,17 @@ pub(crate) fn pd3_from_program<const M: usize>(
     let nt = model.n_theta;
     let ne = model.n_eta;
     let ni = model.pk_indices.len();
+    let mut d2p_dtheta2 = vec![vec![vec![0.0; nt]; nt]; ni];
     let mut d3p_deta3 = vec![vec![vec![vec![0.0; ne]; ne]; ne]; ni];
     let mut d3p_deta2_dtheta = vec![vec![vec![vec![0.0; nt]; ne]; ne]; ni];
     for i in 0..ni {
+        let hh = &p[i].hess;
         let t = &p[i].d3;
+        for m in 0..nt {
+            for n in 0..nt {
+                d2p_dtheta2[i][m][n] = hh[m][n];
+            }
+        }
         for k in 0..ne {
             for l in 0..ne {
                 for m in 0..ne {
@@ -283,6 +293,7 @@ pub(crate) fn pd3_from_program<const M: usize>(
         }
     }
     ParamDerivs3 {
+        d2p_dtheta2,
         d3p_deta3,
         d3p_deta2_dtheta,
     }
@@ -484,6 +495,9 @@ fn run_subject<const N: usize>(
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
+            d2f_dtheta2: Vec::new(),
+            d3f_deta3: Vec::new(),
+            d3f_deta2_dtheta: Vec::new(),
         });
     }
 
