@@ -506,6 +506,220 @@ enum Dir {
 /// provider's third-order `f`-sensitivities (`∂³f/∂η³`, `∂³f/∂η²∂θ`, `∂³f/∂η∂θ²`)
 /// and the α''/β' error scalars; `S_{ηη}` adds `α''` against `∂³f/∂η³`.
 ///
+/// The inner-mode responses to the population parameters, shared by the FOCEI
+/// `½log|H̃|` (M3) and FOCE (Sheiner–Beal) covariance Hessians because they depend
+/// only on the **inner objective** `lᵢ` (the posterior mode is the same for both):
+///
+/// * `eta_d[ζ] = η̂_{·,ζ} = −H⁻¹ M_ζ`, `M_ζ = ∂²lᵢ/∂η∂ζ` (the M2 mode-coupling);
+/// * `eta_dd[ξ][ζ] = η̂_{ξζ} = −H⁻¹[S_{ξζ} + S_{ξη}η̂_ζ + S_{ζη}η̂_ξ +
+///   S_{ηη}:(η̂_ξ,η̂_ζ)]`, `S = ∂lᵢ/∂η`, the second mode response.
+///
+/// Both are indexed over the natural `[θ, Ω, σ]` directions. `S_{ηη}` contracts
+/// `∂³f/∂η³` against `α''`; the σ pieces use the FD-of-closed-form scalars.
+fn inner_eta_responses(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    prep: &Prep,
+    eta_hat: &[f64],
+) -> (Vec<DVector<f64>>, Vec<Vec<DVector<f64>>>) {
+    let ne = prep.n_eta;
+    let n_obs = prep.n_obs;
+    let nt = params.theta.len();
+    let entries = omega_entries(params.omega.diagonal, ne);
+    let n_omega = entries.len();
+    let n_sigma = params.sigma.values.len();
+    let nw = nt + n_omega;
+    let dim = nt + n_omega + n_sigma;
+    let omega_inv = &prep.omega_inv;
+    let h_inner_inv = &prep.h_inner_inv;
+    let z = omega_inv * DVector::from_column_slice(eta_hat);
+    let e_mats: Vec<DMatrix<f64>> = entries.iter().map(|&(r, c)| e_matrix(r, c, ne)).collect();
+
+    let a: Vec<DVector<f64>> = sens
+        .obs
+        .iter()
+        .map(|o| DVector::from_column_slice(&o.df_deta))
+        .collect();
+    let ed: Vec<ErrD2> = (0..n_obs)
+        .map(|j| {
+            let cmt = subject.obs_cmts[j];
+            let f = sens.obs[j].f;
+            let r = model.error_spec.variance_at(cmt, f, &params.sigma.values);
+            let d = model.error_spec.dvar_df(cmt, f, &params.sigma.values);
+            let d2 = model.error_spec.d2var_df2(cmt, &params.sigma.values);
+            err_d2(r, d, d2, subject.observations[j] - f)
+        })
+        .collect();
+    let m3s = m3_sigma_derivs(model, subject, params, sens);
+    let dir_of = |d: usize| -> Dir {
+        if d < nt {
+            Dir::Theta(d)
+        } else if d < nw {
+            Dir::Omega(d - nt)
+        } else {
+            Dir::Sigma(d - nw)
+        }
+    };
+    let t_deta2_dtheta = |j: usize, r: usize, l: usize, m: usize| {
+        sens.obs[j].d3f_deta2_dtheta[(r * ne + l) * nt + m]
+    };
+    let t_deta_dtheta2 = |j: usize, r: usize, m: usize, n: usize| {
+        sens.obs[j].d3f_deta_dtheta2[(r * nt + m) * nt + n]
+    };
+    let t_deta3 =
+        |j: usize, r: usize, l: usize, m: usize| sens.obs[j].d3f_deta3[(r * ne + l) * ne + m];
+
+    let (m_theta, _) = theta_m_and_u(prep, sens, nt);
+    let sd = sigma_derivs(model, subject, params, sens, prep);
+    let m_omega: Vec<DVector<f64>> = e_mats.iter().map(|e| -(omega_inv * (e * &z))).collect();
+    let mut mall: Vec<DVector<f64>> = Vec::with_capacity(dim);
+    mall.extend(m_theta);
+    mall.extend(m_omega);
+    mall.extend(sd.m_sigma.iter().cloned());
+    let eta_d: Vec<DVector<f64>> = mall.iter().map(|m| -(h_inner_inv * m)).collect();
+
+    let spp = |xi: usize, ze: usize| -> DVector<f64> {
+        let mut v = DVector::<f64>::zeros(ne);
+        for j in 0..n_obs {
+            let aj = &a[j];
+            let bj = &sens.obs[j].df_dtheta;
+            let app = ed[j].alpha_pp;
+            let apr = ed[j].alpha_p;
+            let alp = ed[j].alpha;
+            let bmat = |k: usize, m: usize| sens.obs[j].d2f_deta_dtheta[k * nt + m];
+            match (dir_of(xi), dir_of(ze)) {
+                (Dir::Theta(m), Dir::Theta(n)) => {
+                    let c2 = sens.obs[j].d2f_dtheta2[m * nt + n];
+                    for r in 0..ne {
+                        v[r] += 0.5
+                            * (app * bj[m] * bj[n] * aj[r]
+                                + apr * (c2 * aj[r] + bj[m] * bmat(r, n) + bj[n] * bmat(r, m))
+                                + alp * t_deta_dtheta2(j, r, m, n));
+                    }
+                }
+                (Dir::Theta(m), Dir::Sigma(k)) | (Dir::Sigma(k), Dir::Theta(m)) => {
+                    for r in 0..ne {
+                        v[r] += 0.5
+                            * (m3s.dalpha_p[k][j] * bj[m] * aj[r] + m3s.dalpha[k][j] * bmat(r, m));
+                    }
+                }
+                (Dir::Sigma(k), Dir::Sigma(l)) => {
+                    for r in 0..ne {
+                        v[r] += 0.5 * m3s.d2alpha[k][l][j] * aj[r];
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let (Dir::Omega(e), Dir::Omega(f)) = (dir_of(xi), dir_of(ze)) {
+            let ee = &e_mats[e];
+            let ef = &e_mats[f];
+            v += omega_inv * (ee * omega_inv * ef + ef * omega_inv * ee) * &z;
+        }
+        v
+    };
+    let spe = |xi: usize| -> DMatrix<f64> {
+        let mut mtx = DMatrix::<f64>::zeros(ne, ne);
+        match dir_of(xi) {
+            Dir::Theta(n) => {
+                for j in 0..n_obs {
+                    let aj = &a[j];
+                    let bn = sens.obs[j].df_dtheta[n];
+                    let app = ed[j].alpha_pp;
+                    let apr = ed[j].alpha_p;
+                    let alp = ed[j].alpha;
+                    let amat = |k: usize, l: usize| sens.obs[j].d2f_deta2[k * ne + l];
+                    let bmat = |k: usize, m: usize| sens.obs[j].d2f_deta_dtheta[k * nt + m];
+                    for r in 0..ne {
+                        for mm in 0..ne {
+                            mtx[(r, mm)] += 0.5
+                                * (app * aj[mm] * bn * aj[r]
+                                    + apr
+                                        * (bmat(mm, n) * aj[r]
+                                            + bn * amat(r, mm)
+                                            + aj[mm] * bmat(r, n))
+                                    + alp * t_deta2_dtheta(j, r, mm, n));
+                        }
+                    }
+                }
+            }
+            Dir::Sigma(k) => {
+                for j in 0..n_obs {
+                    let aj = &a[j];
+                    let amat = |kk: usize, l: usize| sens.obs[j].d2f_deta2[kk * ne + l];
+                    for r in 0..ne {
+                        for mm in 0..ne {
+                            mtx[(r, mm)] += 0.5
+                                * (m3s.dalpha_p[k][j] * aj[mm] * aj[r]
+                                    + m3s.dalpha[k][j] * amat(r, mm));
+                        }
+                    }
+                }
+            }
+            Dir::Omega(e) => {
+                mtx = -(omega_inv * &e_mats[e] * omega_inv);
+            }
+            Dir::Eta(_) => {}
+        }
+        mtx
+    };
+    let seta = |u: &DVector<f64>, w: &DVector<f64>| -> DVector<f64> {
+        let mut out = DVector::<f64>::zeros(ne);
+        for j in 0..n_obs {
+            let aj = &a[j];
+            let app = ed[j].alpha_pp;
+            let apr = ed[j].alpha_p;
+            let alp = ed[j].alpha;
+            let au = aj.dot(u);
+            let aw = aj.dot(w);
+            let mut uaw = 0.0;
+            let mut au_row = DVector::<f64>::zeros(ne);
+            let mut aw_row = DVector::<f64>::zeros(ne);
+            for r in 0..ne {
+                let mut su = 0.0;
+                let mut sw = 0.0;
+                for l in 0..ne {
+                    let arl = sens.obs[j].d2f_deta2[r * ne + l];
+                    su += arl * u[l];
+                    sw += arl * w[l];
+                }
+                au_row[r] = su;
+                aw_row[r] = sw;
+                uaw += su * w[r];
+            }
+            for r in 0..ne {
+                let mut tcontr = 0.0;
+                for l in 0..ne {
+                    for m in 0..ne {
+                        tcontr += t_deta3(j, r, l, m) * u[l] * w[m];
+                    }
+                }
+                out[r] += 0.5
+                    * (app * aj[r] * au * aw
+                        + apr * (aj[r] * uaw + aw * au_row[r] + au * aw_row[r])
+                        + alp * tcontr);
+            }
+        }
+        out
+    };
+
+    let mut eta_dd: Vec<Vec<DVector<f64>>> = vec![vec![DVector::<f64>::zeros(ne); dim]; dim];
+    for xi in 0..dim {
+        for ze in xi..dim {
+            let mut rhs = spp(xi, ze);
+            rhs += spe(ze) * &eta_d[xi];
+            rhs += spe(xi) * &eta_d[ze];
+            rhs += seta(&eta_d[xi], &eta_d[ze]);
+            let v = -(h_inner_inv * rhs);
+            eta_dd[ze][xi].clone_from(&v);
+            eta_dd[xi][ze] = v;
+        }
+    }
+    (eta_d, eta_dd)
+}
+
 /// Censored (M3-BLOQ) rows are out of scope here (their inner term is `−logΦ`,
 /// not the Gaussian α/p) and gated out by the covariance step.
 pub(crate) fn subject_cov_hessian_m3_natural(
@@ -528,8 +742,6 @@ pub(crate) fn subject_cov_hessian_m3_natural(
 
     let omega_inv = &prep.omega_inv;
     let htilde_inv = &prep.htilde_inv;
-    let h_inner_inv = &prep.h_inner_inv;
-    let z = omega_inv * DVector::from_column_slice(eta_hat);
     let e_mats: Vec<DMatrix<f64>> = entries.iter().map(|&(r, c)| e_matrix(r, c, ne)).collect();
 
     // Per-observation primitives.
@@ -703,150 +915,9 @@ pub(crate) fn subject_cov_hessian_m3_natural(
         }
     }
 
-    // Mode sensitivities η̂_{·,ζ} = −H⁻¹ M_ζ for the natural params (M_ζ = ∂²lᵢ/∂η∂ζ
-    // = the M2 mode-coupling; reuse exactly).
-    let (m_theta, _) = theta_m_and_u(prep, sens, nt);
-    let sd = sigma_derivs(model, subject, params, sens, prep);
-    let m_omega: Vec<DVector<f64>> = e_mats.iter().map(|e| -(omega_inv * (e * &z))).collect();
-    let mut mall: Vec<DVector<f64>> = Vec::with_capacity(dim);
-    mall.extend(m_theta);
-    mall.extend(m_omega);
-    mall.extend(sd.m_sigma.iter().cloned());
-    let eta_d: Vec<DVector<f64>> = mall.iter().map(|m| -(h_inner_inv * m)).collect();
-
-    // Inner-objective third-derivative pieces for the 2nd mode response (term D).
-    // Spp[ξ][ζ] = ∂³lᵢ/∂η∂ξ∂ζ ; Spe[ξ][a,m] = ∂³lᵢ/∂η_a∂ξ∂η_m.
-    let spp = |xi: usize, ze: usize| -> DVector<f64> {
-        let mut v = DVector::<f64>::zeros(ne);
-        for j in 0..n_obs {
-            let aj = &a[j];
-            let bj = &sens.obs[j].df_dtheta;
-            let app = ed[j].alpha_pp;
-            let apr = ed[j].alpha_p;
-            let alp = ed[j].alpha;
-            let bmat = |k: usize, m: usize| sens.obs[j].d2f_deta_dtheta[k * nt + m];
-            match (dir_of(xi), dir_of(ze)) {
-                (Dir::Theta(m), Dir::Theta(n)) => {
-                    let c2 = sens.obs[j].d2f_dtheta2[m * nt + n];
-                    for r in 0..ne {
-                        v[r] += 0.5
-                            * (app * bj[m] * bj[n] * aj[r]
-                                + apr * (c2 * aj[r] + bj[m] * bmat(r, n) + bj[n] * bmat(r, m))
-                                + alp * t_deta_dtheta2(j, r, m, n));
-                    }
-                }
-                (Dir::Theta(m), Dir::Sigma(k)) | (Dir::Sigma(k), Dir::Theta(m)) => {
-                    for r in 0..ne {
-                        v[r] += 0.5
-                            * (m3s.dalpha_p[k][j] * bj[m] * aj[r] + m3s.dalpha[k][j] * bmat(r, m));
-                    }
-                }
-                (Dir::Sigma(k), Dir::Sigma(l)) => {
-                    for r in 0..ne {
-                        v[r] += 0.5 * m3s.d2alpha[k][l][j] * aj[r];
-                    }
-                }
-                _ => {}
-            }
-        }
-        // Ω-coupled inner-grad second derivatives come from the prior ½ηᵀΩ⁻¹η.
-        if let (Dir::Omega(e), Dir::Omega(f)) = (dir_of(xi), dir_of(ze)) {
-            let ee = &e_mats[e];
-            let ef = &e_mats[f];
-            let inner = ee * omega_inv * ef + ef * omega_inv * ee;
-            v += omega_inv * inner * &z;
-        }
-        v
-    };
-    // Spe[ξ]: matrix with column m = ∂(∂²lᵢ/∂η∂ξ)/∂η_m.
-    let spe = |xi: usize| -> DMatrix<f64> {
-        let mut mtx = DMatrix::<f64>::zeros(ne, ne);
-        match dir_of(xi) {
-            Dir::Theta(n) => {
-                for j in 0..n_obs {
-                    let aj = &a[j];
-                    let bn = sens.obs[j].df_dtheta[n];
-                    let app = ed[j].alpha_pp;
-                    let apr = ed[j].alpha_p;
-                    let alp = ed[j].alpha;
-                    let amat = |k: usize, l: usize| sens.obs[j].d2f_deta2[k * ne + l];
-                    let bmat = |k: usize, m: usize| sens.obs[j].d2f_deta_dtheta[k * nt + m];
-                    for r in 0..ne {
-                        for mm in 0..ne {
-                            mtx[(r, mm)] += 0.5
-                                * (app * aj[mm] * bn * aj[r]
-                                    + apr
-                                        * (bmat(mm, n) * aj[r]
-                                            + bn * amat(r, mm)
-                                            + aj[mm] * bmat(r, n))
-                                    + alp * t_deta2_dtheta(j, r, mm, n));
-                        }
-                    }
-                }
-            }
-            Dir::Sigma(k) => {
-                for j in 0..n_obs {
-                    let aj = &a[j];
-                    let amat = |kk: usize, l: usize| sens.obs[j].d2f_deta2[kk * ne + l];
-                    for r in 0..ne {
-                        for mm in 0..ne {
-                            mtx[(r, mm)] += 0.5
-                                * (m3s.dalpha_p[k][j] * aj[mm] * aj[r]
-                                    + m3s.dalpha[k][j] * amat(r, mm));
-                        }
-                    }
-                }
-            }
-            Dir::Omega(e) => {
-                // ∂²(Ω⁻¹η)_a/∂Ω_e∂η_m = −(Ω⁻¹E_eΩ⁻¹)[a,m].
-                mtx = -(omega_inv * &e_mats[e] * omega_inv);
-            }
-            Dir::Eta(_) => {}
-        }
-        mtx
-    };
-    // S_{ηη} contracted with (u,v): component a = ½Σ_j[ α'' a_a(a·u)(a·v)
-    //   + α'( a_a uᵀA v + (a·v)(A[a,:]·u) + (a·u)(A[a,:]·v) ) + α Σ_lm T[a,l,m]u_l v_m ].
-    let seta = |u: &DVector<f64>, w: &DVector<f64>| -> DVector<f64> {
-        let mut out = DVector::<f64>::zeros(ne);
-        for j in 0..n_obs {
-            let aj = &a[j];
-            let app = ed[j].alpha_pp;
-            let apr = ed[j].alpha_p;
-            let alp = ed[j].alpha;
-            let au = aj.dot(u);
-            let aw = aj.dot(w);
-            // uᵀ A w  and  A[a,:]·u , A[a,:]·w.
-            let mut uaw = 0.0;
-            let mut au_row = DVector::<f64>::zeros(ne);
-            let mut aw_row = DVector::<f64>::zeros(ne);
-            for r in 0..ne {
-                let mut su = 0.0;
-                let mut sw = 0.0;
-                for l in 0..ne {
-                    let arl = sens.obs[j].d2f_deta2[r * ne + l];
-                    su += arl * u[l];
-                    sw += arl * w[l];
-                }
-                au_row[r] = su;
-                aw_row[r] = sw;
-                uaw += su * w[r];
-            }
-            for r in 0..ne {
-                let mut tcontr = 0.0;
-                for l in 0..ne {
-                    for m in 0..ne {
-                        tcontr += t_deta3(j, r, l, m) * u[l] * w[m];
-                    }
-                }
-                out[r] += 0.5
-                    * (app * aj[r] * au * aw
-                        + apr * (aj[r] * uaw + aw * au_row[r] + au * aw_row[r])
-                        + alp * tcontr);
-            }
-        }
-        out
-    };
+    // Inner-mode responses (shared with FOCE): η̂_{·,ζ} and η̂_{ξζ}, both functions
+    // of the inner objective `lᵢ` only.
+    let (eta_d, eta_dd) = inner_eta_responses(model, subject, params, sens, prep, eta_hat);
 
     let half_geta = DVector::from_iterator(ne, prep.g_eta.iter().map(|g| 0.5 * g));
     let mut m3 = DMatrix::zeros(dim, dim);
@@ -864,13 +935,8 @@ pub(crate) fn subject_cov_hessian_m3_natural(
                     val += cpp[(dim + l, dim + m)] * eta_d[xi][l] * eta_d[ze][m];
                 }
             }
-            // D: η̂_{ξζ} = −H⁻¹ RHS.
-            let mut rhs = spp(xi, ze);
-            rhs += spe(ze) * &eta_d[xi];
-            rhs += spe(xi) * &eta_d[ze];
-            rhs += seta(&eta_d[xi], &eta_d[ze]);
-            let eta_xz = -(h_inner_inv * rhs);
-            val += half_geta.dot(&eta_xz);
+            // D: ½ g_eta · η̂_{ξζ}.
+            val += half_geta.dot(&eta_dd[xi][ze]);
 
             m3[(xi, ze)] = val;
             m3[(ze, xi)] = val;
