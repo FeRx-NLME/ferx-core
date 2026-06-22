@@ -17,6 +17,7 @@
 
 pub mod dual1;
 pub mod dual2;
+pub mod dual3;
 pub mod jet;
 pub mod num;
 pub mod ode_provider;

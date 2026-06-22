@@ -5,6 +5,7 @@
 
 use super::dual1::Dual1;
 use super::dual2::Dual2;
+use super::dual3::Dual3;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 pub trait PkNum:
@@ -204,11 +205,67 @@ impl<const N: usize> PkNum for Dual2<N> {
     }
 }
 
+impl<const N: usize> PkNum for Dual3<N> {
+    #[inline]
+    fn from_f64(x: f64) -> Self {
+        Dual3::constant(x)
+    }
+    #[inline]
+    fn val(self) -> f64 {
+        self.value
+    }
+    #[inline]
+    fn exp(self) -> Self {
+        Dual3::exp(self)
+    }
+    #[inline]
+    fn ln(self) -> Self {
+        Dual3::ln(self)
+    }
+    #[inline]
+    fn sqrt(self) -> Self {
+        Dual3::sqrt(self)
+    }
+    #[inline]
+    fn pow(self, e: Self) -> Self {
+        Dual3::powd(self, e)
+    }
+    #[inline]
+    fn abs(self) -> Self {
+        Dual3::abs(self)
+    }
+    #[inline]
+    fn inv_logit(self) -> Self {
+        Dual3::inv_logit(self)
+    }
+    #[inline]
+    fn logit(self) -> Self {
+        Dual3::logit(self)
+    }
+    #[inline]
+    fn cos(self) -> Self {
+        Dual3::cos(self)
+    }
+    #[inline]
+    fn acos(self) -> Self {
+        Dual3::acos(self)
+    }
+    #[inline]
+    fn guard_floor(self, lo: f64) -> Self {
+        if self.value < lo {
+            Dual3::constant(lo)
+        } else {
+            self
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sens::dual1::Dual1;
     use crate::sens::dual2::Dual2;
+    use crate::sens::dual3::Dual3;
 
     /// Exercise every `PkNum` method on a value once, so the per-impl delegators
     /// (and the underlying `Dual1`/`Dual2` ops they call) are covered. `0.7` is a
@@ -236,5 +293,6 @@ mod tests {
         exercise::<f64>(0.7);
         exercise::<Dual1<1>>(Dual1::var(0.7, 0));
         exercise::<Dual2<1>>(Dual2::var(0.7, 0));
+        exercise::<Dual3<1>>(Dual3::var(0.7, 0));
     }
 }
