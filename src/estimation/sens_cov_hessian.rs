@@ -35,6 +35,7 @@
 #![allow(dead_code)]
 
 use super::sens_outer_gradient::{mixed_eta_theta, Prep};
+use crate::estimation::parameterization::{theta_packs_log, unpack_params};
 use crate::sens::provider::SubjectSens;
 use crate::types::{CompiledModel, ModelParameters, Subject};
 use nalgebra::{DMatrix, DVector};
@@ -894,12 +895,125 @@ pub(crate) fn subject_cov_hessian_natural(
         + subject_cov_hessian_m3_natural(model, subject, params, sens, prep, eta_hat)
 }
 
+/// Map a natural-space covariance Hessian `h_nat` and the matching natural
+/// gradient `g_nat` (both ordered `[θ, Ω-entries, σ]`) into the optimizer's
+/// **packed** space — log-θ (or identity-θ for sign-bearing params), Cholesky-Ω,
+/// log-σ — via the exact second-order reparameterization chain
+///
+/// ```text
+///   H^packed = Jᵀ H^nat J  +  Σ_e g_nat_e · ∇²_x ζ_e ,   J_{e,a} = ∂ζ_e/∂x_a.
+/// ```
+///
+/// `x` is the packed point and `template` supplies the θ log/identity flags and Ω
+/// structure. The θ/σ maps are scalar (`ζ = e^x` ⇒ `∂ζ/∂x = ∂²ζ/∂x² = ζ`, or
+/// identity). The Ω map factors as `x → L → Ω = LLᵀ`: `L` is `e^x` on the
+/// (log-packed) Cholesky diagonal and raw `x` off-diagonal, and `Ω_{rc} = Σ_k
+/// L_{rk}L_{ck}` is quadratic in `L` (so `∂²Ω/∂L∂L` is constant). The natural Ω
+/// entry and the packed Cholesky entry share the optimizer's lower-triangle order
+/// ([`omega_entries`] = `pack_params`), so the two index sets line up.
+///
+/// Non-IOV `[θ, Ω, σ]` block only (IOV is gated out of the analytic covariance
+/// path). `g_nat`/`h_nat` use the symmetric single-parameter Ω convention (an
+/// off-diagonal entry sets both `Ω_{rc}` and `Ω_{cr}`), matching
+/// [`subject_cov_hessian_natural`] and [`super::sens_outer_gradient::subject_omega_gradient`].
+pub(crate) fn pack_natural_hessian(
+    h_nat: &DMatrix<f64>,
+    g_nat: &[f64],
+    x: &[f64],
+    template: &ModelParameters,
+) -> DMatrix<f64> {
+    let n_eta = template.omega.dim();
+    let nt = template.theta.len();
+    let entries = omega_entries(template.omega.diagonal, n_eta);
+    let n_omega = entries.len();
+    let n_sigma = template.sigma.values.len();
+    let nw = nt + n_omega;
+    let dim = nt + n_omega + n_sigma;
+    let params = unpack_params(x, template);
+    let theta = &params.theta;
+    let l = &params.omega.chol;
+    let sigma = &params.sigma.values;
+
+    // ∂L_{is,js}/∂x_s: L_ii = e^{x} on the (log-packed) diagonal, raw x off it.
+    let lp = |s: usize| -> f64 {
+        let (r, c) = entries[s];
+        if r == c {
+            l[(r, c)]
+        } else {
+            1.0
+        }
+    };
+    // ∂Ω_{rc}/∂L_{ij} = δ_{ri} L_{cj} + δ_{ci} L_{rj}.
+    let domega_dl = |re: usize, ce: usize, is: usize, js: usize| -> f64 {
+        (if re == is { l[(ce, js)] } else { 0.0 }) + (if ce == is { l[(re, js)] } else { 0.0 })
+    };
+
+    // Jacobian J_{e,a} = ∂ζ_e/∂x_a.
+    let mut jmat = DMatrix::<f64>::zeros(dim, dim);
+    for m in 0..nt {
+        jmat[(m, m)] = if theta_packs_log(template.theta_lower[m]) {
+            theta[m]
+        } else {
+            1.0
+        };
+    }
+    for k in 0..n_sigma {
+        jmat[(nw + k, nw + k)] = sigma[k];
+    }
+    for e in 0..n_omega {
+        let (re, ce) = entries[e];
+        for s in 0..n_omega {
+            let (is, js) = entries[s];
+            jmat[(nt + e, nt + s)] = domega_dl(re, ce, is, js) * lp(s);
+        }
+    }
+
+    // Term 1: Jᵀ H^nat J.
+    let mut hpack = jmat.transpose() * h_nat * &jmat;
+
+    // Term 2: Σ_e g_nat_e · ∇²_x ζ_e (the reparameterization curvature).
+    for m in 0..nt {
+        if theta_packs_log(template.theta_lower[m]) {
+            hpack[(m, m)] += g_nat[m] * theta[m];
+        }
+    }
+    for k in 0..n_sigma {
+        hpack[(nw + k, nw + k)] += g_nat[nw + k] * sigma[k];
+    }
+    for e in 0..n_omega {
+        let (re, ce) = entries[e];
+        let ge = g_nat[nt + e];
+        if ge == 0.0 {
+            continue;
+        }
+        for s in 0..n_omega {
+            let (is, js) = entries[s];
+            // Diagonal-in-x curvature ∂²L_{ii}/∂x² = L_{ii} (off-diagonal L is linear).
+            if is == js {
+                hpack[(nt + s, nt + s)] += ge * domega_dl(re, ce, is, js) * l[(is, js)];
+            }
+            // Constant ∂²Ω_{rc}/∂L_s∂L_t, scaled by the L→x chain ∂L_s/∂x ∂L_t/∂x.
+            for t in 0..n_omega {
+                let (it, jt) = entries[t];
+                let d2 = ((re == is && ce == it && js == jt) as i32
+                    + (ce == is && re == it && js == jt) as i32) as f64;
+                if d2 != 0.0 {
+                    hpack[(nt + s, nt + t)] += ge * d2 * lp(s) * lp(t);
+                }
+            }
+        }
+    }
+    hpack
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::estimation::inner_optimizer::find_ebe;
+    use crate::estimation::parameterization::pack_params;
     use crate::estimation::sens_outer_gradient::{
-        prepare, subject_omega_gradient, subject_sigma_gradient, subject_theta_gradient,
+        prepare, subject_omega_gradient, subject_packed_gradient, subject_sigma_gradient,
+        subject_theta_gradient,
     };
     use crate::parser::model_parser::parse_model_string;
     use crate::sens::provider::{subject_sensitivities, subject_sensitivities_cov};
@@ -1186,6 +1300,71 @@ mod tests {
         }
     }
 
+    /// The full FOCEI **packed** gradient `∂F/∂x` at the reconverged precise mode
+    /// for `unpack_params(x)` — the existing NONMEM-validated analytic packed
+    /// gradient. FD of this over `x` is the gold-standard target for the packed
+    /// covariance Hessian.
+    fn full_packed_grad(
+        model: &CompiledModel,
+        subject: &Subject,
+        template: &ModelParameters,
+        x: &[f64],
+    ) -> Vec<f64> {
+        let params = unpack_params(x, template);
+        let eta = precise_ebe(model, subject, &params);
+        subject_packed_gradient(model, subject, template, x, &eta).unwrap()
+    }
+
+    /// Validate the packed-space chain: the analytic packed Hessian (natural
+    /// `M2 + M3` chained through `pack_natural_hessian`) against a reconverged
+    /// precise-EBE finite difference of the analytic packed gradient.
+    fn check_packed(model: &CompiledModel, subject: &Subject, params: &ModelParameters) {
+        let x = pack_params(params);
+        let dim = x.len();
+        let eta = precise_ebe(model, subject, params);
+        let sens = subject_sensitivities_cov(model, subject, &params.theta, &eta).unwrap();
+        let prep = prepare(model, subject, params, &sens).unwrap();
+        let h_nat = subject_cov_hessian_natural(model, subject, params, &sens, &prep, &eta);
+        let g_nat = full_natural_grad(model, subject, params);
+        let analytic = pack_natural_hessian(&h_nat, &g_nat, &x, params);
+
+        let mut fd = DMatrix::zeros(dim, dim);
+        for col in 0..dim {
+            let h = 1e-6 * (1.0 + x[col].abs());
+            let mut xp = x.clone();
+            xp[col] += h;
+            let mut xm = x.clone();
+            xm[col] -= h;
+            let gp = full_packed_grad(model, subject, params, &xp);
+            let gm = full_packed_grad(model, subject, params, &xm);
+            for row in 0..dim {
+                fd[(row, col)] = (gp[row] - gm[row]) / (2.0 * h);
+            }
+        }
+
+        for row in 0..dim {
+            for col in 0..dim {
+                let a = analytic[(row, col)];
+                let f = fd[(row, col)];
+                let tol = 2e-3 * (1.0 + a.abs());
+                assert!(
+                    (a - f).abs() < tol,
+                    "packed H[{},{}]: analytic {:.8e} vs FD {:.8e} (Δ {:.2e})",
+                    row,
+                    col,
+                    a,
+                    f,
+                    (a - f).abs()
+                );
+            }
+        }
+        for row in 0..dim {
+            for col in 0..dim {
+                assert!((analytic[(row, col)] - analytic[(col, row)]).abs() < 1e-9);
+            }
+        }
+    }
+
     /// Perturb the natural parameter at flat index `p` (ordered `[θ, Ω, σ]`) by
     /// `step`, rebuilding Ω (and its cached inverse) for an Ω entry.
     fn perturb_natural(
@@ -1364,6 +1543,49 @@ mod tests {
         let mut params = model.default_params.clone();
         params.theta = theta;
         check_full_natural(&model, &subject, &params);
+    }
+
+    /// Warfarin (1-cpt, diagonal Ω): the analytic **packed** covariance Hessian
+    /// (natural `M2 + M3` chained through the log-θ / Cholesky-Ω / log-σ
+    /// reparameterization) matches the reconverged-FD of the analytic packed
+    /// gradient — the exact replacement for `compute_covariance`'s FD stencil.
+    #[test]
+    fn cov_hessian_packed_matches_reconverged_fd_diagonal() {
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let theta = vec![0.2, 10.0, 1.5];
+        let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta;
+        check_packed(&model, &subject, &params);
+    }
+
+    /// Block-Ω (correlated CL/V): the packed chain through the Cholesky factor's
+    /// off-diagonal entries, the part the diagonal case does not exercise.
+    #[test]
+    fn cov_hessian_packed_matches_reconverged_fd_block_omega() {
+        const BLOCK: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(BLOCK).expect("parse");
+        let theta = vec![0.2, 10.0, 1.5];
+        let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta;
+        check_packed(&model, &subject, &params);
     }
 
     /// Speed & accuracy report for the analytic covariance Hessian (#436): the
