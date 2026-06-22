@@ -3347,6 +3347,15 @@ pub struct FitOptions {
     /// (e.g. on very high-dimensional models where the O(n²) point count
     /// dominates).
     pub covariance_ofv_hessian: bool,
+    /// When `true` (default) and the model is in analytic-covariance scope
+    /// (FOCEI, analytical PK, Gaussian additive/proportional/combined error,
+    /// non-IOV, non-censored, no residual-error random effects), the covariance
+    /// R matrix is the **exact analytic Almquist `M2 + M3` Hessian** (#436) —
+    /// finite-difference-free, so no `fd_hessian_step` to tune and no
+    /// catastrophic cancellation on flat directions. Out-of-scope models fall
+    /// back to the finite-difference covariance regardless. Set `false` to force
+    /// the finite-difference path (it supersedes `covariance_ofv_hessian`).
+    pub analytic_cov_hessian: bool,
     pub interaction: bool,
     pub verbose: bool,
     pub optimizer: Optimizer,
@@ -3740,6 +3749,7 @@ impl Default for FitOptions {
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
             covariance_ofv_hessian: true,
+            analytic_cov_hessian: true,
             interaction: true,
             verbose: true,
             // BOBYQA — derivative-free quadratic trust-region. Chosen as the
@@ -4100,6 +4110,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "covariance_method",
         "covariance_fallback",
         "covariance_ofv_hessian",
+        "analytic_cov_hessian",
         "fd_hessian_step",
         "verbose",
         "sir",

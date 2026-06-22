@@ -3592,6 +3592,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "covariance_ofv_hessian" => {
             opts.covariance_ofv_hessian = parse_bool("covariance_ofv_hessian")?
         }
+        "analytic_cov_hessian" => opts.analytic_cov_hessian = parse_bool("analytic_cov_hessian")?,
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
@@ -13184,6 +13185,10 @@ mod tests {
         // covariance_ofv_hessian bool.
         let off = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap();
         assert!(!off.covariance_ofv_hessian);
+        // analytic_cov_hessian bool (default true; #436).
+        assert!(def.analytic_cov_hessian);
+        let no_an = parse_fit_options(&["analytic_cov_hessian = false".to_string()]).unwrap();
+        assert!(!no_an.analytic_cov_hessian);
     }
 
     // ── mu-referencing pattern detection ─────────────────────────────────
