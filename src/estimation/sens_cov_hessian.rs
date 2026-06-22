@@ -29,14 +29,11 @@
 //! This module assembles M2 in the natural parameter space (θ, Ω entries, σ); the
 //! packed-space chain and M3 are layered on top in later units.
 #![allow(clippy::needless_range_loop)]
-// WIP (#436): the per-block assemblers are built bottom-up and validated against
-// finite differences before being wired into `compute_covariance` in the final
-// unit of this PR. Remove this allow once the covariance step consumes them.
-#![allow(dead_code)]
 
-use super::sens_outer_gradient::{mixed_eta_theta, Prep};
+use super::sens_outer_gradient::{mixed_eta_theta, subject_natural_gradient, Prep};
 use crate::estimation::parameterization::{theta_packs_log, unpack_params};
-use crate::sens::provider::SubjectSens;
+use crate::estimation::sens_outer_gradient::prepare;
+use crate::sens::provider::{subject_sensitivities_cov, SubjectSens};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 use nalgebra::{DMatrix, DVector};
 
@@ -893,6 +890,39 @@ pub(crate) fn subject_cov_hessian_natural(
 ) -> DMatrix<f64> {
     subject_cov_hessian_m2_natural(model, subject, params, sens, prep, eta_hat)
         + subject_cov_hessian_m3_natural(model, subject, params, sens, prep, eta_hat)
+}
+
+/// The exact per-subject FOCEI covariance Hessian `∂²Fᵢ/∂x²` in the optimizer's
+/// **packed** space (log-θ / Cholesky-Ω / log-σ) — the analytic, finite-difference-free
+/// replacement for `compute_covariance`'s per-subject contribution. Returns
+/// `None` when the subject/model is outside the analytic-covariance scope (the
+/// caller then falls back to the existing FD covariance for the whole population):
+///
+/// * `subject_sensitivities_cov` declines (ODE, scaling, LTBS, IOV, time-varying
+///   covariates, oral-infusion, resets, non-fixed doses, non-analytical PK);
+/// * the subject carries M3/BLOQ censored rows (their inner term is `−logΦ`, not
+///   the Gaussian α/p the M3 assembly assumes).
+///
+/// `eta_hat` must be the EBE for `unpack_params(x)`. The result is the per-subject
+/// negative-log-likelihood Hessian; the covariance OFV is `2·Σᵢ Fᵢ`, so the caller
+/// scales the summed contributions by 2.
+pub(crate) fn subject_packed_cov_hessian(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+) -> Option<DMatrix<f64>> {
+    let params = unpack_params(x, template);
+    let sens = subject_sensitivities_cov(model, subject, &params.theta, eta_hat)?;
+    let prep = prepare(model, subject, &params, &sens)?;
+    // Censored (M3/BLOQ) rows are out of the M3 assembly's scope.
+    if !prep.censored.is_empty() {
+        return None;
+    }
+    let h_nat = subject_cov_hessian_natural(model, subject, &params, &sens, &prep, eta_hat);
+    let g_nat = subject_natural_gradient(&prep, &sens, model, subject, &params, eta_hat);
+    Some(pack_natural_hessian(&h_nat, &g_nat, x, template))
 }
 
 /// Map a natural-space covariance Hessian `h_nat` and the matching natural

@@ -2886,340 +2886,383 @@ pub(crate) fn compute_covariance(
 
     let f0 = base_ofv;
 
-    // Adaptively select the FD step: halve up to 8× until all free-parameter
-    // diagonal stencils are finite. Most models use the initial step; halving
-    // only kicks in when the OFV overflows at the default perturbation size.
-    let (eps, n_halvings) = select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv);
-    if options.verbose && n_halvings > 0 {
-        eprintln!(
-            "  [covariance] Adaptive FD step: reduced {:.3e} → {:.3e} ({} halving{})",
-            initial_eps,
-            eps,
-            n_halvings,
-            if n_halvings == 1 { "" } else { "s" }
-        );
-    }
-
     let mut hess = DMatrix::zeros(n, n);
     let is_iov = kappas.iter().any(|k| !k.is_empty());
-    // Route non-interaction FOCE with f-dependent error (proportional/combined)
-    // through the OFV second-difference stencil (the IOV path), which builds
-    // the true Hessian of the actual marginal. The analytical SB gradient is an
-    // envelope approximation with no EBE-response Δ (that correction exists only
-    // for FOCEI, #274), so its central-FD Hessian comes out indefinite on the
-    // f-dependent FOCE surface. Additive FOCE keeps the cheap analytical path
-    // (the Δ vanishes for f-independent variance, and it already matches NONMEM).
-    // Route through the OFV second-difference Hessian when: (a) f-dependent FOCE
-    // (the analytical SB gradient comes out indefinite there), or (b) the user
-    // opts in via `covariance_ofv_hessian`. The latter trades speed for an R
-    // that recomputes `a = ∂f/∂η` at every perturbed point, capturing the
-    // `∂a/∂θ` curvature the analytical stencil drops — which removes the
-    // weakly-identified-θ SE bias (e.g. warfarin TVKA ~9% high vs a Richardson
-    // FD-of-OFV ground truth).
-    // IIV on residual error (#409): the analytical point-grad stencil has no
-    // rule for the per-subject `exp(2·η_ruv)` variance scaling or its θ/σ/η
-    // curvature, so take the OFV second-difference Hessian (it FD-differences
-    // the real scaled marginal end-to-end).
-    let force_ofv_hessian = (!options.interaction && model.error_spec.has_f_dependent_variance())
-        || options.covariance_ofv_hessian
-        || model.residual_error_eta.is_some();
-    let use_analytical = !is_iov && !force_ofv_hessian;
 
     // Track FD failures at source so diagnostics name the right cause (a NaN/Inf
     // stencil result is not a genuine zero curvature). HashSet for O(1) ops.
     let mut fd_diag_nan: HashSet<usize> = HashSet::new();
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
-    if use_analytical {
-        // Issue #209 + #256 + #274: central FD of the analytical population
-        // gradient, as one flat `par_iter` over the 2·n_free perturbed points.
-        //   H[:,k] ≈ (g(x̂ + hₖ·eₖ) − g(x̂ − hₖ·eₖ)) / 2hₖ
-        // `point_grad` reconverges the EBEs serially at each perturbed point, so
-        // the curvature includes the EBE response (and the determinant curvature).
-        //
-        // #256: the work-list is point-level, not the per-subject `par_iter` the
-        // gradient used to fan out into. Each point runs its subjects serially, so
-        // there is no nested parallelism, and the parallel width (2·n_free)
-        // saturates the pool even when n_subj < n_cores — removing the fork/join
-        // overhead of firing 4·n_free rayon barriers in series (~9–11× faster).
-        //
-        // #274: for FOCEI the per-point gradient adds the dropped `log|H̃|`
-        // EBE-response term `2·Σᵢ tᵢ` (`subject_eta_response_correction`). The
-        // fixed-η̂ analytic gradient invokes the envelope theorem, which zeros only
-        // the inner objective — not `log|H̃|` — so without this term the non-IOV
-        // FD Hessian omits the determinant EBE-response curvature `Δ` that the IOV
-        // scalar-OFV stencil captures. Adding it makes the two stencils consistent
-        // and recovers ∇²(−2logL). Mu-ref θ block only; vanishes for additive error.
-        // Count subject-points where the FOCEI Δ correction was skipped because
-        // the Laplace gradient fell back to FD (non-PD H̃) — those contributions
-        // keep the pre-#274 fixed-η̂ curvature, so a non-zero count is surfaced as
-        // a diagnostic (#298).
-        let delta_skips = std::sync::atomic::AtomicUsize::new(0);
-        let point_grad = |xv: &[f64]| -> Vec<f64> {
-            let (_, ehs, hms, _) = reconverge_point(xv);
-            let np = xv.len();
-            // Gradient of `2·pop_nll` (no omega-prior add-back; both the SB and
-            // Laplace marginals already carry Ω — issue #243/#249).
-            //
-            // Build the per-subject gradients serially (subjects are serial inside
-            // each point — the #256 flatten parallelises over points, not subjects)
-            // and reduce through `assemble_population_gradient`, the same reduction
-            // `ad_population_gradient` uses — so the summation order matches and the
-            // FOCE covariance stays bit-identical to the pre-#256 serial stencil.
-            // The Δ correction below is kept as a separate loop (NOT fused): summing
-            // `2·tᵢ` after `2·Σ gᵢ` preserves that reduction order exactly.
-            //
-            // `subject_nll_pop_grad_with_cache` also hands back the per-subject
-            // Laplace intermediates (when this subject took the FOCEI analytical
-            // path); the Δ loop below reuses them so it does not recompute the
-            // predictions or re-factorise H̃.
-            let mut grads: Vec<Vec<f64>> = Vec::with_capacity(n_subj_cov);
-            let mut caches: Vec<Option<crate::estimation::gauss_newton::LaplaceGradCache>> =
-                Vec::with_capacity(n_subj_cov);
-            for i in 0..n_subj_cov {
-                let (_, gi, ci) = crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
-                    xv,
-                    template,
-                    model,
-                    population,
-                    i,
-                    &ehs[i],
-                    &hms[i],
-                    &[],
-                    &bounds,
-                    options,
-                );
-                grads.push(gi);
-                caches.push(ci);
-            }
-            let mut g = assemble_population_gradient(&grads, np);
-            // #274 Δ correction (FOCEI only); summed in subject order to match.
-            if options.interaction {
-                for i in 0..n_subj_cov {
-                    match crate::estimation::gauss_newton::subject_eta_response_correction(
-                        caches[i].as_ref(),
-                        xv,
-                        template,
-                        model,
-                        population,
-                        i,
-                        &ehs[i],
-                        &hms[i],
-                        &bounds,
-                        options,
-                    ) {
-                        Some(ti) => {
-                            for (gk, tk) in g.iter_mut().zip(ti.iter()) {
-                                *gk += 2.0 * *tk;
-                            }
-                        }
-                        None => {
-                            delta_skips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+    // Exact analytic FOCEI covariance Hessian (#436): when every subject is in
+    // analytic scope, the packed R is the chained natural M2 + M3 — exact, with
+    // no finite-difference step (so no `fd_hessian_step` to tune and no
+    // catastrophic cancellation on flat directions). Gated to FOCEI (the Laplace
+    // objective the derivation assumes), non-IOV, non-censored analytical models
+    // without residual-error random effects; any out-of-scope subject (ODE,
+    // scaling, LTBS, tv-covariates, oral-infusion, resets, BLOQ) drops the whole
+    // population back to the finite-difference covariance below.
+    let analytic_hessian = if options.interaction && !is_iov && model.residual_error_eta.is_none() {
+        let (_p0, ehs0, _h0, _k0) = reconverge_point(x_hat);
+        let mut acc: Option<DMatrix<f64>> = Some(DMatrix::zeros(n, n));
+        for i in 0..n_subj_cov {
+            let hi = crate::estimation::sens_cov_hessian::subject_packed_cov_hessian(
+                model,
+                &population.subjects[i],
+                template,
+                x_hat,
+                ehs0[i].as_slice(),
+            );
+            match (acc.as_mut(), hi) {
+                // Covariance OFV = 2·NLL ⇒ R = 2·Σᵢ ∂²Fᵢ/∂x².
+                (Some(a), Some(h)) => *a += h.scale(2.0),
+                _ => {
+                    acc = None;
+                    break;
                 }
             }
-            g
-        };
+        }
+        acc
+    } else {
+        None
+    };
 
-        // One (k, hₖ) spec per free parameter; the two perturbed points (±hₖ) are
-        // kept adjacent so `chunks_exact(2)` re-pairs (g₊, g₋) structurally — the
-        // pairing is no longer a positional `2·pair` index that a reordering of
-        // the point build could silently desync (#298).
-        let specs: Vec<(usize, f64)> = free_idx
-            .iter()
-            .map(|&k| (k, eps * (1.0 + x_hat[k].abs())))
-            .collect();
-        let pts: Vec<Vec<f64>> = specs
-            .iter()
-            .flat_map(|&(k, hk)| {
-                let mut x_p = x_hat.to_vec();
-                x_p[k] += hk;
-                let mut x_m = x_hat.to_vec();
-                x_m[k] -= hk;
-                [x_p, x_m]
-            })
-            .collect();
-        let report = cov_progress("Hessian", pts.len(), options.verbose);
-        let point_grads: Vec<Vec<f64>> = pts
-            .par_iter()
-            .map(|xv| {
-                // Cooperative cancel: skip this point's serial subject sweep and
-                // return a NaN gradient so the queue drains; bailed on below.
-                if crate::cancel::is_cancelled(&options.cancel) {
-                    report();
-                    return vec![f64::NAN; n];
-                }
-                let g = point_grad(xv);
-                report();
-                g
-            })
-            .collect();
-        if crate::cancel::is_cancelled(&options.cancel) {
-            return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
+    if let Some(ah) = analytic_hessian {
+        if options.verbose {
+            eprintln!("  [covariance] Exact analytic FOCEI Hessian (#436); no FD step.");
         }
-        for (&(k, hk), pair) in specs.iter().zip(point_grads.chunks_exact(2)) {
-            let (g_p, g_m) = (&pair[0], &pair[1]);
-            for &j in &free_idx {
-                let h_jk = (g_p[j] - g_m[j]) / (2.0 * hk);
-                if h_jk.is_finite() {
-                    hess[(j, k)] = h_jk;
-                } else if j == k {
-                    fd_diag_nan.insert(k);
-                } else {
-                    fd_offdiag_nan.insert(k);
-                    fd_offdiag_nan.insert(j);
-                }
-            }
-        }
-        let skipped = delta_skips.load(std::sync::atomic::Ordering::Relaxed);
-        if options.interaction && skipped > 0 && options.verbose {
+        hess = ah;
+    } else {
+        // Adaptively select the FD step: halve up to 8× until all free-parameter
+        // diagonal stencils are finite. Most models use the initial step; halving
+        // only kicks in when the OFV overflows at the default perturbation size.
+        let (eps, n_halvings) = select_fd_step(x_hat, &free_idx, initial_eps, f0, &ofv);
+        if options.verbose && n_halvings > 0 {
             eprintln!(
-                "  [covariance] log|H̃| EBE-response correction skipped at {} subject-point(s) \
-                 where the Laplace gradient fell back to FD (non-PD H̃); those contributions \
-                 retain the pre-#274 fixed-η̂ curvature.",
-                skipped
+                "  [covariance] Adaptive FD step: reduced {:.3e} → {:.3e} ({} halving{})",
+                initial_eps,
+                eps,
+                n_halvings,
+                if n_halvings == 1 { "" } else { "s" }
             );
         }
-        // Symmetrise: each column is differenced independently, so H[j,k] and
-        // H[k,j] can differ slightly; average before inversion.
-        for &i in &free_idx {
-            for &j in &free_idx {
-                if j > i {
-                    let avg = (hess[(i, j)] + hess[(j, i)]) * 0.5;
-                    hess[(i, j)] = avg;
-                    hess[(j, i)] = avg;
-                }
-            }
-        }
-    } else {
-        // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
-        // off-diagonal), reconverging the EBEs at each perturbed point. Taken
-        // when the analytical fixed-EBE gradient does not cover the true marginal
-        // curvature: (a) IOV — no analytical gradient covers the kappa block; or
-        // (b) `force_ofv_hessian` — non-IOV FOCE with f-dependent error, whose SB
-        // gradient lacks the EBE-response Δ and yields an indefinite analytical
-        // Hessian. `pop_nll` dispatches on the kappa count, so this stencil is
-        // correct for both the IOV (joint η, κ) and the non-IOV (η-only) cases.
-        //
-        // #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV
-        // points (subjects iterated serially inside `serial_ofv`) instead of the
-        // old serial loop that fired a per-subject `par_iter` at every point —
-        // removing the fork/join overhead of firing a rayon barrier per point.
-        // Bit-identical to the serial stencil: each point's OFV is the same
-        // `2·pop_nll` at the same per-subject `find_ebe`, and the difference
-        // formulas/assembly are unchanged; only the scheduling differs.
-        let f0 = base_ofv;
-        let serial_ofv = |xv: &[f64]| -> f64 {
-            let (params, ehs, hms, kaps) = reconverge_point(xv);
-            2.0 * pop_nll(
-                model,
-                population,
-                &params,
-                &ehs,
-                &hms,
-                &kaps,
-                options.interaction,
-            )
-        };
 
-        let nf = free_idx.len();
-        let hsteps: Vec<f64> = free_idx
-            .iter()
-            .map(|&i| eps * (1.0 + x_hat[i].abs()))
-            .collect();
-        // Flat list of perturbation SPECS (not materialised x-vectors): 2 per
-        // diagonal (±hᵢ), then 4 per (a<b) off-diagonal pair. Each par_iter task
-        // clones `x_hat` once and applies its spec, so only ~n_threads vectors are
-        // live at a time instead of all ~2·nf² perturbed points held resident for
-        // the whole reduction (the pre-#298 O(nf²·np) footprint) (#298).
-        #[derive(Clone, Copy)]
-        enum Pert {
-            Single {
-                i: usize,
-                di: f64,
-            },
-            Pair {
-                i: usize,
-                di: f64,
-                j: usize,
-                dj: f64,
-            },
-        }
-        let mut specs: Vec<Pert> = Vec::with_capacity(2 * nf + 2 * nf * nf);
-        for a in 0..nf {
-            let (i, hi) = (free_idx[a], hsteps[a]);
-            specs.push(Pert::Single { i, di: hi });
-            specs.push(Pert::Single { i, di: -hi });
-        }
-        let n_diag = specs.len();
-        let mut pairs: Vec<(usize, usize)> = Vec::new();
-        for a in 0..nf {
-            for b in (a + 1)..nf {
-                let (i, j) = (free_idx[a], free_idx[b]);
-                let (hi, hj) = (hsteps[a], hsteps[b]);
-                for (si, sj) in [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)] {
-                    specs.push(Pert::Pair {
-                        i,
-                        di: si * hi,
-                        j,
-                        dj: sj * hj,
-                    });
+        // Route non-interaction FOCE with f-dependent error (proportional/combined)
+        // through the OFV second-difference stencil (the IOV path), which builds
+        // the true Hessian of the actual marginal. The analytical SB gradient is an
+        // envelope approximation with no EBE-response Δ (that correction exists only
+        // for FOCEI, #274), so its central-FD Hessian comes out indefinite on the
+        // f-dependent FOCE surface. Additive FOCE keeps the cheap analytical path
+        // (the Δ vanishes for f-independent variance, and it already matches NONMEM).
+        // Route through the OFV second-difference Hessian when: (a) f-dependent FOCE
+        // (the analytical SB gradient comes out indefinite there), or (b) the user
+        // opts in via `covariance_ofv_hessian`. The latter trades speed for an R
+        // that recomputes `a = ∂f/∂η` at every perturbed point, capturing the
+        // `∂a/∂θ` curvature the analytical stencil drops — which removes the
+        // weakly-identified-θ SE bias (e.g. warfarin TVKA ~9% high vs a Richardson
+        // FD-of-OFV ground truth).
+        // IIV on residual error (#409): the analytical point-grad stencil has no
+        // rule for the per-subject `exp(2·η_ruv)` variance scaling or its θ/σ/η
+        // curvature, so take the OFV second-difference Hessian (it FD-differences
+        // the real scaled marginal end-to-end).
+        let force_ofv_hessian = (!options.interaction
+            && model.error_spec.has_f_dependent_variance())
+            || options.covariance_ofv_hessian
+            || model.residual_error_eta.is_some();
+        let use_analytical = !is_iov && !force_ofv_hessian;
+
+        if use_analytical {
+            // Issue #209 + #256 + #274: central FD of the analytical population
+            // gradient, as one flat `par_iter` over the 2·n_free perturbed points.
+            //   H[:,k] ≈ (g(x̂ + hₖ·eₖ) − g(x̂ − hₖ·eₖ)) / 2hₖ
+            // `point_grad` reconverges the EBEs serially at each perturbed point, so
+            // the curvature includes the EBE response (and the determinant curvature).
+            //
+            // #256: the work-list is point-level, not the per-subject `par_iter` the
+            // gradient used to fan out into. Each point runs its subjects serially, so
+            // there is no nested parallelism, and the parallel width (2·n_free)
+            // saturates the pool even when n_subj < n_cores — removing the fork/join
+            // overhead of firing 4·n_free rayon barriers in series (~9–11× faster).
+            //
+            // #274: for FOCEI the per-point gradient adds the dropped `log|H̃|`
+            // EBE-response term `2·Σᵢ tᵢ` (`subject_eta_response_correction`). The
+            // fixed-η̂ analytic gradient invokes the envelope theorem, which zeros only
+            // the inner objective — not `log|H̃|` — so without this term the non-IOV
+            // FD Hessian omits the determinant EBE-response curvature `Δ` that the IOV
+            // scalar-OFV stencil captures. Adding it makes the two stencils consistent
+            // and recovers ∇²(−2logL). Mu-ref θ block only; vanishes for additive error.
+            // Count subject-points where the FOCEI Δ correction was skipped because
+            // the Laplace gradient fell back to FD (non-PD H̃) — those contributions
+            // keep the pre-#274 fixed-η̂ curvature, so a non-zero count is surfaced as
+            // a diagnostic (#298).
+            let delta_skips = std::sync::atomic::AtomicUsize::new(0);
+            let point_grad = |xv: &[f64]| -> Vec<f64> {
+                let (_, ehs, hms, _) = reconverge_point(xv);
+                let np = xv.len();
+                // Gradient of `2·pop_nll` (no omega-prior add-back; both the SB and
+                // Laplace marginals already carry Ω — issue #243/#249).
+                //
+                // Build the per-subject gradients serially (subjects are serial inside
+                // each point — the #256 flatten parallelises over points, not subjects)
+                // and reduce through `assemble_population_gradient`, the same reduction
+                // `ad_population_gradient` uses — so the summation order matches and the
+                // FOCE covariance stays bit-identical to the pre-#256 serial stencil.
+                // The Δ correction below is kept as a separate loop (NOT fused): summing
+                // `2·tᵢ` after `2·Σ gᵢ` preserves that reduction order exactly.
+                //
+                // `subject_nll_pop_grad_with_cache` also hands back the per-subject
+                // Laplace intermediates (when this subject took the FOCEI analytical
+                // path); the Δ loop below reuses them so it does not recompute the
+                // predictions or re-factorise H̃.
+                let mut grads: Vec<Vec<f64>> = Vec::with_capacity(n_subj_cov);
+                let mut caches: Vec<Option<crate::estimation::gauss_newton::LaplaceGradCache>> =
+                    Vec::with_capacity(n_subj_cov);
+                for i in 0..n_subj_cov {
+                    let (_, gi, ci) =
+                        crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
+                            xv,
+                            template,
+                            model,
+                            population,
+                            i,
+                            &ehs[i],
+                            &hms[i],
+                            &[],
+                            &bounds,
+                            options,
+                        );
+                    grads.push(gi);
+                    caches.push(ci);
                 }
-                pairs.push((a, b));
-            }
-        }
-        let report = cov_progress("Hessian", specs.len(), options.verbose);
-        let vals: Vec<f64> = specs
-            .par_iter()
-            .map(|p| {
-                // Cooperative cancel: skip this point's EBE reconvergence and
-                // return NaN so the queue drains; bailed on below.
-                if crate::cancel::is_cancelled(&options.cancel) {
-                    report();
-                    return f64::NAN;
-                }
-                let mut xv = x_hat.to_vec();
-                match *p {
-                    Pert::Single { i, di } => xv[i] += di,
-                    Pert::Pair { i, di, j, dj } => {
-                        xv[i] += di;
-                        xv[j] += dj;
+                let mut g = assemble_population_gradient(&grads, np);
+                // #274 Δ correction (FOCEI only); summed in subject order to match.
+                if options.interaction {
+                    for i in 0..n_subj_cov {
+                        match crate::estimation::gauss_newton::subject_eta_response_correction(
+                            caches[i].as_ref(),
+                            xv,
+                            template,
+                            model,
+                            population,
+                            i,
+                            &ehs[i],
+                            &hms[i],
+                            &bounds,
+                            options,
+                        ) {
+                            Some(ti) => {
+                                for (gk, tk) in g.iter_mut().zip(ti.iter()) {
+                                    *gk += 2.0 * *tk;
+                                }
+                            }
+                            None => {
+                                delta_skips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
                     }
                 }
-                let v = serial_ofv(&xv);
-                report();
-                v
-            })
-            .collect();
-        if crate::cancel::is_cancelled(&options.cancel) {
-            return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
-        }
-        // Diagonal: (f(x+h) − 2f(x) + f(x−h)) / h².
-        for a in 0..nf {
-            let i = free_idx[a];
-            let hi = hsteps[a];
-            let h_ii = (vals[2 * a] - 2.0 * f0 + vals[2 * a + 1]) / (hi * hi);
-            if h_ii.is_finite() {
-                hess[(i, i)] = h_ii;
-            } else {
-                fd_diag_nan.insert(i);
+                g
+            };
+
+            // One (k, hₖ) spec per free parameter; the two perturbed points (±hₖ) are
+            // kept adjacent so `chunks_exact(2)` re-pairs (g₊, g₋) structurally — the
+            // pairing is no longer a positional `2·pair` index that a reordering of
+            // the point build could silently desync (#298).
+            let specs: Vec<(usize, f64)> = free_idx
+                .iter()
+                .map(|&k| (k, eps * (1.0 + x_hat[k].abs())))
+                .collect();
+            let pts: Vec<Vec<f64>> = specs
+                .iter()
+                .flat_map(|&(k, hk)| {
+                    let mut x_p = x_hat.to_vec();
+                    x_p[k] += hk;
+                    let mut x_m = x_hat.to_vec();
+                    x_m[k] -= hk;
+                    [x_p, x_m]
+                })
+                .collect();
+            let report = cov_progress("Hessian", pts.len(), options.verbose);
+            let point_grads: Vec<Vec<f64>> = pts
+                .par_iter()
+                .map(|xv| {
+                    // Cooperative cancel: skip this point's serial subject sweep and
+                    // return a NaN gradient so the queue drains; bailed on below.
+                    if crate::cancel::is_cancelled(&options.cancel) {
+                        report();
+                        return vec![f64::NAN; n];
+                    }
+                    let g = point_grad(xv);
+                    report();
+                    g
+                })
+                .collect();
+            if crate::cancel::is_cancelled(&options.cancel) {
+                return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
             }
-        }
-        // Off-diagonal: (f++ − f+− − f−+ + f−−) / (4 hᵢ hⱼ).
-        let mut off = n_diag;
-        for &(a, b) in &pairs {
-            let (i, j) = (free_idx[a], free_idx[b]);
-            let (hi, hj) = (hsteps[a], hsteps[b]);
-            let (fpp, fpm, fmm, fmp) = (vals[off], vals[off + 1], vals[off + 2], vals[off + 3]);
-            off += 4;
-            let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
-            if h_ij.is_finite() {
-                hess[(i, j)] = h_ij;
-                hess[(j, i)] = h_ij;
-            } else {
-                fd_offdiag_nan.insert(i);
-                fd_offdiag_nan.insert(j);
+            for (&(k, hk), pair) in specs.iter().zip(point_grads.chunks_exact(2)) {
+                let (g_p, g_m) = (&pair[0], &pair[1]);
+                for &j in &free_idx {
+                    let h_jk = (g_p[j] - g_m[j]) / (2.0 * hk);
+                    if h_jk.is_finite() {
+                        hess[(j, k)] = h_jk;
+                    } else if j == k {
+                        fd_diag_nan.insert(k);
+                    } else {
+                        fd_offdiag_nan.insert(k);
+                        fd_offdiag_nan.insert(j);
+                    }
+                }
+            }
+            let skipped = delta_skips.load(std::sync::atomic::Ordering::Relaxed);
+            if options.interaction && skipped > 0 && options.verbose {
+                eprintln!(
+                    "  [covariance] log|H̃| EBE-response correction skipped at {} subject-point(s) \
+                 where the Laplace gradient fell back to FD (non-PD H̃); those contributions \
+                 retain the pre-#274 fixed-η̂ curvature.",
+                    skipped
+                );
+            }
+            // Symmetrise: each column is differenced independently, so H[j,k] and
+            // H[k,j] can differ slightly; average before inversion.
+            for &i in &free_idx {
+                for &j in &free_idx {
+                    if j > i {
+                        let avg = (hess[(i, j)] + hess[(j, i)]) * 0.5;
+                        hess[(i, j)] = avg;
+                        hess[(j, i)] = avg;
+                    }
+                }
+            }
+        } else {
+            // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
+            // off-diagonal), reconverging the EBEs at each perturbed point. Taken
+            // when the analytical fixed-EBE gradient does not cover the true marginal
+            // curvature: (a) IOV — no analytical gradient covers the kappa block; or
+            // (b) `force_ofv_hessian` — non-IOV FOCE with f-dependent error, whose SB
+            // gradient lacks the EBE-response Δ and yields an indefinite analytical
+            // Hessian. `pop_nll` dispatches on the kappa count, so this stencil is
+            // correct for both the IOV (joint η, κ) and the non-IOV (η-only) cases.
+            //
+            // #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV
+            // points (subjects iterated serially inside `serial_ofv`) instead of the
+            // old serial loop that fired a per-subject `par_iter` at every point —
+            // removing the fork/join overhead of firing a rayon barrier per point.
+            // Bit-identical to the serial stencil: each point's OFV is the same
+            // `2·pop_nll` at the same per-subject `find_ebe`, and the difference
+            // formulas/assembly are unchanged; only the scheduling differs.
+            let f0 = base_ofv;
+            let serial_ofv = |xv: &[f64]| -> f64 {
+                let (params, ehs, hms, kaps) = reconverge_point(xv);
+                2.0 * pop_nll(
+                    model,
+                    population,
+                    &params,
+                    &ehs,
+                    &hms,
+                    &kaps,
+                    options.interaction,
+                )
+            };
+
+            let nf = free_idx.len();
+            let hsteps: Vec<f64> = free_idx
+                .iter()
+                .map(|&i| eps * (1.0 + x_hat[i].abs()))
+                .collect();
+            // Flat list of perturbation SPECS (not materialised x-vectors): 2 per
+            // diagonal (±hᵢ), then 4 per (a<b) off-diagonal pair. Each par_iter task
+            // clones `x_hat` once and applies its spec, so only ~n_threads vectors are
+            // live at a time instead of all ~2·nf² perturbed points held resident for
+            // the whole reduction (the pre-#298 O(nf²·np) footprint) (#298).
+            #[derive(Clone, Copy)]
+            enum Pert {
+                Single {
+                    i: usize,
+                    di: f64,
+                },
+                Pair {
+                    i: usize,
+                    di: f64,
+                    j: usize,
+                    dj: f64,
+                },
+            }
+            let mut specs: Vec<Pert> = Vec::with_capacity(2 * nf + 2 * nf * nf);
+            for a in 0..nf {
+                let (i, hi) = (free_idx[a], hsteps[a]);
+                specs.push(Pert::Single { i, di: hi });
+                specs.push(Pert::Single { i, di: -hi });
+            }
+            let n_diag = specs.len();
+            let mut pairs: Vec<(usize, usize)> = Vec::new();
+            for a in 0..nf {
+                for b in (a + 1)..nf {
+                    let (i, j) = (free_idx[a], free_idx[b]);
+                    let (hi, hj) = (hsteps[a], hsteps[b]);
+                    for (si, sj) in [(1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)] {
+                        specs.push(Pert::Pair {
+                            i,
+                            di: si * hi,
+                            j,
+                            dj: sj * hj,
+                        });
+                    }
+                    pairs.push((a, b));
+                }
+            }
+            let report = cov_progress("Hessian", specs.len(), options.verbose);
+            let vals: Vec<f64> = specs
+                .par_iter()
+                .map(|p| {
+                    // Cooperative cancel: skip this point's EBE reconvergence and
+                    // return NaN so the queue drains; bailed on below.
+                    if crate::cancel::is_cancelled(&options.cancel) {
+                        report();
+                        return f64::NAN;
+                    }
+                    let mut xv = x_hat.to_vec();
+                    match *p {
+                        Pert::Single { i, di } => xv[i] += di,
+                        Pert::Pair { i, di, j, dj } => {
+                            xv[i] += di;
+                            xv[j] += dj;
+                        }
+                    }
+                    let v = serial_ofv(&xv);
+                    report();
+                    v
+                })
+                .collect();
+            if crate::cancel::is_cancelled(&options.cancel) {
+                return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
+            }
+            // Diagonal: (f(x+h) − 2f(x) + f(x−h)) / h².
+            for a in 0..nf {
+                let i = free_idx[a];
+                let hi = hsteps[a];
+                let h_ii = (vals[2 * a] - 2.0 * f0 + vals[2 * a + 1]) / (hi * hi);
+                if h_ii.is_finite() {
+                    hess[(i, i)] = h_ii;
+                } else {
+                    fd_diag_nan.insert(i);
+                }
+            }
+            // Off-diagonal: (f++ − f+− − f−+ + f−−) / (4 hᵢ hⱼ).
+            let mut off = n_diag;
+            for &(a, b) in &pairs {
+                let (i, j) = (free_idx[a], free_idx[b]);
+                let (hi, hj) = (hsteps[a], hsteps[b]);
+                let (fpp, fpm, fmm, fmp) = (vals[off], vals[off + 1], vals[off + 2], vals[off + 3]);
+                off += 4;
+                let h_ij = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+                if h_ij.is_finite() {
+                    hess[(i, j)] = h_ij;
+                    hess[(j, i)] = h_ij;
+                } else {
+                    fd_offdiag_nan.insert(i);
+                    fd_offdiag_nan.insert(j);
+                }
             }
         }
     }

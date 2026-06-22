@@ -530,6 +530,25 @@ fn sigma_block(
     grad
 }
 
+/// The full per-subject FOCEI **natural** gradient `[∂Fᵢ/∂θ, ∂Fᵢ/∂Ω, ∂Fᵢ/∂σ]`
+/// (θ then the free Ω entries in `pack_params` lower-triangle order then σ), built
+/// from already-computed `prep`/`sens` so the analytic covariance Hessian can pair
+/// it with [`crate::estimation::sens_cov_hessian`]'s natural Hessian without
+/// recomputing the sensitivities. Same blocks as the public per-axis gradients.
+pub(crate) fn subject_natural_gradient(
+    prep: &Prep,
+    sens: &SubjectSens,
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+) -> Vec<f64> {
+    let mut g = theta_block(prep, sens, params.theta.len());
+    g.extend(omega_block(prep, params, eta_hat));
+    g.extend(sigma_block(prep, model, subject, params, sens));
+    g
+}
+
 /// Per-Ω-Cholesky-entry packed gradient `∂Fᵢ/∂x` in `pack_params` order
 /// (diagonal: `ln L_ii`; block: lower-triangle `(i,j)`, off-diagonals raw). The
 /// fixed-η̂ part is the existing closed form (the inner factor-2 cancels the
