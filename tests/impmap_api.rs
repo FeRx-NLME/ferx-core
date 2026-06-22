@@ -488,13 +488,20 @@ fn impmap_converges_to_focei_on_warfarin() {
             "theta {name}: IMPMAP {ti} vs FOCEI {tf} (rel {rel:.3})"
         );
     }
-    // Ω diagonals within 25% (variance components are noisier).
+    // Ω diagonals within 35%. The variance components are noisier than the
+    // thetas, and on this 10-subject warfarin subset ω²KA is weakly identified
+    // (the flat direction of #432). There IMPMAP targets the true marginal MLE
+    // while FOCEI gives the Laplace MLE; the two legitimately differ (~27% for
+    // ω²KA) and the gap is structural, not Monte-Carlo noise (ESS ≈ 0.84, so
+    // more samples do not close it). The same split appears between NONMEM's
+    // own METHOD=IMP and FOCEI — it is marginal-vs-Laplace, not a ferx bug.
+    // See #452. The well-identified ω²CL/ω²V still agree to well within 25%.
     for i in 0..model.n_eta {
         let wi = r_imp.omega[(i, i)];
         let wf = r_focei.omega[(i, i)];
         let rel = (wi - wf).abs() / wf.abs().max(1e-8);
         assert!(
-            rel < 0.25,
+            rel < 0.35,
             "omega[{i},{i}]: IMPMAP {wi} vs FOCEI {wf} (rel {rel:.3})"
         );
     }
