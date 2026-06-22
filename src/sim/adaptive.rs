@@ -40,6 +40,10 @@ impl DoseAction {
     /// `None` for [`DoseAction::Hold`] / [`DoseAction::Stop`] (which inject
     /// nothing). Bioavailability and lag are applied downstream by the
     /// integrator, exactly as for any `subject.doses` entry — never here.
+    ///
+    /// Assumes a well-formed action — call [`DoseAction::validate`] first; a
+    /// malformed `Infuse`/`Bolus` (e.g. `cmt = 0`, `rate ≤ 0`) is not the
+    /// concern of this pure mapping.
     pub fn to_dose_event(&self, time: f64) -> Option<DoseEvent> {
         match *self {
             DoseAction::Bolus { amt, cmt } => Some(DoseEvent::new(time, amt, cmt, 0.0, false, 0.0)),
@@ -54,6 +58,38 @@ impl DoseAction {
     /// driver should issue no further decisions for this subject.
     pub fn is_stop(&self) -> bool {
         matches!(self, DoseAction::Stop)
+    }
+
+    /// Reject the malformed actions a controller can produce, with a typed error,
+    /// before any are applied. Guards the cases that would otherwise corrupt the
+    /// integrator: compartment `0` (CMT is 1-based — `cmt - 1` would underflow a
+    /// `usize`), a non-positive or non-finite infusion `rate` (which
+    /// [`DoseEvent::new`] would silently turn into a zero-duration "infusion",
+    /// i.e. a degenerate bolus), and a non-finite / negative `amt`. `Hold`/`Stop`
+    /// are always valid. The driver (S1.3a) calls this and surfaces the error
+    /// rather than letting a bad action reach the integrator.
+    pub fn validate(&self) -> Result<(), String> {
+        let (amt, cmt, rate) = match *self {
+            DoseAction::Bolus { amt, cmt } => (amt, cmt, None),
+            DoseAction::Infuse { amt, cmt, rate } => (amt, cmt, Some(rate)),
+            DoseAction::Hold | DoseAction::Stop => return Ok(()),
+        };
+        if cmt == 0 {
+            return Err("dose target compartment is 0, but CMT is 1-based".to_string());
+        }
+        if !amt.is_finite() || amt < 0.0 {
+            return Err(format!(
+                "dose amount must be finite and non-negative; got {amt}"
+            ));
+        }
+        if let Some(rate) = rate {
+            if !(rate.is_finite() && rate > 0.0) {
+                return Err(format!(
+                    "Infuse requires a positive, finite rate; got {rate}"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -156,9 +192,11 @@ impl ControllerCtx<'_> {
 pub struct DoseLedgerEntry {
     /// Subject id.
     pub subject: String,
-    /// Replicate tag (param-draw × subject × residual replicate); aligns with the
-    /// simulation output's row tags (filled in by S1.4).
-    pub replicate: usize,
+    /// Parameter-uncertainty draw index — matches [`crate::SimulationResult::draw`]
+    /// so a ledger row joins to the trajectory rows it produced.
+    pub draw: usize,
+    /// Replicate index within the draw — matches [`crate::SimulationResult::sim`].
+    pub sim: usize,
     /// 0-based index of this dose among the subject's realized doses.
     pub dose_idx: usize,
     /// Time the dose was applied.
@@ -177,10 +215,12 @@ pub struct DoseLedgerEntry {
     /// What the controller observed at this decision (per-analyte value + mode).
     pub observed_signals: Vec<ObservedSignal>,
     /// State immediately before / after the dose discontinuity — the inputs to
-    /// the double-entry / mass-balance checks (S6).
-    pub pre_state: Vec<f64>,
+    /// the double-entry / mass-balance checks (S6). `None` when state snapshots
+    /// are not retained (verification disabled), so a large run isn't charged two
+    /// heap allocations per dose for data nothing consumes.
+    pub pre_state: Option<Vec<f64>>,
     /// See [`DoseLedgerEntry::pre_state`].
-    pub post_state: Vec<f64>,
+    pub post_state: Option<Vec<f64>>,
     /// Bioavailable fraction applied to this dose.
     pub f_applied: f64,
 }
@@ -275,7 +315,8 @@ mod tests {
         };
         let entry = DoseLedgerEntry {
             subject: "1".to_string(),
-            replicate: 0,
+            draw: 0,
+            sim: 0,
             dose_idx: 2,
             time: 48.0,
             amt: 75.0,
@@ -284,12 +325,67 @@ mod tests {
             decision_idx: 2,
             rule_fired: "bolus".to_string(),
             observed_signals: vec![obs.clone()],
-            pre_state: vec![0.5, 0.1],
-            post_state: vec![75.5, 0.1],
+            pre_state: Some(vec![0.5, 0.1]),
+            post_state: Some(vec![75.5, 0.1]),
             f_applied: 1.0,
         };
         assert_eq!(entry.clone(), entry);
         assert_eq!(entry.observed_signals[0], obs);
-        assert_eq!(entry.post_state[0] - entry.pre_state[0], 75.0);
+        let pre = entry.pre_state.as_ref().unwrap();
+        let post = entry.post_state.as_ref().unwrap();
+        assert_eq!(post[0] - pre[0], 75.0);
+    }
+
+    #[test]
+    fn validate_rejects_zero_compartment() {
+        assert!(DoseAction::Bolus { amt: 100.0, cmt: 0 }.validate().is_err());
+        assert!(DoseAction::Infuse {
+            amt: 100.0,
+            cmt: 0,
+            rate: 10.0,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn validate_rejects_nonpositive_or_nonfinite_infusion_rate() {
+        for rate in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                DoseAction::Infuse {
+                    amt: 100.0,
+                    cmt: 1,
+                    rate,
+                }
+                .validate()
+                .is_err(),
+                "rate {rate} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_negative_or_nonfinite_amount() {
+        assert!(DoseAction::Bolus { amt: -1.0, cmt: 1 }.validate().is_err());
+        assert!(DoseAction::Bolus {
+            amt: f64::NAN,
+            cmt: 1,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_actions_and_holds() {
+        assert!(DoseAction::Bolus { amt: 100.0, cmt: 1 }.validate().is_ok());
+        assert!(DoseAction::Infuse {
+            amt: 100.0,
+            cmt: 2,
+            rate: 25.0,
+        }
+        .validate()
+        .is_ok());
+        assert!(DoseAction::Hold.validate().is_ok());
+        assert!(DoseAction::Stop.validate().is_ok());
     }
 }
