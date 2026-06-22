@@ -1249,6 +1249,311 @@ fn foce_sb_fixed_natural(
     Some((grad, hess))
 }
 
+/// The full per-subject **FOCE** (Sheiner–Beal) covariance Hessian and gradient
+/// over the natural `[θ, Ω, σ]` parameters, including the moving-mode response —
+/// the total second/first derivative of `F̂ᵢ(ζ) = Fᵢ(ζ, η̂(ζ))`:
+///
+/// ```text
+///   H[ξ,ζ] = F_{ξζ} + Σ_l(F_{ξη_l}η̂_{l,ζ} + F_{ζη_l}η̂_{l,ξ})
+///          + Σ_{lm} F_{η_lη_m}η̂_{l,ξ}η̂_{m,ζ} + Σ_l c_l η̂_{l,ξζ},
+///   g[ζ]   = F_ζ + Σ_l c_l η̂_{l,ζ} ,   c_l = F_{η_l} (the SB coupling),
+/// ```
+///
+/// where `F_{st}` is the fixed-η̂ Gaussian-marginal second derivative
+/// ([`foce_sb_fixed_natural`]) extended to η directions (`ρ_η_l = Dη̂`,
+/// `V_η_l = D_lΩJᵀ + JΩD_lᵀ`, `D_l = ∂J/∂η_l = ∂²f/∂η∂η_l`; η cross-second
+/// derivatives consume `∂³f/∂η³` and `∂³f/∂η²∂θ`), and `η̂_{l,ζ}`, `η̂_{l,ξζ}`
+/// are the shared inner-mode responses ([`inner_eta_responses`]). `None` outside
+/// scope / on BLOQ censoring. `prep` carries the shared inner Hessian.
+#[allow(clippy::type_complexity, dead_code)]
+fn subject_cov_hessian_foce_natural(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    sens: &SubjectSens,
+    sens0: &SubjectSens,
+    prep: &Prep,
+    eta_hat: &[f64],
+) -> Option<(Vec<f64>, DMatrix<f64>)> {
+    let ne = model.n_eta;
+    let nt = params.theta.len();
+    let nq = subject.observations.len();
+    if model.bloq_method == crate::types::BloqMethod::M3 && subject.cens.iter().any(|&c| c != 0) {
+        return None;
+    }
+    if sens.obs.len() != nq || sens0.obs.len() != nq {
+        return None;
+    }
+    let entries = omega_entries(params.omega.diagonal, ne);
+    let n_omega = entries.len();
+    let sigma = &params.sigma.values;
+    let n_sigma = sigma.len();
+    let dim = nt + n_omega + n_sigma;
+    let nw = nt + n_omega;
+    let nd = dim + ne;
+    let omega = &params.omega.matrix;
+    let cmts: Vec<usize> = (0..nq).map(|i| subject.obs_cmts[i]).collect();
+    let eta_vec = DVector::from_column_slice(eta_hat);
+
+    // J, ρ, R̃, u, R⁰ and f-derivatives — as in `foce_sb_fixed_natural`.
+    let mut jmat = DMatrix::<f64>::zeros(nq, ne);
+    let mut rho = DVector::<f64>::zeros(nq);
+    let mut f0 = vec![0.0; nq];
+    let mut r0 = vec![0.0; nq];
+    let mut d0 = vec![0.0; nq];
+    let mut d20 = vec![0.0; nq];
+    for i in 0..nq {
+        let obs = &sens.obs[i];
+        let mut jeta = 0.0;
+        for k in 0..ne {
+            jmat[(i, k)] = obs.df_deta[k];
+            jeta += obs.df_deta[k] * eta_hat[k];
+        }
+        rho[i] = subject.observations[i] - (obs.f - jeta);
+        let f0act = sens0.obs[i].f;
+        f0[i] = f0act;
+        let r = model.error_spec.variance_at(cmts[i], f0act, sigma);
+        if !(r.is_finite() && r > 0.0) {
+            return None;
+        }
+        r0[i] = r;
+        d0[i] = model.error_spec.dvar_df(cmts[i], f0act, sigma);
+        d20[i] = model.error_spec.d2var_df2(cmts[i], sigma);
+    }
+    let mut rtilde = &jmat * omega * jmat.transpose();
+    for i in 0..nq {
+        rtilde[(i, i)] += r0[i];
+    }
+    let rtilde_inv = rtilde.cholesky()?.inverse();
+    let u = &rtilde_inv * &rho;
+    let s0 = foce0_sigma(model, &cmts, &f0, sigma);
+    let e_mats: Vec<DMatrix<f64>> = entries.iter().map(|&(r, c)| e_matrix(r, c, ne)).collect();
+
+    // B_m[i,l] = ∂²f/∂η_l∂θ_m ; D_l[i,k] = ∂²f/∂η_k∂η_l (= ∂J/∂η_l).
+    let bmats: Vec<DMatrix<f64>> = (0..nt)
+        .map(|m| DMatrix::from_fn(nq, ne, |i, l| sens.obs[i].d2f_deta_dtheta[l * nt + m]))
+        .collect();
+    let dmats: Vec<DMatrix<f64>> = (0..ne)
+        .map(|l| DMatrix::from_fn(nq, ne, |i, k| sens.obs[i].d2f_deta2[k * ne + l]))
+        .collect();
+
+    // ρ_s and V_s over extended directions [θ, Ω, σ, η].
+    let mut rho_s: Vec<DVector<f64>> = Vec::with_capacity(nd);
+    let mut v_s: Vec<DMatrix<f64>> = Vec::with_capacity(nd);
+    for m in 0..nt {
+        let bm = &bmats[m];
+        let mut r = DVector::<f64>::zeros(nq);
+        for i in 0..nq {
+            let mut be = 0.0;
+            for l in 0..ne {
+                be += bm[(i, l)] * eta_hat[l];
+            }
+            r[i] = -sens.obs[i].df_dtheta[m] + be;
+        }
+        rho_s.push(r);
+        let bmojt = bm * omega * jmat.transpose();
+        let mut v = &bmojt + bmojt.transpose();
+        for i in 0..nq {
+            v[(i, i)] += d0[i] * sens0.obs[i].df_dtheta[m];
+        }
+        v_s.push(v);
+    }
+    for e in 0..n_omega {
+        rho_s.push(DVector::zeros(nq));
+        v_s.push(&jmat * &e_mats[e] * jmat.transpose());
+    }
+    for k in 0..n_sigma {
+        rho_s.push(DVector::zeros(nq));
+        v_s.push(DMatrix::from_diagonal(&DVector::from_column_slice(
+            &s0.dr0[k],
+        )));
+    }
+    for l in 0..ne {
+        let dl = &dmats[l];
+        rho_s.push(dl * &eta_vec); // ρ_η_l = D_l η̂
+        let dlojt = dl * omega * jmat.transpose();
+        v_s.push(&dlojt + dlojt.transpose());
+    }
+    let k_s: Vec<DMatrix<f64>> = v_s.iter().map(|v| &rtilde_inv * v).collect();
+    let vu: Vec<DVector<f64>> = v_s.iter().map(|v| v * &u).collect();
+
+    let dir_of = |d: usize| -> Dir {
+        if d < nt {
+            Dir::Theta(d)
+        } else if d < nw {
+            Dir::Omega(d - nt)
+        } else if d < dim {
+            Dir::Sigma(d - nw)
+        } else {
+            Dir::Eta(d - dim)
+        }
+    };
+    // ∂³f tensors at η̂. dB_n/∂η_l[i,k] = ∂³f/∂η_k∂η_l∂θ_n ; dD_l/∂η_m[i,k] = ∂³f/∂η_k∂η_l∂η_m.
+    let dbn_deta = |n: usize, l: usize| -> DMatrix<f64> {
+        DMatrix::from_fn(nq, ne, |i, k| {
+            sens.obs[i].d3f_deta2_dtheta[(k * ne + l) * nt + n]
+        })
+    };
+    let ddl_deta = |l: usize, m: usize| -> DMatrix<f64> {
+        DMatrix::from_fn(nq, ne, |i, k| sens.obs[i].d3f_deta3[(k * ne + l) * ne + m])
+    };
+
+    let rho_st = |aa: usize, bb: usize| -> DVector<f64> {
+        let (lo, hi) = (aa.min(bb), aa.max(bb));
+        match (dir_of(lo), dir_of(hi)) {
+            (Dir::Theta(m), Dir::Theta(n)) => {
+                let mut r = DVector::<f64>::zeros(nq);
+                for i in 0..nq {
+                    let mut s = -sens.obs[i].d2f_dtheta2[m * nt + n];
+                    for l in 0..ne {
+                        s += sens.obs[i].d3f_deta_dtheta2[(l * nt + m) * nt + n] * eta_hat[l];
+                    }
+                    r[i] = s;
+                }
+                r
+            }
+            (Dir::Theta(n), Dir::Eta(l)) => {
+                // ρ_{θn η_l}[i] = Σ_k ∂³f/∂η_k∂η_l∂θ_n · η̂_k.
+                let mut r = DVector::<f64>::zeros(nq);
+                for i in 0..nq {
+                    let mut s = 0.0;
+                    for k in 0..ne {
+                        s += sens.obs[i].d3f_deta2_dtheta[(k * ne + l) * nt + n] * eta_hat[k];
+                    }
+                    r[i] = s;
+                }
+                r
+            }
+            (Dir::Eta(l), Dir::Eta(m)) => {
+                // ρ_{η_l η_m}[i] = Σ_k ∂³f/∂η_k∂η_l∂η_m · η̂_k + ∂²f/∂η_m∂η_l.
+                let mut r = DVector::<f64>::zeros(nq);
+                for i in 0..nq {
+                    let mut s = sens.obs[i].d2f_deta2[m * ne + l];
+                    for k in 0..ne {
+                        s += sens.obs[i].d3f_deta3[(k * ne + l) * ne + m] * eta_hat[k];
+                    }
+                    r[i] = s;
+                }
+                r
+            }
+            _ => DVector::zeros(nq),
+        }
+    };
+    let v_st = |aa: usize, bb: usize| -> DMatrix<f64> {
+        let (lo, hi) = (aa.min(bb), aa.max(bb));
+        match (dir_of(lo), dir_of(hi)) {
+            (Dir::Theta(m), Dir::Theta(n)) => {
+                let bm = &bmats[m];
+                let bn = &bmats[n];
+                // ∂Bm/∂θn[i,l] = ∂³f/∂η_l∂θ_m∂θ_n.
+                let dbmn = DMatrix::from_fn(nq, ne, |i, l| {
+                    sens.obs[i].d3f_deta_dtheta2[(l * nt + m) * nt + n]
+                });
+                let t1 = &dbmn * omega * jmat.transpose();
+                let t2 = bm * omega * bn.transpose();
+                let mut v = &t1 + t1.transpose() + &t2 + t2.transpose();
+                for i in 0..nq {
+                    let f0m = sens0.obs[i].df_dtheta[m];
+                    let f0n = sens0.obs[i].df_dtheta[n];
+                    let f0mn = sens0.obs[i].d2f_dtheta2[m * nt + n];
+                    v[(i, i)] += d20[i] * f0m * f0n + d0[i] * f0mn;
+                }
+                v
+            }
+            (Dir::Theta(m), Dir::Omega(e)) => {
+                let t = &bmats[m] * &e_mats[e] * jmat.transpose();
+                &t + t.transpose()
+            }
+            (Dir::Theta(m), Dir::Sigma(k)) => {
+                let mut v = DMatrix::<f64>::zeros(nq, nq);
+                for i in 0..nq {
+                    v[(i, i)] = s0.dd0[k][i] * sens0.obs[i].df_dtheta[m];
+                }
+                v
+            }
+            (Dir::Theta(n), Dir::Eta(l)) => {
+                // V_{θn η_l} = (∂Bn/∂η_l)ΩJᵀ + Bn Ω D_lᵀ + D_l Ω Bnᵀ + JΩ(∂Bn/∂η_l)ᵀ.
+                let dbnl = dbn_deta(n, l);
+                let t1 = &dbnl * omega * jmat.transpose();
+                let t2 = &bmats[n] * omega * dmats[l].transpose();
+                &t1 + t1.transpose() + &t2 + t2.transpose()
+            }
+            (Dir::Omega(e), Dir::Eta(l)) => {
+                let t = &dmats[l] * &e_mats[e] * jmat.transpose();
+                &t + t.transpose()
+            }
+            (Dir::Sigma(k), Dir::Sigma(ll)) => {
+                DMatrix::from_diagonal(&DVector::from_column_slice(&s0.d2r0[k][ll]))
+            }
+            (Dir::Eta(l), Dir::Eta(m)) => {
+                // V_{η_l η_m} = (∂D_l/∂η_m)ΩJᵀ + D_lΩD_mᵀ + D_mΩD_lᵀ + JΩ(∂D_l/∂η_m)ᵀ.
+                let ddlm = ddl_deta(l, m);
+                let t1 = &ddlm * omega * jmat.transpose();
+                let t2 = &dmats[l] * omega * dmats[m].transpose();
+                &t1 + t1.transpose() + &t2 + t2.transpose()
+            }
+            // ΩΩ, Ωσ, ση (V σ indep of η) vanish.
+            _ => DMatrix::zeros(nq, nq),
+        }
+    };
+
+    // F_{st} REML second derivative for any extended directions.
+    let f_st = |s: usize, t: usize| -> f64 {
+        let rst = rho_st(s, t);
+        let vst = v_st(s, t);
+        let u_t = &rtilde_inv * (&rho_s[t] - &vu[t]);
+        rst.dot(&u) + rho_s[s].dot(&u_t) + 0.5 * (&rtilde_inv * &vst).trace()
+            - 0.5 * (&k_s[t] * &k_s[s]).trace()
+            - u_t.dot(&vu[s])
+            - 0.5 * u.dot(&(&vst * &u))
+    };
+
+    // Fixed-η̂ gradient and coupling c_l = F_{η_l}.
+    let fixed_grad: Vec<f64> = (0..dim)
+        .map(|s| rho_s[s].dot(&u) + 0.5 * k_s[s].trace() - 0.5 * u.dot(&vu[s]))
+        .collect();
+    let c: Vec<f64> = (0..ne)
+        .map(|l| {
+            let s = dim + l;
+            rho_s[s].dot(&u) + 0.5 * k_s[s].trace() - 0.5 * u.dot(&vu[s])
+        })
+        .collect();
+
+    // Shared inner-mode responses.
+    let (eta_d, eta_dd) = inner_eta_responses(model, subject, params, sens, prep, eta_hat);
+
+    // Total gradient g[ζ] = F_ζ + Σ_l c_l η̂_{l,ζ}.
+    let mut grad = vec![0.0; dim];
+    for z in 0..dim {
+        grad[z] = fixed_grad[z];
+        for l in 0..ne {
+            grad[z] += c[l] * eta_d[z][l];
+        }
+    }
+
+    // Total Hessian.
+    let mut hess = DMatrix::zeros(dim, dim);
+    for xi in 0..dim {
+        for ze in xi..dim {
+            let mut val = f_st(xi, ze);
+            for l in 0..ne {
+                val += f_st(xi, dim + l) * eta_d[ze][l] + f_st(ze, dim + l) * eta_d[xi][l];
+            }
+            for l in 0..ne {
+                for m in 0..ne {
+                    val += f_st(dim + l, dim + m) * eta_d[xi][l] * eta_d[ze][m];
+                }
+            }
+            for l in 0..ne {
+                val += c[l] * eta_dd[xi][ze][l];
+            }
+            hess[(xi, ze)] = val;
+            hess[(ze, xi)] = val;
+        }
+    }
+    Some((grad, hess))
+}
+
 /// The exact per-subject FOCEI covariance Hessian `∂²Fᵢ/∂x²` in the optimizer's
 /// **packed** space (log-θ / Cholesky-Ω / log-σ) — the analytic, finite-difference-free
 /// replacement for `compute_covariance`'s per-subject contribution. Returns
@@ -1399,8 +1704,8 @@ mod tests {
     use crate::estimation::inner_optimizer::find_ebe;
     use crate::estimation::parameterization::pack_params;
     use crate::estimation::sens_outer_gradient::{
-        prepare, subject_omega_gradient, subject_packed_gradient, subject_sigma_gradient,
-        subject_theta_gradient,
+        prepare, subject_omega_gradient, subject_packed_gradient, subject_packed_gradient_foce,
+        subject_sigma_gradient, subject_theta_gradient,
     };
     use crate::parser::model_parser::parse_model_string;
     use crate::sens::provider::{subject_sensitivities, subject_sensitivities_cov};
@@ -1809,6 +2114,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Validate the full FOCE (Sheiner–Beal) natural Hessian — fixed part **plus**
+    /// the η̂-mode response — by chaining it to packed space and comparing against a
+    /// reconverged precise-EBE FD of the exact FOCE packed gradient.
+    fn check_foce_full(model: &CompiledModel, subject: &Subject, params: &ModelParameters) {
+        let x = pack_params(params);
+        let dim = x.len();
+        let eta = precise_ebe(model, subject, params);
+        let zeros = vec![0.0; model.n_eta];
+        let sens = subject_sensitivities_cov(model, subject, &params.theta, &eta).unwrap();
+        let sens0 = subject_sensitivities_cov(model, subject, &params.theta, &zeros).unwrap();
+        let prep = prepare(model, subject, params, &sens).unwrap();
+        let (grad, hess) =
+            subject_cov_hessian_foce_natural(model, subject, params, &sens, &sens0, &prep, &eta)
+                .unwrap();
+        let analytic = pack_natural_hessian(&hess, &grad, &x, params);
+
+        let grad_packed = |xv: &[f64]| -> Vec<f64> {
+            let p = unpack_params(xv, params);
+            let e = precise_ebe(model, subject, &p);
+            subject_packed_gradient_foce(model, subject, params, xv, &e).unwrap()
+        };
+        let mut fd = DMatrix::zeros(dim, dim);
+        for col in 0..dim {
+            let h = 1e-6 * (1.0 + x[col].abs());
+            let mut xp = x.clone();
+            xp[col] += h;
+            let mut xm = x.clone();
+            xm[col] -= h;
+            let gp = grad_packed(&xp);
+            let gm = grad_packed(&xm);
+            for row in 0..dim {
+                fd[(row, col)] = (gp[row] - gm[row]) / (2.0 * h);
+            }
+        }
+        for row in 0..dim {
+            for col in 0..dim {
+                let a = analytic[(row, col)];
+                let f = fd[(row, col)];
+                let tol = 2e-3 * (1.0 + a.abs());
+                assert!(
+                    (a - f).abs() < tol,
+                    "FOCE-full packed H[{},{}]: analytic {:.8e} vs FD {:.8e} (Δ {:.2e})",
+                    row,
+                    col,
+                    a,
+                    f,
+                    (a - f).abs()
+                );
+            }
+        }
+    }
+
+    /// Warfarin (1-cpt, diagonal Ω): full FOCE Hessian (with mode response) vs
+    /// reconverged FD of the FOCE packed gradient.
+    #[test]
+    fn cov_hessian_foce_full_matches_reconverged_fd_diagonal() {
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let theta = vec![0.2, 10.0, 1.5];
+        let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta;
+        check_foce_full(&model, &subject, &params);
+    }
+
+    /// Block-Ω: full FOCE Hessian with mode response (off-diagonal Ω + η coupling).
+    #[test]
+    fn cov_hessian_foce_full_matches_reconverged_fd_block_omega() {
+        const BLOCK: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(BLOCK).expect("parse");
+        let theta = vec![0.2, 10.0, 1.5];
+        let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta;
+        check_foce_full(&model, &subject, &params);
     }
 
     /// Warfarin (1-cpt, diagonal Ω): fixed-η̂ FOCE SB Hessian vs frozen FD.
