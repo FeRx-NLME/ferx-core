@@ -41,14 +41,14 @@ use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
 
 /// Per-observation error-model scalars used throughout the assembly.
-struct ErrTerms {
-    r: f64,       // Rⱼ
-    d: f64,       // dⱼ = ∂R/∂f
-    eps: f64,     // εⱼ = y − f
-    alpha: f64,   // αⱼ
-    alpha_p: f64, // α'ⱼ = dαⱼ/df
-    p: f64,       // pⱼ
-    beta: f64,    // βⱼ = dpⱼ/df
+pub(crate) struct ErrTerms {
+    pub(crate) r: f64,       // Rⱼ
+    pub(crate) d: f64,       // dⱼ = ∂R/∂f
+    pub(crate) eps: f64,     // εⱼ = y − f
+    pub(crate) alpha: f64,   // αⱼ
+    pub(crate) alpha_p: f64, // α'ⱼ = dαⱼ/df
+    pub(crate) p: f64,       // pⱼ
+    pub(crate) beta: f64,    // βⱼ = dpⱼ/df
 }
 
 /// Inverse Mills ratio `h = φ(z)/Φ(z)`, evaluated through logs so it stays finite
@@ -106,31 +106,31 @@ fn err_terms(r: f64, d: f64, d2: f64, eps: f64) -> ErrTerms {
 
 /// Shared per-subject quantities the θ/Ω/Σ gradient blocks all consume, built
 /// once from the provider sensitivities at the EBE.
-struct Prep {
-    n_eta: usize,
-    n_obs: usize,
-    et: Vec<ErrTerms>,
+pub(crate) struct Prep {
+    pub(crate) n_eta: usize,
+    pub(crate) n_obs: usize,
+    pub(crate) et: Vec<ErrTerms>,
     /// `Ω⁻¹` (copied so blocks don't borrow `params`).
-    omega_inv: DMatrix<f64>,
+    pub(crate) omega_inv: DMatrix<f64>,
     /// `H̃⁻¹` (first-order FOCEI Hessian inverse).
-    htilde_inv: DMatrix<f64>,
+    pub(crate) htilde_inv: DMatrix<f64>,
     /// `H⁻¹` for the **true** inner Hessian `H = ∂²lᵢ/∂η²` (Eq. 46 denominator).
-    h_inner_inv: DMatrix<f64>,
+    pub(crate) h_inner_inv: DMatrix<f64>,
     /// `wⱼ = H̃⁻¹aⱼ`.
-    w: Vec<DVector<f64>>,
+    pub(crate) w: Vec<DVector<f64>>,
     /// `qⱼ = aⱼᵀ H̃⁻¹ aⱼ`.
-    q: Vec<f64>,
+    pub(crate) q: Vec<f64>,
     /// Exact `∂log|H̃|/∂η` (a-fixed part + `∂²f/∂η²` curvature).
-    g_eta: Vec<f64>,
+    pub(crate) g_eta: Vec<f64>,
     /// Per-observation M3-censored flag. Censored rows enter `H` (true inner
     /// Hessian) and the data gradient but carry `p = β = 0`, so they are excluded
     /// from `H̃` / `log|H̃|` — matching `gaussian_foce_accum`, which accumulates
     /// `hrh`/`ctc` over quantified rows only and adds the censored `−logΦ` to the
     /// data term. Empty `Vec` (all-false) when the subject has no censoring.
-    censored: Vec<bool>,
+    pub(crate) censored: Vec<bool>,
 }
 
-fn prepare(
+pub(crate) fn prepare(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
@@ -1682,7 +1682,7 @@ pub fn predict_warm_etas(
 }
 
 /// `M[:,m] = ∂²lᵢ/∂η∂θₘ = ½ Σⱼ (α'ⱼ bⱼₘ aⱼ + αⱼ Bⱼ[:,m])`.
-fn mixed_eta_theta(
+pub(crate) fn mixed_eta_theta(
     obs: &[ObsSens],
     et: &[ErrTerms],
     n_eta: usize,
