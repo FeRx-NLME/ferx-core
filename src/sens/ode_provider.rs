@@ -231,6 +231,8 @@ pub(crate) struct ParamDerivs3 {
     pub(crate) d3p_deta3: Vec<Vec<Vec<Vec<f64>>>>,
     /// `∂³p_i/∂η_k∂η_l∂θ_m`.
     pub(crate) d3p_deta2_dtheta: Vec<Vec<Vec<Vec<f64>>>>,
+    /// `∂³p_i/∂η_k∂θ_m∂θ_n` — the M3 θθ blocks differentiate `∂f/∂η` twice by θ.
+    pub(crate) d3p_deta_dtheta2: Vec<Vec<Vec<Vec<f64>>>>,
 }
 
 /// [`param_derivatives_from_prog`]'s third-order companion: evaluate the
@@ -273,6 +275,7 @@ pub(crate) fn pd3_from_program<const M: usize>(
     let mut d2p_dtheta2 = vec![vec![vec![0.0; nt]; nt]; ni];
     let mut d3p_deta3 = vec![vec![vec![vec![0.0; ne]; ne]; ne]; ni];
     let mut d3p_deta2_dtheta = vec![vec![vec![vec![0.0; nt]; ne]; ne]; ni];
+    let mut d3p_deta_dtheta2 = vec![vec![vec![vec![0.0; nt]; nt]; ne]; ni];
     for i in 0..ni {
         let hh = &p[i].hess;
         let t = &p[i].d3;
@@ -290,12 +293,19 @@ pub(crate) fn pd3_from_program<const M: usize>(
                     d3p_deta2_dtheta[i][k][l][m] = t[nt + k][nt + l][m];
                 }
             }
+            for m in 0..nt {
+                for n in 0..nt {
+                    // ∂³p/∂η_k∂θ_m∂θ_n (dual axis nt+k is η_k; m, n are θ).
+                    d3p_deta_dtheta2[i][k][m][n] = t[nt + k][m][n];
+                }
+            }
         }
     }
     ParamDerivs3 {
         d2p_dtheta2,
         d3p_deta3,
         d3p_deta2_dtheta,
+        d3p_deta_dtheta2,
     }
 }
 
@@ -498,6 +508,7 @@ fn run_subject<const N: usize>(
             d2f_dtheta2: Vec::new(),
             d3f_deta3: Vec::new(),
             d3f_deta2_dtheta: Vec::new(),
+            d3f_deta_dtheta2: Vec::new(),
         });
     }
 
@@ -1104,6 +1115,34 @@ mod tests {
                         let fd = (dp[i][k][l] - dm[i][k][l]) / (2.0 * s);
                         approx::assert_relative_eq!(
                             pd3.d3p_deta2_dtheta[i][k][l][m],
+                            fd,
+                            max_relative = 1e-3,
+                            epsilon = 1e-6
+                        );
+                    }
+                }
+            }
+        }
+
+        // ∂³p/∂η∂θ² = ∂(∂²p/∂η∂θ)/∂θ_n
+        let d2pt = |e: &[f64], th: &[f64]| {
+            param_derivatives_from_prog(prog, &model, &subject, th, e)
+                .unwrap()
+                .d2p_detadtheta
+        };
+        for n in 0..nt {
+            let s = h * (1.0 + theta[n].abs());
+            let mut tp = theta.clone();
+            tp[n] += s;
+            let mut tm = theta.clone();
+            tm[n] -= s;
+            let (dp, dm) = (d2pt(&eta, &tp), d2pt(&eta, &tm));
+            for i in 0..ni {
+                for k in 0..ne {
+                    for m in 0..nt {
+                        let fd = (dp[i][k][m] - dm[i][k][m]) / (2.0 * s);
+                        approx::assert_relative_eq!(
+                            pd3.d3p_deta_dtheta2[i][k][m][n],
                             fd,
                             max_relative = 1e-3,
                             epsilon = 1e-6

@@ -65,6 +65,8 @@ pub struct ObsSens {
     pub d3f_deta3: Vec<f64>,
     /// `∂³f/∂η_k∂η_l∂θ_m`, row-major `n_eta·n_eta·n_theta`.
     pub d3f_deta2_dtheta: Vec<f64>,
+    /// `∂³f/∂η_k∂θ_m∂θ_n`, row-major `n_eta·n_theta·n_theta`.
+    pub d3f_deta_dtheta2: Vec<f64>,
 }
 
 /// All observations' sensitivities for one subject, parallel to
@@ -854,6 +856,7 @@ fn run_obs_iov<const M: usize>(
             d2f_dtheta2: Vec::new(),
             d3f_deta3: Vec::new(),
             d3f_deta2_dtheta: Vec::new(),
+            d3f_deta_dtheta2: Vec::new(),
         });
     }
     Some(SubjectSens { obs: obs_out })
@@ -1125,6 +1128,7 @@ fn run_obs_tvcov<const M: usize>(
             d2f_dtheta2: Vec::new(),
             d3f_deta3: Vec::new(),
             d3f_deta2_dtheta: Vec::new(),
+            d3f_deta_dtheta2: Vec::new(),
         });
     }
     Some(SubjectSens { obs: obs_out })
@@ -2112,6 +2116,7 @@ fn run_obs<const N: usize>(
             d2f_dtheta2: Vec::new(),
             d3f_deta3: Vec::new(),
             d3f_deta2_dtheta: Vec::new(),
+            d3f_deta_dtheta2: Vec::new(),
         });
     }
     out
@@ -2308,6 +2313,32 @@ fn run_obs_cov<const N: usize>(
                 }
             }
         }
+        // ∂³f/∂η_k∂θ_m∂θ_n (one η, two θ):
+        //   Σ tᵢⱼₗ pe_i,k pt_j,m pt_l,n
+        // + Σ hᵢⱼ (d2pet_i,kn pt_j,m + pe_i,k d2pt_j,mn + d2pet_i,km pt_j,n)
+        // + Σ gᵢ d3p_deta_dtheta2_i,kmn
+        let mut d3f_deta_dtheta2 = vec![0.0; n_eta * n_theta * n_theta];
+        let d2pt = &pd3.d2p_dtheta2;
+        for k in 0..n_eta {
+            for m in 0..n_theta {
+                for nn in 0..n_theta {
+                    let mut acc = 0.0;
+                    for i in 0..N {
+                        for j in 0..N {
+                            for lidx in 0..N {
+                                acc += t[i][j][lidx] * dpe[i][k] * dpt[j][m] * dpt[lidx][nn];
+                            }
+                            acc += h[i][j]
+                                * (d2pet[i][k][nn] * dpt[j][m]
+                                    + dpe[i][k] * d2pt[j][m][nn]
+                                    + d2pet[i][k][m] * dpt[j][nn]);
+                        }
+                        acc += g[i] * pd3.d3p_deta_dtheta2[i][k][m][nn];
+                    }
+                    d3f_deta_dtheta2[(k * n_theta + m) * n_theta + nn] = acc;
+                }
+            }
+        }
 
         out.push(ObsSens {
             f: fval,
@@ -2318,6 +2349,7 @@ fn run_obs_cov<const N: usize>(
             d2f_dtheta2,
             d3f_deta3,
             d3f_deta2_dtheta,
+            d3f_deta_dtheta2,
         });
     }
     out
@@ -2993,23 +3025,35 @@ mod tests {
                     }
                 }
             }
-            // ∂²f/∂θ² vs ∂(∂f/∂θ)/∂θ_n
+            // ∂²f/∂θ² vs ∂(∂f/∂θ)/∂θ_n; ∂³f/∂η∂θ² vs ∂(∂²f/∂η∂θ)/∂θ_n
             for nn in 0..nt {
                 let s = h * (1.0 + theta[nn].abs());
                 let mut tp = theta.to_vec();
                 tp[nn] += s;
                 let mut tm = theta.to_vec();
                 tm[nn] -= s;
-                let dp = base(eta, &tp).obs[oi].df_dtheta.clone();
-                let dm = base(eta, &tm).obs[oi].df_dtheta.clone();
+                let bp = base(eta, &tp).obs[oi].clone();
+                let bm = base(eta, &tm).obs[oi].clone();
                 for m in 0..nt {
-                    let fd = (dp[m] - dm[m]) / (2.0 * s);
+                    let fd = (bp.df_dtheta[m] - bm.df_dtheta[m]) / (2.0 * s);
                     approx::assert_relative_eq!(
                         o.d2f_dtheta2[m * nt + nn],
                         fd,
                         max_relative = 1e-3,
                         epsilon = 1e-6
                     );
+                }
+                for k in 0..ne {
+                    for m in 0..nt {
+                        let fd = (bp.d2f_deta_dtheta[k * nt + m] - bm.d2f_deta_dtheta[k * nt + m])
+                            / (2.0 * s);
+                        approx::assert_relative_eq!(
+                            o.d3f_deta_dtheta2[(k * nt + m) * nt + nn],
+                            fd,
+                            max_relative = 1e-3,
+                            epsilon = 1e-6
+                        );
+                    }
                 }
             }
         }
