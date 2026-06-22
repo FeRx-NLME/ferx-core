@@ -139,9 +139,20 @@ When `covariance = true`, ferx-core computes the variance-covariance matrix of t
 - **Relative standard errors (%RSE)** for assessing estimation precision
 - **Omega SEs** via delta method from the Cholesky parameterization
 
-### How the Hessian is built
+### Exact analytic Hessian (default)
 
-The covariance is `2·H⁻¹`, where `H` is the finite-difference Hessian of the objective. Two details make the SEs match NONMEM's `$COVARIANCE`:
+For in-scope analytical-PK models, ferx builds the R-matrix Hessian `H` in **closed form** rather than by finite differences (issue [#436](https://github.com/FeRx-NLME/ferx-core/issues/436)). This is the exact second derivative of the per-subject objective, assembled from the same analytic sensitivities the gradient uses, extended one order:
+
+- **FOCEI** — the Almquist `M2 + M3` decomposition. Writing `Fᵢ = Φ + ½log|H̃|`, the envelope theorem collapses the `Φ` part (M2) to a Schur complement `∂²Φ/∂ξ∂ζ − M_ξᵀH⁻¹M_ζ`, and the `½log|H̃|` part (M3) is its Hessian carried through the moving mode `η̂(ζ)`, using the third-order sensitivities `∂³f/∂η³`, `∂³f/∂η²∂θ`, `∂³f/∂η∂θ²`.
+- **FOCE** — the second derivative of the Sheiner–Beal marginal `½[ρᵀR̃⁻¹ρ + log|R̃|]` (the standard Gaussian-marginal / REML form), including the EBE-response curvature. The posterior mode is shared with FOCEI, so the mode-response machinery is identical.
+
+Because it is finite-difference-free, the analytic Hessian carries **no `fd_hessian_step` to tune and no catastrophic cancellation** on flat directions (the source of the inflated `SE(ω²KA)` in issue [#432](https://github.com/FeRx-NLME/ferx-core/issues/432)). At NONMEM's own block-Ω warfarin minimum it reproduces `$COV MATRIX=R` to 5–6 significant figures while running ~20× faster for FOCEI (~9× for FOCE) than the finite-difference covariance.
+
+It is on by default (`analytic_cov_hessian = true`). Any out-of-scope subject — ODE models, output scaling, LTBS, IOV, residual-error random effects, BLOQ censoring, time-varying covariates, oral-infusion, resets, or non-analytical PK — transparently drops the whole population back to the finite-difference covariance described next, so those models are unaffected. Set `analytic_cov_hessian = false` to force the finite-difference path.
+
+### How the finite-difference Hessian is built
+
+When the analytic path does not apply (or is disabled), the covariance is `2·H⁻¹`, where `H` is the finite-difference Hessian of the objective. Two details make the SEs match NONMEM's `$COVARIANCE`:
 
 1. **The EBEs are reconverged at every perturbed point.** Like NONMEM's covariance step, ferx re-solves the inner conditional-estimation loop (warm-started from the converged EBEs) at each finite-difference point. Holding the EBEs fixed omits the response of the conditional optimum to the population parameters, which gives a Hessian with the wrong curvature — indefinite even on well-conditioned surfaces such as warfarin — and was the source of the spurious eigenvalue clipping in issue [#129](https://github.com/FeRx-NLME/ferx-core/issues/129).
 2. **The Hessian is a central difference of the analytical gradient** (issue [#209](https://github.com/FeRx-NLME/ferx-core/issues/209)): `H[:,k] ≈ (g(x̂+hₖeₖ) − g(x̂−hₖeₖ)) / 2hₖ`. This is `2·n_free` gradient evaluations instead of `~2·n_free²` objective evaluations, and it avoids the catastrophic cancellation of a four-point second difference of the OFV. The θ part of that gradient reuses H-matrix columns for mu-referenced parameters (issue [#196](https://github.com/FeRx-NLME/ferx-core/issues/196)). IOV models, whose κ block has no fixed-EBE analytical gradient, fall back to a second difference of the reconverged objective.

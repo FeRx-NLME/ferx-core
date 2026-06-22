@@ -20,6 +20,21 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Exact analytic FOCE/FOCEI covariance (the R matrix)** for in-scope analytical
+  PK models: the covariance step's Hessian is now assembled in closed form — the
+  Almquist `M2 + M3` decomposition for FOCEI and the Sheiner–Beal marginal Hessian
+  for FOCE, both including the EBE-response curvature — instead of by finite
+  differences. It therefore carries no `fd_hessian_step` to tune and no
+  catastrophic cancellation on flat directions (the source of the inflated SEs in
+  #432). Default-on via the new `[fit_options]` key `analytic_cov_hessian` (set
+  `false` to force the finite-difference covariance); any out-of-scope subject
+  (ODE, output scaling, LTBS, IOV, residual-error random effects, BLOQ censoring,
+  time-varying covariates, oral-infusion, resets, or non-analytical PK) transparently
+  drops the whole population back to the finite-difference covariance, so results
+  there are unchanged. At NONMEM's own block-Ω warfarin minimum the analytic SEs
+  reproduce `$COV MATRIX=R` to 5–6 significant figures while the covariance step
+  runs ~20× faster for FOCEI (~9× for FOCE) than the finite-difference path it
+  replaces (#436).
 - **Analytic sensitivities for oral infusion** on the analytical 1-/2-/3-cpt
   models: a depot-bypass infusion into the central compartment (RATE>0 into cmt 2,
   #350) and a zero-order input into the oral depot (RATE>0 into cmt 1, #400) are
