@@ -195,67 +195,133 @@ fn sigma_derivs(
     }
 }
 
-/// The M2 covariance Hessian over the natural `[θ, σ]` parameters, per subject:
-/// the θθ block (above), the σσ block, and the θσ cross-block, each as
-/// `∂²Φ/∂ξ∂ζ|_η̂ − M_ξᵀ H⁻¹ M_ζ`. (Ω is added by the natural-block assembler in a
-/// later unit; θΩ/Ωσ explicit cross-partials vanish.)
-pub(crate) fn cov_hessian_m2_theta_sigma(
+/// Free Ω entries in the optimizer's pack order: diagonal `(i,i)`; block lower
+/// triangle `(r,c)` with `c ≤ r`. The natural parameter for an off-diagonal entry
+/// is the single scalar setting both `Ω[r,c]` and `Ω[c,r]` (symmetric).
+pub(crate) fn omega_entries(diagonal: bool, n_eta: usize) -> Vec<(usize, usize)> {
+    if diagonal {
+        (0..n_eta).map(|i| (i, i)).collect()
+    } else {
+        let mut e = Vec::new();
+        for c in 0..n_eta {
+            for r in c..n_eta {
+                e.push((r, c));
+            }
+        }
+        e
+    }
+}
+
+/// `E_{rc}`: the symmetric single-entry derivative matrix `∂Ω/∂Ω_{rc}` — a lone 1
+/// at `(r,r)` for a diagonal entry, or 1s at `(r,c)` and `(c,r)` for the symmetric
+/// off-diagonal parameter.
+fn e_matrix(r: usize, c: usize, n: usize) -> DMatrix<f64> {
+    let mut e = DMatrix::zeros(n, n);
+    e[(r, c)] = 1.0;
+    e[(c, r)] = 1.0;
+    e
+}
+
+/// The full M2 covariance Hessian over the natural `[θ, Ω, σ]` parameters, per
+/// subject. Each entry is `∂²Φ/∂ξ∂ζ|_η̂ − M_ξᵀ H⁻¹ M_ζ` with `M_ζ = ∂²Φ/∂η∂ζ`:
+///
+/// * `θθ` explicit `Σⱼ ½(α' bb + α ∂²f/∂θ²)`, `M_θ = mixed_eta_theta`;
+/// * `σσ`/`θσ` explicit error-variance curvature, `M_σ = ½Σ(∂α/∂σ)a`;
+/// * `ΩΩ` explicit `zᵀE_ξΩ⁻¹E_ζz − ½tr(Ω⁻¹E_ξΩ⁻¹E_ζ)`, `M_Ω = −Ω⁻¹E z`,
+///   `z = Ω⁻¹η̂`;
+/// * `θΩ`/`Ωσ` explicit partials vanish (only the mode coupling survives).
+///
+/// `eta_hat` is the subject's EBE for `params`. This is the natural-space block;
+/// the packed-space chain and the `½log|H̃|` (M3) curvature are layered on later.
+pub(crate) fn subject_cov_hessian_m2_natural(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
     sens: &SubjectSens,
     prep: &Prep,
+    eta_hat: &[f64],
 ) -> DMatrix<f64> {
+    let n_eta = prep.n_eta;
     let n_theta = params.theta.len();
+    let entries = omega_entries(params.omega.diagonal, n_eta);
+    let n_omega = entries.len();
     let n_sigma = params.sigma.values.len();
     let nt = n_theta;
-    let dim = n_theta + n_sigma;
+    let nw = nt + n_omega; // σ offset
+    let dim = n_theta + n_omega + n_sigma;
 
-    let (m_theta, u_theta) = theta_m_and_u(prep, sens, n_theta);
+    let omega_inv = &prep.omega_inv;
+    let z = omega_inv * DVector::from_column_slice(eta_hat);
+    let e_mats: Vec<DMatrix<f64>> = entries
+        .iter()
+        .map(|&(r, c)| e_matrix(r, c, n_eta))
+        .collect();
+
+    // Mode-coupling vectors M_ζ = ∂²Φ/∂η∂ζ for every natural parameter, in order.
+    let (m_theta, _) = theta_m_and_u(prep, sens, n_theta);
     let sd = sigma_derivs(model, subject, params, sens, prep);
-    let u_sigma: Vec<DVector<f64>> = sd.m_sigma.iter().map(|m| &prep.h_inner_inv * m).collect();
+    let m_omega: Vec<DVector<f64>> = e_mats.iter().map(|e| -(omega_inv * (e * &z))).collect();
 
-    let mut h = DMatrix::zeros(dim, dim);
+    let mut mall: Vec<DVector<f64>> = Vec::with_capacity(dim);
+    mall.extend(m_theta);
+    mall.extend(m_omega);
+    mall.extend(sd.m_sigma.iter().cloned());
+    let uall: Vec<DVector<f64>> = mall.iter().map(|m| &prep.h_inner_inv * m).collect();
 
-    // θθ.
-    for n in 0..n_theta {
-        for m in 0..n_theta {
-            let expl = theta_theta_explicit(prep, sens, n_theta, n, m);
-            h[(n, m)] = expl - m_theta[n].dot(&u_theta[m]);
-        }
-    }
-
-    // θσ / σθ: explicit ∂²Φ/∂σ_k∂θ_m = Σⱼ ½ (∂α/∂σ_k) bⱼₘ; coupling −M_θmᵀ H⁻¹ M_σk.
-    for m in 0..n_theta {
-        for k in 0..n_sigma {
-            let mut expl = 0.0;
+    // Explicit cross-partial ∂²Φ/∂ξ∂ζ|_η̂ between natural params a (ζ) and b (ξ).
+    let explicit = |a: usize, b: usize| -> f64 {
+        let (lo, hi) = (a.min(b), a.max(b));
+        if hi < nt {
+            // θθ.
+            theta_theta_explicit(prep, sens, n_theta, a, b)
+        } else if lo < nt && hi >= nt && hi < nw {
+            // θΩ — explicit vanishes.
+            0.0
+        } else if lo < nt && hi >= nw {
+            // θσ: Σⱼ ½ (∂α/∂σ_k) bⱼₘ.
+            let m = lo;
+            let k = hi - nw;
+            let mut s = 0.0;
             for (j, obs) in sens.obs.iter().enumerate() {
-                expl += 0.5 * sd.dalpha[k][j] * obs.df_dtheta[m];
+                s += 0.5 * sd.dalpha[k][j] * obs.df_dtheta[m];
             }
-            let val = expl - m_theta[m].dot(&u_sigma[k]);
-            h[(m, nt + k)] = val;
-            h[(nt + k, m)] = val;
-        }
-    }
-
-    // σσ: explicit ∂²Φ/∂σ_l∂σ_k = Σⱼ ½[(−1/R²+2ε²/R³)R_l R_k + (1/R−ε²/R²)R_kl];
-    // coupling −M_σlᵀ H⁻¹ M_σk.
-    for kk in 0..n_sigma {
-        for ll in 0..n_sigma {
-            let mut expl = 0.0;
+            s
+        } else if lo >= nt && hi < nw {
+            // ΩΩ: zᵀE_b Ω⁻¹ E_a z − ½ tr(Ω⁻¹ E_b Ω⁻¹ E_a).
+            let ea = &e_mats[a - nt];
+            let eb = &e_mats[b - nt];
+            let quad = (eb * &z).dot(&(omega_inv * (ea * &z)));
+            let oeb = omega_inv * eb;
+            let oea = omega_inv * ea;
+            let tr = (&oeb * &oea).trace();
+            quad - 0.5 * tr
+        } else if lo >= nt && lo < nw && hi >= nw {
+            // Ωσ — explicit vanishes.
+            0.0
+        } else {
+            // σσ: Σⱼ ½[(−1/R²+2ε²/R³)R_l R_k + (1/R−ε²/R²)R_kl].
+            let k = lo - nw;
+            let l = hi - nw;
+            let mut s = 0.0;
             for j in 0..prep.n_obs {
                 let (r, eps) = (prep.et[j].r, prep.et[j].eps);
                 let inv_r = 1.0 / r;
                 let inv_r2 = inv_r * inv_r;
                 let inv_r3 = inv_r2 * inv_r;
-                let a_term = (-inv_r2 + 2.0 * eps * eps * inv_r3) * sd.r1[ll][j] * sd.r1[kk][j];
-                let b_term = (inv_r - eps * eps * inv_r2) * sd.r2[kk][ll][j];
-                expl += 0.5 * (a_term + b_term);
+                let a_term = (-inv_r2 + 2.0 * eps * eps * inv_r3) * sd.r1[l][j] * sd.r1[k][j];
+                let b_term = (inv_r - eps * eps * inv_r2) * sd.r2[k][l][j];
+                s += 0.5 * (a_term + b_term);
             }
-            h[(nt + kk, nt + ll)] = expl - sd.m_sigma[kk].dot(&u_sigma[ll]);
+            s
+        }
+    };
+
+    let mut h = DMatrix::zeros(dim, dim);
+    for a in 0..dim {
+        for b in 0..dim {
+            h[(a, b)] = explicit(a, b) - mall[a].dot(&uall[b]);
         }
     }
-
     h
 }
 
@@ -266,7 +332,7 @@ mod tests {
     use crate::estimation::sens_outer_gradient::prepare;
     use crate::parser::model_parser::parse_model_string;
     use crate::sens::provider::{subject_sensitivities, subject_sensitivities_cov};
-    use crate::types::{CompiledModel, DoseEvent, ModelParameters, Subject};
+    use crate::types::{CompiledModel, DoseEvent, ModelParameters, OmegaMatrix, Subject};
     use std::collections::HashMap;
 
     const WARFARIN: &str = r#"
@@ -366,7 +432,10 @@ mod tests {
 
     /// Φ natural gradient `[∂Φ/∂θ, ∂Φ/∂σ]` at the reconverged mode for `params`
     /// (the M2-relevant data part of the analytic gradient — no `log|H̃|`):
-    /// `∂Φ/∂θ_m = ½ Σⱼ αⱼ bⱼₘ`, `∂Φ/∂σ_k = ½ Σⱼ (1/R − ε²/R²) R_k`.
+    /// `∂Φ/∂θ_m = ½ Σⱼ αⱼ bⱼₘ`, `∂Φ/∂Ω_e = ½(−zᵀE z + tr(Ω⁻¹E))`,
+    /// `∂Φ/∂σ_k = ½ Σⱼ (1/R − ε²/R²) R_k`, ordered `[θ, Ω, σ]` — the M2-relevant
+    /// (no `log|H̃|`) part of the analytic gradient, evaluated at the reconverged
+    /// mode.
     fn phi_natural_grad(
         model: &CompiledModel,
         subject: &Subject,
@@ -375,14 +444,26 @@ mod tests {
         let eta = precise_ebe(model, subject, params);
         let sens = subject_sensitivities(model, subject, &params.theta, &eta).unwrap();
         let prep = prepare(model, subject, params, &sens).unwrap();
+        let n_eta = model.n_eta;
         let n_theta = params.theta.len();
+        let entries = omega_entries(params.omega.diagonal, n_eta);
+        let n_omega = entries.len();
         let sigma = &params.sigma.values;
         let n_sigma = sigma.len();
-        let mut g = vec![0.0; n_theta + n_sigma];
+        let nw = n_theta + n_omega;
+        let mut g = vec![0.0; n_theta + n_omega + n_sigma];
         for m in 0..n_theta {
             for (j, obs) in sens.obs.iter().enumerate() {
                 g[m] += 0.5 * prep.et[j].alpha * obs.df_dtheta[m];
             }
+        }
+        let omega_inv = &prep.omega_inv;
+        let z = omega_inv * DVector::from_column_slice(&eta);
+        for (e, &(r, c)) in entries.iter().enumerate() {
+            let em = e_matrix(r, c, n_eta);
+            let quad = z.dot(&(&em * &z));
+            let tr = (omega_inv * &em).trace();
+            g[n_theta + e] = 0.5 * (-quad + tr);
         }
         for k in 0..n_sigma {
             let hk = sigma_fd_step(sigma[k]);
@@ -397,56 +478,80 @@ mod tests {
                 let r_k = (model.error_spec.variance_at(cmt, f, &sp)
                     - model.error_spec.variance_at(cmt, f, &sm))
                     / (2.0 * hk);
-                g[n_theta + k] += 0.5 * (1.0 / r - eps * eps / (r * r)) * r_k;
+                g[nw + k] += 0.5 * (1.0 / r - eps * eps / (r * r)) * r_k;
             }
         }
         g
     }
 
-    /// The `[θ, σ]` M2 block equals the reconverged finite difference of the Φ
-    /// natural gradient (its total derivative through the moving mode) on
-    /// warfarin — exercising θθ, the θσ cross-block, and σσ.
-    #[test]
-    fn cov_hessian_m2_theta_sigma_matches_reconverged_fd() {
-        let model = parse_model_string(WARFARIN).expect("parse");
-        let theta = vec![0.2, 10.0, 1.5];
-        let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
-        let mut params = model.default_params.clone();
-        params.theta = theta.clone();
-
-        let eta = precise_ebe(&model, &subject, &params);
-        let sens = subject_sensitivities_cov(&model, &subject, &params.theta, &eta).unwrap();
-        let prep = prepare(&model, &subject, &params, &sens).unwrap();
-        let n_theta = params.theta.len();
-        let n_sigma = params.sigma.values.len();
-        let dim = n_theta + n_sigma;
-        let analytic = cov_hessian_m2_theta_sigma(&model, &subject, &params, &sens, &prep);
-
-        // Reconverged central FD of the Φ natural gradient over [θ, σ].
-        let nat = |p: usize, base: &ModelParameters, step: f64| -> ModelParameters {
-            let mut q = base.clone();
-            if p < n_theta {
-                q.theta[p] += step;
-            } else {
-                let mut s = q.sigma.values.clone();
-                s[p - n_theta] += step;
-                q.sigma.values = s;
+    /// Perturb the natural parameter at flat index `p` (ordered `[θ, Ω, σ]`) by
+    /// `step`, rebuilding Ω (and its cached inverse) for an Ω entry.
+    fn perturb_natural(
+        base: &ModelParameters,
+        n_theta: usize,
+        entries: &[(usize, usize)],
+        p: usize,
+        step: f64,
+    ) -> ModelParameters {
+        let mut q = base.clone();
+        let n_omega = entries.len();
+        if p < n_theta {
+            q.theta[p] += step;
+        } else if p < n_theta + n_omega {
+            let (r, c) = entries[p - n_theta];
+            let mut m = base.omega.matrix.clone();
+            m[(r, c)] += step;
+            if r != c {
+                m[(c, r)] += step;
             }
-            q
-        };
+            q.omega =
+                OmegaMatrix::from_matrix(m, base.omega.eta_names.clone(), base.omega.diagonal);
+        } else {
+            let mut s = q.sigma.values.clone();
+            s[p - n_theta - n_omega] += step;
+            q.sigma.values = s;
+        }
+        q
+    }
+
+    /// Validate the full natural `[θ, Ω, σ]` M2 block against a reconverged
+    /// precise-EBE finite difference of the Φ natural gradient.
+    fn check_m2_natural(model: &CompiledModel, subject: &Subject, params: &ModelParameters) {
+        let eta = precise_ebe(model, subject, params);
+        let sens = subject_sensitivities_cov(model, subject, &params.theta, &eta).unwrap();
+        let prep = prepare(model, subject, params, &sens).unwrap();
+        let analytic = subject_cov_hessian_m2_natural(model, subject, params, &sens, &prep, &eta);
+
+        let n_theta = params.theta.len();
+        let entries = omega_entries(params.omega.diagonal, model.n_eta);
+        let n_omega = entries.len();
+        let n_sigma = params.sigma.values.len();
+        let dim = n_theta + n_omega + n_sigma;
+
         let base_val = |p: usize| -> f64 {
             if p < n_theta {
-                theta[p]
+                params.theta[p]
+            } else if p < n_theta + n_omega {
+                let (r, c) = entries[p - n_theta];
+                params.omega.matrix[(r, c)]
             } else {
-                params.sigma.values[p - n_theta]
+                params.sigma.values[p - n_theta - n_omega]
             }
         };
 
         let mut fd = DMatrix::zeros(dim, dim);
         for col in 0..dim {
             let h = 1e-6 * (1.0 + base_val(col).abs());
-            let gp = phi_natural_grad(&model, &subject, &nat(col, &params, h));
-            let gm = phi_natural_grad(&model, &subject, &nat(col, &params, -h));
+            let gp = phi_natural_grad(
+                model,
+                subject,
+                &perturb_natural(params, n_theta, &entries, col, h),
+            );
+            let gm = phi_natural_grad(
+                model,
+                subject,
+                &perturb_natural(params, n_theta, &entries, col, -h),
+            );
             for row in 0..dim {
                 fd[(row, col)] = (gp[row] - gm[row]) / (2.0 * h);
             }
@@ -468,11 +573,51 @@ mod tests {
                 );
             }
         }
-        // Symmetry of the analytic block.
         for row in 0..dim {
             for col in 0..dim {
                 assert!((analytic[(row, col)] - analytic[(col, row)]).abs() < 1e-9);
             }
         }
+    }
+
+    /// Warfarin (1-cpt oral, diagonal Ω, proportional error): the natural M2
+    /// Hessian matches reconverged FD across θθ, θΩ, θσ, ΩΩ, Ωσ, σσ.
+    #[test]
+    fn cov_hessian_m2_natural_matches_reconverged_fd_diagonal() {
+        let model = parse_model_string(WARFARIN).expect("parse");
+        let theta = vec![0.2, 10.0, 1.5];
+        let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta;
+        check_m2_natural(&model, &subject, &params);
+    }
+
+    /// Block-Ω (correlated CL/V): exercises the off-diagonal ΩΩ curvature and the
+    /// cross-entry Ω couplings.
+    #[test]
+    fn cov_hessian_m2_natural_matches_reconverged_fd_block_omega() {
+        const BLOCK: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(BLOCK).expect("parse");
+        let theta = vec![0.2, 10.0, 1.5];
+        let subject = warfarin_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta;
+        check_m2_natural(&model, &subject, &params);
     }
 }
