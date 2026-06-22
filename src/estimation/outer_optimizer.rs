@@ -2895,41 +2895,47 @@ pub(crate) fn compute_covariance(
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
     // Exact analytic FOCEI covariance Hessian (#436): when every subject is in
-    // analytic scope, the packed R is the chained natural M2 + M3 — exact, with
-    // no finite-difference step (so no `fd_hessian_step` to tune and no
-    // catastrophic cancellation on flat directions). Gated to FOCEI (the Laplace
-    // objective the derivation assumes), non-IOV, non-censored analytical models
-    // without residual-error random effects; any out-of-scope subject (ODE,
-    // scaling, LTBS, tv-covariates, oral-infusion, resets, BLOQ) drops the whole
-    // population back to the finite-difference covariance below.
-    let analytic_hessian = if options.interaction && !is_iov && model.residual_error_eta.is_none() {
-        let (_p0, ehs0, _h0, _k0) = reconverge_point(x_hat);
-        let mut acc: Option<DMatrix<f64>> = Some(DMatrix::zeros(n, n));
-        for i in 0..n_subj_cov {
-            let hi = crate::estimation::sens_cov_hessian::subject_packed_cov_hessian(
-                model,
-                &population.subjects[i],
-                template,
-                x_hat,
-                ehs0[i].as_slice(),
-            );
-            match (acc.as_mut(), hi) {
-                // Covariance OFV = 2·NLL ⇒ R = 2·Σᵢ ∂²Fᵢ/∂x².
-                (Some(a), Some(h)) => *a += h.scale(2.0),
-                _ => {
-                    acc = None;
-                    break;
+    // analytic scope, the packed R is the chained exact natural Hessian — for
+    // FOCEI the Almquist M2 + M3, for FOCE the Sheiner–Beal marginal Hessian
+    // (with mode response) — finite-difference-free (so no `fd_hessian_step` to
+    // tune and no catastrophic cancellation on flat directions). Gated to non-IOV,
+    // non-censored analytical models without residual-error random effects; any
+    // out-of-scope subject (ODE, scaling, LTBS, tv-covariates, oral-infusion,
+    // resets, BLOQ) drops the whole population back to the FD covariance below.
+    let analytic_hessian =
+        if options.analytic_cov_hessian && !is_iov && model.residual_error_eta.is_none() {
+            let (_p0, ehs0, _h0, _k0) = reconverge_point(x_hat);
+            let mut acc: Option<DMatrix<f64>> = Some(DMatrix::zeros(n, n));
+            for i in 0..n_subj_cov {
+                let eh = ehs0[i].as_slice();
+                let subj = &population.subjects[i];
+                let hi = if options.interaction {
+                    crate::estimation::sens_cov_hessian::subject_packed_cov_hessian(
+                        model, subj, template, x_hat, eh,
+                    )
+                } else {
+                    crate::estimation::sens_cov_hessian::subject_packed_cov_hessian_foce(
+                        model, subj, template, x_hat, eh,
+                    )
+                };
+                match (acc.as_mut(), hi) {
+                    // Covariance OFV = 2·NLL ⇒ R = 2·Σᵢ ∂²Fᵢ/∂x².
+                    (Some(a), Some(h)) => *a += h.scale(2.0),
+                    _ => {
+                        acc = None;
+                        break;
+                    }
                 }
             }
-        }
-        acc
-    } else {
-        None
-    };
+            acc
+        } else {
+            None
+        };
 
     if let Some(ah) = analytic_hessian {
         if options.verbose {
-            eprintln!("  [covariance] Exact analytic FOCEI Hessian (#436); no FD step.");
+            let m = if options.interaction { "FOCEI" } else { "FOCE" };
+            eprintln!("  [covariance] Exact analytic {m} Hessian (#436); no FD step.");
         }
         hess = ah;
     } else {

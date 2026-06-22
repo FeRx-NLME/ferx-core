@@ -958,9 +958,6 @@ pub(crate) fn subject_cov_hessian_natural(
         + subject_cov_hessian_m3_natural(model, subject, params, sens, prep, eta_hat)
 }
 
-// WIP (#436 FOCE): the Sheiner–Beal fixed-η̂ Hessian below is consumed once the
-// η̂-response and the FOCE branch of `compute_covariance` land (next sub-units).
-#[allow(dead_code)]
 /// Per-σ derivatives of the frozen FOCE residual variance `R⁰ = R(f(η=0), σ)` by
 /// finite differences of the closed-form variance (exact algebra). Returns, per
 /// quant row `i`: `∂R⁰/∂σ_k` `[k][i]`, `∂²R⁰/∂σ_k∂σ_l` `[k][l][i]`, and
@@ -972,7 +969,6 @@ struct Foce0Sigma {
     dd0: Vec<Vec<f64>>,       // ∂(∂R⁰/∂f)/∂σ_k [k][i]
 }
 
-#[allow(dead_code)]
 fn foce0_sigma(model: &CompiledModel, cmts: &[usize], f0: &[f64], sigma: &[f64]) -> Foce0Sigma {
     let n_sigma = sigma.len();
     let nq = f0.len();
@@ -1265,7 +1261,7 @@ fn foce_sb_fixed_natural(
 /// derivatives consume `∂³f/∂η³` and `∂³f/∂η²∂θ`), and `η̂_{l,ζ}`, `η̂_{l,ξζ}`
 /// are the shared inner-mode responses ([`inner_eta_responses`]). `None` outside
 /// scope / on BLOQ censoring. `prep` carries the shared inner Hessian.
-#[allow(clippy::type_complexity, dead_code)]
+#[allow(clippy::type_complexity)]
 fn subject_cov_hessian_foce_natural(
     model: &CompiledModel,
     subject: &Subject,
@@ -1696,6 +1692,31 @@ pub(crate) fn pack_natural_hessian(
         }
     }
     hpack
+}
+
+/// The exact per-subject **FOCE** (Sheiner–Beal) covariance Hessian `∂²Fᵢ/∂x²` in
+/// packed space — the FOCE counterpart of [`subject_packed_cov_hessian`]. `None`
+/// outside analytic scope or on BLOQ censoring (caller falls back to FD). The
+/// per-subject NLL Hessian; the covariance OFV is `2·Σᵢ Fᵢ`, so the caller scales
+/// by 2.
+pub(crate) fn subject_packed_cov_hessian_foce(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: &ModelParameters,
+    x: &[f64],
+    eta_hat: &[f64],
+) -> Option<DMatrix<f64>> {
+    let params = unpack_params(x, template);
+    let sens = subject_sensitivities_cov(model, subject, &params.theta, eta_hat)?;
+    let zeros = vec![0.0; model.n_eta];
+    let sens0 = subject_sensitivities_cov(model, subject, &params.theta, &zeros)?;
+    let prep = prepare(model, subject, &params, &sens)?;
+    if !prep.censored.is_empty() {
+        return None;
+    }
+    let (grad, hess) =
+        subject_cov_hessian_foce_natural(model, subject, &params, &sens, &sens0, &prep, eta_hat)?;
+    Some(pack_natural_hessian(&hess, &grad, x, template))
 }
 
 #[cfg(test)]
