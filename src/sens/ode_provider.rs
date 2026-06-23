@@ -3136,8 +3136,9 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
-    // Same disposition shape but with a `transit()` forcing — *not* lifted to
-    // Dual2 in slice 1, so it must stay on the FD fallback.
+    // Same disposition shape but with a `transit()` forcing — lifted to Dual2 in
+    // #430 slice 2, so it is served by the analytic provider (its `ln Γ(n+1)`
+    // constant rides the `ln_gamma` Dual2 rule).
     // IIV on N (the gamma argument) is deliberate: it is what routes the transit
     // forcing's `ln Γ(n+1)` derivatives into the FOCEI Hessian — ∂²f/∂η_N² rides the
     // *trigamma* (2nd-order `ln_gamma`) rule. With IIV only on CL the second-order

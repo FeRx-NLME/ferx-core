@@ -7,7 +7,7 @@
 //!
 //! These are the inherently-numerical absorption models that feed an explicit
 //! ODE disposition (see `plans/absorption-models.md`). They use only
-//! `+ − * /`, `.ln()`, `.exp()`, `.sqrt()`, and `ln_gamma` — all on the `PkNum`
+//! `+ − * /`, `.ln()`, `.exp()`, and `ln_gamma` — all on the `PkNum`
 //! trait. The input-rate forcing is **generic over `T: PkNum`** (the `sens/`
 //! `*_g<T>` convention), so `transit()` and `igd()` models are evaluated over
 //! `Dual2` by `sens/ode_provider.rs` and get **exact analytic** FOCE/FOCEI/Bayes
@@ -447,6 +447,73 @@ mod tests {
                     r.is_finite() && r >= 0.0,
                     "R_in must be finite & non-negative at n={n}, mtt={mtt}, tad={tad}, got {r}"
                 );
+            }
+        }
+    }
+
+    /// Dual-path counterpart to `transit_rate_is_finite_for_domain_excursions`:
+    /// the same transient excursions (`mtt ≤ 0`, `n < 0`, `NaN`), but evaluated
+    /// over `Dual2` (here `DualMixed`), must yield a finite **value, gradient, and
+    /// Hessian** — not merely a finite `f64` value. This is the failure mode that
+    /// turns a mid-search excursion *on the analytic FOCE/FOCEI/Bayes path* into a
+    /// `NaN` gradient → `NaN` OFV (the f64 value test above can't see it — it has
+    /// no jet). The clamp ([`PreparedInputRate::transit`], via `guard_floor` and
+    /// the `n.val() >= 0` branch) makes the clamped region flat, so the **clamped
+    /// parameter's gradient entry is exactly zero**; a regression that let
+    /// `mtt ≤ 0` / `n < 0` reach `ln` / `ln_gamma` would surface here as a `NaN`/
+    /// `∞` jet. `n = 0` (Bateman) is included as an interior case: it is the
+    /// `0·ln x` product-rule edge (value 0, jet `∂/∂n = ln x ≠ 0`) and must stay
+    /// finite with both parameters' jets live.
+    #[test]
+    fn transit_dual_jets_finite_at_domain_excursions() {
+        use crate::sens::dual_mixed::DualMixed;
+        type D = DualMixed<2, 2>;
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::Transit,
+            arg_slots: vec![6, 7], // n @ 6 (dim 0), mtt @ 7 (dim 1)
+        };
+        // (n, mtt, label, clamped_dim): clamped_dim is the seeded dim whose jet the
+        // clamp must zero out (None = interior, both jets live).
+        let cases: &[(f64, f64, &str, Option<usize>)] = &[
+            (-1.0, 2.0, "n<0", Some(0)),
+            (3.0, 0.0, "mtt=0", Some(1)),
+            (3.0, -1.0, "mtt<0", Some(1)),
+            (f64::NAN, 2.0, "NaN n", Some(0)),
+            (3.0, f64::NAN, "NaN mtt", Some(1)),
+            (0.0, 2.0, "n=0 Bateman (interior)", None),
+        ];
+        for &(n, mtt, label, clamped) in cases {
+            let mut params = vec![D::constant(0.0); crate::types::MAX_PK_PARAMS];
+            params[6] = D::var(n, 0); // seed n   → dim 0
+            params[7] = D::var(mtt, 1); // seed mtt → dim 1
+            let prep = forcing
+                .prepare_dual::<D>(&params)
+                .expect("transit lifts over PkNum (slice 2)");
+            for &tad in &[0.5, 2.0, 10.0] {
+                let r = prep.rate(D::constant(tad), D::constant(100.0));
+                assert!(
+                    r.value.is_finite(),
+                    "{label}: value not finite at tad={tad}: {}",
+                    r.value
+                );
+                assert!(
+                    r.grad.iter().all(|g| g.is_finite()),
+                    "{label}: gradient not finite at tad={tad}: {:?}",
+                    r.grad
+                );
+                assert!(
+                    r.hess.iter().flatten().all(|h| h.is_finite()),
+                    "{label}: Hessian not finite at tad={tad}: {:?}",
+                    r.hess
+                );
+                if let Some(d) = clamped {
+                    assert_eq!(
+                        r.grad[d], 0.0,
+                        "{label}: clamped dim {d} must have a flat (zero) jet at tad={tad}, got {}",
+                        r.grad[d]
+                    );
+                }
             }
         }
     }
