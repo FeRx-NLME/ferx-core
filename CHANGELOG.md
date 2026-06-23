@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Performance
+- **Exact analytic gradients for `transit()` absorption ODE models** (#430). The
+  built-in transit input-rate forcing's `ln Γ(n+1)` constant now has a `Dual2` rule
+  (analytic digamma/trigamma derivatives of the shared Lanczos `ln_gamma`), so a
+  `transit()` model is evaluated over `Dual2` by the ODE sensitivity provider and
+  drives exact analytic FOCE/FOCEI/Bayes gradients instead of finite differences —
+  joining `igd()` on the analytic path. Estimates are unchanged; gradients are exact
+  and drop the `(n_params+1)×` FD multiplier on transit fits.
 - **Faster analytic time-varying-covariate inner η-gradient + ODE-sensitivity path
   consolidation** (#451). The per-subject event schedule is now reused across inner
   BFGS steps instead of rebuilt each step, identical per-event covariate snapshots are

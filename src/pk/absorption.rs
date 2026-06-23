@@ -7,18 +7,15 @@
 //!
 //! These are the inherently-numerical absorption models that feed an explicit
 //! ODE disposition (see `plans/absorption-models.md`). They use only
-//! `+ − * /`, `.ln()`, `.exp()`, `.sqrt()`, and `ln_gamma`. Written for `f64`:
-//! a `transit()`/`igd()` model currently differentiates by finite differences,
-//! because the built-in input-rate forcing is on `sens/ode_provider.rs`'s
-//! not-yet-supported list and falls back to FD (rather than being evaluated
-//! over `Dual2`). Making `PreparedInputRate::rate` (and the `ln_gamma` it calls)
-//! generic over the `PkNum` trait — the `sens/` `*_g<T>` convention — would let
-//! the ODE forcing inherit exact analytic sensitivities. (The Enzyme `autodiff`
-//! path these once targeted was retired in #367/#381; `Dual2` handles `max`/`min`
-//! by comparison, so the old `f64::max`/`min` restriction no longer applies.)
+//! `+ − * /`, `.ln()`, `.exp()`, `.sqrt()`, and `ln_gamma` — all on the `PkNum`
+//! trait. The input-rate forcing is **generic over `T: PkNum`** (the `sens/`
+//! `*_g<T>` convention), so `transit()` and `igd()` models are evaluated over
+//! `Dual2` by `sens/ode_provider.rs` and get **exact analytic** FOCE/FOCEI/Bayes
+//! sensitivities, not finite differences (#430). (The Enzyme `autodiff` path
+//! these once targeted was retired in #367/#381; `Dual2` handles `max`/`min` by
+//! comparison, so the old `f64::max`/`min` restriction no longer applies.)
 
 use crate::sens::num::PkNum;
-use crate::stats::special::ln_gamma;
 
 /// `ln(2π)` — the inverse-Gaussian log-density normalisation constant. A literal
 /// (rather than a runtime `(2.0 * PI).ln()`) since `f64::ln` is not `const`; the
@@ -121,8 +118,9 @@ impl InputRateKind {
     /// Whether this kind's input-rate forcing has been lifted to `PkNum`/`Dual2`
     /// so the analytic ODE sensitivity provider (`sens/ode_provider.rs`) can
     /// evaluate it over dual numbers; otherwise a model using it stays on the FD
-    /// fallback. #430 lifts inverse-Gaussian first (no new special function);
-    /// transit follows once `ln_gamma` has a `Dual2` rule, Weibull with Phase 2.
+    /// fallback. Inverse-Gaussian (#430 slice 1) and transit (#430 slice 2, via
+    /// the `ln_gamma` `Dual2` rule = digamma/trigamma) are both lifted; Weibull
+    /// follows with Phase 2 (its `powf` `Dual2` rule).
     pub fn supported_over_dual(self) -> bool {
         // Exhaustive (no `_` arm) so adding a kind forces a decision here, and must
         // stay consistent with [`InputRateForcing::prepare_dual`] — a kind marked
@@ -132,7 +130,7 @@ impl InputRateKind {
         // (#430 review #5 / #451).
         match self {
             InputRateKind::InverseGaussian => true,
-            InputRateKind::Transit => false,
+            InputRateKind::Transit => true,
         }
     }
 }
@@ -205,17 +203,24 @@ impl InputRateForcing {
     /// Build the prepared input-rate constants over `T: PkNum` (e.g.
     /// `T = Dual2<N>` for the analytic ODE sensitivity provider, #430) from the
     /// individual-parameter vector `params` — laid out identically to the `f64`
-    /// [`Self::prepare`] input, so `arg_slots` index the same way. Returns `None`
-    /// for kinds not yet lifted to `PkNum` (transit, until its `ln_gamma`
-    /// `Dual2` rule lands), so the provider keeps those on the FD fallback;
-    /// [`InputRateKind::supported_over_dual`] gates which kinds reach here.
+    /// [`Self::prepare`] input, so `arg_slots` index the same way (and the
+    /// per-kind argument defaults match `prepare`, so the lifted constants
+    /// reproduce the scalar ones for `T = f64`). Both lifted kinds
+    /// (inverse-Gaussian, transit) return `Some`; a future unlifted kind (Weibull,
+    /// pre-Phase-2) would return `None`, keeping that model on the FD fallback.
+    /// [`InputRateKind::supported_over_dual`] gates which kinds reach here and is
+    /// pinned consistent with this `match` by
+    /// `supported_over_dual_agrees_with_prepare_dual`.
     pub fn prepare_dual<T: PkNum>(&self, params: &[T]) -> Option<PreparedInputRate<T>> {
         match self.kind {
+            InputRateKind::Transit => Some(PreparedInputRate::transit(
+                self.arg(params, 0, 0.0),
+                self.arg(params, 1, 1.0),
+            )),
             InputRateKind::InverseGaussian => Some(PreparedInputRate::inverse_gaussian(
                 self.arg(params, 0, 1.0),
                 self.arg(params, 1, 1.0),
             )),
-            InputRateKind::Transit => None,
         }
     }
 }
@@ -274,6 +279,40 @@ impl<T: PkNum> PreparedInputRate<T> {
         }
     }
 
+    /// Precompute the transit constants for `(n, mtt)`.
+    ///
+    /// The arguments are **clamped to the valid domain** (`mtt > 0`, `n ≥ 0`).
+    /// The fit-time guard ([`validate_transit`], wired into
+    /// `check_absorption_dosing`) already rejects an out-of-domain *typical*
+    /// value loudly; but during estimation the inner BFGS perturbs `eta` and the
+    /// outer FD step perturbs `theta`, so an additive parameterisation
+    /// (`MTT = TVMTT + ETA_MTT`) or a wide FD step can drive a transient
+    /// `mtt ≤ 0` / `n < 0` *mid-search*. Left unclamped that yields
+    /// `ktr.ln()` / `ln Γ(n+1) = NaN`, which propagates through the ODE RHS into
+    /// an opaque `NaN` OFV instead of a recoverable step. Clamping keeps `R_in`
+    /// finite at the domain wall so the optimiser can climb back to the interior;
+    /// the converged optimum is interior, so reported estimates are unaffected.
+    /// `NaN` inputs also fall to the floor (`guard_floor` floors `NaN`, matching
+    /// `f64::max`; the `n` branch is false for `NaN`).
+    ///
+    /// Generic over `T` (the `sens/` `*_g<T>` convention) so a `transit()` model
+    /// gets exact analytic `Dual2` sensitivities via [`PkNum::ln_gamma`]
+    /// (digamma/trigamma) — #430 slice 2. For `T = f64` this is byte-identical to
+    /// the previous f64-only constructor (`guard_floor` ≡ `clamp_above_floor`,
+    /// `PkNum::ln_gamma` ≡ `special::ln_gamma`).
+    #[inline]
+    fn transit(n: T, mtt: T) -> Self {
+        let mtt = mtt.guard_floor(Self::MIN_PARAM);
+        let n = if n.val() >= 0.0 { n } else { T::from_f64(0.0) };
+        let ktr = (n + T::from_f64(1.0)) / mtt;
+        PreparedInputRate::Transit {
+            ktr,
+            ln_ktr: ktr.ln(),
+            n,
+            ln_gamma_np1: (n + T::from_f64(1.0)).ln_gamma(),
+        }
+    }
+
     /// Appearance rate `R_in(tad)` for one dose (`dose = F · amt`). Per-dose
     /// contributions are summed by the caller; `tad ≤ 0` or `dose ≤ 0 ⇒ 0` (the
     /// guard branches on `.val()`, so for a `Dual2` it returns a flat zero). The
@@ -310,40 +349,6 @@ impl<T: PkNum> PreparedInputRate<T> {
                 let d = tad - mat;
                 (dose.ln() + c0 - T::from_f64(1.5) * tad.ln() - d * d * inv_2cv2mat / tad).exp()
             }
-        }
-    }
-}
-
-impl PreparedInputRate<f64> {
-    /// Precompute the transit constants for `(n, mtt)`.
-    ///
-    /// The arguments are **clamped to the valid domain** (`mtt > 0`, `n ≥ 0`).
-    /// The fit-time guard ([`validate_transit`], wired into
-    /// `check_absorption_dosing`) already rejects an out-of-domain *typical*
-    /// value loudly; but during estimation the inner BFGS perturbs `eta` and the
-    /// outer FD step perturbs `theta`, so an additive parameterisation
-    /// (`MTT = TVMTT + ETA_MTT`) or a wide FD step can drive a transient
-    /// `mtt ≤ 0` / `n < 0` *mid-search*. Left unclamped that yields
-    /// `ktr.ln()` / `ln Γ(n+1) = NaN`, which propagates through the ODE RHS into
-    /// an opaque `NaN` OFV instead of a recoverable step. Clamping keeps `R_in`
-    /// finite at the domain wall so the optimiser can climb back to the interior;
-    /// the converged optimum is interior, so reported estimates are unaffected.
-    /// `NaN` inputs also fall to the floor (every `>`/`>=` is false for `NaN`).
-    ///
-    /// `f64`-only for now: the `ln_gamma(n+1)` constant needs a `Dual2` rule
-    /// (digamma/trigamma) before transit can join the analytic provider path —
-    /// the slice-2 follow-up of #430. Until then a transit model differentiates
-    /// by FD (see [`InputRateKind::supported_over_dual`]).
-    #[inline]
-    fn transit(n: f64, mtt: f64) -> Self {
-        let mtt = crate::types::clamp_above_floor(mtt, Self::MIN_PARAM);
-        let n = if n >= 0.0 { n } else { 0.0 };
-        let ktr = (n + 1.0) / mtt;
-        PreparedInputRate::Transit {
-            ktr,
-            ln_ktr: ktr.ln(),
-            n,
-            ln_gamma_np1: ln_gamma(n + 1.0),
         }
     }
 }
@@ -676,33 +681,37 @@ mod tests {
         assert!(forcing.validate(&bad_cv2).unwrap_err().contains("cv2"));
     }
 
-    /// `prepare_dual` lifts the IG forcing to a `PkNum` type (here `T = f64`),
-    /// reproducing the scalar `prepare` exactly, and returns `None` for transit —
-    /// not yet lifted, so the provider keeps it on the FD fallback (#430 slice 1).
+    /// `prepare_dual` lifts **both** forcings (IG and transit) to a `PkNum` type
+    /// (here `T = f64`), reproducing the scalar `prepare` exactly — the `T = f64`
+    /// byte-identity that lets the analytic ODE provider evaluate them over `Dual2`
+    /// without drifting from the production predictor (#430; transit = slice 2).
     #[test]
-    fn prepare_dual_lifts_ig_and_declines_transit() {
+    fn prepare_dual_lifts_ig_and_transit() {
+        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
+        params[4] = 2.0; // mat
+        params[5] = 0.3; // cv2
+        params[6] = 3.0; // n
+        params[7] = 1.0; // mtt
+
         let ig = InputRateForcing {
             cmt: 1,
             kind: InputRateKind::InverseGaussian,
             arg_slots: vec![4, 5], // mat @ 4, cv2 @ 5
         };
-        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
-        params[4] = 2.0; // mat
-        params[5] = 0.3; // cv2
-                         // T = f64: the lifted constants reproduce the scalar `prepare` exactly.
-        let lifted = ig.prepare_dual::<f64>(&params).expect("IG is lifted");
-        let scalar = ig.prepare(&params);
-        for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
-            assert_eq!(lifted.rate(tad, 100.0), scalar.rate(tad, 100.0));
-        }
-
-        // Transit is not lifted in slice 1 → None (provider falls back to FD).
         let transit = InputRateForcing {
             cmt: 0,
             kind: InputRateKind::Transit,
-            arg_slots: vec![6, 7],
+            arg_slots: vec![6, 7], // n @ 6, mtt @ 7
         };
-        assert!(transit.prepare_dual::<f64>(&params).is_none());
+        for forcing in [&ig, &transit] {
+            let lifted = forcing
+                .prepare_dual::<f64>(&params)
+                .expect("both kinds lift over PkNum in slice 2");
+            let scalar = forcing.prepare(&params);
+            for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
+                assert_eq!(lifted.rate(tad, 100.0), scalar.rate(tad, 100.0));
+            }
+        }
     }
 
     /// Drift tripwire: `InputRateKind::supported_over_dual` (the gate the ODE

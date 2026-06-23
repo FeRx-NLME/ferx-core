@@ -3138,6 +3138,11 @@ mod tests {
 
     // Same disposition shape but with a `transit()` forcing — *not* lifted to
     // Dual2 in slice 1, so it must stay on the FD fallback.
+    // IIV on N (the gamma argument) is deliberate: it is what routes the transit
+    // forcing's `ln Γ(n+1)` derivatives into the FOCEI Hessian — ∂²f/∂η_N² rides the
+    // *trigamma* (2nd-order `ln_gamma`) rule. With IIV only on CL the second-order
+    // transit test would be vacuous for trigamma (∂²/∂N² would land in the dropped
+    // θ-θ block). Tight ODE tols so analytic ≡ central-FD is clean.
     const TRANSIT_ODE: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 100.0)
@@ -3146,12 +3151,13 @@ mod tests {
   theta TVN(3.0, 0.1, 20.0)
   theta TVKA(1.0, 0.05, 20.0)
   omega ETA_CL ~ 0.09
+  omega ETA_N  ~ 0.04
   sigma PROP_ERR ~ 0.15 (sd)
 [individual_parameters]
   CL  = TVCL * exp(ETA_CL)
   V   = TVV
   MTT = TVMTT
-  N   = TVN
+  N   = TVN * exp(ETA_N)
   KA  = TVKA
 [structural_model]
   ode(obs_cmt=central, states=[depot, central])
@@ -3160,15 +3166,20 @@ mod tests {
   d/dt(central) = KA*depot - CL/V*central
 [error_model]
   DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
 "#;
 
-    /// The kind gate: only inverse-Gaussian is lifted to Dual2 in slice 1 of
-    /// #430; transit (and, later, Weibull) stay on the FD fallback.
+    /// The kind gate: inverse-Gaussian (#430 slice 1) and transit (#430 slice 2)
+    /// are both lifted to Dual2; a future kind (Weibull) stays on the FD fallback
+    /// until its own dual rule lands.
     #[test]
     fn input_rate_kind_supported_over_dual_gates_kinds() {
         use crate::pk::absorption::InputRateKind;
         assert!(InputRateKind::InverseGaussian.supported_over_dual());
-        assert!(!InputRateKind::Transit.supported_over_dual());
+        assert!(InputRateKind::Transit.supported_over_dual());
     }
 
     /// With the IG forcing lifted to Dual2, an `igd()` model is served by the
@@ -3188,16 +3199,83 @@ mod tests {
         check_vs_production(&model, &subject, &theta, &eta);
     }
 
-    /// Slice 1 lifts only IG: a `transit()` model is still *not* served by the
-    /// analytic provider (it differentiates by FD until transit's `ln_gamma`
-    /// Dual2 rule lands in slice 2).
+    /// Slice 2 lifts transit: a `transit()` model is now served by the analytic
+    /// provider, and `f`/`∂f/∂η`/`∂f/∂θ` match the production predictor + central
+    /// FD — including `∂f/∂(TVMTT,TVN)` and `∂f/∂ETA_N`, which flow only through the
+    /// transit forcing's `ln Γ(n+1)` constant (so this exercises the new `ln_gamma`
+    /// `Dual2` = digamma rule end-to-end through the ODE integration).
     #[test]
-    fn ode_provider_transit_absorption_stays_on_fd_fallback() {
+    fn ode_provider_transit_absorption_matches_production() {
         let model = parse_model_string(TRANSIT_ODE).expect("parse");
         assert!(
-            !ode_analytical_supported(&model),
-            "transit() must stay on the FD fallback in slice 1 of #430"
+            ode_analytical_supported(&model),
+            "transit() should be supported once its ln_gamma forcing is lifted to Dual2 (#430 slice 2)"
         );
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = vec![5.0, 50.0, 1.0, 3.0, 1.0]; // TVCL, TVV, TVMTT, TVN, TVKA
+        let eta = vec![0.1, 0.05]; // ETA_CL, ETA_N (N feeds the forcing)
+        check_vs_production(&model, &subject, &theta, &eta);
+    }
+
+    /// Second-order blocks of the transit forcing: FOCEI consumes `d2f_deta2` and
+    /// `d2f_deta_dtheta`, which for transit ride the **trigamma** (2nd-order
+    /// `ln_gamma`) rule. `N` carries IIV (`ETA_N`), so `∂²f/∂ETA_N²` flows through
+    /// `trigamma(N+1)` — a wrong trigamma rule fails here while first-order parity
+    /// still passes. Validated against central FD of the analytic (already
+    /// FD-checked) `df_deta`.
+    #[test]
+    fn ode_provider_transit_second_order_matches_fd_of_gradient() {
+        let model = parse_model_string(TRANSIT_ODE).expect("parse");
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = vec![5.0, 50.0, 1.0, 3.0, 1.0];
+        let eta = vec![0.1, 0.05];
+        let n_eta = model.n_eta;
+        let n_theta = model.n_theta;
+        let base = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+
+        // η-η block: FD of df_deta over η (ETA_N → trigamma through the forcing).
+        let he = 1e-5;
+        for l in 0..n_eta {
+            let mut ep = eta.clone();
+            ep[l] += he;
+            let mut em = eta.clone();
+            em[l] -= he;
+            let sp = ode_subject_sensitivities(&model, &subject, &theta, &ep).expect("supported");
+            let sm = ode_subject_sensitivities(&model, &subject, &theta, &em).expect("supported");
+            for (j, obs) in base.obs.iter().enumerate() {
+                for k in 0..n_eta {
+                    let fd = (sp.obs[j].df_deta[k] - sm.obs[j].df_deta[k]) / (2.0 * he);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta2[k * n_eta + l],
+                        fd,
+                        max_relative = 2e-3,
+                        epsilon = 1e-6
+                    );
+                }
+            }
+        }
+
+        // η-θ cross block: FD of df_deta over θ (TVMTT/TVN flow only through the forcing).
+        for m in 0..n_theta {
+            let s = 1e-5 * (1.0 + theta[m].abs());
+            let mut tp = theta.clone();
+            tp[m] += s;
+            let mut tm = theta.clone();
+            tm[m] -= s;
+            let sp = ode_subject_sensitivities(&model, &subject, &tp, &eta).expect("supported");
+            let sm = ode_subject_sensitivities(&model, &subject, &tm, &eta).expect("supported");
+            for (j, obs) in base.obs.iter().enumerate() {
+                for k in 0..n_eta {
+                    let fd = (sp.obs[j].df_deta[k] - sm.obs[j].df_deta[k]) / (2.0 * s);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta_dtheta[k * n_theta + m],
+                        fd,
+                        max_relative = 2e-3,
+                        epsilon = 1e-6
+                    );
+                }
+            }
+        }
     }
 
     /// Built-in absorption + an EVID 3/4 reset is kept on the FD fallback in
