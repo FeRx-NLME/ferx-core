@@ -1177,9 +1177,8 @@ pub(crate) fn ode_predictions_adaptive(
 
     let mut stopped = false;
 
-    for k in 0..(break_times.len() - 1) {
+    for k in 0..break_times.len() {
         let t_start = break_times[k];
-        let t_end = break_times[k + 1];
 
         // --- Decision hook: observe (pre-dose trough) -> decide -> dose. ---
         if !stopped {
@@ -1233,6 +1232,32 @@ pub(crate) fn ode_predictions_adaptive(
                                      the model has {n} state(s)"
                                 ));
                             }
+                            // Out-of-scope model features the bolus-only S1.3a cut cannot
+                            // honor are typed errors, never a silent wrong answer:
+                            //  - a compartment fed by a built-in input-rate (absorption)
+                            //    function would be double-counted: the trusted static engine
+                            //    delivers such a dose as `R_in` through the wrapped RHS
+                            //    (`input_rate_consumes_cmt`), *not* as a state jump, yet the
+                            //    same forcing is rebuilt from `shadow.doses` here;
+                            //  - a lag time on the dosed compartment would be applied below
+                            //    with zero delay yet excluded from its own TAD anchor inside
+                            //    `integrate_segment` (whose filter is `d.time + lag <= t_start`).
+                            if input_rate_consumes_cmt(ode, cmt) {
+                                return Err(format!(
+                                    "decision {decision_index}: compartment {cmt} is fed by a \
+                                     built-in input-rate (absorption) function; controller \
+                                     dosing into an input-rate compartment is not supported in \
+                                     S1.3a"
+                                ));
+                            }
+                            let lag = ode.dose_attr_map.lagtime(cmt, pk_params_flat);
+                            if lag != 0.0 {
+                                return Err(format!(
+                                    "decision {decision_index}: compartment {cmt} declares a dose \
+                                     lag time ({lag}); lagged controller dosing is not supported \
+                                     in S1.3a"
+                                ));
+                            }
                             let f = ode.dose_attr_map.f_bio(cmt, pk_params_flat);
                             u[cmt - 1] += f * amt;
                             if !ext_params[crate::types::MAX_PK_PARAMS].is_finite() {
@@ -1284,33 +1309,45 @@ pub(crate) fn ode_predictions_adaptive(
             }
         }
 
-        // Per-segment lag/F for the realized doses (bolus-only: lag 0, F per cmt).
-        let dose_lagtimes: Vec<f64> = shadow
-            .doses
-            .iter()
-            .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
-            .collect();
-        let dose_f_bio: Vec<f64> = shadow
-            .doses
-            .iter()
-            .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
-            .collect();
+        // Integrate the open interval `(t_start, t_end]` to the next break, if
+        // there is one. The final break time (== `t_last`) has no successor: its
+        // decision hook and left-boundary observation were applied above, but
+        // there is nothing left to integrate. Processing that last break — rather
+        // than stopping the loop one short of it — is what lets a decision
+        // scheduled at the maximum time still fire: its dose reaches the `ledger`
+        // and any coincident observation is recorded post-dose.
+        if k + 1 < break_times.len() {
+            let t_end = break_times[k + 1];
 
-        integrate_segment(
-            ode,
-            &mut u,
-            t_start,
-            t_end,
-            &shadow,
-            &dose_lagtimes,
-            &dose_f_bio,
-            &mut ext_params,
-            pk_params_flat,
-            theta,
-            eta,
-            &obs_map,
-            &mut predictions,
-        );
+            // Per-segment lag/F for the realized doses (bolus-only: lag 0 — a
+            // nonzero lag is rejected at the decision hook — F per cmt).
+            let dose_lagtimes: Vec<f64> = shadow
+                .doses
+                .iter()
+                .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
+                .collect();
+            let dose_f_bio: Vec<f64> = shadow
+                .doses
+                .iter()
+                .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
+                .collect();
+
+            integrate_segment(
+                ode,
+                &mut u,
+                t_start,
+                t_end,
+                &shadow,
+                &dose_lagtimes,
+                &dose_f_bio,
+                &mut ext_params,
+                pk_params_flat,
+                theta,
+                eta,
+                &obs_map,
+                &mut predictions,
+            );
+        }
     }
 
     // Clamp negative predictions to zero, matching the static predictor.
@@ -2779,6 +2816,152 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("compartment"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_final_decision_at_max_time_still_fires() {
+        // Regression: the last decision must fire even when it lands on the
+        // schedule's maximum time (i.e. at or after the last observation). Here
+        // the second decision (t=24) coincides with the last observation, so it
+        // is the maximum break time; it must still dose, reach the ledger, and
+        // make the t=24 observation read the *post*-dose state.
+        //
+        // Checked against the exact 1-cpt closed form (ke = CL/V = 0.1), not
+        // `ode_predictions`: the static engine likewise never applies a dose on
+        // its terminal break, so a static comparison would mask the bug.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = 0.1
+        let decisions = [0.0, 24.0];
+        let obs = vec![6.0, 24.0]; // last obs coincides with the last decision
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let base = make_subject(vec![], obs);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        // Both decisions dosed — including the one at the maximum time.
+        assert_eq!(run.ledger.len(), 2, "final decision at t_max must dose");
+        assert_eq!(run.ledger[1].time, 24.0);
+        assert_eq!(run.ledger[1].decision_idx, 1);
+
+        let ke = 0.1_f64;
+        // t=6: only the t=0 dose has been given.
+        assert_relative_eq!(
+            run.predictions[0],
+            100.0 * (-ke * 6.0).exp(),
+            max_relative = 1e-5
+        );
+        // t=24: first dose decayed to 24 h, plus the fresh 100 mg bolus (post-dose).
+        let expected_24 = 100.0 * (-ke * 24.0).exp() + 100.0;
+        assert_relative_eq!(run.predictions[1], expected_24, max_relative = 1e-5);
+    }
+
+    #[test]
+    fn adaptive_rejects_out_of_range_bolus_compartment() {
+        // `validate()` only catches cmt == 0; an out-of-range cmt (> n_states) is
+        // caught by the driver's own guard. 1-state model, bolus into cmt 2.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 2 }];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("state"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_out_of_range_monitor_compartment() {
+        // A monitor on a compartment beyond the model is a precondition error.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let monitors = [MonitorSpec::new("A", 2, ObserveMode::Ipred)]; // n_states = 1
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &monitors,
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("state"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_dosing_into_input_rate_compartment() {
+        // A bolus into a compartment fed by a built-in input-rate function would
+        // be double-counted (state jump *and* `R_in` forcing). Must be a typed
+        // error, not a silent wrong answer.
+        let mut ode = one_cpt_ode_spec();
+        ode.input_rate = vec![crate::pk::absorption::InputRateForcing {
+            cmt: 0, // 0-based -> consumes 1-based compartment 1
+            kind: crate::pk::absorption::InputRateKind::Transit,
+            arg_slots: vec![],
+        }];
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("input-rate"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_rejects_lagged_dose_compartment() {
+        // A lag time on the dosed compartment would be applied with zero delay
+        // here yet dropped from its own TAD anchor in `integrate_segment`. Reject.
+        let ode = one_cpt_ode_spec();
+        let mut pk = pk_one(1.0, 10.0);
+        pk.values[crate::types::PK_IDX_LAGTIME] = 2.0; // bare-slot lag on cmt 1
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let base = make_subject(vec![], vec![1.0]);
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .unwrap_err();
+        assert!(err.contains("lag time"), "got: {err}");
     }
 
     /// Two-compartment "accumulator": `d/dt = 0` for both states, so each state
