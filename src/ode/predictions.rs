@@ -2146,6 +2146,88 @@ mod tests {
         }
     }
 
+    /// Build the per-segment `obs_time -> indices` map the integrator uses.
+    fn obs_index_map(obs_times: &[f64]) -> HashMap<u64, Vec<usize>> {
+        let mut m: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, &t) in obs_times.iter().enumerate() {
+            m.entry(t.to_bits()).or_default().push(i);
+        }
+        m
+    }
+
+    #[test]
+    fn integrate_segment_zero_length_is_a_noop() {
+        // A degenerate `[t, t]` segment must skip integration and leave the carried
+        // state and predictions untouched — the guard a reactive driver relies on
+        // when a decision time coincides with another break (#391 S1.2).
+        // `ode_predictions` never reaches it (break_times are deduped at the same
+        // 1e-15), so it has to be exercised directly here.
+        let ode = one_cpt_ode_spec();
+        let subject = make_subject(vec![], vec![5.0]);
+        let pk = pk_one(1.0, 10.0);
+        let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
+        let mut u = vec![10.0];
+        let mut predictions = vec![f64::NAN; subject.obs_times.len()];
+        let obs_map = obs_index_map(&subject.obs_times);
+
+        integrate_segment(
+            &ode,
+            &mut u,
+            5.0,
+            5.0,
+            &subject,
+            &[],
+            &[],
+            &mut ext_params,
+            &pk.values,
+            &[],
+            &[],
+            &obs_map,
+            &mut predictions,
+        );
+
+        assert_eq!(u, vec![10.0], "zero-length segment must not change state");
+        assert!(
+            predictions[0].is_nan(),
+            "zero-length segment must record no observation"
+        );
+    }
+
+    #[test]
+    fn integrate_segment_advances_state_and_records_obs() {
+        // A normal segment integrates 1-cpt decay (ke = CL/V = 0.1) over [0, 10]
+        // and writes the observation at t_end, advancing `u` in place.
+        let ode = one_cpt_ode_spec();
+        let subject = make_subject(vec![], vec![10.0]);
+        let pk = pk_one(1.0, 10.0);
+        let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
+        ext_params[crate::types::PK_IDX_CL] = 1.0;
+        ext_params[crate::types::PK_IDX_V] = 10.0;
+        let mut u = vec![10.0];
+        let mut predictions = vec![f64::NAN; subject.obs_times.len()];
+        let obs_map = obs_index_map(&subject.obs_times);
+
+        integrate_segment(
+            &ode,
+            &mut u,
+            0.0,
+            10.0,
+            &subject,
+            &[],
+            &[],
+            &mut ext_params,
+            &pk.values,
+            &[],
+            &[],
+            &obs_map,
+            &mut predictions,
+        );
+
+        let expected = 10.0 * (-1.0f64).exp(); // 10·e^{-ke·10}, ke = 0.1
+        assert_relative_eq!(u[0], expected, max_relative = 1e-4);
+        assert_relative_eq!(predictions[0], expected, max_relative = 1e-4);
+    }
+
     /// Two-compartment "accumulator": `d/dt = 0` for both states, so each state
     /// holds exactly the bioavailable amount injected into it — letting a test
     /// read `F·amt` (and lag timing) straight off the state. `readout_idx`
