@@ -15,7 +15,7 @@
 //! ## Error-code registry
 //!
 //! Codes are stable identifiers (prefix `E_` for errors, `W_` for warnings).
-//! Add new codes here and document them in `docs/src/file-formats/check-report.md`.
+//! Add new codes here and document them in `docs/file-formats/check-report.qmd`.
 //!
 //! | code | meaning |
 //! |------|---------|

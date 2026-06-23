@@ -426,7 +426,7 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
 - `src/ode/predictions.rs` — synthesized-disposition + `R_in` forcing; SS reuse.
 - prediction dispatcher / `src/estimation/inner_optimizer.rs` — route oral+absorption to the
   forced path; `src/diagnostics.rs` — new `W_ABSORPTION_*`.
-- Docs: new `docs/src/model-file/absorption.md` + `SUMMARY.md`; cross-link
+- Docs: new `docs/model-file/absorption.qmd` + `_quarto.yml`; cross-link
   `structural-model.md`; new `examples/*.ferx`; `CHANGELOG.md` (`[Unreleased] → Added`).
 - `../ferx-r` follow-up PR per user-facing phase — pin bump (`tools/update-ferx-core-lock.sh`)
   + an R example/test/`NEWS.md`; the input-rate functions need no new R glue. See the

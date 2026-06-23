@@ -47,15 +47,23 @@
 //! | TVQ2  | 1.34   | Σ     | 0.0540 |
 //! | TVQ3  | 0.868  |       |        |
 //!
-//! ferx (FOCEI, BOBYQA) reaches: TVV1 5.49, TVV2 24.4, TVV3 289, TVCL 1.93,
-//! TVQ2 1.35, TVQ3 0.864; Ω(V1,V2,CL,Q2) = (0.075, 0.094, 0.017, 0.135);
-//! Σ(var) = 0.054. The structural thetas match to <7%; the BSV variances trade
-//! off between V1 and V2 (their total is within ~2% of NONMEM) — typical of
-//! weakly-identified variance components across FOCEI implementations. The
-//! decisive regression guard is TVCL ≈ 1.9 (the bug pushed it past 3.4).
+//! ## Optimizer (#333)
+//!
+//! The 3-cpt V1/V2/V3 volume split is weakly identified, and the default
+//! derivative-free BOBYQA false-converges ~36 OFV units above the true minimum
+//! (TVV3 ≈ 243, 21% off). A gradient-based variable-metric optimizer — the same
+//! family NONMEM uses for the outer problem — reaches the true minimum and
+//! reproduces NONMEM exactly. This test therefore pins the optimizer to NLopt
+//! L-BFGS (`Optimizer::NloptLbfgs`) with a tight inner tolerance (`inner_tol =
+//! 1e-8`); the marginal OFV is too noisy at the default 1e-5 to resolve the
+//! split. With that configuration ferx reaches TVV1 5.76, TVV2 26.0, TVV3 309,
+//! TVCL 1.92, TVQ2 1.34, TVQ3 0.868; Ω(V1,V2,CL,Q2) = (0.095, 0.076, 0.019,
+//! 0.127); Σ(var) = 0.054 — every parameter within ~1% of NONMEM (OFV −3039.3).
+//! The decisive regression guard is still TVCL ≈ 1.9 (the #195 bug pushed it
+//! past 3.4).
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
+use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
 use std::path::Path;
 
 const SCHNIDER_MODEL: &str = r#"
@@ -97,11 +105,10 @@ const NM_OMEGA: [f64; 4] = [0.0948, 0.0757, 0.0193, 0.127];
 const NM_SIGMA_VAR: f64 = 0.0540;
 
 #[test]
-// TEMP-DISABLED (#333): the 3-cpt V1/V2/V3 split is weakly identified — at the
-// default inner_tol the TVV3 estimate drifts outside the NONMEM 15% band (the
-// thetas come into band only at inner_tol=1e-8 and the ω components remain
-// inflated). Not fixed by the #330 inner_tol/θ-block work; tracked in #333.
-#[ignore = "weakly-identified 3-cpt volume split — tracked in #333"]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn schnider_propofol_matches_nonmem() {
     let parsed = parse_full_model(SCHNIDER_MODEL).expect("model parses");
     let model = parsed.model;
@@ -117,6 +124,11 @@ fn schnider_propofol_matches_nonmem() {
 
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;
+    // The weakly-identified V1/V2/V3 split needs a gradient-based variable-metric
+    // optimizer (BOBYQA false-converges here) and a tight inner tolerance to
+    // resolve the split — see the module docs and #333.
+    opts.optimizer = Optimizer::NloptLbfgs;
+    opts.inner_tol = 1e-8;
     opts.run_covariance_step = false;
     opts.outer_maxiter = 800;
     opts.verbose = false;

@@ -15,6 +15,22 @@ const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 const MIN_PROB: f64 = 1e-300;
 /// ½·ln(2π) — the constant term of the Lanczos `ln_gamma` formula.
 const HALF_LN_2PI: f64 = 0.918_938_533_204_672_74;
+/// Lanczos `g` parameter (g = 7) shared by [`ln_gamma`] and its analytic
+/// derivatives [`digamma`] / [`trigamma`], so the value and its 1st/2nd
+/// derivatives are computed from the *same* approximation and can't drift apart.
+const LANCZOS_G: f64 = 7.0;
+/// Lanczos coefficients for g = 7 (n = 9 terms); see [`LANCZOS_G`].
+const LANCZOS_COEF: [f64; 9] = [
+    0.999_999_999_999_809_93,
+    676.520_368_121_885_1,
+    -1_259.139_216_722_402_8,
+    771.323_428_777_653_13,
+    -176.615_029_162_140_59,
+    12.507_343_278_686_905,
+    -0.138_571_095_265_720_12,
+    9.984_369_578_019_571_6e-6,
+    1.505_632_735_149_311_6e-7,
+];
 
 /// Abramowitz & Stegun 7.1.26 — max error ~1.5e-7 over the whole real line.
 /// Entirely polynomial in t = 1/(1 + p*|x|) and exp(-x²), so cleanly differentiable.
@@ -160,33 +176,68 @@ pub fn normal_inv_cdf(p: f64) -> f64 {
 /// (n ≥ 0 ⇒ argument ≥ 1) but keeps the function correct over the whole
 /// domain x > 0.
 pub fn ln_gamma(x: f64) -> f64 {
-    // Lanczos coefficients for g = 7 (n = 9 terms).
-    const G: f64 = 7.0;
-    const COEF: [f64; 9] = [
-        0.999_999_999_999_809_93,
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_13,
-        -176.615_029_162_140_59,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_571_6e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-
     // Reflection for x < 0.5: ln Γ(x) = ln(π / sin(πx)) − ln Γ(1 − x).
     if x < 0.5 {
         let pi = std::f64::consts::PI;
         return (pi / (pi * x).sin()).ln() - ln_gamma(1.0 - x);
     }
 
-    let x = x - 1.0;
-    let mut a = COEF[0];
-    for (i, &c) in COEF.iter().enumerate().skip(1) {
-        a += c / (x + i as f64);
+    let y = x - 1.0;
+    let mut a = LANCZOS_COEF[0];
+    for (i, &c) in LANCZOS_COEF.iter().enumerate().skip(1) {
+        a += c / (y + i as f64);
     }
-    let t = x + G + 0.5;
-    HALF_LN_2PI + (x + 0.5) * t.ln() - t + a.ln()
+    let t = y + LANCZOS_G + 0.5;
+    HALF_LN_2PI + (y + 0.5) * t.ln() - t + a.ln()
+}
+
+/// Digamma ψ(x) = d/dx ln Γ(x) — the exact analytic derivative of [`ln_gamma`]'s
+/// Lanczos form (same [`LANCZOS_COEF`] / [`LANCZOS_G`]), so a finite difference of
+/// `ln_gamma` and `digamma` agree to ~1e-12 (an independent ψ approximation would
+/// not). The first-order `Dual2` rule for `ln Γ` on the transit absorption
+/// sensitivity path (#430). Reflection mirrors `ln_gamma`:
+/// ψ(x) = ψ(1 − x) − π·cot(πx) for x < 0.5.
+pub fn digamma(x: f64) -> f64 {
+    if x < 0.5 {
+        let pi = std::f64::consts::PI;
+        return digamma(1.0 - x) - pi / (pi * x).tan();
+    }
+
+    let y = x - 1.0;
+    let mut a = LANCZOS_COEF[0];
+    let mut da = 0.0;
+    for (i, &c) in LANCZOS_COEF.iter().enumerate().skip(1) {
+        let d = y + i as f64;
+        a += c / d;
+        da -= c / (d * d);
+    }
+    let t = y + LANCZOS_G + 0.5;
+    t.ln() + (y + 0.5) / t - 1.0 + da / a
+}
+
+/// Trigamma ψ′(x) = d²/dx² ln Γ(x) — the exact second derivative of [`ln_gamma`]'s
+/// Lanczos form; the second-order `Dual2` rule for `ln Γ` (#430). Reflection:
+/// ψ′(x) = π²/sin²(πx) − ψ′(1 − x) for x < 0.5.
+pub fn trigamma(x: f64) -> f64 {
+    if x < 0.5 {
+        let pi = std::f64::consts::PI;
+        let s = (pi * x).sin();
+        return pi * pi / (s * s) - trigamma(1.0 - x);
+    }
+
+    let y = x - 1.0;
+    let mut a = LANCZOS_COEF[0];
+    let mut da = 0.0;
+    let mut dda = 0.0;
+    for (i, &c) in LANCZOS_COEF.iter().enumerate().skip(1) {
+        let d = y + i as f64;
+        a += c / d;
+        da -= c / (d * d);
+        dda += 2.0 * c / (d * d * d);
+    }
+    let t = y + LANCZOS_G + 0.5;
+    let a_ratio = da / a;
+    2.0 / t - (y + 0.5) / (t * t) + dda / a - a_ratio * a_ratio
 }
 
 #[cfg(test)]
@@ -375,5 +426,63 @@ mod tests {
             let rhs = (1.0 - 2.0 * z) * ln2 + half_ln_pi + ln_gamma(2.0 * z);
             assert_relative_eq!(lhs, rhs, epsilon = 1e-9, max_relative = 1e-10);
         }
+    }
+
+    #[test]
+    fn digamma_known_values() {
+        // ψ(1) = −γ, ψ(2) = 1 − γ, ψ(½) = −γ − 2 ln 2.
+        let gamma = 0.577_215_664_901_532_9; // Euler–Mascheroni
+        let ln2 = std::f64::consts::LN_2;
+        assert_relative_eq!(digamma(1.0), -gamma, max_relative = 1e-10);
+        assert_relative_eq!(digamma(2.0), 1.0 - gamma, max_relative = 1e-10);
+        assert_relative_eq!(digamma(0.5), -gamma - 2.0 * ln2, max_relative = 1e-10);
+    }
+
+    #[test]
+    fn trigamma_known_values() {
+        // ψ′(1) = π²/6, ψ′(2) = π²/6 − 1, ψ′(½) = π²/2.
+        let pi = std::f64::consts::PI;
+        assert_relative_eq!(trigamma(1.0), pi * pi / 6.0, max_relative = 1e-9);
+        assert_relative_eq!(trigamma(2.0), pi * pi / 6.0 - 1.0, max_relative = 1e-9);
+        assert_relative_eq!(trigamma(0.5), pi * pi / 2.0, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn digamma_trigamma_recurrence() {
+        // ψ(x+1) = ψ(x) + 1/x ; ψ′(x+1) = ψ′(x) − 1/x².
+        for &x in &[0.7, 1.3, 3.0, 6.5] {
+            assert_relative_eq!(digamma(x + 1.0), digamma(x) + 1.0 / x, max_relative = 1e-11);
+            assert_relative_eq!(
+                trigamma(x + 1.0),
+                trigamma(x) - 1.0 / (x * x),
+                max_relative = 1e-10
+            );
+        }
+    }
+
+    /// digamma/trigamma must be the finite-difference derivatives of `ln_gamma`,
+    /// including the reflection branch (x < 0.5) where `ln_gamma` flips to the sine
+    /// form — the branch the transit path never hits but correctness still demands.
+    #[test]
+    fn digamma_trigamma_match_fd_of_ln_gamma_incl_reflection() {
+        for &x in &[0.2, 0.35, 0.8, 1.0, 2.5, 5.0, 12.0, 15.0] {
+            let h1 = 1e-6;
+            let fd1 = (ln_gamma(x + h1) - ln_gamma(x - h1)) / (2.0 * h1);
+            assert_relative_eq!(digamma(x), fd1, max_relative = 1e-5, epsilon = 1e-8);
+            let h2 = 1e-4;
+            let fd2 = (digamma(x + h2) - digamma(x - h2)) / (2.0 * h2);
+            assert_relative_eq!(trigamma(x), fd2, max_relative = 1e-5, epsilon = 1e-8);
+        }
+    }
+
+    /// digamma/trigamma must be continuous across the `x = 0.5` branch seam
+    /// (reflection below, Lanczos at/above) — a wrong reflection constant or sign
+    /// surfaces as a jump here, which neither side's anchor alone catches. The two
+    /// sides differ only by `O(ψ′)·2ε` / `O(ψ″)·2ε`; a real discontinuity is O(1).
+    #[test]
+    fn digamma_trigamma_continuous_across_reflection_seam() {
+        let eps = 1e-7;
+        assert_relative_eq!(digamma(0.5 - eps), digamma(0.5 + eps), epsilon = 1e-5);
+        assert_relative_eq!(trigamma(0.5 - eps), trigamma(0.5 + eps), epsilon = 1e-4);
     }
 }

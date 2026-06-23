@@ -1168,7 +1168,7 @@ impl PkModel {
     ///
     /// Slots are canonical (`name_to_index` values), so the `v`/`v1` and `q`/`q2`
     /// aliases satisfy the same requirement. The display names mirror the
-    /// "Required Parameters" table in `docs/src/model-file/structural-model.md`;
+    /// "Required Parameters" table in `docs/model-file/structural-model.qmd`;
     /// the parser enforces what that table documents (issue #309).
     pub(crate) fn required_pk_params(&self) -> &'static [(usize, &'static str)] {
         match self {
@@ -1685,7 +1685,7 @@ impl ScalingSpec {
     /// scale drops `d obs_scale / d eta`, so the inner loop is routed to FD
     /// by `inner_optimizer::analytical_ad_unsupported`
     /// (`ScalingSpec::breaks_ad_inner_gradient`) rather than silently
-    /// producing a wrong AD gradient. See `docs/src/model-file/scaling.md`.
+    /// producing a wrong AD gradient. See `docs/model-file/scaling.qmd`.
     ///
     /// Invalid scale values (0, negative, NaN, inf — e.g. from a covariate
     /// that's missing, or from a `1/(TVV-x)` near a singularity) propagate
@@ -3398,7 +3398,7 @@ pub struct FitOptions {
     /// draws are *accumulated* to estimate each subject's conditional mean and
     /// SD of η — the analogue of saemix `conddist.saemix` / Monolix's
     /// "Conditional Distribution" task. Default `false` (mode-only output,
-    /// unchanged behaviour). See `docs/src/estimation/saem.md` (#257).
+    /// unchanged behaviour). See `docs/estimation/saem.qmd` (#257).
     pub saem_conddist: bool,
     /// Number of retained MH sweeps per subject in the conditional-distribution
     /// pass (after burn-in). Larger values tighten the conditional mean/SD
@@ -3757,7 +3757,7 @@ impl Default for FitOptions {
             // hundreds of OFV units above the true minimum. BOBYQA re-evaluates
             // EBEs at every trial point and routinely reaches a lower OFV
             // without the cost of `reconverge_gradient_interval = 1`. See
-            // `docs/src/estimation/optimizers.md` for the cefepime and Emax
+            // `docs/estimation/optimizers.qmd` for the cefepime and Emax
             // PKPD validations and guidance on when to switch back to SLSQP.
             optimizer: Optimizer::Bobyqa,
             inner_optimizer: InnerOptimizer::Auto,
@@ -3886,7 +3886,7 @@ pub enum Optimizer {
     /// SLSQP on ODE/PD models, sparse data, and Hill-ridge problems. Needs more
     /// outer evaluations than SLSQP to triangulate a quadratic from scratch, but
     /// each evaluation is cheap (no FD gradient sweep). See
-    /// `docs/src/estimation/optimizers.md` for the cefepime and Emax PKPD
+    /// `docs/estimation/optimizers.qmd` for the cefepime and Emax PKPD
     /// validations behind the default choice.
     Bobyqa,
     /// Newton trust-region with Steihaug CG subproblem (via argmin)
@@ -4389,7 +4389,7 @@ mod tests {
     #[test]
     fn required_pk_params_match_docs_table() {
         // Locks the per-model required slots to the "Required Parameters" table
-        // in docs/src/model-file/structural-model.md (issue #309).
+        // in docs/model-file/structural-model.qmd (issue #309).
         use PkModel::*;
         let cases: &[(PkModel, &[&str])] = &[
             (OneCptIv, &["cl", "v"]),

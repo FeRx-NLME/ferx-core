@@ -7,13 +7,13 @@
 #
 # NONMEM's coded `RATE` values are parameter-driven (not a DURATION column):
 #   RATE = -2  → infusion DURATION modeled via a `D{cmt}` parameter. Supported on
-#                ODE models (see docs/src/model-file/ode-models.md). This
+#                ODE models (see docs/model-file/ode-models.qmd). This
 #                analytical `pk` model has a single fixed route, so `-2` here is
 #                rejected with a pointer to the ODE form (analytical support is a
 #                tracked #324 follow-up).
 #   RATE = -1  → infusion RATE modeled (R{cmt}); not yet supported — convert to an
 #                explicit positive RATE (= AMT / intended duration) first.
-# See docs/src/data-format.md ("NONMEM coded RATE values") and the FAQ.
+# See docs/data-format.qmd ("NONMEM coded RATE values") and the FAQ.
 #
 # Run:
 #   cargo run --release -- examples/dose_rate.ferx --data data/dose_rate.csv

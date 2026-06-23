@@ -60,4 +60,9 @@ jobs:
         # fails. Without it, cargo aborts at the first failed binary and the
         # remaining ~15 integration-test binaries (alphabetically after the
         # failing one) silently never run, masking concurrent regressions.
-        run: cargo test --no-default-features --features ci,slow-tests --profile ci-test --no-fail-fast
+        #
+        # `survival` is included so the Phase 1 TTE Tier-3 tests
+        # (`tests/tte_convergence.rs`, gated on BOTH `survival` and `slow-tests`)
+        # actually execute here — the ci.yml `survival` job runs the TTE *smoke*
+        # tests but not the slow convergence/SSE fits.
+        run: cargo test --no-default-features --features ci,survival,slow-tests --profile ci-test --no-fail-fast

@@ -198,6 +198,30 @@ impl<const NA: usize, const N: usize> DualMixed<NA, N> {
         }
     }
 
+    /// `ln Γ(self)`. With ψ = digamma, ψ′ = trigamma: `u' = ψ(x)·x'`,
+    /// `u'' = ψ(x)·x'' + ψ′(x)·x'⊗x'`. The transit absorption `ln Γ(n + 1)`
+    /// constant on the analytic ODE sensitivity path (#430); `Dual2 = DualMixed`,
+    /// so this also serves the second-order `Dual2` Hessian.
+    pub fn ln_gamma(self) -> Self {
+        let d1 = crate::stats::special::digamma(self.value);
+        let d2 = crate::stats::special::trigamma(self.value);
+        let mut grad = [0.0; N];
+        let mut hess = [[0.0; N]; NA];
+        for i in 0..N {
+            grad[i] = d1 * self.grad[i];
+        }
+        for r in 0..NA {
+            for c in 0..N {
+                hess[r][c] = d1 * self.hess[r][c] + d2 * self.grad[r] * self.grad[c];
+            }
+        }
+        DualMixed {
+            value: crate::stats::special::ln_gamma(self.value),
+            grad,
+            hess,
+        }
+    }
+
     /// `self^e`. Constant exponent uses the power rule `aⁿ` directly (exact for any
     /// base sign with integer `n`); otherwise the general `exp(e·ln(self))` form
     /// (requires `self.value > 0`). Mirrors [`Dual2::powd`](super::dual2::Dual2::powd).

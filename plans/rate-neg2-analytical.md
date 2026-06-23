@@ -93,12 +93,12 @@ Keep the defensive `assert!(all_doses_fixed())` in `compute_predictions` /
 ## NONMEM comparison (required by CLAUDE.md)
 
 Add a `RATE=-2` analytical example (1-cpt IV, modeled `D1`) and compare IPRED/OFV against
-a NONMEM `$PK D1=...` `ADVAN1`/`ADVAN3` run; record in `docs/src/faq.md` or the relevant
+a NONMEM `$PK D1=...` `ADVAN1`/`ADVAN3` run; record in `docs/faq.qmd` or the relevant
 estimation/error doc + the PR description.
 
 ## Docs + changelog
 
-- `docs/src/` (ode-models.md modeled-RATE note + wherever analytical dosing/RATE is
+- `docs/` (ode-models.qmd modeled-RATE note + wherever analytical dosing/RATE is
   documented; likely a data-format / dosing page): note `RATE=-2` now works for analytical
   models given a `D{cmt}` parameter; keep the `D{n}` reserved-name collision caveat.
 - `CHANGELOG.md` `## [Unreleased]` → `Added`: "`RATE=-2` modeled infusion duration now

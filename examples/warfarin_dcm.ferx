@@ -16,7 +16,7 @@
 #     -- examples/warfarin_dcm.ferx --data data/two_cpt_oral_cov.csv
 #
 # Requires the `nn` cargo feature. The `[covariate_nn]` block syntax is
-# documented at docs/src/model-file/covariate-nn.md.
+# documented at docs/model-file/covariate-nn.qmd.
 
 [parameters]
   # No theta-on-covariate (THETA_WT, THETA_CRCL) needed — the NN learns those.
@@ -40,7 +40,7 @@
   layers     = [8, 8]
   # Hidden activation: tanh keeps hidden units in a smooth bounded regime.
   # Output activation: softplus guarantees positive PK parameters without
-  # exponential blow-up. See docs/src/model-file/covariate-nn.md for the
+  # exponential blow-up. See docs/model-file/covariate-nn.qmd for the
   # tradeoffs.
   activation = tanh
   output     = softplus

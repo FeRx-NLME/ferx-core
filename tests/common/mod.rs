@@ -51,3 +51,41 @@ pub fn subject(
         obs_records: vec![],
     }
 }
+
+/// Build a TTE-only [`Population`](ferx_core::types::Population) from `(time, dv)`
+/// pairs: `dv == 1` is an exact event, anything else is right-censored. Every row
+/// is a single `Event` record on CMT 2 (entry time 0). Shared by the TTE smoke
+/// (`tte_smoke.rs`) and convergence (`tte_convergence.rs`) integration tests so the
+/// one-record-per-subject construction lives in a single place.
+#[cfg(feature = "survival")]
+pub fn tte_pop_from_pairs(data: &[(f64, u8)]) -> ferx_core::types::Population {
+    use ferx_core::types::{EventType, ObsRecord, Population};
+    let subjects = data
+        .iter()
+        .enumerate()
+        .map(|(i, &(t, dv))| {
+            let event_type = if dv == 1 {
+                EventType::Exact
+            } else {
+                EventType::RightCensored
+            };
+            let mut s = subject(&format!("{}", i + 1), vec![], vec![], vec![], vec![]);
+            s.obs_records = vec![ObsRecord::Event {
+                time: t,
+                event_type,
+                entry_time: 0.0,
+                cmt: 2,
+            }];
+            s
+        })
+        .collect();
+
+    Population {
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects,
+    }
+}

@@ -542,10 +542,10 @@ For scalar settings (e.g., `maxiter`), R call continues to override the `.ferx` 
 
 ## Docs
 
-- `docs/src/model-file/` — new page `data-selection.md` describing `[data_selection]`
+- `docs/model-file/` — new page `data-selection.qmd` describing `[data_selection]`
   block, both keywords, expression syntax, worked examples.
-- `docs/src/SUMMARY.md` — add entry.
-- `docs/src/faq.md` — NONMEM equivalence table row: `$DATA IGNORE=` → `[data_selection] ignore =`.
+- `docs/_quarto.yml` — add entry.
+- `docs/faq.qmd` — NONMEM equivalence table row: `$DATA IGNORE=` → `[data_selection] ignore =`.
 
 ### ferx-r package docs (`man/ferx_selection.Rd`)
 

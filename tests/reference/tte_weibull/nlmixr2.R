@@ -10,10 +10,10 @@
 
 library(nlmixr2)
 
-dat <- read.csv("tte_weibull.csv")
-names(dat)[names(dat) == "ID"]   <- "id"
-names(dat)[names(dat) == "DV"]   <- "event"
-names(dat)[names(dat) == "TIME"] <- "time"
+dat <- read.csv("tte_weibull.csv")   # ID,TIME,DV,EVID,CMT,MDV ; DV = event indicator
+# Keep the standard DV/TIME columns (nlmixr2 requires them); the ll(tte) model
+# references an `event` column, so mirror DV into it.
+dat$event <- dat$DV
 
 weibull_model <- function() {
   ini({

@@ -14,4 +14,4 @@ real, runnable example.
 Currently empty — the previous occupant (`warfarin_dcm.ferx`) was promoted
 to `examples/warfarin_dcm.ferx` once `[covariate_nn]` parsing + dispatch +
 mu-ref recognition + tv_fn parity all landed. It still requires building
-with `--features nn`. See `docs/src/model-file/covariate-nn.md` for usage.
+with `--features nn`. See `docs/model-file/covariate-nn.qmd` for usage.

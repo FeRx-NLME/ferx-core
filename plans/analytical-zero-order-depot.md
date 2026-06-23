@@ -141,12 +141,12 @@ follow-up (same status as oral central infusion under AD).
 
 Anchor a `one_cpt_oral` + `D1`-into-depot fit (or `predict`) against an
 equivalent NONMEM `ADVAN2`/`$PK D1` zero-order-into-depot run. Record the OFV /
-predictions comparison in `docs/src/faq.md` (or the relevant estimation page).
+predictions comparison in `docs/faq.qmd` (or the relevant estimation page).
 
 ## Docs & changelog
 
-- `docs/src/model-file/individual-parameters.md` and/or
-  `docs/src/data-format.md`: document that `D{depot}` (cmt 1) is now a valid
+- `docs/model-file/individual-parameters.qmd` and/or
+  `docs/data-format.qmd`: document that `D{depot}` (cmt 1) is now a valid
   zero-order input on analytical oral models, with the absorption interpretation.
 - `CHANGELOG.md` `## [Unreleased]` → `Added`: one line referencing the new issue #.
 - If any new `pub` surface lands, follow up with the `ferx-r` lock bump

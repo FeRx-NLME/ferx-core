@@ -61,6 +61,21 @@ impl<const N: usize> Dual1<N> {
         }
     }
 
+    /// `ln Γ(self)`: `u' = ψ(x)·x'`, where ψ is the digamma function. The
+    /// first-order rule for the transit absorption `ln Γ(n + 1)` constant on the
+    /// analytic ODE sensitivity path (#430).
+    pub fn ln_gamma(self) -> Self {
+        let d1 = crate::stats::special::digamma(self.value);
+        let mut grad = [0.0; N];
+        for i in 0..N {
+            grad[i] = d1 * self.grad[i];
+        }
+        Dual1 {
+            value: crate::stats::special::ln_gamma(self.value),
+            grad,
+        }
+    }
+
     /// `sqrt(self)`: `u' = x'/(2√x)`.
     pub fn sqrt(self) -> Self {
         // Non-positive argument: `1/(2√x)` is singular (and `inf·0 = NaN` when a

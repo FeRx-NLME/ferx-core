@@ -44,6 +44,10 @@ pub trait PkNum:
     /// VM to reproduce the `Op::Ln`/`Op::Sqrt` domain guards (`v.max(lo)`) before
     /// the transcendental call. For duals the clamped region is flat (zero jet).
     fn guard_floor(self, lo: f64) -> Self;
+    /// `ln Γ(self)` (log-gamma). The transit absorption forcing's `ln Γ(n + 1)`
+    /// constant rides this on the analytic ODE sensitivity path, so for the dual
+    /// types it must carry 1st/2nd-order derivatives (digamma/trigamma) (#430).
+    fn ln_gamma(self) -> Self;
 }
 
 impl PkNum for f64 {
@@ -98,6 +102,10 @@ impl PkNum for f64 {
     #[inline]
     fn guard_floor(self, lo: f64) -> Self {
         self.max(lo)
+    }
+    #[inline]
+    fn ln_gamma(self) -> Self {
+        crate::stats::special::ln_gamma(self)
     }
 }
 
@@ -162,6 +170,10 @@ impl<const N: usize> PkNum for Dual1<N> {
             self
         }
     }
+    #[inline]
+    fn ln_gamma(self) -> Self {
+        Dual1::ln_gamma(self)
+    }
 }
 
 impl<const NA: usize, const N: usize> PkNum for DualMixed<NA, N> {
@@ -223,6 +235,10 @@ impl<const NA: usize, const N: usize> PkNum for DualMixed<NA, N> {
             self
         }
     }
+    #[inline]
+    fn ln_gamma(self) -> Self {
+        DualMixed::ln_gamma(self)
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +267,7 @@ mod tests {
         let _ = x.logit().val();
         let _ = x.guard_floor(1e-6).val();
         let _ = x.guard_floor(10.0).val(); // floor-active branch
+        let _ = x.ln_gamma().val(); // 0.7 > 0, in the ln_gamma domain
     }
 
     #[test]
@@ -281,5 +298,53 @@ mod tests {
         assert_eq!(g.grad[0], 0.0);
         // A value already above the floor is untouched.
         assert_eq!(Dual1::<1>::var(5.0, 0).guard_floor(lo).value, 5.0);
+    }
+
+    /// The `ln_gamma` `Dual2` rule: its analytic 1st (digamma) and 2nd (trigamma)
+    /// derivatives must match central finite differences of `special::ln_gamma`,
+    /// since the transit forcing's `ln Γ(n + 1)` constant rides this on the analytic
+    /// ODE sensitivity path (#430 slice 2). This is exactly the `Dual2`-rule
+    /// regression an FD-only check would miss (cf. the `guard_floor` NaN bug, #2).
+    #[test]
+    fn ln_gamma_dual2_matches_central_fd() {
+        use crate::stats::special::ln_gamma;
+        for &x in &[0.6, 1.0, 2.5, 4.0, 7.3] {
+            let d = Dual2::<1>::var(x, 0).ln_gamma();
+            approx::assert_relative_eq!(d.value, ln_gamma(x), max_relative = 1e-12);
+            // 1st derivative (digamma) vs central FD of ln_gamma.
+            let h1 = 1e-5;
+            let fd1 = (ln_gamma(x + h1) - ln_gamma(x - h1)) / (2.0 * h1);
+            approx::assert_relative_eq!(d.grad[0], fd1, max_relative = 1e-6, epsilon = 1e-9);
+            // 2nd derivative (trigamma) vs central second difference of ln_gamma.
+            let h2 = 1e-4;
+            let fd2 = (ln_gamma(x + h2) - 2.0 * ln_gamma(x) + ln_gamma(x - h2)) / (h2 * h2);
+            approx::assert_relative_eq!(d.hess[0][0], fd2, max_relative = 1e-4, epsilon = 1e-6);
+        }
+    }
+
+    /// The dual `ln_gamma` chain rule has two second-order terms — `ψ′·x′⊗x′`
+    /// **and** `ψ·x″`. `ln_gamma_dual2_matches_central_fd` seeds a bare `var`
+    /// (x″ = 0), so it exercises only the first. Feed a dual with a NONZERO input
+    /// Hessian via `x ↦ ln Γ(eˣ)` (the inner `exp` carries x′ and x″) so the
+    /// `ψ·x″` term is exercised too — the path real transit fits hit when an
+    /// absorption param is composite (e.g. `MTT = TVMTT·exp(ETA_MTT)`). Negative
+    /// `x` (eˣ < 0.5) additionally drives the **reflection** branch of the dual
+    /// rule (#458 review #1/#2). Without `ψ·x″`, the main-branch points fail; with
+    /// a wrong reflection rule, the negative points fail.
+    #[test]
+    fn ln_gamma_dual2_chain_rule_nonzero_input_hessian_and_reflection() {
+        use crate::stats::special::ln_gamma;
+        let f = |x: f64| ln_gamma(x.exp());
+        // x = −1.5, −1.0 → eˣ = 0.22, 0.37 < 0.5 (reflection); the rest main branch.
+        for &x in &[-1.5_f64, -1.0, 0.1, 0.5, 1.2, 2.0] {
+            let u = Dual2::<1>::var(x, 0).exp().ln_gamma();
+            approx::assert_relative_eq!(u.value, f(x), max_relative = 1e-12);
+            let h = 1e-5;
+            let fd1 = (f(x + h) - f(x - h)) / (2.0 * h);
+            approx::assert_relative_eq!(u.grad[0], fd1, max_relative = 1e-6, epsilon = 1e-9);
+            let h2 = 1e-4;
+            let fd2 = (f(x + h2) - 2.0 * f(x) + f(x - h2)) / (h2 * h2);
+            approx::assert_relative_eq!(u.hess[0][0], fd2, max_relative = 1e-4, epsilon = 1e-6);
+        }
     }
 }
