@@ -225,6 +225,19 @@ pub struct DoseLedgerEntry {
     pub f_applied: f64,
 }
 
+/// Result of one reactive-dosing run over a single subject: the observation-time
+/// predictions (same layout as [`crate::ode::predictions::ode_predictions`]) and
+/// the realized-dose ledger the controller produced. S1.4 wraps this with the
+/// per-subject/replicate orchestration and the public output schema.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveRun {
+    /// Predictions at the subject's observation times (NaN where unrecorded;
+    /// negatives clamped to zero, as in the static predictor).
+    pub predictions: Vec<f64>,
+    /// Every dose the controller actually issued, in time order.
+    pub ledger: Vec<DoseLedgerEntry>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
