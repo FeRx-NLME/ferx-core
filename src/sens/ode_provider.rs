@@ -2470,6 +2470,52 @@ mod tests {
         );
     }
 
+    /// Indexed `F` is now in model-level scope (parity test above), but the
+    /// *per-subject* gate must still route a **rate-defined infusion under `F ≠ 1`**
+    /// to FD. NONMEM reshapes such an infusion's window (holds the rate, scales the
+    /// duration to `F·amt/rate`, #419), whereas the dual walk scales the rate
+    /// magnitude over the *original* window — so the analytic gradient would diverge
+    /// from the f64 predictor. The model-level gate admits the indexed-`F` model; the
+    /// subject gate (`has_bioavailability() && has_rate_defined_infusion()`) declines
+    /// it. Crucially `has_bioavailability()` detects the indexed `F{cmt}` form too, so
+    /// dropping the `ode_analytical_supported` indexed-`F` decline (#486) does *not*
+    /// open this infusion path. A bolus of the same model stays in scope, so the
+    /// decline is attributable to the infusion, not the `F`.
+    #[test]
+    fn ode_subject_declines_indexed_f_rate_defined_infusion() {
+        let model = parse_model_string(F1F2_IV_ODE).expect("parse F1F2");
+        // Model-level scope admits indexed F (the indexed-F decline gate is gone, #486).
+        assert!(
+            ode_analytical_supported(&model),
+            "indexed F1/F2 model is in model-level scope"
+        );
+
+        // A bolus subject of this model IS served analytically.
+        let bolus = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        assert!(
+            !bolus.doses[0].is_infusion(),
+            "control dose must be a bolus"
+        );
+        assert!(
+            ode_subject_supported(&model, &bolus),
+            "indexed-F bolus subject should be served analytically"
+        );
+
+        // The same model with a *rate-defined* infusion (RATE>0) into the dosed
+        // compartment must decline to FD: `F` reshapes the window, which the dual rate
+        // scale does not reproduce (#419).
+        let mut infusion = bolus.clone();
+        infusion.doses = vec![DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0)];
+        assert!(
+            infusion.doses[0].is_infusion(),
+            "rate=200 must be a rate-defined infusion"
+        );
+        assert!(
+            !ode_subject_supported(&model, &infusion),
+            "rate-defined infusion under indexed F must decline to FD (#419)"
+        );
+    }
+
     /// Infusion doses (RATE>0): the dual loop must add the rate forcing over the
     /// infusion window and match the production predictor through during- and
     /// post-infusion observations.
