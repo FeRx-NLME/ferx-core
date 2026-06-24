@@ -1080,6 +1080,53 @@ fn insert_break(breaks: &mut Vec<f64>, t: f64) {
     breaks.insert(pos, t);
 }
 
+/// Out-of-scope-compartment guards shared by the bolus and infusion decision
+/// branches of [`ode_predictions_adaptive`]. A controller dose into compartment
+/// `cmt` (1-based) is a typed error — never a silent wrong answer — when the
+/// compartment is:
+///  - **out of range** (`cmt > n_states`);
+///  - **fed by a built-in input-rate (absorption) function** — the dose would be
+///    double-counted: the trusted static engine delivers it as `R_in` through the
+///    wrapped RHS (`input_rate_consumes_cmt`), yet the same forcing is rebuilt
+///    from `shadow.doses` here; or
+///  - **lagged** — a lag time would be applied with zero delay yet excluded from
+///    its own TAD anchor inside `integrate_segment` (whose filter is
+///    `d.time + lag <= t_start`).
+///
+/// On success returns the per-compartment bioavailability `F`, which both
+/// branches need (the bolus to scale its state jump, the infusion its window).
+/// Single source of truth so the two branches cannot drift the eligibility
+/// contract apart.
+fn reject_unsupported_dose_compartment(
+    ode: &OdeSpec,
+    cmt: usize,
+    n_states: usize,
+    pk_params_flat: &[f64],
+    decision_index: usize,
+) -> Result<f64, String> {
+    if cmt > n_states {
+        return Err(format!(
+            "decision {decision_index}: dose into compartment {cmt} but the model has \
+             {n_states} state(s)"
+        ));
+    }
+    if input_rate_consumes_cmt(ode, cmt) {
+        return Err(format!(
+            "decision {decision_index}: compartment {cmt} is fed by a built-in input-rate \
+             (absorption) function; controller dosing into an input-rate compartment is not \
+             supported"
+        ));
+    }
+    let lag = ode.dose_attr_map.lagtime(cmt, pk_params_flat);
+    if lag != 0.0 {
+        return Err(format!(
+            "decision {decision_index}: compartment {cmt} declares a dose lag time ({lag}); \
+             lagged controller dosing is not supported"
+        ));
+    }
+    Ok(ode.dose_attr_map.f_bio(cmt, pk_params_flat))
+}
+
 /// Reactive ("adaptive" / feedback) ODE prediction over a single subject (#391
 /// S1.3). Walks a fixed `decision_times` schedule, and at each decision lets
 /// `controller` read the current state (through the declared `monitors`) and
@@ -1117,6 +1164,15 @@ fn insert_break(breaks: &mut Vec<f64>, t: f64) {
 /// Verified contract (see tests): a *state-independent* controller reproduces
 /// [`ode_predictions`] on the same realized doses exactly — for boluses *and*
 /// infusions — anchoring the reactive bookkeeping to the trusted static engine.
+/// The bit-exactness holds when the realized schedule keeps the two engines'
+/// segment structure aligned: a dose is realized at every decision (so a held
+/// decision does not introduce a break the static dose-list lacks) and the last
+/// observation is the global maximum (so neither engine breaks at an interior
+/// observation, and the adaptive `t_last = max(obs ∪ decisions)` coincides with
+/// the static `t_last = max(obs)`). Outside those conditions a phantom decision
+/// break only restarts the integrator on a no-event segment, so predictions are
+/// unaffected on the smooth models tested; genuinely reactive/hold regimens are
+/// therefore pinned against the closed form instead.
 // `dead_code`: this is `pub(crate)` and exercised by tests; the public
 // `simulate_adaptive()` entry point that consumes it lands in S1.4 (#391).
 #[allow(clippy::too_many_arguments, dead_code)]
@@ -1268,39 +1324,15 @@ pub(crate) fn ode_predictions_adaptive(
                             if amt == 0.0 {
                                 continue;
                             }
-                            if cmt > n {
-                                return Err(format!(
-                                    "decision {decision_index}: bolus into compartment {cmt} but \
-                                     the model has {n} state(s)"
-                                ));
-                            }
-                            // Out-of-scope model features the bolus-only S1.3a cut cannot
-                            // honor are typed errors, never a silent wrong answer:
-                            //  - a compartment fed by a built-in input-rate (absorption)
-                            //    function would be double-counted: the trusted static engine
-                            //    delivers such a dose as `R_in` through the wrapped RHS
-                            //    (`input_rate_consumes_cmt`), *not* as a state jump, yet the
-                            //    same forcing is rebuilt from `shadow.doses` here;
-                            //  - a lag time on the dosed compartment would be applied below
-                            //    with zero delay yet excluded from its own TAD anchor inside
-                            //    `integrate_segment` (whose filter is `d.time + lag <= t_start`).
-                            if input_rate_consumes_cmt(ode, cmt) {
-                                return Err(format!(
-                                    "decision {decision_index}: compartment {cmt} is fed by a \
-                                     built-in input-rate (absorption) function; controller \
-                                     dosing into an input-rate compartment is not supported in \
-                                     S1.3a"
-                                ));
-                            }
-                            let lag = ode.dose_attr_map.lagtime(cmt, pk_params_flat);
-                            if lag != 0.0 {
-                                return Err(format!(
-                                    "decision {decision_index}: compartment {cmt} declares a dose \
-                                     lag time ({lag}); lagged controller dosing is not supported \
-                                     in S1.3a"
-                                ));
-                            }
-                            let f = ode.dose_attr_map.f_bio(cmt, pk_params_flat);
+                            // Out-of-range / input-rate / lagged compartments are typed errors
+                            // (never a silent wrong answer) — see the shared guard for why.
+                            let f = reject_unsupported_dose_compartment(
+                                ode,
+                                cmt,
+                                n,
+                                pk_params_flat,
+                                decision_index,
+                            )?;
                             u[cmt - 1] += f * amt;
                             if !ext_params[crate::types::MAX_PK_PARAMS].is_finite() {
                                 ext_params[crate::types::MAX_PK_PARAMS] = t_start;
@@ -1330,33 +1362,16 @@ pub(crate) fn ode_predictions_adaptive(
                             if amt == 0.0 {
                                 continue;
                             }
-                            if cmt > n {
-                                return Err(format!(
-                                    "decision {decision_index}: infusion into compartment {cmt} \
-                                     but the model has {n} state(s)"
-                                ));
-                            }
-                            // Same two out-of-scope guards as the bolus path (and for the same
-                            // reasons): a built-in input-rate (absorption) compartment would be
-                            // double-counted — the wrapped RHS delivers it as `R_in` *and* the
-                            // controller's infusion is rebuilt from `shadow.doses` — and a lagged
-                            // compartment would shift the infusion window out of step with its own
-                            // TAD anchor inside `integrate_segment`. Typed errors, not silent.
-                            if input_rate_consumes_cmt(ode, cmt) {
-                                return Err(format!(
-                                    "decision {decision_index}: compartment {cmt} is fed by a \
-                                     built-in input-rate (absorption) function; controller dosing \
-                                     into an input-rate compartment is not supported in S1.3b"
-                                ));
-                            }
-                            let lag = ode.dose_attr_map.lagtime(cmt, pk_params_flat);
-                            if lag != 0.0 {
-                                return Err(format!(
-                                    "decision {decision_index}: compartment {cmt} declares a dose \
-                                     lag time ({lag}); lagged controller dosing is not supported \
-                                     in S1.3b"
-                                ));
-                            }
+                            // Same out-of-scope guards as the bolus path (and for the same
+                            // reasons) — see the shared guard. A lagged compartment additionally
+                            // shifts the infusion window out of step with its own TAD anchor.
+                            let f = reject_unsupported_dose_compartment(
+                                ode,
+                                cmt,
+                                n,
+                                pk_params_flat,
+                                decision_index,
+                            )?;
                             // Unlike a bolus, an infusion adds nothing to `u` here: it is injected
                             // as a `+rate` derivative term over its window by the next
                             // `integrate_segment` (which reads `shadow.doses` via
@@ -1366,7 +1381,6 @@ pub(crate) fn ode_predictions_adaptive(
                             // end. `bioavailable_infusion` is the SAME mode-aware window (#419) the
                             // static engine and `active_infusions` use, so the adaptive timeline
                             // reproduces the static segmentation exactly (the degenerate oracle).
-                            let f = ode.dose_attr_map.f_bio(cmt, pk_params_flat);
                             let dose = DoseEvent::new(t_start, amt, cmt, rate, false, 0.0);
                             let (_, dur_eff) = dose.bioavailable_infusion(f);
                             insert_break(&mut break_times, t_start + dur_eff);
@@ -3238,6 +3252,63 @@ mod tests {
         let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
         for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
             assert_relative_eq!(*got, *want, max_relative = 1e-9);
+        }
+    }
+
+    #[test]
+    fn adaptive_infusion_f_scaling_matches_static() {
+        // The S1.3b invariant *under F != 1*: the F-scaled infusion end inserted as
+        // a break (`t_start + dur_eff`, from `bioavailable_infusion`) must coincide
+        // with the F-scaled window `active_infusions` re-derives inside
+        // `integrate_segment`. At F = 1 the two are trivially equal (`dur_eff ==
+        // amt/rate`), so every other oracle test leaves this seam unexercised. Here
+        // a bare-slot F = 0.5 halves a rate-defined infusion's window to F·amt/rate;
+        // the degenerate oracle must still reproduce the equivalent static infusion
+        // schedule (carrying the same F) bit-exact.
+        let ode = one_cpt_ode_spec();
+        let mut pk = pk_one(1.0, 10.0); // ke = 0.1
+        pk.values[crate::types::PK_IDX_F] = 0.5; // bare-slot F on all compartments
+        let decisions = [0.0, 24.0, 48.0];
+        // 100 mg @ rate 25 -> nominal 4 h window, F-scaled to 0.5*4 = 2 h. Ends at
+        // 2, 26, 50 (between decisions). The last obs (60) is past every end, so it
+        // is the global maximum and neither engine breaks at an interior obs.
+        let obs = vec![1.0, 3.0, 25.0, 27.0, 49.0, 60.0];
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 100.0,
+                cmt: 1,
+                rate: 25.0,
+            }]
+        };
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        let static_doses: Vec<DoseEvent> = decisions
+            .iter()
+            .map(|&t| DoseEvent::new(t, 100.0, 1, 25.0, false, 0.0))
+            .collect();
+        let static_subject = make_subject(static_doses, obs);
+        let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+
+        assert_eq!(run.predictions.len(), static_preds.len());
+        for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+            assert_relative_eq!(*got, *want, max_relative = 1e-9);
+        }
+        // F is actually applied (window halved), recorded as f_applied on each row.
+        assert_eq!(run.ledger.len(), 3);
+        for entry in &run.ledger {
+            assert_eq!(entry.f_applied, 0.5);
         }
     }
 
