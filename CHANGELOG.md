@@ -67,6 +67,16 @@ section of the SDLC for the versioning policy).
   steady state).
 
 ### Added
+- **Analytic FOCE/FOCEI gradients for compartment-indexed bioavailability
+  (`F1`/`F2`, …) on ODE models** (#486). An ODE model that sets a per-compartment
+  bioavailability now drives the exact analytic outer gradient and light `Dual1`
+  inner η-gradient instead of finite differences: both the static and
+  time-varying-covariate dual walks resolve `F` per dose compartment (the indexed
+  `F{cmt}` slot, else the bare `F`), matching production's `DoseAttrMap::f_bio` and
+  carrying `∂/∂F{cmt}` exactly. Estimates are unchanged; the gradient is exact and
+  cheaper. Validated by an analytic≡production+central-FD parity test (single
+  indexed `F1` with IIV, and distinct `F1`≠`F2` dosed into two compartments).
+  Per-compartment *lag* (`ALAG{cmt}`) stays on FD for now (→ #472).
 - **`ebe_warm_start` fit option** (default `false`, opt-in). When a per-subject
   inner BFGS solve fails and falls back to Nelder–Mead, seed the simplex from the
   BFGS partial η̂ instead of cold-starting from the prior mode η=0. On
