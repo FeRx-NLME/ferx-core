@@ -6,9 +6,18 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | Anchors | ferx feature | NONMEM control stream | ferx model |
 |---------|--------------|-----------------------|------------|
 | **Savic transit** | `transit(n, mtt)` — PR [#343](https://github.com/FeRx-NLME/ferx-core/pull/343) | `savic_transit.ctl` | `transit_savic_fit.ferx` |
-| **Freijer & Post IG** | `igd(mat, cv2)` — issue [#347](https://github.com/FeRx-NLME/ferx-core/issues/347) | `freijer_ig.ctl` | *(after #347 is implemented)* |
+| **Freijer & Post IG** | `igd(mat, cv2)` — issue [#347](https://github.com/FeRx-NLME/ferx-core/issues/347) | `freijer_ig.ctl` | *(in `tests/igd_nonmem_anchor.rs`)* |
+| **Weibull** | `weibull(td, beta)` — [#322](https://github.com/FeRx-NLME/ferx-core/issues/322) Phase 2 | `weibull_absorption.ctl` | `weibull_absorption_fit.ferx` |
 
-Both control streams run on **one** dataset, `transit_oral.csv`.
+The transit control runs on `transit_oral.csv`; the IG and Weibull controls run
+on `igd_oral.csv` (the same data re-keyed to a 1-compartment layout — every record
+on CMT 1 — so the dose feeds the absorption compartment directly).
+
+> **Weibull run status — PENDING.** The control stream and matching ferx model are
+> committed; the NONMEM run output (`results/weibull_absorption.*`) and the
+> slow-gated `tests/weibull_nonmem_anchor.rs` follow once the licensed run lands
+> (same staging as transit: feature + AUC-mass invariant shipped first in this PR;
+> NONMEM anchor follows). Run with `nmfe75 weibull_absorption.ctl weibull_absorption.lst`.
 
 ## The dataset
 

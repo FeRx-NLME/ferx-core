@@ -4650,13 +4650,17 @@ fn parse_scaling_block(
 /// excluded — they can ride on an analytical `pk` model.
 ///
 /// This lists only the functions that are **actually implemented** as input
-/// rates today (`transit`, #343; `igd`, #347). Each later absorption function
-/// adds its own name here in the same PR that implements it — Phase 2 `weibull` —
+/// rates today (`transit`, #343; `igd`, #347; `weibull`, Phase 2). Each later
+/// absorption function adds its own name here in the same PR that implements it,
 /// so the error rule never advertises a function the engine can't yet run (which
 /// would send the user to `ode_template` for a dead end, Ron #363). A slice (not
 /// a fixed-size array) so a new entry needs no length-annotation bump, matching
 /// [`INPUT_RATE_FNS`].
-const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd"];
+///
+/// `weibull` stays on this list **permanently** — unlike `transit`/`igd`, it has
+/// no elementary closed form with linear disposition, so it can never route to an
+/// analytical `pk` and always requires an explicit ODE disposition.
+const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd", "weibull"];
 
 /// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
 /// the first such function name found. Drives the error rule that rejects an
@@ -5302,7 +5306,7 @@ fn split_args_on_commas(s: &str) -> Vec<&str> {
 /// arguments it requires. Arguments are resolved to individual-parameter slots
 /// and stored in `arg_slots` in this order, so `src/pk/absorption.rs` reads them
 /// positionally. Each new model adds one row here in the PR that implements it
-/// (`transit`, #343; `igd`, #347).
+/// (`transit`, #343; `igd`, #347; `weibull`, Phase 2).
 const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] = &[
     (
         "transit",
@@ -5313,6 +5317,11 @@ const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] =
         "igd",
         crate::pk::absorption::InputRateKind::InverseGaussian,
         &["mat", "cv2"],
+    ),
+    (
+        "weibull",
+        crate::pk::absorption::InputRateKind::Weibull,
+        &["td", "beta"],
     ),
 ];
 
@@ -11261,6 +11270,24 @@ mod tests {
     }
 
     #[test]
+    fn error_rule_analytical_pk_plus_weibull() {
+        // Weibull has no closed form, so analytical `pk` + `weibull()` is a hard
+        // error pointing at ode_template — and stays one permanently (unlike
+        // transit/igd, it can never route to the analytical path).
+        let src = two_cpt_oral_model(
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  TD = 2.0\n  BETA = 1.5\n",
+            "[odes]\n  d/dt(depot) = weibull(td=TD, beta=BETA) - KA*depot\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("ode_template"),
+            "should point at ode_template: {err}"
+        );
+        assert!(err.contains("weibull"), "should name the function: {err}");
+    }
+
+    #[test]
     fn ode_only_absorption_fn_detection() {
         let transit = vec!["d/dt(depot) = transit(n=N, mtt=M) - KA*depot".to_string()];
         assert_eq!(
@@ -11271,12 +11298,14 @@ mod tests {
         // (routing an analytical `pk` + `igd()` to `ode_template`).
         let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
         assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), Some("igd"));
-        // The error rule only recognises functions that are actually implemented
-        // (Ron #363): `weibull` is not yet an input rate, so it must NOT be
-        // detected — otherwise the rule would point the user at `ode_template` for a
-        // function the engine can't run. Each phase adds its name here when it lands.
+        // `weibull` is implemented as of Phase 2, so the error rule now recognises
+        // it. Unlike `transit`/`igd`, it has no closed form, so it stays on the
+        // ODE-only list permanently (it can never route to an analytical `pk`).
         let weibull = vec!["d/dt(central) = weibull(td=TD, beta=B) - (CL/V)*central".to_string()];
-        assert_eq!(ode_only_absorption_fn_in_odes(Some(&weibull)), None);
+        assert_eq!(
+            ode_only_absorption_fn_in_odes(Some(&weibull)),
+            Some("weibull")
+        );
         // A plain disposition ODE has no ODE-only absorption call.
         let plain = vec!["d/dt(central) = -(CL/V)*central".to_string()];
         assert_eq!(ode_only_absorption_fn_in_odes(Some(&plain)), None);
@@ -11545,6 +11574,62 @@ mod tests {
         assert!(none.is_empty());
         // Positive control: a bare additive igd() is accepted.
         assert!(go("d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central").is_ok());
+    }
+
+    // ── weibull() input-rate parse-split (#322 Phase 2, design A) ─────────────
+    #[test]
+    fn extract_weibull_input_rate_basic() {
+        // weibull(td, beta) straight into central: forcing on the central cmt,
+        // args resolved to the [td, beta] slots in order; the rest of the RHS
+        // untouched.
+        let lines = vec!["d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central".to_string()];
+        let states = vec!["depot".to_string(), "central".to_string()];
+        let names = vec![
+            "TD".to_string(),
+            "BETA".to_string(),
+            "CL".to_string(),
+            "V".to_string(),
+        ];
+        let slots = vec![4, 5, 0, 1];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].cmt, 1); // central
+        assert!(matches!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::Weibull
+        ));
+        assert_eq!(forcings[0].arg_slots, vec![4, 5]); // [td=TD slot, beta=BETA slot]
+    }
+
+    #[test]
+    fn extract_weibull_input_rate_rejects_bad_specs() {
+        let states = vec!["central".to_string()];
+        let names = vec!["TD".to_string(), "BETA".to_string()];
+        let slots = vec![4, 5];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        assert!(go("d/dt(central) = weibull(td=TD, beta=ZZZ)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        assert!(go("d/dt(central) = weibull(td=TD, foo=BETA)")
+            .unwrap_err()
+            .contains("no argument `foo`"));
+        let err = go("d/dt(central) = weibull(td=TD)").unwrap_err();
+        assert!(
+            err.contains("missing required argument `beta`"),
+            "got: {err}"
+        );
+        // A scaled call is rejected and the message names `weibull`.
+        let scaled = go("d/dt(central) = FR*weibull(td=TD, beta=BETA)").unwrap_err();
+        assert!(
+            scaled.contains("scaled") && scaled.contains("weibull"),
+            "got: {scaled}"
+        );
+        // Positive control: a bare additive weibull() is accepted.
+        assert!(go("d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central").is_ok());
     }
 
     #[test]

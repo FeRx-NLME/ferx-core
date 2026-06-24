@@ -1,0 +1,49 @@
+# ferx Weibull-absorption anchor model — mirrors nonmem_anchor/weibull_absorption.ctl
+#
+# One-compartment layout: central (CMT 1) holds the drug AMOUNT and receives the
+# Weibull input rate weibull(td, beta); concentration = central / V via [scaling].
+# Runs on the shared re-keyed dataset data/igd_oral.csv (every record on CMT 1).
+#
+#   cargo run --release -- nonmem_anchor/weibull_absorption_fit.ferx \
+#     --data data/igd_oral.csv
+#
+# Cross-check the resulting OFV/THETA against the NONMEM run
+# (results/weibull_absorption.ext). Because igd_oral.csv was simulated from a
+# transit model, the Weibull fit is mildly mis-specified — the check is
+# NONMEM-weibull ≈ ferx-weibull at the SHARED optimum, not parameter recovery
+# (same staging as the igd anchor). Tight ODE tolerances match NONMEM's TOL=9.
+
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVTD(2.0,  0.05,  24.0)
+  theta TVBETA(1.5, 0.1,  10.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+
+  sigma PROP_ERR ~ 0.15 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  TD   = TVTD
+  BETA = TVBETA
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+  covariance = true

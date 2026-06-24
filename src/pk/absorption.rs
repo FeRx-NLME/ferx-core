@@ -105,6 +105,52 @@ pub fn validate_igd(mat: f64, cv2: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// Weibull absorption input rate into the compartment it feeds, for scale `td`
+/// (> 0) and shape `beta` (> 0):
+///
+/// ```text
+/// R_in(tad) = dose · (β/Td) · (tad/Td)^(β−1) · exp(−(tad/Td)^β),   dose = F · amt.
+/// ```
+///
+/// This is the Weibull density scaled by the dose — the appearance-rate form of
+/// the cumulative absorbed fraction `1 − exp(−(tad/Td)^β)`. `∫₀^∞ R_in dt = dose`.
+/// Returns `0` for `tad ≤ 0` and for a non-positive `dose`.
+///
+/// Domain: `td > 0`, `beta > 0` (enforce upstream with [`validate_weibull`]).
+/// Evaluated in the log domain so the power `(tad/Td)^β` is `exp(β·ln(tad/Td))` —
+/// **no `powf` / new special function** is needed, and the only building blocks are
+/// `ln`/`exp`/`+ − * /`, all on [`PkNum`], so a `weibull()` model carries exact
+/// analytic `Dual2` sensitivities through `sens/ode_provider.rs` (Phase 2).
+///
+/// Weibull has **no elementary closed form** with linear disposition, so it is
+/// permanently on the numerical ODE path; this `PkNum`-generic forcing is its only
+/// route to exact (rather than finite-difference) gradients. The shape `β` governs
+/// the `tad → 0⁺` edge: `β > 1 ⇒ R_in → 0`, `β = 1 ⇒` first-order with `ka = 1/Td`,
+/// `β < 1 ⇒ R_in → ∞` (an **integrable** spike — `∫R_in` stays `= dose`); the
+/// `tad ≤ 0 ⇒ 0` guard makes the input start at the dose, and the adaptive solver
+/// resolves the spike with small steps rather than the value being capped (a cap
+/// would break mass balance).
+///
+/// This is the readable reference form (used by tests and one-shot callers); the
+/// ODE hot path goes through [`InputRateForcing::prepare`] +
+/// [`PreparedInputRate::rate`], which hoist the dose-invariant constants
+/// (`ln β − ln Td`, `ln Td`) out of the per-dose superposition loop.
+pub fn weibull_input_rate(tad: f64, td: f64, beta: f64, dose: f64) -> f64 {
+    PreparedInputRate::weibull(td, beta).rate(tad, dose)
+}
+
+/// Validate Weibull parameters: `td` (scale) and `beta` (shape) strictly
+/// positive. The negated comparisons also reject `NaN`.
+pub fn validate_weibull(td: f64, beta: f64) -> Result<(), String> {
+    if !(td > 0.0) {
+        return Err(format!("weibull: td (scale) must be > 0, got {td}"));
+    }
+    if !(beta > 0.0) {
+        return Err(format!("weibull: beta (shape) must be > 0, got {beta}"));
+    }
+    Ok(())
+}
+
 /// Which built-in absorption input-rate model a forcing term uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputRateKind {
@@ -112,15 +158,17 @@ pub enum InputRateKind {
     Transit,
     /// Freijer & Post inverse-Gaussian density — `igd(mat, cv2)`.
     InverseGaussian,
+    /// Weibull density absorption — `weibull(td, beta)`.
+    Weibull,
 }
 
 impl InputRateKind {
     /// Whether this kind's input-rate forcing has been lifted to `PkNum`/`Dual2`
     /// so the analytic ODE sensitivity provider (`sens/ode_provider.rs`) can
     /// evaluate it over dual numbers; otherwise a model using it stays on the FD
-    /// fallback. Inverse-Gaussian (#430 slice 1) and transit (#430 slice 2, via
-    /// the `ln_gamma` `Dual2` rule = digamma/trigamma) are both lifted; Weibull
-    /// follows with Phase 2 (its `powf` `Dual2` rule).
+    /// fallback. Inverse-Gaussian (#430 slice 1), transit (#430 slice 2, via the
+    /// `ln_gamma` `Dual2` rule = digamma/trigamma), and Weibull (Phase 2 — its
+    /// log-domain forcing needs only the `ln`/`exp` `Dual2` rules) are all lifted.
     pub fn supported_over_dual(self) -> bool {
         // Exhaustive (no `_` arm) so adding a kind forces a decision here, and must
         // stay consistent with [`InputRateForcing::prepare_dual`] — a kind marked
@@ -131,6 +179,7 @@ impl InputRateKind {
         match self {
             InputRateKind::InverseGaussian => true,
             InputRateKind::Transit => true,
+            InputRateKind::Weibull => true,
         }
     }
 }
@@ -142,7 +191,8 @@ impl InputRateKind {
 /// rather than threaded through the expression AST / bytecode VM / symbolic-AD
 /// machinery. `arg_slots` index the flat individual-parameter vector for this
 /// model's parameters — for [`InputRateKind::Transit`], `[n, mtt]`; for
-/// [`InputRateKind::InverseGaussian`], `[mat, cv2]`.
+/// [`InputRateKind::InverseGaussian`], `[mat, cv2]`; for
+/// [`InputRateKind::Weibull`], `[td, beta]`.
 #[derive(Debug, Clone)]
 pub struct InputRateForcing {
     /// 0-based ODE compartment that receives `R_in`.
@@ -181,6 +231,9 @@ impl InputRateForcing {
                 self.arg(params, 0, 1.0),
                 self.arg(params, 1, 1.0),
             ),
+            InputRateKind::Weibull => {
+                PreparedInputRate::weibull(self.arg(params, 0, 1.0), self.arg(params, 1, 1.0))
+            }
         }
     }
 
@@ -197,6 +250,9 @@ impl InputRateForcing {
             InputRateKind::InverseGaussian => {
                 validate_igd(self.arg(params, 0, 1.0), self.arg(params, 1, 1.0))
             }
+            InputRateKind::Weibull => {
+                validate_weibull(self.arg(params, 0, 1.0), self.arg(params, 1, 1.0))
+            }
         }
     }
 
@@ -205,9 +261,9 @@ impl InputRateForcing {
     /// individual-parameter vector `params` — laid out identically to the `f64`
     /// [`Self::prepare`] input, so `arg_slots` index the same way (and the
     /// per-kind argument defaults match `prepare`, so the lifted constants
-    /// reproduce the scalar ones for `T = f64`). Both lifted kinds
-    /// (inverse-Gaussian, transit) return `Some`; a future unlifted kind (Weibull,
-    /// pre-Phase-2) would return `None`, keeping that model on the FD fallback.
+    /// reproduce the scalar ones for `T = f64`). All current kinds
+    /// (inverse-Gaussian, transit, Weibull) are lifted and return `Some`; a future
+    /// unlifted kind would return `None`, keeping that model on the FD fallback.
     /// [`InputRateKind::supported_over_dual`] gates which kinds reach here and is
     /// pinned consistent with this `match` by
     /// `supported_over_dual_agrees_with_prepare_dual`.
@@ -218,6 +274,10 @@ impl InputRateForcing {
                 self.arg(params, 1, 1.0),
             )),
             InputRateKind::InverseGaussian => Some(PreparedInputRate::inverse_gaussian(
+                self.arg(params, 0, 1.0),
+                self.arg(params, 1, 1.0),
+            )),
+            InputRateKind::Weibull => Some(PreparedInputRate::weibull(
                 self.arg(params, 0, 1.0),
                 self.arg(params, 1, 1.0),
             )),
@@ -245,12 +305,17 @@ pub enum PreparedInputRate<T = f64> {
     /// = 1/(2·cv2·mat)`. (`cv2` is folded into `c0`/`inv_2cv2mat`, so it is not
     /// stored separately.)
     InverseGaussian { mat: T, c0: T, inv_2cv2mat: T },
+    /// Weibull constants: the shape `beta`, `ln Td`, and the dose-invariant log
+    /// prefactor `c0 = ln β − ln Td`. (`Td` itself is folded into `ln_td`/`c0`, so
+    /// it is not stored separately.)
+    Weibull { beta: T, ln_td: T, c0: T },
 }
 
 impl<T: PkNum> PreparedInputRate<T> {
     /// Domain floor for the strictly-positive input-rate parameters (transit
-    /// `mtt`; inverse-Gaussian `mat`, `cv2`) when clamping a transient mid-fit
-    /// excursion (see the `transit` / `inverse_gaussian` constructors). Far below
+    /// `mtt`; inverse-Gaussian `mat`, `cv2`; Weibull `td`, `beta`) when clamping a
+    /// transient mid-fit excursion (see the `transit` / `inverse_gaussian` /
+    /// `weibull` constructors). Far below
     /// any realistic value, so it never perturbs a converged fit — it only keeps
     /// a transient `≤ 0` from turning a `.ln()` / `1/x` into a `NaN`/`∞`. The
     /// generic clamp is [`PkNum::guard_floor`], which for `T = f64` is identical
@@ -313,6 +378,35 @@ impl<T: PkNum> PreparedInputRate<T> {
         }
     }
 
+    /// Precompute the Weibull constants for `(td, beta)`.
+    ///
+    /// Both arguments are **clamped to the valid domain** (`td > 0`, `beta > 0`,
+    /// floor [`Self::MIN_PARAM`]) for the same reason as the other constructors: a
+    /// transient mid-search excursion (additive `eta`, wide FD step) could drive
+    /// `td ≤ 0` or `beta ≤ 0`, turning `ln Td` / `ln β` into a `NaN` that would
+    /// poison the ODE RHS. The fit-time guard ([`validate_weibull`]) rejects an
+    /// out-of-domain *typical* value loudly; the clamp keeps `R_in` finite at the
+    /// domain wall so the optimiser can climb back to the interior, and the
+    /// converged optimum is interior so reported estimates are unaffected. `NaN`
+    /// inputs also fall to the floor.
+    ///
+    /// Generic over `T` (the `sens/` `*_g<T>` convention) so a `weibull()` model
+    /// gets exact analytic `Dual2` sensitivities for `td`/`beta`: the constants and
+    /// [`Self::rate`] use only `ln`/`exp`/`+ − * /`, all on [`PkNum`] — the power
+    /// `(tad/Td)^β` is evaluated as `exp(β·ln(tad/Td))`, so no `powf` rule is
+    /// needed. For `T = f64` this reduces to the scalar Weibull density.
+    #[inline]
+    fn weibull(td: T, beta: T) -> Self {
+        let td = td.guard_floor(Self::MIN_PARAM);
+        let beta = beta.guard_floor(Self::MIN_PARAM);
+        let ln_td = td.ln();
+        PreparedInputRate::Weibull {
+            beta,
+            ln_td,
+            c0: beta.ln() - ln_td,
+        }
+    }
+
     /// Appearance rate `R_in(tad)` for one dose (`dose = F · amt`). Per-dose
     /// contributions are summed by the caller; `tad ≤ 0` or `dose ≤ 0 ⇒ 0` (the
     /// guard branches on `.val()`, so for a `Dual2` it returns a flat zero). The
@@ -348,6 +442,17 @@ impl<T: PkNum> PreparedInputRate<T> {
             } => {
                 let d = tad - mat;
                 (dose.ln() + c0 - T::from_f64(1.5) * tad.ln() - d * d * inv_2cv2mat / tad).exp()
+            }
+            // ln R_in = ln dose + (ln β − ln Td) + (β − 1)·u − exp(β·u),
+            //   u = ln(tad/Td) = ln tad − ln Td.
+            // The power (tad/Td)^β is exp(β·u), so no `powf` is needed. tad > 0
+            // here. As tad → 0⁺ (u → −∞): β > 1 ⇒ (β−1)·u → −∞ ⇒ R_in → 0;
+            // β = 1 ⇒ R_in = dose/Td·exp(−tad/Td) (first-order, ka = 1/Td);
+            // β < 1 ⇒ (β−1)·u → +∞ ⇒ R_in → ∞, an *integrable* spike (∫R_in = dose
+            // still holds), which the adaptive solver resolves with small steps.
+            PreparedInputRate::Weibull { beta, ln_td, c0 } => {
+                let u = tad.ln() - ln_td;
+                (dose.ln() + c0 + (beta - T::from_f64(1.0)) * u - (beta * u).exp()).exp()
             }
         }
     }
@@ -748,17 +853,348 @@ mod tests {
         assert!(forcing.validate(&bad_cv2).unwrap_err().contains("cv2"));
     }
 
-    /// `prepare_dual` lifts **both** forcings (IG and transit) to a `PkNum` type
-    /// (here `T = f64`), reproducing the scalar `prepare` exactly — the `T = f64`
-    /// byte-identity that lets the analytic ODE provider evaluate them over `Dual2`
-    /// without drifting from the production predictor (#430; transit = slice 2).
+    // ── Weibull `weibull(td, beta)` ──────────────────────────────────────────
+
+    /// Direct (non-log-domain) Weibull density × dose, via `powf` — the independent
+    /// reference the log-domain [`weibull_input_rate`] (which uses `exp(β·ln x)`) is
+    /// checked against, so a typo in either route is caught.
+    fn weibull_density_ref(tad: f64, td: f64, beta: f64, dose: f64) -> f64 {
+        if tad <= 0.0 || dose <= 0.0 {
+            return 0.0;
+        }
+        let x = tad / td;
+        dose * (beta / td) * x.powf(beta - 1.0) * (-x.powf(beta)).exp()
+    }
+
+    /// Analytic Weibull survival `S(t) = exp(−(t/Td)^β)`; `dose·(1 − S)` is the
+    /// cumulative absorbed amount, and `R_in = −dose·S'(t)`.
+    fn weibull_survival(t: f64, td: f64, beta: f64) -> f64 {
+        (-(t / td).powf(beta)).exp()
+    }
+
+    #[test]
+    fn weibull_matches_direct_density_formula() {
+        // Log-domain evaluation vs the textbook `powf` density to machine precision,
+        // across β < 1, β = 1, β > 1 — guards the `c0`/`ln_td` hoist algebra and the
+        // `(tad/Td)^β = exp(β·ln(tad/Td))` rewrite.
+        let dose = 100.0;
+        for &(td, beta) in &[(2.0, 0.5), (1.5, 1.0), (3.0, 1.5), (2.0, 3.0), (4.0, 0.8)] {
+            for &tad in &[0.05, 0.5, 1.0, 2.0, 5.0, 12.0, 30.0] {
+                assert_relative_eq!(
+                    weibull_input_rate(tad, td, beta, dose),
+                    weibull_density_ref(tad, td, beta, dose),
+                    max_relative = 1e-12
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weibull_is_negative_derivative_of_survival() {
+        // The strongest normalisation check: R_in(tad) = −dose·S'(t), with
+        // S = exp(−(t/Td)^β). Pins the whole functional form (constant *and*
+        // exponent), and — unlike a trapezoidal mass integral — stays accurate for
+        // β < 1 because it is evaluated pointwise at finite tad (no singular cell).
+        let dose = 100.0;
+        let h = 1e-6;
+        for &(td, beta) in &[(2.0, 0.7), (1.5, 1.0), (3.0, 1.4), (2.0, 2.5)] {
+            for &tad in &[0.2, 0.6, 1.5, 4.0, 9.0] {
+                let s_prime = (weibull_survival(tad + h, td, beta)
+                    - weibull_survival(tad - h, td, beta))
+                    / (2.0 * h);
+                assert_relative_eq!(
+                    weibull_input_rate(tad, td, beta, dose),
+                    -dose * s_prime,
+                    max_relative = 1e-5
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weibull_mass_balance_integrates_to_dose() {
+        // ∫₀^∞ R_in dt = dose for β ≥ 1, where the integrand is finite at tad → 0
+        // so a plain trapezoidal sum from 0 converges. (β < 1 has an integrable
+        // singularity at 0 that trapezoidal-from-0 cannot resolve; its normalisation
+        // is covered exactly by `weibull_is_negative_derivative_of_survival` and the
+        // integrable-spike test below.)
+        for &(td, beta) in &[(1.5_f64, 1.0_f64), (3.0, 1.5), (2.0, 3.0), (4.0, 2.0)] {
+            let dose = 100.0;
+            let upper = td * 8.0;
+            let dt = upper / 400_000.0;
+            let steps = (upper / dt) as usize;
+            let mut sum = 0.0;
+            let mut prev = weibull_input_rate(0.0, td, beta, dose);
+            for i in 1..=steps {
+                let t = i as f64 * dt;
+                let cur = weibull_input_rate(t, td, beta, dose);
+                sum += 0.5 * (prev + cur) * dt;
+                prev = cur;
+            }
+            assert_relative_eq!(sum, dose, max_relative = 2e-3);
+        }
+    }
+
+    #[test]
+    fn weibull_beta_one_is_first_order() {
+        // β = 1 ⇒ R_in = dose/Td·exp(−tad/Td): first-order absorption with ka = 1/Td.
+        let (td, dose) = (2.0_f64, 50.0_f64);
+        let ka = 1.0 / td;
+        for &tad in &[0.0, 0.1, 0.5, 1.0, 3.0, 8.0] {
+            let want = if tad <= 0.0 {
+                0.0
+            } else {
+                dose * ka * (-ka * tad).exp()
+            };
+            assert_relative_eq!(
+                weibull_input_rate(tad, td, 1.0, dose),
+                want,
+                max_relative = 1e-12
+            );
+        }
+    }
+
+    #[test]
+    fn weibull_peaks_at_the_mode_for_shape_gt_one() {
+        // For β > 1 the density has an interior mode at tad = Td·((β−1)/β)^(1/β);
+        // flanks at half / 1.5× the mode are lower.
+        for &(td, beta) in &[(2.0_f64, 1.5_f64), (3.0, 2.0), (1.5, 4.0)] {
+            let mode = td * ((beta - 1.0) / beta).powf(1.0 / beta);
+            let peak = weibull_input_rate(mode, td, beta, 100.0);
+            assert!(peak > weibull_input_rate(mode * 0.5, td, beta, 100.0));
+            assert!(peak > weibull_input_rate(mode * 1.5, td, beta, 100.0));
+        }
+    }
+
+    #[test]
+    fn weibull_beta_lt_one_integrable_spike() {
+        // β < 1: R_in → ∞ as tad → 0⁺, but the spike is *integrable*. Concretely,
+        // as tad shrinks toward 0: (i) R_in is finite & positive at every tad > 0;
+        // (ii) R_in rises (the value is *not* capped — a cap would break mass
+        // balance); (iii) the cumulative absorbed amount dose·(1 − S(t)) *falls*
+        // toward 0 — so the mass under the ever-taller spike vanishes as the window
+        // shrinks. The integral, not the value, is what stays finite.
+        let (td, beta, dose) = (2.0_f64, 0.5_f64, 100.0_f64);
+        let mut prev_r = 0.0_f64; // rises as tad shrinks
+        let mut prev_absorbed = f64::INFINITY; // falls as tad shrinks
+        for &tad in &[1e-1, 1e-3, 1e-6, 1e-9] {
+            let r = weibull_input_rate(tad, td, beta, dose);
+            assert!(
+                r.is_finite() && r > 0.0,
+                "R_in must be finite > 0 at tad={tad}, got {r}"
+            );
+            assert!(
+                r > prev_r,
+                "R_in must rise toward the tad→0 singularity (tad={tad}: {r} vs prev {prev_r})"
+            );
+            prev_r = r;
+
+            let absorbed = dose * (1.0 - weibull_survival(tad, td, beta));
+            assert!(
+                absorbed < prev_absorbed,
+                "cumulative absorbed must fall toward 0 as tad→0 (tad={tad}: {absorbed} vs prev {prev_absorbed})"
+            );
+            prev_absorbed = absorbed;
+        }
+        // At the smallest tad the absorbed mass is a vanishing fraction of the dose,
+        // confirming the singularity is integrable (∫₀^t R_in → 0).
+        assert!(dose * (1.0 - weibull_survival(1e-9, td, beta)) < dose * 1e-3);
+        // tad = 0 itself is the guarded start (input begins at the dose), R_in = 0.
+        assert_eq!(weibull_input_rate(0.0, td, beta, dose), 0.0);
+    }
+
+    #[test]
+    fn weibull_zero_before_dose_and_for_zero_dose() {
+        assert_eq!(weibull_input_rate(0.0, 2.0, 1.5, 100.0), 0.0);
+        assert_eq!(weibull_input_rate(-1.0, 2.0, 1.5, 100.0), 0.0);
+        assert_eq!(weibull_input_rate(1.0, 2.0, 1.5, 0.0), 0.0);
+    }
+
+    #[test]
+    fn validate_weibull_domain() {
+        assert!(validate_weibull(2.0, 1.5).is_ok());
+        assert!(validate_weibull(2.0, 0.5).is_ok()); // β < 1 is valid
+        assert!(validate_weibull(0.0, 1.5).is_err());
+        assert!(validate_weibull(-1.0, 1.5).is_err());
+        assert!(validate_weibull(2.0, 0.0).is_err());
+        assert!(validate_weibull(2.0, -0.5).is_err());
+        assert!(validate_weibull(f64::NAN, 1.5).is_err());
+        assert!(validate_weibull(2.0, f64::NAN).is_err());
+    }
+
+    /// A transient domain excursion (`td ≤ 0`, `beta ≤ 0`, or `NaN`) — reachable
+    /// mid-fit via an additive `eta` / wide FD step — must yield a finite,
+    /// non-negative `R_in` (the clamp in `PreparedInputRate::weibull`), never a
+    /// `NaN`/`∞` poisoning the ODE RHS.
+    #[test]
+    fn weibull_rate_is_finite_for_domain_excursions() {
+        for &(td, beta) in &[
+            (0.0, 1.5),
+            (-1.0, 1.5),
+            (2.0, 0.0),
+            (2.0, -0.5),
+            (f64::NAN, 1.5),
+            (2.0, f64::NAN),
+        ] {
+            for &tad in &[0.5, 2.0, 10.0] {
+                let r = weibull_input_rate(tad, td, beta, 100.0);
+                assert!(
+                    r.is_finite() && r >= 0.0,
+                    "R_in must be finite & non-negative at td={td}, beta={beta}, tad={tad}, got {r}"
+                );
+            }
+        }
+    }
+
+    /// Dual-path counterpart: the same transient excursions over `Dual2` must yield
+    /// a finite **value, gradient, and Hessian** (the analytic FOCE/FOCEI/Bayes
+    /// failure mode the f64 test can't see), and the clamped parameter's jet must be
+    /// exactly flat (zero gradient) since the clamp pins it to a constant.
+    #[test]
+    fn weibull_dual_jets_finite_at_domain_excursions() {
+        use crate::sens::dual_mixed::DualMixed;
+        type D = DualMixed<2, 2>;
+        let forcing = InputRateForcing {
+            cmt: 1,
+            kind: InputRateKind::Weibull,
+            arg_slots: vec![4, 5], // td @ 4 (dim 0), beta @ 5 (dim 1)
+        };
+        // (td, beta, label, clamped_dim)
+        let cases: &[(f64, f64, &str, Option<usize>)] = &[
+            (0.0, 1.5, "td=0", Some(0)),
+            (-1.0, 1.5, "td<0", Some(0)),
+            (2.0, 0.0, "beta=0", Some(1)),
+            (2.0, -0.5, "beta<0", Some(1)),
+            (f64::NAN, 1.5, "NaN td", Some(0)),
+            (2.0, f64::NAN, "NaN beta", Some(1)),
+            (2.0, 1.5, "interior", None),
+        ];
+        for &(td, beta, label, clamped) in cases {
+            let mut params = vec![D::constant(0.0); crate::types::MAX_PK_PARAMS];
+            params[4] = D::var(td, 0);
+            params[5] = D::var(beta, 1);
+            let prep = forcing
+                .prepare_dual::<D>(&params)
+                .expect("weibull lifts over PkNum (Phase 2)");
+            for &tad in &[0.5, 2.0, 10.0] {
+                let r = prep.rate(D::constant(tad), D::constant(100.0));
+                assert!(
+                    r.value.is_finite(),
+                    "{label}: value not finite at tad={tad}: {}",
+                    r.value
+                );
+                assert!(
+                    r.grad.iter().all(|g| g.is_finite()),
+                    "{label}: gradient not finite at tad={tad}: {:?}",
+                    r.grad
+                );
+                assert!(
+                    r.hess.iter().flatten().all(|h| h.is_finite()),
+                    "{label}: Hessian not finite at tad={tad}: {:?}",
+                    r.hess
+                );
+                if let Some(d) = clamped {
+                    assert_eq!(
+                        r.grad[d], 0.0,
+                        "{label}: clamped dim {d} must have a flat jet at tad={tad}, got {}",
+                        r.grad[d]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The analytic `Dual2` gradient `∂R_in/∂(td, beta)` must match central finite
+    /// differences of the scalar `weibull_input_rate` at interior points — the
+    /// per-PR backstop (default `--features ci`, since `Dual2` is the `gradient =
+    /// auto` path) against a wrong log-domain dual rule, the #317-class regression
+    /// FD-only checks miss. Covers β < 1, β = 1, β > 1.
+    #[test]
+    fn weibull_dual_gradient_matches_central_fd() {
+        use crate::sens::dual_mixed::DualMixed;
+        type D = DualMixed<2, 2>;
+        let forcing = InputRateForcing {
+            cmt: 1,
+            kind: InputRateKind::Weibull,
+            arg_slots: vec![4, 5], // td @ 4 (dim 0), beta @ 5 (dim 1)
+        };
+        let dose = 100.0;
+        let h = 1e-6;
+        for &(td, beta) in &[(1.5, 0.8), (2.0, 1.0), (3.0, 1.5), (2.0, 2.5)] {
+            let mut params = vec![D::constant(0.0); crate::types::MAX_PK_PARAMS];
+            params[4] = D::var(td, 0);
+            params[5] = D::var(beta, 1);
+            let prep = forcing.prepare_dual::<D>(&params).unwrap();
+            for &tad in &[0.3, 1.0, 4.0] {
+                let r = prep.rate(D::constant(tad), D::constant(dose));
+                let d_td = (weibull_input_rate(tad, td + h, beta, dose)
+                    - weibull_input_rate(tad, td - h, beta, dose))
+                    / (2.0 * h);
+                let d_beta = (weibull_input_rate(tad, td, beta + h, dose)
+                    - weibull_input_rate(tad, td, beta - h, dose))
+                    / (2.0 * h);
+                assert_relative_eq!(r.grad[0], d_td, max_relative = 1e-5, epsilon = 1e-7);
+                assert_relative_eq!(r.grad[1], d_beta, max_relative = 1e-5, epsilon = 1e-7);
+            }
+        }
+    }
+
+    /// `prepare(...).rate(...)` must agree bit-for-bit with the reference
+    /// `weibull_input_rate`, reading `td`/`beta` from the right slots.
+    #[test]
+    fn prepared_weibull_rate_matches_reference_and_reads_slots() {
+        let forcing = InputRateForcing {
+            cmt: 1,
+            kind: InputRateKind::Weibull,
+            arg_slots: vec![4, 5], // td @ 4, beta @ 5
+        };
+        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
+        params[4] = 2.0; // td
+        params[5] = 1.5; // beta
+        let prepared = forcing.prepare(&params);
+        for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
+            assert_eq!(
+                prepared.rate(tad, 100.0),
+                weibull_input_rate(tad, 2.0, 1.5, 100.0)
+            );
+        }
+    }
+
+    /// `InputRateForcing::validate` reads `td`/`beta` from the right slots for the
+    /// Weibull kind and surfaces the domain error.
+    #[test]
+    fn forcing_validate_weibull_reads_slots_and_flags_domain() {
+        let forcing = InputRateForcing {
+            cmt: 1,
+            kind: InputRateKind::Weibull,
+            arg_slots: vec![4, 5],
+        };
+        let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
+        ok[4] = 2.0;
+        ok[5] = 1.5;
+        assert!(forcing.validate(&ok).is_ok());
+
+        let mut bad_td = ok.clone();
+        bad_td[4] = -1.0;
+        assert!(forcing.validate(&bad_td).unwrap_err().contains("td"));
+
+        let mut bad_beta = ok.clone();
+        bad_beta[5] = 0.0;
+        assert!(forcing.validate(&bad_beta).unwrap_err().contains("beta"));
+    }
+
+    /// `prepare_dual` lifts **all three** forcings (IG, transit, Weibull) to a
+    /// `PkNum` type (here `T = f64`), reproducing the scalar `prepare` exactly — the
+    /// `T = f64` byte-identity that lets the analytic ODE provider evaluate them over
+    /// `Dual2` without drifting from the production predictor (#430; Weibull = Phase 2).
     #[test]
     fn prepare_dual_lifts_ig_and_transit() {
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
-        params[4] = 2.0; // mat
-        params[5] = 0.3; // cv2
+        params[4] = 2.0; // mat / td
+        params[5] = 0.3; // cv2 / (beta below uses its own slots)
         params[6] = 3.0; // n
         params[7] = 1.0; // mtt
+        params[2] = 1.5; // beta (td reuses slot 4)
 
         let ig = InputRateForcing {
             cmt: 1,
@@ -770,10 +1206,15 @@ mod tests {
             kind: InputRateKind::Transit,
             arg_slots: vec![6, 7], // n @ 6, mtt @ 7
         };
-        for forcing in [&ig, &transit] {
+        let weibull = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::Weibull,
+            arg_slots: vec![4, 2], // td @ 4, beta @ 2
+        };
+        for forcing in [&ig, &transit, &weibull] {
             let lifted = forcing
                 .prepare_dual::<f64>(&params)
-                .expect("both kinds lift over PkNum in slice 2");
+                .expect("all kinds lift over PkNum");
             let scalar = forcing.prepare(&params);
             for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
                 assert_eq!(lifted.rate(tad, 100.0), scalar.rate(tad, 100.0));
@@ -789,8 +1230,11 @@ mod tests {
     /// error. Adding a kind: extend `ALL_KINDS` here too (#430 review #5 / #451).
     #[test]
     fn supported_over_dual_agrees_with_prepare_dual() {
-        const ALL_KINDS: &[InputRateKind] =
-            &[InputRateKind::InverseGaussian, InputRateKind::Transit];
+        const ALL_KINDS: &[InputRateKind] = &[
+            InputRateKind::InverseGaussian,
+            InputRateKind::Transit,
+            InputRateKind::Weibull,
+        ];
         let params = vec![1.0; crate::types::MAX_PK_PARAMS];
         for &kind in ALL_KINDS {
             let forcing = InputRateForcing {

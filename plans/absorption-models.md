@@ -2,7 +2,7 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap, in progress (updated 2026-06-20).
+**Status:** approved roadmap, in progress (updated 2026-06-23).
 - **Prerequisite #324:** safety net (PR #326), **modeled infusion duration `Dn` /
   `RATE=-2`** (PR #384), and **modeled rate `Rn` / `RATE=-1` on both engines**
   (PR #418) **merged**; see #383 for any residual analytical-engine items.
@@ -11,9 +11,17 @@
 - **Phase 0b — `ode_template` generation + the analytical-`pk`-plus-absorption
   error rule** (PR #363) **merged**.
 - **Phase 1 — inverse-Gaussian `igd()`** (PR #389) **merged**.
-- **Phases 2–3 not yet implemented** — Phase 2 (Weibull + zero-order family);
-  Phase 3 (analytical incomplete-gamma / exponential tilting, tracked in #386).
-  Biphasic IG + the shared input-rate fraction mechanism tracked in #388.
+- **Analytic `Dual2` ODE forcing (#430)** — `igd` (slice 1), `transit` (slice 2),
+  and (with Phase 2) `weibull` are all lifted off the FD fallback; **#430 closed**.
+- **Phase 2 — `weibull()` merged** (log-domain forcing, exact analytic `Dual2`
+  gradients, permanent ODE-only error rule, AUC-mass invariant; NONMEM anchor kit
+  committed, run pending). **Remaining in Phase 2:** the zero-order family
+  (`zero_order` / `sequential` / `parallel` / `mixed`).
+- **Phase 3 not yet implemented** — analytical incomplete-gamma / exponential
+  tilting for transit + IG, tracked in #386 (now *speed-only*, since #430 already
+  gave transit/IG exact gradients on the ODE path). Biphasic IG + the shared
+  input-rate fraction mechanism tracked in #388. Weibull never reaches Phase 3 (no
+  closed form) — its only exact-gradient route is the #430 generic forcing.
 
 Multi-PR / phased.
 

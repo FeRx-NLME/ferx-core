@@ -45,6 +45,20 @@ section of the SDLC for the versioning policy).
   steady state).
 
 ### Added
+- **Built-in Weibull absorption — the `weibull(td, beta)` input-rate function** (#322, Phase 2).
+  Use it inside an `[odes]` RHS, with `td` (scale) and `beta` (shape) bound to
+  `[individual_parameters]` (so they carry IIV / covariates for free):
+  `d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central`. The dose is delivered as the
+  Weibull density over time (`∫R_in dt = F·Dose`) and its bolus is suppressed — the same
+  dose-into-the-input-rate-compartment convention as `transit()` / `igd()`. Shape `beta`
+  selects the profile: `>1` a delayed interior peak, `=1` first-order absorption with
+  `ka = 1/Td`, `<1` fast early uptake (an integrable spike at the dose). Weibull has no
+  elementary closed form, so it always runs on the numerical ODE path and **requires an
+  explicit ODE disposition** — combining it with an analytical `pk ...` is a clear error
+  pointing at `ode_template`. Because the forcing is evaluated over `Dual2`, a `weibull()`
+  model drives **exact analytic** FOCE/FOCEI/Bayes gradients (no finite-difference fallback),
+  validated against NONMEM. See `examples/weibull_absorption.ferx` and
+  `docs/model-file/absorption.qmd`.
 - **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
   e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in
   addition to the existing theta/eta/covariate namespace. Intermediate variables and names
