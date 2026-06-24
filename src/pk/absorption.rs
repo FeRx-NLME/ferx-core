@@ -1188,7 +1188,7 @@ mod tests {
     /// `T = f64` byte-identity that lets the analytic ODE provider evaluate them over
     /// `Dual2` without drifting from the production predictor (#430; Weibull = Phase 2).
     #[test]
-    fn prepare_dual_lifts_ig_and_transit() {
+    fn prepare_dual_lifts_all_kinds() {
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
         params[4] = 2.0; // mat / td
         params[5] = 0.3; // cv2 / (beta below uses its own slots)
