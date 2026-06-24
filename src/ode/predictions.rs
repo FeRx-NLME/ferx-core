@@ -10,8 +10,8 @@
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
 use crate::pk::absorption::PreparedInputRate;
 use crate::sim::adaptive::{
-    AdaptiveRun, ControllerCtx, DoseAction, DoseLedgerEntry, MonitorSpec, ObserveMode,
-    ObservedSignal,
+    AdaptiveRun, ControllerCtx, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry,
+    MonitorSpec, ObserveMode, ObservedSignal,
 };
 use crate::types::{DoseEvent, PkParams, Subject};
 use std::borrow::Cow;
@@ -1225,6 +1225,7 @@ pub(crate) fn ode_predictions_adaptive(
     let mut u = ode.initial_state(pk_params_flat);
     let mut predictions = vec![f64::NAN; n_obs];
     let mut ledger: Vec<DoseLedgerEntry> = Vec::new();
+    let mut decisions: Vec<DecisionLogEntry> = Vec::new();
 
     // Shadow subject accumulates the controller's realized doses (the #324
     // pattern); `integrate_segment` reads `shadow.doses` for the TAD anchor.
@@ -1314,6 +1315,9 @@ pub(crate) fn ode_predictions_adaptive(
                     controller(&ctx)
                 };
 
+                // Count realized doses this decision so the log can categorize the
+                // outcome (a held / zero-amount decision leaves no ledger row).
+                let mut n_dosed = 0usize;
                 for action in actions {
                     action
                         .validate()
@@ -1356,6 +1360,7 @@ pub(crate) fn ode_predictions_adaptive(
                                 post_state: None,
                                 f_applied: f,
                             });
+                            n_dosed += 1;
                         }
                         DoseAction::Infuse { amt, cmt, rate } => {
                             // A zero-amount infusion is a no-op; don't record an empty dose.
@@ -1404,6 +1409,7 @@ pub(crate) fn ode_predictions_adaptive(
                                 post_state: None,
                                 f_applied: f,
                             });
+                            n_dosed += 1;
                         }
                         DoseAction::Hold => {}
                         DoseAction::Stop => {
@@ -1412,6 +1418,27 @@ pub(crate) fn ode_predictions_adaptive(
                         }
                     }
                 }
+
+                // Log every decision — including holds and no-change, which leave
+                // no ledger row. `stopped` was false on entry to this hook (it gates
+                // the hook), so its truth here means the `Stop` fired this decision.
+                // `observed` is moved in (the ledger rows above already cloned it).
+                let outcome = if stopped {
+                    DecisionOutcome::Stop { dosed: n_dosed }
+                } else if n_dosed > 0 {
+                    DecisionOutcome::Dosed { n: n_dosed }
+                } else {
+                    DecisionOutcome::Hold
+                };
+                decisions.push(DecisionLogEntry {
+                    subject: shadow.id.clone(),
+                    draw: 0,
+                    sim: 0,
+                    decision_idx: decision_index,
+                    time: t_start,
+                    observed_signals: observed,
+                    outcome,
+                });
             }
         }
 
@@ -1481,6 +1508,7 @@ pub(crate) fn ode_predictions_adaptive(
     Ok(AdaptiveRun {
         predictions,
         ledger,
+        decisions,
     })
 }
 
@@ -3555,6 +3583,142 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("lag time"), "got: {err}");
+    }
+
+    // ----- S1.4a decision log (#391) ------------------------------------
+
+    #[test]
+    fn adaptive_decision_log_records_dose_hold_and_stop() {
+        // Every decision is logged — including the hold, which leaves no ledger
+        // row — with the signal the controller observed and the outcome it chose.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let decisions = [0.0, 24.0, 48.0];
+        let mut controller = |ctx: &ControllerCtx| match ctx.decision_index {
+            0 => vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+            1 => vec![DoseAction::Hold],
+            _ => vec![DoseAction::Stop],
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &monitors,
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        assert_eq!(run.decisions.len(), 3, "one log entry per decision");
+        for (i, d) in run.decisions.iter().enumerate() {
+            assert_eq!(d.decision_idx, i);
+            assert_eq!(d.time, decisions[i]);
+            assert_eq!(d.observed_signals.len(), 1);
+            assert_eq!(d.observed_signals[0].name, "A");
+        }
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Dosed { n: 1 });
+        assert_eq!(run.decisions[1].outcome, DecisionOutcome::Hold);
+        assert_eq!(run.decisions[2].outcome, DecisionOutcome::Stop { dosed: 0 });
+        // The pre-dose signal at the first decision is the empty initial state.
+        assert_eq!(run.decisions[0].observed_signals[0].value, 0.0);
+    }
+
+    #[test]
+    fn adaptive_decision_log_omits_decisions_after_stop() {
+        // Once the controller stops, the driver issues no further decisions, so
+        // the Stop entry is the last record (no phantom post-stop log rows).
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.decision_index == 0 {
+                vec![DoseAction::Stop]
+            } else {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            }
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0, 10.0, 20.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1, "only the stop decision is logged");
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Stop { dosed: 0 });
+        assert!(run.ledger.is_empty());
+    }
+
+    #[test]
+    fn adaptive_decision_log_dose_then_stop_in_one_action_list() {
+        // `[Bolus, Stop]` — a final dose, then discontinue — is logged as
+        // `Stop { dosed: 1 }`, not a bare stop, and the dose reaches the ledger.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller =
+            |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }, DoseAction::Stop];
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0, 24.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1, "stop ends the schedule after one");
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Stop { dosed: 1 });
+        assert_eq!(run.ledger.len(), 1);
+    }
+
+    #[test]
+    fn adaptive_decision_log_counts_multiple_doses_in_one_decision() {
+        // A decision can issue more than one dose (e.g. a loading split); the log
+        // records `Dosed { n }` with the realized count, and a zero-amount action
+        // in the same list is excluded (it leaves no ledger row).
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![
+                DoseAction::Bolus { amt: 50.0, cmt: 1 },
+                DoseAction::Bolus { amt: 0.0, cmt: 1 }, // normalized to Hold, not counted
+                DoseAction::Bolus { amt: 50.0, cmt: 1 },
+            ]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1);
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Dosed { n: 2 });
+        assert_eq!(
+            run.ledger.len(),
+            2,
+            "two realized doses, the zero-amt excluded"
+        );
     }
 
     #[test]
