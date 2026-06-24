@@ -196,9 +196,12 @@ pub fn shi_step_sizes(eval: impl Fn(&[f64]) -> f64, eta_hat: &[f64]) -> Vec<f64>
 /// `entry_time > 0` draws conditionally on survival past entry (left
 /// truncation, §3.6). The samplers return `f64::MAX` for degenerate / improper
 /// cases (`λ = 0`; a Gompertz with `γ < 0` whose survival never reaches the
-/// drawn quantile). Testing `t_event < window` (rather than `t_event >= window`)
-/// makes those censor at the window instead of reporting a spurious event at
-/// `f64::MAX`.
+/// drawn quantile). An event is recorded only for a draw that is strictly below
+/// the window **and** below that `f64::MAX` sentinel, so a degenerate draw is
+/// censored rather than reported as a spurious event — even when `window` is
+/// unbounded (`+∞`, an event record carrying no administrative horizon; see
+/// [`observation_window`]), where a bare `t_event < window` test would let the
+/// `f64::MAX` sentinel through.
 fn draw_tte_outcome<R: rand::Rng>(
     family: HazardFamily,
     params: &[f64],
@@ -214,21 +217,48 @@ fn draw_tte_outcome<R: rand::Rng>(
     } else {
         sample_event_time(family, params, u)
     };
-    if t_event < window {
+    // `t_event < f64::MAX` rejects the samplers' degenerate / improper sentinel
+    // (`f64::MAX`); without it an unbounded window would mis-report that sentinel
+    // as an observed event at `f64::MAX`.
+    if t_event < window && t_event < f64::MAX {
         (t_event, true)
     } else {
         (window, false)
     }
 }
 
+/// The administrative right-censoring horizon for a TTE record, or `+∞` when the
+/// record carries none.
+///
+/// Only a `RightCensored` record marks an administrative horizon: the subject
+/// was event-free through `time`, at which point observation ended, so a
+/// simulated draw reaching `time` is genuinely censored there. An `Exact` or
+/// `IntervalCensored` record instead marks an *event* — its `time` field is the
+/// realized event time (or interval upper bound), **not** a horizon. Censoring a
+/// re-simulated draw at a realized event time would truncate the simulated
+/// event-time distribution at the data's own event times (a re-simulation / VPC
+/// bias), so those records draw uncensored (`+∞`). Administrative censoring for
+/// such a design is supplied either by the design itself (right-censored
+/// template rows, as the SSE tests do) or by the forthcoming
+/// `[simulation] horizon` (Phase 2).
+fn observation_window(event_type: &EventType, time: f64) -> f64 {
+    match event_type {
+        EventType::RightCensored => time,
+        EventType::Exact | EventType::IntervalCensored { .. } => f64::INFINITY,
+    }
+}
+
 /// Draw TTE event/censoring outcomes for every TTE record on a subject and
 /// append them to `results`.
 ///
-/// Called from `api::simulate_inner_with_draw` after the Gaussian path. Each
-/// `ObsRecord::Event` carries the subject's observation window in its `time`
-/// field; the simulated event is administratively right-censored at that window
-/// when it would occur later, so simulated data reproduce the censoring pattern
-/// of the design rather than every draw being an uncensored event.
+/// Called from `api::simulate_inner_with_draw` after the Gaussian path. A
+/// simulated draw is administratively right-censored at the subject's
+/// observation horizon when it would occur later, so simulated data reproduce
+/// the censoring pattern of the design rather than every draw being an
+/// uncensored event. The horizon is derived per record by
+/// [`observation_window`]: a right-censored record censors at its `time`; an
+/// event record (`Exact` / `IntervalCensored`) carries no horizon and draws
+/// uncensored.
 pub fn simulate_tte<R: rand::Rng>(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,
@@ -243,8 +273,8 @@ pub fn simulate_tte<R: rand::Rng>(
         let ObsRecord::Event {
             cmt,
             entry_time,
-            time: window,
-            ..
+            time,
+            event_type,
         } = record;
 
         let Some(EndpointLikelihood::Tte { hazard }) = model.endpoints.get(cmt) else {
@@ -253,7 +283,8 @@ pub fn simulate_tte<R: rand::Rng>(
         let HazardSpec::Analytic { family, param_fn } = hazard;
         let params = param_fn(theta, eta, &subject.covariates);
 
-        let (t, observed) = draw_tte_outcome(*family, &params, *entry_time, *window, rng);
+        let window = observation_window(event_type, *time);
+        let (t, observed) = draw_tte_outcome(*family, &params, *entry_time, window, rng);
 
         results.push(crate::api::SimulationResult {
             draw,
@@ -485,8 +516,8 @@ mod tests {
     #[test]
     fn draw_tte_degenerate_zero_hazard_censors_at_window() {
         use rand::SeedableRng;
-        // λ=0 ⇒ sampler returns f64::MAX; the `t_event < window` test must censor
-        // at the window rather than emit a spurious event at f64::MAX.
+        // λ=0 ⇒ sampler returns f64::MAX; with a finite window the draw must
+        // censor at the window rather than emit a spurious event at f64::MAX.
         let mut rng = rand::rngs::StdRng::seed_from_u64(99);
         let window = 12.5_f64;
         for _ in 0..100 {
@@ -522,6 +553,51 @@ mod tests {
         assert!(
             saw_event && saw_censor,
             "expected a mix of events and censored draws"
+        );
+    }
+
+    #[test]
+    fn draw_tte_unbounded_window_degenerate_does_not_emit_spurious_event() {
+        use rand::SeedableRng;
+        // λ=0 ⇒ sampler returns f64::MAX. With an unbounded window (an event
+        // record carries no administrative horizon, so `observation_window`
+        // returns +∞) a bare `t_event < window` test would mis-report that
+        // sentinel as an observed event at f64::MAX. The `t_event < f64::MAX`
+        // guard must classify it as censored (no event) instead.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(123);
+        for _ in 0..100 {
+            let (t, observed) = draw_tte_outcome(
+                HazardFamily::Exponential,
+                &[0.0],
+                0.0,
+                f64::INFINITY,
+                &mut rng,
+            );
+            assert!(
+                !observed,
+                "a degenerate (no-event) draw must never be reported as an observed event"
+            );
+            assert_eq!(t, f64::INFINITY, "censored at the (unbounded) window");
+        }
+    }
+
+    #[test]
+    fn observation_window_only_right_censored_has_a_horizon() {
+        // A right-censored record's `time` IS the administrative horizon.
+        assert_eq!(observation_window(&EventType::RightCensored, 12.0), 12.0);
+        // Event records carry no administrative horizon: their `time` is an
+        // event time / interval bound, so they must draw uncensored (+∞) rather
+        // than truncate at a realized event time.
+        assert_eq!(observation_window(&EventType::Exact, 12.0), f64::INFINITY);
+        assert_eq!(
+            observation_window(
+                &EventType::IntervalCensored {
+                    left: 1.0,
+                    right: 5.0
+                },
+                5.0
+            ),
+            f64::INFINITY
         );
     }
 }
