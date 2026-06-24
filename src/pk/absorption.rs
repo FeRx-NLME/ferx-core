@@ -508,10 +508,10 @@ mod tests {
                     r.hess
                 );
                 if let Some(d) = clamped {
+                    let got = r.grad[d];
                     assert_eq!(
-                        r.grad[d], 0.0,
-                        "{label}: clamped dim {d} must have a flat (zero) jet at tad={tad}, got {}",
-                        r.grad[d]
+                        got, 0.0,
+                        "{label}: clamped dim {d} must have a flat (zero) jet at tad={tad}, got {got}",
                     );
                 }
             }
