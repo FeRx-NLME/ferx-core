@@ -175,6 +175,14 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- **`[simulation]` block now honours the documented `n_subjects` / `dose_amt` /
+  `dose_cmt` keys.** The parser previously only recognised the short
+  `subjects` / `dose` / `cmt` spellings and **silently ignored** every other key,
+  so all `examples/*.ferx` (which use the long forms) fell back to the defaults
+  (10 subjects, dose 100, compartment 1) — e.g. `n_subjects = 12` simulated 10.
+  Both spellings are now accepted (long forms canonical, short forms as aliases),
+  and an **unknown key in `[simulation]` is now a hard parse error** instead of a
+  silent default, matching `[fit_options]`.
 - **TTE simulation now applies administrative right-censoring** (#440). `simulate()`
   for a `[event_model]` (TTE) endpoint previously emitted *every* drawn event time as
   an uncensored event, so simulated data could not reproduce a study's censoring
