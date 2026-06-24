@@ -4,7 +4,8 @@
 //   tte_data_term         — negative log-likelihood for a TTE subject's records
 //   data_term_hessian_fd  — 4-point FD Hessian of any scalar eta-function
 //   shi_step_sizes        — adaptive Shi (2021) step-size vector for FD Hessian
-//   simulate_tte          — draw TTE event times and append to SimulationResult vec
+//   simulate_tte          — draw TTE event times (administratively right-censored at
+//                           each subject's observation window) into a SimulationResult vec
 //
 // See plans/tte-survival-markov.md §3.1, §2.3, §9.3, §8.8.2.
 
@@ -18,7 +19,9 @@ pub use parametric::{
 use nalgebra::DMatrix;
 use std::collections::HashMap;
 
-use crate::types::{EndpointLikelihood, EventType, HazardSpec, ObsRecord, SimOutcome};
+use crate::types::{
+    EndpointLikelihood, EventType, HazardFamily, HazardSpec, ObsRecord, SimOutcome,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  TTE data term
@@ -182,12 +185,50 @@ pub fn shi_step_sizes(eval: impl Fn(&[f64]) -> f64, eta_hat: &[f64]) -> Vec<f64>
 //  Simulation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Draw TTE event times for all TTE records on a subject and append to `results`.
+/// Draw one TTE outcome within the observation window `window`.
 ///
-/// Called from `api::simulate_inner_with_draw` after the Gaussian path.
-/// Administrative censoring is not applied here — the event time is drawn from
-/// the unconditional distribution. Users can filter by time in post-processing.
-/// (Phase 2 will add `[simulation] horizon` support.)
+/// Returns `(time, observed)`:
+/// - an **event** at the drawn time when it falls before `window`
+///   (`observed = true`, `time = t_event`);
+/// - **administrative right-censoring** at `window` when the drawn event time
+///   reaches the window (`observed = false`, `time = window`).
+///
+/// `entry_time > 0` draws conditionally on survival past entry (left
+/// truncation, §3.6). The samplers return `f64::MAX` for degenerate / improper
+/// cases (`λ = 0`; a Gompertz with `γ < 0` whose survival never reaches the
+/// drawn quantile). Testing `t_event < window` (rather than `t_event >= window`)
+/// makes those censor at the window instead of reporting a spurious event at
+/// `f64::MAX`.
+fn draw_tte_outcome<R: rand::Rng>(
+    family: HazardFamily,
+    params: &[f64],
+    entry_time: f64,
+    window: f64,
+    rng: &mut R,
+) -> (f64, bool) {
+    // Open01 samples from (0, 1) exclusive, avoiding the u=0 edge case that
+    // would send -ln(u) to +∞.
+    let u: f64 = rng.sample(rand::distributions::Open01);
+    let t_event = if entry_time > 0.0 {
+        sample_conditional_event_time(family, params, entry_time, u)
+    } else {
+        sample_event_time(family, params, u)
+    };
+    if t_event < window {
+        (t_event, true)
+    } else {
+        (window, false)
+    }
+}
+
+/// Draw TTE event/censoring outcomes for every TTE record on a subject and
+/// append them to `results`.
+///
+/// Called from `api::simulate_inner_with_draw` after the Gaussian path. Each
+/// `ObsRecord::Event` carries the subject's observation window in its `time`
+/// field; the simulated event is administratively right-censored at that window
+/// when it would occur later, so simulated data reproduce the censoring pattern
+/// of the design rather than every draw being an uncensored event.
 pub fn simulate_tte<R: rand::Rng>(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,
@@ -200,7 +241,10 @@ pub fn simulate_tte<R: rand::Rng>(
 ) {
     for record in &subject.obs_records {
         let ObsRecord::Event {
-            cmt, entry_time, ..
+            cmt,
+            entry_time,
+            time: window,
+            ..
         } = record;
 
         let Some(EndpointLikelihood::Tte { hazard }) = model.endpoints.get(cmt) else {
@@ -209,30 +253,16 @@ pub fn simulate_tte<R: rand::Rng>(
         let HazardSpec::Analytic { family, param_fn } = hazard;
         let params = param_fn(theta, eta, &subject.covariates);
 
-        // Open01 samples from (0, 1) exclusive, avoiding the u=0 edge case that
-        // would send -ln(u) to +∞ and clamp the event time to f64::MAX.
-        let u: f64 = rng.sample(rand::distributions::Open01);
-        let t_event = if *entry_time > 0.0 {
-            sample_conditional_event_time(*family, &params, *entry_time, u)
-        } else {
-            sample_event_time(*family, &params, u)
-        };
+        let (t, observed) = draw_tte_outcome(*family, &params, *entry_time, *window, rng);
 
         results.push(crate::api::SimulationResult {
             draw,
             sim,
             id: subject.id.clone(),
-            time: t_event,
+            time: t,
             cmt: *cmt,
             ipred: f64::NAN,
-            outcome: SimOutcome::Event {
-                time: t_event,
-                // TODO(phase-2): apply horizon censoring from [simulation] block;
-                // set observed=false and time=horizon when t_event >= horizon.
-                // Until then, every draw is an uncensored event — simulated data
-                // will not match the censoring pattern of the reference scripts.
-                observed: true,
-            },
+            outcome: SimOutcome::Event { time: t, observed },
         });
     }
 }
@@ -397,5 +427,101 @@ mod tests {
         let a = 0.1_f64 * 10.0; // H(left) - H(entry)
         let expected = a - ((-delta).exp_m1().abs().ln());
         assert_abs_diff_eq!(nll, expected, epsilon = 1e-8);
+    }
+
+    // ── draw_tte_outcome: administrative censoring at the observation window ──
+
+    #[test]
+    fn draw_tte_censoring_fraction_matches_survival() {
+        use rand::SeedableRng;
+        // Exponential λ=0.1 over a window τ=10 ⇒ P(censored) = S(τ) = exp(−λτ) ≈ 0.3679.
+        // 20 000 draws; proportion SE ≈ 0.0034 ⇒ a 0.02 tolerance is ~6σ.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
+        let lambda = 0.1_f64;
+        let window = 10.0_f64;
+        let n = 20_000;
+        let mut censored = 0usize;
+        for _ in 0..n {
+            let (t, observed) =
+                draw_tte_outcome(HazardFamily::Exponential, &[lambda], 0.0, window, &mut rng);
+            if observed {
+                assert!(
+                    t > 0.0 && t < window,
+                    "event time must lie in (0, window): {t}"
+                );
+            } else {
+                assert_eq!(t, window, "censored time must equal the window");
+                censored += 1;
+            }
+        }
+        let frac = censored as f64 / n as f64;
+        let expected = (-lambda * window).exp();
+        assert!(
+            (frac - expected).abs() < 0.02,
+            "censoring fraction {frac} should track S(τ) = {expected}"
+        );
+    }
+
+    #[test]
+    fn draw_tte_infinite_window_never_censors() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        for _ in 0..1000 {
+            let (t, observed) = draw_tte_outcome(
+                HazardFamily::Exponential,
+                &[1.0],
+                0.0,
+                f64::INFINITY,
+                &mut rng,
+            );
+            assert!(observed, "no censoring is possible with an infinite window");
+            assert!(
+                t.is_finite() && t > 0.0,
+                "event time must be finite positive: {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn draw_tte_degenerate_zero_hazard_censors_at_window() {
+        use rand::SeedableRng;
+        // λ=0 ⇒ sampler returns f64::MAX; the `t_event < window` test must censor
+        // at the window rather than emit a spurious event at f64::MAX.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(99);
+        let window = 12.5_f64;
+        for _ in 0..100 {
+            let (t, observed) =
+                draw_tte_outcome(HazardFamily::Exponential, &[0.0], 0.0, window, &mut rng);
+            assert!(!observed, "zero hazard can never produce an event");
+            assert_eq!(t, window);
+        }
+    }
+
+    #[test]
+    fn draw_tte_left_truncation_respects_entry_and_window() {
+        use rand::SeedableRng;
+        // entry=5, window=8, λ=0.2 (memoryless): P(event before window)
+        // = 1 − exp(−0.2·3) ≈ 0.45 ⇒ both outcomes appear in 5 000 draws.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(2024);
+        let (entry, window) = (5.0_f64, 8.0_f64);
+        let (mut saw_event, mut saw_censor) = (false, false);
+        for _ in 0..5000 {
+            let (t, observed) =
+                draw_tte_outcome(HazardFamily::Exponential, &[0.2], entry, window, &mut rng);
+            if observed {
+                assert!(
+                    t > entry && t < window,
+                    "conditional event in (entry, window): {t}"
+                );
+                saw_event = true;
+            } else {
+                assert_eq!(t, window);
+                saw_censor = true;
+            }
+        }
+        assert!(
+            saw_event && saw_censor,
+            "expected a mix of events and censored draws"
+        );
     }
 }

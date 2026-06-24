@@ -133,6 +133,14 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- **TTE simulation now applies administrative right-censoring** (#440). `simulate()`
+  for a `[event_model]` (TTE) endpoint previously emitted *every* drawn event time as
+  an uncensored event, so simulated data could not reproduce a study's censoring
+  pattern (which broke simulation-estimation validation). Each subject's observation
+  window — the `ObsRecord::Event` time — is now honoured: a draw that reaches the
+  window is recorded as right-censored at the window (`observed = false`), and
+  left-truncated (delayed-entry) subjects draw conditional on survival past entry.
+  Behind the `survival` feature.
 - **Analytic sensitivities and predictions for time-varying covariates with
   intermediate `[individual_parameters]` assignments** (#455, #456). A model whose
   individual-parameter block computes intermediate quantities (e.g.
