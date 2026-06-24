@@ -2958,6 +2958,47 @@ mod tests {
         assert!(err.contains("lag time"), "got: {err}");
     }
 
+    #[test]
+    fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
+        // Covers the `last_dose_eff.is_finite()` branch: when a dose precedes the
+        // segment the TAD anchor slot must hold that dose time (not NaN).
+        let ode = one_cpt_ode_spec();
+        let dose = crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let subject = make_subject(vec![dose], vec![10.0]);
+        let pk = pk_one(1.0, 10.0);
+        let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
+        ext_params[crate::types::PK_IDX_CL] = 1.0;
+        ext_params[crate::types::PK_IDX_V] = 10.0;
+        let mut u = vec![100.0]; // pre-loaded with the bolus amount
+        let mut predictions = vec![f64::NAN; subject.obs_times.len()];
+        let obs_map = obs_index_map(&subject.obs_times);
+
+        integrate_segment(
+            &ode,
+            &mut u,
+            0.0,
+            10.0,
+            &subject,
+            &[0.0],
+            &[1.0],
+            &mut ext_params,
+            &pk.values,
+            &[],
+            &[],
+            &obs_map,
+            &mut predictions,
+        );
+
+        // TAD anchor must be the dose time (0.0), not NaN.
+        assert_eq!(
+            ext_params[crate::types::MAX_PK_PARAMS + 1],
+            0.0,
+            "TAD anchor must equal the prior dose time"
+        );
+        let expected = 100.0 * (-1.0f64).exp();
+        assert_relative_eq!(predictions[0], expected, max_relative = 1e-4);
+    }
+
     /// Two-compartment "accumulator": `d/dt = 0` for both states, so each state
     /// holds exactly the bioavailable amount injected into it — letting a test
     /// read `F·amt` (and lag timing) straight off the state. `readout_idx`
