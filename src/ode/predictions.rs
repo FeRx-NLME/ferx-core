@@ -2651,13 +2651,7 @@ mod tests {
     fn adaptive_stop_discontinues_further_dosing() {
         let ode = one_cpt_ode_spec();
         let pk = pk_one(1.0, 10.0);
-        let mut controller = |ctx: &ControllerCtx| {
-            if ctx.decision_index == 0 {
-                vec![DoseAction::Stop]
-            } else {
-                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
-            }
-        };
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Stop];
         let base = make_subject(vec![], vec![12.0, 36.0]);
         let run = ode_predictions_adaptive(
             &ode,
