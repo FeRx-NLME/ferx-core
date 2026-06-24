@@ -191,6 +191,59 @@ stencil (Shi 2021 step-size selection).
 Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is
 the default and the only supported path for TTE objectives.
 
+## Competing risks (cause-specific hazards)
+
+When a subject is at risk of several mutually-exclusive event types, give each
+cause its own `[event_model NAME]` block on a distinct compartment. The blocks
+share the model's random effects (a common frailty links the causes), so this is
+the standard *cause-specific hazard* approach:
+
+``` {.ferx}
+[parameters]
+  theta TVLAMBDA_A(0.10, 0.001, 10.0)
+  theta TVLAMBDA_B(0.06, 0.001, 10.0)
+  omega ETA_F ~ 0.25
+
+[event_model cause_a]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA_A * exp(ETA_F)
+
+[event_model cause_b]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA_B * exp(ETA_F)
+```
+
+**Data format.** Each subject has one row per cause CMT. The cause that occurred
+is `DV=1` on its CMT; every other cause is right-censored (`DV=0`) at the *same*
+time, because experiencing one event removes the subject from risk of the others:
+
+```
+ID,TIME,DV,EVID,AMT,CMT,RATE,MDV
+1,12.25,1,0,0,2,0,0     # subject 1: cause A (CMT 2) at t=12.25 …
+1,12.25,0,0,0,3,0,0     #            … censored for cause B (CMT 3) at the same time
+2,9.38,0,0,0,2,0,0      # subject 2: reached the horizon with no event —
+2,9.38,0,0,0,3,0,0      #            right-censored for both causes
+```
+
+See `examples/tte_competing_risks.ferx` and `data/tte_competing_risks.csv`.
+
+**Prediction — cumulative incidence.** `predict_survival()` reports, per cause,
+the cause-specific cumulative incidence `F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du`
+alongside the all-cause survival `S_all(t) = exp(−Σ_j H_j(t))`. In the presence
+of competing risks the naive `1 − exp(−H_k)` *over*-states a cause's incidence
+(it ignores that the other causes remove subjects from risk); the reported CIF is
+the correct quantity, and across all causes `Σ_k F_k(t) + S_all(t) = 1` exactly.
+For a single endpoint it reduces to `F(t) = 1 − S(t)`.
+
+**Estimation note.** The cause-specific *rates* are well-identified and recover
+tightly. The shared frailty variance ω² is weakly identified for TTE and reads
+high under FOCEI-Laplace at higher event rates (the same approximation limit as
+single-endpoint frailty; see below) — prefer SAEM/IMP for the variance component.
+Subdistribution-hazard (Fine–Gray) modelling is not currently provided;
+cause-specific hazard covers the standard pharmacometric use case.
+
 ## Comparison with reference software
 
 The exponential validation dataset is `tests/reference/tte_exponential/tte_exp.csv`

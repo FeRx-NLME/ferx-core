@@ -89,3 +89,41 @@ pub fn tte_pop_from_pairs(data: &[(f64, u8)]) -> ferx_core::types::Population {
         subjects,
     }
 }
+
+/// Build a two-cause competing-risks TTE population on CMTs 2 and 3 from
+/// `(time, cause)` rows. `cause == 2` or `3` is an exact event on that CMT with
+/// the *other* cause right-censored at the same time (the cause-specific layout
+/// of §3.6); `cause == 0` (or any other value) is right-censored on both. One
+/// subject per row, entry time 0.
+#[cfg(feature = "survival")]
+pub fn tte_competing_pop(rows: &[(f64, u8)]) -> ferx_core::types::Population {
+    use ferx_core::types::{EventType, ObsRecord, Population};
+    let subjects = rows
+        .iter()
+        .enumerate()
+        .map(|(i, &(t, cause))| {
+            let rec = |cmt: usize| ObsRecord::Event {
+                time: t,
+                event_type: if cause == cmt as u8 {
+                    EventType::Exact
+                } else {
+                    EventType::RightCensored
+                },
+                entry_time: 0.0,
+                cmt,
+            };
+            let mut s = subject(&format!("{}", i + 1), vec![], vec![], vec![], vec![]);
+            s.obs_records = vec![rec(2), rec(3)];
+            s
+        })
+        .collect();
+
+    Population {
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects,
+    }
+}

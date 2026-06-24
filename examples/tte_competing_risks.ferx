@@ -1,0 +1,48 @@
+# Competing-risks TTE: two cause-specific hazards (Phase 1b).
+#
+# Each subject is at risk of two distinct event types, modelled as separate
+# cause-specific exponential hazards on their own compartments:
+#   CMT 2 — cause A, rate LAMBDA_A = TVLAMBDA_A * exp(ETA_F)
+#   CMT 3 — cause B, rate LAMBDA_B = TVLAMBDA_B * exp(ETA_F)
+# A shared frailty ETA_F links the two hazards (a subject with high overall risk
+# is at higher risk of both). The observed event is whichever cause occurs first;
+# the subject is right-censored for the other cause at that same time.
+#
+# Data format (one row per cause CMT per subject, EVID=0):
+#   DV=1  this cause was the observed event
+#   DV=0  right-censored for this cause (the other cause fired first, or the
+#         subject reached the administrative censoring time with no event)
+# So a subject experiencing cause A at t has DV=1 on CMT 2 and DV=0 on CMT 3,
+# both at time t (see data/tte_competing_risks.csv).
+#
+# predict_survival() reports, per cause, the cause-specific cumulative incidence
+# F_k(t) alongside the all-cause survival S_all(t), with Σ_k F_k(t) + S_all(t) = 1.
+#
+# Reference (simulated): TVLAMBDA_A = 0.10 h^-1, TVLAMBDA_B = 0.06 h^-1,
+# omega(ETA_F) = 0.25, administrative censoring at t = 14 h.
+#
+# Run:  cargo run --release -- examples/tte_competing_risks.ferx --data data/tte_competing_risks.csv
+#
+# Note: cause-specific *rates* recover tightly; the shared frailty omega^2 is
+# weakly identified and reads high under FOCEI-Laplace for TTE (prefer SAEM/IMP
+# for the variance component — see docs/estimation/tte.qmd).
+
+[parameters]
+  theta TVLAMBDA_A(0.10, 0.001, 10.0)
+  theta TVLAMBDA_B(0.06, 0.001, 10.0)
+
+  omega ETA_F ~ 0.25
+
+[event_model cause_a]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA_A * exp(ETA_F)
+
+[event_model cause_b]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA_B * exp(ETA_F)
+
+[fit_options]
+  method  = focei
+  maxiter = 300

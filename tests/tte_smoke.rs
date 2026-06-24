@@ -85,6 +85,25 @@ mod survival_smoke {
   maxiter = 3
 ";
 
+    /// Two-cause competing-risks TTE (cause-specific hazards on CMT 2 and CMT 3),
+    /// linked by a shared frailty `ETA_F`. TTE-only (no PK blocks).
+    const COMPETING_RISKS_MODEL: &str = r"
+[parameters]
+  theta TVLAMBDA_A(0.05, 0.001, 10.0)
+  theta TVLAMBDA_B(0.03, 0.001, 10.0)
+  omega ETA_F ~ 0.09
+
+[event_model cause_a]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA_A * exp(ETA_F)
+
+[event_model cause_b]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA_B * exp(ETA_F)
+";
+
     // ── Population helpers ───────────────────────────────────────────────────
 
     // The one-record-per-subject `(time, dv)` TTE builder lives in the shared
@@ -343,6 +362,120 @@ mod survival_smoke {
         assert!(
             beyond_event_time > 0,
             "expected draws beyond the record's event time (got {beyond_event_time})"
+        );
+    }
+
+    /// Competing risks (two cause-specific hazards on CMT 2 and CMT 3, shared
+    /// frailty): the model fits to a finite OFV and `predict_survival` reports a
+    /// cause-specific cumulative incidence with `Σ_k CIF_k(t) + S_all(t) = 1`.
+    #[test]
+    fn competing_risks_fits_and_predicts_cif() {
+        use ferx_core::predict_survival;
+        use std::collections::HashMap;
+        let model =
+            parse_model_string(COMPETING_RISKS_MODEL).expect("competing-risks model must parse");
+        assert!(
+            model.endpoints.contains_key(&2) && model.endpoints.contains_key(&3),
+            "both cause CMTs must be registered as TTE endpoints"
+        );
+
+        // 24 subjects: a mix of cause-2 events, cause-3 events, and censored.
+        let rows: Vec<(f64, u8)> = (0..24)
+            .map(|i| match i % 3 {
+                0 => (5.0 + i as f64 * 0.3, 2),
+                1 => (7.0 + i as f64 * 0.2, 3),
+                _ => (30.0, 0),
+            })
+            .collect();
+        let pop = common::tte_competing_pop(&rows);
+
+        let mut opts = FitOptions::default();
+        opts.verbose = false;
+        let r = fit(&model, &pop, &model.default_params, &opts)
+            .expect("competing-risks fit must not error");
+        assert!(r.ofv.is_finite(), "OFV must be finite; got {}", r.ofv);
+
+        // CIF invariant: the two CMT rows at the same (subject, time) must
+        // partition 1 with the all-cause survival.
+        let grid = [0.0, 2.0, 6.0, 15.0, 40.0];
+        let preds = predict_survival(&model, &pop, &model.default_params, &grid);
+        assert!(!preds.is_empty(), "predict_survival must return rows");
+        let mut by_key: HashMap<(String, u64), (f64, f64)> = HashMap::new();
+        for p in &preds {
+            assert!(
+                (0.0..=1.0).contains(&p.cif),
+                "CIF must be in [0,1]: {}",
+                p.cif
+            );
+            let entry = by_key
+                .entry((p.id.clone(), p.time.to_bits()))
+                .or_insert((0.0, p.survival_all));
+            entry.0 += p.cif;
+        }
+        for (_, (sum_cif, s_all)) in by_key {
+            assert!(
+                (sum_cif + s_all - 1.0).abs() < 1e-9,
+                "Σ CIF + S_all must equal 1: {sum_cif} + {s_all}"
+            );
+        }
+    }
+
+    /// Competing-risks simulation: each subject yields one row per cause CMT with
+    /// a shared outcome time; at most one cause is observed (the earliest), the
+    /// rest right-censored at that time. Over many subjects all three outcomes
+    /// (cause-2 event, cause-3 event, censored) appear.
+    #[test]
+    fn simulate_competing_risks_earliest_cause_wins() {
+        use ferx_core::{simulate_with_seed, SimOutcome};
+        use std::collections::HashMap;
+        const TAU: f64 = 25.0;
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model must parse");
+        // Template: 400 subjects censored at τ on both causes; the draw overwrites.
+        let template = common::tte_competing_pop(&vec![(TAU, 0u8); 400]);
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 7);
+
+        let mut by_id: HashMap<String, Vec<&ferx_core::SimulationResult>> = HashMap::new();
+        for s in &sims {
+            by_id.entry(s.id.clone()).or_default().push(s);
+        }
+        assert_eq!(by_id.len(), 400, "one group per subject");
+
+        let (mut ev2, mut ev3, mut cens) = (0usize, 0usize, 0usize);
+        for rowset in by_id.values() {
+            assert_eq!(rowset.len(), 2, "one row per cause CMT");
+            let t0 = match &rowset[0].outcome {
+                SimOutcome::Event { time, .. } => *time,
+                _ => panic!("expected an Event outcome"),
+            };
+            let (mut observed_count, mut observed_cmt) = (0usize, 0usize);
+            for s in rowset {
+                let (time, observed) = match &s.outcome {
+                    SimOutcome::Event { time, observed } => (*time, *observed),
+                    _ => panic!("expected an Event outcome"),
+                };
+                assert!(
+                    (time - t0).abs() < 1e-12,
+                    "both rows share the outcome time"
+                );
+                assert!(time <= TAU + 1e-12, "outcome time within the window");
+                if observed {
+                    observed_count += 1;
+                    observed_cmt = s.cmt;
+                }
+            }
+            assert!(
+                observed_count <= 1,
+                "at most one cause observed per subject"
+            );
+            match observed_cmt {
+                2 => ev2 += 1,
+                3 => ev3 += 1,
+                _ => cens += 1,
+            }
+        }
+        assert!(
+            ev2 > 0 && ev3 > 0 && cens > 0,
+            "expected cause-2, cause-3, and censored subjects (got {ev2}/{ev3}/{cens})"
         );
     }
 

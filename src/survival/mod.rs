@@ -185,6 +185,28 @@ pub fn shi_step_sizes(eval: impl Fn(&[f64]) -> f64, eta_hat: &[f64]) -> Vec<f64>
 //  Simulation
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Draw one latent event time (uncensored) for a hazard family. Consumes exactly
+/// one uniform from `rng`. `entry_time > 0` draws conditionally on survival past
+/// entry (left truncation, §3.6). Returns `f64::MAX` for degenerate / improper
+/// cases (`λ = 0`; a Gompertz with `γ < 0` whose survival never reaches the drawn
+/// quantile) — that value never wins a competing-risks `min` and censors at the
+/// window in `draw_tte_outcome`.
+fn draw_tte_latent<R: rand::Rng>(
+    family: HazardFamily,
+    params: &[f64],
+    entry_time: f64,
+    rng: &mut R,
+) -> f64 {
+    // Open01 samples from (0, 1) exclusive, avoiding the u=0 edge case that
+    // would send -ln(u) to +∞.
+    let u: f64 = rng.sample(rand::distributions::Open01);
+    if entry_time > 0.0 {
+        sample_conditional_event_time(family, params, entry_time, u)
+    } else {
+        sample_event_time(family, params, u)
+    }
+}
+
 /// Draw one TTE outcome within the observation window `window`.
 ///
 /// Returns `(time, observed)`:
@@ -193,15 +215,11 @@ pub fn shi_step_sizes(eval: impl Fn(&[f64]) -> f64, eta_hat: &[f64]) -> Vec<f64>
 /// - **administrative right-censoring** at `window` when the drawn event time
 ///   reaches the window (`observed = false`, `time = window`).
 ///
-/// `entry_time > 0` draws conditionally on survival past entry (left
-/// truncation, §3.6). The samplers return `f64::MAX` for degenerate / improper
-/// cases (`λ = 0`; a Gompertz with `γ < 0` whose survival never reaches the
-/// drawn quantile). An event is recorded only for a draw that is strictly below
-/// the window **and** below that `f64::MAX` sentinel, so a degenerate draw is
-/// censored rather than reported as a spurious event — even when `window` is
-/// unbounded (`+∞`, an event record carrying no administrative horizon; see
-/// [`observation_window`]), where a bare `t_event < window` test would let the
-/// `f64::MAX` sentinel through.
+/// The draw comes from [`draw_tte_latent`], whose `f64::MAX` degenerate / improper
+/// sentinel must not be reported as an event: an event is recorded only for a draw
+/// strictly below the window **and** below that sentinel, so a degenerate draw is
+/// censored even when `window` is unbounded (`+∞`, an event record carrying no
+/// administrative horizon; see [`observation_window`]).
 fn draw_tte_outcome<R: rand::Rng>(
     family: HazardFamily,
     params: &[f64],
@@ -209,17 +227,10 @@ fn draw_tte_outcome<R: rand::Rng>(
     window: f64,
     rng: &mut R,
 ) -> (f64, bool) {
-    // Open01 samples from (0, 1) exclusive, avoiding the u=0 edge case that
-    // would send -ln(u) to +∞.
-    let u: f64 = rng.sample(rand::distributions::Open01);
-    let t_event = if entry_time > 0.0 {
-        sample_conditional_event_time(family, params, entry_time, u)
-    } else {
-        sample_event_time(family, params, u)
-    };
-    // `t_event < f64::MAX` rejects the samplers' degenerate / improper sentinel
-    // (`f64::MAX`); without it an unbounded window would mis-report that sentinel
-    // as an observed event at `f64::MAX`.
+    let t_event = draw_tte_latent(family, params, entry_time, rng);
+    // `t_event < f64::MAX` rejects the samplers' degenerate / improper sentinel;
+    // without it an unbounded window would mis-report that sentinel as an
+    // observed event at `f64::MAX`.
     if t_event < window && t_event < f64::MAX {
         (t_event, true)
     } else {
@@ -248,17 +259,40 @@ fn observation_window(event_type: &EventType, time: f64) -> f64 {
     }
 }
 
-/// Draw TTE event/censoring outcomes for every TTE record on a subject and
-/// append them to `results`.
+/// Resolve a competing-risks outcome from each cause's latent event time and the
+/// subject's administrative `window`. Returns `(winning cause index, observed
+/// time, event_observed)`: the earliest latent time wins, and an event is
+/// observed only if it precedes the window — otherwise the subject is censored at
+/// the window (the winning index is still the earliest cause but `event = false`).
+/// `total_cmp` makes ties and `f64::MAX` sentinels deterministic (lowest index).
+/// The `t_star < f64::MAX` guard prevents a degenerate / improper draw (the
+/// samplers' sentinel) from being reported as a spurious event when the window is
+/// unbounded (`+∞`, e.g. every cause is an event record carrying no horizon).
+fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
+    let (win_idx, &t_star) = latents
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .expect("at least one cause");
+    let event = t_star < window && t_star < f64::MAX;
+    (win_idx, if event { t_star } else { window }, event)
+}
+
+/// Draw TTE event/censoring outcomes for a subject and append them to `results`.
 ///
-/// Called from `api::simulate_inner_with_draw` after the Gaussian path. A
-/// simulated draw is administratively right-censored at the subject's
-/// observation horizon when it would occur later, so simulated data reproduce
-/// the censoring pattern of the design rather than every draw being an
-/// uncensored event. The horizon is derived per record by
-/// [`observation_window`]: a right-censored record censors at its `time`; an
-/// event record (`Exact` / `IntervalCensored`) carries no horizon and draws
-/// uncensored.
+/// Called from `api::simulate_inner_with_draw` after the Gaussian path. Each
+/// `ObsRecord::Event` carries the subject's observation window in its `time`
+/// field.
+///
+/// - **Single endpoint:** the drawn event is administratively right-censored at
+///   the window when it would occur later, so simulated data reproduce the
+///   design's censoring pattern rather than every draw being an event.
+/// - **Competing risks** (≥2 TTE records, one per cause CMT — §3.6): a latent
+///   time is drawn for each cause; the **earliest** is the observed event (its
+///   CMT, `observed = true`) and every other cause is right-censored at that same
+///   time (`observed = false`). If no cause fires before the (shared, earliest)
+///   window, all causes are censored at the window. One row per cause CMT is
+///   emitted, giving the cause-specific censoring layout the data reader expects.
 pub fn simulate_tte<R: rand::Rng>(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,
@@ -269,6 +303,10 @@ pub fn simulate_tte<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<crate::api::SimulationResult>,
 ) {
+    // Gather this subject's TTE causes — records routed to a `Tte` endpoint —
+    // with each cause's drawn-parameter vector, entry time and window. (A subject
+    // may also carry non-TTE records; those are skipped here.)
+    let mut causes: Vec<(usize, HazardFamily, Vec<f64>, f64, f64)> = Vec::new();
     for record in &subject.obs_records {
         let ObsRecord::Event {
             cmt,
@@ -276,26 +314,107 @@ pub fn simulate_tte<R: rand::Rng>(
             time,
             event_type,
         } = record;
-
         let Some(EndpointLikelihood::Tte { hazard }) = model.endpoints.get(cmt) else {
             continue;
         };
         let HazardSpec::Analytic { family, param_fn } = hazard;
         let params = param_fn(theta, eta, &subject.covariates);
-
+        // Only a right-censored record marks an administrative horizon; an event
+        // record draws uncensored (+∞) — see `observation_window`.
         let window = observation_window(event_type, *time);
-        let (t, observed) = draw_tte_outcome(*family, &params, *entry_time, window, rng);
+        causes.push((*cmt, *family, params, *entry_time, window));
+    }
 
+    let mut push = |cmt: usize, time: f64, observed: bool, results: &mut Vec<_>| {
         results.push(crate::api::SimulationResult {
             draw,
             sim,
             id: subject.id.clone(),
-            time: t,
-            cmt: *cmt,
+            time,
+            cmt,
             ipred: f64::NAN,
-            outcome: SimOutcome::Event { time: t, observed },
+            outcome: SimOutcome::Event { time, observed },
         });
+    };
+
+    match causes.as_slice() {
+        [] => {}
+        // Single endpoint: administrative censoring at its own window. (Draws one
+        // uniform, preserving the RNG sequence of the pre-competing-risks path.)
+        [(cmt, family, params, entry_time, window)] => {
+            let (t, observed) = draw_tte_outcome(*family, params, *entry_time, *window, rng);
+            push(*cmt, t, observed, results);
+        }
+        // Competing risks: earliest latent event wins; the rest censor at that
+        // time. Draw in record order so the RNG sequence stays deterministic.
+        _ => {
+            let latents: Vec<f64> = causes
+                .iter()
+                .map(|(_, family, params, entry_time, _)| {
+                    draw_tte_latent(*family, params, *entry_time, rng)
+                })
+                .collect();
+            // Subject leaves at the earliest administrative window across causes.
+            let window = causes
+                .iter()
+                .map(|(_, _, _, _, w)| *w)
+                .fold(f64::INFINITY, f64::min);
+            let (win_idx, obs_time, event) = resolve_competing_risks(&latents, window);
+            for (i, (cmt, ..)) in causes.iter().enumerate() {
+                push(*cmt, obs_time, event && i == win_idx, results);
+            }
+        }
     }
+}
+
+/// Cause-specific cumulative incidence functions (CIF) from per-cause cumulative
+/// and instantaneous hazards on a shared time grid (`cum_hazards[k][i] = H_k(t_i)`,
+/// `hazards[k][i] = h_k(t_i)`).
+///
+/// Uses the Aalen–Johansen / actuarial allocation: at each grid step the drop in
+/// all-cause survival `ΔS = S_all(t_{i−1}) − S_all(t_i)` is split across causes in
+/// proportion to their instantaneous-hazard share `h_k / Σ_j h_j`. This guarantees
+/// the exact invariant `Σ_k F_k(t) + S_all(t) = 1` at every grid point
+/// (telescoping), reduces to `F = 1 − S` for a single cause, and is **exact**
+/// (grid-independent) for constant hazards. `S_all(0) = 1` is assumed (parametric
+/// cumulative hazards vanish at `t = 0`), so the lower integration limit is 0.
+///
+/// Returns `(cif[k][i], s_all[i])` where `s_all[i] = exp(−Σ_k H_k(t_i))`.
+pub(crate) fn cif_curves(
+    cum_hazards: &[Vec<f64>],
+    hazards: &[Vec<f64>],
+) -> (Vec<Vec<f64>>, Vec<f64>) {
+    let n_cause = cum_hazards.len();
+    let n_grid = cum_hazards.first().map_or(0, |h| h.len());
+
+    let s_all: Vec<f64> = (0..n_grid)
+        .map(|i| {
+            let h_tot: f64 = (0..n_cause).map(|k| cum_hazards[k][i]).sum();
+            (-h_tot).exp()
+        })
+        .collect();
+
+    let mut cif = vec![vec![0.0_f64; n_grid]; n_cause];
+    let mut acc = vec![0.0_f64; n_cause];
+    let mut s_prev = 1.0_f64; // S_all(0)
+    for i in 0..n_grid {
+        let drop = (s_prev - s_all[i]).max(0.0); // ΔS_i ≥ 0
+        let h_tot: f64 = (0..n_cause).map(|k| hazards[k][i]).sum();
+        // Allocate the survival drop by hazard share. Guard the degenerate node
+        // (no/Infinite total hazard, or ΔS = 0 at t = 0) so the accumulator just
+        // carries forward — never 0·∞ = NaN.
+        if drop > 0.0 && h_tot > 0.0 && h_tot.is_finite() {
+            for k in 0..n_cause {
+                acc[k] += drop * hazards[k][i] / h_tot;
+            }
+        }
+        for k in 0..n_cause {
+            cif[k][i] = acc[k];
+        }
+        s_prev = s_all[i];
+    }
+
+    (cif, s_all)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -581,6 +700,101 @@ mod tests {
         }
     }
 
+    // ── resolve_competing_risks: earliest cause wins, else administrative censor ──
+
+    #[test]
+    fn resolve_competing_risks_earliest_wins() {
+        // Cause 1 (index 1) is earliest at t=3 < window=10 ⇒ observed event.
+        let (idx, t, event) = resolve_competing_risks(&[5.0, 3.0, 8.0], 10.0);
+        assert_eq!(idx, 1);
+        assert_eq!(t, 3.0);
+        assert!(event);
+    }
+
+    #[test]
+    fn resolve_competing_risks_all_after_window_censors() {
+        // No cause fires before the window ⇒ censored at the window, no event.
+        let (idx, t, event) = resolve_competing_risks(&[12.0, 15.0], 10.0);
+        assert_eq!(idx, 0, "winner is still the earliest latent");
+        assert_eq!(t, 10.0);
+        assert!(!event);
+    }
+
+    #[test]
+    fn resolve_competing_risks_max_sentinel_never_wins() {
+        // f64::MAX (degenerate cause) must not win over a real event.
+        let (idx, t, event) = resolve_competing_risks(&[f64::MAX, 4.0], 10.0);
+        assert_eq!(idx, 1);
+        assert_eq!(t, 4.0);
+        assert!(event);
+    }
+
+    #[test]
+    fn resolve_competing_risks_tie_picks_lowest_index() {
+        let (idx, t, event) = resolve_competing_risks(&[3.0, 3.0], 10.0);
+        assert_eq!(idx, 0, "ties resolve to the lowest cause index");
+        assert_eq!(t, 3.0);
+        assert!(event);
+    }
+
+    // ── cif_curves: cause-specific cumulative incidence ──────────────────────
+
+    #[test]
+    fn cif_two_cause_exponential_closed_form() {
+        // Constant hazards λ1=0.1, λ2=0.3 ⇒ closed form (grid-independent):
+        //   F_k(t) = (λ_k/Σλ)·(1 − exp(−Σλ·t)),  S_all(t) = exp(−Σλ·t).
+        let (l1, l2) = (0.1_f64, 0.3_f64);
+        let grid = [0.0, 2.0, 5.0, 13.0, 40.0];
+        let cum: Vec<Vec<f64>> = vec![
+            grid.iter().map(|&t| l1 * t).collect(),
+            grid.iter().map(|&t| l2 * t).collect(),
+        ];
+        let haz: Vec<Vec<f64>> = vec![vec![l1; grid.len()], vec![l2; grid.len()]];
+
+        let (cif, s_all) = cif_curves(&cum, &haz);
+        let lsum = l1 + l2;
+        for (i, &t) in grid.iter().enumerate() {
+            let s_ref = (-lsum * t).exp();
+            assert_abs_diff_eq!(s_all[i], s_ref, epsilon = 1e-12);
+            assert_abs_diff_eq!(cif[0][i], (l1 / lsum) * (1.0 - s_ref), epsilon = 1e-12);
+            assert_abs_diff_eq!(cif[1][i], (l2 / lsum) * (1.0 - s_ref), epsilon = 1e-12);
+            // Invariant must hold exactly at every grid point.
+            assert_abs_diff_eq!(cif[0][i] + cif[1][i] + s_all[i], 1.0, epsilon = 1e-12);
+        }
+        // t = 0 ⇒ no incidence, full survival.
+        assert_eq!(cif[0][0], 0.0);
+        assert_eq!(cif[1][0], 0.0);
+        assert_eq!(s_all[0], 1.0);
+    }
+
+    #[test]
+    fn cif_invariant_holds_for_mixed_families() {
+        // Weibull-like increasing hazard + a constant hazard on a coarse,
+        // irregular grid. The per-cause CIF is only approximate here, but the
+        // partition invariant Σ_k F_k + S_all = 1 must be exact (telescoping).
+        let grid = [1.0_f64, 2.5, 4.0, 9.0, 20.0];
+        // cause 0: Weibull scale=8, shape=1.7 ⇒ H=(t/8)^1.7, h=(1.7/8)(t/8)^0.7
+        let (sc, sh) = (8.0_f64, 1.7_f64);
+        let h0: Vec<f64> = grid
+            .iter()
+            .map(|&t| (sh / sc) * (t / sc).powf(sh - 1.0))
+            .collect();
+        let cum0: Vec<f64> = grid.iter().map(|&t| (t / sc).powf(sh)).collect();
+        // cause 1: constant λ=0.05
+        let h1: Vec<f64> = vec![0.05; grid.len()];
+        let cum1: Vec<f64> = grid.iter().map(|&t| 0.05 * t).collect();
+
+        let (cif, s_all) = cif_curves(&[cum0, cum1], &[h0, h1]);
+        for i in 0..grid.len() {
+            assert_abs_diff_eq!(cif[0][i] + cif[1][i] + s_all[i], 1.0, epsilon = 1e-12);
+            assert!(cif[0][i] >= 0.0 && cif[1][i] >= 0.0, "CIF non-negative");
+            if i > 0 {
+                assert!(cif[0][i] >= cif[0][i - 1] - 1e-15, "CIF non-decreasing");
+                assert!(cif[1][i] >= cif[1][i - 1] - 1e-15, "CIF non-decreasing");
+            }
+        }
+    }
+
     #[test]
     fn observation_window_only_right_censored_has_a_horizon() {
         // A right-censored record's `time` IS the administrative horizon.
@@ -599,5 +813,18 @@ mod tests {
             ),
             f64::INFINITY
         );
+    }
+
+    #[test]
+    fn cif_single_cause_is_one_minus_survival() {
+        // One cause ⇒ CIF = 1 − S_all = 1 − S, invariant trivially holds.
+        let grid = [0.0, 1.0, 4.0, 12.0];
+        let lam = 0.2_f64;
+        let cum = vec![grid.iter().map(|&t| lam * t).collect::<Vec<_>>()];
+        let haz = vec![vec![lam; grid.len()]];
+        let (cif, s_all) = cif_curves(&cum, &haz);
+        for i in 0..grid.len() {
+            assert_abs_diff_eq!(cif[0][i], 1.0 - s_all[i], epsilon = 1e-12);
+        }
     }
 }

@@ -5107,12 +5107,21 @@ pub struct SurvivalPredictionResult {
     pub cmt: usize,
     /// Time at which S(t), H(t), h(t) are evaluated.
     pub time: f64,
-    /// Survival probability S(t) = exp(−H(t)).
+    /// Cause-specific survival probability S(t) = exp(−H(t)) (this CMT alone).
     pub survival: f64,
-    /// Cumulative hazard H(t).
+    /// Cumulative hazard H(t) for this CMT.
     pub cum_hazard: f64,
-    /// Instantaneous hazard h(t).
+    /// Instantaneous hazard h(t) for this CMT.
     pub hazard: f64,
+    /// Cause-specific cumulative incidence F(t) = ∫₀ᵗ h(u)·S_all(u) du — the
+    /// probability of having had *this* event type by t in the presence of the
+    /// other (competing) causes. Equals 1 − survival when there is a single
+    /// endpoint. Across all TTE CMTs, Σ cif + survival_all = 1.
+    pub cif: f64,
+    /// All-cause survival S_all(t) = exp(−Σ_j H_j(t)) over every TTE CMT — the
+    /// probability of no event of any type by t. Equals `survival` when there is
+    /// a single endpoint.
+    pub survival_all: f64,
     /// Median survival time T₅₀ (where S(T₅₀) = 0.5); analytic closed form.
     pub median_survival: f64,
     /// Mean survival time E[T] = ∫₀^∞ S(t) dt; analytic for Exponential,
@@ -5122,9 +5131,13 @@ pub struct SurvivalPredictionResult {
 
 /// Compute survival function predictions for TTE endpoints.
 ///
-/// For each subject and each TTE CMT in `model.endpoints`, evaluates
-/// `S(t) = exp(−H(t))`, `H(t)`, and `h(t)` at every point in `time_grid`
-/// using population typical values (η = 0).
+/// For each subject and each TTE CMT in `model.endpoints`, evaluates the
+/// cause-specific `S(t) = exp(−H(t))`, `H(t)`, and `h(t)` at every point in
+/// `time_grid` using population typical values (η = 0). When the model has
+/// multiple TTE CMTs (competing risks) it also reports, per CMT, the
+/// cause-specific cumulative incidence `F(t)` and the all-cause survival
+/// `S_all(t) = exp(−Σ_j H_j(t))`, computed together so that
+/// `Σ_k F_k(t) + S_all(t) = 1` holds at every grid point (see [`cif_curves`]).
 ///
 /// Returns an empty Vec when the model has no TTE endpoints.
 #[cfg(feature = "survival")]
@@ -5134,37 +5147,62 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
-    use crate::survival::{hazard_and_cum_hazard, mean_survival, median_survival};
+    use crate::survival::{cif_curves, hazard_and_cum_hazard, mean_survival, median_survival};
     use crate::types::EndpointLikelihood;
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
 
     for subject in &population.subjects {
+        // Gather this subject's TTE causes at the typical values (η = 0). The
+        // all-cause survival and CIF need *every* cause's cumulative hazard at
+        // each grid point, so collect the per-cause parameters up front.
+        let mut causes: Vec<(usize, crate::types::HazardFamily, Vec<f64>, f64, f64)> = Vec::new();
         for (&cmt, endpoint) in &model.endpoints {
             let EndpointLikelihood::Tte { hazard } = endpoint else {
                 continue;
             };
             let crate::types::HazardSpec::Analytic { family, param_fn } = hazard;
             let params_vec = param_fn(&params.theta, &zero_eta, &subject.covariates);
-
-            // Distributional summaries are parameter-dependent, not time-dependent —
-            // compute once per (subject, cmt) pair and repeat across the time grid.
+            // Distributional summaries are parameter-dependent, not time-dependent.
             let t_median = median_survival(*family, &params_vec);
             let t_mean = mean_survival(*family, &params_vec);
+            causes.push((cmt, *family, params_vec, t_median, t_mean));
+        }
+        if causes.is_empty() {
+            continue;
+        }
 
+        // Per-cause hazard and cumulative hazard over the grid.
+        let mut hz = Vec::with_capacity(causes.len());
+        let mut chz = Vec::with_capacity(causes.len());
+        for (_, family, params_vec, _, _) in &causes {
+            let mut h_row = Vec::with_capacity(time_grid.len());
+            let mut cum_row = Vec::with_capacity(time_grid.len());
             for &t in time_grid {
-                let (h_val, cum_h) = hazard_and_cum_hazard(*family, t, &params_vec);
-                let s = (-cum_h).exp();
+                let (h_val, cum_h) = hazard_and_cum_hazard(*family, t, params_vec);
+                h_row.push(h_val);
+                cum_row.push(cum_h);
+            }
+            hz.push(h_row);
+            chz.push(cum_row);
+        }
+
+        let (cif, s_all) = cif_curves(&chz, &hz);
+
+        for (k, (cmt, _, _, t_median, t_mean)) in causes.iter().enumerate() {
+            for (i, &t) in time_grid.iter().enumerate() {
                 results.push(SurvivalPredictionResult {
                     id: subject.id.clone(),
-                    cmt,
+                    cmt: *cmt,
                     time: t,
-                    survival: s,
-                    cum_hazard: cum_h,
-                    hazard: h_val,
-                    median_survival: t_median,
-                    mean_survival: t_mean,
+                    survival: (-chz[k][i]).exp(),
+                    cum_hazard: chz[k][i],
+                    hazard: hz[k][i],
+                    cif: cif[k][i],
+                    survival_all: s_all[i],
+                    median_survival: *t_median,
+                    mean_survival: *t_mean,
                 });
             }
         }
