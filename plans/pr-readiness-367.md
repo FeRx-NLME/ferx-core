@@ -104,7 +104,7 @@ finite-difference outer gradient, so follow-up PRs have one place to pick from.
 Each is a *transparent* fallback: the fit still runs (correct estimates), only the
 gradient is numeric, so a gradient-based optimizer is slower / may stall on
 weakly-identified variance components. Mirrored in CHANGELOG (TV-cov + IOV entries)
-and `docs/src/model-file/covariates.md` / `iov.md`.
+and `docs/model-file/covariates.qmd` / `iov.qmd`.
 
 | Combination | Status | Notes / where to start |
 |---|---|---|

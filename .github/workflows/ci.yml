@@ -34,6 +34,16 @@ jobs:
       - name: cargo check
         run: cargo check --tests --no-default-features --features ci
 
+      # `tests/tte_convergence.rs` is gated on BOTH `survival` and `slow-tests`, and
+      # no other per-PR job sets both (check/test/coverage-pr use `ci`; the survival
+      # job uses `ci,survival`) — so those Tier-3 TTE tests are compiled in *neither*.
+      # Without this step a renamed public API or changed `FitResult` field would land
+      # green and only break the nightly slow-tests run, decoupled from the offending
+      # PR. Compile-only (`cargo check`, no run — the tests themselves stay nightly per
+      # the tier rules), so it is cheap. (#441 review finding #3.)
+      - name: cargo check (survival + slow-tests gated tests)
+        run: cargo check --tests --no-default-features --features ci,survival,slow-tests
+
   test:
     name: Test
     runs-on: ubuntu-latest

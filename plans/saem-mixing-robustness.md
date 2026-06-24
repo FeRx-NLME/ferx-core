@@ -93,7 +93,7 @@ with Ω/σ in the right ballpark. So mixing — not the algorithm — is the pro
 - **Phase 5 — SKIPPED** by request (no standalone NONMEM-validation writeup;
   the in-line comparison above suffices).
 - **Phase 6 — DONE.** Docs: `omega_burnin` documented in
-  `docs/src/model-file/fit-options.md` and the SAEM page (M-step Ω section,
+  `docs/model-file/fit-options.qmd` and the SAEM page (M-step Ω section,
   config block, new "Ω Collapses / Residual Error Inflates" troubleshooting
   entry). Tests: Tier-1 floor unit tests + parser test (above) and a new
   slow-tests-gated convergence test `tests/saem_omega_burnin.rs` — a fully
@@ -168,7 +168,7 @@ Re-run the Jasmine vanco-peds model (`ferx-testdata/jasmine_vanco_peds/run60.fer
 `train_0416.csv`) with default settings after Phases 1–3 and compare Ω, σ, OFV to
 the NONMEM eval (`run60_nm_eval-fit.yaml`, OFV 67513). Target: default SAEM lands
 Ω/σ within the same ballpark and OFV ≤ ~67600 *without* user tuning. Record the
-comparison in the PR description and add a row to `docs/src/estimation/saem.md`.
+comparison in the PR description and add a row to `docs/estimation/saem.qmd`.
 Re-measure wall time (default SAEM bench was 736 s) so the `n_mh_steps` bump is
 accounted for.
 
@@ -178,7 +178,7 @@ accounted for.
 - Tier-3 `slow-tests` gated convergence test: sparse multi-η synthetic model whose
   default-settings SAEM recovers Ω within tolerance (would fail pre-fix).
 - Docs: document `saem_omega_burnin` and the changed `n_mh_steps`/`adapt_interval`
-  defaults in `docs/src/model-file/fit-options.md` and the SAEM page; note the
+  defaults in `docs/model-file/fit-options.qmd` and the SAEM page; note the
   sparse-data guidance and the `method = [saem, focei]` polish.
 
 ## Risks / open questions

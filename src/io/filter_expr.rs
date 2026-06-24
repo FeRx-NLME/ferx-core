@@ -249,7 +249,7 @@ impl FilterClause {
 /// column, not a covariate, even though it has no [`RowContext`] field and so is
 /// not a usable filter target (a condition on it is an inert no-op). The dynamic
 /// occasion / IOV column cannot be listed here; filtering on it is likewise
-/// unsupported (see `docs/src/model-file/data-selection.md`).
+/// unsupported (see `docs/model-file/data-selection.qmd`).
 pub fn is_standard_column(col: &str) -> bool {
     matches!(
         col,

@@ -724,6 +724,139 @@ impl OdeReadout {
 /// `pk_params_flat` is a flat array of PK parameters passed to the RHS function.
 /// `theta` and `eta` are forwarded to `OdeSpec::output_fn` for Form C
 /// (`[scaling] y = <expr>`); pass empty slices when no Form C is configured.
+/// Integrate one timeline segment `(t_start, t_end]` of the plain ODE path.
+///
+/// Builds the segment's `saveat`, sets the per-segment TAD anchor on
+/// `ext_params`, integrates the forcing-wrapped RHS from the carried state `u`,
+/// records every observation landing in the half-open interval, and advances
+/// `u` in place to `t_end` so the caller can continue with the next segment.
+///
+/// The left-boundary discontinuities (SS pre-seed, bolus jumps) and the
+/// observation recorded exactly at `t_start` are applied by the caller *before*
+/// this call — this function owns only the integration of the open interval,
+/// which is the piece a reactive (state-dependent) driver reuses unchanged
+/// (#391 S1.2). Behaviour is identical to the inline segment body it replaced.
+#[allow(clippy::too_many_arguments)]
+fn integrate_segment(
+    ode: &OdeSpec,
+    u: &mut [f64],
+    t_start: f64,
+    t_end: f64,
+    subject: &Subject,
+    dose_lagtimes: &[f64],
+    dose_f_bio: &[f64],
+    ext_params: &mut [f64],
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    obs_map: &HashMap<u64, Vec<usize>>,
+    predictions: &mut [f64],
+) {
+    let opts = ode.solver_opts;
+
+    // Observation times in this segment (t_start < t <= t_end)
+    let mut saveat: Vec<f64> = subject
+        .obs_times
+        .iter()
+        .filter(|&&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+        .cloned()
+        .collect();
+    // Always include t_end so u is updated for next segment
+    if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
+        saveat.push(t_end);
+    }
+    saveat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+
+    if (t_end - t_start).abs() < 1e-15 {
+        return;
+    }
+
+    // Update TAD anchor (slot MAX_PK_PARAMS+1): last effective dose time
+    // before this segment, SS-aware (gives TAD = t - last_dose_eff).
+    {
+        let last_dose_eff = subject
+            .doses
+            .iter()
+            .enumerate()
+            .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
+            .map(|(i, d)| {
+                let lag = dose_lagtimes[i];
+                if d.ss && d.ii > 0.0 {
+                    let elapsed = t_start - (d.time + lag);
+                    t_start - elapsed.rem_euclid(d.ii)
+                } else {
+                    d.time + lag
+                }
+            })
+            .fold(f64::NEG_INFINITY, f64::max);
+        // Store NaN when no effective prior dose exists so the ODE RHS injects
+        // NaN for TAD (consistent with sdtab) rather than +∞ (t - NEG_INFINITY).
+        ext_params[crate::types::MAX_PK_PARAMS + 1] = if last_dose_eff.is_finite() {
+            last_dose_eff
+        } else {
+            f64::NAN
+        };
+    }
+
+    // Integrate. If any infusions are active in this segment, wrap
+    // the user RHS so it adds `+rate` to each infusion's compartment.
+    // The plain (non-event-driven) ODE path never sees reset subjects —
+    // the dispatcher routes those to `ode_predictions_event_driven` — so
+    // no reset floor applies here.
+    let active = active_infusions(
+        &subject.doses,
+        t_start,
+        t_end,
+        dose_lagtimes,
+        dose_f_bio,
+        f64::NEG_INFINITY,
+    );
+    // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
+    // snapshot `ext_params` is constant across the integration (#322 #7).
+    let prepared = prepare_input_rates(ode, ext_params);
+    let wrapped_rhs = wrap_rhs_with_forcings(
+        ode,
+        &subject.doses,
+        dose_lagtimes,
+        dose_f_bio,
+        f64::NEG_INFINITY,
+        &prepared,
+        InfusionInput::Spanning(active),
+    );
+    let sol = solve_ode(
+        &wrapped_rhs,
+        u,
+        (t_start, t_end),
+        ext_params,
+        &saveat,
+        &opts,
+    );
+
+    // Extract predictions and update state
+    for pt in &sol {
+        if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
+            for &obs_idx in obs_idxs {
+                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                predictions[obs_idx] = read_observable(
+                    ode,
+                    &pt.u,
+                    pk_params_flat,
+                    theta,
+                    eta,
+                    &subject.covariates,
+                    cmt,
+                );
+            }
+        }
+    }
+
+    // State at end of segment
+    if let Some(last) = sol.last() {
+        u.copy_from_slice(&last.u);
+    }
+}
+
 /// Dose events are handled as state discontinuities between integration segments.
 pub fn ode_predictions(
     ode: &OdeSpec,
@@ -879,107 +1012,26 @@ pub fn ode_predictions(
             }
         }
 
-        // Observation times in this segment (t_start < t <= t_end)
-        let mut saveat: Vec<f64> = subject
-            .obs_times
-            .iter()
-            .filter(|&&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
-            .cloned()
-            .collect();
-        // Always include t_end so u is updated for next segment
-        if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
-            saveat.push(t_end);
-        }
-        saveat.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
-
-        if (t_end - t_start).abs() < 1e-15 {
-            continue;
-        }
-
-        // Update TAD anchor (slot MAX_PK_PARAMS+1): last effective dose time
-        // before this segment, SS-aware (gives TAD = t - last_dose_eff).
-        {
-            let last_dose_eff = subject
-                .doses
-                .iter()
-                .enumerate()
-                .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
-                .map(|(i, d)| {
-                    let lag = dose_lagtimes[i];
-                    if d.ss && d.ii > 0.0 {
-                        let elapsed = t_start - (d.time + lag);
-                        t_start - elapsed.rem_euclid(d.ii)
-                    } else {
-                        d.time + lag
-                    }
-                })
-                .fold(f64::NEG_INFINITY, f64::max);
-            // Store NaN when no effective prior dose exists so the ODE RHS injects
-            // NaN for TAD (consistent with sdtab) rather than +∞ (t - NEG_INFINITY).
-            ext_params[crate::types::MAX_PK_PARAMS + 1] = if last_dose_eff.is_finite() {
-                last_dose_eff
-            } else {
-                f64::NAN
-            };
-        }
-
-        // Integrate. If any infusions are active in this segment, wrap
-        // the user RHS so it adds `+rate` to each infusion's compartment.
-        // The plain (non-event-driven) ODE path never sees reset subjects —
-        // the dispatcher routes those to `ode_predictions_event_driven` — so
-        // no reset floor applies here.
-        let active = active_infusions(
-            &subject.doses,
+        // Integrate the open interval `(t_start, t_end]` from the carried state,
+        // recording observations inside it and advancing `u` to `t_end`. The
+        // left-boundary discontinuities and the `t_start` observation were applied
+        // above; `integrate_segment` owns only the integration — the piece a
+        // reactive (state-dependent) driver reuses unchanged (#391 S1.2).
+        integrate_segment(
+            ode,
+            &mut u,
             t_start,
             t_end,
+            subject,
             &dose_lagtimes,
             &dose_f_bio,
-            f64::NEG_INFINITY,
+            &mut ext_params,
+            pk_params_flat,
+            theta,
+            eta,
+            &obs_map,
+            &mut predictions,
         );
-        // Hoist the input-rate constants (ln Γ, KTR, …) once per segment; the PK
-        // snapshot `ext_params` is constant across the integration (#322 #7).
-        let prepared = prepare_input_rates(ode, &ext_params);
-        let wrapped_rhs = wrap_rhs_with_forcings(
-            ode,
-            &subject.doses,
-            &dose_lagtimes,
-            &dose_f_bio,
-            f64::NEG_INFINITY,
-            &prepared,
-            InfusionInput::Spanning(active),
-        );
-        let sol = solve_ode(
-            &wrapped_rhs,
-            &u,
-            (t_start, t_end),
-            &ext_params,
-            &saveat,
-            &opts,
-        );
-
-        // Extract predictions and update state
-        for pt in &sol {
-            if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
-                for &obs_idx in obs_idxs {
-                    let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                    predictions[obs_idx] = read_observable(
-                        ode,
-                        &pt.u,
-                        pk_params_flat,
-                        theta,
-                        eta,
-                        &subject.covariates,
-                        cmt,
-                    );
-                }
-            }
-        }
-
-        // State at end of segment
-        if let Some(last) = sol.last() {
-            u.copy_from_slice(&last.u);
-        }
     }
 
     // Clamp negative predictions to zero (ODE solver overshoot guard).
@@ -2100,6 +2152,129 @@ mod tests {
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
+    }
+
+    /// Build the per-segment `obs_time -> indices` map the integrator uses.
+    fn obs_index_map(obs_times: &[f64]) -> HashMap<u64, Vec<usize>> {
+        let mut m: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, &t) in obs_times.iter().enumerate() {
+            m.entry(t.to_bits()).or_default().push(i);
+        }
+        m
+    }
+
+    #[test]
+    fn integrate_segment_zero_length_is_a_noop() {
+        // A degenerate `[t, t]` segment must skip integration and leave the carried
+        // state and predictions untouched — the guard a reactive driver relies on
+        // when a decision time coincides with another break (#391 S1.2).
+        // `ode_predictions` never reaches it (break_times are deduped at the same
+        // 1e-15), so it has to be exercised directly here.
+        let ode = one_cpt_ode_spec();
+        let subject = make_subject(vec![], vec![5.0]);
+        let pk = pk_one(1.0, 10.0);
+        let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
+        let mut u = vec![10.0];
+        let mut predictions = vec![f64::NAN; subject.obs_times.len()];
+        let obs_map = obs_index_map(&subject.obs_times);
+
+        integrate_segment(
+            &ode,
+            &mut u,
+            5.0,
+            5.0,
+            &subject,
+            &[],
+            &[],
+            &mut ext_params,
+            &pk.values,
+            &[],
+            &[],
+            &obs_map,
+            &mut predictions,
+        );
+
+        assert_eq!(u, vec![10.0], "zero-length segment must not change state");
+        assert!(
+            predictions[0].is_nan(),
+            "zero-length segment must record no observation"
+        );
+    }
+
+    #[test]
+    fn integrate_segment_advances_state_and_records_obs() {
+        // A normal segment integrates 1-cpt decay (ke = CL/V = 0.1) over [0, 10]
+        // and writes the observation at t_end, advancing `u` in place.
+        let ode = one_cpt_ode_spec();
+        let subject = make_subject(vec![], vec![10.0]);
+        let pk = pk_one(1.0, 10.0);
+        let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
+        ext_params[crate::types::PK_IDX_CL] = 1.0;
+        ext_params[crate::types::PK_IDX_V] = 10.0;
+        let mut u = vec![10.0];
+        let mut predictions = vec![f64::NAN; subject.obs_times.len()];
+        let obs_map = obs_index_map(&subject.obs_times);
+
+        integrate_segment(
+            &ode,
+            &mut u,
+            0.0,
+            10.0,
+            &subject,
+            &[],
+            &[],
+            &mut ext_params,
+            &pk.values,
+            &[],
+            &[],
+            &obs_map,
+            &mut predictions,
+        );
+
+        let expected = 10.0 * (-1.0f64).exp(); // 10·e^{-ke·10}, ke = 0.1
+        assert_relative_eq!(u[0], expected, max_relative = 1e-4);
+        assert_relative_eq!(predictions[0], expected, max_relative = 1e-4);
+    }
+
+    #[test]
+    fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
+        // Covers the `last_dose_eff.is_finite()` branch: when a dose precedes the
+        // segment the TAD anchor slot must hold that dose time (not NaN).
+        let ode = one_cpt_ode_spec();
+        let dose = crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let subject = make_subject(vec![dose], vec![10.0]);
+        let pk = pk_one(1.0, 10.0);
+        let mut ext_params = [0.0f64; crate::types::MAX_PK_PARAMS + 2];
+        ext_params[crate::types::PK_IDX_CL] = 1.0;
+        ext_params[crate::types::PK_IDX_V] = 10.0;
+        let mut u = vec![100.0]; // pre-loaded with the bolus amount
+        let mut predictions = vec![f64::NAN; subject.obs_times.len()];
+        let obs_map = obs_index_map(&subject.obs_times);
+
+        integrate_segment(
+            &ode,
+            &mut u,
+            0.0,
+            10.0,
+            &subject,
+            &[0.0],
+            &[1.0],
+            &mut ext_params,
+            &pk.values,
+            &[],
+            &[],
+            &obs_map,
+            &mut predictions,
+        );
+
+        // TAD anchor must be the dose time (0.0), not NaN.
+        assert_eq!(
+            ext_params[crate::types::MAX_PK_PARAMS + 1],
+            0.0,
+            "TAD anchor must equal the prior dose time"
+        );
+        let expected = 100.0 * (-1.0f64).exp();
+        assert_relative_eq!(predictions[0], expected, max_relative = 1e-4);
     }
 
     /// Two-compartment "accumulator": `d/dt = 0` for both states, so each state

@@ -11,7 +11,7 @@
 //! - `warnings.txt`      — one warning per line (mirrors `fit.json` for grep)
 //! - `data.csv`          — copy of the input NONMEM CSV (only when caller opts in)
 //!
-//! See `docs/src/file-formats/fitrx.md` for the field-by-field schema.
+//! See `docs/file-formats/fitrx.qmd` for the field-by-field schema.
 
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};

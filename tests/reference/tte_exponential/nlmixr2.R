@@ -8,12 +8,10 @@
 
 library(nlmixr2)
 
-dat <- read.csv("tte_exp.csv")
-# nlmixr2 ll() interface requires column named 'event' (not DV) for event indicator
-# and 'id' (lower-case). Rename accordingly.
-names(dat)[names(dat) == "ID"]   <- "id"
-names(dat)[names(dat) == "DV"]   <- "event"
-names(dat)[names(dat) == "TIME"] <- "time"
+dat <- read.csv("tte_exp.csv")   # ID,TIME,DV,EVID,CMT,MDV ; DV = event indicator (1=event,0=cens)
+# nlmixr2 needs the standard DV/TIME columns present; the ll(tte) model references an
+# `event` column, so mirror DV into it (keep DV/TIME so nlmixr2's data check passes).
+dat$event <- dat$DV
 
 expo_model <- function() {
   ini({

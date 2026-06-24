@@ -14,7 +14,7 @@
 //! NONMEM evaluates the model at the fixed θ with η = 0 (`$OMEGA 0 FIX`,
 //! `$ESTIMATION MAXEVAL=0`) and tables the raw compartment **amounts** `A(i)`.
 //! ferx exposes central/peripheral compartments as **concentrations**
-//! (`A(i)/V`) and the depot as an amount (see `docs/src/model-file/derived.md`),
+//! (`A(i)/V`) and the depot as an amount (see `docs/model-file/derived.qmd`),
 //! so the check rescales ferx's `compartments[i]` by the matching volume before
 //! comparing to `A(i)`. ferx is likewise evaluated at η = 0 (fixed θ via
 //! `(.. , FIX)`, `omega ~ 0.0`).

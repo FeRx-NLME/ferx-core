@@ -87,38 +87,9 @@ mod survival_smoke {
 
     // ── Population helpers ───────────────────────────────────────────────────
 
-    /// Build a TTE-only population from (time, dv) pairs.
-    /// `dv`: 0 = right-censored, 1 = exact event.
-    fn tte_population(data: &[(f64, u8)]) -> Population {
-        let subjects = data
-            .iter()
-            .enumerate()
-            .map(|(i, &(t, dv))| {
-                let event_type = if dv == 1 {
-                    EventType::Exact
-                } else {
-                    EventType::RightCensored
-                };
-                let mut s = common::subject(&format!("{}", i + 1), vec![], vec![], vec![], vec![]);
-                s.obs_records = vec![ObsRecord::Event {
-                    time: t,
-                    event_type,
-                    entry_time: 0.0,
-                    cmt: 2,
-                }];
-                s
-            })
-            .collect();
-
-        Population {
-            covariate_names: vec![],
-            dv_column: "DV".to_string(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-            subjects,
-        }
-    }
+    // The one-record-per-subject `(time, dv)` TTE builder lives in the shared
+    // `tests/common/mod.rs` as `common::tte_pop_from_pairs` (also used by
+    // `tte_convergence.rs`) — call that instead of duplicating it here.
 
     // Synthetic data: 20 subjects, ~75% events, ~25% censored at t=30.
     const TTE_DATA: &[(f64, u8)] = &[
@@ -271,7 +242,7 @@ mod survival_smoke {
     #[test]
     fn tte_fit_exponential_3iter() {
         let model = parse_model_string(EXP_TTE_MODEL).expect("model must parse");
-        let pop = tte_population(TTE_DATA);
+        let pop = common::tte_pop_from_pairs(TTE_DATA);
 
         let mut opts = FitOptions::default();
         opts.verbose = false;
@@ -294,7 +265,7 @@ mod survival_smoke {
     #[test]
     fn tte_fit_fixed_effects_n_eta_0() {
         let model = parse_model_string(EXP_TTE_FIXED).expect("model must parse");
-        let pop = tte_population(TTE_DATA);
+        let pop = common::tte_pop_from_pairs(TTE_DATA);
 
         let mut opts = FitOptions::default();
         opts.verbose = false;
@@ -381,7 +352,7 @@ mod survival_smoke {
         let model_no_lhr = parse_model_string(src_no_lhr).expect("baseline model must parse");
         let model_with_lhr = parse_model_string(src_with_lhr).expect("model with loghr must parse");
 
-        let pop = tte_population(TTE_DATA);
+        let pop = common::tte_pop_from_pairs(TTE_DATA);
         let mut opts = FitOptions::default();
         opts.verbose = false;
 
@@ -578,7 +549,7 @@ mod survival_smoke {
     #[test]
     fn tte_only_fit_completes_without_pk_blocks() {
         let model = parse_model_string(EXP_TTE_ONLY).expect("must parse");
-        let pop = tte_population(TTE_DATA);
+        let pop = common::tte_pop_from_pairs(TTE_DATA);
         let mut opts = ferx_core::FitOptions::default();
         opts.verbose = false;
         let result = ferx_core::fit(&model, &pop, &model.default_params, &opts);
@@ -833,7 +804,7 @@ mod survival_smoke {
         use ferx_core::predict_survival;
 
         let model = parse_model_string(EXP_TTE_MODEL).expect("must parse");
-        let pop = tte_population(&TTE_DATA[..3]);
+        let pop = common::tte_pop_from_pairs(&TTE_DATA[..3]);
         let grid = vec![1.0, 5.0, 10.0, 20.0];
         let rows = predict_survival(&model, &pop, &model.default_params, &grid);
         assert!(
@@ -1067,7 +1038,7 @@ mod survival_smoke {
     #[test]
     fn tte_weibull_fit_completes() {
         let model = parse_model_string(WEIBULL_TTE_ONLY).expect("WEIBULL_TTE_ONLY must parse");
-        let pop = tte_population(WEIBULL_DATA);
+        let pop = common::tte_pop_from_pairs(WEIBULL_DATA);
         let mut opts = FitOptions::default();
         opts.verbose = false;
         match fit(&model, &pop, &model.default_params, &opts) {
@@ -1084,7 +1055,7 @@ mod survival_smoke {
     #[test]
     fn tte_gompertz_fit_completes() {
         let model = parse_model_string(GOMPERTZ_TTE_ONLY).expect("GOMPERTZ_TTE_ONLY must parse");
-        let pop = tte_population(GOMPERTZ_DATA);
+        let pop = common::tte_pop_from_pairs(GOMPERTZ_DATA);
         let mut opts = FitOptions::default();
         opts.verbose = false;
         match fit(&model, &pop, &model.default_params, &opts) {
@@ -1102,7 +1073,7 @@ mod survival_smoke {
     #[test]
     fn tte_saem_fit_completes() {
         let model = parse_model_string(EXP_TTE_SAEM).expect("EXP_TTE_SAEM must parse");
-        let pop = tte_population(TTE_DATA);
+        let pop = common::tte_pop_from_pairs(TTE_DATA);
         let mut opts = FitOptions::default();
         opts.verbose = false;
         match fit(&model, &pop, &model.default_params, &opts) {

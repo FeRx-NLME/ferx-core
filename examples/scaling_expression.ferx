@@ -10,7 +10,7 @@
 # `obs_scale = WT / 70`). Works with both `gradient = ad` and
 # `gradient = fd`: AD uses a subject-static per-observation scale array
 # (exact for eta-independent scales like this one). See
-# `docs/src/model-file/scaling.md` for the subject-static caveat.
+# `docs/model-file/scaling.qmd` for the subject-static caveat.
 
 [parameters]
   theta TVCL(5.0,  0.1,  50.0)

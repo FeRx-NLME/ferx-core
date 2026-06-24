@@ -67,7 +67,7 @@ impl SelectionFilter {
     /// Checks short-circuit on the first match, so a record is attributed to the
     /// first rule that excludes it. A rule that only ever matches records already
     /// removed by an earlier rule therefore never appears in the fired-condition
-    /// summary — see `docs/src/model-file/data-selection.md`.
+    /// summary — see `docs/model-file/data-selection.qmd`.
     pub fn should_exclude(&self, ctx: &RowContext<'_>) -> (bool, Option<String>) {
         // 1. ignore_subjects shorthand.
         if self.ignore_subject_ids.iter().any(|id| id == ctx.id) {

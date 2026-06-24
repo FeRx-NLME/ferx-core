@@ -168,7 +168,7 @@ const OMEGA_DIAG_FLOOR: f64 = 1e-6;
 /// looser than BSV because per-occasion variances are smaller).
 const OMEGA_IOV_DIAG_FLOOR: f64 = 1e-8;
 /// Max split-R̂ at or below which the fit is reported converged. Matches the
-/// guidance in `docs/src/estimation/bayes.md` (Vehtari et al. 2021); used for
+/// guidance in `docs/estimation/bayes.qmd` (Vehtari et al. 2021); used for
 /// both the `converged` flag and the non-convergence warning.
 const RHAT_CONVERGENCE_THRESHOLD: f64 = 1.01;
 

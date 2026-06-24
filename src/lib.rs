@@ -12,6 +12,7 @@ pub mod parser;
 pub mod pk;
 pub mod propensity_match;
 pub mod sens;
+pub mod sim;
 pub mod stats;
 pub mod suggest_start;
 #[cfg(feature = "survival")]

@@ -93,7 +93,7 @@ Dispatch ODE-supported models into the new provider from `population_gradient`. 
 provider against central FD of `compute_predictions_with_tv` on an ODE model (e.g. the
 `transit_2cpt` example), and the end-to-end gradient against FD, with a NONMEM OFV/estimate
 anchor. **Right-size `N`** to the count of PK parameters the model actually reads. Docs
-(`docs/src/estimation/optimizers.md`, faq) + CHANGELOG.
+(`docs/estimation/optimizers.qmd`, faq) + CHANGELOG.
 
 ## Phases (each lands with tests + anchor)
 

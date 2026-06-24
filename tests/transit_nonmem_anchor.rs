@@ -27,7 +27,7 @@
 //! accuracy (`ode_reltol = ode_abstol = 1e-9`, matching `TOL=9`). The loose
 //! defaults (`1e-4`/`1e-6`) recover the fixed effects but inject integration
 //! noise into the FOCEI Hessian that inflates the ω² estimates (see
-//! `docs/src/model-file/absorption.md` "Verification against NONMEM"). This
+//! `docs/model-file/absorption.qmd` "Verification against NONMEM"). This
 //! test therefore sets the tight tolerances explicitly.
 
 use ferx_core::parser::model_parser::parse_full_model;

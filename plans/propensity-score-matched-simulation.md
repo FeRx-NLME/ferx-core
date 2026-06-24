@@ -126,12 +126,12 @@ optimal-Mahalanobis assignment against the R reference: dump a fixed set of
 observed etas + drawn etas + Ω, run `MatchIt::matchit(method="optimal",
 distance="mahalanobis")` (and the poster's NONMEM workflow), and confirm the Rust
 assignment reproduces the same matched pairs (or same total cost on ties). Record
-in the PR description / a short `docs/src` note.
+in the PR description / a short `docs` note.
 
 ## Docs & changelog
 
-- `docs/src` — document the `match` simulate argument (a simulation/FAQ page; add
-  to `SUMMARY.md` if a new page). Explain the pmVPC use case and that matching
+- `docs` — document the `match` simulate argument (a simulation/FAQ page; add
+  to `_quarto.yml` if a new page). Explain the pmVPC use case and that matching
   requires observed designs + fitted etas.
 - `CHANGELOG.md` `## [Unreleased]` → `Added`: propensity-score-matched simulation
   (`match`) for VPCs on adaptively-dosed real-world data (`#NN`).
@@ -142,7 +142,7 @@ in the PR description / a short `docs/src` note.
 - `src/lib.rs` — register module.
 - `src/api.rs` — `SimulateOptions`, `simulate_with_options`, matched branch.
 - `tests/*.rs` — integration test.
-- `docs/src/...` + `SUMMARY.md`, `CHANGELOG.md`.
+- `docs/...` + `_quarto.yml`, `CHANGELOG.md`.
 - (Follow-up) `ferx-r` — lock bump + R `match` argument.
 
 ## Open questions for reviewer

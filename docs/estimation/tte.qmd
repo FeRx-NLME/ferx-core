@@ -191,18 +191,46 @@ stencil (Shi 2021 step-size selection).
 Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is
 the default and the only supported path for TTE objectives.
 
-## Comparison with nlmixr2 and NONMEM
+## Comparison with reference software
 
-Reference exponential fit (30 subjects, λ=0.05 h⁻¹, ω²=0.09, 30% censored):
+The exponential validation dataset is `tests/reference/tte_exponential/tte_exp.csv`
+(100 subjects; data-generating λ=0.1 h⁻¹, ω²=0.25 on log-rate; right-censored at
+t=24 → 82 events, 18% censored). All tools fit the same file.
 
-| Parameter | True | ferx | nlmixr2 | NONMEM (LAPLACIAN) |
-|-----------|------|------|---------|------------------|
-| TVLAMBDA  | 0.050 | — | — | — |
-| ω²(ETA_LAMBDA) | 0.09 | — | — | — |
-| OFV | — | — | — | — |
+**Fixed-effects (no random effect) — exact, license-free anchor.** A censored
+exponential MLE is the closed form λ = events/Σtime, so a ferx `n_eta=0` fit must
+match base-R `survival::survreg` exactly:
 
-*Reference values will be filled after running the nlmixr2 and NONMEM scripts
-in `tests/reference/tte_exponential/`.*
+| Quantity | ferx (fixed) | `survreg` | agreement |
+|----------|-------------|-----------|-----------|
+| λ (rate) | 0.074506 | 0.074506 | exact (<1e‑4) |
+| OFV / −2logLik | 589.888 | 589.888 | exact |
+
+This confirms ferx's TTE hazard, censoring, and likelihood **constants** are correct.
+
+**Mixed-effects (frailty) — FOCEI.** ferx recovers the data-generating truth under a
+clean large-N simulation–estimation check (N=2000): λ_pop = 0.099 (−1%), ω² = 0.232
+(−7%). The small ω² shortfall is the expected mild FOCEI-Laplace bias for TTE (it
+grows at low event rates; SAEM/IMP reduce it). On the 100-subject file itself:
+
+| Parameter | True | ferx FOCEI | nlmixr2 FOCEI | NONMEM (LAPLACIAN) |
+|-----------|------|-----------|---------------|--------------------|
+| TVLAMBDA (rate) | 0.10 | 0.0768 | 0.0770 | 0.0771 |
+| ω²(ETA_LAMBDA) | 0.25 | 0.290 | 0.293 | 0.286 |
+| OFV (−2LL) | — | 588.93 | 588.94 | 588.93 |
+
+ferx and **nlmixr2** FOCEI agree to ~3 digits on all parameters and the −2LL for all three
+families (Weibull and Gompertz likewise — see `tests/reference/tte_*/expected.md`); for the
+nonlinear-frailty Weibull `omega^2` the two FOCEI tools differ (0.204 vs 0.173), itself
+evidence for the over-estimation note above.
+
+> NONMEM reports `THETA(1)=log λ`; compare `exp(THETA(1))` to ferx `TVLAMBDA`. The NONMEM frailty
+> column is from `nonmem_frailty.ctl` (`CONDITIONAL LAPLACIAN INTERACTION`). Two NONMEM gotchas for
+> `F_FLAG=1` likelihood models: a dummy `$SIGMA 1 FIX` is required **and must be referenced**
+> (`DUMMY = EPS(1)`) or NM-TRAN infers single-subject data and rejects `CONDITIONAL`; and `NUMERICAL
+> SLOW` are required with `LAPLACIAN INTERACTION`. All three tools agree on the linear-frailty
+> exponential (λ within 0.4%, ω² within ~2%, identical −2LL). **Gompertz** (fixed-effects) also
+> matches NONMEM to OFV 3011.12. nlmixr2's OFV constants differ (§11.3) — compare parameters.
 
 ### nlmixr2 equivalent
 
@@ -228,9 +256,36 @@ $THETA (0.001, 0.05, 10)
 $OMEGA 0.09
 ```
 
+### Weibull and Gompertz
+
+The same validation kit exists for Weibull (`tests/reference/tte_weibull/`) and Gompertz
+(`tests/reference/tte_gompertz/`). Highlights:
+
+- **Weibull** fixed-effects fit matches `survreg` exactly (scale 22.18, shape 2.12); the
+  300-subject **Gompertz** RCT fixed-effects fit recovers `log_alpha`, `log_gamma` and the
+  treatment `log_hr` essentially exactly, exercising the `[event_model]` covariate + `loghr`
+  term.
+
+> **Choosing an estimator for frailty TTE.** When a random effect sits on a *nonlinear* hazard
+> parameter (e.g. the Weibull **shape** or Gompertz **growth rate**, not the exponential rate),
+> FOCEI-Laplace **over-estimates** the frailty variance `omega^2` — a clean large-N
+> simulation–estimation check recovers the structural parameters but inflates `omega^2`
+> (Weibull shape: 0.34 vs a true 0.20), while a SAEM fit of the same data reads lower (~0.13).
+> This is an approximation limitation, not a likelihood error (fixed-effects fits match
+> `survreg` exactly). A three-tool cross-check on the n=100 Weibull file agrees: **NONMEM
+> LAPLACIAN (ω² 0.175) and nlmixr2 FOCEI (0.173) land together, below ferx FOCEI (0.204)** —
+> structural params and −2LL match across all three (≤0.5% / identical OFV), with the spread
+> isolated to the weakly-identified ω². Prefer **SAEM/IMP** for frailty TTE on nonlinear
+> parameters, as in the standard pharmacometric guidance; FOCEI on a *linear* rate (exponential)
+> is near-unbiased and all three tools agree there (ω² 0.286–0.293).
+
 ## See also
 
 - `examples/tte_exponential.ferx` — minimal worked example
-- `data/tte_exponential.csv` — simulated dataset (30 subjects)
+- `data/tte_exponential.csv` — small dataset (30 subjects) used by the smoke tests
+- `tests/reference/tte_exponential/` — 100-subject validation dataset (`tte_exp.csv`),
+  reference scripts (`simulate.R`, `survreg.R`, `nlmixr2.R`, `nonmem.ctl`), `README.md`
+  (NONMEM/nlmixr2 hand-off) and `expected.md` (filled comparison)
 - `tests/tte_smoke.rs` — Tier-2 parse and short-run smoke tests
+- `tests/tte_convergence.rs` — Tier-3 convergence + SSE tests (`--features survival,slow-tests`)
 - `plans/tte-survival-markov.md` — full multi-phase roadmap
