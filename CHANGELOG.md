@@ -20,6 +20,28 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Performance
+- **Ω-preconditioned inner EBE loop for all FOCE/FOCEI fits.** The inner BFGS
+  now initialises its inverse-Hessian (the search `H0`) to the prior conditional
+  scale `diag(1/Ω⁻¹ᵢᵢ)` for every model, not just FREM. A correlated or
+  multi-scale Ω (e.g. a block-Ω where one η has several× the variance of another)
+  otherwise mis-scales the identity-`H0` search, costing extra inner iterations.
+  The convergence *test* stays the raw L2 gradient norm for general fits (only
+  FREM needs the preconditioned norm, issue #406), so `H0` changes only the path
+  to the mode — the converged EBE and the estimates are unchanged. On the
+  two-compartment UVM FOCEI/MMA benchmark this cuts inner BFGS steps per EBE
+  solve ~25→16 and total predictions ~17M→6.2M for a **~1.23× faster fit**
+  (single- and 8-thread) at the same optimum (OFV within 4e-5 of the prior
+  result; matches NONMEM `run18`).
+- **Interpolating inner-loop line search** (#462). The EBE BFGS line search now
+  picks each trial step by safeguarded quadratic interpolation instead of fixed
+  halving, and reuses the objective value the optimiser already tracks instead of
+  recomputing it. On the two-compartment UVM FOCEI/MMA benchmark this cuts the
+  average backtracks per line search from ~22 to ~3 (cap-exhaustion 20% → 0.1%),
+  roughly halving the prediction-walk count for a ~2.5× faster single-threaded
+  fit at the same optimum.
+- Reuse per-thread scratch buffers when evaluating individual PK parameters,
+  reducing allocator traffic in FOCE/FOCEI inner loops with time-varying
+  covariates (#462).
 - **Exact analytic gradients for `transit()` absorption ODE models** (#430). The
   built-in transit input-rate forcing's `ln Γ(n+1)` constant now has a `Dual2` rule
   (analytic digamma/trigamma derivatives of the shared Lanczos `ln_gamma`), so a
@@ -59,6 +81,16 @@ section of the SDLC for the versioning policy).
   model drives **exact analytic** FOCE/FOCEI/Bayes gradients (no finite-difference fallback),
   validated against NONMEM. See `examples/weibull_absorption.ferx` and
   `docs/model-file/absorption.qmd`.
+- **`ebe_warm_start` fit option** (default `false`, opt-in). When a per-subject
+  inner BFGS solve fails and falls back to Nelder–Mead, seed the simplex from the
+  BFGS partial η̂ instead of cold-starting from the prior mode η=0. On
+  fallback-heavy fits (e.g. an unidentifiable peripheral volume that drives BFGS
+  far onto the steep prior slope) NM then converges in a fraction of the
+  iterations — ≈1.7× faster on a 2-cpt unidentifiable-V2 benchmark. Off by
+  default because warm-starting moves the fallback subjects' EBEs, which perturbs
+  the outer optimiser's trajectory: harmless for the BOBYQA default but can derail
+  a gradient-based outer optimiser (e.g. `mma`) into a worse basin on some models.
+  Validate OFV/estimates on your model + `optimizer` before enabling.
 - **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
   e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in
   addition to the existing theta/eta/covariate namespace. Intermediate variables and names
@@ -147,6 +179,18 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- **TTE simulation now applies administrative right-censoring** (#440). `simulate()`
+  for a `[event_model]` (TTE) endpoint previously emitted *every* drawn event time as
+  an uncensored event, so simulated data could not reproduce a study's censoring
+  pattern (which broke simulation-estimation validation). A subject's administrative
+  observation horizon is now honoured: a draw that reaches it is recorded as
+  right-censored at the horizon (`observed = false`). The horizon is the
+  `ObsRecord::Event` time of a *right-censored* record; an exact-event (or
+  interval-censored) record carries no horizon — its `time` is the event time, not a
+  censoring window — so it draws uncensored rather than being truncated at the
+  realized event time (which would bias re-simulation / VPC). Left-truncated
+  (delayed-entry) subjects draw conditional on survival past entry. Behind the
+  `survival` feature.
 - **Analytic sensitivities and predictions for time-varying covariates with
   intermediate `[individual_parameters]` assignments** (#455, #456). A model whose
   individual-parameter block computes intermediate quantities (e.g.

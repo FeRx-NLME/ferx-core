@@ -3686,6 +3686,21 @@ pub struct FitOptions {
     /// (or to `outer_maxiter`), e.g. for debugging or for problems with
     /// very slow-but-real OFV improvements below the stagnation threshold.
     pub stagnation_guard: bool,
+    /// When an inner EBE BFGS solve fails and falls back to Nelder–Mead, warm-start
+    /// the simplex from the BFGS partial η̂ instead of cold-starting from the prior
+    /// mode η=0. A weakly-identified η (e.g. an unidentifiable peripheral volume)
+    /// drives BFGS onto the steep prior slope far from 0, and NM slides down it to
+    /// the mode in far fewer iterations than refining from 0 in the flat basin —
+    /// substantially fewer prediction walks on fallback-heavy fits (≈1.7× on a
+    /// 2-cpt unidentifiable-V2 benchmark).
+    ///
+    /// **Opt-in (default `false`).** Warm-starting moves the fallback subjects'
+    /// EBEs, which perturbs the outer optimiser's trajectory: harmless for the
+    /// derivative-free BOBYQA default, but it can derail a gradient-based outer
+    /// optimiser (e.g. MMA) into a worse basin on some models. Enable it only
+    /// after validating the OFV/estimates on your model + outer optimiser; leave
+    /// it `false` for the historical (cold-restart) behaviour.
+    pub ebe_warm_start: bool,
     /// When `Some(_)`, call [`crate::suggest_start::inits_from_nca`] with the
     /// selected strategy before the optimizer loop to derive NCA-based starting
     /// values from the data. Useful when the model file's defaults are far from
@@ -3828,6 +3843,7 @@ impl Default for FitOptions {
             max_unconverged_frac: 0.1,
             min_obs_for_convergence_check: 2,
             stagnation_guard: true,
+            ebe_warm_start: false,
             inits_from_nca: None,
             ignore_exprs: Vec::new(),
             accept_exprs: Vec::new(),
@@ -4133,6 +4149,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "parameter_scaling",
         "max_unconverged_frac",
         "min_obs_for_convergence_check",
+        "ebe_warm_start",
         "inits_from_nca",
         "frem_predictions",
         "frem_sigma",

@@ -86,27 +86,25 @@ fn fit_opts() -> FitOptions {
 }
 
 /// `n` bare TTE subjects (one placeholder Event each on CMT 2) used only as a
-/// `simulate()` template — the drawn event time replaces the placeholder. This is
-/// exactly [`common::tte_pop_from_pairs`] over `n` exact-event rows at `t = 0`.
-fn tte_sim_template(n: usize) -> Population {
-    common::tte_pop_from_pairs(&vec![(0.0, 1); n])
+/// `simulate()` template. Each placeholder carries the administrative censoring
+/// window `censor` in its record `time`; `simulate_tte` right-censors any draw
+/// that reaches it (the drawn event time otherwise replaces the placeholder).
+/// This is exactly [`common::tte_pop_from_pairs`] over `n` right-censored rows at
+/// `t = censor`.
+fn tte_sim_template(n: usize, censor: f64) -> Population {
+    common::tte_pop_from_pairs(&vec![(censor, 0); n])
 }
 
-/// Map ferx `simulate()` outcomes to `(time, dv)` pairs, applying administrative
-/// right-censoring at `t_censor` exactly as `simulate.R` does: `simulate_tte`
-/// draws *uncensored* event times (every draw is observed), so a draw past
-/// `t_censor` becomes a right-censored row at `t_censor`. Panics on any non-`Event`
-/// outcome — that would mean a Gaussian model/template was simulated by mistake.
-fn sims_to_pairs(sims: &[SimulationResult], t_censor: f64) -> Vec<(f64, u8)> {
+/// Map ferx `simulate()` outcomes to `(time, dv)` pairs. `simulate_tte` already
+/// applies administrative right-censoring at each subject's observation window
+/// (set by [`tte_sim_template`]), so this just reads the `observed` flag: an
+/// observed draw is an event row `(time, 1)`, a censored draw a `(window, 0)` row.
+/// Panics on any non-`Event` outcome — that would mean a Gaussian model/template
+/// was simulated by mistake.
+fn sims_to_pairs(sims: &[SimulationResult]) -> Vec<(f64, u8)> {
     sims.iter()
         .map(|r| match r.outcome {
-            SimOutcome::Event { time, .. } => {
-                if time <= t_censor {
-                    (time, 1)
-                } else {
-                    (t_censor, 0)
-                }
-            }
+            SimOutcome::Event { time, observed } => (time, observed as u8),
             _ => panic!("expected an Event outcome for a TTE simulation"),
         })
         .collect()
@@ -142,12 +140,12 @@ fn tte_sse_exponential_recovers_truth() {
     const SEED: u64 = 20260621;
 
     let truth = parse_model_string(EXP_TRUTH).expect("truth model must parse");
-    let template = tte_sim_template(N);
+    let template = tte_sim_template(N, T_CENSOR);
 
     let sims = simulate_with_seed(&truth, &template, &truth.default_params, 1, SEED);
     assert_eq!(sims.len(), N, "one simulated event per template subject");
 
-    let pairs = sims_to_pairs(&sims, T_CENSOR);
+    let pairs = sims_to_pairs(&sims);
 
     let event_frac = pairs.iter().filter(|(_, dv)| *dv == 1).count() as f64 / N as f64;
     eprintln!("[SSE] event fraction = {event_frac:.4} (expected ~0.88 at lambda_pop=0.1, omega^2=0.25, censor t=24)");
@@ -319,9 +317,15 @@ fn tte_sse_weibull_recovers_truth() {
     const SEED: u64 = 20260622;
 
     let truth = parse_model_string(WEIBULL_TRUTH).expect("truth model must parse");
-    let sims = simulate_with_seed(&truth, &tte_sim_template(N), &truth.default_params, 1, SEED);
+    let sims = simulate_with_seed(
+        &truth,
+        &tte_sim_template(N, T_CENSOR),
+        &truth.default_params,
+        1,
+        SEED,
+    );
 
-    let pairs = sims_to_pairs(&sims, T_CENSOR);
+    let pairs = sims_to_pairs(&sims);
 
     let model = parse_model_string(WEIBULL_FIT).expect("fit model must parse");
     let r = fit(
@@ -551,9 +555,15 @@ fn tte_sse_gompertz_recovers_truth() {
     const SEED: u64 = 20260623;
 
     let truth = parse_model_string(GOMPERTZ_TRUTH_FRAILTY).expect("truth model must parse");
-    let sims = simulate_with_seed(&truth, &tte_sim_template(N), &truth.default_params, 1, SEED);
+    let sims = simulate_with_seed(
+        &truth,
+        &tte_sim_template(N, T_CENSOR),
+        &truth.default_params,
+        1,
+        SEED,
+    );
 
-    let pairs = sims_to_pairs(&sims, T_CENSOR);
+    let pairs = sims_to_pairs(&sims);
 
     let model = parse_model_string(GOMPERTZ_FIT_FRAILTY).expect("fit model must parse");
     let r = fit(

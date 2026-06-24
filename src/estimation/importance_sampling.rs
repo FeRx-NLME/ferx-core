@@ -1683,14 +1683,38 @@ fn logsumexp_with_normalised(xs: &[f64]) -> (f64, Vec<f64>) {
     if xs.is_empty() {
         return (f64::NEG_INFINITY, Vec::new());
     }
-    let m = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    let n_pos_inf = xs
+        .iter()
+        .filter(|x| x.is_infinite() && x.is_sign_positive())
+        .count();
+    if n_pos_inf > 0 {
+        let w = 1.0 / n_pos_inf as f64;
+        let weights = xs
+            .iter()
+            .map(|x| {
+                if x.is_infinite() && x.is_sign_positive() {
+                    w
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        return (f64::INFINITY, weights);
+    }
+
+    let m = xs
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
     if !m.is_finite() {
-        return (m, vec![0.0; xs.len()]);
+        return (f64::NEG_INFINITY, vec![0.0; xs.len()]);
     }
     let mut sum = 0.0;
     let mut shifted: Vec<f64> = Vec::with_capacity(xs.len());
     for &x in xs {
-        let s = (x - m).exp();
+        let s = if x.is_finite() { (x - m).exp() } else { 0.0 };
         shifted.push(s);
         sum += s;
     }
@@ -1923,6 +1947,25 @@ mod tests {
         let (lse, w) = logsumexp_with_normalised(&[f64::NEG_INFINITY; 3]);
         assert_eq!(lse, f64::NEG_INFINITY);
         assert_eq!(w, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn logsumexp_ignores_nan_log_weights() {
+        let (lse, w) = logsumexp_with_normalised(&[f64::NAN, 2.0, 3.0, f64::NEG_INFINITY]);
+        assert!((lse - (3.0 + (1.0 + (-1.0_f64).exp()).ln())).abs() < 1e-10);
+        assert_eq!(w[0], 0.0);
+        assert!(w[1] > 0.0);
+        assert!(w[2] > w[1]);
+        assert_eq!(w[3], 0.0);
+        let sum: f64 = w.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn logsumexp_handles_positive_infinite_log_weights_without_nan() {
+        let (lse, w) = logsumexp_with_normalised(&[1.0, f64::INFINITY, f64::NAN, f64::INFINITY]);
+        assert_eq!(lse, f64::INFINITY);
+        assert_eq!(w, vec![0.0, 0.5, 0.0, 0.5]);
     }
 
     #[test]

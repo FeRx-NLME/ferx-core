@@ -3110,13 +3110,13 @@ fn collect_variable_names(expr: &Expression, out: &mut std::collections::HashSet
 /// empty map without allocating, so such hazards pay nothing for the feature.
 ///
 /// Evaluation uses the tree-walking `eval_statements`, NOT the bytecode
-/// `eval_statements_indexed`: only the latter borrows the `FERX_SCRATCH`
-/// thread-local, so this is safe to call from inside the likelihood's hazard
-/// `param_fn`, and it transparently handles NONMEM-style `if (...) CL = ...`
-/// conditional parameters. Kappa (IOV) and `[covariate_nn]`-output references in
-/// these statements are rejected up front (see `needed_indiv_stmts`), so the
-/// BSV-only `eta` slice never indexes out of bounds and the empty `nn_outputs`
-/// here is never read.
+/// bytecode indexed evaluators: those borrow the `FERX_SCRATCH` thread-local,
+/// so this is safe to call from inside the likelihood's hazard `param_fn`, and
+/// it transparently handles NONMEM-style `if (...) CL = ...` conditional
+/// parameters. Kappa (IOV) and `[covariate_nn]`-output references in these
+/// statements are rejected up front (see `needed_indiv_stmts`), so the BSV-only
+/// `eta` slice never indexes out of bounds and the empty `nn_outputs` here is
+/// never read.
 #[cfg(feature = "survival")]
 fn eval_indiv_param_vars(
     stmts: &[Statement],
@@ -4025,6 +4025,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 parse_usize("min_obs_for_convergence_check")? as u32
         }
         "stagnation_guard" => opts.stagnation_guard = parse_bool("stagnation_guard")?,
+        "ebe_warm_start" => opts.ebe_warm_start = parse_bool("ebe_warm_start")?,
         "inits_from_nca" => {
             use crate::suggest_start::NcaInit;
             opts.inits_from_nca = match value.to_lowercase().as_str() {
@@ -5692,7 +5693,7 @@ fn build_ode_spec(
     // FOCEI fit on the Emax PK/PD model in the experiment, billions of
     // hash-map ops across the whole run.
     //
-    // Switch to the indexed AST evaluator (`eval_statements_indexed`) that
+    // Switch to the indexed AST evaluator (`eval_statements_indexed_with_stack`) that
     // the existing `pk_param_fn` already uses. Layout:
     //   vars[0..n_states]                                  → state values (read from u)
     //   vars[n_states..n_states+n_indiv]                   → indiv params  (read from params via indiv_slots)
@@ -7310,17 +7311,6 @@ fn build_pk_param_fn(
 
     let pk_param_fn: PkParamFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
-            // Materialise covariates into a Vec<f64> aligned with
-            // `referenced_covariates`. For the typical 3-5 covariates
-            // this is ~3-5 HashMap probes + one short alloc; cheaper
-            // than the 10-20 probes the previous unresolved AST was
-            // paying for both variables AND covariates.
-            let mut cov_vec = vec![0.0_f64; n_cov];
-            for (i, name) in cov_names_for_lookup.iter().enumerate() {
-                cov_vec[i] = covariates.get(name).copied().unwrap_or(0.0);
-            }
-            let mut vars = vec![0.0_f64; n_vars];
-
             // Pre-compute each NN's forward output once per call. The
             // indexed evaluator reads `nn_outputs[nn_idx][output_idx]` for
             // every `Expression::NnOutput` it visits, so multiple `.CL`,
@@ -7342,41 +7332,65 @@ fn build_pk_param_fn(
             #[cfg(not(feature = "nn"))]
             let nn_outputs: Vec<Vec<f64>> = Vec::new();
 
-            // pk_param_fn doesn't compute derivatives — no `du` to pass.
-            eval_statements_indexed(
-                &stmts_owned,
-                theta,
-                eta,
-                &cov_vec,
-                &mut vars,
-                None,
-                &nn_outputs,
-            );
-
             let mut p = PkParams::default();
-            if is_analytical_pk {
-                for &(pk_slot, var_slot) in &pk_assignment_mapping {
-                    p.values[pk_slot] = vars[var_slot];
+            FERX_SCRATCH.with(|cell| {
+                let mut scratch = cell.borrow_mut();
+                let FerxThreadScratch {
+                    pk_cov,
+                    pk_vars,
+                    bc_stack,
+                    ..
+                } = &mut *scratch;
+
+                // Materialise covariates into thread-local scratch aligned with
+                // `referenced_covariates`. This runs millions of times in FOCE
+                // inner loops, so keeping the buffers hot avoids short heap
+                // allocations per event/line-search evaluation.
+                pk_cov.resize(n_cov, 0.0);
+                for (i, name) in cov_names_for_lookup.iter().enumerate() {
+                    pk_cov[i] = covariates.get(name).copied().unwrap_or(0.0);
                 }
-                // Literal-valued slots (e.g. `ka=1.0`) are constants — no
-                // per-call evaluation, just write the parsed value.
-                for &(pk_slot, c) in &pk_const_mapping {
-                    p.values[pk_slot] = c;
+                pk_vars.resize(n_vars, 0.0);
+                pk_vars.fill(0.0);
+
+                // pk_param_fn doesn't compute derivatives — no `du` to pass.
+                // Call the stack-threaded evaluator directly while this scratch
+                // borrow is live; the wrapper would re-enter FERX_SCRATCH.
+                eval_statements_indexed_with_stack(
+                    &stmts_owned,
+                    theta,
+                    eta,
+                    pk_cov,
+                    pk_vars,
+                    None,
+                    &nn_outputs,
+                    bc_stack,
+                );
+
+                if is_analytical_pk {
+                    for &(pk_slot, var_slot) in &pk_assignment_mapping {
+                        p.values[pk_slot] = pk_vars[var_slot];
+                    }
+                    // Literal-valued slots (e.g. `ka=1.0`) are constants — no
+                    // per-call evaluation, just write the parsed value.
+                    for &(pk_slot, c) in &pk_const_mapping {
+                        p.values[pk_slot] = c;
+                    }
+                    // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write
+                    // each duration parameter into its reserved spare slot so the
+                    // analytical dose-resolution step can read it.
+                    for &(pk_slot, var_slot) in &analytical_extra_mapping {
+                        p.values[pk_slot] = pk_vars[var_slot];
+                    }
+                } else {
+                    // ODE model: store each individual parameter at its
+                    // `ode_param_slots` slot (canonical names at their PK slot, F at
+                    // PK_IDX_F, lagtime at PK_IDX_LAGTIME, others at free slots).
+                    for &(slot, var_slot) in &ode_assignment_mapping {
+                        p.values[slot] = pk_vars[var_slot];
+                    }
                 }
-                // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write each
-                // duration parameter into its reserved spare slot so the analytical
-                // dose-resolution step (`DoseEvent::resolve_rate`) can read it.
-                for &(pk_slot, var_slot) in &analytical_extra_mapping {
-                    p.values[pk_slot] = vars[var_slot];
-                }
-            } else {
-                // ODE model: store each individual parameter at its
-                // `ode_param_slots` slot (canonical names at their PK slot, F at
-                // PK_IDX_F, lagtime at PK_IDX_LAGTIME, others at free slots).
-                for &(slot, var_slot) in &ode_assignment_mapping {
-                    p.values[slot] = vars[var_slot];
-                }
-            }
+            });
             p
         },
     );
@@ -8018,8 +8032,9 @@ enum Op {
 //
 // All hot-path closures in this module need their own `Vec<f64>` scratch:
 //   - `build_ode_rhs_fn`        : `rhs_vars` (state ‖ indiv params ‖ inters)
+//   - `build_pk_param_fn`       : `pk_cov` + `pk_vars` (individual params)
 //   - `build_y_output_fn`       : `y_vars` + `y_cov` (Form C readout)
-//   - `eval_statements_indexed` : `bc_stack` (bytecode f64 stack)
+//   - indexed statement eval    : `bc_stack` (bytecode f64 stack)
 //   - `build_y_output_fn`       : also needs the bc_stack for its readout eval
 //
 // Each was originally its own `thread_local!`. A samply profile of the
@@ -8032,6 +8047,8 @@ enum Op {
 #[derive(Debug)]
 struct FerxThreadScratch {
     rhs_vars: Vec<f64>,
+    pk_cov: Vec<f64>,
+    pk_vars: Vec<f64>,
     y_vars: Vec<f64>,
     y_cov: Vec<f64>,
     bc_stack: Vec<f64>,
@@ -8041,6 +8058,8 @@ impl FerxThreadScratch {
     const fn new_empty() -> Self {
         Self {
             rhs_vars: Vec::new(),
+            pk_cov: Vec::new(),
+            pk_vars: Vec::new(),
             y_vars: Vec::new(),
             y_cov: Vec::new(),
             bc_stack: Vec::new(),
@@ -8904,49 +8923,9 @@ fn eval_condition_indexed(
     }
 }
 
-/// Indexed-form statement executor; mirror of `eval_statements`. Handles
-/// `AssignIdx`, `DiffEqIdx`, and `If`; if any non-indexed `Assign` or
-/// `DiffEq` slips through, it falls back to a no-op (defensive — caller
-/// should ensure the AST has been run through `resolve_variable_indices`).
-///
-/// `du` carries the derivative buffer the `DiffEqIdx` arm writes into. ODE
-/// RHS callers (`build_ode_rhs_fn`) pass `Some(du)`; non-derivative callers
-/// (`pk_param_fn`) pass `None` and never construct a `DiffEqIdx`.
-fn eval_statements_indexed(
-    stmts: &[Statement],
-    theta: &[f64],
-    eta: &[f64],
-    covariates: &[f64],
-    vars: &mut [f64],
-    du: Option<&mut [f64]>,
-    nn_outputs: &[Vec<f64>],
-) {
-    // Acquire the bytecode-stack scratch ONCE per call from the shared
-    // FERX_SCRATCH; the borrow is held for the lifetime of this statement
-    // loop and threaded into recursive `If` arms. Callers that already
-    // hold FERX_SCRATCH (`build_ode_rhs_fn` does, for the rhs_vars setup)
-    // should bypass this wrapper and call eval_statements_indexed_with_stack
-    // directly with the bc_stack field — re-entering the borrow_mut here
-    // would panic.
-    FERX_SCRATCH.with(|cell| {
-        let mut s = cell.borrow_mut();
-        eval_statements_indexed_with_stack(
-            stmts,
-            theta,
-            eta,
-            covariates,
-            vars,
-            du,
-            nn_outputs,
-            &mut s.bc_stack,
-        );
-    });
-}
-
 /// Inner statement evaluator threaded with a caller-owned bytecode stack.
-/// Split from `eval_statements_indexed` so recursive `If` evaluation reuses
-/// the same `Vec<f64>` scratch instead of re-acquiring the TLS borrow per
-/// nested call.
+/// Recursive `If` evaluation reuses the same `Vec<f64>` scratch instead of
+/// re-acquiring the TLS borrow per nested call.
 #[allow(clippy::too_many_arguments)]
 fn eval_statements_indexed_with_stack(
     stmts: &[Statement],
@@ -13217,6 +13196,31 @@ mod tests {
                 warnings
             );
             assert!(warnings[0].contains("stagnation_guard"));
+        }
+    }
+
+    #[test]
+    fn test_ebe_warm_start_parses_and_is_framework_key() {
+        // Parses to the bool, defaults to false (opt-in).
+        let opts = parse_fit_options(&[
+            "method = focei".to_string(),
+            "ebe_warm_start = true".to_string(),
+        ])
+        .unwrap();
+        assert!(opts.ebe_warm_start);
+        assert!(!FitOptions::default().ebe_warm_start, "default is off");
+        // Framework key: the inner NM fallback exists under every method, so it
+        // must not warn as unsupported for any of them.
+        for method in ["foce", "focei", "gn", "saem"] {
+            let opts = parse_fit_options(&[
+                format!("method = {method}"),
+                "ebe_warm_start = true".to_string(),
+            ])
+            .unwrap();
+            assert!(
+                opts.unsupported_keys_warnings().is_empty(),
+                "method={method} should accept the framework key ebe_warm_start"
+            );
         }
     }
 

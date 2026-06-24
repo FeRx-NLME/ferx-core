@@ -260,6 +260,92 @@ mod survival_smoke {
         }
     }
 
+    /// `simulate()` must administratively right-censor TTE draws at each subject's
+    /// observation window (the `ObsRecord::Event.time`) rather than emit every draw
+    /// as an uncensored event. Drives the full `simulate_tte` wiring; the draw/censor
+    /// logic itself is unit-tested in `survival/mod.rs` (`draw_tte_*`).
+    #[test]
+    fn simulate_tte_censors_at_observation_window() {
+        use ferx_core::{simulate_with_seed, SimOutcome};
+        // 300 subjects sharing a τ=20 window. λ≈0.05 ⇒ S(20)=exp(−1)≈0.37 censored,
+        // so the run must contain both observed events and administrative censors.
+        const TAU: f64 = 20.0;
+        let model = parse_model_string(EXP_TTE_MODEL).expect("model must parse");
+        let template = common::tte_pop_from_pairs(&vec![(TAU, 0); 300]);
+
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 4242);
+        assert_eq!(sims.len(), 300, "one TTE outcome per template subject");
+
+        let (mut events, mut censored) = (0usize, 0usize);
+        for r in &sims {
+            match r.outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert!(time <= TAU, "no outcome may exceed the window: {time}");
+                    if observed {
+                        assert!(
+                            time < TAU,
+                            "an observed event must precede the window: {time}"
+                        );
+                        events += 1;
+                    } else {
+                        assert_eq!(time, TAU, "a censored outcome sits exactly at the window");
+                        censored += 1;
+                    }
+                }
+                ref other => panic!("expected an Event outcome, got {other:?}"),
+            }
+        }
+        assert!(events > 0, "expected some observed events (got {events})");
+        assert!(
+            censored > 0,
+            "expected some administratively censored subjects (got {censored})"
+        );
+    }
+
+    /// An **exact-event** template (`dv = 1`) carries no administrative horizon —
+    /// its record `time` is the realized event time, not a censoring window — so
+    /// `simulate()` must draw every outcome uncensored from the model's full
+    /// predictive distribution rather than truncate at that event time. Guards
+    /// against re-introducing the re-simulation / VPC truncation bias.
+    #[test]
+    fn simulate_tte_exact_event_template_draws_uncensored() {
+        use ferx_core::{simulate_with_seed, SimOutcome};
+        // 300 exact-event rows at t=5. The (old, buggy) behaviour would have
+        // censored every draw past t=5 at the event time; the correct behaviour
+        // ignores it as a horizon and draws fresh, finite event times.
+        let model = parse_model_string(EXP_TTE_MODEL).expect("model must parse");
+        let template = common::tte_pop_from_pairs(&vec![(5.0, 1); 300]);
+
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 1234);
+        assert_eq!(sims.len(), 300, "one TTE outcome per template subject");
+
+        let mut beyond_event_time = 0usize;
+        for r in &sims {
+            match r.outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert!(
+                        observed,
+                        "an exact-event template carries no horizon → every draw is observed"
+                    );
+                    assert!(
+                        time.is_finite() && time > 0.0,
+                        "event time must be finite positive: {time}"
+                    );
+                    if time > 5.0 {
+                        beyond_event_time += 1;
+                    }
+                }
+                ref other => panic!("expected an Event outcome, got {other:?}"),
+            }
+        }
+        // With λ≈0.05 the median event time is ~14, so the bulk of draws land
+        // past t=5 — impossible under the old truncate-at-event-time behaviour.
+        assert!(
+            beyond_event_time > 0,
+            "expected draws beyond the record's event time (got {beyond_event_time})"
+        );
+    }
+
     /// `fit()` on a fixed-effects TTE model (n_eta=0, no inner loop) must
     /// return Ok immediately (single outer-loop evaluation per iteration).
     #[test]
