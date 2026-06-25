@@ -59,6 +59,7 @@ visible at the point of use:
 | Individual parameters DSL | **beta** | [Individual Parameters](model-file/individual-parameters.qmd) |
 | BLOQ / censored observations (M3) | **beta** | [BLOQ](model-file/bloq.qmd) |
 | ODE models (Dormand-Prince RK45) | **beta** | [ODE Models](model-file/ode-models.qmd) |
+| Built-in absorption models (transit / inverse-Gaussian / Weibull) | **beta** | [Absorption](model-file/absorption.qmd) |
 | Scaling | **beta** | [Scaling](model-file/scaling.qmd) |
 | Data selection | **beta** | [Data Selection](model-file/data-selection.qmd) |
 | Derived columns | **beta** | [Derived Columns](model-file/derived.qmd) |

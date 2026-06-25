@@ -1,5 +1,7 @@
 # Built-in Absorption Models
 
+> **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
+
 ferx provides built-in **absorption input-rate functions** for ODE models — a
 dose-driven appearance rate `R_in(tad)` that is added into the dosing
 compartment instead of treating the dose as an instantaneous bolus. They let you
