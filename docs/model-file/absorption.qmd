@@ -380,15 +380,27 @@ dataset. Because the data were simulated from a transit model, the Weibull fit i
 mildly mis-specified, so the check is **NONMEM-weibull ≈ ferx-weibull at the
 shared optimum** (the objective, not the optimiser path), not parameter recovery.
 
-In the meantime, the Weibull forcing is validated in-repo without NONMEM by: the
-absorption-independent **mass-balance invariant** `∫A dt = F·Dose/ke`
-(`tests/weibull_absorption.rs`), which catches a missing forcing, a
-double-counted bolus, or a mis-normalised density end-to-end through the ODE
-pipeline; and a unit-level **analytic-`Dual2` ≡ central-FD gradient** check on the
-forcing (`src/pk/absorption.rs`) plus the full ODE-integrated parity in
-`src/sens/ode_provider.rs`. The slow-gated `tests/weibull_nonmem_anchor.rs`
-follows once the licensed NONMEM run lands (the same staging as transit, where the
-feature shipped before its NONMEM anchor).
+On the mis-specified ridge ferx's derivative-free outer optimiser stalls only
+slightly short of NONMEM's gradient FOCEI (≈ 1.5 OFV units, milder than `igd`'s
+~18), so — as for `igd` — the implementation check is the **objective at the
+shared optimum**. Evaluating ferx's full FOCEI objective (inner EBEs + Laplace +
+ODE integration of the `weibull` forcing) at NONMEM's reported optimum reproduces
+it (NONMEM `ADVAN13 TOL=9`, MINIMIZATION SUCCESSFUL):
+
+| Quantity | NONMEM | ferx (at NONMEM's optimum) |
+|----------|--------|----------------------------|
+| FOCEI objective | −943.83 | **−943.85** (Δ 0.01) |
+
+evaluated at `CL 5.398`, `V 63.02`, `TD 1.656`, `BETA 3.479`. The 0.01-unit
+agreement confirms the `weibull` density and its ODE machinery reproduce the
+NONMEM `$DES` Weibull input (`nonmem_anchor/results/weibull_absorption.ext`; the
+ferx anchor is `tests/weibull_nonmem_anchor.rs`, gated behind
+`--features slow-tests`). Unlike the stiffer transit/IG forcings, the smooth
+Weibull density matches to 0.01 even at default ODE tolerances. The forcing is
+additionally validated in-repo without NONMEM by the absorption-independent
+**mass-balance invariant** `∫A dt = F·Dose/ke` (`tests/weibull_absorption.rs`) and
+the **analytic-`Dual2` ≡ central-FD gradient** parity (`src/pk/absorption.rs`,
+`src/sens/ode_provider.rs`).
 
 ## Generating the disposition — `ode_template`
 

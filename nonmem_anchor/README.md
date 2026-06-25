@@ -13,11 +13,11 @@ The transit control runs on `transit_oral.csv`; the IG and Weibull controls run
 on `igd_oral.csv` (the same data re-keyed to a 1-compartment layout — every record
 on CMT 1 — so the dose feeds the absorption compartment directly).
 
-> **Weibull run status — PENDING.** The control stream and matching ferx model are
-> committed; the NONMEM run output (`results/weibull_absorption.*`) and the
-> slow-gated `tests/weibull_nonmem_anchor.rs` follow once the licensed run lands
-> (same staging as transit: feature + AUC-mass invariant shipped first in this PR;
-> NONMEM anchor follows). Run with `nmfe75 weibull_absorption.ctl weibull_absorption.lst`.
+> **Weibull run status — DONE (#503).** The licensed NONMEM run landed
+> (`results/weibull_absorption.{ext,lst,tab,…}`, MINIMIZATION SUCCESSFUL,
+> `#OBJV = −943.833`) and the slow-gated `tests/weibull_nonmem_anchor.rs` pins the
+> verified comparison below. Re-run with
+> `nmfe75 weibull_absorption.ctl weibull_absorption.lst`.
 
 ## The dataset
 
@@ -155,6 +155,50 @@ compartment (the plan's dose-routing rule: the dose feeds the function on its
 a single central compartment carrying both the IG-driven dose and the
 observations. The two are likelihood-identical (NONMEM's depot is inert), so they
 share the same objective.
+
+### Weibull — RESULT (FOCEI, 20 subj / 240 obs)
+
+NONMEM run: `results/weibull_absorption.*` (`nmfe75`, `ADVAN13 TOL=9`,
+MINIMIZATION SUCCESSFUL, `#OBJV = −943.833`). ferx anchor:
+`tests/weibull_nonmem_anchor.rs` on `data/igd_oral.csv` (same all-CMT-1 re-key as
+the igd anchor). As with `igd`, the data are transit-truth, so this is an
+**implementation** check (`NONMEM-weibull ≈ ferx-weibull at the shared optimum`),
+not parameter recovery.
+
+**The check is the objective at the shared optimum.** Evaluating ferx's full
+FOCEI marginal objective (inner EBEs + Laplace + ODE integration of the `weibull`
+forcing) at NONMEM's reported optimum:
+
+| Quantity | NONMEM | ferx (at NONMEM's optimum) |
+|----------|--------|----------------------------|
+| FOCEI objective | −943.833 | **−943.845** (Δ 0.01) |
+
+evaluated at `CL 5.39758`, `V 63.0166`, `TD 1.65572`, `BETA 3.47905`,
+`ω²(CL) 0.0506751`, `ω²(V) 0.0420421`, `σ²(prop) 0.0479645`. Agreement to **0.01
+units** (tighter than igd's 0.02) confirms the `weibull()` density and its ODE
+machinery (forcing, dose routing, bolus suppression, superposition) reproduce the
+NONMEM `$DES` Weibull input. Unlike the stiffer transit/IG forcings, the smooth
+Weibull density matches to 0.01 even at default ODE tolerances.
+
+A **free** ferx fit (generic initials, `weibull_absorption_fit.ferx`) recovers the
+fixed effects tightly and stalls only slightly short of the ridge optimum:
+
+| Quantity | NONMEM | ferx (free fit) | Δ (ferx vs NM) |
+|----------|--------|-----------------|----------------|
+| OFV (min objective) | −943.833 | −942.359 | +1.47 |
+| TVCL  | 5.3976 | 5.4237 | +0.5% |
+| TVV   | 63.017 | 63.868 | +1.4% |
+| TVTD (scale)  | 1.6557 | 1.6581 | +0.1% |
+| TVBETA (shape) | 3.4791 | 3.4750 | −0.1% |
+| ω²(CL) | 0.0507 | 0.0343 | −32% |
+| ω²(V)  | 0.0420 | 0.0493 | +17% |
+| σ² (prop) | 0.0480 | 0.0490 | +2.2% |
+
+All four fixed effects agree within ~1.4%; the +1.47 OFV is the
+derivative-free BOBYQA outer optimiser stalling on the flat mis-specified ridge
+(ferx's *own* objective at NONMEM's point, −943.845, is below where its free fit
+lands), and the ω² spread is the usual n=20 + Laplace-on-a-ridge behaviour — not a
+density bug, which check #1 above rules out at 0.01 units.
 
 ## Implementation notes (why the streams look the way they do)
 
