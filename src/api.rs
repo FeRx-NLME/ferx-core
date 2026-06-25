@@ -217,6 +217,24 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             .to_string());
     }
 
+    // A synthetic design must have *something* to observe: continuous `times` for
+    // a Gaussian model, or TTE rows for a TTE model. The parser's `times`-or-
+    // `horizon` rule lets a Gaussian model through with `horizon` alone, which
+    // would otherwise build zero-observation subjects and fit on empty data with
+    // no diagnostic — restore the early, clear error the old `times`-required rule
+    // gave for that case (#522 review).
+    #[cfg(feature = "survival")]
+    let model_has_tte = !tte_cmts.is_empty();
+    #[cfg(not(feature = "survival"))]
+    let model_has_tte = false;
+    if sim_spec.obs_times.is_empty() && !model_has_tte {
+        return Err(
+            "[simulation] has no `times` and the model has no TTE endpoint \
+             to observe — a Gaussian model requires `times = [...]`"
+                .to_string(),
+        );
+    }
+
     // Build template population
     let subjects: Vec<Subject> = (1..=sim_spec.n_subjects)
         .map(|i| Subject {
@@ -4821,6 +4839,20 @@ pub fn simulate_with_options(
     opts: &SimulateOptions,
 ) -> Result<Vec<SimulationResult>, String> {
     use rand::SeedableRng;
+
+    // Validate the TTE horizon on the library path too — the `.ferx` parser
+    // already rejects a non-finite / non-positive horizon, but a direct caller of
+    // this API must get the same guard: a NaN window makes every `t_event < window`
+    // test false (silent NaN event times), and a `<= 0` horizon censors every
+    // subject at or before entry (#522 review).
+    if let Some(h) = opts.horizon {
+        if !h.is_finite() || h <= 0.0 {
+            return Err(format!(
+                "SimulateOptions.horizon must be finite and > 0 (got {h})"
+            ));
+        }
+    }
+
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
         None => rand::make_rng(),

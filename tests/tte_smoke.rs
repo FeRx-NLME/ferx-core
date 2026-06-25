@@ -727,6 +727,35 @@ mod survival_smoke {
         );
     }
 
+    /// The library `simulate_with_options` validates `horizon` the same way the
+    /// `.ferx` parser does: a non-finite or non-positive horizon is rejected, so a
+    /// NaN window (every `t_event < NaN` is false → silent NaN event times) or a
+    /// `<= 0` horizon (censors every subject at/before entry) cannot slip in via
+    /// the API (#522 review).
+    #[test]
+    fn simulate_with_options_rejects_bad_horizon() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model parses");
+        let pop = common::tte_competing_pop(&vec![(0.5_f64, 2u8); 4]);
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -3.0] {
+            let opts = SimulateOptions {
+                seed: Some(1),
+                match_method: None,
+                horizon: Some(bad),
+            };
+            let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+                .expect_err("non-finite / non-positive horizon must error");
+            assert!(err.contains("horizon"), "got: {err}");
+        }
+        // A valid horizon still succeeds.
+        let ok = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(10.0),
+        };
+        assert!(simulate_with_options(&model, &pop, &model.default_params, 1, &ok).is_ok());
+    }
+
     /// `predict_survival` must keep the partition invariant `Σ_k CIF_k + S_all = 1`
     /// even when the caller supplies an out-of-order time grid: the CIF telescopes
     /// the all-cause survival drop, so the grid is sorted internally. Guards the
