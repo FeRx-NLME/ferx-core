@@ -790,6 +790,54 @@ mod survival_smoke {
         }
     }
 
+    /// A **joint** PK+TTE model given only `horizon` (no `times`) must error, not
+    /// silently simulate zero PK observations. The model has a residual-error
+    /// (continuous) endpoint, so `times` is required even though it also has a TTE
+    /// endpoint — the mixed-model half of the silent-data gap the pure-Gaussian
+    /// guard left open (#522 review).
+    #[test]
+    fn simulate_block_mixed_horizon_only_errors() {
+        let model_src = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[event_model only_cause]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA
+
+[simulation]
+  n_subjects = 4
+  dose_amt   = 100
+  dose_cmt   = 1
+  horizon    = 14
+";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("mixed_horizon_only.ferx");
+        std::fs::write(&path, model_src).expect("write model");
+
+        let err = ferx_core::run_model_simulate(path.to_str().unwrap())
+            .expect_err("a joint PK+TTE model with horizon but no times must error");
+        assert!(
+            err.contains("times") && err.contains("continuous"),
+            "error must point at the missing continuous `times`: {err}"
+        );
+    }
+
     /// The library `simulate_with_options` validates `horizon` the same way the
     /// `.ferx` parser does: a non-finite or non-positive horizon is rejected, so a
     /// NaN window (every `t_event < NaN` is false → silent NaN event times) or a

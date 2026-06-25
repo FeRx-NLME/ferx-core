@@ -217,22 +217,42 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             .to_string());
     }
 
-    // A synthetic design must have *something* to observe: continuous `times` for
-    // a Gaussian model, or TTE rows for a TTE model. The parser's `times`-or-
-    // `horizon` rule lets a Gaussian model through with `horizon` alone, which
-    // would otherwise build zero-observation subjects and fit on empty data with
-    // no diagnostic — restore the early, clear error the old `times`-required rule
-    // gave for that case (#522 review).
+    // A synthetic design must have something to observe. The parser's
+    // `times`-or-`horizon` rule is deliberately permissive (a pure-TTE model has
+    // no continuous `times`), so enforce the model-specific requirement here, once
+    // the endpoints are known (#522 review):
+    //   - a model with a residual-error (continuous) endpoint needs `times` — this
+    //     keeps the pre-#522 contract and closes the gap where a Gaussian, or a
+    //     joint PK+TTE, model given only `horizon` would silently build
+    //     zero-`observation` subjects and fit on empty continuous data;
+    //   - a pure-TTE model (no error model, hence no sigma) instead needs a
+    //     `horizon`, already enforced above.
+    // A declared `[error_model]` is the signal for "produces continuous
+    // observations": it is the only thing that allocates sigma, and every model
+    // otherwise carries a default `pk_model`, so the structural model alone can't
+    // distinguish intent.
+    let model_has_continuous = !parsed.model.default_params.sigma.values.is_empty();
     #[cfg(feature = "survival")]
     let model_has_tte = !tte_cmts.is_empty();
     #[cfg(not(feature = "survival"))]
     let model_has_tte = false;
-    if sim_spec.obs_times.is_empty() && !model_has_tte {
-        return Err(
-            "[simulation] has no `times` and the model has no TTE endpoint \
-             to observe — a Gaussian model requires `times = [...]`"
-                .to_string(),
-        );
+    if sim_spec.obs_times.is_empty() {
+        if model_has_continuous {
+            return Err(
+                "[simulation] has no `times`, but the model has a continuous \
+                 (residual-error) endpoint that needs observation times — add \
+                 `times = [...]` (a joint PK + TTE design needs both `times` and a \
+                 `horizon`)"
+                    .to_string(),
+            );
+        }
+        if !model_has_tte {
+            return Err(
+                "[simulation] has no `times` and the model has no TTE endpoint \
+                 to observe at a `horizon` — nothing to simulate"
+                    .to_string(),
+            );
+        }
     }
 
     // Build template population

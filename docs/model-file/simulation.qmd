@@ -25,10 +25,17 @@ The optional `[simulation]` block defines a virtual clinical trial design for ge
 | `times` | | Continuous observation time points (Gaussian endpoints) |
 | `horizon` | | Administrative censoring time for TTE endpoints (finite, `> 0`) |
 
-A block must define **at least one of `times` or `horizon`** — `times` for a
-Gaussian (continuous) model, `horizon` for a time-to-event model. A model with a
-[time-to-event endpoint](../estimation/tte.qmd) **requires `horizon`** (see
-[TTE simulation](#tte-simulation) below).
+A block must define **at least one of `times` or `horizon`**, matched to the
+model's endpoints:
+
+- a model with a **continuous** (residual-error) endpoint **requires `times`**;
+- a model with a [**time-to-event** endpoint](../estimation/tte.qmd) **requires
+  `horizon`** (see [TTE simulation](#tte-simulation) below);
+- a **joint PK + TTE** model requires **both**.
+
+Supplying only `horizon` for a model that has a continuous endpoint is an error
+(it would otherwise simulate zero continuous observations), as is supplying only
+`times` for a TTE model.
 
 An **unknown or malformed key in `[simulation]` is a parse error** (not silently
 ignored), so a typo such as `n_subject`, or a line missing its `=` such as
