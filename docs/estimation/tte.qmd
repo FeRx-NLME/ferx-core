@@ -244,6 +244,41 @@ single-endpoint frailty; see below) — prefer SAEM/IMP for the variance compone
 Subdistribution-hazard (Fine–Gray) modelling is not currently provided;
 cause-specific hazard covers the standard pharmacometric use case.
 
+**Validation of the cumulative incidence.** The CIF is anchored at three levels:
+
+1. *Closed form (constant hazards).* For two exponential causes the actuarial
+   allocation is exact: `F_k(t) = (λ_k / Σλ)·(1 − e^{−Σλ·t})`. Asserted to
+   machine precision in `cif_two_cause_exponential_closed_form`
+   (`src/survival/mod.rs`).
+2. *Independent quadrature (time-varying hazards).* For a Weibull + Gompertz pair
+   the per-cause `F_k(t)` from `cif_curves` matches a high-resolution
+   composite-Simpson integration of the defining integral
+   `F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du` — a different numerical scheme — to within
+   `1e-3` (`cif_time_varying_matches_independent_quadrature`).
+3. *Nonparametric reference (R `cmprsk::cuminc`).* Simulating the example's two
+   exponential causes (`λ_A = 0.10`, `λ_B = 0.06`, administrative censoring at
+   `t = 14`, `N = 200 000`) and estimating the cumulative incidence with the
+   license-free `cmprsk::cuminc` reproduces ferx's analytic CIF (max absolute
+   difference `≈ 2·10⁻³`, i.e. Monte-Carlo noise):
+
+   | t | cause A — `cmprsk` | cause A — ferx | cause B — `cmprsk` | cause B — ferx |
+   |---:|---:|---:|---:|---:|
+   | 2  | 0.1708 | 0.1712 | 0.1032 | 0.1027 |
+   | 6  | 0.3848 | 0.3857 | 0.2324 | 0.2314 |
+   | 10 | 0.4970 | 0.4988 | 0.3009 | 0.2993 |
+   | 14 | 0.5565 | 0.5585 | 0.3370 | 0.3351 |
+
+   ```r
+   library(cmprsk)
+   set.seed(20260625)
+   lamA <- 0.10; lamB <- 0.06; tau <- 14; N <- 2e5
+   tA <- rexp(N, lamA); tB <- rexp(N, lamB)
+   tmin <- pmin(tA, tB); cause <- ifelse(tA < tB, 1L, 2L)
+   status <- ifelse(tmin <= tau, cause, 0L); ftime <- pmin(tmin, tau)
+   timepoints(cuminc(ftime, status, cencode = 0L), c(2, 6, 10, 14))$est
+   # ferx analytic: F_k(t) = (lam_k/(lamA+lamB)) * (1 - exp(-(lamA+lamB)*t))
+   ```
+
 ## Comparison with reference software
 
 The exponential validation dataset is `tests/reference/tte_exponential/tte_exp.csv`

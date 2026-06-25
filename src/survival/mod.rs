@@ -810,6 +810,67 @@ mod tests {
     }
 
     #[test]
+    fn cif_time_varying_matches_independent_quadrature() {
+        // Numeric anchor for the *time-varying* per-cause CIF, which the partition
+        // invariant alone does not pin down (the constant-hazard values are pinned
+        // by `cif_two_cause_exponential_closed_form`). Two increasing hazards —
+        // Weibull + Gompertz — are compared against an INDEPENDENT high-resolution
+        // composite-Simpson integration of the defining integral
+        //   F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du,   S_all(u) = exp(−Σ_j H_j(u)),
+        // which uses a different numerical scheme (direct integrand quadrature)
+        // than `cif_curves`' actuarial ΔS-allocation, so agreement is a genuine
+        // cross-check rather than a restatement. This is the closed-form-free
+        // analogue of an R `cmprsk::cuminc` cross-check (see docs/estimation/tte.qmd).
+        let (sc, sh) = (10.0_f64, 1.6_f64); // cause 0: Weibull  H=(t/sc)^sh
+        let (alpha, gamma) = (0.03_f64, 0.08_f64); // cause 1: Gompertz H=(α/γ)(e^{γt}−1)
+        let h0 = |t: f64| (sh / sc) * (t / sc).powf(sh - 1.0);
+        let cumh0 = |t: f64| (t / sc).powf(sh);
+        let h1 = |t: f64| alpha * (gamma * t).exp();
+        let cumh1 = |t: f64| (alpha / gamma) * ((gamma * t).exp() - 1.0);
+        let s_all = |t: f64| (-(cumh0(t) + cumh1(t))).exp();
+
+        // Independent reference: composite Simpson (N even) of ∫₀ᵗ h_k·S_all.
+        let ref_cif = |hk: &dyn Fn(f64) -> f64, t: f64| -> f64 {
+            let n = 60_000usize;
+            let dt = t / n as f64;
+            let mut acc = 0.0;
+            for i in 0..=n {
+                let u = i as f64 * dt;
+                let w = if i == 0 || i == n {
+                    1.0
+                } else if i % 2 == 1 {
+                    4.0
+                } else {
+                    2.0
+                };
+                acc += w * hk(u) * s_all(u);
+            }
+            acc * dt / 3.0
+        };
+
+        // `cif_curves` on a fine grid over [0, 15] (dt = 0.0025).
+        let n_grid = 6000usize;
+        let grid: Vec<f64> = (0..=n_grid)
+            .map(|i| i as f64 * 15.0 / n_grid as f64)
+            .collect();
+        let chz = vec![
+            grid.iter().map(|&t| cumh0(t)).collect::<Vec<_>>(),
+            grid.iter().map(|&t| cumh1(t)).collect::<Vec<_>>(),
+        ];
+        let (cif, s) = cif_curves(&chz);
+
+        // Check at five interior/boundary points (exact grid nodes).
+        for &idx in &[1200usize, 2400, 3600, 4800, 6000] {
+            let t = grid[idx];
+            assert_abs_diff_eq!(s[idx], s_all(t), epsilon = 1e-12);
+            assert_abs_diff_eq!(cif[0][idx], ref_cif(&h0, t), epsilon = 1e-3);
+            assert_abs_diff_eq!(cif[1][idx], ref_cif(&h1, t), epsilon = 1e-3);
+            // Sanity: still a valid partition.
+            assert_abs_diff_eq!(cif[0][idx] + cif[1][idx] + s[idx], 1.0, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
     fn observation_window_only_right_censored_has_a_horizon() {
         // A right-censored record's `time` IS the administrative horizon.
         assert_eq!(observation_window(&EventType::RightCensored, 12.0), 12.0);
