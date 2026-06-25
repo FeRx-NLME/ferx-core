@@ -27,7 +27,7 @@ use ferx_core::{fit, read_nonmem_csv};
 // effective optimisation would fail. Truth: TVCL=2.0, TVV=20.0.
 const RESET_IV_MODEL: &str = r#"
 # 1-cpt IV with two EVID=4 washout occasions. Truth: TVCL=2, TVV=20.
-# optimizer = lbfgs makes the gradient-based path (and thus the analytic reset
+# optimizer = nlopt_lbfgs makes the gradient-based path (and thus the analytic reset
 # gradient) the one actually exercised; bobyqa (default) is gradient-free.
 [parameters]
   theta TVCL(5.0, 0.05, 50.0)
@@ -50,7 +50,7 @@ const RESET_IV_MODEL: &str = r#"
 
 [fit_options]
   method     = focei
-  optimizer  = lbfgs
+  optimizer  = nlopt_lbfgs
   maxiter    = 200
   covariance = false
 "#;

@@ -38,8 +38,8 @@ use super::one_cpt::one_cpt_conc_g;
 use super::three_cpt::three_cpt_conc_g;
 use super::two_cpt::two_cpt_conc_g;
 use crate::types::{
-    CompiledModel, DoseEvent, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_F, PK_IDX_KA,
-    PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
+    CompiledModel, DoseEvent, GradientMethod, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_F,
+    PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
 };
 
 /// Exact sensitivities of one observation w.r.t. η and θ. Hessian-shaped fields
@@ -251,6 +251,24 @@ fn scaling_supported(model: &CompiledModel) -> bool {
 pub fn sens_supported(model: &CompiledModel) -> bool {
     analytical_supported(model)
         || (ODE_SENS_ENABLED && crate::sens::ode_provider::ode_analytical_supported(model))
+}
+
+/// Whether the exact analytic **outer** (population) FOCE/FOCEI gradient is
+/// available for `model`: it is in the sensitivity provider's scope (non-IOV
+/// [`sens_supported`] or [`iov_analytical_supported`]) and the user did not
+/// force finite differences via `gradient_method = fd`.
+///
+/// Single source of truth for the analytic-vs-FD outer-gradient decision. The
+/// outer-loop gradient dispatch (`outer_optimizer::population_gradient`),
+/// [`Optimizer::resolve_auto`](crate::types::Optimizer::resolve_auto), and
+/// `build_info::gradient_method_outer` all consult this so the `auto` optimizer
+/// can never resolve to a gradient-based optimizer while the loop actually
+/// computes an FD gradient (a drift that would run a gradient optimizer on a
+/// noisy FD gradient). The per-eval `reconverge_gradient_interval` override is
+/// orthogonal and handled at the dispatch site, not here.
+pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
+    !matches!(model.gradient_method, GradientMethod::Fd)
+        && (sens_supported(model) || iov_analytical_supported(model))
 }
 
 /// Whether the light **ODE inner** η-gradient (`Dual1`) serves this model+subject:
@@ -1537,8 +1555,14 @@ fn subject_eta_grad_impl(
         .as_ref()
         .filter(|prog| prog_covers_required_pk_slots(model, prog))
         .and_then(|prog| {
-            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
-                .map(|pd| (pd.dp_deta, prog.pk_slots()))
+            // Light `Dual1<n_eta>` η-gradient: the inner EBE loop consumes only
+            // `∂p/∂η`, so seeding η alone avoids the θ-axes and second-order
+            // Hessian the full `Dual2` `param_derivatives_from_prog` carries (#485
+            // follow-up).
+            crate::sens::ode_provider::param_eta_derivatives_from_prog(
+                prog, model, subject, theta, eta,
+            )
+            .map(|dp_deta| (dp_deta, prog.pk_slots()))
         }) {
         Some(v) => v,
         None => {
@@ -2550,8 +2574,24 @@ mod tests {
     use super::*;
     use crate::parser::model_parser::parse_model_string;
     use crate::pk::compute_predictions_with_tv;
-    use crate::types::{DoseEvent, Subject};
+    use crate::types::{test_helpers, DoseEvent, Subject};
     use std::collections::HashMap;
+
+    #[test]
+    fn analytic_outer_gradient_available_tracks_scope_and_fd() {
+        // Analytical PK model with `gradient = auto` → analytic outer gradient.
+        assert!(analytic_outer_gradient_available(
+            &test_helpers::analytical_model(GradientMethod::Auto)
+        ));
+        // `gradient = fd` forces FD even for an analytical model.
+        assert!(!analytic_outer_gradient_available(
+            &test_helpers::analytical_model(GradientMethod::Fd)
+        ));
+        // An ODE model is outside the analytic scope.
+        assert!(!analytic_outer_gradient_available(
+            &test_helpers::ode_model(GradientMethod::Auto)
+        ));
+    }
 
     const WARFARIN: &str = r#"
 [parameters]

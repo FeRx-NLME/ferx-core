@@ -262,9 +262,17 @@ pub struct PredictionResult {
 For each replicate and each subject:
 
 1. Sample random effects: $\eta_i \sim N(0, \Omega)$ using the Cholesky factor $L$: $\eta = L \cdot z$, where $z \sim N(0, I)$
-2. Compute individual PK parameters via `pk_param_fn(theta, eta, covariates)`
-3. Generate predictions using the structural model
-4. Add residual error: $DV = IPRED + \sqrt{V} \cdot \epsilon$, where $\epsilon \sim N(0, 1)$ and $V$ is the residual variance from the error model
+2. Generate predictions through the same time-varying-covariate-aware dispatcher
+   used by estimation and `predict()` (`compute_predictions_with_tv`). PK
+   parameters are recomputed per event from each row's covariate snapshot, so a
+   covariate that changes over a subject's record (e.g. body weight) drives the
+   prediction at each time — not just the baseline value. Subjects with no
+   time-varying covariates stay on the single-evaluation fast path
+   (`pk_param_fn(theta, eta, covariates)`), so their output is unchanged.
+3. Add residual error: $DV = IPRED + \sqrt{V} \cdot \epsilon$, where $\epsilon \sim N(0, 1)$ and $V$ is the residual variance from the error model. FREM covariate pseudo-observations (`FREMTYPE > 0`) instead use the additive covariate error $V = \sigma_\text{EPSCOV}^2$, matching the FREM likelihood.
+
+The same per-event covariate snapshots drive the NPDE/NPD diagnostics and the
+NCA-based start-value sweep, so all simulation-backed surfaces agree.
 
 ## Simulation with Uncertainty Process
 

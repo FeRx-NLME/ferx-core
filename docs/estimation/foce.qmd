@@ -47,7 +47,7 @@ If the EBE search wanders into a region where the individual NLL evaluates to a 
 
 ### Gradient accuracy vs cost (reconverged EBEs)
 
-By default the population gradient holds each subject's EBEs ($\hat\eta$) and FOCE Hessian fixed while perturbing the population parameters — the *fixed-EBE* gradient. This is cheap, but it omits the response of the inner solution to $\theta$ and $\Omega$. On well-conditioned problems that omitted term is negligible and a gradient optimizer matches the derivative-free `bobyqa` (the default; see [Outer Optimizers](optimizers.qmd)). On **ill-conditioned** problems it is not: the omitted term is what separates a true descent direction from a flat-looking plateau, and `slsqp` can report `converged` at an OFV far above the `bobyqa` optimum — which is exactly why `bobyqa` is the default.
+By default the population gradient holds each subject's EBEs ($\hat\eta$) and FOCE Hessian fixed while perturbing the population parameters — the *fixed-EBE* gradient. This is cheap, but it omits the response of the inner solution to $\theta$ and $\Omega$. On well-conditioned problems that omitted term is negligible and a gradient optimizer matches the derivative-free `bobyqa` (see [Outer Optimizers](optimizers.qmd)). On **ill-conditioned** problems it is not: the omitted term is what separates a true descent direction from a flat-looking plateau, and `slsqp` can report `converged` at an OFV far above the `bobyqa` optimum — which is exactly why the default `optimizer = auto` falls back to `bobyqa` on the FD-only fits where this bias bites.
 
 Set `reconverge_gradient_interval = 1` (in `[fit_options]`) to re-solve the inner EBE loop at every finite-difference perturbation, recovering the full surface. This costs roughly **5–6×** per gradient — reserve it for fits whose OFV looks suspiciously high. IOV models (`kappa`/`block_kappa`) always reconverge, so the setting is a no-op there; it only changes non-IOV fits.
 
@@ -66,7 +66,7 @@ To amortize that cost, `reconverge_gradient_interval = N` reconverges only every
 
 The fixed-EBE gradient stalls `slsqp` ~2,650 OFV units above `bobyqa`. Reconverging the EBEs on every gradient evaluation closes the entire gap and reaches an optimum marginally below `bobyqa`'s — and below the point NONMEM converged to (NONMEM's estimates score 67,514 under ferx's likelihood), confirming the stall was a gradient-bias artifact, not a worse model.
 
-A larger `reconverge_gradient_interval` trades that accuracy back for speed: reconverging every 5th or 10th gradient still closes ~80% of the stall, but the OFV degrades monotonically as the interval grows (the cheap fixed-EBE gradients in between bias the direction enough that `slsqp` declares convergence slightly early). On this problem every interval setting is dominated by `bobyqa` on *both* OFV and wall time — which is why `bobyqa` is the default. The reconverged-`slsqp` path earns its keep when a gradient optimizer is required (e.g. parameter count high enough that derivative-free search scales poorly, or downstream tooling that consumes the optimizer's gradient).
+A larger `reconverge_gradient_interval` trades that accuracy back for speed: reconverging every 5th or 10th gradient still closes ~80% of the stall, but the OFV degrades monotonically as the interval grows (the cheap fixed-EBE gradients in between bias the direction enough that `slsqp` declares convergence slightly early). On this problem every interval setting is dominated by `bobyqa` on *both* OFV and wall time — which is why the default `optimizer = auto` selects `bobyqa` on FD-only fits like this one. The reconverged-`slsqp` path earns its keep when a gradient optimizer is required (e.g. parameter count high enough that derivative-free search scales poorly, or downstream tooling that consumes the optimizer's gradient).
 
 ## FOCE vs FOCEI
 
@@ -285,5 +285,5 @@ The inner loop warm-starts EBE estimation from the previous outer iteration's EB
   method     = focei
   maxiter    = 500
   covariance = true
-  # optimizer omitted → uses the default (bobyqa); set explicitly to switch
+  # optimizer omitted → uses the default (auto); set explicitly to switch
 ```

@@ -232,6 +232,10 @@ mod tests {
         FitOptions {
             verbose: false,
             run_covariance_step: true,
+            // Pin the derivative-free outer optimizer: this test exercises the
+            // SIR plumbing, not the optimizer-default choice, so keep it on the
+            // path it was validated against rather than the `auto` default (#490).
+            optimizer: crate::types::Optimizer::Bobyqa,
             sir_samples: 8,
             sir_resamples: 4,
             sir_seed: Some(1),

@@ -23,8 +23,9 @@ The optional `[simulation]` block defines a virtual clinical trial design for ge
 | `seed` | | Random seed for reproducible simulations |
 | `times` | | Observation time points (required) |
 
-An **unknown key in `[simulation]` is a parse error** (not silently ignored), so a
-typo such as `n_subject` is reported rather than falling back to the default.
+An **unknown or malformed key in `[simulation]` is a parse error** (not silently
+ignored), so a typo such as `n_subject`, or a line missing its `=` such as
+`n_subjects 6`, is reported rather than falling back to the default.
 
 ## Example
 

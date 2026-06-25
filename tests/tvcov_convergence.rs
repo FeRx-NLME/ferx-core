@@ -28,8 +28,8 @@ use ferx_core::{fit, read_nonmem_csv};
 
 // Initials are well off the recovery tolerances so a regression that did no
 // effective optimisation would fail. Truth: TVCL=0.15, TVV=8.0, TVKA=1.0,
-// THETA_WT=0.75. `optimizer = lbfgs` makes the gradient-based path (and thus the
-// analytic TV-cov gradient) the one actually exercised.
+// THETA_WT=0.75. `optimizer = nlopt_lbfgs` makes the gradient-based path (and thus
+// the analytic TV-cov gradient) the one actually exercised.
 const TVCOV_ORAL_MODEL: &str = r#"
 # 1-cpt oral with allometric WT-on-CL. Truth: TVCL=0.15, TVV=8, TVKA=1, THETA_WT=0.75.
 [parameters]
@@ -59,7 +59,7 @@ const TVCOV_ORAL_MODEL: &str = r#"
 
 [fit_options]
   method     = focei
-  optimizer  = lbfgs
+  optimizer  = nlopt_lbfgs
   maxiter    = 200
   covariance = false
 "#;

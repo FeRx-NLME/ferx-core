@@ -19,7 +19,7 @@ use crate::estimation::parameterization::{
 };
 use crate::types::{FitResult, ModelParameters, OmegaMatrix, SigmaVector};
 use nalgebra::{DMatrix, DVector};
-use rand::Rng;
+use rand::{Rng, RngExt};
 use rand_distr::StandardNormal;
 
 /// How parameter-uncertainty draws are produced.
@@ -278,7 +278,7 @@ fn draw_sir(
             ));
         }
         tries += 1;
-        let idx = rng.gen_range(0..pool.len());
+        let idx = rng.random_range(0..pool.len());
         let mut x_k = pool[idx].clone();
         // Re-pin fixed indices defensively: SIR samples should already
         // respect the pin (SIR's own bounds use `compute_bounds`), but

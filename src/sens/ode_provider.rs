@@ -473,6 +473,26 @@ fn param_eta_derivatives(
     eta: &[f64],
 ) -> Option<Vec<Vec<f64>>> {
     let prog = model.ode_spec.as_ref()?.indiv_param_program.as_ref()?;
+    param_eta_derivatives_from_prog(prog, model, subject, theta, eta)
+}
+
+/// First-order `∂p/∂η` (the η-block of [`ParamDerivs::dp_deta`]) from an explicit
+/// individual-parameter program, over a `Dual1<M>` seeded on η (`M = n_eta`). The
+/// light inner counterpart of [`param_derivatives_from_prog`], shared by the ODE
+/// provider (program on `ode_spec`) and the analytical PK provider (program on
+/// `indiv_param_partials`): it skips the θ-axes and second-order Hessian the full
+/// `Dual2` path computes, since the inner EBE η-gradient consumes only `dp_deta`
+/// (#410). Dispatches on `n_eta` alone — so unlike the `Dual2`
+/// [`param_derivatives_from_prog`] it still serves models whose combined
+/// `n_theta + n_eta` exceeds the dual dispatch ceiling, as long as `n_eta` does
+/// not. Returns `None` on the same axis-count mismatch as the full path.
+pub(crate) fn param_eta_derivatives_from_prog(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<Vec<f64>>> {
     if prog.n_theta_axis() != model.n_theta || prog.n_eta_axis() != model.n_eta {
         return None;
     }
@@ -880,8 +900,8 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
 fn run_subject<const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    _theta: &[f64],
+    _eta: &[f64],
     pk_values: &[f64],
     pd: &ParamDerivs,
 ) -> Option<SubjectSens> {
@@ -978,8 +998,8 @@ fn run_subject<const N: usize>(
 fn run_subject_mixed<const NA: usize, const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    _theta: &[f64],
+    _eta: &[f64],
     pk_values: &[f64],
     pd: &ParamDerivs,
     axis_of: &[usize],

@@ -30,6 +30,7 @@ use crate::stats::special::ln_gamma;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_distr::{ChiSquared, Distribution, StandardNormal};
 use rayon::prelude::*;
@@ -112,7 +113,7 @@ fn sobol_normal_draws(d: usize, k_samples: usize, seed: u64) -> Vec<Vec<f64>> {
 
     // Cranley-Patterson rotation: shift Sobol points by a uniform random vector
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(0x534F_424F_4C00_0000u64));
-    let shift: Vec<f64> = (0..d).map(|_| rand::Rng::gen::<f64>(&mut rng)).collect();
+    let shift: Vec<f64> = (0..d).map(|_| rng.random::<f64>()).collect();
 
     let params = JoeKuoD6::minimal(); // supports up to 100 dims
     let sobol_seq = Sobol::<f64>::new(d, &params);

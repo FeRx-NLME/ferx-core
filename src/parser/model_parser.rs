@@ -2120,8 +2120,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Theta/eta indices used in event_model expressions are collected here so
     // that check_unused_parameters (below) can suppress false "not referenced"
     // warnings for parameters that only appear in [event_model].
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_thetas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_etas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     #[cfg(feature = "survival")]
@@ -3520,7 +3522,14 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
     for line in lines {
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
         if parts.len() != 2 {
-            continue;
+            // No `=` on a non-blank, non-comment line (comments/blanks are already
+            // stripped by `extract_blocks`). Treat it as a hard error rather than
+            // silently skipping — e.g. `n_subjects 5` must not fall back to the
+            // default, which is the whole point of this block's strict parsing.
+            return Err(format!(
+                "[simulation]: malformed line (expected `key = value`): {}",
+                line.trim()
+            ));
         }
         match parts[0] {
             // `n_subjects` / `dose_amt` / `dose_cmt` are the canonical spellings
@@ -3546,9 +3555,12 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
             "seed" => {
                 seed = parts[1]
                     .parse()
-                    .map_err(|_| format!("[simulation]: bad seed: {}", line))?
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
             }
-            "times" => obs_times = parse_float_array(parts[1])?,
+            "times" => {
+                obs_times = parse_float_array(parts[1])
+                    .map_err(|e| format!("[simulation]: bad times: {e}"))?
+            }
             other => return Err(format!("[simulation]: unknown key `{}`", other)),
         }
     }
@@ -3774,20 +3786,26 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
             opts.optimizer = match value.to_lowercase().as_str() {
+                // `auto` (the default) picks nlopt_lbfgs when the analytic
+                // FOCE/FOCEI gradient is available, bobyqa otherwise (#490).
+                "auto" => Optimizer::Auto,
                 "slsqp" => Optimizer::Slsqp,
-                // `lbfgs` is the built-in limited-memory L-BFGS (analytic gradient,
-                // Eq. 48 warm EBEs, no SLSQP polish). The NLopt L-BFGS + SLSQP-polish
-                // path is still reachable explicitly via `nlopt_lbfgs`.
-                "lbfgs" => Optimizer::Lbfgs,
-                "nlopt_lbfgs" => Optimizer::NloptLbfgs,
+                // `lbfgs` and `bfgs` are deprecated aliases for `nlopt_lbfgs`: they now
+                // select the NLopt L-BFGS (+ SLSQP polish) path. The hand-rolled
+                // built-in BFGS/L-BFGS is strictly worse — 3–5× slower on
+                // analytic-gradient models and prone to diverging or hanging on harder
+                // problems (see #483) — so the keyword no longer reaches it. The
+                // `Optimizer::Bfgs`/`Lbfgs` variants remain for a Rust caller that
+                // constructs them directly, pending removal.
+                "lbfgs" | "bfgs" | "nlopt_lbfgs" => Optimizer::NloptLbfgs,
                 "mma" => Optimizer::Mma,
-                "bfgs" => Optimizer::Bfgs,
                 "bobyqa" => Optimizer::Bobyqa,
                 "trust_region" | "newton_tr" => Optimizer::TrustRegion,
                 other => {
                     return Err(format!(
                         "fit option `optimizer`: unknown value `{other}` — expected \
-                         slsqp/lbfgs/nlopt_lbfgs/mma/bfgs/bobyqa/trust_region"
+                         auto/bobyqa/slsqp/nlopt_lbfgs/mma/trust_region (`lbfgs` and \
+                         `bfgs` are accepted as deprecated aliases for `nlopt_lbfgs`)"
                     ));
                 }
             };
@@ -7289,9 +7307,23 @@ fn build_pk_param_fn(
     // `stmts_owned` / the mappings. `pk_var_slots` is `(pk_slot, var_slot)` per
     // individual parameter; ODE models use `ode_assignment_mapping`, analytical
     // models `pk_assignment_mapping` (both are `(pk_slot, var_slot)`).
+    // Classify cov-static var slots once (#485): the analytic η/θ sensitivity
+    // walks fold these to `f64` constants instead of re-deriving the covariate
+    // kernel under dual arithmetic on every inner/outer evaluation. Drop the mask
+    // when nothing is foldable so the eval paths stay on the original branch.
+    let cov_static_mask = {
+        let m = compute_cov_static_mask(&stmts_owned, n_vars);
+        if m.iter().any(|&b| b) {
+            m
+        } else {
+            Vec::new()
+        }
+    };
+
     let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
+        cov_static_mask,
         pk_var_slots: if is_analytical_pk {
             pk_assignment_mapping.clone()
         } else {
@@ -9032,12 +9064,21 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
     vars: &mut [T],
     du: Option<&mut [T]>,
     bc_stack: &mut Vec<T>,
+    // Per var-slot mask: when `skip[idx]` is `true`, the `AssignBc(idx, _)` for
+    // that slot is NOT re-evaluated — its value is assumed already present in
+    // `vars` (the cov-static constant-folding pre-seed, #485). Empty slice =
+    // skip nothing (every other caller passes `&[]`). Conditions are still
+    // evaluated and branches still descended, so control flow is identical.
+    skip: &[bool],
 ) {
     let empty_nn: Vec<Vec<f64>> = Vec::new();
     let mut du_opt = du;
     for s in stmts {
         match s {
             Statement::AssignBc(idx, bc) => {
+                if skip.get(*idx).copied().unwrap_or(false) {
+                    continue;
+                }
                 let v = eval_bytecode_g::<T>(bc, theta, eta, cov, vars, &empty_nn, bc_stack);
                 if let Some(slot) = vars.get_mut(*idx) {
                     *slot = v;
@@ -9071,6 +9112,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                             vars,
                             du_opt.as_deref_mut(),
                             bc_stack,
+                            skip,
                         );
                         taken = true;
                         break;
@@ -9086,6 +9128,7 @@ fn eval_statements_g<T: crate::sens::num::PkNum>(
                             vars,
                             du_opt.as_deref_mut(),
                             bc_stack,
+                            skip,
                         );
                     }
                 }
@@ -9171,8 +9214,116 @@ impl OdeRhsProgram {
         }
         // The ODE RHS references states/indiv-params (in `vars`) only, not
         // θ/η/cov directly — so those are empty here.
-        eval_statements_g::<T>(&self.stmts, &[], &[], &[], vars, Some(du), stack);
+        eval_statements_g::<T>(&self.stmts, &[], &[], &[], vars, Some(du), stack, &[]);
     }
+}
+
+/// Does this compiled expression's value vary across the dual axes the
+/// sensitivity providers differentiate — i.e. does it read η, *any* θ, an NN
+/// output, or a variable already known to be dynamic? Reading only covariates,
+/// literals, and other cov-static variables makes it cov-static (foldable to a
+/// constant). See [`compute_cov_static_mask`] (#485).
+///
+/// θ is treated as dynamic even when FIXED: the `Dual2` path seeds *every* θ
+/// (FIXED included) as a variable, so a FIXED-θ-dependent slot still carries a
+/// non-zero `∂/∂θ_fixed` column that folding to a constant would silently zero.
+/// Restricting the fold to genuinely θ-free slots keeps it bit-identical to the
+/// unfolded walk on all axes.
+fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
+    bc.ops.iter().any(|op| match op {
+        Op::PushEta(_) | Op::PushTheta(_) | Op::PushNnOutput(_, _) => true,
+        Op::PushVar(i) => dyn_vars.get(*i as usize).copied().unwrap_or(false),
+        _ => false,
+    })
+}
+
+/// Condition counterpart of [`bytecode_is_dynamic`], over the (resolved) AST a
+/// branch condition still carries. An unresolved `Variable` is treated as
+/// dynamic (conservative — it never appears in a resolved program).
+fn expr_is_dynamic(e: &Expression, dyn_vars: &[bool]) -> bool {
+    match e {
+        Expression::Eta(_) | Expression::Theta(_) | Expression::NnOutput { .. } => true,
+        Expression::Variable(_) => true,
+        Expression::VariableIdx(i) => dyn_vars.get(*i).copied().unwrap_or(false),
+        Expression::Literal(_) | Expression::Covariate(_) | Expression::CovariateIdx(_) => false,
+        Expression::BinOp(a, _, b) | Expression::Power(a, b) => {
+            expr_is_dynamic(a, dyn_vars) || expr_is_dynamic(b, dyn_vars)
+        }
+        Expression::UnaryFn(_, a) => expr_is_dynamic(a, dyn_vars),
+        Expression::Conditional(c, a, b) => {
+            cond_is_dynamic(c, dyn_vars)
+                || expr_is_dynamic(a, dyn_vars)
+                || expr_is_dynamic(b, dyn_vars)
+        }
+    }
+}
+
+fn cond_is_dynamic(c: &Condition, dyn_vars: &[bool]) -> bool {
+    match c {
+        Condition::Compare(l, _, r) => expr_is_dynamic(l, dyn_vars) || expr_is_dynamic(r, dyn_vars),
+        Condition::And(a, b) | Condition::Or(a, b) => {
+            cond_is_dynamic(a, dyn_vars) || cond_is_dynamic(b, dyn_vars)
+        }
+        Condition::Not(c) => cond_is_dynamic(c, dyn_vars),
+    }
+}
+
+/// Classify each individual-parameter var slot as **cov-static** (`true`): its
+/// value is constant across every (θ, η) axis the analytic sensitivity providers
+/// differentiate, so the `Dual2`/`Dual1` walks can pre-seed it as a constant
+/// computed once in plain `f64` instead of carrying it through dual arithmetic
+/// (#485). A slot is cov-static iff every assignment to it reads only covariates,
+/// literals, and other cov-static slots, AND it is never assigned under an `if`
+/// whose governing condition is itself dynamic.
+///
+/// Computed by monotone fixpoint over the `dynamic` complement: a pass marks a
+/// slot dynamic when its bytecode, an enclosing condition, or a referenced slot
+/// is dynamic; passes repeat until no slot flips (var refs can be forward, so a
+/// single pass is not enough). `n_vars` is small (tens), so this is cheap and
+/// runs once at compile time. The returned mask has length `n_vars`.
+fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> {
+    fn walk(stmts: &[Statement], ctx_dynamic: bool, dyn_vars: &mut [bool], changed: &mut bool) {
+        for s in stmts {
+            match s {
+                Statement::AssignBc(idx, bc) => {
+                    let already = dyn_vars.get(*idx).copied().unwrap_or(true);
+                    if !already && (ctx_dynamic || bytecode_is_dynamic(bc, dyn_vars)) {
+                        if let Some(slot) = dyn_vars.get_mut(*idx) {
+                            *slot = true;
+                            *changed = true;
+                        }
+                    }
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // The `else` arm fires only when *every* branch condition was
+                    // false, so it is governed by all of them: dynamic if any is.
+                    let mut any_cond_dynamic = ctx_dynamic;
+                    for (cond, body) in branches {
+                        let branch_dynamic = ctx_dynamic || cond_is_dynamic(cond, dyn_vars);
+                        any_cond_dynamic |= branch_dynamic;
+                        walk(body, branch_dynamic, dyn_vars, changed);
+                    }
+                    if let Some(eb) = else_body {
+                        walk(eb, any_cond_dynamic, dyn_vars, changed);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut dyn_vars = vec![false; n_vars];
+    loop {
+        let mut changed = false;
+        walk(stmts, false, &mut dyn_vars, &mut changed);
+        if !changed {
+            break;
+        }
+    }
+    dyn_vars.iter().map(|&d| !d).collect()
 }
 
 /// Compiled `[individual_parameters]` block + var layout, exposed so the
@@ -9184,6 +9335,13 @@ impl OdeRhsProgram {
 pub struct IndivParamProgram {
     stmts: Vec<Statement>,
     n_vars: usize,
+    /// Per var-slot mask: `true` = the slot is cov-static (constant across every
+    /// θ / η dual axis), so [`eval_param_duals`](Self::eval_param_duals) and
+    /// [`eval_param_eta_grad`](Self::eval_param_eta_grad) compute it once in `f64`
+    /// and seed it as a dual constant instead of re-running the (often pow/exp/log
+    /// heavy) covariate kernel under dual arithmetic every call (#485). Empty when
+    /// no slot is foldable, in which case both paths run exactly as before.
+    cov_static_mask: Vec<bool>,
     /// `(pk_slot, var_slot)` per individual parameter, in declaration order
     /// (parallel to `CompiledModel.pk_indices`).
     pk_var_slots: Vec<(usize, usize)>,
@@ -9261,6 +9419,19 @@ impl IndivParamProgram {
             .collect();
         let mut vars = vec![Dual2::<M>::constant(0.0); self.n_vars];
         let mut stack: Vec<Dual2<M>> = Vec::new();
+        // Cov-static fold (#485): evaluate the constant-across-(θ,η) slots once in
+        // plain f64, seed them as dual constants (zero gradient/Hessian — exactly
+        // what they carry), and skip their (pow/exp/log heavy) re-derivation in the
+        // Dual2 walk. `skip` empty ⇒ original full-dual path.
+        let skip: &[bool] = &self.cov_static_mask;
+        if !skip.is_empty() {
+            let static_vals = self.eval_cov_static_f64(theta, &cov_vec);
+            for (v, &is_static) in skip.iter().enumerate() {
+                if is_static {
+                    vars[v] = Dual2::constant(static_vals[v]);
+                }
+            }
+        }
         eval_statements_g::<Dual2<M>>(
             &self.stmts,
             &theta_d,
@@ -9269,11 +9440,48 @@ impl IndivParamProgram {
             &mut vars,
             None,
             &mut stack,
+            skip,
         );
         self.pk_var_slots
             .iter()
             .map(|&(_, vs)| vars.get(vs).copied().unwrap_or(Dual2::constant(0.0)))
             .collect()
+    }
+
+    /// Compute the f64 values of the cov-static var slots (the slots flagged in
+    /// `cov_static_mask`), evaluating only those assignments — the dynamic ones
+    /// are skipped, so their slots stay `0.0` and must not be read. Branch
+    /// conditions are still evaluated (cheap comparisons); cov-static slots are
+    /// only ever governed by cov-static conditions, so the decisions — and hence
+    /// the returned values — are independent of the η seed used here (#485).
+    fn eval_cov_static_f64(&self, theta: &[f64], cov_vec: &[f64]) -> Vec<f64> {
+        use crate::sens::dual2::Dual2;
+        let dynamic: Vec<bool> = self.cov_static_mask.iter().map(|&s| !s).collect();
+        // Evaluated over a zero-width `Dual2<0>` (no gradient/Hessian axes), NOT
+        // native `f64`: the dual divides via `× recip` and raises powers via the
+        // dual `powd`, both of which differ from `f64::/` / `f64::powf` by up to
+        // 1 ULP. A division-bearing covariate kernel (CKD-EPI, Schwartz
+        // `0.413·HEIGHT/CREAT`, FFM) would otherwise make a folded slot drift ~1
+        // ULP from the unfolded walk. Both `Dual1<M>` and `Dual2<M>` share the
+        // `× recip` division and the same `powd`/`exp`/`ln` value arithmetic, and
+        // the `.value` field is computed independently of the axis count, so a
+        // `Dual2<0>` `.value` is bit-for-bit equal to what either unfolded path
+        // computes for the same slot — keeping the fold exactly identical (#485).
+        let theta_d: Vec<Dual2<0>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
+        let eta_zero = vec![Dual2::<0>::constant(0.0); self.n_eta];
+        let mut vars = vec![Dual2::<0>::constant(0.0); self.n_vars];
+        let mut stack: Vec<Dual2<0>> = Vec::new();
+        eval_statements_g::<Dual2<0>>(
+            &self.stmts,
+            &theta_d,
+            &eta_zero,
+            cov_vec,
+            &mut vars,
+            None,
+            &mut stack,
+            &dynamic,
+        );
+        vars.iter().map(|d| d.value).collect()
     }
 
     /// Evaluate the individual parameters over `Dual1<M>` seeded on **η only**
@@ -9308,6 +9516,17 @@ impl IndivParamProgram {
             .collect();
         let mut vars = vec![Dual1::<M>::constant(0.0); self.n_vars];
         let mut stack: Vec<Dual1<M>> = Vec::new();
+        // Cov-static fold (#485): same as the Dual2 path — cov-static slots are a
+        // fortiori η-independent, so seeding them as Dual1 constants is exact.
+        let skip: &[bool] = &self.cov_static_mask;
+        if !skip.is_empty() {
+            let static_vals = self.eval_cov_static_f64(theta, &cov_vec);
+            for (v, &is_static) in skip.iter().enumerate() {
+                if is_static {
+                    vars[v] = Dual1::constant(static_vals[v]);
+                }
+            }
+        }
         eval_statements_g::<Dual1<M>>(
             &self.stmts,
             &theta_d,
@@ -9316,6 +9535,7 @@ impl IndivParamProgram {
             &mut vars,
             None,
             &mut stack,
+            skip,
         );
         self.pk_var_slots
             .iter()
@@ -12908,10 +13128,12 @@ mod tests {
     #[test]
     fn test_apply_fit_option_optimizer_and_bloq() {
         let mut opts = FitOptions::default();
-        // `lbfgs` resolves to the built-in limited-memory L-BFGS; the NLopt
-        // L-BFGS + SLSQP-polish path keeps the explicit `nlopt_lbfgs` keyword.
+        // `lbfgs` and `bfgs` are deprecated aliases for `nlopt_lbfgs` — all three
+        // resolve to the NLopt L-BFGS (+ SLSQP polish) path. See #483.
         assert_eq!(apply_fit_option(&mut opts, "optimizer", "lbfgs"), Ok(true));
-        assert_eq!(opts.optimizer, Optimizer::Lbfgs);
+        assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
+        assert_eq!(apply_fit_option(&mut opts, "optimizer", "bfgs"), Ok(true));
+        assert_eq!(opts.optimizer, Optimizer::NloptLbfgs);
         assert_eq!(
             apply_fit_option(&mut opts, "optimizer", "nlopt_lbfgs"),
             Ok(true)
@@ -14573,6 +14795,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_optimizer_auto() {
+        let content = minimal_model_with_fit_options("  optimizer = auto");
+        let parsed = parse_full_model(&content).unwrap();
+        assert_eq!(parsed.fit_options.optimizer, Optimizer::Auto);
+    }
+
+    #[test]
     fn test_parse_optimizer_trust_region() {
         let content = minimal_model_with_fit_options("  optimizer = trust_region");
         let parsed = parse_full_model(&content).unwrap();
@@ -14588,6 +14817,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_optimizer_lbfgs_bfgs_alias_nlopt() {
+        // `lbfgs` and `bfgs` are deprecated aliases for `nlopt_lbfgs`: all three
+        // select the NLopt L-BFGS path. The hand-rolled built-in is no longer
+        // reachable by keyword. See #483.
+        for key in ["lbfgs", "bfgs", "nlopt_lbfgs"] {
+            let content = minimal_model_with_fit_options(&format!("  optimizer = {key}"));
+            let parsed = parse_full_model(&content).unwrap();
+            assert_eq!(
+                parsed.fit_options.optimizer,
+                Optimizer::NloptLbfgs,
+                "optimizer = {key} should resolve to NLopt L-BFGS"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_optimizer_case_insensitive() {
         // Parser lowercases the value, so mixed-case should map the same way.
         let content = minimal_model_with_fit_options("  optimizer = BOBYQA");
@@ -14600,13 +14845,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_optimizer_defaults_to_bobyqa() {
+    fn test_parse_optimizer_defaults_to_auto() {
         // `[fit_options]` block present but `optimizer` omitted → default is
-        // BOBYQA (derivative-free trust-region). See `FitOptions::default` for
-        // the rationale.
+        // `auto`, which resolves per-model to nlopt_lbfgs (analytic gradient) or
+        // bobyqa (FD only). See `FitOptions::default` and #490.
         let content = minimal_model_with_fit_options("  maxiter = 100");
         let parsed = parse_full_model(&content).unwrap();
-        assert_eq!(parsed.fit_options.optimizer, Optimizer::Bobyqa);
+        assert_eq!(parsed.fit_options.optimizer, Optimizer::Auto);
     }
 
     #[test]
@@ -14637,10 +14882,10 @@ mod tests {
     #[test]
     fn test_fit_options_defaults() {
         // Guard against accidental drift in defaults — documented as:
-        //   optimizer = bobyqa, inner_maxiter = 200, inner_tol = 1e-5,
+        //   optimizer = auto, inner_maxiter = 200, inner_tol = 1e-5,
         //   steihaug_max_iters = None (adaptive).
         let opts = FitOptions::default();
-        assert_eq!(opts.optimizer, Optimizer::Bobyqa);
+        assert_eq!(opts.optimizer, Optimizer::Auto);
         assert_eq!(opts.inner_maxiter, 200);
         assert!((opts.inner_tol - 1e-5).abs() < 1e-20);
         assert_eq!(opts.steihaug_max_iters, None);
@@ -18576,7 +18821,7 @@ if (WT > 70) {
         ];
         let mut dud = vec![Dual2::<1>::constant(0.0)];
         let mut sd: Vec<Dual2<1>> = Vec::new();
-        eval_statements_g::<Dual2<1>>(&stmts, &[], &[], &[], &mut vd, Some(&mut dud), &mut sd);
+        eval_statements_g::<Dual2<1>>(&stmts, &[], &[], &[], &mut vd, Some(&mut dud), &mut sd, &[]);
 
         assert!(close(dud[0].value, duf[0], 1e-12, 1e-12), "value vs f64");
         // du[0] = −k·u = −0.6; ∂/∂k = −u = −2; ∂²/∂k² = 0.
@@ -21037,6 +21282,417 @@ CL V KA WT
         assert_eq!(opts.frem_sigma.as_deref(), Some("EPSCOV"));
     }
 
+    /// #485: the cov-static constant fold in `eval_param_duals` /
+    /// `eval_param_eta_grad` must be bit-identical to the unfolded path. The
+    /// model below has a covariate + FIXED-θ kernel (`FMAT`, `FAC` — foldable)
+    /// and a dynamic tail (`CL = free-θ × … × exp(η)` — not foldable).
+    const COV_STATIC_FOLD_MODEL: &str = r#"
+[parameters]
+  theta TVCL (5, 0.001, 100.0)
+  theta GAM (2.0, FIX)
+  omega ETA_CL ~ 0.1
+  sigma PROP ~ 0.2 (sd)
+[individual_parameters]
+  FMAT = WT ^ GAM / (WT ^ GAM + 3 ^ GAM)
+  if (AGE < 13) {
+    FAC = AGE * 0.1
+  } else {
+    FAC = 1.0
+  }
+  CL = TVCL * FMAT * FAC * exp(ETA_CL)
+  V1 = 10
+[structural_model]
+  pk one_cpt_iv(cl=CL, v1=V1)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    fn cov_static_fold_fixture() -> (CompiledModel, Vec<f64>, Vec<f64>, HashMap<String, f64>) {
+        let model = parse_model_string(COV_STATIC_FOLD_MODEL).expect("model compiles");
+        let theta = vec![5.0, 2.0];
+        let eta = vec![0.3_f64];
+        let cov: HashMap<String, f64> = [("WT".to_string(), 70.0), ("AGE".to_string(), 5.0)]
+            .into_iter()
+            .collect();
+        (model, theta, eta, cov)
+    }
+
+    #[test]
+    fn cov_static_mask_classifies_kernel_and_dynamic_tail() {
+        let (model, ..) = cov_static_fold_fixture();
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("indiv param program present");
+        // Some slots fold (the covariate/FIXED-θ kernel) …
+        assert!(
+            prog.cov_static_mask.iter().any(|&b| b),
+            "expected some cov-static slots"
+        );
+        // … and at least one does not (the free-θ × exp(η) CL slot).
+        assert!(
+            prog.cov_static_mask.iter().any(|&b| !b),
+            "expected the dynamic CL slot to stay unfolded"
+        );
+    }
+
+    #[test]
+    fn cov_static_fold_matches_unfolded_dual2() {
+        let (model, theta, eta, cov) = cov_static_fold_fixture();
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("indiv param program present");
+        // n_theta + n_eta = 2 + 1 = 3.
+        let folded = prog.eval_param_duals::<3>(&theta, &eta, &cov);
+        let mut unfolded_prog = prog.clone();
+        unfolded_prog.cov_static_mask = Vec::new();
+        let unfolded = unfolded_prog.eval_param_duals::<3>(&theta, &eta, &cov);
+
+        assert_eq!(folded.len(), unfolded.len());
+        for (i, (a, b)) in folded.iter().zip(unfolded.iter()).enumerate() {
+            assert_eq!(a.value, b.value, "value mismatch at row {i}");
+            assert_eq!(a.grad, b.grad, "grad mismatch at row {i}");
+            assert_eq!(a.hess, b.hess, "hess mismatch at row {i}");
+        }
+    }
+
+    /// A covariate-heavy individual-parameters block modelled on the jasmine
+    /// vancomycin-pediatrics run60 kernel: a large covariate-only prefix
+    /// (CKD-EPI-/FFM-style pow/exp/log + sex/age branches — all cov-static) feeding
+    /// a small free-θ × exp(η) tail. Used by the fold microbenchmark.
+    const COV_STATIC_BENCH_MODEL: &str = r#"
+[parameters]
+  theta TVCL (5, 0.001, 100.0)
+  theta TVV1 (30, 0.001, 500.0)
+  theta THCR (0.2, -5.0, 5.0)
+  omega ETA_CL ~ 0.1
+  omega ETA_V1 ~ 0.1
+  sigma PROP ~ 0.2 (sd)
+[individual_parameters]
+  BMI = WEIGHT / ((HEIGHT / 100.0) ^ 2)
+  if (SEX == 0) {
+    FFM = 9270.0 * WEIGHT / (8780.0 + 244.0 * BMI)
+    A1  = -0.241
+    KK  = 0.7
+  } else {
+    FFM = 9270.0 * WEIGHT / (6680.0 + 216.0 * BMI)
+    A1  = -0.302
+    KK  = 0.9
+  }
+  CKDEPI = 142 * (CREAT / KK) ^ A1 * 0.9938 ^ AGE
+  SCH    = 0.413 * HEIGHT / CREAT
+  EGFR   = if (AGE < 13) SCH else CKDEPI
+  FCOV   = (EGFR / 100) ^ 0.75 * exp(-log(2) / 0.6 * AGE) * (FFM / 34) ^ 0.75
+  CL = TVCL * FCOV * exp(ETA_CL)
+  V1 = TVV1 * (FFM / 34) * exp(ETA_V1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v1=V1)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    /// #485: bit-identity of the cov-static fold on a covariate-heavy kernel
+    /// (the jasmine-style [`COV_STATIC_BENCH_MODEL`]: a `SEX` branch, an inline
+    /// `if (AGE < 13) … else …` conditional, FFM forward-references, and
+    /// pow/exp/log throughout). A far richer block than `cov_static_fold_fixture`:
+    /// it asserts the fold is bit-for-bit identical to the unfolded walk on every
+    /// dual axis, for both branches of the `SEX` split.
+    ///
+    /// The per-call timing microbenchmark these numbers came from is dev-only
+    /// scaffolding (its figures live in PR #489), so it is not committed as a test.
+    #[test]
+    fn cov_static_fold_matches_unfolded_bench_kernel() {
+        let model = parse_model_string(COV_STATIC_BENCH_MODEL).expect("bench model compiles");
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("indiv param program");
+        // The covariate kernel (BMI/FFM/CKDEPI/SCH/EGFR/FCOV/A1/KK) folds; the
+        // free-θ × exp(η) CL/V1 tail does not.
+        assert!(
+            prog.cov_static_mask.iter().any(|&b| b),
+            "expected cov-static slots in the kernel"
+        );
+        assert!(
+            prog.cov_static_mask.iter().any(|&b| !b),
+            "expected the CL/V1 tail to stay dynamic"
+        );
+        let theta: Vec<f64> = vec![5.0, 30.0, 0.2];
+        assert_eq!(theta.len(), model.n_theta);
+        let eta = vec![0.05_f64, -0.1_f64];
+        assert_eq!(eta.len(), model.n_eta);
+        let base_cov: HashMap<String, f64> = [
+            ("AGE", 4.0),
+            ("CREAT", 0.4),
+            ("SEX", 1.0),
+            ("HEIGHT", 100.0),
+            ("WEIGHT", 16.0),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+
+        let mut unfolded_prog = prog.clone();
+        unfolded_prog.cov_static_mask = Vec::new();
+
+        // Both arms of the `if (SEX == 0)` split, to fold each FFM branch.
+        for sex in [1.0_f64, 0.0_f64] {
+            let mut cov = base_cov.clone();
+            cov.insert("SEX".to_string(), sex);
+
+            // Dual2 (outer θ,η): n_theta + n_eta = 3 + 2 = 5.
+            let folded2 = prog.eval_param_duals::<5>(&theta, &eta, &cov);
+            let unfolded2 = unfolded_prog.eval_param_duals::<5>(&theta, &eta, &cov);
+            assert_eq!(folded2.len(), unfolded2.len());
+            for (i, (a, b)) in folded2.iter().zip(unfolded2.iter()).enumerate() {
+                assert_eq!(
+                    a.value, b.value,
+                    "SEX={sex} dual2 value mismatch at row {i}"
+                );
+                assert_eq!(a.grad, b.grad, "SEX={sex} dual2 grad mismatch at row {i}");
+                assert_eq!(a.hess, b.hess, "SEX={sex} dual2 hess mismatch at row {i}");
+            }
+
+            // Dual1 (inner η): n_eta = 2.
+            let folded1 = prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
+            let unfolded1 = unfolded_prog.eval_param_eta_grad::<2>(&theta, &eta, &cov);
+            assert_eq!(folded1.len(), unfolded1.len());
+            for (i, (a, b)) in folded1.iter().zip(unfolded1.iter()).enumerate() {
+                assert_eq!(
+                    a.value, b.value,
+                    "SEX={sex} dual1 value mismatch at row {i}"
+                );
+                assert_eq!(a.grad, b.grad, "SEX={sex} dual1 grad mismatch at row {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn cov_static_fold_matches_unfolded_dual1() {
+        let (model, theta, eta, cov) = cov_static_fold_fixture();
+        let prog = model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .expect("indiv param program present");
+        // n_eta = 1.
+        let folded = prog.eval_param_eta_grad::<1>(&theta, &eta, &cov);
+        let mut unfolded_prog = prog.clone();
+        unfolded_prog.cov_static_mask = Vec::new();
+        let unfolded = unfolded_prog.eval_param_eta_grad::<1>(&theta, &eta, &cov);
+
+        assert_eq!(folded.len(), unfolded.len());
+        for (i, (a, b)) in folded.iter().zip(unfolded.iter()).enumerate() {
+            assert_eq!(a.value, b.value, "value mismatch at row {i}");
+            assert_eq!(a.grad, b.grad, "grad mismatch at row {i}");
+        }
+    }
+
+    /// #485: exhaustively exercise the cov-static classifier helpers on every
+    /// AST / bytecode arm. The model-driven tests only reach the arms a parsed
+    /// `[individual_parameters]` block happens to emit; hand-built nodes hit the
+    /// rest (NN outputs, `&&`/`||`/`!`, inline conditionals, dynamic var refs).
+    #[test]
+    fn cov_static_classifier_helpers_cover_all_arms() {
+        // dual-axis state: slot 0 dynamic, slot 1 cov-static.
+        let dv = [true, false];
+
+        // ── bytecode_is_dynamic ──
+        let bc = |ops: Vec<Op>| Bytecode {
+            ops,
+            constants: vec![0.0],
+            max_stack: 2,
+        };
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushEta(0)]), &dv));
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushTheta(0)]), &dv));
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushNnOutput(0, 0)]), &dv));
+        assert!(bytecode_is_dynamic(&bc(vec![Op::PushVar(0)]), &dv)); // slot 0 dynamic
+        assert!(!bytecode_is_dynamic(&bc(vec![Op::PushVar(1)]), &dv)); // slot 1 static
+        assert!(!bytecode_is_dynamic(
+            &bc(vec![Op::PushCov(0), Op::PushConst(0), Op::Add]),
+            &dv
+        ));
+
+        // ── expr_is_dynamic ──
+        let lit = || Expression::Literal(1.0);
+        assert!(expr_is_dynamic(&Expression::Eta(0), &dv));
+        assert!(expr_is_dynamic(&Expression::Theta(0), &dv));
+        assert!(expr_is_dynamic(
+            &Expression::NnOutput {
+                nn_idx: 0,
+                output_idx: 0
+            },
+            &dv
+        ));
+        assert!(expr_is_dynamic(&Expression::Variable("x".into()), &dv));
+        assert!(expr_is_dynamic(&Expression::VariableIdx(0), &dv)); // dynamic slot
+        assert!(!expr_is_dynamic(&Expression::VariableIdx(1), &dv)); // static slot
+        assert!(!expr_is_dynamic(&lit(), &dv));
+        assert!(!expr_is_dynamic(&Expression::Covariate("WT".into()), &dv));
+        assert!(!expr_is_dynamic(&Expression::CovariateIdx(0), &dv));
+        // BinOp / Power recurse into both operands.
+        assert!(expr_is_dynamic(
+            &Expression::BinOp(Box::new(Expression::Theta(0)), BinOp::Add, Box::new(lit())),
+            &dv
+        ));
+        assert!(!expr_is_dynamic(
+            &Expression::Power(
+                Box::new(Expression::Covariate("WT".into())),
+                Box::new(lit())
+            ),
+            &dv
+        ));
+        // UnaryFn recurses into its argument.
+        assert!(expr_is_dynamic(
+            &Expression::UnaryFn("exp".into(), Box::new(Expression::Eta(0))),
+            &dv
+        ));
+        assert!(!expr_is_dynamic(
+            &Expression::UnaryFn("log".into(), Box::new(lit())),
+            &dv
+        ));
+
+        // ── cond_is_dynamic ──
+        let static_cmp = Condition::Compare(Expression::Covariate("AGE".into()), CmpOp::Lt, lit());
+        let dyn_cmp = Condition::Compare(Expression::Theta(0), CmpOp::Gt, lit());
+        assert!(!cond_is_dynamic(&static_cmp, &dv));
+        assert!(cond_is_dynamic(&dyn_cmp, &dv));
+        assert!(cond_is_dynamic(
+            &Condition::And(Box::new(static_cmp.clone()), Box::new(dyn_cmp.clone())),
+            &dv
+        ));
+        assert!(!cond_is_dynamic(
+            &Condition::Or(Box::new(static_cmp.clone()), Box::new(static_cmp.clone())),
+            &dv
+        ));
+        assert!(cond_is_dynamic(
+            &Condition::Not(Box::new(dyn_cmp.clone())),
+            &dv
+        ));
+        assert!(!cond_is_dynamic(
+            &Condition::Not(Box::new(static_cmp.clone())),
+            &dv
+        ));
+
+        // ── inline conditional (expr_is_dynamic::Conditional) ──
+        assert!(expr_is_dynamic(
+            &Expression::Conditional(
+                Box::new(static_cmp.clone()),
+                Box::new(Expression::Eta(0)), // dynamic `then`
+                Box::new(lit())
+            ),
+            &dv
+        ));
+        assert!(expr_is_dynamic(
+            &Expression::Conditional(
+                Box::new(dyn_cmp.clone()), // dynamic condition
+                Box::new(Expression::Covariate("WT".into())),
+                Box::new(lit())
+            ),
+            &dv
+        ));
+        assert!(!expr_is_dynamic(
+            &Expression::Conditional(
+                Box::new(static_cmp),
+                Box::new(Expression::Covariate("WT".into())),
+                Box::new(lit())
+            ),
+            &dv
+        ));
+    }
+
+    /// #485: `compute_cov_static_mask` corner cases the parsed fixtures don't
+    /// reach — a forward reference (a single pass is insufficient, so the
+    /// monotone fixpoint must re-iterate) and a slot assigned under a dynamic
+    /// `if` condition (covariate-only body, θ-dependent governing condition).
+    #[test]
+    fn cov_static_mask_fixpoint_and_dynamic_if_context() {
+        // slot0 = slot1 + 1   (forward ref — slot1 is assigned *after* slot0)
+        // slot1 = θ0          (dynamic)
+        // A single forward pass marks slot0 static; the fixpoint re-pass flips it.
+        let fwd = vec![
+            // A non-`AssignBc`/`If` statement is ignored by the classifier (the
+            // `_ => {}` arm) — `[individual_parameters]` never emits one, so cover
+            // it here.
+            Statement::Assign("ignored".into(), Expression::Literal(0.0)),
+            Statement::AssignBc(
+                0,
+                Bytecode {
+                    ops: vec![Op::PushVar(1), Op::PushConst(0), Op::Add],
+                    constants: vec![1.0],
+                    max_stack: 2,
+                },
+            ),
+            Statement::AssignBc(
+                1,
+                Bytecode {
+                    ops: vec![Op::PushTheta(0)],
+                    constants: vec![],
+                    max_stack: 1,
+                },
+            ),
+        ];
+        assert_eq!(compute_cov_static_mask(&fwd, 2), vec![false, false]);
+
+        // if (θ0 > 5) { X = WT } else { X = 0 } — covariate/literal bodies, but the
+        // governing condition is dynamic, so X must not fold.
+        let dyn_if = vec![Statement::If {
+            branches: vec![(
+                Condition::Compare(Expression::Theta(0), CmpOp::Gt, Expression::Literal(5.0)),
+                vec![Statement::AssignBc(
+                    0,
+                    Bytecode {
+                        ops: vec![Op::PushCov(0)],
+                        constants: vec![],
+                        max_stack: 1,
+                    },
+                )],
+            )],
+            else_body: Some(vec![Statement::AssignBc(
+                0,
+                Bytecode {
+                    ops: vec![Op::PushConst(0)],
+                    constants: vec![0.0],
+                    max_stack: 1,
+                },
+            )]),
+        }];
+        assert_eq!(compute_cov_static_mask(&dyn_if, 1), vec![false]);
+
+        // Pure-covariate `if`: the slot stays static (static branch of the If arm
+        // + the else_body walk under a non-dynamic governing condition).
+        let stat_if = vec![Statement::If {
+            branches: vec![(
+                Condition::Compare(
+                    Expression::Covariate("AGE".into()),
+                    CmpOp::Lt,
+                    Expression::Literal(13.0),
+                ),
+                vec![Statement::AssignBc(
+                    0,
+                    Bytecode {
+                        ops: vec![Op::PushCov(0)],
+                        constants: vec![],
+                        max_stack: 1,
+                    },
+                )],
+            )],
+            else_body: Some(vec![Statement::AssignBc(
+                0,
+                Bytecode {
+                    ops: vec![Op::PushConst(0)],
+                    constants: vec![1.0],
+                    max_stack: 1,
+                },
+            )]),
+        }];
+        assert_eq!(compute_cov_static_mask(&stat_if, 1), vec![true]);
+    }
+
     // ── [simulation] block key handling ──────────────────────────────────────
     fn sim_lines(body: &[&str]) -> Vec<String> {
         body.iter().map(|s| s.to_string()).collect()
@@ -21064,8 +21720,9 @@ CL V KA WT
 
     #[test]
     fn simulation_short_form_aliases_apply() {
-        // Back-compat: the short `subjects`/`dose`/`cmt` forms (documented form)
-        // remain valid aliases for the same fields.
+        // Back-compat: the short `subjects`/`dose`/`cmt` forms (the previously
+        // documented spelling) remain valid aliases for the same fields, and the
+        // defaults hold for the keys we omit (seed = 42).
         let spec = parse_simulation_block(&sim_lines(&[
             "subjects = 3",
             "dose = 25",
@@ -21076,6 +21733,7 @@ CL V KA WT
         assert_eq!(spec.n_subjects, 3);
         assert_eq!(spec.dose_amt, 25.0);
         assert_eq!(spec.dose_cmt, 4);
+        assert_eq!(spec.seed, 42, "untouched seed keeps its default");
     }
 
     #[test]
@@ -21088,19 +21746,43 @@ CL V KA WT
         ]))
         .unwrap_err();
         assert!(
-            err.contains("unknown key") && err.contains("n_subject"),
+            err.starts_with("[simulation]:")
+                && err.contains("unknown key")
+                && err.contains("n_subject"),
             "got: {err}"
         );
     }
 
     #[test]
-    fn simulation_bad_value_errors() {
+    fn simulation_malformed_line_errors() {
+        // A non-blank line with no `=` (e.g. a forgotten `=`) is malformed and must
+        // error rather than being silently skipped into the default.
         let err =
-            parse_simulation_block(&sim_lines(&["n_subjects = abc", "times = [1.0]"])).unwrap_err();
+            parse_simulation_block(&sim_lines(&["n_subjects 5", "times = [1.0]"])).unwrap_err();
         assert!(
-            err.contains("bad") && err.contains("n_subjects"),
+            err.starts_with("[simulation]:") && err.contains("malformed line"),
             "got: {err}"
         );
+    }
+
+    // Every value-parsing arm must report a clear, prefixed error on a bad value —
+    // not just `n_subjects`. This pins the error branch of each `map_err`/`?` so the
+    // diff isn't covered by happy paths alone.
+    #[test]
+    fn simulation_bad_value_errors_per_key() {
+        for (line, key) in [
+            ("n_subjects = abc", "n_subjects"),
+            ("dose_amt = abc", "dose_amt"),
+            ("dose_cmt = 1.5", "dose_cmt"), // non-integer compartment
+            ("seed = -1", "seed"),          // seed is u64
+            ("times = [1.0, oops]", "times"),
+        ] {
+            let err = parse_simulation_block(&sim_lines(&[line, "times = [1.0]"])).unwrap_err();
+            assert!(
+                err.starts_with("[simulation]:") && err.contains(key),
+                "key `{key}` on `{line}` gave: {err}"
+            );
+        }
     }
 
     #[test]
