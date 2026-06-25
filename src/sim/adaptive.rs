@@ -258,9 +258,11 @@ pub enum DecisionOutcome {
 /// Reproducibility assumes the controller decides from its declared
 /// `observed_signals`. [`ControllerCtx`] also exposes the raw `state`,
 /// `covariates`, and dose `history`, but those are deterministically re-derivable
-/// from the frozen inputs + ledger + schedule, so they are not re-stored here —
-/// the signals are recorded precisely because they are the one input that is *not*
-/// otherwise recoverable once S1.5 adds the per-subject assay-noise draw.
+/// from the frozen inputs + ledger + schedule, so they are not re-stored here. The
+/// signals *are* stored: under S1.3a (`Ipred` only) they are likewise re-derivable
+/// and serve as a self-contained, directly-auditable record, and under S1.5's `Dv`
+/// mode they pin the realized assay-noise draw, so the audit can verify what the
+/// controller saw without re-running the stochastic observation.
 ///
 /// A decision reached *after* a `Stop` is not logged — once discontinued the
 /// driver issues no further decisions, so the `Stop` entry is the last record.
