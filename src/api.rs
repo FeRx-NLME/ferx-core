@@ -376,6 +376,9 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                         } else {
                             crate::types::EventType::RightCensored
                         },
+                        // Synthetic `[simulation]` subjects always enter at 0 (no
+                        // left truncation), matching the template row above; keep
+                        // the two in sync if this path ever gains delayed entry.
                         entry_time: 0.0,
                         cmt: s.cmt,
                     })

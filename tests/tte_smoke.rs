@@ -696,6 +696,82 @@ mod survival_smoke {
         );
     }
 
+    /// `[simulation]`-block path with a **single** `[event_model]` (#522): the
+    /// docs promise "a single `[event_model]` yields one row per subject — an event
+    /// before the horizon, or right-censoring at the horizon". The competing test
+    /// above covers ≥2 causes; this pins the single-cause `run_model_simulate` path
+    /// end-to-end: exactly one TTE row per synthetic subject, at entry 0 and within
+    /// the horizon, with a mix of observed events and horizon-censored survivors.
+    #[test]
+    fn simulate_block_generates_single_cause_tte_rows() {
+        const H: f64 = 8.0;
+        let model_src = r"
+[parameters]
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+
+[event_model only_cause]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA
+
+[fit_options]
+  method  = focei
+  maxiter = 1
+
+[simulation]
+  n_subjects = 60
+  horizon    = 8
+  seed       = 11
+";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("single_cause_sim.ferx");
+        std::fs::write(&path, model_src).expect("write model");
+
+        let (_fit, pop) =
+            ferx_core::run_model_simulate(path.to_str().unwrap()).expect("simulate+fit succeeds");
+        assert_eq!(
+            pop.subjects.len(),
+            60,
+            "one synthetic subject per n_subjects"
+        );
+
+        let (mut events, mut censored_at_h) = (0usize, 0usize);
+        for subj in &pop.subjects {
+            assert_eq!(subj.obs_records.len(), 1, "single cause ⇒ one TTE row");
+            let ObsRecord::Event {
+                time,
+                event_type,
+                entry_time,
+                cmt,
+            } = &subj.obs_records[0];
+            assert_eq!(*cmt, 2, "row on the cause CMT");
+            assert_eq!(
+                *entry_time, 0.0,
+                "synthetic subjects have no left truncation"
+            );
+            assert!(*time <= H + 1e-9, "row time {time} exceeds horizon {H}");
+            match event_type {
+                EventType::Exact => events += 1,
+                EventType::RightCensored => {
+                    assert!(
+                        (time - H).abs() < 1e-9,
+                        "a censored row must land on the horizon, got {time}"
+                    );
+                    censored_at_h += 1;
+                }
+                other => panic!("unexpected event_type {other:?}"),
+            }
+        }
+        assert!(
+            events > 0,
+            "synthetic single-cause data must contain observed events"
+        );
+        assert!(
+            censored_at_h > 0,
+            "with horizon {H} some subjects survive past it and censor there"
+        );
+    }
+
     /// A TTE model simulated via `[simulation]` *requires* a `horizon` (there are
     /// no continuous `times` to censor against). `times` alone satisfies the
     /// parser, but `run_model_simulate` must then reject the TTE design with a
