@@ -112,6 +112,24 @@ const COMPETING_FIT: &str = r"
   scale  = TVLAMBDA_B * exp(ETA_F)
 ";
 
+/// Fixed-effects (no frailty) competing-risks model — anchors the cause-specific
+/// likelihood against the per-cause closed-form / `survreg` MLE.
+const COMPETING_FIXED: &str = r"
+[parameters]
+  theta TVLAMBDA_A(0.05, 0.001, 10.0)
+  theta TVLAMBDA_B(0.03, 0.001, 10.0)
+
+[event_model cause_a]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA_A
+
+[event_model cause_b]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA_B
+";
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn fit_opts() -> FitOptions {
@@ -431,6 +449,49 @@ fn tte_convergence_exponential_fixed_matches_survreg() {
         "fixed-effects OFV {:.4} must match survreg -2logLik {SURVREG_LAMBDA_M2LL} within 1e-3",
         r.ofv
     );
+}
+
+/// Cross-tool, exact: a FIXED-EFFECTS (n_eta=0) competing-risks exponential fit
+/// must recover each cause's closed-form MLE `λ̂_k = d_k / Σ_i t_i` — identical to
+/// base-R `survreg(dist="exponential")` fitted per cause (other-cause events as
+/// censoring). Without a shared frailty the cause-specific likelihood factorises
+/// into independent per-cause exponential regressions, so this anchors the
+/// cause-specific hazard likelihood against an external reference (the
+/// competing-risks analogue of `tte_convergence_exponential_fixed_matches_survreg`).
+#[test]
+fn tte_competing_fixed_matches_per_cause_mle() {
+    // data/tte_competing_risks.csv: N=40, d_A(CMT2)=23, d_B(CMT3)=15, Σt=201.6552
+    //   ⇒ λ̂_A = 23/201.6552 = 0.114056,  λ̂_B = 15/201.6552 = 0.074384
+    //   (verified equal to survreg(Surv(time, cause==k) ~ 1, dist="exponential")).
+    const MLE_A: f64 = 0.114056;
+    const MLE_B: f64 = 0.074384;
+    const COMPETING_CSV: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/data/tte_competing_risks.csv");
+
+    let model = parse_model_string(COMPETING_FIXED).expect("fixed competing model must parse");
+    assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
+
+    let (pop, _cov) = read_population_for(&model, &None, COMPETING_CSV, None, None, None)
+        .expect("competing CSV reads");
+
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fixed competing fit");
+    let (la, lb) = (r.theta[0], r.theta[1]);
+    eprintln!(
+        "[CR-fixed] lambda_A = {la:.6} (MLE {MLE_A:.6}), lambda_B = {lb:.6} (MLE {MLE_B:.6}), OFV = {:.4}",
+        r.ofv
+    );
+
+    let rel_a = (la - MLE_A).abs() / MLE_A;
+    let rel_b = (lb - MLE_B).abs() / MLE_B;
+    assert!(
+        rel_a < 0.01,
+        "lambda_A {la:.6} must match per-cause MLE {MLE_A:.6} within 1% (rel {rel_a:.4})"
+    );
+    assert!(
+        rel_b < 0.01,
+        "lambda_B {lb:.6} must match per-cause MLE {MLE_B:.6} within 1% (rel {rel_b:.4})"
+    );
+    assert!(r.ofv.is_finite(), "OFV must be finite");
 }
 
 // ═══════════════════════════ Weibull ═══════════════════════════════════════════
