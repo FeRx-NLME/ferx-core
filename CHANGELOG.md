@@ -230,7 +230,7 @@ section of the SDLC for the versioning policy).
 ### Fixed
 - The ODE-solver fit options `ode_reltol`, `ode_abstol`, and `ode_max_steps` no
   longer emit a spurious "is not used by method … and will be ignored" warning
-  (#503). They configure the RK45 integrator and *are* applied to any ODE model
+  (#516). They configure the RK45 integrator and *are* applied to any ODE model
   under every estimation method; they were simply missing from the warning's
   framework-key allowlist. Behaviour is unchanged — only the misleading warning
   is removed.
