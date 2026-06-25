@@ -380,9 +380,7 @@ dataset. Because the data were simulated from a transit model, the Weibull fit i
 mildly mis-specified, so the check is **NONMEM-weibull ≈ ferx-weibull at the
 shared optimum** (the objective, not the optimiser path), not parameter recovery.
 
-On the mis-specified ridge ferx's derivative-free outer optimiser stalls only
-slightly short of NONMEM's gradient FOCEI (≈ 1.5 OFV units, milder than `igd`'s
-~18), so — as for `igd` — the implementation check is the **objective at the
+As for `igd`, the path-independent implementation check is the **objective at the
 shared optimum**. Evaluating ferx's full FOCEI objective (inner EBEs + Laplace +
 ODE integration of the `weibull` forcing) at NONMEM's reported optimum reproduces
 it (NONMEM `ADVAN13 TOL=9`, MINIMIZATION SUCCESSFUL):
@@ -401,6 +399,33 @@ additionally validated in-repo without NONMEM by the absorption-independent
 **mass-balance invariant** `∫A dt = F·Dose/ke` (`tests/weibull_absorption.rs`) and
 the **analytic-`Dual2` ≡ central-FD gradient** parity (`src/pk/absorption.rs`,
 `src/sens/ode_provider.rs`).
+
+A **free fit also converges** under the default [`optimizer = auto`](fit-options.qmd),
+which selects gradient-based NLopt L-BFGS whenever the exact analytic outer gradient
+is available — and the `weibull()` forcing now provides it through the `Dual2`
+ODE-sensitivity path. From generic initials the free fit lands essentially **on** the
+NONMEM optimum; the legacy derivative-free `bobyqa` (the pre-`auto` default) is shown
+for contrast:
+
+| Quantity | NONMEM | `auto` → L-BFGS (default) | Δ vs NM | legacy `optimizer = bobyqa` |
+|----------|--------|---------------------------|---------|-----------------------------|
+| OFV | −943.8326 | **−943.8326** | ~1e-6 | −942.359 (+1.47) |
+| TVCL | 5.39758 | 5.39762 | +0.007 % | 5.4237 |
+| TVV | 63.0166 | 63.0172 | +0.001 % | 63.868 |
+| TVTD | 1.65572 | 1.65571 | −0.001 % | 1.6581 |
+| TVBETA | 3.47905 | 3.47907 | +0.001 % | 3.4750 |
+| ω²(CL) | 0.050675 | 0.050671 | −0.008 % | 0.0343 |
+| ω²(V) | 0.042042 | 0.042046 | +0.010 % | 0.0493 |
+| σ²(prop) | 0.0479645 | 0.047964 | −0.001 % | 0.0490 |
+
+Under `auto` → L-BFGS the free fit matches NONMEM to **~1e-6** in OFV and **< 0.01 %**
+on every fixed effect and variance component. The legacy `bobyqa` instead stalls
+~1.47 units short: a derivative-free trust-region method cannot resolve the shallow
+descent direction on the flat mis-specified ridge from function values alone — a
+pure optimiser artefact, not a density issue (the shared-optimum check above rules
+that out at 0.01 units). This run doubles as an end-to-end verification that `auto`
+plus the analytic `Dual2` ODE-forcing gradient resolve and converge on a `weibull()`
+model.
 
 ## Generating the disposition — `ode_template`
 

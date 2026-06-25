@@ -180,25 +180,35 @@ machinery (forcing, dose routing, bolus suppression, superposition) reproduce th
 NONMEM `$DES` Weibull input. Unlike the stiffer transit/IG forcings, the smooth
 Weibull density matches to 0.01 even at default ODE tolerances.
 
-A **free** ferx fit (generic initials, `weibull_absorption_fit.ferx`) recovers the
-fixed effects tightly and stalls only slightly short of the ridge optimum:
+**A free ferx fit also converges — and doubles as optimiser verification.** A free
+fit from generic initials (`weibull_absorption_fit.ferx`) under the default `auto`
+optimiser lands essentially **on** NONMEM's optimum. `auto` (#490) picks
+gradient-based NLopt L-BFGS whenever the exact analytic outer gradient is
+available, and the `weibull()` forcing now provides it via the live `Dual2`
+ODE-sensitivity path (#430 generic forcing + #498 `supported_over_dual`). The
+legacy derivative-free `bobyqa` (the pre-#490 default) is shown for contrast:
 
-| Quantity | NONMEM | ferx (free fit) | Δ (ferx vs NM) |
-|----------|--------|-----------------|----------------|
-| OFV (min objective) | −943.833 | −942.359 | +1.47 |
-| TVCL  | 5.3976 | 5.4237 | +0.5% |
-| TVV   | 63.017 | 63.868 | +1.4% |
-| TVTD (scale)  | 1.6557 | 1.6581 | +0.1% |
-| TVBETA (shape) | 3.4791 | 3.4750 | −0.1% |
-| ω²(CL) | 0.0507 | 0.0343 | −32% |
-| ω²(V)  | 0.0420 | 0.0493 | +17% |
-| σ² (prop) | 0.0480 | 0.0490 | +2.2% |
+| Quantity | NONMEM | `auto` → L-BFGS (default) | Δ vs NM | legacy `optimizer = bobyqa` |
+|----------|--------|---------------------------|---------|-----------------------------|
+| OFV (min objective) | −943.8326 | **−943.8326** | ~1e-6 | −942.359 (+1.47) |
+| TVCL  | 5.39758 | 5.39762 | +0.007 % | 5.4237 |
+| TVV   | 63.0166 | 63.0172 | +0.001 % | 63.868 |
+| TVTD (scale)  | 1.65572 | 1.65571 | −0.001 % | 1.6581 |
+| TVBETA (shape) | 3.47905 | 3.47907 | +0.001 % | 3.4750 |
+| ω²(CL) | 0.050675 | 0.050671 | −0.008 % | 0.0343 |
+| ω²(V)  | 0.042042 | 0.042046 | +0.010 % | 0.0493 |
+| σ² (prop) | 0.0479645 | 0.047964 | −0.001 % | 0.0490 |
 
-All four fixed effects agree within ~1.4%; the +1.47 OFV is the
-derivative-free BOBYQA outer optimiser stalling on the flat mis-specified ridge
-(ferx's *own* objective at NONMEM's point, −943.845, is below where its free fit
-lands), and the ω² spread is the usual n=20 + Laplace-on-a-ridge behaviour — not a
-density bug, which check #1 above rules out at 0.01 units.
+Under `auto` → L-BFGS, OFV matches NONMEM to **~1e-6** and every fixed effect and
+variance component to **< 0.01 %** — a free-fit reproduction of the NONMEM optimum,
+not merely the shared-optimum evaluation above. The legacy `bobyqa` instead stalls
+~1.47 OFV units short: on the flat mis-specified ridge its interpolation model can't
+resolve the shallow descent direction from function values alone (the trust radius
+hits `rhoend` before convergence). That is a pure **optimiser** artefact, not a
+density issue — the shared-optimum check above independently rules out a density bug
+at 0.01 units, and the analytic `Dual2` gradient (which NONMEM-style gradient FOCEI
+also relies on) closes the gap. This run therefore also verifies that `auto` + the
+analytic ODE-forcing gradient resolve and converge end-to-end on a `weibull()` model.
 
 ## Implementation notes (why the streams look the way they do)
 
