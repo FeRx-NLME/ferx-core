@@ -93,9 +93,11 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
         return false;
     }
     // Built-in absorption input-rate forcing is evaluated over Dual2 only for
-    // kinds lifted to PkNum: inverse-Gaussian (#430) and transit (#468, riding the
-    // `ln_gamma` Dual2 rule #458). Other kinds — Weibull until Phase 2, and any later
-    // kind — keep the FD fallback, so a model using one is not "supported" here.
+    // kinds lifted to PkNum: inverse-Gaussian (#430), transit (#468, riding the
+    // `ln_gamma` Dual2 rule #458), and Weibull (#498, log-domain `exp(β·ln x)`)
+    // are all lifted. The check stays kind-agnostic via `supported_over_dual()`
+    // so a *future* unlifted kind keeps the FD fallback (a model using it is not
+    // "supported" here) without editing this gate.
     if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
         return false;
     }
@@ -3369,14 +3371,118 @@ mod tests {
   ode_abstol = 1e-11
 "#;
 
-    /// The kind gate: inverse-Gaussian (#430 slice 1) and transit (#430 slice 2)
-    /// are both lifted to Dual2; a future kind (Weibull) stays on the FD fallback
-    /// until its own dual rule lands.
+    // 1-cpt disposition with Weibull absorption via the built-in `weibull()` input
+    // rate (Phase 2; mirrors examples/weibull_absorption.ferx). TD/BETA appear
+    // *only* inside `weibull()`, so `∂f/∂(TVTD,TVBETA)` and `∂f/∂ETA_BETA` flow
+    // entirely through the forcing — the parity check fails if the log-domain Dual2
+    // forcing is wrong. IIV on BETA (the forcing param) routes the forcing's `ln`/
+    // `exp` 2nd-order rules into the FOCEI Hessian (the transit-N analogue). β = 1.5
+    // (> 1) so the integrand is smooth at the dose and analytic ≡ central-FD is
+    // clean (the β < 1 integrable spike is unit-tested in pk/absorption.rs). Tight
+    // ODE tolerances so analytic ≡ FD is crisp.
+    const WEIBULL_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVTD(2.0,  0.05,  24.0)
+  theta TVBETA(1.5, 0.1,  10.0)
+  omega ETA_CL   ~ 0.09
+  omega ETA_BETA ~ 0.04
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  TD   = TVTD
+  BETA = TVBETA * exp(ETA_BETA)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    // Same as WEIBULL_ODE but with an estimated bioavailability F. The dose into
+    // the weibull() compartment is suppressed as a bolus and fed to `R_in` as
+    // `F·amt`, so F appears *only* inside the forcing — `∂f/∂THETA_F` exercises the
+    // F derivative carried by the Dual2 forcing (uncovered by WEIBULL_ODE).
+    const WEIBULL_ODE_F: &str = r#"
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVTD(2.0,  0.05,  24.0)
+  theta TVBETA(1.5, 0.1,  10.0)
+  theta THETA_F(0.7, 0.001, 0.999)
+  omega ETA_CL   ~ 0.09
+  omega ETA_BETA ~ 0.04
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  TD   = TVTD
+  BETA = TVBETA * exp(ETA_BETA)
+  F    = THETA_F
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    // Same as WEIBULL_ODE but with a compartment-indexed absorption lag `ALAG1` on
+    // the weibull() compartment — wired through the `DoseAttrMap`, not `pk_indices`,
+    // so the provider gate must consult `has_lagtime()` to exclude it (the
+    // kind-agnostic #430 finding-1 fix, here exercised for Weibull). The dual loop
+    // never applies the dose-attr lag, so an admitted model would get a no-lag
+    // gradient diverging from the f64 predictor.
+    const WEIBULL_ALAG_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVTD(2.0,  0.05,  24.0)
+  theta TVBETA(1.5, 0.1,  10.0)
+  theta TVLAG(0.3, 0.01,   5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV  * exp(ETA_V)
+  TD    = TVTD
+  BETA  = TVBETA
+  ALAG1 = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// The kind gate: inverse-Gaussian (#430 slice 1), transit (#430 slice 2), and
+    /// Weibull (Phase 2 — log-domain forcing over `ln`/`exp`) are all lifted to
+    /// Dual2, so every built-in input-rate kind is served by the analytic provider.
     #[test]
     fn input_rate_kind_supported_over_dual_gates_kinds() {
         use crate::pk::absorption::InputRateKind;
         assert!(InputRateKind::InverseGaussian.supported_over_dual());
         assert!(InputRateKind::Transit.supported_over_dual());
+        assert!(InputRateKind::Weibull.supported_over_dual());
     }
 
     /// With the IG forcing lifted to Dual2, an `igd()` model is served by the
@@ -3473,6 +3579,151 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Phase 2 lifts Weibull: a `weibull()` model is served by the analytic
+    /// provider, and `f`/`∂f/∂η`/`∂f/∂θ` match the production predictor + central FD
+    /// — including `∂f/∂(TVTD,TVBETA)` and `∂f/∂ETA_BETA`, which flow only through the
+    /// Weibull forcing (so this exercises the log-domain `exp(β·ln(tad/Td))` Dual2
+    /// evaluation end-to-end through the ODE integration).
+    #[test]
+    fn ode_provider_weibull_absorption_matches_production() {
+        let model = parse_model_string(WEIBULL_ODE).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "weibull() should be supported once its log-domain forcing is lifted to Dual2 (Phase 2)"
+        );
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = vec![5.0, 50.0, 2.0, 1.5]; // TVCL, TVV, TVTD, TVBETA
+        let eta = vec![0.1, 0.05]; // ETA_CL, ETA_BETA (BETA feeds the forcing)
+        check_vs_production(&model, &subject, &theta, &eta);
+    }
+
+    /// Second-order blocks of the Weibull forcing: FOCEI consumes `d2f_deta2` and
+    /// `d2f_deta_dtheta`. `BETA` carries IIV (`ETA_BETA`) and appears only inside the
+    /// forcing, so `∂²f/∂ETA_BETA²` flows through the forcing's `ln`/`exp` 2nd-order
+    /// `Dual2` rules — a wrong 2nd-order rule fails here while first-order parity
+    /// still passes. Validated against central FD of the analytic (already
+    /// FD-checked) `df_deta`.
+    #[test]
+    fn ode_provider_weibull_second_order_matches_fd_of_gradient() {
+        let model = parse_model_string(WEIBULL_ODE).expect("parse");
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = vec![5.0, 50.0, 2.0, 1.5];
+        let eta = vec![0.1, 0.05];
+        let n_eta = model.n_eta;
+        let n_theta = model.n_theta;
+        let base = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("supported");
+
+        // η-η block: FD of df_deta over η (ETA_BETA → forcing 2nd-order rules).
+        let he = 1e-5;
+        for l in 0..n_eta {
+            let mut ep = eta.clone();
+            ep[l] += he;
+            let mut em = eta.clone();
+            em[l] -= he;
+            let sp = ode_subject_sensitivities(&model, &subject, &theta, &ep).expect("supported");
+            let sm = ode_subject_sensitivities(&model, &subject, &theta, &em).expect("supported");
+            for (j, obs) in base.obs.iter().enumerate() {
+                for k in 0..n_eta {
+                    let fd = (sp.obs[j].df_deta[k] - sm.obs[j].df_deta[k]) / (2.0 * he);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta2[k * n_eta + l],
+                        fd,
+                        max_relative = 2e-3,
+                        epsilon = 1e-6
+                    );
+                }
+            }
+        }
+
+        // η-θ cross block: FD of df_deta over θ (TVTD/TVBETA flow only through the forcing).
+        for m in 0..n_theta {
+            let s = 1e-5 * (1.0 + theta[m].abs());
+            let mut tp = theta.clone();
+            tp[m] += s;
+            let mut tm = theta.clone();
+            tm[m] -= s;
+            let sp = ode_subject_sensitivities(&model, &subject, &tp, &eta).expect("supported");
+            let sm = ode_subject_sensitivities(&model, &subject, &tm, &eta).expect("supported");
+            for (j, obs) in base.obs.iter().enumerate() {
+                for k in 0..n_eta {
+                    let fd = (sp.obs[j].df_deta[k] - sm.obs[j].df_deta[k]) / (2.0 * s);
+                    approx::assert_relative_eq!(
+                        obs.d2f_deta_dtheta[k * n_theta + m],
+                        fd,
+                        max_relative = 2e-3,
+                        epsilon = 1e-6
+                    );
+                }
+            }
+        }
+    }
+
+    /// Bioavailability F on a weibull() model flows *only* through the input-rate
+    /// forcing (the bolus into the absorption compartment is suppressed and fed to
+    /// `R_in` as `F·amt`), so the analytic `∂f/∂THETA_F` here exercises the F
+    /// derivative carried by the Dual2 forcing — the path WEIBULL_ODE (no F) leaves
+    /// untested.
+    #[test]
+    fn ode_provider_weibull_absorption_with_f_matches_production() {
+        let model = parse_model_string(WEIBULL_ODE_F).expect("parse");
+        assert!(
+            ode_analytical_supported(&model),
+            "weibull()+F should be supported (F scales the dose as a dual)"
+        );
+        let subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = vec![5.0, 50.0, 2.0, 1.5, 0.7];
+        let eta = vec![0.1, 0.05];
+        check_vs_production(&model, &subject, &theta, &eta);
+    }
+
+    /// A `weibull()` model **with a compartment-indexed lag `ALAG1`** must stay on
+    /// the FD fallback: the dual loop never applies the dose-attr lag, so admitting
+    /// it would give a no-lag gradient diverging from the f64 predictor. The gate is
+    /// kind-agnostic (`has_lagtime()`), so Weibull inherits the #430 finding-1 fix —
+    /// this pins it (the Weibull analogue of `ode_provider_igd_with_alag_*`).
+    #[test]
+    fn ode_provider_weibull_with_alag_stays_on_fd_fallback() {
+        let model = parse_model_string(WEIBULL_ALAG_ODE).expect("parse");
+        assert!(
+            model.has_lagtime(),
+            "ALAG1 must enable has_lagtime() (precondition for the gate)"
+        );
+        assert!(
+            !ode_analytical_supported(&model),
+            "weibull()+ALAG1 must stay on the FD fallback (#430 finding 1, kind-agnostic)"
+        );
+    }
+
+    /// A `weibull()` model **with an EVID 3/4 reset** must fall back to FD on both
+    /// the outer θ-sensitivities and the inner η-gradient: the dual forcing loop
+    /// doesn't replicate the f64 `reset_floor` that turns off pre-reset dose tails.
+    /// The reset gate keys on `!input_rate.is_empty()` (kind-agnostic), so Weibull
+    /// inherits it — pinned here (the Weibull analogue of the igd reset test).
+    #[test]
+    fn ode_provider_weibull_with_reset_falls_back_to_fd() {
+        let model = parse_model_string(WEIBULL_ODE).expect("parse");
+        let mut subject = bolus_subject(&[1.0, 3.0, 6.0, 11.0, 13.0, 16.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(10.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        subject.reset_times = vec![10.0];
+        let theta = [5.0, 50.0, 2.0, 1.5];
+        let eta = [0.1, 0.05];
+        assert!(
+            ode_subject_sensitivities(&model, &subject, &theta, &eta).is_none(),
+            "weibull() + reset must fall back to FD on the outer θ-sensitivity path"
+        );
+        assert!(
+            !ode_subject_supported(&model, &subject),
+            "weibull() + reset must be out of shared scope (covers the inner η-gradient)"
+        );
+        assert!(
+            ode_subject_eta_grad(&model, &subject, &theta, &eta).is_none(),
+            "weibull() + reset must fall back to FD on the inner η-gradient path too"
+        );
     }
 
     /// Built-in absorption + an EVID 3/4 reset is kept on the FD fallback in

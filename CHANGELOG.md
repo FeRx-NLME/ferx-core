@@ -92,6 +92,20 @@ section of the SDLC for the versioning policy).
   (previously an FD fall-back).
 
 ### Added
+- **Built-in Weibull absorption — the `weibull(td, beta)` input-rate function** (#322, Phase 2).
+  Use it inside an `[odes]` RHS, with `td` (scale) and `beta` (shape) bound to
+  `[individual_parameters]` (so they carry IIV / covariates for free):
+  `d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central`. The dose is delivered as the
+  Weibull density over time (`∫R_in dt = F·Dose`) and its bolus is suppressed — the same
+  dose-into-the-input-rate-compartment convention as `transit()` / `igd()`. Shape `beta`
+  selects the profile: `>1` a delayed interior peak, `=1` first-order absorption with
+  `ka = 1/Td`, `<1` fast early uptake (an integrable spike at the dose). Weibull has no
+  elementary closed form, so it always runs on the numerical ODE path and **requires an
+  explicit ODE disposition** — combining it with an analytical `pk ...` is a clear error
+  pointing at `ode_template`. Because the forcing is evaluated over `Dual2`, a `weibull()`
+  model drives **exact analytic** FOCE/FOCEI/Bayes gradients (no finite-difference fallback),
+  validated against NONMEM. See `examples/weibull_absorption.ferx` and
+  `docs/model-file/absorption.qmd`.
 - **Analytic FOCE/FOCEI gradients for compartment-indexed bioavailability
   (`F1`/`F2`, …) on ODE models** (#486). An ODE model that sets a per-compartment
   bioavailability now drives the exact analytic outer gradient and light `Dual1`
@@ -242,6 +256,14 @@ section of the SDLC for the versioning policy).
   mixed PK+TTE) models that the sensitivity provider cannot supply, so `auto`
   resolved to a gradient-based optimizer that stalled at the initial estimates;
   TTE fits with the default optimizer now converge (#490).
+- **`[simulation]` block now honours the documented `n_subjects` / `dose_amt` /
+  `dose_cmt` keys.** The parser previously only recognised the short
+  `subjects` / `dose` / `cmt` spellings and **silently ignored** every other key,
+  so all `examples/*.ferx` (which use the long forms) fell back to the defaults
+  (10 subjects, dose 100, compartment 1) — e.g. `n_subjects = 12` simulated 10.
+  Both spellings are now accepted (long forms canonical, short forms as aliases),
+  and an **unknown or malformed key in `[simulation]` is now a hard parse error**
+  instead of a silent default, matching `[fit_options]`.
 - The ODE-solver fit options `ode_reltol`, `ode_abstol`, and `ode_max_steps` no
   longer emit a spurious "is not used by method … and will be ignored" warning
   (#516). They configure the RK45 integrator and *are* applied to any ODE model

@@ -7,9 +7,10 @@ write a flexible absorption *shape* (transit-chain delay, etc.) as a single
 intrinsic in the `[odes]` block, rather than hand-coding a chain of physical
 transit compartments.
 
-ferx ships the **transit-compartment** model (`transit`) and the **Freijer &
-Post inverse-Gaussian** model (`igd`); more input-rate models (Weibull,
-zero-order families) are planned — see `plans/absorption-models.md`.
+ferx ships the **transit-compartment** model (`transit`), the **Freijer & Post
+inverse-Gaussian** model (`igd`), and the **Weibull** model (`weibull`); more
+input-rate models (the zero-order families) are planned — see
+`plans/absorption-models.md`.
 
 ## Transit-compartment absorption — `transit(n, mtt)`
 
@@ -209,6 +210,98 @@ on simulated data:
 cargo run --release -- examples/igd_inverse_gaussian.ferx --simulate
 ```
 
+## Weibull absorption — `weibull(td, beta)`
+
+The absorption time follows a **Weibull distribution**, and the input rate is that
+density scaled by the dose, fed **straight into the central compartment** (no
+separate first-order `ka` step — like `igd`, the Weibull models the entire
+absorption delay):
+
+$$
+R_\text{in}(t_\text{ad}) = \text{Dose}\;\frac{\beta}{T_d}\left(\frac{t_\text{ad}}{T_d}\right)^{\beta-1}
+\exp\!\left(-\left(\frac{t_\text{ad}}{T_d}\right)^{\beta}\right)
+$$
+
+with scale `td` ($T_d$) and shape `beta` ($\beta$) — the appearance-rate form of
+the cumulative absorbed fraction $1 - \exp(-(t_\text{ad}/T_d)^\beta)$. The input
+integrates to the full dose (`∫₀^∞ R_in dt = F·Dose`) and `R_in = 0` for
+`tad ≤ 0`.
+
+The **shape `beta` selects the absorption profile**:
+
+| `beta` | Profile | Edge at `tad → 0` |
+|--------|---------|-------------------|
+| `> 1`  | Delayed, sigmoidal uptake with an interior peak — the common PK case | `R_in → 0` |
+| `= 1`  | Reduces exactly to first-order absorption with `ka = 1/Td` | finite (`Dose/Td`) |
+| `< 1`  | Fast early uptake tapering off | `R_in → ∞`, an **integrable** spike |
+
+For `beta < 1` the rate diverges as `tad → 0⁺`, but the spike is integrable
+(the cumulative absorbed amount still goes to 0 as the window shrinks, and
+`∫R_in = F·Dose` holds) — the value is *not* capped, and the adaptive ODE solver
+resolves it with small steps.
+
+### Syntax
+
+Add `weibull(...)` to the **central** compartment's ODE, writing the state as an
+**amount** and converting to concentration in `[scaling]` (the same convention as
+`igd`):
+
+```text
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  TD   = TVTD          # Weibull scale (h)
+  BETA = TVBETA        # Weibull shape (dimensionless)
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+
+[scaling]
+  y = central / V
+```
+
+- **Arguments are named**: `td=<param>` and `beta=<param>`, both declared
+  `[individual_parameters]`.
+- As with `transit`/`igd`, `weibull(...)` is a standalone, positively-signed
+  input-rate term: it may appear **once** per `d/dt` line and must not be scaled,
+  negated, or parenthesised.
+
+### Shared behaviour
+
+`weibull` reuses the same dose machinery as `transit`/`igd`:
+
+- **Dose routing** — the dose feeds `weibull` over time and is **not** also added
+  as a bolus.
+- **Bioavailability `F`, lagtime, multiple-dose superposition, and IOV** behave
+  exactly as for `transit`. Do not multiply `weibull(...)` by `F`.
+- **Parameter domains** `td > 0`, `beta > 0` are validated at typical values
+  (`E_ABSORPTION_DOMAIN`) and clamped for transient mid-fit excursions — a
+  log-normal parameterisation avoids excursions and is recommended.
+- The same **not-yet-supported** combinations (an infusion `RATE>0`, `SS=1`, or a
+  `[diffusion]` block into the input-rate compartment) are rejected with a clear
+  error.
+
+Unlike `transit`/`igd`, the Weibull has **no elementary closed form** with linear
+disposition, so it is permanently a numerical-ODE model — it always requires an
+explicit ODE disposition (`ode(...)` or `ode_template`) and can never ride an
+analytical `pk` (see the error rule below). Because the forcing is evaluated over
+`Dual2`, a `weibull()` model still drives **exact analytic** FOCE/FOCEI/Bayes
+gradients — this generic input-rate forcing is the *only* exact-gradient route for
+Weibull (it has no Phase-3 closed form to fall back on).
+
+### Worked example
+
+[`examples/weibull_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/weibull_absorption.ferx)
+is a complete one-compartment oral model with Weibull absorption. Run it on
+simulated data:
+
+```bash
+cargo run --release -- examples/weibull_absorption.ferx --simulate
+```
+
 ## Numerical note
 
 The transit input is integrated numerically through the ODE solver (the same
@@ -277,6 +370,63 @@ agreement confirms the `igd` density and its ODE machinery reproduce the NONMEM
 `$DES` inverse-Gaussian input (`nonmem_anchor/results/freijer_ig.ext`; the ferx
 anchor is `tests/igd_nonmem_anchor.rs`, gated behind `--features slow-tests`).
 
+### Weibull (`weibull`)
+
+The Weibull NONMEM cross-check uses the same `$DES` implementation-anchor design
+as `igd`: a NONMEM `ADVAN13 TOL=9` FOCEI control with the Weibull density forcing
+(`nonmem_anchor/weibull_absorption.ctl`) and the matching ferx model
+(`nonmem_anchor/weibull_absorption_fit.ferx`), run on the shared `igd_oral.csv`
+dataset. Because the data were simulated from a transit model, the Weibull fit is
+mildly mis-specified, so the check is **NONMEM-weibull ≈ ferx-weibull at the
+shared optimum** (the objective, not the optimiser path), not parameter recovery.
+
+As for `igd`, the path-independent implementation check is the **objective at the
+shared optimum**. Evaluating ferx's full FOCEI objective (inner EBEs + Laplace +
+ODE integration of the `weibull` forcing) at NONMEM's reported optimum reproduces
+it (NONMEM `ADVAN13 TOL=9`, MINIMIZATION SUCCESSFUL):
+
+| Quantity | NONMEM | ferx (at NONMEM's optimum) |
+|----------|--------|----------------------------|
+| FOCEI objective | −943.83 | **−943.85** (Δ 0.01) |
+
+evaluated at `CL 5.398`, `V 63.02`, `TD 1.656`, `BETA 3.479`. The 0.01-unit
+agreement confirms the `weibull` density and its ODE machinery reproduce the
+NONMEM `$DES` Weibull input (`nonmem_anchor/results/weibull_absorption.ext`; the
+ferx anchor is `tests/weibull_nonmem_anchor.rs`, gated behind
+`--features slow-tests`). Unlike the stiffer transit/IG forcings, the smooth
+Weibull density matches to 0.01 even at default ODE tolerances. The forcing is
+additionally validated in-repo without NONMEM by the absorption-independent
+**mass-balance invariant** `∫A dt = F·Dose/ke` (`tests/weibull_absorption.rs`) and
+the **analytic-`Dual2` ≡ central-FD gradient** parity (`src/pk/absorption.rs`,
+`src/sens/ode_provider.rs`).
+
+A **free fit also converges** under the default [`optimizer = auto`](fit-options.qmd),
+which selects gradient-based NLopt L-BFGS whenever the exact analytic outer gradient
+is available — and the `weibull()` forcing now provides it through the `Dual2`
+ODE-sensitivity path. From generic initials the free fit lands essentially **on** the
+NONMEM optimum; the legacy derivative-free `bobyqa` (the pre-`auto` default) is shown
+for contrast:
+
+| Quantity | NONMEM | `auto` → L-BFGS (default) | Δ vs NM | legacy `optimizer = bobyqa` |
+|----------|--------|---------------------------|---------|-----------------------------|
+| OFV | −943.8326 | **−943.8326** | ~1e-6 | −942.359 (+1.47) |
+| TVCL | 5.39758 | 5.39762 | +0.007 % | 5.4237 |
+| TVV | 63.0166 | 63.0172 | +0.001 % | 63.868 |
+| TVTD | 1.65572 | 1.65571 | −0.001 % | 1.6581 |
+| TVBETA | 3.47905 | 3.47907 | +0.001 % | 3.4750 |
+| ω²(CL) | 0.050675 | 0.050671 | −0.008 % | 0.0343 |
+| ω²(V) | 0.042042 | 0.042046 | +0.010 % | 0.0493 |
+| σ²(prop) | 0.0479645 | 0.047964 | −0.001 % | 0.0490 |
+
+Under `auto` → L-BFGS the free fit matches NONMEM to **~1e-6** in OFV and **< 0.01 %**
+on every fixed effect and variance component. The legacy `bobyqa` instead stalls
+~1.47 units short: a derivative-free trust-region method cannot resolve the shallow
+descent direction on the flat mis-specified ridge from function values alone — a
+pure optimiser artefact, not a density issue (the shared-optimum check above rules
+that out at 0.01 units). This run doubles as an end-to-end verification that `auto`
+plus the analytic `Dual2` ODE-forcing gradient resolve and converge on a `weibull()`
+model.
+
 ## Generating the disposition — `ode_template`
 
 The transit example above hand-writes the disposition ODE
@@ -325,8 +475,8 @@ need a different compartment structure.
 
 ## The error rule — ODE-only absorption needs an ODE disposition
 
-`transit(...)` and `igd(...)` (and the planned `weibull(...)`) have **no closed
-form**, so they can only feed an ODE disposition. Combining one with an
+`transit(...)`, `igd(...)`, and `weibull(...)` are currently served by numerical
+ODE integration, so they can only feed an ODE disposition. Combining one with an
 analytical `pk NAME(...)` is a **hard error**, not a silent conversion:
 
 ```text
@@ -342,3 +492,9 @@ ferx rejects this and points you at the fix: replace `pk two_cpt_oral(...)` with
 `[odes]`. ferx never silently turns an analytical `pk` request into an ODE —
 asking for the closed-form model and getting numerical integration instead would
 be a surprise.
+
+`transit` and `igd` both have closed-form convolutions with 1-/2-compartment
+disposition (planned via the analytical incomplete-gamma / inverse-Gaussian forms,
+`plans/absorption-models.md`), so this restriction is interim for them. **Weibull
+has no elementary closed form, so its error rule is permanent** — `weibull(...)`
+will always require an explicit ODE disposition.

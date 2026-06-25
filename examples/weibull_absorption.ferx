@@ -1,0 +1,78 @@
+# Weibull absorption — built-in `weibull()` input rate
+#
+# One-compartment oral disposition with a Weibull absorption-time distribution,
+# expressed with the built-in `weibull()` input-rate function. Like `igd()` (and
+# unlike a transit chain), the Weibull density models the *entire* absorption
+# delay and feeds the central compartment directly (no downstream first-order
+# `ka`):
+#
+#   R_in(tad) = F·Dose · (β/Td) · (tad/Td)^(β−1) · exp(−(tad/Td)^β)
+#
+# the standard Weibull density with scale Td and shape β (the appearance-rate
+# form of the cumulative absorbed fraction 1 − exp(−(tad/Td)^β)). The whole dose
+# is delivered through `weibull()` over time (∫ R_in dt = F·Dose) and is NOT also
+# added as a bolus — the same dose-into-the-input-rate-compartment convention as
+# `transit()` / `igd()`.
+#
+# Weibull absorption has NO elementary closed form with linear disposition, so it
+# always runs on the numerical ODE path; it can only be used with an explicit ODE
+# disposition (`ode(...)` here, or a generated `ode_template`), never an
+# analytical `pk ...` (which errors, pointing at `ode_template`).
+#
+# Shape β controls the absorption profile:
+#   β > 1  delayed, interior peak (sigmoidal uptake) — the common PK case
+#   β = 1  reduces to first-order absorption with ka = 1/Td
+#   β < 1  fast early uptake (an integrable spike at the dose) tapering off
+#
+# ── Unit convention (Form C: amount ODE + [scaling]) ─────────────────────────
+#   CMT=1  central  — drug AMOUNT (mg); receives R_in(tad), elimination CL/V
+#   observation y   — concentration (mg/L) = central / V, via the [scaling] block
+#
+# Self-contained: run it with no data file
+#   cargo run --release -- examples/weibull_absorption.ferx --simulate
+# which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
+# fits it back. True simulation parameters: TVCL=5, TVV=50, TVTD=2, TVBETA=1.5,
+#   omega_CL=omega_V=0.09, sigma_prop=0.15.
+
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)    # typical clearance (L/h)
+  theta TVV(50.0,   5.0, 500.0)    # typical central volume (L)
+  theta TVTD(2.0,  0.05,  24.0)    # Weibull scale (h)
+  theta TVBETA(1.5, 0.1,  10.0)    # Weibull shape (dimensionless)
+
+  omega ETA_CL ~ 0.09              # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09              # IIV on V  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)       # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL   = TVCL  * exp(ETA_CL)
+  V    = TVV   * exp(ETA_V)
+  TD   = TVTD
+  BETA = TVBETA
+
+[structural_model]
+  ode(states=[central])            # no obs_cmt — Form C provides the observable
+
+[odes]
+  # central holds drug AMOUNT (mg); weibull() delivers F·Dose over time as the
+  # Weibull density, then first-order elimination CL/V.
+  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central
+
+[scaling]
+  y = central / V                  # observable = concentration (mg/L)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7

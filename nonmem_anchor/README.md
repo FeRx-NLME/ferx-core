@@ -6,9 +6,18 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | Anchors | ferx feature | NONMEM control stream | ferx model |
 |---------|--------------|-----------------------|------------|
 | **Savic transit** | `transit(n, mtt)` — PR [#343](https://github.com/FeRx-NLME/ferx-core/pull/343) | `savic_transit.ctl` | `transit_savic_fit.ferx` |
-| **Freijer & Post IG** | `igd(mat, cv2)` — issue [#347](https://github.com/FeRx-NLME/ferx-core/issues/347) | `freijer_ig.ctl` | *(after #347 is implemented)* |
+| **Freijer & Post IG** | `igd(mat, cv2)` — issue [#347](https://github.com/FeRx-NLME/ferx-core/issues/347) | `freijer_ig.ctl` | *(in `tests/igd_nonmem_anchor.rs`)* |
+| **Weibull** | `weibull(td, beta)` — [#322](https://github.com/FeRx-NLME/ferx-core/issues/322) Phase 2 | `weibull_absorption.ctl` | `weibull_absorption_fit.ferx` |
 
-Both control streams run on **one** dataset, `transit_oral.csv`.
+The transit control runs on `transit_oral.csv`; the IG and Weibull controls run
+on `igd_oral.csv` (the same data re-keyed to a 1-compartment layout — every record
+on CMT 1 — so the dose feeds the absorption compartment directly).
+
+> **Weibull run status — DONE (#503).** The licensed NONMEM run landed
+> (`results/weibull_absorption.{ext,lst,tab,…}`, MINIMIZATION SUCCESSFUL,
+> `#OBJV = −943.833`) and the slow-gated `tests/weibull_nonmem_anchor.rs` pins the
+> verified comparison below. Re-run with
+> `nmfe75 weibull_absorption.ctl weibull_absorption.lst`.
 
 ## The dataset
 
@@ -146,6 +155,60 @@ compartment (the plan's dose-routing rule: the dose feeds the function on its
 a single central compartment carrying both the IG-driven dose and the
 observations. The two are likelihood-identical (NONMEM's depot is inert), so they
 share the same objective.
+
+### Weibull — RESULT (FOCEI, 20 subj / 240 obs)
+
+NONMEM run: `results/weibull_absorption.*` (`nmfe75`, `ADVAN13 TOL=9`,
+MINIMIZATION SUCCESSFUL, `#OBJV = −943.833`). ferx anchor:
+`tests/weibull_nonmem_anchor.rs` on `data/igd_oral.csv` (same all-CMT-1 re-key as
+the igd anchor). As with `igd`, the data are transit-truth, so this is an
+**implementation** check (`NONMEM-weibull ≈ ferx-weibull at the shared optimum`),
+not parameter recovery.
+
+**The check is the objective at the shared optimum.** Evaluating ferx's full
+FOCEI marginal objective (inner EBEs + Laplace + ODE integration of the `weibull`
+forcing) at NONMEM's reported optimum:
+
+| Quantity | NONMEM | ferx (at NONMEM's optimum) |
+|----------|--------|----------------------------|
+| FOCEI objective | −943.833 | **−943.845** (Δ 0.01) |
+
+evaluated at `CL 5.39758`, `V 63.0166`, `TD 1.65572`, `BETA 3.47905`,
+`ω²(CL) 0.0506751`, `ω²(V) 0.0420421`, `σ²(prop) 0.0479645`. Agreement to **0.01
+units** (tighter than igd's 0.02) confirms the `weibull()` density and its ODE
+machinery (forcing, dose routing, bolus suppression, superposition) reproduce the
+NONMEM `$DES` Weibull input. Unlike the stiffer transit/IG forcings, the smooth
+Weibull density matches to 0.01 even at default ODE tolerances.
+
+**A free ferx fit also converges — and doubles as optimiser verification.** A free
+fit from generic initials (`weibull_absorption_fit.ferx`) under the default `auto`
+optimiser lands essentially **on** NONMEM's optimum. `auto` (#490) picks
+gradient-based NLopt L-BFGS whenever the exact analytic outer gradient is
+available, and the `weibull()` forcing now provides it via the live `Dual2`
+ODE-sensitivity path (#430 generic forcing + #498 `supported_over_dual`). The
+legacy derivative-free `bobyqa` (the pre-#490 default) is shown for contrast:
+
+| Quantity | NONMEM | `auto` → L-BFGS (default) | Δ vs NM | legacy `optimizer = bobyqa` |
+|----------|--------|---------------------------|---------|-----------------------------|
+| OFV (min objective) | −943.8326 | **−943.8326** | ~1e-6 | −942.359 (+1.47) |
+| TVCL  | 5.39758 | 5.39762 | +0.007 % | 5.4237 |
+| TVV   | 63.0166 | 63.0172 | +0.001 % | 63.868 |
+| TVTD (scale)  | 1.65572 | 1.65571 | −0.001 % | 1.6581 |
+| TVBETA (shape) | 3.47905 | 3.47907 | +0.001 % | 3.4750 |
+| ω²(CL) | 0.050675 | 0.050671 | −0.008 % | 0.0343 |
+| ω²(V)  | 0.042042 | 0.042046 | +0.010 % | 0.0493 |
+| σ² (prop) | 0.0479645 | 0.047964 | −0.001 % | 0.0490 |
+
+Under `auto` → L-BFGS, OFV matches NONMEM to **~1e-6** and every fixed effect and
+variance component to **< 0.01 %** — a free-fit reproduction of the NONMEM optimum,
+not merely the shared-optimum evaluation above. The legacy `bobyqa` instead stalls
+~1.47 OFV units short: on the flat mis-specified ridge its interpolation model can't
+resolve the shallow descent direction from function values alone (the trust radius
+hits `rhoend` before convergence). That is a pure **optimiser** artefact, not a
+density issue — the shared-optimum check above independently rules out a density bug
+at 0.01 units, and the analytic `Dual2` gradient (which NONMEM-style gradient FOCEI
+also relies on) closes the gap. This run therefore also verifies that `auto` + the
+analytic ODE-forcing gradient resolve and converge end-to-end on a `weibull()` model.
 
 ## Implementation notes (why the streams look the way they do)
 

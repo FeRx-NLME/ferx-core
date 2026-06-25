@@ -8,30 +8,34 @@ The optional `[simulation]` block defines a virtual clinical trial design for ge
 
 ```
 [simulation]
-  subjects = N
-  dose = AMOUNT
-  cmt = COMPARTMENT
-  seed = SEED
-  times = [t1, t2, t3, ...]
+  n_subjects = N
+  dose_amt   = AMOUNT
+  dose_cmt   = COMPARTMENT
+  seed       = SEED
+  times      = [t1, t2, t3, ...]
 ```
 
-| Key | Description |
-|-----|-------------|
-| `subjects` | Number of virtual subjects to simulate |
-| `dose` | Dose amount administered to each subject |
-| `cmt` | Dosing compartment (1-indexed) |
-| `seed` | Random seed for reproducible simulations |
-| `times` | Observation time points |
+| Key | Aliases | Description |
+|-----|---------|-------------|
+| `n_subjects` | `subjects` | Number of virtual subjects to simulate |
+| `dose_amt` | `dose` | Dose amount administered to each subject |
+| `dose_cmt` | `cmt` | Dosing compartment (1-indexed) |
+| `seed` | | Random seed for reproducible simulations |
+| `times` | | Observation time points (required) |
+
+An **unknown or malformed key in `[simulation]` is a parse error** (not silently
+ignored), so a typo such as `n_subject`, or a line missing its `=` such as
+`n_subjects 6`, is reported rather than falling back to the default.
 
 ## Example
 
 ```
 [simulation]
-  subjects = 100
-  dose = 100
-  cmt = 1
-  seed = 12345
-  times = [0.5, 1, 2, 4, 8, 12, 24]
+  n_subjects = 100
+  dose_amt   = 100
+  dose_cmt   = 1
+  seed       = 12345
+  times      = [0.5, 1, 2, 4, 8, 12, 24]
 ```
 
 This simulates 100 subjects, each receiving a dose of 100 units into compartment 1, with observations at 0.5, 1, 2, 4, 8, 12, and 24 hours.

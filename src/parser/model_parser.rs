@@ -3522,27 +3522,46 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
     for line in lines {
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
         if parts.len() != 2 {
-            continue;
+            // No `=` on a non-blank, non-comment line (comments/blanks are already
+            // stripped by `extract_blocks`). Treat it as a hard error rather than
+            // silently skipping — e.g. `n_subjects 5` must not fall back to the
+            // default, which is the whole point of this block's strict parsing.
+            return Err(format!(
+                "[simulation]: malformed line (expected `key = value`): {}",
+                line.trim()
+            ));
         }
         match parts[0] {
-            "subjects" => {
+            // `n_subjects` / `dose_amt` / `dose_cmt` are the canonical spellings
+            // (they match the `SimulationSpec` fields and every `examples/*.ferx`);
+            // the short `subjects` / `dose` / `cmt` forms are kept as back-compat
+            // aliases. An unknown key is a hard error (mirrors [fit_options]) so a
+            // typo like `n_subject` no longer silently falls back to the default.
+            "subjects" | "n_subjects" => {
                 n_subjects = parts[1]
                     .parse()
-                    .map_err(|_| format!("Bad subjects: {}", line))?
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
             }
-            "dose" => {
+            "dose" | "dose_amt" => {
                 dose_amt = parts[1]
                     .parse()
-                    .map_err(|_| format!("Bad dose: {}", line))?
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
             }
-            "cmt" => dose_cmt = parts[1].parse().map_err(|_| format!("Bad cmt: {}", line))?,
+            "cmt" | "dose_cmt" => {
+                dose_cmt = parts[1]
+                    .parse()
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
+            }
             "seed" => {
                 seed = parts[1]
                     .parse()
-                    .map_err(|_| format!("Bad seed: {}", line))?
+                    .map_err(|_| format!("[simulation]: bad {}: {}", parts[0], line))?
             }
-            "times" => obs_times = parse_float_array(parts[1])?,
-            _ => {}
+            "times" => {
+                obs_times = parse_float_array(parts[1])
+                    .map_err(|e| format!("[simulation]: bad times: {e}"))?
+            }
+            other => return Err(format!("[simulation]: unknown key `{}`", other)),
         }
     }
     if obs_times.is_empty() {
@@ -4659,13 +4678,17 @@ fn parse_scaling_block(
 /// excluded — they can ride on an analytical `pk` model.
 ///
 /// This lists only the functions that are **actually implemented** as input
-/// rates today (`transit`, #343; `igd`, #347). Each later absorption function
-/// adds its own name here in the same PR that implements it — Phase 2 `weibull` —
+/// rates today (`transit`, #343; `igd`, #347; `weibull`, Phase 2). Each later
+/// absorption function adds its own name here in the same PR that implements it,
 /// so the error rule never advertises a function the engine can't yet run (which
 /// would send the user to `ode_template` for a dead end, Ron #363). A slice (not
 /// a fixed-size array) so a new entry needs no length-annotation bump, matching
 /// [`INPUT_RATE_FNS`].
-const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd"];
+///
+/// `weibull` stays on this list **permanently** — unlike `transit`/`igd`, it has
+/// no elementary closed form with linear disposition, so it can never route to an
+/// analytical `pk` and always requires an explicit ODE disposition.
+const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd", "weibull"];
 
 /// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
 /// the first such function name found. Drives the error rule that rejects an
@@ -5311,7 +5334,7 @@ fn split_args_on_commas(s: &str) -> Vec<&str> {
 /// arguments it requires. Arguments are resolved to individual-parameter slots
 /// and stored in `arg_slots` in this order, so `src/pk/absorption.rs` reads them
 /// positionally. Each new model adds one row here in the PR that implements it
-/// (`transit`, #343; `igd`, #347).
+/// (`transit`, #343; `igd`, #347; `weibull`, Phase 2).
 const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] = &[
     (
         "transit",
@@ -5322,6 +5345,11 @@ const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] =
         "igd",
         crate::pk::absorption::InputRateKind::InverseGaussian,
         &["mat", "cv2"],
+    ),
+    (
+        "weibull",
+        crate::pk::absorption::InputRateKind::Weibull,
+        &["td", "beta"],
     ),
 ];
 
@@ -11450,6 +11478,24 @@ mod tests {
     }
 
     #[test]
+    fn error_rule_analytical_pk_plus_weibull() {
+        // Weibull has no closed form, so analytical `pk` + `weibull()` is a hard
+        // error pointing at ode_template — and stays one permanently (unlike
+        // transit/igd, it can never route to the analytical path).
+        let src = two_cpt_oral_model(
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "  TD = 2.0\n  BETA = 1.5\n",
+            "[odes]\n  d/dt(depot) = weibull(td=TD, beta=BETA) - KA*depot\n\n",
+        );
+        let err = parse_err(&src);
+        assert!(
+            err.contains("ode_template"),
+            "should point at ode_template: {err}"
+        );
+        assert!(err.contains("weibull"), "should name the function: {err}");
+    }
+
+    #[test]
     fn ode_only_absorption_fn_detection() {
         let transit = vec!["d/dt(depot) = transit(n=N, mtt=M) - KA*depot".to_string()];
         assert_eq!(
@@ -11460,12 +11506,14 @@ mod tests {
         // (routing an analytical `pk` + `igd()` to `ode_template`).
         let igd = vec!["d/dt(central) = igd(mat=MAT, cv2=CV2) - (CL/V)*central".to_string()];
         assert_eq!(ode_only_absorption_fn_in_odes(Some(&igd)), Some("igd"));
-        // The error rule only recognises functions that are actually implemented
-        // (Ron #363): `weibull` is not yet an input rate, so it must NOT be
-        // detected — otherwise the rule would point the user at `ode_template` for a
-        // function the engine can't run. Each phase adds its name here when it lands.
+        // `weibull` is implemented as of Phase 2, so the error rule now recognises
+        // it. Unlike `transit`/`igd`, it has no closed form, so it stays on the
+        // ODE-only list permanently (it can never route to an analytical `pk`).
         let weibull = vec!["d/dt(central) = weibull(td=TD, beta=B) - (CL/V)*central".to_string()];
-        assert_eq!(ode_only_absorption_fn_in_odes(Some(&weibull)), None);
+        assert_eq!(
+            ode_only_absorption_fn_in_odes(Some(&weibull)),
+            Some("weibull")
+        );
         // A plain disposition ODE has no ODE-only absorption call.
         let plain = vec!["d/dt(central) = -(CL/V)*central".to_string()];
         assert_eq!(ode_only_absorption_fn_in_odes(Some(&plain)), None);
@@ -11734,6 +11782,62 @@ mod tests {
         assert!(none.is_empty());
         // Positive control: a bare additive igd() is accepted.
         assert!(go("d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central").is_ok());
+    }
+
+    // ── weibull() input-rate parse-split (#322 Phase 2, design A) ─────────────
+    #[test]
+    fn extract_weibull_input_rate_basic() {
+        // weibull(td, beta) straight into central: forcing on the central cmt,
+        // args resolved to the [td, beta] slots in order; the rest of the RHS
+        // untouched.
+        let lines = vec!["d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central".to_string()];
+        let states = vec!["depot".to_string(), "central".to_string()];
+        let names = vec![
+            "TD".to_string(),
+            "BETA".to_string(),
+            "CL".to_string(),
+            "V".to_string(),
+        ];
+        let slots = vec![4, 5, 0, 1];
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&lines, &states, &names, &slots).unwrap();
+        assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(forcings[0].cmt, 1); // central
+        assert!(matches!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::Weibull
+        ));
+        assert_eq!(forcings[0].arg_slots, vec![4, 5]); // [td=TD slot, beta=BETA slot]
+    }
+
+    #[test]
+    fn extract_weibull_input_rate_rejects_bad_specs() {
+        let states = vec!["central".to_string()];
+        let names = vec!["TD".to_string(), "BETA".to_string()];
+        let slots = vec![4, 5];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        assert!(go("d/dt(central) = weibull(td=TD, beta=ZZZ)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        assert!(go("d/dt(central) = weibull(td=TD, foo=BETA)")
+            .unwrap_err()
+            .contains("no argument `foo`"));
+        let err = go("d/dt(central) = weibull(td=TD)").unwrap_err();
+        assert!(
+            err.contains("missing required argument `beta`"),
+            "got: {err}"
+        );
+        // A scaled call is rejected and the message names `weibull`.
+        let scaled = go("d/dt(central) = FR*weibull(td=TD, beta=BETA)").unwrap_err();
+        assert!(
+            scaled.contains("scaled") && scaled.contains("weibull"),
+            "got: {scaled}"
+        );
+        // Positive control: a bare additive weibull() is accepted.
+        assert!(go("d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central").is_ok());
     }
 
     #[test]
@@ -21695,5 +21799,103 @@ CL V KA WT
             )]),
         }];
         assert_eq!(compute_cov_static_mask(&stat_if, 1), vec![true]);
+    }
+
+    // ── [simulation] block key handling ──────────────────────────────────────
+    fn sim_lines(body: &[&str]) -> Vec<String> {
+        body.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn simulation_long_form_keys_apply() {
+        // The canonical (and example-file) spellings must actually be honored —
+        // the bug was that `n_subjects`/`dose_amt`/`dose_cmt` were silently ignored
+        // and fell back to the defaults (10 / 100 / 1).
+        let spec = parse_simulation_block(&sim_lines(&[
+            "n_subjects = 7",
+            "dose_amt = 50",
+            "dose_cmt = 2",
+            "seed = 99",
+            "times = [0.5, 1.0, 2.0]",
+        ]))
+        .expect("long-form keys parse");
+        assert_eq!(spec.n_subjects, 7);
+        assert_eq!(spec.dose_amt, 50.0);
+        assert_eq!(spec.dose_cmt, 2);
+        assert_eq!(spec.seed, 99);
+        assert_eq!(spec.obs_times, vec![0.5, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn simulation_short_form_aliases_apply() {
+        // Back-compat: the short `subjects`/`dose`/`cmt` forms (the previously
+        // documented spelling) remain valid aliases for the same fields, and the
+        // defaults hold for the keys we omit (seed = 42).
+        let spec = parse_simulation_block(&sim_lines(&[
+            "subjects = 3",
+            "dose = 25",
+            "cmt = 4",
+            "times = [1.0]",
+        ]))
+        .expect("short-form aliases parse");
+        assert_eq!(spec.n_subjects, 3);
+        assert_eq!(spec.dose_amt, 25.0);
+        assert_eq!(spec.dose_cmt, 4);
+        assert_eq!(spec.seed, 42, "untouched seed keeps its default");
+    }
+
+    #[test]
+    fn simulation_unknown_key_errors() {
+        // A typo (e.g. `n_subject`) must be a hard error, not a silent default —
+        // this is the silent-failure class the fix closes.
+        let err = parse_simulation_block(&sim_lines(&[
+            "n_subject = 5", // typo: missing the trailing 's'
+            "times = [1.0]",
+        ]))
+        .unwrap_err();
+        assert!(
+            err.starts_with("[simulation]:")
+                && err.contains("unknown key")
+                && err.contains("n_subject"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn simulation_malformed_line_errors() {
+        // A non-blank line with no `=` (e.g. a forgotten `=`) is malformed and must
+        // error rather than being silently skipped into the default.
+        let err =
+            parse_simulation_block(&sim_lines(&["n_subjects 5", "times = [1.0]"])).unwrap_err();
+        assert!(
+            err.starts_with("[simulation]:") && err.contains("malformed line"),
+            "got: {err}"
+        );
+    }
+
+    // Every value-parsing arm must report a clear, prefixed error on a bad value —
+    // not just `n_subjects`. This pins the error branch of each `map_err`/`?` so the
+    // diff isn't covered by happy paths alone.
+    #[test]
+    fn simulation_bad_value_errors_per_key() {
+        for (line, key) in [
+            ("n_subjects = abc", "n_subjects"),
+            ("dose_amt = abc", "dose_amt"),
+            ("dose_cmt = 1.5", "dose_cmt"), // non-integer compartment
+            ("seed = -1", "seed"),          // seed is u64
+            ("times = [1.0, oops]", "times"),
+        ] {
+            let err = parse_simulation_block(&sim_lines(&[line, "times = [1.0]"])).unwrap_err();
+            assert!(
+                err.starts_with("[simulation]:") && err.contains(key),
+                "key `{key}` on `{line}` gave: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn simulation_requires_times() {
+        let err = parse_simulation_block(&sim_lines(&["n_subjects = 5"])).unwrap_err();
+        assert!(err.contains("times"), "got: {err}");
     }
 }
