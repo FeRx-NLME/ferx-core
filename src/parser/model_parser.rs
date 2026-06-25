@@ -13257,6 +13257,29 @@ mod tests {
     }
 
     #[test]
+    fn test_ode_solver_keys_do_not_warn() {
+        // ode_reltol/ode_abstol/ode_max_steps configure the RK45 integrator (any
+        // ODE model, any estimation method) — they are framework-level, not
+        // method-specific. Regression for the spurious "is not used by method
+        // FOCEI and will be ignored" warning these once produced even though
+        // `sync_ode_solver_opts` does apply them.
+        for method in ["focei", "foce", "saem", "imp", "bayes"] {
+            let opts = parse_fit_options(&[
+                format!("method = {method}"),
+                "ode_reltol = 1e-9".to_string(),
+                "ode_abstol = 1e-11".to_string(),
+                "ode_max_steps = 1000000".to_string(),
+            ])
+            .unwrap();
+            assert!(
+                opts.unsupported_keys_warnings().is_empty(),
+                "method={method} spuriously warned on ODE-solver keys: {:?}",
+                opts.unsupported_keys_warnings()
+            );
+        }
+    }
+
+    #[test]
     fn test_inner_optimizer_under_focei_does_not_warn() {
         // `inner_optimizer` drives the per-subject EBE loop, which FOCEI uses —
         // it must be in the method's recognized keys and not flagged "ignored".
