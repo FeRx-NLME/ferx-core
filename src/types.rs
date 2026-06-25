@@ -4232,6 +4232,14 @@ pub fn framework_keys() -> &'static [&'static str] {
         "inits_from_nca",
         "frem_predictions",
         "frem_sigma",
+        // RK45 ODE-solver knobs: applied to the integrator at parse time via
+        // `sync_ode_solver_opts` (gated on the model being an ODE model, not on
+        // the estimation method), so they are framework-level — every method
+        // that integrates an ODE model honours them. Listing them here keeps
+        // `unsupported_keys_warnings` from falsely flagging them as "ignored".
+        "ode_reltol",
+        "ode_abstol",
+        "ode_max_steps",
     ]
 }
 

@@ -236,6 +236,12 @@ section of the SDLC for the versioning policy).
   Both spellings are now accepted (long forms canonical, short forms as aliases),
   and an **unknown or malformed key in `[simulation]` is now a hard parse error**
   instead of a silent default, matching `[fit_options]`.
+- The ODE-solver fit options `ode_reltol`, `ode_abstol`, and `ode_max_steps` no
+  longer emit a spurious "is not used by method … and will be ignored" warning
+  (#516). They configure the RK45 integrator and *are* applied to any ODE model
+  under every estimation method; they were simply missing from the warning's
+  framework-key allowlist. Behaviour is unchanged — only the misleading warning
+  is removed.
 - Simulation, NPDE/NPD diagnostics, and the NCA-init grid sweep now honour
   time-varying covariate snapshots on dose, observation, and EVID=2 rows instead
   of using only each subject's baseline covariates (#506). FREM covariate
