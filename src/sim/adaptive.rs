@@ -225,9 +225,69 @@ pub struct DoseLedgerEntry {
     pub f_applied: f64,
 }
 
+/// What a controller did at one decision — the audit summary the decision log
+/// records alongside the signals it observed.
+///
+/// The realized doses themselves live in the [`DoseLedgerEntry`] rows tagged with
+/// the same `decision_idx`; this only categorizes the decision so a held / no-dose
+/// decision (invisible in the dose ledger) is still on the record. `Stop` carries
+/// `dosed` so a "give a final dose, then discontinue" action list (`[Bolus, Stop]`)
+/// is logged faithfully rather than as a bare stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecisionOutcome {
+    /// The controller issued `n` realized dose(s) (bolus/infusion with `amt > 0`).
+    /// Always `n >= 1`: a decision whose actions are all `Hold` or zero-amount is
+    /// [`DecisionOutcome::Hold`], not `Dosed { n: 0 }`.
+    Dosed { n: usize },
+    /// No dose this decision — every action was `Hold`, an empty action list, or a
+    /// zero-amount dose.
+    Hold,
+    /// The controller discontinued; `dosed` counts any dose(s) issued *before* the
+    /// `Stop` in the same action list (`0` for a bare stop). `Stop` must be the
+    /// final action — the driver rejects any action after it — so `dosed` is a
+    /// faithful count, never an undercount from a silently-dropped trailing dose.
+    Stop { dosed: usize },
+}
+
+/// One decision the controller made, recorded for **every** decision time —
+/// including holds and no-change, which leave no [`DoseLedgerEntry`]. This is the
+/// Part-D decision log and the input to the Part-E decision-audit replay (S1.6):
+/// it pins exactly what the controller saw (`observed_signals`) and what it did
+/// (`outcome`) at each decision, so the run can be reproduced and audited.
+///
+/// Reproducibility assumes the controller decides from its declared
+/// `observed_signals`. [`ControllerCtx`] also exposes the raw `state`,
+/// `covariates`, and dose `history`, but those are deterministically re-derivable
+/// from the frozen inputs + ledger + schedule, so they are not re-stored here. The
+/// signals *are* stored: under S1.3a (`Ipred` only) they are likewise re-derivable
+/// and serve as a self-contained, directly-auditable record, and under S1.5's `Dv`
+/// mode they pin the realized assay-noise draw, so the audit can verify what the
+/// controller saw without re-running the stochastic observation.
+///
+/// A decision reached *after* a `Stop` is not logged — once discontinued the
+/// driver issues no further decisions, so the `Stop` entry is the last record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecisionLogEntry {
+    /// Subject id.
+    pub subject: String,
+    /// Parameter-uncertainty draw index — matches [`crate::SimulationResult::draw`].
+    pub draw: usize,
+    /// Replicate index within the draw — matches [`crate::SimulationResult::sim`].
+    pub sim: usize,
+    /// 0-based index of this decision in the schedule.
+    pub decision_idx: usize,
+    /// Decision time on the subject's clock.
+    pub time: f64,
+    /// What the controller observed at this decision (per-analyte value + mode) —
+    /// the exact inputs to reproduce the decision.
+    pub observed_signals: Vec<ObservedSignal>,
+    /// What the controller did (dose / hold / stop).
+    pub outcome: DecisionOutcome,
+}
+
 /// Result of one reactive-dosing run over a single subject: the observation-time
-/// predictions (same layout as [`crate::ode::predictions::ode_predictions`]) and
-/// the realized-dose ledger the controller produced. S1.4 wraps this with the
+/// predictions (same layout as [`crate::ode::predictions::ode_predictions`]), the
+/// realized-dose ledger, and the per-decision log. S1.4 wraps this with the
 /// per-subject/replicate orchestration and the public output schema.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdaptiveRun {
@@ -236,6 +296,9 @@ pub struct AdaptiveRun {
     pub predictions: Vec<f64>,
     /// Every dose the controller actually issued, in time order.
     pub ledger: Vec<DoseLedgerEntry>,
+    /// One entry per decision (incl. holds), in schedule order, up to and
+    /// including any `Stop`.
+    pub decisions: Vec<DecisionLogEntry>,
 }
 
 #[cfg(test)]
@@ -347,6 +410,34 @@ mod tests {
         let pre = entry.pre_state.as_ref().unwrap();
         let post = entry.post_state.as_ref().unwrap();
         assert_eq!(post[0] - pre[0], 75.0);
+    }
+
+    #[test]
+    fn decision_log_entry_round_trips_and_outcomes_are_distinct() {
+        let obs = ObservedSignal {
+            name: "A".to_string(),
+            value: 0.0,
+            mode: ObserveMode::Ipred,
+        };
+        let entry = DecisionLogEntry {
+            subject: "1".to_string(),
+            draw: 0,
+            sim: 0,
+            decision_idx: 3,
+            time: 72.0,
+            observed_signals: vec![obs.clone()],
+            outcome: DecisionOutcome::Dosed { n: 2 },
+        };
+        assert_eq!(entry.clone(), entry);
+        assert_eq!(entry.observed_signals[0], obs);
+        // The three outcome categories are distinct, and `Stop` carries the count
+        // of any dose(s) issued before discontinuation.
+        assert_ne!(DecisionOutcome::Hold, DecisionOutcome::Dosed { n: 0 });
+        assert_ne!(
+            DecisionOutcome::Stop { dosed: 0 },
+            DecisionOutcome::Stop { dosed: 1 }
+        );
+        assert_ne!(DecisionOutcome::Hold, DecisionOutcome::Stop { dosed: 0 });
     }
 
     #[test]
