@@ -15,15 +15,17 @@
 //! **Supported:** single-endpoint `ObsCmt`, uniform Form C (`y = central/V1`), or
 //! per-CMT Form C (`y[CMT=N] = <expr>` — each endpoint differentiated over the dual,
 //! #439) readout; **bolus and infusion** doses; **bioavailability F** (incl.
-//! estimated, any parameterization — log-normal, logit-normal, additive); **EVID 3/4
-//! resets / multi-occasion**; **non-zero `init(...)` initial conditions**; static
-//! covariates; a constant `obs_scale` divisor and **LTBS** (`log(DV) ~ …`) output
-//! transforms; up to [`MAX_ODE_SENS_DIM`] individual parameters. Both the full
-//! `Dual2` **outer** gradient and a light `Dual1` **inner** η-gradient
-//! ([`ode_subject_eta_grad`]) are served (#410).
+//! estimated, any parameterization — log-normal, logit-normal, additive — and the
+//! compartment-indexed `F{cmt}` form, #486); **EVID 3/4 resets / multi-occasion**;
+//! **non-zero `init(...)` initial conditions**; static covariates; a constant
+//! `obs_scale` divisor and **LTBS** (`log(DV) ~ …`) output transforms; the built-in
+//! igd/transit input-rate forcings (#430/#468); up to [`MAX_ODE_SENS_DIM`] individual
+//! parameters. Both the full `Dual2` **outer** gradient and a light `Dual1` **inner**
+//! η-gradient ([`ode_subject_eta_grad`]) are served (#410).
 //!
 //! **Not yet supported** (falls back to the gradient-free / FD path): steady-state
-//! dosing, lagtime, built-in input-rate absorption, IOV, SDE/diffusion, expression
+//! dosing, lagtime (incl. compartment-indexed `ALAG{cmt}`), `weibull()` and other
+//! input-rate forcings beyond igd/transit, IOV, SDE/diffusion, expression
 //! `obs_scale`, time-varying covariates.
 #![allow(clippy::needless_range_loop)]
 
@@ -91,9 +93,9 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
         return false;
     }
     // Built-in absorption input-rate forcing is evaluated over Dual2 only for
-    // kinds lifted to PkNum (#430: inverse-Gaussian). Other kinds — transit
-    // until its `ln_gamma` dual rule, Weibull until Phase 2 — keep the FD
-    // fallback, so a model using one is not "supported" here.
+    // kinds lifted to PkNum: inverse-Gaussian (#430) and transit (#468, riding the
+    // `ln_gamma` Dual2 rule #458). Other kinds — Weibull until Phase 2, and any later
+    // kind — keep the FD fallback, so a model using one is not "supported" here.
     if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
         return false;
     }
@@ -126,18 +128,14 @@ pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
     if model.has_lagtime() {
         return false;
     }
-    // Per-compartment bioavailability (`F1`/`F2`, #369): production resolves
-    // `f_bio(d.cmt)` per dose compartment, but both the static `integrate_g` and the
-    // TV-cov walk apply the single bare `PK_IDX_F` slot, so a compartment-indexed `F`
-    // would give the wrong analytic gradient — decline to FD (the bare / no-`F` case
-    // is unaffected). (Per-compartment lag is already covered by `has_lagtime()`
-    // above.) (#449 review #7, #1)
-    if model
-        .active_dose_attr_map()
-        .has_indexed_attr(crate::types::DoseAttr::F)
-    {
-        return false;
-    }
+    // Per-compartment bioavailability (`F1`/`F2`, #369) IS supported: both the static
+    // `integrate_g` and the TV-cov walk resolve `F` per dose compartment via
+    // `f_bio_slot` (the indexed `F{cmt}` slot, else the bare `PK_IDX_F`), mirroring
+    // production's `DoseAttrMap::f_bio` — so the analytic gradient carries `∂/∂F{cmt}`
+    // exactly (#486). The indexed `F{cmt}` is an ordinary individual parameter, so its
+    // slot is seeded in `params_dual` like any other. Per-compartment *lag*
+    // (`ALAG{cmt}`) is still gated to FD by the `has_lagtime()` check above — the dual
+    // loop applies no dose-time shift, so it stays out of scope (→ #472).
     // The η/θ chain evaluates the individual-parameter program over `Dual2`
     // seeded on (θ, η); require it present, with matching axis counts (no NN-θ /
     // IOV), and within the analytic-chain dual-width cap.
@@ -475,6 +473,26 @@ fn param_eta_derivatives(
     eta: &[f64],
 ) -> Option<Vec<Vec<f64>>> {
     let prog = model.ode_spec.as_ref()?.indiv_param_program.as_ref()?;
+    param_eta_derivatives_from_prog(prog, model, subject, theta, eta)
+}
+
+/// First-order `∂p/∂η` (the η-block of [`ParamDerivs::dp_deta`]) from an explicit
+/// individual-parameter program, over a `Dual1<M>` seeded on η (`M = n_eta`). The
+/// light inner counterpart of [`param_derivatives_from_prog`], shared by the ODE
+/// provider (program on `ode_spec`) and the analytical PK provider (program on
+/// `indiv_param_partials`): it skips the θ-axes and second-order Hessian the full
+/// `Dual2` path computes, since the inner EBE η-gradient consumes only `dp_deta`
+/// (#410). Dispatches on `n_eta` alone — so unlike the `Dual2`
+/// [`param_derivatives_from_prog`] it still serves models whose combined
+/// `n_theta + n_eta` exceeds the dual dispatch ceiling, as long as `n_eta` does
+/// not. Returns `None` on the same axis-count mismatch as the full path.
+pub(crate) fn param_eta_derivatives_from_prog(
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<Vec<Vec<f64>>> {
     if prog.n_theta_axis() != model.n_theta || prog.n_eta_axis() != model.n_eta {
         return None;
     }
@@ -761,6 +779,19 @@ fn resolve_obs_readout<T: crate::sens::num::PkNum>(
     apply_output_transform::<T>(model, raw)
 }
 
+/// PK-parameter slot holding bioavailability `F` for a dose into 1-based `cmt`:
+/// the compartment-indexed `F{cmt}` slot when the model declared one (#369), else
+/// the bare [`PK_IDX_F`] (default 1.0). Mirrors production's
+/// [`DoseAttrMap::f_bio`](crate::types::DoseAttrMap::f_bio) slot resolution so the
+/// dual walk applies the same per-compartment `F` the f64 predictor does —
+/// `params_dual[slot]` then carries `∂/∂F{cmt}`, since an indexed `F{cmt}` is an
+/// ordinary seeded individual parameter (#486).
+fn f_bio_slot(ode: &OdeSpec, cmt: usize) -> usize {
+    ode.dose_attr_map
+        .indexed_slot(crate::types::DoseAttr::F, cmt)
+        .unwrap_or(PK_IDX_F)
+}
+
 /// Shared setup for both ODE drivers, generic over the dual type `T` (`Dual2<N>`
 /// for the full outer walk, `Dual1<N>` for the light inner η-gradient): seed the
 /// flat PK-parameter vector (individual parameter `i` → dual dimension `i`),
@@ -796,14 +827,20 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
     if pk_values[PK_IDX_LAGTIME].abs() > 1e-12 {
         return None;
     }
-    // Bioavailability F scales the dosed amount/rate (NONMEM F·AMT / F·RATE). F
-    // lives at PK_IDX_F (pk_param_fn defaults it to 1 when undeclared); when F is an
-    // estimated individual parameter, its derivative flows via `params_dual`. Use the
-    // raw slot — mirroring production's `DoseAttrMap::f_bio` (raw `params[PK_IDX_F]`,
-    // with the 1.0 default baked into the slot at construction) — so a transient
-    // F ≤ 0 mid-fit scales the dose by F exactly as the f64 predictor does, rather
-    // than substituting 1.0 and dropping ∂/∂F (#451 / #433 review #3).
-    let f_bio = params_dual[PK_IDX_F];
+    // Bioavailability F scales the dosed amount/rate (NONMEM F·AMT / F·RATE),
+    // resolved *per dose compartment*: `F{cmt}` if the model declared a
+    // compartment-indexed bioavailability for that dose's compartment, else the bare
+    // `PK_IDX_F` (#369 / #486). When F is an estimated individual parameter its
+    // derivative flows via `params_dual[slot]`. Use the raw slot — mirroring
+    // production's `DoseAttrMap::f_bio` (the 1.0 default baked into the bare slot at
+    // construction) — so a transient F ≤ 0 mid-fit scales the dose by F exactly as the
+    // f64 predictor does, rather than substituting 1.0 and dropping ∂/∂F (#451 / #433
+    // review #3).
+    let dose_f_bio: Vec<T> = subject
+        .doses
+        .iter()
+        .map(|d| params_dual[f_bio_slot(ode, d.cmt)])
+        .collect();
 
     // Dose-time anchors for TAFD/TAD (constants w.r.t. the parameters).
     let first_dose_time = subject
@@ -830,7 +867,7 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
         ode,
         &prepared_forcings,
         &params_dual,
-        f_bio,
+        &dose_f_bio,
         init_state,
         first_dose_time,
         &opts,
@@ -863,8 +900,8 @@ fn integrate_subject_duals<T: crate::sens::num::PkNum>(
 fn run_subject<const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    _theta: &[f64],
+    _eta: &[f64],
     pk_values: &[f64],
     pd: &ParamDerivs,
 ) -> Option<SubjectSens> {
@@ -961,8 +998,8 @@ fn run_subject<const N: usize>(
 fn run_subject_mixed<const NA: usize, const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    _theta: &[f64],
+    _eta: &[f64],
     pk_values: &[f64],
     pd: &ParamDerivs,
     axis_of: &[usize],
@@ -1203,10 +1240,17 @@ fn integrate_tvcov_readout<T: crate::sens::num::PkNum>(
         .expect("ode_analytical_supported (via ode_tvcov_supported) guarantees rhs_program");
     let opts = ode.solver_opts;
 
-    // Raw slot, mirroring production's `DoseAttrMap::f_bio` (1.0 default baked in at
+    // Per dose compartment, mirroring production's `DoseAttrMap::f_bio`: `F{cmt}` if
+    // declared else the bare `PK_IDX_F` slot (#369 / #486), read from that dose's own
+    // covariate snapshot `pk_at_dose[k]`. Raw slot (1.0 default baked in at
     // construction) — a transient F ≤ 0 scales the dose by F like the f64 predictor,
     // not 1.0 (#451 / #433 review #3).
-    let f_bio_at_dose: Vec<T> = pk_at_dose.iter().map(|p| p[PK_IDX_F]).collect();
+    let f_bio_at_dose: Vec<T> = subject
+        .doses
+        .iter()
+        .zip(pk_at_dose.iter())
+        .map(|(d, p)| p[f_bio_slot(ode, d.cmt)])
+        .collect();
     let first_dose_time = subject
         .doses
         .iter()
@@ -1641,7 +1685,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     ode: &OdeSpec,
     prepared_forcings: &[PreparedInputRate<T>],
     params_dual: &[T],
-    f_bio: T,
+    dose_f_bio: &[T],
     init_state: &[T],
     first_dose_time: f64,
     opts: &crate::ode::solver::OdeSolverOptions,
@@ -1701,10 +1745,12 @@ fn integrate_g<T: crate::sens::num::PkNum>(
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
     let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
 
-    // Per-dose bioavailability for the shared absorption-forcing helper. The static
-    // walk applies one `f_bio` to every dose (per-compartment F is gated off), built
-    // once per subject rather than per RK45 stage (#451 / #433 review #6).
-    let dose_f_bio_all: Vec<T> = vec![f_bio; subject.doses.len()];
+    // `dose_f_bio` (one bioavailability per dose, resolved per compartment by the
+    // caller — `F{cmt}` else bare `PK_IDX_F`, #486) is built once per subject and
+    // indexed by dose position throughout: the bolus load, the infusion rate forcing,
+    // and the shared absorption-forcing helper all read `dose_f_bio[k]` (#451 / #433
+    // review #6).
+    debug_assert_eq!(dose_f_bio.len(), subject.doses.len());
 
     for w in 0..(break_times.len() - 1) {
         let t_start = break_times[w];
@@ -1727,7 +1773,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         // A compartment fed by a built-in absorption input rate is skipped here — the
         // dose feeds R_in (the forcing in the RHS below), not a bolus (#430, mirroring
         // production's `input_rate_consumes_cmt` routing).
-        for dose in &subject.doses {
+        for (k, dose) in subject.doses.iter().enumerate() {
             if !dose.is_infusion()
                 && (dose.time - t_start).abs() < 1e-12
                 && dose.cmt >= 1
@@ -1735,7 +1781,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
             {
                 let cmt_idx = dose.cmt - 1;
                 if cmt_idx < n_states {
-                    u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
+                    u[cmt_idx] = u[cmt_idx] + dose_f_bio[k] * T::from_f64(dose.amt);
                 }
             }
         }
@@ -1765,14 +1811,17 @@ fn integrate_g<T: crate::sens::num::PkNum>(
         saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
         // Infusions spanning this whole segment add a constant rate forcing
-        // F·rate to their compartment (the break times guarantee a segment is
-        // fully inside or outside each infusion window).
-        let active_inf: Vec<(usize, f64)> = subject
+        // `F·rate` to their compartment (the break times guarantee a segment is
+        // fully inside or outside each infusion window). `F` is resolved per dose
+        // compartment (`dose_f_bio[k]`, #486); pre-scale `F·rate` as a dual once per
+        // segment so the RHS closure (called every RK45 stage) just adds it.
+        let active_inf: Vec<(usize, T)> = subject
             .doses
             .iter()
-            .filter(|d| d.is_infusion())
-            .filter(|d| d.time <= t_start + 1e-9 && d.time + d.duration >= t_end - 1e-9)
-            .map(|d| (d.cmt.saturating_sub(1), d.rate))
+            .enumerate()
+            .filter(|(_, d)| d.is_infusion())
+            .filter(|(_, d)| d.time <= t_start + 1e-9 && d.time + d.duration >= t_end - 1e-9)
+            .map(|(k, d)| (d.cmt.saturating_sub(1), dose_f_bio[k] * T::from_f64(d.rate)))
             .collect();
 
         // Last effective dose at or before the segment start, for TAD.
@@ -1796,9 +1845,10 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 &mut stack_cell.borrow_mut(),
             );
             // Infusion rate forcing (static walk only; the TV-cov subset is bolus-only).
-            for &(cmt, rate) in &active_inf {
+            // `scaled_rate` already carries `F·rate` for this dose's compartment (#486).
+            for &(cmt, scaled_rate) in &active_inf {
                 if cmt < du.len() {
-                    du[cmt] = du[cmt] + f_bio * T::from_f64(rate);
+                    du[cmt] = du[cmt] + scaled_rate;
                 }
             }
             // Built-in absorption input-rate forcing R_in(tad), via the shared
@@ -1812,7 +1862,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                     prepared_forcings,
                     &subject.doses,
                     &[],
-                    &dose_f_bio_all,
+                    dose_f_bio,
                     f64::NEG_INFINITY,
                     t,
                     du,
@@ -2196,6 +2246,12 @@ mod tests {
         s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
         check(&m, &s, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
 
+        // Compartment-indexed F1 (with IIV) → per-compartment `f_bio_slot` path (#486).
+        let m = parse_model_string(F1_ODE).expect("parse");
+        let mut s = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        check(&m, &s, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
+
         // LTBS output transform over the Dual1 readout.
         let m = parse_model_string(TWOCPT_ODE_LTBS).expect("parse");
         check(
@@ -2278,26 +2334,25 @@ mod tests {
         check_vs_production(&model, &subject, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
     }
 
-    /// Compartment-indexed bioavailability (`F1`) and lag time (`ALAG1`) land in the
-    /// dose-attr map, not the bare `PK_IDX_F` / `PK_IDX_LAGTIME` slots — the dual
-    /// walks apply only the bare `F` and dose at the bare `d.time`, so the analytic
-    /// gradient would diverge from production's per-compartment `f_bio(cmt)` /
-    /// `d.time + lagtime(cmt)`. The gate must decline both to FD (#449 re-review #1, #3).
-    #[test]
-    fn ode_analytical_declines_per_compartment_f_and_lag() {
-        const F1_ODE: &str = r#"
+    // 1-cpt oral ODE with a *compartment-indexed* bioavailability `F1` (dose into the
+    // depot, cmt 1) carrying IIV (logit-normal). `F1` lands in the dose-attr map at its
+    // own slot, NOT the bare `PK_IDX_F` (which stays 1.0): so a walk that read the bare
+    // slot would apply F = 1.0 and diverge from production's `f_bio(cmt=1)` — both in
+    // value and in ∂/∂F. The IIV (`ETA_F`) routes F1 into the inner η-gradient too (#486).
+    const F1_ODE: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
   theta TVV(50.0, 5.0, 500.0)
   theta TVKA(1.5, 0.05, 20.0)
   theta THETA_F1(0.70, 0.001, 0.999)
   omega ETA_CL ~ 0.09
+  omega ETA_F  ~ 0.10
   sigma PROP_ERR ~ 0.15 (sd)
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
   V  = TVV
   KA = TVKA
-  F1 = THETA_F1
+  F1 = inv_logit(logit(THETA_F1) + ETA_F)
 [structural_model]
   ode(obs_cmt=central, states=[depot, central])
 [odes]
@@ -2305,13 +2360,108 @@ mod tests {
   d/dt(central) = KA * depot / V - CL/V * central
 [error_model]
   DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
 "#;
-        let m = parse_model_string(F1_ODE).expect("parse F1");
-        assert!(
-            !ode_analytical_supported(&m),
-            "compartment-indexed F1 must decline to FD"
-        );
 
+    // 2-cpt IV ODE with *distinct* per-compartment bioavailabilities `F1` (central,
+    // cmt 1) and `F2` (peripheral, cmt 2). With one dose into each compartment, a walk
+    // that did not key F by the dose's own compartment (e.g. applied dose 0's F to
+    // both) would diverge from production. `obs_cmt = central`, so both F1 (direct) and
+    // F2 (via peripheral→central redistribution) move the observed concentration, hence
+    // both ∂/∂F1 and ∂/∂F2 are observable (#486).
+    const F1F2_IV_ODE: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(12.0, 1.0, 500.0)
+  theta TVQ(2.0, 0.01, 100.0)
+  theta TVV2(25.0, 1.0, 500.0)
+  theta THETA_F1(0.80, 0.001, 0.999)
+  theta THETA_F2(0.50, 0.001, 0.999)
+  omega ETA_CL ~ 0.10
+  sigma PROP_ERR ~ 0.05 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  Q  = TVQ
+  V2 = TVV2
+  F1 = THETA_F1
+  F2 = THETA_F2
+[structural_model]
+  ode(obs_cmt=central, states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+"#;
+
+    /// `f_bio_slot` resolves a dose's bioavailability slot per compartment: the
+    /// indexed `F{cmt}` slot when declared, else the bare `PK_IDX_F` (#486).
+    #[test]
+    fn f_bio_slot_resolves_indexed_then_bare() {
+        let m = parse_model_string(F1F2_IV_ODE).expect("parse F1F2");
+        let ode = m.ode_spec.as_ref().expect("ode_spec");
+        let bare = crate::types::PK_IDX_F;
+        let s1 = f_bio_slot(ode, 1);
+        let s2 = f_bio_slot(ode, 2);
+        assert_ne!(s1, bare, "F1 must resolve to its own indexed slot");
+        assert_ne!(s2, bare, "F2 must resolve to its own indexed slot");
+        assert_ne!(s1, s2, "F1 and F2 occupy distinct slots");
+        assert_eq!(
+            s1,
+            ode.dose_attr_map
+                .indexed_slot(crate::types::DoseAttr::F, 1)
+                .unwrap()
+        );
+        // A compartment with no indexed `F` falls back to the bare slot.
+        assert_eq!(f_bio_slot(ode, 3), bare);
+    }
+
+    /// Compartment-indexed bioavailability (`F1`/`F2`, #369) is now served analytically
+    /// (#486): the dual walks resolve `F` per dose compartment, so analytic f / ∂f/∂η /
+    /// ∂f/∂θ match the production predictor and its FD. Covers the single-indexed depot
+    /// case (with IIV on F1) and distinct F1≠F2 into two compartments.
+    #[test]
+    fn ode_provider_compartment_indexed_f_matches_production() {
+        // Single indexed F1 into the depot, with IIV.
+        let model = parse_model_string(F1_ODE).expect("parse F1");
+        assert!(
+            ode_analytical_supported(&model),
+            "compartment-indexed F1 should now be in scope"
+        );
+        let mut subject = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        subject.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+        check_vs_production(&model, &subject, &[5.0, 50.0, 1.5, 0.70], &[0.15, 0.2]);
+
+        // Distinct F1 (central) and F2 (peripheral) with a dose into each compartment.
+        let model = parse_model_string(F1F2_IV_ODE).expect("parse F1F2");
+        assert!(
+            ode_analytical_supported(&model),
+            "distinct per-compartment F1/F2 should be in scope"
+        );
+        let mut subject = bolus_subject(&[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 50.0, 2, 0.0, false, 0.0),
+        ];
+        check_vs_production(
+            &model,
+            &subject,
+            &[4.0, 12.0, 2.0, 25.0, 0.80, 0.50],
+            &[0.1],
+        );
+    }
+
+    /// Compartment-indexed lag (`ALAG1`) is still declined to FD: the dual loop applies
+    /// no dose-time shift, so an estimated per-compartment lag stays out of scope (→
+    /// #472). (Indexed `F` is now supported — see the parity test above.)
+    #[test]
+    fn ode_analytical_declines_per_compartment_lag() {
         const ALAG1_ODE: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -2337,6 +2487,52 @@ mod tests {
         assert!(
             !ode_analytical_supported(&m),
             "compartment-indexed ALAG1 must decline to FD"
+        );
+    }
+
+    /// Indexed `F` is now in model-level scope (parity test above), but the
+    /// *per-subject* gate must still route a **rate-defined infusion under `F ≠ 1`**
+    /// to FD. NONMEM reshapes such an infusion's window (holds the rate, scales the
+    /// duration to `F·amt/rate`, #419), whereas the dual walk scales the rate
+    /// magnitude over the *original* window — so the analytic gradient would diverge
+    /// from the f64 predictor. The model-level gate admits the indexed-`F` model; the
+    /// subject gate (`has_bioavailability() && has_rate_defined_infusion()`) declines
+    /// it. Crucially `has_bioavailability()` detects the indexed `F{cmt}` form too, so
+    /// dropping the `ode_analytical_supported` indexed-`F` decline (#486) does *not*
+    /// open this infusion path. A bolus of the same model stays in scope, so the
+    /// decline is attributable to the infusion, not the `F`.
+    #[test]
+    fn ode_subject_declines_indexed_f_rate_defined_infusion() {
+        let model = parse_model_string(F1F2_IV_ODE).expect("parse F1F2");
+        // Model-level scope admits indexed F (the indexed-F decline gate is gone, #486).
+        assert!(
+            ode_analytical_supported(&model),
+            "indexed F1/F2 model is in model-level scope"
+        );
+
+        // A bolus subject of this model IS served analytically.
+        let bolus = bolus_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        assert!(
+            !bolus.doses[0].is_infusion(),
+            "control dose must be a bolus"
+        );
+        assert!(
+            ode_subject_supported(&model, &bolus),
+            "indexed-F bolus subject should be served analytically"
+        );
+
+        // The same model with a *rate-defined* infusion (RATE>0) into the dosed
+        // compartment must decline to FD: `F` reshapes the window, which the dual rate
+        // scale does not reproduce (#419).
+        let mut infusion = bolus.clone();
+        infusion.doses = vec![DoseEvent::new(0.0, 1000.0, 1, 200.0, false, 0.0)];
+        assert!(
+            infusion.doses[0].is_infusion(),
+            "rate=200 must be a rate-defined infusion"
+        );
+        assert!(
+            !ode_subject_supported(&model, &infusion),
+            "rate-defined infusion under indexed F must decline to FD (#419)"
         );
     }
 

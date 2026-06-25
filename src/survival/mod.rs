@@ -17,6 +17,7 @@ pub use parametric::{
 };
 
 use nalgebra::DMatrix;
+use rand::RngExt;
 use std::collections::HashMap;
 
 use crate::types::{
@@ -199,7 +200,7 @@ fn draw_tte_latent<R: rand::Rng>(
 ) -> f64 {
     // Open01 samples from (0, 1) exclusive, avoiding the u=0 edge case that
     // would send -ln(u) to +∞.
-    let u: f64 = rng.sample(rand::distributions::Open01);
+    let u: f64 = rng.sample(rand::distr::Open01);
     if entry_time > 0.0 {
         sample_conditional_event_time(family, params, entry_time, u)
     } else {

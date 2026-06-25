@@ -26,7 +26,7 @@ These chain after a primary method via `methods = [...]` and refine the result r
 
 ## Outer optimizers
 
-The outer loop optimizer is selected independently of the method. See **[Outer Optimizers](optimizers.qmd)** for a full comparison of BOBYQA, SLSQP, trust-region, BFGS, and the others. Short version: keep the default (`bobyqa` — derivative-free, robust on ODE/PD models and sparse data); switch to `slsqp` for smooth analytical PK models where the gradient is reliable.
+The outer loop optimizer is selected independently of the method. See **[Outer Optimizers](optimizers.qmd)** for a full comparison of BOBYQA, SLSQP, trust-region, BFGS, and the others. Short version: keep the default (`auto`, which picks `nlopt_lbfgs` for analytic-gradient models and the derivative-free `bobyqa` for ODE/PD models and sparse data); name a specific optimizer only to override that choice.
 
 ---
 

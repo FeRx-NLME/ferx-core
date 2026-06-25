@@ -899,7 +899,7 @@ fn parse_subject(
     // runs inside `#[cfg(feature = "survival")]` blocks.
     tte_cmts: &HashSet<usize>,
     // Column index of the TENTRY (left-truncation time) column, if present.
-    tentry_col: Option<usize>,
+    _tentry_col: Option<usize>,
 ) -> Result<(Subject, usize, usize, SubjectExclusion, Vec<String>, usize), String> {
     let mut doses = Vec::new();
     let mut obs_times = Vec::new();
@@ -1308,7 +1308,7 @@ fn parse_subject(
                 #[cfg(feature = "survival")]
                 {
                     use crate::types::{EventType, ObsRecord};
-                    let raw_entry = tentry_col
+                    let raw_entry = _tentry_col
                         .and_then(|c| row.get(c))
                         .map(|s| parse_f64(s))
                         .unwrap_or(0.0)

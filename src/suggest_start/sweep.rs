@@ -6,7 +6,7 @@
 use nalgebra::DVector;
 use rayon::prelude::*;
 
-use crate::api::{model_preds, predict};
+use crate::api::predict;
 use crate::estimation::inner_optimizer::run_inner_loop_warm;
 use crate::suggest_start::find_theta_for_slot;
 use crate::types::{CompiledModel, ModelParameters, Population};
@@ -198,8 +198,10 @@ fn rrmse_ebe(
 
     for (subj, eta) in population.subjects.iter().zip(eta_hats.iter()) {
         let eta_slice = eta.as_slice();
-        let pk_params = (model.pk_param_fn)(&params.theta, eta_slice, &subj.covariates);
-        let preds = model_preds(model, subj, &pk_params, &params.theta, eta_slice);
+        // TV-covariate-aware dispatcher (#506): the rRMSE objective must score
+        // candidates with the same per-event covariate snapshots the fit uses,
+        // not the baseline-only `pk_param_fn(subj.covariates)`.
+        let preds = crate::pk::compute_predictions_with_tv(model, subj, &params.theta, eta_slice);
 
         for (j, (&obs, &cens)) in subj.observations.iter().zip(subj.cens.iter()).enumerate() {
             if cens == 0 && obs > 0.0 && obs.is_finite() {
@@ -389,6 +391,33 @@ mod tests {
         assert!(
             r.is_infinite() && r > 0.0,
             "empty population must give +∞ rRMSE, got {r}"
+        );
+    }
+
+    /// Regression for #506: the NCA-init EBE rRMSE objective must score
+    /// candidates with the time-varying covariate snapshots the fit uses, not
+    /// the baseline-only `pk_param_fn(subj.covariates)`. Observations are set to
+    /// the TV-aware predictions, so a TV-aware objective sees ~zero relative
+    /// error; the pre-fix baseline-only objective would see large error on the
+    /// WT 140/210 rows.
+    #[test]
+    fn test_rrmse_ebe_honours_tv_covariates() {
+        let (model, mut subject) = crate::types::test_helpers::tv_cov_iv_model_and_subject();
+        let params = model.default_params.clone();
+        let tv_ipred = crate::pk::compute_predictions_with_tv(&model, &subject, &params.theta, &[]);
+        subject.observations = tv_ipred;
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["WT".into()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let (r, _etas) = rrmse_ebe(&model, &population, &params, None);
+        assert!(
+            r < 1e-6,
+            "rRMSE={r} — TV covariate ignored in NCA-EBE sweep?"
         );
     }
 

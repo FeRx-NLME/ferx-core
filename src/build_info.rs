@@ -1,4 +1,4 @@
-use crate::types::{CompiledModel, EstimationMethod, GradientMethod, Optimizer};
+use crate::types::{CompiledModel, EstimationMethod, Optimizer};
 
 /// Compile-time build metadata embedded by `build.rs`.
 pub struct BuildInfo {
@@ -101,19 +101,17 @@ pub fn gradient_method_outer(
         EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
             GradientMethodKind::FiniteDifferences
         }
-        EstimationMethod::Foce | EstimationMethod::FoceI => match optimizer {
+        EstimationMethod::Foce | EstimationMethod::FoceI => match optimizer.resolve_auto(model) {
             Optimizer::Bobyqa => GradientMethodKind::NotApplicable,
-            Optimizer::Bfgs
+            // `Auto` is resolved above; only its concrete results reach here.
+            Optimizer::Auto
+            | Optimizer::Bfgs
             | Optimizer::Lbfgs
             | Optimizer::Slsqp
             | Optimizer::NloptLbfgs
             | Optimizer::Mma
             | Optimizer::TrustRegion => {
-                let user_forces_fd = matches!(model.gradient_method, GradientMethod::Fd);
-                let analytic = !user_forces_fd
-                    && (crate::sens::provider::sens_supported(model)
-                        || crate::sens::provider::iov_analytical_supported(model));
-                if analytic {
+                if crate::sens::provider::analytic_outer_gradient_available(model) {
                     GradientMethodKind::Analytic
                 } else {
                     GradientMethodKind::FiniteDifferences
@@ -127,6 +125,7 @@ pub fn gradient_method_outer(
 mod tests {
     use super::*;
     use crate::types::test_helpers;
+    use crate::types::GradientMethod;
 
     fn ad_build() -> BuildInfo {
         BuildInfo {

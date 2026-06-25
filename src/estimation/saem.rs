@@ -202,7 +202,7 @@ pub(crate) fn mh_steps(
         // Symmetric proposal q(η_prop|η) = q(η|η_prop) cancels in the ratio,
         // so the prior+likelihood difference encoded in `individual_nll` is
         // the full acceptance criterion.
-        let log_u: f64 = rng.gen::<f64>().ln();
+        let log_u: f64 = rng.random::<f64>().ln();
         if log_u < nll - nll_prop {
             eta.copy_from_slice(&eta_prop);
             nll = nll_prop;
@@ -282,7 +282,7 @@ pub(crate) fn mh_steps_componentwise(
             };
 
             // Symmetric scalar proposal cancels, same as the block kernel.
-            let log_u: f64 = rng.gen::<f64>().ln();
+            let log_u: f64 = rng.random::<f64>().ln();
             if log_u < nll - nll_prop {
                 nll = nll_prop;
                 per_eta_accepted[j] += 1;
@@ -352,7 +352,7 @@ pub(crate) fn mh_kappa_steps(
             sigma_values,
         );
 
-        let log_u: f64 = rng.gen::<f64>().ln();
+        let log_u: f64 = rng.random::<f64>().ln();
         if log_u < nll - nll_prop {
             // Accept
             nll = nll_prop;
