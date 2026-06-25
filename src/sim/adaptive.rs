@@ -236,11 +236,16 @@ pub struct DoseLedgerEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecisionOutcome {
     /// The controller issued `n` realized dose(s) (bolus/infusion with `amt > 0`).
+    /// Always `n >= 1`: a decision whose actions are all `Hold` or zero-amount is
+    /// [`DecisionOutcome::Hold`], not `Dosed { n: 0 }`.
     Dosed { n: usize },
-    /// No dose this decision — every action was `Hold` or a zero-amount dose.
+    /// No dose this decision — every action was `Hold`, an empty action list, or a
+    /// zero-amount dose.
     Hold,
     /// The controller discontinued; `dosed` counts any dose(s) issued *before* the
-    /// `Stop` in the same action list (`0` for a bare stop).
+    /// `Stop` in the same action list (`0` for a bare stop). `Stop` must be the
+    /// final action — the driver rejects any action after it — so `dosed` is a
+    /// faithful count, never an undercount from a silently-dropped trailing dose.
     Stop { dosed: usize },
 }
 
@@ -249,6 +254,13 @@ pub enum DecisionOutcome {
 /// Part-D decision log and the input to the Part-E decision-audit replay (S1.6):
 /// it pins exactly what the controller saw (`observed_signals`) and what it did
 /// (`outcome`) at each decision, so the run can be reproduced and audited.
+///
+/// Reproducibility assumes the controller decides from its declared
+/// `observed_signals`. [`ControllerCtx`] also exposes the raw `state`,
+/// `covariates`, and dose `history`, but those are deterministically re-derivable
+/// from the frozen inputs + ledger + schedule, so they are not re-stored here —
+/// the signals are recorded precisely because they are the one input that is *not*
+/// otherwise recoverable once S1.5 adds the per-subject assay-noise draw.
 ///
 /// A decision reached *after* a `Stop` is not logged — once discontinued the
 /// driver issues no further decisions, so the `Stop` entry is the last record.

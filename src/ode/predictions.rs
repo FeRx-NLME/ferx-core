@@ -1315,13 +1315,29 @@ pub(crate) fn ode_predictions_adaptive(
                     controller(&ctx)
                 };
 
+                // Validate the whole action list up front — before any action is
+                // applied — and require `Stop` to be the final action. A malformed
+                // action anywhere (not only one before the first `Stop`) is a typed
+                // error, and a controller that issues actions *after* discontinuing
+                // (`[Stop, …]`) is rejected rather than silently truncated, so the
+                // decision log can never disagree with the ledger about what ran.
+                for (j, action) in actions.iter().enumerate() {
+                    action
+                        .validate()
+                        .map_err(|e| format!("decision {decision_index} at t={t_start}: {e}"))?;
+                    if action.is_stop() && j + 1 < actions.len() {
+                        return Err(format!(
+                            "decision {decision_index} at t={t_start}: Stop must be the final \
+                             action, but {} action(s) follow it",
+                            actions.len() - j - 1
+                        ));
+                    }
+                }
+
                 // Count realized doses this decision so the log can categorize the
                 // outcome (a held / zero-amount decision leaves no ledger row).
                 let mut n_dosed = 0usize;
                 for action in actions {
-                    action
-                        .validate()
-                        .map_err(|e| format!("decision {decision_index} at t={t_start}: {e}"))?;
                     match action {
                         DoseAction::Bolus { amt, cmt } => {
                             // A zero-amount bolus is a no-op; don't record an empty dose.
@@ -3638,7 +3654,12 @@ mod tests {
             if ctx.decision_index == 0 {
                 vec![DoseAction::Stop]
             } else {
-                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+                // The driver must never call the controller again after a Stop;
+                // reaching here would be the bug this test guards against.
+                unreachable!(
+                    "driver issued a decision after Stop (idx {})",
+                    ctx.decision_index
+                )
             }
         };
         let base = make_subject(vec![], vec![1.0]);
@@ -3719,6 +3740,150 @@ mod tests {
             2,
             "two realized doses, the zero-amt excluded"
         );
+    }
+
+    #[test]
+    fn adaptive_decision_log_records_infusion_as_dosed() {
+        // An infusion is a realized dose: its decision categorizes to `Dosed { n }`
+        // exactly as a bolus does (the outcome doesn't distinguish route), and it
+        // reaches the ledger.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![DoseAction::Infuse {
+                amt: 100.0,
+                cmt: 1,
+                rate: 50.0,
+            }]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1);
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Dosed { n: 1 });
+        assert_eq!(run.ledger.len(), 1);
+    }
+
+    #[test]
+    fn adaptive_decision_log_infusion_then_stop() {
+        // `[Infuse, Stop]` mirrors the bolus dose-then-stop: a final infusion, then
+        // discontinue, logged as `Stop { dosed: 1 }` with the infusion in the ledger.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| {
+            vec![
+                DoseAction::Infuse {
+                    amt: 100.0,
+                    cmt: 1,
+                    rate: 50.0,
+                },
+                DoseAction::Stop,
+            ]
+        };
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0, 24.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1, "stop ends the schedule after one");
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Stop { dosed: 1 });
+        assert_eq!(run.ledger.len(), 1);
+    }
+
+    #[test]
+    fn adaptive_decision_log_empty_action_list_is_hold() {
+        // An empty action list is a no-change decision: it categorizes to `Hold`
+        // (no dose, not stopped) and leaves no ledger row — same as `[Hold]`.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| Vec::<DoseAction>::new();
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert_eq!(run.decisions.len(), 1);
+        assert_eq!(run.decisions[0].outcome, DecisionOutcome::Hold);
+        assert!(run.ledger.is_empty());
+    }
+
+    #[test]
+    fn adaptive_driver_rejects_malformed_or_post_stop_actions() {
+        // The whole action list is validated up front, before anything is applied:
+        // a malformed action is a typed error wherever it sits, and `Stop` must be
+        // the final action — a controller that issues actions after discontinuing is
+        // rejected, not silently truncated, so the log can't disagree with the
+        // ledger. Nothing is applied when the list is rejected (the ledger would be
+        // discarded with the `Err` regardless).
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let base = make_subject(vec![], vec![1.0]);
+
+        let cases: [(Vec<DoseAction>, &str); 3] = [
+            // Malformed action (compartment 0) -> the up-front validate() error.
+            (
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 0 }],
+                "compartment is 0",
+            ),
+            // A well-formed action after a Stop -> Stop-must-be-final error.
+            (
+                vec![DoseAction::Stop, DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+                "Stop must be the final action",
+            ),
+            // A Stop in the middle of the list -> same rejection (not a silent drop
+            // of the trailing dose).
+            (
+                vec![
+                    DoseAction::Bolus { amt: 50.0, cmt: 1 },
+                    DoseAction::Stop,
+                    DoseAction::Bolus { amt: 50.0, cmt: 1 },
+                ],
+                "Stop must be the final action",
+            ),
+        ];
+
+        for (actions, needle) in cases {
+            let mut controller = |_ctx: &ControllerCtx| actions.clone();
+            let err = ode_predictions_adaptive(
+                &ode,
+                &pk.values,
+                &[],
+                &[],
+                &base,
+                &[0.0],
+                &[],
+                &mut controller,
+                100,
+            )
+            .expect_err("malformed / post-stop action list is rejected");
+            assert!(err.contains(needle), "expected {needle:?}, got: {err}");
+        }
     }
 
     #[test]
