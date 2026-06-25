@@ -756,6 +756,48 @@ mod survival_smoke {
         assert!(simulate_with_options(&model, &pop, &model.default_params, 1, &ok).is_ok());
     }
 
+    /// A horizon below a left-truncated subject's `entry_time` would censor it
+    /// before it entered observation (a row with `time < entry_time`); the library
+    /// path rejects it. The `[simulation]`-block path always enters at 0, so this
+    /// only guards `SimulateOptions { horizon }` on real left-truncated data (#522
+    /// review).
+    #[test]
+    fn simulate_with_options_rejects_horizon_below_entry_time() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model parses");
+        // One left-truncated subject: enters at t = 5 on both causes.
+        let mut pop = common::tte_competing_pop(&[(10.0_f64, 0u8)]);
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 10.0,
+                event_type: EventType::RightCensored,
+                entry_time: 5.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 10.0,
+                event_type: EventType::RightCensored,
+                entry_time: 5.0,
+                cmt: 3,
+            },
+        ];
+        let below = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(3.0), // < entry_time 5.0
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &below)
+            .expect_err("horizon below entry_time must error");
+        assert!(err.contains("entry_time"), "got: {err}");
+        // A horizon at/above entry is fine.
+        let above = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(8.0),
+        };
+        assert!(simulate_with_options(&model, &pop, &model.default_params, 1, &above).is_ok());
+    }
+
     /// `predict_survival` must keep the partition invariant `Σ_k CIF_k + S_all = 1`
     /// even when the caller supplies an out-of-order time grid: the CIF telescopes
     /// the all-cause survival drop, so the grid is sorted internally. Guards the

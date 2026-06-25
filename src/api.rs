@@ -263,12 +263,16 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             fremtype: Vec::new(),
             // One right-censored template row per cause CMT, at the administrative
             // horizon (overwritten by the draw). Empty when the model has no TTE
-            // endpoint, reproducing the previous all-Gaussian behaviour. (#522)
+            // endpoint, reproducing the previous all-Gaussian behaviour. The
+            // `expect` cannot fire: a non-empty `tte_cmts` guarantees `horizon` is
+            // `Some` (the TTE-requires-horizon check above returns early). (#522)
             #[cfg(feature = "survival")]
             obs_records: tte_cmts
                 .iter()
                 .map(|&cmt| crate::types::ObsRecord::Event {
-                    time: sim_spec.horizon.unwrap_or(f64::INFINITY),
+                    time: sim_spec
+                        .horizon
+                        .expect("TTE endpoints require a horizon (checked above)"),
                     event_type: crate::types::EventType::RightCensored,
                     entry_time: 0.0,
                     cmt,
@@ -364,10 +368,22 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         }
     }
 
+    // `n_obs()` counts only Gaussian observations; add the simulated TTE event
+    // rows so a TTE-only `--simulate` run doesn't misleadingly report "0
+    // observations" (#522 review).
+    #[cfg(feature = "survival")]
+    let n_records = population.n_obs()
+        + population
+            .subjects
+            .iter()
+            .map(|s| s.obs_records.len())
+            .sum::<usize>();
+    #[cfg(not(feature = "survival"))]
+    let n_records = population.n_obs();
     eprintln!(
         "Loaded {} subjects, {} observations",
         population.subjects.len(),
-        population.n_obs()
+        n_records
     );
 
     let init_params = build_init_params(&parsed);
@@ -4850,6 +4866,24 @@ pub fn simulate_with_options(
             return Err(format!(
                 "SimulateOptions.horizon must be finite and > 0 (got {h})"
             ));
+        }
+        // A horizon below a subject's TTE entry_time would censor it before it
+        // entered observation (a row with time = h < entry_time). The
+        // `[simulation]`-block path always enters at 0, but a left-truncated
+        // population passed to this API must be rejected (#522 review).
+        #[cfg(feature = "survival")]
+        for subject in &population.subjects {
+            for record in &subject.obs_records {
+                let crate::types::ObsRecord::Event { entry_time, .. } = record;
+                if *entry_time > h {
+                    return Err(format!(
+                        "SimulateOptions.horizon ({h}) is below subject '{}' entry_time \
+                         ({entry_time}); the administrative horizon must be ≥ every \
+                         subject's entry time",
+                        subject.id
+                    ));
+                }
+            }
         }
     }
 
