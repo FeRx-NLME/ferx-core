@@ -157,6 +157,16 @@ section of the SDLC for the versioning policy).
   plus the all-cause survival `survival_all` (with `Σ_k cif_k(t) + survival_all(t) = 1`),
   the correct competing-risks quantities. Example `examples/tte_competing_risks.ferx`.
   Behind the `survival` feature.
+- **`[simulation] horizon` for TTE / competing-risks VPC** (#522). A new
+  `horizon = <t>` key sets an administrative censoring time that is *decoupled
+  from the observed event times*: when present it overrides each TTE record's
+  per-record observation window, so re-simulating event-bearing data (a VPC)
+  censors every cause at the planned study end `t` instead of drawing unbounded.
+  It is also honoured by the `[simulation]`-block `--simulate` path, which now
+  generates one right-censored TTE row per cause compartment per synthetic subject
+  (a TTE model under `[simulation]` therefore requires `horizon`); previously that
+  path emitted zero TTE rows. Exposed on the library `SimulateOptions { horizon }`.
+  Behind the `survival` feature.
 - **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
   e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in
   addition to the existing theta/eta/covariate namespace. Intermediate variables and names

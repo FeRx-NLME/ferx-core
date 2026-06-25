@@ -3519,6 +3519,7 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
     let mut dose_cmt = 1;
     let mut obs_times = Vec::new();
     let mut seed = 42u64;
+    let mut horizon: Option<f64> = None;
 
     for line in lines {
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
@@ -3562,11 +3563,34 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
                 obs_times = parse_float_array(parts[1])
                     .map_err(|e| format!("[simulation]: bad times: {e}"))?
             }
+            // Administrative censoring horizon for TTE endpoints (#522). Must be a
+            // finite, strictly-positive time: it is the right-censoring window for
+            // every simulated TTE cause and a non-positive / non-finite horizon
+            // would censor every subject at or before entry (no events possible).
+            "horizon" => {
+                let t: f64 = parts[1]
+                    .parse()
+                    .map_err(|_| format!("[simulation]: bad horizon: {}", line))?;
+                if !t.is_finite() || t <= 0.0 {
+                    return Err(format!(
+                        "[simulation]: horizon must be finite and > 0: {}",
+                        line
+                    ));
+                }
+                horizon = Some(t);
+            }
             other => return Err(format!("[simulation]: unknown key `{}`", other)),
         }
     }
-    if obs_times.is_empty() {
-        return Err("[simulation] block requires 'times = [...]'".to_string());
+    // A synthetic design needs *something* to observe: continuous `times` for a
+    // Gaussian model, or a `horizon` for a TTE model (#522). Require at least one;
+    // the model-vs-spec check (e.g. "TTE endpoint needs a horizon") happens once
+    // the endpoints are known, in `api::run_model_simulate`.
+    if obs_times.is_empty() && horizon.is_none() {
+        return Err(
+            "[simulation] block requires 'times = [...]' (Gaussian) or 'horizon = <t>' (TTE)"
+                .to_string(),
+        );
     }
 
     Ok(SimulationSpec {
@@ -3575,6 +3599,7 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
         dose_cmt,
         obs_times,
         seed,
+        horizon,
         covariates: vec![],
     })
 }
@@ -21925,5 +21950,52 @@ CL V KA WT
     fn simulation_requires_times() {
         let err = parse_simulation_block(&sim_lines(&["n_subjects = 5"])).unwrap_err();
         assert!(err.contains("times"), "got: {err}");
+    }
+
+    #[test]
+    fn simulation_horizon_parses() {
+        // `horizon = <t>` is captured as the administrative censoring window (#522).
+        let spec = parse_simulation_block(&sim_lines(&["horizon = 14", "times = [1.0]"]))
+            .expect("horizon parses");
+        assert_eq!(spec.horizon, Some(14.0));
+        // Absent ⇒ None (the per-record window path).
+        let spec = parse_simulation_block(&sim_lines(&["times = [1.0]"])).expect("no horizon");
+        assert_eq!(spec.horizon, None);
+    }
+
+    #[test]
+    fn simulation_horizon_satisfies_observe_requirement() {
+        // A TTE-only design has no continuous `times`; a `horizon` alone is enough
+        // to make the block valid (the relaxed times-OR-horizon rule).
+        let spec = parse_simulation_block(&sim_lines(&["n_subjects = 5", "horizon = 14"]))
+            .expect("horizon alone is a valid design");
+        assert_eq!(spec.horizon, Some(14.0));
+        assert!(spec.obs_times.is_empty());
+    }
+
+    #[test]
+    fn simulation_horizon_rejects_nonpositive_and_nonfinite() {
+        for bad in [
+            "horizon = 0",
+            "horizon = -3",
+            "horizon = inf",
+            "horizon = nan",
+        ] {
+            let err = parse_simulation_block(&sim_lines(&[bad, "times = [1.0]"])).unwrap_err();
+            assert!(
+                err.starts_with("[simulation]:") && err.contains("horizon"),
+                "`{bad}` gave: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn simulation_horizon_bad_value_errors() {
+        let err =
+            parse_simulation_block(&sim_lines(&["horizon = abc", "times = [1.0]"])).unwrap_err();
+        assert!(
+            err.starts_with("[simulation]:") && err.contains("horizon"),
+            "got: {err}"
+        );
     }
 }

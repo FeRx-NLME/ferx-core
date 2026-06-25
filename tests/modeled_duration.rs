@@ -927,6 +927,7 @@ fn simulate_propensity_on_analytical_model_with_modeled_dose_panics() {
     let opts = SimulateOptions {
         seed: Some(1),
         match_method: Some(ferx_core::MatchMethod::Optimal),
+        horizon: None,
     };
     let _ = simulate_with_options(&model, &pop, &model.default_params, 1, &opts);
 }

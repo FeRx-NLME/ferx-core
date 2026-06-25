@@ -66,6 +66,7 @@ pub fn simulate_with_options(
 pub struct SimulateOptions {
     pub seed: Option<u64>,                  // None draws from entropy
     pub match_method: Option<MatchMethod>,  // None disables matching
+    pub horizon: Option<f64>,               // TTE administrative censoring time; None = per-record window
 }
 
 pub enum MatchMethod {
@@ -75,8 +76,15 @@ pub enum MatchMethod {
 }
 ```
 
-With `match_method = None` this is identical to `simulate_with_seed()` (or
-`simulate()` when `seed` is `None`).
+With `match_method = None` and `horizon = None` this is identical to
+`simulate_with_seed()` (or `simulate()` when `seed` is `None`).
+
+`horizon = Some(t)` sets an administrative censoring time for **time-to-event**
+endpoints, decoupled from the observed event times: it overrides each TTE
+record's per-record observation window so a re-simulated event-bearing subject
+(a competing-risks VPC) censors at the planned study end `t` rather than drawing
+unbounded. It has no effect on Gaussian endpoints. See
+[TTE simulation](../model-file/simulation.qmd#tte-simulation).
 
 ### Why match?
 

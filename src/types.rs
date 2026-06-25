@@ -4368,6 +4368,14 @@ pub struct SimulationSpec {
     pub dose_cmt: usize,
     pub obs_times: Vec<f64>,
     pub seed: u64,
+    /// Administrative censoring horizon for TTE endpoints (`[simulation] horizon`).
+    /// `Some(t)` makes `t` the right-censoring window for **every** simulated TTE
+    /// cause, overriding the per-record `observation_window` so a re-simulated
+    /// event-bearing subject censors at the planned study end rather than drawing
+    /// unbounded (the competing-risks VPC fix — see `survival::simulate_tte`).
+    /// `None` falls back to the per-record window. Required when the model has a
+    /// TTE endpoint and synthetic subjects are generated.
+    pub horizon: Option<f64>,
     /// Optional per-subject covariates: (name, values) — length must equal n_subjects
     pub covariates: Vec<(String, Vec<f64>)>,
 }
