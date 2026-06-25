@@ -37,7 +37,6 @@
 //! simulation path's convention of holding kappas at zero, so NPDE/NPD on IOV
 //! models omit the inter-occasion component of the predictive variance.
 
-use crate::api::model_preds;
 use crate::stats::special::normal_inv_cdf;
 use crate::types::{CompiledModel, ModelParameters, Population};
 use nalgebra::{DMatrix, DVector};
@@ -107,17 +106,28 @@ pub fn compute_npde_npd(
                 let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
                 eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
-                let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
-                let ipreds = model_preds(model, subject, &pk, &params.theta, &eta_slice);
+                // TV-covariate-aware dispatcher, matching simulate()/predict()
+                // (#506): a per-event covariate snapshot must drive NPDE IPREDs,
+                // not the baseline-only `pk_param_fn(subject.covariates)`.
+                let ipreds = crate::pk::compute_predictions_with_tv(
+                    model,
+                    subject,
+                    &params.theta,
+                    &eta_slice,
+                );
 
                 // IIV on residual error (#409): the simulated eta draw includes
                 // the residual-error eta, so scale the residual variance by
                 // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
                 let ruv_scale = model.residual_var_scale(&eta_slice);
                 for (j, &ip) in ipreds.iter().enumerate() {
-                    let var =
-                        model.residual_variance_at(subject.obs_cmts[j], ip, &params.sigma.values)
-                            * ruv_scale;
+                    let var = model.sim_residual_variance(
+                        subject,
+                        j,
+                        ip,
+                        &params.sigma.values,
+                        ruv_scale,
+                    );
                     let eps: f64 = normal.sample(&mut rng);
                     sims[(j, k)] = ip + var.sqrt() * eps;
                 }
@@ -252,6 +262,37 @@ fn clamp_prob(p: f64, k: usize) -> f64 {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// Regression for #506: NPDE/NPD must simulate against the time-varying
+    /// covariate snapshots, like `simulate()`/`predict()`, not the baseline-only
+    /// `pk_param_fn(subject.covariates)`. Each observation is placed exactly on
+    /// the TV-aware IPRED, so its replicate sims center on it and NPD ≈ 0 on
+    /// every row. If NPDE regressed to the baseline-only predictor, the WT
+    /// 140/210 rows would sit several residual-SDs from the WT=70 sims and NPD
+    /// would blow up.
+    #[test]
+    fn compute_npde_honours_tv_covariates() {
+        let (model, mut subject) = crate::types::test_helpers::tv_cov_iv_model_and_subject();
+        let params = model.default_params.clone();
+        let tv_ipred = crate::pk::compute_predictions_with_tv(&model, &subject, &params.theta, &[]);
+        subject.observations = tv_ipred.clone();
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["WT".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let out = compute_npde_npd(&model, &population, &params, 1000, Some(506));
+        assert_eq!(out.len(), 1);
+        for (j, &npd) in out[0].npd.iter().enumerate() {
+            assert!(
+                npd.abs() < 0.25,
+                "row {j}: NPD={npd} not ≈0 — TV covariate snapshot ignored?"
+            );
+        }
+    }
 
     /// Build an n_obs×k simulation matrix from a `[replicate][obs]` slice.
     fn sims_matrix(rows: &[Vec<f64>]) -> DMatrix<f64> {

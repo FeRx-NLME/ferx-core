@@ -11,7 +11,7 @@
 //! ([`crate::estimation::inner_optimizer::analytic_eta_nll_gradient`]) — the same
 //! exact gradient the FOCEI inner loop uses — so HMC needs no autodiff.
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 use rand_distr::StandardNormal;
 
 /// Leapfrog energy-error magnitude above which an HMC transition is flagged
@@ -179,7 +179,7 @@ pub fn hmc_step(
     // diagnostic. Threshold matches Stan's Δ_max.
     let divergent = !delta_h.is_finite() || delta_h.abs() > HMC_DIVERGENCE_THRESHOLD;
 
-    let log_u: f64 = rng.gen::<f64>().ln();
+    let log_u: f64 = rng.random::<f64>().ln();
     if log_u < delta_h {
         Some((eta_prop, nll_prop, true, divergent)) // accepted: advance to proposal
     } else {

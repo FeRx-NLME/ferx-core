@@ -60,10 +60,28 @@ pub fn optimize_population(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
-    match options.optimizer {
-        Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma | Optimizer::Bobyqa => {
-            optimize_nlopt(model, population, init_params, options)
-        }
+    // Resolve `auto` once, here, so the concrete optimizer flows through the rest
+    // of the outer loop (optimize_nlopt re-reads `options.optimizer` for its own
+    // branching). Every other variant is returned unchanged, so this is a no-op
+    // unless the user left the default `auto` in place.
+    let resolved = options.optimizer.resolve_auto(model);
+    let owned_opts;
+    let options = if resolved == options.optimizer {
+        options
+    } else {
+        owned_opts = FitOptions {
+            optimizer: resolved,
+            ..options.clone()
+        };
+        &owned_opts
+    };
+    match resolved {
+        // `Auto` is resolved away above; group it with the NLopt path defensively.
+        Optimizer::Slsqp
+        | Optimizer::NloptLbfgs
+        | Optimizer::Mma
+        | Optimizer::Bobyqa
+        | Optimizer::Auto => optimize_nlopt(model, population, init_params, options),
         Optimizer::Bfgs | Optimizer::Lbfgs => {
             optimize_bfgs(model, population, init_params, options)
         }
@@ -243,6 +261,23 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
     } else {
         false
     }
+}
+
+/// Decide whether to run the SLSQP fallback after the primary NLopt run.
+///
+/// The fallback retries from the current point with SLSQP when the primary
+/// optimizer did not report a clean convergence code. It is suppressed when the
+/// stop was `MaxEvalReached` (#499): a spent evaluation budget is not a failure a
+/// second optimizer can fix — the user needs a larger `maxiter` — so re-running a
+/// fresh full-budget SLSQP would just double the cost. It is also suppressed when
+/// the run already used SLSQP (nothing to switch to) or the user cancelled.
+fn should_run_slsqp_fallback(
+    converged: bool,
+    already_slsqp: bool,
+    cancelled: bool,
+    max_eval_reached: bool,
+) -> bool {
+    !converged && !already_slsqp && !cancelled && !max_eval_reached
 }
 
 fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
@@ -673,12 +708,15 @@ fn optimize_nlopt(
     let ebe_accum: Arc<Mutex<EbeAccum>> = Arc::new(Mutex::new(EbeAccum::default()));
     let ebe_accum_cl = Arc::clone(&ebe_accum);
 
-    // Select NLopt algorithm
+    // Select NLopt algorithm. `optimize_population` resolves `Auto` to a concrete
+    // optimizer before dispatching here, so `Auto` should never reach this match;
+    // map it to BOBYQA (auto's FD fallback) rather than the catch-all SLSQP so a
+    // future bypass degrades to the safe derivative-free path, not a silent SLSQP.
     let algo = match options.optimizer {
         Optimizer::Slsqp => nlopt::Algorithm::Slsqp,
         Optimizer::NloptLbfgs => nlopt::Algorithm::Lbfgs,
         Optimizer::Mma => nlopt::Algorithm::Mma,
-        Optimizer::Bobyqa => nlopt::Algorithm::Bobyqa,
+        Optimizer::Bobyqa | Optimizer::Auto => nlopt::Algorithm::Bobyqa,
         _ => nlopt::Algorithm::Slsqp,
     };
 
@@ -956,11 +994,16 @@ fn optimize_nlopt(
     // Run optimization
     let result = opt.optimize(&mut x0);
 
+    // `max_eval_reached` is tracked separately from `converged` (#499): hitting
+    // the eval budget is not a failure that a fresh SLSQP run can fix — the user
+    // simply needs a larger `maxiter` — so it must not trigger the fallback.
+    let mut max_eval_reached = false;
     let (mut converged, first_algo) = match &result {
         Ok((status, _)) => {
             if options.verbose {
                 eprintln!("NLopt finished: {:?}", status);
             }
+            max_eval_reached = matches!(status, nlopt::SuccessState::MaxEvalReached);
             (
                 matches!(
                     status,
@@ -982,11 +1025,27 @@ fn optimize_nlopt(
 
     drop(opt);
 
-    // Fallback: if L-BFGS failed, retry with SLSQP from current best point.
-    // Skip the fallback if the user cancelled — no point burning more cycles.
+    // Fallback: retry with SLSQP from the current point when the primary
+    // optimizer did not converge cleanly — except on `MaxEvalReached`, which is a
+    // spent eval budget, not a failure a second optimizer can fix (#499).
     let already_slsqp = matches!(first_algo, nlopt::Algorithm::Slsqp);
     let cancelled = crate::cancel::is_cancelled(&options.cancel);
-    if !converged && !already_slsqp && !cancelled {
+    if max_eval_reached {
+        warnings.push(format!(
+            "Outer optimization hit the evaluation budget (maxiter = {}) before \
+             converging; increase maxiter for a tighter fit.",
+            options.outer_maxiter,
+        ));
+        if options.verbose {
+            eprintln!(
+                "NLopt hit the evaluation budget (maxiter = {}) without converging — \
+                 increase maxiter for a tighter fit. Skipping the SLSQP fallback \
+                 (it cannot fix a spent budget).",
+                options.outer_maxiter,
+            );
+        }
+    }
+    if should_run_slsqp_fallback(converged, already_slsqp, cancelled, max_eval_reached) {
         if options.verbose {
             eprintln!("Retrying with NLopt SLSQP from current point...");
         }
@@ -2160,11 +2219,11 @@ fn population_gradient(
     // `gradient = fd` forces the numeric path for the outer gradient too (the inner
     // EBE gradient honours it via `analytic_inner_grad_supported`), so the option
     // fully disables the analytic sensitivities rather than only the inner half.
-    let user_forces_fd = matches!(model.gradient_method, GradientMethod::Fd);
-    if !force_reconverge
-        && !user_forces_fd
-        && (crate::sens::provider::sens_supported(model) || iov_analytic)
-    {
+    // `analytic_outer_gradient_available` is the shared predicate that
+    // `Optimizer::resolve_auto` and `build_info::gradient_method_outer` also use,
+    // so the `auto` optimizer cannot pick a gradient-based optimizer while this
+    // gate falls through to FD (#490 review).
+    if !force_reconverge && crate::sens::provider::analytic_outer_gradient_available(model) {
         let g = if iov_analytic {
             if options.interaction {
                 crate::estimation::sens_outer_gradient::population_gradient_sens_iov(
@@ -3678,6 +3737,23 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    /// SLSQP-fallback gate (#499): fall back only when the primary run did not
+    /// converge and did not exhaust its eval budget, is not already SLSQP, and was
+    /// not cancelled. `MaxEvalReached` (budget spent) must suppress it.
+    #[test]
+    fn slsqp_fallback_gate() {
+        // Genuine non-convergence (not MaxEvalReached) → fall back.
+        assert!(should_run_slsqp_fallback(false, false, false, false));
+
+        // Hit the eval budget → skip (needs larger maxiter, not another optimizer).
+        assert!(!should_run_slsqp_fallback(false, false, false, true));
+
+        // Already converged, already SLSQP, or cancelled → never fall back.
+        assert!(!should_run_slsqp_fallback(true, false, false, false));
+        assert!(!should_run_slsqp_fallback(false, true, false, false));
+        assert!(!should_run_slsqp_fallback(false, false, true, false));
+    }
 
     /// Covariance progress reporter math (the pure pieces behind `cov_progress`).
     /// Stride caps output at ~20 lines but never zero; the print predicate fires

@@ -15,8 +15,8 @@ use crate::estimation::parameterization::{
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
-use rand_distr::{ChiSquared, Distribution, StandardNormal, WeightedIndex};
+use rand::{RngExt, SeedableRng};
+use rand_distr::{weighted::WeightedIndex, ChiSquared, Distribution, StandardNormal};
 use rayon::prelude::*;
 
 /// Results from the SIR procedure.

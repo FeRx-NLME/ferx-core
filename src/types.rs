@@ -2390,6 +2390,37 @@ impl CompiledModel {
         }
     }
 
+    /// Residual *variance* for resampling observation row `j` of `subject`
+    /// during simulation or NPDE, including the FREM and IIV-on-RUV splits that
+    /// a bare [`residual_variance_at`](Self::residual_variance_at) call misses:
+    ///
+    /// * FREM covariate pseudo-observations (`FREMTYPE > 0`) follow the additive
+    ///   model `Y = θ+η+ε` with the covariate sigma (EPSCOV), independent of the
+    ///   PK error model, and are **not** scaled by the PK residual-error IIV —
+    ///   mirroring the likelihood (`stats/likelihood.rs`) and the IWRES path
+    ///   (`api.rs`). Their `f_pred` is the `θ+η` override, so feeding it into the
+    ///   PK error model would scale the noise by the covariate magnitude (e.g.
+    ///   proportional error), which is wrong.
+    /// * All other rows use the PK error model scaled by `ruv_scale` (pass
+    ///   [`residual_var_scale`](Self::residual_var_scale)).
+    #[inline]
+    pub fn sim_residual_variance(
+        &self,
+        subject: &Subject,
+        j: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        ruv_scale: f64,
+    ) -> f64 {
+        if let Some(ref fc) = self.frem_config {
+            if subject.fremtype.get(j).copied().unwrap_or(0) > 0 {
+                let s = sigma[fc.covariate_sigma_index];
+                return (s * s).max(1e-12);
+            }
+        }
+        self.residual_variance_at(subject.obs_cmts[j], f_pred, sigma) * ruv_scale
+    }
+
     /// Canonical compartment names for analytical models, used in `[derived]` expressions.
     /// For ODE models use `ode_spec.state_names` instead.
     /// Returns a `'static` slice so it can be used in `DerivedContext` without lifetime issues.
@@ -3167,10 +3198,14 @@ pub struct FitResult {
     /// BOBYQA (derivative-free), built-in BFGS, GN, and SAEM.
     pub final_gradient: Option<Vec<f64>>,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
-    /// Outer optimizer used for this fit, as a short lowercase label
-    /// ("bobyqa", "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs",
-    /// "trust_region").  Always populated; the label is the same regardless of
-    /// method chain length.
+    /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
+    /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
+    /// `optimizer = auto` default resolved the choice, the label is the compound
+    /// form `"auto (<resolved>)"` — e.g. `"auto (nlopt_lbfgs)"` — recording both
+    /// the setting and what actually ran. SAEM/GN/IMP report their own fixed
+    /// labels ("saem", "gn", "imp-bobyqa", "impmap-bobyqa"). Always populated;
+    /// the label is the same regardless of method chain length. Consumers that
+    /// match on the label should accept the `auto (...)` prefix (#490).
     pub optimizer: String,
     /// Number of random multi-starts attempted. 1 means a single fit from
     /// the model-file initial values (no multi-start).
@@ -3357,6 +3392,9 @@ pub struct FitOptions {
     pub covariance_ofv_hessian: bool,
     pub interaction: bool,
     pub verbose: bool,
+    /// Outer-loop (population parameter) optimizer. Defaults to
+    /// [`Optimizer::Auto`], which picks `nlopt_lbfgs` when the analytic FOCE/FOCEI
+    /// gradient is available and `bobyqa` when only finite differences are (#490).
     pub optimizer: Optimizer,
     /// Inner-loop (EBE) optimizer. `Auto` keeps the size-based default; any other
     /// value pins the inner solver with no dimension-based switching.
@@ -3765,16 +3803,16 @@ impl Default for FitOptions {
             covariance_ofv_hessian: true,
             interaction: true,
             verbose: true,
-            // BOBYQA — derivative-free quadratic trust-region. Chosen as the
-            // default because the fixed-EBE FD gradient that SLSQP/L-BFGS rely
-            // on is biased on ill-conditioned fits (ODE/PD models, sparse data,
-            // Hill-ridge identifiability), and SLSQP can declare convergence
-            // hundreds of OFV units above the true minimum. BOBYQA re-evaluates
-            // EBEs at every trial point and routinely reaches a lower OFV
-            // without the cost of `reconverge_gradient_interval = 1`. See
-            // `docs/estimation/optimizers.qmd` for the cefepime and Emax
-            // PKPD validations and guidance on when to switch back to SLSQP.
-            optimizer: Optimizer::Bobyqa,
+            // `Auto` resolves per model (see `Optimizer::resolve_auto`): the
+            // gradient-based NLopt L-BFGS when the exact analytic FOCE/FOCEI
+            // gradient is available, and the derivative-free BOBYQA otherwise.
+            // BOBYQA is the fallback because the fixed-EBE FD gradient that the
+            // gradient-based optimizers rely on is biased on ill-conditioned fits
+            // (ODE/PD models, sparse data, Hill-ridge identifiability), where
+            // SLSQP can declare convergence hundreds of OFV units above the true
+            // minimum. See `docs/estimation/optimizers.qmd` for the benchmarking
+            // (#490) behind these defaults and how to pin an optimizer explicitly.
+            optimizer: Optimizer::Auto,
             inner_optimizer: InnerOptimizer::Auto,
             lbfgs_memory: 5,
             global_search: false,
@@ -3880,6 +3918,17 @@ impl BloqMethod {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Optimizer {
+    /// Pick the outer optimizer automatically from the model (the default).
+    /// Resolves to [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI
+    /// gradient is available (the model is in the sensitivity provider's scope
+    /// and the user did not force `gradient_method = fd`), and to
+    /// [`Optimizer::Bobyqa`] otherwise (ODE/PD models, LTBS, SDE, or
+    /// `gradient_method = fd`, where the outer loop must fall back to finite
+    /// differences). Benchmarking across ~10 real FOCEI datasets (#490) found
+    /// NLopt L-BFGS fastest-to-optimum on every analytic-gradient problem, while
+    /// BOBYQA was both fastest and most reliable when only finite differences
+    /// are available. See [`Optimizer::resolve_auto`].
+    Auto,
     Bfgs,
     Lbfgs,
     /// NLopt LD_SLSQP — Sequential Least Squares Programming. Gradient-based;
@@ -3970,7 +4019,13 @@ pub enum ParameterScaling {
 
 impl Optimizer {
     pub fn label(self) -> &'static str {
+        // NB: the `bfgs`/`lbfgs` labels no longer round-trip through the parser —
+        // `apply_fit_option` resolves both keywords to `NloptLbfgs` (see #483).
+        // The labels stay as the variant's own name for truthful run provenance;
+        // only a Rust caller that constructs `Optimizer::Bfgs`/`Lbfgs` directly can
+        // produce them, and those variants are slated for removal.
         match self {
+            Optimizer::Auto => "auto",
             Optimizer::Bfgs => "bfgs",
             Optimizer::Lbfgs => "lbfgs",
             Optimizer::Slsqp => "slsqp",
@@ -3978,6 +4033,30 @@ impl Optimizer {
             Optimizer::Mma => "mma",
             Optimizer::Bobyqa => "bobyqa",
             Optimizer::TrustRegion => "trust_region",
+        }
+    }
+
+    /// Resolve [`Optimizer::Auto`] to a concrete optimizer for `model`; every
+    /// other variant is returned unchanged (idempotent). `auto` picks
+    /// [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI gradient is
+    /// available — the model is in the sensitivity provider's scope and the user
+    /// did not force `gradient_method = fd` — and [`Optimizer::Bobyqa`]
+    /// otherwise. This mirrors the analytic-vs-FD predicate the outer loop uses
+    /// (see `build_info::gradient_method_outer`), so `auto` lands on the
+    /// gradient-based optimizer exactly when there is an exact gradient to feed
+    /// it (#490).
+    pub fn resolve_auto(self, model: &CompiledModel) -> Optimizer {
+        if self != Optimizer::Auto {
+            return self;
+        }
+        // Use the single shared predicate so `auto` can never disagree with the
+        // outer loop's actual gradient dispatch (#490 review): resolving to a
+        // gradient-based optimizer while the loop ran FD would feed it a noisy
+        // gradient.
+        if crate::sens::provider::analytic_outer_gradient_available(model) {
+            Optimizer::NloptLbfgs
+        } else {
+            Optimizer::Bobyqa
         }
     }
 }
@@ -4397,11 +4476,223 @@ pub(crate) mod test_helpers {
             residual_error_eta: None,
         }
     }
+
+    /// A 1-cpt IV model with **proportional** error whose CL scales with the
+    /// `WT` covariate (`CL = TVCL·WT/70`), paired with a subject whose `WT`
+    /// rises across observation rows (70 → 140 → 210). Because `WT` is
+    /// time-varying, the TV-aware predictor and the baseline-only
+    /// `pk_param_fn(subject.covariates)` disagree on every obs row after the
+    /// first — the fixture shared by the simulation / NPDE / NCA-sweep
+    /// TV-covariate regression tests (#506). `n_eta = 0` so the only spread in
+    /// simulated replicates is residual error, which keeps NPD deterministic.
+    pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
+        let params = ModelParameters {
+            theta: vec![5.0, 50.0],
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            theta_lower: vec![0.1, 5.0],
+            theta_upper: vec![50.0, 500.0],
+            theta_fixed: vec![false; 2],
+            omega: OmegaMatrix::from_diagonal(&[], vec![]),
+            omega_fixed: Vec::new(),
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        let model = CompiledModel {
+            name: "tv_cov_iv".into(),
+            pk_model: PkModel::OneCptIv,
+            error_model: ErrorModel::Proportional,
+            error_spec: ErrorSpec::Single(ErrorModel::Proportional),
+            pk_param_fn: Box::new(|theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
+                let mut p = PkParams::default();
+                let wt = cov.get("WT").copied().unwrap_or(70.0);
+                p.values[0] = theta[0] * (wt / 70.0);
+                p.values[1] = theta[1];
+                p
+            }),
+            n_theta: 2,
+            n_eta: 0,
+            n_epsilon: 1,
+            n_kappa: 0,
+            kappa_names: Vec::new(),
+            theta_names: vec!["TVCL".into(), "TVV".into()],
+            eta_names: Vec::new(),
+            indiv_param_names: vec!["CL".into(), "V".into()],
+            indiv_param_partials: IndivParamPartials::empty(),
+            default_params: params.clone(),
+            omega_init_as_sd: Vec::new(),
+            sigma_init_as_sd: vec![false],
+            kappa_init_as_sd: Vec::new(),
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: Vec::new(),
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: Vec::new(),
+            ode_spec: None,
+            dose_attr_map: Default::default(),
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: vec!["WT".into()],
+            gradient_method: GradientMethod::Fd,
+            parse_warnings: Vec::new(),
+            has_conditional_eta_params: false,
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
+            #[cfg(feature = "survival")]
+            endpoints: HashMap::new(),
+            frem_config: None,
+            residual_error_eta: None,
+        };
+
+        let mut baseline_cov = HashMap::new();
+        baseline_cov.insert("WT".to_string(), 70.0);
+        let subject = Subject {
+            id: "TVCOV".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 3.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0, 0.0, 0.0],
+            obs_cmts: vec![1, 1, 1],
+            covariates: baseline_cov,
+            dose_covariates: vec![HashMap::from([("WT".to_string(), 70.0)])],
+            obs_covariates: vec![
+                HashMap::from([("WT".to_string(), 70.0)]),
+                HashMap::from([("WT".to_string(), 140.0)]),
+                HashMap::from([("WT".to_string(), 210.0)]),
+            ],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0],
+            occasions: vec![1, 1, 1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        (model, subject)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sim_residual_variance` must split FREM covariate pseudo-observations
+    /// (FREMTYPE>0) off the PK error model: they use the additive covariate
+    /// sigma (EPSCOV) and ignore the IIV-on-RUV scaling, while ordinary PK rows
+    /// use the PK error model scaled by `ruv_scale`. Regression for the FREM
+    /// simulation corruption introduced when sim/NPDE moved onto the TV-cov
+    /// dispatcher (which writes the θ+η override into FREM rows).
+    #[test]
+    fn sim_residual_variance_splits_frem_rows_from_pk_error() {
+        let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+        // Proportional PK error: V_pk = (f·σ)².
+        model.error_model = ErrorModel::Proportional;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        // FREMTYPE 100 maps to (θ[0], η[0]); the covariate sigma sits at index 1.
+        model.frem_config = Some(FremConfig {
+            fremtype_to_indices: std::collections::HashMap::from([(100u16, (0usize, 0usize))]),
+            covariate_sigma_index: 1,
+        });
+
+        let subject = Subject {
+            id: "S".into(),
+            doses: vec![],
+            obs_times: vec![1.0, 2.0],
+            obs_raw_times: vec![],
+            observations: vec![0.0, 0.0],
+            obs_cmts: vec![1, 1],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: vec![],
+            obs_covariates: vec![],
+            pk_only_times: vec![],
+            pk_only_covariates: vec![],
+            reset_times: vec![],
+            cens: vec![0, 0],
+            occasions: vec![],
+            dose_occasions: vec![],
+            // Row 0 = PK observation, row 1 = covariate pseudo-observation.
+            fremtype: vec![0, 100],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        let sigma = vec![0.3, 0.5]; // [pk_prop_sigma, frem_cov_sigma]
+        let ruv = 4.0; // exercise the IIV-on-RUV scaling on the PK row
+        let f = 2.0;
+
+        // PK row: (f·σ_pk)² · ruv_scale.
+        let pk_var = model.sim_residual_variance(&subject, 0, f, &sigma, ruv);
+        assert!((pk_var - (f * 0.3) * (f * 0.3) * ruv).abs() < 1e-12);
+
+        // FREM row: covariate σ², independent of `f_pred` and `ruv_scale`.
+        let frem_var = model.sim_residual_variance(&subject, 1, 999.0, &sigma, ruv);
+        assert!((frem_var - 0.5 * 0.5).abs() < 1e-12);
+
+        // Without a FREM config every row uses the PK error model.
+        model.frem_config = None;
+        let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, 1.0);
+        assert!((pk_only - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn resolve_auto_picks_nlopt_lbfgs_when_analytic() {
+        // Analytical PK model with `gradient = auto` → exact FOCE gradient is
+        // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
+        let m = test_helpers::analytical_model(GradientMethod::Auto);
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m),
+            Optimizer::NloptLbfgs,
+            "analytic-gradient model should resolve auto → nlopt_lbfgs"
+        );
+    }
+
+    #[test]
+    fn resolve_auto_picks_bobyqa_when_fd_only() {
+        // ODE model (no analytic scope) and an analytical model with
+        // `gradient = fd` both fall back to finite differences → bobyqa.
+        let ode = test_helpers::ode_model(GradientMethod::Auto);
+        let forced_fd = test_helpers::analytical_model(GradientMethod::Fd);
+        for m in [&ode, &forced_fd] {
+            assert_eq!(
+                Optimizer::Auto.resolve_auto(m),
+                Optimizer::Bobyqa,
+                "FD-only model should resolve auto → bobyqa"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_auto_is_identity_for_concrete_optimizers() {
+        // Every non-`Auto` optimizer is returned unchanged, regardless of model.
+        let m = test_helpers::analytical_model(GradientMethod::Auto);
+        for opt in [
+            Optimizer::Bfgs,
+            Optimizer::Lbfgs,
+            Optimizer::Slsqp,
+            Optimizer::NloptLbfgs,
+            Optimizer::Mma,
+            Optimizer::Bobyqa,
+            Optimizer::TrustRegion,
+        ] {
+            assert_eq!(opt.resolve_auto(&m), opt);
+        }
+    }
 
     #[test]
     fn required_pk_params_match_docs_table() {

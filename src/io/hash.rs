@@ -9,11 +9,21 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// Compute the SHA-256 of `bytes`, returning the lowercase hex digest (64 chars).
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex_lower(h.finalize().as_ref())
 }
 
 /// Read `path` and return its SHA-256 hex digest. Streams the file in 64 KiB
@@ -31,7 +41,7 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
         }
         h.update(&buf[..n]);
     }
-    Ok(format!("{:x}", h.finalize()))
+    Ok(hex_lower(h.finalize().as_ref()))
 }
 
 #[cfg(test)]

@@ -65,6 +65,31 @@ section of the SDLC for the versioning policy).
   so the inner EBE loop is exact and replaces FD's `~2·n_eta+1` predictions per step
   with one. Validated against the FD-validated outer `df_deta` (1-/2-/3-cpt, IV/oral,
   steady state).
+- **Constant-fold covariate-only individual-parameter sub-expressions in the
+  analytic sensitivity walks** (#485). The `[individual_parameters]` block is
+  re-evaluated on every inner-EBE and outer-gradient step; for covariate-heavy
+  models its covariate-only prefix (e.g. CKD-EPI / Schwartz / FFM / maturation —
+  often the bulk of the `pow`/`exp`/`log` work) does not depend on θ or η, yet was
+  carried through `Dual2`/`Dual1` arithmetic (gradient + Hessian per operation)
+  every call. The parser now classifies those slots once at compile time and the
+  `Dual2`/`Dual1` providers evaluate them once in plain `f64` and seed them as
+  dual constants, skipping the redundant dual re-derivation. Numerically identical
+  (bit-for-bit gradients and Hessians); only θ/η-free slots are folded, so all
+  dual axes — including `∂/∂θ_fixed` — are preserved. On a jasmine-style
+  covariate kernel (8/10 slots foldable) this is ~1.7× faster per `Dual2`
+  individual-parameter evaluation. Found while profiling the jasmine
+  vancomycin-pediatrics FOCEI fit.
+- **Light `Dual1` inner η-gradient for analytical PK models** (#491). The inner
+  EBE loop's `∂p/∂η` for analytical 1-/2-/3-cpt models was computed over the full
+  `Dual2<n_theta + n_eta>` (carrying the θ-axes gradient and the second-order
+  Hessian) and then all but the η-block discarded. It now uses the light
+  `Dual1<n_eta>` walk the ODE inner loop already used (#410), seeding η only — so
+  e.g. a 10-θ / 4-η fit drops a `Dual2<14>` (14-vector grad + 14×14 Hessian per
+  op) to a `Dual1<4>`. Converged EBEs and OFV are unchanged (the inner gradient
+  method only affects the path to the mode); validated by the existing
+  analytic-vs-FD inner-gradient tests. Also serves models whose combined
+  `n_theta + n_eta` exceeds the dual dispatch ceiling but whose `n_eta` does not
+  (previously an FD fall-back).
 
 ### Added
 - **Built-in Weibull absorption — the `weibull(td, beta)` input-rate function** (#322, Phase 2).
@@ -81,6 +106,16 @@ section of the SDLC for the versioning policy).
   model drives **exact analytic** FOCE/FOCEI/Bayes gradients (no finite-difference fallback),
   validated against NONMEM. See `examples/weibull_absorption.ferx` and
   `docs/model-file/absorption.qmd`.
+- **Analytic FOCE/FOCEI gradients for compartment-indexed bioavailability
+  (`F1`/`F2`, …) on ODE models** (#486). An ODE model that sets a per-compartment
+  bioavailability now drives the exact analytic outer gradient and light `Dual1`
+  inner η-gradient instead of finite differences: both the static and
+  time-varying-covariate dual walks resolve `F` per dose compartment (the indexed
+  `F{cmt}` slot, else the bare `F`), matching production's `DoseAttrMap::f_bio` and
+  carrying `∂/∂F{cmt}` exactly. Estimates are unchanged; the gradient is exact and
+  cheaper. Validated by an analytic≡production+central-FD parity test (single
+  indexed `F1` with IIV, and distinct `F1`≠`F2` dosed into two compartments).
+  Per-compartment *lag* (`ALAG{cmt}`) stays on FD for now (→ #472).
 - **`ebe_warm_start` fit option** (default `false`, opt-in). When a per-subject
   inner BFGS solve fails and falls back to Nelder–Mead, seed the simplex from the
   BFGS partial η̂ instead of cold-starting from the prior mode η=0. On
@@ -157,6 +192,34 @@ section of the SDLC for the versioning policy).
   test in the default build (#430).
 
 ### Changed
+- **`optimizer` now defaults to `auto`** (#490). The new `auto` choice picks the
+  outer optimizer per model: `nlopt_lbfgs` when the exact analytic FOCE/FOCEI
+  gradient is available, and `bobyqa` when only finite differences are (ODE/PD
+  models, LTBS/SDE, or `gradient = fd`). Limited benchmarking across ~10 real
+  FOCEI datasets found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient
+  problem and `bobyqa` fastest and most reliable on the finite-difference ones, so
+  `auto` gives most users a good default without tuning. The fit output reports
+  the resolved pick as `auto (<resolved>)`; set `optimizer` explicitly (e.g.
+  `optimizer = bobyqa`) to keep the previous fixed default.
+- **The SLSQP fallback no longer triggers on `MaxEvalReached`** (#499). After the
+  primary NLopt run (`nlopt_lbfgs`/`slsqp`/`mma`), ferx retried from the current
+  point with a fresh, full-budget SLSQP optimization whenever the primary didn't
+  report a clean convergence code — including when it simply hit the evaluation
+  budget. A spent budget is not a failure a second optimizer can fix (it just
+  doubles the cost); ferx now emits an "increase `maxiter`" warning and returns
+  the best-seen point instead. The genuine-failure fallback (`Failure` /
+  `RoundoffLimited`) is unchanged. Found during the jasmine FOCEI slowness
+  investigation.
+- **`optimizer = lbfgs` and `optimizer = bfgs` now select the NLopt L-BFGS**
+  (`nlopt_lbfgs`) instead of the hand-rolled built-in BFGS / limited-memory L-BFGS
+  (#483). Across analytic-gradient FOCEI benchmarks (jasmine, infliximab, uvm) the
+  NLopt path reaches the best OFV and is 3–5× faster than the built-in, which on
+  harder fits diverged (infliximab) or hung with no outer progress (busulfan
+  ODE+IOV). The two keys are now deprecated aliases; the built-in implementation is
+  slated for removal. The NLopt path's accuracy is validated against NONMEM/nlmixr2
+  reference fits on the [Outer Optimizers](docs/estimation/optimizers.qmd) page
+  (e.g. warfarin LTBS OFV −675.302, recovering NONMEM's MLE; `two_cpt_oral_cov`
+  OFV −1197.23 ≈ nlmixr2's −1199.24).
 - **Documentation now builds as a Quarto website** using the shared ferx site
   branding and styling instead of mdBook. Source pages now live under
   `docs/**/*.qmd`, with navigation in `docs/_quarto.yml` (#443).
@@ -179,6 +242,11 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- Simulation, NPDE/NPD diagnostics, and the NCA-init grid sweep now honour
+  time-varying covariate snapshots on dose, observation, and EVID=2 rows instead
+  of using only each subject's baseline covariates (#506). FREM covariate
+  pseudo-observations keep their additive `EPSCOV` error in simulation/NPDE
+  rather than being fed through the PK residual-error model.
 - **TTE simulation now applies administrative right-censoring** (#440). `simulate()`
   for a `[event_model]` (TTE) endpoint previously emitted *every* drawn event time as
   an uncensored event, so simulated data could not reproduce a study's censoring

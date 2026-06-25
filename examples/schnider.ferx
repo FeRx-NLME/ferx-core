@@ -29,4 +29,4 @@
 
 [fit_options]
   method        = focei
-  optimizer     = lbfgs
+  optimizer     = nlopt_lbfgs
