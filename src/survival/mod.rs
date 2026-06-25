@@ -291,9 +291,11 @@ fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
 /// - **Competing risks** (≥2 TTE records, one per cause CMT — §3.6): a latent
 ///   time is drawn for each cause; the **earliest** is the observed event (its
 ///   CMT, `observed = true`) and every other cause is right-censored at that same
-///   time (`observed = false`). If no cause fires before the (shared, earliest)
-///   window, all causes are censored at the window. One row per cause CMT is
-///   emitted, giving the cause-specific censoring layout the data reader expects.
+///   time (`observed = false`). The subject's administrative horizon is shared
+///   across causes: a record carrying an observed event (`Exact`) imposes none
+///   (+∞), so only an all-`RightCensored` subject is censored, at its common
+///   window (the `max` of the per-cause windows — see the match arm). One row per
+///   cause CMT is emitted, giving the cause-specific layout the data reader expects.
 pub fn simulate_tte<R: rand::Rng>(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,
@@ -326,7 +328,7 @@ pub fn simulate_tte<R: rand::Rng>(
         causes.push((*cmt, *family, params, *entry_time, window));
     }
 
-    let mut push = |cmt: usize, time: f64, observed: bool, results: &mut Vec<_>| {
+    let push = |cmt: usize, time: f64, observed: bool, results: &mut Vec<_>| {
         results.push(crate::api::SimulationResult {
             draw,
             sim,
@@ -355,11 +357,20 @@ pub fn simulate_tte<R: rand::Rng>(
                     draw_tte_latent(*family, params, *entry_time, rng)
                 })
                 .collect();
-            // Subject leaves at the earliest administrative window across causes.
+            // Shared administrative horizon across causes. `observation_window`
+            // already maps an event-bearing record (Exact / IntervalCensored) to
+            // +∞ — it carries no horizon — so a subject with any observed cause
+            // must draw uncensored (the #494 anti-truncation rule), and only an
+            // all-`RightCensored` subject is censored, at its common window.
+            // Folding with `max` realises exactly that: any +∞ wins ⇒ unbounded;
+            // otherwise the (shared) censoring time. `min` would instead re-censor
+            // a re-simulated event-bearing subject at its own observed event time
+            // (the sibling cause's `RightCensored` window = the event time),
+            // re-introducing the VPC bias #494 removed for single endpoints.
             let window = causes
                 .iter()
                 .map(|(_, _, _, _, w)| *w)
-                .fold(f64::INFINITY, f64::min);
+                .fold(f64::NEG_INFINITY, f64::max);
             let (win_idx, obs_time, event) = resolve_competing_risks(&latents, window);
             for (i, (cmt, ..)) in causes.iter().enumerate() {
                 push(*cmt, obs_time, event && i == win_idx, results);
@@ -369,22 +380,24 @@ pub fn simulate_tte<R: rand::Rng>(
 }
 
 /// Cause-specific cumulative incidence functions (CIF) from per-cause cumulative
-/// and instantaneous hazards on a shared time grid (`cum_hazards[k][i] = H_k(t_i)`,
-/// `hazards[k][i] = h_k(t_i)`).
+/// hazards on a shared, **ascending** time grid (`cum_hazards[k][i] = H_k(t_i)`).
 ///
-/// Uses the Aalen–Johansen / actuarial allocation: at each grid step the drop in
-/// all-cause survival `ΔS = S_all(t_{i−1}) − S_all(t_i)` is split across causes in
-/// proportion to their instantaneous-hazard share `h_k / Σ_j h_j`. This guarantees
-/// the exact invariant `Σ_k F_k(t) + S_all(t) = 1` at every grid point
-/// (telescoping), reduces to `F = 1 − S` for a single cause, and is **exact**
-/// (grid-independent) for constant hazards. `S_all(0) = 1` is assumed (parametric
-/// cumulative hazards vanish at `t = 0`), so the lower integration limit is 0.
+/// Uses the discrete Aalen–Johansen / actuarial allocation: at each grid step the
+/// drop in all-cause survival `ΔS = S_all(t_{i−1}) − S_all(t_i)` is split across
+/// causes in proportion to their cumulative-hazard increment share
+/// `ΔH_k / Σ_j ΔH_j` over that step. This guarantees the exact invariant
+/// `Σ_k F_k(t) + S_all(t) = 1` at every grid point (telescoping), reduces to
+/// `F = 1 − S` for a single cause, and is **exact** (grid-independent) for
+/// constant hazards. Because `ΔS` and `Σ_j ΔH_j` are derived from the *same*
+/// cumulative hazards, `ΔS > 0 ⟺ Σ_j ΔH_j > 0`: the degenerate-node guard can
+/// only skip a step whose `ΔS` is already 0, so the invariant never breaks.
+///
+/// `S_all(0) = 1` is assumed (parametric cumulative hazards vanish at `t = 0`), so
+/// the running cumulative hazard starts at 0 and the lower integration limit is 0.
+/// The grid must be ascending (the caller sorts it) so every increment is ≥ 0.
 ///
 /// Returns `(cif[k][i], s_all[i])` where `s_all[i] = exp(−Σ_k H_k(t_i))`.
-pub(crate) fn cif_curves(
-    cum_hazards: &[Vec<f64>],
-    hazards: &[Vec<f64>],
-) -> (Vec<Vec<f64>>, Vec<f64>) {
+pub(crate) fn cif_curves(cum_hazards: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) {
     let n_cause = cum_hazards.len();
     let n_grid = cum_hazards.first().map_or(0, |h| h.len());
 
@@ -397,20 +410,26 @@ pub(crate) fn cif_curves(
 
     let mut cif = vec![vec![0.0_f64; n_grid]; n_cause];
     let mut acc = vec![0.0_f64; n_cause];
+    let mut cum_prev = vec![0.0_f64; n_cause]; // H_k(0) = 0
     let mut s_prev = 1.0_f64; // S_all(0)
     for i in 0..n_grid {
-        let drop = (s_prev - s_all[i]).max(0.0); // ΔS_i ≥ 0
-        let h_tot: f64 = (0..n_cause).map(|k| hazards[k][i]).sum();
-        // Allocate the survival drop by hazard share. Guard the degenerate node
-        // (no/Infinite total hazard, or ΔS = 0 at t = 0) so the accumulator just
-        // carries forward — never 0·∞ = NaN.
-        if drop > 0.0 && h_tot > 0.0 && h_tot.is_finite() {
+        // ΔS_i ≥ 0, and the per-cause cumulative-hazard increment ΔH_k ≥ 0 on an
+        // ascending grid. `dh_tot` and `drop` are both functions of the same
+        // cumulative hazards, so `drop > 0 ⟺ dh_tot > 0`; the guard therefore only
+        // skips a node whose ΔS is 0 (e.g. t = 0) — never one carrying mass.
+        let drop = (s_prev - s_all[i]).max(0.0);
+        let dh: Vec<f64> = (0..n_cause)
+            .map(|k| (cum_hazards[k][i] - cum_prev[k]).max(0.0))
+            .collect();
+        let dh_tot: f64 = dh.iter().sum();
+        if drop > 0.0 && dh_tot > 0.0 && dh_tot.is_finite() {
             for k in 0..n_cause {
-                acc[k] += drop * hazards[k][i] / h_tot;
+                acc[k] += drop * dh[k] / dh_tot;
             }
         }
         for k in 0..n_cause {
             cif[k][i] = acc[k];
+            cum_prev[k] = cum_hazards[k][i];
         }
         s_prev = s_all[i];
     }
@@ -750,9 +769,8 @@ mod tests {
             grid.iter().map(|&t| l1 * t).collect(),
             grid.iter().map(|&t| l2 * t).collect(),
         ];
-        let haz: Vec<Vec<f64>> = vec![vec![l1; grid.len()], vec![l2; grid.len()]];
 
-        let (cif, s_all) = cif_curves(&cum, &haz);
+        let (cif, s_all) = cif_curves(&cum);
         let lsum = l1 + l2;
         for (i, &t) in grid.iter().enumerate() {
             let s_ref = (-lsum * t).exp();
@@ -774,18 +792,13 @@ mod tests {
         // irregular grid. The per-cause CIF is only approximate here, but the
         // partition invariant Σ_k F_k + S_all = 1 must be exact (telescoping).
         let grid = [1.0_f64, 2.5, 4.0, 9.0, 20.0];
-        // cause 0: Weibull scale=8, shape=1.7 ⇒ H=(t/8)^1.7, h=(1.7/8)(t/8)^0.7
+        // cause 0: Weibull scale=8, shape=1.7 ⇒ H=(t/8)^1.7
         let (sc, sh) = (8.0_f64, 1.7_f64);
-        let h0: Vec<f64> = grid
-            .iter()
-            .map(|&t| (sh / sc) * (t / sc).powf(sh - 1.0))
-            .collect();
         let cum0: Vec<f64> = grid.iter().map(|&t| (t / sc).powf(sh)).collect();
-        // cause 1: constant λ=0.05
-        let h1: Vec<f64> = vec![0.05; grid.len()];
+        // cause 1: constant λ=0.05 ⇒ H=0.05·t
         let cum1: Vec<f64> = grid.iter().map(|&t| 0.05 * t).collect();
 
-        let (cif, s_all) = cif_curves(&[cum0, cum1], &[h0, h1]);
+        let (cif, s_all) = cif_curves(&[cum0, cum1]);
         for i in 0..grid.len() {
             assert_abs_diff_eq!(cif[0][i] + cif[1][i] + s_all[i], 1.0, epsilon = 1e-12);
             assert!(cif[0][i] >= 0.0 && cif[1][i] >= 0.0, "CIF non-negative");
@@ -822,8 +835,7 @@ mod tests {
         let grid = [0.0, 1.0, 4.0, 12.0];
         let lam = 0.2_f64;
         let cum = vec![grid.iter().map(|&t| lam * t).collect::<Vec<_>>()];
-        let haz = vec![vec![lam; grid.len()]];
-        let (cif, s_all) = cif_curves(&cum, &haz);
+        let (cif, s_all) = cif_curves(&cum);
         for i in 0..grid.len() {
             assert_abs_diff_eq!(cif[0][i], 1.0 - s_all[i], epsilon = 1e-12);
         }

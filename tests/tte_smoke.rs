@@ -479,6 +479,72 @@ mod survival_smoke {
         );
     }
 
+    /// Re-simulating a competing-risks subject that already has an observed event
+    /// (an `Exact` record, the sibling cause `RightCensored` at the same time)
+    /// must NOT truncate the fresh draw at that original event time: an event
+    /// record carries no administrative horizon (+∞ from `observation_window`,
+    /// #494), so a simulated outcome can fall after it. Guards against the
+    /// per-cause window collapsing to the earliest (`min`) horizon.
+    #[test]
+    fn simulate_competing_risks_event_record_draws_uncensored() {
+        use ferx_core::{simulate_with_seed, SimOutcome};
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model must parse");
+        // 300 subjects, each with cause A (CMT 2) observed at t=0.5 and cause B
+        // (CMT 3) censored at 0.5 — the cause-specific layout of an early event.
+        let template = common::tte_competing_pop(&vec![(0.5_f64, 2u8); 300]);
+        let sims = simulate_with_seed(&model, &template, &model.default_params, 1, 99);
+
+        let max_t = sims
+            .iter()
+            .filter_map(|s| match s.outcome {
+                SimOutcome::Event { time, .. } => Some(time),
+                _ => None,
+            })
+            .fold(0.0_f64, f64::max);
+        // With the #494-consistent horizon (Exact ⇒ +∞) the redraw is unbounded,
+        // so outcomes land well after the original 0.5; the buggy `min` horizon
+        // clamped every outcome to 0.5.
+        assert!(
+            max_t > 0.5 + 1e-6,
+            "event-bearing competing subjects must redraw uncensored, not clamp to \
+             the original event time (max outcome {max_t})"
+        );
+    }
+
+    /// `predict_survival` must keep the partition invariant `Σ_k CIF_k + S_all = 1`
+    /// even when the caller supplies an out-of-order time grid: the CIF telescopes
+    /// the all-cause survival drop, so the grid is sorted internally. Guards the
+    /// public-API robustness of the invariant.
+    #[test]
+    fn predict_survival_cif_invariant_holds_for_unsorted_grid() {
+        use ferx_core::predict_survival;
+        use std::collections::HashMap;
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model must parse");
+        let pop = common::tte_competing_pop(&[(5.0, 2u8), (8.0, 3u8), (30.0, 0u8)]);
+        // Deliberately unsorted.
+        let grid = [15.0, 0.0, 6.0, 2.0, 40.0];
+        let preds = predict_survival(&model, &pop, &model.default_params, &grid);
+        assert!(!preds.is_empty(), "predict_survival must return rows");
+        let mut by_key: HashMap<(String, u64), (f64, f64)> = HashMap::new();
+        for p in &preds {
+            assert!(
+                (0.0..=1.0).contains(&p.cif),
+                "CIF must be in [0,1]: {}",
+                p.cif
+            );
+            let entry = by_key
+                .entry((p.id.clone(), p.time.to_bits()))
+                .or_insert((0.0, p.survival_all));
+            entry.0 += p.cif;
+        }
+        for (_, (sum_cif, s_all)) in by_key {
+            assert!(
+                (sum_cif + s_all - 1.0).abs() < 1e-9,
+                "Σ CIF + S_all must equal 1 on an unsorted grid: {sum_cif} + {s_all}"
+            );
+        }
+    }
+
     /// `fit()` on a fixed-effects TTE model (n_eta=0, no inner loop) must
     /// return Ok immediately (single outer-loop evaluation per iteration).
     #[test]

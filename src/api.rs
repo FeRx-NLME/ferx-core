@@ -5165,6 +5165,14 @@ pub fn predict_survival(
     use crate::survival::{cif_curves, hazard_and_cum_hazard, mean_survival, median_survival};
     use crate::types::EndpointLikelihood;
 
+    // The competing-risks CIF telescopes the all-cause survival drop, which
+    // requires the grid in ascending time order; sort a local copy so the
+    // per-cause `cif` and the `Σ_k F_k + S_all = 1` invariant are correct for any
+    // caller-supplied grid. A no-op for the already-sorted common case.
+    let mut sorted_grid: Vec<f64> = time_grid.to_vec();
+    sorted_grid.sort_by(f64::total_cmp);
+    let time_grid: &[f64] = &sorted_grid;
+
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
 
@@ -5203,7 +5211,7 @@ pub fn predict_survival(
             chz.push(cum_row);
         }
 
-        let (cif, s_all) = cif_curves(&chz, &hz);
+        let (cif, s_all) = cif_curves(&chz);
 
         for (k, (cmt, _, _, t_median, t_mean)) in causes.iter().enumerate() {
             for (i, &t) in time_grid.iter().enumerate() {

@@ -236,6 +236,12 @@ section of the SDLC for the versioning policy).
   (#367).
 
 ### Fixed
+- The `auto` optimizer now selects the derivative-free Bobyqa for time-to-event
+  (`[event_model]`) objectives, which are finite-difference-only. The shared
+  analytic-outer-gradient predicate previously reported a gradient for TTE (and
+  mixed PK+TTE) models that the sensitivity provider cannot supply, so `auto`
+  resolved to a gradient-based optimizer that stalled at the initial estimates;
+  TTE fits with the default optimizer now converge (#490).
 - The ODE-solver fit options `ode_reltol`, `ode_abstol`, and `ode_max_steps` no
   longer emit a spurious "is not used by method … and will be ignored" warning
   (#516). They configure the RK45 integrator and *are* applied to any ODE model

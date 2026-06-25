@@ -266,8 +266,17 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 /// computes an FD gradient (a drift that would run a gradient optimizer on a
 /// noisy FD gradient). The per-eval `reconverge_gradient_interval` override is
 /// orthogonal and handled at the dispatch site, not here.
+///
+/// TTE (`[event_model]`) endpoints are excluded: the hazard log-likelihood has no
+/// analytic outer gradient (the sensitivity provider only covers the structural
+/// PK/PD model), so a TTE — or mixed PK+TTE — objective must be differentiated by
+/// finite differences. Without this guard a TTE model would report an analytic
+/// gradient it cannot supply, so `resolve_auto` would pick a gradient-based
+/// optimizer that then stalls on a meaningless gradient (TTE is FD-only — see
+/// `docs/estimation/tte.qmd`).
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
+        && !model.has_tte()
         && (sens_supported(model) || iov_analytical_supported(model))
 }
 
@@ -2591,6 +2600,38 @@ mod tests {
         assert!(!analytic_outer_gradient_available(
             &test_helpers::ode_model(GradientMethod::Auto)
         ));
+    }
+
+    /// A TTE (`[event_model]`) objective has no analytic outer gradient (the
+    /// provider only covers the structural PK/PD model), so the predicate must be
+    /// `false` even with `gradient = auto` — and `resolve_auto` must therefore
+    /// pick the derivative-free Bobyqa, not a gradient-based optimizer that would
+    /// stall on a gradient TTE cannot supply (#490 auto-optimizer × TTE).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_outer_gradient_unavailable_for_tte() {
+        use crate::types::Optimizer;
+        const TTE: &str = r"
+[parameters]
+  theta TVLAMBDA(0.1, 0.001, 10.0)
+  omega ETA ~ 0.09
+
+[event_model e]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA)
+";
+        let m = parse_model_string(TTE).expect("TTE model must parse");
+        assert!(m.has_tte(), "model must register a TTE endpoint");
+        assert!(
+            !analytic_outer_gradient_available(&m),
+            "TTE objective is FD-only: no analytic outer gradient"
+        );
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m),
+            Optimizer::Bobyqa,
+            "auto must resolve to derivative-free Bobyqa for a TTE model"
+        );
     }
 
     const WARFARIN: &str = r#"
