@@ -727,6 +727,69 @@ mod survival_smoke {
         );
     }
 
+    /// A joint **PK + TTE** `[simulation]` (both `times` and `horizon` set):
+    /// continuous PK observations and TTE event rows are generated for the same
+    /// subjects, the Gaussian write-back routes the continuous rows into
+    /// `observations`, and the TTE write-back routes the event rows into
+    /// `obs_records` (its non-`Event` `filter_map` arm sees the continuous rows).
+    /// Exercises the mixed path end-to-end (#522 review).
+    #[test]
+    fn simulate_block_mixed_pk_and_tte() {
+        let model_src = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[event_model only_cause]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA
+
+[fit_options]
+  method  = focei
+  maxiter = 1
+
+[simulation]
+  n_subjects = 6
+  dose_amt   = 100
+  dose_cmt   = 1
+  times      = [0.5, 2.0, 8.0]
+  horizon    = 14
+  seed       = 3
+";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("mixed_pk_tte.ferx");
+        std::fs::write(&path, model_src).expect("write model");
+
+        let (_fit, pop) =
+            ferx_core::run_model_simulate(path.to_str().unwrap()).expect("mixed simulate+fit");
+        assert_eq!(pop.subjects.len(), 6);
+        for subj in &pop.subjects {
+            // Continuous PK observations: one per `times` entry, written by the
+            // Gaussian write-back.
+            assert_eq!(subj.observations.len(), 3, "3 continuous PK observations");
+            // One TTE row on the cause CMT, written by the TTE write-back. Reaching
+            // this also drives the non-`Event` `filter_map` arm (the continuous rows).
+            assert_eq!(subj.obs_records.len(), 1, "one TTE event row");
+            let ObsRecord::Event { time, cmt, .. } = &subj.obs_records[0];
+            assert_eq!(*cmt, 2, "TTE row on the cause CMT");
+            assert!(*time <= 14.0 + 1e-9, "TTE outcome within the horizon");
+        }
+    }
+
     /// The library `simulate_with_options` validates `horizon` the same way the
     /// `.ferx` parser does: a non-finite or non-positive horizon is rejected, so a
     /// NaN window (every `t_event < NaN` is false → silent NaN event times) or a
