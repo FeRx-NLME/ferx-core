@@ -105,60 +105,6 @@ pub(crate) fn resolve_subject_doses<'a>(
 /// same constant so its trough can't drift from this f64 predictor (#473 review #11).
 pub(crate) const SS_EQUILIBRATION_CYCLES: usize = 50;
 
-/// Relative-`L∞` tolerance for the steady-state equilibration **early stop** (#519). The
-/// `(apply dose; integrate II)` cycle is a geometric contraction with ratio `≈ exp(−λ·II)`;
-/// once the cycle-to-cycle state change falls below this *relative* threshold, every
-/// remaining cycle would move the trough by less still, so the truncation is already at f64
-/// precision and we stop. Conservative (`1e-12`): the dropped tail is far below the
-/// `provider`-vs-production parity tolerance, so the value is unchanged for any realistic
-/// PK. Fast disposition (`λ·II ≈ 2`) converges in ~14 cycles; slow PK (`λ·II ≈ 0.1`) never
-/// trips it and runs the full [`SS_EQUILIBRATION_CYCLES`] — identical to the old behaviour.
-pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
-
-/// Whether the SS-equilibration trough has converged between two successive cycles. Shared
-/// by the f64 predictor and the dual gradient path so both truncate on the *same* criterion
-/// — the dual feeds the value parts (`PkNum::val`) of its state (#519).
-///
-/// **Per-compartment** relative test (#532 review #1): each compartment must stop moving
-/// relative to *itself* (`|Δ| ≤ tol·|cur|`), so in a scale-separated model a small
-/// compartment (effect-site / metabolite many orders below central) is not held only to the
-/// dominant compartment's scale. Compartments negligible versus the overall state
-/// (`|cur| ≤ tol·max_mag`) can't affect any prediction, so they don't block the stop.
-///
-/// A **non-finite** (`NaN`/`Inf`) compartment means the integration blew up: never report
-/// convergence — don't early-exit and silently return a poisoned state; run the full cycle
-/// budget exactly as the pre-#519 code did so the failure surfaces identically (#532 review
-/// #4). Required because `f64::max` would otherwise *drop* a `NaN` and mask it.
-pub(crate) fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
-    if cur.iter().any(|x| !x.is_finite()) {
-        return false;
-    }
-    let max_mag = cur.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
-    let floor = tol * max_mag;
-    cur.iter()
-        .zip(prev)
-        .all(|(&a, &b)| (a - b).abs() <= tol * a.abs() || a.abs() <= floor)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Cycles the most recent [`equilibrate_ss_state`] call ran — a **test-only** observation
-    /// of the #519 early stop, so a test can assert it fired for fast PK and ran the full
-    /// budget for slow PK (#532 review #6 — otherwise the stop logic ships unverified, since
-    /// the loose end-value tolerances absorb a too-early exit).
-    static LAST_SS_EQUILIBRATION_CYCLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn record_ss_equilibration_cycles(n: usize) {
-    LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.set(n));
-}
-
-/// No-op in non-test builds (zero cost on the hot path).
-#[cfg(not(test))]
-#[inline(always)]
-fn record_ss_equilibration_cycles(_n: usize) {}
-
 /// Pre-equilibrate the ODE state to its steady-state value for an SS=1
 /// dose with interval `dose.ii`. NONMEM SS=1 semantics: at the time of
 /// the SS dose, the compartments are loaded with the steady-state
@@ -211,11 +157,7 @@ fn equilibrate_ss_state(
         return u;
     }
 
-    // Early stop once the trough stops moving (#519): `prev` holds the previous cycle's
-    // state; from cycle 1 on, break when the relative change is below `SS_EQUILIBRATION_TOL`.
-    let mut prev = vec![0.0; n];
-    let mut cycles_run = 0usize;
-    for cycle in 0..SS_EQUILIBRATION_CYCLES {
+    for _ in 0..SS_EQUILIBRATION_CYCLES {
         if is_inf {
             // Active-infusion window: wrapped RHS injects rate into the
             // dosing compartment.
@@ -269,13 +211,7 @@ fn equilibrate_ss_state(
                 u.copy_from_slice(&last.u);
             }
         }
-        cycles_run = cycle + 1;
-        if cycle > 0 && ss_cycle_converged(&u, &prev, SS_EQUILIBRATION_TOL) {
-            break;
-        }
-        prev.copy_from_slice(&u);
     }
-    record_ss_equilibration_cycles(cycles_run);
 
     u
 }
@@ -5048,90 +4984,6 @@ mod tests {
     // equilibration loop in `equilibrate_ss_state`.
 
     #[test]
-    fn ss_cycle_converged_is_relative_linf() {
-        // Below tol (relative L∞): a 1e-13 absolute change on a magnitude-100 state is
-        // 1e-15 relative ≪ 1e-12 → converged.
-        assert!(ss_cycle_converged(
-            &[100.0, 50.0],
-            &[100.0 + 1e-13, 50.0],
-            SS_EQUILIBRATION_TOL
-        ));
-        // Above tol: a 1e-4 absolute change is 1e-6 relative ≫ 1e-12 → not converged.
-        assert!(!ss_cycle_converged(
-            &[100.0, 50.0],
-            &[100.0001, 50.0],
-            SS_EQUILIBRATION_TOL
-        ));
-        // Scale-invariant: the same *relative* change at a tiny magnitude → same verdict.
-        assert!(ss_cycle_converged(
-            &[1e-6],
-            &[1e-6 + 1e-19],
-            SS_EQUILIBRATION_TOL
-        ));
-        assert!(!ss_cycle_converged(
-            &[1e-6],
-            &[1e-6 + 1e-15],
-            SS_EQUILIBRATION_TOL
-        ));
-        // A genuinely zero state (no dose effect) is trivially converged.
-        assert!(ss_cycle_converged(
-            &[0.0, 0.0],
-            &[0.0, 0.0],
-            SS_EQUILIBRATION_TOL
-        ));
-        // Non-finite compartment (blown-up integration) is never "converged" → no early exit.
-        assert!(!ss_cycle_converged(
-            &[f64::NAN, 1.0],
-            &[f64::NAN, 1.0],
-            SS_EQUILIBRATION_TOL
-        ));
-        assert!(!ss_cycle_converged(
-            &[f64::INFINITY],
-            &[1.0],
-            SS_EQUILIBRATION_TOL
-        ));
-        // Per-compartment: a small compartment moving 1% (relative to itself) blocks the stop
-        // even though the dominant compartment is steady — global-max normalization would miss it.
-        assert!(!ss_cycle_converged(
-            &[100.0, 1e-3],
-            &[100.0, 1e-3 * 1.01],
-            SS_EQUILIBRATION_TOL
-        ));
-    }
-
-    #[test]
-    fn ss_equilibration_early_stop_fires_for_fast_pk() {
-        // #532 review #6: pin that the #519 early stop actually fires (the loose end-value
-        // tolerances would otherwise hide a broken stop). Use a tight integrator tol — the
-        // gradient context where the speedup matters.
-        let mut ode = one_cpt_ode_spec();
-        ode.solver_opts.reltol = 1e-10;
-        ode.solver_opts.abstol = 1e-12;
-        let dose = DoseEvent::new(0.0, 1000.0, 1, 0.0, true, 12.0);
-
-        // Fast disposition (ke = CL/V = 2.0, λ·II = 24): the trough converges in a few cycles,
-        // so the early stop fires well inside SS_EQUILIBRATION_CYCLES.
-        let fast = pk_one(20.0, 10.0);
-        let _ = equilibrate_ss_state(&ode, &fast.values, &dose, &ode.solver_opts);
-        let fast_cycles = LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.get());
-        assert!(
-            (2..SS_EQUILIBRATION_CYCLES).contains(&fast_cycles),
-            "fast PK should early-stop inside the budget, ran {fast_cycles}"
-        );
-
-        // Near-non-eliminating (ke ≈ 5e-4, λ·II ≈ 6e-3): never reaches the 1e-12 relative
-        // threshold in the budget → runs the full SS_EQUILIBRATION_CYCLES (this is the
-        // pre-existing slow-PK truncation, tracked separately — #532 review #12).
-        let slow = pk_one(0.05, 100.0);
-        let _ = equilibrate_ss_state(&ode, &slow.values, &dose, &ode.solver_opts);
-        let slow_cycles = LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.get());
-        assert_eq!(
-            slow_cycles, SS_EQUILIBRATION_CYCLES,
-            "slow PK should run the full budget, ran {slow_cycles}"
-        );
-    }
-
-    #[test]
     fn ode_ss_iv_bolus_matches_analytical_ss() {
         // The test ODE stores compartment AMOUNT (dA/dt = -ke·A), while the
         // analytical formula returns CONCENTRATION = amount/V. Divide
@@ -5153,10 +5005,9 @@ mod tests {
 
         for (j, &t) in obs_times.iter().enumerate() {
             let expected = one_cpt_iv_bolus_ss(&dose, t, cl, v);
-            // The RK45 reltol/abstol set in `[fit_options]` dominate the error here; the SS
-            // equilibration now stops on the `SS_EQUILIBRATION_TOL` (1e-12) early-stop
-            // (#519) rather than a fixed N=50 truncation, so its own tail is negligible.
-            // 1e-4 is the safe headroom across the population.
+            // RK45 default tolerance is ~1e-6 relative; SS equilibration
+            // truncation at N=50 leaves a ~1e-9 tail. 1e-4 is the safe
+            // headroom across the population.
             assert_relative_eq!(preds[j] / v, expected, epsilon = 1e-6, max_relative = 1e-4);
         }
     }

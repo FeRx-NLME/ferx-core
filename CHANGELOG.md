@@ -133,15 +133,6 @@ section of the SDLC for the versioning policy).
   (#474)
 
 ### Performance
-- **Convergence-based early stop for steady-state equilibration** (#519). The SS=1
-  pre-equilibration (both the f64 predictor and the `Dual1`/`Dual2` gradient path,
-  and the closed-form/event-driven SS loops) previously always expanded a fixed
-  50-cycle `(apply dose; integrate II)` train. It now stops once the trough stops
-  moving — a shared per-compartment relative-`L∞` criterion (`SS_EQUILIBRATION_TOL
-  = 1e-12`) applied identically across all paths, driven by the value parts so the
-  dual truncation matches the f64 one. Fast disposition converges in ~14 cycles
-  (~3.5× fewer); slow PK still runs the full budget, so SS predictions, gradients,
-  and covariance SEs are unchanged. The dominant cost of analytic-gradient SS fits.
 - **Exact analytic gradients for `[initial_conditions]` models** (#524). A non-IOV
   closed-form model with an `[initial_conditions]` baseline now runs FOCE/FOCEI
   on exact analytic `Dual2`/`Dual1` sensitivities under `gradient = auto` instead
