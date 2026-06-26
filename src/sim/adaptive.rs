@@ -1,8 +1,8 @@
 //! Vocabulary for state-reactive ("adaptive" / feedback) dosing simulation (#391).
 //!
-//! This is step **S1.1**: the *types* the reactive driver (S1.3+) and the public
-//! `simulate_adaptive()` entry point (S1.4) are built on — no integration logic
-//! yet. The shapes here are deliberately the public API surface:
+//! The *types* the reactive driver ([`crate::ode::predictions::ode_predictions_adaptive`])
+//! and the public [`crate::api::simulate_adaptive`] entry point are built on. The
+//! shapes here are deliberately the public API surface:
 //!
 //! - a controller is `FnMut(&ControllerCtx) -> Vec<DoseAction>`;
 //! - it reads a set of declared [`MonitorSpec`] signals, **each on its own**
@@ -22,7 +22,14 @@ use std::collections::HashMap;
 /// `Hold` and `Stop` carry no payload: `Hold` skips *this* decision (the regimen
 /// continues), while `Stop` discontinues all future dosing for the subject. Only
 /// `Bolus`/`Infuse` map to a [`DoseEvent`] — see [`DoseAction::to_dose_event`].
+///
+/// `#[non_exhaustive]`: new actions (e.g. the infusion-truncating safety-halt of
+/// #391/#495) land additively without a breaking change. Within `ferx-core` the
+/// driver still matches exhaustively — the attribute only forces a wildcard arm
+/// in downstream crates (`ferx-r`), so adding a variant here can never silently
+/// skip a code path the compiler should have flagged.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum DoseAction {
     /// Instantaneous dose of `amt` into 1-based compartment `cmt`.
     Bolus { amt: f64, cmt: usize },
@@ -31,7 +38,10 @@ pub enum DoseAction {
     Infuse { amt: f64, cmt: usize, rate: f64 },
     /// Skip this decision — no dose now, the regimen continues.
     Hold,
-    /// Discontinue — no further doses for this subject.
+    /// Discontinue all *future* dosing for this subject. An infusion already in
+    /// flight at the `Stop` decision **runs to its scheduled end** — `Stop` halts
+    /// the schedule, it does not retract an active infusion. Truncating an
+    /// in-flight infusion is a distinct action tracked in #495.
     Stop,
 }
 

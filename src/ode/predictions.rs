@@ -1308,9 +1308,9 @@ fn reject_unsupported_dose_compartment(
 /// break only restarts the integrator on a no-event segment, so predictions are
 /// unaffected on the smooth models tested; genuinely reactive/hold regimens are
 /// therefore pinned against the closed form instead.
-// `dead_code`: this is `pub(crate)` and exercised by tests; the public
-// `simulate_adaptive()` entry point that consumes it lands in S1.4 (#391).
-#[allow(clippy::too_many_arguments, dead_code)]
+// Consumed by the public `crate::api::simulate_adaptive()` entry point (S1.4b,
+// #391), which wraps it with per-(subject, replicate) orchestration.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ode_predictions_adaptive(
     ode: &OdeSpec,
     pk_params_flat: &[f64],
@@ -1671,6 +1671,81 @@ pub(crate) fn ode_predictions_adaptive(
         ledger,
         decisions,
     })
+}
+
+/// Frozen-schedule replay verifier — the Part-E backbone of #391, default-on in
+/// [`crate::api::simulate_adaptive`].
+///
+/// Rebuild the *static* dose schedule from a reactive run's realized `ledger`,
+/// integrate it through the trusted static engine ([`ode_predictions`]) on the
+/// same `eta`, and check the reactive trajectory against it. The reactive driver
+/// (which re-plans break times as the controller acts) and `ode_predictions`
+/// (which plans up front) are different code, so agreement proves **the driver
+/// applied every realized dose identically to the static engine** — cleanly
+/// separating dose-bookkeeping correctness from controller logic (the latter is
+/// captured in the ledger). A divergence localizes a bug to dose application.
+///
+/// The check is a tolerance, **not** bit-equality, and that bound is principled
+/// rather than a magic number: a held (no-dose) decision makes the reactive
+/// driver restart the integrator at a time the static dose-list has no break
+/// for, and that restart perturbs the adaptive RK45 step sequence at the
+/// solver's own error level (`reltol`/`abstol`). The ×100 factor sits well above
+/// that accumulation floor yet far below a real bookkeeping bug — a dropped
+/// dose, wrong compartment, or double-applied `F` moves a prediction by O(dose),
+/// i.e. tens of percent. When a dose lands at every decision the break
+/// structures align and agreement is in fact exact (see the degenerate-oracle
+/// tests). The bound is deliberately conservative: a default-on verifier must
+/// never false-positive on a legitimate run; the exact double-entry / mass-
+/// balance bookkeeping checks are S6.
+///
+/// `base_subject` is the dose-free subject the run was driven from; its
+/// observation grid (and any covariates) carry over, only `doses` are replaced
+/// with the realized ledger. The ledger stores nominal `amt`/`rate`
+/// (pre-bioavailability), exactly as a `subject.doses` entry, so `F`/lag re-apply
+/// downstream identically.
+pub(crate) fn verify_adaptive_frozen_replay(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    base_subject: &Subject,
+    run: &AdaptiveRun,
+) -> Result<(), String> {
+    let mut static_subject = base_subject.clone();
+    static_subject.doses = run
+        .ledger
+        .iter()
+        .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+        .collect();
+
+    let static_preds = ode_predictions(ode, pk_params_flat, theta, eta, &static_subject);
+
+    if static_preds.len() != run.predictions.len() {
+        return Err(format!(
+            "frozen replay produced {} prediction(s) but the reactive run has {}",
+            static_preds.len(),
+            run.predictions.len()
+        ));
+    }
+
+    let rel_tol = (100.0 * ode.solver_opts.reltol).max(1e-9);
+    let abs_tol = (100.0 * ode.solver_opts.abstol).max(1e-12);
+    for (j, (got, want)) in run.predictions.iter().zip(static_preds.iter()).enumerate() {
+        // Unrecorded slots are NaN in both engines (same observation grid), so
+        // NaN==NaN is agreement; a NaN-vs-finite split is a genuine divergence.
+        if got.is_nan() && want.is_nan() {
+            continue;
+        }
+        let diff = (got - want).abs();
+        let tol = abs_tol + rel_tol * want.abs();
+        if !(diff <= tol) {
+            return Err(format!(
+                "prediction {j} diverges from the frozen-schedule replay: \
+                 reactive={got}, static={want}, |Δ|={diff} > tol={tol}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// ODE-based predictions with per-event PK parameters (time-varying-covariate
@@ -2906,6 +2981,48 @@ mod tests {
             assert_eq!(run.ledger[i].decision_idx, i);
             assert_eq!(run.ledger[i].dose_idx, i);
         }
+    }
+
+    #[test]
+    fn frozen_replay_verifier_accepts_aligned_run_and_rejects_corruption() {
+        // The verifier's Err branches aren't reachable from a faithful run (the
+        // bookkeeping is correct), so exercise them directly: a faithful run
+        // passes, a perturbed trajectory is a typed divergence error, and a
+        // wrong-length prediction vector is a typed error rather than a panic.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let decisions = [0.0, 24.0, 48.0];
+        let obs = vec![6.0, 30.0, 54.0];
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let base = make_subject(vec![], obs);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+
+        // A dose at every decision aligns the segment structure → exact match.
+        verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &run)
+            .expect("aligned run matches the static replay");
+
+        let mut perturbed = run.clone();
+        perturbed.predictions[0] += 10.0;
+        let err = verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &perturbed)
+            .expect_err("a perturbed trajectory must fail verification");
+        assert!(err.contains("diverges"), "got: {err}");
+
+        let mut short = run.clone();
+        short.predictions.pop();
+        let err = verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &short)
+            .expect_err("a length mismatch must fail verification");
+        assert!(err.contains("prediction"), "got: {err}");
     }
 
     #[test]

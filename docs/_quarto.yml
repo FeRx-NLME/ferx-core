@@ -74,6 +74,7 @@ website:
           - model-file/output.qmd
           - model-file/fit-options.qmd
           - model-file/simulation.qmd
+          - model-file/adaptive-dosing.qmd
           - model-file/event-model.qmd
       - text: "Estimation Methods"
         href: estimation/index.qmd

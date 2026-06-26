@@ -1,0 +1,137 @@
+# Adaptive (Feedback) Dosing
+
+> **Maturity: experimental** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+Adaptive dosing simulates regimens where **future doses depend on the simulated
+state** — therapeutic-drug-monitoring (TDM) target attainment, oncology
+toxicity-driven dose reduction, biomarker titration, target-controlled infusion.
+A plain [simulation](simulation.qmd) is a pure forward pass: every dose is fixed
+before integration. Here a *controller* is consulted at a schedule of decision
+times, reads the current state, and chooses what to do next.
+
+This page documents the first slice (epic #391): a **programmatic** entry point,
+`simulate_adaptive()`. The declarative `[adaptive_dosing]` model-file block and
+multi-model composition are on the roadmap and not yet available.
+
+## The controller
+
+A controller is a closure consulted at each decision time. It receives a
+read-only [`ControllerCtx`] — the decision time, the live ODE state, the
+subject's covariates, the realized dose history, and the resolved value of every
+declared *monitor* — and returns a list of [`DoseAction`]s:
+
+| Action | Meaning |
+|--------|---------|
+| `Bolus { amt, cmt }` | Instantaneous dose into 1-based compartment `cmt`. |
+| `Infuse { amt, cmt, rate }` | Zero-order infusion; duration is `amt / rate`. |
+| `Hold` | Skip this decision — no dose now, the regimen continues. |
+| `Stop` | Discontinue all **future** dosing. An infusion already in flight runs to its scheduled end. |
+
+A `Stop` must be the final action in a decision's list; issuing work after a
+`Stop` is a typed error, not a silently dropped dose.
+
+### One controller per subject
+
+`simulate_adaptive()` takes a **factory** (`Fn() -> FnMut(...)`), not a single
+shared closure. A fresh controller is built for each `(subject, replicate)`.
+Real controllers carry per-subject state — a debounce counter, a windowed AUC,
+the current rung of a titration ladder — and a single shared closure would leak
+that state from one subject to the next. The factory makes the isolation
+structural: a stateless rule is just a factory whose closure ignores its
+environment.
+
+## Monitors
+
+A controller reads named signals declared as [`MonitorSpec`]s. Each monitor
+observes a 1-based compartment/endpoint under an [`ObserveMode`]:
+
+- `Ipred` — the latent individual prediction (no measurement noise).
+- `Dv` — the realized, assay-noised measurement (the realistic TDM signal).
+
+> **This slice supports `Ipred` monitors only.** A `Dv` monitor is rejected with
+> a typed error; assay-noised monitoring (and its per-subject reproducible RNG
+> substreams) lands in a follow-up.
+
+The engine — not the controller — resolves every monitor, so draw order stays
+reproducible.
+
+## Example
+
+```rust
+use ferx_core::{simulate_adaptive, AdaptiveSimulateOptions};
+use ferx_core::sim::adaptive::{ControllerCtx, DoseAction, MonitorSpec, ObserveMode};
+
+let opts = AdaptiveSimulateOptions {
+    seed: Some(42),
+    decision_times: vec![0.0, 24.0, 48.0, 72.0, 96.0],
+    monitors: vec![MonitorSpec::new("CONC", 1, ObserveMode::Ipred)],
+    ..Default::default() // verify = true, max_decisions = 10_000
+};
+
+// A fresh controller per subject: titrate a trough toward the [10, 20] window.
+let make_controller = || {
+    move |ctx: &ControllerCtx| match ctx.signal("CONC") {
+        Some(c) if c < 10.0 => vec![DoseAction::Bolus { amt: 150.0, cmt: 1 }],
+        Some(c) if c > 20.0 => vec![DoseAction::Hold],
+        _ => vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+    }
+};
+
+let result = simulate_adaptive(&model, &population, &params, 100, make_controller, &opts)?;
+```
+
+The result bundles the three tidy, long-form artifacts — each tagged by
+`(draw, sim, id)` so they join cleanly:
+
+- `trajectories` — per-observation predictions (`Vec<SimulationResult>`).
+- `ledger` — every realized dose, with provenance (the decision that produced it,
+  observed signals, applied bioavailability).
+- `decisions` — one row per decision **including holds**, so non-events are on the
+  record rather than inferred from gaps in the ledger.
+
+## Verification (on by default)
+
+Adaptive dosing is bookkeeping-heavy (event ordering, bioavailability/lag,
+segment carry-over). `simulate_adaptive()` runs a **frozen-schedule replay
+verifier** after every run (`verify = true`): it rebuilds a static subject from
+the realized dose ledger, re-integrates it through the trusted static engine, and
+checks the reactive trajectory against it. Because the reactive driver and the
+static engine are different code, agreement proves the driver applied every dose
+identically to the static engine. A divergence is a typed error that taints the
+result — never a silent wrong number.
+
+The check uses a tolerance tied to the ODE solver's own error control, not
+bit-equality: a held decision makes the reactive driver restart the integrator at
+a point the static schedule has no break for, which perturbs the adaptive step
+sequence at the solver's error level. A real bookkeeping bug moves a prediction
+by orders of magnitude more, so the check still catches it.
+
+## Validation
+
+NONMEM has **no native feedback dosing**, so there is no equivalent NONMEM run to
+anchor against — the standard NONMEM comparison does not apply to this feature
+family. It is validated instead by:
+
+- a **degenerate oracle** — a controller that re-emits a fixed regimen reproduces
+  a plain simulation of that regimen, bit-for-bit;
+- the **frozen-schedule replay** verifier above (an exact internal bookkeeping
+  anchor);
+- for genuinely reactive behaviour, reproduction of a published **mrgsolve**
+  dynamic-dosing example (the apples-to-apples external comparator, since mrgsolve
+  does do feedback dosing) — landing with the declarative block.
+
+## Current scope and limits
+
+- **ODE models only** (the reactive driver runs on the ODE engine).
+- **Dose-free base subjects** — the regimen is fully controller-driven; a subject
+  that already carries doses is rejected.
+- **`Ipred` monitors only** (assay-noised `Dv` follows).
+- **Between-subject variability only** — η is drawn per subject/replicate;
+  parameter-uncertainty propagation is a later layer.
+- **Programmatic API only** — the declarative `[adaptive_dosing]` block,
+  imperative `[dose_control]`, and PK+PD+safety model composition are roadmap.
+
+[`ControllerCtx`]: https://docs.rs/ferx-core
+[`DoseAction`]: https://docs.rs/ferx-core
+[`MonitorSpec`]: https://docs.rs/ferx-core
+[`ObserveMode`]: https://docs.rs/ferx-core
