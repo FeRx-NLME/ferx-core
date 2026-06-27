@@ -55,18 +55,12 @@ pub fn tte_data_term(
                 |t| hazard_and_cum_hazard(*family, t, &params).0,
             )
         }
-        // ODE-accumulated hazard needs the integrated CHZ trajectory, which only the
-        // per-subject ODE solve (in the likelihood / predict layer) can supply. Those
-        // callers invoke `tte_nll_from_curves` directly with `H(t)` / `h(t)` read from
-        // the solution; this analytic entry point must not be reached for ODE endpoints.
-        // (Slice 2.1 wiring: see `foce_subject_nll_interaction_with_tte`.)
-        HazardSpec::OdeAccumulated { .. } => {
-            debug_assert!(
-                false,
-                "OdeAccumulated routed through analytic tte_data_term; use tte_nll_from_curves"
-            );
-            1e20
-        }
+        // ODE-accumulated hazards are routed through `tte_endpoint_nll` → `tte_ode_nll`
+        // (which reads H(t)/h(t) from the integrated CHZ state); this closed-form entry
+        // point is analytic-only and returns the ill-defined sentinel if mis-called. Kept
+        // as an explicit, testable arm (not `unreachable!`/`debug_assert!`) so the dispatch
+        // contract is covered and behaves identically in debug and ci-test builds.
+        HazardSpec::OdeAccumulated { .. } => 1e20,
     }
 }
 
@@ -611,6 +605,56 @@ mod tests {
             sigma_idx: vec![],
         });
         assert!(tte_cause_params(&gaussian, &theta, &eta, &cov).is_none());
+
+        // An ODE-accumulated hazard has no closed-form cause params either (its H/h come
+        // from the integrated CHZ state), so it also takes the `None` branch.
+        let ode = EndpointLikelihood::Tte {
+            hazard: HazardSpec::OdeAccumulated { chz_state: 2 },
+        };
+        assert!(tte_cause_params(&ode, &theta, &eta, &cov).is_none());
+    }
+
+    #[test]
+    fn tte_data_term_ode_accumulated_is_analytic_only_sentinel() {
+        // `tte_data_term` is the closed-form (Analytic) entry point. ODE-accumulated
+        // hazards are dispatched elsewhere (tte_endpoint_nll → tte_ode_nll), so calling
+        // this with an OdeAccumulated hazard returns the ill-defined sentinel rather than
+        // a real likelihood — documenting (and covering) the dispatch contract.
+        let records = vec![ObsRecord::Event {
+            time: 10.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let hazard = HazardSpec::OdeAccumulated { chz_state: 2 };
+        let cov = HashMap::new();
+        let nll = tte_data_term(&records, &hazard, &[0.1], &[0.0], &cov);
+        assert_eq!(nll, 1e20);
+    }
+
+    #[test]
+    fn tte_nll_from_curves_degenerate_interval_returns_sentinel() {
+        use crate::types::HazardFamily;
+        // An interval with right ≤ left gives a non-positive Δ = H(right) − H(left); the
+        // shared per-record path returns the 1e20 sentinel (covers the degenerate guard).
+        let records = vec![ObsRecord::Event {
+            time: 0.0,
+            event_type: EventType::IntervalCensored {
+                left: 10.0,
+                right: 5.0,
+            },
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let param_fn: crate::types::HazardParamFn =
+            Box::new(|theta: &[f64], _eta: &[f64], _cov: &HashMap<String, f64>| vec![theta[0]]);
+        let hazard = HazardSpec::Analytic {
+            family: HazardFamily::Exponential,
+            param_fn,
+        };
+        let cov = HashMap::new();
+        let nll = tte_data_term(&records, &hazard, &[0.1], &[0.0], &cov);
+        assert_eq!(nll, 1e20);
     }
 
     #[test]

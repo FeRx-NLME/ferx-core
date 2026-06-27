@@ -2024,6 +2024,11 @@ mod survival_smoke {
             }
             other => panic!("expected OdeAccumulated hazard, got {other:?}"),
         }
+        // Debug formatting names the variant (covers the HazardSpec Debug impl).
+        assert!(
+            format!("{hazard:?}").contains("OdeAccumulated"),
+            "Debug should name the variant; got {hazard:?}"
+        );
 
         // The ODE system gained the synthetic accumulator as its trailing state.
         let ode = model
@@ -2119,6 +2124,75 @@ mod survival_smoke {
         assert!(
             err.contains("mixes"),
             "error should flag the hazard/family conflict; got: {err}"
+        );
+    }
+
+    #[test]
+    fn hazard_without_cmt_errors() {
+        // `hazard =` with no `cmt`: the pre-scan can't key the accumulator to an endpoint.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  H0 = TVH0
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[event_model]
+  hazard = H0
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let err = parse_model_string(src).expect_err("hazard= without cmt must error");
+        assert!(err.contains("cmt"), "error should ask for cmt; got: {err}");
+    }
+
+    #[test]
+    fn hazard_with_iov_errors() {
+        // ODE-accumulated hazard + IOV (kappa) is rejected: the PK-driven hazard would
+        // need per-occasion η threaded into the ODE solve (not supported in Slice 2.1).
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let err = parse_model_string(src).expect_err("hazard= with IOV must error");
+        assert!(
+            err.contains("IOV"),
+            "error should flag the IOV limitation; got: {err}"
         );
     }
 }
