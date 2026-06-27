@@ -20,6 +20,11 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`[fit_options] outer_xtol` / `outer_ftol`** (#469) — expose the derivative-free
+  `bobyqa` outer optimizer's step (`xtol_rel`) and objective (`ftol_rel`) stop
+  tolerances, previously hardcoded. Lets a fit tighten or loosen BOBYQA's
+  convergence on flat/noisy objective ridges. See
+  [fit options](model-file/fit-options.qmd).
 - **Experimental `simulate_adaptive()` — state-reactive ("feedback") dosing simulation**
   (#553, epic #391). A programmatic entry point that simulates regimens where each dose is
   chosen at run time by a controller reading the simulated state (TDM target attainment,
@@ -177,6 +182,15 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- **TTE frailty ω² on a nonlinear hazard parameter now converges onto the
+  NONMEM/nlmixr2 consensus** (#469). The derivative-free `bobyqa` outer optimizer
+  false-converged on the near-flat ω² ridge — its `ftol_rel` default (`1e-6`)
+  stopped it short of ferx's *own* objective minimum, so a Weibull shape-frailty
+  read ω² 0.204 against the NONMEM LAPLACIAN 0.175 / nlmixr2 0.173 consensus on
+  identical data. The TTE objective is evaluated exactly, so its `ftol_rel` is now
+  auto-tightened to `1e-8` (it lands 0.176); non-TTE fits keep `1e-6` to avoid
+  grinding on noisy ODE/FD-inner objectives. This is a pure optimizer-convergence
+  fix and does not touch the separate FOCEI-Laplace *method* bias (#440).
 - `outer_maxiter = 0` (NONMEM `MAXEVAL=0`) now means *evaluation only* on every
   optimizer (#562). The gradient NLopt path (`nlopt_lbfgs`/`slsqp`/`mma`) passed
   `maxiter = 0` straight to NLopt's `set_maxeval`, where `0` means **no limit** —

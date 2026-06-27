@@ -331,9 +331,15 @@ grows at low event rates; SAEM/IMP reduce it). On the 100-subject file itself:
 | OFV (−2LL) | — | 588.93 | 588.94 | 588.93 |
 
 ferx and **nlmixr2** FOCEI agree to ~3 digits on all parameters and the −2LL for all three
-families (Weibull and Gompertz likewise — see `tests/reference/tte_*/expected.md`); for the
-nonlinear-frailty Weibull `omega^2` the two FOCEI tools differ (0.204 vs 0.173), itself
-evidence for the over-estimation note above.
+families (Weibull and Gompertz likewise — see `tests/reference/tte_*/expected.md`), **including
+the nonlinear-frailty Weibull `omega^2`**: ferx 0.176, nlmixr2 0.173, NONMEM LAPLACIAN 0.175.
+Earlier ferx read 0.204 there — not a likelihood difference but a derivative-free outer-optimizer
+artifact: on the near-flat ω² ridge (the whole 0.175→0.204 span is &lt;0.01 OFV) BOBYQA's
+`ftol_rel` default stopped it short of ferx's own profile minimum, which already sat at ~0.175.
+Tightening the TTE outer `ftol_rel` to `1e-8` (#469; auto-applied to pure-TTE models, whose
+hazard objective is exact) lands it on the consensus. This is separate from the FOCEI-Laplace
+*method* bias above (the large-N Weibull SSE still over-estimates the shape frailty, ~0.34 vs a
+true 0.20 — that is #440, unchanged by the optimizer fix).
 
 > NONMEM reports `THETA(1)=log λ`; compare `exp(THETA(1))` to ferx `TVLAMBDA`. The NONMEM frailty
 > column is from `nonmem_frailty.ctl` (`CONDITIONAL LAPLACIAN INTERACTION`). Two NONMEM gotchas for
@@ -383,10 +389,12 @@ The same validation kit exists for Weibull (`tests/reference/tte_weibull/`) and 
 > simulation–estimation check recovers the structural parameters but inflates `omega^2`
 > (Weibull shape: 0.34 vs a true 0.20), while a SAEM fit of the same data reads lower (~0.13).
 > This is an approximation limitation, not a likelihood error (fixed-effects fits match
-> `survreg` exactly). A three-tool cross-check on the n=100 Weibull file agrees: **NONMEM
-> LAPLACIAN (ω² 0.175) and nlmixr2 FOCEI (0.173) land together, below ferx FOCEI (0.204)** —
-> structural params and −2LL match across all three (≤0.5% / identical OFV), with the spread
-> isolated to the weakly-identified ω². Prefer **SAEM/IMP** for frailty TTE on nonlinear
+> `survreg` exactly), and it is a property of the *method*, not of any one tool: a three-tool
+> cross-check on the n=100 Weibull file has **ferx FOCEI (ω² 0.176), nlmixr2 FOCEI (0.173) and
+> NONMEM LAPLACIAN (0.175) all in agreement** (structural params and −2LL match too, ≤0.5% /
+> identical OFV). (ferx read 0.204 here before #469 — a derivative-free outer-optimizer
+> convergence artifact on the flat ω² ridge, since fixed; it is unrelated to the method bias,
+> which shows in the large-N SSE above.) Prefer **SAEM/IMP** for frailty TTE on nonlinear
 > parameters, as in the standard pharmacometric guidance; FOCEI on a *linear* rate (exponential)
 > is near-unbiased and all three tools agree there (ω² 0.286–0.293).
 

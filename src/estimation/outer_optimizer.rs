@@ -732,6 +732,21 @@ fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
     }
 }
 
+/// Resolve the derivative-free `bobyqa` outer optimizer's `ftol_rel` stop tolerance.
+///
+/// `override_ftol` (`[fit_options] outer_ftol`) wins when set. Otherwise auto-select:
+/// `1e-8` for a **pure-TTE** model — its hazard objective is evaluated *exactly*, so
+/// the looser historical `1e-6` stopped BOBYQA short of the optimum on the near-flat
+/// frailty-ω² ridge (#469: a Weibull shape-frailty read 0.204 vs the NONMEM/nlmixr2
+/// 0.175 consensus; `1e-8` lands 0.176) — and `1e-6` for everything else. The non-TTE
+/// floor is deliberate: on a **noisy** objective (ODE solver error, or an FD-inner
+/// FOCE model such as LTBS) `1e-8` is unreachable, so BOBYQA would grind toward its
+/// maxeval budget instead of converging (≈3× the evaluations on an ODE fit). A TTE
+/// endpoint carried on an ODE disposition (`is_ode` true) therefore keeps `1e-6`.
+fn resolve_outer_ftol(has_tte: bool, is_ode: bool, override_ftol: Option<f64>) -> f64 {
+    override_ftol.unwrap_or(if has_tte && !is_ode { 1e-8 } else { 1e-6 })
+}
+
 fn optimize_nlopt(
     model: &CompiledModel,
     population: &Population,
@@ -1114,11 +1129,14 @@ fn optimize_nlopt(
         // BOBYQA's xtol_rel controls rho_end / rho_start — i.e. how much
         // it must shrink the trust radius to declare success. 1e-12 is
         // unreachable in any realistic budget and forces MaxevalReached
-        // at an arbitrary interim point; 1e-4 in scaled log-space is a
-        // ~0.01% move in the natural-scale parameter, which is plenty
-        // tight for NLME work.
-        opt.set_xtol_rel(1e-4).unwrap();
-        opt.set_ftol_rel(1e-6).unwrap();
+        // at an arbitrary interim point; the default xtol 1e-4 in scaled
+        // log-space is a ~0.01% move in the natural-scale parameter, which
+        // is plenty tight for NLME work.
+        opt.set_xtol_rel(options.outer_xtol).unwrap();
+        // ftol_rel is the objective-change stop; see `resolve_outer_ftol` for the
+        // `None` auto-selection (1e-8 pure-TTE, 1e-6 otherwise) and #469 rationale.
+        let ftol = resolve_outer_ftol(model.has_tte(), model.is_ode_based(), options.outer_ftol);
+        opt.set_ftol_rel(ftol).unwrap();
         // NLopt's default rhobeg is 25% of the bound-width — huge in our
         // log-space packing (theta bounds can span 40+ log units), so the
         // initial 2n+1 interpolation probes land in regions where the EBE
@@ -3986,6 +4004,22 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    /// `outer_ftol` auto-selection (#469): pure-TTE tightens to 1e-8; ODE/PK/LTBS
+    /// and TTE-on-ODE keep 1e-6; an explicit override always wins.
+    #[test]
+    fn resolve_outer_ftol_auto_and_override() {
+        // Pure-TTE (exact objective) → tighten.
+        assert_eq!(resolve_outer_ftol(true, false, None), 1e-8);
+        // TTE carried on an ODE disposition (noisy) → safe floor.
+        assert_eq!(resolve_outer_ftol(true, true, None), 1e-6);
+        // Non-TTE analytical/LTBS and ODE-PK → safe floor.
+        assert_eq!(resolve_outer_ftol(false, false, None), 1e-6);
+        assert_eq!(resolve_outer_ftol(false, true, None), 1e-6);
+        // Explicit override wins regardless of model shape.
+        assert_eq!(resolve_outer_ftol(true, false, Some(1e-5)), 1e-5);
+        assert_eq!(resolve_outer_ftol(false, false, Some(1e-10)), 1e-10);
+    }
 
     /// SLSQP-fallback gate (#499): fall back only when the primary run did not
     /// converge and did not exhaust its eval budget, is not already SLSQP, and was

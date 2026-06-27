@@ -3551,6 +3551,22 @@ pub struct FitOptions {
     pub methods: Vec<EstimationMethod>,
     pub outer_maxiter: usize,
     pub outer_gtol: f64,
+    /// Relative **step** tolerance for the derivative-free outer optimizer
+    /// (`Bobyqa`): NLopt's `xtol_rel`, controlling how far the trust radius must
+    /// shrink to declare success. Default `1e-4` (~0.01% move in the natural-scale
+    /// parameter). Other optimizers use their own fixed internal tolerances.
+    pub outer_xtol: f64,
+    /// Relative **objective** tolerance for the derivative-free outer optimizer
+    /// (`Bobyqa`): NLopt's `ftol_rel`, the relative OFV change below which the
+    /// optimizer stops. `None` (the default) auto-selects per model: `1e-8` for a
+    /// pure-TTE model (an *exactly*-evaluated hazard objective, where the looser
+    /// historical `1e-6` stopped short on a near-flat frailty-ω² ridge — #469 — and
+    /// the reported variance landed above its own minimum), and `1e-6` otherwise.
+    /// The `1e-6` floor for non-TTE fits is deliberate: on a *noisy* objective
+    /// (ODE solver error, FD-inner FOCE) a tighter `ftol` is unreachable, so BOBYQA
+    /// grinds toward its maxeval budget instead of converging. `Some(x)` pins `x`
+    /// for every model, overriding the auto-selection.
+    pub outer_ftol: Option<f64>,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
     /// RK45 ODE solver relative tolerance (`[fit_options] ode_reltol`, or via
@@ -3982,6 +3998,16 @@ impl Default for FitOptions {
             methods: Vec::new(),
             outer_maxiter: 500,
             outer_gtol: 1e-6,
+            // BOBYQA trust-region stop tolerances (NLopt xtol_rel/ftol_rel).
+            // `outer_ftol = None` auto-selects 1e-8 for pure-TTE (exact objective)
+            // and 1e-6 elsewhere (#469): the historical 1e-6 stopped the derivative-
+            // free outer optimizer short on the near-flat frailty-ω² ridge (read
+            // 0.204 vs the NONMEM/nlmixr2 0.175 consensus; at 1e-8 it lands 0.176),
+            // but on a *noisy* objective (ODE/FD-inner) 1e-8 is unreachable and
+            // BOBYQA grinds to maxeval, so non-TTE fits keep 1e-6. Override either
+            // via `[fit_options] outer_xtol`/`outer_ftol`.
+            outer_xtol: 1e-4,
+            outer_ftol: None,
             inner_maxiter: 200,
             // 1e-5, not the looser 1e-4 that an earlier comment justified as
             // matching "NONMEM's ~3-SIGDIGITS inner loop" — that conflated the
@@ -4488,6 +4514,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_optimizer",
             "optimizer",
+            "outer_xtol",
+            "outer_ftol",
             "steihaug_max_iters",
             "global_search",
             "global_maxeval",
@@ -4507,6 +4535,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_optimizer",
             "optimizer",
+            "outer_xtol",
+            "outer_ftol",
             "steihaug_max_iters",
             "global_search",
             "global_maxeval",
