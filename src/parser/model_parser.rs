@@ -5645,14 +5645,17 @@ fn parse_input_rate_prefix(
             }
             // The identifier must stand alone as the leading factor: the char before
             // it (skipping spaces) is `+`/`=`/start. Anything else is a compound
-            // expression (`(1-FR)*`, `K*FR*`, `1-FR*`), rejected per #388.
+            // expression (`(1-FR)*`, `K*FR*`, `1-FR*`) or a negated/subtracted term
+            // (`- FR*`) — the sign/scale would be silently dropped, so this is the
+            // `scaled_err` case, *not* a "not a declared parameter" one (the name may
+            // well be declared; the problem is its surrounding context).
             let mut p = id_start;
             while p > 0 && b[p - 1] == b' ' {
                 p -= 1;
             }
             let name = &line[id_start..k];
             if p != 0 && !matches!(b[p - 1], b'+' | b'=') {
-                return Err(frac_not_param_err(fname, name));
+                return Err(scaled_err());
             }
             let slot = indiv_param_names
                 .iter()
@@ -12578,6 +12581,20 @@ mod tests {
         // An undeclared multiplier names the offender and points at the fix.
         let err2 = go("d/dt(central) = ZZ*igd(mat=MAT, cv2=CV2)").unwrap_err();
         assert!(err2.contains("pathway-fraction multiplier"), "got: {err2}");
+
+        // A *declared* fraction in a negated/subtracted position is a dropped-sign
+        // error, not a "not a declared parameter" one: `FR` here IS declared, the
+        // defect is the leading `-`. Report it as the sign/scale rejection so the
+        // message is not misleading (regression for the misattributed diagnostic).
+        let err3 = go("d/dt(central) = MAT*central - FR*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(
+            err3.contains("bare additive") && err3.contains("negated"),
+            "got: {err3}"
+        );
+        // A compound multiplier (`K*FR*`) where both names are declared is likewise a
+        // scale rejection, not a non-parameter one.
+        let err4 = go("d/dt(central) = MAT*FR*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(err4.contains("bare additive"), "got: {err4}");
     }
 
     #[test]
