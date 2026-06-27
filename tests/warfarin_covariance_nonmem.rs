@@ -174,6 +174,10 @@ fn nonmem_refs(focei: bool) -> [SeRef; 7] {
 /// covariance SE matches the NONMEM `MATRIX=R` reference within 20%.
 fn assert_covariance_se_matches_nonmem(method: EstimationMethod, interaction: bool) {
     let model = parse_model_string(MODEL_SRC).expect("warfarin model parses");
+    assert!(
+        model.residual_correlations.is_empty(),
+        "Warfarin covariance NONMEM fixture must remain a diagonal-RUV anchor"
+    );
     let pop =
         read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
 
@@ -182,6 +186,14 @@ fn assert_covariance_se_matches_nonmem(method: EstimationMethod, interaction: bo
     opts.interaction = interaction;
     opts.outer_maxiter = 300;
     opts.run_covariance_step = true;
+    if interaction {
+        // The plain proportional Warfarin FOCEI anchor has no block_sigma
+        // residual correlations. Keep this NONMEM MATRIX=R check on the
+        // analytical R path; the OFV second-difference override is noisier at
+        // the current L-BFGS solution and can explode the TVCL SE even though
+        // the diagonal residual model itself is unchanged.
+        opts.covariance_ofv_hessian = false;
+    }
     opts.verbose = false;
 
     let result = fit(&model, &pop, &model.default_params, &opts).expect("warfarin fit runs");

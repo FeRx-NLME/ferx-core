@@ -46,3 +46,14 @@
 [fit_options]
   method  = focei
   maxiter = 300
+
+# Simulation design (used by `--simulate`, not by `--data`). `horizon` is the
+# administrative censoring time: each synthetic subject gets one right-censored
+# TTE row per cause compartment (CMT 2 and CMT 3), and the draw either records the
+# earliest cause as the event or right-censors the subject at the horizon. It is
+# also the decoupled censoring window a competing-risks VPC needs when
+# re-simulating event-bearing data (#522). A TTE `[simulation]` requires it.
+[simulation]
+  n_subjects = 200
+  horizon    = 14
+  seed       = 12345

@@ -13,6 +13,7 @@ The optional `[simulation]` block defines a virtual clinical trial design for ge
   dose_cmt   = COMPARTMENT
   seed       = SEED
   times      = [t1, t2, t3, ...]
+  horizon    = T          # TTE only — administrative censoring time
 ```
 
 | Key | Aliases | Description |
@@ -21,11 +22,25 @@ The optional `[simulation]` block defines a virtual clinical trial design for ge
 | `dose_amt` | `dose` | Dose amount administered to each subject |
 | `dose_cmt` | `cmt` | Dosing compartment (1-indexed) |
 | `seed` | | Random seed for reproducible simulations |
-| `times` | | Observation time points (required) |
+| `times` | | Continuous observation time points (Gaussian endpoints) |
+| `horizon` | | Administrative censoring time for TTE endpoints (finite, `> 0`) |
+
+A block must define **at least one of `times` or `horizon`**, matched to the
+model's endpoints:
+
+- a model with a **continuous** (residual-error) endpoint **requires `times`**;
+- a model with a [**time-to-event** endpoint](../estimation/tte.qmd) **requires
+  `horizon`** (see [TTE simulation](#tte-simulation) below);
+- a **joint PK + TTE** model requires **both**.
+
+Supplying only `horizon` for a model that has a continuous endpoint is an error
+(it would otherwise simulate zero continuous observations), as is supplying only
+`times` for a TTE model.
 
 An **unknown or malformed key in `[simulation]` is a parse error** (not silently
 ignored), so a typo such as `n_subject`, or a line missing its `=` such as
-`n_subjects 6`, is reported rather than falling back to the default.
+`n_subjects 6`, is reported rather than falling back to the default. A `horizon`
+that is not finite and strictly positive is likewise rejected.
 
 ## Example
 
@@ -61,6 +76,45 @@ This will:
 3. Predictions are generated using the structural model
 4. Residual error is added: $DV = IPRED + \epsilon$, where $\epsilon \sim N(0, V)$
 5. Observations below 0.001 are clipped to 0.001
+
+## TTE simulation {#tte-simulation}
+
+For a [time-to-event model](../estimation/tte.qmd) there are no continuous
+observations to schedule; instead each synthetic subject is followed until an
+event occurs or until the **administrative `horizon`**, at which point an
+event-free subject is right-censored. `--simulate` therefore generates, for each
+subject, **one right-censored TTE row per event (cause) compartment**, then draws
+the outcome:
+
+- a single `[event_model]` yields one row per subject — an event before the
+  horizon, or right-censoring at the horizon;
+- [competing risks](../estimation/tte.qmd#competing-risks-cause-specific-hazards)
+  (several `[event_model]` blocks on distinct compartments) yield one row per
+  cause: the earliest latent event is observed and the remaining causes are
+  right-censored at that same time, or — if no cause fires before the horizon —
+  every cause is right-censored at the horizon.
+
+```
+[simulation]
+  n_subjects = 200
+  horizon    = 14     # follow each subject to t = 14, censoring survivors there
+  seed       = 12345
+```
+
+Because a TTE design has no continuous `times`, the `horizon` key is **required**
+when the model has a TTE endpoint; omitting it is a parse error. See
+`examples/tte_competing_risks.ferx`.
+
+### Decoupled horizon and VPC
+
+The `horizon` is an administrative censoring time **decoupled from the observed
+event times**. This matters when re-simulating an *existing* event-bearing
+dataset for a visual predictive check (VPC): without an explicit horizon a record
+that already carries an event imposes no censoring window (it would re-draw
+unbounded), which biases the simulated event-time distribution. Supplying
+`horizon` overrides each record's per-record window so every simulated cause
+censors at the planned study end. The same control is available on the library
+API as `SimulateOptions { horizon, .. }`.
 
 ## Covariates in Simulation
 

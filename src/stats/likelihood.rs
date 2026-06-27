@@ -164,38 +164,10 @@ pub fn individual_nll_into_with_schedule(
         matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !model.residual_correlations.is_empty() && !has_censored_m3 && !has_frem_rows {
-        let mut r = compute_r_matrix_with_correlations(
-            &model.error_spec,
-            &preds,
-            &subject.obs_cmts,
-            &subject.obs_times,
-            &subject.obs_raw_times,
-            &subject.occasions,
-            sigma_values,
-            &model.residual_correlations,
-        );
-        if ruv_scale != 1.0 {
-            r *= ruv_scale;
-        }
-        for (j, v) in p_obs.iter().enumerate() {
-            if j < r.nrows() {
-                r[(j, j)] += *v;
-            }
-        }
-        let chol = match r.cholesky() {
-            Some(c) => c,
+        match dense_residual_data_term(model, subject, &preds, sigma_values, ruv_scale, &p_obs) {
+            Some(term) => data_ll += term,
             None => return 1e20,
-        };
-        let residuals = DVector::from_iterator(
-            subject.observations.len(),
-            subject
-                .observations
-                .iter()
-                .zip(preds.iter())
-                .map(|(&y, &f)| y - f),
-        );
-        let solved = chol.solve(&residuals);
-        data_ll += residuals.dot(&solved) + chol_log_det(&chol.l());
+        }
     } else {
         for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
             // FREM dispatch: covariate pseudo-observations use theta+eta as
@@ -269,6 +241,59 @@ pub fn individual_nll_into_with_schedule(
     }
 }
 
+/// Dense correlated-residual (block_sigma) Gaussian data term for one subject.
+///
+/// Builds the residual covariance `R` from [`compute_r_matrix_with_correlations`],
+/// scales it by `ruv_scale`, adds the per-observation EKF process-noise `p_obs`
+/// to the diagonal (`&[]` on the SAEM / non-SDE paths), then returns the
+/// un-halved quadratic form plus log-determinant `rᵀ R⁻¹ r + log|R|`. Returns
+/// `None` when `R` is not positive-definite so the caller can emit its `1e20`
+/// sentinel.
+///
+/// Shared by the FOCE/E-step ([`individual_nll_into_with_schedule`]) and the
+/// SAEM M-step ([`obs_nll_subject_into`]) so both evaluate an identical
+/// conditional likelihood — the two previously carried divergent copies, one of
+/// which floored predictions while the other did not, biasing SAEM σ/θ when a
+/// prediction reached ≤ 0 (#557).
+fn dense_residual_data_term(
+    model: &CompiledModel,
+    subject: &Subject,
+    preds: &[f64],
+    sigma_values: &[f64],
+    ruv_scale: f64,
+    p_obs: &[f64],
+) -> Option<f64> {
+    let mut r = compute_r_matrix_with_correlations(
+        &model.error_spec,
+        preds,
+        &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        sigma_values,
+        &model.residual_correlations,
+    );
+    if ruv_scale != 1.0 {
+        r *= ruv_scale;
+    }
+    for (j, v) in p_obs.iter().enumerate() {
+        if j < r.nrows() {
+            r[(j, j)] += *v;
+        }
+    }
+    let chol = r.cholesky()?;
+    let residuals = DVector::from_iterator(
+        subject.observations.len(),
+        subject
+            .observations
+            .iter()
+            .zip(preds.iter())
+            .map(|(&y, &f)| y - f),
+    );
+    let solved = chol.solve(&residuals);
+    Some(residuals.dot(&solved) + chol_log_det(&chol.l()))
+}
+
 /// Observation-only NLL for a single subject with ETAs held fixed.
 ///
 /// Returns the data term `−log p(y_i | η, θ, σ)` (no prior, no |Ω| term) — the
@@ -284,8 +309,26 @@ pub(crate) fn obs_nll_subject_into(
     eta: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
-    let m3 = matches!(model.bloq_method, BloqMethod::M3);
     let preds = pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+    obs_nll_subject_from_preds(model, subject, &preds, theta, sigma_values, eta)
+}
+
+/// Observation-only NLL from *precomputed* predictions.
+///
+/// Identical to [`obs_nll_subject_into`] except the caller supplies `preds`
+/// (predictions are independent of `σ`), letting the SAEM M-step σ-gradient FD
+/// loop reuse one ODE solve across all σ perturbations instead of re-solving per
+/// element (#557). `theta` is only consumed by the TTE hazard term.
+#[cfg_attr(not(feature = "survival"), allow(unused_variables))]
+pub(crate) fn obs_nll_subject_from_preds(
+    model: &CompiledModel,
+    subject: &Subject,
+    preds: &[f64],
+    theta: &[f64],
+    sigma_values: &[f64],
+    eta: &[f64],
+) -> f64 {
+    let m3 = matches!(model.bloq_method, BloqMethod::M3);
     // FREM covariate rows use EPSCOV, not the PK residual error (see
     // build_frem_r_override); FREM covariate rows are never BLOQ.
     let frem_ov =
@@ -294,25 +337,36 @@ pub(crate) fn obs_nll_subject_into(
     // FREM covariate rows keep their own (unscaled) EPSCOV variance.
     let ruv_scale = model.residual_var_scale(eta);
     let mut nll = 0.0;
-    for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-        let frem_var = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
-        // FREM covariate pseudo-observations predict a covariate *value* (any
-        // real: centered/standardized/log-scale covariates are routinely ≤ 0),
-        // not a concentration — do NOT clamp them to 1e-12. Clamping a negative
-        // covariate prediction up to 1e-12 fabricates a huge residual and, on the
-        // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
-        // (#406). Ordinary PK rows keep the positivity clamp.
-        let f = if frem_var.is_some() { f } else { f.max(1e-12) };
-        let v = match frem_var {
-            Some(vv) => vv.max(1e-12),
-            None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale)
-                .max(1e-12),
-        };
-        let cens = subject.cens.get(j).copied().unwrap_or(0);
-        if m3 && cens != 0 {
-            nll += -m3_logcdf(y, f, v.sqrt(), cens);
-        } else {
-            nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
+    let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
+    if !model.residual_correlations.is_empty() && !m3 && !has_frem_rows {
+        // block_sigma + SDE is rejected up front (E_BLOCK_SIGMA_SDE_UNSUPPORTED)
+        // for the SAEM M-step, so no EKF process noise enters here.
+        match dense_residual_data_term(model, subject, preds, sigma_values, ruv_scale, &[]) {
+            Some(term) => nll += 0.5 * term,
+            None => return 1e20,
+        }
+    } else {
+        for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
+            let frem_var = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
+            // FREM covariate pseudo-observations predict a covariate *value* (any
+            // real: centered/standardized/log-scale covariates are routinely ≤ 0),
+            // not a concentration — do NOT clamp them to 1e-12. Clamping a negative
+            // covariate prediction up to 1e-12 fabricates a huge residual and, on the
+            // Rao-Blackwellised path, breaks the `obs_nll(η_c=d) ≈ const` assumption
+            // (#406). Ordinary PK rows keep the positivity clamp.
+            let f = if frem_var.is_some() { f } else { f.max(1e-12) };
+            let v = match frem_var {
+                Some(vv) => vv.max(1e-12),
+                None => (model.residual_variance_at(subject.obs_cmts[j], f, sigma_values)
+                    * ruv_scale)
+                    .max(1e-12),
+            };
+            let cens = subject.cens.get(j).copied().unwrap_or(0);
+            if m3 && cens != 0 {
+                nll += -m3_logcdf(y, f, v.sqrt(), cens);
+            } else {
+                nll += 0.5 * (v.ln() + (y - f).powi(2) / v);
+            }
         }
     }
 
@@ -540,7 +594,15 @@ pub fn foce_subject_nll(
     // takes the interaction path. This matches NONMEM `METHOD=1 LAPLACE` with vs
     // without INTER (FOCE-M3 and FOCEI-M3 are genuinely different optima).
     let _ = m3_active;
-    if interaction {
+    // block_sigma cross-endpoint residual covariance is only carried by the
+    // non-interaction (Sheiner–Beal) path via `compute_r_matrix_with_correlations`;
+    // the interaction accumulator builds R diagonally and would silently drop the
+    // off-diagonal covariance. FOCEI + block_sigma is rejected up front
+    // (E_BLOCK_SIGMA_METHOD_UNSUPPORTED), and SAEM — which evaluates this OFV with
+    // `interaction = true` for AIC/BIC comparability — has no interaction-aware
+    // correlated objective to match, so route any correlated model through the
+    // FOCE objective instead of returning a correlation-free OFV (#557).
+    if interaction && model.residual_correlations.is_empty() {
         foce_subject_nll_interaction(
             subject,
             &ipreds,
@@ -1609,7 +1671,8 @@ pub fn individual_nll_iov(
 mod tests {
     use super::*;
     use crate::types::{
-        BloqMethod, DoseEvent, ErrorModel, ErrorSpec, GradientMethod, PkModel, PkParams,
+        BloqMethod, DoseEvent, EndpointError, ErrorModel, ErrorSpec, GradientMethod, PkModel,
+        PkParams, ResidualCorrelation,
     };
     use approx::assert_relative_eq;
     use std::collections::HashMap;
@@ -1713,6 +1776,56 @@ mod tests {
             residual_error_eta: None,
             analytical_init: Vec::new(),
         }
+    }
+
+    #[test]
+    fn obs_nll_subject_into_uses_cross_endpoint_residual_covariance() {
+        let mut model = make_model();
+        model.error_spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        model.residual_correlations = vec![ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+
+        let mut subj = make_simple_subject();
+        subj.obs_times = vec![1.0, 1.0];
+        subj.obs_raw_times = Vec::new();
+        subj.observations = vec![1.8, 2.4];
+        subj.obs_cmts = vec![1, 2];
+        subj.cens = vec![0, 0];
+        subj.occasions = vec![1, 1];
+        subj.fremtype = Vec::new();
+        let theta = vec![5.0, 50.0];
+        let eta = vec![0.0];
+        let sigma = vec![0.2, 0.3];
+        let mut scratch = pk::EventPkParams::default();
+
+        let dense = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+        model.residual_correlations.clear();
+        let diagonal = obs_nll_subject_into(&model, &subj, &theta, &sigma, &eta, &mut scratch);
+
+        assert!(dense.is_finite());
+        assert!(diagonal.is_finite());
+        assert!(
+            (dense - diagonal).abs() > 1e-6,
+            "cross-endpoint residual covariance must contribute to SAEM obs NLL"
+        );
     }
 
     #[test]

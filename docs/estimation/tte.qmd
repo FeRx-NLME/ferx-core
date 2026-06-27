@@ -279,6 +279,29 @@ cause-specific hazard covers the standard pharmacometric use case.
    # ferx analytic: F_k(t) = (lam_k/(lamA+lamB)) * (1 - exp(-(lamA+lamB)*t))
    ```
 
+**Simulation and VPC.** `simulate()` draws the competing causes with the same
+earliest-cause-wins rule: a latent time is drawn per cause, the earliest is the
+observed event, and every other cause is right-censored at that time. For a
+**visual predictive check** the simulation needs an administrative censoring
+horizon that is *decoupled from the observed event times* — otherwise a
+re-simulated subject that already carries an event re-draws unbounded, biasing the
+simulated event-time distribution. Supply it with the
+[`[simulation] horizon`](../model-file/simulation.qmd#tte-simulation) key (or
+`SimulateOptions { horizon, .. }` on the library API); when set, it overrides each
+record's per-record window so every cause censors at the planned study end:
+
+``` {.ferx}
+[simulation]
+  n_subjects = 200
+  horizon    = 14     # follow each subject to t = 14, censoring survivors there
+  seed       = 12345
+```
+
+Running `ferx examples/tte_competing_risks.ferx --simulate` then generates one
+right-censored TTE row per cause compartment (CMT 2 and CMT 3) per synthetic
+subject and overwrites each with the drawn outcome. A TTE `[simulation]` block
+**requires `horizon`** (there are no continuous `times` to schedule).
+
 ## Comparison with reference software
 
 The exponential validation dataset is `tests/reference/tte_exponential/tte_exp.csv`

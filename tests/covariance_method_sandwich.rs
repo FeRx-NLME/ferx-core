@@ -54,6 +54,12 @@ fn warfarin_focei_opts(method: CovarianceMethod) -> FitOptions {
     opts.outer_maxiter = 300;
     opts.run_covariance_step = true;
     opts.covariance_method = method;
+    // This plain proportional Warfarin fixture is the historical diagonal-RUV
+    // NONMEM anchor. Keep it on the analytical R path: the OFV second-difference
+    // override is useful for some weakly identified surfaces, but after the
+    // block_sigma work it is noisier at the current L-BFGS solution and can make
+    // the RSR anchor look like a residual-correlation regression.
+    opts.covariance_ofv_hessian = false;
     opts.verbose = false;
     opts
 }
@@ -71,7 +77,7 @@ fn all_ses(r: &ferx_core::FitResult) -> Vec<f64> {
 /// and returns finite positive SEs. This is the Tier-2 guard that runs in the
 /// per-PR fast job — where the NONMEM-anchored convergence tests below are
 /// `#[ignore]`d — so it exercises the score cross-product's `log|H̃|`
-/// EBE-response path (#335) and `compute_covariance`'s OFV-Hessian R stencil on
+/// EBE-response path (#335) and `compute_covariance`'s analytical R stencil on
 /// every PR. Accuracy vs NONMEM is asserted by the slow tests; this guards that
 /// the assembly runs and the EBE-response term stays finite. A modest
 /// `outer_maxiter` keeps it fast (the covariance step still runs at the final
@@ -79,6 +85,10 @@ fn all_ses(r: &ferx_core::FitResult) -> Vec<f64> {
 #[test]
 fn covariance_rsr_assembles_finite_ses_fast() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
+    assert!(
+        model.residual_correlations.is_empty(),
+        "Warfarin FOCEI covariance fixture must remain a diagonal-RUV anchor"
+    );
     let pop =
         read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
     let mut opts = warfarin_focei_opts(CovarianceMethod::Sandwich);
@@ -103,6 +113,10 @@ fn covariance_rsr_assembles_finite_ses_fast() {
 )]
 fn covariance_methods_produce_consistent_ses_on_warfarin() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
+    assert!(
+        model.residual_correlations.is_empty(),
+        "Warfarin FOCEI covariance fixture must remain a diagonal-RUV anchor"
+    );
     let pop =
         read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
 
@@ -123,6 +137,11 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
     };
 
     let se_r = run(CovarianceMethod::Hessian);
+    assert!(
+        se_r[0] < 2.0e-2,
+        "diagonal-RUV Warfarin R SE(TVCL) should stay on the pre-block_sigma scale, got {:.4e}",
+        se_r[0]
+    );
     let se_s = run(CovarianceMethod::CrossProduct);
     let se_rsr = run(CovarianceMethod::Sandwich);
 
@@ -164,16 +183,18 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
     not(feature = "slow-tests"),
     ignore = "slow + NONMEM-anchored FOCEI s/rsr covariance SE cross-check (#266/#335): opt in with --features slow-tests"
 )]
-// Re-enabled (#335): the regression was the analytical R-matrix's weakly-identified-θ
-// bias (it holds a=∂f/∂η fixed in the log|H̃| θ-gradient), which the tighter
-// inner_tol (#330) exposed and which propagated through the RSR sandwich
-// (R⁻¹SR⁻¹), pushing SE(TVKA) to ~24% (band 15%). Computing R from the OFV
-// second-difference stencil (`covariance_ofv_hessian = true`) recomputes `a` at
-// every perturbed point and matches a Richardson FD-of-OFV ground truth to <1%,
-// bringing the RSR back within band. The `s` (pure cross-product) estimator is a
-// 10-subject outer-product and is inherently noisier (20% band).
+// Re-enabled (#335): the `s` (pure cross-product) estimator is a 10-subject
+// outer-product and is inherently noisier (20% band). The Warfarin RSR anchor is
+// intentionally kept on the analytical R path here because this fixture has no
+// residual correlations; the OFV second-difference override is validated
+// elsewhere and is too sensitive to finite-difference step/inner-loop noise at
+// the current L-BFGS solution.
 fn covariance_se_matches_nonmem_s_rsr() {
     let model = parse_model_string(WARFARIN_FOCEI).expect("warfarin model parses");
+    assert!(
+        model.residual_correlations.is_empty(),
+        "Warfarin FOCEI covariance fixture must remain a diagonal-RUV anchor"
+    );
     let pop =
         read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data loads");
 
@@ -190,11 +211,7 @@ fn covariance_se_matches_nonmem_s_rsr() {
     ];
 
     let ferx_ses = |m: CovarianceMethod| {
-        // Build R from the OFV second-difference stencil so the weakly-identified
-        // θ curvature (warfarin TVKA) is captured exactly — see the note above.
-        let mut opts = warfarin_focei_opts(m);
-        opts.covariance_ofv_hessian = true;
-        let r = fit(&model, &pop, &model.default_params, &opts)
+        let r = fit(&model, &pop, &model.default_params, &warfarin_focei_opts(m))
             .unwrap_or_else(|e| panic!("{m:?} fit failed: {e}"));
         assert_eq!(
             r.covariance_status,

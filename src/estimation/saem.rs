@@ -13,8 +13,8 @@ use crate::estimation::outer_optimizer::{
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
-    individual_nll, individual_nll_into, individual_nll_iov, obs_nll_subject_into,
-    split_obs_by_occasion,
+    individual_nll, individual_nll_into, individual_nll_iov, obs_nll_subject_from_preds,
+    obs_nll_subject_into, split_obs_by_occasion,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -473,13 +473,16 @@ fn obs_nll_subject_grad_iov(
     pk_scratch: &mut crate::pk::EventPkParams,
 ) -> (f64, Vec<f64>) {
     let n = n_theta + n_sigma;
-    let m3 = matches!(model.bloq_method, BloqMethod::M3);
+    // IOV + block_sigma is rejected up front (E_BLOCK_SIGMA_IOV_UNSUPPORTED), so
+    // `residual_correlations` is never set on this IOV path — only M3 (and TTE,
+    // under the `survival` feature) need the full-FD fallback here.
+    let fd_all = matches!(model.bloq_method, BloqMethod::M3);
     // Fall back to full FD when TTE endpoints are present: the analytic non-M3
     // path is Gaussian-only and would silently zero hazard-parameter gradients.
     #[cfg(feature = "survival")]
-    let m3 = m3 || !model.endpoints.is_empty();
+    let fd_all = fd_all || !model.endpoints.is_empty();
 
-    if m3 {
+    if fd_all {
         // M3 / TTE path: forward-FD of obs_nll_subject_into_iov.
         let nll_base =
             obs_nll_subject_into_iov(model, subject, theta, sigma_values, eta, kappas, pk_scratch);
@@ -861,15 +864,22 @@ fn obs_nll_subject_grad(
     pk_scratch: &mut EventPkParams,
 ) -> (f64, Vec<f64>) {
     let n = n_theta + n_sigma;
-    let m3 = matches!(model.bloq_method, BloqMethod::M3);
+    let fd_all =
+        matches!(model.bloq_method, BloqMethod::M3) || !model.residual_correlations.is_empty();
     // Fall back to the full-FD path when TTE endpoints are present: the analytic
     // non-M3 path is Gaussian-only and would silently zero hazard-parameter gradients.
     #[cfg(feature = "survival")]
-    let m3 = m3 || !model.endpoints.is_empty();
+    let fd_all = fd_all || !model.endpoints.is_empty();
 
-    if m3 {
-        // M3 / TTE path: forward-FD of obs_nll_subject_into for all parameters.
-        let nll_base = obs_nll_subject_into(model, subject, theta, sigma_values, eta, pk_scratch);
+    if fd_all {
+        // M3 / TTE / dense residual-covariance path: forward-FD of
+        // obs_nll_subject_into for all parameters. Predictions are σ-independent,
+        // so solve the model once and reuse the base predictions across every σ
+        // perturbation — only θ perturbations need a fresh solve (#557).
+        let preds_base =
+            crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch);
+        let nll_base =
+            obs_nll_subject_from_preds(model, subject, &preds_base, theta, sigma_values, eta);
         let mut grad = vec![0.0f64; n];
         let h = 1e-5;
         for i in 0..n {
@@ -893,7 +903,8 @@ fn obs_nll_subject_grad(
                 let mut sigma_p = sigma_values.to_vec();
                 let delta = h * (1.0 + sigma_values[k].abs());
                 sigma_p[k] += delta;
-                let nll_p = obs_nll_subject_into(model, subject, theta, &sigma_p, eta, pk_scratch);
+                let nll_p =
+                    obs_nll_subject_from_preds(model, subject, &preds_base, theta, &sigma_p, eta);
                 // log-packing for sigma: d/d(log_sigma_k) = sigma_k * d/d(sigma_k)
                 grad[i] = sigma_values[k] * (nll_p - nll_base) / delta;
             }
@@ -3199,6 +3210,135 @@ mod tests {
                 rel < 1e-3,
                 "per-CMT grad[{j}]: analytical={:.6e}, fd={:.6e}, rel={:.2e}",
                 total_grad[j],
+                ref_grad[j],
+                rel
+            );
+        }
+    }
+
+    /// Dense residual-covariance M-step gradient must match FD of the same
+    /// dense observation NLL. This exercises the `block_sigma` SAEM path, which
+    /// deliberately routes through full FD because the analytic scalar-RUV score
+    /// terms do not apply to off-diagonal R blocks.
+    #[test]
+    fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{DoseEvent, Population};
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
+    0.04,
+    0.01, 0.09
+  ]
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y[CMT=1] = 2.0 * central / V
+  y[CMT=2] = central / V
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
+  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
+",
+        )
+        .expect("cross-endpoint block_sigma ODE model parses");
+
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 1.0, 2.0, 2.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![17.0, 8.0, 15.0, 7.0],
+            obs_cmts: vec![1, 2, 1, 2],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject.clone()],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let theta = vec![1.0f64, 10.0];
+        let sigma_values = vec![0.20f64, 0.30];
+        let etas: Vec<Vec<f64>> = vec![vec![0.05]];
+        let n_theta = 2;
+        let n_sigma = 2;
+        let n = n_theta + n_sigma;
+
+        let f0 = obs_nll_sum(&model, &population, &theta, &sigma_values, &etas);
+        let h = 1e-6;
+        let mut ref_grad = vec![0.0f64; n];
+        for i in 0..n_theta {
+            let mut tp = theta.clone();
+            tp[i] += h;
+            let fp = obs_nll_sum(&model, &population, &tp, &sigma_values, &etas);
+            ref_grad[i] = theta[i] * (fp - f0) / h;
+        }
+        for k in 0..n_sigma {
+            let mut sp = sigma_values.clone();
+            sp[k] += h;
+            let fp = obs_nll_sum(&model, &population, &theta, &sp, &etas);
+            ref_grad[n_theta + k] = sigma_values[k] * (fp - f0) / h;
+        }
+
+        let mask = vec![true; n_theta];
+        let lo = vec![-1e30f64; n];
+        let hi = vec![1e30f64; n];
+        let mut scratch = EventPkParams::default();
+        let (nll, grad) = obs_nll_subject_grad(
+            &model,
+            &subject,
+            &theta,
+            &sigma_values,
+            &etas[0],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+
+        assert!((nll - f0).abs() < 1e-8, "nll mismatch: {nll} vs {f0}");
+        for j in 0..n {
+            let rel = if ref_grad[j].abs() > 1e-8 {
+                (grad[j] - ref_grad[j]).abs() / ref_grad[j].abs()
+            } else {
+                (grad[j] - ref_grad[j]).abs()
+            };
+            assert!(
+                rel < 1e-4,
+                "block_sigma grad[{j}]: fd-path={:.6e}, ref={:.6e}, rel={:.2e}",
+                grad[j],
                 ref_grad[j],
                 rel
             );

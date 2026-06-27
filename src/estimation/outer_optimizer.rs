@@ -60,6 +60,21 @@ pub fn optimize_population(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
+    // `outer_maxiter == 0` requests an evaluation-only run (NONMEM `MAXEVAL=0`):
+    // report the objective at the *initial* parameters with no minimisation. This
+    // must short-circuit before any optimizer is constructed, because NLopt's
+    // `set_maxeval(0)` means "no limit", not "zero evaluations" — so the gradient
+    // NLopt path (`NloptLbfgs`/`Slsqp`/`Mma`) would otherwise run a *full fit* on
+    // a `maxiter = 0` request, making the reported OFV an optimizer- and
+    // platform-dependent converged value rather than the deterministic θ₀ check
+    // callers expect (see #562: ferx-r's `settings = list(maxiter = 0)` silently
+    // ran to convergence, so `two_cpt_oral_cov_ode`'s "init" OFV diverged ~534
+    // from its analytical sibling on x86 Linux). BOBYQA and the built-in BFGS loop
+    // already honour 0, but routing every optimizer through one eval-only path
+    // keeps the semantics uniform.
+    if options.outer_maxiter == 0 {
+        return evaluate_at_initial_params(model, population, init_params, options);
+    }
     // Resolve `auto` once, here, so the concrete optimizer flows through the rest
     // of the outer loop (optimize_nlopt re-reads `options.optimizer` for its own
     // branching). Every other variant is returned unchanged, so this is a no-op
@@ -91,6 +106,119 @@ pub fn optimize_population(
             init_params,
             options,
         ),
+    }
+}
+
+/// Evaluate the population objective at the initial parameters without running
+/// the outer optimizer (`outer_maxiter == 0`, NONMEM `MAXEVAL=0` semantics).
+///
+/// Runs one inner EBE solve per subject from a cold start (η = 0), reports the
+/// FOCE/FOCEI objective `2 · pop_nll` at the initial parameters, and — when
+/// requested — the covariance step at that point. `converged` is `false` (no
+/// minimisation was attempted) and `n_iterations` is 0; the generic
+/// "did not converge" warning is intentionally *not* emitted, since an eval-only
+/// run is a request, not a failure. This is the single eval-only entry every
+/// outer optimizer routes through, so `maxiter = 0` is deterministic regardless
+/// of which optimizer `auto` would have picked.
+fn evaluate_at_initial_params(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    options: &FitOptions,
+) -> OuterResult {
+    let bounds = compute_bounds(init_params);
+    let mut x = pack_params(init_params);
+    clamp_to_bounds(&mut x, &bounds);
+    let params = unpack_params(&x, init_params);
+    let n_subj = population.subjects.len();
+    let n_eta = model.n_eta;
+
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let cold_etas = vec![DVector::zeros(n_eta); n_subj];
+    let (eta_hats, h_matrices, _, kappas) = run_inner_loop_warm(
+        model,
+        population,
+        &params,
+        options.inner_maxiter,
+        options.inner_tol,
+        Some(&cold_etas),
+        Some(&mu_k),
+        options.min_obs_for_convergence_check as usize,
+    );
+    let ofv = 2.0
+        * pop_nll(
+            model,
+            population,
+            &params,
+            &eta_hats,
+            &h_matrices,
+            &kappas,
+            options.interaction,
+        );
+
+    if options.verbose {
+        eprintln!("Iter {:>4}: OFV = {:.6}", 0, ofv);
+        eprintln!("outer_maxiter = 0: evaluation only, no optimization performed.");
+    }
+
+    let mut warnings = Vec::new();
+    let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
+    let covariance_matrix =
+        if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
+            if options.verbose {
+                eprintln!("Computing covariance matrix...");
+            }
+            match compute_covariance(
+                &x,
+                init_params,
+                model,
+                population,
+                &eta_hats,
+                &h_matrices,
+                &kappas,
+                options,
+            ) {
+                CovarianceStepResult::Success(out) => {
+                    warnings.extend(out.warnings);
+                    Some(out.matrix)
+                }
+                CovarianceStepResult::Unusable(msg) => {
+                    warnings.push(msg);
+                    None
+                }
+                CovarianceStepResult::FailedNonPd {
+                    reason,
+                    fallback_proposal,
+                } => {
+                    warnings.push(reason);
+                    sir_fallback_proposal = Some(fallback_proposal);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+    OuterResult {
+        params,
+        ofv,
+        converged: false,
+        n_iterations: 0,
+        eta_hats,
+        h_matrices,
+        kappas,
+        covariance_matrix,
+        warnings,
+        saem_mu_ref_m_step_evals_saved: None,
+        saem_n_subjects_hmc: None,
+        ebe_convergence_warnings: 0,
+        max_unconverged_subjects: 0,
+        total_ebe_fallbacks: 0,
+        final_gradient: None,
+        sir_fallback_proposal,
+        impmap_trace: None,
+        bayes: None,
+        cond_dist: None,
     }
 }
 
@@ -6131,6 +6259,91 @@ mod tests {
         assert!(
             halvings > 0,
             "finite-numerator/infinite-quotient step must not be accepted at halvings == 0"
+        );
+    }
+
+    /// `outer_maxiter == 0` is evaluation-only (NONMEM `MAXEVAL=0`): every
+    /// optimizer must report the *initial*-point objective with zero iterations,
+    /// and the value must be identical across optimizers. Regression for #562:
+    /// the gradient NLopt path set `set_maxeval(0)` — which NLopt reads as "no
+    /// limit" — so `NloptLbfgs`/`Slsqp`/`Mma` silently ran a full fit on a
+    /// `maxiter = 0` request, making the reported "init" OFV optimizer- and
+    /// platform-dependent.
+    #[test]
+    fn outer_maxiter_zero_is_eval_only_and_optimizer_independent() {
+        let model = make_model();
+        let population = make_population(3);
+        let template = &model.default_params;
+
+        // Reference init objective, computed through the same pack/unpack/clamp
+        // round-trip the optimizer entry uses, so the comparison is exact.
+        let mut x = pack_params(template);
+        clamp_to_bounds(&mut x, &compute_bounds(template));
+        let init_params = unpack_params(&x, template);
+        let mu_k = compute_mu_k(&model, &init_params.theta, true);
+        let cold: Vec<DVector<f64>> = (0..population.subjects.len())
+            .map(|_| DVector::zeros(model.n_eta))
+            .collect();
+        let (ehs, hms, _, kappas) = run_inner_loop_warm(
+            &model,
+            &population,
+            &init_params,
+            200,
+            1e-6,
+            Some(&cold),
+            Some(&mu_k),
+            0,
+        );
+        let init_ofv = 2.0 * pop_nll(&model, &population, &init_params, &ehs, &hms, &kappas, true);
+        assert!(init_ofv.is_finite(), "test setup: init OFV must be finite");
+
+        let base = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            mu_referencing: true,
+            ..FitOptions::default()
+        };
+
+        // The buggy path was `NloptLbfgs`; check it alongside the others (incl.
+        // `Auto`, which resolves per-model) — all must agree and not iterate.
+        for opt in [
+            Optimizer::NloptLbfgs,
+            Optimizer::Slsqp,
+            Optimizer::Bobyqa,
+            Optimizer::Bfgs,
+            Optimizer::Auto,
+        ] {
+            let o = FitOptions {
+                optimizer: opt,
+                ..base.clone()
+            };
+            let r = optimize_population(&model, &population, template, &o);
+            assert_eq!(r.n_iterations, 0, "maxiter=0 must not iterate ({opt:?})");
+            assert!(
+                !r.converged,
+                "maxiter=0 must not claim convergence ({opt:?})"
+            );
+            assert!(
+                (r.ofv - init_ofv).abs() < 1e-9,
+                "maxiter=0 OFV must equal the init objective for {opt:?}: got {} vs {init_ofv}",
+                r.ofv
+            );
+        }
+
+        // Counter-check: given a real budget, `NloptLbfgs` actually moves — so the
+        // eval-only result above is a genuine skip, not a coincidence.
+        let run = FitOptions {
+            optimizer: Optimizer::NloptLbfgs,
+            outer_maxiter: 50,
+            ..base.clone()
+        };
+        let r = optimize_population(&model, &population, template, &run);
+        assert!(
+            r.ofv < init_ofv - 1e-6,
+            "with a budget the optimizer should improve the OFV: {} vs init {init_ofv}",
+            r.ofv
         );
     }
 }

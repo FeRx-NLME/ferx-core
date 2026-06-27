@@ -208,6 +208,52 @@ fn simulate_writes_outputs() {
     assert!(tmp.path().join("sim_model-fit.yaml").exists());
 }
 
+/// A Gaussian `[simulation]` block given only `horizon` (no `times`) must fail
+/// loudly. The relaxed `times`-or-`horizon` parser rule (added for TTE models)
+/// accepts it, but a Gaussian model has nothing to observe at a TTE horizon, so
+/// `--simulate` must error rather than silently build zero-observation subjects
+/// and fit on empty data (#522 review). Fast — errors before any fitting.
+#[test]
+fn simulate_gaussian_horizon_only_errors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let model_src = "\
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[simulation]
+  n_subjects = 5
+  horizon    = 14
+";
+    let model = tmp.path().join("gauss_horizon_only.ferx");
+    std::fs::write(&model, model_src).expect("write model");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ferx"))
+        .current_dir(tmp.path())
+        .arg(&model)
+        .arg("--simulate")
+        .output()
+        .expect("run ferx --simulate");
+    assert!(
+        !out.status.success(),
+        "a Gaussian horizon-only [simulation] must fail, not fit on empty data"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("times"),
+        "error must point at the missing `times`: {stderr}"
+    );
+}
+
 /// Covers the arg-parsing error exits in `main` (each calls `process::exit(1)`
 /// before any fitting, so these are fast). One subprocess per bad flag.
 #[test]

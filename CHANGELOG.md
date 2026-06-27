@@ -28,6 +28,10 @@ section of the SDLC for the versioning policy).
   returned alongside the trajectories, and a frozen-schedule replay verifier checks the dose
   bookkeeping by default. Ipred monitors only for now (assay-noised `Dv` monitoring follows).
   See [Adaptive dosing](model-file/adaptive-dosing.qmd).
+- Warn when no estimation method is set in the model file's `[fit_options]` or by
+  the caller, making the implicit fallback to FOCEI visible instead of silent (#558).
+- Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary
+  Gaussian paired-endpoint models (#548).
 - Support NONMEM-style `block_sigma` residual covariance across paired same-time
   multi-endpoint observations under FOCE (#546).
 - Support fixed residual-error correlations via `block_sigma` for FOCE combined-error
@@ -161,6 +165,18 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- `outer_maxiter = 0` (NONMEM `MAXEVAL=0`) now means *evaluation only* on every
+  optimizer (#562). The gradient NLopt path (`nlopt_lbfgs`/`slsqp`/`mma`) passed
+  `maxiter = 0` straight to NLopt's `set_maxeval`, where `0` means **no limit** —
+  so a `maxiter = 0` request silently ran a *full* fit and reported a converged,
+  optimizer- and platform-dependent OFV instead of the objective at the initial
+  parameters. All optimizers now route through a single eval-only path that runs
+  one inner EBE solve at θ₀ and reports `2·NLL` there (covariance step still
+  honoured). This is what surfaced as the `two_cpt_oral_cov_ode` ODE-vs-analytical
+  "init OFV" diverging ~534 on x86 Linux in the ferx-r equivalence tests.
+- FOCEI now falls back to finite-difference h-matrices when an ODE analytic
+  Jacobian is unavailable or non-finite, avoiding sentinel-inflated OFVs on sparse
+  subjects such as the pembrolizumab RadboudUMC model (#551).
 - Reject `block_sigma` with IOV until the IOV inner objective supports the full
   residual covariance matrix, use shifted times when pairing reset-segment
   residual blocks, and keep FREM CWRES variances unscaled by `iiv_on_ruv`
@@ -362,6 +378,16 @@ section of the SDLC for the versioning policy).
   that time — and `predict_survival()` gains a cause-specific cumulative incidence `cif`
   plus the all-cause survival `survival_all` (with `Σ_k cif_k(t) + survival_all(t) = 1`),
   the correct competing-risks quantities. Example `examples/tte_competing_risks.ferx`.
+  Behind the `survival` feature.
+- **`[simulation] horizon` for TTE / competing-risks VPC** (#522). A new
+  `horizon = <t>` key sets an administrative censoring time that is *decoupled
+  from the observed event times*: when present it overrides each TTE record's
+  per-record observation window, so re-simulating event-bearing data (a VPC)
+  censors every cause at the planned study end `t` instead of drawing unbounded.
+  It is also honoured by the `[simulation]`-block `--simulate` path, which now
+  generates one right-censored TTE row per cause compartment per synthetic subject
+  (a TTE model under `[simulation]` therefore requires `horizon`); previously that
+  path emitted zero TTE rows. Exposed on the library `SimulateOptions { horizon }`.
   Behind the `survival` feature.
 - **`[event_model]` hazard expressions can reference `[individual_parameters]`** names —
   e.g. a hazard driven by an individual `CL` — resolved per subject at evaluation time, in

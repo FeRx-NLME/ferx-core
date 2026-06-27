@@ -239,16 +239,30 @@ covariance matrix, so paired rows such as total/unbound assays receive the
 NONMEM-style covariance term `f_total * f_unbound * Cov(EPS_total, EPS_unbound)`.
 
 Current scope: `block_sigma` is supported for ordinary Gaussian `method = foce`
-fits. FOCEI/GN, SAEM, importance-sampling paths, M3 censored-observation
-likelihoods, FREM covariate pseudo-observations, and `iiv_on_ruv` reject
-correlated residual sigma blocks until their residual-error derivative code is
-extended beyond diagonal RUV.
+and `method = saem` fits. FOCEI/GN, importance-sampling paths, M3
+censored-observation likelihoods, FREM covariate pseudo-observations,
+`iiv_on_ruv`, TTE endpoints, and IOV reject correlated residual sigma blocks
+until their residual-error derivative code is extended beyond diagonal RUV.
+SDE/EKF process-noise models carry the correlation under `method = foce` (the
+EKF variance is added to the dense `R`) but are rejected under `method = saem`,
+whose M-step data term does not yet include the process-noise inflation.
 
 Validation: `examples/correlated_residual_combined.ferx` and
 `nonmem_anchor/correlated_residual_combined.ctl` run the same fixed-parameter
 one-compartment IV model with `$SIGMA BLOCK(2) FIX`. On
 `data/correlated_residual_combined.csv`, NONMEM 7.5.1 (`METHOD=1 MAXEVAL=0`)
 reports OFV 18.715849 and ferx FOCE reports OFV 18.727365 (difference 0.0115).
+
+The SAEM path reuses the same dense residual-covariance likelihood
+(`dense_residual_data_term`) for its E-step Metropolis acceptance and its
+theta/sigma M-step objective, and its reported OFV (the FOCE-approximation
+`2·pop_nll` used for AIC/BIC comparability) is routed through the
+correlation-aware non-interaction objective. On the same fixed-parameter model
+ferx SAEM reports OFV 18.7274 — matching ferx FOCE to 4 decimals — against
+NONMEM's importance-sampling marginal −2LL at the reference parameters
+(`METHOD=IMP EONLY=1`, 30 000 samples) of 18.68. Dropping the off-diagonal
+covariance (a diagonal `$SIGMA`) lowers all three engines to ≈14.62, so the
+≈4-OFV gap is the cross-endpoint correlation being correctly accounted for.
 
 ## IIV on residual error (`iiv_on_ruv`)
 

@@ -18,10 +18,7 @@ use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::{compute_covariance, CovarianceStepResult, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
-use crate::stats::likelihood::{
-    build_frem_r_override, chol_log_det, compute_r_tilde, foce_subject_nll_interaction,
-    foce_subject_nll_standard,
-};
+use crate::stats::likelihood::{chol_log_det, compute_r_tilde};
 use crate::stats::residual_error::compute_r_diag;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -1922,64 +1919,16 @@ fn subject_nll_at(
         }
     }
 
-    let ipreds =
-        crate::pk::compute_predictions_with_tv(model, subject, &params.theta, eta_hat.as_slice());
-
-    let m3_active =
-        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
-
-    // FREM R-diagonal override for covariate pseudo-observations.
-    let frem_r_override = build_frem_r_override(
-        model.frem_config.as_ref(),
-        &subject.fremtype,
+    crate::stats::likelihood::foce_subject_nll(
+        model,
+        subject,
+        &params.theta,
+        eta_hat,
+        h_matrix,
+        &params.omega,
         &params.sigma.values,
-    );
-
-    if options.interaction || m3_active {
-        foce_subject_nll_interaction(
-            subject,
-            &ipreds,
-            eta_hat,
-            h_matrix,
-            &params.omega,
-            &params.sigma.values,
-            &model.error_spec,
-            model.bloq_method,
-            &[],
-            frem_r_override.as_deref(),
-            model.residual_error_eta,
-        )
-    } else {
-        // FOCE (no interaction): evaluate R at the population prediction f(η=0)
-        // for f-dependent error, consistent with the marginal in likelihood.rs
-        // and with `subject_nll_pop_grad_analytical` (so GN's NLL matches its
-        // gradient). Additive error keeps f0 (bit-identical).
-        let pop_preds: Option<Vec<f64>> = if model.error_spec.has_f_dependent_variance() {
-            let zeros = vec![0.0_f64; eta_hat.len()];
-            Some(crate::pk::compute_predictions_with_tv(
-                model,
-                subject,
-                &params.theta,
-                &zeros,
-            ))
-        } else {
-            None
-        };
-        foce_subject_nll_standard(
-            subject,
-            &ipreds,
-            eta_hat,
-            h_matrix,
-            &params.omega,
-            &params.sigma.values,
-            &model.error_spec,
-            &model.residual_correlations,
-            model.bloq_method,
-            &[],
-            frem_r_override.as_deref(),
-            pop_preds.as_deref(),
-        )
-    }
+        options.interaction,
+    )
 }
 
 #[cfg(test)]

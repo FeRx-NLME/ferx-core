@@ -192,6 +192,71 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
 
     eprintln!("Model: {}", parsed.model.name);
 
+    // TTE endpoints (survival only): a synthetic subject must carry one
+    // right-censored template row per cause CMT — otherwise `--simulate` emits
+    // zero TTE rows (the synthetic `obs_records` are empty). The administrative
+    // `[simulation] horizon` is the censoring time for those rows; the per-subject
+    // draw then overwrites each template with its realised outcome (#522). Compute
+    // the cause-CMT list once, outside the per-subject loop.
+    #[cfg(feature = "survival")]
+    let tte_cmts: Vec<usize> = {
+        let mut c: Vec<usize> = parsed
+            .model
+            .endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| {
+                matches!(ep, crate::types::EndpointLikelihood::Tte { .. }).then_some(*cmt)
+            })
+            .collect();
+        c.sort_unstable();
+        c
+    };
+    #[cfg(feature = "survival")]
+    if !tte_cmts.is_empty() && sim_spec.horizon.is_none() {
+        return Err("[simulation] with a TTE endpoint requires `horizon = <t>` \
+             (the administrative censoring time at which event-free subjects are \
+             right-censored)"
+            .to_string());
+    }
+
+    // A synthetic design must have something to observe. The parser's
+    // `times`-or-`horizon` rule is deliberately permissive (a pure-TTE model has
+    // no continuous `times`), so enforce the model-specific requirement here, once
+    // the endpoints are known (#522 review):
+    //   - a model with a residual-error (continuous) endpoint needs `times` — this
+    //     keeps the pre-#522 contract and closes the gap where a Gaussian, or a
+    //     joint PK+TTE, model given only `horizon` would silently build
+    //     zero-`observation` subjects and fit on empty continuous data;
+    //   - a pure-TTE model (no error model, hence no sigma) instead needs a
+    //     `horizon`, already enforced above.
+    // A declared `[error_model]` is the signal for "produces continuous
+    // observations": it is the only thing that allocates sigma, and every model
+    // otherwise carries a default `pk_model`, so the structural model alone can't
+    // distinguish intent.
+    let model_has_continuous = !parsed.model.default_params.sigma.values.is_empty();
+    #[cfg(feature = "survival")]
+    let model_has_tte = !tte_cmts.is_empty();
+    #[cfg(not(feature = "survival"))]
+    let model_has_tte = false;
+    if sim_spec.obs_times.is_empty() {
+        if model_has_continuous {
+            return Err(
+                "[simulation] has no `times`, but the model has a continuous \
+                 (residual-error) endpoint that needs observation times — add \
+                 `times = [...]` (a joint PK + TTE design needs both `times` and a \
+                 `horizon`)"
+                    .to_string(),
+            );
+        }
+        if !model_has_tte {
+            return Err(
+                "[simulation] has no `times` and the model has no TTE endpoint \
+                 to observe at a `horizon` — nothing to simulate"
+                    .to_string(),
+            );
+        }
+    }
+
     // Build template population
     let subjects: Vec<Subject> = (1..=sim_spec.n_subjects)
         .map(|i| Subject {
@@ -218,8 +283,23 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
+            // One right-censored template row per cause CMT, at the administrative
+            // horizon (overwritten by the draw). Empty when the model has no TTE
+            // endpoint, reproducing the previous all-Gaussian behaviour. The
+            // `expect` cannot fire: a non-empty `tte_cmts` guarantees `horizon` is
+            // `Some` (the TTE-requires-horizon check above returns early). (#522)
             #[cfg(feature = "survival")]
-            obs_records: vec![],
+            obs_records: tte_cmts
+                .iter()
+                .map(|&cmt| crate::types::ObsRecord::Event {
+                    time: sim_spec
+                        .horizon
+                        .expect("TTE endpoints require a horizon (checked above)"),
+                    event_type: crate::types::EventType::RightCensored,
+                    entry_time: 0.0,
+                    cmt,
+                })
+                .collect(),
         })
         .collect();
     let template = Population {
@@ -236,17 +316,35 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         "Simulating {} subjects (seed={})...",
         sim_spec.n_subjects, sim_spec.seed
     );
-    let sim_results = simulate_with_seed(
+    // Pass the administrative `horizon` through so TTE causes censor at the
+    // planned study end (#522). `match_method = None` makes this identical to
+    // `simulate_with_seed` for the Gaussian path (same seeded RNG, no matching),
+    // and the `None`-matching branch cannot error.
+    let sim_results = simulate_with_options(
         &parsed.model,
         &template,
         &parsed.model.default_params,
         1,
-        sim_spec.seed,
-    );
+        &SimulateOptions {
+            seed: Some(sim_spec.seed),
+            match_method: None,
+            horizon: sim_spec.horizon,
+        },
+    )
+    .map_err(|e| format!("simulation failed: {e}"))?;
 
     let mut population = template;
     for subject in &mut population.subjects {
-        let sims: Vec<_> = sim_results.iter().filter(|s| s.id == subject.id).collect();
+        // Gaussian write-back: only continuous outcomes map onto `observations`.
+        // A TTE `Event` row would trip `continuous_value()`'s debug-assert, so
+        // filter it out here; the TTE outcomes are written into `obs_records` below.
+        let sims: Vec<_> = sim_results
+            .iter()
+            .filter(|s| {
+                s.id == subject.id
+                    && matches!(s.outcome, crate::types::SimOutcome::Continuous { .. })
+            })
+            .collect();
         for (j, s) in sims.iter().enumerate() {
             if j < subject.observations.len() {
                 // Under LTBS the simulated DV is on the log scale and may be
@@ -262,10 +360,55 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
         }
     }
 
+    // TTE write-back (#522): replace each subject's template rows with the
+    // realised simulated outcomes — `Exact` at the drawn event time, or
+    // `RightCensored` at the horizon when no cause fired — so the fitted dataset
+    // (and any output) carries the simulated events rather than the placeholders.
+    #[cfg(feature = "survival")]
+    for subject in &mut population.subjects {
+        let events: Vec<crate::types::ObsRecord> = sim_results
+            .iter()
+            .filter(|s| s.id == subject.id)
+            .filter_map(|s| match s.outcome {
+                crate::types::SimOutcome::Event { time, observed } => {
+                    Some(crate::types::ObsRecord::Event {
+                        time,
+                        event_type: if observed {
+                            crate::types::EventType::Exact
+                        } else {
+                            crate::types::EventType::RightCensored
+                        },
+                        // Synthetic `[simulation]` subjects always enter at 0 (no
+                        // left truncation), matching the template row above; keep
+                        // the two in sync if this path ever gains delayed entry.
+                        entry_time: 0.0,
+                        cmt: s.cmt,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        if !events.is_empty() {
+            subject.obs_records = events;
+        }
+    }
+
+    // `n_obs()` counts only Gaussian observations; add the simulated TTE event
+    // rows so a TTE-only `--simulate` run doesn't misleadingly report "0
+    // observations" (#522 review).
+    #[cfg(feature = "survival")]
+    let n_records = population.n_obs()
+        + population
+            .subjects
+            .iter()
+            .map(|s| s.obs_records.len())
+            .sum::<usize>();
+    #[cfg(not(feature = "survival"))]
+    let n_records = population.n_obs();
     eprintln!(
         "Loaded {} subjects, {} observations",
         population.subjects.len(),
-        population.n_obs()
+        n_records
     );
 
     let init_params = build_init_params(&parsed);
@@ -916,13 +1059,13 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
 
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
-            if m != EstimationMethod::Foce {
+            if !matches!(m, EstimationMethod::Foce | EstimationMethod::Saem) {
                 diags.push(
                     Diagnostic::error(
                         "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
                         "block_sigma correlated residual errors are currently supported for \
-                         method = foce only. FOCEI, GN, SAEM, and importance-sampling paths \
-                         still use diagonal residual-error derivatives.",
+                         method = foce and method = saem only. FOCEI, GN, and \
+                         importance-sampling paths still use diagonal residual-error derivatives.",
                     )
                     .with_block("fit_options"),
                 );
@@ -966,6 +1109,37 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     "block_sigma correlated residual errors are not yet supported with \
                      inter-occasion variability (κ / [iov]) because the IOV inner \
                      objective does not yet use the full residual covariance matrix.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        // SDE is unsupported for SAEM only: the FOCE non-interaction path adds the
+        // EKF process-noise `p_obs` into the dense R (foce_subject_nll_standard),
+        // so FOCE + block_sigma + SDE works, but SAEM's M-step data term
+        // (`obs_nll_subject_into`) carries no `p_obs`, so its E-step sampler and
+        // M-step objective would optimize different likelihoods. FOCE keeps the
+        // combination it supported before this PR added SAEM support.
+        let chain_has_saem = chain.iter().any(|&m| m == EstimationMethod::Saem);
+        if chain_has_saem && model.is_sde() {
+            diags.push(
+                Diagnostic::error(
+                    "E_BLOCK_SIGMA_SDE_UNSUPPORTED",
+                    "block_sigma correlated residual errors are not yet supported with \
+                     method = saem and SDE / EKF process-noise likelihoods.",
+                )
+                .with_block("fit_options"),
+            );
+        }
+        // TTE is unsupported for every method: the TTE Laplace path
+        // (foce_subject_nll_interaction_with_tte) accumulates R diagonally and
+        // cannot represent the cross-endpoint covariance, so it would silently
+        // drop the correlation for FOCE as well as SAEM.
+        if model.has_tte() {
+            diags.push(
+                Diagnostic::error(
+                    "E_BLOCK_SIGMA_TTE_UNSUPPORTED",
+                    "block_sigma correlated residual errors are not yet supported with \
+                     time-to-event endpoints.",
                 )
                 .with_block("fit_options"),
             );
@@ -2688,7 +2862,12 @@ fn fit_inner(
     // Compute up-front so we can both surface the warnings before the fit
     // starts (a long-running fit shouldn't bury a "this option is unused"
     // notice at the end) and carry them through into FitResult.warnings.
-    let unsupported_warnings = options.unsupported_keys_warnings();
+    let mut unsupported_warnings = options.unsupported_keys_warnings();
+    // Surface a "no method specified, defaulting to FOCEI" notice through the
+    // same channel so it reaches both stderr and FitResult.warnings.
+    if let Some(w) = options.method_default_warning() {
+        unsupported_warnings.push(w);
+    }
 
     // Capture thread count before chain runs (current_num_threads() reports
     // whichever Rayon pool is active — scoped pool when threads=Some, else global).
@@ -4829,6 +5008,12 @@ pub struct SimulateOptions {
     /// observations so its posthoc eta can be computed. Has no effect for the
     /// synthetic `[simulation]` block (no observed designs to match against).
     pub match_method: Option<MatchMethod>,
+    /// Administrative censoring horizon for TTE endpoints (#522). When `Some(t)`,
+    /// `t` overrides every TTE record's per-record `observation_window` so a
+    /// re-simulated event-bearing subject censors at the planned study end `t`
+    /// rather than drawing unbounded — the decoupled horizon a competing-risks VPC
+    /// needs. `None` keeps the per-record window. No effect on Gaussian endpoints.
+    pub horizon: Option<f64>,
 }
 
 /// Simulate observations, optionally with propensity-score matching.
@@ -4851,6 +5036,38 @@ pub fn simulate_with_options(
     opts: &SimulateOptions,
 ) -> Result<Vec<SimulationResult>, String> {
     use rand::SeedableRng;
+
+    // Validate the TTE horizon on the library path too — the `.ferx` parser
+    // already rejects a non-finite / non-positive horizon, but a direct caller of
+    // this API must get the same guard: a NaN window makes every `t_event < window`
+    // test false (silent NaN event times), and a `<= 0` horizon censors every
+    // subject at or before entry (#522 review).
+    if let Some(h) = opts.horizon {
+        if !h.is_finite() || h <= 0.0 {
+            return Err(format!(
+                "SimulateOptions.horizon must be finite and > 0 (got {h})"
+            ));
+        }
+        // A horizon below a subject's TTE entry_time would censor it before it
+        // entered observation (a row with time = h < entry_time). The
+        // `[simulation]`-block path always enters at 0, but a left-truncated
+        // population passed to this API must be rejected (#522 review).
+        #[cfg(feature = "survival")]
+        for subject in &population.subjects {
+            for record in &subject.obs_records {
+                let crate::types::ObsRecord::Event { entry_time, .. } = record;
+                if *entry_time > h {
+                    return Err(format!(
+                        "SimulateOptions.horizon ({h}) is below subject '{}' entry_time \
+                         ({entry_time}); the administrative horizon must be ≥ every \
+                         subject's entry time",
+                        subject.id
+                    ));
+                }
+            }
+        }
+    }
+
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
         None => rand::make_rng(),
@@ -4870,7 +5087,14 @@ pub fn simulate_with_options(
         Some(m) => m,
         None => {
             return Ok(simulate_inner_with_draw(
-                model, population, params, n_sim, 1, None, &mut rng,
+                model,
+                population,
+                params,
+                n_sim,
+                1,
+                None,
+                opts.horizon,
+                &mut rng,
             ));
         }
     };
@@ -4926,6 +5150,7 @@ pub fn simulate_with_options(
         n_sim,
         1,
         Some((&eta_hats, omega_inv, method)),
+        opts.horizon,
         &mut rng,
     ))
 }
@@ -4937,7 +5162,9 @@ fn simulate_inner<R: rand::Rng>(
     n_sim: usize,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
-    simulate_inner_with_draw(model, population, params, n_sim, 1, None, rng)
+    // `simulate` / `simulate_with_seed` carry no horizon; the per-record window
+    // applies. An explicit `[simulation] horizon` enters via `simulate_with_options`.
+    simulate_inner_with_draw(model, population, params, n_sim, 1, None, None, rng)
 }
 
 /// Emit all observation rows for one subject given a fully-formed `eta_slice`
@@ -4964,9 +5191,15 @@ fn emit_subject_rows<R: rand::Rng>(
     draw: usize,
     sim: usize,
     normal: rand_distr::Normal<f64>,
+    horizon: Option<f64>,
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
 ) {
+    // `horizon` is consumed only by the TTE path below; without the `survival`
+    // feature there are no TTE endpoints, so discard it to avoid an unused-arg warn.
+    #[cfg(not(feature = "survival"))]
+    let _ = horizon;
+
     // Use the same TV-covariate-aware dispatcher as estimation and post-fit
     // diagnostics. For no-TV subjects this stays on the one-pk-param fast path.
     let ipreds = pk::compute_predictions_with_tv(model, subject, &params.theta, eta_slice);
@@ -5005,6 +5238,7 @@ fn emit_subject_rows<R: rand::Rng>(
         eta_slice,
         draw,
         sim,
+        horizon,
         rng,
         results,
     );
@@ -5024,6 +5258,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     n_sim: usize,
     draw: usize,
     matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
+    horizon: Option<f64>,
     rng: &mut R,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
@@ -5067,6 +5302,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         draw,
                         sim,
                         normal,
+                        horizon,
                         rng,
                         &mut results,
                     );
@@ -5088,6 +5324,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         draw,
                         sim,
                         normal,
+                        horizon,
                         rng,
                         &mut results,
                     );
@@ -5399,6 +5636,7 @@ pub fn simulate_with_uncertainty(
             params,
             opts.n_sim_per_draw,
             k + 1,
+            None,
             None,
             &mut rng,
         );
@@ -6188,10 +6426,10 @@ mod iov_integration {
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 
-    // block_sigma correlated residual errors are only wired into FOCE; every
-    // other method in the chain must be rejected up front (PR #545).
+    // block_sigma correlated residual errors are wired into ordinary Gaussian
+    // FOCE and SAEM; every other method in the chain must be rejected up front.
     #[test]
-    fn test_check_model_options_block_sigma_rejects_non_foce() {
+    fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
         let mut model =
             crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
         model.residual_correlations = vec![crate::types::ResidualCorrelation {
@@ -6207,11 +6445,11 @@ mod iov_integration {
             .iter()
             .find(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED")
             .expect("expected E_BLOCK_SIGMA_METHOD_UNSUPPORTED for FOCEI");
-        assert!(d.is_error() && d.message.contains("method = foce"));
+        assert!(d.is_error() && d.message.contains("method = foce") && d.message.contains("saem"));
 
-        // SAEM is rejected too.
+        // SAEM is accepted for the ordinary Gaussian subset.
         let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
-        assert!(super::check_model_options(&model, &saem)
+        assert!(!super::check_model_options(&model, &saem)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
 
@@ -6220,6 +6458,256 @@ mod iov_integration {
         assert!(!super::check_model_options(&model, &foce)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+
+        model.n_kappa = 1;
+        assert!(super::check_model_options(&model, &saem)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED"));
+    }
+
+    // The block_sigma + SDE rejection is scoped to SAEM: the FOCE dense path adds
+    // the EKF process-noise `p_obs` into R and worked before SAEM support was
+    // added, so a FOCE-only chain must stay accepted. Regression guard against
+    // the over-broad method-agnostic rejection (PR #557 review).
+    #[test]
+    fn test_check_model_options_block_sigma_sde_rejected_for_saem_not_foce() {
+        let mut model =
+            crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        // is_sde() reads diffusion_theta_start; flag the model as an SDE/EKF model.
+        model.diffusion_theta_start = Some(0);
+
+        let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        assert!(super::check_model_options(&model, &saem)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_SDE_UNSUPPORTED"));
+
+        let foce = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        assert!(!super::check_model_options(&model, &foce)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_SDE_UNSUPPORTED"));
+    }
+
+    // The block_sigma + TTE rejection is blanket (every method): the TTE Laplace
+    // path accumulates R diagonally and cannot carry the cross-endpoint
+    // covariance, so it must be rejected for FOCE as well as SAEM (PR #557).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn test_check_model_options_block_sigma_tte_rejected_all_methods() {
+        let mut model =
+            crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        }];
+        // has_tte() scans endpoints for a Tte variant; attach a trivial one.
+        model.endpoints.insert(
+            2,
+            crate::types::EndpointLikelihood::Tte {
+                hazard: crate::types::HazardSpec::Analytic {
+                    family: crate::types::HazardFamily::Exponential,
+                    param_fn: Box::new(|_theta, _eta, _cov| vec![0.1]),
+                },
+            },
+        );
+
+        for method in [EstimationMethod::Saem, EstimationMethod::Foce] {
+            let opts = fast_opts(method, Optimizer::Bobyqa, false);
+            assert!(
+                super::check_model_options(&model, &opts)
+                    .iter()
+                    .any(|d| d.code == "E_BLOCK_SIGMA_TTE_UNSUPPORTED"),
+                "TTE + block_sigma must be rejected for {method:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
+    0.04,
+    0.01, 0.09
+  ]
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y[CMT=1] = 2.0 * central / V
+  y[CMT=2] = central / V
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
+  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
+",
+        )
+        .expect("cross-endpoint block_sigma ODE model parses");
+
+        let mut subjects = Vec::new();
+        for (id, dose_amt, obs) in [
+            ("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]),
+            ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
+        ] {
+            subjects.push(Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 1.0, 2.0, 2.0],
+                obs_raw_times: Vec::new(),
+                observations: obs,
+                obs_cmts: vec![1, 2, 1, 2],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 4],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            });
+        }
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let mut opts = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        opts.saem_n_exploration = 1;
+        opts.saem_n_convergence = 0;
+        opts.saem_n_mh_steps = 1;
+        opts.saem_adapt_interval = 10;
+        opts.saem_omega_burnin = 0;
+        opts.saem_seed = Some(548);
+
+        let result = fit(&model, &population, &model.default_params, &opts)
+            .expect("SAEM fit with cross-endpoint block_sigma should succeed");
+        assert!(result.ofv.is_finite(), "SAEM OFV must be finite");
+    }
+
+    // Regression: the SAEM final OFV (computed via `2·pop_nll` with
+    // `interaction = true`) must include the block_sigma cross-endpoint
+    // covariance. The interaction Laplace accumulator builds R diagonally, so
+    // before #557 SAEM silently dropped the correlation and reported the
+    // diagonal OFV (~4 units low here) instead of the FOCE/NONMEM value. At
+    // fully-fixed parameters both estimators evaluate the same conditional
+    // likelihood, so their OFVs must agree.
+    #[test]
+    fn test_saem_block_sigma_ofv_matches_foce() {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        // Single-endpoint combined error with a fixed correlated $SIGMA block —
+        // the docs validation model (NONMEM FOCE OFV 18.7158, ferx FOCE 18.7274).
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0) FIX
+  theta TVV(10.0, 0.1, 100.0) FIX
+  omega ETA_CL ~ 0.04 FIX
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+",
+        )
+        .expect("fixed-param block_sigma combined model parses");
+
+        let mut subjects = Vec::new();
+        for (id, obs) in [
+            ("1", vec![9.5, 8.0, 6.2]),
+            ("2", vec![10.5, 7.4, 5.6]),
+            ("3", vec![8.8, 7.9, 6.7]),
+        ] {
+            subjects.push(Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 2.0, 4.0],
+                obs_raw_times: Vec::new(),
+                observations: obs,
+                obs_cmts: vec![1, 1, 1],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 3],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            });
+        }
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        // FOCE evaluation (all params fixed → maxiter 0 just evaluates the OFV).
+        let mut foce_opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        foce_opts.outer_maxiter = 0;
+        let foce_ofv = fit(&model, &population, &model.default_params, &foce_opts)
+            .expect("FOCE block_sigma evaluation succeeds")
+            .ofv;
+
+        // SAEM evaluation at the same fixed params.
+        let mut saem_opts = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
+        saem_opts.saem_n_exploration = 2;
+        saem_opts.saem_n_convergence = 0;
+        saem_opts.saem_n_mh_steps = 1;
+        saem_opts.saem_adapt_interval = 10;
+        saem_opts.saem_omega_burnin = 0;
+        saem_opts.saem_seed = Some(12345);
+        let saem_ofv = fit(&model, &population, &model.default_params, &saem_opts)
+            .expect("SAEM block_sigma evaluation succeeds")
+            .ofv;
+
+        // Params are fixed, so the EBEs (hence the conditional OFV) are identical
+        // regardless of estimator; the dense covariance must be carried by both.
+        assert!(
+            (saem_ofv - foce_ofv).abs() < 1e-3,
+            "SAEM OFV {saem_ofv} must match FOCE OFV {foce_ofv} (block_sigma correlation dropped?)"
+        );
     }
 
     #[test]

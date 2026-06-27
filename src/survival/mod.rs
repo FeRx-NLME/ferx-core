@@ -296,6 +296,16 @@ fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
 ///   (+∞), so only an all-`RightCensored` subject is censored, at its common
 ///   window (the `max` of the per-cause windows — see the match arm). One row per
 ///   cause CMT is emitted, giving the cause-specific layout the data reader expects.
+///
+/// `horizon` (`[simulation] horizon`, #522), when `Some(h)`, **overrides** the
+/// per-record [`observation_window`] for every cause: `h` becomes the shared
+/// administrative censoring window regardless of each record's `event_type`. This
+/// is what a competing-risks VPC needs — re-simulating event-bearing data
+/// (`Exact` records, which on their own draw unbounded) then censors at the
+/// *planned* study end `h` rather than at the data's own observed event times.
+/// `None` keeps the per-record window. The override changes only the censoring
+/// comparison, never the number of uniforms drawn, so the RNG sequence (and the
+/// SSE characterization tests) are unaffected.
 pub fn simulate_tte<R: rand::Rng>(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,
@@ -303,6 +313,7 @@ pub fn simulate_tte<R: rand::Rng>(
     eta: &[f64],
     draw: usize,
     sim: usize,
+    horizon: Option<f64>,
     rng: &mut R,
     results: &mut Vec<crate::api::SimulationResult>,
 ) {
@@ -322,9 +333,10 @@ pub fn simulate_tte<R: rand::Rng>(
         };
         let HazardSpec::Analytic { family, param_fn } = hazard;
         let params = param_fn(theta, eta, &subject.covariates);
-        // Only a right-censored record marks an administrative horizon; an event
-        // record draws uncensored (+∞) — see `observation_window`.
-        let window = observation_window(event_type, *time);
+        // With an explicit `horizon`, every cause shares it as the administrative
+        // window (#522); otherwise only a right-censored record marks a horizon and
+        // an event record draws uncensored (+∞) — see `observation_window`.
+        let window = horizon.unwrap_or_else(|| observation_window(event_type, *time));
         causes.push((*cmt, *family, params, *entry_time, window));
     }
 

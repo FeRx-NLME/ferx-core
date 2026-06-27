@@ -511,6 +511,480 @@ mod survival_smoke {
         );
     }
 
+    /// Competing-risks VPC (#522): re-simulating event-bearing data **with** an
+    /// explicit `[simulation] horizon` must (a) decouple the draw from the data's
+    /// own event times — simulated events may land *after* the original event
+    /// time, not truncated at it — and (b) administratively censor at the planned
+    /// horizon, so no outcome exceeds it and a subject surviving every cause past
+    /// the horizon lands exactly on it. The complement of
+    /// `simulate_competing_risks_event_record_draws_uncensored` (no horizon ⇒
+    /// unbounded redraw): the horizon overrides the per-record `observation_window`.
+    #[test]
+    fn simulate_competing_risks_horizon_censors_at_planned_end() {
+        use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
+        use std::collections::HashMap;
+        const H: f64 = 14.0; // planned study end (≈ above the ~8.7 median total event time)
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model must parse");
+        // 300 subjects with cause A (CMT 2) observed at t=0.5 — the data's event
+        // time, which must NOT bound the re-simulation under an explicit horizon.
+        let template = common::tte_competing_pop(&vec![(0.5_f64, 2u8); 300]);
+        let opts = SimulateOptions {
+            seed: Some(99),
+            match_method: None,
+            horizon: Some(H),
+        };
+        let sims = simulate_with_options(&model, &template, &model.default_params, 1, &opts)
+            .expect("simulate with horizon must succeed");
+
+        // Group the two cause rows per subject (they share one outcome time, with
+        // at most one cause observed — the earliest-cause-wins layout).
+        let mut by_id: HashMap<String, Vec<&ferx_core::SimulationResult>> = HashMap::new();
+        for s in &sims {
+            by_id.entry(s.id.clone()).or_default().push(s);
+        }
+        assert_eq!(by_id.len(), 300, "one group per subject");
+
+        let (mut events_after_original, mut censored_at_h) = (0usize, 0usize);
+        for rowset in by_id.values() {
+            assert_eq!(rowset.len(), 2, "one row per cause CMT");
+            let mut t0 = None;
+            let mut observed_any = false;
+            for s in rowset {
+                let (time, observed) = match s.outcome {
+                    SimOutcome::Event { time, observed } => (time, observed),
+                    _ => panic!("expected an Event outcome"),
+                };
+                // (b) the horizon is a hard cap: no outcome can exceed the planned end.
+                assert!(time <= H + 1e-9, "outcome {time} exceeds horizon {H}");
+                let prev = *t0.get_or_insert(time);
+                assert!(
+                    (time - prev).abs() < 1e-12,
+                    "both rows share the outcome time"
+                );
+                observed_any |= observed;
+            }
+            let t0 = t0.unwrap();
+            if observed_any {
+                // (a) decoupled from the data: events may fall after the original 0.5.
+                if t0 > 0.5 + 1e-6 {
+                    events_after_original += 1;
+                }
+            } else {
+                // A subject with no cause firing is censored administratively at the
+                // horizon — exactly, not at the data's 0.5 event time.
+                assert!(
+                    (t0 - H).abs() < 1e-9,
+                    "a fully-censored subject must land on the horizon, got {t0}"
+                );
+                censored_at_h += 1;
+            }
+        }
+        // A proper VPC mix: events past the original event time, plus survivors
+        // censored at the planned horizon.
+        assert!(
+            events_after_original > 0,
+            "horizon must not truncate the redraw at the original 0.5 event time"
+        );
+        assert!(
+            censored_at_h > 0,
+            "expected subjects surviving every cause past the horizon (censored at H)"
+        );
+    }
+
+    /// `[simulation]`-block path (#522): `run_model_simulate` (the `--simulate`
+    /// CLI entry) must generate one TTE row per cause CMT per synthetic subject,
+    /// censored at the `[simulation] horizon`. Without it the synthetic
+    /// `obs_records` are empty and `--simulate` emits zero TTE rows. A
+    /// fixed-effects (n_eta=0) competing model keeps the bundled fit fast.
+    #[test]
+    fn simulate_block_generates_competing_tte_rows() {
+        const H: f64 = 8.0;
+        let model_src = r"
+[parameters]
+  theta TVLAMBDA_A(0.10, 0.001, 10.0)
+  theta TVLAMBDA_B(0.06, 0.001, 10.0)
+
+[event_model cause_a]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA_A
+
+[event_model cause_b]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA_B
+
+[fit_options]
+  method  = focei
+  maxiter = 1
+
+[simulation]
+  n_subjects = 40
+  horizon    = 8
+  seed       = 7
+";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("competing_sim.ferx");
+        std::fs::write(&path, model_src).expect("write model");
+
+        let (_fit, pop) =
+            ferx_core::run_model_simulate(path.to_str().unwrap()).expect("simulate+fit succeeds");
+        assert_eq!(
+            pop.subjects.len(),
+            40,
+            "one synthetic subject per n_subjects"
+        );
+
+        let (mut events, mut censored_at_h) = (0usize, 0usize);
+        for subj in &pop.subjects {
+            // One row per cause CMT (2 and 3), each at entry 0 and within horizon.
+            assert_eq!(subj.obs_records.len(), 2, "one TTE row per cause CMT");
+            let mut cmts: Vec<usize> = subj
+                .obs_records
+                .iter()
+                .map(|r| {
+                    let ObsRecord::Event {
+                        cmt,
+                        entry_time,
+                        time,
+                        ..
+                    } = r;
+                    assert_eq!(
+                        *entry_time, 0.0,
+                        "synthetic subjects have no left truncation"
+                    );
+                    assert!(*time <= H + 1e-9, "row time {time} exceeds horizon {H}");
+                    *cmt
+                })
+                .collect();
+            cmts.sort_unstable();
+            assert_eq!(cmts, vec![2, 3], "rows on both cause CMTs");
+
+            let n_observed = subj
+                .obs_records
+                .iter()
+                .filter(|r| {
+                    let ObsRecord::Event { event_type, .. } = r;
+                    matches!(event_type, EventType::Exact)
+                })
+                .count();
+            assert!(n_observed <= 1, "at most one cause is the observed event");
+            if n_observed == 1 {
+                events += 1;
+            } else {
+                // No cause fired ⇒ both rows right-censored at the horizon.
+                for r in &subj.obs_records {
+                    let ObsRecord::Event {
+                        time, event_type, ..
+                    } = r;
+                    assert!(matches!(event_type, EventType::RightCensored));
+                    assert!(
+                        (time - H).abs() < 1e-9,
+                        "censored row must land on the horizon, got {time}"
+                    );
+                }
+                censored_at_h += 1;
+            }
+        }
+        assert!(
+            events > 0,
+            "synthetic competing data must contain observed events"
+        );
+        assert!(
+            censored_at_h > 0,
+            "with horizon {H} some subjects survive every cause and censor at it"
+        );
+    }
+
+    /// `[simulation]`-block path with a **single** `[event_model]` (#522): the
+    /// docs promise "a single `[event_model]` yields one row per subject — an event
+    /// before the horizon, or right-censoring at the horizon". The competing test
+    /// above covers ≥2 causes; this pins the single-cause `run_model_simulate` path
+    /// end-to-end: exactly one TTE row per synthetic subject, at entry 0 and within
+    /// the horizon, with a mix of observed events and horizon-censored survivors.
+    #[test]
+    fn simulate_block_generates_single_cause_tte_rows() {
+        const H: f64 = 8.0;
+        let model_src = r"
+[parameters]
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+
+[event_model only_cause]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA
+
+[fit_options]
+  method  = focei
+  maxiter = 1
+
+[simulation]
+  n_subjects = 60
+  horizon    = 8
+  seed       = 11
+";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("single_cause_sim.ferx");
+        std::fs::write(&path, model_src).expect("write model");
+
+        let (_fit, pop) =
+            ferx_core::run_model_simulate(path.to_str().unwrap()).expect("simulate+fit succeeds");
+        assert_eq!(
+            pop.subjects.len(),
+            60,
+            "one synthetic subject per n_subjects"
+        );
+
+        let (mut events, mut censored_at_h) = (0usize, 0usize);
+        for subj in &pop.subjects {
+            assert_eq!(subj.obs_records.len(), 1, "single cause ⇒ one TTE row");
+            let ObsRecord::Event {
+                time,
+                event_type,
+                entry_time,
+                cmt,
+            } = &subj.obs_records[0];
+            assert_eq!(*cmt, 2, "row on the cause CMT");
+            assert_eq!(
+                *entry_time, 0.0,
+                "synthetic subjects have no left truncation"
+            );
+            assert!(*time <= H + 1e-9, "row time {time} exceeds horizon {H}");
+            match event_type {
+                EventType::Exact => events += 1,
+                EventType::RightCensored => {
+                    assert!(
+                        (time - H).abs() < 1e-9,
+                        "a censored row must land on the horizon, got {time}"
+                    );
+                    censored_at_h += 1;
+                }
+                other => panic!("unexpected event_type {other:?}"),
+            }
+        }
+        assert!(
+            events > 0,
+            "synthetic single-cause data must contain observed events"
+        );
+        assert!(
+            censored_at_h > 0,
+            "with horizon {H} some subjects survive past it and censor there"
+        );
+    }
+
+    /// A TTE model simulated via `[simulation]` *requires* a `horizon` (there are
+    /// no continuous `times` to censor against). `times` alone satisfies the
+    /// parser, but `run_model_simulate` must then reject the TTE design with a
+    /// clear, actionable error (#522).
+    #[test]
+    fn simulate_block_tte_requires_horizon() {
+        let model_src = r"
+[parameters]
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+
+[event_model only_cause]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA
+
+[simulation]
+  n_subjects = 3
+  times      = [1.0]
+";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("tte_no_horizon.ferx");
+        std::fs::write(&path, model_src).expect("write model");
+
+        let err = ferx_core::run_model_simulate(path.to_str().unwrap())
+            .expect_err("a TTE [simulation] without a horizon must error");
+        assert!(
+            err.contains("horizon") && err.contains("TTE"),
+            "error must name the missing horizon: {err}"
+        );
+    }
+
+    /// A joint **PK + TTE** `[simulation]` (both `times` and `horizon` set):
+    /// continuous PK observations and TTE event rows are generated for the same
+    /// subjects, the Gaussian write-back routes the continuous rows into
+    /// `observations`, and the TTE write-back routes the event rows into
+    /// `obs_records` (its non-`Event` `filter_map` arm sees the continuous rows).
+    /// Exercises the mixed path end-to-end (#522 review).
+    #[test]
+    fn simulate_block_mixed_pk_and_tte() {
+        let model_src = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[event_model only_cause]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA
+
+[fit_options]
+  method  = focei
+  maxiter = 1
+
+[simulation]
+  n_subjects = 6
+  dose_amt   = 100
+  dose_cmt   = 1
+  times      = [0.5, 2.0, 8.0]
+  horizon    = 14
+  seed       = 3
+";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("mixed_pk_tte.ferx");
+        std::fs::write(&path, model_src).expect("write model");
+
+        let (_fit, pop) =
+            ferx_core::run_model_simulate(path.to_str().unwrap()).expect("mixed simulate+fit");
+        assert_eq!(pop.subjects.len(), 6);
+        for subj in &pop.subjects {
+            // Continuous PK observations: one per `times` entry, written by the
+            // Gaussian write-back.
+            assert_eq!(subj.observations.len(), 3, "3 continuous PK observations");
+            // One TTE row on the cause CMT, written by the TTE write-back. Reaching
+            // this also drives the non-`Event` `filter_map` arm (the continuous rows).
+            assert_eq!(subj.obs_records.len(), 1, "one TTE event row");
+            let ObsRecord::Event { time, cmt, .. } = &subj.obs_records[0];
+            assert_eq!(*cmt, 2, "TTE row on the cause CMT");
+            assert!(*time <= 14.0 + 1e-9, "TTE outcome within the horizon");
+        }
+    }
+
+    /// A **joint** PK+TTE model given only `horizon` (no `times`) must error, not
+    /// silently simulate zero PK observations. The model has a residual-error
+    /// (continuous) endpoint, so `times` is required even though it also has a TTE
+    /// endpoint — the mixed-model half of the silent-data gap the pure-Gaussian
+    /// guard left open (#522 review).
+    #[test]
+    fn simulate_block_mixed_horizon_only_errors() {
+        let model_src = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[event_model only_cause]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA
+
+[simulation]
+  n_subjects = 4
+  dose_amt   = 100
+  dose_cmt   = 1
+  horizon    = 14
+";
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("mixed_horizon_only.ferx");
+        std::fs::write(&path, model_src).expect("write model");
+
+        let err = ferx_core::run_model_simulate(path.to_str().unwrap())
+            .expect_err("a joint PK+TTE model with horizon but no times must error");
+        assert!(
+            err.contains("times") && err.contains("continuous"),
+            "error must point at the missing continuous `times`: {err}"
+        );
+    }
+
+    /// The library `simulate_with_options` validates `horizon` the same way the
+    /// `.ferx` parser does: a non-finite or non-positive horizon is rejected, so a
+    /// NaN window (every `t_event < NaN` is false → silent NaN event times) or a
+    /// `<= 0` horizon (censors every subject at/before entry) cannot slip in via
+    /// the API (#522 review).
+    #[test]
+    fn simulate_with_options_rejects_bad_horizon() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model parses");
+        let pop = common::tte_competing_pop(&vec![(0.5_f64, 2u8); 4]);
+        for bad in [f64::NAN, f64::INFINITY, 0.0, -3.0] {
+            let opts = SimulateOptions {
+                seed: Some(1),
+                match_method: None,
+                horizon: Some(bad),
+            };
+            let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+                .expect_err("non-finite / non-positive horizon must error");
+            assert!(err.contains("horizon"), "got: {err}");
+        }
+        // A valid horizon still succeeds.
+        let ok = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(10.0),
+        };
+        assert!(simulate_with_options(&model, &pop, &model.default_params, 1, &ok).is_ok());
+    }
+
+    /// A horizon below a left-truncated subject's `entry_time` would censor it
+    /// before it entered observation (a row with `time < entry_time`); the library
+    /// path rejects it. The `[simulation]`-block path always enters at 0, so this
+    /// only guards `SimulateOptions { horizon }` on real left-truncated data (#522
+    /// review).
+    #[test]
+    fn simulate_with_options_rejects_horizon_below_entry_time() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(COMPETING_RISKS_MODEL).expect("model parses");
+        // One left-truncated subject: enters at t = 5 on both causes.
+        let mut pop = common::tte_competing_pop(&[(10.0_f64, 0u8)]);
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 10.0,
+                event_type: EventType::RightCensored,
+                entry_time: 5.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 10.0,
+                event_type: EventType::RightCensored,
+                entry_time: 5.0,
+                cmt: 3,
+            },
+        ];
+        let below = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(3.0), // < entry_time 5.0
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &below)
+            .expect_err("horizon below entry_time must error");
+        assert!(err.contains("entry_time"), "got: {err}");
+        // A horizon at/above entry is fine.
+        let above = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(8.0),
+        };
+        assert!(simulate_with_options(&model, &pop, &model.default_params, 1, &above).is_ok());
+    }
+
     /// `predict_survival` must keep the partition invariant `Σ_k CIF_k + S_all = 1`
     /// even when the caller supplies an out-of-order time grid: the CIF telescopes
     /// the all-cause survival drop, so the grid is sorted internally. Guards the

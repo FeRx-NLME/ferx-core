@@ -92,6 +92,7 @@ fn matched_simulation_has_expected_shape_and_finite_dvs() {
         let opts = SimulateOptions {
             seed: Some(2024),
             match_method: Some(method),
+            horizon: None,
         };
         let rows = simulate_with_options(&model, &pop, &model.default_params, n_sim, &opts)
             .unwrap_or_else(|e| panic!("matched simulation ({method:?}) succeeds: {e}"));
@@ -126,6 +127,7 @@ fn matched_simulation_is_reproducible_and_distinct_from_unmatched() {
     let unmatched = SimulateOptions {
         seed: Some(7),
         match_method: None,
+        horizon: None,
     };
     let c = simulate_with_options(&model, &pop, &model.default_params, 3, &unmatched).unwrap();
 
@@ -133,6 +135,7 @@ fn matched_simulation_is_reproducible_and_distinct_from_unmatched() {
         let matched = SimulateOptions {
             seed: Some(7),
             match_method: Some(method),
+            horizon: None,
         };
         let a = simulate_with_options(&model, &pop, &model.default_params, 3, &matched).unwrap();
         let b = simulate_with_options(&model, &pop, &model.default_params, 3, &matched).unwrap();
@@ -160,6 +163,7 @@ fn unmatched_options_path_equals_simulate_with_seed() {
     let opts = SimulateOptions {
         seed: Some(99),
         match_method: None,
+        horizon: None,
     };
     let via_opts = simulate_with_options(&model, &pop, &model.default_params, 2, &opts).unwrap();
     let via_seed = simulate_with_seed(&model, &pop, &model.default_params, 2, 99);
@@ -199,6 +203,7 @@ fn matching_requires_observations() {
     let opts = SimulateOptions {
         seed: Some(1),
         match_method: Some(MatchMethod::Optimal),
+        horizon: None,
     };
     let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
         .expect_err("matching without observations must error");
