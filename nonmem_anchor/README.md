@@ -8,16 +8,28 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **Savic transit** | `transit(n, mtt)` — PR [#343](https://github.com/FeRx-NLME/ferx-core/pull/343) | `savic_transit.ctl` | `transit_savic_fit.ferx` |
 | **Freijer & Post IG** | `igd(mat, cv2)` — issue [#347](https://github.com/FeRx-NLME/ferx-core/issues/347) | `freijer_ig.ctl` | *(in `tests/igd_nonmem_anchor.rs`)* |
 | **Weibull** | `weibull(td, beta)` — [#322](https://github.com/FeRx-NLME/ferx-core/issues/322) Phase 2 | `weibull_absorption.ctl` | `weibull_absorption_fit.ferx` |
+| **Biphasic IG** | `FR1*igd(...) + FR2*igd(...)` — [#388](https://github.com/FeRx-NLME/ferx-core/issues/388) | `freijer_biphasic_ig.ctl` | `biphasic_ig_fit.ferx` |
 
 The transit control runs on `transit_oral.csv`; the IG and Weibull controls run
 on `igd_oral.csv` (the same data re-keyed to a 1-compartment layout — every record
-on CMT 1 — so the dose feeds the absorption compartment directly).
+on CMT 1 — so the dose feeds the absorption compartment directly). The **biphasic
+IG** control runs on its own matched dataset `biphasic_ig_oral.csv` (see below).
 
 > **Weibull run status — DONE (#503).** The licensed NONMEM run landed
 > (`results/weibull_absorption.{ext,lst,tab,…}`, MINIMIZATION SUCCESSFUL,
 > `#OBJV = −943.833`) and the slow-gated `tests/weibull_nonmem_anchor.rs` pins the
 > verified comparison below. Re-run with
 > `nmfe75 weibull_absorption.ctl weibull_absorption.lst`.
+
+> **Biphasic IG run status — PENDING a licensed run (#388).** Unlike the others,
+> the biphasic anchor ships its own **matched** (well-specified) dataset, simulated
+> from the biphasic model itself (`simulate_biphasic_ig_data.py`). Run
+> `nmfe75 freijer_biphasic_ig.ctl freijer_biphasic_ig.lst`, drop the outputs in
+> `results/`, and finalize a slow-gated `tests/biphasic_igd_nonmem_anchor.rs`
+> (mirroring `igd`/`weibull`) pinning the FOCEI objective at NONMEM's optimum.
+> Both engines should also **recover** the truths (matched data), so this anchor
+> doubles as a parameter-recovery check for the pathway fractions. ferx side:
+> `cargo run --release -- nonmem_anchor/biphasic_ig_fit.ferx --data data/biphasic_ig_oral.csv`.
 
 ## The dataset
 
