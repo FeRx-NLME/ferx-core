@@ -1958,4 +1958,166 @@ mod survival_smoke {
             Err(e) => panic!("IOV+TTE FOCEI fit must not error: {e}"),
         }
     }
+
+    // ── Joint PK-TTE: ODE-accumulated hazard (Phase 2, Slice 2.1 — #564) ───────
+
+    /// Oral 1-cpt PK + a drug-driven hazard on CMT=2. The hazard references the
+    /// `central` ODE state, so it must be ODE-accumulated, not analytic.
+    const JOINT_PKTTE_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+";
+
+    #[test]
+    fn joint_pktte_hazard_injects_chz_state_and_ode_endpoint() {
+        let model = parse_model_string(JOINT_PKTTE_MODEL)
+            .expect("joint PK-TTE model with [event_model] hazard= must parse");
+
+        // CMT=2 is an ODE-accumulated TTE endpoint pointing at the appended
+        // accumulator. PK states depot=0, central=1, so __chz lands at index 2.
+        let ep = model
+            .endpoints
+            .get(&2)
+            .expect("CMT=2 must be a TTE endpoint");
+        let EndpointLikelihood::Tte { hazard } = ep else {
+            panic!("expected Tte endpoint, got {ep:?}");
+        };
+        match hazard {
+            ferx_core::HazardSpec::OdeAccumulated { chz_state } => {
+                assert_eq!(
+                    *chz_state, 2,
+                    "accumulator state index follows depot(0), central(1)"
+                );
+            }
+            other => panic!("expected OdeAccumulated hazard, got {other:?}"),
+        }
+
+        // The ODE system gained the synthetic accumulator as its trailing state.
+        let ode = model
+            .ode_spec
+            .as_ref()
+            .expect("joint PK-TTE is an ODE model");
+        assert_eq!(
+            ode.state_names,
+            vec![
+                "depot".to_string(),
+                "central".to_string(),
+                "__chz_2".to_string()
+            ],
+            "parser must append __chz_<cmt> as the trailing ODE state"
+        );
+    }
+
+    #[test]
+    fn hazard_without_ode_model_errors() {
+        // `hazard =` on an analytical (non-ODE) model has no accumulator to read.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  H0 = TVH0
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[event_model]
+  cmt    = 2
+  hazard = H0
+
+[fit_options]
+  method = focei
+";
+        let err = parse_model_string(src).expect_err("hazard= on a non-ODE model must error");
+        assert!(
+            err.contains("ODE model"),
+            "error should point at needing an ODE model; got: {err}"
+        );
+    }
+
+    #[test]
+    fn hazard_with_family_errors() {
+        // `hazard =` (ODE-accumulated) and `family =` (analytic) are mutually exclusive.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  H0 = TVH0
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = H0
+  hazard = H0
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method = focei
+";
+        let err = parse_model_string(src).expect_err("hazard= plus family= must error");
+        assert!(
+            err.contains("mixes"),
+            "error should flag the hazard/family conflict; got: {err}"
+        );
+    }
 }

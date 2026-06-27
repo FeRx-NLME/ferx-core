@@ -1163,6 +1163,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         Vec::new()
     };
 
+    // Joint PK-TTE (Slice 2.1, #564): cmt → index of the synthetic cumulative-hazard
+    // ODE state appended for each ODE-driven `[event_model] hazard = ...`. Stays empty
+    // for every model without an ODE-accumulated hazard.
+    #[cfg(feature = "survival")]
+    let mut chz_state_map: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+
     let (
         pk_model,
         pk_param_map,
@@ -1172,12 +1179,30 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         diffusion_theta_fixed,
         diffusion_state_indices,
     ) = if is_ode {
-        let (state_names, obs_cmt_name) = parse_ode_structural(struct_lines)?;
-        let ode_lines = blocks
+        #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+        let (mut state_names, obs_cmt_name) = parse_ode_structural(struct_lines)?;
+        // Owned copy of the [odes] derivative lines so joint PK-TTE can append a
+        // cumulative-hazard accumulator without mutating the shared block map.
+        #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+        let mut ode_lines: Vec<String> = blocks
             .get("odes")
-            .ok_or("ODE model requires [odes] block")?;
+            .ok_or("ODE model requires [odes] block")?
+            .clone();
+        // For each ODE-driven `[event_model] hazard = <expr>`, append a synthetic
+        // accumulator state `__chz_<cmt>` with `d/dt(__chz_<cmt>) = <expr>`. It then
+        // compiles in the [odes] RHS namespace (states + individual parameters) like
+        // any derivative; the TTE likelihood reads H(t)/h(t) from this state, and the
+        // endpoint records its index via `chz_state_map` (#564).
+        #[cfg(feature = "survival")]
+        for (cmt, hazard_expr) in prescan_ode_hazards(&extracted)? {
+            let chz_idx = state_names.len();
+            let state = format!("__chz_{cmt}");
+            ode_lines.push(format!("d/dt({state}) = {hazard_expr}"));
+            state_names.push(state);
+            chz_state_map.insert(cmt, chz_idx);
+        }
         let mut ode_spec = build_ode_spec(
-            ode_lines,
+            &ode_lines,
             &state_names,
             obs_cmt_name.as_deref(),
             &indiv_var_names,
@@ -2191,6 +2216,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 &indiv_stmts,
                 &model.kappa_names,
                 &model.error_spec,
+                &chz_state_map,
             )?;
             if model.endpoints.contains_key(&cmt) {
                 return Err(format!("[event_model]: CMT={cmt} declared more than once"));
@@ -3198,6 +3224,7 @@ fn parse_event_model_block(
     indiv_stmts: &[Statement],
     kappa_names: &[String],
     error_spec: &ErrorSpec,
+    chz_state_map: &std::collections::HashMap<usize, usize>,
 ) -> Result<
     (
         usize,
@@ -3234,6 +3261,10 @@ fn parse_event_model_block(
     let mut gamma_expr: Option<Expression> = None;
     // Any family: Σ(β·covariate) added on the log-hazard scale.
     let mut loghr_expr: Option<Expression> = None;
+    // ODE-accumulated hazard (joint PK-TTE): `hazard = <expr>` is injected as a
+    // cumulative-hazard ODE derivative before the ODE spec is built; here we only
+    // record its presence and route to the OdeAccumulated endpoint below.
+    let mut hazard_present = false;
 
     for line in lines {
         let trimmed = line.trim();
@@ -3282,19 +3313,24 @@ fn parse_event_model_block(
             "loghr" => {
                 loghr_expr = Some(parse_scalar_expression(value, ctx)?);
             }
+            "hazard" => {
+                // The expression itself is injected as the `d/dt(__chz_<cmt>)` ODE
+                // derivative by the parser pre-scan, so it is not compiled here.
+                hazard_present = true;
+            }
             other => {
                 return Err(format!(
                     "[event_model]: unknown key `{other}` \
-                     — valid keys: cmt, family, scale, rate, shape, alpha, gamma, loghr"
+                     — valid keys: cmt, family, scale, rate, shape, alpha, gamma, loghr, hazard"
                 ));
             }
         }
     }
 
     let cmt = cmt_opt.ok_or("[event_model]: missing required key `cmt`")?;
-    let family = family_opt.ok_or("[event_model]: missing required key `family`")?;
 
-    // Guard: same CMT can't be both Gaussian and TTE.
+    // Guard: same CMT can't be both Gaussian and TTE (applies to the analytic and
+    // the ODE-accumulated `hazard =` endpoint paths alike).
     match error_spec {
         ErrorSpec::PerCmt(cmt_map) => {
             if cmt_map.contains_key(&cmt) {
@@ -3316,6 +3352,48 @@ fn parse_event_model_block(
             // parse-time validation.
         }
     }
+
+    // ODE-accumulated hazard path (joint PK-TTE, Slice 2.1): `hazard = <expr>` was
+    // injected as a cumulative-hazard ODE derivative (`d/dt(__chz_<cmt>)`); the
+    // endpoint only records that accumulator's state index. Mutually exclusive with
+    // the analytic closed-form `family` keys.
+    if hazard_present {
+        if family_opt.is_some()
+            || scale_expr.is_some()
+            || shape_expr.is_some()
+            || alpha_expr.is_some()
+            || gamma_expr.is_some()
+            || loghr_expr.is_some()
+        {
+            return Err(format!(
+                "[event_model]: CMT={cmt} mixes `hazard = ...` (ODE-accumulated, joint \
+                 PK-TTE) with analytic keys (family/scale/rate/shape/alpha/gamma/loghr). \
+                 Use either a closed-form `family` or an ODE `hazard` expression, not both \
+                 — put drug and covariate effects directly in the hazard expression."
+            ));
+        }
+        let chz_state = *chz_state_map.get(&cmt).ok_or_else(|| {
+            format!(
+                "[event_model]: CMT={cmt} declares `hazard = ...` but the model has no ODE \
+                 system. ODE-accumulated hazard (joint PK-TTE) requires an ODE model — use \
+                 `ode(...)` in [structural_model] and define [odes]."
+            )
+        })?;
+        // The hazard compiles as the injected ODE derivative, so its θ/η/covariate
+        // dependencies flow through [individual_parameters] / [odes] (already covered by
+        // check_unused_parameters and the dead-parameter census) — none to report here.
+        return Ok((
+            cmt,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { chz_state },
+            },
+            Vec::new(),
+            std::collections::HashSet::new(),
+            std::collections::HashSet::new(),
+        ));
+    }
+
+    let family = family_opt.ok_or("[event_model]: missing required key `family`")?;
 
     // Validate family-specific keys: reject keys that do not belong to the chosen family.
     // Accepting and silently dropping them would mislead users into thinking they had an effect.
@@ -3550,6 +3628,55 @@ fn parse_event_model_block(
         event_model_thetas,
         event_model_etas,
     ))
+}
+
+/// Pre-scan `[event_model]` blocks for ODE-accumulated hazards (joint PK-TTE, #564).
+///
+/// Returns `(cmt, hazard_expr_text)` for every block that declares `hazard = <expr>`.
+/// Runs *before* the ODE spec is built so each hazard can be appended to the ODE
+/// system as a cumulative-hazard accumulator state (`d/dt(__chz_<cmt>) = <expr>`),
+/// which then compiles in the `[odes]` RHS namespace. Only the `cmt` and `hazard`
+/// keys are read here; full key/family validation and the `OdeAccumulated` endpoint
+/// are produced later by [`parse_event_model_block`] (malformed lines are reported
+/// there, so they are skipped rather than errored on in this lightweight pass).
+#[cfg(feature = "survival")]
+fn prescan_ode_hazards(extracted: &ExtractedBlocks) -> Result<Vec<(usize, String)>, String> {
+    let mut event_blocks: Vec<&Vec<String>> = Vec::new();
+    if let Some(lines) = extracted.unnamed.get("event_model") {
+        event_blocks.push(lines);
+    }
+    if let Some(named_map) = extracted.named.get("event_model") {
+        for lines in named_map.values() {
+            event_blocks.push(lines);
+        }
+    }
+
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for lines in event_blocks {
+        let mut cmt: Option<usize> = None;
+        let mut hazard: Option<String> = None;
+        for line in lines {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.splitn(2, '=').map(|s| s.trim()).collect();
+            if parts.len() != 2 {
+                continue; // malformed `key = value` lines are reported downstream
+            }
+            match parts[0] {
+                "cmt" => cmt = parts[1].parse::<usize>().ok(),
+                "hazard" => hazard = Some(parts[1].to_string()),
+                _ => {}
+            }
+        }
+        if let Some(expr) = hazard {
+            let cmt = cmt
+                .ok_or("[event_model]: `hazard` requires `cmt` (the TTE endpoint's compartment)")?;
+            out.push((cmt, expr));
+        }
+    }
+    Ok(out)
 }
 
 // ── [simulation] block parser ───────────────────────────────────────────────
