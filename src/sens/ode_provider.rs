@@ -3216,6 +3216,7 @@ fn integrate_g<T: crate::sens::num::PkNum>(
                 crate::ode::predictions::add_prepared_input_rate_forcing::<T>(
                     ode,
                     prepared_forcings,
+                    ps,
                     &subject.doses,
                     &[],
                     dose_f_bio,

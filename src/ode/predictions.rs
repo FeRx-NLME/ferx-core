@@ -690,11 +690,17 @@ fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> Vec<PreparedInputRate> 
 /// instead of `sens/ode_provider.rs` hand-maintaining a second copy (#430 review
 /// #4 / #451). The dual caller passes `dose_lagtimes = &[]` (lagtime gated off) and
 /// `reset_floor = NEG_INFINITY` (reset gated off), so those branches are inert there.
+///
+/// `params` is the flat individual-parameter vector the `prepared` constants were
+/// built from; it is read here only for the optional pathway-fraction multiplier
+/// (`FR*fn(...)`, #388) via [`InputRateForcing::frac`] — `frac = 1` (no `frac_slot`)
+/// is the single-pathway default, so this is a no-op for unfractioned forcings.
 #[inline]
 #[allow(clippy::too_many_arguments)] // mirrors the dose context threaded into the RHS wrappers
 pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
     ode: &OdeSpec,
     prepared: &[PreparedInputRate<T>],
+    params: &[T],
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     dose_f_bio: &[T],
@@ -734,7 +740,11 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
             acc = acc + prep.rate(T::from_f64(tad), dose_mass);
         }
-        dy[forcing.cmt] = dy[forcing.cmt] + acc;
+        // Pathway fraction (#388): a `FR*fn(...)` term scales its whole `R_in` by
+        // the declared fraction `FR`; `frac = 1` for an unfractioned single-pathway
+        // forcing, so this is a no-op there. The multiplier flows linearly, so for
+        // `T = Dual2` it carries the exact `∂R_in/∂frac` sensitivity.
+        dy[forcing.cmt] = dy[forcing.cmt] + acc * forcing.frac(params);
     }
 }
 
@@ -801,6 +811,7 @@ fn wrap_rhs_with_forcings<'a>(
             add_prepared_input_rate_forcing(
                 ode,
                 prepared,
+                p,
                 doses,
                 dose_lagtimes,
                 dose_f_bio,
@@ -3865,6 +3876,7 @@ mod tests {
             cmt: 0, // 0-based -> consumes 1-based compartment 1
             kind: crate::pk::absorption::InputRateKind::Transit,
             arg_slots: vec![],
+            frac_slot: None,
         }];
         let pk = pk_one(1.0, 10.0);
         let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
@@ -4303,6 +4315,7 @@ mod tests {
             cmt: 0, // 0-based -> consumes 1-based compartment 1
             kind: crate::pk::absorption::InputRateKind::Transit,
             arg_slots: vec![],
+            frac_slot: None,
         }];
         let pk = pk_one(1.0, 10.0);
         let mut controller = |_ctx: &ControllerCtx| {
@@ -4926,6 +4939,7 @@ mod tests {
                 cmt: 0,
                 kind: InputRateKind::Transit,
                 arg_slots: vec![6, 7],
+                frac_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -4979,6 +4993,7 @@ mod tests {
                 cmt: 0,
                 kind: InputRateKind::ZeroOrder,
                 arg_slots: vec![4],
+                frac_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -5257,6 +5272,7 @@ mod tests {
         add_prepared_input_rate_forcing(
             &ode,
             &prepared,
+            &params,
             &doses,
             &lags,
             &f_bio,
@@ -5273,6 +5289,7 @@ mod tests {
         add_prepared_input_rate_forcing(
             &ode,
             &prepared,
+            &params,
             &doses,
             &lags,
             &f_bio,
@@ -5281,6 +5298,105 @@ mod tests {
             &mut dy_off,
         );
         assert_eq!(dy_off[0], 0.0);
+    }
+
+    #[test]
+    fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
+        // Biphasic IG (#388): two igd forcings on one compartment, split FR1/FR2.
+        // The seam adds `FR1·R_in1 + FR2·R_in2`; because the fraction enters
+        // linearly, the analytic dual derivative ∂(dy)/∂FR1 is exactly R_in1 (so
+        // the FOCEI/Bayes gradient w.r.t. a pathway fraction is exact, no FD).
+        use crate::pk::absorption::{InputRateForcing, InputRateKind, PreparedInputRate};
+        use crate::sens::dual_mixed::DualMixed;
+        use crate::sens::num::PkNum;
+        use crate::types::{MAX_PK_PARAMS, PK_IDX_F};
+
+        // Slots: FR1@0, FR2@1, MAT1@2, CV2_1@3, MAT2@4, CV2_2@5, F@PK_IDX_F.
+        let mk = |frac_slot, arg_slots| InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::InverseGaussian,
+            arg_slots,
+            frac_slot: Some(frac_slot),
+        };
+        let ode = OdeSpec {
+            rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: vec![mk(0, vec![2, 3]), mk(1, vec![4, 5])],
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        };
+
+        let (fr1, fr2) = (0.7_f64, 0.3_f64);
+        let mut params = vec![0.0; MAX_PK_PARAMS];
+        params[0] = fr1;
+        params[1] = fr2;
+        params[2] = 2.0; // MAT1
+        params[3] = 0.3; // CV2_1
+        params[4] = 5.0; // MAT2
+        params[5] = 0.6; // CV2_2
+        params[PK_IDX_F] = 1.0;
+
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)]; // CMT 1 → cmt 0
+        let f_bio = vec![1.0];
+        let (t, tad) = (2.5_f64, 2.5_f64);
+
+        // f64: dy = FR1·R_in1 + FR2·R_in2.
+        let prepared = prepare_input_rates(&ode, &params);
+        let (r1, r2) = (prepared[0].rate(tad, 100.0), prepared[1].rate(tad, 100.0));
+        assert!(r1 > 0.0 && r2 > 0.0);
+        let mut dy = vec![0.0];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            &params,
+            &doses,
+            &[0.0],
+            &f_bio,
+            f64::NEG_INFINITY,
+            t,
+            &mut dy,
+        );
+        assert_relative_eq!(dy[0], fr1 * r1 + fr2 * r2, max_relative = 1e-12);
+
+        // Dual: seed FR1 as the variable ⇒ value matches f64 and ∂(dy)/∂FR1 = R_in1.
+        type D = DualMixed<1, 1>;
+        let mut dp = vec![D::constant(0.0); MAX_PK_PARAMS];
+        dp[0] = D::var(fr1, 0);
+        dp[1] = D::constant(fr2);
+        dp[2] = D::constant(2.0);
+        dp[3] = D::constant(0.3);
+        dp[4] = D::constant(5.0);
+        dp[5] = D::constant(0.6);
+        dp[PK_IDX_F] = D::constant(1.0);
+        let prepared_d: Vec<PreparedInputRate<D>> = ode
+            .input_rate
+            .iter()
+            .map(|f| f.prepare_dual::<D>(&dp).unwrap())
+            .collect();
+        let f_bio_d = vec![D::constant(1.0)];
+        let mut dyd = vec![D::constant(0.0)];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared_d,
+            &dp,
+            &doses,
+            &[],
+            &f_bio_d,
+            f64::NEG_INFINITY,
+            t,
+            &mut dyd,
+        );
+        assert_relative_eq!(dyd[0].val(), fr1 * r1 + fr2 * r2, max_relative = 1e-12);
+        assert_relative_eq!(dyd[0].grad[0], r1, max_relative = 1e-9);
     }
 
     #[test]

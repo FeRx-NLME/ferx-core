@@ -44,6 +44,18 @@ section of the SDLC for the versioning policy).
   per-segment constant; `dur`'s gradient is finite-difference for now (the analytic
   boundary impulse is follow-up #530). Examples
   `examples/zero_order_absorption.ferx` and `examples/sequential_absorption.ferx`.
+- **Biphasic / parallel absorption via a pathway-fraction multiplier** (#388). An
+  `[odes]` input-rate function may now be scaled by a declared individual parameter
+  (`FR*igd(...)`), and more than one input-rate term may feed a compartment — so the
+  Freijer & Post biphasic inverse-Gaussian model is written as
+  `d/dt(central) = FR1*igd(...) + FR2*igd(...)`, splitting the dose across two
+  pathways. The multiplier must be a single declared parameter (not an expression
+  like `(1-FR)`), so a two-pathway split declares a complementary fraction
+  (`FR2 = 1 - FR1`); the fit-time check enforces `0 < FR ≤ 1` and that the fractions
+  on a compartment sum to 1. The fraction's gradient is exact (analytic `Dual2`).
+  Example `examples/biphasic_igd_absorption.ferx`. (A fraction on `zero_order(...)`,
+  i.e. the `mixed`/`parallel` zero-order family, is not yet supported — follow-up
+  #505.)
 - Support NONMEM-style `block_sigma` residual covariance across paired same-time
   multi-endpoint observations under FOCE (#546).
 - Support fixed residual-error correlations via `block_sigma` for FOCE combined-error

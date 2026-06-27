@@ -1,0 +1,76 @@
+# Biphasic inverse-Gaussian (Freijer & Post) absorption — shared fraction mechanism
+#
+# Two parallel inverse-Gaussian absorption pathways feeding the central
+# compartment, split by a dose fraction (#388). This is the Freijer & Post (1997)
+# *biphasic* form: a fast pathway (short mean absorption time MAT1) and a slow
+# pathway (long MAT2), each a built-in `igd()` input rate, weighted by fractions
+# that partition the dose:
+#
+#   R_in(tad) = FR1·igd(MAT1, CV2_1) + FR2·igd(MAT2, CV2_2),   FR1 + FR2 = 1
+#
+# Each `FR*igd(...)` multiplier must be a single declared individual parameter
+# (not an expression like `(1-FR)`), so the complementary fraction is declared
+# explicitly: FR2 = 1 - FR1. The two pathways together deliver exactly the dose
+# (∫ R_in dt = F·Dose); the parser accepts ≥2 input-rate terms on one compartment
+# and the fit-time check enforces 0 < FR ≤ 1 and Σ FR ≈ 1.
+#
+# ── Unit convention (Form C: amount ODE + [scaling]) ─────────────────────────
+#   CMT=1  central  — drug AMOUNT (mg); receives R_in(tad), elimination CL/V
+#   observation y   — concentration (mg/L) = central / V, via the [scaling] block
+#
+# Self-contained: run it with no data file
+#   cargo run --release -- examples/biphasic_igd_absorption.ferx --simulate
+# which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
+# fits it back. True simulation parameters: TVCL=5, TVV=50, TVFR1=0.6,
+#   TVMAT1=0.5, TVMAT2=4.0, TVCV2_1=0.2, TVCV2_2=0.5, omega_CL=omega_V=0.09,
+#   sigma_prop=0.15.
+
+[parameters]
+  theta TVCL(5.0,    0.1, 100.0)   # typical clearance (L/h)
+  theta TVV(50.0,    5.0, 500.0)   # typical central volume (L)
+  theta TVFR1(0.6,  0.05,  0.95)   # fraction of dose through the fast pathway
+  theta TVMAT1(0.5, 0.05,  24.0)   # mean absorption time, fast pathway (h)
+  theta TVMAT2(4.0, 0.05,  24.0)   # mean absorption time, slow pathway (h)
+  theta TVCV2_1(0.2, 0.001, 10.0)  # relative dispersion, fast pathway
+  theta TVCV2_2(0.5, 0.001, 10.0)  # relative dispersion, slow pathway
+
+  omega ETA_CL ~ 0.09              # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09              # IIV on V  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)       # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV  * exp(ETA_V)
+  FR1   = TVFR1                     # fast-pathway fraction
+  FR2   = 1 - TVFR1                # slow-pathway fraction (declared complement; FR1 + FR2 = 1)
+  MAT1  = TVMAT1
+  MAT2  = TVMAT2
+  CV2_1 = TVCV2_1
+  CV2_2 = TVCV2_2
+
+[structural_model]
+  ode(states=[central])            # no obs_cmt — Form C provides the observable
+
+[odes]
+  # central holds drug AMOUNT (mg); the dose splits across two IG pathways
+  # (FR1 fast + FR2 slow), then first-order elimination CL/V.
+  d/dt(central) = FR1*igd(mat=MAT1, cv2=CV2_1) + FR2*igd(mat=MAT2, cv2=CV2_2) - CL/V*central
+
+[scaling]
+  y = central / V                  # observable = concentration (mg/L)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7

@@ -844,6 +844,39 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // subject, so a covariate relationship that pushes a subject's typical
     // parameter out of range is caught too. Reported once — a single fatal
     // error already halts the fit.
+    // Pathway-fraction structural check (#388, model-level): fractions must
+    // *partition* the dose on a compartment. ≥2 input-rate terms on one compartment
+    // therefore must **each** carry a fraction (`FR*fn(...)`); a bare term alongside
+    // a fractioned one (or two bare terms) would deliver the full `F·Dose` more than
+    // once. A lone term may stay unfractioned (fraction defaults to 1).
+    use std::collections::BTreeMap;
+    let mut frac_count: BTreeMap<usize, (usize, usize)> = BTreeMap::new(); // cmt -> (total, fractioned)
+    for f in &ode.input_rate {
+        let e = frac_count.entry(f.cmt).or_insert((0, 0));
+        e.0 += 1;
+        if f.frac_slot.is_some() {
+            e.1 += 1;
+        }
+    }
+    for (&cmt, &(total, fractioned)) in &frac_count {
+        if total >= 2 && fractioned != total {
+            diags.push(
+                Diagnostic::error(
+                    "E_ABSORPTION_FRACTION",
+                    format!(
+                        "Compartment {} has {total} built-in absorption input-rate terms but \
+                         only {fractioned} carry a pathway fraction. When more than one term \
+                         feeds a compartment, each must be written `FR*fn(...)` with the \
+                         fractions summing to 1 — otherwise the dose mass is counted more than \
+                         once.",
+                        cmt + 1
+                    ),
+                )
+                .with_block("odes"),
+            );
+        }
+    }
+
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     'subjects: for subject in &population.subjects {
         let pk = (model.pk_param_fn)(&model.default_params.theta, &zero_eta, &subject.covariates);
@@ -857,6 +890,52 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
                              values (subject {}): {msg}. Constrain the parameter so it stays \
                              positive (e.g. a log-normal `P = TVP * exp(ETA_P)` \
                              parameterisation).",
+                            subject.id
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+                break 'subjects;
+            }
+        }
+
+        // Pathway-fraction value checks (#388, η = 0, per subject so a covariate on a
+        // fraction is caught too): each fraction in (0, 1], and the fractions on a
+        // compartment sum to ≈ 1. Reported once — a single fatal error halts the fit.
+        let mut frac_sum: BTreeMap<usize, f64> = BTreeMap::new();
+        for forcing in &ode.input_rate {
+            let Some(slot) = forcing.frac_slot else {
+                continue;
+            };
+            let fr = pk.values.get(slot).copied().unwrap_or(1.0);
+            if !(fr > 0.0 && fr <= 1.0) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_ABSORPTION_FRACTION",
+                        format!(
+                            "Pathway fraction out of range at typical values (subject {}): \
+                             {fr} is not in (0, 1]. A `FR*fn(...)` multiplier is a \
+                             dose-splitting fraction — constrain it to (0, 1] (e.g. a logit \
+                             `FR = 1/(1+exp(-X))` parameterisation).",
+                            subject.id
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+                break 'subjects;
+            }
+            *frac_sum.entry(forcing.cmt).or_insert(0.0) += fr;
+        }
+        for (&cmt, &sum) in &frac_sum {
+            if (sum - 1.0).abs() > 1e-4 {
+                diags.push(
+                    Diagnostic::error(
+                        "E_ABSORPTION_FRACTION",
+                        format!(
+                            "Pathway fractions on compartment {} sum to {sum} at typical values \
+                             (subject {}), not 1. Declare fractions that partition the dose — \
+                             e.g. a parameter `FR` and a complementary `FR2 = 1 - FR`.",
+                            cmt + 1,
                             subject.id
                         ),
                     )
