@@ -2569,18 +2569,22 @@ impl CompiledModel {
         )
     }
 
-    /// True when a residual error model is defined for `cmt`, so a DV
-    /// (assay-noised) observation can be drawn there. False for a
-    /// [`ErrorSpec::PerCmt`] spec that omits `cmt`, or a model with no
-    /// `[error_model]` at all (empty `sigma`). `simulate_adaptive` consults this
-    /// before drawing a DV monitor so an un-modeled compartment is a typed error
-    /// rather than a fabricated σ (#391 S1.5 edge a) — and so
+    /// True when a residual error model is defined for `cmt` *and* its sigmas
+    /// resolve in `sigma`, so a DV (assay-noised) observation can be drawn there.
+    /// False for a [`ErrorSpec::PerCmt`] spec that omits `cmt` (or whose endpoint
+    /// `sigma_idx` falls outside `sigma`), or a model with no `[error_model]` at
+    /// all (empty `sigma`). `simulate_adaptive` consults this before drawing a DV
+    /// monitor so an un-modeled compartment is a typed error rather than a
+    /// fabricated σ (#391 S1.5 edge a) — and so
     /// [`residual_variance_at`](Self::residual_variance_at), which indexes
-    /// `sigma[0]` for a `Single` model, is never reached with an empty `sigma`.
+    /// `sigma[0]` for a `Single` model (and the endpoint's `sigma_idx` for a
+    /// `PerCmt` one), is never reached with a `sigma` too short to cover it.
     pub fn has_residual_error_for_cmt(&self, cmt: usize, sigma: &[f64]) -> bool {
         match &self.error_spec {
             ErrorSpec::Single(_) => !sigma.is_empty(),
-            ErrorSpec::PerCmt(map) => map.contains_key(&cmt),
+            ErrorSpec::PerCmt(map) => map
+                .get(&cmt)
+                .is_some_and(|ep| ep.sigma_idx.iter().all(|&i| i < sigma.len())),
         }
     }
 
@@ -6292,6 +6296,13 @@ mod tests {
         assert!(
             !model.has_residual_error_for_cmt(1, &[0.1]),
             "cmt 1 is not in the map"
+        );
+        // An endpoint whose sigma_idx falls outside `sigma` is not drawable —
+        // `residual_variance_at` would otherwise return NaN (symmetric to the
+        // Single empty-sigma guard, never a fabricated σ).
+        assert!(
+            !model.has_residual_error_for_cmt(2, &[]),
+            "cmt 2's sigma_idx is out of range for an empty sigma"
         );
     }
 }
