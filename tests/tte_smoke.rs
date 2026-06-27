@@ -1378,6 +1378,9 @@ mod survival_smoke {
         };
         let param_fn = match hazard {
             ferx_core::HazardSpec::Analytic { param_fn, .. } => param_fn,
+            ferx_core::HazardSpec::OdeAccumulated { .. } => {
+                panic!("expected an analytic hazard, got OdeAccumulated")
+            }
         };
 
         let covariates = std::collections::HashMap::new();
@@ -1488,6 +1491,9 @@ mod survival_smoke {
         };
         let param_fn = match hazard {
             ferx_core::HazardSpec::Analytic { param_fn, .. } => param_fn,
+            ferx_core::HazardSpec::OdeAccumulated { .. } => {
+                panic!("expected an analytic hazard, got OdeAccumulated")
+            }
         };
         let theta = [1.0, 10.0, 0.05]; // TVCL, TVV, TVBASE
 

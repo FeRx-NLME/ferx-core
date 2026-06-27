@@ -46,9 +46,48 @@ pub fn tte_data_term(
     eta: &[f64],
     covariates: &HashMap<String, f64>,
 ) -> f64 {
-    let HazardSpec::Analytic { family, param_fn } = hazard;
-    let params = param_fn(theta, eta, covariates);
+    match hazard {
+        HazardSpec::Analytic { family, param_fn } => {
+            let params = param_fn(theta, eta, covariates);
+            tte_nll_from_curves(
+                records,
+                |t| cum_hazard(*family, t, &params),
+                |t| hazard_and_cum_hazard(*family, t, &params).0,
+            )
+        }
+        // ODE-accumulated hazard needs the integrated CHZ trajectory, which only the
+        // per-subject ODE solve (in the likelihood / predict layer) can supply. Those
+        // callers invoke `tte_nll_from_curves` directly with `H(t)` / `h(t)` read from
+        // the solution; this analytic entry point must not be reached for ODE endpoints.
+        // (Slice 2.1 wiring: see `foce_subject_nll_interaction_with_tte`.)
+        HazardSpec::OdeAccumulated { .. } => {
+            debug_assert!(
+                false,
+                "OdeAccumulated routed through analytic tte_data_term; use tte_nll_from_curves"
+            );
+            1e20
+        }
+    }
+}
 
+/// Per-record TTE negative log-likelihood from cumulative-hazard / hazard curves.
+///
+/// Shared by the analytic-family path ([`tte_data_term`]) and the ODE-accumulated
+/// path (joint PK-TTE); they differ only in *where* the curves come from.
+/// `cumhaz_at(t)` returns `H(t)`; `hazard_at(t)` returns the instantaneous hazard
+/// `h(t)`. Handles all three [`EventType`] variants and left truncation
+/// (entry_time > 0):
+///   RightCensored:    H(T) − H(entry)
+///   Exact:            H(T) − H(entry) − log h(T)
+///   IntervalCensored: −log [ exp(−(H(left)−H(entry))) − exp(−(H(right)−H(entry))) ]
+///
+/// Returns 1e20 as a sentinel when the likelihood is numerically ill-defined
+/// (e.g. negative interval probability, non-positive hazard for an exact event).
+pub fn tte_nll_from_curves(
+    records: &[ObsRecord],
+    cumhaz_at: impl Fn(f64) -> f64,
+    hazard_at: impl Fn(f64) -> f64,
+) -> f64 {
     let mut nll = 0.0_f64;
 
     for record in records {
@@ -60,26 +99,25 @@ pub fn tte_data_term(
         } = record;
 
         let h_entry = if *entry_time > 0.0 {
-            cum_hazard(*family, *entry_time, &params)
+            cumhaz_at(*entry_time)
         } else {
             0.0
         };
 
         match event_type {
             EventType::RightCensored => {
-                let h_t = cum_hazard(*family, *time, &params);
-                nll += h_t - h_entry;
+                nll += cumhaz_at(*time) - h_entry;
             }
             EventType::Exact => {
-                let (h_val, h_t) = hazard_and_cum_hazard(*family, *time, &params);
+                let h_val = hazard_at(*time);
                 if h_val <= 0.0 {
                     return 1e20;
                 }
-                nll += h_t - h_entry - h_val.ln();
+                nll += cumhaz_at(*time) - h_entry - h_val.ln();
             }
             EventType::IntervalCensored { left, right } => {
-                let h_l = cum_hazard(*family, *left, &params);
-                let h_r = cum_hazard(*family, *right, &params);
+                let h_l = cumhaz_at(*left);
+                let h_r = cumhaz_at(*right);
                 let a = h_l - h_entry; // H(left) − H(entry) ≥ 0
                 let delta = h_r - h_l; // H(right) − H(left) > 0 for a proper interval
                 if delta <= 0.0 {
@@ -298,7 +336,13 @@ pub(crate) fn tte_cause_params(
     let EndpointLikelihood::Tte { hazard } = endpoint else {
         return None;
     };
-    let HazardSpec::Analytic { family, param_fn } = hazard;
+    // Analytic families expose closed-form cause params; the ODE-accumulated hazard
+    // does not (its H/h come from the integrated CHZ state), so it has no analytic
+    // cause params here. Simulation of ODE-accumulated TTE is guarded at the api
+    // layer (Slice 2.2 root-finder); this simply reports "no analytic cause".
+    let HazardSpec::Analytic { family, param_fn } = hazard else {
+        return None;
+    };
     Some((*family, param_fn(theta, eta, covariates)))
 }
 
