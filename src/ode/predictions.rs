@@ -1004,6 +1004,32 @@ pub fn ode_predictions(
     eta: &[f64],
     subject: &Subject,
 ) -> Vec<f64> {
+    ode_predictions_with_extra_breaks(ode, pk_params_flat, theta, eta, subject, &[])
+}
+
+/// [`ode_predictions`] with additional, dose-free segment break points seeded
+/// into the integration timeline.
+///
+/// Each `extra_break` only *splits* an integration interval — the integrator
+/// restarts there with the carried state, but no dose, observation, or state
+/// change is applied (the TAFD/TAD anchors, derived from `subject.doses`, are
+/// untouched). On the smooth models we integrate the result is invariant to
+/// where a no-event break falls only up to the adaptive solver's own error
+/// control, so this is the lever the frozen-schedule replay verifier
+/// ([`verify_adaptive_frozen_replay`]) uses to reproduce the reactive driver's
+/// segment structure exactly: the driver restarts at *every* decision time
+/// (including holds and post-`Stop` no-ops), so replaying with those same
+/// decision times as breaks makes the two engines share `integrate_segment`
+/// over identical segments — turning the comparison bit-aligned rather than
+/// merely tolerance-close.
+pub(crate) fn ode_predictions_with_extra_breaks(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+    extra_breaks: &[f64],
+) -> Vec<f64> {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
     let opts = ode.solver_opts;
@@ -1088,6 +1114,15 @@ pub fn ode_predictions(
         }
     }
     break_times.push(t_last);
+    // No-event break points (e.g. the reactive driver's decision times) — they
+    // only re-segment the integration, never change state. Drop non-positive /
+    // non-finite entries (0.0 is already present; the timeline starts at 0).
+    break_times.extend(
+        extra_breaks
+            .iter()
+            .copied()
+            .filter(|b| b.is_finite() && *b > 0.0),
+    );
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
@@ -1685,18 +1720,26 @@ pub(crate) fn ode_predictions_adaptive(
 /// separating dose-bookkeeping correctness from controller logic (the latter is
 /// captured in the ledger). A divergence localizes a bug to dose application.
 ///
-/// The check is a tolerance, **not** bit-equality, and that bound is principled
-/// rather than a magic number: a held (no-dose) decision makes the reactive
-/// driver restart the integrator at a time the static dose-list has no break
-/// for, and that restart perturbs the adaptive RK45 step sequence at the
-/// solver's own error level (`reltol`/`abstol`). The ×100 factor sits well above
-/// that accumulation floor yet far below a real bookkeeping bug — a dropped
-/// dose, wrong compartment, or double-applied `F` moves a prediction by O(dose),
-/// i.e. tens of percent. When a dose lands at every decision the break
-/// structures align and agreement is in fact exact (see the degenerate-oracle
-/// tests). The bound is deliberately conservative: a default-on verifier must
+/// The replay reproduces the reactive driver's **segment structure**, so the
+/// check sits at the solver's true round-off floor rather than a held-decision
+/// slack. The driver restarts the integrator at *every* decision time (holds and
+/// post-`Stop` no-ops included); a naive static replay breaks only at realized
+/// doses, so a held decision used to perturb the adaptive RK45 step sequence at
+/// the solver's error level and forced a wide (×100) tolerance. Here the
+/// `decision_times` are fed back in as no-op breaks
+/// ([`ode_predictions_with_extra_breaks`]), so both engines walk the same
+/// segments through the same `integrate_segment` — agreement is bit-aligned, and
+/// the bound is a small multiple of the solver tolerance, tight enough to catch a
+/// sub-percent bookkeeping error (a dropped dose, wrong compartment, or
+/// double-applied `F` moves a prediction by O(dose), i.e. tens of percent) while
+/// staying clear of pure floating-point accumulation. A default-on verifier must
 /// never false-positive on a legitimate run; the exact double-entry / mass-
 /// balance bookkeeping checks are S6.
+///
+/// `decision_times` is the full schedule the run was driven from (not just the
+/// realized-dose times) — post-`Stop` decisions are not in `run.decisions` but
+/// the driver still breaks at them, so the realized ledger alone cannot
+/// reconstruct the segmentation.
 ///
 /// `base_subject` is the dose-free subject the run was driven from; its
 /// observation grid (and any covariates) carry over, only `doses` are replaced
@@ -1709,6 +1752,7 @@ pub(crate) fn verify_adaptive_frozen_replay(
     theta: &[f64],
     eta: &[f64],
     base_subject: &Subject,
+    decision_times: &[f64],
     run: &AdaptiveRun,
 ) -> Result<(), String> {
     let mut static_subject = base_subject.clone();
@@ -1718,7 +1762,14 @@ pub(crate) fn verify_adaptive_frozen_replay(
         .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
         .collect();
 
-    let static_preds = ode_predictions(ode, pk_params_flat, theta, eta, &static_subject);
+    let static_preds = ode_predictions_with_extra_breaks(
+        ode,
+        pk_params_flat,
+        theta,
+        eta,
+        &static_subject,
+        decision_times,
+    );
 
     if static_preds.len() != run.predictions.len() {
         return Err(format!(
@@ -1728,8 +1779,13 @@ pub(crate) fn verify_adaptive_frozen_replay(
         ));
     }
 
-    let rel_tol = (100.0 * ode.solver_opts.reltol).max(1e-9);
-    let abs_tol = (100.0 * ode.solver_opts.abstol).max(1e-12);
+    // Segment structures now match, so the slack is bounded by floating-point
+    // accumulation across the shared integration, not by where holds fall. A
+    // small multiple of the solver's own error control covers that while still
+    // flagging any sub-percent dose-bookkeeping divergence.
+    const REPLAY_TOL_FACTOR: f64 = 8.0;
+    let rel_tol = (REPLAY_TOL_FACTOR * ode.solver_opts.reltol).max(1e-9);
+    let abs_tol = (REPLAY_TOL_FACTOR * ode.solver_opts.abstol).max(1e-12);
     for (j, (got, want)) in run.predictions.iter().zip(static_preds.iter()).enumerate() {
         // Unrecorded slots are NaN in both engines (same observation grid), so
         // NaN==NaN is agreement; a NaN-vs-finite split is a genuine divergence.
@@ -3009,20 +3065,72 @@ mod tests {
         .expect("driver runs");
 
         // A dose at every decision aligns the segment structure → exact match.
-        verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &run)
+        verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &decisions, &run)
             .expect("aligned run matches the static replay");
 
         let mut perturbed = run.clone();
         perturbed.predictions[0] += 10.0;
-        let err = verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &perturbed)
-            .expect_err("a perturbed trajectory must fail verification");
+        let err = verify_adaptive_frozen_replay(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &perturbed,
+        )
+        .expect_err("a perturbed trajectory must fail verification");
         assert!(err.contains("diverges"), "got: {err}");
 
         let mut short = run.clone();
         short.predictions.pop();
-        let err = verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &short)
-            .expect_err("a length mismatch must fail verification");
+        let err =
+            verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &decisions, &short)
+                .expect_err("a length mismatch must fail verification");
         assert!(err.contains("prediction"), "got: {err}");
+    }
+
+    #[test]
+    fn frozen_replay_aligns_break_structure_on_held_decisions() {
+        // Regression for the held-decision tolerance fix: a run that holds at
+        // some decisions used to only agree with the static replay within a wide
+        // (×100·reltol) slack, because the driver breaks at every decision while a
+        // naive static replay breaks only at realized doses. Feeding the decision
+        // schedule back in as no-op breaks aligns the two engines' segments, so
+        // the run now passes the *tight* default verifier. Dose only while the
+        // central amount is below 50: at t=0 the trough is 0 → dose; the later
+        // decisions see a decayed-but-still-high amount → hold.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let decisions = [0.0, 2.0, 4.0];
+        let obs = vec![1.0, 3.0, 5.0];
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A declared") < 50.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        };
+        let base = make_subject(vec![], obs);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &monitors,
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        // Exactly one realized dose (t=0); the t=2 / t=4 decisions held.
+        assert_eq!(run.ledger.len(), 1, "only the t=0 decision should dose");
+
+        // Passes the tight (aligned) verifier — the whole point of the fix.
+        verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &decisions, &run)
+            .expect("held-decision run matches the aligned static replay");
     }
 
     #[test]

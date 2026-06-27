@@ -4944,6 +4944,18 @@ fn simulate_inner<R: rand::Rng>(
 /// (length `n_eta + n_kappa`). Draws only residual epsilons from `rng`; the eta
 /// is supplied by the caller (freshly sampled, or propensity-matched).
 #[allow(clippy::too_many_arguments)]
+/// Display time for observation row `j`: the raw data TIME when available
+/// (matches sdtab / input), falling back to the internal `obs_times` clock,
+/// which may be the shifted clock for stacked reset occasions. Shared by every
+/// simulation row emitter so the static and reactive paths cannot drift.
+fn obs_row_time(subject: &Subject, j: usize) -> f64 {
+    subject
+        .obs_raw_times
+        .get(j)
+        .copied()
+        .unwrap_or(subject.obs_times[j])
+}
+
 fn emit_subject_rows<R: rand::Rng>(
     model: &CompiledModel,
     subject: &Subject,
@@ -4977,11 +4989,7 @@ fn emit_subject_rows<R: rand::Rng>(
             id: subject.id.clone(),
             // Raw data TIME (matches sdtab / input); `obs_times` may be
             // the internal shifted clock for stacked reset occasions.
-            time: subject
-                .obs_raw_times
-                .get(j)
-                .copied()
-                .unwrap_or(subject.obs_times[j]),
+            time: obs_row_time(subject, j),
             cmt: subject.obs_cmts[j],
             ipred,
             outcome: SimOutcome::Continuous { value },
@@ -5117,6 +5125,8 @@ pub struct AdaptiveSimulateOptions {
     pub seed: Option<u64>,
     /// Decision schedule on the subject clock — the times the controller is
     /// consulted. The same schedule is used for every subject in this slice.
+    /// Must be non-empty: an empty schedule never consults the controller and is
+    /// rejected (it would otherwise be a silent dose-free run).
     pub decision_times: Vec<f64>,
     /// Signals the controller may read at each decision. **Ipred only** here — a
     /// [`crate::sim::adaptive::ObserveMode::Dv`] monitor is rejected (it needs
@@ -5191,6 +5201,8 @@ pub struct AdaptiveSimulationResult {
 ///
 /// ## Requirements — typed errors, never a silent wrong answer
 ///
+/// - **Non-empty decision schedule.** An empty `opts.decision_times` never
+///   consults the controller (a silent dose-free run) and is rejected.
 /// - **ODE model.** The reactive driver runs on the ODE engine; a model with no
 ///   `[odes]` block is rejected.
 /// - **Dose-free subjects.** The regimen is controller-driven; a subject that
@@ -5222,6 +5234,18 @@ where
          engine); this model has no [odes] block"
             .to_string()
     })?;
+
+    // An empty schedule means the controller is never consulted: the result is a
+    // dose-free simulation that the verifier (replaying an empty ledger) passes
+    // trivially. That is almost always a forgotten `decision_times` (the field
+    // defaults to empty), so reject it rather than return a silent no-op — the
+    // same "never a silent wrong answer" contract as the other preconditions.
+    if opts.decision_times.is_empty() {
+        return Err("simulate_adaptive requires a non-empty decision schedule \
+             (`AdaptiveSimulateOptions::decision_times`); with no decision times the controller \
+             is never consulted and no dose is ever issued"
+            .to_string());
+    }
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
@@ -5268,6 +5292,7 @@ where
                     &params.theta,
                     &eta_slice,
                     subject,
+                    &opts.decision_times,
                     &run,
                 )
                 .map_err(|e| {
@@ -5285,11 +5310,7 @@ where
                     draw: 1,
                     sim,
                     id: subject.id.clone(),
-                    time: subject
-                        .obs_raw_times
-                        .get(j)
-                        .copied()
-                        .unwrap_or(subject.obs_times[j]),
+                    time: obs_row_time(subject, j),
                     cmt: subject.obs_cmts[j],
                     ipred: pred,
                     outcome: SimOutcome::Continuous { value: pred },
@@ -9774,6 +9795,22 @@ mod adaptive_sim_tests {
         let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
             .expect_err("analytical model must be rejected");
         assert!(err.contains("ODE"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_decision_schedule() {
+        // The default `decision_times` is empty; a caller who forgets to set it
+        // would otherwise get a silent dose-free run that passes the verifier
+        // trivially. That must be a typed error, not a happy-path no-op.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![6.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default() // decision_times left empty
+        };
+        let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect_err("an empty decision schedule must be rejected");
+        assert!(err.contains("decision schedule"), "got: {err}");
     }
 
     #[test]

@@ -34,6 +34,14 @@ pub use frem::{prepare_frem, FremDataInfo, FremPrepareResult};
 pub use io::datareader::{read_nonmem_csv, read_nonmem_csv_with_covariates};
 pub use parser::model_parser::{parse_full_model_file, parse_model_file, parse_model_string};
 pub use propensity_match::MatchMethod;
+// Adaptive (feedback) dosing vocabulary (#391). Re-exported at the crate root so
+// the public `simulate_adaptive` API — its controller, monitors, and the fields
+// of `AdaptiveSimulationResult` (`ledger` / `decisions`) — is usable without
+// reaching into the `sim::adaptive` module path.
+pub use sim::adaptive::{
+    ControllerCtx, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry, MonitorSpec,
+    ObserveMode, ObservedSignal,
+};
 pub use suggest_start::{inits_from_nca, NcaInit, SuggestedStart};
 pub use types::*;
 

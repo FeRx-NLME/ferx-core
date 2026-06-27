@@ -58,8 +58,9 @@ reproducible.
 ## Example
 
 ```rust
-use ferx_core::{simulate_adaptive, AdaptiveSimulateOptions};
-use ferx_core::sim::adaptive::{ControllerCtx, DoseAction, MonitorSpec, ObserveMode};
+use ferx_core::{
+    simulate_adaptive, AdaptiveSimulateOptions, ControllerCtx, DoseAction, MonitorSpec, ObserveMode,
+};
 
 let opts = AdaptiveSimulateOptions {
     seed: Some(42),
@@ -100,11 +101,15 @@ static engine are different code, agreement proves the driver applied every dose
 identically to the static engine. A divergence is a typed error that taints the
 result — never a silent wrong number.
 
-The check uses a tolerance tied to the ODE solver's own error control, not
-bit-equality: a held decision makes the reactive driver restart the integrator at
-a point the static schedule has no break for, which perturbs the adaptive step
-sequence at the solver's error level. A real bookkeeping bug moves a prediction
-by orders of magnitude more, so the check still catches it.
+The replay reproduces the reactive driver's *segment structure* — the driver
+restarts the integrator at every decision time (holds included), so the replay
+feeds those same decision times back in as no-op breaks. Both engines then walk
+the same segments through the same integrator, so the comparison sits at the
+solver's true round-off floor (a small multiple of its error control) rather than
+a wide held-decision slack. A real bookkeeping bug — a dropped dose, wrong
+compartment, double-applied bioavailability — moves a prediction by orders of
+magnitude more, so the tight check still catches it without ever false-positiving
+on a legitimate run.
 
 ## Validation
 
@@ -123,6 +128,9 @@ family. It is validated instead by:
 ## Current scope and limits
 
 - **ODE models only** (the reactive driver runs on the ODE engine).
+- **A non-empty decision schedule is required** — an empty `decision_times` never
+  consults the controller, so it is rejected rather than run as a silent
+  dose-free simulation.
 - **Dose-free base subjects** — the regimen is fully controller-driven; a subject
   that already carries doses is rejected.
 - **`Ipred` monitors only** (assay-noised `Dv` follows).
