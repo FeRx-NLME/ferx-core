@@ -1997,7 +1997,8 @@ mod survival_smoke {
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method = focei
+  method  = focei
+  maxiter = 3
 ";
 
     #[test]

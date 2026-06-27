@@ -3372,6 +3372,15 @@ fn parse_event_model_block(
                  — put drug and covariate effects directly in the hazard expression."
             ));
         }
+        if !kappa_names.is_empty() {
+            return Err(format!(
+                "[event_model]: CMT={cmt} declares an ODE-accumulated `hazard = ...` (joint \
+                 PK-TTE) in a model with inter-occasion variability (IOV / kappa). The \
+                 PK-driven hazard needs per-occasion random effects threaded into the ODE \
+                 solve, which is not yet supported (Slice 2.1) — remove IOV, or use an \
+                 analytic `family` hazard instead."
+            ));
+        }
         let chz_state = *chz_state_map.get(&cmt).ok_or_else(|| {
             format!(
                 "[event_model]: CMT={cmt} declares `hazard = ...` but the model has no ODE \

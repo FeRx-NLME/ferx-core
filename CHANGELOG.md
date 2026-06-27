@@ -20,6 +20,12 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Joint PK-TTE — drug-driven hazard via `[event_model] hazard = <expr>`** (#564). On an ODE
+  model, a `hazard` expression that references the PK state (e.g. `H0 * exp(BETA * (central / V))`)
+  is accumulated as a cumulative-hazard ODE compartment and estimated jointly with the PK by
+  FOCEI/SAEM, with shared random effects. Mutually exclusive with the analytic `family` hazard;
+  requires an ODE model (no IOV yet). Simulation of the ODE-accumulated hazard follows in a later
+  slice. See [Time-to-event](estimation/tte.qmd).
 - **Experimental `simulate_adaptive()` — state-reactive ("feedback") dosing simulation**
   (#553, epic #391). A programmatic entry point that simulates regimens where each dose is
   chosen at run time by a controller reading the simulated state (TDM target attainment,

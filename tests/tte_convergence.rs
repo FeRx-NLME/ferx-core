@@ -847,3 +847,97 @@ fn tte_sse_gompertz_recovers_truth() {
     );
     assert!(r.ofv.is_finite(), "OFV must be finite");
 }
+
+// ── Joint PK-TTE (Phase 2, Slice 2.1 — #564) ─────────────────────────────────
+
+/// Oral 1-cpt PK + drug-driven (ODE-accumulated) hazard. The hazard reads the
+/// `central` ODE state, so it is integrated as a cumulative-hazard compartment and
+/// estimated jointly with the PK.
+const JOINT_PKTTE_FIT: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+
+/// End-to-end joint PK-TTE FOCEI fit must complete with a finite OFV. Nightly
+/// Tier-3 guard: the augmented PK+CHZ integration (re-solved per inner eval and per
+/// FD-Hessian perturbation) makes a full fit slow, so per-PR coverage of the
+/// ODE-hazard likelihood lives in the fast `joint_pktte_ode_hazard_nll_paths_finite`
+/// unit test instead. A simulation-estimation (SSE) recovery check awaits the
+/// Slice 2.2 event-time root-finder. See #564.
+#[test]
+fn joint_pktte_focei_fit_completes() {
+    use ferx_core::types::{DoseEvent, EventType, ObsRecord};
+
+    let model = parse_model_string(JOINT_PKTTE_FIT).expect("joint PK-TTE model must parse");
+
+    // 6 oral-dose subjects: 2 PK obs (central amount) + one TTE record on CMT 2,
+    // mixing exact events and a window censor so both hazard arms are exercised.
+    let event_times = [5.0, 12.0, 30.0, 8.0, 20.0, 3.0];
+    let subjects = (0..event_times.len())
+        .map(|i| {
+            let mut s = common::subject(
+                &format!("{}", i + 1),
+                vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                vec![2.0, 8.0],
+                vec![30.0, 20.0],
+                vec![1, 1],
+            );
+            let censored = event_times[i] >= 30.0;
+            s.obs_records = vec![ObsRecord::Event {
+                time: event_times[i],
+                event_type: if censored {
+                    EventType::RightCensored
+                } else {
+                    EventType::Exact
+                },
+                entry_time: 0.0,
+                cmt: 2,
+            }];
+            s
+        })
+        .collect();
+    let pop = Population {
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects,
+    };
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    match fit(&model, &pop, &model.default_params, &opts) {
+        Ok(r) => assert!(
+            r.ofv.is_finite(),
+            "joint PK-TTE FOCEI OFV must be finite; got {}",
+            r.ofv
+        ),
+        Err(e) => panic!("joint PK-TTE FOCEI fit must not error: {e}"),
+    }
+}

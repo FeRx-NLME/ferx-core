@@ -115,6 +115,102 @@ pub fn individual_nll_into(
     )
 }
 
+/// TTE negative log-likelihood for an ODE-accumulated hazard (joint PK-TTE, #564).
+///
+/// Solves the subject's augmented ODE at `(theta, eta)` and reads the cumulative
+/// hazard `H(t) = u[chz_state]` (and, for exact events, the instantaneous hazard
+/// `h(t) = u̇[chz_state]`) at the event / censor / entry / interval times, then feeds
+/// them to the shared [`crate::survival::tte_nll_from_curves`] per-record likelihood.
+/// Re-solves the ODE on every call, so the inner EBE search and the FOCEI FD-Hessian
+/// (which perturbs η) each get a consistent, freshly-integrated hazard.
+#[cfg(feature = "survival")]
+fn tte_ode_nll(
+    model: &CompiledModel,
+    subject: &Subject,
+    chz_state: usize,
+    records: &[ObsRecord],
+    theta: &[f64],
+    eta: &[f64],
+) -> f64 {
+    let Some(ode) = model.ode_spec.as_ref() else {
+        return 1e20; // OdeAccumulated requires an ODE model (the parser enforces this)
+    };
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+
+    // Distinct times where H(t) — and h(t) for exact events — is needed.
+    let mut times: Vec<f64> = Vec::new();
+    for r in records {
+        let ObsRecord::Event {
+            time,
+            event_type,
+            entry_time,
+            ..
+        } = r;
+        if *entry_time > 0.0 {
+            times.push(*entry_time);
+        }
+        match event_type {
+            EventType::IntervalCensored { left, right } => {
+                times.push(*left);
+                times.push(*right);
+            }
+            _ => times.push(*time),
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).expect("TTE event times are finite"));
+    times.dedup();
+
+    let states = crate::ode::ode_dense_solve_states(ode, &pk.values, theta, eta, subject, &times);
+    if states.len() != times.len() {
+        return 1e20;
+    }
+
+    // tte_nll_from_curves calls these with the same f64 values that populated `times`,
+    // so an exact binary search resolves each lookup.
+    let cumhaz_at = |t: f64| -> f64 {
+        match times.binary_search_by(|x| x.partial_cmp(&t).unwrap()) {
+            Ok(i) => states[i][chz_state],
+            Err(_) => f64::NAN,
+        }
+    };
+    let hazard_at = |t: f64| -> f64 {
+        match times.binary_search_by(|x| x.partial_cmp(&t).unwrap()) {
+            Ok(i) => {
+                // h(t) is the cumulative-hazard derivative: the hazard RHS at the
+                // integrated state (dose forcings touch PK compartments, not CHZ).
+                let mut du = vec![0.0; ode.n_states];
+                (ode.rhs)(&states[i], &pk.values, t, &mut du);
+                du[chz_state]
+            }
+            Err(_) => f64::NAN,
+        }
+    };
+
+    crate::survival::tte_nll_from_curves(records, cumhaz_at, hazard_at)
+}
+
+/// Dispatch a TTE endpoint's per-subject NLL on its hazard representation: the
+/// closed-form [`crate::survival::tte_data_term`] for `Analytic`, or the
+/// ODE-accumulated [`tte_ode_nll`] for joint PK-TTE.
+#[cfg(feature = "survival")]
+fn tte_endpoint_nll(
+    model: &CompiledModel,
+    subject: &Subject,
+    hazard: &HazardSpec,
+    records: &[ObsRecord],
+    theta: &[f64],
+    eta: &[f64],
+) -> f64 {
+    match hazard {
+        HazardSpec::Analytic { .. } => {
+            crate::survival::tte_data_term(records, hazard, theta, eta, &subject.covariates)
+        }
+        HazardSpec::OdeAccumulated { chz_state } => {
+            tte_ode_nll(model, subject, *chz_state, records, theta, eta)
+        }
+    }
+}
+
 /// Hot-path variant that additionally threads through a pre-built
 /// [`pk::event_driven::EventSchedule`]. The FOCE inner-loop obj closure
 /// and Jacobian build the schedule once per `find_ebe` call and reuse
@@ -203,7 +299,6 @@ pub fn individual_nll_into_with_schedule(
     // the subject has non-Gaussian obs_records.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::survival::tte_data_term;
         use crate::types::EndpointLikelihood;
         // Iterate model.endpoints (typically 1–3 entries) rather than scanning
         // obs_records for unique CMTs — avoids the HashSet and one pass over records.
@@ -220,10 +315,10 @@ pub fn individual_nll_into_with_schedule(
                 if records_for_cmt.is_empty() {
                     continue; // subject has no records for this TTE CMT
                 }
-                // tte_data_term returns a raw NLL; multiply by 2 to match the
+                // tte_endpoint_nll returns a raw NLL; multiply by 2 to match the
                 // Gaussian data_ll convention (everything is halved at the end).
                 data_ll +=
-                    2.0 * tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+                    2.0 * tte_endpoint_nll(model, subject, hazard, &records_for_cmt, theta, eta);
             }
         }
     }
@@ -374,7 +469,6 @@ pub(crate) fn obs_nll_subject_from_preds(
     // gradient receives TTE hazard contributions, not just Gaussian residuals.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::survival::tte_data_term;
         use crate::types::EndpointLikelihood;
         for (cmt, endpoint) in &model.endpoints {
             if let EndpointLikelihood::Tte { hazard } = endpoint {
@@ -392,7 +486,7 @@ pub(crate) fn obs_nll_subject_from_preds(
                 if records_for_cmt.is_empty() {
                     continue;
                 }
-                nll += tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+                nll += tte_endpoint_nll(model, subject, hazard, &records_for_cmt, theta, eta);
             }
         }
     }
@@ -533,7 +627,7 @@ pub fn foce_subject_nll(
     // but h_matrix is empty and hrh comes entirely from the TTE Hessian.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
-        use crate::survival::{data_term_hessian_fd, shi_step_sizes, tte_data_term};
+        use crate::survival::{data_term_hessian_fd, shi_step_sizes};
         use crate::types::EndpointLikelihood;
 
         // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
@@ -556,10 +650,10 @@ pub fn foce_subject_nll(
                 if records_for_cmt.is_empty() {
                     continue; // subject has no records for this TTE CMT
                 }
-                // Closure that evaluates the TTE NLL at a given eta vector.
-                let covariates = &subject.covariates;
+                // Closure that evaluates the TTE NLL at a given eta vector — re-solving
+                // the ODE per perturbed η for the ODE-accumulated (joint PK-TTE) case.
                 let tte_fn = |eta_eval: &[f64]| -> f64 {
-                    tte_data_term(&records_for_cmt, hazard, theta, eta_eval, covariates)
+                    tte_endpoint_nll(model, subject, hazard, &records_for_cmt, theta, eta_eval)
                 };
                 tte_nll_at_mode += tte_fn(eta_hat.as_slice());
                 if n_eta > 0 {
@@ -2556,6 +2650,109 @@ mod tests {
             focei_combined,
             focei_additive,
             gap,
+        );
+    }
+
+    /// Joint PK-TTE (ODE-accumulated hazard) must give a finite per-subject NLL on every
+    /// estimation entry point: the inner EBE NLL, the SAEM M-step, and the FOCEI Laplace
+    /// objective (which adds the TTE FD-Hessian). Fast — a handful of ODE solves, no outer
+    /// optimisation (the full fit is the Tier-3 test in `tte_convergence.rs`). This is the
+    /// per-PR coverage for the ODE-hazard likelihood path (#564).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn joint_pktte_ode_hazard_nll_paths_finite() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(src).expect("joint PK-TTE model must parse");
+        let mut subject = make_simple_subject();
+        // make_simple_subject doses CMT 1 (depot) with 6 PK obs; add a TTE event on CMT 2.
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+
+        let p = &model.default_params;
+        let eta = [0.0_f64];
+        let n_obs = subject.observations.len();
+
+        // (1) Inner EBE NLL: individual_nll → tte_endpoint_nll → tte_ode_nll.
+        let inner = individual_nll(&model, &subject, &p.theta, &eta, &p.omega, &p.sigma.values);
+        assert!(
+            inner.is_finite(),
+            "inner joint NLL must be finite; got {inner}"
+        );
+
+        // (2) SAEM M-step: obs_nll_subject_from_preds (Gaussian preds supplied).
+        let preds = vec![30.0_f64; n_obs];
+        let saem =
+            obs_nll_subject_from_preds(&model, &subject, &preds, &p.theta, &p.sigma.values, &eta);
+        assert!(
+            saem.is_finite(),
+            "SAEM M-step joint NLL must be finite; got {saem}"
+        );
+
+        // (3) FOCEI Laplace objective, incl. the ODE-TTE FD-Hessian term. A zero Gaussian
+        // sensitivity matrix is fine here — the prior + TTE Hessian keep H̃ positive-definite.
+        let eta_hat = DVector::from_vec(vec![0.0]);
+        let h_matrix = DMatrix::<f64>::zeros(n_obs, 1);
+        let foce = foce_subject_nll(
+            &model,
+            &subject,
+            &p.theta,
+            &eta_hat,
+            &h_matrix,
+            &p.omega,
+            &p.sigma.values,
+            true,
+        );
+        assert!(
+            foce.is_finite(),
+            "FOCEI joint NLL must be finite; got {foce}"
+        );
+
+        // The ODE hazard must actually contribute: moving η changes the inner NLL.
+        let moved = individual_nll(
+            &model,
+            &subject,
+            &p.theta,
+            &[0.4],
+            &p.omega,
+            &p.sigma.values,
+        );
+        assert!(
+            moved.is_finite() && (moved - inner).abs() > 1e-9,
+            "η must move the joint NLL (inner={inner}, moved={moved})"
         );
     }
 }
