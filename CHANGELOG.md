@@ -26,8 +26,14 @@ section of the SDLC for the versioning policy).
   oncology dose reduction, biomarker titration). ODE models only; the controller is supplied
   as a per-subject factory; every realized dose and every decision (including holds) is
   returned alongside the trajectories, and a frozen-schedule replay verifier checks the dose
-  bookkeeping by default. Ipred monitors only for now (assay-noised `Dv` monitoring follows).
-  See [Adaptive dosing](model-file/adaptive-dosing.qmd).
+  bookkeeping by default. See [Adaptive dosing](model-file/adaptive-dosing.qmd).
+- **Assay-noised (`Dv`) monitors for `simulate_adaptive()`** (#566, epic #391). A controller can
+  titrate on the realized, assay-noised measurement — `IPRED + ε·√(residual variance)`, clamped
+  at 0, drawn from the endpoint's `[error_model]` — instead of (or, per-monitor, alongside) the
+  latent `Ipred`. This is the realistic TDM / titration signal. The assay draws come from a
+  per-purpose RNG substream keyed by `(subject, replicate, decision, analyte)`, so they are
+  deterministic under a fixed seed, invariant to subject ordering, and never perturb another
+  monitor's (or η's) draws.
 - Warn when no estimation method is set in the model file's `[fit_options]` or by
   the caller, making the implicit fallback to FOCEI visible instead of silent (#558).
 - Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary

@@ -2569,6 +2569,21 @@ impl CompiledModel {
         )
     }
 
+    /// True when a residual error model is defined for `cmt`, so a DV
+    /// (assay-noised) observation can be drawn there. False for a
+    /// [`ErrorSpec::PerCmt`] spec that omits `cmt`, or a model with no
+    /// `[error_model]` at all (empty `sigma`). `simulate_adaptive` consults this
+    /// before drawing a DV monitor so an un-modeled compartment is a typed error
+    /// rather than a fabricated σ (#391 S1.5 edge a) — and so
+    /// [`residual_variance_at`](Self::residual_variance_at), which indexes
+    /// `sigma[0]` for a `Single` model, is never reached with an empty `sigma`.
+    pub fn has_residual_error_for_cmt(&self, cmt: usize, sigma: &[f64]) -> bool {
+        match &self.error_spec {
+            ErrorSpec::Single(_) => !sigma.is_empty(),
+            ErrorSpec::PerCmt(map) => map.contains_key(&cmt),
+        }
+    }
+
     /// Multiplicative factor applied to the residual *variance* for a subject
     /// whose random-effect vector is `eta`, from the IIV-on-RUV term
     /// (`Y = IPRED + EPS*EXP(ETA)`). Returns `exp(2*eta[k])` when
@@ -6245,5 +6260,38 @@ mod tests {
         }];
         let v = model.residual_variance_at(0, 10.0, &[0.2, 1.0]);
         assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn has_residual_error_for_cmt_covers_single_and_per_cmt() {
+        let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+
+        // Single error model: defined for every cmt iff sigma is non-empty.
+        model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        assert!(model.has_residual_error_for_cmt(1, &[0.1]));
+        assert!(model.has_residual_error_for_cmt(99, &[0.1]));
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[]),
+            "no sigma ⇒ no error model"
+        );
+
+        // PerCmt: defined only for compartments present in the map.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            2usize,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        model.error_spec = ErrorSpec::PerCmt(map);
+        assert!(
+            model.has_residual_error_for_cmt(2, &[0.1]),
+            "cmt 2 has an endpoint"
+        );
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[0.1]),
+            "cmt 1 is not in the map"
+        );
     }
 }

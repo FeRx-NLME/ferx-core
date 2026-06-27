@@ -46,14 +46,26 @@ A controller reads named signals declared as [`MonitorSpec`]s. Each monitor
 observes a 1-based compartment/endpoint under an [`ObserveMode`]:
 
 - `Ipred` — the latent individual prediction (no measurement noise).
-- `Dv` — the realized, assay-noised measurement (the realistic TDM signal).
+- `Dv` — the realized, assay-noised measurement: `IPRED + ε·√(residual variance)`,
+  clamped at 0, with the residual variance taken from the endpoint's own
+  `[error_model]`. This is the realistic TDM / titration signal — a clinician
+  titrates on a *measured* value, not the latent truth.
 
-> **This slice supports `Ipred` monitors only.** A `Dv` monitor is rejected with
-> a typed error; assay-noised monitoring (and its per-subject reproducible RNG
-> substreams) lands in a follow-up.
+Mode is chosen **per monitor**, so a PK exposure target can run on `Ipred` while a
+safety marker (e.g. ANC → CTCAE grade) runs on `Dv` in the same simulation.
 
-The engine — not the controller — resolves every monitor, so draw order stays
-reproducible.
+The engine — not the controller — resolves every monitor and draws any assay
+noise, on a dedicated **controller-assay RNG substream** keyed by
+`(subject, replicate, decision, analyte)`. That identity keying makes the assay
+draws (under a fixed `seed`):
+
+- **deterministic** — re-running reproduces them exactly;
+- **permutation-invariant** — a subject's draws do not depend on iteration order;
+- **non-perturbing** — adding a monitor never shifts another monitor's (or η's)
+  draws, so the frozen-replay verifier stays exact.
+
+A `Dv` monitor on a compartment with no `[error_model]` is a typed error (never a
+fabricated σ), and a noised reading below zero is clamped to 0.
 
 ## Example
 
@@ -65,7 +77,9 @@ use ferx_core::{
 let opts = AdaptiveSimulateOptions {
     seed: Some(42),
     decision_times: vec![0.0, 24.0, 48.0, 72.0, 96.0],
-    monitors: vec![MonitorSpec::new("CONC", 1, ObserveMode::Ipred)],
+    // Titrate on the noisy assay (DV), as in real TDM. Use `ObserveMode::Ipred`
+    // to titrate on the latent prediction instead.
+    monitors: vec![MonitorSpec::new("CONC", 1, ObserveMode::Dv)],
     ..Default::default() // verify = true, max_decisions = 10_000
 };
 
@@ -133,7 +147,8 @@ family. It is validated instead by:
   dose-free simulation.
 - **Dose-free base subjects** — the regimen is fully controller-driven; a subject
   that already carries doses is rejected.
-- **`Ipred` monitors only** (assay-noised `Dv` follows).
+- **Diagonal assay noise** — each `Dv` monitor draws independently; correlated
+  cross-endpoint (`block_sigma`) assay noise is a follow-up.
 - **Between-subject variability only** — η is drawn per subject/replicate;
   parameter-uncertainty propagation is a later layer.
 - **Programmatic API only** — the declarative `[adaptive_dosing]` block,
