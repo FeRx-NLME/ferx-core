@@ -3134,6 +3134,107 @@ mod tests {
     }
 
     #[test]
+    fn frozen_replay_residual_is_pinned_below_the_verifier_bound() {
+        // Characterization of the residual that justifies the verifier's tolerance
+        // factor (`REPLAY_TOL_FACTOR = 8`). On a held-decision run we measure the
+        // max relative |reactive − static| both ways:
+        //   * ALIGNED   (decision times fed back as no-op breaks): measured 0.0 —
+        //     the reactive driver and the static engine, walking identical segments
+        //     through the same `integrate_segment`, agree BIT-FOR-BIT.
+        //   * UNALIGNED (naive replay, breaks only at realized doses): measured
+        //     ~7.3e-8 here — a real held-decision perturbation that the alignment
+        //     removes entirely.
+        // Both sit far under the live verifier bound (×8·reltol = 8e-4), so it
+        // never false-positives; the ×8 is the conservative margin that holds even
+        // on stiffer models where the (pre-alignment) perturbation would be larger.
+        // If the alignment ever regresses, `rel_aligned` jumps toward the unaligned
+        // level and the bit-exact bound below fails loudly.
+        let ode = one_cpt_ode_spec(); // reltol 1e-4 / abstol 1e-6 (defaults)
+        let pk = pk_one(1.0, 10.0);
+        // CL=1, V=10 → k=0.1/h. A 100-unit bolus only while the central amount is
+        // below 50; it decays 100·e^{-0.1t}, crossing 50 near t≈6.9, so over this
+        // schedule the t=0 and t=8 troughs dose and t∈{2,4,6} hold — a dose/hold mix.
+        let decisions = [0.0, 2.0, 4.0, 6.0, 8.0];
+        let obs = vec![1.0, 3.0, 5.0, 7.0, 9.0];
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let mut controller = |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A declared") < 50.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        };
+        let base = make_subject(vec![], obs);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &monitors,
+            &mut controller,
+            100,
+        )
+        .expect("driver runs");
+        assert!(
+            run.ledger.len() >= 2,
+            "expected a dose/hold mix (≥2 realized doses), got {}",
+            run.ledger.len()
+        );
+
+        // Rebuild the static subject from the realized ledger, exactly as the
+        // verifier does.
+        let mut static_subject = base.clone();
+        static_subject.doses = run
+            .ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+            .collect();
+
+        let max_rel = |preds: &[f64]| -> f64 {
+            run.predictions
+                .iter()
+                .zip(preds)
+                .filter(|(g, w)| g.is_finite() && w.is_finite() && w.abs() > 0.0)
+                .map(|(g, w)| (g - w).abs() / w.abs())
+                .fold(0.0_f64, f64::max)
+        };
+
+        let aligned = ode_predictions_with_extra_breaks(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &static_subject,
+            &decisions,
+        );
+        let unaligned = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+
+        let rel_aligned = max_rel(&aligned);
+        let rel_unaligned = max_rel(&unaligned);
+
+        // Aligned replay is bit-exact (measured 0.0). Allow a few ULP of headroom
+        // for future legitimate reordering, but stay ~9 orders under the live ×8
+        // bound: a held-break-mismatch regression pushes this toward the unaligned
+        // level (~7e-8) and trips here long before the ×8 verifier would.
+        assert!(
+            rel_aligned <= 1e-12,
+            "aligned replay should match the reactive driver bit-for-bit, got {rel_aligned:e} \
+             (verifier bound is 8·reltol = 8e-4); the decision-time break alignment may have \
+             regressed"
+        );
+        // And the alignment is genuinely doing the work: the naive (unaligned)
+        // replay carries a real, measurable residual that the alignment eliminates.
+        assert!(
+            rel_unaligned > 1e-9,
+            "expected a measurable unaligned residual (the perturbation alignment removes); \
+             got {rel_unaligned:e} — if this is ~0 the scenario no longer holds any decisions, \
+             so the characterization is vacuous"
+        );
+    }
+
+    #[test]
     fn adaptive_feedback_doses_only_below_threshold() {
         // State-dependent: dose 100 only when the monitored amount is below 50.
         // At t=0 amount is 0 (<50) -> dose; by t=2 it decayed to 100·e^{-0.2}
