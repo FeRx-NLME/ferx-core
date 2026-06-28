@@ -1649,6 +1649,11 @@ pub(crate) fn ode_predictions_adaptive(
                                     m.name, m.cmt
                                 )
                             })?;
+                            // `has_residual_error_for_cmt` (the gate behind `resid_var`)
+                            // requires `sigma` to cover the model's σ indices, so a `Some`
+                            // here is panic-free and structurally finite — no downstream
+                            // finiteness guard. Value-pathology (a NaN/∞ in `sigma`, a
+                            // diverged IPRED) is whole-sim garbage-in, out of scope here.
                             let eps = assay_standard_normal(a.base_seed, decision_index, &m.name);
                             // Edge (b): an assay cannot read below zero; clamp the
                             // noised value at 0 (BLQ-blinding is deferred to Part F).

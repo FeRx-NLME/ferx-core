@@ -670,5 +670,12 @@ mod tests {
             mean.abs() < 0.1,
             "standard-normal draws should center near 0, got {mean}"
         );
+        // Unit variance too, so the noise scale is right (a mis-scaled generator
+        // would still pass the sign/mean checks).
+        let var = draws.iter().map(|&d| (d - mean).powi(2)).sum::<f64>() / n as f64;
+        assert!(
+            (var - 1.0).abs() < 0.2,
+            "standard-normal draws should have ~unit variance, got {var}"
+        );
     }
 }

@@ -10578,5 +10578,22 @@ mod adaptive_sim_tests {
             ledger_for(&r_ba, "B"),
             "B's DV-driven doses must be order-independent"
         );
+
+        // Non-vacuity: the assay noise must actually be id-keyed (not a no-op), or
+        // the invariance above could hold even under a position-keyed stream. At
+        // t=4 the trough is ~67 (non-zero, so proportional noise is live), and A and
+        // B observe *different* measured values — confirming the noise is consequential.
+        let dv_at = |r: &AdaptiveSimulationResult, id: &str, didx: usize| {
+            r.decisions
+                .iter()
+                .find(|d| d.subject == id && d.decision_idx == didx)
+                .map(|d| d.observed_signals[0].value)
+                .expect("decision logged")
+        };
+        assert_ne!(
+            dv_at(&r_ab, "A", 1),
+            dv_at(&r_ab, "B", 1),
+            "id-keyed assay noise must differ between subjects (test would be vacuous otherwise)"
+        );
     }
 }
