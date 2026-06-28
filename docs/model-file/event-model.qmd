@@ -49,6 +49,36 @@ Named blocks allow multiple TTE endpoints:
   shape  = TVSHAPE_DEATH
 ```
 
+## Joint PK-TTE: ODE-accumulated hazard (`hazard =`)
+
+For a **drug-driven** hazard — one that depends on the (ODE) PK state — use the
+`hazard` key instead of an analytic `family`:
+
+```
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))   # references ODE states + individual parameters
+```
+
+The parser appends a cumulative-hazard accumulator to the model's ODE system
+(`d/dt(__chz) = <hazard>`, starting at 0) and estimates it **jointly** with the PK;
+the TTE likelihood reads `H(t)` from that state and `h(t)` from its derivative, so the
+PK and the event model share the same random effects (a common frailty). Notes:
+
+- Requires an **ODE model** (`ode(...)` in `[structural_model]` with an `[odes]` block).
+- `hazard` is **mutually exclusive** with the analytic `family` / `scale` / `shape` /
+  `alpha` / `gamma` keys.
+- The expression compiles in the **`[odes]` RHS namespace** — it may reference ODE state
+  names (e.g. `central`) and `[individual_parameters]` (e.g. `V`, `H0`), but **not** raw
+  thetas or covariates directly, so declare hazard parameters and any between-subject
+  variability in `[individual_parameters]`.
+- **IOV is not yet supported** with an ODE hazard (rejected at parse time).
+- `fit()` and `predict_survival()` work; **`simulate()` is not yet supported** for an
+  ODE-accumulated hazard (drug-driven event-time sampling is a later slice — it returns a
+  clear error rather than silently emitting no event rows).
+
+See [Joint PK-TTE](../estimation/tte.qmd#joint-pk-tte) for a worked example.
+
 ## TTE-only models
 
 For models with only TTE endpoints and no Gaussian PK data, the

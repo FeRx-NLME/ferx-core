@@ -191,6 +191,66 @@ stencil (Shi 2021 step-size selection).
 Set `method = focei` in `[fit_options]`. The `gradient = fd` setting is
 the default and the only supported path for TTE objectives.
 
+## Joint PK-TTE {#joint-pk-tte}
+
+When the hazard depends on drug exposure, write it as an expression over the PK
+state instead of a closed-form `family`. On an ODE model, the `hazard` key in
+`[event_model]` is accumulated as an extra ODE compartment and estimated **jointly**
+with the PK, with shared random effects:
+
+```
+[parameters]
+  theta TVCL(1.0, 0.01, 100); theta TVV(10, 0.1, 500); theta TVKA(1, 0.01, 50)
+  theta TVH0(0.01, 1e-5, 10); theta TVBETA(0.5, -10, 10)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 3                                  # TTE on its own CMT (PK observed on CMT 2)
+  hazard = H0 * exp(BETA * (central / V))     # log-linear hazard in concentration
+
+[error_model]
+  DV ~ proportional(PROP_ERR)                  # Gaussian PK rows (CMT 2); TTE rows (CMT 3) route to the event likelihood
+
+[fit_options]
+  method = focei
+```
+
+The parser appends `d/dt(__chz) = H0 * exp(BETA * (central / V))` (init 0) to the ODE
+system; the TTE likelihood reads `H(T)` from that state and `h(T)` from its derivative,
+combined with the Gaussian PK likelihood in one FOCEI objective (`central / V` is the
+concentration driving the hazard). Put the PK observation and the event on **different
+compartments** so the data reader can route Gaussian rows and TTE rows unambiguously.
+
+`predict_survival()` returns `S(t)` / `H(t)` / `h(t)` for the endpoint by integrating
+the same augmented system at the typical values (its `mean_survival` is `NaN` — an
+`∫₀^∞ S` summary for ODE hazards is a follow-up; `median_survival` is interpolated from
+the cumulative-hazard grid).
+
+::: {.callout-note}
+## Current limitations
+The hazard expression lives in the `[odes]` RHS namespace (ODE states + individual
+parameters — route thetas/covariates through `[individual_parameters]`); inter-occasion
+variability (IOV) is rejected; and `simulate()` of an ODE hazard returns an error
+(drug-driven event-time sampling needs the forthcoming ODE root-finder). Joint PK-TTE is
+the standard NONMEM `$DES` + cumulative-hazard construct; recovery against
+NONMEM / nlmixr2 is tracked in issue #564. See `examples/pktte_joint.ferx`.
+:::
+
 ## Competing risks (cause-specific hazards)
 
 When a subject is at risk of several mutually-exclusive event types, give each

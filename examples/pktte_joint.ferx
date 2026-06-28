@@ -1,0 +1,47 @@
+# Joint PK-TTE — drug-driven (ODE-accumulated) hazard
+#
+# One-compartment oral PK with a time-to-event endpoint whose hazard depends on the
+# central concentration. The `hazard =` expression is appended to the ODE system as a
+# cumulative-hazard state (d/dt(__chz) = hazard) and estimated jointly with the PK by
+# FOCEI, sharing the CL random effect. See docs/estimation/tte.qmd (Joint PK-TTE).
+#
+# PK is observed on CMT 2 (central); the event is on CMT 3, so Gaussian and TTE rows
+# route unambiguously. fit() and predict_survival() work; simulate() of an
+# ODE-accumulated hazard is not yet supported (Slice 2.2). Run with:
+#   cargo run --release -- examples/pktte_joint.ferx --data data/pktte_joint.csv
+
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)   # applies to the Gaussian PK rows (CMT 2); TTE rows (CMT 3) route to the event likelihood
+
+[fit_options]
+  method  = focei
+  maxiter = 50

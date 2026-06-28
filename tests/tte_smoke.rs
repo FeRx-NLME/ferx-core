@@ -1649,6 +1649,61 @@ mod survival_smoke {
         assert_eq!(model.n_eta, 1, "n_eta should be 1 (ETA_GAMMA)");
     }
 
+    /// `examples/pktte_joint.ferx` must parse: an ODE PK model with an ODE-accumulated
+    /// (joint PK-TTE) hazard on CMT=3 and the synthetic `__chz` state appended.
+    #[test]
+    fn pktte_joint_example_file_parses() {
+        let src = include_str!("../examples/pktte_joint.ferx");
+        let model = parse_model_string(src).expect("pktte_joint.ferx must parse");
+        match model.endpoints.get(&3) {
+            Some(EndpointLikelihood::Tte {
+                hazard: ferx_core::HazardSpec::OdeAccumulated { chz_state },
+            }) => {
+                // depot(0), central(1), __chz(2)
+                assert_eq!(*chz_state, 2, "accumulator appended after depot, central");
+            }
+            other => panic!("expected OdeAccumulated TTE endpoint on CMT=3, got: {other:?}"),
+        }
+        let ode = model
+            .ode_spec
+            .as_ref()
+            .expect("joint PK-TTE is an ODE model");
+        assert!(
+            ode.state_names.iter().any(|s| s == "__chz_3"),
+            "ODE system must carry the appended accumulator; got {:?}",
+            ode.state_names
+        );
+    }
+
+    /// `data/pktte_joint.csv` must load with `examples/pktte_joint.ferx` and route rows
+    /// correctly: PK rows (CMT 2) → Gaussian observations, the event (CMT 3) → obs_records.
+    #[test]
+    fn pktte_joint_example_data_loads_and_routes() {
+        use ferx_core::api::read_population_for;
+        let model = parse_model_string(include_str!("../examples/pktte_joint.ferx"))
+            .expect("pktte_joint.ferx must parse");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/pktte_joint.csv");
+        let (pop, _) = read_population_for(&model, &None, path, None, None, None)
+            .expect("pktte_joint.csv must load");
+        assert_eq!(pop.subjects.len(), 6, "6 subjects");
+        for s in &pop.subjects {
+            assert_eq!(
+                s.observations.len(),
+                2,
+                "subject {} has 2 PK obs (CMT 2)",
+                s.id
+            );
+            assert_eq!(
+                s.obs_records.len(),
+                1,
+                "subject {} has 1 TTE record (CMT 3)",
+                s.id
+            );
+            let ObsRecord::Event { cmt, .. } = &s.obs_records[0];
+            assert_eq!(*cmt, 3, "the TTE record is routed to CMT 3");
+        }
+    }
+
     // ── Phase 1 follow-up: Weibull / Gompertz fit smoke tests ─────────────────
 
     /// Simulated Weibull TTE data (30 subjects, seed=42).
