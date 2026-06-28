@@ -367,13 +367,15 @@ fn first_order_on_analytical_pk_is_rejected_pointing_at_ode_template() {
 }
 
 #[test]
-fn multiple_zero_order_on_one_compartment_is_rejected() {
+fn multiple_zero_order_on_one_compartment_is_rejected_at_parse() {
     // Biphasic zero-order (≥2 `zero_order(...)` on one compartment) is not supported:
     // the per-segment zero-order channel builds one window per dose and resolves a
-    // single zero-order forcing, so a second would be silently under-delivered. A
-    // fit-init check rejects it loudly (E_ABSORPTION_ZERO_ORDER_MULTI). Contrast the
-    // allowed `mixed` (one zero + one first), which the oracle test above exercises.
-    use ferx_core::check_model_data;
+    // single zero-order forcing, so a second would be silently under-delivered. The
+    // parser rejects it loudly — *at parse time* (`build_ode_spec`), so every entry
+    // point surfaces the error, not just `fit()`'s data-level `check_model_data`
+    // (the `simulate`-path regression below pins the gap the fit-init-only check
+    // left open). Contrast the allowed `mixed` (one zero + one first), exercised by
+    // the oracle test above.
     let src = r#"
 [parameters]
   theta TVCL(5.0,   0.1, 100.0)
@@ -401,16 +403,63 @@ fn multiple_zero_order_on_one_compartment_is_rejected() {
 [fit_options]
   method = focei
 "#;
-    let model = parse_full_model(src)
-        .expect("biphasic zero-order parses (rejected at fit-init, not parse)")
-        .model;
-    let diags = check_model_data(&model, &pop_single(vec![0.5, 1.0, 2.0, 4.0, 8.0]));
+    let err = parse_full_model(src)
+        .err()
+        .expect("biphasic zero-order (≥2 zero_order on a compartment) must be rejected at parse");
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == "E_ABSORPTION_ZERO_ORDER_MULTI"),
-        "≥2 zero-order terms on a compartment must raise E_ABSORPTION_ZERO_ORDER_MULTI, got: {:?}",
-        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        err.contains("zero-order input-rate terms") && err.contains("compartment 1"),
+        "≥2 zero-order terms on a compartment must be rejected with a clear message, got: {err}"
+    );
+}
+
+#[test]
+fn multiple_zero_order_rejected_on_simulate_path() {
+    // The structural guard lives in the parser (`build_ode_spec`), so the
+    // `--simulate` entry point (`run_model_simulate`, which parses the file before
+    // it touches the `[simulation]` block) rejects a biphasic-zero-order model too —
+    // the exact path the old fit-init-only check let through with a silently
+    // under-delivered second pathway (#505 review). The model below is otherwise a
+    // complete, self-simulating design, so the rejection is attributable to the
+    // biphasic zero-order alone.
+    let src = r#"
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)
+  theta TVV(50.0,   5.0, 500.0)
+  theta TVFA(0.5,  0.05,  0.95)
+  theta TVDUR1(2.0, 0.05, 24.0)
+  theta TVDUR2(6.0, 0.05, 24.0)
+  omega ETA_CL ~ 0.0
+  sigma PROP_ERR ~ 0.01 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  FA   = TVFA
+  FB   = 1 - TVFA
+  DUR1 = TVDUR1
+  DUR2 = TVDUR2
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FA*zero_order(dur=DUR1) + FB*zero_order(dur=DUR2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[simulation]
+  n_subjects = 4
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.5, 1.0, 2.0, 4.0, 8.0]
+  seed       = 1
+"#;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = tmp.path().join("biphasic_zero_order_sim.ferx");
+    std::fs::write(&path, src).expect("write model");
+    let err = ferx_core::run_model_simulate(path.to_str().unwrap())
+        .expect_err("biphasic zero-order must be rejected on the simulate path");
+    assert!(
+        err.contains("zero-order input-rate terms") && err.contains("compartment 1"),
+        "the simulate path must surface the biphasic-zero-order rejection, got: {err}"
     );
 }
 

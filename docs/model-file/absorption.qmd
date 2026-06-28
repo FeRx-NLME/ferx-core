@@ -500,7 +500,8 @@ A zero-order release (`FZO` of the dose, over `DUR`) plus a first-order phase
 
 A pathway fraction on `zero_order(...)` is supported here (the per-segment
 zero-order channel carries the fraction). At most **one** `zero_order(...)` term may
-feed a compartment — biphasic zero-order is rejected (`E_ABSORPTION_ZERO_ORDER_MULTI`).
+feed a compartment — biphasic zero-order is rejected when the model is parsed (so a
+`fit`, `simulate`, or `predict` run all surface the error the same way).
 
 ### Sensitivities
 

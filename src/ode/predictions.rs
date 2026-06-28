@@ -571,9 +571,9 @@ fn active_zero_order_inputs(
 ///
 /// `find_map` resolves **one** zero-order forcing per dose-compartment — the
 /// `mixed` model has exactly one (alongside a `first_order` on the same
-/// compartment), and `check_absorption_dosing` rejects `> 1` zero-order term on a
-/// compartment (biphasic zero-order, #505), so this single-forcing lookup never
-/// under-delivers.
+/// compartment), and the parser (`build_ode_spec`) rejects `> 1` zero-order term
+/// on a compartment (biphasic zero-order, #505), so this single-forcing lookup
+/// never under-delivers.
 fn zero_order_dur_and_frac_for_dose(
     ode: &OdeSpec,
     dose: &DoseEvent,

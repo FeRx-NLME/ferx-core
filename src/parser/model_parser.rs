@@ -6047,9 +6047,9 @@ fn extract_input_rate_terms(
             // A `FR*zero_order(...)` term (the `mixed` model, #505) is now accepted:
             // the per-segment zero-order channel (`zero_order_windows`) scales its
             // window rate by the pathway fraction. Multiple zero-order terms on one
-            // compartment (biphasic zero-order) are rejected at fit-init
-            // (`check_absorption_dosing`), since the single-window-per-dose channel
-            // would under-deliver them.
+            // compartment (biphasic zero-order) are rejected by the structural check
+            // in `build_ode_spec` (after the full forcing list is assembled), since
+            // the single-window-per-dose channel would under-deliver them.
 
             // Resolve each named arg into its declared slot position.
             let mut slots: Vec<Option<usize>> = vec![None; arg_names.len()];
@@ -6205,6 +6205,38 @@ fn build_ode_spec(
         indiv_param_names,
         indiv_param_slots,
     )?;
+
+    // Structural invariant (compile-time): **at most one zero-order forcing per
+    // compartment**. The per-segment zero-order channel
+    // (`predictions::zero_order_windows`) builds one window per dose and
+    // `zero_order_dur_and_frac_for_dose` resolves a *single* zero-order forcing per
+    // dose-compartment via `find_map`, so a second `zero_order(...)` on the same
+    // compartment would be silently under-delivered (#505). A `mixed` model pairs
+    // one zero-order with a `first_order(...)` (a freely-superposed Channel-A
+    // pointwise term) — that is allowed; only ≥2 *zero-order* terms on a
+    // compartment are rejected. Enforced here, in the parser, rather than in the
+    // data-level `api::check_absorption_dosing` so the `simulate()` / `predict()`
+    // paths — which never run that fit-init check — are guarded too (every entry
+    // point parses the model first).
+    {
+        let mut zero_order_per_cmt: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for f in &input_rate {
+            if f.kind == crate::pk::absorption::InputRateKind::ZeroOrder {
+                *zero_order_per_cmt.entry(f.cmt).or_insert(0) += 1;
+            }
+        }
+        if let Some((&cmt, &n)) = zero_order_per_cmt.iter().find(|&(_, &n)| n >= 2) {
+            return Err(format!(
+                "[odes]: compartment {} has {n} zero-order input-rate terms \
+                 (`zero_order(...)`). Multiple zero-order pathways on one compartment \
+                 (biphasic zero-order) are not supported — use at most one \
+                 `zero_order(...)` per compartment (a `mixed` model pairs it with a \
+                 `first_order(...)` term).",
+                cmt + 1
+            ));
+        }
+    }
 
     // For ODE RHS expressions, states + individual params get injected into the
     // `vars` map at eval time, so every bare identifier should resolve to a
