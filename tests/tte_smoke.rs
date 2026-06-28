@@ -2251,6 +2251,42 @@ mod survival_smoke {
         );
     }
 
+    #[test]
+    fn hazard_state_name_collision_errors() {
+        // A user ODE state literally named `__chz_3` collides with the synthetic
+        // accumulator the parser appends for the CMT=3 hazard — must error, not silently
+        // corrupt the user's state via a duplicate name.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  H0 = TVH0
+[structural_model]
+  ode(obs_cmt=central, states=[central, __chz_3])
+[odes]
+  d/dt(central) = -(CL/V) * central
+  d/dt(__chz_3) = 0
+[event_model]
+  cmt    = 3
+  hazard = H0
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let err = parse_model_string(src).expect_err("__chz_3 state-name collision must error");
+        assert!(
+            err.contains("reserved") || err.contains("collides"),
+            "error should flag the reserved-name collision; got: {err}"
+        );
+    }
+
     // One joint PK-TTE subject: oral dose + 2 PK obs + one (window-censored) TTE record.
     fn joint_pktte_pop() -> Population {
         let mut s = common::subject(

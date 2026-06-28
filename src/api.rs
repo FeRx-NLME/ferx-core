@@ -5778,6 +5778,13 @@ pub struct SurvivalPredictionResult {
 #[cfg(feature = "survival")]
 fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64 {
     let ln2 = std::f64::consts::LN_2;
+    // H(0) = 0 for a cumulative hazard, so if it has already reached ln2 by the first
+    // grid point the median lies in (0, grid[0]] — interpolate from the origin.
+    if let (Some(&t0), Some(&h0)) = (time_grid.first(), cum_haz.first()) {
+        if h0.is_finite() && h0 >= ln2 && t0 > 0.0 {
+            return t0 * ln2 / h0;
+        }
+    }
     for i in 1..time_grid.len() {
         let (h0, h1) = (cum_haz[i - 1], cum_haz[i]);
         if h0.is_finite() && h1.is_finite() && h0 < ln2 && h1 >= ln2 && h1 > h0 {
@@ -5852,28 +5859,19 @@ pub fn predict_survival(
                     rows.push((cmt, h_row, cum_row, t_median, t_mean));
                 }
                 crate::types::HazardSpec::OdeAccumulated { chz_state } => {
-                    let Some(ode) = model.ode_spec.as_ref() else {
+                    if model.ode_spec.is_none() {
                         continue;
-                    };
-                    let pk = (model.pk_param_fn)(&params.theta, &zero_eta, &subject.covariates);
-                    let states = crate::ode::ode_dense_solve_states(
-                        ode,
-                        &pk.values,
+                    }
+                    // Read H(t)/h(t) from the augmented ODE solve — shared with the TTE
+                    // likelihood via `crate::survival::ode_cumhaz_hazard`.
+                    let (cum_row, h_row) = crate::survival::ode_cumhaz_hazard(
+                        model,
+                        subject,
+                        *chz_state,
                         &params.theta,
                         &zero_eta,
-                        subject,
                         time_grid,
                     );
-                    let mut h_row = vec![f64::NAN; time_grid.len()];
-                    let mut cum_row = vec![f64::NAN; time_grid.len()];
-                    for (i, &t) in time_grid.iter().enumerate() {
-                        if let Some(s) = states.get(i) {
-                            cum_row[i] = s[*chz_state];
-                            let mut du = vec![0.0; ode.n_states];
-                            (ode.rhs)(s, &pk.values, t, &mut du);
-                            h_row[i] = du[*chz_state];
-                        }
-                    }
                     // Median where S(t) = 0.5 ⇔ H(t) = ln2, linearly interpolated on the
                     // grid (NaN if the grid never reaches it). Mean needs ∫₀^∞ S and is
                     // left NaN for ODE hazards (a numerical-to-∞ summary is a follow-up).
@@ -5929,6 +5927,13 @@ mod survival_predict_tests {
         // H never reaches ln2 on the grid → NaN.
         let never = grid_median_from_cumhaz(&grid, &[0.0, 0.1, 0.2, 0.3]);
         assert!(never.is_nan(), "no crossing → NaN; got {never}");
+        // Median at/before the first grid point (H(grid[0]) ≥ ln2): interpolated from the
+        // origin (0,0). grid[0]=2, H=2·ln2 ⇒ median = 2·ln2 / (2·ln2) = 1.0.
+        let early = grid_median_from_cumhaz(&[2.0, 4.0], &[ln2 * 2.0, ln2 * 4.0]);
+        assert!(
+            (early - 1.0).abs() < 1e-9,
+            "median before the first grid point interpolates from the origin; got {early}"
+        );
     }
 }
 

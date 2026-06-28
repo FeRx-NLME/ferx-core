@@ -132,11 +132,6 @@ fn tte_ode_nll(
     theta: &[f64],
     eta: &[f64],
 ) -> f64 {
-    let Some(ode) = model.ode_spec.as_ref() else {
-        return 1e20; // OdeAccumulated requires an ODE model (the parser enforces this)
-    };
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
-
     // Distinct times where H(t) — and h(t) for exact events — is needed.
     let mut times: Vec<f64> = Vec::new();
     for r in records {
@@ -160,30 +155,21 @@ fn tte_ode_nll(
     times.sort_by(|a, b| a.partial_cmp(b).expect("TTE event times are finite"));
     times.dedup();
 
-    let states = crate::ode::ode_dense_solve_states(ode, &pk.values, theta, eta, subject, &times);
-    if states.len() != times.len() {
-        return 1e20;
-    }
-
-    // tte_nll_from_curves calls these with the same f64 values that populated `times`,
-    // so an exact binary search resolves each lookup.
+    // Solve the augmented ODE once and read H/h at those times — shared with
+    // predict_survival via `ode_cumhaz_hazard` (a missing ODE or a short solve yields
+    // NaN curves, which `tte_nll_from_curves` maps to the 1e20 sentinel). The closures
+    // look up by the same f64 values that populated `times`, so the search is exact.
+    let (cum, haz) =
+        crate::survival::ode_cumhaz_hazard(model, subject, chz_state, theta, eta, &times);
     let cumhaz_at = |t: f64| -> f64 {
-        match times.binary_search_by(|x| x.partial_cmp(&t).unwrap()) {
-            Ok(i) => states[i][chz_state],
-            Err(_) => f64::NAN,
-        }
+        times
+            .binary_search_by(|x| x.partial_cmp(&t).unwrap())
+            .map_or(f64::NAN, |i| cum[i])
     };
     let hazard_at = |t: f64| -> f64 {
-        match times.binary_search_by(|x| x.partial_cmp(&t).unwrap()) {
-            Ok(i) => {
-                // h(t) is the cumulative-hazard derivative: the hazard RHS at the
-                // integrated state (dose forcings touch PK compartments, not CHZ).
-                let mut du = vec![0.0; ode.n_states];
-                (ode.rhs)(&states[i], &pk.values, t, &mut du);
-                du[chz_state]
-            }
-            Err(_) => f64::NAN,
-        }
+        times
+            .binary_search_by(|x| x.partial_cmp(&t).unwrap())
+            .map_or(f64::NAN, |i| haz[i])
     };
 
     crate::survival::tte_nll_from_curves(records, cumhaz_at, hazard_at)

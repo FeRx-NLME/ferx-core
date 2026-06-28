@@ -340,6 +340,45 @@ pub(crate) fn tte_cause_params(
     Some((*family, param_fn(theta, eta, covariates)))
 }
 
+/// Solve a subject's augmented ODE at `(theta, eta)` and read the cumulative hazard
+/// `H(t) = u[chz_state]` and instantaneous hazard `h(t) = u̇[chz_state]` at each `times`
+/// point (joint PK-TTE, #564). `times` must be the exact f64 values the caller will look
+/// up. Returns `(H, h)` aligned to `times`; an entry is NaN where the solve did not reach
+/// that time (or there is no ODE / the solve length disagrees). Shared by the TTE
+/// likelihood (`stats::likelihood::tte_ode_nll`) and `api::predict_survival` so the
+/// H/h-extraction contract lives in one place; one reusable derivative buffer serves all
+/// `h(t)` evaluations.
+#[cfg(feature = "survival")]
+pub(crate) fn ode_cumhaz_hazard(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    chz_state: usize,
+    theta: &[f64],
+    eta: &[f64],
+    times: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let n = times.len();
+    let (mut cum, mut haz) = (vec![f64::NAN; n], vec![f64::NAN; n]);
+    let Some(ode) = model.ode_spec.as_ref() else {
+        return (cum, haz);
+    };
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let states = crate::ode::ode_dense_solve_states(ode, &pk.values, theta, eta, subject, times);
+    if states.len() != n {
+        return (cum, haz);
+    }
+    // `h(t)` is the cumulative-hazard derivative: the bare hazard RHS at the integrated
+    // state (dose forcings touch PK compartments, not CHZ). One buffer, reused — only the
+    // `chz_state` slot is read, and the RHS always writes it.
+    let mut du = vec![0.0; ode.n_states];
+    for (i, &t) in times.iter().enumerate() {
+        cum[i] = states[i][chz_state];
+        (ode.rhs)(&states[i], &pk.values, t, &mut du);
+        haz[i] = du[chz_state];
+    }
+    (cum, haz)
+}
+
 /// Draw TTE event/censoring outcomes for a subject and append them to `results`.
 ///
 /// Called from `api::simulate_inner_with_draw` after the Gaussian path. Each

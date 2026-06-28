@@ -1197,6 +1197,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         for (cmt, hazard_expr) in prescan_ode_hazards(&extracted)? {
             let chz_idx = state_names.len();
             let state = format!("__chz_{cmt}");
+            if state_names.contains(&state) {
+                return Err(format!(
+                    "[odes]: state `{state}` collides with the cumulative-hazard accumulator \
+                     the parser appends for the [event_model] CMT={cmt} hazard (joint PK-TTE) \
+                     — rename the ODE state (`__chz_*` names are reserved)."
+                ));
+            }
             ode_lines.push(format!("d/dt({state}) = {hazard_expr}"));
             state_names.push(state);
             chz_state_map.insert(cmt, chz_idx);
