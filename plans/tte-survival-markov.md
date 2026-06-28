@@ -1,8 +1,8 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Phase 1 complete — ferx-core PRs #190, #192, #206 merged; ferx-r PRs #134 & #142 merged; open: Tier 3 slow-tests, NONMEM/nlmixr2 comparison table, `predict_survival` R wrapper, `[event_model]`→`[individual_parameters]` name threading  
-**Scope:** Active implementation — Phase 1b next  
-**Revised:** 2026-06-21 (no new TTE PRs since 2026-06-10; adjacent SAEM conditional-distribution pass #265 merged → §5.9; Enzyme/autodiff retired → §16 D8)
+**Status:** Phase 1 **and Phase 1b complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. Open follow-ups: `predict_survival` R wrapper + R-side TTE test; #469 (FOCEI nonlinear-frailty ω² ~17% high vs NONMEM, spin-off of #440). **Phase 2 (Joint PK-TTE, ODE hazard accumulator) started — Slice 2.1 (fit path) = #564.**  
+**Scope:** Active implementation — Phase 2 Slice 2.1 (#564)  
+**Revised:** 2026-06-27 (Phase 1b cleanup #531 merged via #563; Phase 2 kicked off — DSL decided = auto-append `hazard=`, fit-first slicing, Slice 2.1 tracked in #564; #440 spun off #469; markov/categorical phases untouched)
 
 ---
 
@@ -2228,54 +2228,82 @@ and the `predict_survival` R wrapper remain.
   (Weibull shape +72%, Gompertz gamma +62% at N=2000; does not vanish as ω²→0; SAEM of the same data
   reads ~0.13 vs FOCEI 0.34). Likelihood is exact (fixed-effects matches `survreg`); structural params
   recover. Confirms §3.3/§13 (SAEM/IMP preferred for TTE). FOCEI on a *linear* rate (Exponential) is
-  near-unbiased (−7%). Candidate Phase 3/3b follow-up: SAEM/IMP comparison + Shi FD-step audit (§9.3).
+  near-unbiased (−7%). **Spun off as #469** (FOCEI nonlinear-frailty ω² reads ~17% above NONMEM/nlmixr2
+  on identical data — inner-Hessian accuracy lead, still OPEN). Candidate Phase 3/3b follow-up:
+  SAEM/IMP comparison + Shi FD-step audit (§9.3). Validation issue **#440 CLOSED 2026-06-27** — the
+  3-tool comparison (ferx FOCEI + `survreg` + nlmixr2 + NONMEM LAPLACIAN) is fully filled and committed;
+  residual frailty work lives in #469.
 
 **Parser / DSL:**
-- ❌ `[event_model]` expressions cannot reference `[individual_parameters]` names — `param_fn`
-  evaluates in theta/eta/covariate namespace only; documented with Note callout; fix requires
-  threading individual_parameters evaluator into `parse_event_model_block`
+- ✅ `[event_model]` expressions can now reference `[individual_parameters]` names — **PR #442 merged
+  2026-06-22** (`91da4c37`; hardening `3c2394cb`). `param_fn` now threads the individual-parameters
+  evaluator into `parse_event_model_block`; kappa/IOV and NN refs rejected with a clear error.
 
 **ferx-r:**
 - ❌ `predict_survival` R wrapper — fully unblocked; ferx-r TTE routing is merged
 - ❌ R-side end-to-end TTE test (Tier 2: parse model with `[event_model]`, read CSV,
   verify `obs_records` populated, OFV finite)
 
-### Phase 1b — Competing risks (cause-specific hazard)
+### Phase 1b — Competing risks (cause-specific hazard) — ✅ complete
 
 **Scope:** Multiple event types, one `[event_model]` per CMT; a subject experiencing event
 type A is right-censored for type B at the same time. Shared random effects link the hazards.
 No new infrastructure beyond Phase 1 — this is multiple TTE endpoints with per-CMT routing.
 
-**Deliverables:**
-- Multiple `[event_model]` blocks keyed by distinct CMT; per-CMT `HazardSpec`
-- Datareader: per-event-type censoring rows (DV=1 on the experienced CMT, DV=0 on the others
+**Status: complete.** Landed across three merged PRs:
+- **#494** (merged 2026-06-24) — right-censor TTE simulation at the observation window; the
+  prerequisite simulation-censoring fix.
+- **#501** (merged 2026-06-25) — competing-risks TTE: earliest-cause event simulation + cause-specific
+  cumulative incidence (CIF / Aalen–Johansen). `examples/tte_competing_risks.ferx` + `data/tte_competing_risks.csv`.
+- **#526** (merged 2026-06-26, closes #522) — `[simulation] horizon` + TTE-row generation for the
+  competing-risks VPC.
+
+**Deliverables (all ✅):**
+- ✅ Multiple `[event_model]` blocks keyed by distinct CMT; per-CMT `HazardSpec` (Phase 1 infra #192)
+- ✅ Datareader: per-event-type censoring rows (DV=1 on the experienced CMT, DV=0 on the others
   at the same time) — see §3.6 data format
-- **Simulation**: draw each cause's latent event time independently; the observed event is the
-  earliest, its CMT is the cause; all other causes censored at that time (§8.8.2)
-- **Prediction**: per-cause `Prediction::Survival`; cause-specific cumulative incidence
-  function (CIF) `∫₀ᵗ h_k(u)·S_all(u) du` reported as a derived output
-- Reference: NONMEM cause-specific hazard; `survival::survfit` CIF (R, free)
-- Docs + comparison table in `docs/estimation/tte.qmd`; **Tier 3 SSE** (two competing causes)
+- ✅ **Simulation**: draw each cause's latent event time independently; the observed event is the
+  earliest, its CMT is the cause; all other causes censored at that time (§8.8.2) — #501
+- ✅ **Prediction**: per-cause cumulative incidence function (CIF) `∫₀ᵗ h_k(u)·S_all(u) du` (#501)
+- ✅ Docs + example in `docs/estimation/tte.qmd`; SSE / TTE-row VPC generation (#526)
+
+**Cleanup done:** #531 — review cleanups from #526 (fold sim write-back passes, share
+`gather_tte_causes`, reuse `has_tte()`) merged 2026-06-27 via PR #563. Refactor only, no
+behaviour change.
 
 **Note (Fine–Gray):** subdistribution-hazard / Fine–Gray CIF modeling is **deferred** (§10.2)
 — it needs IPCW weighting and is numerically unstable for sparse data. Cause-specific hazard
 covers the standard pharmacometric use case.
 
-### Phase 2 — Joint PK-TTE, ODE hazard accumulator
+### Phase 2 — Joint PK-TTE, ODE hazard accumulator — STARTED
 
 **Scope:** Drug-dependent hazard; CHZ as extra ODE state; shared ETA; PK + TTE simultaneously.
 
-**Deliverables:**
-- `HazardSpec::OdeAccumulated`; `chz_state` DSL keyword
-- Parser appends `dCHZ/dt = h(t)` to `OdeSpec`
-- **ODE event-location root-finder** `integrate_until_threshold` (§8.8.3) — shared infra for
-  drug-driven event-time simulation
-- **Selective per-state ODE reset** (§8.8.6): zero CHZ between events while preserving PK
-  compartments. Needed only by **clock-reset RTTE** (Phase 3); built here as shared infra
+**DSL (decided 2026-06-27): auto-append `hazard=`.** User writes `hazard = <expr>` in
+`[event_model]` (referencing ODE amounts / theta / eta / covariates); the parser synthesizes and
+appends `__chz' = <expr>` (init 0) to `OdeSpec` and records its state index on the endpoint. No
+user-written accumulator. Expression compiles in the ODE-RHS namespace (reuses #442 threading).
+
+**Slice 2.1 — fit path (#564, in progress):**
+- `HazardSpec::OdeAccumulated { chz_state, hazard_fn }` (replaces the `// deferred` placeholder)
+- Parser appends `dCHZ/dt = hazard` to `OdeSpec`; rejects `hazard` + analytic `family` together
+- `tte_data_term` ODE branch reads `H(T)` / `h(T)` from the ODE solution (Exact + RightCensored)
+- FOCEI FD-Hessian re-integrates the ODE per perturbed η; SAEM M-step mirrors it
+- `predict_survival` from the ODE; simulate of `OdeAccumulated` guarded with a "Slice 2.2" error
+- NONMEM `$DES`+CHZ anchor + nlmixr2 (local); **Tier-2 smoke** (coverage gate);
+  `examples/pktte_weibull.ferx`
+
+**Slice 2.2 — simulation:**
+- **ODE event-location root-finder** `integrate_until_threshold` (§8.8.3) — shared infra
 - **Simulation**: drug-driven hazard event-time sampling via the root-finder
-- NONMEM comparison (joint $DES + CHZ)
-- Example: `examples/pktte_weibull.ferx`
-- Tests: Tier 2 smoke; Tier 3 convergence; **Tier 3 SSE** for joint PK-TTE
+- **Tier-3 SSE** (simulate → fit → recover) + Tier-3 convergence
+
+**Slice 2.3 — docs/example polish + comparison table.**
+
+**Deferred:**
+- **Selective per-state ODE reset** (§8.8.6) → Phase 3 (clock-reset RTTE; no Phase 2 consumer;
+  sub-integration fallback available)
+- `IntervalCensored`+ODE and left-truncation (`entry_time>0`)+ODE → small follow-ups after 2.1
 
 ### Phase 3 — RTTE
 
@@ -2645,13 +2673,13 @@ for TTE/categorical is **default-on**.
 
 ## 18. Milestone Order
 
-1. **Phase 1** — Parametric TTE, Laplace (incl. left truncation / delayed entry)  
-   All new infrastructure. Lowest risk. Validates FD Hessian + log-det term.
+1. **Phase 1** ✅ — Parametric TTE, Laplace (incl. left truncation / delayed entry)  
+   All new infrastructure. Lowest risk. Validates FD Hessian + log-det term. (#190/#192/#206/#441/#442)
 
-2. **Phase 1b** — Competing risks (cause-specific hazard)  
-   No new infrastructure; multiple TTE endpoints. Can land with or right after Phase 1.
+2. **Phase 1b** ✅ — Competing risks (cause-specific hazard)  
+   No new infrastructure; multiple TTE endpoints. (#494/#501/#526; cleanup #531 via #563)
 
-3. **Phase 2** — Joint PK-TTE, ODE hazard accumulator  
+3. **Phase 2** — Joint PK-TTE, ODE hazard accumulator ← **IN PROGRESS** (Slice 2.1 = #564)  
    Most clinically demanded. Extends Phase 1 via ODE.
 
 4. **Phase 3** — RTTE + **Phase 3b** SAEM proposal option  

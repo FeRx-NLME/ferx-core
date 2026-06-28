@@ -682,16 +682,22 @@ fn tte_convergence_weibull_mixed() {
         (1.5..2.8).contains(&shape),
         "shape off: got {shape:.4}, expected ~2"
     );
-    // On this single n=100 realisation ferx's shape-frailty omega^2 is ~0.204 — at the
-    // truth, because the FOCEI over-estimation that the large-N SSE isolates (~0.34) is
-    // masked by single-realisation noise here; nlmixr2 reads 0.173 on the same file
-    // (the cross-tool spread is itself #440 evidence). Narrow characterization band
-    // around ferx's deterministic value — the previous (0.05..0.70) was far too wide to
-    // catch a regression (#441 review #4). The bias itself is tracked by the SSE test
-    // above, not here.
+    // On this single n=100 realisation ferx's shape-frailty omega^2 is ~0.176 — on the
+    // NONMEM LAPLACIAN (0.175) / nlmixr2 FOCEI (0.173) consensus. Before #469 ferx read
+    // 0.204 here: the derivative-free BOBYQA outer optimizer false-converged on the
+    // near-flat ω² ridge (the whole 0.175→0.204 span is <0.01 OFV) because its ftol_rel
+    // default (1e-6) stopped it short of ferx's *own* profile minimum (which already sat
+    // at ~0.175). Tightening the TTE ftol to 1e-8 (#469; auto-selected for pure-TTE
+    // models, whose hazard objective is evaluated exactly) walks it down to the
+    // consensus. This is a pure optimizer-convergence fix, distinct from the FOCEI-
+    // Laplace *method* bias on nonlinear frailty (the large-N SSE above still reads
+    // ~0.34 — that bias is unchanged, and tracked by #440). Band brackets the
+    // deterministic 0.176 and EXCLUDES the pre-#469 0.204, so a regression in the outer
+    // ftol (or its TTE auto-selection) fails here.
     assert!(
-        (0.17..0.24).contains(&omega2),
-        "omega^2 {omega2:.4} off ferx's documented ~0.204 on this file (truth 0.20, nlmixr2 0.173); see expected.md / #440"
+        (0.16..0.19).contains(&omega2),
+        "omega^2 {omega2:.4} off ferx's post-#469 ~0.176 (NONMEM 0.175 / nlmixr2 0.173); \
+         a value near 0.204 means the BOBYQA TTE ftol tightening regressed. See expected.md / #469"
     );
     assert!(r.ofv.is_finite(), "OFV must be finite");
 }

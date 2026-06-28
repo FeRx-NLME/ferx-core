@@ -3786,6 +3786,24 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "maxiter" => opts.outer_maxiter = parse_usize("maxiter")?,
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
+        "outer_xtol" => {
+            let v = parse_f64("outer_xtol")?;
+            if v <= 0.0 || !v.is_finite() {
+                return Err(format!(
+                    "outer_xtol must be a positive finite value, got {v}"
+                ));
+            }
+            opts.outer_xtol = v;
+        }
+        "outer_ftol" => {
+            let v = parse_f64("outer_ftol")?;
+            if v <= 0.0 || !v.is_finite() {
+                return Err(format!(
+                    "outer_ftol must be a positive finite value, got {v}"
+                ));
+            }
+            opts.outer_ftol = Some(v);
+        }
         "ode_reltol" => {
             let v = parse_f64("ode_reltol")?;
             if v <= 0.0 || !v.is_finite() {
@@ -4025,6 +4043,17 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 return Err("fit option `iscale_max` must be > 0".to_string());
             }
             opts.iscale_max = v;
+        }
+        // `impmap_defensive_alpha` is an alias for `imp_defensive_alpha`: the
+        // defensive mixture is shared IMP/IMPMAP machinery, so both names write
+        // the same field (issue #528). The alias keeps the `impmap_*` namespace
+        // discoverable for IMPMAP users.
+        "imp_defensive_alpha" | "impmap_defensive_alpha" => {
+            let v = parse_f64(key)?;
+            if !(0.0..1.0).contains(&v) {
+                return Err(format!("fit option `{key}` must be in [0, 1), got {v}"));
+            }
+            opts.imp_defensive_alpha = v;
         }
         "npde_nsim" => opts.npde_nsim = parse_usize("npde_nsim")?,
         "npde_seed" => opts.npde_seed = parse_u64_opt("npde_seed")?,
@@ -14654,6 +14683,33 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_imp_defensive_alpha() {
+        // Default is opt-out (legacy single-proposal sampler); the mixture is
+        // opt-in (issue #528).
+        assert_eq!(parse_fit_options(&[]).unwrap().imp_defensive_alpha, 0.0);
+        // In-range values are accepted.
+        let opts = parse_fit_options(&["imp_defensive_alpha = 0.25".to_string()]).unwrap();
+        assert_eq!(opts.imp_defensive_alpha, 0.25);
+        assert_eq!(
+            parse_fit_options(&["imp_defensive_alpha = 0.0".to_string()])
+                .unwrap()
+                .imp_defensive_alpha,
+            0.0
+        );
+        // `impmap_defensive_alpha` is an accepted alias for the same field.
+        assert_eq!(
+            parse_fit_options(&["impmap_defensive_alpha = 0.1".to_string()])
+                .unwrap()
+                .imp_defensive_alpha,
+            0.1
+        );
+        // Out of [0, 1) is rejected at parse time, under either spelling.
+        assert!(parse_fit_options(&["imp_defensive_alpha = 1.0".to_string()]).is_err());
+        assert!(parse_fit_options(&["imp_defensive_alpha = -0.1".to_string()]).is_err());
+        assert!(parse_fit_options(&["impmap_defensive_alpha = 1.0".to_string()]).is_err());
+    }
+
+    #[test]
     fn test_parse_covariance_fallback_none_and_sir() {
         use crate::types::CovarianceFallback;
         let opts = parse_fit_options(&["covariance_fallback = sir".to_string()]).unwrap();
@@ -16340,6 +16396,23 @@ mod tests {
 
         assert!(apply_fit_option(&mut opts, "inner_maxiter", "oops").is_err());
         assert!(apply_fit_option(&mut opts, "inner_tol", "not_a_num").is_err());
+    }
+
+    #[test]
+    fn test_apply_fit_option_outer_xtol_ftol() {
+        let mut opts = FitOptions::default();
+        assert_eq!(apply_fit_option(&mut opts, "outer_xtol", "1e-5"), Ok(true));
+        assert!((opts.outer_xtol - 1e-5).abs() < 1e-20);
+        assert_eq!(apply_fit_option(&mut opts, "outer_ftol", "1e-9"), Ok(true));
+        assert!((opts.outer_ftol.unwrap() - 1e-9).abs() < 1e-24);
+        // Default is None (auto: 1e-8 for pure-TTE, 1e-6 otherwise).
+        assert_eq!(FitOptions::default().outer_ftol, None);
+
+        // Non-numeric, non-positive, and non-finite values are rejected.
+        assert!(apply_fit_option(&mut opts, "outer_xtol", "not_a_num").is_err());
+        assert!(apply_fit_option(&mut opts, "outer_ftol", "0").is_err());
+        assert!(apply_fit_option(&mut opts, "outer_ftol", "-1e-8").is_err());
+        assert!(apply_fit_option(&mut opts, "outer_xtol", "inf").is_err());
     }
 
     #[test]

@@ -2569,6 +2569,33 @@ impl CompiledModel {
         )
     }
 
+    /// True when a residual error model is defined for `cmt` *and* its sigmas
+    /// resolve in `sigma`, so a DV (assay-noised) observation can be drawn there.
+    /// False for a [`ErrorSpec::PerCmt`] spec that omits `cmt` (or whose endpoint
+    /// `sigma_idx` falls outside `sigma`), or a `Single` model whose `sigma` is
+    /// shorter than its error model needs (`< n_sigma` — e.g. a `Combined` model
+    /// carrying one σ, down to no `[error_model]` at all). `simulate_adaptive`
+    /// consults this before drawing a DV monitor so an un-modeled compartment is a
+    /// typed error rather than a fabricated σ (#391 S1.5 edge a) — and so
+    /// [`residual_variance_at`](Self::residual_variance_at), which indexes
+    /// `sigma[0..n_sigma]` for a `Single` model (and the endpoint's `sigma_idx` for
+    /// a `PerCmt` one), is never reached with a `sigma` too short to cover it
+    /// (which would otherwise **panic** for `Single` or return **NaN** for
+    /// `PerCmt`). The two branches are symmetric: each requires `sigma` to cover
+    /// every index the variance computation will read.
+    pub fn has_residual_error_for_cmt(&self, cmt: usize, sigma: &[f64]) -> bool {
+        match &self.error_spec {
+            ErrorSpec::Single(em) => sigma.len() >= em.n_sigma(),
+            ErrorSpec::PerCmt(map) => map.get(&cmt).is_some_and(|ep| {
+                // The endpoint must carry enough sigma indices for its model *and*
+                // every one must resolve in `sigma`; `variance_at` reads
+                // `sigma_idx[0..n_sigma]`, so either shortfall yields a NaN variance.
+                ep.sigma_idx.len() >= ep.error_model.n_sigma()
+                    && ep.sigma_idx.iter().all(|&i| i < sigma.len())
+            }),
+        }
+    }
+
     /// Multiplicative factor applied to the residual *variance* for a subject
     /// whose random-effect vector is `eta`, from the IIV-on-RUV term
     /// (`Y = IPRED + EPS*EXP(ETA)`). Returns `exp(2*eta[k])` when
@@ -3551,6 +3578,22 @@ pub struct FitOptions {
     pub methods: Vec<EstimationMethod>,
     pub outer_maxiter: usize,
     pub outer_gtol: f64,
+    /// Relative **step** tolerance for the derivative-free outer optimizer
+    /// (`Bobyqa`): NLopt's `xtol_rel`, controlling how far the trust radius must
+    /// shrink to declare success. Default `1e-4` (~0.01% move in the natural-scale
+    /// parameter). Other optimizers use their own fixed internal tolerances.
+    pub outer_xtol: f64,
+    /// Relative **objective** tolerance for the derivative-free outer optimizer
+    /// (`Bobyqa`): NLopt's `ftol_rel`, the relative OFV change below which the
+    /// optimizer stops. `None` (the default) auto-selects per model: `1e-8` for a
+    /// pure-TTE model (an *exactly*-evaluated hazard objective, where the looser
+    /// historical `1e-6` stopped short on a near-flat frailty-ω² ridge — #469 — and
+    /// the reported variance landed above its own minimum), and `1e-6` otherwise.
+    /// The `1e-6` floor for non-TTE fits is deliberate: on a *noisy* objective
+    /// (ODE solver error, FD-inner FOCE) a tighter `ftol` is unreachable, so BOBYQA
+    /// grinds toward its maxeval budget instead of converging. `Some(x)` pins `x`
+    /// for every model, overriding the auto-selection.
+    pub outer_ftol: Option<f64>,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
     /// RK45 ODE solver relative tolerance (`[fit_options] ode_reltol`, or via
@@ -3797,6 +3840,27 @@ pub struct FitOptions {
     /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
     /// Default 10.0.
     pub iscale_max: f64,
+    /// Defensive-mixture weight for the IMP/IMPMAP importance-sampling proposal
+    /// (issue #528). Each subject draws an `imp_defensive_alpha` fraction of its
+    /// samples from the prior `N(0, Ω)` instead of the mode-centred t-proposal,
+    /// and every sample is scored under the resulting mixture density. Because
+    /// the prior is guaranteed to cover the conditional posterior, this bounds
+    /// each importance weight by `p(y|η)/alpha`, so no single sample from a
+    /// weakly-identified subject (e.g. an analytical `[initial_conditions]`
+    /// baseline whose V cancels in the amplitude) can hijack the importance-
+    /// weighted M-step and walk θ to the bounds. (It bounds the weights, not the
+    /// raw ESS — a sharp interior likelihood spike can still keep ESS low.)
+    /// Applies to the estimating IMP/IMPMAP phases (including the FREM
+    /// Rao-Blackwell path) and the eval-only IS marginal-likelihood pass. Must be
+    /// in `[0, 1)`. Default `0.0` — the mixture is **opt-in**, so the default
+    /// reproduces the pre-#528 single-proposal sampler and stays bit-comparable
+    /// with NONMEM (which has no defensive mixture); set a small positive value
+    /// (e.g. `0.1`) to enable the rescue for weakly-identified models. For an
+    /// IMPMAP stage the option may also be written as `impmap_defensive_alpha`
+    /// (an alias for this same field). Enabling the mixture disables Sobol QMC and
+    /// raises the per-subject ESS floor by ≈`alpha` (so `imp_low_ess_threshold`
+    /// flags fewer subjects).
+    pub imp_defensive_alpha: f64,
     /// How LOQ-censored observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -3982,6 +4046,16 @@ impl Default for FitOptions {
             methods: Vec::new(),
             outer_maxiter: 500,
             outer_gtol: 1e-6,
+            // BOBYQA trust-region stop tolerances (NLopt xtol_rel/ftol_rel).
+            // `outer_ftol = None` auto-selects 1e-8 for pure-TTE (exact objective)
+            // and 1e-6 elsewhere (#469): the historical 1e-6 stopped the derivative-
+            // free outer optimizer short on the near-flat frailty-ω² ridge (read
+            // 0.204 vs the NONMEM/nlmixr2 0.175 consensus; at 1e-8 it lands 0.176),
+            // but on a *noisy* objective (ODE/FD-inner) 1e-8 is unreachable and
+            // BOBYQA grinds to maxeval, so non-TTE fits keep 1e-6. Override either
+            // via `[fit_options] outer_xtol`/`outer_ftol`.
+            outer_xtol: 1e-4,
+            outer_ftol: None,
             inner_maxiter: 200,
             // 1e-5, not the looser 1e-4 that an earlier comment justified as
             // matching "NONMEM's ~3-SIGDIGITS inner loop" — that conflated the
@@ -4074,6 +4148,7 @@ impl Default for FitOptions {
             impmap_auto: true,
             iscale_min: 0.1,
             iscale_max: 10.0,
+            imp_defensive_alpha: 0.0,
             bloq_method: BloqMethod::Drop,
             npde_nsim: 0,
             npde_seed: None,
@@ -4488,6 +4563,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_optimizer",
             "optimizer",
+            "outer_xtol",
+            "outer_ftol",
             "steihaug_max_iters",
             "global_search",
             "global_maxeval",
@@ -4507,6 +4584,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_optimizer",
             "optimizer",
+            "outer_xtol",
+            "outer_ftol",
             "steihaug_max_iters",
             "global_search",
             "global_maxeval",
@@ -4547,6 +4626,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_max",
             "frem_rao_blackwell",
             "imp_auto",
+            "imp_defensive_alpha",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -4565,6 +4645,11 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_max",
             "frem_rao_blackwell",
             "impmap_auto",
+            // Both spellings write the same field; `impmap_*` is the canonical
+            // IMPMAP form, `imp_*` is accepted so neither is wrongly flagged
+            // "unsupported" (issue #528).
+            "impmap_defensive_alpha",
+            "imp_defensive_alpha",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",
@@ -6245,5 +6330,69 @@ mod tests {
         }];
         let v = model.residual_variance_at(0, 10.0, &[0.2, 1.0]);
         assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn has_residual_error_for_cmt_covers_single_and_per_cmt() {
+        let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+
+        // Single error model: defined for every cmt iff sigma covers its n_sigma.
+        model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        assert!(model.has_residual_error_for_cmt(1, &[0.1]));
+        assert!(model.has_residual_error_for_cmt(99, &[0.1]));
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[]),
+            "no sigma ⇒ no error model"
+        );
+        // A Combined model needs two sigmas; one is too short — `residual_variance`
+        // would otherwise index `sigma[1]` and PANIC (symmetric to the PerCmt
+        // out-of-range guard below, never a fabricated σ).
+        model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+        assert!(model.has_residual_error_for_cmt(1, &[0.1, 0.2]));
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[0.1]),
+            "Combined needs 2 sigmas; 1 is too short to draw a DV"
+        );
+
+        // PerCmt: defined only for compartments present in the map.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            2usize,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        model.error_spec = ErrorSpec::PerCmt(map);
+        assert!(
+            model.has_residual_error_for_cmt(2, &[0.1]),
+            "cmt 2 has an endpoint"
+        );
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[0.1]),
+            "cmt 1 is not in the map"
+        );
+        // An endpoint whose sigma_idx falls outside `sigma` is not drawable —
+        // `residual_variance_at` would otherwise return NaN (symmetric to the
+        // Single empty-sigma guard, never a fabricated σ).
+        assert!(
+            !model.has_residual_error_for_cmt(2, &[]),
+            "cmt 2's sigma_idx is out of range for an empty sigma"
+        );
+        // A Combined endpoint needs two sigma indices; one is too few — `variance_at`
+        // would read `sigma_idx[1]` (absent) and return NaN even though sigma is long.
+        let mut combined_map = std::collections::HashMap::new();
+        combined_map.insert(
+            2usize,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![0], // only one index for a two-sigma model
+            },
+        );
+        model.error_spec = ErrorSpec::PerCmt(combined_map);
+        assert!(
+            !model.has_residual_error_for_cmt(2, &[0.1, 0.2]),
+            "a Combined endpoint with too few sigma indices is not drawable"
+        );
     }
 }

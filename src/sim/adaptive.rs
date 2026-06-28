@@ -311,6 +311,92 @@ pub struct AdaptiveRun {
     pub decisions: Vec<DecisionLogEntry>,
 }
 
+// ── Controller-assay RNG substream (#391 S1.5) ──────────────────────────────
+//
+// A DV-mode monitor observes a *realized* measurement = IPRED + ε·√(residual
+// variance). Those ε draws live on their **own** per-purpose substream, separate
+// from the η draws and the (currently latent) output trajectory, and each draw is
+// independently keyed by `(subject, replicate, decision_index, analyte)`. Keying
+// by identity rather than draw order makes the assay noise:
+//   * **deterministic** — a pure function of the run seed and the key;
+//   * **permutation-invariant** — subject iteration order cannot change a
+//     subject's draws (Part E);
+//   * **non-perturbing** — adding a monitor (a new analyte) or a decision never
+//     shifts any other monitor's draws, because no draw consumes a shared stream
+//     position.
+// The controller-less frozen-replay verifier therefore reproduces the trajectory
+// regardless of these draws (it replays realized doses, not decisions).
+
+/// Purpose tag folded into the assay seed so the controller-assay stream is
+/// disjoint from any other stream derived from the same run seed (η, output).
+const ASSAY_PURPOSE_SALT: u64 = 0xA55A_E155_0DE0_0001;
+
+/// 64-bit golden-ratio odd constant for seed mixing (same family as the
+/// per-chain seeding in `estimation/bayes.rs`).
+const GOLDEN64: u64 = 0x9E37_79B9_7F4A_7C15;
+
+/// FNV-1a 64-bit hash of a string — a *stable* (cross-platform, cross-run) hash
+/// for keying substreams by subject id / analyte name. `DefaultHasher` is
+/// deliberately avoided because its output is not guaranteed stable across builds.
+pub(crate) fn stable_hash_str(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Fold one more key component into a running seed (a splitmix64 finalizer over a
+/// golden-ratio-scrambled component). Order-sensitive, so distinct key tuples map
+/// to distinct seeds.
+pub(crate) fn combine_seed(seed: u64, component: u64) -> u64 {
+    let mut z = seed ^ component.wrapping_mul(GOLDEN64);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+/// Per-(subject, replicate) base seed for the controller-assay substream, rooted
+/// at the run-level `root` seed. Keyed by the subject *id* (not its loop
+/// position), so the stream is permutation-invariant.
+pub(crate) fn subject_assay_base_seed(root: u64, subject_id: &str, replicate: usize) -> u64 {
+    let s = combine_seed(root ^ ASSAY_PURPOSE_SALT, stable_hash_str(subject_id));
+    combine_seed(s, replicate as u64)
+}
+
+/// One standard-normal assay draw for monitor `analyte` at decision
+/// `decision_index`, on the substream rooted at `base_seed`. A fresh RNG is seeded
+/// per draw from the full key, so the draw depends on nothing else in the run
+/// (the non-perturbing property).
+pub(crate) fn assay_standard_normal(base_seed: u64, decision_index: usize, analyte: &str) -> f64 {
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, Normal};
+    let key = combine_seed(
+        combine_seed(base_seed, decision_index as u64),
+        stable_hash_str(analyte),
+    );
+    let mut rng = rand::rngs::StdRng::seed_from_u64(key);
+    Normal::new(0.0, 1.0).unwrap().sample(&mut rng)
+}
+
+/// Assay-noise capability threaded into
+/// [`crate::ode::predictions::ode_predictions_adaptive`] so it can resolve
+/// DV-mode monitors (#391 S1.5). Bundles the residual-variance resolver (already
+/// folded with the subject's `ruv_scale`) and the per-(subject, replicate) base
+/// seed that keys the controller-assay substream.
+///
+/// `resid_var(cmt, ipred)` returns `Some(variance)` for a compartment that has a
+/// residual error model and `None` when none is defined — the driver turns the
+/// `None` into a typed error rather than fabricating a σ (S1.5 edge a).
+pub(crate) struct AssayNoise<'a> {
+    /// `(cmt, ipred) -> Some(residual variance incl. ruv_scale)`, or `None` when
+    /// no residual error model covers `cmt`.
+    pub resid_var: &'a dyn Fn(usize, f64) -> Option<f64>,
+    /// Per-(subject, replicate) base seed; see [`subject_assay_base_seed`].
+    pub base_seed: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +587,95 @@ mod tests {
         .is_ok());
         assert!(DoseAction::Hold.validate().is_ok());
         assert!(DoseAction::Stop.validate().is_ok());
+    }
+
+    // ----- S1.5: controller-assay substream seed helpers ----------------
+
+    #[test]
+    fn stable_hash_str_is_deterministic_and_distinguishes() {
+        assert_eq!(stable_hash_str("CONC"), stable_hash_str("CONC"));
+        assert_ne!(stable_hash_str("CONC"), stable_hash_str("ANC"));
+        // Empty string is well-defined (the FNV-1a offset basis).
+        assert_eq!(stable_hash_str(""), 0xcbf2_9ce4_8422_2325);
+    }
+
+    #[test]
+    fn combine_seed_is_order_sensitive() {
+        // Folding components in a different order yields a different seed, so key
+        // tuples map injectively enough for substream separation.
+        assert_ne!(
+            combine_seed(combine_seed(0, 1), 2),
+            combine_seed(combine_seed(0, 2), 1)
+        );
+    }
+
+    #[test]
+    fn subject_assay_base_seed_separates_subjects_and_replicates() {
+        let a = subject_assay_base_seed(42, "subj-1", 1);
+        assert_eq!(a, subject_assay_base_seed(42, "subj-1", 1), "deterministic");
+        assert_ne!(
+            a,
+            subject_assay_base_seed(42, "subj-2", 1),
+            "subject id keys the stream"
+        );
+        assert_ne!(
+            a,
+            subject_assay_base_seed(42, "subj-1", 2),
+            "replicate keys the stream"
+        );
+        assert_ne!(
+            a,
+            subject_assay_base_seed(7, "subj-1", 1),
+            "root seed keys the stream"
+        );
+    }
+
+    #[test]
+    fn assay_standard_normal_is_deterministic_and_key_separated() {
+        let x = assay_standard_normal(100, 0, "A");
+        assert_eq!(x, assay_standard_normal(100, 0, "A"), "deterministic");
+        assert_ne!(
+            x,
+            assay_standard_normal(100, 1, "A"),
+            "decision index keys the draw"
+        );
+        assert_ne!(
+            x,
+            assay_standard_normal(100, 0, "B"),
+            "analyte keys the draw"
+        );
+        assert_ne!(
+            x,
+            assay_standard_normal(101, 0, "A"),
+            "base seed keys the draw"
+        );
+    }
+
+    #[test]
+    fn assay_standard_normal_spans_both_signs() {
+        // The clamp (edge b) is only reachable if draws can be negative; confirm the
+        // generator produces both signs across keys, with a mean near 0.
+        let n = 2000;
+        let draws: Vec<f64> = (0..n).map(|i| assay_standard_normal(1, i, "A")).collect();
+        assert!(
+            draws.iter().any(|&d| d < 0.0),
+            "some draws must be negative"
+        );
+        assert!(
+            draws.iter().any(|&d| d > 0.0),
+            "some draws must be positive"
+        );
+        let mean = draws.iter().sum::<f64>() / n as f64;
+        assert!(
+            mean.abs() < 0.1,
+            "standard-normal draws should center near 0, got {mean}"
+        );
+        // Unit variance too, so the noise scale is right (a mis-scaled generator
+        // would still pass the sign/mean checks).
+        let var = draws.iter().map(|&d| (d - mean).powi(2)).sum::<f64>() / n as f64;
+        assert!(
+            (var - 1.0).abs() < 0.2,
+            "standard-normal draws should have ~unit variance, got {var}"
+        );
     }
 }
