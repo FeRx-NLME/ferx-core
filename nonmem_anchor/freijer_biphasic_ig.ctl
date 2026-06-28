@@ -27,8 +27,8 @@ $PK
   FR1   = THETA(3)         ; fraction of dose through the fast pathway
   MAT1  = THETA(4)         ; fast-pathway mean absorption time (h)
   MAT2  = THETA(5)         ; slow-pathway mean absorption time (h)
-  CV2_1 = THETA(6)         ; fast-pathway relative dispersion (Var/mean^2)
-  CV2_2 = THETA(7)         ; slow-pathway relative dispersion
+  CV21 = THETA(6)         ; fast-pathway relative dispersion (Var/mean^2) = ferx CV2_1
+  CV22 = THETA(7)         ; slow-pathway relative dispersion             = ferx CV2_2
 
   FR2 = 1.0 - FR1
   K20 = CL/V
@@ -47,10 +47,10 @@ $DES
   TAD = T - TDOS
   IF (TAD.LE.1.0E-10) TAD = 1.0E-10
   ; Each pathway: IGi = PODO * sqrt(MATi/(2*pi*CV2i*tad^3)) * exp(-(tad-MATi)^2/(2*CV2i*MATi*tad))
-  AG1 = -(TAD - MAT1)**2 / (2.0*CV2_1*MAT1*TAD)
-  IG1 = PODO*SQRT(MAT1/(2.0*PI*CV2_1*TAD**3))*EXP(AG1)
-  AG2 = -(TAD - MAT2)**2 / (2.0*CV2_2*MAT2*TAD)
-  IG2 = PODO*SQRT(MAT2/(2.0*PI*CV2_2*TAD**3))*EXP(AG2)
+  AG1 = -(TAD - MAT1)**2 / (2.0*CV21*MAT1*TAD)
+  IG1 = PODO*SQRT(MAT1/(2.0*PI*CV21*TAD**3))*EXP(AG1)
+  AG2 = -(TAD - MAT2)**2 / (2.0*CV22*MAT2*TAD)
+  IG2 = PODO*SQRT(MAT2/(2.0*PI*CV22*TAD**3))*EXP(AG2)
   RIN = FR1*IG1 + FR2*IG2        ; biphasic input rate (dose split FR1 / 1-FR1)
   DADT(1) = 0.0                  ; depot is an inert dose carrier
   DADT(2) = RIN - K20*A(2)       ; biphasic IG input straight into central
@@ -65,8 +65,8 @@ $THETA
   (0.001, 0.6,  0.999) ; 3 FR1         fast-pathway fraction
   (0.05,  0.5,  2.0)   ; 4 MAT1  (h)   fast pathway (bounded < MAT2 to break label symmetry)
   (2.0,   4.0,  24)    ; 5 MAT2  (h)   slow pathway
-  (0.001, 0.2,  10)    ; 6 CV2_1       fast-pathway dispersion
-  (0.001, 0.5,  10)    ; 7 CV2_2       slow-pathway dispersion
+  (0.001, 0.2,  10)    ; 6 CV21       fast-pathway dispersion
+  (0.001, 0.5,  10)    ; 7 CV22       slow-pathway dispersion
 
 $OMEGA
   0.09    ; IIV CL
