@@ -383,6 +383,28 @@ pub fn simulate_tte<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<crate::api::SimulationResult>,
 ) {
+    // ODE-accumulated (joint PK-TTE) hazards have no closed-form event-time inverse;
+    // drug-driven event-time sampling needs the Slice 2.2 ODE root-finder. The
+    // Result-returning `simulate_with_options` rejects this gracefully before reaching
+    // here; the bare `simulate()` / `simulate_with_seed()` (which return a Vec and cannot
+    // otherwise signal an error) hit this backstop rather than silently emitting no rows.
+    for record in &subject.obs_records {
+        let ObsRecord::Event { cmt, .. } = record;
+        if matches!(
+            model.endpoints.get(cmt),
+            Some(EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { .. }
+            })
+        ) {
+            panic!(
+                "simulate() does not yet support ODE-accumulated TTE hazards (joint PK-TTE, \
+                 CMT={cmt}); drug-driven event-time sampling lands in Slice 2.2 (#564). Call \
+                 simulate_with_options(...) for a graceful error, or use an analytic \
+                 [event_model] family."
+            );
+        }
+    }
+
     // Gather this subject's TTE causes — records routed to a `Tte` endpoint —
     // with each cause's drawn-parameter vector, entry time and window. (A subject
     // may also carry non-TTE records; those are skipped here.)

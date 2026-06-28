@@ -2195,4 +2195,104 @@ mod survival_smoke {
             "error should flag the IOV limitation; got: {err}"
         );
     }
+
+    // One joint PK-TTE subject: oral dose + 2 PK obs + one (window-censored) TTE record.
+    fn joint_pktte_pop() -> Population {
+        let mut s = common::subject(
+            "1",
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            vec![2.0, 8.0],
+            vec![30.0, 20.0],
+            vec![1, 1],
+        );
+        s.obs_records = vec![ObsRecord::Event {
+            time: 24.0,
+            event_type: EventType::RightCensored,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        Population {
+            covariate_names: vec![],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+            subjects: vec![s],
+        }
+    }
+
+    #[test]
+    fn predict_survival_joint_pktte_reads_ode_hazard() {
+        use ferx_core::predict_survival;
+        let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
+        let pop = joint_pktte_pop();
+        let grid = [0.0, 4.0, 8.0, 16.0, 24.0];
+        let preds = predict_survival(&model, &pop, &model.default_params, &grid);
+
+        assert_eq!(
+            preds.len(),
+            grid.len(),
+            "one row per grid point (single TTE CMT)"
+        );
+        assert!(
+            preds[0].cum_hazard.abs() < 1e-9,
+            "H(0)=0; got {}",
+            preds[0].cum_hazard
+        );
+        assert!(
+            (preds[0].survival - 1.0).abs() < 1e-9,
+            "S(0)=1; got {}",
+            preds[0].survival
+        );
+        for w in preds.windows(2) {
+            assert!(
+                w[1].cum_hazard >= w[0].cum_hazard - 1e-9,
+                "cumulative hazard must be non-decreasing"
+            );
+            assert!(
+                w[1].survival <= w[0].survival + 1e-9,
+                "survival must be non-increasing"
+            );
+            assert!(
+                w[1].hazard.is_finite() && w[1].hazard >= 0.0,
+                "instantaneous hazard must be finite ≥ 0; got {}",
+                w[1].hazard
+            );
+        }
+        // mean_survival is intentionally NaN for ODE hazards (∫₀^∞ S is a follow-up).
+        assert!(
+            preds[0].mean_survival.is_nan(),
+            "ODE mean_survival is NaN by design; got {}",
+            preds[0].mean_survival
+        );
+    }
+
+    #[test]
+    fn simulate_with_options_rejects_ode_hazard() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
+        let pop = joint_pktte_pop();
+        let err = simulate_with_options(
+            &model,
+            &pop,
+            &model.default_params,
+            1,
+            &SimulateOptions::default(),
+        )
+        .expect_err("simulate must reject an ODE-accumulated hazard");
+        assert!(
+            err.contains("ODE-accumulated") && err.contains("Slice 2.2"),
+            "error should explain the ODE-hazard limitation; got: {err}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ODE-accumulated")]
+    fn simulate_seed_ode_hazard_panics() {
+        // The Vec-returning convenience entry can't signal an Err, so it hits the
+        // simulate_tte backstop panic rather than silently emitting no TTE rows.
+        let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
+        let pop = joint_pktte_pop();
+        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 7);
+    }
 }
