@@ -39,7 +39,8 @@ pub use propensity_match::MatchMethod;
 // of `AdaptiveSimulationResult` (`ledger` / `decisions`) — is usable without
 // reaching into the `sim::adaptive` module path.
 pub use sim::adaptive::{
-    ControllerCtx, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry, MonitorSpec,
+    AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
+    DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry, DoseStep, MonitorSpec,
     ObserveMode, ObservedSignal,
 };
 pub use suggest_start::{inits_from_nca, NcaInit, SuggestedStart};

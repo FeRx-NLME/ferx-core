@@ -397,6 +397,117 @@ pub(crate) struct AssayNoise<'a> {
     pub base_seed: u64,
 }
 
+// ── Declarative `[adaptive_dosing]` block (#391 S2) ─────────────────────────
+//
+// The *parsed* form of the file-driven reactive controller. This is pure syntax
+// (an AST): it carries no binding to the model's parameters and no runtime. The
+// `observe` expression is kept as source text and compiled against the model's
+// parameter context when the controller is built (S2.2) — holding the spec as
+// data keeps the parser independent of the integration engine. The parser
+// (`parse_adaptive_dosing_block` in `parser::model_parser`) is the single place
+// that establishes the field invariants documented below.
+
+/// A parsed `[adaptive_dosing]` block: a declarative, file-driven reactive
+/// controller (#391 S2).
+///
+/// **Invariants** (guaranteed by the block parser, assumed downstream): `at` is
+/// non-empty and strictly increasing; `dose_bounds.0 <= dose_bounds.1` with
+/// `0 <= dose_bounds.0`; `start_dose` lies within `dose_bounds`; `confirm >= 1`;
+/// `rules` is non-empty; `levels`, when present, is non-empty and strictly
+/// increasing and contains `start_dose`; and the rule ladder uses percentage
+/// dose steps iff `levels` is `None` and one-level steps iff `levels` is `Some`
+/// (never mixed). When `with_assay_error` is set on an *expression* `observe`,
+/// `assay_cmt` designates the endpoint whose residual error supplies the noise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveDosingSpec {
+    /// The monitored signal — an expression over states + individual parameters
+    /// (e.g. `central / V`). Stored as validated source text; compiled against the
+    /// model in S2.2. The `when` rules compare the keyword `signal` to this value.
+    pub observe: String,
+    /// Titrate on the assay-noised DV (`true`) rather than the latent IPRED
+    /// (`false`, the default).
+    pub with_assay_error: bool,
+    /// 1-based compartment whose `[error_model]` σ supplies the assay noise. Used
+    /// when `with_assay_error` is on and `observe` is an expression (so the
+    /// endpoint is not itself obvious). `None` otherwise.
+    pub assay_cmt: Option<usize>,
+    /// Decision schedule (subject clock), expanded to explicit times at parse
+    /// time — the times the controller is consulted.
+    pub at: Vec<f64>,
+    /// Dose issued at the first decision; seeds the controller's running dose.
+    pub start_dose: f64,
+    /// How an emitted dose is delivered.
+    pub route: AdaptiveRoute,
+    /// Inclusive `(low, high)` clamp applied to every emitted dose.
+    pub dose_bounds: (f64, f64),
+    /// Debounce: act only after this many *consecutive* matches of the same rule.
+    /// `1` acts on the first breach.
+    pub confirm: u32,
+    /// Discrete titration levels (oncology). When set, `increase`/`decrease` step
+    /// one level; mutually exclusive with percentage steps.
+    pub levels: Option<Vec<f64>>,
+    /// The first-matching-rule ladder, in file order.
+    pub rules: Vec<AdaptiveRule>,
+}
+
+/// How an adaptive dose is delivered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdaptiveRoute {
+    /// Instantaneous dose into 1-based compartment `cmt`.
+    Bolus { cmt: usize },
+    /// Zero-order infusion of duration `over` into 1-based compartment `cmt`.
+    Infuse { cmt: usize, over: f64 },
+}
+
+/// One rung of the ladder: `when signal <op> <threshold> : <action>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveRule {
+    /// The comparison applied to the observed `signal`.
+    pub op: Comparison,
+    /// The right-hand side of the comparison.
+    pub threshold: f64,
+    /// What to do when this rule is the first to match.
+    pub action: AdaptiveAction,
+}
+
+/// A signal comparison operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+    /// `==`
+    Eq,
+}
+
+/// What a matched rule does to the running dose.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdaptiveAction {
+    /// Raise the dose (by a percentage, or one level if the block declares `levels`).
+    Increase(DoseStep),
+    /// Lower the dose (by a percentage, or one level if the block declares `levels`).
+    Decrease(DoseStep),
+    /// Skip this decision — no dose now, the regimen continues.
+    Hold,
+    /// Discontinue all future dosing.
+    Stop,
+}
+
+/// The magnitude of an [`AdaptiveAction::Increase`] / [`AdaptiveAction::Decrease`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DoseStep {
+    /// Scale by this percent, e.g. `Percent(25.0)` for `increase 25%`. Valid only
+    /// when the block has no `levels` ladder.
+    Percent(f64),
+    /// Step one discrete level. Valid only when the block declares `levels`.
+    Level,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
