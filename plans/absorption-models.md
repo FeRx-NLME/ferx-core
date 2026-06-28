@@ -2,7 +2,7 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap, in progress (updated 2026-06-25).
+**Status:** approved roadmap, in progress (updated 2026-06-27).
 - **Prerequisite #324:** safety net (PR #326), **modeled infusion duration `Dn` /
   `RATE=-2`** (PR #384), and **modeled rate `Rn` / `RATE=-1` on both engines**
   (PR #418) **merged**; see #383 for any residual analytical-engine items.
@@ -17,20 +17,26 @@
   forcing, exact analytic `Dual2` gradients, permanent ODE-only error rule, AUC-mass
   invariant; **NONMEM `$DES` anchor ran** (slow-tests-gated `tests/weibull_nonmem_anchor.rs`:
   ferx FOCEI marginal OFV vs NONMEM `#OBJV` −943.833 at NONMEM's optimum, ~1.5 OFV apart).
-  **Remaining in Phase 2** (the zero-order family, now tracked):
-  - **#504 — `zero_order(dur)` + `sequential`**: single-input (no fraction). **Smallest
-    on the parser axis** (no new mechanism), but **its `∂/∂dur` is the hardest sensitivity
-    so far** — a *moving boundary* (`R_in` cuts off hard at `tad=dur`), unlike the smooth
-    `transit`/`igd`/`weibull`. The merged `RATE=-2`/`Dn` forcing (#384/#395) is reused for
-    the **value path only**; #384's `dur` sensitivity is **FD** (the `all_doses_fixed` gate
-    routes every modeled-`RATE` dose to FD). So #504 ships `zero_order`/`sequential` with
-    `dur` on **FD** first (`InputRateKind::supported_over_dual()=false`, reusing the existing
-    input-rate FD-fallback gate); the analytic moving-boundary `∂/∂dur` — a dual-channel
-    impulse at `tad=dur` that *also* lifts #384's `Dn` infusion off FD — is a cross-cutting
-    **follow-up (#530)**, not a `zero_order` rider.
-  - **#505 — `parallel` / `mixed` + `first_order()` composition**: dual-pathway,
-    **blocked on the shared fraction multiplier in #388** (the parser rejects scaled
-    input-rate calls today).
+  **Remaining in Phase 2** (the zero-order / dual-pathway family, now tracked):
+  - **#504 — `zero_order(dur)` + `sequential`** — **✅ MERGED — PR #556 (`4fd737e9`,
+    2026-06-27).** Single-input (no fraction); `InputRateKind::ZeroOrder` is the new intrinsic,
+    `sequential` is just `zero_order(dur=DUR) - KA*depot` composition (no new mechanism).
+    Delivered as a **per-segment constant** through the wrapper's spanning channel (like an
+    infusion), not pointwise — the hard `tad ≤ dur` cutoff is placed on the ODE timeline so the
+    post-cutoff segment can't over-count mass (`predictions.rs`). The merged `RATE=-2`/`Dn`
+    forcing (#384) is reused for the **value path**; `dur` ships on **FD**
+    (`InputRateKind::ZeroOrder.supported_over_dual()=false`), since its moving-boundary
+    `∂/∂dur` (a dual-channel impulse at `tad=dur` that *also* lifts #384's `Dn` infusion off FD)
+    is the cross-cutting **follow-up #530**, not a `zero_order` rider. Shipped
+    `examples/{zero_order,sequential}_absorption.ferx` + a **direct NONMEM ADVAN1 anchor**
+    (`tests/zero_order_absorption.rs`, max abs ≈ 4e-4) plus reset-mid-window & lag>0 adversarial
+    tests. **ferx-r follow-up ✅ done — PR [#204](https://github.com/FeRx-NLME/ferx-r/pull/204)
+    merged 2026-06-27 (`56e7cafc`): pin bump + zero_order/sequential examples + validate tests.**
+  - **#505 — `parallel` / `mixed` + `first_order()` composition** ← **NEXT (after #388)**:
+    dual-pathway, **blocked on the shared fraction multiplier in #388** (the parser still
+    rejects scaled input-rate calls — `call_is_scaled_or_signed`, `model_parser.rs`). Needs a
+    new `InputRateKind::FirstOrder` (`first_order(ka)`) so the existing first-order absorption
+    can be composed in `[odes]`.
 - **#388 — biphasic IG + the shared input-rate fraction mechanism.** Build the
   `FR*fn(...) + (1-FR)*fn(...)` multiplier once; consumed by both biphasic IG and
   #505's `parallel`/`mixed`.
@@ -40,9 +46,11 @@
   reaches Phase 3 (no closed form) — its only exact-gradient route is the #430
   generic forcing.
 
-Recommended sequence after Weibull (#498): **#504** (single-input, no new parser
-mechanism) → **#388** fraction mechanism + **#505** (`parallel`/`mixed`) → **#386**
-(speed pass).
+Recommended sequence after Weibull (#498) and zero-order (#504, ✅ merged): **#388**
+(shared input-rate **fraction multiplier** — biphasic IG; unblocks #505) → **#505**
+(`parallel`/`mixed` + `first_order()`) → **#386** (Phase 3 speed pass). The
+moving-boundary sensitivity **#530** (`zero_order` `dur` + `Dn` off FD) is a parallel,
+cross-cutting track — independent of the catalogue work above, not gating it.
 
 Multi-PR / phased.
 
@@ -166,6 +174,14 @@ compartment it is added to (dose amount × F, superposed over doses). Arguments 
 parser-validated, so a swapped or typo'd argument errors instead of silently giving wrong
 numbers. Fractions for parallel / biphasic pathways are **plain scalar multipliers** — so no
 `pathway` grammar is needed, and `frac` just splits the dose by linearity.
+
+> **#388 implementation constraint (decided on the issue):** the multiplier must be a **single
+> declared individual parameter** (`FR*igd(...)`) so it binds to one slot (`frac_slot`) — *not*
+> an arbitrary expression like `(1-FR)`. So a two-pathway split is written as **two declared
+> parameters** that sum to 1: `FR1*igd(...) + FR2*igd(...)` with `FR2 = 1 - FR1` declared in
+> `[individual_parameters]` (validated `Σfrac ≈ 1`). The `(1-FR)*...` / `(1-FZO)*...` forms in
+> the #505 `parallel`/`mixed` examples below are shorthand — they lower to that declared-complement
+> pattern, not inline arithmetic in the `[odes]` RHS.
 
 *Savic transit* — `transit(n, mtt)` into a depot, then first-order `ka` (shown above);
 `ktr = (n+1)/mtt`, continuous `n`.
@@ -426,9 +442,10 @@ boundary term — a dual-channel impulse of magnitude `R_in(boundary)·∂dur/�
 analytic gradient diverges from FD for any observation after the window closes). This is the *same*
 gap that keeps #384's modeled-duration `Dn` infusion on FD (`ode_provider.rs` routes every
 modeled-`RATE` dose to FD via `all_doses_fixed`). It is therefore a **cross-cutting follow-up**, not
-a `zero_order` rider: #504 ships `dur` on FD (`supported_over_dual()=false`), and **#530**
-builds the boundary-impulse mechanism that lifts both `zero_order` and `Dn` off FD. Scope/feasibility
-against the provider's `MAX_ODE_SENS_DIM` monomorphisation budget.
+a `zero_order` rider: #504 **shipped** `dur` on FD (`InputRateKind::ZeroOrder.supported_over_dual()
+=false`, merged PR #556), and **#530** builds the boundary-impulse mechanism that lifts both
+`zero_order` and `Dn` off FD. Scope/feasibility against the provider's `MAX_ODE_SENS_DIM`
+monomorphisation budget.
 
 ## Robustness ("no happy paths") — explicit requirements
 
@@ -519,15 +536,28 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
     gradients come *only* via the `PkNum`-generic forcing route (see §"Analytic
     sensitivities for the ODE forcing"), never Phase 3. NONMEM `$DES` anchor ran
     (`tests/weibull_nonmem_anchor.rs`, slow-tests-gated, OFV −943.833).
-  - **`zero_order` + `sequential` (#504)** — single-input; reuses #324's merged
-    `RATE=-2`/`Dn` estimated-duration forcing **for the value path**. **Closed-form**
-    (superpose existing solvers / piecewise). Ships on the ODE path with `dur` on **FD**
-    first — its `∂/∂dur` is a *moving boundary* (the one hard part), and the analytic
-    boundary-term impulse (shared with #384's `Dn` infusion) is a cross-cutting follow-up
-    (#530), not bundled here. Then optionally accelerated via the closed form.
+  - **`zero_order` + `sequential` (#504) ✅ MERGED — PR #556 (`4fd737e9`)** — single-input;
+    reuses #324's merged `RATE=-2`/`Dn` estimated-duration forcing **for the value path**.
+    **Closed-form** (superpose existing solvers / piecewise). Shipped on the ODE path with
+    `dur` on **FD** — its `∂/∂dur` is a *moving boundary* (the one hard part), and the analytic
+    boundary-term impulse (shared with #384's `Dn` infusion) is the cross-cutting follow-up
+    #530, not bundled here. Direct NONMEM ADVAN1 anchor (`tests/zero_order_absorption.rs`).
+    Then optionally accelerated via the closed form. **ferx-r follow-up done — PR #204
+    (`56e7cafc`, merged 2026-06-27).**
+  - **#388 — shared input-rate fraction multiplier (biphasic IG)** ← **NEXT.** Add a
+    fraction scale to `InputRateForcing` (`frac_slot: Option<usize>`, applied as
+    `dy[cmt] += frac * R_in` in `add_prepared_input_rate_forcing`) and relax the two Phase-1
+    parser guards (`call_is_scaled_or_signed` + the one-input-rate-call-per-`d/dt` limit) to
+    accept a leading **named-parameter** multiplier (`FR*igd(...)`, declared individual
+    parameter only — not an arbitrary `(1-FR)` expression) and ≥2 input-rate terms per
+    equation. Validate `0 < frac ≤ 1` per term and `Σfrac ≈ 1`; per-model mass balance
+    `∫ Σ fracᵢ·R_inᵢ = F·Dose`. Anchored vs a new biphasic-IG `$DES` run. The same multiplier
+    then serves #505.
   - **`parallel` / `mixed` + `first_order()` composition (#505)** — dual-pathway,
     **blocked on the #388 shared fraction multiplier** (the parser rejects scaled
-    input-rate calls today). **Closed-form** (superpose `*_oral` solvers by `frac`).
+    input-rate calls today). Adds `InputRateKind::FirstOrder` (`first_order(ka)`) so existing
+    first-order absorption can be composed. **Closed-form** (superpose `*_oral` solvers by
+    `frac`).
 - **Phase 3 — analytical closed forms for transit and IG** (1/2-cpt). Both are implemented
   via the **`TiltedAbsorption` trait** in a new `src/pk/analytical_absorption.rs`:
 

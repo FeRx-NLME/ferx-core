@@ -5490,6 +5490,19 @@ where
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
 
+    // Root seed for the controller-assay substreams (DV-mode monitors, S1.5).
+    // Resolved independently of the η `rng` above so that enabling a `Dv` monitor
+    // never shifts the η draws (the all-`Ipred` path stays byte-identical). With no
+    // run seed it is drawn from a fresh entropy source, matching the η stream's own
+    // nondeterminism.
+    let assay_root: u64 = match opts.seed {
+        Some(s) => s,
+        None => {
+            let mut entropy: rand::rngs::StdRng = rand::make_rng();
+            entropy.random::<u64>()
+        }
+    };
+
     let mut trajectories: Vec<SimulationResult> = Vec::new();
     let mut ledger: Vec<DoseLedgerEntry> = Vec::new();
     let mut decisions: Vec<DecisionLogEntry> = Vec::new();
@@ -5506,6 +5519,28 @@ where
 
             let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
 
+            // Controller-assay capability for any `Dv` monitor: resolve the
+            // endpoint's residual variance by CMT (scaled by this subject's
+            // `ruv_scale` for IIV-on-RUV), or `None` when no [error_model] covers
+            // that compartment (S1.5 edge a). The base seed keys this
+            // (subject, replicate)'s controller-assay substream.
+            let ruv_scale = model.residual_var_scale(&eta_slice);
+            let sigma = &params.sigma.values;
+            let resid_var = |cmt: usize, ipred: f64| -> Option<f64> {
+                if !model.has_residual_error_for_cmt(cmt, sigma) {
+                    return None;
+                }
+                Some(model.residual_variance_at(cmt, ipred, sigma) * ruv_scale)
+            };
+            let assay = crate::sim::adaptive::AssayNoise {
+                resid_var: &resid_var,
+                base_seed: crate::sim::adaptive::subject_assay_base_seed(
+                    assay_root,
+                    &subject.id,
+                    sim,
+                ),
+            };
+
             // A fresh controller per (subject, replicate) — see the factory note.
             let mut controller = make_controller();
             let run: AdaptiveRun = crate::ode::ode_predictions_adaptive(
@@ -5518,6 +5553,7 @@ where
                 &opts.monitors,
                 &mut controller,
                 opts.max_decisions,
+                Some(&assay),
             )
             .map_err(|e| format!("subject '{}' (sim {sim}): {e}", subject.id))?;
 
@@ -10322,19 +10358,21 @@ mod adaptive_sim_tests {
     }
 
     #[test]
-    fn rejects_dv_monitor() {
-        // The Dv (assay-noised) path needs the per-subject RNG substreams of
-        // S1.5; until then a Dv monitor is a typed error.
+    fn dv_monitor_without_error_model_is_rejected() {
+        // Edge (a): a DV monitor on a model with no residual error (here sigma is
+        // stripped) is a typed error, never a fabricated σ.
         let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let mut params = model.default_params.clone();
+        params.sigma.values = vec![]; // no [error_model] coverage for the monitor
         let pop = population(vec![subj("1", vec![6.0], vec![])]);
         let opts = AdaptiveSimulateOptions {
             decision_times: vec![0.0],
             monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
             ..Default::default()
         };
-        let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
-            .expect_err("Dv monitor must be rejected");
-        assert!(err.contains("DV") || err.contains("S1.5"), "got: {err}");
+        let err = simulate_adaptive(&model, &pop, &params, 1, fixed_bolus, &opts)
+            .expect_err("DV monitor with no error model must be rejected");
+        assert!(err.contains("error_model"), "got: {err}");
     }
 
     #[test]
@@ -10373,5 +10411,189 @@ mod adaptive_sim_tests {
             r.trajectories.iter().map(|t| t.ipred).collect::<Vec<_>>()
         };
         assert_eq!(ip(&checked), ip(&unchecked));
+    }
+
+    // ----- S1.5: DV-mode (assay-noised) monitors --------------------------
+
+    /// Factory (mirrors `fixed_bolus`): titrate on the *measured* (DV) central
+    /// amount "A" — dose 100 mg when it falls below 50, else hold.
+    fn dv_threshold() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
+        |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A declared") < 50.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        }
+    }
+
+    #[test]
+    fn dv_monitor_run_passes_default_verifier() {
+        // End-to-end: a controller titrating on the DV signal, verify = true. Covers
+        // the assay-noise wiring (resid_var closure + per-subject base seed) and the
+        // driver's DV branch, and confirms the frozen-replay verifier stays green on
+        // a DV run (it replays realized doses, not decisions).
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![2.0, 6.0, 10.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times: vec![0.0, 4.0, 8.0],
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
+            ..Default::default()
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, dv_threshold, &opts)
+            .expect("DV run passes the verifier");
+        assert_eq!(res.decisions.len(), 3);
+        // The DV value the controller saw is recorded, tagged as the Dv mode.
+        assert!(res
+            .decisions
+            .iter()
+            .all(|d| d.observed_signals[0].mode == ObserveMode::Dv));
+    }
+
+    #[test]
+    fn dv_monitor_collapses_to_ipred_as_sigma_to_zero() {
+        // sigma -> 0: titrating on the DV reproduces titrating on the latent IPRED,
+        // realized-ledger for realized-ledger.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![2.0, 6.0, 10.0], vec![])]);
+        let mut params = model.default_params.clone();
+        params.sigma.values = vec![1e-12];
+        let decision_times = vec![0.0, 4.0, 8.0];
+
+        let dv_opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times: decision_times.clone(),
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
+            ..Default::default()
+        };
+        let ipred_opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times,
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Ipred)],
+            ..Default::default()
+        };
+        let dv = simulate_adaptive(&model, &pop, &params, 1, dv_threshold, &dv_opts).expect("dv");
+        let ip =
+            simulate_adaptive(&model, &pop, &params, 1, dv_threshold, &ipred_opts).expect("ipred");
+        // Compare the *dosing decisions* (time/amt/cmt/rate), not the recorded
+        // observed signals: the residual variance floors at MIN_VARIANCE, so the DV
+        // readout never collapses to IPRED bit-for-bit — but the decisions it drives
+        // do. (The exact bit-for-bit collapse is pinned at the driver level with a
+        // literal zero-variance resolver.)
+        let schedule = |r: &AdaptiveSimulationResult| {
+            r.ledger
+                .iter()
+                .map(|e| (e.time, e.amt, e.cmt, e.rate))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            schedule(&dv),
+            schedule(&ip),
+            "DV with sigma→0 must make the same dosing decisions as IPRED"
+        );
+    }
+
+    #[test]
+    fn adding_dv_monitor_does_not_perturb_eta_trajectory() {
+        // Isolation: the controller-assay substream is disjoint from the η stream,
+        // so enabling a DV monitor leaves the η draws (hence the IPRED trajectory)
+        // bit-identical. Uses ODE_IIV (η on CL) and a signal-independent controller,
+        // so any trajectory difference could only come from a shifted η draw.
+        let model = parse_model_string(ODE_IIV).expect("parse");
+        let pop = population(vec![
+            subj("1", vec![6.0, 30.0], vec![]),
+            subj("2", vec![6.0, 30.0], vec![]),
+        ]);
+        let opts = |monitors: Vec<MonitorSpec>| AdaptiveSimulateOptions {
+            seed: Some(3),
+            decision_times: vec![0.0, 24.0],
+            monitors,
+            ..Default::default()
+        };
+        let no_mon = simulate_adaptive(
+            &model,
+            &pop,
+            &model.default_params,
+            3,
+            fixed_bolus,
+            &opts(vec![]),
+        )
+        .expect("no monitor");
+        let with_dv = simulate_adaptive(
+            &model,
+            &pop,
+            &model.default_params,
+            3,
+            fixed_bolus,
+            &opts(vec![MonitorSpec::new("A", 1, ObserveMode::Dv)]),
+        )
+        .expect("dv monitor");
+        let ip = |r: &AdaptiveSimulationResult| {
+            r.trajectories.iter().map(|t| t.ipred).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ip(&no_mon),
+            ip(&with_dv),
+            "a DV monitor must not shift the η draws / IPRED trajectory"
+        );
+    }
+
+    #[test]
+    fn dv_assay_draws_are_permutation_invariant() {
+        // The controller-assay substream is keyed by subject id, so a subject's DV
+        // draws — and thus its decisions — do not depend on iteration order. A large
+        // residual CV makes the noise flip decisions (so a position-keyed stream
+        // *would* change the ledger), and ODE_NO_IIV keeps η out of the picture.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let mut params = model.default_params.clone();
+        params.sigma.values = vec![0.3]; // 30% proportional CV: noise is consequential
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(11),
+            decision_times: vec![0.0, 4.0, 8.0],
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
+            ..Default::default()
+        };
+        let a = subj("A", vec![2.0, 6.0, 10.0], vec![]);
+        let b = subj("B", vec![2.0, 6.0, 10.0], vec![]);
+        let pop_ab = population(vec![a.clone(), b.clone()]);
+        let pop_ba = population(vec![b, a]);
+        let r_ab = simulate_adaptive(&model, &pop_ab, &params, 1, dv_threshold, &opts).expect("ab");
+        let r_ba = simulate_adaptive(&model, &pop_ba, &params, 1, dv_threshold, &opts).expect("ba");
+
+        let ledger_for = |r: &AdaptiveSimulationResult, id: &str| {
+            r.ledger
+                .iter()
+                .filter(|e| e.subject == id)
+                .map(|e| (e.time, e.amt))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ledger_for(&r_ab, "A"),
+            ledger_for(&r_ba, "A"),
+            "A's DV-driven doses must be order-independent"
+        );
+        assert_eq!(
+            ledger_for(&r_ab, "B"),
+            ledger_for(&r_ba, "B"),
+            "B's DV-driven doses must be order-independent"
+        );
+
+        // Non-vacuity: the assay noise must actually be id-keyed (not a no-op), or
+        // the invariance above could hold even under a position-keyed stream. At
+        // t=4 the trough is ~67 (non-zero, so proportional noise is live), and A and
+        // B observe *different* measured values — confirming the noise is consequential.
+        let dv_at = |r: &AdaptiveSimulationResult, id: &str, didx: usize| {
+            r.decisions
+                .iter()
+                .find(|d| d.subject == id && d.decision_idx == didx)
+                .map(|d| d.observed_signals[0].value)
+                .expect("decision logged")
+        };
+        assert_ne!(
+            dv_at(&r_ab, "A", 1),
+            dv_at(&r_ab, "B", 1),
+            "id-keyed assay noise must differ between subjects (test would be vacuous otherwise)"
+        );
     }
 }

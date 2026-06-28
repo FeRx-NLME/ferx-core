@@ -25,14 +25,33 @@ section of the SDLC for the versioning policy).
   tolerances, previously hardcoded. Lets a fit tighten or loosen BOBYQA's
   convergence on flat/noisy objective ridges. See
   [fit options](model-file/fit-options.qmd).
+- **Defensive-mixture importance sampling for IMP/IMPMAP — new `imp_defensive_alpha`
+  fit option** (#528). Each subject can draw an `imp_defensive_alpha` fraction of its
+  importance samples from the prior `N(0, Ω)`, bounding the importance weights so a
+  weakly-identified subject — e.g. an analytical `[initial_conditions]` baseline whose
+  `V` cancels in the amplitude — can no longer hijack the weighted M-step and walk θ to
+  the bounds. The option is **opt-in** (default `0.0`, the legacy single-proposal sampler
+  that stays bit-comparable with NONMEM); set a small positive value such as `0.1` to
+  enable the rescue. Applies to `imp` and `impmap`, including the FREM Rao-Blackwell
+  path; for an `impmap` stage it may also be written `impmap_defensive_alpha`. See
+  [Importance sampling](estimation/importance-sampling.qmd#defensive-mixture).
+- IMP/IMPMAP and SAEM now flag a finite-but-enormous runaway objective (≥ `1e15`) as
+  **not converged**, so a collapsed-weight blow-up can no longer report `converged` or
+  win multi-start selection (#528).
 - **Experimental `simulate_adaptive()` — state-reactive ("feedback") dosing simulation**
   (#553, epic #391). A programmatic entry point that simulates regimens where each dose is
   chosen at run time by a controller reading the simulated state (TDM target attainment,
   oncology dose reduction, biomarker titration). ODE models only; the controller is supplied
   as a per-subject factory; every realized dose and every decision (including holds) is
   returned alongside the trajectories, and a frozen-schedule replay verifier checks the dose
-  bookkeeping by default. Ipred monitors only for now (assay-noised `Dv` monitoring follows).
-  See [Adaptive dosing](model-file/adaptive-dosing.qmd).
+  bookkeeping by default. See [Adaptive dosing](model-file/adaptive-dosing.qmd).
+- **Assay-noised (`Dv`) monitors for `simulate_adaptive()`** (#566, epic #391). A controller can
+  titrate on the realized, assay-noised measurement — `IPRED + ε·√(residual variance)`, clamped
+  at 0, drawn from the endpoint's `[error_model]` — instead of (or, per-monitor, alongside) the
+  latent `Ipred`. This is the realistic TDM / titration signal. The assay draws come from a
+  per-purpose RNG substream keyed by `(subject, replicate, decision, analyte)`, so they are
+  deterministic under a fixed seed, invariant to subject ordering, and never perturb another
+  monitor's (or η's) draws.
 - Warn when no estimation method is set in the model file's `[fit_options]` or by
   the caller, making the implicit fallback to FOCEI visible instead of silent (#558).
 - Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary
@@ -191,6 +210,11 @@ section of the SDLC for the versioning policy).
   auto-tightened to `1e-8` (it lands 0.176); non-TTE fits keep `1e-6` to avoid
   grinding on noisy ODE/FD-inner objectives. This is a pure optimizer-convergence
   fix and does not touch the separate FOCEI-Laplace *method* bias (#440).
+- A diverged IMP/IMPMAP run is no longer reported as converged (#528). A
+  collapsed-weight runaway pins θ to the parameter bounds and the final objective
+  blows up to a finite-but-enormous value (~1e35); the convergence check only
+  tested `is_finite()`, so such a run could be flagged converged and even win
+  multi-start selection. It is now treated as diverged.
 - `outer_maxiter = 0` (NONMEM `MAXEVAL=0`) now means *evaluation only* on every
   optimizer (#562). The gradient NLopt path (`nlopt_lbfgs`/`slsqp`/`mma`) passed
   `maxiter = 0` straight to NLopt's `set_maxeval`, where `0` means **no limit** —

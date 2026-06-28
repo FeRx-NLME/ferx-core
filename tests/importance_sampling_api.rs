@@ -240,6 +240,49 @@ fn imp_after_saem_populates_field() {
 }
 
 #[test]
+fn imp_defensive_mixture_runs_for_both_alpha_branches() {
+    // The defensive-mixture proposal (issue #528) is opt-in (default
+    // `imp_defensive_alpha = 0.0`, the legacy single-proposal sampler); a small
+    // positive `alpha` enables it. Both must produce a finite IS −2LL with
+    // in-range ESS, and on a
+    // well-identified model (warfarin) the two estimates should be close — the
+    // mixture only changes things materially when the narrow proposal is
+    // degenerate. This exercises both sampler branches in the fast PR job.
+    let (model, population, mut opts) = warfarin_setup();
+    opts.methods = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
+
+    opts.imp_defensive_alpha = 0.1;
+    let with_mix = fit(&model, &population, &model.default_params, &opts)
+        .expect("defensive-mixture imp must fit")
+        .importance_sampling
+        .expect("imp field populated");
+    assert!(
+        with_mix.minus2_log_likelihood.is_finite(),
+        "mixture −2LL must be finite, got {}",
+        with_mix.minus2_log_likelihood
+    );
+    assert!((0.0..=1.0).contains(&with_mix.ess_median));
+
+    opts.imp_defensive_alpha = 0.0;
+    let without_mix = fit(&model, &population, &model.default_params, &opts)
+        .expect("legacy single-proposal imp must fit")
+        .importance_sampling
+        .expect("imp field populated");
+    assert!(without_mix.minus2_log_likelihood.is_finite());
+
+    // Well-identified model: the prior-defensive draws land in the same
+    // high-density region, so the marginal estimate barely moves.
+    let gap = (with_mix.minus2_log_likelihood - without_mix.minus2_log_likelihood).abs();
+    assert!(
+        gap < 20.0,
+        "defensive mixture shifted warfarin IS −2LL by {gap:.2} (mix {:.2} vs legacy {:.2}); \
+         expected < 20 on a well-identified model",
+        with_mix.minus2_log_likelihood,
+        without_mix.minus2_log_likelihood,
+    );
+}
+
+#[test]
 fn imp_minus2_ll_is_in_loose_neighbourhood_of_focei_ofv() {
     // Warfarin is well-sampled (≈8 obs/subject) — the Laplace approximation is
     // good here, so the IS and FOCEI likelihoods should be within tens of OFV
