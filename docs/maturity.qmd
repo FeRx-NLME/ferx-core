@@ -67,7 +67,7 @@ visible at the point of use:
 | Time-to-event endpoints (TTE) | **beta** | [Time-to-Event Endpoints](model-file/event-model.qmd) |
 | Stochastic differential equations (SDE) | **experimental** | [SDE](model-file/diffusion.qmd) |
 | Neural networks (DCM / NODE) | **experimental** | [Neural Networks](model-file/neural-networks.qmd) |
-| Adaptive (feedback) dosing — `simulate_adaptive()` | **experimental** | [Adaptive Dosing](model-file/adaptive-dosing.qmd) |
+| Adaptive (feedback) dosing — `[adaptive_dosing]` block / `simulate_adaptive()` | **experimental** | [Adaptive Dosing](model-file/adaptive-dosing.qmd) |
 
 ### Estimation features
 

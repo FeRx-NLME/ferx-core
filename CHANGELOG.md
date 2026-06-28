@@ -67,6 +67,16 @@ section of the SDLC for the versioning policy).
   per-purpose RNG substream keyed by `(subject, replicate, decision, analyte)`, so they are
   deterministic under a fixed seed, invariant to subject ordering, and never perturb another
   monitor's (or η's) draws.
+- **Declarative `[adaptive_dosing]` model-file block — `simulate_adaptive_from_spec()`**
+  (#584, epic #391). A reactive dosing *policy* can now be written in the model file — an
+  `observe` signal expression, a decision schedule (`at`), `start_dose` / `route` /
+  `dose_bounds`, an optional `confirm` debounce and discrete `levels` ladder, and a
+  first-match-wins ladder of `when signal <op> value : increase/decrease/hold/stop` rules —
+  and run with `simulate_adaptive_from_spec()`, no controller code required. It compiles to
+  the same reactive engine, dose ledger, decision log, RNG substreams, and frozen-replay
+  verifier as the programmatic `simulate_adaptive()`; titrating on the assay-noised
+  measurement (`with_assay_error`) reuses the `Dv` substream. Example
+  `examples/adaptive_tdm_titration.ferx`. See [Adaptive dosing](model-file/adaptive-dosing.qmd).
 - Warn when no estimation method is set in the model file's `[fit_options]` or by
   the caller, making the implicit fallback to FOCEI visible instead of silent (#558).
 - Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary

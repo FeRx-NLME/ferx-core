@@ -1515,9 +1515,14 @@ fn reject_unsupported_dose_compartment(
 /// break only restarts the integrator on a no-event segment, so predictions are
 /// unaffected on the smooth models tested; genuinely reactive/hold regimens are
 /// therefore pinned against the closed form instead.
-// Consumed by the public `crate::api::simulate_adaptive()` entry point (S1.4b,
-// #391), which wraps it with per-(subject, replicate) orchestration.
-#[allow(clippy::too_many_arguments)]
+// The cmt-only adaptive driver entry: forwards to `ode_predictions_adaptive_impl`
+// with no compiled `observe` expressions. The driver's own unit tests exercise the
+// reactive engine through this focused path, so it is retained as a named cmt-only
+// entry (`dead_code`: production no longer calls it directly). Both public entry
+// points — the programmatic `crate::api::simulate_adaptive` and the declarative
+// `crate::api::simulate_adaptive_from_spec` — go through `_impl`, so the
+// declarative path can supply expression-backed `observe` monitors (S2.3, #391).
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn ode_predictions_adaptive(
     ode: &OdeSpec,
     pk_params_flat: &[f64],

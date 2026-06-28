@@ -14,10 +14,9 @@
 //! from the model (compiling the `observe` expression and feeding it through the
 //! engine's monitor mechanism, so `Dv` keeps the S1.5 assay substream) is the
 //! separate engine-side half of S2.2.
-// Wired to the public file-driven entry point in S2.3 (#391); until then the
-// compile / controller items below are constructed only by tests (mirrors the
-// `#[allow(dead_code)]` the S1.3a driver carried before S1.4 made it public).
-#![allow(dead_code)]
+//!
+//! Wired to the public file-driven entry point [`crate::simulate_adaptive_from_spec`]
+//! in S2.3 (#391).
 
 use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
