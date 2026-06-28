@@ -972,6 +972,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 

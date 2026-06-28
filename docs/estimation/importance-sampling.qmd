@@ -226,6 +226,51 @@ $$
   `imp_*` defaults is listed in the
   [`[fit_options]` reference](../model-file/fit-options.qmd#importance-sampling-imp).
 
+## Defensive mixture {#defensive-mixture}
+
+A weakly-identified subject — e.g. an analytical `[initial_conditions]` baseline
+whose `V` cancels in the amplitude — can produce a proposal so badly centred that
+a *single* importance sample carries almost all the weight. That one sample then
+hijacks the weighted M-step and walks θ to the parameter bounds; the run "diverges"
+to a finite-but-enormous OFV. (This is issue #528; the OFV blow-up is now caught
+by the convergence check, which flags an objective ≥ `1e15` as **not converged**
+for both IMP/IMPMAP and SAEM.)
+
+The optional **defensive mixture** (`imp_defensive_alpha`, default `0`) hardens the
+sampler against this. With weight $\alpha \in [0,1)$ the proposal becomes
+
+$$
+q(\eta) = (1-\alpha)\,q_\text{narrow}(\eta) + \alpha\,q_\text{broad}(\eta),
+$$
+
+where $q_\text{broad} = \mathcal N(0, \Omega)$ is the prior (for the FREM
+Rao-Blackwell path it is the *conditional* PK prior $\mathcal N(\mu, P_{pp}^{-1})$).
+An $\alpha$ fraction of draws come from $q_\text{broad}$, and **every** sample is
+scored under the full mixture density (the balance heuristic). Because the prior
+provably covers the conditional posterior, this bounds each importance weight by
+$p(y\mid\eta)/\alpha$, so no single sample can dominate — keeping the population
+estimates identifiable even when the narrow proposal is poor.
+
+Practical notes:
+
+- **Opt-in / NONMEM parity.** The default `0` reproduces the single-proposal
+  sampler **exactly** (same numbers, same RNG stream) and stays bit-comparable
+  with NONMEM, which has no defensive mixture. Enable it (e.g. `0.1`) only for
+  models that exhibit the runaway above. Changing $\alpha$ changes the reported
+  IS `−2 log L`, so re-validate against your reference when you turn it on.
+- **It bounds the weights, not the raw ESS.** A sharp interior likelihood spike
+  can still keep ESS low; the mixture only guarantees no single sample runs away.
+- **ESS-floor side effect.** Roughly $\alpha$ of each subject's samples now come
+  from the broad prior, which raises the per-subject ESS fraction. A genuinely
+  weakly-identified subject that would have been listed under
+  `imp_low_ess_threshold` may no longer trip it — read the low-ESS diagnostic with
+  that in mind when $\alpha > 0$.
+- **Sobol QMC is disabled** while the mixture is active (the per-sample
+  broad/narrow branch breaks the quasi-random sequence); IMPMAP emits a warning
+  if you set both `impmap_sobol = true` and `imp_defensive_alpha > 0`.
+- For an IMPMAP stage the option may also be written `impmap_defensive_alpha`
+  (an alias for the same field).
+
 ## SDE / [diffusion] models (not supported)
 
 IMP refuses to run on models with a `[diffusion]` block. The EKF

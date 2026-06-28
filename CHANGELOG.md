@@ -26,14 +26,47 @@ section of the SDLC for the versioning policy).
   FOCEI/SAEM, with shared random effects. Mutually exclusive with the analytic `family` hazard;
   requires an ODE model (no IOV yet). Simulation of the ODE-accumulated hazard follows in a later
   slice. See [Time-to-event](estimation/tte.qmd).
+- **Custom / time-varying residual-error magnitude** (#484). An `[error_model]`
+  sigma argument may now be an expression of `TIME`, covariates, and thetas
+  rather than a bare parameter — e.g.
+  `DV ~ combined(PROP_ERR * (if (TIME > 24) RUV_LATE else 1.0), ADD_ERR)` —
+  reproducing the NONMEM `$ERROR` idiom of a time- or covariate-dependent error
+  coefficient. The expression scales that sigma's loading per observation;
+  magnitudes may depend only on `TIME`/covariates/thetas (not η or the
+  prediction) and are supported for `method = foce`/`focei` (the analytic
+  gradient falls back to finite differences when active).
+- **`[fit_options] outer_xtol` / `outer_ftol`** (#469) — expose the derivative-free
+  `bobyqa` outer optimizer's step (`xtol_rel`) and objective (`ftol_rel`) stop
+  tolerances, previously hardcoded. Lets a fit tighten or loosen BOBYQA's
+  convergence on flat/noisy objective ridges. See
+  [fit options](model-file/fit-options.qmd).
+- **Defensive-mixture importance sampling for IMP/IMPMAP — new `imp_defensive_alpha`
+  fit option** (#528). Each subject can draw an `imp_defensive_alpha` fraction of its
+  importance samples from the prior `N(0, Ω)`, bounding the importance weights so a
+  weakly-identified subject — e.g. an analytical `[initial_conditions]` baseline whose
+  `V` cancels in the amplitude — can no longer hijack the weighted M-step and walk θ to
+  the bounds. The option is **opt-in** (default `0.0`, the legacy single-proposal sampler
+  that stays bit-comparable with NONMEM); set a small positive value such as `0.1` to
+  enable the rescue. Applies to `imp` and `impmap`, including the FREM Rao-Blackwell
+  path; for an `impmap` stage it may also be written `impmap_defensive_alpha`. See
+  [Importance sampling](estimation/importance-sampling.qmd#defensive-mixture).
+- IMP/IMPMAP and SAEM now flag a finite-but-enormous runaway objective (≥ `1e15`) as
+  **not converged**, so a collapsed-weight blow-up can no longer report `converged` or
+  win multi-start selection (#528).
 - **Experimental `simulate_adaptive()` — state-reactive ("feedback") dosing simulation**
   (#553, epic #391). A programmatic entry point that simulates regimens where each dose is
   chosen at run time by a controller reading the simulated state (TDM target attainment,
   oncology dose reduction, biomarker titration). ODE models only; the controller is supplied
   as a per-subject factory; every realized dose and every decision (including holds) is
   returned alongside the trajectories, and a frozen-schedule replay verifier checks the dose
-  bookkeeping by default. Ipred monitors only for now (assay-noised `Dv` monitoring follows).
-  See [Adaptive dosing](model-file/adaptive-dosing.qmd).
+  bookkeeping by default. See [Adaptive dosing](model-file/adaptive-dosing.qmd).
+- **Assay-noised (`Dv`) monitors for `simulate_adaptive()`** (#566, epic #391). A controller can
+  titrate on the realized, assay-noised measurement — `IPRED + ε·√(residual variance)`, clamped
+  at 0, drawn from the endpoint's `[error_model]` — instead of (or, per-monitor, alongside) the
+  latent `Ipred`. This is the realistic TDM / titration signal. The assay draws come from a
+  per-purpose RNG substream keyed by `(subject, replicate, decision, analyte)`, so they are
+  deterministic under a fixed seed, invariant to subject ordering, and never perturb another
+  monitor's (or η's) draws.
 - Warn when no estimation method is set in the model file's `[fit_options]` or by
   the caller, making the implicit fallback to FOCEI visible instead of silent (#558).
 - Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary
@@ -50,6 +83,18 @@ section of the SDLC for the versioning policy).
   per-segment constant; `dur`'s gradient is finite-difference for now (the analytic
   boundary impulse is follow-up #530). Examples
   `examples/zero_order_absorption.ferx` and `examples/sequential_absorption.ferx`.
+- **Biphasic / parallel absorption via a pathway-fraction multiplier** (#388). An
+  `[odes]` input-rate function may now be scaled by a declared individual parameter
+  (`FR*igd(...)`), and more than one input-rate term may feed a compartment — so the
+  Freijer & Post biphasic inverse-Gaussian model is written as
+  `d/dt(central) = FR1*igd(...) + FR2*igd(...)`, splitting the dose across two
+  pathways. The multiplier must be a single declared parameter (not an expression
+  like `(1-FR)`), so a two-pathway split declares a complementary fraction
+  (`FR2 = 1 - FR1`); the fit-time check enforces `0 < FR ≤ 1` and that the fractions
+  on a compartment sum to 1. The fraction's gradient is exact (analytic `Dual2`).
+  Example `examples/biphasic_igd_absorption.ferx`. (A fraction on `zero_order(...)`,
+  i.e. the `mixed`/`parallel` zero-order family, is not yet supported — follow-up
+  #505.)
 - Support NONMEM-style `block_sigma` residual covariance across paired same-time
   multi-endpoint observations under FOCE (#546).
 - Support fixed residual-error correlations via `block_sigma` for FOCE combined-error
@@ -182,6 +227,7 @@ section of the SDLC for the versioning policy).
   combination with a steady-state dose (`W_STEADY_STATE_INIT`) or a compartment
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
+
 ### Fixed
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on
   the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
@@ -190,6 +236,33 @@ section of the SDLC for the versioning policy).
   natural-scale thetas the reported SE was multiplied by the estimate (and would flip sign
   for a negative estimate). Such thetas now report `SE = SE(packed)` directly. Surfaced by
   the joint PK-TTE anchor, where `BETA`'s SE matched NONMEM only after the fix.
+- **Custom residual-error magnitude (#484) now applies on every path, not just
+  the FOCE/FOCEI objective** (#576). The per-observation multiplier was wired
+  only into the OFV and silently dropped everywhere else, all without a guard:
+  `simulate()`/`--simulate` and NPDE drew residual error with a constant SD; the
+  sdtab IWRES/CWRES columns (and downstream VPC/goodness-of-fit) were mis-scaled
+  wherever the magnitude departed from 1; an ODE model under `focei` ran its
+  inner EBE loop with an analytic gradient that omitted the multiplier
+  (mismatched against the magnitude-aware objective → biased η̂ and estimates);
+  and a mixed PK+TTE model dropped the multiplier on its PK rows. All four paths
+  are now magnitude-aware. The parser also now rejects a magnitude expression
+  that references an **undeclared covariate** (including typos) even when the
+  model has no `[covariates]` block — previously such a name silently evaluated
+  to 0 and collapsed the multiplier to a constant.
+- **TTE frailty ω² on a nonlinear hazard parameter now converges onto the
+  NONMEM/nlmixr2 consensus** (#469). The derivative-free `bobyqa` outer optimizer
+  false-converged on the near-flat ω² ridge — its `ftol_rel` default (`1e-6`)
+  stopped it short of ferx's *own* objective minimum, so a Weibull shape-frailty
+  read ω² 0.204 against the NONMEM LAPLACIAN 0.175 / nlmixr2 0.173 consensus on
+  identical data. The TTE objective is evaluated exactly, so its `ftol_rel` is now
+  auto-tightened to `1e-8` (it lands 0.176); non-TTE fits keep `1e-6` to avoid
+  grinding on noisy ODE/FD-inner objectives. This is a pure optimizer-convergence
+  fix and does not touch the separate FOCEI-Laplace *method* bias (#440).
+- A diverged IMP/IMPMAP run is no longer reported as converged (#528). A
+  collapsed-weight runaway pins θ to the parameter bounds and the final objective
+  blows up to a finite-but-enormous value (~1e35); the convergence check only
+  tested `is_finite()`, so such a run could be flagged converged and even win
+  multi-start selection. It is now treated as diverged.
 - `outer_maxiter = 0` (NONMEM `MAXEVAL=0`) now means *evaluation only* on every
   optimizer (#562). The gradient NLopt path (`nlopt_lbfgs`/`slsqp`/`mma`) passed
   `maxiter = 0` straight to NLopt's `set_maxeval`, where `0` means **no limit** —

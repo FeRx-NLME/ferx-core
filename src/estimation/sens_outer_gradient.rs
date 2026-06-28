@@ -2162,6 +2162,7 @@ mod tests {
             &[],
             None,
             model.residual_error_eta,
+            model.ruv_obs_mult(subject, &params.theta).as_deref(),
         )
     }
 

@@ -54,6 +54,58 @@ $$
 
 Use when both proportional and additive error sources are present. Requires two sigma parameters defined in `[parameters]`.
 
+## Time-varying / covariate-dependent magnitude
+
+> **Maturity: experimental** ([#484](https://github.com/FeRx-NLME/ferx-core/issues/484)).
+
+Any sigma argument may be written as an **expression** instead of a bare
+parameter name, letting the residual-error magnitude depend on `TIME`,
+covariates, and thetas. This reproduces the NONMEM `$ERROR` idiom of a
+time- or covariate-dependent error coefficient, e.g.
+
+```nonmem
+PROP = THETA(2)
+IF(TIME.GT.24) PROP = THETA(2) * THETA(3)
+W = SQRT(THETA(3)**2 + PROP**2 * IPRED**2)
+```
+
+which in ferx becomes:
+
+```
+[parameters]
+  sigma PROP_ERR ~ 0.1  (sd)
+  sigma ADD_ERR  ~ 22.0 (sd)
+  theta RUV_LATE(1.5, 0.0, 10.0)   # late-phase RUV inflation
+
+[error_model]
+  DV ~ combined(PROP_ERR * (if (TIME > 24.0) RUV_LATE else 1.0), ADD_ERR)
+```
+
+The expression is a **per-observation multiplier on that sigma's loading**, so
+the variance contribution becomes
+
+$$
+\text{Var}_i(DV) = \sum_k \big(\text{loading}_{k,i} \cdot m_k(\text{TIME}_i, \text{cov}_i, \theta) \cdot \sigma_k\big)^2
+$$
+
+A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
+
+**Rules and restrictions (current).**
+
+- An expression argument must reference **exactly one** declared sigma — the one
+  whose magnitude it scales.
+- The magnitude may depend only on `TIME`, declared covariates, thetas, and the
+  scaled sigma. It may **not** depend on a random effect (η), on an individual
+  parameter, or on the prediction (`IPRED`/`PRED`/`DV`) — the multiplier must be
+  independent of the inner empirical-Bayes loop. `TAD`/`TAFD` are not yet
+  available.
+- The `TIME` fed to the expression is the raw data-file time (matching NONMEM's
+  `$ERROR`).
+- Supported for `method = foce` and `method = focei` only. SAEM, GN, GN-hybrid,
+  and importance-sampling are rejected up front. When a custom magnitude is
+  active the analytic outer/inner gradients fall back to finite differences
+  (which are magnitude-aware), so fits are correct but slightly slower.
+
 ## Log-transform-both-sides (LTBS)
 
 For data whose residual error is *multiplicative* (a constant CV across the

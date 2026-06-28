@@ -11,8 +11,11 @@ transit compartments.
 
 ferx ships the **transit-compartment** model (`transit`), the **Freijer & Post
 inverse-Gaussian** model (`igd`), the **Weibull** model (`weibull`), and the
-**zero-order** model (`zero_order`); more input-rate models (the dual-pathway
-`parallel`/`mixed` families) are planned — see `plans/absorption-models.md`.
+**zero-order** model (`zero_order`). Two or more input-rate terms can be combined
+on one compartment with **pathway fractions** (`FR1*igd(...) + FR2*igd(...)`) for
+biphasic / parallel absorption — see
+[Biphasic (parallel) absorption](#biphasic-parallel-absorption). The dual-pathway
+zero-order `mixed`/`parallel` family is still planned — see `plans/absorption-models.md`.
 
 ## Transit-compartment absorption — `transit(n, mtt)`
 
@@ -180,11 +183,11 @@ convention:
 - **Arguments are named**: `mat=<param>` and `cv2=<param>`, both declared
   `[individual_parameters]` (so they fold in theta/eta/covariates and carry
   IIV/IOV like any other parameter).
-- As with `transit`, `igd(...)` is a standalone, positively-signed input-rate
-  term: it may appear **once** per `d/dt` line and must not be scaled, negated, or
-  parenthesised. The biphasic Freijer sum-of-two
-  (`FR*igd(...) + (1-FR)*igd(...)`) needs a scaled-fraction mechanism and is a
-  planned follow-up ([#388](https://github.com/FeRx-NLME/ferx-core/issues/388)).
+- `igd(...)` is a positively-signed input-rate term: it must not be negated,
+  divided, raised to a power, or parenthesised. It **may** be scaled by a single
+  declared pathway fraction (`FR*igd(...)`), and more than one input-rate term may
+  feed a compartment — see [Biphasic (parallel) absorption](#biphasic-parallel-absorption)
+  below for the Freijer sum-of-two.
 
 ### Shared behaviour
 
@@ -210,6 +213,46 @@ on simulated data:
 
 ```bash
 cargo run --release -- examples/igd_inverse_gaussian.ferx --simulate
+```
+
+### Biphasic (parallel) absorption
+
+The Freijer & Post **biphasic** form splits the dose across two inverse-Gaussian
+pathways — typically a fast and a slow one — that feed the same compartment. Write
+it as a sum of two `igd(...)` terms, each scaled by a **pathway fraction**:
+
+```text
+[individual_parameters]
+  FR1   = TVFR1            # fraction through the fast pathway
+  FR2   = 1 - TVFR1        # complementary fraction (FR1 + FR2 = 1)
+  MAT1  = TVMAT1
+  MAT2  = TVMAT2
+  CV2_1 = TVCV2_1
+  CV2_2 = TVCV2_2
+
+[odes]
+  d/dt(central) = FR1*igd(mat=MAT1, cv2=CV2_1) + FR2*igd(mat=MAT2, cv2=CV2_2) - CL/V*central
+```
+
+Rules for the fraction multiplier:
+
+- It must be a **single declared individual parameter** (`FR1*igd(...)`), *not* an
+  expression such as `(1-FR)`. Declare the complementary fraction explicitly
+  (`FR2 = 1 - TVFR1`) so each term binds to one parameter. This also lets the
+  fraction carry IIV/covariates and keeps its gradient exact (analytic `Dual2`).
+- The dose is **partitioned**, not duplicated: when more than one input-rate term
+  feeds a compartment, **each** must carry a fraction, and the fractions are
+  checked at fit-init to lie in `(0, 1]` and sum to ≈ 1 (`E_ABSORPTION_FRACTION`).
+  Two pathways together still deliver exactly `F·Dose` (`∫ Σ FRᵢ·R_inᵢ dt = F·Dose`).
+- The same multiplier works for `transit`/`weibull` terms. A fraction on
+  `zero_order(...)` (the `mixed`/`parallel` zero-order family) is **not yet
+  supported** ([#505](https://github.com/FeRx-NLME/ferx-core/issues/505)).
+
+[`examples/biphasic_igd_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/biphasic_igd_absorption.ferx)
+is a complete biphasic model; run it on simulated data:
+
+```bash
+cargo run --release -- examples/biphasic_igd_absorption.ferx --simulate
 ```
 
 ## Weibull absorption — `weibull(td, beta)`

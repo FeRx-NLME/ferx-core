@@ -8,16 +8,27 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **Savic transit** | `transit(n, mtt)` — PR [#343](https://github.com/FeRx-NLME/ferx-core/pull/343) | `savic_transit.ctl` | `transit_savic_fit.ferx` |
 | **Freijer & Post IG** | `igd(mat, cv2)` — issue [#347](https://github.com/FeRx-NLME/ferx-core/issues/347) | `freijer_ig.ctl` | *(in `tests/igd_nonmem_anchor.rs`)* |
 | **Weibull** | `weibull(td, beta)` — [#322](https://github.com/FeRx-NLME/ferx-core/issues/322) Phase 2 | `weibull_absorption.ctl` | `weibull_absorption_fit.ferx` |
+| **Biphasic IG** | `FR1*igd(...) + FR2*igd(...)` — [#388](https://github.com/FeRx-NLME/ferx-core/issues/388) | `freijer_biphasic_ig.ctl` | `biphasic_ig_fit.ferx` |
 
 The transit control runs on `transit_oral.csv`; the IG and Weibull controls run
 on `igd_oral.csv` (the same data re-keyed to a 1-compartment layout — every record
-on CMT 1 — so the dose feeds the absorption compartment directly).
+on CMT 1 — so the dose feeds the absorption compartment directly). The **biphasic
+IG** control runs on its own matched dataset `biphasic_ig_oral.csv` (see below).
 
 > **Weibull run status — DONE (#503).** The licensed NONMEM run landed
 > (`results/weibull_absorption.{ext,lst,tab,…}`, MINIMIZATION SUCCESSFUL,
 > `#OBJV = −943.833`) and the slow-gated `tests/weibull_nonmem_anchor.rs` pins the
 > verified comparison below. Re-run with
 > `nmfe75 weibull_absorption.ctl weibull_absorption.lst`.
+
+> **Biphasic IG run status — DONE (#388).** The licensed NONMEM run landed
+> (`results/freijer_biphasic_ig.{ext,lst,cov,cor,coi,phi,ctl}` + `biphasic_ig.tab`,
+> MINIMIZATION SUCCESSFUL, `#OBJV = −754.211`) and the slow-gated
+> `tests/biphasic_igd_nonmem_anchor.rs` pins the verified comparison below. Unlike
+> the others, the biphasic anchor ships its own **matched** (well-specified)
+> dataset, simulated from the biphasic model itself (`simulate_biphasic_ig_data.py`),
+> so NONMEM also **recovers** the truths. Re-run with
+> `nmfe75 freijer_biphasic_ig.ctl freijer_biphasic_ig.lst`.
 
 ## The dataset
 
@@ -209,6 +220,38 @@ density issue — the shared-optimum check above independently rules out a densi
 at 0.01 units, and the analytic `Dual2` gradient (which NONMEM-style gradient FOCEI
 also relies on) closes the gap. This run therefore also verifies that `auto` + the
 analytic ODE-forcing gradient resolve and converge end-to-end on a `weibull()` model.
+
+### Biphasic IG — RESULT (FOCEI, 20 subj / 240 obs)
+
+NONMEM run: `results/freijer_biphasic_ig.*` (`nmfe75`, `ADVAN13 TOL=9`,
+MINIMIZATION SUCCESSFUL, `#OBJV = −754.211`). ferx anchor:
+`tests/biphasic_igd_nonmem_anchor.rs` on `data/biphasic_ig_oral.csv` (the all-CMT-1
+re-key) — `FR1*igd(...) + FR2*igd(...)` with `FR2 = 1 - FR1`.
+
+Unlike the igd / Weibull anchors, the data are **matched** (simulated from this
+biphasic model), so this is both an **implementation** check (`NONMEM ≈ ferx at the
+shared optimum`) **and** a **recovery** check. NONMEM recovers the data-generating
+values, with the `MAT1 < MAT2` bounds holding the fast/slow pathway labels:
+
+| Param | NONMEM | Truth |
+|-------|-------:|------:|
+| TVCL  | 5.366  | 5.0   |
+| TVV   | 56.94  | 50.0  |
+| **FR1** (fast-pathway fraction) | **0.6435** | **0.6** |
+| MAT1 (fast) | 0.5281 | 0.5 |
+| MAT2 (slow) | 4.124  | 4.0 |
+| CV2_1 | 0.2188 | 0.2 |
+| CV2_2 | 0.3453 | 0.5 |
+| ω²(CL) | 0.0480 | 0.09 |
+| ω²(V)  | 0.0429 | 0.09 |
+| σ² (prop) | 0.02493 | 0.0225 |
+
+Evaluating ferx's FOCEI objective at NONMEM's optimum gives **−754.2113** vs
+NONMEM `#OBJV −754.211` — agreement to **~1e-5** (tighter than igd's 0.02 and
+Weibull's 0.01), confirming the **pathway-fraction superposition** (`FR1·R_in1 +
+FR2·R_in2`) and the IG density reproduce the NONMEM `$DES` biphasic input. The
+fixed effects (CL, V, FR1, MAT1/2, CV2_1/2) recover tightly; the variance
+components carry the usual finite-sample (N=20) noise.
 
 ## Implementation notes (why the streams look the way they do)
 

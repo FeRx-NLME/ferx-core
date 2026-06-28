@@ -150,22 +150,68 @@ pub fn compute_r_matrix_with_correlations(
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> DMatrix<f64> {
+    // The bare-sigma `R` is exactly the custom-magnitude `R` with an all-ones
+    // multiplier: an empty `mult` makes every observation's loading multiplier
+    // default to 1.0. Delegate to the scaled builder so the diagonal-variance
+    // and cross-covariance formulas live in one place (#484 review #9) — a fix
+    // to the correlation math can no longer diverge the magnitude path from the
+    // bare path.
+    compute_r_matrix_with_correlations_scaled(
+        error_spec,
+        ipreds,
+        obs_cmts,
+        obs_times,
+        obs_raw_times,
+        occasions,
+        sigma_values,
+        correlations,
+        &[],
+    )
+}
+
+/// Build the subject residual covariance matrix `R` with a per-observation
+/// custom magnitude (#484). `mult` is the `[obs][sigma-slot]` multiplier matrix
+/// from [`crate::types::RuvMagnitude::eval_obs`]; each observation's sigma
+/// loadings are scaled by its row before forming the diagonal variance and any
+/// `block_sigma` cross-covariance. A `mult` whose rows are all ones reproduces
+/// [`compute_r_matrix_with_correlations`] exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_r_matrix_with_correlations_scaled(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: &[Vec<f64>],
+) -> DMatrix<f64> {
     let n = ipreds.len();
     let mut r = DMatrix::<f64>::zeros(n, n);
-    let r_diag =
-        compute_r_diag_with_correlations(error_spec, ipreds, obs_cmts, sigma_values, correlations);
-    for (j, &v) in r_diag.iter().enumerate() {
-        r[(j, j)] = v;
+    let ones: Vec<f64> = Vec::new();
+    let row = |j: usize| -> &[f64] { mult.get(j).map(|v| v.as_slice()).unwrap_or(&ones) };
+    for j in 0..n {
+        let f = ipreds[j];
+        let cmt = obs_cmts.get(j).copied().unwrap_or(0);
+        r[(j, j)] = error_spec.variance_at_scaled(cmt, f, sigma_values, correlations, row(j));
     }
     if correlations.is_empty() {
         return r;
     }
-
-    let loadings: Vec<Vec<(usize, f64)>> = ipreds
-        .iter()
-        .zip(obs_cmts.iter())
-        .map(|(&f, &cmt)| error_spec.sigma_loadings(cmt, f, sigma_values.len()))
-        .collect();
+    // Scale each observation's loadings by its multiplier row before computing
+    // the cross-observation covariance.
+    let scale_loadings = |j: usize| -> Vec<(usize, f64)> {
+        let f = ipreds[j];
+        let cmt = obs_cmts.get(j).copied().unwrap_or(0);
+        let m = row(j);
+        error_spec
+            .sigma_loadings(cmt, f, sigma_values.len())
+            .into_iter()
+            .map(|(idx, coeff)| (idx, coeff * m.get(idx).copied().unwrap_or(1.0)))
+            .collect()
+    };
+    let loadings: Vec<Vec<(usize, f64)>> = (0..n).map(scale_loadings).collect();
     for j in 0..n {
         if loadings[j].is_empty() {
             continue;
@@ -218,7 +264,15 @@ pub fn compute_iwres(
 }
 
 /// Compute IWRES using residual variances that include fixed `block_sigma`
-/// correlations. With no correlations this is exactly [`compute_iwres`].
+/// correlations. With no correlations and no custom magnitude this is exactly
+/// [`compute_iwres`].
+///
+/// `ruv_mult` is the per-observation custom-magnitude multiplier matrix (#484)
+/// from [`crate::types::CompiledModel::ruv_obs_mult`]; `None` reproduces the
+/// legacy unscaled IWRES. When present, each observation's residual variance is
+/// scaled by its multiplier row so the sdtab IWRES matches the magnitude-aware
+/// OFV variance (otherwise late/covariate-varying rows are systematically
+/// mis-scaled).
 pub fn compute_iwres_with_correlations(
     observations: &[f64],
     ipreds: &[f64],
@@ -226,7 +280,24 @@ pub fn compute_iwres_with_correlations(
     error_spec: &ErrorSpec,
     sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
+    ruv_mult: Option<&[Vec<f64>]>,
 ) -> Vec<f64> {
+    if let Some(mult) = ruv_mult {
+        // variance_at_scaled handles empty `correlations` (no cross terms) and a
+        // short/empty multiplier row (slots default to 1.0), so this one path
+        // covers correlated and uncorrelated custom-magnitude models alike.
+        return observations
+            .iter()
+            .zip(ipreds.iter())
+            .zip(obs_cmts.iter())
+            .enumerate()
+            .map(|(j, ((&y, &f), &cmt))| {
+                let m = mult.get(j).map(|v| v.as_slice()).unwrap_or(&[]);
+                let v = error_spec.variance_at_scaled(cmt, f, sigma_values, correlations, m);
+                (y - f) / v.sqrt()
+            })
+            .collect();
+    }
     if correlations.is_empty() {
         return compute_iwres(observations, ipreds, obs_cmts, error_spec, sigma_values);
     }
@@ -539,8 +610,15 @@ mod tests {
             rho: 0.5,
         };
         // V = (10 * 0.2)^2 + 1^2 + 2 * 10 * 0.5 * 0.2 * 1 = 7.
-        let result =
-            compute_iwres_with_correlations(&[12.0], &[10.0], &[1], &spec, &[0.2, 1.0], &[corr]);
+        let result = compute_iwres_with_correlations(
+            &[12.0],
+            &[10.0],
+            &[1],
+            &spec,
+            &[0.2, 1.0],
+            &[corr],
+            None,
+        );
         assert_relative_eq!(result[0], 2.0 / 7.0_f64.sqrt(), epsilon = 1e-12);
     }
 
@@ -551,8 +629,50 @@ mod tests {
         let ipreds = [10.0, 20.0];
         let obs_cmts = [1, 1];
         let plain = compute_iwres(&obs, &ipreds, &obs_cmts, &spec, &[1.0]);
-        let with = compute_iwres_with_correlations(&obs, &ipreds, &obs_cmts, &spec, &[1.0], &[]);
+        let with =
+            compute_iwres_with_correlations(&obs, &ipreds, &obs_cmts, &spec, &[1.0], &[], None);
         assert_eq!(plain, with);
+    }
+
+    #[test]
+    fn test_compute_iwres_with_correlations_applies_custom_magnitude() {
+        // #484 review #4: the sdtab IWRES must use the per-observation magnitude
+        // multiplier, so a row whose multiplier ≠ 1 is scaled by it. Proportional
+        // error: V = (f·m·σ)², so IWRES = (y−f)/(f·m·σ).
+        let spec = ErrorSpec::Single(ErrorModel::Proportional);
+        let obs = [12.0, 22.0];
+        let ipreds = [10.0, 20.0];
+        let obs_cmts = [1, 1];
+        let sigma = [0.2];
+        // Row 0 bare (mult 1), row 1 inflated by 2.
+        let mult = vec![vec![1.0], vec![2.0]];
+        let scaled = compute_iwres_with_correlations(
+            &obs,
+            &ipreds,
+            &obs_cmts,
+            &spec,
+            &sigma,
+            &[],
+            Some(&mult),
+        );
+        assert_relative_eq!(scaled[0], 2.0 / (10.0 * 1.0 * 0.2), epsilon = 1e-12);
+        assert_relative_eq!(scaled[1], 2.0 / (20.0 * 2.0 * 0.2), epsilon = 1e-12);
+
+        // An all-ones multiplier reproduces the unscaled IWRES exactly.
+        let ones = vec![vec![1.0], vec![1.0]];
+        let unit = compute_iwres_with_correlations(
+            &obs,
+            &ipreds,
+            &obs_cmts,
+            &spec,
+            &sigma,
+            &[],
+            Some(&ones),
+        );
+        let bare =
+            compute_iwres_with_correlations(&obs, &ipreds, &obs_cmts, &spec, &sigma, &[], None);
+        assert_relative_eq!(unit[0], bare[0], epsilon = 1e-12);
+        assert_relative_eq!(unit[1], bare[1], epsilon = 1e-12);
     }
 
     fn make_subject(iwres: Vec<f64>) -> SubjectResult {

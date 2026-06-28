@@ -254,6 +254,47 @@ fn frem_impmap_rao_blackwell_runs_finite() {
     );
 }
 
+/// The defensive mixture (`imp_defensive_alpha > 0`, issue #528) must also apply
+/// on the FREM Rao-Blackwell E-step — its covering component is the conditional
+/// PK prior `N(μ, P_pp⁻¹)`. A few IMPMAP iterations with the mixture enabled must
+/// still produce a finite OFV and a well-formed 5×5 omega (regression for the
+/// finding that `subject_is_draws_frem_rb` ignored `imp_defensive_alpha`).
+#[test]
+fn frem_impmap_rao_blackwell_defensive_mixture_runs_finite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = setup_frem(tmp.path());
+
+    let model = parse_model_file(&result.model_path).unwrap();
+    let pop = read_nonmem_csv(&result.data_path, None, None).unwrap();
+
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Impmap;
+    opts.impmap_iterations = 3;
+    opts.impmap_samples = 200;
+    opts.imp_defensive_alpha = 0.1; // exercise the RB mixture branch
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+
+    let fit_result = fit(&model, &pop, &model.default_params, &opts)
+        .expect("FREM IMPMAP fit with defensive mixture should not error");
+
+    assert!(
+        fit_result.ofv.is_finite(),
+        "IMPMAP OFV with defensive mixture should be finite, got {}",
+        fit_result.ofv
+    );
+    let omega = &fit_result.omega;
+    assert_eq!(omega.nrows(), 5);
+    assert_eq!(omega.ncols(), 5);
+    for i in 0..5 {
+        assert!(
+            omega[(i, i)] > 0.0 && omega[(i, i)].is_finite(),
+            "omega[{i},{i}] should be positive finite, got {}",
+            omega[(i, i)]
+        );
+    }
+}
+
 /// Regression guard for the FREM covariate-marginal 2π bookkeeping.
 ///
 /// `log_p_d` once included the covariate-obs `nc·ln(2π)` normalizer that the

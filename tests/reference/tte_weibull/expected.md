@@ -38,27 +38,30 @@ shape variability — that is what the SSE checks separately.)
 |---|---|---|---|---|
 | scale | 20.0 | **21.87** | **21.87** | **21.90** |
 | shape | 2.0 | **2.21** | **2.20** | **2.210** |
-| omega^2 (var log-shape) | 0.20 | **0.204** | **0.173** | **0.175** |
-| OFV (−2LL) | — | **639.99** | **639.99** | **639.98** |
+| omega^2 (var log-shape) | 0.20 | **0.176** | **0.173** | **0.175** |
+| OFV (−2LL) | — | **639.98** | **639.99** | **639.98** |
 
 > **NONMEM status (2026-06-23): DONE — converged (MINIMIZATION SUCCESSFUL, SEs computed).** Getting
 > it to run needed a dummy **`$SIGMA 1 FIX` REFERENCED in `$PRED` via `DUMMY = EPS(1)`** (declaring
 > `$SIGMA` alone leaves NM-TRAN inferring single-subject → `CONDITIONAL` invalid, error 350), plus
 > estimated ω² + `LAPLACIAN INTERACTION NUMERICAL SLOW`.
 >
-> **Verdict on the #440 ω²:** the three Laplace tools split — **NONMEM 0.175 ≈ nlmixr2 0.173**, while
-> **ferx 0.204 sits ~17% higher**. Structural params (scale, shape) and the −2LL match across all
-> three to ≤0.5% / identical OFV (639.98–639.99), and the OFV is essentially flat across that ω²
-> spread → the nonlinear-frailty ω² is **weakly identified**, exactly the #440 sensitivity. NONMEM
-> (the licensed reference) siding with nlmixr2 *below* ferx reinforces that ferx's FOCEI reads ω²
-> high for nonlinear frailty (the large-N SSE is +72%); SAEM/IMP remain preferred (§3.3, §13).
+> **ω² — all three Laplace tools now agree (ferx 0.176 ≈ NONMEM 0.175 ≈ nlmixr2 0.173).**
+> ferx previously read **0.204** here, ~17% above the consensus. That gap (#469) was **not** a
+> likelihood or method difference — it was the derivative-free **BOBYQA outer optimizer**
+> false-converging on the near-flat ω² ridge: its `ftol_rel` default (1e-6) stopped it short of
+> ferx's *own* objective minimum (a fixed-ω² profile of ferx's −2LL already bottomed at ~0.175,
+> with the free fit halting at 0.204 / OFV 639.99 — *above* its own minimum 639.98). Auto-tightening
+> the TTE outer `ftol_rel` to 1e-8 (the hazard objective is evaluated exactly, so 1e-8 is reachable)
+> walks ferx onto the consensus. This is purely a **convergence** fix; structural params and −2LL
+> already matched across all three (≤0.5% / OFV 639.98–639.99).
 
-> ferx ↔ nlmixr2 FOCEI agree to ~3 digits on `scale`, `shape` and the −2LL — but the
-> shape-frailty `omega^2` differs (0.204 vs 0.173) **between two FOCEI implementations**.
-> That spread is itself evidence for the nonlinear-frailty `omega^2` sensitivity in #440
-> (different FD-Hessian step strategies land differently on the hard variance). On this n=100
-> realisation ferx's value happens to land on the truth — the clean large-N SSE below exposes
-> the systematic FOCEI over-estimation. (nlmixr2 −2LL = AIC − 2·npar = 645.99 − 6.)
+> ferx ↔ nlmixr2 ↔ NONMEM now agree to ~3 digits on `scale`, `shape`, the −2LL **and** the
+> shape-frailty `omega^2` (0.176 / 0.173 / 0.175) after the #469 outer-`ftol_rel` fix. This is
+> distinct from the FOCEI-Laplace **method** bias (#440): on a single n=100 realisation the Laplace
+> ω² sits near the truth, but the clean large-N SSE below still exposes the systematic
+> nonlinear-frailty over-estimation (+72%) that SAEM/IMP correct. (nlmixr2 −2LL = AIC − 2·npar =
+> 645.99 − 6.)
 
 ## Simulation–estimation (SSE) recovery — truth check, N = 2000
 
@@ -85,9 +88,9 @@ structural parameters (`scale`, `shape`) recover well under both estimators.
 | ferx fixed-effects scale & shape vs survreg | < 1% | ✅ exact |
 | SSE scale & shape recovery (N=2000) | ±5% | ✅ ±2% |
 | SSE omega^2 (nonlinear frailty) | — | ⚠️ FOCEI over-estimates (+72%); SAEM ~0.13; see #440 |
-| ferx vs **nlmixr2** FOCEI on tte_weibull.csv | scale/shape + −2LL match (ω² differs, see #440) | ✅ scale/shape/−2LL agree |
+| ferx vs **nlmixr2** FOCEI on tte_weibull.csv | scale/shape/ω²/−2LL match | ✅ all agree (ω² 0.176 vs 0.173 post-#469) |
 | **NONMEM** fixed-effects (ω²=0 FIX) vs ferx/survreg | scale/shape ±1%; −2LL match | ✅ ≤0.2%, −2LL 640.261 identical |
-| **NONMEM** frailty (LAPLACIAN) vs ferx/nlmixr2 | scale/shape/−2LL; the #440 ω² | ✅ struct+OFV match; ω² NONMEM 0.175 ≈ nlmixr2 0.173 < ferx 0.204 |
+| **NONMEM** frailty (LAPLACIAN) vs ferx/nlmixr2 | scale/shape/ω²/−2LL | ✅ all agree: ω² ferx 0.176 ≈ NONMEM 0.175 ≈ nlmixr2 0.173 (post-#469 outer-`ftol` fix) |
 
 Fixed-effects nlmixr2 from `nlmixr2_fixed.R`; the frailty NONMEM column needs `nonmem_frailty.ctl`
 (corrected estimated-ω² + LAPLACIAN file) run on a licensed machine — see `README.md`.

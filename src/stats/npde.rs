@@ -99,6 +99,10 @@ pub fn compute_npde_npd(
             // layout so the covariance is one D·Dᵀ gemm and decorrelation is one
             // batched triangular solve.
             let mut sims = DMatrix::<f64>::zeros(n_obs, nsim);
+            // Custom residual magnitude (#484): η-independent (θ/covariate/TIME
+            // only), so build the per-observation multiplier matrix once and
+            // reuse it across all replicates.
+            let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
             for k in 0..nsim {
                 // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
                 let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
@@ -127,6 +131,7 @@ pub fn compute_npde_npd(
                         ip,
                         &params.sigma.values,
                         ruv_scale,
+                        ruv_mult.as_ref().map(|m| m[j].as_slice()),
                     );
                     let eps: f64 = normal.sample(&mut rng);
                     sims[(j, k)] = ip + var.sqrt() * eps;

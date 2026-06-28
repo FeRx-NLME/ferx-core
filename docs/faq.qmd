@@ -136,6 +136,49 @@ Reach for a different optimizer when the default misbehaves:
 See [Fit Options](model-file/fit-options.qmd#optimizer-choices) for the full
 list.
 
+## Does ferx have a `LAPLACIAN` estimation method, like NONMEM?
+
+There is no separate `LAPLACE` / `LAPLACIAN` switch in ferx — and you don't need
+one. In NONMEM, `METHOD=COND` (FOCE/FOCEI) and `METHOD=COND LAPLACE` differ only
+in how the curvature of the individual objective in the random effects (`η`) is
+formed: FOCE uses a first-order (Gauss–Newton) approximation that drops the
+second derivative of the prediction, whereas LAPLACE computes the **exact**
+second derivative of the individual `−2·log L` in `η`. LAPLACE is *required*
+whenever a subject's likelihood is not the built-in Gaussian-residual form — i.e.
+a user-defined likelihood (NONMEM's `F_FLAG`): categorical, count, and
+**time-to-event** data.
+
+ferx's conditional engine is itself a Laplace approximation, and it selects the
+right curvature per endpoint automatically:
+
+| Endpoint | NONMEM | ferx |
+|----------|--------|------|
+| Continuous (Gaussian residual error) | FOCE / FOCEI — first-order Hessian | FOCEI — same first-order Laplace form (matches nlmixr2) |
+| Time-to-event (`[event_model]` hazard) | **`LAPLACIAN` required** | **exact second-order η-Hessian — applied automatically** |
+
+So for a survival model you still write `method = focei`; ferx detects the
+`[event_model]` endpoint and, because there is no Gaussian residual to linearize,
+computes the true second derivative of the hazard `−log L` with respect to `η`
+and folds it into the Laplace marginal. That is exactly NONMEM's LAPLACIAN
+computation — which is why ferx TTE fits are validated against NONMEM
+`CONDITIONAL LAPLACIAN INTERACTION` (see [Time-to-event
+estimation](estimation/tte.qmd)). It is not a user-selectable option because no
+alternative is meaningful: a hazard likelihood always uses it.
+
+For continuous data, ferx (like nlmixr2 FOCEI) keeps the first-order Hessian and
+does **not** offer a full-Laplace-on-Gaussian toggle — the extra curvature term
+it would add is rarely worth it. When FOCE/Laplace accuracy is genuinely the
+concern (strong nonlinearity, non-Gaussian `η` posteriors), reach for the
+importance-sampling (`imp` / `impmap`) or `saem` / `bayes` methods, which
+*integrate* over `η` rather than approximating around its mode. See
+[FOCE/FOCEI](estimation/foce.qmd) and [Fit Options](model-file/fit-options.qmd).
+
+> **The Laplace approximation has limits either way.** Because Laplace is exact
+> only for Gaussian integrands, frailty variances on *nonlinear* hazard
+> parameters can be over-estimated under FOCEI-Laplace — in ferx **and** in
+> NONMEM. Prefer SAEM/IMP there; the [TTE page](estimation/tte.qmd) has the
+> cross-tool comparison.
+
 ## How do I fit on the log scale, like NONMEM's `Y = LOG(F) + EPS(1)`?
 
 Use a log-transform-both-sides (LTBS) error model. Two forms are available in the

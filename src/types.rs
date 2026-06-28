@@ -1380,6 +1380,66 @@ impl Default for ErrorSpec {
     }
 }
 
+/// Per-observation multiplier for one flat sigma slot (#484).
+///
+/// Evaluates the residual-error *magnitude factor* for a single observation
+/// from `(theta, observation-covariate map, TIME)`. The factor multiplies that
+/// sigma's loading, so the slot's variance contribution becomes
+/// `(loading · factor · sigma)²`. Inputs are deliberately limited to
+/// quantities that do **not** depend on the random effects (η) or the
+/// prediction beyond the built-in proportional loading, so the multiplier is
+/// constant across the inner EBE loop for a fixed θ. The covariate map must
+/// supply `TIME` (the parser injects it as a covariate reference) plus any
+/// model covariates the expression names.
+pub type RuvMagFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64) -> f64 + Send + Sync>;
+
+/// Custom residual-error magnitude (#484): one optional multiplier per flat
+/// sigma slot, indexed positionally to match `ErrorSpec::Single`'s sigma
+/// consumption order. `per_sigma[k] == None` means slot `k` is a bare sigma
+/// (multiplier ≡ 1, the legacy path); `Some(f)` makes the slot's magnitude
+/// vary with TIME / covariates / theta.
+#[derive(Default)]
+pub struct RuvMagnitude {
+    pub per_sigma: Vec<Option<RuvMagFn>>,
+}
+
+impl std::fmt::Debug for RuvMagnitude {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let slots: Vec<&str> = self
+            .per_sigma
+            .iter()
+            .map(|s| if s.is_some() { "expr" } else { "bare" })
+            .collect();
+        write!(f, "RuvMagnitude({:?})", slots)
+    }
+}
+
+impl RuvMagnitude {
+    /// Whether any slot carries a non-trivial multiplier. A `RuvMagnitude` whose
+    /// slots are all `None` behaves identically to no custom magnitude.
+    pub fn is_active(&self) -> bool {
+        self.per_sigma.iter().any(|s| s.is_some())
+    }
+
+    /// Per-sigma multiplier vector for one observation. Slot `k` evaluates its
+    /// program; bare slots return `1.0`. The returned vector has length
+    /// `per_sigma.len()`.
+    pub fn eval_obs(
+        &self,
+        theta: &[f64],
+        obs_covariates: &HashMap<String, f64>,
+        time: f64,
+    ) -> Vec<f64> {
+        self.per_sigma
+            .iter()
+            .map(|slot| match slot {
+                Some(f) => f(theta, obs_covariates, time),
+                None => 1.0,
+            })
+            .collect()
+    }
+}
+
 impl ErrorSpec {
     /// Observation-level loadings onto the flat residual-error vector.
     ///
@@ -1458,26 +1518,53 @@ impl ErrorSpec {
         if correlations.is_empty() {
             return self.variance_at(cmt, f_pred, sigma);
         }
+        // The correlated variance is exactly [`variance_at_scaled`] with an
+        // all-ones multiplier: an empty `mult` makes every loading's multiplier
+        // default to 1.0. Delegate so the loading + cross-covariance formula
+        // lives in one place (#484 review #9) and the magnitude path can never
+        // silently diverge from the bare-sigma path.
+        self.variance_at_scaled(cmt, f_pred, sigma, correlations, &[])
+    }
+
+    /// Residual variance with a per-observation custom magnitude (#484).
+    ///
+    /// Like [`variance_at_with_correlations`] but scales each sigma loading by
+    /// the per-observation multiplier `mult[idx]` (1-based on the flat sigma
+    /// vector, supplied by [`RuvMagnitude::eval_obs`]). A `mult` of all ones
+    /// reproduces [`variance_at_with_correlations`] exactly. Cross terms from
+    /// `block_sigma` scale by the product of the two loadings' multipliers.
+    ///
+    /// [`variance_at_with_correlations`]: ErrorSpec::variance_at_with_correlations
+    pub fn variance_at_scaled(
+        &self,
+        cmt: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        correlations: &[ResidualCorrelation],
+        mult: &[f64],
+    ) -> f64 {
         let loadings = self.sigma_loadings(cmt, f_pred, sigma.len());
         if loadings.is_empty() {
             return f64::NAN;
         }
+        let m = |idx: usize| mult.get(idx).copied().unwrap_or(1.0);
         let mut v = 0.0;
         for &(idx, coeff) in &loadings {
             let Some(&s) = sigma.get(idx) else {
                 return f64::NAN;
             };
-            v += coeff * coeff * s * s;
+            let c = coeff * m(idx);
+            v += c * c * s * s;
         }
         for corr in correlations {
             let ci = loadings
                 .iter()
                 .find(|(idx, _)| *idx == corr.sigma_i)
-                .map(|(_, coeff)| *coeff);
+                .map(|(_, coeff)| *coeff * m(corr.sigma_i));
             let cj = loadings
                 .iter()
                 .find(|(idx, _)| *idx == corr.sigma_j)
-                .map(|(_, coeff)| *coeff);
+                .map(|(_, coeff)| *coeff * m(corr.sigma_j));
             let (Some(ci), Some(cj)) = (ci, cj) else {
                 continue;
             };
@@ -1547,6 +1634,30 @@ impl ErrorSpec {
             ErrorModel::Additive => 0.0,
             ErrorModel::Proportional | ErrorModel::Combined => 2.0 * f * prop_sigma * prop_sigma,
         }
+    }
+
+    /// `dvar_df` with a per-observation custom magnitude (#484).
+    ///
+    /// The proportional loading carries the multiplier `m_prop`, so the
+    /// variance's `f`-dependent term is `(f·m_prop·σ_prop)²` and its `f`
+    /// derivative scales by `m_prop²`. The proportional sigma is the first sigma
+    /// slot for both `Proportional` and `Combined`; `mult` is indexed on the
+    /// flat sigma vector. A `mult` of all ones reproduces [`dvar_df`].
+    ///
+    /// [`dvar_df`]: ErrorSpec::dvar_df
+    pub fn dvar_df_scaled(&self, cmt: usize, f: f64, sigma: &[f64], mult: &[f64]) -> f64 {
+        let prop_slot = match self {
+            ErrorSpec::Single(_) => 0,
+            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
+                Some(ep) => match ep.sigma_idx.first() {
+                    Some(&i) => i,
+                    None => return 0.0,
+                },
+                None => return 0.0,
+            },
+        };
+        let m = mult.get(prop_slot).copied().unwrap_or(1.0);
+        self.dvar_df(cmt, f, sigma) * m * m
     }
 
     /// `d²(residual variance)/d(prediction f)²` for one observation at `cmt`.
@@ -2384,6 +2495,12 @@ pub struct CompiledModel {
     /// `F`-bypassed bolus impulse onto the dose-driven prediction; see
     /// [`AnalyticalInit`] and `pk::add_analytical_init`.
     pub analytical_init: Vec<AnalyticalInit>,
+    /// Custom residual-error magnitude (#484). `None` for the common case where
+    /// every sigma is a bare parameter (the legacy variance path). `Some` when
+    /// the `[error_model]` makes a sigma's magnitude an expression of TIME /
+    /// covariates / theta; the FOCE/FOCEI likelihood then scales each
+    /// observation's sigma loadings by [`RuvMagnitude::eval_obs`].
+    pub ruv_magnitude: Option<RuvMagnitude>,
 }
 
 /// FREM (Full Random Effects Model) configuration.
@@ -2579,6 +2696,82 @@ impl CompiledModel {
         )
     }
 
+    /// Residual variance for one observation with a per-observation custom
+    /// magnitude (#484). `mult` is the per-sigma multiplier vector for this
+    /// observation (from [`RuvMagnitude::eval_obs`]); a `None` falls back to the
+    /// plain [`residual_variance_at`](Self::residual_variance_at).
+    pub fn residual_variance_at_scaled(
+        &self,
+        cmt: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        mult: Option<&[f64]>,
+    ) -> f64 {
+        match mult {
+            Some(m) => self.error_spec.variance_at_scaled(
+                cmt,
+                f_pred,
+                sigma,
+                &self.residual_correlations,
+                m,
+            ),
+            None => self.residual_variance_at(cmt, f_pred, sigma),
+        }
+    }
+
+    /// Per-observation residual-magnitude multipliers for `subject` at `theta`
+    /// (#484), as an `[obs][sigma-slot]` matrix, or `None` when no custom
+    /// magnitude is active. Evaluated once per outer iteration (it depends on
+    /// θ, observation covariates, and TIME — never on η), so the FOCE/FOCEI
+    /// data term, Laplace curvature term, and inner EBE objective can all share
+    /// one matrix and stay mutually consistent. The TIME fed to each row is the
+    /// raw data-file time (`obs_raw_times`, matching what NONMEM's `$ERROR`
+    /// sees), falling back to `obs_times` for in-memory subjects.
+    pub fn ruv_obs_mult(&self, subject: &Subject, theta: &[f64]) -> Option<Vec<Vec<f64>>> {
+        let rm = self.ruv_magnitude.as_ref()?;
+        if !rm.is_active() {
+            return None;
+        }
+        let n = subject.observations.len();
+        let mut out = Vec::with_capacity(n);
+        for j in 0..n {
+            let time = subject
+                .obs_raw_times
+                .get(j)
+                .copied()
+                .unwrap_or_else(|| subject.obs_times.get(j).copied().unwrap_or(0.0));
+            out.push(rm.eval_obs(theta, subject.obs_cov(j), time));
+        }
+        Some(out)
+    }
+
+    /// True when a residual error model is defined for `cmt` *and* its sigmas
+    /// resolve in `sigma`, so a DV (assay-noised) observation can be drawn there.
+    /// False for a [`ErrorSpec::PerCmt`] spec that omits `cmt` (or whose endpoint
+    /// `sigma_idx` falls outside `sigma`), or a `Single` model whose `sigma` is
+    /// shorter than its error model needs (`< n_sigma` — e.g. a `Combined` model
+    /// carrying one σ, down to no `[error_model]` at all). `simulate_adaptive`
+    /// consults this before drawing a DV monitor so an un-modeled compartment is a
+    /// typed error rather than a fabricated σ (#391 S1.5 edge a) — and so
+    /// [`residual_variance_at`](Self::residual_variance_at), which indexes
+    /// `sigma[0..n_sigma]` for a `Single` model (and the endpoint's `sigma_idx` for
+    /// a `PerCmt` one), is never reached with a `sigma` too short to cover it
+    /// (which would otherwise **panic** for `Single` or return **NaN** for
+    /// `PerCmt`). The two branches are symmetric: each requires `sigma` to cover
+    /// every index the variance computation will read.
+    pub fn has_residual_error_for_cmt(&self, cmt: usize, sigma: &[f64]) -> bool {
+        match &self.error_spec {
+            ErrorSpec::Single(em) => sigma.len() >= em.n_sigma(),
+            ErrorSpec::PerCmt(map) => map.get(&cmt).is_some_and(|ep| {
+                // The endpoint must carry enough sigma indices for its model *and*
+                // every one must resolve in `sigma`; `variance_at` reads
+                // `sigma_idx[0..n_sigma]`, so either shortfall yields a NaN variance.
+                ep.sigma_idx.len() >= ep.error_model.n_sigma()
+                    && ep.sigma_idx.iter().all(|&i| i < sigma.len())
+            }),
+        }
+    }
+
     /// Multiplicative factor applied to the residual *variance* for a subject
     /// whose random-effect vector is `eta`, from the IIV-on-RUV term
     /// (`Y = IPRED + EPS*EXP(ETA)`). Returns `exp(2*eta[k])` when
@@ -2600,6 +2793,18 @@ impl CompiledModel {
     pub fn iiv_on_ruv_forces_fd(&self) -> bool {
         self.residual_error_eta.is_some()
             && (self.n_kappa > 0 || matches!(self.bloq_method, BloqMethod::M3))
+    }
+
+    /// Whether a custom residual-error magnitude (#484) is active. The
+    /// per-observation magnitude expression makes the residual variance depend
+    /// on θ directly (not only through the prediction `f`), which the analytic
+    /// inner/outer gradient kernels do not yet carry — so both gradient loops
+    /// fall back to finite differences when this is `true`. The FD forward NLL
+    /// is itself magnitude-aware, so FD stays exact. Removing this gate is the
+    /// Phase 5 follow-up (AD through the magnitude program).
+    #[inline]
+    pub fn has_custom_ruv_magnitude(&self) -> bool {
+        self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
     }
 
     #[inline]
@@ -2626,6 +2831,12 @@ impl CompiledModel {
     ///   proportional error), which is wrong.
     /// * All other rows use the PK error model scaled by `ruv_scale` (pass
     ///   [`residual_var_scale`](Self::residual_var_scale)).
+    ///
+    /// `mult` is the per-sigma custom-magnitude multiplier row (#484) for this
+    /// observation, from [`ruv_obs_mult`](Self::ruv_obs_mult); `None` (or a row
+    /// of ones) reproduces the legacy unscaled variance. FREM covariate rows are
+    /// never magnitude-scaled — the multiplier acts on the PK residual only,
+    /// mirroring the likelihood and IWRES paths.
     #[inline]
     pub fn sim_residual_variance(
         &self,
@@ -2634,6 +2845,7 @@ impl CompiledModel {
         f_pred: f64,
         sigma: &[f64],
         ruv_scale: f64,
+        mult: Option<&[f64]>,
     ) -> f64 {
         if let Some(ref fc) = self.frem_config {
             if subject.fremtype.get(j).copied().unwrap_or(0) > 0 {
@@ -2641,7 +2853,7 @@ impl CompiledModel {
                 return (s * s).max(1e-12);
             }
         }
-        self.residual_variance_at(subject.obs_cmts[j], f_pred, sigma) * ruv_scale
+        self.residual_variance_at_scaled(subject.obs_cmts[j], f_pred, sigma, mult) * ruv_scale
     }
 
     /// Canonical compartment names for analytical models, used in `[derived]` expressions.
@@ -3561,6 +3773,22 @@ pub struct FitOptions {
     pub methods: Vec<EstimationMethod>,
     pub outer_maxiter: usize,
     pub outer_gtol: f64,
+    /// Relative **step** tolerance for the derivative-free outer optimizer
+    /// (`Bobyqa`): NLopt's `xtol_rel`, controlling how far the trust radius must
+    /// shrink to declare success. Default `1e-4` (~0.01% move in the natural-scale
+    /// parameter). Other optimizers use their own fixed internal tolerances.
+    pub outer_xtol: f64,
+    /// Relative **objective** tolerance for the derivative-free outer optimizer
+    /// (`Bobyqa`): NLopt's `ftol_rel`, the relative OFV change below which the
+    /// optimizer stops. `None` (the default) auto-selects per model: `1e-8` for a
+    /// pure-TTE model (an *exactly*-evaluated hazard objective, where the looser
+    /// historical `1e-6` stopped short on a near-flat frailty-ω² ridge — #469 — and
+    /// the reported variance landed above its own minimum), and `1e-6` otherwise.
+    /// The `1e-6` floor for non-TTE fits is deliberate: on a *noisy* objective
+    /// (ODE solver error, FD-inner FOCE) a tighter `ftol` is unreachable, so BOBYQA
+    /// grinds toward its maxeval budget instead of converging. `Some(x)` pins `x`
+    /// for every model, overriding the auto-selection.
+    pub outer_ftol: Option<f64>,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
     /// RK45 ODE solver relative tolerance (`[fit_options] ode_reltol`, or via
@@ -3807,6 +4035,27 @@ pub struct FitOptions {
     /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
     /// Default 10.0.
     pub iscale_max: f64,
+    /// Defensive-mixture weight for the IMP/IMPMAP importance-sampling proposal
+    /// (issue #528). Each subject draws an `imp_defensive_alpha` fraction of its
+    /// samples from the prior `N(0, Ω)` instead of the mode-centred t-proposal,
+    /// and every sample is scored under the resulting mixture density. Because
+    /// the prior is guaranteed to cover the conditional posterior, this bounds
+    /// each importance weight by `p(y|η)/alpha`, so no single sample from a
+    /// weakly-identified subject (e.g. an analytical `[initial_conditions]`
+    /// baseline whose V cancels in the amplitude) can hijack the importance-
+    /// weighted M-step and walk θ to the bounds. (It bounds the weights, not the
+    /// raw ESS — a sharp interior likelihood spike can still keep ESS low.)
+    /// Applies to the estimating IMP/IMPMAP phases (including the FREM
+    /// Rao-Blackwell path) and the eval-only IS marginal-likelihood pass. Must be
+    /// in `[0, 1)`. Default `0.0` — the mixture is **opt-in**, so the default
+    /// reproduces the pre-#528 single-proposal sampler and stays bit-comparable
+    /// with NONMEM (which has no defensive mixture); set a small positive value
+    /// (e.g. `0.1`) to enable the rescue for weakly-identified models. For an
+    /// IMPMAP stage the option may also be written as `impmap_defensive_alpha`
+    /// (an alias for this same field). Enabling the mixture disables Sobol QMC and
+    /// raises the per-subject ESS floor by ≈`alpha` (so `imp_low_ess_threshold`
+    /// flags fewer subjects).
+    pub imp_defensive_alpha: f64,
     /// How LOQ-censored observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -3992,6 +4241,16 @@ impl Default for FitOptions {
             methods: Vec::new(),
             outer_maxiter: 500,
             outer_gtol: 1e-6,
+            // BOBYQA trust-region stop tolerances (NLopt xtol_rel/ftol_rel).
+            // `outer_ftol = None` auto-selects 1e-8 for pure-TTE (exact objective)
+            // and 1e-6 elsewhere (#469): the historical 1e-6 stopped the derivative-
+            // free outer optimizer short on the near-flat frailty-ω² ridge (read
+            // 0.204 vs the NONMEM/nlmixr2 0.175 consensus; at 1e-8 it lands 0.176),
+            // but on a *noisy* objective (ODE/FD-inner) 1e-8 is unreachable and
+            // BOBYQA grinds to maxeval, so non-TTE fits keep 1e-6. Override either
+            // via `[fit_options] outer_xtol`/`outer_ftol`.
+            outer_xtol: 1e-4,
+            outer_ftol: None,
             inner_maxiter: 200,
             // 1e-5, not the looser 1e-4 that an earlier comment justified as
             // matching "NONMEM's ~3-SIGDIGITS inner loop" — that conflated the
@@ -4084,6 +4343,7 @@ impl Default for FitOptions {
             impmap_auto: true,
             iscale_min: 0.1,
             iscale_max: 10.0,
+            imp_defensive_alpha: 0.0,
             bloq_method: BloqMethod::Drop,
             npde_nsim: 0,
             npde_seed: None,
@@ -4498,6 +4758,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_optimizer",
             "optimizer",
+            "outer_xtol",
+            "outer_ftol",
             "steihaug_max_iters",
             "global_search",
             "global_maxeval",
@@ -4517,6 +4779,8 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_optimizer",
             "optimizer",
+            "outer_xtol",
+            "outer_ftol",
             "steihaug_max_iters",
             "global_search",
             "global_maxeval",
@@ -4557,6 +4821,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_max",
             "frem_rao_blackwell",
             "imp_auto",
+            "imp_defensive_alpha",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -4575,6 +4840,11 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "iscale_max",
             "frem_rao_blackwell",
             "impmap_auto",
+            // Both spellings write the same field; `impmap_*` is the canonical
+            // IMPMAP form, `imp_*` is accepted so neither is wrongly flagged
+            // "unsupported" (issue #528).
+            "impmap_defensive_alpha",
+            "imp_defensive_alpha",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",
@@ -4735,6 +5005,7 @@ pub(crate) mod test_helpers {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -4819,6 +5090,7 @@ pub(crate) mod test_helpers {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -4901,17 +5173,64 @@ mod tests {
         let f = 2.0;
 
         // PK row: (f·σ_pk)² · ruv_scale.
-        let pk_var = model.sim_residual_variance(&subject, 0, f, &sigma, ruv);
+        let pk_var = model.sim_residual_variance(&subject, 0, f, &sigma, ruv, None);
         assert!((pk_var - (f * 0.3) * (f * 0.3) * ruv).abs() < 1e-12);
 
         // FREM row: covariate σ², independent of `f_pred` and `ruv_scale`.
-        let frem_var = model.sim_residual_variance(&subject, 1, 999.0, &sigma, ruv);
+        let frem_var = model.sim_residual_variance(&subject, 1, 999.0, &sigma, ruv, None);
         assert!((frem_var - 0.5 * 0.5).abs() < 1e-12);
 
         // Without a FREM config every row uses the PK error model.
         model.frem_config = None;
-        let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, 1.0);
+        let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, 1.0, None);
         assert!((pk_only - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sim_residual_variance_applies_custom_magnitude() {
+        // #484 review #3: simulate() must draw residual error with the custom
+        // magnitude, not a constant SD. A multiplier m on the proportional slot
+        // scales the variance by m²; an all-ones / None multiplier is the legacy
+        // variance exactly.
+        let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+        model.error_model = ErrorModel::Proportional;
+        model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        model.frem_config = None;
+
+        let subject = Subject {
+            id: "S".into(),
+            doses: vec![],
+            obs_times: vec![1.0],
+            obs_raw_times: vec![],
+            observations: vec![0.0],
+            obs_cmts: vec![1],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: vec![],
+            obs_covariates: vec![],
+            pk_only_times: vec![],
+            pk_only_covariates: vec![],
+            reset_times: vec![],
+            cens: vec![0],
+            occasions: vec![],
+            dose_occasions: vec![],
+            fremtype: vec![0],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let sigma = vec![0.3];
+        let f = 2.0;
+
+        // Bare row: (f·σ)².
+        let bare = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, None);
+        assert!((bare - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+
+        // Magnitude 2 on the proportional slot: (f·2·σ)² = 4·bare.
+        let scaled = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, Some(&[2.0]));
+        assert!((scaled - 4.0 * (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+
+        // An all-ones multiplier reproduces the bare variance.
+        let unit = model.sim_residual_variance(&subject, 0, f, &sigma, 1.0, Some(&[1.0]));
+        assert!((unit - bare).abs() < 1e-12);
     }
 
     #[test]
@@ -5515,6 +5834,39 @@ mod tests {
             combined.sigma_types(2),
             vec![SigmaType::Proportional, SigmaType::Additive]
         );
+    }
+
+    #[test]
+    fn variance_at_scaled_unit_mult_matches_legacy() {
+        // A unit multiplier must reproduce the plain variance bit-for-bit.
+        let combined = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.3, 2.0];
+        let f = 5.0;
+        let base = combined.variance_at_with_correlations(1, f, &sigma, &[]);
+        let scaled = combined.variance_at_scaled(1, f, &sigma, &[], &[1.0, 1.0]);
+        assert_eq!(base, scaled);
+    }
+
+    #[test]
+    fn variance_at_scaled_scales_proportional_loading() {
+        // mult = [2, 1] on combined → (2·f·σ_p)² + σ_a².
+        let combined = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.3, 2.0];
+        let f = 5.0;
+        let v = combined.variance_at_scaled(1, f, &sigma, &[], &[2.0, 1.0]);
+        let expected = (2.0 * f * 0.3).powi(2) + 2.0_f64.powi(2);
+        assert!((v - expected).abs() < 1e-12, "got {v}, want {expected}");
+    }
+
+    #[test]
+    fn dvar_df_scaled_scales_by_mprop_squared() {
+        // dvar_df scales by the proportional multiplier squared.
+        let combined = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.3, 2.0];
+        let f = 7.0;
+        let base = combined.dvar_df(1, f, &sigma);
+        let scaled = combined.dvar_df_scaled(1, f, &sigma, &[3.0, 1.0]);
+        assert!((scaled - base * 9.0).abs() < 1e-12);
     }
 
     #[test]
@@ -6255,5 +6607,69 @@ mod tests {
         }];
         let v = model.residual_variance_at(0, 10.0, &[0.2, 1.0]);
         assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn has_residual_error_for_cmt_covers_single_and_per_cmt() {
+        let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+
+        // Single error model: defined for every cmt iff sigma covers its n_sigma.
+        model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        assert!(model.has_residual_error_for_cmt(1, &[0.1]));
+        assert!(model.has_residual_error_for_cmt(99, &[0.1]));
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[]),
+            "no sigma ⇒ no error model"
+        );
+        // A Combined model needs two sigmas; one is too short — `residual_variance`
+        // would otherwise index `sigma[1]` and PANIC (symmetric to the PerCmt
+        // out-of-range guard below, never a fabricated σ).
+        model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+        assert!(model.has_residual_error_for_cmt(1, &[0.1, 0.2]));
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[0.1]),
+            "Combined needs 2 sigmas; 1 is too short to draw a DV"
+        );
+
+        // PerCmt: defined only for compartments present in the map.
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            2usize,
+            EndpointError {
+                error_model: ErrorModel::Proportional,
+                sigma_idx: vec![0],
+            },
+        );
+        model.error_spec = ErrorSpec::PerCmt(map);
+        assert!(
+            model.has_residual_error_for_cmt(2, &[0.1]),
+            "cmt 2 has an endpoint"
+        );
+        assert!(
+            !model.has_residual_error_for_cmt(1, &[0.1]),
+            "cmt 1 is not in the map"
+        );
+        // An endpoint whose sigma_idx falls outside `sigma` is not drawable —
+        // `residual_variance_at` would otherwise return NaN (symmetric to the
+        // Single empty-sigma guard, never a fabricated σ).
+        assert!(
+            !model.has_residual_error_for_cmt(2, &[]),
+            "cmt 2's sigma_idx is out of range for an empty sigma"
+        );
+        // A Combined endpoint needs two sigma indices; one is too few — `variance_at`
+        // would read `sigma_idx[1]` (absent) and return NaN even though sigma is long.
+        let mut combined_map = std::collections::HashMap::new();
+        combined_map.insert(
+            2usize,
+            EndpointError {
+                error_model: ErrorModel::Combined,
+                sigma_idx: vec![0], // only one index for a two-sigma model
+            },
+        );
+        model.error_spec = ErrorSpec::PerCmt(combined_map);
+        assert!(
+            !model.has_residual_error_for_cmt(2, &[0.1, 0.2]),
+            "a Combined endpoint with too few sigma indices is not drawable"
+        );
     }
 }

@@ -349,6 +349,9 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
         && model.residual_correlations.is_empty()
         && !model.has_tte()
+        // Custom residual-error magnitude (#484): θ-dependent variance not yet in
+        // the analytic outer θ/σ kernels — FD gradient only (it is magnitude-aware).
+        && !model.has_custom_ruv_magnitude()
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
         && (sens_supported(model) || iov_sens_supported(model))

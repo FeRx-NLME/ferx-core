@@ -10,8 +10,8 @@
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
 use crate::pk::absorption::PreparedInputRate;
 use crate::sim::adaptive::{
-    AdaptiveRun, ControllerCtx, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry,
-    MonitorSpec, ObserveMode, ObservedSignal,
+    assay_standard_normal, AdaptiveRun, AssayNoise, ControllerCtx, DecisionLogEntry,
+    DecisionOutcome, DoseAction, DoseLedgerEntry, MonitorSpec, ObserveMode, ObservedSignal,
 };
 use crate::types::{DoseEvent, PkParams, Subject};
 use std::borrow::Cow;
@@ -690,11 +690,17 @@ fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> Vec<PreparedInputRate> 
 /// instead of `sens/ode_provider.rs` hand-maintaining a second copy (#430 review
 /// #4 / #451). The dual caller passes `dose_lagtimes = &[]` (lagtime gated off) and
 /// `reset_floor = NEG_INFINITY` (reset gated off), so those branches are inert there.
+///
+/// `params` is the flat individual-parameter vector the `prepared` constants were
+/// built from; it is read here only for the optional pathway-fraction multiplier
+/// (`FR*fn(...)`, #388) via [`InputRateForcing::frac`] — `frac = 1` (no `frac_slot`)
+/// is the single-pathway default, so this is a no-op for unfractioned forcings.
 #[inline]
 #[allow(clippy::too_many_arguments)] // mirrors the dose context threaded into the RHS wrappers
 pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
     ode: &OdeSpec,
     prepared: &[PreparedInputRate<T>],
+    params: &[T],
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     dose_f_bio: &[T],
@@ -734,7 +740,11 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
             acc = acc + prep.rate(T::from_f64(tad), dose_mass);
         }
-        dy[forcing.cmt] = dy[forcing.cmt] + acc;
+        // Pathway fraction (#388): a `FR*fn(...)` term scales its whole `R_in` by
+        // the declared fraction `FR`; `frac = 1` for an unfractioned single-pathway
+        // forcing, so this is a no-op there. The multiplier flows linearly, so for
+        // `T = Dual2` it carries the exact `∂R_in/∂frac` sensitivity.
+        dy[forcing.cmt] = dy[forcing.cmt] + acc * forcing.frac(params);
     }
 }
 
@@ -801,6 +811,7 @@ fn wrap_rhs_with_forcings<'a>(
             add_prepared_input_rate_forcing(
                 ode,
                 prepared,
+                p,
                 doses,
                 dose_lagtimes,
                 dose_f_bio,
@@ -1470,8 +1481,13 @@ fn reject_unsupported_dose_compartment(
 ///   discontinues *future* decisions only; an infusion already in flight
 ///   completes its delivery (a committed dose is not retracted — a true safety
 ///   halt is a separate, explicit action, tracked as a follow-up).
-/// - **`ObserveMode::Ipred` only.** A `Dv` (assay-noised) monitor errors until
-///   S1.5 adds the per-subject RNG substreams that keep assay draws verifier-safe.
+/// - **Monitors resolve per-mode (S1.5).** `ObserveMode::Ipred` reads the latent
+///   state; `ObserveMode::Dv` adds the endpoint's residual draw — `IPRED +
+///   ε·√(residual variance)`, clamped at 0 — on the controller-assay substream
+///   carried in `assay` (keyed `(subject, replicate, decision, analyte)`). A `Dv`
+///   monitor with `assay = None`, or on a compartment with no `[error_model]`, is
+///   a typed error (never a fabricated σ). The all-`Ipred` path draws nothing, so
+///   it is byte-identical regardless of `assay`.
 /// - **Dose-free base subject** — the regimen is entirely controller-driven
 ///   (augmenting pre-scheduled doses is a later step).
 /// - **No lagged or input-rate (absorption) dosing.** Controller dosing into a
@@ -1512,6 +1528,9 @@ pub(crate) fn ode_predictions_adaptive(
     monitors: &[MonitorSpec],
     controller: &mut dyn FnMut(&ControllerCtx) -> Vec<DoseAction>,
     max_decisions: usize,
+    // Assay-noise capability for `Dv` monitors (#391 S1.5). `None` ⇒ Ipred-only;
+    // a `Dv` monitor then errors at its first decision.
+    assay: Option<&AssayNoise>,
 ) -> Result<AdaptiveRun, String> {
     let n = ode.n_states;
 
@@ -1531,13 +1550,6 @@ pub(crate) fn ode_predictions_adaptive(
         ));
     }
     for m in monitors {
-        if m.mode == ObserveMode::Dv {
-            return Err(format!(
-                "monitor '{}' requests DV (assay-noised) observation, which needs the per-subject \
-                 RNG substreams added in S1.5; the S1.3a driver serves Ipred monitors only",
-                m.name
-            ));
-        }
         if m.cmt == 0 || m.cmt > n {
             return Err(format!(
                 "monitor '{}' observes compartment {} but the model has {} state(s)",
@@ -1622,8 +1634,43 @@ pub(crate) fn ode_predictions_adaptive(
                 let mut signals: HashMap<String, f64> = HashMap::new();
                 let mut observed: Vec<ObservedSignal> = Vec::with_capacity(monitors.len());
                 for m in monitors {
-                    let value =
+                    let latent =
                         read_observable(ode, &u, pk_params_flat, theta, eta, decision_cov, m.cmt);
+                    // Resolve the monitored signal on its own mode: Ipred is the
+                    // latent readout; Dv adds the endpoint's assay residual draw on
+                    // the controller-assay substream (#391 S1.5).
+                    let value = match m.mode {
+                        ObserveMode::Ipred => latent,
+                        ObserveMode::Dv => {
+                            let a = assay.ok_or_else(|| {
+                                format!(
+                                    "decision {decision_index} at t={t_start}: monitor '{}' \
+                                     requests DV (assay-noised) observation but no assay-noise \
+                                     capability was supplied (Ipred-only run)",
+                                    m.name
+                                )
+                            })?;
+                            // Edge (a): a DV monitor on a compartment with no
+                            // residual error model is a typed error, not a guessed σ.
+                            let var = (a.resid_var)(m.cmt, latent).ok_or_else(|| {
+                                format!(
+                                    "decision {decision_index} at t={t_start}: monitor '{}' \
+                                     requests DV observation on compartment {} but no [error_model] \
+                                     defines residual error there",
+                                    m.name, m.cmt
+                                )
+                            })?;
+                            // `has_residual_error_for_cmt` (the gate behind `resid_var`)
+                            // requires `sigma` to cover the model's σ indices, so a `Some`
+                            // here is panic-free and structurally finite — no downstream
+                            // finiteness guard. Value-pathology (a NaN/∞ in `sigma`, a
+                            // diverged IPRED) is whole-sim garbage-in, out of scope here.
+                            let eps = assay_standard_normal(a.base_seed, decision_index, &m.name);
+                            // Edge (b): an assay cannot read below zero; clamp the
+                            // noised value at 0 (BLQ-blinding is deferred to Part F).
+                            (latent + var.sqrt() * eps).max(0.0)
+                        }
+                    };
                     signals.insert(m.name.clone(), value);
                     observed.push(ObservedSignal {
                         name: m.name.clone(),
@@ -3224,6 +3271,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3270,6 +3318,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3332,6 +3381,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         // Exactly one realized dose (t=0); the t=2 / t=4 decisions held.
@@ -3384,6 +3434,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert!(
@@ -3472,6 +3523,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3548,6 +3600,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3583,6 +3636,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert!(
@@ -3611,6 +3665,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert!(run.ledger.is_empty(), "zero-amount bolus records no dose");
@@ -3652,6 +3707,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3674,11 +3730,18 @@ mod tests {
         }
     }
 
+    // ----- S1.5: DV-mode (assay-noised) monitors (#391) -----------------
+
+    fn dv_monitor() -> [MonitorSpec; 1] {
+        [MonitorSpec::new("A", 1, ObserveMode::Dv)]
+    }
+
     #[test]
-    fn adaptive_rejects_dv_monitor() {
+    fn adaptive_dv_without_assay_capability_errors() {
+        // A DV monitor on an Ipred-only run (assay = None) is a typed error, not a
+        // silent fallback to the latent value.
         let ode = one_cpt_ode_spec();
         let pk = pk_one(1.0, 10.0);
-        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Dv)];
         let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
         let base = make_subject(vec![], vec![1.0]);
         let err = ode_predictions_adaptive(
@@ -3688,12 +3751,228 @@ mod tests {
             &[],
             &base,
             &[0.0],
-            &monitors,
+            &dv_monitor(),
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
-        assert!(err.contains("DV") || err.contains("S1.5"), "got: {err}");
+        assert!(
+            err.contains("DV") && err.contains("capability"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_dv_no_error_model_errors() {
+        // Edge (a): a DV monitor on a compartment with no residual error model is a
+        // typed error (resid_var returns None), never a fabricated sigma.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let base = make_subject(vec![], vec![1.0]);
+        let no_model = |_cmt: usize, _ipred: f64| None;
+        let assay = AssayNoise {
+            resid_var: &no_model,
+            base_seed: 7,
+        };
+        let err = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &dv_monitor(),
+            &mut controller,
+            100,
+            Some(&assay),
+        )
+        .unwrap_err();
+        assert!(err.contains("error_model"), "got: {err}");
+    }
+
+    #[test]
+    fn adaptive_dv_zero_variance_equals_ipred() {
+        // sigma -> 0: the DV signal collapses to the latent IPRED. Compare the value
+        // the controller saw under a zero-variance assay against an Ipred monitor on
+        // the same realized run.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0); // ke = 0.1
+        let decisions = [0.0, 24.0]; // dose at t=0, observe pre-dose trough at t=24
+        let base = make_subject(vec![], vec![24.0]);
+        let dose = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+
+        let mut ctrl_ref = dose;
+        let ref_run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[MonitorSpec::new("A", 1, ObserveMode::Ipred)],
+            &mut ctrl_ref,
+            100,
+            None,
+        )
+        .expect("ipred run");
+        let ipred = ref_run.decisions[1].observed_signals[0].value;
+
+        let zero_var = |_cmt: usize, _ipred: f64| Some(0.0);
+        let assay = AssayNoise {
+            resid_var: &zero_var,
+            base_seed: 12345,
+        };
+        let mut ctrl_dv = dose;
+        let dv_run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &dv_monitor(),
+            &mut ctrl_dv,
+            100,
+            Some(&assay),
+        )
+        .expect("dv run");
+        let dv = dv_run.decisions[1].observed_signals[0].value;
+
+        assert!(ipred > 0.0, "expected a non-zero trough at t=24");
+        assert_relative_eq!(dv, ipred, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn adaptive_dv_noised_and_deterministic() {
+        // Non-zero variance perturbs the latent IPRED, and the draw is reproducible:
+        // the same base seed yields the same value, a different seed a different one.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let decisions = [0.0, 24.0];
+        let base = make_subject(vec![], vec![24.0]);
+        let var4 = |_cmt: usize, _ipred: f64| Some(4.0); // sd = 2
+
+        let observe = |seed: u64| {
+            let assay = AssayNoise {
+                resid_var: &var4,
+                base_seed: seed,
+            };
+            let mut ctrl = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+            ode_predictions_adaptive(
+                &ode,
+                &pk.values,
+                &[],
+                &[],
+                &base,
+                &decisions,
+                &dv_monitor(),
+                &mut ctrl,
+                100,
+                Some(&assay),
+            )
+            .expect("dv run")
+            .decisions[1]
+                .observed_signals[0]
+                .value
+        };
+
+        let a = observe(999);
+        let b = observe(999);
+        let c = observe(1000);
+        assert_eq!(a, b, "same base seed must reproduce the assay draw");
+        assert_ne!(a, c, "a different base seed must change the assay draw");
+        let latent = 100.0 * (-2.4f64).exp(); // trough at t=24
+        assert!(
+            (a - latent).abs() > 1e-9,
+            "expected the assay to perturb the latent value"
+        );
+    }
+
+    #[test]
+    fn adaptive_dv_clamps_negative_at_zero() {
+        // Edge (b): the noised value cannot read below zero. At t=0 the pre-dose
+        // trough is 0, so a negative assay draw with a large sigma would push it
+        // negative; assert it clamps to exactly 0.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let neg_seed = (0u64..)
+            .find(|&s| assay_standard_normal(s, 0, "A") < 0.0)
+            .expect("some seed gives a negative draw");
+        let big_var = |_cmt: usize, _ipred: f64| Some(1.0e6);
+        let assay = AssayNoise {
+            resid_var: &big_var,
+            base_seed: neg_seed,
+        };
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+        let base = make_subject(vec![], vec![1.0]);
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0],
+            &dv_monitor(),
+            &mut controller,
+            100,
+            Some(&assay),
+        )
+        .expect("dv run");
+        assert_eq!(
+            run.decisions[0].observed_signals[0].value, 0.0,
+            "a negative assay reading must clamp at 0"
+        );
+    }
+
+    #[test]
+    fn adaptive_dv_added_monitor_does_not_perturb_other_draw() {
+        // Non-perturbing: adding a second DV monitor (a new analyte) must not change
+        // the first analyte's draw — each is keyed by its own analyte name.
+        let ode = one_cpt_ode_spec();
+        let pk = pk_one(1.0, 10.0);
+        let decisions = [0.0, 24.0];
+        let base = make_subject(vec![], vec![24.0]);
+        let var4 = |_cmt: usize, _ipred: f64| Some(4.0);
+
+        let signal_a = |monitors: &[MonitorSpec]| {
+            let assay = AssayNoise {
+                resid_var: &var4,
+                base_seed: 555,
+            };
+            let mut ctrl = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+            let run = ode_predictions_adaptive(
+                &ode,
+                &pk.values,
+                &[],
+                &[],
+                &base,
+                &decisions,
+                monitors,
+                &mut ctrl,
+                100,
+                Some(&assay),
+            )
+            .expect("dv run");
+            run.decisions[1]
+                .observed_signals
+                .iter()
+                .find(|s| s.name == "A")
+                .expect("analyte A present")
+                .value
+        };
+
+        let one = [MonitorSpec::new("A", 1, ObserveMode::Dv)];
+        let two = [
+            MonitorSpec::new("A", 1, ObserveMode::Dv),
+            MonitorSpec::new("B", 1, ObserveMode::Dv),
+        ];
+        assert_eq!(
+            signal_a(&one),
+            signal_a(&two),
+            "adding analyte B must not perturb A's draw"
+        );
     }
 
     #[test]
@@ -3715,6 +3994,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("dose-free"), "got: {err}");
@@ -3736,6 +4016,7 @@ mod tests {
             &[],
             &mut controller,
             2,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("max_decisions"), "got: {err}");
@@ -3757,6 +4038,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("compartment"), "got: {err}");
@@ -3789,6 +4071,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3827,6 +4110,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("state"), "got: {err}");
@@ -3850,6 +4134,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("state"), "got: {err}");
@@ -3865,6 +4150,7 @@ mod tests {
             cmt: 0, // 0-based -> consumes 1-based compartment 1
             kind: crate::pk::absorption::InputRateKind::Transit,
             arg_slots: vec![],
+            frac_slot: None,
         }];
         let pk = pk_one(1.0, 10.0);
         let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
@@ -3879,6 +4165,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("input-rate"), "got: {err}");
@@ -3903,6 +4190,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("lag time"), "got: {err}");
@@ -3947,6 +4235,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -3994,6 +4283,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -4042,6 +4332,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.ledger.len(), 1, "only the first decision infuses");
@@ -4090,6 +4381,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -4145,6 +4437,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -4197,6 +4490,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -4233,6 +4527,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert!(
@@ -4264,6 +4559,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("rate"), "got: {err}");
@@ -4291,6 +4587,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("state"), "got: {err}");
@@ -4303,6 +4600,7 @@ mod tests {
             cmt: 0, // 0-based -> consumes 1-based compartment 1
             kind: crate::pk::absorption::InputRateKind::Transit,
             arg_slots: vec![],
+            frac_slot: None,
         }];
         let pk = pk_one(1.0, 10.0);
         let mut controller = |_ctx: &ControllerCtx| {
@@ -4323,6 +4621,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("input-rate"), "got: {err}");
@@ -4351,6 +4650,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("lag time"), "got: {err}");
@@ -4382,6 +4682,7 @@ mod tests {
             &monitors,
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
 
@@ -4428,6 +4729,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1, "only the stop decision is logged");
@@ -4454,6 +4756,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1, "stop ends the schedule after one");
@@ -4486,6 +4789,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1);
@@ -4522,6 +4826,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1);
@@ -4556,6 +4861,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1, "stop ends the schedule after one");
@@ -4581,6 +4887,7 @@ mod tests {
             &[],
             &mut controller,
             100,
+            None,
         )
         .expect("driver runs");
         assert_eq!(run.decisions.len(), 1);
@@ -4635,6 +4942,7 @@ mod tests {
                 &[],
                 &mut controller,
                 100,
+                None,
             )
             .expect_err("malformed / post-stop action list is rejected");
             assert!(err.contains(needle), "expected {needle:?}, got: {err}");
@@ -4926,6 +5234,7 @@ mod tests {
                 cmt: 0,
                 kind: InputRateKind::Transit,
                 arg_slots: vec![6, 7],
+                frac_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -4979,6 +5288,7 @@ mod tests {
                 cmt: 0,
                 kind: InputRateKind::ZeroOrder,
                 arg_slots: vec![4],
+                frac_slot: None,
             }],
             init_fn: None,
             rhs_program: None,
@@ -5257,6 +5567,7 @@ mod tests {
         add_prepared_input_rate_forcing(
             &ode,
             &prepared,
+            &params,
             &doses,
             &lags,
             &f_bio,
@@ -5273,6 +5584,7 @@ mod tests {
         add_prepared_input_rate_forcing(
             &ode,
             &prepared,
+            &params,
             &doses,
             &lags,
             &f_bio,
@@ -5281,6 +5593,105 @@ mod tests {
             &mut dy_off,
         );
         assert_eq!(dy_off[0], 0.0);
+    }
+
+    #[test]
+    fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
+        // Biphasic IG (#388): two igd forcings on one compartment, split FR1/FR2.
+        // The seam adds `FR1·R_in1 + FR2·R_in2`; because the fraction enters
+        // linearly, the analytic dual derivative ∂(dy)/∂FR1 is exactly R_in1 (so
+        // the FOCEI/Bayes gradient w.r.t. a pathway fraction is exact, no FD).
+        use crate::pk::absorption::{InputRateForcing, InputRateKind, PreparedInputRate};
+        use crate::sens::dual_mixed::DualMixed;
+        use crate::sens::num::PkNum;
+        use crate::types::{MAX_PK_PARAMS, PK_IDX_F};
+
+        // Slots: FR1@0, FR2@1, MAT1@2, CV2_1@3, MAT2@4, CV2_2@5, F@PK_IDX_F.
+        let mk = |frac_slot, arg_slots| InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::InverseGaussian,
+            arg_slots,
+            frac_slot: Some(frac_slot),
+        };
+        let ode = OdeSpec {
+            rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            }),
+            n_states: 1,
+            state_names: vec!["central".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions::default(),
+            input_rate: vec![mk(0, vec![2, 3]), mk(1, vec![4, 5])],
+            init_fn: None,
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+        };
+
+        let (fr1, fr2) = (0.7_f64, 0.3_f64);
+        let mut params = vec![0.0; MAX_PK_PARAMS];
+        params[0] = fr1;
+        params[1] = fr2;
+        params[2] = 2.0; // MAT1
+        params[3] = 0.3; // CV2_1
+        params[4] = 5.0; // MAT2
+        params[5] = 0.6; // CV2_2
+        params[PK_IDX_F] = 1.0;
+
+        let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)]; // CMT 1 → cmt 0
+        let f_bio = vec![1.0];
+        let (t, tad) = (2.5_f64, 2.5_f64);
+
+        // f64: dy = FR1·R_in1 + FR2·R_in2.
+        let prepared = prepare_input_rates(&ode, &params);
+        let (r1, r2) = (prepared[0].rate(tad, 100.0), prepared[1].rate(tad, 100.0));
+        assert!(r1 > 0.0 && r2 > 0.0);
+        let mut dy = vec![0.0];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            &params,
+            &doses,
+            &[0.0],
+            &f_bio,
+            f64::NEG_INFINITY,
+            t,
+            &mut dy,
+        );
+        assert_relative_eq!(dy[0], fr1 * r1 + fr2 * r2, max_relative = 1e-12);
+
+        // Dual: seed FR1 as the variable ⇒ value matches f64 and ∂(dy)/∂FR1 = R_in1.
+        type D = DualMixed<1, 1>;
+        let mut dp = vec![D::constant(0.0); MAX_PK_PARAMS];
+        dp[0] = D::var(fr1, 0);
+        dp[1] = D::constant(fr2);
+        dp[2] = D::constant(2.0);
+        dp[3] = D::constant(0.3);
+        dp[4] = D::constant(5.0);
+        dp[5] = D::constant(0.6);
+        dp[PK_IDX_F] = D::constant(1.0);
+        let prepared_d: Vec<PreparedInputRate<D>> = ode
+            .input_rate
+            .iter()
+            .map(|f| f.prepare_dual::<D>(&dp).unwrap())
+            .collect();
+        let f_bio_d = vec![D::constant(1.0)];
+        let mut dyd = vec![D::constant(0.0)];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared_d,
+            &dp,
+            &doses,
+            &[],
+            &f_bio_d,
+            f64::NEG_INFINITY,
+            t,
+            &mut dyd,
+        );
+        assert_relative_eq!(dyd[0].val(), fr1 * r1 + fr2 * r2, max_relative = 1e-12);
+        assert_relative_eq!(dyd[0].grad[0], r1, max_relative = 1e-9);
     }
 
     #[test]

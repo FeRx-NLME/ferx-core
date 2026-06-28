@@ -844,6 +844,60 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // subject, so a covariate relationship that pushes a subject's typical
     // parameter out of range is caught too. Reported once — a single fatal
     // error already halts the fit.
+    // Pathway-fraction structural check (#388, model-level): fractions must
+    // *partition* the dose on a compartment. ≥2 input-rate terms on one compartment
+    // therefore must **each** carry a fraction (`FR*fn(...)`); a bare term alongside
+    // a fractioned one (or two bare terms) would deliver the full `F·Dose` more than
+    // once. A fraction is only meaningful across ≥2 partitioning terms, so a *lone*
+    // fractioned term is rejected too (a single pathway is written bare).
+    use std::collections::BTreeMap;
+    let mut frac_count: BTreeMap<usize, (usize, usize)> = BTreeMap::new(); // cmt -> (total, fractioned)
+    for f in &ode.input_rate {
+        let e = frac_count.entry(f.cmt).or_insert((0, 0));
+        e.0 += 1;
+        if f.frac_slot.is_some() {
+            e.1 += 1;
+        }
+    }
+    for (&cmt, &(total, fractioned)) in &frac_count {
+        if total >= 2 && fractioned != total {
+            diags.push(
+                Diagnostic::error(
+                    "E_ABSORPTION_FRACTION",
+                    format!(
+                        "Compartment {} has {total} built-in absorption input-rate terms but \
+                         only {fractioned} carry a pathway fraction. When more than one term \
+                         feeds a compartment, each must be written `FR*fn(...)` with the \
+                         fractions summing to 1 — otherwise the dose mass is counted more than \
+                         once.",
+                        cmt + 1
+                    ),
+                )
+                .with_block("odes"),
+            );
+        } else if total == 1 && fractioned == 1 {
+            // A *lone* fractioned term can't partition anything: `FR*fn(...)` as the
+            // only input on a compartment is only ever valid at `FR = 1` (≡ a bare
+            // term), so reject it here with a precise message instead of letting the
+            // per-subject sum-check below report the confusing "fractions sum to 0.6,
+            // not 1" (review #1). A single pathway is written bare; `F` handles
+            // partial absorption.
+            diags.push(
+                Diagnostic::error(
+                    "E_ABSORPTION_FRACTION",
+                    format!(
+                        "Compartment {} has a single input-rate term carrying a pathway fraction \
+                         (`FR*fn(...)`). A pathway fraction only applies when ≥2 terms split the \
+                         dose across a compartment — write a single pathway as a bare \
+                         `+ fn(...)`, and use bioavailability `F` for partial absorption.",
+                        cmt + 1
+                    ),
+                )
+                .with_block("odes"),
+            );
+        }
+    }
+
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     'subjects: for subject in &population.subjects {
         let pk = (model.pk_param_fn)(&model.default_params.theta, &zero_eta, &subject.covariates);
@@ -857,6 +911,56 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
                              values (subject {}): {msg}. Constrain the parameter so it stays \
                              positive (e.g. a log-normal `P = TVP * exp(ETA_P)` \
                              parameterisation).",
+                            subject.id
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+                break 'subjects;
+            }
+        }
+
+        // Pathway-fraction value checks (#388, η = 0, per subject so a covariate on a
+        // fraction is caught too): each fraction in (0, 1], and the fractions on a
+        // compartment sum to ≈ 1. Reported once — a single fatal error halts the fit.
+        let mut frac_sum: BTreeMap<usize, f64> = BTreeMap::new();
+        for forcing in &ode.input_rate {
+            let Some(slot) = forcing.frac_slot else {
+                continue;
+            };
+            let fr = pk.values.get(slot).copied().unwrap_or(1.0);
+            if !(fr > 0.0 && fr <= 1.0) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_ABSORPTION_FRACTION",
+                        format!(
+                            "Pathway fraction out of range at typical values (subject {}): \
+                             {fr} is not in (0, 1]. A `FR*fn(...)` multiplier is a \
+                             dose-splitting fraction — constrain it to (0, 1] (e.g. a logit \
+                             `FR = 1/(1+exp(-X))` parameterisation).",
+                            subject.id
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+                break 'subjects;
+            }
+            *frac_sum.entry(forcing.cmt).or_insert(0.0) += fr;
+        }
+        for (&cmt, &sum) in &frac_sum {
+            // Only a genuine ≥2-pathway split is checked for Σ ≈ 1; a lone fractioned
+            // term is already rejected structurally above, so don't double-report it
+            // with the misleading "sum to <FR>, not 1" here (review #1).
+            let multi = frac_count.get(&cmt).is_some_and(|&(total, _)| total >= 2);
+            if multi && (sum - 1.0).abs() > 1e-4 {
+                diags.push(
+                    Diagnostic::error(
+                        "E_ABSORPTION_FRACTION",
+                        format!(
+                            "Pathway fractions on compartment {} sum to {sum} at typical values \
+                             (subject {}), not 1. Declare fractions that partition the dose — \
+                             e.g. a parameter `FR` and a complementary `FR2 = 1 - FR`.",
+                            cmt + 1,
                             subject.id
                         ),
                     )
@@ -1054,6 +1158,29 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
             )
             .with_block("fit_options"),
         );
+    }
+
+    // Custom residual-error magnitude (#484) is wired through the FOCE/FOCEI
+    // objective (data term + Laplace curvature) only. SAEM's σ/θ M-step, the
+    // Gauss-Newton BHHH gradient, and the importance-sampling likelihood read
+    // the residual variance through paths that do not yet apply the
+    // per-observation magnitude, so reject them up front rather than silently
+    // fitting a mis-specified error model.
+    if model.has_custom_ruv_magnitude() {
+        for &m in &chain {
+            if !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_RUV_MAGNITUDE_METHOD_UNSUPPORTED",
+                        "a custom residual-error magnitude (an [error_model] sigma written as an \
+                         expression of TIME / covariates / thetas) is currently supported for \
+                         method = foce and method = focei only. SAEM, GN, GN-hybrid, and \
+                         importance-sampling paths do not yet apply the per-observation magnitude.",
+                    )
+                    .with_block("error_model"),
+                );
+            }
+        }
     }
 
     if !model.residual_correlations.is_empty() {
@@ -4272,6 +4399,11 @@ fn compute_subject_results(
             let pred =
                 crate::pk::compute_predictions_with_tv(model, subject, &params.theta, &zero_eta);
 
+            // Per-observation custom residual magnitude (#484): η-independent
+            // (θ/covariate/TIME only), so build it once and feed both the IWRES
+            // and CWRES diagnostics so they match the magnitude-aware OFV.
+            let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
+
             // IWRES (NaN on censored rows — see compute_cwres for CWRES handling).
             let mut iwres = compute_iwres_with_correlations(
                 &subject.observations,
@@ -4280,6 +4412,7 @@ fn compute_subject_results(
                 &model.error_spec,
                 &params.sigma.values,
                 &model.residual_correlations,
+                ruv_mult.as_deref(),
             );
             // IIV on residual error (#409): the individual residual SD is scaled
             // by exp(η̂_ruv), so IWRES = (y−f)/(SD·exp(η̂_ruv)) = base / exp(η̂_ruv).
@@ -4315,6 +4448,7 @@ fn compute_subject_results(
                 &model.residual_correlations,
                 frem_r_override.as_deref(),
                 model.residual_error_eta,
+                ruv_mult.as_deref(),
             );
 
             // OFV contribution
@@ -5238,11 +5372,21 @@ fn emit_subject_rows<R: rand::Rng>(
     // drawn `eta_slice` includes η_ruv, so scale the residual variance by
     // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
     let ruv_scale = model.residual_var_scale(eta_slice);
+    // Per-observation custom residual magnitude (#484): η-independent, so build
+    // the [obs][sigma-slot] matrix once per subject and index it per row.
+    let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
     for (j, &ipred) in ipreds.iter().enumerate() {
         // FREM covariate pseudo-observations (FREMTYPE>0) use the additive
         // covariate sigma, not the PK error model applied to the θ+η override
         // that `compute_predictions_with_tv` now writes into FREM rows.
-        let var = model.sim_residual_variance(subject, j, ipred, &params.sigma.values, ruv_scale);
+        let var = model.sim_residual_variance(
+            subject,
+            j,
+            ipred,
+            &params.sigma.values,
+            ruv_scale,
+            ruv_mult.as_ref().map(|m| m[j].as_slice()),
+        );
         let eps: f64 = rng.sample(normal);
         let value = ipred + var.sqrt() * eps;
 
@@ -5521,6 +5665,19 @@ where
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
 
+    // Root seed for the controller-assay substreams (DV-mode monitors, S1.5).
+    // Resolved independently of the η `rng` above so that enabling a `Dv` monitor
+    // never shifts the η draws (the all-`Ipred` path stays byte-identical). With no
+    // run seed it is drawn from a fresh entropy source, matching the η stream's own
+    // nondeterminism.
+    let assay_root: u64 = match opts.seed {
+        Some(s) => s,
+        None => {
+            let mut entropy: rand::rngs::StdRng = rand::make_rng();
+            entropy.random::<u64>()
+        }
+    };
+
     let mut trajectories: Vec<SimulationResult> = Vec::new();
     let mut ledger: Vec<DoseLedgerEntry> = Vec::new();
     let mut decisions: Vec<DecisionLogEntry> = Vec::new();
@@ -5537,6 +5694,28 @@ where
 
             let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
 
+            // Controller-assay capability for any `Dv` monitor: resolve the
+            // endpoint's residual variance by CMT (scaled by this subject's
+            // `ruv_scale` for IIV-on-RUV), or `None` when no [error_model] covers
+            // that compartment (S1.5 edge a). The base seed keys this
+            // (subject, replicate)'s controller-assay substream.
+            let ruv_scale = model.residual_var_scale(&eta_slice);
+            let sigma = &params.sigma.values;
+            let resid_var = |cmt: usize, ipred: f64| -> Option<f64> {
+                if !model.has_residual_error_for_cmt(cmt, sigma) {
+                    return None;
+                }
+                Some(model.residual_variance_at(cmt, ipred, sigma) * ruv_scale)
+            };
+            let assay = crate::sim::adaptive::AssayNoise {
+                resid_var: &resid_var,
+                base_seed: crate::sim::adaptive::subject_assay_base_seed(
+                    assay_root,
+                    &subject.id,
+                    sim,
+                ),
+            };
+
             // A fresh controller per (subject, replicate) — see the factory note.
             let mut controller = make_controller();
             let run: AdaptiveRun = crate::ode::ode_predictions_adaptive(
@@ -5549,6 +5728,7 @@ where
                 &opts.monitors,
                 &mut controller,
                 opts.max_decisions,
+                Some(&assay),
             )
             .map_err(|e| format!("subject '{}' (sim {sim}): {e}", subject.id))?;
 
@@ -6039,6 +6219,7 @@ mod iov_integration {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -7818,6 +7999,7 @@ mod simulate_with_uncertainty_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -8632,6 +8814,7 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -8959,6 +9142,7 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -9117,6 +9301,7 @@ mod tests_derived_session_clock {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -9435,6 +9620,7 @@ mod tests_derived_iov_kappa {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
@@ -10478,19 +10664,21 @@ mod adaptive_sim_tests {
     }
 
     #[test]
-    fn rejects_dv_monitor() {
-        // The Dv (assay-noised) path needs the per-subject RNG substreams of
-        // S1.5; until then a Dv monitor is a typed error.
+    fn dv_monitor_without_error_model_is_rejected() {
+        // Edge (a): a DV monitor on a model with no residual error (here sigma is
+        // stripped) is a typed error, never a fabricated σ.
         let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let mut params = model.default_params.clone();
+        params.sigma.values = vec![]; // no [error_model] coverage for the monitor
         let pop = population(vec![subj("1", vec![6.0], vec![])]);
         let opts = AdaptiveSimulateOptions {
             decision_times: vec![0.0],
             monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
             ..Default::default()
         };
-        let err = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
-            .expect_err("Dv monitor must be rejected");
-        assert!(err.contains("DV") || err.contains("S1.5"), "got: {err}");
+        let err = simulate_adaptive(&model, &pop, &params, 1, fixed_bolus, &opts)
+            .expect_err("DV monitor with no error model must be rejected");
+        assert!(err.contains("error_model"), "got: {err}");
     }
 
     #[test]
@@ -10529,5 +10717,189 @@ mod adaptive_sim_tests {
             r.trajectories.iter().map(|t| t.ipred).collect::<Vec<_>>()
         };
         assert_eq!(ip(&checked), ip(&unchecked));
+    }
+
+    // ----- S1.5: DV-mode (assay-noised) monitors --------------------------
+
+    /// Factory (mirrors `fixed_bolus`): titrate on the *measured* (DV) central
+    /// amount "A" — dose 100 mg when it falls below 50, else hold.
+    fn dv_threshold() -> impl FnMut(&ControllerCtx) -> Vec<DoseAction> {
+        |ctx: &ControllerCtx| {
+            if ctx.signal("A").expect("monitor A declared") < 50.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            }
+        }
+    }
+
+    #[test]
+    fn dv_monitor_run_passes_default_verifier() {
+        // End-to-end: a controller titrating on the DV signal, verify = true. Covers
+        // the assay-noise wiring (resid_var closure + per-subject base seed) and the
+        // driver's DV branch, and confirms the frozen-replay verifier stays green on
+        // a DV run (it replays realized doses, not decisions).
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![2.0, 6.0, 10.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times: vec![0.0, 4.0, 8.0],
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
+            ..Default::default()
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, dv_threshold, &opts)
+            .expect("DV run passes the verifier");
+        assert_eq!(res.decisions.len(), 3);
+        // The DV value the controller saw is recorded, tagged as the Dv mode.
+        assert!(res
+            .decisions
+            .iter()
+            .all(|d| d.observed_signals[0].mode == ObserveMode::Dv));
+    }
+
+    #[test]
+    fn dv_monitor_collapses_to_ipred_as_sigma_to_zero() {
+        // sigma -> 0: titrating on the DV reproduces titrating on the latent IPRED,
+        // realized-ledger for realized-ledger.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let pop = population(vec![subj("1", vec![2.0, 6.0, 10.0], vec![])]);
+        let mut params = model.default_params.clone();
+        params.sigma.values = vec![1e-12];
+        let decision_times = vec![0.0, 4.0, 8.0];
+
+        let dv_opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times: decision_times.clone(),
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
+            ..Default::default()
+        };
+        let ipred_opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times,
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Ipred)],
+            ..Default::default()
+        };
+        let dv = simulate_adaptive(&model, &pop, &params, 1, dv_threshold, &dv_opts).expect("dv");
+        let ip =
+            simulate_adaptive(&model, &pop, &params, 1, dv_threshold, &ipred_opts).expect("ipred");
+        // Compare the *dosing decisions* (time/amt/cmt/rate), not the recorded
+        // observed signals: the residual variance floors at MIN_VARIANCE, so the DV
+        // readout never collapses to IPRED bit-for-bit — but the decisions it drives
+        // do. (The exact bit-for-bit collapse is pinned at the driver level with a
+        // literal zero-variance resolver.)
+        let schedule = |r: &AdaptiveSimulationResult| {
+            r.ledger
+                .iter()
+                .map(|e| (e.time, e.amt, e.cmt, e.rate))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            schedule(&dv),
+            schedule(&ip),
+            "DV with sigma→0 must make the same dosing decisions as IPRED"
+        );
+    }
+
+    #[test]
+    fn adding_dv_monitor_does_not_perturb_eta_trajectory() {
+        // Isolation: the controller-assay substream is disjoint from the η stream,
+        // so enabling a DV monitor leaves the η draws (hence the IPRED trajectory)
+        // bit-identical. Uses ODE_IIV (η on CL) and a signal-independent controller,
+        // so any trajectory difference could only come from a shifted η draw.
+        let model = parse_model_string(ODE_IIV).expect("parse");
+        let pop = population(vec![
+            subj("1", vec![6.0, 30.0], vec![]),
+            subj("2", vec![6.0, 30.0], vec![]),
+        ]);
+        let opts = |monitors: Vec<MonitorSpec>| AdaptiveSimulateOptions {
+            seed: Some(3),
+            decision_times: vec![0.0, 24.0],
+            monitors,
+            ..Default::default()
+        };
+        let no_mon = simulate_adaptive(
+            &model,
+            &pop,
+            &model.default_params,
+            3,
+            fixed_bolus,
+            &opts(vec![]),
+        )
+        .expect("no monitor");
+        let with_dv = simulate_adaptive(
+            &model,
+            &pop,
+            &model.default_params,
+            3,
+            fixed_bolus,
+            &opts(vec![MonitorSpec::new("A", 1, ObserveMode::Dv)]),
+        )
+        .expect("dv monitor");
+        let ip = |r: &AdaptiveSimulationResult| {
+            r.trajectories.iter().map(|t| t.ipred).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ip(&no_mon),
+            ip(&with_dv),
+            "a DV monitor must not shift the η draws / IPRED trajectory"
+        );
+    }
+
+    #[test]
+    fn dv_assay_draws_are_permutation_invariant() {
+        // The controller-assay substream is keyed by subject id, so a subject's DV
+        // draws — and thus its decisions — do not depend on iteration order. A large
+        // residual CV makes the noise flip decisions (so a position-keyed stream
+        // *would* change the ledger), and ODE_NO_IIV keeps η out of the picture.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let mut params = model.default_params.clone();
+        params.sigma.values = vec![0.3]; // 30% proportional CV: noise is consequential
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(11),
+            decision_times: vec![0.0, 4.0, 8.0],
+            monitors: vec![MonitorSpec::new("A", 1, ObserveMode::Dv)],
+            ..Default::default()
+        };
+        let a = subj("A", vec![2.0, 6.0, 10.0], vec![]);
+        let b = subj("B", vec![2.0, 6.0, 10.0], vec![]);
+        let pop_ab = population(vec![a.clone(), b.clone()]);
+        let pop_ba = population(vec![b, a]);
+        let r_ab = simulate_adaptive(&model, &pop_ab, &params, 1, dv_threshold, &opts).expect("ab");
+        let r_ba = simulate_adaptive(&model, &pop_ba, &params, 1, dv_threshold, &opts).expect("ba");
+
+        let ledger_for = |r: &AdaptiveSimulationResult, id: &str| {
+            r.ledger
+                .iter()
+                .filter(|e| e.subject == id)
+                .map(|e| (e.time, e.amt))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ledger_for(&r_ab, "A"),
+            ledger_for(&r_ba, "A"),
+            "A's DV-driven doses must be order-independent"
+        );
+        assert_eq!(
+            ledger_for(&r_ab, "B"),
+            ledger_for(&r_ba, "B"),
+            "B's DV-driven doses must be order-independent"
+        );
+
+        // Non-vacuity: the assay noise must actually be id-keyed (not a no-op), or
+        // the invariance above could hold even under a position-keyed stream. At
+        // t=4 the trough is ~67 (non-zero, so proportional noise is live), and A and
+        // B observe *different* measured values — confirming the noise is consequential.
+        let dv_at = |r: &AdaptiveSimulationResult, id: &str, didx: usize| {
+            r.decisions
+                .iter()
+                .find(|d| d.subject == id && d.decision_idx == didx)
+                .map(|d| d.observed_signals[0].value)
+                .expect("decision logged")
+        };
+        assert_ne!(
+            dv_at(&r_ab, "A", 1),
+            dv_at(&r_ab, "B", 1),
+            "id-keyed assay noise must differ between subjects (test would be vacuous otherwise)"
+        );
     }
 }

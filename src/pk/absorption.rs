@@ -242,6 +242,15 @@ impl InputRateKind {
 /// [`InputRateKind::InverseGaussian`], `[mat, cv2]`; for
 /// [`InputRateKind::Weibull`], `[td, beta]`; for [`InputRateKind::ZeroOrder`],
 /// the single `[dur]`.
+///
+/// `frac_slot` is the optional **pathway fraction** multiplier for parallel /
+/// biphasic absorption (#388): when a `[odes]` term is written `FR*igd(...)`, the
+/// leading declared individual parameter `FR` is resolved to its slot here, and
+/// the delivered rate is `frac · R_in` (so the dose mass splits across pathways by
+/// linearity). `None` is the common single-pathway case (`frac = 1`). The fraction
+/// is required to be a single declared parameter — not an arbitrary expression
+/// like `(1-FR)` — so it binds to one slot; a two-pathway split is two terms whose
+/// fractions sum to 1 (validated at fit-init).
 #[derive(Debug, Clone)]
 pub struct InputRateForcing {
     /// 0-based ODE compartment that receives `R_in`.
@@ -249,6 +258,9 @@ pub struct InputRateForcing {
     pub kind: InputRateKind,
     /// Indices into the flat individual-parameter vector for this model's args.
     pub arg_slots: Vec<usize>,
+    /// Optional slot of the pathway-fraction multiplier (`FR*fn(...)`, #388).
+    /// `None` ⇒ fraction `1` (single pathway). See [`Self::frac`].
+    pub frac_slot: Option<usize>,
 }
 
 impl InputRateForcing {
@@ -264,6 +276,20 @@ impl InputRateForcing {
             .and_then(|&s| params.get(s))
             .copied()
             .unwrap_or(T::from_f64(dflt))
+    }
+
+    /// The pathway-fraction multiplier for this forcing, read from the flat
+    /// individual-parameter vector `params`. Returns `1` when there is no
+    /// `frac_slot` (the single-pathway default) or the slot is absent, so an
+    /// unfractioned `igd(...)`/`transit(...)`/etc. is unaffected. Generic over
+    /// `T: PkNum` so the `Dual2` provider carries the exact `∂R_in/∂frac`
+    /// sensitivity (the multiplier flows linearly into the forcing — #388).
+    #[inline]
+    pub fn frac<T: PkNum>(&self, params: &[T]) -> T {
+        self.frac_slot
+            .and_then(|s| params.get(s))
+            .copied()
+            .unwrap_or(T::from_f64(1.0))
     }
 
     /// Precompute the dose-invariant constants for this forcing's parameters
@@ -676,6 +702,7 @@ mod tests {
             cmt: 0,
             kind: InputRateKind::Transit,
             arg_slots: vec![6, 7], // n @ 6 (dim 0), mtt @ 7 (dim 1)
+            frac_slot: None,
         };
         // (n, mtt, label, clamped_dim): clamped_dim is the seeded dim whose jet the
         // clamp must zero out (None = interior, both jets live).
@@ -731,6 +758,7 @@ mod tests {
             cmt: 0,
             kind: InputRateKind::Transit,
             arg_slots: vec![6, 7], // n @ 6, mtt @ 7
+            frac_slot: None,
         };
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
         params[6] = 3.0; // n
@@ -752,6 +780,7 @@ mod tests {
             cmt: 0,
             kind: InputRateKind::Transit,
             arg_slots: vec![6, 7],
+            frac_slot: None,
         };
         let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
         ok[6] = 3.0;
@@ -916,6 +945,7 @@ mod tests {
             cmt: 1,
             kind: InputRateKind::InverseGaussian,
             arg_slots: vec![4, 5], // mat @ 4, cv2 @ 5
+            frac_slot: None,
         };
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
         params[4] = 2.0; // mat
@@ -937,6 +967,7 @@ mod tests {
             cmt: 1,
             kind: InputRateKind::InverseGaussian,
             arg_slots: vec![4, 5],
+            frac_slot: None,
         };
         let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
         ok[4] = 2.0;
@@ -1157,6 +1188,7 @@ mod tests {
             cmt: 1,
             kind: InputRateKind::Weibull,
             arg_slots: vec![4, 5], // td @ 4 (dim 0), beta @ 5 (dim 1)
+            frac_slot: None,
         };
         // (td, beta, label, clamped_dim)
         let cases: &[(f64, f64, &str, Option<usize>)] = &[
@@ -1216,6 +1248,7 @@ mod tests {
             cmt: 1,
             kind: InputRateKind::Weibull,
             arg_slots: vec![4, 5], // td @ 4 (dim 0), beta @ 5 (dim 1)
+            frac_slot: None,
         };
         let dose = 100.0;
         let h = 1e-6;
@@ -1246,6 +1279,7 @@ mod tests {
             cmt: 1,
             kind: InputRateKind::Weibull,
             arg_slots: vec![4, 5], // td @ 4, beta @ 5
+            frac_slot: None,
         };
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
         params[4] = 2.0; // td
@@ -1267,6 +1301,7 @@ mod tests {
             cmt: 1,
             kind: InputRateKind::Weibull,
             arg_slots: vec![4, 5],
+            frac_slot: None,
         };
         let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
         ok[4] = 2.0;
@@ -1352,6 +1387,7 @@ mod tests {
             cmt: 0,
             kind: InputRateKind::ZeroOrder,
             arg_slots: vec![4], // dur @ 4
+            frac_slot: None,
         };
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
         params[4] = 4.0; // dur
@@ -1372,6 +1408,7 @@ mod tests {
             cmt: 0,
             kind: InputRateKind::ZeroOrder,
             arg_slots: vec![4],
+            frac_slot: None,
         };
         let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
         ok[4] = 4.0;
@@ -1392,6 +1429,7 @@ mod tests {
             cmt: 0,
             kind: InputRateKind::ZeroOrder,
             arg_slots: vec![4],
+            frac_slot: None,
         };
         let params = vec![1.0; crate::types::MAX_PK_PARAMS];
         assert!(forcing.prepare_dual::<f64>(&params).is_none());
@@ -1414,16 +1452,19 @@ mod tests {
             cmt: 1,
             kind: InputRateKind::InverseGaussian,
             arg_slots: vec![4, 5], // mat @ 4, cv2 @ 5
+            frac_slot: None,
         };
         let transit = InputRateForcing {
             cmt: 0,
             kind: InputRateKind::Transit,
             arg_slots: vec![6, 7], // n @ 6, mtt @ 7
+            frac_slot: None,
         };
         let weibull = InputRateForcing {
             cmt: 0,
             kind: InputRateKind::Weibull,
             arg_slots: vec![4, 2], // td @ 4, beta @ 2
+            frac_slot: None,
         };
         for forcing in [&ig, &transit, &weibull] {
             let lifted = forcing
@@ -1456,6 +1497,7 @@ mod tests {
                 cmt: 1,
                 kind,
                 arg_slots: vec![4, 5],
+                frac_slot: None,
             };
             assert_eq!(
                 kind.supported_over_dual(),

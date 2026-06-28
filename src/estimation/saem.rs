@@ -2266,7 +2266,10 @@ pub fn run_saem(
     Ok(OuterResult {
         params: final_params,
         ofv,
-        converged: ofv.is_finite(),
+        // A finite-but-enormous OFV is the bounded blowup of a runaway, not a
+        // converged fit — guard against it the same way IMP/IMPMAP does, since
+        // SAEM is commonly the first phase of a SAEM→IMP chain (issue #528).
+        converged: crate::estimation::impmap::objective_converged(ofv),
         n_iterations: n_iter,
         eta_hats,
         h_matrices,
@@ -2954,6 +2957,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
 
         // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.

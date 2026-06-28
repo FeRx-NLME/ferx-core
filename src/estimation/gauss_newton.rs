@@ -2015,6 +2015,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
@@ -2981,6 +2982,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         };
 
         let template = &model.default_params;
@@ -3264,6 +3266,7 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            ruv_magnitude: None,
         }
     }
 
