@@ -1532,6 +1532,45 @@ pub(crate) fn ode_predictions_adaptive(
     // a `Dv` monitor then errors at its first decision.
     assay: Option<&AssayNoise>,
 ) -> Result<AdaptiveRun, String> {
+    // Cmt-based monitors only (the programmatic path): no expression-backed
+    // `observe`, so every monitor resolves via its `cmt`.
+    ode_predictions_adaptive_impl(
+        ode,
+        pk_params_flat,
+        theta,
+        eta,
+        subject,
+        decision_times,
+        monitors,
+        controller,
+        max_decisions,
+        assay,
+        &[],
+    )
+}
+
+/// As [`ode_predictions_adaptive`], but monitor `i` whose `observe_exprs[i]` is
+/// `Some(f)` takes its **latent** value from the compiled expression `f` rather
+/// than from `read_observable(cmt)` — the engine-resolved signal for a
+/// declarative `[adaptive_dosing]` block (#391 S2.2). `Dv` still draws its σ from
+/// the monitor's `cmt`. An empty `observe_exprs` (or a `None` entry) means
+/// cmt-based resolution, so the programmatic path is byte-for-byte unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ode_predictions_adaptive_impl(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+    decision_times: &[f64],
+    monitors: &[MonitorSpec],
+    controller: &mut dyn FnMut(&ControllerCtx) -> Vec<DoseAction>,
+    max_decisions: usize,
+    assay: Option<&AssayNoise>,
+    // Per-monitor compiled `observe` expressions, aligned to `monitors`. A
+    // `Some(f)` overrides the cmt readout for that monitor's latent value.
+    observe_exprs: &[Option<&OdeOutputFn>],
+) -> Result<AdaptiveRun, String> {
     let n = ode.n_states;
 
     // --- Preconditions (typed errors, never silent) ----------------------
@@ -1633,9 +1672,22 @@ pub(crate) fn ode_predictions_adaptive(
                 // Resolve each monitored signal at the current (pre-dose) state.
                 let mut signals: HashMap<String, f64> = HashMap::new();
                 let mut observed: Vec<ObservedSignal> = Vec::with_capacity(monitors.len());
-                for m in monitors {
-                    let latent =
-                        read_observable(ode, &u, pk_params_flat, theta, eta, decision_cov, m.cmt);
+                for (mi, m) in monitors.iter().enumerate() {
+                    // A declarative `[adaptive_dosing]` block (S2.2) supplies a
+                    // compiled `observe` expression for the latent value; absent
+                    // one (the programmatic path), read the model's cmt readout.
+                    let latent = match observe_exprs.get(mi).copied().flatten() {
+                        Some(f) => f(&u, pk_params_flat, theta, eta, decision_cov),
+                        None => read_observable(
+                            ode,
+                            &u,
+                            pk_params_flat,
+                            theta,
+                            eta,
+                            decision_cov,
+                            m.cmt,
+                        ),
+                    };
                     // Resolve the monitored signal on its own mode: Ipred is the
                     // latent readout; Dv adds the endpoint's assay residual draw on
                     // the controller-assay substream (#391 S1.5).
@@ -6989,5 +7041,78 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn adaptive_observe_expression_flows_through_driver() {
+        // The model readout is the raw `central` amount (`[scaling] y = central`),
+        // but the declarative controller observes `central / V` (concentration).
+        // The driver must feed the controller the compiled expression's value, not
+        // the cmt readout — this exercises the S2.2 `observe_exprs` path.
+        const M: &str = r#"
+[parameters]
+  theta TVCL(1.0)
+  theta TVV(50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central / V
+  at = [24, 48]
+  start_dose = 100
+  route = bolus(cmt = 1)
+  dose_bounds = [0, 400]
+  when signal > 1000 : decrease 25%
+"#;
+        let parsed = crate::parser::model_parser::parse_full_model(M).expect("parses");
+        let model = parsed.model;
+        let spec = parsed.adaptive_dosing.expect("has adaptive block");
+        let compiled =
+            crate::sim::adaptive_control::compile_adaptive(&model, &spec).expect("compiles");
+        let theta = model.default_params.theta.clone();
+        let eta = vec![0.0; model.n_eta + model.n_kappa];
+        let pk = (model.pk_param_fn)(&theta, &eta, &HashMap::new());
+        let subject = make_subject(vec![], spec.at.clone());
+        let mut controller = (compiled.make_controller)();
+        let observe_refs: Vec<Option<&OdeOutputFn>> = vec![Some(&compiled.observe)];
+        let run = ode_predictions_adaptive_impl(
+            model.ode_spec.as_ref().unwrap(),
+            &pk.values,
+            &theta,
+            &eta,
+            &subject,
+            &spec.at,
+            &compiled.monitors,
+            &mut controller,
+            spec.at.len() + 1,
+            None,
+            &observe_refs,
+        )
+        .expect("driver runs");
+
+        // Decision 0 is the pre-dose trough (central = 0 ⇒ concentration 0).
+        assert_eq!(run.decisions[0].observed_signals[0].value, 0.0);
+        // Decision 1: one bolus of start_dose decayed over Δt, divided by V — the
+        // CONCENTRATION. Reading the cmt amount instead would be ~50× larger (the
+        // raw `central`), so this pins the expression path.
+        let ke = theta[0] / theta[1]; // CL/V at eta = 0
+        let dt = spec.at[1] - spec.at[0];
+        let expected_conc = spec.start_dose * (-ke * dt).exp() / theta[1];
+        let got = run.decisions[1].observed_signals[0].value;
+        assert!(
+            (got - expected_conc).abs() < 1e-3,
+            "observed {got}, expected concentration {expected_conc} (raw amount would be ~{})",
+            expected_conc * theta[1]
+        );
     }
 }

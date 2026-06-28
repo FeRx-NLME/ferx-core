@@ -5213,8 +5213,10 @@ fn parse_initial_conditions_block(
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
 /// the uniform and per-CMT paths.
-fn build_y_output_fn(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_y_output_fn(
     value: &str,
+    context: &str,
     theta_names: &[String],
     eta_names: &[String],
     indiv_var_names: &[String],
@@ -5231,7 +5233,7 @@ fn build_y_output_fn(
         }
     }
     let ctx = ParseCtx::new(theta_names, eta_names, &defined);
-    let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {}", e))?;
+    let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("{context}: {e}"))?;
 
     // Reject KAPPA_* (IOV) references in a Form C ODE output expression: the
     // readout is evaluated once per observation with a single eta, so under IOV
@@ -5243,7 +5245,7 @@ fn build_y_output_fn(
     // occasion-dependent structural parameter (e.g. CL) instead.
     if let Some(name) = expr_references_kappa(&expr, kappa_names) {
         return Err(format!(
-            "[scaling] y: Form C output expressions cannot reference the IOV \
+            "{context}: Form C output expressions cannot reference the IOV \
              parameter `{name}` — the ODE readout is evaluated per observation and \
              would see kappa = 0. Reference the occasion-dependent structural \
              parameter (e.g. CL) instead. See issue #107."
@@ -5532,6 +5534,7 @@ fn parse_scaling_block(
                 }
                 let (out_fn, out_program, cov_names) = build_y_output_fn(
                     value,
+                    "[scaling] y",
                     theta_names,
                     eta_names,
                     indiv_var_names,

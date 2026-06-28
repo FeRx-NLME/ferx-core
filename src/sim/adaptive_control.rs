@@ -14,11 +14,17 @@
 //! from the model (compiling the `observe` expression and feeding it through the
 //! engine's monitor mechanism, so `Dv` keeps the S1.5 assay substream) is the
 //! separate engine-side half of S2.2.
+// Wired to the public file-driven entry point in S2.3 (#391); until then the
+// compile / controller items below are constructed only by tests (mirrors the
+// `#[allow(dead_code)]` the S1.3a driver carried before S1.4 made it public).
+#![allow(dead_code)]
 
+use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
     AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
-    DoseAction, DoseStep,
+    DoseAction, DoseStep, MonitorSpec, ObserveMode,
 };
+use crate::types::CompiledModel;
 
 /// The monitor name the declarative controller reads — the `signal` keyword the
 /// `when signal <op> <value>` rules compare. The engine-side half declares its
@@ -189,6 +195,7 @@ impl AdaptiveController {
 /// state never leaks across `(subject, replicate)` runs — the isolation
 /// [`crate::api::simulate_adaptive`] makes structural via a factory rather than a
 /// shared closure. The controller reads its signal under [`ADAPTIVE_SIGNAL`].
+#[allow(clippy::type_complexity)] // a controller factory is inherently nested Fn/FnMut
 pub(crate) fn build_adaptive_controller(
     spec: &AdaptiveDosingSpec,
 ) -> impl Fn() -> Box<dyn FnMut(&ControllerCtx) -> Vec<DoseAction>> {
@@ -197,6 +204,105 @@ pub(crate) fn build_adaptive_controller(
         let mut controller = template.clone();
         Box::new(move |ctx: &ControllerCtx| controller.decide(ctx))
     }
+}
+
+/// Compile the spec's `observe` expression into the engine's readout-closure
+/// shape ([`OdeOutputFn`]) by reusing the model's own output-expression compiler
+/// ([`crate::parser::model_parser::build_y_output_fn`]).
+///
+/// The closure resolves states + individual parameters + covariates exactly as a
+/// model readout does, so the controller observes the same quantity the model
+/// would predict — `observe = central / V` yields the concentration, not the raw
+/// amount. ODE-only (the adaptive engine runs on the ODE path); an unknown name
+/// or an IOV reference in `observe` is rejected by the shared compiler.
+pub(crate) fn compile_observe(
+    model: &CompiledModel,
+    spec: &AdaptiveDosingSpec,
+) -> Result<OdeOutputFn, String> {
+    let ode = model.ode_spec.as_ref().ok_or_else(|| {
+        "[adaptive_dosing] requires an ODE model (the analytical engine is a follow-up)".to_string()
+    })?;
+    let (out_fn, _program, _cov_names) = crate::parser::model_parser::build_y_output_fn(
+        &spec.observe,
+        "[adaptive_dosing] observe",
+        &model.theta_names,
+        &model.eta_names,
+        &model.indiv_param_names,
+        &model.pk_indices,
+        &ode.state_names,
+        &model.kappa_names,
+    )?;
+    Ok(out_fn)
+}
+
+/// The 1-based compartment whose `[error_model]` σ supplies assay noise for a
+/// `Dv` observe. Uses the explicit `assay_cmt` when given; otherwise resolves a
+/// bare `observe` (a state name or a compartment number) to its compartment. A
+/// `Dv` observe that is neither — e.g. a multi-term expression — is rejected at
+/// parse time, so reaching here without a resolvable endpoint is a typed error,
+/// never a guessed σ.
+fn resolve_observe_cmt(model: &CompiledModel, spec: &AdaptiveDosingSpec) -> Result<usize, String> {
+    if let Some(c) = spec.assay_cmt {
+        return Ok(c);
+    }
+    let obs = spec.observe.trim();
+    if let Ok(n) = obs.parse::<usize>() {
+        if n >= 1 {
+            return Ok(n);
+        }
+    }
+    if let Some(ode) = model.ode_spec.as_ref() {
+        if let Some(idx) = ode.state_names.iter().position(|s| s == obs) {
+            return Ok(idx + 1);
+        }
+    }
+    Err(format!(
+        "[adaptive_dosing] with_assay_error: cannot determine which endpoint's residual error \
+         applies to observe `{}` — set `assay_cmt = N`",
+        spec.observe
+    ))
+}
+
+/// Everything needed to drive a declarative `[adaptive_dosing]` block through the
+/// S1 reactive engine: the monitor(s) the engine resolves into `ControllerCtx`,
+/// the compiled `observe` readout the engine evaluates for the signal's latent
+/// value, and the per-subject controller factory.
+pub(crate) struct CompiledAdaptive {
+    /// Single monitor named [`ADAPTIVE_SIGNAL`]; its `cmt` supplies the σ under
+    /// `Dv` and is unused under `Ipred`.
+    pub monitors: Vec<MonitorSpec>,
+    /// Compiled `observe` expression — the latent signal value at each decision.
+    pub observe: OdeOutputFn,
+    /// Mints a fresh controller per `(subject, replicate)` (state isolation).
+    #[allow(clippy::type_complexity)]
+    pub make_controller: Box<dyn Fn() -> Box<dyn FnMut(&ControllerCtx) -> Vec<DoseAction>>>,
+}
+
+/// Compile a declarative spec against its model into the engine-ready
+/// [`CompiledAdaptive`] bundle (#391 S2.2).
+pub(crate) fn compile_adaptive(
+    model: &CompiledModel,
+    spec: &AdaptiveDosingSpec,
+) -> Result<CompiledAdaptive, String> {
+    let observe = compile_observe(model, spec)?;
+    let mode = if spec.with_assay_error {
+        ObserveMode::Dv
+    } else {
+        ObserveMode::Ipred
+    };
+    // Under `Dv` the cmt selects the residual σ; under `Ipred` the latent value
+    // comes from the compiled `observe`, so the cmt is unused (placeholder 1).
+    let cmt = match mode {
+        ObserveMode::Dv => resolve_observe_cmt(model, spec)?,
+        ObserveMode::Ipred => spec.assay_cmt.unwrap_or(1),
+    };
+    let monitors = vec![MonitorSpec::new(ADAPTIVE_SIGNAL, cmt, mode)];
+    let factory = build_adaptive_controller(spec);
+    Ok(CompiledAdaptive {
+        monitors,
+        observe,
+        make_controller: Box::new(factory),
+    })
 }
 
 #[cfg(test)]
@@ -499,5 +605,124 @@ mod tests {
         let mut b = factory();
         let b1 = b(&ctx);
         assert_eq!(b1, bolus(150.0, 1));
+    }
+
+    // ── Engine-side compile (observe expression → readout closure) ──
+
+    use crate::parser::model_parser::parse_full_model;
+
+    const ODE_MODEL: &str = r#"
+[parameters]
+  theta TVCL(1.0)
+  theta TVV(50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    const ANALYTICAL_MODEL: &str = r#"
+[parameters]
+  theta TVCL(1.0)
+  theta TVV(50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    fn mk_spec(
+        observe: &str,
+        with_assay_error: bool,
+        assay_cmt: Option<usize>,
+    ) -> AdaptiveDosingSpec {
+        AdaptiveDosingSpec {
+            observe: observe.to_string(),
+            with_assay_error,
+            assay_cmt,
+            at: vec![24.0, 48.0],
+            start_dose: 100.0,
+            route: AdaptiveRoute::Bolus { cmt: 1 },
+            dose_bounds: (0.0, 400.0),
+            confirm: 1,
+            levels: None,
+            rules: vec![rule(Comparison::Gt, 1000.0, AdaptiveAction::Hold)],
+        }
+    }
+
+    #[test]
+    fn compile_observe_yields_concentration_not_amount() {
+        let model = parse_full_model(ODE_MODEL).expect("ODE model parses").model;
+        let observe = compile_observe(&model, &mk_spec("central / V", false, None))
+            .expect("observe compiles");
+        let theta = model.default_params.theta.clone();
+        let eta = vec![0.0; model.n_eta + model.n_kappa];
+        let cov = HashMap::new();
+        let pk = (model.pk_param_fn)(&theta, &eta, &cov);
+        // central amount = 200, V = 50 ⇒ concentration 4.0 — NOT the raw amount 200.
+        let v = observe(&[200.0], &pk.values, &theta, &eta, &cov);
+        assert!(
+            (v - 4.0).abs() < 1e-9,
+            "expected concentration 4.0, got {v}"
+        );
+    }
+
+    #[test]
+    fn compile_observe_requires_ode_model() {
+        let model = parse_full_model(ANALYTICAL_MODEL).unwrap().model;
+        let err = compile_observe(&model, &mk_spec("central / V", false, None))
+            .err()
+            .expect("analytical model must error");
+        assert!(err.contains("requires an ODE model"), "got: {err}");
+    }
+
+    #[test]
+    fn compile_adaptive_sets_monitor_mode_and_cmt() {
+        let model = parse_full_model(ODE_MODEL).unwrap().model;
+        let ipred = compile_adaptive(&model, &mk_spec("central / V", false, None)).unwrap();
+        assert_eq!(ipred.monitors.len(), 1);
+        assert_eq!(ipred.monitors[0].name, ADAPTIVE_SIGNAL);
+        assert_eq!(ipred.monitors[0].mode, ObserveMode::Ipred);
+
+        let dv = compile_adaptive(&model, &mk_spec("central / V", true, Some(1))).unwrap();
+        assert_eq!(dv.monitors[0].mode, ObserveMode::Dv);
+        assert_eq!(dv.monitors[0].cmt, 1);
+    }
+
+    #[test]
+    fn resolve_observe_cmt_bare_name_number_explicit_and_error() {
+        let model = parse_full_model(ODE_MODEL).unwrap().model;
+        // bare state name → its 1-based compartment
+        assert_eq!(
+            resolve_observe_cmt(&model, &mk_spec("central", true, None)).unwrap(),
+            1
+        );
+        // bare compartment number
+        assert_eq!(
+            resolve_observe_cmt(&model, &mk_spec("2", true, None)).unwrap(),
+            2
+        );
+        // explicit assay_cmt wins
+        assert_eq!(
+            resolve_observe_cmt(&model, &mk_spec("central / V", true, Some(3))).unwrap(),
+            3
+        );
+        // an expression with no assay_cmt cannot designate an endpoint → typed error
+        let err = resolve_observe_cmt(&model, &mk_spec("central / V", true, None)).unwrap_err();
+        assert!(err.contains("cannot determine"), "got: {err}");
     }
 }
