@@ -15,17 +15,24 @@ Full NONMEM record (control-stream corrections, covariance, diagnostics): `nonme
 
 | Parameter | Truth | ferx FOCEI | nlmixr2 FOCEI | nlmixr2 BOBYQA | NONMEM LAPLACE |
 |-----------|------:|-----------:|--------------:|---------------:|---------------:|
-| CL        | 1.0   | _pending_  | 1.026         | 1.029          | 1.031          |
-| V         | 10.0  | _pending_  | 9.946         | 9.951          | 9.897          |
-| KA        | 1.0   | _pending_  | 0.9935        | 0.9943         | 0.9796         |
-| H0        | 0.015 | _pending_  | 0.02100       | 0.02206        | 0.01491        |
-| BETA      | 0.25  | _pending_  | 0.2014        | 0.1930         | 0.2506         |
-| ω²(CL)    | 0.09  | _pending_  | 0.0803        | 0.0801         | 0.0814         |
-| prop. sd  | 0.10  | _pending_  | 0.1023        | 0.1023         | 0.0919         |
-| −2LL      | —     | _pending_  | −1589.60      | −1589.68       | 626.65 (OFV)†  |
+| CL        | 1.0   | 1.039      | 1.026         | 1.029          | 1.031          |
+| V         | 10.0  | 9.879      | 9.946         | 9.951          | 9.897          |
+| KA        | 1.0   | 0.9778     | 0.9935        | 0.9943         | 0.9796         |
+| H0        | 0.015 | 0.01446    | 0.02100       | 0.02206        | 0.01491        |
+| BETA      | 0.25  | 0.2559     | 0.2014        | 0.1930         | 0.2506         |
+| ω²(CL)    | 0.09  | 0.0832     | 0.0803        | 0.0801         | 0.0814         |
+| prop. sd  | 0.10  | 0.0918     | 0.1023        | 0.1023         | 0.0919         |
+| −2LL      | —     | 624.65 (OFV)‡ | −1589.60   | −1589.68       | 626.65 (OFV)†  |
 
 (nlmixr2 estimates are on the natural scale: `CL = exp(lcl)`, etc. NONMEM prop. sd = √σ²,
 σ² = 0.00844 → 0.0919.)
+
+‡ ferx FOCEI (`cargo run --release --features survival -- pktte_joint_fit.ferx --data
+pktte_joint.csv`): MINIMIZATION SUCCESSFUL, covariance step successful. ferx uses NONMEM's OFV
+convention (drops `N·log(2π)`), so its OFV (624.65) sits next to NONMEM's (626.65), not
+nlmixr2's −2LL — see the OFV note below. SEs/RSEs: CL 2.8%, V 1.2%, KA 2.0%, ω²(CL) 14%; **H0
+31.3%, BETA 20.5%, corr(H0,BETA) = −0.93** — the same flat ridge NONMEM measures (RSE H0 27% /
+BETA 18%, corr −0.91).
 
 † NONMEM 7.6.0, `METHOD=COND LAPLACE INTER`, run 2026-06-28: MINIMIZATION SUCCESSFUL,
 3.6 significant digits. **The OFV is not cross-tool comparable to nlmixr2's −2LL:** 626.65 is
@@ -44,28 +51,36 @@ honest). Diagnostics: ETABAR p = 0.60, η-shrinkage 4.0%, ε-shrinkage 11.8%.
 ## Notes
 
 - **The PK block recovers cleanly and agrees across all three tools.** CL, V, KA, ω²(CL),
-  and the proportional error match to ~2–3 significant figures. This is the valid
-  cross-tool numerical check, and what ferx must reproduce.
+  and the proportional error match to ~2–3 significant figures (ferx 1.039 / 9.879 / 0.978 /
+  0.0832 / 0.0918 vs the nlmixr2 and NONMEM columns). This is the valid cross-tool numerical
+  check, and ferx reproduces it.
 
 - **H0 and BETA are weakly identified and trade off — the exposure–hazard slope sits on a flat
   collinear ridge.** `H0·exp(BETA·Cc)` is collinear in (H0, BETA), and a single dose gives only
-  a narrow concentration range over which to estimate the slope. NONMEM measures the ridge
-  directly: corr(H0, BETA) = −0.91 with a singular Hessian along it. The honest reading is that
+  a narrow concentration range over which to estimate the slope. Both ferx and NONMEM measure
+  the ridge directly: corr(H0, BETA) = −0.93 (ferx) / −0.91 (NONMEM), with high H0/BETA RSEs
+  (ferx 31% / 20%, NONMEM 27% / 18%) against 1–3% for the PK block. The honest reading is that
   the data constrain the exposure–hazard *curve* well but the individual (H0, BETA) pair poorly.
 
 - **Different tools land at different points on the same ridge — this is the expected behaviour,
-  not a discrepancy.** NONMEM (LAPLACE, started at the truth-valued initials 0.015 / 0.25)
-  stays near H0 ≈ 0.0149, BETA ≈ 0.251; nlmixr2 (FOCEI *and* derivative-free BOBYQA) converges
-  to H0 ≈ 0.022, BETA ≈ 0.19. NONMEM's near-truth landing is *start-value dependent on a flat
-  ridge* — not independent truth recovery — and nlmixr2's agreement between its own gradient-based
-  and derivative-free optimizers confirms its point is a genuine optimum, not a convergence
-  artifact. Both are valid optima of an under-determined likelihood.
+  not a discrepancy.** ferx (FOCEI) and NONMEM (LAPLACE), both started at the truth-valued
+  initials 0.015 / 0.25, stay near H0 ≈ 0.0145–0.0149, BETA ≈ 0.251–0.256; nlmixr2 (FOCEI *and*
+  derivative-free BOBYQA) converges to H0 ≈ 0.022, BETA ≈ 0.19. The near-truth landing of
+  ferx/NONMEM is *start-value dependent on a flat ridge* — not independent truth recovery — and
+  nlmixr2's agreement between its own gradient-based and derivative-free optimizers confirms its
+  point is a genuine optimum too. All are valid optima of an under-determined likelihood.
 
-- **Acceptance check for ferx:** match the identified block (CL, V, KA, ω²(CL), prop. error)
-  to the nlmixr2/NONMEM columns within ~2–3 significant figures, and land *somewhere on the
-  H0/BETA ridge* (a plausible H0·exp(BETA·Cc) curve) rather than at a specific (H0, BETA) point.
-  The anchor validates cross-tool agreement on what is identifiable, plus three-way agreement
-  that H0/BETA is a ridge — not exact-truth recovery of H0/BETA.
+- **Acceptance check for ferx — passes.** ferx matches the identified block (CL, V, KA, ω²(CL),
+  prop. error) to the nlmixr2/NONMEM columns within ~2–3 significant figures, lands on the
+  H0/BETA ridge alongside NONMEM, and recovers the same ridge geometry (corr ≈ −0.93, high
+  H0/BETA RSEs). The anchor validates cross-tool agreement on what is identifiable, plus
+  agreement that H0/BETA is a ridge — not exact-truth recovery of H0/BETA.
+
+- **A bug this anchor caught:** cross-checking ferx's SEs against NONMEM surfaced a covariance
+  back-transform bug — `BETA`'s SE (negative lower bound → estimated on the natural scale) was
+  being multiplied by the estimate as if it were log-packed, reporting RSE 5.3% instead of the
+  correct 20.5% (matching NONMEM's 18%). Fixed in this PR (`extract_standard_errors`,
+  `api.rs`); the numbers above are post-fix.
 
 ## To reproduce
 

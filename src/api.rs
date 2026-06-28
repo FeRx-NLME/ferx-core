@@ -4842,10 +4842,20 @@ fn extract_standard_errors(
         })
         .collect();
 
-    // Theta: SE on original scale via delta method
-    // If x = log(theta), then SE(theta) = theta * SE(x)
+    // Theta: SE on original scale. Log-packed thetas (lower bound >= 0) are
+    // optimized as x = log(theta), so SE(theta) = theta * SE(x) (delta method).
+    // Identity-packed thetas (negative lower bound — e.g. covariate exponents,
+    // exposure–hazard slopes) are optimized on the natural scale already, so
+    // SE(theta) = SE(x): multiplying by the estimate would mis-scale it (and
+    // flip the sign for a negative estimate). See `theta_packs_log`.
     let se_theta: Vec<f64> = (0..n_theta)
-        .map(|i| template.theta[i] * se_packed[i])
+        .map(|i| {
+            if theta_packs_log(template.theta_lower[i]) {
+                template.theta[i] * se_packed[i]
+            } else {
+                se_packed[i]
+            }
+        })
         .collect();
 
     // Omega: SE via multivariate delta method on Cholesky parameterization.
@@ -7183,6 +7193,57 @@ mod extract_se_tests {
         let se = se_omega.unwrap();
         assert!((se[0] - 2.0 * 0.04).abs() < 1e-12);
         assert!((se[1] - 2.0 * 0.09).abs() < 1e-12);
+    }
+
+    /// Theta SE back-transform must respect the packing scale. A log-packed theta
+    /// (lower bound >= 0) is optimized as log(theta), so SE(theta) = theta * SE(x);
+    /// an identity-packed theta (negative lower bound, e.g. an exposure–hazard slope
+    /// or covariate exponent) is optimized on the natural scale, so SE(theta) = SE(x)
+    /// with no multiply. Regression for the bug where every theta was multiplied by
+    /// its estimate, mis-scaling (and sign-flipping for negative estimates) the SE
+    /// of identity-packed thetas.
+    #[test]
+    fn test_se_theta_respects_packing_scale() {
+        // theta[0] = TVCL, lower 0.1 >= 0  → log-packed
+        // theta[1] = BETA, lower -10 < 0   → identity-packed (can be negative)
+        let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["E1".into()]);
+        let template = ModelParameters {
+            theta: vec![2.0, 0.25],
+            theta_names: vec!["TVCL".into(), "BETA".into()],
+            theta_lower: vec![0.1, -10.0],
+            theta_upper: vec![50.0, 10.0],
+            theta_fixed: vec![false, false],
+            omega,
+            omega_fixed: vec![false],
+            sigma: SigmaVector {
+                values: vec![0.05],
+                names: vec!["PROP_ERR".into()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+        };
+        // Packed layout: theta(2) + omega(1) + sigma(1) = 4.
+        // Set diagonal so packed SEs are theta:0.1, theta:0.3 (the rest unused here).
+        let mut cov = DMatrix::<f64>::zeros(4, 4);
+        cov[(0, 0)] = 0.1_f64.powi(2); // se_packed[0] = 0.1
+        cov[(1, 1)] = 0.3_f64.powi(2); // se_packed[1] = 0.3
+        cov[(2, 2)] = 1.0;
+        cov[(3, 3)] = 1.0;
+        let (se_theta, _, _, _) = extract_standard_errors(&Some(cov), &template);
+        let se = se_theta.unwrap();
+        // log-packed: SE = theta * SE(x) = 2.0 * 0.1 = 0.2
+        assert!(
+            (se[0] - 0.2).abs() < 1e-12,
+            "log-packed theta SE = {}",
+            se[0]
+        );
+        // identity-packed: SE = SE(x) = 0.3 (NOT 0.25 * 0.3 = 0.075)
+        assert!(
+            (se[1] - 0.3).abs() < 1e-12,
+            "identity-packed theta SE = {} (must be the packed SE, not estimate-scaled)",
+            se[1]
+        );
     }
 
     // ── IOV (kappa) ──────────────────────────────────────────────────────────

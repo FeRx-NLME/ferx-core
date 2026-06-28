@@ -183,6 +183,13 @@ section of the SDLC for the versioning policy).
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 ### Fixed
+- Standard errors for `theta` parameters with a **negative lower bound** (estimated on
+  the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
+  mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to
+  every theta, but it only applies to log-packed (non-negative) parameters; for
+  natural-scale thetas the reported SE was multiplied by the estimate (and would flip sign
+  for a negative estimate). Such thetas now report `SE = SE(packed)` directly. Surfaced by
+  the joint PK-TTE anchor, where `BETA`'s SE matched NONMEM only after the fix.
 - `outer_maxiter = 0` (NONMEM `MAXEVAL=0`) now means *evaluation only* on every
   optimizer (#562). The gradient NLopt path (`nlopt_lbfgs`/`slsqp`/`mma`) passed
   `maxiter = 0` straight to NLopt's `set_maxeval`, where `0` means **no limit** —
