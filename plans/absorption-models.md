@@ -2,7 +2,7 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap, in progress (updated 2026-06-27).
+**Status:** approved roadmap, in progress (updated 2026-06-28).
 - **Prerequisite #324:** safety net (PR #326), **modeled infusion duration `Dn` /
   `RATE=-2`** (PR #384), and **modeled rate `Rn` / `RATE=-1` on both engines**
   (PR #418) **merged**; see #383 for any residual analytical-engine items.
@@ -32,25 +32,36 @@
     (`tests/zero_order_absorption.rs`, max abs ≈ 4e-4) plus reset-mid-window & lag>0 adversarial
     tests. **ferx-r follow-up ✅ done — PR [#204](https://github.com/FeRx-NLME/ferx-r/pull/204)
     merged 2026-06-27 (`56e7cafc`): pin bump + zero_order/sequential examples + validate tests.**
-  - **#505 — `parallel` / `mixed` + `first_order()` composition** ← **NEXT (after #388)**:
-    dual-pathway, **blocked on the shared fraction multiplier in #388** (the parser still
-    rejects scaled input-rate calls — `call_is_scaled_or_signed`, `model_parser.rs`). Needs a
-    new `InputRateKind::FirstOrder` (`first_order(ka)`) so the existing first-order absorption
-    can be composed in `[odes]`.
-- **#388 — biphasic IG + the shared input-rate fraction mechanism.** Build the
-  `FR*fn(...) + (1-FR)*fn(...)` multiplier once; consumed by both biphasic IG and
-  #505's `parallel`/`mixed`.
+  - **#388 — biphasic IG + the shared input-rate fraction multiplier — ✅ MERGED — PR #568
+    (`39c85724`, 2026-06-28); closes #388.** `frac_slot` on `InputRateForcing` + a generic
+    `frac()` reader; `add_prepared_input_rate_forcing` applies `acc·frac` on **both** the f64 and
+    analytic-`Dual2` paths (exact `∂/∂frac`); `parse_input_rate_prefix` (new) accepts a leading
+    declared parameter `FR*fn(...)` and ≥2 input-rate terms per `d/dt`; `E_ABSORPTION_FRACTION`
+    validation (0 < FR ≤ 1, Σ FR ≈ 1, all-or-none, lone-fraction rejected). The multiplier must be
+    a single declared parameter (not `(1-FR)`), so a split declares a complement (`FR2 = 1 - FR1`).
+    **NONMEM `$DES` biphasic anchor ran** (`tests/biphasic_igd_nonmem_anchor.rs`: ferx FOCEI OFV at
+    NONMEM's optimum −754.2113 vs `#OBJV −754.211`, ~1e-5; matched data also recovers the truths).
+    `FR*zero_order` (the `mixed` zero-order family) is deferred to #505. **ferx-r follow-up ✅ done —
+    PR [#207](https://github.com/FeRx-NLME/ferx-r/pull/207) merged 2026-06-28 (`8c8ecd1d`): pin bump
+    + `biphasic_igd_absorption` example + validate test.**
+  - **#505 — `parallel` / `mixed` + `first_order()` composition** ← **NEXT (now unblocked).**
+    Dual-pathway. The shared fraction multiplier it needed **landed with #388** (`parse_input_rate_prefix`
+    accepts `FR*fn(...)` + ≥2 terms per `d/dt`; `frac_slot` on `InputRateForcing`). Still needs a new
+    `InputRateKind::FirstOrder` (`first_order(ka)`) so the existing first-order absorption can be
+    composed in `[odes]`, **plus** the zero-order-channel fraction (for `mixed` — #388 rejects
+    `FR*zero_order` today, since that delivery channel doesn't carry the scale yet).
 - **Phase 3 — #386 — analytical incomplete-gamma / exponential tilting** for
   transit + IG. Now *speed-only* (#430 already gave transit/IG exact gradients on
   the ODE path), so this only removes the ODE solve. Lowest urgency. Weibull never
   reaches Phase 3 (no closed form) — its only exact-gradient route is the #430
   generic forcing.
 
-Recommended sequence after Weibull (#498) and zero-order (#504, ✅ merged): **#388**
-(shared input-rate **fraction multiplier** — biphasic IG; unblocks #505) → **#505**
-(`parallel`/`mixed` + `first_order()`) → **#386** (Phase 3 speed pass). The
-moving-boundary sensitivity **#530** (`zero_order` `dur` + `Dn` off FD) is a parallel,
-cross-cutting track — independent of the catalogue work above, not gating it.
+Recommended sequence: Weibull (#498), zero-order (#504), and the shared **fraction
+multiplier #388** (biphasic IG) are all **✅ merged** (ferx-core + ferx-r). **NEXT =
+#505** (`parallel`/`mixed` + a new `InputRateKind::FirstOrder` + the zero-order-channel
+fraction, now unblocked by #388) → **#386** (Phase 3 speed pass). The moving-boundary
+sensitivity **#530** (`zero_order` `dur` + `Dn` off FD) is a parallel, cross-cutting
+track — independent of the catalogue work above, not gating it.
 
 Multi-PR / phased.
 
@@ -526,9 +537,9 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
   analytical fast path is added. Anchored vs a NONMEM `$DES` IG run
   (`tests/igd_nonmem_anchor.rs`) at the likelihood at the shared optimum — a path-independent
   check, because default derivative-free BOBYQA stalls on the flat mis-specified ridge while
-  NONMEM's gradient FOCEI climbs `MAT`. The **biphasic sum-of-two IG** is deferred to **#388** (no
-  biphasic NONMEM run yet → would be an unanchored happy path; its fraction-multiplier mechanism
-  is shared with the planned parallel/mixed `first_order`, so design it once).
+  NONMEM's gradient FOCEI climbs `MAT`. The **biphasic sum-of-two IG** was deferred to **#388**
+  (✅ merged 2026-06-28) so its fraction-multiplier mechanism — shared with the parallel/mixed
+  `first_order` family — could be designed once and anchored with its own biphasic-IG `$DES` run.
 - **Phase 2 — Weibull + zero-order + sequential + parallel + mixed.** Round out the
   catalogue; each with a NONMEM anchor. Split into tracked slices:
   - **Weibull (#497) ✅ MERGED — PR #498 (`6252946a`)** — **numerical** (no closed
@@ -544,19 +555,22 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
     #530, not bundled here. Direct NONMEM ADVAN1 anchor (`tests/zero_order_absorption.rs`).
     Then optionally accelerated via the closed form. **ferx-r follow-up done — PR #204
     (`56e7cafc`, merged 2026-06-27).**
-  - **#388 — shared input-rate fraction multiplier (biphasic IG)** ← **NEXT.** Add a
-    fraction scale to `InputRateForcing` (`frac_slot: Option<usize>`, applied as
-    `dy[cmt] += frac * R_in` in `add_prepared_input_rate_forcing`) and relax the two Phase-1
-    parser guards (`call_is_scaled_or_signed` + the one-input-rate-call-per-`d/dt` limit) to
-    accept a leading **named-parameter** multiplier (`FR*igd(...)`, declared individual
-    parameter only — not an arbitrary `(1-FR)` expression) and ≥2 input-rate terms per
-    equation. Validate `0 < frac ≤ 1` per term and `Σfrac ≈ 1`; per-model mass balance
-    `∫ Σ fracᵢ·R_inᵢ = F·Dose`. Anchored vs a new biphasic-IG `$DES` run. The same multiplier
-    then serves #505.
-  - **`parallel` / `mixed` + `first_order()` composition (#505)** — dual-pathway,
-    **blocked on the #388 shared fraction multiplier** (the parser rejects scaled
-    input-rate calls today). Adds `InputRateKind::FirstOrder` (`first_order(ka)`) so existing
-    first-order absorption can be composed. **Closed-form** (superpose `*_oral` solvers by
+  - **#388 — shared input-rate fraction multiplier (biphasic IG) ✅ MERGED — PR #568
+    (`39c85724`, 2026-06-28).** Added `frac_slot: Option<usize>` to `InputRateForcing` (applied as
+    `acc·frac` in `add_prepared_input_rate_forcing`, on **both** the f64 and analytic-`Dual2` paths
+    → exact `∂/∂frac`); the two Phase-1 parser guards were replaced by `parse_input_rate_prefix`,
+    which accepts a leading **declared-parameter** multiplier (`FR*igd(...)`, not `(1-FR)`) and ≥2
+    input-rate terms per equation. `E_ABSORPTION_FRACTION` validates `0 < FR ≤ 1`, `Σfrac ≈ 1`,
+    all-or-none, and rejects a lone fractioned term; mass balance `∫ Σ fracᵢ·R_inᵢ = F·Dose`.
+    **NONMEM biphasic-IG `$DES` anchor ran** (`tests/biphasic_igd_nonmem_anchor.rs`: ferx FOCEI OFV
+    at NONMEM's optimum −754.2113 vs `#OBJV −754.211`, ~1e-5; matched data recovers the truths).
+    `FR*zero_order` deferred to #505. **ferx-r follow-up done — PR #207 (`8c8ecd1d`, merged
+    2026-06-28).**
+  - **`parallel` / `mixed` + `first_order()` composition (#505)** ← **NEXT** — dual-pathway,
+    **unblocked** now that the #388 fraction multiplier landed. Adds `InputRateKind::FirstOrder`
+    (`first_order(ka)`) so existing first-order absorption can be composed, plus the
+    zero-order-channel fraction (for `mixed`; #388 rejects `FR*zero_order` today, since that
+    delivery channel doesn't carry the scale yet). **Closed-form** (superpose `*_oral` solvers by
     `frac`).
 - **Phase 3 — analytical closed forms for transit and IG** (1/2-cpt). Both are implemented
   via the **`TiltedAbsorption` trait** in a new `src/pk/analytical_absorption.rs`:
