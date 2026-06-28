@@ -257,4 +257,11 @@ fn biphasic_igd_fraction_validation() {
         "d/dt(central) = FR1*igd(mat=MAT1, cv2=CV2_1) + igd(mat=MAT2, cv2=CV2_2) - CL/V*central",
         "  FR1 = TVFR1",
     )));
+    // (d) A *lone* fractioned term (a single pathway carrying a fraction) is rejected:
+    //     a fraction only partitions a dose across ≥2 terms, so a single pathway must
+    //     be written bare (review #1). Caught structurally, before the sum-check.
+    assert!(has_fraction_err(&biphasic_model(
+        "d/dt(central) = FR1*igd(mat=MAT1, cv2=CV2_1) - CL/V*central",
+        "  FR1 = TVFR1",
+    )));
 }

@@ -848,7 +848,8 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // *partition* the dose on a compartment. ≥2 input-rate terms on one compartment
     // therefore must **each** carry a fraction (`FR*fn(...)`); a bare term alongside
     // a fractioned one (or two bare terms) would deliver the full `F·Dose` more than
-    // once. A lone term may stay unfractioned (fraction defaults to 1).
+    // once. A fraction is only meaningful across ≥2 partitioning terms, so a *lone*
+    // fractioned term is rejected too (a single pathway is written bare).
     use std::collections::BTreeMap;
     let mut frac_count: BTreeMap<usize, (usize, usize)> = BTreeMap::new(); // cmt -> (total, fractioned)
     for f in &ode.input_rate {
@@ -869,6 +870,26 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
                          feeds a compartment, each must be written `FR*fn(...)` with the \
                          fractions summing to 1 — otherwise the dose mass is counted more than \
                          once.",
+                        cmt + 1
+                    ),
+                )
+                .with_block("odes"),
+            );
+        } else if total == 1 && fractioned == 1 {
+            // A *lone* fractioned term can't partition anything: `FR*fn(...)` as the
+            // only input on a compartment is only ever valid at `FR = 1` (≡ a bare
+            // term), so reject it here with a precise message instead of letting the
+            // per-subject sum-check below report the confusing "fractions sum to 0.6,
+            // not 1" (review #1). A single pathway is written bare; `F` handles
+            // partial absorption.
+            diags.push(
+                Diagnostic::error(
+                    "E_ABSORPTION_FRACTION",
+                    format!(
+                        "Compartment {} has a single input-rate term carrying a pathway fraction \
+                         (`FR*fn(...)`). A pathway fraction only applies when ≥2 terms split the \
+                         dose across a compartment — write a single pathway as a bare \
+                         `+ fn(...)`, and use bioavailability `F` for partial absorption.",
                         cmt + 1
                     ),
                 )
@@ -927,7 +948,11 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             *frac_sum.entry(forcing.cmt).or_insert(0.0) += fr;
         }
         for (&cmt, &sum) in &frac_sum {
-            if (sum - 1.0).abs() > 1e-4 {
+            // Only a genuine ≥2-pathway split is checked for Σ ≈ 1; a lone fractioned
+            // term is already rejected structurally above, so don't double-report it
+            // with the misleading "sum to <FR>, not 1" here (review #1).
+            let multi = frac_count.get(&cmt).is_some_and(|&(total, _)| total >= 2);
+            if multi && (sum - 1.0).abs() > 1e-4 {
                 diags.push(
                     Diagnostic::error(
                         "E_ABSORPTION_FRACTION",

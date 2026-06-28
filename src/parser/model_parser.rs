@@ -5654,6 +5654,13 @@ fn parse_input_rate_prefix(
                 p -= 1;
             }
             let name = &line[id_start..k];
+            // A leading digit means the "multiplier" is a numeric literal (`5*igd(...)`,
+            // or the `5` tail of `2.5*igd(...)`), not a parameter identifier — it drops
+            // a scale, so report the sign/scale rejection rather than the misleading
+            // "`5` is not a declared parameter".
+            if name.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+                return Err(scaled_err());
+            }
             if p != 0 && !matches!(b[p - 1], b'+' | b'=') {
                 return Err(scaled_err());
             }
@@ -12606,6 +12613,39 @@ mod tests {
         // scale rejection, not a non-parameter one.
         let err4 = go("d/dt(central) = MAT*FR*igd(mat=MAT, cv2=CV2)").unwrap_err();
         assert!(err4.contains("bare additive"), "got: {err4}");
+        // A numeric-literal multiplier is a dropped scale, not a "declared parameter"
+        // problem — report it as the sign/scale rejection (review finding #2).
+        let err5 = go("d/dt(central) = 5*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(
+            err5.contains("bare additive") && !err5.contains("pathway-fraction multiplier"),
+            "got: {err5}"
+        );
+        let err6 = go("d/dt(central) = 2.5*igd(mat=MAT, cv2=CV2)").unwrap_err();
+        assert!(err6.contains("bare additive"), "got: {err6}");
+    }
+
+    #[test]
+    fn extract_input_rate_non_ascii_does_not_panic() {
+        // The input-rate extractor byte-indexes the RHS, but every slice point is an
+        // ASCII anchor (`(` `)`, the fn name, the identifier/`*` of a fraction), so a
+        // multi-byte char *between* anchors must surface as a clean error or pass
+        // through untouched — never a non-char-boundary slice panic (review finding #4).
+        let states = vec!["central".to_string()];
+        let names = vec!["MAT".to_string(), "CV2".to_string()];
+        let slots = vec![4, 5];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+
+        // Unicode inside an arg value (param name): clean "not declared" error.
+        assert!(go("d/dt(central) = igd(mat=MÄT, cv2=CV2)").is_err());
+        // Unicode minus (U+2212) and an accented word outside the call: the igd term is
+        // still extracted and the non-ASCII tail is preserved verbatim.
+        let (cleaned, f) = go("d/dt(central) = igd(mat=MAT, cv2=CV2) \u{2212} café").unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(cleaned[0], "d/dt(central) = 0 \u{2212} café");
+        // Unicode immediately before a `+`-led bare term.
+        let (_c, f2) = go("d/dt(central) = café + igd(mat=MAT, cv2=CV2)").unwrap();
+        assert_eq!(f2.len(), 1);
     }
 
     #[test]
