@@ -37,17 +37,21 @@ $DES
   DADT(3) =  H0*EXP(BETA*CONC)          ; cumulative hazard accumulator (= ferx __chz)
 
 $ERROR
-  CONC = A(2)/V
+  ; CC recomputes the central concentration from the compartment amount at the
+  ; event time. It must NOT reuse the name CONC defined in $DES -- NM-TRAN treats
+  ; $DES variables as global and forbids re-defining them in $ERROR (error 292).
+  CC   = A(2)/V
   CHZ  = A(3)
-  HAZ  = H0*EXP(BETA*CONC)
-  IF (CMT.EQ.2) THEN                    ; Gaussian PK observation (concentration)
-    F_FLAG = 0
-    Y = CONC*(1 + ERR(1))
-  ELSE                                  ; TTE observation on CMT 3 (F_FLAG=1 => Y is L)
-    F_FLAG = 1
-    IF (DV.EQ.1) Y = HAZ*EXP(-CHZ)      ; exact event:    h(T)*S(T)
-    IF (DV.EQ.0) Y = EXP(-CHZ)          ; right-censored: S(T)
-  ENDIF
+  HAZ  = H0*EXP(BETA*CC)
+  ; F_FLAG selects the likelihood: 0 = Gaussian PK (CMT 2), 1 = TTE (CMT 3).
+  F_FLAG = 0
+  IF (CMT.EQ.3) F_FLAG = 1
+  ; The EPS-containing (continuous PK) prediction must sit at the top level, not
+  ; inside a nested IF, or NM-TRAN rejects it (error 326). The TTE rows overwrite
+  ; Y below with their likelihood contribution (no EPS) via flat single-line IFs.
+  Y = CC*(1 + ERR(1))                              ; Gaussian PK observation
+  IF (CMT.EQ.3.AND.DV.EQ.1) Y = HAZ*EXP(-CHZ)      ; exact event:    h(T)*S(T)
+  IF (CMT.EQ.3.AND.DV.EQ.0) Y = EXP(-CHZ)          ; right-censored: S(T)
 
 $THETA
   (0,  1.0)     ; 1 CL
@@ -62,5 +66,8 @@ $SIGMA
 
 ; LAPLACIAN + INTERACTION are required for the F_FLAG=1 (likelihood) TTE rows.
 $ESTIMATION METHOD=COND LAPLACE INTER MAXEVAL=9999 PRINT=5 NOABORT
-$COVARIANCE
+; The default sandwich R^-1 S R^-1 aborts: the R matrix (Hessian) is singular along
+; the flat (H0,BETA) ridge. MATRIX=S bases SEs on the gradient cross-product (S),
+; which inverts when R cannot; UNCONDITIONAL forces output past the sanity checks.
+$COVARIANCE MATRIX=S UNCONDITIONAL
 $TABLE ID TIME CMT DV PRED NOPRINT ONEHEADER FILE=pktte_joint.tab
