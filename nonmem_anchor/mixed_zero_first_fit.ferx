@@ -1,0 +1,57 @@
+# ferx mixed zero+first-order anchor model — mirrors nonmem_anchor/mixed_zero_first.ctl
+#
+# A zero-order (constant-rate over a modeled duration) input plus a first-order
+# (Bateman) input feeding a 1-cpt central compartment in parallel, split by a dose
+# fraction (FZO zero-order / FZO1 = 1-FZO first-order) — ferx's mixed model (#505).
+# central (CMT 1) holds the drug AMOUNT and receives
+# FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR); concentration = central / V via
+# [scaling]. Runs on data/mixed_oral.csv (every record on CMT 1), the ferx-keyed
+# copy of nonmem_anchor/mixed_oral.csv.
+#
+#   cargo run --release -- nonmem_anchor/mixed_zero_first_fit.ferx \
+#     --data data/mixed_oral.csv
+#
+# The dataset is simulated FROM this mixed model (same truths), so this is a matched
+# fit: cross-check the resulting OFV/THETA against the NONMEM run
+# (results/mixed_zero_first.ext) at the shared optimum, and both should recover
+# TVCL=5, TVV=50, TVFZO=0.4, TVKA=1.0, TVDUR=3.0. Tight ODE tolerances match
+# NONMEM's TOL=9. The zero-order pathway's DUR (and the fraction FZO) ride on finite
+# differences (the moving-boundary ∂/∂DUR analytic impulse is follow-up #530).
+
+[parameters]
+  theta TVCL(5.0,    0.1, 100.0)
+  theta TVV(50.0,    5.0, 500.0)
+  theta TVFZO(0.4, 0.001, 0.999)   # zero-order-pathway fraction
+  theta TVKA(1.0,   0.05,  24.0)   # first-order absorption rate (1/h)
+  theta TVDUR(3.0,  0.05,  24.0)   # zero-order input duration (h)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+
+  sigma PROP_ERR ~ 0.15 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  FZO  = TVFZO
+  FZO1 = 1 - TVFZO
+  KA   = TVKA
+  DUR  = TVDUR
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+  covariance = true

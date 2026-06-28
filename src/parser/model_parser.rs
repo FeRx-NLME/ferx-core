@@ -5168,13 +5168,15 @@ fn parse_scaling_block(
 /// `weibull` stays here **permanently** — it has no elementary closed form with
 /// linear disposition, so it always requires an explicit ODE disposition.
 /// `transit`/`igd` will leave the list once their analytical (incomplete-gamma /
-/// tilted-IG) closed forms land (#386 / Phase 3). `zero_order` is closed-form-able
-/// (it is an infusion into the depot/central), but #504 ships it on the **ODE
-/// forcing path only**; it leaves the list when that closed-form acceleration is
-/// added under the equivalence harness. Until then, listing it keeps the
-/// no-surprises contract (a `pk ... + zero_order(...)` model errors loudly instead
-/// of dropping the absorption).
-const ODE_ONLY_ABSORPTION_FNS: &[&str] = &["transit", "igd", "weibull", "zero_order"];
+/// tilted-IG) closed forms land (#386 / Phase 3). `zero_order` and `first_order`
+/// are both closed-form-able (a zero-order infusion / a Bateman superposition),
+/// but #504 / #505 ship them on the **ODE forcing path only**; they leave the list
+/// when that closed-form acceleration is added under the equivalence harness.
+/// Until then, listing them keeps the no-surprises contract (a `pk ... +
+/// zero_order(...)` / `pk ... + first_order(...)` model errors loudly instead of
+/// dropping the absorption).
+const ODE_ONLY_ABSORPTION_FNS: &[&str] =
+    &["transit", "igd", "weibull", "zero_order", "first_order"];
 
 /// Scan an `[odes]` block for an ODE-only absorption input-rate call, returning
 /// the first such function name found. Drives the error rule that rejects an
@@ -5935,6 +5937,11 @@ const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str])] =
         crate::pk::absorption::InputRateKind::ZeroOrder,
         &["dur"],
     ),
+    (
+        "first_order",
+        crate::pk::absorption::InputRateKind::FirstOrder,
+        &["ka"],
+    ),
 ];
 
 /// Extract built-in absorption input-rate calls ([`INPUT_RATE_FNS`] —
@@ -6037,18 +6044,12 @@ fn extract_input_rate_terms(
                 indiv_param_slots,
             )?;
 
-            // The zero-order family is delivered through a separate per-segment channel
-            // (`active_zero_order_inputs`) that does not yet carry the fraction scale, so
-            // a `FR*zero_order(...)` term (the `mixed` model) lands with #505. Reject it
-            // loudly rather than silently dropping the fraction.
-            if frac_slot.is_some() && kind == crate::pk::absorption::InputRateKind::ZeroOrder {
-                return Err(
-                    "[odes]: a pathway fraction on `zero_order(...)` (`FR*zero_order(...)`) is \
-                     not yet supported — fractional / mixed zero-order absorption lands with \
-                     #505. Use a bare `+ zero_order(...)` term for now."
-                        .to_string(),
-                );
-            }
+            // A `FR*zero_order(...)` term (the `mixed` model, #505) is now accepted:
+            // the per-segment zero-order channel (`zero_order_windows`) scales its
+            // window rate by the pathway fraction. Multiple zero-order terms on one
+            // compartment (biphasic zero-order) are rejected at fit-init
+            // (`check_absorption_dosing`), since the single-window-per-dose channel
+            // would under-deliver them.
 
             // Resolve each named arg into its declared slot position.
             let mut slots: Vec<Option<usize>> = vec![None; arg_names.len()];
@@ -13268,14 +13269,16 @@ mod tests {
         assert!(go("d/dt(central) = zero_order()")
             .unwrap_err()
             .contains("name=parameter"));
-        // A pathway fraction on zero_order — even with a *declared* `FZO` — is rejected
-        // pending #505 (the zero-order channel doesn't carry the fraction scale yet);
-        // the `mixed`/`parallel` composition lands there.
-        let scaled = go("d/dt(central) = FZO*zero_order(dur=DUR)").unwrap_err();
-        assert!(
-            scaled.contains("not yet supported") && scaled.contains("zero_order"),
-            "got: {scaled}"
+        // A pathway fraction on zero_order with a *declared* `FZO` now parses (#505):
+        // the zero-order channel carries the fraction (`mixed` model). The
+        // `FZO` multiplier resolves to its slot and the term is a ZeroOrder forcing.
+        let (_, frac_forcings) = go("d/dt(central) = FZO*zero_order(dur=DUR)").unwrap();
+        assert_eq!(frac_forcings.len(), 1);
+        assert_eq!(
+            frac_forcings[0].kind,
+            crate::pk::absorption::InputRateKind::ZeroOrder
         );
+        assert_eq!(frac_forcings[0].frac_slot, Some(6)); // FZO @ slot 6
         assert!(go("x = zero_order(dur=DUR)").unwrap_err().contains("d/dt"));
         // Positive control: a bare additive zero_order() is accepted.
         assert!(go("d/dt(central) = zero_order(dur=DUR) - CL/V*central").is_ok());
@@ -13308,6 +13311,107 @@ mod tests {
             crate::pk::absorption::InputRateKind::InverseGaussian
         ));
         assert!(forcings.iter().all(|f| f.cmt == 0 && f.frac_slot.is_none()));
+    }
+
+    // ── first_order() composition: parallel / mixed (#505) ────────────────────
+
+    #[test]
+    fn extract_first_order_single_input_rate() {
+        // first_order(ka) straight into central: one FirstOrder forcing reading `ka`,
+        // no fraction (single pathway), rewritten to `0`.
+        let states = vec!["central".to_string()];
+        let names = vec!["KA".to_string(), "CL".to_string(), "V".to_string()];
+        let slots = vec![4, 0, 1];
+        let line = "d/dt(central) = first_order(ka=KA) - CL/V*central".to_string();
+        let (cleaned, forcings) =
+            extract_input_rate_terms(&[line], &states, &names, &slots).unwrap();
+        assert_eq!(cleaned[0], "d/dt(central) = 0 - CL/V*central");
+        assert_eq!(forcings.len(), 1);
+        assert_eq!(
+            forcings[0].kind,
+            crate::pk::absorption::InputRateKind::FirstOrder
+        );
+        assert_eq!(forcings[0].arg_slots, vec![4]); // ka @ 4
+        assert_eq!(forcings[0].frac_slot, None);
+    }
+
+    #[test]
+    fn extract_parallel_dual_first_order() {
+        // parallel: FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) — two FirstOrder
+        // forcings on one compartment, each carrying a declared pathway fraction.
+        let states = vec!["central".to_string()];
+        let names = vec![
+            "FR1".to_string(),
+            "FR2".to_string(),
+            "KA1".to_string(),
+            "KA2".to_string(),
+        ];
+        let slots = vec![2, 3, 4, 5];
+        let line =
+            "d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central"
+                .to_string();
+        let (_, forcings) = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap();
+        assert_eq!(forcings.len(), 2);
+        assert!(forcings
+            .iter()
+            .all(|f| f.kind == crate::pk::absorption::InputRateKind::FirstOrder && f.cmt == 0));
+        assert_eq!(forcings[0].frac_slot, Some(2)); // FR1
+        assert_eq!(forcings[1].frac_slot, Some(3)); // FR2
+        assert_eq!(forcings[0].arg_slots, vec![4]); // KA1
+        assert_eq!(forcings[1].arg_slots, vec![5]); // KA2
+    }
+
+    #[test]
+    fn extract_mixed_first_plus_zero_order() {
+        // mixed: FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) — a Channel-A
+        // first-order term and a Channel-B zero-order term on one compartment, both
+        // fractioned. Table order puts zero_order before first_order.
+        let states = vec!["central".to_string()];
+        let names = vec![
+            "FZO1".to_string(),
+            "FZO".to_string(),
+            "KA".to_string(),
+            "DUR".to_string(),
+        ];
+        let slots = vec![2, 3, 4, 6];
+        let line =
+            "d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central"
+                .to_string();
+        let (_, forcings) = extract_input_rate_terms(&[line], &states, &names, &slots).unwrap();
+        assert_eq!(forcings.len(), 2);
+        // Every forcing carries a fraction and feeds central.
+        assert!(forcings.iter().all(|f| f.frac_slot.is_some() && f.cmt == 0));
+        let zo = forcings
+            .iter()
+            .find(|f| f.kind == crate::pk::absorption::InputRateKind::ZeroOrder)
+            .expect("a zero-order forcing");
+        let fo = forcings
+            .iter()
+            .find(|f| f.kind == crate::pk::absorption::InputRateKind::FirstOrder)
+            .expect("a first-order forcing");
+        assert_eq!(zo.frac_slot, Some(3)); // FZO
+        assert_eq!(fo.frac_slot, Some(2)); // FZO1
+    }
+
+    #[test]
+    fn extract_first_order_rejects_bad_specs() {
+        let states = vec!["central".to_string()];
+        let names = vec!["KA".to_string(), "FR".to_string()];
+        let slots = vec![4, 2];
+        let go =
+            |line: &str| extract_input_rate_terms(&[line.to_string()], &states, &names, &slots);
+        // Unknown / wrong argument name.
+        assert!(go("d/dt(central) = first_order(mtt=KA)")
+            .unwrap_err()
+            .contains("no argument `mtt`"));
+        // Undeclared parameter as the argument.
+        assert!(go("d/dt(central) = first_order(ka=ZZZ)")
+            .unwrap_err()
+            .contains("not a declared individual parameter"));
+        // A non-fraction scaling (division) is rejected by the shared prefix parser.
+        assert!(go("d/dt(central) = first_order(ka=KA)/V").is_err());
+        // Positive control: a bare additive first_order() parses.
+        assert!(go("d/dt(central) = first_order(ka=KA) - CL/V*central").is_ok());
     }
 
     #[test]

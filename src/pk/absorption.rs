@@ -183,6 +183,47 @@ pub fn validate_zero_order(dur: f64) -> Result<(), String> {
     Ok(())
 }
 
+/// First-order absorption input rate into the compartment it feeds, for an
+/// absorption rate constant `ka` (> 0):
+///
+/// ```text
+/// R_in(tad) = dose · ka · exp(−ka·tad),   dose = F · amt.
+/// ```
+///
+/// This is the classic first-order (Bateman) input — the same absorption the
+/// analytical `pk *_oral` solvers use, exposed here as an input-rate function so
+/// it can be **composed** in `[odes]` for parallel / mixed dual-pathway models
+/// (#505): `FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2)` (parallel) and
+/// `FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR)` (mixed). Standalone
+/// first-order absorption still uses the analytical `pk *_oral` path; this is for
+/// the multi-pathway case the closed forms can't express in one term.
+/// `∫₀^∞ R_in dt = dose`. Returns `0` for `tad ≤ 0` and for a non-positive `dose`.
+///
+/// Domain: `ka > 0` (enforce upstream with [`validate_first_order`]). The
+/// `tad → 0⁺` edge is finite (`R_in → dose·ka`), so there is no singularity to
+/// guard — unlike the densities above. The single building block is `exp` (on
+/// [`PkNum`]), so a `first_order()` model carries exact analytic `Dual2`
+/// sensitivities through `sens/ode_provider.rs` (it is identical to `transit`
+/// with `n = 0`, whose middle term `0·ln x` vanishes).
+///
+/// This is the readable reference form (used by tests and one-shot callers); the
+/// ODE hot path goes through [`InputRateForcing::prepare`] +
+/// [`PreparedInputRate::rate`], which hoist `ka` out of the per-dose loop.
+pub fn first_order_input_rate(tad: f64, ka: f64, dose: f64) -> f64 {
+    PreparedInputRate::first_order(ka).rate(tad, dose)
+}
+
+/// Validate the first-order parameter: `ka` (absorption rate constant) strictly
+/// positive. The negated comparison also rejects `NaN`.
+pub fn validate_first_order(ka: f64) -> Result<(), String> {
+    if !(ka > 0.0) {
+        return Err(format!(
+            "first_order: ka (absorption rate constant) must be > 0, got {ka}"
+        ));
+    }
+    Ok(())
+}
+
 /// Which built-in absorption input-rate model a forcing term uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputRateKind {
@@ -200,6 +241,14 @@ pub enum InputRateKind {
     /// express, so it stays on the FD fallback ([`Self::supported_over_dual`])
     /// until the boundary-impulse mechanism lands (#530).
     ZeroOrder,
+    /// First-order (Bateman) absorption — `first_order(ka)`. `R_in = dose·ka·
+    /// e^{−ka·tad}` (#505). The existing first-order absorption exposed as an
+    /// input-rate function so it can be **composed** in `[odes]` for parallel /
+    /// mixed dual-pathway models; standalone first-order still uses the analytical
+    /// `pk *_oral` path. A smooth density like the three above (it uses only
+    /// `exp`), so it stays on the pointwise `R_in(tad)` path and is lifted to
+    /// `Dual2` ([`Self::supported_over_dual`] = `true`).
+    FirstOrder,
 }
 
 impl InputRateKind {
@@ -220,6 +269,10 @@ impl InputRateKind {
             InputRateKind::InverseGaussian => true,
             InputRateKind::Transit => true,
             InputRateKind::Weibull => true,
+            // First-order is a smooth `dose·ka·e^{−ka·tad}` density (only `exp`),
+            // pointwise like the three above — exact `Dual2` forcing sensitivities
+            // for `ka` and the pathway fraction `frac` (#505).
+            InputRateKind::FirstOrder => true,
             // Zero-order has a hard cutoff at `tad = dur`; `∂R_in/∂dur` carries a
             // Leibniz boundary term (a dual-channel impulse at the cutoff) that the
             // smooth pointwise `rate(tad) → Dual2` walk misses. Until that impulse
@@ -310,6 +363,7 @@ impl InputRateForcing {
                 PreparedInputRate::weibull(self.arg(params, 0, 1.0), self.arg(params, 1, 1.0))
             }
             InputRateKind::ZeroOrder => PreparedInputRate::zero_order(self.arg(params, 0, 1.0)),
+            InputRateKind::FirstOrder => PreparedInputRate::first_order(self.arg(params, 0, 1.0)),
         }
     }
 
@@ -330,6 +384,7 @@ impl InputRateForcing {
                 validate_weibull(self.arg(params, 0, 1.0), self.arg(params, 1, 1.0))
             }
             InputRateKind::ZeroOrder => validate_zero_order(self.arg(params, 0, 1.0)),
+            InputRateKind::FirstOrder => validate_first_order(self.arg(params, 0, 1.0)),
         }
     }
 
@@ -362,6 +417,10 @@ impl InputRateForcing {
             // Not lifted: the cutoff at `tad = dur` makes `∂/∂dur` a boundary
             // impulse the pointwise dual walk can't carry (#530). FD fallback.
             InputRateKind::ZeroOrder => None,
+            // Lifted: a smooth `exp`-only density, exact `Dual2` like the others.
+            InputRateKind::FirstOrder => {
+                Some(PreparedInputRate::first_order(self.arg(params, 0, 1.0)))
+            }
         }
     }
 }
@@ -394,6 +453,9 @@ pub enum PreparedInputRate<T = f64> {
     /// and its reciprocal `inv_dur = 1/dur` (the constant rate factor, so the
     /// per-dose `rate` is one multiply: `dose · inv_dur`).
     ZeroOrder { dur: T, inv_dur: T },
+    /// First-order constant: the absorption rate constant `ka` (the per-dose
+    /// `rate` is `dose · ka · exp(−ka·tad)`).
+    FirstOrder { ka: T },
 }
 
 impl<T: PkNum> PreparedInputRate<T> {
@@ -518,6 +580,28 @@ impl<T: PkNum> PreparedInputRate<T> {
         }
     }
 
+    /// Precompute the first-order constant for `ka`.
+    ///
+    /// `ka` is **clamped to the valid domain** (`ka > 0`, floor [`Self::MIN_PARAM`])
+    /// for the same reason as the other constructors: a transient mid-search
+    /// excursion (additive `eta`, wide FD step) could drive `ka ≤ 0`, turning the
+    /// input rate negative / non-physical. The fit-time guard
+    /// ([`validate_first_order`]) rejects an out-of-domain *typical* value loudly;
+    /// the clamp keeps `R_in` finite and positive at the domain wall so the
+    /// optimiser can climb back to the interior, and the converged optimum is
+    /// interior so reported estimates are unaffected. `NaN` falls to the floor.
+    ///
+    /// Generic over `T` (the `sens/` `*_g<T>` convention) so a `first_order()`
+    /// model gets exact analytic `Dual2` sensitivities for `ka` and the pathway
+    /// fraction: [`Self::rate`] uses only `exp`/`* −`, all on [`PkNum`]. For
+    /// `T = f64` this reduces to the scalar first-order (Bateman) input rate.
+    #[inline]
+    fn first_order(ka: T) -> Self {
+        PreparedInputRate::FirstOrder {
+            ka: ka.guard_floor(Self::MIN_PARAM),
+        }
+    }
+
     /// Appearance rate `R_in(tad)` for one dose (`dose = F · amt`). Per-dose
     /// contributions are summed by the caller; `tad ≤ 0` or `dose ≤ 0 ⇒ 0` (the
     /// guard branches on `.val()`, so for a `Dual2` it returns a flat zero). The
@@ -579,6 +663,12 @@ impl<T: PkNum> PreparedInputRate<T> {
                     T::from_f64(0.0)
                 }
             }
+            // R_in = dose · ka · exp(−ka·tad) — the first-order (Bateman) input.
+            // tad > 0 here (guarded above). Evaluated directly (not in the log
+            // domain): the only building block is `exp`, so it carries exact
+            // `Dual2` sensitivities for `ka` with no special function. As tad → 0⁺
+            // it is finite (R_in → dose·ka); there is no singularity to guard.
+            PreparedInputRate::FirstOrder { ka } => dose * ka * (-(ka * tad)).exp(),
         }
     }
 }
@@ -1435,10 +1525,12 @@ mod tests {
         assert!(forcing.prepare_dual::<f64>(&params).is_none());
     }
 
-    /// `prepare_dual` lifts **all three** forcings (IG, transit, Weibull) to a
-    /// `PkNum` type (here `T = f64`), reproducing the scalar `prepare` exactly — the
-    /// `T = f64` byte-identity that lets the analytic ODE provider evaluate them over
-    /// `Dual2` without drifting from the production predictor (#430; Weibull = Phase 2).
+    /// `prepare_dual` lifts the **smooth** forcings (IG, transit, Weibull,
+    /// first-order) to a `PkNum` type (here `T = f64`), reproducing the scalar
+    /// `prepare` exactly — the `T = f64` byte-identity that lets the analytic ODE
+    /// provider evaluate them over `Dual2` without drifting from the production
+    /// predictor (#430; Weibull = Phase 2; first-order = #505). Zero-order is the
+    /// one non-lifted kind, checked separately (`zero_order_is_not_lifted_over_dual`).
     #[test]
     fn prepare_dual_lifts_all_kinds() {
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
@@ -1447,6 +1539,7 @@ mod tests {
         params[6] = 3.0; // n
         params[7] = 1.0; // mtt
         params[2] = 1.5; // beta (td reuses slot 4)
+        params[3] = 1.2; // ka (first-order)
 
         let ig = InputRateForcing {
             cmt: 1,
@@ -1466,7 +1559,13 @@ mod tests {
             arg_slots: vec![4, 2], // td @ 4, beta @ 2
             frac_slot: None,
         };
-        for forcing in [&ig, &transit, &weibull] {
+        let first_order = InputRateForcing {
+            cmt: 1,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![3], // ka @ 3
+            frac_slot: None,
+        };
+        for forcing in [&ig, &transit, &weibull, &first_order] {
             let lifted = forcing
                 .prepare_dual::<f64>(&params)
                 .expect("all kinds lift over PkNum");
@@ -1490,6 +1589,7 @@ mod tests {
             InputRateKind::Transit,
             InputRateKind::Weibull,
             InputRateKind::ZeroOrder,
+            InputRateKind::FirstOrder,
         ];
         let params = vec![1.0; crate::types::MAX_PK_PARAMS];
         for &kind in ALL_KINDS {
@@ -1504,6 +1604,199 @@ mod tests {
                 forcing.prepare_dual::<f64>(&params).is_some(),
                 "supported_over_dual must match prepare_dual liftability for {kind:?}"
             );
+        }
+    }
+
+    // ── First-order `first_order(ka)` ─────────────────────────────────────────
+
+    #[test]
+    fn first_order_matches_bateman_input_and_is_zero_before_dose() {
+        // R_in = dose·ka·exp(−ka·tad) for tad > 0; 0 for tad ≤ 0 and dose ≤ 0.
+        let (ka, dose) = (1.3_f64, 80.0_f64);
+        for &tad in &[0.1, 0.5, 1.0, 3.0, 8.0] {
+            let want = dose * ka * (-ka * tad).exp();
+            assert_relative_eq!(
+                first_order_input_rate(tad, ka, dose),
+                want,
+                max_relative = 1e-12
+            );
+        }
+        // The input starts at the dose (no negative-tad leak) and a non-positive
+        // dose contributes nothing.
+        assert_eq!(first_order_input_rate(0.0, ka, dose), 0.0);
+        assert_eq!(first_order_input_rate(-1.0, ka, dose), 0.0);
+        assert_eq!(first_order_input_rate(1.0, ka, 0.0), 0.0);
+        // The peak rate is at the dose instant (finite, no singularity): dose·ka.
+        assert_relative_eq!(
+            first_order_input_rate(1e-9, ka, dose),
+            dose * ka,
+            max_relative = 1e-6
+        );
+    }
+
+    #[test]
+    fn first_order_mass_balance_integrates_to_dose() {
+        // ∫₀^∞ dose·ka·e^{−ka·tad} dt = dose. The integrand is finite at tad → 0,
+        // so a plain trapezoidal sum from 0 converges (like the β ≥ 1 Weibull case).
+        for &ka in &[0.5_f64, 1.0, 2.5] {
+            let dose = 100.0;
+            let upper = 30.0 / ka; // ≫ several 1/ka time-constants
+            let dt = upper / 400_000.0;
+            let steps = (upper / dt) as usize;
+            let mut sum = 0.0;
+            let mut prev = first_order_input_rate(0.0, ka, dose);
+            for i in 1..=steps {
+                let t = i as f64 * dt;
+                let cur = first_order_input_rate(t, ka, dose);
+                sum += 0.5 * (prev + cur) * dt;
+                prev = cur;
+            }
+            assert_relative_eq!(sum, dose, max_relative = 2e-3);
+        }
+    }
+
+    #[test]
+    fn first_order_equals_transit_n_zero() {
+        // first_order(ka) is exactly transit(n = 0, mtt = 1/ka): with n = 0 the
+        // transit chain's gamma density collapses to the Bateman input KTR·e^{−KTR·tad}
+        // with KTR = (0+1)/mtt = ka. A cheap cross-check that the new kind agrees with
+        // the established transit evaluator.
+        for &ka in &[0.4_f64, 1.0, 2.0] {
+            let mtt = 1.0 / ka;
+            for &tad in &[0.0, 0.25, 1.0, 4.0, 10.0] {
+                assert_relative_eq!(
+                    first_order_input_rate(tad, ka, 100.0),
+                    transit_input_rate(tad, 0.0, mtt, 100.0),
+                    max_relative = 1e-12,
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_first_order_domain() {
+        assert!(validate_first_order(1.0).is_ok());
+        assert!(validate_first_order(0.0).unwrap_err().contains("ka"));
+        assert!(validate_first_order(-1.0).is_err());
+        assert!(validate_first_order(f64::NAN).is_err());
+    }
+
+    /// A transient domain excursion (`ka ≤ 0` or `NaN`) — reachable mid-fit via an
+    /// additive `eta` / wide FD step — must yield a finite, non-negative `R_in` (the
+    /// clamp in `PreparedInputRate::first_order`), never a `NaN`/negative rate.
+    #[test]
+    fn first_order_rate_is_finite_for_domain_excursions() {
+        for &ka in &[0.0, -1.0, f64::NAN] {
+            for &tad in &[0.5, 2.0, 10.0] {
+                let r = first_order_input_rate(tad, ka, 100.0);
+                assert!(
+                    r.is_finite() && r >= 0.0,
+                    "R_in must be finite & non-negative at ka={ka}, tad={tad}, got {r}"
+                );
+            }
+        }
+    }
+
+    /// `prepare(...).rate(...)` (the hoisted ODE-hot-path form) must agree
+    /// bit-for-bit with the reference `first_order_input_rate`, reading `ka` from the
+    /// right (single) slot.
+    #[test]
+    fn prepared_first_order_rate_matches_reference_and_reads_slot() {
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![3], // ka @ 3
+            frac_slot: None,
+        };
+        let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
+        params[3] = 1.1; // ka
+        let prepared = forcing.prepare(&params);
+        for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
+            assert_eq!(
+                prepared.rate(tad, 100.0),
+                first_order_input_rate(tad, 1.1, 100.0)
+            );
+        }
+    }
+
+    /// `InputRateForcing::validate` reads `ka` from the right slot for the
+    /// first-order kind and surfaces the domain error.
+    #[test]
+    fn forcing_validate_first_order_reads_slot_and_flags_domain() {
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![3],
+            frac_slot: None,
+        };
+        let mut ok = vec![0.0; crate::types::MAX_PK_PARAMS];
+        ok[3] = 1.0;
+        assert!(forcing.validate(&ok).is_ok());
+        let mut bad = ok.clone();
+        bad[3] = -1.0;
+        assert!(forcing.validate(&bad).unwrap_err().contains("ka"));
+    }
+
+    /// First-order **is** lifted over `Dual2` (a smooth `exp`-only density): the
+    /// gate says so and `prepare_dual` returns `Some`, so a pure-`first_order()`
+    /// (e.g. `parallel`) model gets exact analytic ODE sensitivities (#505).
+    #[test]
+    fn first_order_is_lifted_over_dual() {
+        assert!(InputRateKind::FirstOrder.supported_over_dual());
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![3],
+            frac_slot: None,
+        };
+        let params = vec![1.0; crate::types::MAX_PK_PARAMS];
+        assert!(forcing.prepare_dual::<f64>(&params).is_some());
+    }
+
+    /// The analytic `Dual2` gradient of the **delivered** first-order forcing
+    /// (`frac · R_in`) matches central finite differences for both `ka` and the
+    /// pathway fraction `frac` — the #505 / issue requirement "analytic ≡ FD incl.
+    /// ∂/∂frac". The fraction enters linearly (`acc · frac` in
+    /// `add_prepared_input_rate_forcing`), so `∂/∂frac = R_in`; `ka` flows through
+    /// the `exp` density. Exercised through the same `frac()` reader the ODE
+    /// provider uses, so a wrong dual rule (a missing `exp` jet or a dropped
+    /// fraction channel) would surface here in the default `--features ci` build.
+    #[test]
+    fn first_order_dual_gradient_matches_central_fd() {
+        use crate::sens::dual_mixed::DualMixed;
+        type D = DualMixed<2, 2>;
+        let forcing = InputRateForcing {
+            cmt: 0,
+            kind: InputRateKind::FirstOrder,
+            arg_slots: vec![4], // ka @ 4 (dim 0)
+            frac_slot: Some(2), // frac @ 2 (dim 1)
+        };
+        let dose = 100.0;
+        let h = 1e-6;
+        for &(ka, frac) in &[(0.5, 0.3), (1.2, 0.6), (2.5, 0.45)] {
+            let mut params = vec![D::constant(0.0); crate::types::MAX_PK_PARAMS];
+            params[4] = D::var(ka, 0);
+            params[2] = D::var(frac, 1);
+            let prep = forcing.prepare_dual::<D>(&params).unwrap();
+            for &tad in &[0.3, 1.0, 4.0] {
+                // Delivered rate = R_in(tad) · frac (the per-dose contribution).
+                let delivered =
+                    prep.rate(D::constant(tad), D::constant(dose)) * forcing.frac(&params);
+                // ∂/∂ka = frac · ∂R_in/∂ka; ∂/∂frac = R_in (linear multiplier).
+                let d_ka = frac
+                    * (first_order_input_rate(tad, ka + h, dose)
+                        - first_order_input_rate(tad, ka - h, dose))
+                    / (2.0 * h);
+                let d_frac = first_order_input_rate(tad, ka, dose);
+                assert_relative_eq!(delivered.grad[0], d_ka, max_relative = 1e-5, epsilon = 1e-7);
+                assert_relative_eq!(
+                    delivered.grad[1],
+                    d_frac,
+                    max_relative = 1e-5,
+                    epsilon = 1e-7
+                );
+            }
         }
     }
 }

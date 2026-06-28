@@ -1,0 +1,56 @@
+# ferx parallel dual-first-order anchor model — mirrors nonmem_anchor/parallel_first_order.ctl
+#
+# Two first-order (Bateman) absorption pathways feeding a 1-cpt central compartment,
+# split by a dose fraction (FR1 fast / FR2 = 1-FR1 slow) — ferx's parallel model
+# (#505). central (CMT 1) holds the drug AMOUNT and receives
+# FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2); concentration = central / V via
+# [scaling]. Runs on data/parallel_oral.csv (every record on CMT 1), the ferx-keyed
+# copy of nonmem_anchor/parallel_oral.csv.
+#
+#   cargo run --release -- nonmem_anchor/parallel_first_order_fit.ferx \
+#     --data data/parallel_oral.csv
+#
+# The dataset is simulated FROM this parallel model (same truths), so this is a
+# matched fit: cross-check the resulting OFV/THETA against the NONMEM run
+# (results/parallel_first_order.ext) at the shared optimum, and both should recover
+# TVCL=5, TVV=50, TVFR1=0.6, TVKA1=1.5, TVKA2=0.3. Tight ODE tolerances match
+# NONMEM's TOL=9. KA1 > KA2 bounds break the pathway-label symmetry (keep the same
+# convention as the .ctl).
+
+[parameters]
+  theta TVCL(5.0,    0.1, 100.0)
+  theta TVV(50.0,    5.0, 500.0)
+  theta TVFR1(0.6, 0.001, 0.999)   # fast-pathway fraction
+  theta TVKA1(1.5,   0.5,  24.0)   # fast pathway (bounded > KA2)
+  theta TVKA2(0.3,  0.01,   0.5)   # slow pathway
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+
+  sigma PROP_ERR ~ 0.15 (sd)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+  KA1 = TVKA1
+  KA2 = TVKA2
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  ode_reltol = 1e-9
+  ode_abstol = 1e-11
+  covariance = true

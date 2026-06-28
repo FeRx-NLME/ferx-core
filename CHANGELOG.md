@@ -20,6 +20,17 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
+  built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
+  absorption for composition in `[odes]`, so two absorption pathways can be split by a dose
+  fraction: `parallel` (dual first-order, `FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2)`) and
+  `mixed` (zero-order + first-order, `FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR)`). A pathway
+  fraction on `zero_order(...)` (`FR*zero_order(...)`) is now accepted (previously rejected), so the
+  per-segment zero-order channel carries the fraction; the fractions must partition the dose
+  (each `0 < FR ≤ 1`, `Σ FR ≈ 1`). `parallel` keeps exact analytic FOCEI gradients (including
+  ∂/∂fraction); `mixed` differentiates the zero-order duration/fraction by finite differences (the
+  moving-boundary case, #530). Standalone first-order absorption still uses the analytical
+  `pk *_oral` path. See [Absorption models](model-file/absorption.qmd).
 - **Joint PK-TTE — drug-driven hazard via `[event_model] hazard = <expr>`** (#564). On an ODE
   model, a `hazard` expression that references the PK state (e.g. `H0 * exp(BETA * (central / V))`)
   is accumulated as a cumulative-hazard ODE compartment and estimated jointly with the PK by

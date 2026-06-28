@@ -15,7 +15,8 @@ inverse-Gaussian** model (`igd`), the **Weibull** model (`weibull`), and the
 on one compartment with **pathway fractions** (`FR1*igd(...) + FR2*igd(...)`) for
 biphasic / parallel absorption — see
 [Biphasic (parallel) absorption](#biphasic-parallel-absorption). The dual-pathway
-zero-order `mixed`/`parallel` family is still planned — see `plans/absorption-models.md`.
+first-order (`parallel`) and zero-order + first-order (`mixed`) families are built
+with `first_order(ka)` — see [Parallel / mixed absorption](#parallel-mixed).
 
 ## Transit-compartment absorption — `transit(n, mtt)`
 
@@ -244,9 +245,10 @@ Rules for the fraction multiplier:
   feeds a compartment, **each** must carry a fraction, and the fractions are
   checked at fit-init to lie in `(0, 1]` and sum to ≈ 1 (`E_ABSORPTION_FRACTION`).
   Two pathways together still deliver exactly `F·Dose` (`∫ Σ FRᵢ·R_inᵢ dt = F·Dose`).
-- The same multiplier works for `transit`/`weibull` terms. A fraction on
-  `zero_order(...)` (the `mixed`/`parallel` zero-order family) is **not yet
-  supported** ([#505](https://github.com/FeRx-NLME/ferx-core/issues/505)).
+- The same multiplier works for `transit`/`weibull`/`first_order` terms, and on
+  `zero_order(...)` as part of a `mixed` model — see
+  [Parallel / mixed absorption](#parallel-mixed)
+  ([#505](https://github.com/FeRx-NLME/ferx-core/issues/505)).
 
 [`examples/biphasic_igd_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/biphasic_igd_absorption.ferx)
 is a complete biphasic model; run it on simulated data:
@@ -391,10 +393,11 @@ term (there is no separate `sequential` keyword):
 ```
 
 - The argument is named: `dur=<param>`, declared in `[individual_parameters]`.
-- As with the other input rates, `zero_order(...)` is a standalone,
-  positively-signed term: it may appear **once** per `d/dt` line and must not be
-  scaled, negated, or parenthesised. (The fraction-weighted `parallel`/`mixed`
-  compositions are a planned follow-up.)
+- A bare `zero_order(...)` is a standalone, positively-signed term and must not be
+  scaled (other than by a pathway fraction), negated, or parenthesised. It **may**
+  be weighted by a single declared pathway fraction (`FZO*zero_order(...)`) as part
+  of a `mixed` model — see [Parallel / mixed absorption](#parallel-mixed) below.
+  At most **one** `zero_order(...)` term may feed a given compartment.
 
 ### Shared behaviour
 
@@ -440,6 +443,95 @@ is the sequential (zero-then-first-order) variant. Run either on simulated data:
 cargo run --release -- examples/zero_order_absorption.ferx --simulate
 cargo run --release -- examples/sequential_absorption.ferx --simulate
 ```
+
+## Parallel / mixed absorption — `first_order(ka)` {#parallel-mixed}
+
+Some drugs are absorbed through **two pathways at once** — e.g. a fast and a slow
+first-order phase, or an immediate zero-order release plus a first-order tail. ferx
+expresses these by **composing input-rate functions split by a dose fraction**, with
+no need for extra compartments or per-compartment bioavailability.
+
+The building block is `first_order(ka)` — the classic first-order (Bateman)
+absorption, exposed as an input-rate function so it can be composed:
+
+$$
+R_\text{in}(t_\text{ad}) = \text{Dose}\cdot k_a\cdot e^{-k_a\,t_\text{ad}}
+$$
+
+(Standalone first-order absorption still uses the analytical `pk one_cpt_oral(...)`
+path; `first_order(...)` is for the multi-pathway case a single closed form can't
+express.)
+
+### Pathway fractions
+
+A multi-pathway term is written `FR*fn(...)`, where `FR` is a **single declared
+individual parameter** in `(0, 1]` (not an expression like `(1-FR)`). The fractions
+on a compartment must **partition the dose** — `Σ FR ≈ 1` — so a two-pathway split
+declares a complementary parameter:
+
+```text
+[individual_parameters]
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1      # declared complement; FR1 + FR2 = 1
+```
+
+This is the same fraction mechanism as biphasic `igd` (see above): validated at
+fit-init (`E_ABSORPTION_FRACTION`) — each `0 < FR ≤ 1`, the fractions sum to 1, and a
+lone fractioned term is rejected (a single pathway is written bare).
+
+### Parallel — dual first-order
+
+Two first-order pathways (a fast `KA1` and a slow `KA2`) feeding central:
+
+```text
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+```
+
+### Mixed — zero-order + first-order
+
+A zero-order release (`FZO` of the dose, over `DUR`) plus a first-order phase
+(`FZO1 = 1 − FZO`):
+
+```text
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central
+```
+
+A pathway fraction on `zero_order(...)` is supported here (the per-segment
+zero-order channel carries the fraction). At most **one** `zero_order(...)` term may
+feed a compartment — biphasic zero-order is rejected (`E_ABSORPTION_ZERO_ORDER_MULTI`).
+
+### Sensitivities
+
+`parallel` (only smooth `first_order` terms) keeps **exact analytic** (`Dual2`)
+FOCE/FOCEI gradients — including the derivative with respect to the pathway fraction.
+`mixed` contains a `zero_order` term, so — exactly as for a plain `zero_order` model —
+the zero-order **duration and fraction** are differentiated by **finite differences**
+(the moving-boundary case, [#530](https://github.com/FeRx-NLME/ferx-core/issues/530));
+the first-order pathway's parameters stay analytic.
+
+### Worked examples
+
+[`examples/parallel_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/parallel_absorption.ferx)
+and
+[`examples/mixed_absorption.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/mixed_absorption.ferx)
+are self-contained; run either on simulated data:
+
+```bash
+cargo run --release -- examples/parallel_absorption.ferx --simulate
+cargo run --release -- examples/mixed_absorption.ferx --simulate
+```
+
+The value path is anchored by an **in-engine superposition oracle**
+(`tests/parallel_mixed_absorption.rs`): by the linearity of the disposition ODE, a
+dual-pathway curve is *exactly* the fraction-weighted sum of its single-pathway
+curves, so `parallel ≡ FR1·first_order(ka1) + FR2·first_order(ka2)` and
+`mixed ≡ FZO1·first_order(ka) + FZO·zero_order(dur)` to numerical precision. Each
+is *also* anchored against a licensed NONMEM `ADVAN13 $DES` run (committed under
+`nonmem_anchor/`): ferx's FOCEI objective at NONMEM's optimum matches NONMEM's
+`#OBJV` to ~1e-5 for `parallel` (−688.019) and ~1e-4 for `mixed` (−698.966), and
+both recover the data-generating parameters (`tests/parallel_mixed_nonmem_anchor.rs`).
 
 ## Numerical note
 

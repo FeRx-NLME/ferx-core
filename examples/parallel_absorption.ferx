@@ -1,0 +1,84 @@
+# Parallel (dual first-order) absorption — first_order() composition
+#
+# Two parallel first-order absorption pathways feeding the central compartment,
+# split by a dose fraction (#505). A fast pathway (large KA1) and a slow pathway
+# (small KA2), each a built-in `first_order()` input rate, weighted by fractions
+# that partition the dose:
+#
+#   R_in(tad) = FR1·first_order(KA1) + FR2·first_order(KA2),   FR1 + FR2 = 1
+#             = FR1·Dose·KA1·e^{−KA1·tad} + FR2·Dose·KA2·e^{−KA2·tad}
+#
+# `first_order(ka)` is the classic first-order (Bateman) absorption exposed as an
+# input-rate function so two pathways can be composed in one ODE — standalone
+# first-order still uses the analytical `pk *_oral` path. Each `FR*first_order(...)`
+# multiplier must be a single declared individual parameter (not an expression like
+# `(1-FR)`), so the complementary fraction is declared explicitly: FR2 = 1 - FR1.
+# The two pathways together deliver exactly the dose (∫ R_in dt = F·Dose); the
+# fit-time check enforces 0 < FR ≤ 1 and Σ FR ≈ 1.
+#
+# One dose record per dose: both pathways feed the SAME central compartment and
+# read the SAME single dose (split internally by FR1/FR2), so the data needs only
+# one dosing row into CMT=1 — NOT one per pathway. (This differs from a classic
+# NONMEM two-depot parallel-absorption model, which duplicates the dose into two
+# depots with F1/F2; the NONMEM $DES anchor for this model uses the same single
+# dose + PODO split, see nonmem_anchor/parallel_first_order.ctl.)
+#
+# Both pathways are smooth `exp`-only densities (Channel A), so the model carries
+# exact analytic Dual2 sensitivities — including ∂/∂FR1 — and stays on the
+# analytic FOCEI gradient path (no finite differences).
+#
+# ── Unit convention (Form C: amount ODE + [scaling]) ─────────────────────────
+#   CMT=1  central  — drug AMOUNT (mg); receives R_in(tad), elimination CL/V
+#   observation y   — concentration (mg/L) = central / V, via the [scaling] block
+#
+# Self-contained: run it with no data file
+#   cargo run --release -- examples/parallel_absorption.ferx --simulate
+# which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
+# fits it back. True simulation parameters: TVCL=5, TVV=50, TVFR1=0.6,
+#   TVKA1=1.5 (fast), TVKA2=0.3 (slow), omega_CL=omega_V=0.09, sigma_prop=0.15.
+
+[parameters]
+  theta TVCL(5.0,    0.1, 100.0)   # typical clearance (L/h)
+  theta TVV(50.0,    5.0, 500.0)   # typical central volume (L)
+  theta TVFR1(0.6,  0.05,  0.95)   # fraction of dose through the fast pathway
+  theta TVKA1(1.5,  0.05,  24.0)   # absorption rate, fast pathway (1/h)
+  theta TVKA2(0.3,  0.01,  24.0)   # absorption rate, slow pathway (1/h)
+
+  omega ETA_CL ~ 0.09              # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09              # IIV on V  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)       # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  FR1 = TVFR1                      # fast-pathway fraction
+  FR2 = 1 - TVFR1                  # slow-pathway fraction (declared complement; FR1 + FR2 = 1)
+  KA1 = TVKA1
+  KA2 = TVKA2
+
+[structural_model]
+  ode(states=[central])            # no obs_cmt — Form C provides the observable
+
+[odes]
+  # central holds drug AMOUNT (mg); the dose splits across two first-order
+  # pathways (FR1 fast + FR2 slow), then first-order elimination CL/V.
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - CL/V*central
+
+[scaling]
+  y = central / V                  # observable = concentration (mg/L)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7

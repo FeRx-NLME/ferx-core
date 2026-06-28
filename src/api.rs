@@ -852,11 +852,42 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // fractioned term is rejected too (a single pathway is written bare).
     use std::collections::BTreeMap;
     let mut frac_count: BTreeMap<usize, (usize, usize)> = BTreeMap::new(); // cmt -> (total, fractioned)
+    let mut zero_order_count: BTreeMap<usize, usize> = BTreeMap::new(); // cmt -> #zero-order terms
     for f in &ode.input_rate {
         let e = frac_count.entry(f.cmt).or_insert((0, 0));
         e.0 += 1;
         if f.frac_slot.is_some() {
             e.1 += 1;
+        }
+        if f.kind == crate::pk::absorption::InputRateKind::ZeroOrder {
+            *zero_order_count.entry(f.cmt).or_insert(0) += 1;
+        }
+    }
+
+    // Multiple zero-order terms on one compartment (biphasic zero-order) are not
+    // supported (#505): the per-segment zero-order channel
+    // (`predictions::zero_order_windows`) builds one window per dose and resolves a
+    // *single* zero-order forcing per compartment, so a second `FR*zero_order(...)`
+    // on the same compartment would be silently under-delivered. A `mixed` model is
+    // one zero-order + one `first_order` (a Channel-A pointwise term, freely
+    // superposed) — that is allowed; only ≥2 *zero-order* terms on a compartment are
+    // rejected. Reported once.
+    for (&cmt, &n_zo) in &zero_order_count {
+        if n_zo >= 2 {
+            diags.push(
+                Diagnostic::error(
+                    "E_ABSORPTION_ZERO_ORDER_MULTI",
+                    format!(
+                        "Compartment {} has {n_zo} zero-order input-rate terms \
+                         (`zero_order(...)`). Multiple zero-order pathways on one compartment \
+                         (biphasic zero-order) are not yet supported — use at most one \
+                         `zero_order(...)` per compartment (a `mixed` model pairs it with a \
+                         `first_order(...)` term).",
+                        cmt + 1
+                    ),
+                )
+                .with_block("odes"),
+            );
         }
     }
     for (&cmt, &(total, fractioned)) in &frac_count {

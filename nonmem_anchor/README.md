@@ -9,11 +9,41 @@ the CLAUDE.md "compare with NONMEM output" rule:
 | **Freijer & Post IG** | `igd(mat, cv2)` — issue [#347](https://github.com/FeRx-NLME/ferx-core/issues/347) | `freijer_ig.ctl` | *(in `tests/igd_nonmem_anchor.rs`)* |
 | **Weibull** | `weibull(td, beta)` — [#322](https://github.com/FeRx-NLME/ferx-core/issues/322) Phase 2 | `weibull_absorption.ctl` | `weibull_absorption_fit.ferx` |
 | **Biphasic IG** | `FR1*igd(...) + FR2*igd(...)` — [#388](https://github.com/FeRx-NLME/ferx-core/issues/388) | `freijer_biphasic_ig.ctl` | `biphasic_ig_fit.ferx` |
+| **Parallel** | `FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2)` — [#505](https://github.com/FeRx-NLME/ferx-core/issues/505) | `parallel_first_order.ctl` | `parallel_first_order_fit.ferx` |
+| **Mixed** | `FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR)` — [#505](https://github.com/FeRx-NLME/ferx-core/issues/505) | `mixed_zero_first.ctl` | `mixed_zero_first_fit.ferx` |
 
 The transit control runs on `transit_oral.csv`; the IG and Weibull controls run
 on `igd_oral.csv` (the same data re-keyed to a 1-compartment layout — every record
 on CMT 1 — so the dose feeds the absorption compartment directly). The **biphasic
-IG** control runs on its own matched dataset `biphasic_ig_oral.csv` (see below).
+IG**, **parallel**, and **mixed** controls each run on their own matched dataset
+(`biphasic_ig_oral.csv`, `parallel_oral.csv`, `mixed_oral.csv`), simulated from the
+respective model (see below).
+
+> **Parallel / mixed run status — DONE (#505).** Both licensed NONMEM runs landed
+> (`results/parallel_first_order.{ext,lst,cov,cor,coi,phi,tab}`,
+> `results/mixed_zero_first.{ext,lst,phi,tab}`, NONMEM 7.6.0 / `ADVAN13 TOL=9`,
+> both MINIMIZATION SUCCESSFUL — the mixed run flagged its covariance step). The
+> slow-gated `tests/parallel_mixed_nonmem_anchor.rs` pins the verified comparison
+> (ferx FOCEI marginal OFV at NONMEM's optimum). Both ship their own **matched**
+> (well-specified) datasets, simulated from the model itself
+> (`simulate_{parallel,mixed}_data.py`), so NONMEM also **recovers** the truths.
+> Re-run with `nmfe75 parallel_first_order.ctl parallel_first_order.lst` /
+> `nmfe75 mixed_zero_first.ctl mixed_zero_first.lst`. The value path is *additionally*
+> anchored by the license-free **in-engine superposition oracle** in
+> `tests/parallel_mixed_absorption.rs` (a dual-pathway curve equals the
+> fraction-weighted sum of its single-pathway curves, exactly, by ODE linearity).
+>
+> | Anchor | NONMEM `#OBJV` | ferx FOCEI OFV at NONMEM optimum | Agreement |
+> |--------|---------------:|---------------------------------:|----------:|
+> | Parallel (dual first-order) | −688.019 | −688.0194 | ~1e-5 |
+> | Mixed (zero + first-order) | −698.966 | −698.9662 | ~1e-4 |
+>
+> Parallel recovers FR1 0.639 / KA1 1.367 / KA2 0.255 (truths 0.6 / 1.5 / 0.3);
+> mixed recovers FZO 0.293 / KA 0.864 / DUR 3.044 (truths 0.4 / 1.0 / 3.0). The
+> mixed agreement is looser than the smooth parallel/biphasic anchors (the
+> zero-order hard `tad ≤ DUR` cutoff integrates slightly differently under ferx's
+> per-segment break vs NONMEM's adaptive `$DES`), but still far inside any
+> model-discrepancy scale.
 
 > **Weibull run status — DONE (#503).** The licensed NONMEM run landed
 > (`results/weibull_absorption.{ext,lst,tab,…}`, MINIMIZATION SUCCESSFUL,

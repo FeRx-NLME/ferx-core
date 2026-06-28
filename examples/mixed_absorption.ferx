@@ -1,0 +1,74 @@
+# Mixed (zero-order + first-order) absorption — first_order() / zero_order() composition
+#
+# Two parallel absorption pathways feeding the central compartment, split by a
+# dose fraction (#505): a zero-order (constant-rate) input over a modeled
+# duration, plus a first-order input — the classic "mixed" / dual-input model.
+#
+#   R_in(tad) = FZO·zero_order(DUR) + FZO1·first_order(KA),   FZO + FZO1 = 1
+#             = FZO·Dose/DUR  (on 0 < tad ≤ DUR)  +  FZO1·Dose·KA·e^{−KA·tad}
+#
+# Each `FR*fn(...)` multiplier must be a single declared individual parameter (not
+# an expression like `(1-FZO)`), so the first-order fraction is declared
+# explicitly: FZO1 = 1 - FZO. The two pathways together deliver exactly the dose
+# (∫ R_in dt = F·Dose); the fit-time check enforces 0 < FR ≤ 1 and Σ FR ≈ 1.
+#
+# The zero-order pathway has a hard cutoff at tad = DUR, so — like a plain
+# `zero_order()` model — the duration DUR (and the zero-order fraction FZO) are
+# differentiated by finite differences (the moving-boundary ∂/∂DUR analytic impulse
+# is follow-up #530). The first-order pathway is a smooth `exp`-only density.
+#
+# ── Unit convention (Form C: amount ODE + [scaling]) ─────────────────────────
+#   CMT=1  central  — drug AMOUNT (mg); receives R_in(tad), elimination CL/V
+#   observation y   — concentration (mg/L) = central / V, via the [scaling] block
+#
+# Self-contained: run it with no data file
+#   cargo run --release -- examples/mixed_absorption.ferx --simulate
+# which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
+# fits it back. True simulation parameters: TVCL=5, TVV=50, TVFZO=0.4,
+#   TVKA=1.0, TVDUR=3.0, omega_CL=omega_V=0.09, sigma_prop=0.15.
+
+[parameters]
+  theta TVCL(5.0,    0.1, 100.0)   # typical clearance (L/h)
+  theta TVV(50.0,    5.0, 500.0)   # typical central volume (L)
+  theta TVFZO(0.4,  0.05,  0.95)   # fraction of dose through the zero-order pathway
+  theta TVKA(1.0,   0.05,  24.0)   # first-order absorption rate (1/h)
+  theta TVDUR(3.0,  0.05,  24.0)   # zero-order input duration (h)
+
+  omega ETA_CL ~ 0.09              # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09              # IIV on V  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)       # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  FZO  = TVFZO                     # zero-order-pathway fraction
+  FZO1 = 1 - TVFZO                 # first-order-pathway fraction (declared complement; FZO + FZO1 = 1)
+  KA   = TVKA
+  DUR  = TVDUR
+
+[structural_model]
+  ode(states=[central])            # no obs_cmt — Form C provides the observable
+
+[odes]
+  # central holds drug AMOUNT (mg); the dose splits across a zero-order input
+  # (FZO over DUR) and a first-order input (FZO1 at rate KA), then CL/V elimination.
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - CL/V*central
+
+[scaling]
+  y = central / V                  # observable = concentration (mg/L)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7
