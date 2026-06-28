@@ -12569,6 +12569,17 @@ mod tests {
         let (_c, f) = go("d/dt(central) = FR*igd(mat=MAT, cv2=CV2)").unwrap();
         assert_eq!(f[0].frac_slot, Some(0));
 
+        // Whitespace around the `*` is tolerated (the prefix scanner skips spaces on
+        // both sides of the multiplier): `FR *igd`, `FR* igd`, `FR * igd` all resolve.
+        for line in [
+            "d/dt(central) = FR *igd(mat=MAT, cv2=CV2)",
+            "d/dt(central) = FR* igd(mat=MAT, cv2=CV2)",
+            "d/dt(central) = FR * igd(mat=MAT, cv2=CV2)",
+        ] {
+            let (_c, f) = go(line).unwrap();
+            assert_eq!(f[0].frac_slot, Some(0), "spaced fraction: {line}");
+        }
+
         // `(1-FR)` is an expression, not a bare declared parameter — rejected (#388);
         // the user must declare a complementary parameter.
         let err = go("d/dt(central) = FR*igd(mat=MAT, cv2=CV2) + (1-FR)*igd(mat=MAT, cv2=CV2)")
