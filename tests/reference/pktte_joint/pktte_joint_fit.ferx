@@ -1,0 +1,49 @@
+# Joint PK-TTE anchor model (concentration observable) — matches pktte_joint.csv.
+#
+# Same model as examples/pktte_joint.ferx, but observes the central *concentration*
+# (Form C `[scaling] y = central/V`) to match the reference dataset (PK conc on CMT 2,
+# event on CMT 3), so ferx / NONMEM / nlmixr2 all fit the identical model + data.
+#
+# Run:
+#   cargo run --release --features survival -- \
+#     tests/reference/pktte_joint/pktte_joint_fit.ferx \
+#     --data tests/reference/pktte_joint/pktte_joint.csv
+
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.015, 1e-5, 10.0)
+  theta TVBETA(0.25, -10.0, 10.0)
+
+  omega ETA_CL ~ 0.09
+
+  sigma PROP_ERR ~ 0.10 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(states=[depot, central])
+
+[scaling]
+  y = central / V
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 300
