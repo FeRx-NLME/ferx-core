@@ -450,6 +450,112 @@ pub struct AdaptiveDosingSpec {
     pub rules: Vec<AdaptiveRule>,
 }
 
+impl AdaptiveDosingSpec {
+    /// Enforce every cross-field invariant the block parser checks, in one place.
+    ///
+    /// The struct is `pub` with `pub` fields, so a programmatically-built spec can
+    /// reach the controller without going through the parser. The parser calls
+    /// this on the spec it assembles, and
+    /// [`compile_adaptive`](crate::sim::adaptive_control::compile_adaptive) calls
+    /// it again as the safety net for hand-built specs — so neither path can drive
+    /// the controller with a contradiction (a `Level` step without a `levels`
+    /// ladder, a `start_dose` outside `dose_bounds`, a rung outside `dose_bounds`,
+    /// …) the other would have rejected.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.rules.is_empty() {
+            return Err(
+                "[adaptive_dosing]: at least one `when … : …` rule is required".to_string(),
+            );
+        }
+        let (lo, hi) = self.dose_bounds;
+        if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi < lo {
+            return Err(format!(
+                "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: [{lo}, {hi}]"
+            ));
+        }
+        if !self.start_dose.is_finite() || self.start_dose < 0.0 {
+            return Err(format!(
+                "[adaptive_dosing]: start_dose must be finite and >= 0: {}",
+                self.start_dose
+            ));
+        }
+        if self.start_dose < lo || self.start_dose > hi {
+            return Err(format!(
+                "[adaptive_dosing]: start_dose {} is outside dose_bounds [{lo}, {hi}]",
+                self.start_dose
+            ));
+        }
+        if self.assay_cmt.is_some() && !self.with_assay_error {
+            return Err(
+                "[adaptive_dosing]: assay_cmt is set but with_assay_error = false".to_string(),
+            );
+        }
+        // The load-bearing S2 fork: assay noise on an *expression* observe is
+        // ambiguous (which endpoint's σ?). A bare endpoint can be resolved against
+        // the model in S2.2; an expression cannot, so it must designate `assay_cmt`
+        // — else a typed error, never a guessed σ.
+        if self.with_assay_error
+            && self.assay_cmt.is_none()
+            && self.observe.chars().any(|c| "+-*/() ".contains(c))
+        {
+            return Err(format!(
+                "[adaptive_dosing]: with_assay_error on an expression observe (`{}`) is \
+                 ambiguous — which endpoint's residual error applies? Designate it with `assay_cmt = N`.",
+                self.observe
+            ));
+        }
+
+        // Percentage vs one-level dose steps are mutually exclusive and tied to `levels`.
+        let has_percent = self.rules.iter().any(|r| {
+            matches!(
+                r.action,
+                AdaptiveAction::Increase(DoseStep::Percent(_))
+                    | AdaptiveAction::Decrease(DoseStep::Percent(_))
+            )
+        });
+        let has_level = self.rules.iter().any(|r| {
+            matches!(
+                r.action,
+                AdaptiveAction::Increase(DoseStep::Level)
+                    | AdaptiveAction::Decrease(DoseStep::Level)
+            )
+        });
+        match &self.levels {
+            Some(l) => {
+                if has_percent {
+                    return Err("[adaptive_dosing]: percentage actions (`increase N%`) are not \
+                                allowed with `levels`; use bare `increase`/`decrease` to step one level"
+                        .to_string());
+                }
+                if !l.contains(&self.start_dose) {
+                    return Err(format!(
+                        "[adaptive_dosing]: start_dose {} must be one of the declared levels {l:?}",
+                        self.start_dose
+                    ));
+                }
+                // Every rung must lie within `dose_bounds`; otherwise `step_dose`
+                // clamps the emitted dose while the rung index keeps advancing,
+                // decoupling the decision log from the realized dose.
+                if let Some(bad) = l.iter().find(|&&x| x < lo || x > hi) {
+                    return Err(format!(
+                        "[adaptive_dosing]: level {bad} is outside dose_bounds [{lo}, {hi}]"
+                    ));
+                }
+            }
+            None => {
+                if has_level {
+                    return Err(
+                        "[adaptive_dosing]: bare `increase`/`decrease` (a level step) requires \
+                                a `levels = [...]` ladder; use `increase N%` for continuous titration"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// How an adaptive dose is delivered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AdaptiveRoute {
@@ -565,6 +671,65 @@ mod tests {
         assert_eq!(m.name, "ANC");
         assert_eq!(m.cmt, 3);
         assert_eq!(m.mode, ObserveMode::Dv);
+    }
+
+    fn base_spec() -> AdaptiveDosingSpec {
+        AdaptiveDosingSpec {
+            observe: "central".to_string(),
+            with_assay_error: false,
+            assay_cmt: None,
+            at: vec![24.0],
+            start_dose: 100.0,
+            route: AdaptiveRoute::Bolus { cmt: 1 },
+            dose_bounds: (0.0, 400.0),
+            confirm: 1,
+            levels: None,
+            rules: vec![AdaptiveRule {
+                op: Comparison::Lt,
+                threshold: 10.0,
+                action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+            }],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_spec() {
+        assert!(base_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_programmatic_spec_violations() {
+        // The struct is `pub` with `pub` fields, so these never pass through the
+        // block parser — `validate` (called by `compile_adaptive`) is the guard.
+        let level_rule = || {
+            vec![AdaptiveRule {
+                op: Comparison::Lt,
+                threshold: 10.0,
+                action: AdaptiveAction::Increase(DoseStep::Level),
+            }]
+        };
+
+        // start_dose outside dose_bounds.
+        let mut s = base_spec();
+        s.start_dose = 500.0;
+        assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
+
+        // no rules.
+        let mut s = base_spec();
+        s.rules.clear();
+        assert!(s.validate().unwrap_err().contains("rule"));
+
+        // a Level step with no `levels` ladder (a silent no-op in `step_dose`).
+        let mut s = base_spec();
+        s.rules = level_rule();
+        assert!(s.validate().unwrap_err().contains("levels"));
+
+        // a level rung outside dose_bounds.
+        let mut s = base_spec();
+        s.dose_bounds = (0.0, 120.0);
+        s.levels = Some(vec![100.0, 150.0]);
+        s.rules = level_rule();
+        assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
     }
 
     #[test]

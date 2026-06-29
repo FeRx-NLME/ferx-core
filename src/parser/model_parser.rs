@@ -3963,70 +3963,11 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     let start_dose = start_dose.ok_or("[adaptive_dosing]: missing required `start_dose`")?;
     let route = route.ok_or("[adaptive_dosing]: missing required `route`")?;
     let dose_bounds = dose_bounds.ok_or("[adaptive_dosing]: missing required `dose_bounds`")?;
-    if rules.is_empty() {
-        return Err("[adaptive_dosing]: at least one `when … : …` rule is required".to_string());
-    }
-
-    // ── Cross-field invariants (no happy paths) ──
-    if start_dose < dose_bounds.0 || start_dose > dose_bounds.1 {
-        return Err(format!(
-            "[adaptive_dosing]: start_dose {start_dose} is outside dose_bounds [{}, {}]",
-            dose_bounds.0, dose_bounds.1
-        ));
-    }
-    if assay_cmt.is_some() && !with_assay_error {
-        return Err("[adaptive_dosing]: assay_cmt is set but with_assay_error = false".to_string());
-    }
-    // The load-bearing S2 fork: assay noise on an *expression* observe is
-    // ambiguous (which endpoint's σ?). A bare endpoint can be resolved against the
-    // model in S2.2; an expression cannot, so it must designate `assay_cmt` — else
-    // a typed error, never a guessed σ.
-    if with_assay_error && assay_cmt.is_none() && observe.chars().any(|c| "+-*/() ".contains(c)) {
-        return Err(format!(
-            "[adaptive_dosing]: with_assay_error on an expression observe (`{observe}`) is \
-             ambiguous — which endpoint's residual error applies? Designate it with `assay_cmt = N`."
-        ));
-    }
-
-    // Percentage vs one-level dose steps are mutually exclusive and tied to `levels`.
-    let has_percent = rules.iter().any(|r| {
-        matches!(
-            r.action,
-            AdaptiveAction::Increase(DoseStep::Percent(_))
-                | AdaptiveAction::Decrease(DoseStep::Percent(_))
-        )
-    });
-    let has_level = rules.iter().any(|r| {
-        matches!(
-            r.action,
-            AdaptiveAction::Increase(DoseStep::Level) | AdaptiveAction::Decrease(DoseStep::Level)
-        )
-    });
-    match &levels {
-        Some(l) => {
-            if has_percent {
-                return Err("[adaptive_dosing]: percentage actions (`increase N%`) are not \
-                            allowed with `levels`; use bare `increase`/`decrease` to step one level"
-                    .to_string());
-            }
-            if !l.contains(&start_dose) {
-                return Err(format!(
-                    "[adaptive_dosing]: start_dose {start_dose} must be one of the declared levels {l:?}"
-                ));
-            }
-        }
-        None => {
-            if has_level {
-                return Err(
-                    "[adaptive_dosing]: bare `increase`/`decrease` (a level step) requires \
-                            a `levels = [...]` ladder; use `increase N%` for continuous titration"
-                        .to_string(),
-                );
-            }
-        }
-    }
-
-    Ok(AdaptiveDosingSpec {
+    // Assemble the spec, then enforce every cross-field invariant in one place
+    // (`AdaptiveDosingSpec::validate`). The same validator runs again in
+    // `compile_adaptive`, so a programmatically-built spec can never reach the
+    // controller with a contradiction the parser would have rejected here.
+    let spec = AdaptiveDosingSpec {
         observe,
         with_assay_error,
         assay_cmt,
@@ -4037,7 +3978,9 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
         confirm,
         levels,
         rules,
-    })
+    };
+    spec.validate()?;
+    Ok(spec)
 }
 
 /// Parse an `at =` decision schedule: either an explicit list `[t1, t2, …]` or an
@@ -4047,6 +3990,11 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
 fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
     let v = val.trim();
     if v.starts_with('[') {
+        if !v.ends_with(']') {
+            return Err(format!(
+                "[adaptive_dosing]: `at` list is missing its closing `]`: {val}"
+            ));
+        }
         let times = parse_float_array(v).map_err(|e| format!("[adaptive_dosing]: bad at: {e}"))?;
         if times.is_empty() {
             return Err("[adaptive_dosing]: `at` schedule is empty".to_string());
@@ -4060,6 +4008,11 @@ fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
             return Err(format!(
                 "[adaptive_dosing]: `at` times must be strictly increasing: {val}"
             ));
+        }
+        // Strictly increasing ⇒ the first element is the minimum; reject a
+        // negative decision time (start_dose / dose_bounds reject < 0 too).
+        if times[0] < 0.0 {
+            return Err(format!("[adaptive_dosing]: `at` times must be >= 0: {val}"));
         }
         return Ok(times);
     }
@@ -4085,12 +4038,15 @@ fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
             toks[1]
         ));
     }
-    if !t0.is_finite() || !t1.is_finite() || t1 < t0 {
+    if !t0.is_finite() || !t1.is_finite() || t1 < t0 || t0 < 0.0 {
         return Err(format!(
-            "[adaptive_dosing]: `at` range must be finite with start <= end: {val}"
+            "[adaptive_dosing]: `at` range must be finite with 0 <= start <= end: {val}"
         ));
     }
-    let n_f = ((t1 - t0) / step).floor();
+    // Relative tolerance so float division error (e.g. 1.0 / 0.1 = 9.999…8) does
+    // not drop the inclusive final time when `t1` is an exact multiple of `step`.
+    let ratio = (t1 - t0) / step;
+    let n_f = (ratio + 1e-9 * ratio.max(1.0)).floor();
     if n_f > 100_000.0 {
         return Err(
             "[adaptive_dosing]: `at` schedule expands to too many decision times (> 100000)"
@@ -24762,6 +24718,66 @@ mod adaptive_dosing_tests {
         assert_adaptive_err(
             &parse_adaptive_dosing_block(&b).unwrap_err(),
             "outside dose_bounds",
+        );
+    }
+
+    #[test]
+    fn levels_outside_dose_bounds_error() {
+        // start_dose is in both `levels` and `dose_bounds`, but a rung exceeds the
+        // high bound — `step_dose` would clamp the dose while the rung index keeps
+        // advancing, decoupling the decision log from the realized dose.
+        let err = parse_adaptive_dosing_block(&lines(&[
+            "observe = central",
+            "at = [24]",
+            "start_dose = 100",
+            "route = bolus(cmt = 1)",
+            "dose_bounds = [0, 120]",
+            "levels = [100, 150, 200]",
+            "when signal < 10 : increase",
+        ]))
+        .unwrap_err();
+        assert_adaptive_err(&err, "outside dose_bounds");
+    }
+
+    #[test]
+    fn schedule_negative_times_error() {
+        // `start_dose` / `dose_bounds` reject < 0; `at` must too, on both forms.
+        let mk = |at: &str| {
+            let mut b = without("at");
+            b.push(format!("at = {at}"));
+            parse_adaptive_dosing_block(&b).unwrap_err()
+        };
+        assert_adaptive_err(&mk("[-24, 0, 24]"), ">= 0");
+        assert_adaptive_err(&mk("every 24 from -24 to 24"), "0 <= start <= end");
+    }
+
+    #[test]
+    fn schedule_unclosed_bracket_errors() {
+        // `[24, 48` (no closing `]`) was silently accepted as [24, 48].
+        let mut b = without("at");
+        b.push("at = [24, 48".into());
+        assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "closing `]`");
+    }
+
+    #[test]
+    fn schedule_every_keeps_inclusive_endpoint_for_decimal_step() {
+        // 0.3 / 0.1 = 2.999…6 in f64; a bare floor() drops the inclusive endpoint.
+        let mk = |at: &str| {
+            let mut b = without("at");
+            b.push(format!("at = {at}"));
+            parse_adaptive_dosing_block(&b).expect("schedule parses").at
+        };
+        let decimal = mk("every 0.1 from 0 to 0.3");
+        assert_eq!(
+            decimal.len(),
+            4,
+            "expected the inclusive 0.3, got {decimal:?}"
+        );
+        assert!((decimal.last().unwrap() - 0.3).abs() < 1e-12);
+        // A non-multiple endpoint stays excluded (last point < t1, no spurious add).
+        assert_eq!(
+            mk("every 24 from 0 to 100"),
+            vec![0.0, 24.0, 48.0, 72.0, 96.0]
         );
     }
 

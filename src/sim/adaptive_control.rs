@@ -176,6 +176,14 @@ impl AdaptiveController {
     }
 
     fn emit_dose(&self, dose: f64) -> Vec<DoseAction> {
+        // A dose titrated to exactly 0 is a hold, not a degenerate zero-amount
+        // dose. An `Infuse { amt: 0 }` would carry `rate = 0 / over = 0`, which the
+        // driver's up-front action validation rejects (`rate > 0`), erroring the
+        // whole run instead of holding — whereas a zero bolus is silently skipped.
+        // Emitting `Hold` keeps the bolus and infusion routes symmetric.
+        if dose == 0.0 {
+            return vec![DoseAction::Hold];
+        }
         match self.route {
             AdaptiveRoute::Bolus { cmt } => vec![DoseAction::Bolus { amt: dose, cmt }],
             AdaptiveRoute::Infuse { cmt, over } => vec![DoseAction::Infuse {
@@ -217,11 +225,15 @@ pub(crate) fn build_adaptive_controller(
 pub(crate) fn compile_observe(
     model: &CompiledModel,
     spec: &AdaptiveDosingSpec,
-) -> Result<OdeOutputFn, String> {
+) -> Result<(OdeOutputFn, Vec<String>), String> {
     let ode = model.ode_spec.as_ref().ok_or_else(|| {
         "[adaptive_dosing] requires an ODE model (the analytical engine is a follow-up)".to_string()
     })?;
-    let (out_fn, _program, _cov_names) = crate::parser::model_parser::build_y_output_fn(
+    // `cov_names` are the covariates the `observe` expression references; the
+    // caller validates them against the data so a misspelt name fails loudly
+    // instead of silently reading 0.0 (the readout leaves an absent covariate at
+    // 0.0, which would drive the controller off a wrong signal).
+    let (out_fn, _program, cov_names) = crate::parser::model_parser::build_y_output_fn(
         &spec.observe,
         "[adaptive_dosing] observe",
         &model.theta_names,
@@ -231,7 +243,7 @@ pub(crate) fn compile_observe(
         &ode.state_names,
         &model.kappa_names,
     )?;
-    Ok(out_fn)
+    Ok((out_fn, cov_names))
 }
 
 /// The 1-based compartment whose `[error_model]` σ supplies assay noise for a
@@ -272,6 +284,10 @@ pub(crate) struct CompiledAdaptive {
     pub monitors: Vec<MonitorSpec>,
     /// Compiled `observe` expression — the latent signal value at each decision.
     pub observe: OdeOutputFn,
+    /// Covariate names the `observe` expression references — the file-driven entry
+    /// validates these against the data's covariate columns so a misspelt covariate
+    /// fails loudly instead of silently reading 0.0.
+    pub observe_covariates: Vec<String>,
     /// Mints a fresh controller per `(subject, replicate)` (state isolation).
     #[allow(clippy::type_complexity)]
     pub make_controller: Box<dyn Fn() -> Box<dyn FnMut(&ControllerCtx) -> Vec<DoseAction>>>,
@@ -283,7 +299,11 @@ pub(crate) fn compile_adaptive(
     model: &CompiledModel,
     spec: &AdaptiveDosingSpec,
 ) -> Result<CompiledAdaptive, String> {
-    let observe = compile_observe(model, spec)?;
+    // Re-check the spec's cross-field invariants here too: the struct is `pub`
+    // with `pub` fields, so a programmatically-built spec may not have passed
+    // through the block parser (which validates on its way out).
+    spec.validate()?;
+    let (observe, observe_covariates) = compile_observe(model, spec)?;
     let mode = if spec.with_assay_error {
         ObserveMode::Dv
     } else {
@@ -295,11 +315,26 @@ pub(crate) fn compile_adaptive(
         ObserveMode::Dv => resolve_observe_cmt(model, spec)?,
         ObserveMode::Ipred => spec.assay_cmt.unwrap_or(1),
     };
+    // Bound the σ compartment against the model so an out-of-range `assay_cmt` /
+    // bare-number `observe` is a compile error here, not a deferred driver failure
+    // (`cmt > n_states`) at the first decision. Only `Dv` reads σ from `cmt`.
+    if mode == ObserveMode::Dv {
+        if let Some(ode) = model.ode_spec.as_ref() {
+            if cmt > ode.n_states {
+                return Err(format!(
+                    "[adaptive_dosing]: assay compartment {cmt} is out of range \
+                     (model has {} compartment(s))",
+                    ode.n_states
+                ));
+            }
+        }
+    }
     let monitors = vec![MonitorSpec::new(ADAPTIVE_SIGNAL, cmt, mode)];
     let factory = build_adaptive_controller(spec);
     Ok(CompiledAdaptive {
         monitors,
         observe,
+        observe_covariates,
         make_controller: Box::new(factory),
     })
 }
@@ -449,23 +484,40 @@ mod tests {
     }
 
     #[test]
-    fn decrease_to_zero_emits_zero_bolus() {
-        // low bound 0 ⇒ a 100% decrease floors at 0; the driver later normalises
-        // amt==0 to Hold, but the controller's job is just to emit the clamped dose.
+    fn decrease_to_zero_holds_for_both_routes() {
+        // low bound 0 ⇒ a 100% decrease floors the dose at 0. A 0 dose is a *hold*,
+        // not a zero-amount dose: an `Infuse { amt: 0 }` would carry `rate = 0`,
+        // which the driver's up-front action validation rejects (`rate > 0`),
+        // erroring the whole run. Both routes must emit `Hold` instead.
+        let decrease_100 = || {
+            vec![rule(
+                Comparison::Gt,
+                1.0,
+                AdaptiveAction::Decrease(DoseStep::Percent(100.0)),
+            )]
+        };
+        // Bolus route (previously a zero bolus the driver silently skipped).
         let s = spec(
             100.0,
             AdaptiveRoute::Bolus { cmt: 1 },
             (0.0, 400.0),
             1,
             None,
-            vec![rule(
-                Comparison::Gt,
-                1.0,
-                AdaptiveAction::Decrease(DoseStep::Percent(100.0)),
-            )],
+            decrease_100(),
         );
-        let out = run(&s, &[50.0]);
-        assert_eq!(out[0], bolus(0.0, 1));
+        assert_eq!(run(&s, &[50.0])[0], vec![DoseAction::Hold]);
+
+        // Infuse route: previously emitted `Infuse { amt: 0, rate: 0 }`, the
+        // route-asymmetric crash this guards against.
+        let s = spec(
+            100.0,
+            AdaptiveRoute::Infuse { cmt: 1, over: 2.0 },
+            (0.0, 400.0),
+            1,
+            None,
+            decrease_100(),
+        );
+        assert_eq!(run(&s, &[50.0])[0], vec![DoseAction::Hold]);
     }
 
     #[test]
@@ -666,7 +718,7 @@ mod tests {
     #[test]
     fn compile_observe_yields_concentration_not_amount() {
         let model = parse_full_model(ODE_MODEL).expect("ODE model parses").model;
-        let observe = compile_observe(&model, &mk_spec("central / V", false, None))
+        let (observe, _cov) = compile_observe(&model, &mk_spec("central / V", false, None))
             .expect("observe compiles");
         let theta = model.default_params.theta.clone();
         let eta = vec![0.0; model.n_eta + model.n_kappa];
@@ -723,5 +775,20 @@ mod tests {
         // an expression with no assay_cmt cannot designate an endpoint → typed error
         let err = resolve_observe_cmt(&model, &mk_spec("central / V", true, None)).unwrap_err();
         assert!(err.contains("cannot determine"), "got: {err}");
+    }
+
+    #[test]
+    fn compile_adaptive_rejects_out_of_range_assay_compartment() {
+        // ODE_MODEL has a single compartment; a σ endpoint above it would only
+        // surface as a deferred driver failure, so reject it at compile time.
+        let model = parse_full_model(ODE_MODEL).unwrap().model;
+        let err = compile_adaptive(&model, &mk_spec("2", true, None))
+            .err()
+            .expect("out-of-range bare number must error");
+        assert!(err.contains("out of range"), "bare number: {err}");
+        let err = compile_adaptive(&model, &mk_spec("central / V", true, Some(3)))
+            .err()
+            .expect("out-of-range assay_cmt must error");
+        assert!(err.contains("out of range"), "explicit assay_cmt: {err}");
     }
 }

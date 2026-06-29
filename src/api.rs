@@ -5900,6 +5900,28 @@ pub fn simulate_adaptive_from_spec(
     // here rather than allowed to silently produce nothing.
     let compiled = crate::sim::adaptive_control::compile_adaptive(model, spec)
         .map_err(|e| format!("simulate_adaptive_from_spec: {e}"))?;
+    // An `observe` covariate absent from the data would silently read 0.0 and
+    // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
+    // Apply the same loud check fits use for model covariates (`check_covariates`).
+    let missing: Vec<&str> = compiled
+        .observe_covariates
+        .iter()
+        .filter(|name| !population.covariate_names.iter().any(|n| n == *name))
+        .map(|s| s.as_str())
+        .collect();
+    if !missing.is_empty() {
+        let available = if population.covariate_names.is_empty() {
+            "(none)".to_string()
+        } else {
+            population.covariate_names.join(", ")
+        };
+        return Err(format!(
+            "simulate_adaptive_from_spec: [adaptive_dosing] `observe` references covariate(s) \
+             not found in data (case-sensitive): {}. Available covariate columns: {}.",
+            missing.join(", "),
+            available
+        ));
+    }
     let ode = model
         .ode_spec
         .as_ref()
@@ -11349,6 +11371,26 @@ mod adaptive_sim_tests {
         let err = simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &spec, &opts)
             .unwrap_err();
         assert!(err.contains("ODE model"), "got: {err}");
+    }
+
+    #[test]
+    fn from_spec_rejects_observe_covariate_absent_from_data() {
+        // An `observe` covariate not present in the data would silently read 0.0 and
+        // drive the controller off a wrong signal (`central / BADCOV` → central/0).
+        // Reject it loudly, exactly as a fit does for model covariates.
+        let model = parse_model_string(ODE_NO_IIV).expect("parse");
+        let spec = AdaptiveDosingSpec {
+            observe: "central / BADCOV".to_string(),
+            ..simple_titration_spec()
+        };
+        let pop = population(vec![subj("1", vec![6.0], vec![])]); // no covariate columns
+        let opts = AdaptiveSimulateOptions::default();
+        let err = simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &spec, &opts)
+            .unwrap_err();
+        assert!(
+            err.contains("BADCOV") && err.contains("not found in data"),
+            "got: {err}"
+        );
     }
 
     #[test]
