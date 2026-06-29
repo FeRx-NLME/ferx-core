@@ -2,7 +2,9 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap, in progress (updated 2026-06-28).
+**Status:** approved roadmap, in progress (updated 2026-06-29). **The full model
+catalogue is merged** (Phases −1/0a/0b/1/2). The only remaining roadmap phase is
+**Phase 3 (#386, analytical closed forms)**; see "Route to close #322" below.
 - **Prerequisite #324:** safety net (PR #326), **modeled infusion duration `Dn` /
   `RATE=-2`** (PR #384), and **modeled rate `Rn` / `RATE=-1` on both engines**
   (PR #418) **merged**; see #383 for any residual analytical-engine items.
@@ -44,26 +46,77 @@
     `FR*zero_order` (the `mixed` zero-order family) is deferred to #505. **ferx-r follow-up ✅ done —
     PR [#207](https://github.com/FeRx-NLME/ferx-r/pull/207) merged 2026-06-28 (`8c8ecd1d`): pin bump
     + `biphasic_igd_absorption` example + validate test.**
-  - **#505 — `parallel` / `mixed` + `first_order()` composition** ← **NEXT (now unblocked).**
-    Dual-pathway. The shared fraction multiplier it needed **landed with #388** (`parse_input_rate_prefix`
-    accepts `FR*fn(...)` + ≥2 terms per `d/dt`; `frac_slot` on `InputRateForcing`). Still needs a new
-    `InputRateKind::FirstOrder` (`first_order(ka)`) so the existing first-order absorption can be
-    composed in `[odes]`, **plus** the zero-order-channel fraction (for `mixed` — #388 rejects
-    `FR*zero_order` today, since that delivery channel doesn't carry the scale yet).
+  - **#505 — `parallel` / `mixed` + `first_order()` composition — ✅ MERGED — PR #586
+    (`8701f9b2`, 2026-06-28); closes #505.** Dual-pathway. Added `InputRateKind::FirstOrder`
+    (`first_order(ka)`, Channel-A pointwise `R_in`, `supported_over_dual()=true`) so `parallel`
+    is two fraction-weighted `first_order` terms (frac free from #388, analytic); the zero-order
+    delivery channel now carries the `frac` multiplier too, unblocking `mixed` (`mixed` is FD via
+    the kind-agnostic zero-order gate). NONMEM `$DES` anchors ran (`tests/parallel_mixed_nonmem_anchor.rs`:
+    parallel ferx −688.0194 vs `#OBJV −688.019`, ~1e-5; mixed −698.9662 vs −698.966, ~1e-4).
+    Review-fix `89db5f61` hoisted the ≥2-zero-order-per-cmt reject from fit-init to parse-time
+    (`build_ode_spec`). **ferx-r follow-up ✅ done — PR [#209](https://github.com/FeRx-NLME/ferx-r/pull/209)
+    merged 2026-06-28 (`5b3937e5`): pin bump + parallel/mixed examples + validate tests.** Spun off
+    **#588** (fraction value-checks still skipped on the `simulate()`/`predict()` paths).
 - **Phase 3 — #386 — analytical incomplete-gamma / exponential tilting** for
   transit + IG. Now *speed-only* (#430 already gave transit/IG exact gradients on
   the ODE path), so this only removes the ODE solve. Lowest urgency. Weibull never
   reaches Phase 3 (no closed form) — its only exact-gradient route is the #430
   generic forcing.
 
-Recommended sequence: Weibull (#498), zero-order (#504), and the shared **fraction
-multiplier #388** (biphasic IG) are all **✅ merged** (ferx-core + ferx-r). **NEXT =
-#505** (`parallel`/`mixed` + a new `InputRateKind::FirstOrder` + the zero-order-channel
-fraction, now unblocked by #388) → **#386** (Phase 3 speed pass). The moving-boundary
-sensitivity **#530** (`zero_order` `dur` + `Dn` off FD) is a parallel, cross-cutting
-track — independent of the catalogue work above, not gating it.
+Recommended sequence: Weibull (#498), zero-order (#504), the shared **fraction
+multiplier #388** (biphasic IG), and **`parallel`/`mixed` #505** are all **✅ merged**
+(ferx-core + ferx-r). The model catalogue is therefore complete. **NEXT = #386**
+(Phase 3 closed forms — the last roadmap phase). The moving-boundary sensitivity
+**#530** (`zero_order` `dur` + `Dn` off FD) and the **#588** fraction-validation hole
+are parallel, off-roadmap tracks — independent of Phase 3, not gating it.
 
 Multi-PR / phased.
+
+## Route to close #322 (remaining work)
+
+Phases −1/0a/0b/1/2 are merged — the entire model catalogue (`transit`, `igd` +
+biphasic, `weibull`, `zero_order`, `sequential`, `parallel`, `mixed`, `first_order`)
+ships with NONMEM anchors and ferx-r exposure. **The only remaining roadmap phase is
+Phase 3 (#386).** Two nuances:
+
+- **#386 as filed is transit-only** (its scope note: "Covers transit → standard 1-/2-cpt
+  disposition only"). The plan's Phase 3 *also* describes an **IG closed form**, but that
+  half is **unfiled** — it needs a conscious **do-or-drop** decision (Stage 3 below).
+- **Weibull stays numerical forever** (no elementary closed form); it already has exact
+  gradients via #430, so it never reaches Phase 3 and does **not** block closing #322.
+
+The critical path to close #322 is **Stage 2 + Stage 4**. Stages 1, 3-IG, and 5 are
+quality — fold them in for a clean finish, or defer.
+
+| Stage | Work | Issue | Size | Risk | Critical path? |
+|---|---|---|---|---|---|
+| **0** | Make this plan truthful (#505 merged; #386 = sole remaining phase) | — | XS | none | enables the rest |
+| **1** | Hoist `E_ABSORPTION_FRACTION` value-checks to the parse/sim path | **#588** | S | low | no (debt) |
+| **2a** | `regularized_gamma_p(a,x)`: f64 + `Dual2` 1st/2nd-order rules, mutation-verified | **#386** | M | **HIGH** | **yes** |
+| **2b** | 1-cpt transit closed form (`TiltedAbsorption` + `convolve_1cpt`); relax error rule for transit; equivalence test (n=0 ≡ Bateman) | **#386** | M | med | **yes** |
+| **2c** | 2-cpt transit closed form | **#386** | L | med | **yes** |
+| **3** | **Decide IG**: file + build IG closed form (`normal_cdf` on `PkNum`), *or* consciously drop (IG already has exact gradients and isn't stiff) | new / note | M or 0 | med | judgment |
+| **4** | Re-anchor transit vs the #385 NONMEM dataset, record new runtime; CHANGELOG/docs; **close #322** | **#386** | S | low | **yes** |
+| **5** | Get `zero_order`/`mixed`/`Dn` off FD via one boundary-impulse mechanism | **#530** | M | med-high | no (parallel) |
+
+**Why this order.**
+- **2a is the linchpin and highest risk.** `∂P/∂x` is clean (`x^{a-1}e^{-x}/Γ(a)`), but
+  transit's shape is `a = N+1` and **N carries IIV**, so `∂P/∂a` is required — and that
+  partial is not elementary. Landing `regularized_gamma_p` + its dual rules *first*, behind
+  mutation-verified tests, mirrors how `ln_gamma` (#340 → #458) was retired before transit
+  wiring, and lets the Phase-3 *speed* justification (it is explicitly **lowest urgency**) be
+  re-weighed cheaply if 2a proves hard.
+- **IG is a deliberate fork.** Phase 3's *motivation* (the #385 anchor: ~89 s release at
+  `ode_*tol=1e-9` vs NONMEM's ~16 s) is specifically transit's stiffness. IG isn't stiff and
+  already has exact `Dual2` gradients (#430/#433), so its closed form is marginal speed polish.
+  Lean: **drop IG from the closure scope** unless there's a transit-scale IG perf complaint.
+- **#530 is genuinely parallel.** #386 moves *transit/IG* off the ODE path, but
+  `zero_order`/`mixed` get no closed form — #530 is the only route to make the *whole*
+  absorption family analytic-gradient. It doesn't block #322 and can run independently.
+
+**Definition of done for #322:** transit closed form merged + equivalence-tested (≡ Phase-0
+ODE) + re-anchored with recorded runtime; error rule relaxed for transit and documented; IG
+do-or-drop recorded; plan + CHANGELOG + docs updated. (#588/#530 optional for a clean finish.)
 
 > **Autodiff landscape (2026-06):** the Enzyme autodiff path (`src/ad/`, the `autodiff`
 > Cargo feature) was **retired** (#367/#381) in favour of hand-rolled forward sensitivities in
@@ -566,12 +619,13 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
     at NONMEM's optimum −754.2113 vs `#OBJV −754.211`, ~1e-5; matched data recovers the truths).
     `FR*zero_order` deferred to #505. **ferx-r follow-up done — PR #207 (`8c8ecd1d`, merged
     2026-06-28).**
-  - **`parallel` / `mixed` + `first_order()` composition (#505)** ← **NEXT** — dual-pathway,
-    **unblocked** now that the #388 fraction multiplier landed. Adds `InputRateKind::FirstOrder`
-    (`first_order(ka)`) so existing first-order absorption can be composed, plus the
-    zero-order-channel fraction (for `mixed`; #388 rejects `FR*zero_order` today, since that
-    delivery channel doesn't carry the scale yet). **Closed-form** (superpose `*_oral` solvers by
-    `frac`).
+  - **`parallel` / `mixed` + `first_order()` composition (#505) ✅ MERGED — PR #586
+    (`8701f9b2`, 2026-06-28).** Added `InputRateKind::FirstOrder` (`first_order(ka)`) so existing
+    first-order absorption can be composed (`parallel` = two fraction-weighted terms, analytic),
+    plus the zero-order-channel fraction (for `mixed`; FD via the kind-agnostic zero-order gate).
+    **Closed-form** (superpose `*_oral` solvers by `frac`). NONMEM `$DES` anchors ran
+    (`tests/parallel_mixed_nonmem_anchor.rs`). **ferx-r follow-up done — PR #209 (`5b3937e5`,
+    merged 2026-06-28).** Spun off **#588** (fraction value-checks skip the simulate/predict paths).
 - **Phase 3 — analytical closed forms for transit and IG** (1/2-cpt). Both are implemented
   via the **`TiltedAbsorption` trait** in a new `src/pk/analytical_absorption.rs`:
 
