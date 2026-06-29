@@ -21,7 +21,7 @@
 use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
     AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
-    DoseAction, DoseStep, MonitorSpec, ObserveMode,
+    ControllerDecision, DoseAction, DoseStep, MonitorSpec, ObserveMode,
 };
 use crate::types::CompiledModel;
 
@@ -97,9 +97,12 @@ impl AdaptiveController {
 
     /// One decision: read the signal, find the first matching rule, apply the
     /// `confirm` debounce, and return the dose action(s).
-    fn decide(&mut self, ctx: &ControllerCtx) -> Vec<DoseAction> {
+    fn decide(&mut self, ctx: &ControllerCtx) -> ControllerDecision {
         if self.stopped {
-            return vec![];
+            return ControllerDecision {
+                actions: vec![],
+                rule: None,
+            };
         }
         // The engine-side half always declares the `signal` monitor this
         // controller reads, so `None` is an internal wiring bug, not user input;
@@ -107,7 +110,12 @@ impl AdaptiveController {
         // signal.
         let signal = match ctx.signal(ADAPTIVE_SIGNAL) {
             Some(v) => v,
-            None => return self.emit_dose(self.dose),
+            None => {
+                return ControllerDecision {
+                    actions: self.emit_dose(self.dose),
+                    rule: None,
+                }
+            }
         };
 
         let matched = self.rules.iter().position(|r| r.matches(signal));
@@ -129,11 +137,20 @@ impl AdaptiveController {
         if let Some(idx) = matched {
             if self.streak >= self.confirm {
                 self.streak = 0; // a fresh streak must build before acting again
+                                 // Name the rule that fired (for the ledger's `rule_fired`); compute
+                                 // the label before `apply` takes `&mut self`.
+                let rule = self.rules[idx].label();
                 let action = self.rules[idx].action.clone();
-                return self.apply(action);
+                return ControllerDecision {
+                    actions: self.apply(action),
+                    rule: Some(rule),
+                };
             }
         }
-        self.emit_dose(self.dose)
+        ControllerDecision {
+            actions: self.emit_dose(self.dose),
+            rule: None,
+        }
     }
 
     fn apply(&mut self, action: AdaptiveAction) -> Vec<DoseAction> {
@@ -205,7 +222,7 @@ impl AdaptiveController {
 #[allow(clippy::type_complexity)] // a controller factory is inherently nested Fn/FnMut
 pub(crate) fn build_adaptive_controller(
     spec: &AdaptiveDosingSpec,
-) -> impl Fn() -> Box<dyn FnMut(&ControllerCtx) -> Vec<DoseAction>> {
+) -> impl Fn() -> Box<dyn FnMut(&ControllerCtx) -> ControllerDecision> {
     let template = AdaptiveController::new(spec);
     move || {
         let mut controller = template.clone();
@@ -301,7 +318,7 @@ pub(crate) struct CompiledAdaptive {
     pub observe_covariates: Vec<String>,
     /// Mints a fresh controller per `(subject, replicate)` (state isolation).
     #[allow(clippy::type_complexity)]
-    pub make_controller: Box<dyn Fn() -> Box<dyn FnMut(&ControllerCtx) -> Vec<DoseAction>>>,
+    pub make_controller: Box<dyn Fn() -> Box<dyn FnMut(&ControllerCtx) -> ControllerDecision>>,
 }
 
 /// Compile a declarative spec against its model into the engine-ready
@@ -406,7 +423,7 @@ mod tests {
                     decision_index: i,
                     signals: &sig,
                 };
-                controller(&ctx)
+                controller(&ctx).actions
             })
             .collect()
     }
@@ -662,10 +679,10 @@ mod tests {
         // start from 100 again, proving no shared state.
         let mut a = factory();
         let _ = a(&ctx);
-        let a2 = a(&ctx);
+        let a2 = a(&ctx).actions;
         assert_eq!(a2, bolus(225.0, 1));
         let mut b = factory();
-        let b1 = b(&ctx);
+        let b1 = b(&ctx).actions;
         assert_eq!(b1, bolus(150.0, 1));
     }
 

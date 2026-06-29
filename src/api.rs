@@ -5659,9 +5659,26 @@ where
             .to_string());
     }
 
-    // Programmatic path: cmt-based monitors only, no compiled `observe`
-    // expressions, so the empty `observe_exprs` keeps the reactive driver
-    // byte-for-byte identical to the pre-S2 behaviour.
+    // Programmatic path: cmt-based monitors (no compiled `observe` expression) and
+    // a `Vec<DoseAction>` controller with no rule provenance. Adapt both into the
+    // engine's paired-monitor / `ControllerDecision` contract; the all-`None`
+    // `observe`/`rule` keeps the reactive driver byte-for-byte identical to the
+    // pre-S2 behaviour.
+    let monitors: Vec<crate::sim::adaptive::AdaptiveMonitor> = opts
+        .monitors
+        .iter()
+        .map(|spec| crate::sim::adaptive::AdaptiveMonitor {
+            spec,
+            observe: None,
+        })
+        .collect();
+    let make = move || {
+        let mut c = make_controller();
+        move |ctx: &ControllerCtx| crate::sim::adaptive::ControllerDecision {
+            actions: c(ctx),
+            rule: None,
+        }
+    };
     run_adaptive_population(
         model,
         ode,
@@ -5669,9 +5686,8 @@ where
         params,
         n_sim,
         &opts.decision_times,
-        &opts.monitors,
-        &[],
-        make_controller,
+        &monitors,
+        make,
         opts,
     )
 }
@@ -5683,9 +5699,11 @@ where
 ///
 /// The decision schedule and monitors are passed explicitly: the programmatic
 /// entry takes them from `opts`, the declarative entry derives them from the
-/// `[adaptive_dosing]` spec. `observe_exprs`, aligned to `monitors`, lets a
-/// monitor take its latent value from a compiled `observe` expression — it is
-/// empty for the programmatic path (cmt readout only), so that path is unchanged.
+/// `[adaptive_dosing]` spec. Each [`AdaptiveMonitor`](crate::sim::adaptive) carries
+/// its own optional compiled `observe` expression (the declarative signal) or
+/// `None` (the programmatic cmt readout, byte-for-byte unchanged), and the
+/// controller returns a `ControllerDecision` so the ledger can record which rule
+/// fired.
 ///
 /// Both entries resolve `ode` and validate the schedule before calling, so this
 /// helper assumes them well-formed and focuses on the run loop.
@@ -5697,14 +5715,13 @@ fn run_adaptive_population<F, C>(
     params: &ModelParameters,
     n_sim: usize,
     decision_times: &[f64],
-    monitors: &[MonitorSpec],
-    observe_exprs: &[Option<&crate::ode::OdeOutputFn>],
+    monitors: &[crate::sim::adaptive::AdaptiveMonitor],
     make_controller: F,
     opts: &AdaptiveSimulateOptions,
 ) -> Result<AdaptiveSimulationResult, String>
 where
     F: Fn() -> C,
-    C: FnMut(&ControllerCtx) -> Vec<DoseAction>,
+    C: FnMut(&ControllerCtx) -> crate::sim::adaptive::ControllerDecision,
 {
     use rand::SeedableRng;
 
@@ -5779,7 +5796,6 @@ where
                 &mut controller,
                 opts.max_decisions,
                 Some(&assay),
-                observe_exprs,
             )
             .map_err(|e| format!("subject '{}' (sim {sim}): {e}", subject.id))?;
 
@@ -5926,7 +5942,12 @@ pub fn simulate_adaptive_from_spec(
         .ode_spec
         .as_ref()
         .expect("compile_adaptive accepted the model, so it carries an ODE spec");
-    let observe_exprs: Vec<Option<&crate::ode::OdeOutputFn>> = vec![Some(&compiled.observe)];
+    // Pair the single `signal` monitor with its compiled `observe` expression so
+    // the driver reads the engine-resolved signal rather than the bare cmt readout.
+    let monitors = vec![crate::sim::adaptive::AdaptiveMonitor {
+        spec: &compiled.monitors[0],
+        observe: Some(&compiled.observe),
+    }];
 
     run_adaptive_population(
         model,
@@ -5935,8 +5956,7 @@ pub fn simulate_adaptive_from_spec(
         params,
         n_sim,
         &spec.at,
-        &compiled.monitors,
-        &observe_exprs,
+        &monitors,
         compiled.make_controller.as_ref(),
         opts,
     )
@@ -11176,6 +11196,12 @@ mod adaptive_sim_tests {
             res.ledger.iter().all(|e| e.amt == 100.0),
             "fixed start_dose, never titrated"
         );
+        // No `when` rule ever fires here, so every dose is a re-issue: `rule_fired`
+        // records the route, never a fabricated rule (#391 S2 traceability).
+        assert!(
+            res.ledger.iter().all(|e| e.rule_fired == "bolus"),
+            "a re-issue records the dose by its route, not a rule"
+        );
 
         // Static reference: the same fixed schedule pre-scheduled through predict().
         let static_doses: Vec<DoseEvent> = [0.0, 24.0, 48.0]
@@ -11257,9 +11283,60 @@ mod adaptive_sim_tests {
             !from_spec.ledger.is_empty(),
             "the ladder must fire and dose"
         );
-        assert_eq!(
-            from_spec.ledger, programmatic.ledger,
-            "declarative block and hand-written closure must realize the identical ledger"
+        // Identical *dosing* — every realized-dose field matches bit-for-bit. The
+        // one field that legitimately differs is the audit-only `rule_fired`: the
+        // declarative path now names the rung that fired, while a hand-written
+        // closure has no rule to name (asserted separately below).
+        assert_eq!(from_spec.ledger.len(), programmatic.ledger.len());
+        for (d, p) in from_spec.ledger.iter().zip(&programmatic.ledger) {
+            assert_eq!(
+                (
+                    &d.subject,
+                    d.draw,
+                    d.sim,
+                    d.dose_idx,
+                    d.time,
+                    d.amt,
+                    d.cmt,
+                    d.rate,
+                    d.decision_idx,
+                    &d.observed_signals,
+                    d.f_applied,
+                ),
+                (
+                    &p.subject,
+                    p.draw,
+                    p.sim,
+                    p.dose_idx,
+                    p.time,
+                    p.amt,
+                    p.cmt,
+                    p.rate,
+                    p.decision_idx,
+                    &p.observed_signals,
+                    p.f_applied,
+                ),
+                "declarative block and hand-written closure must realize the identical dosing"
+            );
+        }
+        // Traceability (#391 S2): the declarative ledger names the rung that fired;
+        // the programmatic ledger (arbitrary controller, no rules) records the
+        // dose by its route.
+        assert!(
+            from_spec
+                .ledger
+                .iter()
+                .all(|e| e.rule_fired == "signal < 50 : increase 25%"),
+            "declarative rule_fired names the rung that fired: {:?}",
+            from_spec
+                .ledger
+                .iter()
+                .map(|e| e.rule_fired.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            programmatic.ledger.iter().all(|e| e.rule_fired == "bolus"),
+            "programmatic rule_fired records the route, not a rule"
         );
         assert_eq!(
             from_spec.decisions, programmatic.decisions,

@@ -148,6 +148,29 @@ impl MonitorSpec {
     }
 }
 
+/// A monitor paired with its optional compiled `observe` expression — the
+/// driver's per-signal input.
+///
+/// Pairing the expression *with* its [`MonitorSpec`] (rather than carrying a
+/// parallel `observe_exprs` slice the driver indexes by position) makes a
+/// monitor/expression desync unrepresentable. `observe == None` ⇒ read the
+/// model's `cmt` readout (the programmatic path); `Some(f)` ⇒ the declarative
+/// `[adaptive_dosing]` block's compiled signal expression (#391 S2).
+pub(crate) struct AdaptiveMonitor<'a> {
+    pub spec: &'a MonitorSpec,
+    pub observe: Option<&'a crate::ode::OdeOutputFn>,
+}
+
+/// What a controller returns at one decision: the dose [`DoseAction`]s to apply,
+/// plus optional provenance — the label of the declarative `when` rule that
+/// fired, so the dose ledger can record *why* a dose changed. `rule == None` for
+/// a programmatic controller or a no-rule re-issue (the driver then records the
+/// dose by its route), so the field never fabricates a rule that did not fire.
+pub(crate) struct ControllerDecision {
+    pub actions: Vec<DoseAction>,
+    pub rule: Option<String>,
+}
+
 /// The value a monitored signal actually presented to the controller at a
 /// decision, plus the mode it was resolved under — recorded on each
 /// [`DoseLedgerEntry`] so decision-audit replay (#391 Part E) can reproduce the
@@ -620,6 +643,47 @@ pub enum DoseStep {
     Percent(f64),
     /// Step one discrete level. Valid only when the block declares `levels`.
     Level,
+}
+
+impl Comparison {
+    /// The operator's source symbol, for rule labels / diagnostics.
+    fn symbol(self) -> &'static str {
+        match self {
+            Comparison::Lt => "<",
+            Comparison::Le => "<=",
+            Comparison::Gt => ">",
+            Comparison::Ge => ">=",
+            Comparison::Eq => "==",
+        }
+    }
+}
+
+impl AdaptiveAction {
+    /// The action's source-like label (`"increase 25%"`, `"hold"`, …).
+    fn label(&self) -> String {
+        match self {
+            AdaptiveAction::Increase(DoseStep::Percent(p)) => format!("increase {p}%"),
+            AdaptiveAction::Increase(DoseStep::Level) => "increase".to_string(),
+            AdaptiveAction::Decrease(DoseStep::Percent(p)) => format!("decrease {p}%"),
+            AdaptiveAction::Decrease(DoseStep::Level) => "decrease".to_string(),
+            AdaptiveAction::Hold => "hold".to_string(),
+            AdaptiveAction::Stop => "stop".to_string(),
+        }
+    }
+}
+
+impl AdaptiveRule {
+    /// A human-readable label reconstructing the rule as written
+    /// (`"signal < 10 : increase 25%"`) — recorded as the dose ledger's
+    /// `rule_fired` so an audit can name which rung produced each dose.
+    pub(crate) fn label(&self) -> String {
+        format!(
+            "signal {} {} : {}",
+            self.op.symbol(),
+            self.threshold,
+            self.action.label()
+        )
+    }
 }
 
 #[cfg(test)]

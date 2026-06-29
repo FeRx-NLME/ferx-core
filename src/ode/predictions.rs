@@ -10,9 +10,14 @@
 use crate::ode::solver::{solve_ode, OdeSolverOptions};
 use crate::pk::absorption::PreparedInputRate;
 use crate::sim::adaptive::{
-    assay_standard_normal, AdaptiveRun, AssayNoise, ControllerCtx, DecisionLogEntry,
-    DecisionOutcome, DoseAction, DoseLedgerEntry, MonitorSpec, ObserveMode, ObservedSignal,
+    assay_standard_normal, AdaptiveMonitor, AdaptiveRun, AssayNoise, ControllerCtx,
+    ControllerDecision, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry,
+    ObserveMode, ObservedSignal,
 };
+// `MonitorSpec` is named only by the `#[cfg(test)]` cmt-only wrapper and the
+// driver's unit tests (production pairs it inside `AdaptiveMonitor`).
+#[cfg(test)]
+use crate::sim::adaptive::MonitorSpec;
 use crate::types::{DoseEvent, PkParams, Subject};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -1515,14 +1520,16 @@ fn reject_unsupported_dose_compartment(
 /// break only restarts the integrator on a no-event segment, so predictions are
 /// unaffected on the smooth models tested; genuinely reactive/hold regimens are
 /// therefore pinned against the closed form instead.
-// The cmt-only adaptive driver entry: forwards to `ode_predictions_adaptive_impl`
-// with no compiled `observe` expressions. The driver's own unit tests exercise the
-// reactive engine through this focused path, so it is retained as a named cmt-only
-// entry (`dead_code`: production no longer calls it directly). Both public entry
-// points — the programmatic `crate::api::simulate_adaptive` and the declarative
-// `crate::api::simulate_adaptive_from_spec` — go through `_impl`, so the
-// declarative path can supply expression-backed `observe` monitors (S2.3, #391).
-#[allow(dead_code, clippy::too_many_arguments)]
+// The cmt-only adaptive driver entry used by the driver's own unit tests: wraps
+// each [`MonitorSpec`] into an [`AdaptiveMonitor`] with no compiled `observe`
+// expression (every signal resolves via its `cmt`) and adapts a plain
+// `Vec<DoseAction>` controller to the engine's [`ControllerDecision`] contract
+// (rule provenance is the declarative path's, so `None` here). `#[cfg(test)]`:
+// production goes through `_impl` directly — both public entry points supply
+// expression-backed monitors and rule-aware controllers — so this is test-only
+// scaffolding, not dead production code (#391).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ode_predictions_adaptive(
     ode: &OdeSpec,
     pk_params_flat: &[f64],
@@ -1537,8 +1544,17 @@ pub(crate) fn ode_predictions_adaptive(
     // a `Dv` monitor then errors at its first decision.
     assay: Option<&AssayNoise>,
 ) -> Result<AdaptiveRun, String> {
-    // Cmt-based monitors only (the programmatic path): no expression-backed
-    // `observe`, so every monitor resolves via its `cmt`.
+    let mons: Vec<AdaptiveMonitor> = monitors
+        .iter()
+        .map(|spec| AdaptiveMonitor {
+            spec,
+            observe: None,
+        })
+        .collect();
+    let mut decide = |ctx: &ControllerCtx| ControllerDecision {
+        actions: controller(ctx),
+        rule: None,
+    };
     ode_predictions_adaptive_impl(
         ode,
         pk_params_flat,
@@ -1546,20 +1562,22 @@ pub(crate) fn ode_predictions_adaptive(
         eta,
         subject,
         decision_times,
-        monitors,
-        controller,
+        &mons,
+        &mut decide,
         max_decisions,
         assay,
-        &[],
     )
 }
 
-/// As [`ode_predictions_adaptive`], but monitor `i` whose `observe_exprs[i]` is
-/// `Some(f)` takes its **latent** value from the compiled expression `f` rather
-/// than from `read_observable(cmt)` — the engine-resolved signal for a
-/// declarative `[adaptive_dosing]` block (#391 S2.2). `Dv` still draws its σ from
-/// the monitor's `cmt`. An empty `observe_exprs` (or a `None` entry) means
-/// cmt-based resolution, so the programmatic path is byte-for-byte unchanged.
+/// The core reactive driver. Each [`AdaptiveMonitor`] carries its own optional
+/// compiled `observe` expression: `Some(f)` takes the monitor's **latent** value
+/// from `f` (the engine-resolved signal for a declarative `[adaptive_dosing]`
+/// block, #391 S2), `None` reads `read_observable(cmt)` (the programmatic path,
+/// byte-for-byte unchanged). `Dv` still draws its σ from the monitor's `cmt`.
+///
+/// The controller returns a [`ControllerDecision`] — the dose actions plus the
+/// optional label of the `when` rule that fired, recorded as each dose row's
+/// `rule_fired`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ode_predictions_adaptive_impl(
     ode: &OdeSpec,
@@ -1568,13 +1586,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
     eta: &[f64],
     subject: &Subject,
     decision_times: &[f64],
-    monitors: &[MonitorSpec],
-    controller: &mut dyn FnMut(&ControllerCtx) -> Vec<DoseAction>,
+    monitors: &[AdaptiveMonitor],
+    controller: &mut dyn FnMut(&ControllerCtx) -> ControllerDecision,
     max_decisions: usize,
     assay: Option<&AssayNoise>,
-    // Per-monitor compiled `observe` expressions, aligned to `monitors`. A
-    // `Some(f)` overrides the cmt readout for that monitor's latent value.
-    observe_exprs: &[Option<&OdeOutputFn>],
 ) -> Result<AdaptiveRun, String> {
     let n = ode.n_states;
 
@@ -1594,7 +1609,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
             max_decisions
         ));
     }
-    for m in monitors {
+    for am in monitors {
+        let m = am.spec;
         if m.cmt == 0 || m.cmt > n {
             return Err(format!(
                 "monitor '{}' observes compartment {} but the model has {} state(s)",
@@ -1678,11 +1694,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // Resolve each monitored signal at the current (pre-dose) state.
                 let mut signals: HashMap<String, f64> = HashMap::new();
                 let mut observed: Vec<ObservedSignal> = Vec::with_capacity(monitors.len());
-                for (mi, m) in monitors.iter().enumerate() {
-                    // A declarative `[adaptive_dosing]` block (S2.2) supplies a
+                for am in monitors.iter() {
+                    let m = am.spec;
+                    // A declarative `[adaptive_dosing]` block (S2) supplies a
                     // compiled `observe` expression for the latent value; absent
                     // one (the programmatic path), read the model's cmt readout.
-                    let latent = match observe_exprs.get(mi).copied().flatten() {
+                    let latent = match am.observe {
                         Some(f) => f(&u, pk_params_flat, theta, eta, decision_cov),
                         None => read_observable(
                             ode,
@@ -1708,6 +1725,18 @@ pub(crate) fn ode_predictions_adaptive_impl(
                                     m.name
                                 )
                             })?;
+                            // σ is `residual_variance_at(cmt, latent)`, so `latent`
+                            // (the `observe` value) must be on the *same scale* as
+                            // `cmt`'s error model — e.g. `observe = central / V` with
+                            // a proportional error fit on that concentration. The
+                            // parser already forces the user to designate `assay_cmt`
+                            // for an expression `observe` (the σ would otherwise be
+                            // ambiguous); designating it is the user's assertion that
+                            // the two scales agree. Verifying that agreement at compile
+                            // time would need the endpoint's readout source, which the
+                            // model does not retain (`OdeReadout::Single` is an opaque
+                            // closure) — tracked as a follow-up, see #391.
+                            //
                             // Edge (a): a DV monitor on a compartment with no
                             // residual error model is a typed error, not a guessed σ.
                             let var = (a.resid_var)(m.cmt, latent).ok_or_else(|| {
@@ -1737,7 +1766,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     });
                 }
 
-                let actions = {
+                let decision = {
                     let ctx = ControllerCtx {
                         t: t_start,
                         state: &u,
@@ -1748,6 +1777,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     };
                     controller(&ctx)
                 };
+                // The `when` rule that produced these actions (declarative path);
+                // `None` for a re-issue or a programmatic controller, in which case
+                // the ledger records the dose by its route below.
+                let rule_fired = decision.rule;
+                let actions = decision.actions;
 
                 // Validate the whole action list up front — before any action is
                 // applied — and require `Stop` to be the final action. A malformed
@@ -1804,7 +1838,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
                                 cmt,
                                 rate: 0.0,
                                 decision_idx: decision_index,
-                                rule_fired: "bolus".to_string(),
+                                rule_fired: rule_fired
+                                    .clone()
+                                    .unwrap_or_else(|| "bolus".to_string()),
                                 observed_signals: observed.clone(),
                                 pre_state: None,
                                 post_state: None,
@@ -1853,7 +1889,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
                                 cmt,
                                 rate,
                                 decision_idx: decision_index,
-                                rule_fired: "infuse".to_string(),
+                                rule_fired: rule_fired
+                                    .clone()
+                                    .unwrap_or_else(|| "infuse".to_string()),
                                 observed_signals: observed.clone(),
                                 pre_state: None,
                                 post_state: None,
@@ -7090,7 +7128,10 @@ mod tests {
         let pk = (model.pk_param_fn)(&theta, &eta, &HashMap::new());
         let subject = make_subject(vec![], spec.at.clone());
         let mut controller = (compiled.make_controller)();
-        let observe_refs: Vec<Option<&OdeOutputFn>> = vec![Some(&compiled.observe)];
+        let monitors = vec![crate::sim::adaptive::AdaptiveMonitor {
+            spec: &compiled.monitors[0],
+            observe: Some(&compiled.observe),
+        }];
         let run = ode_predictions_adaptive_impl(
             model.ode_spec.as_ref().unwrap(),
             &pk.values,
@@ -7098,11 +7139,10 @@ mod tests {
             &eta,
             &subject,
             &spec.at,
-            &compiled.monitors,
+            &monitors,
             &mut controller,
             spec.at.len() + 1,
             None,
-            &observe_refs,
         )
         .expect("driver runs");
 
