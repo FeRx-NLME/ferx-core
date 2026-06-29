@@ -6,6 +6,8 @@
 //! generic `PkNum`/`Dual2` instantiation differentiates them cleanly (no
 //! `f64::max`/`min` branch ambiguity).
 
+use crate::sens::num::PkNum;
+
 /// 1 / sqrt(2)
 const INV_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// 1 / sqrt(2*pi)
@@ -268,6 +270,110 @@ pub fn trigamma(x: f64) -> f64 {
     2.0 / t - (y + 0.5) / (t * t) + dda / a - a_ratio * a_ratio
 }
 
+/// Regularized lower incomplete gamma `P(a, x) = γ(a, x) / Γ(a)` — the CDF of a
+/// Gamma(shape = `a`, rate = 1) distribution at `x`, defined for `a > 0`,
+/// `x ≥ 0` (returns `0` for `x ≤ 0`).
+///
+/// Added for the **Phase 3** analytical absorption closed forms (#386): the
+/// exponential-tilting convolution of a Savic transit (Gamma) input with a linear
+/// 1-/2-cpt disposition is `P(n + 1, (KTR − k)·t)` (see `plans/absorption-models.md`
+/// §Phase 3), so this is the special function the `convolve_*` closed forms evaluate.
+///
+/// **Generic over [`PkNum`] on purpose.** Unlike [`ln_gamma`] — whose parameter
+/// derivative has a closed form ([`digamma`] / [`trigamma`]) — the incomplete
+/// gamma's `∂P/∂a` is *not* elementary. So rather than hand-derive a dual rule, the
+/// series / continued-fraction iteration is written **once** over `T: PkNum` and the
+/// dual numbers carry the exact `∂P/∂a`, `∂P/∂x` (and 2nd order) through the very
+/// same arithmetic — the `sens/` `*_g<T>` convention, with no second copy to drift.
+/// Only the branch and convergence *decisions* read `T::val()` (the value part); the
+/// body is `+ − * / .exp() .ln()` and [`PkNum::ln_gamma`], all of which the dual
+/// types already differentiate. `T = f64` yields the plain value; `T = Dual2<N>`
+/// yields the value plus exact 1st/2nd-order sensitivities.
+///
+/// Algorithm (Numerical Recipes §6.2; Abramowitz & Stegun 6.5): the power series for
+/// `x < a + 1`, else Lentz's continued fraction for the complementary upper tail
+/// `Q(a, x)` with `P = 1 − Q` — each form converges fastest on its own side of the
+/// `x = a + 1` switch. Transit fits sit mostly in the continued-fraction regime
+/// (`x = (KTR − k)·t` grows with the dosing interval while `a = n + 1` stays small).
+pub fn regularized_gamma_p<T: PkNum>(a: T, x: T) -> T {
+    if x.val() <= 0.0 {
+        return T::from_f64(0.0);
+    }
+    if x.val() < a.val() + 1.0 {
+        gamma_p_series(a, x)
+    } else {
+        T::from_f64(1.0) - gamma_q_cf(a, x)
+    }
+}
+
+/// Shared prefactor `x^a · e^{−x} / Γ(a) = exp(a·ln x − x − ln Γ(a))` of both the
+/// series and the continued fraction. Caller guarantees `x > 0`, `a > 0`.
+fn gamma_pref<T: PkNum>(a: T, x: T) -> T {
+    (a * x.ln() - x - a.ln_gamma()).exp()
+}
+
+/// Power series for `P(a, x)`, used when `x < a + 1`:
+/// `P = pref · Σ_{n≥0} xⁿ / [a(a+1)…(a+n)]`, with term₀ = 1/a and
+/// termₙ = termₙ₋₁ · x/(a+n). Converges in `O(x)` terms in this regime.
+fn gamma_p_series<T: PkNum>(a: T, x: T) -> T {
+    const EPS: f64 = 1e-15;
+    const MAX_ITER: usize = 300;
+    let one = T::from_f64(1.0);
+    let mut ap = a;
+    let mut del = one / a;
+    let mut sum = del;
+    for _ in 0..MAX_ITER {
+        ap = ap + one;
+        del = del * x / ap;
+        sum = sum + del;
+        // Convergence is judged on the value part; the dual jets of `sum` are
+        // resolved at least as tightly (the per-term derivatives decay with the
+        // term), and the gradient-agreement tests confirm it.
+        if del.val().abs() < sum.val().abs() * EPS {
+            break;
+        }
+    }
+    sum * gamma_pref(a, x)
+}
+
+/// Lentz's continued fraction for the upper incomplete gamma `Q(a, x)`, used when
+/// `x ≥ a + 1`; the caller returns `P = 1 − Q`. `aₙ = −n·(n − a)`,
+/// `bₙ = x + 1 − a + 2n`.
+fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
+    const EPS: f64 = 1e-15;
+    const FPMIN: f64 = 1e-300;
+    const MAX_ITER: usize = 300;
+    let one = T::from_f64(1.0);
+    let two = T::from_f64(2.0);
+    let mut b = x + one - a;
+    let mut c = T::from_f64(1.0 / FPMIN);
+    let mut d = one / b;
+    let mut h = d;
+    for i in 1..=MAX_ITER {
+        let ai = T::from_f64(i as f64);
+        let an = -ai * (ai - a); // aₙ = −n·(n − a)
+        b = b + two;
+        d = an * d + b;
+        // Guard a vanishing denominator (Lentz). This fires with probability ~0 for
+        // valid `a, x` (here `d, c` are O(1)); the constant rescue zeros the local
+        // jet, but the flat region is never reached on the tested paths.
+        if d.val().abs() < FPMIN {
+            d = T::from_f64(FPMIN);
+        }
+        c = b + an / c;
+        if c.val().abs() < FPMIN {
+            c = T::from_f64(FPMIN);
+        }
+        d = one / d;
+        let del = d * c;
+        h = h * del;
+        if (del.val() - 1.0).abs() < EPS {
+            break;
+        }
+    }
+    h * gamma_pref(a, x)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,5 +618,128 @@ mod tests {
         let eps = 1e-7;
         assert_relative_eq!(digamma(0.5 - eps), digamma(0.5 + eps), epsilon = 1e-5);
         assert_relative_eq!(trigamma(0.5 - eps), trigamma(0.5 + eps), epsilon = 1e-4);
+    }
+
+    /// `P(a, x)` against two independent closed forms, spanning both algorithm
+    /// branches (`x < a+1` series, `x ≥ a+1` continued fraction):
+    /// `P(1, x) = 1 − e^{−x}` (exponential CDF) and `P(½, x) = erf(√x)`.
+    #[test]
+    fn regularized_gamma_p_matches_closed_forms() {
+        for &x in &[0.05_f64, 0.5, 1.0, 1.9, 2.0, 3.0, 8.0, 20.0] {
+            let want = 1.0 - (-x).exp();
+            assert_relative_eq!(
+                regularized_gamma_p::<f64>(1.0, x),
+                want,
+                epsilon = 1e-12,
+                max_relative = 1e-12
+            );
+        }
+        // P(1/2, x) = erf(√x); tolerance set by erf's A&S ~1.5e-7 error.
+        for &x in &[0.1, 0.7, 1.5, 4.0] {
+            assert_relative_eq!(
+                regularized_gamma_p::<f64>(0.5, x),
+                erf(x.sqrt()),
+                epsilon = 1e-6,
+                max_relative = 1e-6
+            );
+        }
+    }
+
+    /// Boundary behaviour: `P(a, 0) = 0`, `x ≤ 0 ⇒ 0`, and `P(a, x) → 1` as `x → ∞`.
+    #[test]
+    fn regularized_gamma_p_boundary_values() {
+        for &a in &[0.5, 1.0, 3.0, 7.5] {
+            assert_eq!(regularized_gamma_p::<f64>(a, 0.0), 0.0);
+            assert_eq!(regularized_gamma_p::<f64>(a, -1.0), 0.0);
+            let tail = regularized_gamma_p::<f64>(a, a + 80.0);
+            assert!((tail - 1.0).abs() < 1e-9, "P({a}, {}) = {tail}", a + 80.0);
+        }
+    }
+
+    /// `P(a, ·)` is a CDF: it stays in `[0, 1]` and is monotone non-decreasing in `x`,
+    /// across the series/CF switch at `x = a + 1`.
+    #[test]
+    fn regularized_gamma_p_is_a_monotone_cdf() {
+        let a = 3.0;
+        let mut prev = -1.0;
+        for k in 0..=40 {
+            let x = k as f64 * 0.5;
+            let p = regularized_gamma_p::<f64>(a, x);
+            assert!((-1e-15..=1.0 + 1e-12).contains(&p), "P out of [0,1]: {p}");
+            assert!(p >= prev - 1e-12, "non-monotone at x={x}");
+            prev = p;
+        }
+    }
+
+    /// The series (`x < a+1`) and continued fraction (`x ≥ a+1`) must agree across the
+    /// seam: stepping `±ε` over `x = a + 1` may move `P` only by `O(ε·pdf)` (the true
+    /// derivative), never the `O(1)` jump a branch mismatch would produce.
+    #[test]
+    fn regularized_gamma_p_continuous_across_branch_seam() {
+        for &a in &[0.7, 2.0, 4.5] {
+            let seam = a + 1.0;
+            let eps = 1e-6;
+            let below = regularized_gamma_p::<f64>(a, seam - eps); // series
+            let above = regularized_gamma_p::<f64>(a, seam + eps); // continued fraction
+            assert!(
+                (below - above).abs() < 1e-5,
+                "branch jump at a={a}: {below} vs {above}"
+            );
+        }
+    }
+
+    /// The point of the generic `PkNum` form: the `Dual2` 1st **and** 2nd-order
+    /// sensitivities in *both* arguments (and the cross term) must match central
+    /// finite differences of the `f64` value — including the non-elementary `∂P/∂a`.
+    /// Cases span both branches and the transit-typical large-`x` (CF) regime; a
+    /// mis-transcribed series/CF coefficient or a broken `ln_gamma` dual rule fails
+    /// here. (FD-only checks would miss exactly this — cf. #317 / #458.)
+    #[test]
+    fn regularized_gamma_p_dual_gradients_match_central_fd() {
+        use crate::sens::dual2::Dual2;
+        let p = |av: f64, xv: f64| regularized_gamma_p::<f64>(av, xv);
+        // (a, x): series (x<a+1), CF (x≥a+1), and transit-like large x.
+        for &(av, xv) in &[(2.0, 1.0), (3.5, 2.0), (4.0, 9.0), (1.5, 6.0), (6.0, 6.5)] {
+            let dual = regularized_gamma_p(Dual2::<2>::var(av, 0), Dual2::<2>::var(xv, 1));
+            assert_relative_eq!(dual.value, p(av, xv), max_relative = 1e-12);
+
+            let h = 1e-5;
+            let dpda = (p(av + h, xv) - p(av - h, xv)) / (2.0 * h);
+            let dpdx = (p(av, xv + h) - p(av, xv - h)) / (2.0 * h);
+            assert_relative_eq!(dual.grad[0], dpda, max_relative = 1e-5, epsilon = 1e-9);
+            assert_relative_eq!(dual.grad[1], dpdx, max_relative = 1e-5, epsilon = 1e-9);
+
+            let h2 = 1e-3;
+            let d2a = (p(av + h2, xv) - 2.0 * p(av, xv) + p(av - h2, xv)) / (h2 * h2);
+            let d2x = (p(av, xv + h2) - 2.0 * p(av, xv) + p(av, xv - h2)) / (h2 * h2);
+            let dax = (p(av + h2, xv + h2) - p(av + h2, xv - h2) - p(av - h2, xv + h2)
+                + p(av - h2, xv - h2))
+                / (4.0 * h2 * h2);
+            assert_relative_eq!(dual.hess[0][0], d2a, max_relative = 2e-3, epsilon = 1e-6);
+            assert_relative_eq!(dual.hess[1][1], d2x, max_relative = 2e-3, epsilon = 1e-6);
+            assert_relative_eq!(dual.hess[0][1], dax, max_relative = 2e-3, epsilon = 1e-6);
+        }
+    }
+
+    /// Exercise the second-order chain through a **composite** input (`a = e^θ`, so the
+    /// seeded variable carries a nonzero input Hessian `x″`): `∂²P/∂θ²` must match the
+    /// central second difference of `θ ↦ P(e^θ, x)`. This is the `ψ·x″`-style term the
+    /// bare-`var` case in the test above does not exercise (cf. the `ln_gamma` chain
+    /// test in `sens::num`).
+    #[test]
+    fn regularized_gamma_p_dual_chain_rule_with_composite_input() {
+        use crate::sens::dual2::Dual2;
+        let f = |theta: f64, xv: f64| regularized_gamma_p::<f64>(theta.exp(), xv);
+        for &(theta, xv) in &[(0.4_f64, 1.0), (1.0, 9.0), (-0.3, 3.0)] {
+            let dual =
+                regularized_gamma_p(Dual2::<1>::var(theta, 0).exp(), Dual2::<1>::from_f64(xv));
+            assert_relative_eq!(dual.value, f(theta, xv), max_relative = 1e-12);
+            let h = 1e-5;
+            let fd1 = (f(theta + h, xv) - f(theta - h, xv)) / (2.0 * h);
+            assert_relative_eq!(dual.grad[0], fd1, max_relative = 1e-5, epsilon = 1e-9);
+            let h2 = 1e-3;
+            let fd2 = (f(theta + h2, xv) - 2.0 * f(theta, xv) + f(theta - h2, xv)) / (h2 * h2);
+            assert_relative_eq!(dual.hess[0][0], fd2, max_relative = 2e-3, epsilon = 1e-6);
+        }
     }
 }
