@@ -95,6 +95,17 @@ impl<T: PkNum> TiltedAbsorption<T> for TransitAbsorption<T> {
     fn mgf(&self, k: T) -> T {
         // Gamma(n+1, KTR) MGF: M(k) = (KTR/(KTR−k))^{n+1}, converges for k < KTR.
         let ktr = self.ktr();
+        // Enforce the domain at the point of violation: above the abscissa the base
+        // KTR/(KTR−k) goes negative and `.pow` of a non-integer exponent is NaN,
+        // which would otherwise propagate silently into the likelihood. The analytic
+        // dispatch guards `ke < KTR` upstream (routing to the ODE path otherwise), so
+        // this never fires on a valid call — it catches a guard regression in tests.
+        debug_assert!(
+            k.val() < ktr.val(),
+            "transit MGF diverges for k ≥ KTR ({} ≥ {}); caller must guard ke < KTR",
+            k.val(),
+            ktr.val()
+        );
         (ktr / (ktr - k)).pow(self.n + T::from_f64(1.0))
     }
 
@@ -237,11 +248,14 @@ mod tests {
     /// The reason for the closed form: exact `Dual2` sensitivities. We validate a
     /// two-rung ladder so each order is checked against the one below:
     ///   * 1st order `∂C/∂{n,mtt,ke}` vs a central difference of the `f64` value;
-    ///   * 2nd order (incl. the `∂²C/∂n∂ke` cross term) vs a central difference of
-    ///     the **exact dual 1st-derivative** — this avoids the `1/h²` roundoff
-    ///     blow-up of a value-based second difference (differencing values that
-    ///     nearly cancel), the trap that a naive 2nd-order FD reference falls into.
-    /// `t` and `F·Dose/V` are constants here.
+    ///   * 2nd order (all three diagonals plus the `∂²C/∂n∂mtt`, `∂²C/∂n∂ke`,
+    ///     `∂²C/∂mtt∂ke` cross terms) vs a central difference of the **exact dual
+    ///     1st-derivative** — this avoids the `1/h²` roundoff blow-up of a
+    ///     value-based second difference (differencing values that nearly cancel),
+    ///     the trap that a naive 2nd-order FD reference falls into.
+    ///
+    /// `t` and `F·Dose/V` are held constant here; their sensitivities are checked
+    /// in [`convolve_1cpt_t_and_dose_sensitivities`].
     #[test]
     fn convolve_1cpt_dual_gradients_match_fd() {
         let fdv = 2.0;
@@ -278,10 +292,93 @@ mod tests {
             let dnk = (dual_conc(nv, mv, tv, kv + h2, fdv).grad[0]
                 - dual_conc(nv, mv, tv, kv - h2, fdv).grad[0])
                 / (2.0 * h2);
+            // cross term ∂²C/∂n∂mtt: difference ∂C/∂n in the mtt direction.
+            let dnm = (dual_conc(nv, mv + h2, tv, kv, fdv).grad[0]
+                - dual_conc(nv, mv - h2, tv, kv, fdv).grad[0])
+                / (2.0 * h2);
+            // cross term ∂²C/∂mtt∂ke: difference ∂C/∂mtt in the ke direction.
+            let dmk = (dual_conc(nv, mv, tv, kv + h2, fdv).grad[1]
+                - dual_conc(nv, mv, tv, kv - h2, fdv).grad[1])
+                / (2.0 * h2);
             assert_relative_eq!(d.hess[0][0], d2n, max_relative = 1e-4, epsilon = 1e-7);
             assert_relative_eq!(d.hess[1][1], d2m, max_relative = 1e-4, epsilon = 1e-7);
             assert_relative_eq!(d.hess[2][2], d2k, max_relative = 1e-4, epsilon = 1e-7);
             assert_relative_eq!(d.hess[0][2], dnk, max_relative = 1e-4, epsilon = 1e-7);
+            assert_relative_eq!(d.hess[0][1], dnm, max_relative = 1e-4, epsilon = 1e-7);
+            assert_relative_eq!(d.hess[1][2], dmk, max_relative = 1e-4, epsilon = 1e-7);
         }
+    }
+
+    /// `n = 0` is the Bateman boundary: `a = n+1 = 1`, exactly where `special.rs`
+    /// clamps `∂P/∂x` at `x → 0`. The `n=0` *value* is anchored against Bateman above;
+    /// here we confirm the clamp doesn't corrupt the *live* (`t > 0`) gradient path —
+    /// `∂C/∂mtt` and `∂C/∂ke` at `n = 0` match a central difference. (`∂C/∂n` is
+    /// one-sided at the `n ≥ 0` boundary, not a meaningful two-sided derivative there,
+    /// so it is intentionally not asserted.)
+    #[test]
+    fn transit_n0_gradients_match_fd() {
+        let fdv = 2.0;
+        let h = 1e-6;
+        for &(mv, kv, tv) in &[(2.0, 0.10, 1.5), (0.7, 0.20, 3.0), (1.5, 0.05, 6.0)] {
+            let d = dual_conc(0.0, mv, tv, kv, fdv);
+            let dm = (conc(0.0, mv + h, tv, kv, fdv) - conc(0.0, mv - h, tv, kv, fdv)) / (2.0 * h);
+            let dk = (conc(0.0, mv, tv, kv + h, fdv) - conc(0.0, mv, tv, kv - h, fdv)) / (2.0 * h);
+            assert_relative_eq!(d.grad[1], dm, max_relative = 1e-4, epsilon = 1e-8);
+            assert_relative_eq!(d.grad[2], dk, max_relative = 1e-4, epsilon = 1e-8);
+        }
+    }
+
+    /// Sensitivities in the two arguments the gradient ladder holds constant:
+    ///   * `∂C/∂t` (and `∂²C/∂t²`) — the only direct exercise of the incomplete
+    ///     gamma's `∂P/∂x` through the closed form — vs the same two-rung FD ladder;
+    ///   * `F·Dose/V`, in which `C` must be *exactly* linear (`∂C/∂fdv = C/fdv`,
+    ///     `∂²C/∂fdv² = 0`).
+    #[test]
+    fn convolve_1cpt_t_and_dose_sensitivities() {
+        let h = 1e-6;
+        let h2 = 1e-4;
+        for &(n, mtt, ke, t) in &[
+            (2.5, 1.0, 0.10, 1.5),
+            (1.3, 0.7, 0.20, 3.0),
+            (0.4, 3.0, 0.15, 2.0),
+        ] {
+            let abs = TransitAbsorption {
+                n: Dual2::<1>::from_f64(n),
+                mtt: Dual2::<1>::from_f64(mtt),
+            };
+            let ke_c = Dual2::<1>::from_f64(ke);
+            let fdv_c = Dual2::<1>::from_f64(2.0);
+            let d = convolve_1cpt(&abs, Dual2::<1>::var(t, 0), ke_c, fdv_c);
+            // 1st order ∂C/∂t vs central difference of the value.
+            let dt = (conc(n, mtt, t + h, ke, 2.0) - conc(n, mtt, t - h, ke, 2.0)) / (2.0 * h);
+            assert_relative_eq!(d.grad[0], dt, max_relative = 1e-4, epsilon = 1e-8);
+            // 2nd order ∂²C/∂t² vs central difference of the exact dual 1st-derivative.
+            let gp = convolve_1cpt(&abs, Dual2::<1>::var(t + h2, 0), ke_c, fdv_c).grad[0];
+            let gm = convolve_1cpt(&abs, Dual2::<1>::var(t - h2, 0), ke_c, fdv_c).grad[0];
+            assert_relative_eq!(
+                d.hess[0][0],
+                (gp - gm) / (2.0 * h2),
+                max_relative = 1e-4,
+                epsilon = 1e-7
+            );
+        }
+        // C is exactly linear in F·Dose/V: ∂C/∂fdv = C/fdv, ∂²C/∂fdv² = 0.
+        let fdv = 2.0;
+        let abs = TransitAbsorption {
+            n: Dual2::<1>::from_f64(2.5),
+            mtt: Dual2::<1>::from_f64(1.0),
+        };
+        let d = convolve_1cpt(
+            &abs,
+            Dual2::<1>::from_f64(1.5),
+            Dual2::<1>::from_f64(0.1),
+            Dual2::<1>::var(fdv, 0),
+        );
+        assert_relative_eq!(
+            d.grad[0],
+            conc(2.5, 1.0, 1.5, 0.1, fdv) / fdv,
+            max_relative = 1e-12
+        );
+        assert_relative_eq!(d.hess[0][0], 0.0, epsilon = 1e-12);
     }
 }
