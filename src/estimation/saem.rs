@@ -13,8 +13,8 @@ use crate::estimation::outer_optimizer::{
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
-    individual_nll, individual_nll_into, individual_nll_iov, obs_nll_subject_from_preds,
-    obs_nll_subject_into, split_obs_by_occasion,
+    individual_nll, individual_nll_into, individual_nll_iov, iov_occasion_groups,
+    obs_nll_subject_from_preds, obs_nll_subject_into,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -1320,7 +1320,7 @@ pub fn run_saem(
             .subjects
             .iter()
             .map(|s| {
-                let n_occ = split_obs_by_occasion(s).len();
+                let n_occ = iov_occasion_groups(s).len();
                 vec![vec![0.0f64; n_kappa]; n_occ]
             })
             .collect();

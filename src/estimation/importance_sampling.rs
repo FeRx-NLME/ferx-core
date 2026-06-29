@@ -24,7 +24,7 @@
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
-use crate::stats::likelihood::{m3_logcdf, obs_nll_subject_into, split_obs_by_occasion};
+use crate::stats::likelihood::{iov_occasion_groups, m3_logcdf, obs_nll_subject_into};
 use crate::stats::residual_error::compute_r_diag;
 use crate::stats::special::ln_gamma;
 use crate::types::*;
@@ -204,7 +204,7 @@ pub fn run_importance_sampling(
     // Defensive: the joint (η, κ) path builds a mode vector of size
     // `n_eta + n_occ·n_iov`, filling the κ blocks from the per-occasion EBEs in
     // `kappas[i]`. The two notions of "number of occasions" — the EBE count and
-    // `split_obs_by_occasion(subject).len()` — must agree, or the fill loop
+    // `iov_occasion_groups(subject).len()` — must agree, or the fill loop
     // would index out of bounds (κ too long) or silently leave occasions at
     // κ = 0 (κ too short). Verify once up front so the parallel loop can index
     // freely. Subjects with no κ EBEs fall through to the η-only path.
@@ -214,7 +214,7 @@ pub fn run_importance_sampling(
             if kap_len == 0 {
                 continue;
             }
-            let n_occ = split_obs_by_occasion(subject).len();
+            let n_occ = iov_occasion_groups(subject).len();
             if kap_len != n_occ {
                 return Err(format!(
                     "IS: subject {} has {} κ occasion block(s) but {} observation \
@@ -324,7 +324,7 @@ pub fn run_importance_sampling(
                 let log_det_omega_iov = log_det_omega_iov
                     .expect("omega_iov present for IOV model (checked in run_importance_sampling)");
 
-                let occ_groups = split_obs_by_occasion(subject);
+                let occ_groups = iov_occasion_groups(subject);
                 let n_occ = occ_groups.len();
                 let n_iov = model.n_kappa;
                 let n_b = n_eta + n_occ * n_iov;

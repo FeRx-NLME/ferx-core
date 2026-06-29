@@ -862,7 +862,16 @@ fn write_predictions_csv<W: Write>(
         for j in 0..sr.ipred.len() {
             let mut row = csv_escape(&sr.id);
             row.push(',');
-            row.push_str(&fmt_f64(subj.obs_times[j]));
+            // Report the raw data TIME (so the bundle's predictions.csv joins back
+            // to the input CSV and to the sdtab, which is also raw); `obs_times`
+            // may be the internal shifted timeline for stacked reset occasions.
+            // Falls back to `obs_times` when no raw vector was recorded.
+            row.push_str(&fmt_f64(
+                subj.obs_raw_times
+                    .get(j)
+                    .copied()
+                    .unwrap_or(subj.obs_times[j]),
+            ));
             row.push(',');
             row.push_str(&fmt_f64(subj.observations[j]));
             row.push(',');

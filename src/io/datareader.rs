@@ -2196,6 +2196,62 @@ mod tests {
     }
 
     #[test]
+    fn test_off_zero_time_origin_keeps_raw_clock() {
+        // Regression #573: data may use calendar/clock TIME values that do not
+        // start at zero for each subject. The data reader keeps every TIME on the
+        // raw data clock (no per-subject origin shift); the off-zero start is
+        // handled by the ODE drivers, which begin integration at the first event
+        // (NONMEM semantics) rather than at an artificial t=0. So `obs_times`,
+        // `doses[].time`, and `obs_raw_times` all carry the user's TIME values.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CR\n\
+                   1,10,.,1,1,100,1.0\n\
+                   1,11,5.0,0,0,.,1.0\n\
+                   1,14,.,2,1,0,2.0\n\
+                   1,15,3.0,0,0,.,2.0\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+
+        assert_eq!(subj.doses.len(), 1);
+        assert_eq!(subj.doses[0].time, 10.0);
+        assert_eq!(subj.obs_times, vec![11.0, 15.0]);
+        assert_eq!(subj.obs_raw_times, vec![11.0, 15.0]);
+        assert_eq!(subj.pk_only_times, vec![14.0]);
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn test_tte_entry_time_is_raw_not_origin_shifted() {
+        // Regression #573 / left-truncation: a survival subject whose risk-set
+        // entry (TENTRY) precedes its first observed record must keep the raw
+        // entry time. An earlier subject-relative-origin shift subtracted the
+        // first row's TIME and clamped to 0, which silently defeated left
+        // truncation (entry is always before the event row, so it collapsed to
+        // t=0 and the cumulative hazard integrated from 0 instead of TENTRY).
+        use crate::types::{EventType, ObsRecord};
+        let tte_cmts: std::collections::HashSet<usize> = [1].into_iter().collect();
+        // TIME starts at 100; TENTRY=90 is before the first record.
+        let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n\
+                   1,100,1,0,0,.,1,90\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv_filtered_tte(f.path(), None, None, None, &tte_cmts).unwrap();
+        let recs = &pop.subjects[0].obs_records;
+        assert_eq!(recs.len(), 1);
+        let ObsRecord::Event {
+            time,
+            event_type,
+            entry_time,
+            ..
+        } = &recs[0];
+        assert_eq!(*time, 100.0, "event time stays on the raw data clock");
+        assert_eq!(
+            *entry_time, 90.0,
+            "TENTRY must be the raw value, not shifted to first-row origin or clamped to 0"
+        );
+        assert!(matches!(event_type, EventType::Exact));
+    }
+
+    #[test]
     fn test_evid4_restart_shifts_second_occasion_onto_monotonic_timeline() {
         // Two dosing occasions stacked under one ID, each opened by an EVID=4
         // reset whose TIME column restarts at 0 (NONMEM processes records

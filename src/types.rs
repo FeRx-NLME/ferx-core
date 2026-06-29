@@ -4899,6 +4899,11 @@ pub struct SimulationSpec {
 pub struct ParsedModel {
     pub model: CompiledModel,
     pub simulation: Option<SimulationSpec>,
+    /// Parsed `[adaptive_dosing]` block (#391 S2): a declarative, file-driven
+    /// reactive controller. `None` when the block is absent. This slice (S2.1)
+    /// only parses and validates the spec; compiling it to a controller and
+    /// running it against `model` is a later step (S2.2+).
+    pub adaptive_dosing: Option<crate::sim::adaptive::AdaptiveDosingSpec>,
     pub fit_options: FitOptions,
     /// Declarations from the optional `[covariates]` block. `None` when the
     /// block is absent (legacy auto-detect: every non-standard CSV column is a

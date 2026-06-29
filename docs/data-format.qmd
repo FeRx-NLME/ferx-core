@@ -7,8 +7,18 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 | Column | Type | Description |
 |--------|------|-------------|
 | `ID` | string/numeric | Subject identifier |
-| `TIME` | numeric | Time relative to first dose |
+| `TIME` | numeric | Observation/event time on the data clock |
 | `DV` | numeric | Dependent variable (observed concentration) |
+
+> **`TIME` need not start at zero.** A subject's `TIME` column may begin at any
+> value (e.g. a calendar/clock time). Integration starts at each subject's first
+> record — matching NONMEM — so an off-zero start is **not** integrated over a
+> phantom `[0, first record]` window. `TIME` is used exactly as written
+> everywhere it is visible: the model `TIME`/`T` builtin, `[derived]` columns,
+> the survival left-truncation `TENTRY`, and the sdtab / `predict()` /
+> `simulate()` output. ferx does not re-base `TIME` onto a per-subject elapsed
+> clock (the one exception is stacked reset occasions — see
+> [System Resets](#system-resets-evid3-evid4)).
 
 ## Optional Standard Columns
 

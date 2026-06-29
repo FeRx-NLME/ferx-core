@@ -432,10 +432,8 @@ pub fn compute_event_pk_params_into(
 /// history and issue #104.
 ///
 /// `eta_bsv` is the BSV eta (length `n_eta`); `kappas[k]` is the kappa vector
-/// for the k-th occasion group in `split_obs_by_occasion` order. A dose/obs
-/// whose occasion has no kappa group (e.g. a dose in an occasion with no
-/// observations) uses zero kappa. EVID=2 rows carry no occasion label and also
-/// use zero kappa.
+/// for the k-th occasion group in `iov_occasion_groups` order, including dose-only
+/// occasions. EVID=2 rows carry no occasion label and use zero kappa.
 ///
 /// Every `PkModel` variant has event-driven analytical support and every ODE
 /// model takes the ODE path, so the dispatch below is total; an unsupported
@@ -492,8 +490,8 @@ pub fn predict_iov(
     use std::collections::HashMap;
     let n_kappa = model.n_kappa;
 
-    // occasion id -> kappa-group index (split_obs_by_occasion order).
-    let occ_groups = crate::stats::likelihood::split_obs_by_occasion(subject);
+    // occasion id -> kappa-group index (iov_occasion_groups order).
+    let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
     let mut occ_to_k: HashMap<u32, usize> = HashMap::with_capacity(occ_groups.len());
     for (k, (occ_id, _)) in occ_groups.iter().enumerate() {
         occ_to_k.insert(*occ_id, k);

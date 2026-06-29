@@ -127,7 +127,7 @@ All `[scaling]` variants on the **analytical PK path** support the default
 | Scalar `obs_scale = K` | exact analytic | exact FD | The constant threads as one entry per observation. |
 | Expression `obs_scale = <expr>` | subject-static analytic | exact FD | See subject-static caveat below. |
 | Per-CMT `obs_scale[CMT=N]` | subject-static analytic | exact FD | One per-observation scale entry per observation, dispatched by `subject.obs_cmts[i]`. |
-| Form C `y[…] = <expr>` (ODE only) | exact analytic (in-scope ODE) | exact FD | Since #410/#439 the ODE sensitivity provider differentiates the Form C readout — uniform `y = <expr>` and per-CMT `y[CMT=N] = <expr>` — over `Dual2`/`Dual1` (outer and inner), including **covariate references** in the readout (#540): a covariate threads in as a constant from the per-observation snapshot, so a free→total protein-binding readout gated on a `FREE` flag stays analytic. A θ or η referenced *directly* in the readout (rather than via an `[individual_parameters]` entry) falls back to FD, as do out-of-scope ODE features (steady state, IOV, …). |
+| Form C `y[…] = <expr>` (ODE only) | exact analytic (in-scope ODE) | exact FD | Since #410/#439 the ODE sensitivity provider differentiates the Form C readout — uniform `y = <expr>` and per-CMT `y[CMT=N] = <expr>` — over `Dual2`/`Dual1` (outer and inner), including **covariate references** in the readout (#540): a covariate threads in as a constant from the per-observation snapshot, so a free→total protein-binding readout gated on a `FREE` flag stays analytic. A θ or η referenced *directly* in the readout (rather than via an `[individual_parameters]` entry) falls back to FD, as do out-of-scope ODE features (input-rate/SDE, unsupported steady-state combinations, …). |
 
 **Analytic outer gradient handles expression scaling exactly.** The analytic
 sensitivity provider that drives the gradient-based outer optimizers (`bfgs`,
@@ -143,10 +143,14 @@ light inner-gradient provider now carries the η-only quotient rule
 quotient rule, evaluated once per subject over the same `Dual2`-differentiable scale
 program — so the per-subject inner EBE loop is exact for an η-dependent expression
 `obs_scale` like `1000 / V`, not just the outer gradient. The ODE (`[odes]`) path also
-serves an η-dependent `obs_scale` analytically — on both loops, on its static walk —
-since #486. (Per-CMT `obs_scale[CMT=N]` falls outside the analytic provider's scope
-entirely, and LTBS, time-varying covariates, and the IOV inner loop keep their FD
-routes for expression scaling.) Result-neutral — estimates and SEs are unchanged.
+serves an η-dependent `obs_scale` analytically on both loops: on the static walk since
+#486, for IOV since #575, and for IOV subjects that also have time-varying covariates
+since #590. The IOV expression-scale quotient follows production semantics: the scale is
+evaluated once per occasion group with the subject-level covariate snapshot, while the ODE
+event walk still uses per-event covariate snapshots for the dynamics. Per-CMT
+`obs_scale[CMT=N]` falls outside the analytic provider's scope entirely, and ODE
+expression scaling combined with LTBS still routes to FD. Result-neutral — estimates and
+SEs are unchanged.
 
 ## Interaction with SDE / `[diffusion]`
 
@@ -215,18 +219,19 @@ analytically by the ODE sensitivity provider — each endpoint's compiled
 output program is evaluated over `Dual2` (outer gradient) and `Dual1`
 (inner EBE η-gradient), dispatched per observation by `subject.obs_cmts[i]`.
 So `gradient = auto` serves it; `gradient = fd` is no longer required (the
-fit falls back to FD only for out-of-scope ODE features such as steady
-state, IOV, or time-varying covariates).
+fit falls back to FD only for out-of-scope ODE features such as input-rate/SDE,
+unsupported steady-state combinations, or LTBS).
 
 Since #486, an η-dependent **expression `obs_scale = <expr>`** divisor on an
 **ODE** model is also differentiated analytically (previously a Form-C readout
-`y = state/V` was the only analytic route). The same subject-static quotient
-rule the closed-form provider uses (`apply_expression_scale_*`) is applied to
-the ODE prediction jet for both the outer θ/Ω/σ gradient and the inner EBE
-η-gradient. It is served on the **static** dual walk only: combined with **LTBS**
-or **time-varying covariates** an ODE expression `obs_scale` still falls back to
-FD (the walk applies LTBS before the η/θ chain, and a TV-cov scale would be
-per-event rather than subject-static).
+`y = state/V` was the only analytic route). The same quotient rule the
+closed-form provider uses (`apply_expression_scale_*`) is applied to the ODE
+prediction jet for both the outer θ/Ω/σ gradient and the inner EBE η-gradient.
+The static ODE walk evaluates one scale jet per subject. The ODE IOV walk
+evaluates one scale jet per occasion group, so an IOV model with time-varying
+covariates in the dynamics and `obs_scale = V` stays on the analytic route since
+#590. Combined with **LTBS**, an ODE expression `obs_scale` still falls back to FD
+because the walk applies LTBS before the η/θ chain.
 
 **Numerical validation.** The per-CMT analytic gradient inherits the NONMEM
 validation of the user-ODE sensitivity engine (#410): the gradient machinery —

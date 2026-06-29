@@ -1,0 +1,50 @@
+# Adaptive (feedback) dosing — TDM trough titration (epic #391)
+#
+# A vancomycin-style therapeutic-drug-monitoring (TDM) example: the dose is
+# titrated every 12 h to drive the measured pre-dose trough concentration into a
+# 10–20 mg/L window. This is a *declarative dosing policy* — the next dose
+# depends on the simulated, assay-noised state — so it is run with
+# `simulate_adaptive_from_spec()`, not the plain forward `simulate()`.
+#
+# 1-compartment IV model; the observed/predicted endpoint is the concentration
+# C = central / V (mg/L). The controller titrates on the *measured* trough
+# (`with_assay_error = true`), as a clinician would, so the proportional assay
+# error feeds each decision.
+#
+# See docs/model-file/adaptive-dosing.qmd for the block reference.
+
+[parameters]
+  theta TVCL(4.0,  0.5,  20.0)    # clearance (L/h)
+  theta TVV(50.0,  5.0, 200.0)    # volume of distribution (L)
+
+  omega ETA_CL ~ 0.09             # between-subject variability on CL (log-normal)
+
+  sigma PROP ~ 0.10 (sd)          # proportional assay error (10% CV)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  # central: drug amount (mg); concentration C = central / V (mg/L)
+  d/dt(central) = -(CL / V) * central
+
+[scaling]
+  y = central / V                 # observed/predicted endpoint is concentration
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[adaptive_dosing]
+  with_assay_error = true                 # titrate on the *measured* trough (assay-noised)
+  assay_cmt        = 1                     # output #1 — the concentration (y = central/V) + its proportional error
+  at               = every 12 from 0 to 96 # a TDM decision before each q12h dose
+  start_dose       = 1000                  # initial dose (mg)
+  route            = infuse(cmt=1, over=1) # 1-hour IV infusion
+  dose_bounds      = [250, 2000]           # never below 250 or above 2000 mg
+  confirm          = 1                     # act on the first breach
+  when signal < 10 : increase 25%          # sub-therapeutic trough → escalate
+  when signal > 20 : decrease 25%          # supra-therapeutic trough → de-escalate

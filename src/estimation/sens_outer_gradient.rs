@@ -541,7 +541,7 @@ pub fn subject_theta_gradient_iov(
         &params.theta,
         stacked_eta_hat,
     )?;
-    let k_groups = crate::stats::likelihood::split_obs_by_occasion(subject).len();
+    let k_groups = crate::stats::likelihood::iov_occasion_groups(subject).len();
     let n_stacked = model.n_eta + k_groups * model.n_kappa;
     if stacked_eta_hat.len() != n_stacked {
         return None;
@@ -892,7 +892,7 @@ pub fn subject_packed_gradient_iov(
         &params.theta,
         stacked_eta_hat,
     )?;
-    let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
+    let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
     let n_stacked = n_eta_bsv + k * n_iov;
@@ -1489,7 +1489,7 @@ pub fn subject_eta_dx_iov(
         &params.theta,
         stacked_eta_hat,
     )?;
-    let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
+    let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
     let n_st = n_eta_bsv + k * n_iov;
@@ -1617,7 +1617,7 @@ pub fn subject_packed_gradient_foce_iov(
         &params.theta,
         stacked_eta_hat,
     )?;
-    let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
+    let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
     let n_eta_bsv = model.n_eta;
     let n_iov = model.n_kappa;
     let n_st = n_eta_bsv + k * n_iov;
@@ -4651,7 +4651,7 @@ mod tests {
         subject: &Subject,
         params: &ModelParameters,
     ) -> (Vec<f64>, DVector<f64>, Vec<DVector<f64>>, DMatrix<f64>) {
-        let k = crate::stats::likelihood::split_obs_by_occasion(subject).len();
+        let k = crate::stats::likelihood::iov_occasion_groups(subject).len();
         let n_eta = model.n_eta;
         let n_kappa = model.n_kappa;
         let n_st = n_eta + k * n_kappa;

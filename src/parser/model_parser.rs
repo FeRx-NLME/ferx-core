@@ -1,3 +1,7 @@
+use crate::sim::adaptive::{
+    validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
+    Comparison, DoseStep,
+};
 use crate::types::*;
 use regex::Regex;
 use std::collections::HashMap;
@@ -1834,6 +1838,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .get("simulation")
         .map(|lines| parse_simulation_block(lines))
         .transpose()?;
+    // Declarative reactive-dosing controller (#391 S2). Parsed and validated here;
+    // compiled to a controller and run by the adaptive simulate path in a later slice.
+    let adaptive_dosing = blocks
+        .get("adaptive_dosing")
+        .map(|lines| parse_adaptive_dosing_block(lines))
+        .transpose()?;
     let mut fit_options = if let Some(lines) = blocks.get("fit_options") {
         parse_fit_options(lines)?
     } else {
@@ -2457,6 +2467,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     Ok(ParsedModel {
         model,
         simulation,
+        adaptive_dosing,
         fit_options,
         covariate_decls,
         block_lines: extracted.block_lines.clone(),
@@ -3817,6 +3828,388 @@ fn parse_simulation_block(lines: &[String]) -> Result<SimulationSpec, String> {
     })
 }
 
+// ── [adaptive_dosing] block parser (#391 S2.1) ──────────────────────────────
+
+/// Parse a declarative `[adaptive_dosing]` block into an [`AdaptiveDosingSpec`]
+/// (#391 S2).
+///
+/// Pure syntax: every malformed, unknown, or ambiguous construct is a typed error
+/// with no silent default (mirroring the strict `[simulation]` / `[fit_options]`
+/// parsers). No controller is built and the `observe` expression is **not**
+/// compiled here — that, and resolving which endpoint a bare `observe` maps to,
+/// is the S2.2 step. The one ambiguity this parser *can* settle without the model
+/// — `with_assay_error` on an expression `observe` with no designated endpoint —
+/// is rejected here rather than left to guess a σ downstream.
+fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, String> {
+    let mut observe: Option<String> = None;
+    let mut with_assay_error = false;
+    let mut assay_cmt: Option<usize> = None;
+    let mut at: Option<Vec<f64>> = None;
+    let mut start_dose: Option<f64> = None;
+    let mut route: Option<AdaptiveRoute> = None;
+    let mut dose_bounds: Option<(f64, f64)> = None;
+    let mut confirm: u32 = 1;
+    let mut levels: Option<Vec<f64>> = None;
+    let mut rules: Vec<AdaptiveRule> = Vec::new();
+
+    for line in lines {
+        let line = line.trim();
+        // Rule lines (`when …`) carry no top-level `=`; everything else is `key = value`.
+        if let Some(rest) = line.strip_prefix("when ") {
+            rules.push(parse_adaptive_rule(rest)?);
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "[adaptive_dosing]: malformed line (expected `key = value` or `when …`): {line}"
+            ));
+        }
+        let (key, val) = (parts[0], parts[1]);
+        match key {
+            "observe" => {
+                if val.is_empty() {
+                    return Err("[adaptive_dosing]: `observe` requires an expression".to_string());
+                }
+                observe = Some(val.to_string());
+            }
+            "with_assay_error" => {
+                with_assay_error = match val {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        return Err(format!(
+                            "[adaptive_dosing]: with_assay_error must be `true` or `false`, got `{other}`"
+                        ))
+                    }
+                };
+            }
+            "assay_cmt" => {
+                let c: usize = val.parse().map_err(|_| {
+                    format!("[adaptive_dosing]: bad assay_cmt (expected a positive integer): {val}")
+                })?;
+                if c == 0 {
+                    return Err(
+                        "[adaptive_dosing]: assay_cmt is 1-based and must be >= 1".to_string()
+                    );
+                }
+                assay_cmt = Some(c);
+            }
+            "at" => at = Some(parse_decision_schedule(val)?),
+            "start_dose" => {
+                let d: f64 = val
+                    .parse()
+                    .map_err(|_| format!("[adaptive_dosing]: bad start_dose: {val}"))?;
+                if !d.is_finite() || d < 0.0 {
+                    return Err(format!(
+                        "[adaptive_dosing]: start_dose must be finite and >= 0: {val}"
+                    ));
+                }
+                start_dose = Some(d);
+            }
+            "route" => route = Some(parse_adaptive_route(val)?),
+            "dose_bounds" => {
+                let b = parse_float_array(val)
+                    .map_err(|e| format!("[adaptive_dosing]: bad dose_bounds: {e}"))?;
+                if b.len() != 2 {
+                    return Err(format!(
+                        "[adaptive_dosing]: dose_bounds must be `[low, high]`: {val}"
+                    ));
+                }
+                let (lo, hi) = (b[0], b[1]);
+                if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi < lo {
+                    return Err(format!(
+                        "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: {val}"
+                    ));
+                }
+                dose_bounds = Some((lo, hi));
+            }
+            "confirm" => {
+                let n: u32 = val.parse().map_err(|_| {
+                    format!("[adaptive_dosing]: bad confirm (expected a positive integer): {val}")
+                })?;
+                if n == 0 {
+                    return Err(
+                        "[adaptive_dosing]: confirm must be >= 1 (1 acts on the first breach)"
+                            .to_string(),
+                    );
+                }
+                confirm = n;
+            }
+            "levels" => {
+                let l = parse_float_array(val)
+                    .map_err(|e| format!("[adaptive_dosing]: bad levels: {e}"))?;
+                validate_increasing_finite(&l, "levels")?;
+                levels = Some(l);
+            }
+            other => return Err(format!("[adaptive_dosing]: unknown key `{other}`")),
+        }
+    }
+
+    // ── Required keys ──
+    // `observe` is *conditionally* required (a latent signal needs it; an
+    // assay-noised signal uses the model output instead) — `validate()` enforces
+    // the `observe` xor `with_assay_error` rule, so it stays an `Option` here.
+    let at = at.ok_or("[adaptive_dosing]: missing required `at` (decision schedule)")?;
+    let start_dose = start_dose.ok_or("[adaptive_dosing]: missing required `start_dose`")?;
+    let route = route.ok_or("[adaptive_dosing]: missing required `route`")?;
+    let dose_bounds = dose_bounds.ok_or("[adaptive_dosing]: missing required `dose_bounds`")?;
+    // Assemble the spec, then enforce every cross-field invariant in one place
+    // (`AdaptiveDosingSpec::validate`). The same validator runs again in
+    // `compile_adaptive`, so a programmatically-built spec can never reach the
+    // controller with a contradiction the parser would have rejected here.
+    let spec = AdaptiveDosingSpec {
+        observe,
+        with_assay_error,
+        assay_cmt,
+        at,
+        start_dose,
+        route,
+        dose_bounds,
+        confirm,
+        levels,
+        rules,
+    };
+    spec.validate()?;
+    Ok(spec)
+}
+
+/// Parse an `at =` decision schedule: either an explicit list `[t1, t2, …]` or an
+/// arithmetic sequence `every <Δ> from <t0> to <t1>` (inclusive), expanded to
+/// explicit times. The `to` bound is required (an open-ended schedule has no
+/// finite decision list); times must be finite and strictly increasing.
+fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
+    let v = val.trim();
+    if v.starts_with('[') {
+        if !v.ends_with(']') {
+            return Err(format!(
+                "[adaptive_dosing]: `at` list is missing its closing `]`: {val}"
+            ));
+        }
+        let times = parse_float_array(v).map_err(|e| format!("[adaptive_dosing]: bad at: {e}"))?;
+        validate_increasing_finite(&times, "`at` times")?;
+        // Strictly increasing ⇒ the first element is the minimum; reject a
+        // negative decision time (start_dose / dose_bounds reject < 0 too).
+        if times[0] < 0.0 {
+            return Err(format!("[adaptive_dosing]: `at` times must be >= 0: {val}"));
+        }
+        return Ok(times);
+    }
+    let toks: Vec<&str> = v.split_whitespace().collect();
+    if toks.len() != 6 || toks[0] != "every" || toks[2] != "from" || toks[4] != "to" {
+        return Err(format!(
+            "[adaptive_dosing]: `at` must be a list `[t1, t2, …]` or \
+             `every <Δ> from <t0> to <t1>`: {val}"
+        ));
+    }
+    let step: f64 = toks[1]
+        .parse()
+        .map_err(|_| format!("[adaptive_dosing]: bad `at` interval: {}", toks[1]))?;
+    let t0: f64 = toks[3]
+        .parse()
+        .map_err(|_| format!("[adaptive_dosing]: bad `at` start: {}", toks[3]))?;
+    let t1: f64 = toks[5]
+        .parse()
+        .map_err(|_| format!("[adaptive_dosing]: bad `at` end: {}", toks[5]))?;
+    if !step.is_finite() || step <= 0.0 {
+        return Err(format!(
+            "[adaptive_dosing]: `at` interval must be finite and > 0: {}",
+            toks[1]
+        ));
+    }
+    if !t0.is_finite() || !t1.is_finite() || t1 < t0 || t0 < 0.0 {
+        return Err(format!(
+            "[adaptive_dosing]: `at` range must be finite with 0 <= start <= end: {val}"
+        ));
+    }
+    // Relative tolerance so float division error (e.g. 1.0 / 0.1 = 9.999…8) does
+    // not drop the inclusive final time when `t1` is an exact multiple of `step`.
+    let ratio = (t1 - t0) / step;
+    let n_f = (ratio + 1e-9 * ratio.max(1.0)).floor();
+    if n_f > 100_000.0 {
+        // Hard parse-time expansion bound (avoids allocating a runaway `Vec` here);
+        // distinct from, and far above, the runtime `max_decisions` cap. Tighten the
+        // range or step rather than relying on either as a policy knob.
+        return Err(
+            "[adaptive_dosing]: `at` schedule expands to too many decision times (> 100000); \
+             tighten the range or step"
+                .to_string(),
+        );
+    }
+    let n = n_f as usize;
+    // Index-based expansion (t0 + i·Δ) avoids accumulating floating-point drift.
+    let times: Vec<f64> = (0..=n).map(|i| t0 + i as f64 * step).collect();
+    Ok(times)
+}
+
+/// Parse a `route =` value: `bolus(cmt = N)` or `infuse(cmt = N, over = T)`.
+fn parse_adaptive_route(val: &str) -> Result<AdaptiveRoute, String> {
+    let v = val.trim();
+    let (kind, args) = v
+        .strip_suffix(')')
+        .and_then(|s| s.split_once('('))
+        .ok_or_else(|| {
+            format!(
+                "[adaptive_dosing]: route must be `bolus(cmt=N)` or `infuse(cmt=N, over=T)`: {val}"
+            )
+        })?;
+    let mut cmt: Option<usize> = None;
+    let mut over: Option<f64> = None;
+    for arg in args.split(',') {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            continue;
+        }
+        let (k, x) = arg.split_once('=').ok_or_else(|| {
+            format!("[adaptive_dosing]: bad route argument `{arg}` (expected key = value)")
+        })?;
+        match (k.trim(), x.trim()) {
+            ("cmt", x) => {
+                let c: usize = x
+                    .parse()
+                    .map_err(|_| format!("[adaptive_dosing]: bad route cmt: {x}"))?;
+                if c == 0 {
+                    return Err(
+                        "[adaptive_dosing]: route cmt is 1-based and must be >= 1".to_string()
+                    );
+                }
+                cmt = Some(c);
+            }
+            ("over", x) => {
+                let t: f64 = x
+                    .parse()
+                    .map_err(|_| format!("[adaptive_dosing]: bad route over: {x}"))?;
+                if !t.is_finite() || t <= 0.0 {
+                    return Err(format!(
+                        "[adaptive_dosing]: route over (infusion duration) must be finite and > 0: {x}"
+                    ));
+                }
+                over = Some(t);
+            }
+            (other, _) => {
+                return Err(format!(
+                    "[adaptive_dosing]: unknown route argument `{other}`"
+                ))
+            }
+        }
+    }
+    let cmt = cmt.ok_or_else(|| {
+        format!(
+            "[adaptive_dosing]: route `{}` requires cmt = N",
+            kind.trim()
+        )
+    })?;
+    match kind.trim() {
+        "bolus" => {
+            if over.is_some() {
+                return Err(
+                    "[adaptive_dosing]: bolus route does not take `over` (use infuse)".to_string(),
+                );
+            }
+            Ok(AdaptiveRoute::Bolus { cmt })
+        }
+        "infuse" => {
+            let over = over
+                .ok_or("[adaptive_dosing]: infuse route requires over = T (infusion duration)")?;
+            Ok(AdaptiveRoute::Infuse { cmt, over })
+        }
+        other => Err(format!(
+            "[adaptive_dosing]: unknown route `{other}` (expected bolus or infuse)"
+        )),
+    }
+}
+
+/// Parse the body of a `when …` rule line (everything after `when `):
+/// `<signal-condition> : <action>`.
+fn parse_adaptive_rule(rest: &str) -> Result<AdaptiveRule, String> {
+    let (cond, action) = rest.split_once(':').ok_or_else(|| {
+        format!(
+            "[adaptive_dosing]: rule must be `when <signal> <op> <value> : <action>`: when {rest}"
+        )
+    })?;
+    let (op, threshold) = parse_signal_condition(cond.trim())?;
+    let action = parse_rule_action(action.trim())?;
+    Ok(AdaptiveRule {
+        op,
+        threshold,
+        action,
+    })
+}
+
+/// Parse `signal <op> <value>` where `<op>` is one of `< <= > >= ==`.
+fn parse_signal_condition(cond: &str) -> Result<(Comparison, f64), String> {
+    let rest = cond.trim().strip_prefix("signal").ok_or_else(|| {
+        format!("[adaptive_dosing]: rule condition must compare `signal`: {cond}")
+    })?;
+    let rest = rest.trim_start();
+    // Two-character operators first so `<=`/`>=` aren't read as `<`/`>`.
+    let (op, num) = if let Some(r) = rest.strip_prefix("<=") {
+        (Comparison::Le, r)
+    } else if let Some(r) = rest.strip_prefix(">=") {
+        (Comparison::Ge, r)
+    } else if let Some(r) = rest.strip_prefix("==") {
+        (Comparison::Eq, r)
+    } else if let Some(r) = rest.strip_prefix('<') {
+        (Comparison::Lt, r)
+    } else if let Some(r) = rest.strip_prefix('>') {
+        (Comparison::Gt, r)
+    } else {
+        return Err(format!(
+            "[adaptive_dosing]: rule needs a comparison operator (< <= > >= ==): {cond}"
+        ));
+    };
+    let threshold: f64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("[adaptive_dosing]: bad rule threshold: {}", num.trim()))?;
+    if !threshold.is_finite() {
+        return Err(format!(
+            "[adaptive_dosing]: rule threshold must be finite: {cond}"
+        ));
+    }
+    Ok((op, threshold))
+}
+
+/// Parse a rule action: `increase N%` / `decrease N%` (continuous), bare
+/// `increase` / `decrease` (one discrete level), `hold`, or `stop`.
+fn parse_rule_action(action: &str) -> Result<AdaptiveAction, String> {
+    let a = action.trim();
+    match a {
+        "hold" => return Ok(AdaptiveAction::Hold),
+        "stop" => return Ok(AdaptiveAction::Stop),
+        "" => return Err("[adaptive_dosing]: rule has no action after `:`".to_string()),
+        _ => {}
+    }
+    let (verb, operand) = match a.split_once(char::is_whitespace) {
+        Some((v, o)) => (v, o.trim()),
+        None => (a, ""),
+    };
+    let step = if operand.is_empty() {
+        DoseStep::Level
+    } else {
+        let pct = operand.strip_suffix('%').ok_or_else(|| {
+            format!("[adaptive_dosing]: dose change must be a percentage like `25%` (or bare for a level step): {action}")
+        })?;
+        let p: f64 = pct
+            .trim()
+            .parse()
+            .map_err(|_| format!("[adaptive_dosing]: bad percentage in action: {action}"))?;
+        if !p.is_finite() || p < 0.0 {
+            return Err(format!(
+                "[adaptive_dosing]: percentage must be finite and >= 0: {action}"
+            ));
+        }
+        DoseStep::Percent(p)
+    };
+    match verb {
+        "increase" => Ok(AdaptiveAction::Increase(step)),
+        "decrease" => Ok(AdaptiveAction::Decrease(step)),
+        other => Err(format!(
+            "[adaptive_dosing]: unknown action `{other}` (expected increase/decrease/hold/stop): {action}"
+        )),
+    }
+}
+
 // ── [fit_options] block parser ──────────────────────────────────────────────
 
 fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
@@ -4759,8 +5152,10 @@ fn parse_initial_conditions_block(
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
 /// the uniform and per-CMT paths.
-fn build_y_output_fn(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_y_output_fn(
     value: &str,
+    context: &str,
     theta_names: &[String],
     eta_names: &[String],
     indiv_var_names: &[String],
@@ -4777,7 +5172,7 @@ fn build_y_output_fn(
         }
     }
     let ctx = ParseCtx::new(theta_names, eta_names, &defined);
-    let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {}", e))?;
+    let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("{context}: {e}"))?;
 
     // Reject KAPPA_* (IOV) references in a Form C ODE output expression: the
     // readout is evaluated once per observation with a single eta, so under IOV
@@ -4789,7 +5184,7 @@ fn build_y_output_fn(
     // occasion-dependent structural parameter (e.g. CL) instead.
     if let Some(name) = expr_references_kappa(&expr, kappa_names) {
         return Err(format!(
-            "[scaling] y: Form C output expressions cannot reference the IOV \
+            "{context}: Form C output expressions cannot reference the IOV \
              parameter `{name}` — the ODE readout is evaluated per observation and \
              would see kappa = 0. Reference the occasion-dependent structural \
              parameter (e.g. CL) instead. See issue #107."
@@ -5078,6 +5473,7 @@ fn parse_scaling_block(
                 }
                 let (out_fn, out_program, cov_names) = build_y_output_fn(
                     value,
+                    "[scaling] y",
                     theta_names,
                     eta_names,
                     indiv_var_names,
@@ -24188,5 +24584,535 @@ CL V KA WT
             err.starts_with("[simulation]:") && err.contains("horizon"),
             "got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod adaptive_dosing_tests {
+    use super::*;
+
+    fn lines(body: &[&str]) -> Vec<String> {
+        body.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A minimal block that parses — the base every "one thing wrong" error test
+    /// mutates. Continuous (percentage) titration, bare-endpoint observe.
+    fn valid_min() -> Vec<&'static str> {
+        vec![
+            "observe = central",
+            "at = [24, 48]",
+            "start_dose = 100",
+            "route = bolus(cmt = 1)",
+            "dose_bounds = [0, 400]",
+            "when signal < 10 : increase 25%",
+        ]
+    }
+
+    /// `valid_min` with every line starting with `prefix` removed.
+    fn without(prefix: &str) -> Vec<String> {
+        valid_min()
+            .into_iter()
+            .filter(|l| !l.starts_with(prefix))
+            .map(String::from)
+            .collect()
+    }
+
+    fn perr(body: &[&str]) -> String {
+        parse_adaptive_dosing_block(&lines(body)).expect_err("expected a typed parse error")
+    }
+
+    // ── Happy paths ──
+
+    #[test]
+    fn full_continuous_block_parses() {
+        let spec = parse_adaptive_dosing_block(&lines(&[
+            "observe = central / V",
+            "at = every 24 from 24 to 96",
+            "start_dose = 100",
+            "route = bolus(cmt = 1)",
+            "dose_bounds = [0, 400]",
+            "confirm = 2",
+            "when signal < 10 : increase 25%",
+            "when signal > 20 : decrease 25%",
+            "when signal > 30 : hold",
+            "when signal > 40 : stop",
+        ]))
+        .expect("canonical block parses");
+        assert_eq!(spec.observe.as_deref(), Some("central / V"));
+        assert!(!spec.with_assay_error);
+        assert_eq!(spec.assay_cmt, None);
+        assert_eq!(spec.at, vec![24.0, 48.0, 72.0, 96.0]);
+        assert_eq!(spec.start_dose, 100.0);
+        assert_eq!(spec.route, AdaptiveRoute::Bolus { cmt: 1 });
+        assert_eq!(spec.dose_bounds, (0.0, 400.0));
+        assert_eq!(spec.confirm, 2);
+        assert_eq!(spec.levels, None);
+        assert_eq!(spec.rules.len(), 4);
+        assert_eq!(
+            spec.rules[0],
+            AdaptiveRule {
+                op: Comparison::Lt,
+                threshold: 10.0,
+                action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+            }
+        );
+        assert_eq!(
+            spec.rules[1].action,
+            AdaptiveAction::Decrease(DoseStep::Percent(25.0))
+        );
+        assert_eq!(spec.rules[1].op, Comparison::Gt);
+        assert_eq!(spec.rules[2].action, AdaptiveAction::Hold);
+        assert_eq!(spec.rules[3].action, AdaptiveAction::Stop);
+    }
+
+    #[test]
+    fn minimal_block_parses_with_defaults() {
+        let spec = parse_adaptive_dosing_block(&without("nothing")).expect("valid_min parses");
+        // Optional keys take their documented defaults.
+        assert_eq!(spec.confirm, 1);
+        assert!(!spec.with_assay_error);
+        assert_eq!(spec.assay_cmt, None);
+        assert_eq!(spec.levels, None);
+    }
+
+    #[test]
+    fn at_explicit_list_is_honored() {
+        let spec = parse_adaptive_dosing_block(&{
+            let mut b = without("at");
+            b.push("at = [24, 48, 72]".into());
+            b
+        })
+        .expect("explicit at list parses");
+        assert_eq!(spec.at, vec![24.0, 48.0, 72.0]);
+    }
+
+    #[test]
+    fn at_every_from_to_expands_inclusive() {
+        let spec = parse_adaptive_dosing_block(&{
+            let mut b = without("at");
+            b.push("at = every 12 from 12 to 48".into());
+            b
+        })
+        .expect("every-from-to parses");
+        assert_eq!(spec.at, vec![12.0, 24.0, 36.0, 48.0]);
+    }
+
+    #[test]
+    fn all_comparison_operators_parse() {
+        let spec = parse_adaptive_dosing_block(&lines(&[
+            "observe = central",
+            "at = [24]",
+            "start_dose = 100",
+            "route = bolus(cmt = 1)",
+            "dose_bounds = [0, 400]",
+            "when signal < 1 : hold",
+            "when signal <= 2 : hold",
+            "when signal > 3 : hold",
+            "when signal >= 4 : hold",
+            "when signal == 5 : hold",
+        ]))
+        .expect("all operators parse");
+        let ops: Vec<Comparison> = spec.rules.iter().map(|r| r.op).collect();
+        assert_eq!(
+            ops,
+            vec![
+                Comparison::Lt,
+                Comparison::Le,
+                Comparison::Gt,
+                Comparison::Ge,
+                Comparison::Eq,
+            ]
+        );
+    }
+
+    #[test]
+    fn discrete_levels_block_parses() {
+        let spec = parse_adaptive_dosing_block(&lines(&[
+            "observe = neutrophils",
+            "at = [24, 48]",
+            "start_dose = 100",
+            "route = bolus(cmt = 1)",
+            "dose_bounds = [0, 200]",
+            "levels = [50, 100, 150, 200]",
+            "when signal < 1 : increase",
+            "when signal > 3 : decrease",
+        ]))
+        .expect("discrete levels block parses");
+        assert_eq!(spec.levels, Some(vec![50.0, 100.0, 150.0, 200.0]));
+        assert_eq!(
+            spec.rules[0].action,
+            AdaptiveAction::Increase(DoseStep::Level)
+        );
+        assert_eq!(
+            spec.rules[1].action,
+            AdaptiveAction::Decrease(DoseStep::Level)
+        );
+    }
+
+    #[test]
+    fn infuse_route_parses() {
+        let spec = parse_adaptive_dosing_block(&{
+            let mut b = without("route");
+            b.push("route = infuse(cmt = 2, over = 1.5)".into());
+            b
+        })
+        .expect("infuse route parses");
+        assert_eq!(spec.route, AdaptiveRoute::Infuse { cmt: 2, over: 1.5 });
+    }
+
+    #[test]
+    fn assay_error_names_output_parses() {
+        // With assay error the signal is the noised model output named by
+        // `assay_cmt` — there is no `observe` expression to re-type.
+        let spec = parse_adaptive_dosing_block(&lines(&[
+            "with_assay_error = true",
+            "assay_cmt = 2",
+            "at = [24]",
+            "start_dose = 100",
+            "route = bolus(cmt = 1)",
+            "dose_bounds = [0, 400]",
+            "when signal < 10 : increase 25%",
+        ]))
+        .expect("assay error naming the output parses");
+        assert!(spec.with_assay_error);
+        assert_eq!(spec.assay_cmt, Some(2));
+        assert_eq!(spec.observe, None);
+    }
+
+    // ── Typed-error matrix (no happy paths) ──
+
+    fn assert_adaptive_err(err: &str, needle: &str) {
+        assert!(
+            err.starts_with("[adaptive_dosing]:") && err.contains(needle),
+            "expected an [adaptive_dosing] error containing {needle:?}, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_errors() {
+        assert_adaptive_err(&perr(&["foo = 1"]), "unknown key");
+    }
+
+    #[test]
+    fn malformed_line_errors() {
+        assert_adaptive_err(&perr(&["this is not a key value pair"]), "malformed line");
+    }
+
+    #[test]
+    fn missing_required_keys_error() {
+        // `observe` is conditionally required (it is the latent signal), so it is
+        // covered by the signal-source matrix below, not here.
+        for (prefix, needle) in [
+            ("at", "missing required `at`"),
+            ("start_dose", "missing required `start_dose`"),
+            ("route", "missing required `route`"),
+            ("dose_bounds", "missing required `dose_bounds`"),
+        ] {
+            let err = parse_adaptive_dosing_block(&without(prefix)).unwrap_err();
+            assert_adaptive_err(&err, needle);
+        }
+    }
+
+    #[test]
+    fn signal_source_matrix_errors() {
+        // No signal (drop `observe`, no assay error).
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&without("observe")).unwrap_err(),
+            "a signal is required",
+        );
+        // Both an observe expression and assay error.
+        let mut both = without("nothing"); // full valid block (observe present)…
+        both.push("with_assay_error = true".into());
+        both.push("assay_cmt = 1".into());
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&both).unwrap_err(),
+            "remove `observe`",
+        );
+        // Assay error without naming the measured output.
+        let mut no_cmt = without("observe");
+        no_cmt.push("with_assay_error = true".into());
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&no_cmt).unwrap_err(),
+            "requires `assay_cmt",
+        );
+    }
+
+    #[test]
+    fn no_rules_errors() {
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&without("when")).unwrap_err(),
+            "rule",
+        );
+    }
+
+    #[test]
+    fn dose_bounds_problems_error() {
+        let mk = |bounds: &str| {
+            let mut b = without("dose_bounds");
+            b.push(format!("dose_bounds = {bounds}"));
+            parse_adaptive_dosing_block(&b).unwrap_err()
+        };
+        assert_adaptive_err(&mk("[400, 0]"), "0 <= low <= high"); // inverted
+        assert_adaptive_err(&mk("[-1, 400]"), "0 <= low <= high"); // negative low
+        assert_adaptive_err(&mk("[0, 100, 200]"), "[low, high]"); // wrong length
+    }
+
+    #[test]
+    fn start_dose_outside_bounds_errors() {
+        let mut b = without("start_dose");
+        b.push("start_dose = 500".into()); // bounds are [0, 400]
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&b).unwrap_err(),
+            "outside dose_bounds",
+        );
+    }
+
+    #[test]
+    fn levels_outside_dose_bounds_error() {
+        // start_dose is in both `levels` and `dose_bounds`, but a rung exceeds the
+        // high bound — `step_dose` would clamp the dose while the rung index keeps
+        // advancing, decoupling the decision log from the realized dose.
+        let err = parse_adaptive_dosing_block(&lines(&[
+            "observe = central",
+            "at = [24]",
+            "start_dose = 100",
+            "route = bolus(cmt = 1)",
+            "dose_bounds = [0, 120]",
+            "levels = [100, 150, 200]",
+            "when signal < 10 : increase",
+        ]))
+        .unwrap_err();
+        assert_adaptive_err(&err, "outside dose_bounds");
+    }
+
+    #[test]
+    fn schedule_negative_times_error() {
+        // `start_dose` / `dose_bounds` reject < 0; `at` must too, on both forms.
+        let mk = |at: &str| {
+            let mut b = without("at");
+            b.push(format!("at = {at}"));
+            parse_adaptive_dosing_block(&b).unwrap_err()
+        };
+        assert_adaptive_err(&mk("[-24, 0, 24]"), ">= 0");
+        assert_adaptive_err(&mk("every 24 from -24 to 24"), "0 <= start <= end");
+    }
+
+    #[test]
+    fn schedule_unclosed_bracket_errors() {
+        // `[24, 48` (no closing `]`) was silently accepted as [24, 48].
+        let mut b = without("at");
+        b.push("at = [24, 48".into());
+        assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "closing `]`");
+    }
+
+    #[test]
+    fn schedule_every_keeps_inclusive_endpoint_for_decimal_step() {
+        // 0.3 / 0.1 = 2.999…6 in f64; a bare floor() drops the inclusive endpoint.
+        let mk = |at: &str| {
+            let mut b = without("at");
+            b.push(format!("at = {at}"));
+            parse_adaptive_dosing_block(&b).expect("schedule parses").at
+        };
+        let decimal = mk("every 0.1 from 0 to 0.3");
+        assert_eq!(
+            decimal.len(),
+            4,
+            "expected the inclusive 0.3, got {decimal:?}"
+        );
+        assert!((decimal.last().unwrap() - 0.3).abs() < 1e-12);
+        // A non-multiple endpoint stays excluded (last point < t1, no spurious add).
+        assert_eq!(
+            mk("every 24 from 0 to 100"),
+            vec![0.0, 24.0, 48.0, 72.0, 96.0]
+        );
+    }
+
+    #[test]
+    fn confirm_zero_errors() {
+        let mut b = without("nothing");
+        b.push("confirm = 0".into());
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&b).unwrap_err(),
+            "confirm must be >= 1",
+        );
+    }
+
+    #[test]
+    fn assay_cmt_without_assay_error_errors() {
+        let mut b = without("nothing");
+        b.push("assay_cmt = 2".into());
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&b).unwrap_err(),
+            "with_assay_error = false",
+        );
+    }
+
+    #[test]
+    fn mixed_percent_and_levels_errors() {
+        let err = perr(&[
+            "observe = central",
+            "at = [24]",
+            "start_dose = 100",
+            "route = bolus(cmt = 1)",
+            "dose_bounds = [0, 200]",
+            "levels = [50, 100, 150]",
+            "when signal < 10 : increase 25%", // percentage with levels declared
+        ]);
+        assert_adaptive_err(&err, "not");
+    }
+
+    #[test]
+    fn bare_level_step_without_levels_errors() {
+        let err = perr(&[
+            "observe = central",
+            "at = [24]",
+            "start_dose = 100",
+            "route = bolus(cmt = 1)",
+            "dose_bounds = [0, 400]",
+            "when signal < 10 : increase", // level step, no levels ladder
+        ]);
+        assert_adaptive_err(&err, "requires a `levels");
+    }
+
+    #[test]
+    fn start_dose_not_a_level_errors() {
+        let err = perr(&[
+            "observe = central",
+            "at = [24]",
+            "start_dose = 120",
+            "route = bolus(cmt = 1)",
+            "dose_bounds = [0, 200]",
+            "levels = [50, 100, 150, 200]",
+            "when signal < 10 : increase",
+        ]);
+        assert_adaptive_err(&err, "one of the declared levels");
+    }
+
+    #[test]
+    fn levels_not_strictly_increasing_errors() {
+        let mut b = without("nothing");
+        b.push("levels = [50, 50, 100]".into());
+        b.push("when signal < 10 : increase".into()); // make it a level block
+                                                      // valid_min already has a percentage rule; drop it so only level steps remain.
+        let b: Vec<String> = b.into_iter().filter(|l| !l.contains("25%")).collect();
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&b).unwrap_err(),
+            "strictly increasing",
+        );
+    }
+
+    #[test]
+    fn rule_condition_must_compare_signal() {
+        let mut b = without("when");
+        b.push("when conc < 10 : hold".into());
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&b).unwrap_err(),
+            "compare `signal`",
+        );
+    }
+
+    #[test]
+    fn rule_missing_operator_errors() {
+        let mut b = without("when");
+        b.push("when signal 10 : hold".into());
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&b).unwrap_err(),
+            "comparison operator",
+        );
+    }
+
+    #[test]
+    fn rule_missing_action_colon_errors() {
+        let mut b = without("when");
+        b.push("when signal < 10".into());
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&b).unwrap_err(),
+            "when <signal>",
+        );
+    }
+
+    #[test]
+    fn unknown_action_errors() {
+        let mut b = without("when");
+        b.push("when signal < 10 : obliterate".into());
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&b).unwrap_err(),
+            "unknown action",
+        );
+    }
+
+    #[test]
+    fn percentage_missing_percent_sign_errors() {
+        let mut b = without("when");
+        b.push("when signal < 10 : increase 25".into()); // no % and not bare → not a level
+                                                         // `increase 25` has an operand `25` that is not a percentage.
+        assert_adaptive_err(&parse_adaptive_dosing_block(&b).unwrap_err(), "percentage");
+    }
+
+    #[test]
+    fn route_problems_error() {
+        let mk = |route: &str| {
+            let mut b = without("route");
+            b.push(format!("route = {route}"));
+            parse_adaptive_dosing_block(&b).unwrap_err()
+        };
+        assert_adaptive_err(&mk("squirt(cmt = 1)"), "unknown route");
+        assert_adaptive_err(&mk("bolus(cmt = 1, over = 2)"), "bolus route does not take");
+        assert_adaptive_err(&mk("infuse(cmt = 1)"), "infuse route requires over");
+        assert_adaptive_err(&mk("bolus()"), "requires cmt");
+        assert_adaptive_err(&mk("bolus(cmt = 0)"), "1-based");
+        assert_adaptive_err(&mk("bolus(cmt = 1, dose = 5)"), "unknown route argument");
+        assert_adaptive_err(&mk("bolus cmt 1"), "bolus(cmt=N)");
+    }
+
+    #[test]
+    fn at_problems_error() {
+        let mk = |at: &str| {
+            let mut b = without("at");
+            b.push(format!("at = {at}"));
+            parse_adaptive_dosing_block(&b).unwrap_err()
+        };
+        assert_adaptive_err(&mk("every 24 from 24"), "every <"); // missing `to`
+        assert_adaptive_err(&mk("[48, 24]"), "strictly increasing"); // out of order
+        assert_adaptive_err(
+            &mk("every 0 from 24 to 96"),
+            "interval must be finite and > 0",
+        );
+    }
+
+    // ── End-to-end wiring: the block reaches ParsedModel ──
+
+    const MODEL_HEAD: &str = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn parsed_model_carries_adaptive_dosing_block() {
+        let with_block = format!(
+            "{MODEL_HEAD}\n[adaptive_dosing]\n  observe = central / V\n  at = every 24 from 24 to 96\n  start_dose = 100\n  route = bolus(cmt = 1)\n  dose_bounds = [0, 400]\n  when signal < 10 : increase 25%\n"
+        );
+        let parsed = parse_full_model(&with_block).expect("model with [adaptive_dosing] parses");
+        let spec = parsed
+            .adaptive_dosing
+            .expect("the block must attach to ParsedModel");
+        assert_eq!(spec.start_dose, 100.0);
+        assert_eq!(spec.at.len(), 4);
+    }
+
+    #[test]
+    fn parsed_model_without_block_is_none() {
+        let parsed = parse_full_model(MODEL_HEAD).expect("plain model parses");
+        assert!(parsed.adaptive_dosing.is_none());
     }
 }

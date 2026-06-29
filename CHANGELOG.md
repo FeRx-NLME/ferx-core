@@ -86,6 +86,16 @@ section of the SDLC for the versioning policy).
   per-purpose RNG substream keyed by `(subject, replicate, decision, analyte)`, so they are
   deterministic under a fixed seed, invariant to subject ordering, and never perturb another
   monitor's (or η's) draws.
+- **Declarative `[adaptive_dosing]` model-file block — `simulate_adaptive_from_spec()`**
+  (#584, epic #391). A reactive dosing *policy* can now be written in the model file — an
+  `observe` signal expression, a decision schedule (`at`), `start_dose` / `route` /
+  `dose_bounds`, an optional `confirm` debounce and discrete `levels` ladder, and a
+  first-match-wins ladder of `when signal <op> value : increase/decrease/hold/stop` rules —
+  and run with `simulate_adaptive_from_spec()`, no controller code required. It compiles to
+  the same reactive engine, dose ledger, decision log, RNG substreams, and frozen-replay
+  verifier as the programmatic `simulate_adaptive()`; titrating on the assay-noised
+  measurement (`with_assay_error`) reuses the `Dv` substream. Example
+  `examples/adaptive_tdm_titration.ferx`. See [Adaptive dosing](model-file/adaptive-dosing.qmd).
 - Warn when no estimation method is set in the model file's `[fit_options]` or by
   the caller, making the implicit fallback to FOCEI visible instead of silent (#558).
 - Support NONMEM-style `block_sigma` residual covariance under SAEM for ordinary
@@ -246,6 +256,13 @@ section of the SDLC for the versioning policy).
   combination with a steady-state dose (`W_STEADY_STATE_INIT`) or a compartment
   `[derived]` reference (`W_DERIVED_INIT_ANALYTICAL`) warns rather than silently
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
+- **Datasets whose TIME column does not start at zero** (#573). ODE models now
+  begin integration at each subject's first record (matching NONMEM) instead of
+  at a fixed `t = 0`, so a subject whose first TIME is off-zero is no longer
+  integrated over a phantom `[0, first_record]` window. TIME stays on the raw
+  data clock everywhere — the model `TIME`/`T` builtin, `[derived]` columns,
+  sdtab/predict/simulate output, and the survival left-truncation `TENTRY` all
+  report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
 - **Joint PK-TTE fit now rejects a non-monotone (negative) cumulative hazard** (#564).
@@ -255,6 +272,21 @@ section of the SDLC for the versioning policy).
   objective that could pull the optimizer into the ill-posed region); they now return the
   same `1e20` sentinel as the other ill-defined cases. This matches the simulation path,
   which already hard-errors on a non-monotone cumulative hazard.
+- ODE+IOV fits now report their actual analytic-vs-finite-difference inner-gradient route,
+  including subject-level fallback reasons, instead of using the non-IOV gradient probe
+  for diagnostics (#590).
+- ODE+IOV models with an expression `[scaling] obs_scale` and time-varying covariates
+  now stay on the analytic inner/outer gradient route instead of falling back to finite
+  differences (#590).
+- ODE+IOV models with EVID=2 covariate-only breakpoints now keep analytic inner/outer
+  gradients when otherwise in scope; the breakpoint updates the ODE segment PK snapshot
+  with κ fixed at zero, matching production prediction semantics (#590).
+- ODE+IOV models with many occasion blocks or dose-only occasions now keep analytic
+  inner/outer gradients when otherwise in scope, covering per-subject stacks up to 96
+  axes (#590).
+- Wide ODE+IOV analytic gradients now run on larger Rayon worker stacks, avoiding
+  native stack-overflow crashes in R/CLI release builds for PNA-scale occasion counts
+  (#590).
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on
   the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
   mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to
@@ -305,6 +337,27 @@ section of the SDLC for the versioning policy).
   residual covariance matrix, use shifted times when pairing reset-segment
   residual blocks, and keep FREM CWRES variances unscaled by `iiv_on_ruv`
   (#549).
+- **Inner EBE optimizer no longer spuriously fails on ODE objectives, fixing a wrong OFV
+  for η-dependent `[scaling] obs_scale` models** (#555). The per-subject empirical-Bayes
+  BFGS stopped only on its gradient norm, but an adaptive-ODE-solver objective puts a
+  noise floor on the gradient that can sit above the inner tolerance — so a search that
+  had already reached the mode spun to `max_iter` and reported failure. The inner loop
+  then discarded the correct estimate and restarted Nelder–Mead from η=0, which on a
+  multimodal inner objective (e.g. `obs_scale = V1` with `V1 = … · exp(ETA_V1)`) settled
+  in a worse local minimum and inflated the FOCEI objective (≈370 OFV on the
+  `two_cpt_oral_cov` example; its analytical twin was unaffected). Two changes fix it, both
+  scoped to ODE objectives so analytical, event-driven, FREM and finite-difference fits stay
+  bit-identical to before: for ODE models the inner fallback (both the BSV and the IOV paths)
+  now keeps the **lower-objective** of the BFGS partial and the Nelder–Mead restart instead
+  of blindly overwriting with NM, and the inner BFGS gained an objective-stall stop so it
+  converges at the mode rather than spinning. Exact objectives have no gradient-noise floor,
+  so a BFGS failure there is genuine non-convergence and the historical NM-from-η=0 recovery
+  is retained. The ODE form's OFV-at-init now matches its analytical twin (`−1193.59`,
+  previously `−823.05`), at the default ODE tolerance, and affected subjects converge in far
+  fewer inner iterations. *Note:* with `ebe_warm_start` off (the default), an **ODE** fit that
+  hits the inner fallback with a BFGS partial that beats the η=0 restart now returns that
+  partial rather than the NM-from-0 result, so a previously fallback-stalled EBE/OFV may shift
+  toward the better optimum.
 - **Form C (`[scaling] y = <expr>`) ODE readouts now use per-observation covariate
   snapshots** (#535, #538). The explicit-output readout is evaluated against the
   covariate values on each observation's own data row rather than the subject's

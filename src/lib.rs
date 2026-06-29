@@ -22,9 +22,10 @@ pub mod types;
 pub use api::{
     check_model_data, check_model_data_warnings, check_model_options, fit, fit_from_files, predict,
     run_from_file, run_model_simulate, run_model_with_data, run_model_with_data_inits, simulate,
-    simulate_adaptive, simulate_with_options, simulate_with_seed, simulate_with_uncertainty,
-    validate_model_file, AdaptiveSimulateOptions, AdaptiveSimulationResult, PredictionResult,
-    SimulateOptions, SimulateUncertaintyOptions, SimulationResult,
+    simulate_adaptive, simulate_adaptive_from_spec, simulate_with_options, simulate_with_seed,
+    simulate_with_uncertainty, validate_model_file, AdaptiveSimulateOptions,
+    AdaptiveSimulationResult, PredictionResult, SimulateOptions, SimulateUncertaintyOptions,
+    SimulationResult,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, Severity};
@@ -39,7 +40,8 @@ pub use propensity_match::MatchMethod;
 // of `AdaptiveSimulationResult` (`ledger` / `decisions`) — is usable without
 // reaching into the `sim::adaptive` module path.
 pub use sim::adaptive::{
-    ControllerCtx, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry, MonitorSpec,
+    AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
+    DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry, DoseStep, MonitorSpec,
     ObserveMode, ObservedSignal,
 };
 pub use suggest_start::{inits_from_nca, NcaInit, SuggestedStart};

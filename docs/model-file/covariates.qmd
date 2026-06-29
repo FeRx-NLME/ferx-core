@@ -87,12 +87,12 @@ taken at that event's covariate snapshot), rather than falling back to finite
 differences. Covariate changes carried by EVID=2 records between observations are
 supported, as are combinations with EVID 3/4 resets, **steady-state dosing**, a
 **constant `obs_scale` divisor**, and **inter-occasion variability (IOV)** (the
-covariate and κ both switch the individual parameters across occasions). Two
-combinations still fall back to the finite-difference gradient: time-varying
-covariates with **dose lagtime**, and time-varying covariates with
-**expression-based output scaling** (`obs_scale = <expr>` that references
-parameters or covariates). (See [FOCE/FOCEI](../estimation/foce.qmd) for the
-optimizer/gradient interaction.)
+covariate and κ both switch the individual parameters across occasions, including
+subject-static expression `obs_scale` divisors since #590). Two combinations still
+fall back to the finite-difference gradient: time-varying covariates with **dose
+lagtime**, and non-IOV ODE time-varying covariates with **expression-based output
+scaling** (`obs_scale = <expr>` that references parameters or covariates). (See
+[FOCE/FOCEI](../estimation/foce.qmd) for the optimizer/gradient interaction.)
 
 ## Covariate table
 

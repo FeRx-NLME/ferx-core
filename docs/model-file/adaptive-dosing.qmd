@@ -9,9 +9,98 @@ A plain [simulation](simulation.qmd) is a pure forward pass: every dose is fixed
 before integration. Here a *controller* is consulted at a schedule of decision
 times, reads the current state, and chooses what to do next.
 
-This page documents the first slice (epic #391): a **programmatic** entry point,
-`simulate_adaptive()`. The declarative `[adaptive_dosing]` model-file block and
-multi-model composition are on the roadmap and not yet available.
+There are two ways to drive a controller, and they compile to the **same**
+reactive engine — the same dose ledger, decision log, RNG substreams, and
+frozen-replay verifier (epic #391):
+
+- the declarative **`[adaptive_dosing]` model-file block**, run with
+  [`simulate_adaptive_from_spec()`] — the file-driven path, documented next;
+- the **programmatic** [`simulate_adaptive()`], which takes a hand-written
+  controller closure — the lower-level path, documented under
+  [The controller](#the-controller).
+
+Multi-model composition (PK + PD + safety) and an imperative `[dose_control]`
+block remain on the roadmap.
+
+## The declarative `[adaptive_dosing]` block
+
+Put the policy in the model file and run it with
+[`simulate_adaptive_from_spec()`]. The block is **declarative** — a fixed dosing
+*policy* (trough < target → increase, grade 4 → stop), not a script — that rides
+with the run, never with a fitted model's parameters.
+
+```
+[adaptive_dosing]
+  observe     = central / V              # monitored signal: a derived expression
+  at          = every 24 from 0 to 168   # decision schedule (or an explicit list)
+  start_dose  = 100                      # dose issued at the first decision
+  route       = bolus(cmt=1)             # or: infuse(cmt=1, over=2)
+  dose_bounds = [0, 400]                 # every emitted dose is clamped here
+  confirm     = 2                        # act only after 2 consecutive breaches
+  when signal < 10 : increase 25%        # first matching rule wins
+  when signal > 20 : decrease 25%
+```
+
+### Keys
+
+| Key | Required | Meaning |
+|-----|:--------:|---------|
+| `observe` | signal¹ | The **latent** monitored signal — a free-form expression over states + individual parameters (e.g. `central / V` for concentration), titrated on with **no** measurement noise. Provide this *or* `with_assay_error`, never both. The `when` rules compare the keyword `signal` to its value. |
+| `at` | ✓ | Decision schedule on the subject clock: an explicit list `[0, 24, 48]` or an arithmetic sequence `every <Δ> from <t0> to <t1>` (inclusive). |
+| `start_dose` | ✓ | The dose issued at the first decision; seeds the running dose. |
+| `route` | ✓ | `bolus(cmt=N)` or `infuse(cmt=N, over=T)` (zero-order over duration `T`). |
+| `dose_bounds` | ✓ | Inclusive `[low, high]` clamp applied to every emitted dose. |
+| `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
+| `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. |
+| `with_assay_error` | signal¹ | Titrate on the **noised measurement** of a model output (named by `assay_cmt`) instead of a latent expression (default `false`). The signal's value comes from that output's `[scaling]` readout and its σ from that output's `[error_model]`, so the two are always on the same scale — there is no re-typed `observe` expression to mis-scale. Mutually exclusive with `observe`. |
+| `assay_cmt` | | The 1-based compartment of the model output measured under `with_assay_error` — its `[scaling]` readout is the signal value and its `[error_model]` σ the noise. **Required** with `with_assay_error`. |
+
+¹ **The signal source is exactly one of `observe` (a latent expression, un-noised) or `with_assay_error = true` + `assay_cmt` (a noised model output).** Setting both, or neither, is a parse error. Titrating on a *measured* quantity uses the model's own output (so its value and σ can never disagree on scale); titrating on a *derived latent* quantity (effect-site, a ratio — anything with no error model) uses `observe`.
+
+### Rules — `when signal <op> <value> : <action>`
+
+Rules are evaluated top to bottom and the **first match wins**, so order the
+most specific / most severe condition first. `<op>` is one of `< <= > >= ==`.
+
+| Action | Meaning |
+|--------|---------|
+| `increase N%` / `decrease N%` | Scale the running dose by ±N % (continuous titration). |
+| `increase` / `decrease` | Step one rung up / down a `levels` ladder. |
+| `hold` | Skip this decision's dose. |
+| `stop` | Discontinue all future dosing. |
+
+A dose change is clamped to `dose_bounds`; a level step saturates at the ends of
+the ladder. When no rule matches (or a matched rule has not yet `confirm`-ed),
+the running dose is **re-issued** unchanged — the regimen continues, an explicit
+no-op rather than a silent skip.
+
+### Running it
+
+```rust
+use ferx_core::{parse_full_model_file, simulate_adaptive_from_spec, AdaptiveSimulateOptions};
+use std::path::Path;
+
+let parsed = parse_full_model_file(Path::new("titration.ferx"))?;
+let spec = parsed
+    .adaptive_dosing
+    .as_ref()
+    .ok_or("model has no [adaptive_dosing] block")?;
+
+// The block owns the schedule and the monitor, so leave `decision_times` and
+// `monitors` empty here (setting either is a typed error); `seed` / `verify` /
+// `max_decisions` still apply.
+let opts = AdaptiveSimulateOptions { seed: Some(42), ..Default::default() };
+
+let result = simulate_adaptive_from_spec(
+    &parsed.model, &population, &parsed.model.default_params, 100, spec, &opts,
+)?;
+```
+
+The block compiles to exactly the controller, monitor, and engine described
+below, so every guarantee in [Monitors](#monitors) and
+[Verification](#verification-on-by-default) applies unchanged, and `result` is
+the same bundled `trajectories` / `ledger` / `decisions`. The lower-level
+programmatic API follows.
 
 ## The controller
 
@@ -135,9 +224,16 @@ family. It is validated instead by:
   a plain simulation of that regimen, bit-for-bit;
 - the **frozen-schedule replay** verifier above (an exact internal bookkeeping
   anchor);
+- the **three-witnesses** check — a declarative `[adaptive_dosing]` block and a
+  hand-written controller closure with the identical ladder realize the identical
+  ledger, decision log, and trajectory, byte-for-byte (so the block compiles to
+  exactly the engine the programmatic API exercises);
+- a **closed-loop** check — a titration that starts below its target band drives
+  the trough into the band and holds it there;
 - for genuinely reactive behaviour, reproduction of a published **mrgsolve**
   dynamic-dosing example (the apples-to-apples external comparator, since mrgsolve
-  does do feedback dosing) — landing with the declarative block.
+  does do feedback dosing) — the external anchor lands in a later slice of epic
+  #391.
 
 ## Current scope and limits
 
@@ -151,10 +247,15 @@ family. It is validated instead by:
   cross-endpoint (`block_sigma`) assay noise is a follow-up.
 - **Between-subject variability only** — η is drawn per subject/replicate;
   parameter-uncertainty propagation is a later layer.
-- **Programmatic API only** — the declarative `[adaptive_dosing]` block,
-  imperative `[dose_control]`, and PK+PD+safety model composition are roadmap.
+- **One monitored signal per block** — the declarative block titrates on a single
+  `observe`; multiple named per-analyte monitors (already supported by the
+  programmatic engine) are a declarative-surface follow-up.
+- **Roadmap** — per-subject outcome metrics on the result, the imperative
+  `[dose_control]` block, and PK + PD + safety model composition.
 
 [`ControllerCtx`]: https://docs.rs/ferx-core
 [`DoseAction`]: https://docs.rs/ferx-core
 [`MonitorSpec`]: https://docs.rs/ferx-core
 [`ObserveMode`]: https://docs.rs/ferx-core
+[`simulate_adaptive()`]: https://docs.rs/ferx-core
+[`simulate_adaptive_from_spec()`]: https://docs.rs/ferx-core

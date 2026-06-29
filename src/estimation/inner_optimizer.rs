@@ -1,10 +1,11 @@
 use crate::pk;
 use crate::stats::likelihood::{
-    individual_nll_into_with_schedule, individual_nll_iov, split_obs_by_occasion,
+    individual_nll_into_with_schedule, individual_nll_iov, iov_occasion_groups,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The inner-loop η-gradient route resolved for a subject. Reported in the
@@ -112,7 +113,7 @@ pub(crate) fn gradient_route_summary(
 ) -> String {
     let (mut analytic, mut fd) = (0usize, 0usize);
     for subject in &population.subjects {
-        match resolve_gradient_method(model, subject) {
+        match resolve_gradient_method_for_reporting(model, subject, &model.default_params.theta) {
             InnerGradientMethod::Analytic => analytic += 1,
             InnerGradientMethod::Fd => fd += 1,
         }
@@ -145,6 +146,94 @@ pub(crate) fn gradient_route_summary(
     format!("{resolved}  [requested: {requested_label}]")
 }
 
+fn resolve_gradient_method_for_reporting(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+) -> InnerGradientMethod {
+    if model.n_kappa == 0 {
+        return resolve_gradient_method(model, subject);
+    }
+    if iov_inner_subject_route(model, subject, theta).is_some() {
+        InnerGradientMethod::Analytic
+    } else {
+        InnerGradientMethod::Fd
+    }
+}
+
+fn iov_inner_subject_route(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+) -> Option<Vec<crate::sens::provider::ObsGrad>> {
+    if !crate::sens::provider::iov_sens_supported(model)
+        || model.default_params.omega_iov.is_none()
+        || analytic_inner_common_bail(model)
+        || subject_has_survival_records(subject)
+    {
+        return None;
+    }
+    let k_occasions = iov_occasion_groups(subject).len();
+    let n_flat = model.n_eta + k_occasions * model.n_kappa;
+    let stacked = vec![0.0; n_flat];
+    crate::sens::provider::subject_eta_grad_iov(model, subject, theta, &stacked)
+}
+
+fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
+    if matches!(model.gradient_method, GradientMethod::Fd) {
+        return "gradient = fd";
+    }
+    if analytic_inner_common_bail(model) {
+        return "model-level analytic inner fallback";
+    }
+    if model.default_params.omega_iov.is_none() {
+        return "missing omega_iov";
+    }
+    if subject_has_survival_records(subject) {
+        return "survival/TTE observations";
+    }
+    if !crate::sens::provider::iov_sens_supported(model) {
+        return "model outside IOV analytic scope";
+    }
+    if model.ode_spec.is_some() {
+        if !subject.all_doses_fixed() {
+            return "modeled RATE/DURATION dose";
+        }
+        // Mirror the SS gates of `ode_iov_subject_supported`, in the same order
+        // (they are checked *before* the occasion/axis gates below, so omitting
+        // them would misattribute an SS bail to a later reason). #590 review.
+        if crate::sens::ode_provider::has_rate_defined_ss_infusion_under_f(model, subject) {
+            return "steady-state rate-defined infusion under F";
+        }
+        let has_ss = subject.doses.iter().any(|d| d.ss && d.ii > 0.0);
+        if has_ss && model.has_lagtime() {
+            return "steady-state dose + estimated lagtime";
+        }
+        if has_ss
+            && model
+                .ode_spec
+                .as_ref()
+                .and_then(|o| o.rhs_program.as_ref())
+                .is_some_and(|p| p.uses_time_vars())
+        {
+            return "steady-state dose + time-dependent ODE RHS";
+        }
+        let occ_groups = iov_occasion_groups(subject);
+        if occ_groups.is_empty() {
+            return "no observation occasions";
+        }
+        let n_stacked = model.n_eta + occ_groups.len() * model.n_kappa;
+        let m_dim = model.n_theta + n_stacked;
+        if m_dim > crate::sens::ode_provider::MAX_ODE_IOV_AXES {
+            return "ODE IOV stacked axis cap";
+        }
+    }
+    // Reached only for an FD subject (the caller invokes this after
+    // `iov_inner_subject_route(..).is_none()`), so this is the catch-all for any
+    // provider bail not enumerated above — never the analytic case.
+    "subject outside IOV analytic scope"
+}
+
 /// Warning when *some but not all* subjects fall back to the FD inner gradient
 /// (outside the analytic provider's scope — SS+reset, time-varying covariates,
 /// oral infusion, modeled-duration doses, …). Returns `None` for a uniform
@@ -161,6 +250,9 @@ pub(crate) fn fd_fallback_warning(
     population: &Population,
     theta: &[f64],
 ) -> Option<String> {
+    if model.n_kappa != 0 {
+        return iov_fd_fallback_warning(model, population, theta);
+    }
     let zeros = vec![0.0; model.n_eta];
     let n_total = population.subjects.len();
     let n_fd = population
@@ -178,6 +270,38 @@ pub(crate) fn fd_fallback_warning(
     } else {
         None
     }
+}
+
+fn iov_fd_fallback_warning(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+) -> Option<String> {
+    let n_total = population.subjects.len();
+    let mut n_fd = 0usize;
+    let mut reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for subject in &population.subjects {
+        if iov_inner_subject_route(model, subject, theta).is_none() {
+            n_fd += 1;
+            *reasons.entry(iov_fd_reason(model, subject)).or_insert(0) += 1;
+        }
+    }
+    // Mirror the non-IOV contract: only warn for a *mixed* population. An
+    // all-analytic (`n_fd == 0`) population needs no warning, and an all-FD
+    // (`n_fd == n_total`) one is already obvious from the `finite-difference`
+    // banner and the model itself (e.g. `gradient = fd`, LTBS). #590 review.
+    if n_fd == 0 || n_fd == n_total {
+        return None;
+    }
+    let reason_text = reasons
+        .into_iter()
+        .map(|(reason, count)| format!("{reason}: {count}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "{n_fd} of {n_total} subjects use finite-difference inner gradients \
+         in the IOV loop ({reason_text}); their results are correct but slower."
+    ))
 }
 
 /// Global per-fit timing counters for gradient/Jacobian calls. Printed by
@@ -267,7 +391,7 @@ pub struct EbeResult {
     pub nll: f64,
     /// Per-occasion kappas (empty when n_kappa == 0).
     /// `kappas[k]` corresponds to the k-th unique occasion (same order as
-    /// `split_obs_by_occasion`).
+    /// `iov_occasion_groups`).
     pub kappas: Vec<DVector<f64>>,
 }
 
@@ -278,6 +402,55 @@ pub struct InnerLoopStats {
     pub n_unconverged: usize,
     /// Subjects for which the BFGS→Nelder-Mead fallback was triggered.
     pub n_fallback: usize,
+}
+
+/// Inner-EBE fallback shared by [`find_ebe`] and [`find_ebe_iov`], invoked when the inner
+/// BFGS reports non-convergence. Keeps the lower-objective of the BFGS partial and a single
+/// Nelder–Mead restart, so a `false`-on-a-converged search (gradient-noise floor / line-
+/// search exhaustion at the mode, #555) cannot have its correct η̂ discarded by an NM
+/// restart that wanders into a worse basin. The same policy serves IOV and non-IOV so the
+/// two paths cannot drift into contradictory convergence behaviour.
+///
+/// The restart seeds from the BFGS `partial` when `ebe_warm_start` is set (it sits on the
+/// steep prior slope, so NM reaches the mode in fewer steps), else from `cold_seed` (η=0
+/// for non-IOV, `[μ, 0…]` for IOV — the historical reset point). Exactly **one** NM solve
+/// runs, so enabling `ebe_warm_start` is never slower than leaving it off.
+///
+/// Returns `(eta, nm_converged)`. The **value** is the lower-objective of the BFGS partial
+/// and the NM restart — the substantive #555 fix: the previous code overwrote `eta` with the
+/// NM restart unconditionally, discarding a correct partial that BFGS had reached but not
+/// gnorm-verified. `nm_converged` is the Nelder–Mead convergence flag (as the pre-#555 code
+/// reported), so the per-subject convergence/diagnostic semantics are unchanged; the η̂
+/// *value* fed to the FOCEI gradient is what improves. A non-finite `obj(partial)` (NaN/∞)
+/// makes the partial unusable so the NM result is taken.
+fn argmin_inner_fallback(
+    obj: &dyn Fn(&[f64]) -> f64,
+    partial: &[f64],
+    cold_seed: &[f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+) -> (Vec<f64>, bool) {
+    let partial_f = obj(partial);
+    let partial_usable = partial_f.is_finite();
+    let warm = ebe_warm_start_enabled() && partial_usable;
+    let mut eta_nm = if warm {
+        partial.to_vec()
+    } else {
+        cold_seed.to_vec()
+    };
+    let nm_ok = nelder_mead_minimize(obj, &mut eta_nm, n, max_iter * 5, tol);
+    let f_nm = obj(&eta_nm);
+    // Keep the partial unless NM is *strictly* better. Written as a positive comparison so a
+    // non-finite `f_nm` (NM diverged) leaves `nm_strictly_better = false` and the finite
+    // partial is kept.
+    let nm_strictly_better = f_nm < partial_f;
+    let best = if partial_usable && !nm_strictly_better {
+        partial.to_vec()
+    } else {
+        eta_nm
+    };
+    (best, nm_ok)
 }
 
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
@@ -442,76 +615,88 @@ pub fn find_ebe(
     // in scope (Almquist et al. 2015): one provider evaluation per inner step
     // instead of the FD gradient's ~2·n_eta+1 predictions, and exact → fewer
     // steps. Per-point FD fallback if the provider can't serve a given (θ, η).
-    let result = {
-        if analytic_inner_grad_supported(model, subject) {
-            let profile = inner_profile_enabled();
-            let agrad = |e: &[f64]| -> Vec<f64> {
-                let t0 = std::time::Instant::now();
-                match analytic_eta_nll_gradient_with_schedule(
-                    model,
-                    subject,
-                    &params.theta,
-                    e,
-                    &params.omega,
-                    &params.sigma.values,
-                    schedule.as_ref(),
-                ) {
-                    Some(g) => {
-                        GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
-                        if profile {
-                            PROFILE_INNER_ANALYTIC_GRAD
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        g
-                    }
-                    None => {
-                        let g = gradient_fd(&obj, e, n_eta);
-                        GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
-                        if profile {
-                            PROFILE_INNER_FD_FALLBACK
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        g
-                    }
+    //
+    // Enable the objective-stall convergence stop only for ODE models, whose adaptive
+    // RK45 objective carries a gradient-noise floor that can sit above `tol` (#555).
+    // Analytical/event-driven objectives are exact, so they keep the pure `gnorm < tol`
+    // criterion and stay bit-identical to prior releases.
+    let enable_stall = model.ode_spec.is_some();
+    // Single gradient closure used by *both* the optimizer and the fallback's stationarity
+    // check, so the two agree on convergence: the exact analytic η-gradient (Almquist 2015,
+    // one provider eval per step) when in scope with a per-point FD fallback, else FD
+    // throughout. Checking the fallback with a *different* (FD) gradient than the analytic
+    // one the BFGS converged on mislabels weakly-identified flat-basin EBEs (#587 review).
+    let use_analytic = analytic_inner_grad_supported(model, subject);
+    let profile = inner_profile_enabled();
+    let agrad = |e: &[f64]| -> Vec<f64> {
+        if !use_analytic {
+            return gradient_fd(&obj, e, n_eta);
+        }
+        let t0 = std::time::Instant::now();
+        match analytic_eta_nll_gradient_with_schedule(
+            model,
+            subject,
+            &params.theta,
+            e,
+            &params.omega,
+            &params.sigma.values,
+            schedule.as_ref(),
+        ) {
+            Some(g) => {
+                GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
+                if profile {
+                    PROFILE_INNER_ANALYTIC_GRAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-            };
-            inner_minimize_with_grad(
-                &obj,
-                &agrad,
-                &mut eta,
-                n_eta,
-                max_iter,
-                tol,
-                precond.as_deref(),
-                stop_precond,
-            )
-        } else {
-            inner_minimize(
-                &obj,
-                &mut eta,
-                n_eta,
-                max_iter,
-                tol,
-                precond.as_deref(),
-                stop_precond,
-            )
+                g
+            }
+            None => {
+                let g = gradient_fd(&obj, e, n_eta);
+                GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
+                if profile {
+                    PROFILE_INNER_FD_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                g
+            }
         }
     };
+    let result = inner_minimize_with_grad(
+        &obj,
+        &agrad,
+        &mut eta,
+        n_eta,
+        max_iter,
+        tol,
+        precond.as_deref(),
+        stop_precond,
+        enable_stall,
+    );
 
-    // If BFGS failed, fall back to Nelder-Mead. With `ebe_warm_start` (opt-in, off
-    // by default) seed the simplex from the BFGS partial η̂ — a weakly-identified η that BFGS
-    // ran far out sits on the steep prior slope, so NM slides to the mode in far
-    // fewer iterations than refining from η=0 in the flat basin. A non-finite
-    // partial is unusable, so cold-start from η=0 there. With the flag off, always
-    // cold-start from η=0 (bit-identical to the historical behaviour).
+    // If BFGS failed, fall back to Nelder-Mead. The recovery policy depends on whether the
+    // objective carries a gradient-noise floor (ODE) or is exact (analytical / event-driven /
+    // FREM):
+    //   * ODE (#555): the "failure" is usually a *certification* failure — the adaptive RK45
+    //     gradient-noise floor blocks `gnorm < tol` at a genuine mode. Keep the lower-objective
+    //     of {BFGS partial, NM-from-0} so a correct, lower-objective partial is never discarded
+    //     for a worse NM basin (the #555 bug). See [`argmin_inner_fallback`].
+    //   * Exact objectives: there is no noise floor, so a BFGS failure is genuine
+    //     non-convergence and the partial may be a non-stationary, merely-low-objective point
+    //     (e.g. run out along a FREM covariate pseudo-obs flat direction). Keeping it would
+    //     mis-center the FREM/IMP proposal, so recover with NM from η=0 (or the warm partial)
+    //     exactly as prior releases — bit-identical for analytical/FREM fits.
     let bfgs_converged = result;
     let (nm_converged, used_fallback) = if !bfgs_converged {
-        let warm = ebe_warm_start_enabled() && eta.iter().all(|v| v.is_finite());
-        if !warm {
-            eta = vec![0.0; n_eta];
+        let partial = eta.clone();
+        let cold = vec![0.0; n_eta];
+        if enable_stall {
+            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+            eta = best;
+            (ok, true)
+        } else {
+            let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
+            eta = if warm { partial } else { cold };
+            let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
+            (nm_ok, true)
         }
-        let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
-        (nm_ok, true)
     } else {
         (false, false)
     };
@@ -599,7 +784,7 @@ fn find_ebe_iov(
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
 
-    let occ_groups = split_obs_by_occasion(subject);
+    let occ_groups = iov_occasion_groups(subject);
     let k_occasions = occ_groups.len();
 
     let n_flat = n_eta + k_occasions * n_kappa;
@@ -666,41 +851,69 @@ fn find_ebe_iov(
         && omega_iov_ref.is_some()
         && !analytic_inner_common_bail(model)
         && !subject_has_survival_records(subject);
-    let bfgs_converged = if analytic_iov_inner {
+    // ODE objectives carry the adaptive-solver gradient-noise floor; enable the
+    // objective-stall stop only for them (see `find_ebe`).
+    let enable_stall = model.ode_spec.is_some();
+    // One gradient closure for both the optimizer and the fallback stationarity check
+    // (analytic stacked-η IOV gradient when in scope, else FD), so they agree on
+    // convergence — see the matching note in `find_ebe`.
+    let agrad = |p: &[f64]| -> Vec<f64> {
+        if !analytic_iov_inner {
+            return gradient_fd(&obj, p, n_flat);
+        }
         let omega_iov = omega_iov_ref.expect("analytic_iov_inner requires omega_iov");
-        let agrad = |p: &[f64]| -> Vec<f64> {
-            // Recover stacked_true = [η_true (= psi − mu), κ…] from the psi-space `p`;
-            // the gradient is identical in psi- and η_true-space (constant `mu` shift).
-            let mut stacked_true = p.to_vec();
-            for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
-                *st = p[k] - mu[k];
-            }
-            match analytic_eta_nll_gradient_iov(
-                model,
-                subject,
-                &params.theta,
-                &stacked_true,
-                &params.omega,
-                omega_iov,
-                &params.sigma.values,
-                n_eta,
-                n_kappa,
-                k_occasions,
-            ) {
-                Some(g) => g,
-                None => gradient_fd(&obj, p, n_flat),
-            }
-        };
-        inner_minimize_with_grad(&obj, &agrad, &mut x, n_flat, max_iter, tol, None, None)
-    } else {
-        inner_minimize(&obj, &mut x, n_flat, max_iter, tol, None, None)
+        // Recover stacked_true = [η_true (= psi − mu), κ…] from the psi-space `p`; the
+        // gradient is identical in psi- and η_true-space (constant `mu` shift).
+        let mut stacked_true = p.to_vec();
+        for (k, st) in stacked_true.iter_mut().take(n_eta).enumerate() {
+            *st = p[k] - mu[k];
+        }
+        match analytic_eta_nll_gradient_iov(
+            model,
+            subject,
+            &params.theta,
+            &stacked_true,
+            &params.omega,
+            omega_iov,
+            &params.sigma.values,
+            n_eta,
+            n_kappa,
+            k_occasions,
+        ) {
+            Some(g) => g,
+            None => gradient_fd(&obj, p, n_flat),
+        }
     };
+    let bfgs_converged = inner_minimize_with_grad(
+        &obj,
+        &agrad,
+        &mut x,
+        n_flat,
+        max_iter,
+        tol,
+        None,
+        None,
+        enable_stall,
+    );
+    // On BFGS failure, recover with the same ODE-gated policy as the non-IOV `find_ebe`
+    // (cold seed = prior mode `bsv_psi = μ`, κ = 0): for ODE objectives keep the
+    // lower-objective of {BFGS partial, NM restart} so a correct η̂ floored above `tol` by
+    // solver noise is never discarded (#555); for exact objectives recover with NM from the
+    // cold seed, as prior releases, so a non-stationary low-objective partial can't be kept.
     let (nm_converged, used_fallback) = if !bfgs_converged {
-        // Reset to prior mode: bsv_psi = mu (eta_true = 0), kappas = 0.
-        x = vec![0.0; n_flat];
-        x[..n_eta].copy_from_slice(&mu);
-        let nm_ok = nelder_mead_minimize(&obj, &mut x, n_flat, max_iter * 5, tol);
-        (nm_ok, true)
+        let partial = x.clone();
+        let mut cold = vec![0.0; n_flat];
+        cold[..n_eta].copy_from_slice(&mu);
+        if enable_stall {
+            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
+            x = best;
+            (ok, true)
+        } else {
+            let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
+            x = if warm { partial } else { cold };
+            let nm_ok = nelder_mead_minimize(&obj, &mut x, n_flat, max_iter * 5, tol);
+            (nm_ok, true)
+        }
     } else {
         (false, false)
     };
@@ -1569,36 +1782,8 @@ fn inner_use_lbfgs(n: usize) -> bool {
     }
 }
 
-/// Inner EBE minimization with a finite-difference gradient. Dispatches per the
-/// fit-scoped [`inner_optimizer_mode`] (dense BFGS / L-BFGS / Nelder–Mead); in
-/// `Auto` it falls back to the [`INNER_LBFGS_MIN_DIM`] size threshold. All
-/// gradient-based variants converge to the same EBE (stationary point of
-/// `individual_nll + ½η'Ω⁻¹η`).
-fn inner_minimize(
-    obj: &dyn Fn(&[f64]) -> f64,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    stop_precond: Option<&[f64]>,
-) -> bool {
-    if matches!(
-        inner_optimizer_mode(),
-        crate::types::InnerOptimizer::NelderMead
-    ) {
-        return nelder_mead_minimize(obj, x, n, max_iter, tol);
-    }
-    let grad = |p: &[f64]| gradient_fd(obj, p, n);
-    if inner_use_lbfgs(n) {
-        lbfgs_core(obj, &grad, x, n, max_iter, tol, precond, stop_precond)
-    } else {
-        dense_bfgs_core(obj, &grad, x, n, max_iter, tol, precond, stop_precond)
-    }
-}
-
 /// Inner EBE minimization with an externally-provided gradient (analytic
-/// sensitivities or AD). Same fit-scoped dispatch as [`inner_minimize`]; the
+/// sensitivities or AD). Fit-scoped dispatch (dense BFGS / L-BFGS / Nelder–Mead); the
 /// `NelderMead` mode ignores the supplied gradient.
 #[allow(clippy::too_many_arguments)]
 fn inner_minimize_with_grad(
@@ -1610,6 +1795,7 @@ fn inner_minimize_with_grad(
     tol: f64,
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
+    enable_stall: bool,
 ) -> bool {
     if matches!(
         inner_optimizer_mode(),
@@ -1618,9 +1804,29 @@ fn inner_minimize_with_grad(
         return nelder_mead_minimize(obj, x, n, max_iter, tol);
     }
     if inner_use_lbfgs(n) {
-        lbfgs_core(obj, grad, x, n, max_iter, tol, precond, stop_precond)
+        lbfgs_core(
+            obj,
+            grad,
+            x,
+            n,
+            max_iter,
+            tol,
+            precond,
+            stop_precond,
+            enable_stall,
+        )
     } else {
-        dense_bfgs_core(obj, grad, x, n, max_iter, tol, precond, stop_precond)
+        dense_bfgs_core(
+            obj,
+            grad,
+            x,
+            n,
+            max_iter,
+            tol,
+            precond,
+            stop_precond,
+            enable_stall,
+        )
     }
 }
 
@@ -1636,12 +1842,19 @@ fn lbfgs_core(
     tol: f64,
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
+    enable_stall: bool,
 ) -> bool {
     let mut s_hist: Vec<Vec<f64>> = Vec::new();
     let mut y_hist: Vec<Vec<f64>> = Vec::new();
     let mut rho_hist: Vec<f64> = Vec::new();
     let mut g = grad(x);
     let mut f_cur = obj(x);
+    // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): for ODE
+    // objectives whose gradient norm is floored above `tol` by solver noise, a search that
+    // reached the mode declares convergence rather than spinning to `max_iter`. Gated on
+    // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`).
+    let mut stall = 0u32;
+    let mut best_gnorm = f64::INFINITY;
 
     for _iter in 0..max_iter {
         // Stopping metric. `stop_precond` is `Some` only for FREM, where the raw
@@ -1653,6 +1866,11 @@ fn lbfgs_core(
         let gnorm = grad_norm_metric(&g, stop_precond);
         if gnorm < tol {
             return true;
+        }
+        // Has the gradient norm meaningfully improved on the best seen? (Plateau guard.)
+        let gnorm_improving = gnorm < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
+        if gnorm < best_gnorm {
+            best_gnorm = gnorm;
         }
 
         let mut d = lbfgs_direction(&g, &s_hist, &y_hist, &rho_hist, n, precond);
@@ -1667,16 +1885,25 @@ fn lbfgs_core(
         }
 
         let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
-        // No sufficient-decrease step found: report non-convergence so the caller
-        // takes the fallback path rather than accepting a non-stationary η̂.
+        // No sufficient-decrease step found: report non-convergence so the caller takes the
+        // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
             return false;
         }
+        // Stall only for ODE objectives, and only once the gradient has plateaued (no
+        // longer improving) — see [`INNER_FTOL_REL`]. `objective_stalled` is always called
+        // so the flat-step counter stays accurate; the plateau/ODE gates only decide
+        // whether a reached count converts to convergence.
+        let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
+        let stalled = enable_stall && obj_flat && !gnorm_improving;
         f_cur = f_new;
 
         let s: Vec<f64> = (0..n).map(|i| alpha * d[i]).collect();
         for i in 0..n {
             x[i] += s[i];
+        }
+        if stalled {
+            return true;
         }
 
         let g_new = grad(x);
@@ -1713,6 +1940,7 @@ fn dense_bfgs_core(
     tol: f64,
     precond: Option<&[f64]>,
     stop_precond: Option<&[f64]>,
+    enable_stall: bool,
 ) -> bool {
     let mut h_inv = init_h_inv(n, precond);
     let mut g = grad(x);
@@ -1720,12 +1948,23 @@ fn dense_bfgs_core(
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).
     let mut f_cur = obj(x);
     let mut first_step = true;
+    // Objective-stall convergence (see [`objective_stalled`] / [`INNER_FTOL_REL`]): gated on
+    // `enable_stall` (ODE only) and on the gradient having *plateaued* (`best_gnorm`), so
+    // smooth analytical/FD fits stay bit-identical and a non-stationary mid-descent iterate
+    // can't be accepted.
+    let mut stall = 0u32;
+    let mut best_gnorm = f64::INFINITY;
 
     for _iter in 0..max_iter {
         // `stop_precond` is `Some` only for FREM (issue #406); general fits stop
         // on the raw L2 norm so the converged EBE is independent of the `precond`
         // H0 that accelerates the search.
         let gnorm = grad_norm_metric(&g, stop_precond);
+        // Plateau guard: has `gnorm` meaningfully improved on the best seen?
+        let gnorm_improving = gnorm < best_gnorm * (1.0 - INNER_FTOL_GNORM_PLATEAU);
+        if gnorm < best_gnorm {
+            best_gnorm = gnorm;
+        }
 
         // Scale initial Hessian so first step is O(1) not O(gnorm). Only for the
         // identity-H0 path (`precond.is_none()`), where `stop_precond` is also
@@ -1752,26 +1991,26 @@ fn dense_bfgs_core(
             let d: Vec<f64> = (-&h_inv * &g_vec).iter().copied().collect();
             let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
             // Even steepest descent found no sufficient-decrease step: report
-            // non-convergence so the caller takes the Nelder–Mead fallback,
-            // which re-solves from η=0 and reaches the true mode. Claiming
-            // convergence here would hand the outer FOCE gradient a
-            // non-stationary η̂ and stall the population optimiser.
+            // non-convergence so the caller takes the argmin Nelder–Mead fallback.
             if alpha == 0.0 {
                 return false;
             }
             for i in 0..n {
                 x[i] += alpha * d[i];
             }
+            let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
+            let stalled = enable_stall && obj_flat && !gnorm_improving;
             f_cur = f_new;
+            if stalled {
+                return true;
+            }
             g = grad(x);
             continue;
         }
 
         let (alpha, f_new) = backtracking_line_search(obj, x, &d, &g, n, f_cur);
-        // No sufficient-decrease step found: not yet at the mode (the descent
-        // direction exists but the line search exhausted its trials). Report
-        // failure so Nelder–Mead re-solves and the outer gradient sees a true
-        // stationary η̂.
+        // No sufficient-decrease step found: report non-convergence so the caller takes the
+        // argmin Nelder–Mead fallback rather than accepting a non-stationary η̂.
         if alpha == 0.0 {
             return false;
         }
@@ -1780,7 +2019,12 @@ fn dense_bfgs_core(
         for i in 0..n {
             x[i] += s[i];
         }
+        let obj_flat = objective_stalled(f_cur, f_new, &mut stall);
+        let stalled = enable_stall && obj_flat && !gnorm_improving;
         f_cur = f_new;
+        if stalled {
+            return true;
+        }
 
         let g_new = grad(x);
         let y: Vec<f64> = (0..n).map(|i| g_new[i] - g[i]).collect();
@@ -1926,6 +2170,56 @@ fn nelder_mead_minimize(
 /// 1–3 trials; the cap only bites on directions with no representable decrease
 /// (i.e. the iterate is already at the posterior mode to machine precision).
 const MAX_LINE_SEARCH_TRIALS: usize = 30;
+
+/// Function-value stopping criterion for the inner BFGS, complementing the gradient
+/// norm test (`gnorm < tol`). When the objective is computed by the adaptive RK45 ODE
+/// solver, its step-pattern non-smoothness puts a noise floor on the gradient
+/// (empirically ~6e-7 at the mode for a 5-η `obs_scale = V1` model) that can sit *above*
+/// the inner `tol`. A BFGS that has already reached the posterior mode then sits on the
+/// answer with a dead-flat objective but never satisfies `gnorm < tol`, so it spins to
+/// `max_iter` and reports failure.
+///
+/// Declaring convergence once the *objective* has stopped improving for
+/// [`INNER_STALL_LIMIT`] consecutive accepted steps short-circuits that wasted spin. Two
+/// guards keep it from accepting a non-stationary iterate:
+///
+/// 1. **ODE-only** (`enable_stall`, set by `find_ebe`/`find_ebe_iov` for `[odes]` models).
+///    Analytical / event-driven objectives are exact, reach `gnorm < tol` normally, and
+///    stay bit-identical to prior releases — the stall never touches them.
+/// 2. **Gradient-plateau.** The stall fires only once the gradient has *stopped
+///    decreasing* — the current `gnorm` no longer improves the best seen by more than
+///    [`INNER_FTOL_GNORM_PLATEAU`]. Mid-descent (including a heavily-backtracked
+///    tiny-`alpha` stretch) the gradient is still shrinking, so the plateau test fails and
+///    the stall cannot fire at a non-stationary point. This adapts to whatever noise floor
+///    the solver tolerance produces, rather than a fixed multiple of `tol`. The plateau is
+///    measured on the same `stop_precond` metric the `gnorm < tol` test uses, so FREM's
+///    preconditioned stop (#406) stays authoritative.
+///
+/// This is a fast-path optimisation only: correctness on every `false`-on-a-converged
+/// search does **not** depend on it — the inner fallback keeps the lower-objective of the
+/// BFGS partial and the Nelder–Mead restart and reports convergence from a real
+/// stationarity check, so a stall that never fires still yields the correct EBE. See #555.
+const INNER_FTOL_REL: f64 = 1e-11;
+/// Consecutive negligible-improvement steps required before [`INNER_FTOL_REL`] declares
+/// convergence (a small count guards against a one-off flat step mid-descent).
+const INNER_STALL_LIMIT: u32 = 3;
+/// Relative gradient-norm decrease that still counts as "the gradient is improving" for the
+/// plateau guard on the objective-stall stop (see [`INNER_FTOL_REL`]). While `gnorm` keeps
+/// dropping by more than this fraction the search is still descending, so the stall is held
+/// off; once it plateaus (no such decrease) the search is at the noise floor.
+const INNER_FTOL_GNORM_PLATEAU: f64 = 1e-3;
+
+/// True once the objective has failed to improve by more than `INNER_FTOL_REL·(1+|f|)`
+/// for [`INNER_STALL_LIMIT`] consecutive accepted steps. Shared verbatim by the dense and
+/// L-BFGS inner drivers so the two paths cannot drift apart on convergence (#555).
+fn objective_stalled(f_old: f64, f_new: f64, stall: &mut u32) -> bool {
+    if (f_old - f_new) <= INNER_FTOL_REL * (1.0 + f_old.abs()) {
+        *stall += 1;
+    } else {
+        *stall = 0;
+    }
+    *stall >= INNER_STALL_LIMIT
+}
 
 /// Backtracking line search with an Armijo sufficient-decrease test, choosing
 /// each successive trial step by **safeguarded quadratic interpolation** rather
@@ -2477,8 +2771,10 @@ mod tests {
                 }
                 t0.elapsed().as_secs_f64() * 1e3 / runs as f64
             };
-            let t_dense = time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None));
-            let t_lbfgs = time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None));
+            let t_dense =
+                time_it(&|x| dense_bfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
+            let t_lbfgs =
+                time_it(&|x| lbfgs_core(&obj, &grad, x, n, 2000, 1e-8, None, None, false));
             eprintln!(
                 "  n={n:4}  dense={t_dense:8.3} ms  lbfgs={t_lbfgs:8.3} ms  dense/lbfgs={:.2}x",
                 t_dense / t_lbfgs
@@ -2544,7 +2840,7 @@ mod tests {
             |x: &[f64]| -> f64 { (x[0] - 1.0) * (x[0] - 1.0) + 4.0 * (x[1] + 2.0) * (x[1] + 2.0) };
         let grad = |x: &[f64]| -> Vec<f64> { vec![2.0 * (x[0] - 1.0), 8.0 * (x[1] + 2.0)] };
         let mut x = vec![0.0, 0.0];
-        let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None);
+        let ok = dense_bfgs_core(&obj, &grad, &mut x, 2, 200, 1e-10, None, None, false);
         assert!(ok, "BFGS should report convergence");
         assert!((x[0] - 1.0).abs() < 1e-6, "x0 = {}", x[0]);
         assert!((x[1] + 2.0).abs() < 1e-6, "x1 = {}", x[1]);
@@ -2888,6 +3184,50 @@ mod iov_tests {
         );
     }
 
+    #[test]
+    fn gradient_route_summary_reports_ode_iov_analytic_route() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+        let population = Population {
+            subjects: vec![Subject {
+                id: "1".into(),
+                doses: vec![
+                    DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                    DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+                ],
+                obs_times: vec![1.0, 6.0, 25.0, 30.0],
+                obs_raw_times: Vec::new(),
+                observations: vec![8.0, 6.0, 7.0, 5.0],
+                obs_cmts: vec![1; 4],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 4],
+                occasions: vec![1, 1, 2, 2],
+                dose_occasions: vec![1, 2],
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            }],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let summary = gradient_route_summary(&model, &population, GradientMethod::Auto);
+        assert!(
+            summary.starts_with("analytic (Dual2)"),
+            "ODE IOV provider should be reported as analytic, got: {summary}"
+        );
+    }
+
     /// Regression: `gradient = fd` must force the FD inner route on an
     /// analytic-supported model (previously the executor ignored
     /// `model.gradient_method`, so the option silently ran the Dual2 path while
@@ -2949,6 +3289,173 @@ mod iov_tests {
 
         // Uniform analytic → no warning.
         assert!(fd_fallback_warning(&model, &mk_pop(vec![analytic]), theta).is_none());
+    }
+
+    #[test]
+    fn iov_fd_fallback_warning_reports_subject_reason() {
+        // Covariate-free ODE IOV model the provider serves analytically, so the FD
+        // subject below is the *only* one out of scope — a genuinely mixed
+        // population (the all-FD case is suppressed, mirroring the non-IOV
+        // contract, #590 review).
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+        // Analytic subject: doses and observations in the same occasions.
+        let analytic_subject = Subject {
+            id: "1".into(),
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1, 2],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        // FD subject: more occasion groups than the widened ODE IOV dispatch serves.
+        let n_wide = crate::sens::ode_provider::MAX_ODE_IOV_AXES;
+        let fd_subject = Subject {
+            id: "2".into(),
+            doses: (0..n_wide)
+                .map(|i| DoseEvent::new(i as f64 * 24.0, 100.0, 1, 0.0, false, 0.0))
+                .collect(),
+            obs_times: (0..n_wide).map(|i| i as f64 * 24.0 + 1.0).collect(),
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0; n_wide],
+            obs_cmts: vec![1; n_wide],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n_wide],
+            occasions: (1..=n_wide as u32).collect(),
+            dose_occasions: (1..=n_wide as u32).collect(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![analytic_subject, fd_subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let warning = fd_fallback_warning(&model, &population, &model.default_params.theta)
+            .expect("mixed IOV population should warn with a reason");
+        assert!(warning.contains("1 of 2"), "got: {warning}");
+        assert!(
+            warning.contains("ODE IOV stacked axis cap"),
+            "got: {warning}"
+        );
+    }
+
+    /// Uniform all-FD IOV populations are silent, matching the non-IOV contract:
+    /// the `finite-difference` banner already makes a model-level fallback obvious.
+    #[test]
+    fn iov_fd_fallback_warning_silent_for_uniform_all_fd() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  gradient = fd\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV + gradient = fd");
+        let mk_subject = |id: &str| Subject {
+            id: id.into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![mk_subject("1"), mk_subject("2")],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        // gradient = fd routes every subject to FD (uniform) → no warning.
+        assert!(
+            fd_fallback_warning(&model, &population, &model.default_params.theta).is_none(),
+            "uniform all-FD population must not warn"
+        );
+    }
+
+    /// Regression (#590 review): the SS gates of `ode_iov_subject_supported` are
+    /// checked *before* the occasion/axis gates, so `iov_fd_reason` must report an
+    /// SS bail as such — not fall through to a later, wrong reason. Without the
+    /// SS branch this subject was reported as "subject outside IOV analytic scope".
+    #[test]
+    fn iov_fd_reason_attributes_steady_state_lagtime_bail() {
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVLAG(0.5,0.01,5.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_LAG ~ 0.09\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  LAGTIME = TVLAG * exp(ETA_LAG)\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  obs_scale = V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV + lagtime");
+        assert!(
+            model.has_lagtime(),
+            "model should carry a LAGTIME individual parameter"
+        );
+        let subject = Subject {
+            id: "1".into(),
+            // Steady-state bolus (ss, ii > 0) under an estimated lagtime: the IOV
+            // provider declines via the `SS + lagtime` gate.
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
+            obs_times: vec![1.0, 6.0, 25.0, 30.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![8.0, 6.0, 7.0, 5.0],
+            obs_cmts: vec![1; 4],
+            // No covariates: keep `has_tv_covariates()` false so the FD cause is the
+            // SS+lagtime gate, not the earlier `ExpressionScale + tv-cov` gate.
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; 4],
+            occasions: vec![1, 1, 2, 2],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        assert!(
+            iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_none(),
+            "SS + lagtime subject must route to FD"
+        );
+        assert_eq!(
+            iov_fd_reason(&model, &subject),
+            "steady-state dose + estimated lagtime"
+        );
     }
 
     fn make_iov_model() -> CompiledModel {
@@ -3114,7 +3621,7 @@ mod iov_tests {
         let params = model.default_params.clone();
         let n_eta = model.n_eta;
         let n_kappa = model.n_kappa;
-        let k = split_obs_by_occasion(&subject).len();
+        let k = iov_occasion_groups(&subject).len();
         let n_stacked = n_eta + k * n_kappa;
         let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
         let stacked = vec![0.10, -0.05, 0.08, -0.12];
@@ -3160,6 +3667,203 @@ mod iov_tests {
             let fd = (nll(&sp) - nll(&sm)) / (2.0 * h);
             approx::assert_relative_eq!(g[p], fd, max_relative = 1e-4, epsilon = 1e-6);
         }
+    }
+
+    // ----- #555 shared fixtures (two_cpt_oral_cov, η+covariate `obs_scale = V1`) -----
+
+    /// Analytical + ODE twin of the ferx-r `two_cpt_oral_cov` model (5 η, `obs_scale = V1`
+    /// with `V1 = TVV1·(WT/70)^θ·exp(ETA_V1)` — both covariate- and η-dependent). The ODE
+    /// solver block is caller-supplied so a cheap fixed-η check can run tight and the inner
+    /// EBE check can run loose.
+    fn repro555_model_pair(ode_solver_block: &str) -> (CompiledModel, CompiledModel) {
+        use crate::parser::model_parser::parse_model_string;
+        let header = "[parameters]\n  theta TVCL(5.0,0.1,100.0)\n  theta TVV1(50.0,1.0,500.0)\n  theta TVQ(10.0,0.1,100.0)\n  theta TVV2(100.0,1.0,500.0)\n  theta TVKA(1.2,0.01,10.0)\n  theta THETA_WT(0.75,0.01,5.0)\n  theta THETA_CRCL(0.50,0.01,5.0)\n  omega ETA_CL ~ 0.10\n  omega ETA_V1 ~ 0.10\n  omega ETA_Q ~ 0.05\n  omega ETA_V2 ~ 0.05\n  omega ETA_KA ~ 0.15\n  sigma PROP_ERR ~ 0.02 (sd)\n[individual_parameters]\n  CL = TVCL * (WT/70)^THETA_WT * (CRCL/100)^THETA_CRCL * exp(ETA_CL)\n  V1 = TVV1 * (WT/70)^THETA_WT * exp(ETA_V1)\n  Q = TVQ * exp(ETA_Q)\n  V2 = TVV2 * exp(ETA_V2)\n  KA = TVKA * exp(ETA_KA)\n";
+        let an = parse_model_string(&format!(
+            "{header}[structural_model]\n  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)\n[covariates]\n  WT continuous\n  CRCL continuous\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n"
+        )).expect("parse analytical");
+        let ode = parse_model_string(&format!(
+            "{header}[structural_model]\n  ode(obs_cmt=central, states=[depot, central, periph])\n[odes]\n  d/dt(depot) = -KA * depot\n  d/dt(central) = KA*depot - (CL/V1 + Q/V1)*central + (Q/V2)*periph\n  d/dt(periph) = (Q/V1)*central - (Q/V2)*periph\n[scaling]\n  obs_scale = V1\n[covariates]\n  WT continuous\n  CRCL continuous\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n{ode_solver_block}"
+        )).expect("parse ode");
+        (an, ode)
+    }
+
+    /// Subject 22 of the ferx-r `two_cpt_oral_cov` dataset — the subject that diverged in
+    /// #555 — inlined verbatim so the regression is self-contained (no external data file).
+    fn repro555_subject22() -> Subject {
+        let mut covariates = HashMap::new();
+        covariates.insert("WT".to_string(), 72.1);
+        covariates.insert("CRCL".to_string(), 76.7);
+        let obs_times = vec![0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0];
+        let observations = vec![
+            2.0190, 2.4021, 2.2985, 1.8141, 1.4699, 1.2589, 1.0804, 0.8993, 0.7054, 0.5966,
+        ];
+        let n = obs_times.len();
+        Subject {
+            id: "22".into(),
+            doses: vec![DoseEvent::new(0.0, 250.0, 1, 0.0, false, 0.0)],
+            obs_times,
+            obs_raw_times: Vec::new(),
+            observations,
+            obs_cmts: vec![2; n],
+            covariates,
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    /// #555 guard: at a *fixed* η the ODE `obs_scale = V1` form and its analytical twin
+    /// must agree on the assembled FOCEI marginal (incl. log|H̃|) to integrator tolerance —
+    /// the forward IPRED, the ∂f/∂η Jacobian, and the assembly are all path-independent
+    /// here. (The #555 divergence lives in EBE *convergence*, not this fixed-η objective —
+    /// see `repro555_ode_exprscale_ebe_finds_global_min`.) Tight ODE tol is cheap: no inner
+    /// optimisation runs, only a handful of `predict`/Jacobian evaluations.
+    #[test]
+    fn repro555_ode_exprscale_marginal_vs_analytical() {
+        use crate::stats::likelihood::foce_subject_nll_interaction;
+        let (an, ode) = repro555_model_pair("  ode_reltol = 1e-11\n  ode_abstol = 1e-13\n");
+        let subject = repro555_subject22();
+
+        let marginal = |m: &CompiledModel, eta: &[f64]| -> f64 {
+            let p = &m.default_params;
+            let eta_v = nalgebra::DVector::from_column_slice(eta);
+            let ipreds = crate::pk::compute_predictions_with_tv(m, &subject, &p.theta, eta);
+            let jac = crate::sens::provider::subject_eta_jacobian(m, &subject, &p.theta, eta)
+                .expect("analytic jac");
+            let h = nalgebra::DMatrix::from_row_slice(subject.obs_times.len(), m.n_eta, &jac);
+            foce_subject_nll_interaction(
+                &subject,
+                &ipreds,
+                &eta_v,
+                &h,
+                &p.omega,
+                &p.sigma.values,
+                &m.error_spec,
+                m.bloq_method,
+                &[],
+                None,
+                m.residual_error_eta,
+                None, // no custom residual magnitude (#484) in this model
+            )
+        };
+
+        for eta in [vec![0.0; 5], vec![0.12, -0.08, 0.05, 0.04, -0.10]] {
+            let ma = marginal(&an, &eta);
+            let mo = marginal(&ode, &eta);
+            approx::assert_relative_eq!(ma, mo, max_relative = 1e-5, epsilon = 1e-4);
+        }
+    }
+
+    /// #555 regression: on an ODE model with an η-dependent `[scaling] obs_scale = V1`,
+    /// the inner EBE must reach the correct posterior mode.
+    ///
+    /// Root cause: the inner BFGS *reaches* the mode but its gradient norm floors above
+    /// `tol` (the adaptive ODE solver's non-smoothness caps `gnorm` above `tol`), so it
+    /// spun to `max_iter` and reported failure; `find_ebe` then discarded that correct η̂
+    /// and overwrote it with a cold Nelder–Mead restart from η=0, which on this multimodal
+    /// inner objective settled ~20 NLL units worse, inflating the FOCEI OFV by ~370 on the
+    /// full dataset (the analytical twin, whose smooth objective lets BFGS satisfy
+    /// `gnorm < tol`, was the correct reference). The fix is twofold: `find_ebe` now keeps
+    /// the lower-objective of the BFGS partial and the NM restart (so a `false`-on-a-
+    /// converged search can never regress the EBE), and the inner BFGS gained a gated
+    /// objective-stall (`ftol`) stop so it converges at the mode instead of spinning. This
+    /// test runs at a *moderate* ODE tolerance (not the 1e-10 of the original repro) to
+    /// stay Tier-1-fast and to exercise the realistic-tolerance path where the stall may
+    /// not fire and the argmin fallback is what guarantees correctness.
+    #[test]
+    fn repro555_ode_exprscale_ebe_finds_global_min() {
+        use crate::stats::likelihood::individual_nll;
+        let subject = repro555_subject22();
+
+        // Run at the DEFAULT ODE tolerances (`ode_reltol = 1e-4`, no override) — the
+        // realistic case a user actually hits, and the one where the gradient-noise floor
+        // is high enough that the BFGS objective-stall may never fire, so the argmin
+        // fallback is what guarantees the correct EBE. The analytical twin (whose smooth
+        // objective lets BFGS satisfy `gnorm < tol`) gives the reference global minimum.
+        let (an, ode) = repro555_model_pair("");
+
+        let nll = |m: &CompiledModel, e: &[f64]| {
+            let p = &m.default_params;
+            individual_nll(m, &subject, &p.theta, e, &p.omega, &p.sigma.values)
+        };
+
+        let e_an = find_ebe(&an, &subject, &an.default_params, 300, 1e-7, None, None);
+        let eta_an: Vec<f64> = e_an.eta.iter().copied().collect();
+        let ref_nll = nll(&an, &eta_an);
+
+        // The ODE form must reach the same global minimum (objectives are identical), and
+        // must report it as a converged EBE (not a fallback that left it non-stationary).
+        let e_od = find_ebe(&ode, &subject, &ode.default_params, 300, 1e-7, None, None);
+        let eta_od: Vec<f64> = e_od.eta.iter().copied().collect();
+        let ode_nll = nll(&ode, &eta_od);
+
+        // Pre-fix the ODE EBE stalled ~20 NLL units high in a spurious basin; the global
+        // min is now reached (to integrator tolerance) at the default ODE tolerance too.
+        assert!(
+            ode_nll <= ref_nll + 0.5,
+            "ODE EBE stuck in a spurious basin: inner NLL {ode_nll:.4} vs analytical global min {ref_nll:.4} \
+             (eta_ode={eta_od:?}, eta_an={eta_an:?})"
+        );
+        assert!(
+            e_od.converged,
+            "ODE EBE should be reported converged at the mode"
+        );
+    }
+
+    /// #587 review: the shared inner-EBE fallback keeps the lower-objective **value** of the
+    /// BFGS partial and the Nelder–Mead restart (the substantive #555 fix — the η̂ value fed
+    /// to the FOCEI gradient), seeds NM from the partial under `ebe_warm_start`, and discards
+    /// a non-finite-objective partial. Uses a bimodal 1-D objective (deep well at x=-2,
+    /// f=-10; shallow well at x=+2, f=-1).
+    #[test]
+    fn argmin_inner_fallback_keeps_better_basin() {
+        let obj = |x: &[f64]| -> f64 {
+            let v = x[0];
+            if v < 0.0 {
+                (v + 2.0).powi(2) - 10.0
+            } else {
+                (v - 2.0).powi(2) - 1.0
+            }
+        };
+        set_ebe_warm_start(false);
+
+        // Partial in the deep (global) well, cold NM seed in the shallow well: the fallback
+        // keeps the lower-objective partial rather than overwriting with the shallow NM
+        // result (the old behaviour, which on this multimodal objective inflated the OFV).
+        let (eta, _) = argmin_inner_fallback(&obj, &[-2.0], &[2.0], 1, 200, 1e-8);
+        assert!((eta[0] + 2.0).abs() < 1e-2, "kept deep well, got {eta:?}");
+
+        // Partial in the shallow well, cold NM seed reaches the deep well: NM wins.
+        let (eta2, _) = argmin_inner_fallback(&obj, &[2.0], &[-2.0], 1, 200, 1e-8);
+        assert!(
+            (eta2[0] + 2.0).abs() < 1e-2,
+            "NM found deeper well, got {eta2:?}"
+        );
+
+        // Non-finite partial objective → unusable → NM result is taken.
+        let (eta3, _) = argmin_inner_fallback(&obj, &[f64::NAN], &[-2.0], 1, 200, 1e-8);
+        assert!(
+            eta3[0].is_finite(),
+            "NaN partial must be discarded, got {eta3:?}"
+        );
+
+        // `ebe_warm_start` seeds the single NM from the partial (covers the warm branch):
+        // from the deep well it stays there even though the cold seed is far away.
+        set_ebe_warm_start(true);
+        let (eta4, _) = argmin_inner_fallback(&obj, &[-2.0], &[5.0], 1, 200, 1e-8);
+        assert!(
+            (eta4[0] + 2.0).abs() < 1e-2,
+            "warm seed held the deep well, got {eta4:?}"
+        );
+        set_ebe_warm_start(false);
     }
 
     /// Closed-form IOV + `iiv_on_ruv` (#4b): the analytic stacked-η inner gradient
@@ -3208,7 +3912,7 @@ mod iov_tests {
         let params = model.default_params.clone();
         let n_eta = model.n_eta;
         let n_kappa = model.n_kappa;
-        let k = split_obs_by_occasion(&subject).len();
+        let k = iov_occasion_groups(&subject).len();
         let n_stacked = n_eta + k * n_kappa;
         let omega_iov = params.omega_iov.as_ref().expect("omega_iov present");
         // Non-zero η_ruv (index 3) so the residual-variance scaling is genuinely exercised.
@@ -3264,7 +3968,7 @@ mod iov_tests {
     /// variance, and `gradient = fd` would silently fail to disable the analytic inner.
     /// (`ExpressionScale` is no longer a common bail — the non-IOV analytical inner serves
     /// it via the quotient rule. The **ODE** IOV path now serves an η-dependent `obs_scale`
-    /// too via the per-occasion-group post-walk quotient (#575); the **closed-form** IOV
+    /// too via the post-walk quotient (#575/#590); the **closed-form** IOV
     /// path still declines it (`iov_analytical_supported` requires `ScalingSpec::None`) —
     /// both pinned by the `iov_sens_supported` assertions below.)
     #[test]
@@ -3312,10 +4016,10 @@ mod iov_tests {
         model.residual_error_eta = None;
         assert!(crate::sens::provider::iov_sens_supported(&model));
 
-        // ODE IOV + η-dependent `ExpressionScale` `obs_scale` is now analytic (#575): the
-        // per-occasion-group post-walk quotient carries `d(obs_scale)/d(stacked-η)`, so
-        // `ode_iov_supported` (and hence `iov_sens_supported`) admits it. LTBS still
-        // declines — pinned in `sens::provider::tests::ode_iov_expr_scale_supported_and_gated`.
+        // ODE IOV + η-dependent `ExpressionScale` `obs_scale` is analytic (#575/#590):
+        // the post-walk quotient carries `d(obs_scale)/d(stacked-η)`, so `ode_iov_supported`
+        // (and hence `iov_sens_supported`) admits it. LTBS still declines — pinned in
+        // `sens::provider::tests::ode_iov_expr_scale_supported_and_gated`.
         let iov_scaled = parse_model_string(
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
@@ -3329,7 +4033,7 @@ mod iov_tests {
         );
         assert!(
             crate::sens::provider::iov_sens_supported(&iov_scaled),
-            "ODE IOV + η-dependent obs_scale is analytic via the per-group quotient (#575)"
+            "ODE IOV + η-dependent obs_scale is analytic via the post-walk quotient (#575/#590)"
         );
 
         // Same for the CLOSED-FORM IOV path (`iov_analytical_supported`, provider.rs:638,

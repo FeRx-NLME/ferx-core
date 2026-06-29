@@ -1342,7 +1342,7 @@ pub(crate) fn chol_log_det(l: &DMatrix<f64>) -> f64 {
 /// [`foce_subject_nll`].
 ///
 /// `kappas[k]` is the EBE kappa vector for occasion k (same order as
-/// `split_obs_by_occasion`).  When `kappas` is empty, falls through to the
+/// `iov_occasion_groups`).  When `kappas` is empty, falls through to the
 /// non-IOV path (no overhead for non-IOV subjects or models).
 pub fn foce_subject_nll_iov(
     model: &CompiledModel,
@@ -1369,7 +1369,7 @@ pub fn foce_subject_nll_iov(
         );
     }
 
-    let occ_groups = split_obs_by_occasion(subject);
+    let occ_groups = iov_occasion_groups(subject);
     let n_obs = subject.obs_times.len();
     let n_eta = eta_hat.len();
     let n_iov = omega_iov.matrix.nrows();
@@ -1693,7 +1693,25 @@ pub fn split_obs_by_occasion(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
         .collect()
 }
 
-/// Map each occasion id to its group index `k` (the order [`split_obs_by_occasion`]
+/// IOV kappa groups for a subject.
+///
+/// Observation occasions keep the historical [`split_obs_by_occasion`] order. Dose
+/// occasions that have no sampled observations are appended in first-dose order with an
+/// empty observation-index list. This preserves existing stacked-kappa ordering for the
+/// common case while assigning dose-only occasions their own axes, so dose carryover into
+/// later observations can be differentiated analytically.
+pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
+    let mut groups = split_obs_by_occasion(subject);
+    let mut seen: std::collections::HashSet<u32> = groups.iter().map(|(occ, _)| *occ).collect();
+    for &occ in &subject.dose_occasions {
+        if seen.insert(occ) {
+            groups.push((occ, Vec::new()));
+        }
+    }
+    groups
+}
+
+/// Map each occasion id to its group index `k` (the order [`iov_occasion_groups`]
 /// returns). Shared by the closed-form (`build_iov_sources`) and ODE (`run_subject_iov` /
 /// `run_subject_iov_eta`) IOV providers so the occasion→group mapping is defined once
 /// (#466 review round 2).
@@ -1720,6 +1738,18 @@ pub fn iov_combined_effect(
     c.extend_from_slice(&stacked_eta[..n_eta]);
     let base = n_eta + g * n_kappa;
     c.extend_from_slice(&stacked_eta[base..base + n_kappa]);
+    c
+}
+
+/// The combined effect vector `[η_bsv, 0…0]` for an **EVID=2 pk-only** event — the κ=0
+/// counterpart of [`iov_combined_effect`]. Pk-only breakpoints carry no occasion, so their
+/// IOV κ block is held at zero (matching production `predict_iov`'s `combined_for(u32::MAX)`
+/// branch). Shares the stacked-η layout with [`iov_combined_effect`] so the closed-form and
+/// ODE IOV providers cannot seed the κ=0 block differently (#598 review).
+pub fn iov_combined_pk_only(stacked_eta: &[f64], n_eta: usize, n_kappa: usize) -> Vec<f64> {
+    let mut c = Vec::with_capacity(n_eta + n_kappa);
+    c.extend_from_slice(&stacked_eta[..n_eta]);
+    c.extend(std::iter::repeat(0.0).take(n_kappa));
     c
 }
 
@@ -1755,7 +1785,7 @@ pub fn build_block_diag_omega(
 /// IOV-aware individual NLL: uses per-occasion kappas.
 ///
 /// `kappas[k]` is the kappa vector for the k-th unique occasion (in the order
-/// returned by `split_obs_by_occasion`).  When `kappas` is empty, falls back
+/// returned by `iov_occasion_groups`).  When `kappas` is empty, falls back
 /// to the standard (no-IOV) `individual_nll` path.
 ///
 /// **Cross-occasion dose carryover (issue #104).** Predictions are computed by
@@ -2109,6 +2139,18 @@ mod tests {
         subj.cens = Vec::new();
         let groups = split_obs_by_occasion(&subj);
         assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_iov_occasion_groups_appends_dose_only_occ() {
+        let mut subj = make_simple_subject();
+        subj.dose_occasions = vec![1, 3, 2, 4, 3];
+        let groups = iov_occasion_groups(&subj);
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0], (1, vec![0, 1, 2]));
+        assert_eq!(groups[1], (2, vec![3, 4, 5]));
+        assert_eq!(groups[2], (3, Vec::new()));
+        assert_eq!(groups[3], (4, Vec::new()));
     }
 
     #[test]

@@ -56,18 +56,18 @@ fn main() {
         eprintln!("Warning: --include-data ignored (no --data file to embed)");
     }
 
-    // Configure rayon's global pool before any parallel work starts. build_global()
-    // is once-per-process — correct for a CLI binary. Without a --threads flag we
-    // leave rayon's default (one worker per logical CPU) in place.
+    // Honor --threads by sizing rayon's global pool (build_global() is once-per-process,
+    // correct for a CLI binary) so fit()'s default pool — sized to current_num_threads()
+    // — inherits the count. The 32 MiB worker stack that wide ODE+IOV analytic gradients
+    // need is applied by fit()'s own fit-scoped pool (api::default_fit_pool), so the
+    // global pool keeps the platform-default stack here rather than reserving a second
+    // 32 MiB × N. Without --threads, fit() sizes its pool to all cores.
     if let Some(n) = threads {
         if let Err(e) = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global()
         {
-            eprintln!(
-                "Warning: failed to configure thread pool with {} threads: {}",
-                n, e
-            );
+            eprintln!("Warning: failed to configure thread pool with {n} threads: {e}");
         }
     }
 

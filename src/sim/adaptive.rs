@@ -148,6 +148,29 @@ impl MonitorSpec {
     }
 }
 
+/// A monitor paired with its optional compiled `observe` expression — the
+/// driver's per-signal input.
+///
+/// Pairing the expression *with* its [`MonitorSpec`] (rather than carrying a
+/// parallel `observe_exprs` slice the driver indexes by position) makes a
+/// monitor/expression desync unrepresentable. `observe == None` ⇒ read the
+/// model's `cmt` readout (the programmatic path); `Some(f)` ⇒ the declarative
+/// `[adaptive_dosing]` block's compiled signal expression (#391 S2).
+pub(crate) struct AdaptiveMonitor<'a> {
+    pub spec: &'a MonitorSpec,
+    pub observe: Option<&'a crate::ode::OdeOutputFn>,
+}
+
+/// What a controller returns at one decision: the dose [`DoseAction`]s to apply,
+/// plus optional provenance — the label of the declarative `when` rule that
+/// fired, so the dose ledger can record *why* a dose changed. `rule == None` for
+/// a programmatic controller or a no-rule re-issue (the driver then records the
+/// dose by its route), so the field never fabricates a rule that did not fire.
+pub(crate) struct ControllerDecision {
+    pub actions: Vec<DoseAction>,
+    pub rule: Option<String>,
+}
+
 /// The value a monitored signal actually presented to the controller at a
 /// decision, plus the mode it was resolved under — recorded on each
 /// [`DoseLedgerEntry`] so decision-audit replay (#391 Part E) can reproduce the
@@ -397,6 +420,335 @@ pub(crate) struct AssayNoise<'a> {
     pub base_seed: u64,
 }
 
+// ── Declarative `[adaptive_dosing]` block (#391 S2) ─────────────────────────
+//
+// The *parsed* form of the file-driven reactive controller. This is pure syntax
+// (an AST): it carries no binding to the model's parameters and no runtime. The
+// `observe` expression is kept as source text and compiled against the model's
+// parameter context when the controller is built (S2.2) — holding the spec as
+// data keeps the parser independent of the integration engine. The parser
+// (`parse_adaptive_dosing_block` in `parser::model_parser`) is the single place
+// that establishes the field invariants documented below.
+
+/// A parsed `[adaptive_dosing]` block: a declarative, file-driven reactive
+/// controller (#391 S2).
+///
+/// **Invariants** (guaranteed by the block parser, assumed downstream): `at` is
+/// non-empty and strictly increasing; `dose_bounds.0 <= dose_bounds.1` with
+/// `0 <= dose_bounds.0`; `start_dose` lies within `dose_bounds`; `confirm >= 1`;
+/// `rules` is non-empty; `levels`, when present, is non-empty and strictly
+/// increasing and contains `start_dose`; and the rule ladder uses percentage
+/// dose steps iff `levels` is `None` and one-level steps iff `levels` is `Some`
+/// (never mixed). Exactly one signal source: `observe` (a latent expression, with
+/// `with_assay_error = false`) **or** `with_assay_error = true` naming a model
+/// output via `assay_cmt` — never both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveDosingSpec {
+    /// The latent (Ipred) monitored signal — a free-form expression over states +
+    /// individual parameters (e.g. `central / V`), compiled against the model in
+    /// S2.2. `Some` for an un-noised signal; `None` when `with_assay_error` is set
+    /// (the signal is then the noised model output named by `assay_cmt`, not a
+    /// re-typed expression). The `when` rules compare the keyword `signal` to it.
+    pub observe: Option<String>,
+    /// Titrate on the assay-noised measurement of a model output (`true`) rather
+    /// than a latent expression (`false`, the default). When set, the signal's
+    /// value *and* its σ both come from the output named by `assay_cmt`, so they
+    /// can never be on different scales.
+    pub with_assay_error: bool,
+    /// 1-based compartment of the model output to measure under `with_assay_error`
+    /// — its `[scaling]` readout is the signal value and its `[error_model]` σ the
+    /// noise. Required iff `with_assay_error`; `None` otherwise.
+    pub assay_cmt: Option<usize>,
+    /// Decision schedule (subject clock), expanded to explicit times at parse
+    /// time — the times the controller is consulted.
+    pub at: Vec<f64>,
+    /// Dose issued at the first decision; seeds the controller's running dose.
+    pub start_dose: f64,
+    /// How an emitted dose is delivered.
+    pub route: AdaptiveRoute,
+    /// Inclusive `(low, high)` clamp applied to every emitted dose.
+    pub dose_bounds: (f64, f64),
+    /// Debounce: act only after this many *consecutive* matches of the same rule.
+    /// `1` acts on the first breach.
+    pub confirm: u32,
+    /// Discrete titration levels (oncology). When set, `increase`/`decrease` step
+    /// one level; mutually exclusive with percentage steps.
+    pub levels: Option<Vec<f64>>,
+    /// The first-matching-rule ladder, in file order.
+    pub rules: Vec<AdaptiveRule>,
+}
+
+/// Validate a `[adaptive_dosing]` float list is non-empty, all-finite, and
+/// strictly increasing — the shared contract of the `levels` ladder and an
+/// explicit `at` decision list. Called from BOTH the block parser and
+/// [`AdaptiveDosingSpec::validate`] so the file-driven and programmatic paths
+/// enforce it identically (a single source of truth, not two that can drift).
+/// `what` names the list in the error (e.g. `"levels"`, `` "`at` times" ``).
+pub(crate) fn validate_increasing_finite(xs: &[f64], what: &str) -> Result<(), String> {
+    if xs.is_empty() {
+        return Err(format!(
+            "[adaptive_dosing]: {what} must be a non-empty list"
+        ));
+    }
+    if !xs.iter().all(|x| x.is_finite()) {
+        return Err(format!("[adaptive_dosing]: {what} must all be finite"));
+    }
+    if xs.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(format!(
+            "[adaptive_dosing]: {what} must be strictly increasing"
+        ));
+    }
+    Ok(())
+}
+
+impl AdaptiveDosingSpec {
+    /// Enforce every invariant the block parser checks, in one place.
+    ///
+    /// The struct is `pub` with `pub` fields, so a programmatically-built spec can
+    /// reach the controller without going through the parser. The parser calls
+    /// this on the spec it assembles, and
+    /// [`compile_adaptive`](crate::sim::adaptive_control::compile_adaptive) calls
+    /// it again as the safety net for hand-built specs — so neither path can drive
+    /// the controller with a contradiction (a `Level` step without a `levels`
+    /// ladder, a `start_dose` outside `dose_bounds`, a rung outside `dose_bounds`,
+    /// an empty or unsorted `at`/`levels`, a `confirm` of 0, …) the other would
+    /// have rejected.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.rules.is_empty() {
+            return Err(
+                "[adaptive_dosing]: at least one `when … : …` rule is required".to_string(),
+            );
+        }
+        let (lo, hi) = self.dose_bounds;
+        if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi < lo {
+            return Err(format!(
+                "[adaptive_dosing]: dose_bounds must be finite with 0 <= low <= high: [{lo}, {hi}]"
+            ));
+        }
+        if !self.start_dose.is_finite() || self.start_dose < 0.0 {
+            return Err(format!(
+                "[adaptive_dosing]: start_dose must be finite and >= 0: {}",
+                self.start_dose
+            ));
+        }
+        if self.start_dose < lo || self.start_dose > hi {
+            return Err(format!(
+                "[adaptive_dosing]: start_dose {} is outside dose_bounds [{lo}, {hi}]",
+                self.start_dose
+            ));
+        }
+        // The decision schedule must be a non-empty, finite, strictly-increasing
+        // list of non-negative times. The parser enforces this on the way in;
+        // re-check here so a hand-built spec can't silently run with no doses
+        // (empty `at`) or a permuted decision log (unsorted `at`).
+        validate_increasing_finite(&self.at, "`at` times")?;
+        if self.at[0] < 0.0 {
+            // Strictly increasing ⇒ `at[0]` is the minimum.
+            return Err(format!(
+                "[adaptive_dosing]: `at` times must be >= 0: {}",
+                self.at[0]
+            ));
+        }
+        if self.confirm < 1 {
+            return Err(
+                "[adaptive_dosing]: confirm must be >= 1 (1 acts on the first breach)".to_string(),
+            );
+        }
+        // Exactly one signal source. `observe` is the latent (Ipred) signal — a
+        // free-form expression with no measurement noise. `with_assay_error = true`
+        // makes the signal the *noised measurement* of the model output named by
+        // `assay_cmt`: its value and σ both come from that one output, so they can
+        // never be on different scales. The two forms are mutually exclusive.
+        match (
+            self.with_assay_error,
+            self.observe.is_some(),
+            self.assay_cmt.is_some(),
+        ) {
+            (false, true, false) => {} // Ipred: titrate on the `observe` expression.
+            (true, false, true) => {}  // Dv: titrate on the noised output at `assay_cmt`.
+            (false, false, _) => {
+                return Err(
+                    "[adaptive_dosing]: a signal is required — set `observe = <expr>` to titrate \
+                     on a latent quantity, or `with_assay_error = true` with `assay_cmt = N` to \
+                     titrate on a noised measurement"
+                        .to_string(),
+                )
+            }
+            (false, true, true) => {
+                return Err(
+                    "[adaptive_dosing]: assay_cmt is set but with_assay_error = false".to_string(),
+                )
+            }
+            (true, true, _) => {
+                return Err(
+                    "[adaptive_dosing]: with `with_assay_error = true` the signal is the noised \
+                     measurement of the model output named by `assay_cmt`; remove `observe` (it \
+                     applies only to un-noised Ipred titration)"
+                        .to_string(),
+                )
+            }
+            (true, false, false) => return Err(
+                "[adaptive_dosing]: `with_assay_error = true` requires `assay_cmt = N` to name \
+                     which model output is measured"
+                    .to_string(),
+            ),
+        }
+
+        // Percentage vs one-level dose steps are mutually exclusive and tied to `levels`.
+        let has_percent = self.rules.iter().any(|r| {
+            matches!(
+                r.action,
+                AdaptiveAction::Increase(DoseStep::Percent(_))
+                    | AdaptiveAction::Decrease(DoseStep::Percent(_))
+            )
+        });
+        let has_level = self.rules.iter().any(|r| {
+            matches!(
+                r.action,
+                AdaptiveAction::Increase(DoseStep::Level)
+                    | AdaptiveAction::Decrease(DoseStep::Level)
+            )
+        });
+        match &self.levels {
+            Some(l) => {
+                // Non-empty, finite, strictly increasing: a `Level` step indexes
+                // this ladder and assumes ascending order — on a descending list
+                // `increase` would *lower* the dose. The parser checks this on the
+                // way in; re-check for hand-built specs.
+                validate_increasing_finite(l, "levels")?;
+                if has_percent {
+                    return Err("[adaptive_dosing]: percentage actions (`increase N%`) are not \
+                                allowed with `levels`; use bare `increase`/`decrease` to step one level"
+                        .to_string());
+                }
+                if !l.contains(&self.start_dose) {
+                    return Err(format!(
+                        "[adaptive_dosing]: start_dose {} must be one of the declared levels {l:?}",
+                        self.start_dose
+                    ));
+                }
+                // Every rung must lie within `dose_bounds`; otherwise `step_dose`
+                // clamps the emitted dose while the rung index keeps advancing,
+                // decoupling the decision log from the realized dose.
+                if let Some(bad) = l.iter().find(|&&x| x < lo || x > hi) {
+                    return Err(format!(
+                        "[adaptive_dosing]: level {bad} is outside dose_bounds [{lo}, {hi}]"
+                    ));
+                }
+            }
+            None => {
+                if has_level {
+                    return Err(
+                        "[adaptive_dosing]: bare `increase`/`decrease` (a level step) requires \
+                                a `levels = [...]` ladder; use `increase N%` for continuous titration"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How an adaptive dose is delivered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdaptiveRoute {
+    /// Instantaneous dose into 1-based compartment `cmt`.
+    Bolus { cmt: usize },
+    /// Zero-order infusion of duration `over` into 1-based compartment `cmt`.
+    Infuse { cmt: usize, over: f64 },
+}
+
+/// One rung of the ladder: `when signal <op> <threshold> : <action>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdaptiveRule {
+    /// The comparison applied to the observed `signal`.
+    pub op: Comparison,
+    /// The right-hand side of the comparison.
+    pub threshold: f64,
+    /// What to do when this rule is the first to match.
+    pub action: AdaptiveAction,
+}
+
+/// A signal comparison operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    /// `<`
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
+    /// `==`
+    Eq,
+}
+
+/// What a matched rule does to the running dose.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdaptiveAction {
+    /// Raise the dose (by a percentage, or one level if the block declares `levels`).
+    Increase(DoseStep),
+    /// Lower the dose (by a percentage, or one level if the block declares `levels`).
+    Decrease(DoseStep),
+    /// Skip this decision — no dose now, the regimen continues.
+    Hold,
+    /// Discontinue all future dosing.
+    Stop,
+}
+
+/// The magnitude of an [`AdaptiveAction::Increase`] / [`AdaptiveAction::Decrease`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum DoseStep {
+    /// Scale by this percent, e.g. `Percent(25.0)` for `increase 25%`. Valid only
+    /// when the block has no `levels` ladder.
+    Percent(f64),
+    /// Step one discrete level. Valid only when the block declares `levels`.
+    Level,
+}
+
+impl Comparison {
+    /// The operator's source symbol, for rule labels / diagnostics.
+    fn symbol(self) -> &'static str {
+        match self {
+            Comparison::Lt => "<",
+            Comparison::Le => "<=",
+            Comparison::Gt => ">",
+            Comparison::Ge => ">=",
+            Comparison::Eq => "==",
+        }
+    }
+}
+
+impl AdaptiveAction {
+    /// The action's source-like label (`"increase 25%"`, `"hold"`, …).
+    fn label(&self) -> String {
+        match self {
+            AdaptiveAction::Increase(DoseStep::Percent(p)) => format!("increase {p}%"),
+            AdaptiveAction::Increase(DoseStep::Level) => "increase".to_string(),
+            AdaptiveAction::Decrease(DoseStep::Percent(p)) => format!("decrease {p}%"),
+            AdaptiveAction::Decrease(DoseStep::Level) => "decrease".to_string(),
+            AdaptiveAction::Hold => "hold".to_string(),
+            AdaptiveAction::Stop => "stop".to_string(),
+        }
+    }
+}
+
+impl AdaptiveRule {
+    /// A human-readable label reconstructing the rule as written
+    /// (`"signal < 10 : increase 25%"`) — recorded as the dose ledger's
+    /// `rule_fired` so an audit can name which rung produced each dose.
+    pub(crate) fn label(&self) -> String {
+        format!(
+            "signal {} {} : {}",
+            self.op.symbol(),
+            self.threshold,
+            self.action.label()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,6 +806,146 @@ mod tests {
         assert_eq!(m.name, "ANC");
         assert_eq!(m.cmt, 3);
         assert_eq!(m.mode, ObserveMode::Dv);
+    }
+
+    fn base_spec() -> AdaptiveDosingSpec {
+        AdaptiveDosingSpec {
+            observe: Some("central".to_string()),
+            with_assay_error: false,
+            assay_cmt: None,
+            at: vec![24.0],
+            start_dose: 100.0,
+            route: AdaptiveRoute::Bolus { cmt: 1 },
+            dose_bounds: (0.0, 400.0),
+            confirm: 1,
+            levels: None,
+            rules: vec![AdaptiveRule {
+                op: Comparison::Lt,
+                threshold: 10.0,
+                action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
+            }],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_spec() {
+        assert!(base_spec().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_programmatic_spec_violations() {
+        // The struct is `pub` with `pub` fields, so these never pass through the
+        // block parser — `validate` (called by `compile_adaptive`) is the guard.
+        let level_rule = || {
+            vec![AdaptiveRule {
+                op: Comparison::Lt,
+                threshold: 10.0,
+                action: AdaptiveAction::Increase(DoseStep::Level),
+            }]
+        };
+
+        // start_dose outside dose_bounds.
+        let mut s = base_spec();
+        s.start_dose = 500.0;
+        assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
+
+        // no rules.
+        let mut s = base_spec();
+        s.rules.clear();
+        assert!(s.validate().unwrap_err().contains("rule"));
+
+        // a Level step with no `levels` ladder (a silent no-op in `step_dose`).
+        let mut s = base_spec();
+        s.rules = level_rule();
+        assert!(s.validate().unwrap_err().contains("levels"));
+
+        // a level rung outside dose_bounds.
+        let mut s = base_spec();
+        s.dose_bounds = (0.0, 120.0);
+        s.levels = Some(vec![100.0, 150.0]);
+        s.rules = level_rule();
+        assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
+    }
+
+    #[test]
+    fn validate_rejects_schedule_and_levels_ordering() {
+        // These single-field invariants are enforced by the block parser; `validate`
+        // is the safety net for a hand-built `pub` spec that never saw the parser.
+        // Without them a programmatic spec drives a silent wrong result through the
+        // public `simulate_adaptive_from_spec`.
+
+        // empty `at` — would otherwise run a silent no-dose simulation.
+        let mut s = base_spec();
+        s.at = vec![];
+        assert!(s.validate().unwrap_err().contains("non-empty"));
+
+        // unsorted `at` — would permute the decision log.
+        let mut s = base_spec();
+        s.at = vec![48.0, 24.0];
+        assert!(s.validate().unwrap_err().contains("strictly increasing"));
+
+        // negative decision time.
+        let mut s = base_spec();
+        s.at = vec![-1.0, 24.0];
+        assert!(s.validate().unwrap_err().contains(">= 0"));
+
+        // confirm = 0 (the parser requires >= 1).
+        let mut s = base_spec();
+        s.confirm = 0;
+        assert!(s.validate().unwrap_err().contains("confirm"));
+
+        // Descending `levels` — the regression that motivated this: a `Level` step
+        // on a non-ascending ladder makes `increase` *lower* the dose. `validate`
+        // must reject it rather than let the controller silently invert.
+        let mut s = base_spec();
+        s.start_dose = 200.0;
+        s.levels = Some(vec![200.0, 100.0, 50.0]);
+        s.rules = vec![AdaptiveRule {
+            op: Comparison::Lt,
+            threshold: 10.0,
+            action: AdaptiveAction::Increase(DoseStep::Level),
+        }];
+        assert!(s.validate().unwrap_err().contains("strictly increasing"));
+    }
+
+    #[test]
+    fn validate_enforces_one_signal_source() {
+        // `observe` (latent) and `with_assay_error` (noised model output) are
+        // mutually exclusive; exactly one is required.
+        // valid Ipred: observe set, no assay error.
+        assert!(base_spec().validate().is_ok());
+
+        // valid Dv: no observe, with_assay_error naming the output.
+        let mut s = base_spec();
+        s.observe = None;
+        s.with_assay_error = true;
+        s.assay_cmt = Some(1);
+        assert!(s.validate().is_ok());
+
+        // no signal at all.
+        let mut s = base_spec();
+        s.observe = None;
+        assert!(s.validate().unwrap_err().contains("a signal is required"));
+
+        // both an observe expression and assay error.
+        let mut s = base_spec();
+        s.with_assay_error = true;
+        s.assay_cmt = Some(1);
+        assert!(s.validate().unwrap_err().contains("remove `observe`"));
+
+        // assay error without naming the measured output.
+        let mut s = base_spec();
+        s.observe = None;
+        s.with_assay_error = true;
+        assert!(s.validate().unwrap_err().contains("requires `assay_cmt"));
+
+        // assay_cmt set but no assay error.
+        let mut s = base_spec();
+        s.assay_cmt = Some(1);
+        assert!(s
+            .validate()
+            .unwrap_err()
+            .contains("assay_cmt is set but with_assay_error = false"));
     }
 
     #[test]

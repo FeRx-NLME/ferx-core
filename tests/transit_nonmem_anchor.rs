@@ -30,6 +30,7 @@
 //! `docs/model-file/absorption.qmd` "Verification against NONMEM"). This
 //! test therefore sets the tight tolerances explicitly.
 
+use ferx_core::ode::{ode_predictions_with_solver_stats, OdeSolverStats};
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
@@ -115,5 +116,64 @@ fn savic_transit_matches_nonmem_ofv() {
         result.ofv,
         EXPECTED_OFV,
         TOLERANCE,
+    );
+}
+
+/// The #387 solver-decision gate: at NONMEM-equivalent tolerances the Savic
+/// transit anchor should be accepted-step dominated, not rejection/min-step
+/// dominated. That means a stabilized low-order method such as ROCK2 should not
+/// be treated as the expected #385 fix without a separate loose-tolerance stiff
+/// benchmark.
+#[test]
+fn savic_transit_1e9_rk45_stats_are_accepted_step_dominated() {
+    let mut model = parse_full_model(MODEL_SRC)
+        .expect("Savic transit model must parse")
+        .model;
+    let pop = read_nonmem_csv(Path::new("data/transit_oral.csv"), None, None)
+        .expect("transit_oral data must load");
+    {
+        let ode = model
+            .ode_spec
+            .as_mut()
+            .expect("Savic transit model must be ODE-based");
+        ode.solver_opts.reltol = 1e-9;
+        ode.solver_opts.abstol = 1e-9;
+    }
+
+    // Tight-tolerance ferx estimates from the NONMEM anchor documentation:
+    // docs/model-file/absorption.qmd, "Savic transit (`transit`)".
+    let theta = [5.453, 55.759, 0.950, 0.966, 3.128];
+    let eta = vec![0.0; model.n_eta];
+    let mut stats = OdeSolverStats::default();
+    let mut n_pred = 0usize;
+
+    for subject in &pop.subjects {
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
+        let (pred, subject_stats) = ode_predictions_with_solver_stats(
+            model.ode_spec.as_ref().unwrap(),
+            &pk.values,
+            &theta,
+            &eta,
+            subject,
+        );
+        n_pred += pred.len();
+        stats.attempted_steps += subject_stats.attempted_steps;
+        stats.accepted_steps += subject_stats.accepted_steps;
+        stats.rejected_steps += subject_stats.rejected_steps;
+        stats.min_step_clamped_steps += subject_stats.min_step_clamped_steps;
+    }
+
+    assert_eq!(n_pred, 240);
+    assert_eq!(
+        stats.attempted_steps,
+        stats.accepted_steps + stats.rejected_steps
+    );
+    assert!(
+        stats.accepted_steps > 10 * stats.rejected_steps.max(1),
+        "Savic transit at 1e-9 should be accepted-step dominated; stats = {stats:?}"
+    );
+    assert_eq!(
+        stats.min_step_clamped_steps, 0,
+        "Savic transit at 1e-9 should not be min-step clamped; stats = {stats:?}"
     );
 }
