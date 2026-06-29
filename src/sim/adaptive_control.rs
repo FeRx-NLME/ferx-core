@@ -362,6 +362,7 @@ mod tests {
             dose_bounds,
             confirm,
             levels,
+            target_window: None,
             rules,
         }
     }
@@ -712,6 +713,7 @@ mod tests {
             dose_bounds: (0.0, 400.0),
             confirm: 1,
             levels: None,
+            target_window: None,
             rules: vec![rule(Comparison::Gt, 1000.0, AdaptiveAction::Hold)],
         }
     }

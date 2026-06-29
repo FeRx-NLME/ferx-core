@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Per-subject outcome metrics for adaptive dosing** (#391, S2.4). `simulate_adaptive()` and
+  `simulate_adaptive_from_spec()` now return a `metrics` field on `AdaptiveSimulationResult` —
+  one `AdaptiveSubjectMetrics` row per realized `(subject, draw, sim)` run: cumulative dose,
+  dose-increase / -decrease / hold / discontinuation counts, time-to-discontinuation, and the
+  observed-signal summary (min / max / mean). A new optional `[adaptive_dosing] target_window =
+  [low, high]` key adds `pct_time_in_window` (the fraction of decisions whose observed signal fell
+  in the band; `high` may be `inf` for a one-sided target) — it reports a metric only and never
+  influences dosing. Every metric is derived from the realized dose ledger and decision log alone.
+  See [Adaptive dosing](model-file/adaptive-dosing.qmd).
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose

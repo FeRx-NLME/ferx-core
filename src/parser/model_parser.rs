@@ -3850,6 +3850,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     let mut dose_bounds: Option<(f64, f64)> = None;
     let mut confirm: u32 = 1;
     let mut levels: Option<Vec<f64>> = None;
+    let mut target_window: Option<(f64, f64)> = None;
     let mut rules: Vec<AdaptiveRule> = Vec::new();
 
     for line in lines {
@@ -3942,6 +3943,27 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
                 validate_increasing_finite(&l, "levels")?;
                 levels = Some(l);
             }
+            "target_window" => {
+                // Therapeutic band `[low, high]` for the `pct_time_in_window` metric
+                // only — it does not affect dosing. `low` must be finite; `high` may
+                // be `inf` for a one-sided "at or above low" target. The same check
+                // runs in `AdaptiveDosingSpec::validate`.
+                let b = parse_float_array(val)
+                    .map_err(|e| format!("[adaptive_dosing]: bad target_window: {e}"))?;
+                if b.len() != 2 {
+                    return Err(format!(
+                        "[adaptive_dosing]: target_window must be `[low, high]`: {val}"
+                    ));
+                }
+                let (lo, hi) = (b[0], b[1]);
+                if !lo.is_finite() || hi.is_nan() || hi < lo {
+                    return Err(format!(
+                        "[adaptive_dosing]: target_window must be `[low, high]` with low finite \
+                         and low <= high (high may be `inf`): {val}"
+                    ));
+                }
+                target_window = Some((lo, hi));
+            }
             other => return Err(format!("[adaptive_dosing]: unknown key `{other}`")),
         }
     }
@@ -3968,6 +3990,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
         dose_bounds,
         confirm,
         levels,
+        target_window,
         rules,
     };
     spec.validate()?;
@@ -24673,6 +24696,50 @@ mod adaptive_dosing_tests {
         assert!(!spec.with_assay_error);
         assert_eq!(spec.assay_cmt, None);
         assert_eq!(spec.levels, None);
+        // No `target_window` declared ⇒ `None` (metrics leave `pct_time_in_window`
+        // unreported rather than guessing a band).
+        assert_eq!(spec.target_window, None);
+    }
+
+    #[test]
+    fn target_window_parses_band_and_one_sided() {
+        let band = parse_adaptive_dosing_block(&{
+            let mut b = without("nothing");
+            b.push("target_window = [10, 20]".into());
+            b
+        })
+        .expect("two-sided target_window parses");
+        assert_eq!(band.target_window, Some((10.0, 20.0)));
+
+        // A one-sided "at or above 10" target: `high = inf` is allowed.
+        let one_sided = parse_adaptive_dosing_block(&{
+            let mut b = without("nothing");
+            b.push("target_window = [10, inf]".into());
+            b
+        })
+        .expect("one-sided target_window parses");
+        let (lo, hi) = one_sided.target_window.expect("Some");
+        assert_eq!(lo, 10.0);
+        assert!(hi.is_infinite() && hi > 0.0);
+    }
+
+    #[test]
+    fn target_window_bad_band_errors() {
+        // Inverted, non-finite low, and wrong arity each reject loudly, naming the key.
+        for bad in [
+            "target_window = [20, 10]", // high < low
+            "target_window = [nan, 20]",
+            "target_window = [inf, 20]", // low must be finite
+            "target_window = [10]",      // not [low, high]
+        ] {
+            let mut b = without("nothing");
+            b.push(bad.into());
+            let err = parse_adaptive_dosing_block(&b).expect_err("expected a typed parse error");
+            assert!(
+                err.starts_with("[adaptive_dosing]:") && err.contains("target_window"),
+                "`{bad}` gave: {err}"
+            );
+        }
     }
 
     #[test]

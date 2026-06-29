@@ -52,6 +52,7 @@ with the run, never with a fitted model's parameters.
 | `dose_bounds` | ✓ | Inclusive `[low, high]` clamp applied to every emitted dose. |
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. |
+| `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
 | `with_assay_error` | signal¹ | Titrate on the **noised measurement** of a model output (named by `assay_cmt`) instead of a latent expression (default `false`). The signal's value comes from that output's `[scaling]` readout and its σ from that output's `[error_model]`, so the two are always on the same scale — there is no re-typed `observe` expression to mis-scale. Mutually exclusive with `observe`. |
 | `assay_cmt` | | The 1-based compartment of the model output measured under `with_assay_error` — its `[scaling]` readout is the signal value and its `[error_model]` σ the noise. **Required** with `with_assay_error`. |
 
@@ -184,7 +185,7 @@ let make_controller = || {
 let result = simulate_adaptive(&model, &population, &params, 100, make_controller, &opts)?;
 ```
 
-The result bundles the three tidy, long-form artifacts — each tagged by
+The result bundles four tidy, long-form artifacts — each tagged by
 `(draw, sim, id)` so they join cleanly:
 
 - `trajectories` — per-observation predictions (`Vec<SimulationResult>`).
@@ -192,6 +193,17 @@ The result bundles the three tidy, long-form artifacts — each tagged by
   observed signals, applied bioavailability).
 - `decisions` — one row per decision **including holds**, so non-events are on the
   record rather than inferred from gaps in the ledger.
+- `metrics` — one per-subject `AdaptiveSubjectMetrics` row per realized run:
+  cumulative dose, dose-increase / -decrease / hold / discontinuation counts,
+  time-to-discontinuation, the observed-signal summary (min / max / mean), and
+  `pct_time_in_window` when the block declares a `target_window`. Every field is
+  derived from `ledger` + `decisions` alone, so it is auditable against those rows
+  (no re-integration). Increases / decreases are counted by realized dose change,
+  not by which rule fired — a `decrease` clamped at the lower bound re-issues the
+  same dose and is not counted. The signal summary is over the troughs/peaks the
+  controller saw at the decision times (a decision-grid summary, not a
+  dense-trajectory extremum). Population summaries **with uncertainty bands** ride
+  with the uncertainty slice, where bands carry meaning.
 
 ## Verification (on by default)
 
@@ -250,7 +262,7 @@ family. It is validated instead by:
 - **One monitored signal per block** — the declarative block titrates on a single
   `observe`; multiple named per-analyte monitors (already supported by the
   programmatic engine) are a declarative-surface follow-up.
-- **Roadmap** — per-subject outcome metrics on the result, the imperative
+- **Roadmap** — population outcome summaries with uncertainty bands, the imperative
   `[dose_control]` block, and PK + PD + safety model composition.
 
 [`ControllerCtx`]: https://docs.rs/ferx-core
