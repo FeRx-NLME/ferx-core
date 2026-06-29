@@ -2408,11 +2408,21 @@ differencing and remain (true elimination needs analytic CHZ η-sensitivities �
 - **Degenerate oracle (unit):** constant-hazard ODE (`dCHZ/dt = λ`) sampled via the root-finder
   vs. the analytic Exponential inverse-CDF, **same seed**, compared per-draw to a tolerance tied
   to solver `abstol`/`reltol` + the bisection tol — directly pins root-finder accuracy.
+- **PIT / KS goodness-of-fit (the decisive sampler validator, gated `slow-tests`):** for a
+  **fixed-effects** joint PK-TTE truth, simulate N event times with the production root-finder,
+  then probability-integral-transform each — `V_i = exp(−Ĥ(T_i))` where `Ĥ` is an **independent**
+  closed-form-PK + trapezoid cumulative-hazard oracle (no shared code with the sampler) — and KS-test
+  `{V_i}` against Uniform(0,1) at the 5% level. This validates that the sampler draws from the
+  model's *own* survival, and is **immune to the (H0,BETA) collinear ridge** (no estimation) and to
+  FOCEI-Laplace bias. `joint_pktte_event_times_match_model_survival` (observed KS D ≈ 0.040 ≈ the
+  `0.87/√N` expectation for a correct sampler, N=500).
 - **Tier-3 SSE** (gated `slow-tests`): simulate joint PK-TTE from known (θ, Ω) → fit → recover.
-  Fixed seed; **design the dataset for hazard-param identifiability** — the H0/BETA collinear
-  ridge from 2.1 (corr −0.93) means BETA needs enough events / exposure spread or recovery is
-  flaky; assert recovery of the *hazard* params (not just CL/V) with a tol derived from the
-  simulation SE, not eyeballed.
+  Fixed seed; assert tight **truth recovery of the identifiable params** (CL, V, KA, ω²(CL), pinned
+  by the continuous obs) + finite OFV + a non-degenerate event/censor mix. **Do NOT band H0/BETA to
+  truth:** they are collinear at any single-occasion design and exposure spread does *not* break it
+  (confirmed: doses {20,40,80} still give max |ΔS(t)| ≈ 0.16, H0/BETA off-truth along the ridge —
+  the same finding as 2.1's corr −0.91 across NONMEM/nlmixr2). A wide "sane-range" band on a
+  non-identified parameter passes for the wrong reason; hazard correctness is the PIT/KS test's job.
 - **Edge tests:** all-censored (hazard≈0 to horizon), all-immediate (huge hazard),
   `entry_time ≥ horizon` (empty risk window), no-horizon-set, and a negative-hazard model — each
   asserting the *specific* error/outcome, not just `is_err()`.
