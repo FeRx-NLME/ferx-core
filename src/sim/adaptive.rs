@@ -439,20 +439,25 @@ pub(crate) struct AssayNoise<'a> {
 /// `rules` is non-empty; `levels`, when present, is non-empty and strictly
 /// increasing and contains `start_dose`; and the rule ladder uses percentage
 /// dose steps iff `levels` is `None` and one-level steps iff `levels` is `Some`
-/// (never mixed). When `with_assay_error` is set on an *expression* `observe`,
-/// `assay_cmt` designates the endpoint whose residual error supplies the noise.
+/// (never mixed). Exactly one signal source: `observe` (a latent expression, with
+/// `with_assay_error = false`) **or** `with_assay_error = true` naming a model
+/// output via `assay_cmt` — never both.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdaptiveDosingSpec {
-    /// The monitored signal — an expression over states + individual parameters
-    /// (e.g. `central / V`). Stored as validated source text; compiled against the
-    /// model in S2.2. The `when` rules compare the keyword `signal` to this value.
-    pub observe: String,
-    /// Titrate on the assay-noised DV (`true`) rather than the latent IPRED
-    /// (`false`, the default).
+    /// The latent (Ipred) monitored signal — a free-form expression over states +
+    /// individual parameters (e.g. `central / V`), compiled against the model in
+    /// S2.2. `Some` for an un-noised signal; `None` when `with_assay_error` is set
+    /// (the signal is then the noised model output named by `assay_cmt`, not a
+    /// re-typed expression). The `when` rules compare the keyword `signal` to it.
+    pub observe: Option<String>,
+    /// Titrate on the assay-noised measurement of a model output (`true`) rather
+    /// than a latent expression (`false`, the default). When set, the signal's
+    /// value *and* its σ both come from the output named by `assay_cmt`, so they
+    /// can never be on different scales.
     pub with_assay_error: bool,
-    /// 1-based compartment whose `[error_model]` σ supplies the assay noise. Used
-    /// when `with_assay_error` is on and `observe` is an expression (so the
-    /// endpoint is not itself obvious). `None` otherwise.
+    /// 1-based compartment of the model output to measure under `with_assay_error`
+    /// — its `[scaling]` readout is the signal value and its `[error_model]` σ the
+    /// noise. Required iff `with_assay_error`; `None` otherwise.
     pub assay_cmt: Option<usize>,
     /// Decision schedule (subject clock), expanded to explicit times at parse
     /// time — the times the controller is consulted.
@@ -474,17 +479,6 @@ pub struct AdaptiveDosingSpec {
 }
 
 impl AdaptiveDosingSpec {
-    /// Whether `observe` is a multi-token *expression* (so its measured endpoint is
-    /// not self-evident) rather than a bare endpoint (a state name or compartment
-    /// number). The single classifier behind both the parse-time
-    /// `with_assay_error` ambiguity check ([`AdaptiveDosingSpec::validate`]) and the
-    /// compile-time endpoint resolver
-    /// ([`resolve_observe_cmt`](crate::sim::adaptive_control)), so the two can't
-    /// disagree about what counts as an expression.
-    pub(crate) fn observe_is_expression(&self) -> bool {
-        self.observe.chars().any(|c| "+-*/() ".contains(c))
-    }
-
     /// Enforce every cross-field invariant the block parser checks, in one place.
     ///
     /// The struct is `pub` with `pub` fields, so a programmatically-built spec can
@@ -519,21 +513,44 @@ impl AdaptiveDosingSpec {
                 self.start_dose
             ));
         }
-        if self.assay_cmt.is_some() && !self.with_assay_error {
-            return Err(
-                "[adaptive_dosing]: assay_cmt is set but with_assay_error = false".to_string(),
-            );
-        }
-        // The load-bearing S2 fork: assay noise on an *expression* observe is
-        // ambiguous (which endpoint's σ?). A bare endpoint can be resolved against
-        // the model in S2.2; an expression cannot, so it must designate `assay_cmt`
-        // — else a typed error, never a guessed σ.
-        if self.with_assay_error && self.assay_cmt.is_none() && self.observe_is_expression() {
-            return Err(format!(
-                "[adaptive_dosing]: with_assay_error on an expression observe (`{}`) is \
-                 ambiguous — which endpoint's residual error applies? Designate it with `assay_cmt = N`.",
-                self.observe
-            ));
+        // Exactly one signal source. `observe` is the latent (Ipred) signal — a
+        // free-form expression with no measurement noise. `with_assay_error = true`
+        // makes the signal the *noised measurement* of the model output named by
+        // `assay_cmt`: its value and σ both come from that one output, so they can
+        // never be on different scales. The two forms are mutually exclusive.
+        match (
+            self.with_assay_error,
+            self.observe.is_some(),
+            self.assay_cmt.is_some(),
+        ) {
+            (false, true, false) => {} // Ipred: titrate on the `observe` expression.
+            (true, false, true) => {}  // Dv: titrate on the noised output at `assay_cmt`.
+            (false, false, _) => {
+                return Err(
+                    "[adaptive_dosing]: a signal is required — set `observe = <expr>` to titrate \
+                     on a latent quantity, or `with_assay_error = true` with `assay_cmt = N` to \
+                     titrate on a noised measurement"
+                        .to_string(),
+                )
+            }
+            (false, true, true) => {
+                return Err(
+                    "[adaptive_dosing]: assay_cmt is set but with_assay_error = false".to_string(),
+                )
+            }
+            (true, true, _) => {
+                return Err(
+                    "[adaptive_dosing]: with `with_assay_error = true` the signal is the noised \
+                     measurement of the model output named by `assay_cmt`; remove `observe` (it \
+                     applies only to un-noised Ipred titration)"
+                        .to_string(),
+                )
+            }
+            (true, false, false) => return Err(
+                "[adaptive_dosing]: `with_assay_error = true` requires `assay_cmt = N` to name \
+                     which model output is measured"
+                    .to_string(),
+            ),
         }
 
         // Percentage vs one-level dose steps are mutually exclusive and tied to `levels`.
@@ -747,7 +764,7 @@ mod tests {
 
     fn base_spec() -> AdaptiveDosingSpec {
         AdaptiveDosingSpec {
-            observe: "central".to_string(),
+            observe: Some("central".to_string()),
             with_assay_error: false,
             assay_cmt: None,
             at: vec![24.0],
@@ -802,6 +819,46 @@ mod tests {
         s.levels = Some(vec![100.0, 150.0]);
         s.rules = level_rule();
         assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
+    }
+
+    #[test]
+    fn validate_enforces_one_signal_source() {
+        // `observe` (latent) and `with_assay_error` (noised model output) are
+        // mutually exclusive; exactly one is required.
+        // valid Ipred: observe set, no assay error.
+        assert!(base_spec().validate().is_ok());
+
+        // valid Dv: no observe, with_assay_error naming the output.
+        let mut s = base_spec();
+        s.observe = None;
+        s.with_assay_error = true;
+        s.assay_cmt = Some(1);
+        assert!(s.validate().is_ok());
+
+        // no signal at all.
+        let mut s = base_spec();
+        s.observe = None;
+        assert!(s.validate().unwrap_err().contains("a signal is required"));
+
+        // both an observe expression and assay error.
+        let mut s = base_spec();
+        s.with_assay_error = true;
+        s.assay_cmt = Some(1);
+        assert!(s.validate().unwrap_err().contains("remove `observe`"));
+
+        // assay error without naming the measured output.
+        let mut s = base_spec();
+        s.observe = None;
+        s.with_assay_error = true;
+        assert!(s.validate().unwrap_err().contains("requires `assay_cmt"));
+
+        // assay_cmt set but no assay error.
+        let mut s = base_spec();
+        s.assay_cmt = Some(1);
+        assert!(s
+            .validate()
+            .unwrap_err()
+            .contains("assay_cmt is set but with_assay_error = false"));
     }
 
     #[test]

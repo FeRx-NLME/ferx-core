@@ -5942,11 +5942,12 @@ pub fn simulate_adaptive_from_spec(
         .ode_spec
         .as_ref()
         .expect("compile_adaptive accepted the model, so it carries an ODE spec");
-    // Pair the single `signal` monitor with its compiled `observe` expression so
-    // the driver reads the engine-resolved signal rather than the bare cmt readout.
+    // Pair the single `signal` monitor with its compiled `observe` expression (the
+    // latent/`Ipred` case); under `Dv` `compiled.observe` is `None`, so the driver
+    // reads the model's own output for that cmt — value and σ from one source.
     let monitors = vec![crate::sim::adaptive::AdaptiveMonitor {
         spec: &compiled.monitors[0],
-        observe: Some(&compiled.observe),
+        observe: compiled.observe.as_ref(),
     }];
 
     run_adaptive_population(
@@ -11146,7 +11147,7 @@ mod adaptive_sim_tests {
     /// tests, which never reach the run loop.
     fn simple_titration_spec() -> AdaptiveDosingSpec {
         AdaptiveDosingSpec {
-            observe: "central".to_string(),
+            observe: Some("central".to_string()),
             with_assay_error: false,
             assay_cmt: None,
             at: vec![0.0, 24.0],
@@ -11235,7 +11236,7 @@ mod adaptive_sim_tests {
         let pop = population(vec![subj("S", obs.clone(), vec![])]);
 
         let spec = AdaptiveDosingSpec {
-            observe: "central".to_string(),
+            observe: Some("central".to_string()),
             with_assay_error: false,
             assay_cmt: None,
             at: at.clone(),
@@ -11457,7 +11458,7 @@ mod adaptive_sim_tests {
         // Reject it loudly, exactly as a fit does for model covariates.
         let model = parse_model_string(ODE_NO_IIV).expect("parse");
         let spec = AdaptiveDosingSpec {
-            observe: "central / BADCOV".to_string(),
+            observe: Some("central / BADCOV".to_string()),
             ..simple_titration_spec()
         };
         let pop = population(vec![subj("1", vec![6.0], vec![])]); // no covariate columns
@@ -11484,7 +11485,7 @@ mod adaptive_sim_tests {
         let pop = population(vec![subj("1", vec![6.0, 30.0, 54.0], vec![])]);
 
         let ipred_spec = AdaptiveDosingSpec {
-            observe: "central".to_string(),
+            observe: Some("central".to_string()),
             with_assay_error: false,
             assay_cmt: None,
             at: at.clone(),
@@ -11499,8 +11500,13 @@ mod adaptive_sim_tests {
                 action: AdaptiveAction::Increase(DoseStep::Percent(25.0)),
             }],
         };
+        // Choice-2 Dv: no observe expression — measure model output #1 (whose
+        // readout `y = central` for ODE_NO_IIV is the same quantity the Ipred spec
+        // observes) with assay noise.
         let dv_spec = AdaptiveDosingSpec {
+            observe: None,
             with_assay_error: true,
+            assay_cmt: Some(1),
             ..ipred_spec.clone()
         };
 

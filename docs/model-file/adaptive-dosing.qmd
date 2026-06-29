@@ -45,15 +45,17 @@ with the run, never with a fitted model's parameters.
 
 | Key | Required | Meaning |
 |-----|:--------:|---------|
-| `observe` | ✓ | The monitored signal: an expression over states + individual parameters (e.g. `central / V` for concentration). Compiled against the model, so it titrates on the *derived* quantity, not the raw amount. The `when` rules compare the keyword `signal` to this value. |
+| `observe` | signal¹ | The **latent** monitored signal — a free-form expression over states + individual parameters (e.g. `central / V` for concentration), titrated on with **no** measurement noise. Provide this *or* `with_assay_error`, never both. The `when` rules compare the keyword `signal` to its value. |
 | `at` | ✓ | Decision schedule on the subject clock: an explicit list `[0, 24, 48]` or an arithmetic sequence `every <Δ> from <t0> to <t1>` (inclusive). |
 | `start_dose` | ✓ | The dose issued at the first decision; seeds the running dose. |
 | `route` | ✓ | `bolus(cmt=N)` or `infuse(cmt=N, over=T)` (zero-order over duration `T`). |
 | `dose_bounds` | ✓ | Inclusive `[low, high]` clamp applied to every emitted dose. |
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. |
-| `with_assay_error` | | Titrate on the assay-noised `Dv` instead of the latent `Ipred` (default `false`). See [Monitors](#monitors). |
-| `assay_cmt` | | Which endpoint's `[error_model]` σ supplies the assay noise — **required** when `with_assay_error` is on and `observe` is a multi-term expression (otherwise the σ is ambiguous, a parse error). The noise σ is computed from the `observe` value, so `observe` must be on the **same scale** as that endpoint's error model (e.g. `observe = central / V` with a proportional error fit on the concentration). Designating `assay_cmt` is your assertion that the two agree. |
+| `with_assay_error` | signal¹ | Titrate on the **noised measurement** of a model output (named by `assay_cmt`) instead of a latent expression (default `false`). The signal's value comes from that output's `[scaling]` readout and its σ from that output's `[error_model]`, so the two are always on the same scale — there is no re-typed `observe` expression to mis-scale. Mutually exclusive with `observe`. |
+| `assay_cmt` | | The 1-based compartment of the model output measured under `with_assay_error` — its `[scaling]` readout is the signal value and its `[error_model]` σ the noise. **Required** with `with_assay_error`. |
+
+¹ **The signal source is exactly one of `observe` (a latent expression, un-noised) or `with_assay_error = true` + `assay_cmt` (a noised model output).** Setting both, or neither, is a parse error. Titrating on a *measured* quantity uses the model's own output (so its value and σ can never disagree on scale); titrating on a *derived latent* quantity (effect-site, a ratio — anything with no error model) uses `observe`.
 
 ### Rules — `when signal <op> <value> : <action>`
 

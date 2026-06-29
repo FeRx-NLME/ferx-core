@@ -39,9 +39,8 @@
   DV ~ proportional(PROP)
 
 [adaptive_dosing]
-  observe          = central / V          # titrate on concentration (mg/L)
-  with_assay_error = true                 # ... as measured (proportional assay noise)
-  assay_cmt        = 1                     # endpoint whose residual error noises the reading
+  with_assay_error = true                 # titrate on the *measured* trough (assay-noised)
+  assay_cmt        = 1                     # output #1 — the concentration (y = central/V) + its proportional error
   at               = every 12 from 0 to 96 # a TDM decision before each q12h dose
   start_dose       = 1000                  # initial dose (mg)
   route            = infuse(cmt=1, over=1) # 1-hour IV infusion

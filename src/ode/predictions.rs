@@ -1725,17 +1725,13 @@ pub(crate) fn ode_predictions_adaptive_impl(
                                     m.name
                                 )
                             })?;
-                            // σ is `residual_variance_at(cmt, latent)`, so `latent`
-                            // (the `observe` value) must be on the *same scale* as
-                            // `cmt`'s error model — e.g. `observe = central / V` with
-                            // a proportional error fit on that concentration. The
-                            // parser already forces the user to designate `assay_cmt`
-                            // for an expression `observe` (the σ would otherwise be
-                            // ambiguous); designating it is the user's assertion that
-                            // the two scales agree. Verifying that agreement at compile
-                            // time would need the endpoint's readout source, which the
-                            // model does not retain (`OdeReadout::Single` is an opaque
-                            // closure) — tracked as a follow-up, see #391.
+                            // Scale-correct by construction: under `Dv` the
+                            // declarative path compiles no `observe` expression, so
+                            // `latent` here is the model's own readout for this
+                            // monitor's `cmt` (`am.observe == None` ⇒ `read_observable`
+                            // above) and σ is `residual_variance_at(cmt, latent)` — both
+                            // come from the same model output, so the noised signal is
+                            // always on the error model's scale (#391 S2).
                             //
                             // Edge (a): a DV monitor on a compartment with no
                             // residual error model is a typed error, not a guessed σ.
@@ -7130,7 +7126,7 @@ mod tests {
         let mut controller = (compiled.make_controller)();
         let monitors = vec![crate::sim::adaptive::AdaptiveMonitor {
             spec: &compiled.monitors[0],
-            observe: Some(&compiled.observe),
+            observe: compiled.observe.as_ref(),
         }];
         let run = ode_predictions_adaptive_impl(
             model.ode_spec.as_ref().unwrap(),

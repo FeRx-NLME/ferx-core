@@ -3946,7 +3946,9 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     }
 
     // ── Required keys ──
-    let observe = observe.ok_or("[adaptive_dosing]: missing required `observe`")?;
+    // `observe` is *conditionally* required (a latent signal needs it; an
+    // assay-noised signal uses the model output instead) — `validate()` enforces
+    // the `observe` xor `with_assay_error` rule, so it stays an `Option` here.
     let at = at.ok_or("[adaptive_dosing]: missing required `at` (decision schedule)")?;
     let start_dose = start_dose.ok_or("[adaptive_dosing]: missing required `start_dose`")?;
     let route = route.ok_or("[adaptive_dosing]: missing required `route`")?;
@@ -24520,7 +24522,7 @@ mod adaptive_dosing_tests {
             "when signal > 40 : stop",
         ]))
         .expect("canonical block parses");
-        assert_eq!(spec.observe, "central / V");
+        assert_eq!(spec.observe.as_deref(), Some("central / V"));
         assert!(!spec.with_assay_error);
         assert_eq!(spec.assay_cmt, None);
         assert_eq!(spec.at, vec![24.0, 48.0, 72.0, 96.0]);
@@ -24643,9 +24645,10 @@ mod adaptive_dosing_tests {
     }
 
     #[test]
-    fn assay_error_on_bare_endpoint_with_cmt_parses() {
+    fn assay_error_names_output_parses() {
+        // With assay error the signal is the noised model output named by
+        // `assay_cmt` — there is no `observe` expression to re-type.
         let spec = parse_adaptive_dosing_block(&lines(&[
-            "observe = central",
             "with_assay_error = true",
             "assay_cmt = 2",
             "at = [24]",
@@ -24654,9 +24657,10 @@ mod adaptive_dosing_tests {
             "dose_bounds = [0, 400]",
             "when signal < 10 : increase 25%",
         ]))
-        .expect("assay error with designated endpoint parses");
+        .expect("assay error naming the output parses");
         assert!(spec.with_assay_error);
         assert_eq!(spec.assay_cmt, Some(2));
+        assert_eq!(spec.observe, None);
     }
 
     // ── Typed-error matrix (no happy paths) ──
@@ -24680,8 +24684,9 @@ mod adaptive_dosing_tests {
 
     #[test]
     fn missing_required_keys_error() {
+        // `observe` is conditionally required (it is the latent signal), so it is
+        // covered by the signal-source matrix below, not here.
         for (prefix, needle) in [
-            ("observe", "missing required `observe`"),
             ("at", "missing required `at`"),
             ("start_dose", "missing required `start_dose`"),
             ("route", "missing required `route`"),
@@ -24690,6 +24695,30 @@ mod adaptive_dosing_tests {
             let err = parse_adaptive_dosing_block(&without(prefix)).unwrap_err();
             assert_adaptive_err(&err, needle);
         }
+    }
+
+    #[test]
+    fn signal_source_matrix_errors() {
+        // No signal (drop `observe`, no assay error).
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&without("observe")).unwrap_err(),
+            "a signal is required",
+        );
+        // Both an observe expression and assay error.
+        let mut both = without("nothing"); // full valid block (observe present)…
+        both.push("with_assay_error = true".into());
+        both.push("assay_cmt = 1".into());
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&both).unwrap_err(),
+            "remove `observe`",
+        );
+        // Assay error without naming the measured output.
+        let mut no_cmt = without("observe");
+        no_cmt.push("with_assay_error = true".into());
+        assert_adaptive_err(
+            &parse_adaptive_dosing_block(&no_cmt).unwrap_err(),
+            "requires `assay_cmt",
+        );
     }
 
     #[test]
@@ -24790,20 +24819,6 @@ mod adaptive_dosing_tests {
             &parse_adaptive_dosing_block(&b).unwrap_err(),
             "confirm must be >= 1",
         );
-    }
-
-    #[test]
-    fn assay_error_on_expression_without_cmt_is_ambiguous() {
-        let err = perr(&[
-            "observe = central / V",
-            "with_assay_error = true",
-            "at = [24]",
-            "start_dose = 100",
-            "route = bolus(cmt = 1)",
-            "dose_bounds = [0, 400]",
-            "when signal < 10 : increase 25%",
-        ]);
-        assert_adaptive_err(&err, "ambiguous");
     }
 
     #[test]
