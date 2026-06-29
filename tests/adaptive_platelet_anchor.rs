@@ -56,6 +56,34 @@ const REF_LADDER: [(f64, f64, f64); 10] = [
 /// Cross-solver platelet-signal band (x10^9/L); see the module note.
 const SIGNAL_TOL: f64 = 0.5;
 
+/// Fast PR-time guard (NOT slow-gated). The cross-engine check below only runs
+/// nightly, so without this a typo in `adaptive_platelet_ladder.ferx` — which
+/// exercises new DSL surface, notably the one-sided `target_window = [100, inf]`
+/// — would slip past the per-PR job. `parse_full_model_file` runs the full
+/// `[adaptive_dosing]` `validate()`, so a successful parse plus these spot-checks
+/// pin the ladder the anchor relies on.
+#[test]
+fn platelet_example_parses_and_pins_the_ladder() {
+    let parsed = parse_full_model_file(Path::new("examples/adaptive_platelet_ladder.ferx"))
+        .expect("platelet model must parse");
+    let spec = parsed
+        .adaptive_dosing
+        .as_ref()
+        .expect("[adaptive_dosing] block present");
+    assert_eq!(
+        spec.levels.as_deref(),
+        Some(&[25.0, 50.0, 75.0, 100.0][..]),
+        "strictly-increasing discrete ladder"
+    );
+    assert_eq!(spec.start_dose, 100.0, "starts at the top rung");
+    assert_eq!(
+        spec.target_window,
+        Some((100.0, f64::INFINITY)),
+        "one-sided `PLT >= 100` window parsed (the `inf` upper bound)"
+    );
+    assert_eq!(spec.at.len(), 10, "ten weekly decisions, t = 0..=1512 h");
+}
+
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
