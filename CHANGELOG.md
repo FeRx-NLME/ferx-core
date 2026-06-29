@@ -25,8 +25,8 @@ section of the SDLC for the versioning policy).
   one `AdaptiveSubjectMetrics` row per realized `(subject, draw, sim)` run: cumulative dose,
   dose-increase / -decrease / hold / discontinuation counts, time-to-discontinuation, and the
   observed-signal summary (min / max / mean). A new optional `[adaptive_dosing] target_window =
-  [low, high]` key adds `pct_time_in_window` (the fraction of decisions whose observed signal fell
-  in the band; `high` may be `inf` for a one-sided target) — it reports a metric only and never
+  [low, high]` key adds `pct_time_in_window` (the fraction of the signal-bearing decisions whose
+  observed signal fell in the band; `high` may be `inf` for a one-sided target) — it reports a metric only and never
   influences dosing. Every metric is derived from the realized dose ledger and decision log alone.
   See [Adaptive dosing](model-file/adaptive-dosing.qmd).
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new

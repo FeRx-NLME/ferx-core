@@ -379,17 +379,21 @@ pub struct AdaptiveSubjectMetrics {
     pub discontinued: bool,
     /// Time of the `Stop` decision, or `None` if the run never discontinued.
     pub time_to_discontinuation: Option<f64>,
-    /// Lowest observed signal across the run's decisions (the deepest trough the
-    /// monitor saw), or `None` if no decision recorded a signal.
+    /// Lowest observed signal across the decisions that recorded one (the deepest
+    /// trough the monitor saw), or `None` if no decision recorded a signal.
     pub signal_min: Option<f64>,
-    /// Highest observed signal across the run's decisions.
+    /// Highest observed signal across the decisions that recorded one.
     pub signal_max: Option<f64>,
-    /// Mean observed signal across the run's decisions.
+    /// Mean observed signal across the decisions that recorded one.
     pub signal_mean: Option<f64>,
-    /// Fraction of decisions whose observed signal fell within the spec's
-    /// `target_window` `[lo, hi]` (inclusive), in `[0, 1]`. `None` when no
-    /// `target_window` is declared (or no signal was recorded) — never a band
-    /// guessed from the rule thresholds (#584).
+    /// Fraction of the **signal-bearing** decisions whose observed value fell
+    /// within the spec's `target_window` `[lo, hi]` (inclusive), in `[0, 1]`. The
+    /// denominator is the count of decisions that recorded a signal — the same
+    /// basis as the signal summary above — not the raw decision count: a decision
+    /// with no recorded signal is neither in nor out of band, so it is excluded
+    /// rather than counted as a miss. `None` when no `target_window` is declared
+    /// (or no signal was recorded) — never a band guessed from the rule
+    /// thresholds (#584).
     pub pct_time_in_window: Option<f64>,
 }
 
@@ -1475,5 +1479,36 @@ mod tests {
         assert_eq!(m.signal_max, None);
         assert_eq!(m.signal_mean, None);
         assert_eq!(m.pct_time_in_window, None);
+    }
+
+    #[test]
+    fn metrics_signalless_decisions_are_excluded_not_counted_as_misses() {
+        // A *mixed* decision log — some decisions recorded a signal, some did not.
+        // `compute_subject_metrics` is a pure function whose contract admits this
+        // (a decision can carry an empty `observed_signals`), even though the
+        // current single-monitor engine records one at every decision. The signal
+        // summary and `pct_time_in_window` are over the **signal-bearing** decisions
+        // only: a measurement-less decision is neither in nor out of band, so it is
+        // excluded from the denominator rather than counted as a miss.
+        let ledger = vec![ledger_entry(100.0), ledger_entry(100.0)];
+        let decisions = vec![
+            decision(0.0, Some(12.0), DecisionOutcome::Dosed { n: 1 }), // in [10, 20]
+            decision(24.0, None, DecisionOutcome::Dosed { n: 1 }),      // no signal
+            decision(48.0, Some(8.0), DecisionOutcome::Dosed { n: 1 }), // below band
+            decision(72.0, None, DecisionOutcome::Hold),                // no signal
+        ];
+        let m = compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)));
+
+        // Summary spans only the two decisions that recorded a signal (12 and 8),
+        // not the two signal-less ones.
+        assert_eq!(m.signal_min, Some(8.0));
+        assert_eq!(m.signal_max, Some(12.0));
+        assert_eq!(m.signal_mean, Some(10.0));
+        // Denominator = 2 signal-bearing decisions, of which one (12) is in band:
+        // 1/2 = 0.5 — not 1/4 (raw decision count) and not 1/3.
+        assert_eq!(m.pct_time_in_window, Some(0.5));
+        // Holds are counted over all decisions, independent of whether a signal
+        // was recorded, so the signal-less Hold still registers.
+        assert_eq!(m.n_holds, 1);
     }
 }
