@@ -76,13 +76,24 @@ pub fn tte_data_term(
 ///   IntervalCensored: −log [ exp(−(H(left)−H(entry))) − exp(−(H(right)−H(entry))) ]
 ///
 /// Returns 1e20 as a sentinel when the likelihood is numerically ill-defined
-/// (e.g. negative interval probability, non-positive hazard for an exact event).
+/// (e.g. negative interval probability, non-positive hazard for an exact event,
+/// or a **non-monotone cumulative hazard** — `H(b) < H(a)` for `b ≥ a`, which a
+/// negative drug-driven hazard produces and which would imply `S = exp(−ΔH) > 1`).
 pub fn tte_nll_from_curves(
     records: &[ObsRecord],
     cumhaz_at: impl Fn(f64) -> f64,
     hazard_at: impl Fn(f64) -> f64,
 ) -> f64 {
     let mut nll = 0.0_f64;
+
+    // A cumulative hazard is non-decreasing: `H(b) ≥ H(a)` for `b ≥ a`. A drug-driven
+    // `[odes]` hazard is a free user expression with no `h ≥ 0` constraint, so a
+    // sign-flipped / non-monotone hazard can make an increment negative — `S = exp(−ΔH)
+    // > 1`, ill-posed. Flag any such increment past a relative round-off floor (the ODE
+    // `reltol` defaults to 1e-4) so a near-zero hazard's quadrature noise on a flat `H`
+    // is tolerated. The simulation path hard-errors on the same non-monotone CHZ; here,
+    // with an optimizer to steer, it folds into the shared 1e20 sentinel.
+    let monotone_violation = |hi: f64, lo: f64| hi - lo < -(1e-6 + 1e-3 * hi.abs().max(lo.abs()));
 
     for record in records {
         let ObsRecord::Event {
@@ -100,18 +111,31 @@ pub fn tte_nll_from_curves(
 
         match event_type {
             EventType::RightCensored => {
-                nll += cumhaz_at(*time) - h_entry;
+                let h_t = cumhaz_at(*time);
+                if monotone_violation(h_t, h_entry) {
+                    return 1e20;
+                }
+                nll += h_t - h_entry;
             }
             EventType::Exact => {
                 let h_val = hazard_at(*time);
                 if h_val <= 0.0 {
                     return 1e20;
                 }
-                nll += cumhaz_at(*time) - h_entry - h_val.ln();
+                let h_t = cumhaz_at(*time);
+                if monotone_violation(h_t, h_entry) {
+                    return 1e20;
+                }
+                nll += h_t - h_entry - h_val.ln();
             }
             EventType::IntervalCensored { left, right } => {
                 let h_l = cumhaz_at(*left);
                 let h_r = cumhaz_at(*right);
+                // H(left) ≥ H(entry) and H(right) > H(left): a non-monotone CHZ
+                // (negative hazard) violates either and is ill-posed.
+                if monotone_violation(h_l, h_entry) {
+                    return 1e20;
+                }
                 let a = h_l - h_entry; // H(left) − H(entry) ≥ 0
                 let delta = h_r - h_l; // H(right) − H(left) > 0 for a proper interval
                 if delta <= 0.0 {
@@ -781,6 +805,65 @@ mod tests {
         let cov = HashMap::new();
         let nll = tte_data_term(&records, &hazard, &[0.1], &[0.0], &cov);
         assert_eq!(nll, 1e20);
+    }
+
+    /// A right-censored record whose cumulative hazard *decreased* (`H(T) < H(entry)`,
+    /// i.e. a negative / non-monotone drug-driven hazard) is ill-posed — `S(T) =
+    /// exp(−ΔH) > 1`. It must hit the 1e20 sentinel, not contribute a spurious
+    /// *negative* NLL that pulls the optimizer toward the negative-hazard region (the
+    /// simulation path hard-errors on the same non-monotone CHZ; #564 Slice 2.2 review).
+    #[test]
+    fn tte_nll_from_curves_rejects_non_monotone_censored() {
+        let records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::RightCensored,
+            entry_time: 0.0,
+            cmt: 3,
+        }];
+        // CHZ is negative by t=5 (entry H=0): a clear monotonicity violation.
+        let nll = tte_nll_from_curves(&records, |_t| -0.5, |_t| 0.1);
+        assert_eq!(
+            nll, 1e20,
+            "non-monotone CHZ on a censor must be sentinel-guarded"
+        );
+    }
+
+    /// The guard also covers an exact event with a non-monotone cumulative hazard:
+    /// a positive instantaneous `h(T)` is not enough — the accumulated `H` must be
+    /// non-decreasing too.
+    #[test]
+    fn tte_nll_from_curves_rejects_non_monotone_exact() {
+        let records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 3,
+        }];
+        let nll = tte_nll_from_curves(&records, |_t| -0.5, |_t| 0.1);
+        assert_eq!(
+            nll, 1e20,
+            "non-monotone CHZ on an exact event must be sentinel-guarded"
+        );
+    }
+
+    /// The monotonicity guard tolerates ODE quadrature round-off on a (near-)flat
+    /// cumulative hazard: a tiny negative dip within the relative floor is NOT
+    /// rejected, so a legitimate `h ≈ 0` model keeps a finite likelihood (guards the
+    /// floor against false positives that would derail a valid fit).
+    #[test]
+    fn tte_nll_from_curves_tolerates_flat_hazard_roundoff() {
+        let records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::RightCensored,
+            entry_time: 0.0,
+            cmt: 3,
+        }];
+        // H(5) = −1e−9, below the 1e−6 absolute floor ⇒ accepted, not sentinel.
+        let nll = tte_nll_from_curves(&records, |_t| -1e-9, |_t| 0.0);
+        assert!(
+            nll.abs() < 1e-6,
+            "round-off dip must stay finite, got {nll}"
+        );
     }
 
     #[test]

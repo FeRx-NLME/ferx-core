@@ -248,6 +248,13 @@ section of the SDLC for the versioning policy).
   mispredicting. See [Initial Conditions](model-file/initial-conditions.qmd).
 
 ### Fixed
+- **Joint PK-TTE fit now rejects a non-monotone (negative) cumulative hazard** (#564).
+  A drug-driven `hazard =` expression is unconstrained, so a sign-flipped hazard could make
+  the cumulative hazard *decrease* — implying a survival `S(t) > 1`. The right-censored and
+  exact-event likelihood terms previously accepted this silently (a finite, spuriously low
+  objective that could pull the optimizer into the ill-posed region); they now return the
+  same `1e20` sentinel as the other ill-defined cases. This matches the simulation path,
+  which already hard-errors on a non-monotone cumulative hazard.
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on
   the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
   mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to
