@@ -276,6 +276,13 @@ pub fn trigamma(x: f64) -> f64 {
 /// Gamma(shape = `a`, rate = 1) distribution at `x`, defined for `a > 0`,
 /// `x ≥ 0` (returns `0` for `x ≤ 0`).
 ///
+/// **Boundary `x ≤ 0`** is a flat clamp: value `0` with a **zero** gradient. That is
+/// exact for `a > 1` (the Gamma pdf `∂P/∂x → 0`) and a deliberate clamp for `a ≤ 1`
+/// (where the true `∂P/∂x|_{x→0⁺}` is `1` at `a = 1` and `+∞` for `a < 1`, neither
+/// representable). The transit closed form only reaches `a = n + 1 = 1` (single
+/// transit) at `t = 0`, where the concentration is `0` regardless, so this clamp is
+/// never on a live sensitivity path there.
+///
 /// Added for the **Phase 3** analytical absorption closed forms (#386): the
 /// exponential-tilting convolution of a Savic transit (Gamma) input with a linear
 /// 1-/2-cpt disposition is `P(n + 1, (KTR − k)·t)` (see `plans/absorption-models.md`
@@ -787,10 +794,21 @@ mod tests {
             let dual = regularized_gamma_p(Dual2::<2>::var(av, 0), Dual2::<2>::var(xv, 1));
             let h = 1e-6;
             let dpda = (p(av + h, xv) - p(av - h, xv)) / (2.0 * h);
+            let dpdx = (p(av, xv + h) - p(av, xv - h)) / (2.0 * h);
             assert_relative_eq!(dual.grad[0], dpda, max_relative = 1e-4, epsilon = 1e-7);
+            assert_relative_eq!(dual.grad[1], dpdx, max_relative = 1e-4, epsilon = 1e-7);
+            // ALL second-order components must be converged near the seam — not just
+            // ∂²/∂a² (the SETTLE streak covers every jet, but the slow `a`-direction
+            // also drives the cross term, so pin ∂²/∂a∂x and ∂²/∂x² too).
             let h2 = 1e-3;
             let d2a = (p(av + h2, xv) - 2.0 * p(av, xv) + p(av - h2, xv)) / (h2 * h2);
+            let d2x = (p(av, xv + h2) - 2.0 * p(av, xv) + p(av, xv - h2)) / (h2 * h2);
+            let d2ax = (p(av + h2, xv + h2) - p(av + h2, xv - h2) - p(av - h2, xv + h2)
+                + p(av - h2, xv - h2))
+                / (4.0 * h2 * h2);
             assert_relative_eq!(dual.hess[0][0], d2a, max_relative = 5e-3, epsilon = 1e-5);
+            assert_relative_eq!(dual.hess[1][1], d2x, max_relative = 5e-3, epsilon = 1e-5);
+            assert_relative_eq!(dual.hess[0][1], d2ax, max_relative = 5e-3, epsilon = 1e-5);
         }
     }
 }
