@@ -5165,6 +5165,90 @@ pub struct SimulateOptions {
     pub horizon: Option<f64>,
 }
 
+/// Validate the preventable preconditions of **ODE-accumulated (joint PK-TTE)**
+/// event-time simulation, returning a clear `Err` for a caller to act on. A model
+/// with no ODE-accumulated TTE endpoint is unaffected (returns `Ok`).
+///
+/// Drug-driven event times are sampled by integrating the augmented ODE until the
+/// cumulative hazard reaches `−log u` (Slice 2.2). Two conditions cannot be sampled
+/// and are *user-fixable*, so they are reported here rather than panicking deep in
+/// sampling:
+/// - a **finite, positive horizon** is required — a drug-driven hazard can vanish
+///   and never fire, so there is no implicit observation window to censor at;
+/// - **EVID-3/4 resets** and **left truncation** (`entry_time > 0`) on an ODE-TTE
+///   subject are unsupported (a full reset would zero the hazard accumulator
+///   mid-flight; conditional sampling past entry is a deferred follow-up).
+///
+/// A genuinely divergent hazard (negative / non-finite) is *not* preventable here —
+/// it surfaces loudly during integration (never as a silent censor).
+#[cfg(feature = "survival")]
+fn validate_ode_tte_simulatable(
+    model: &CompiledModel,
+    population: &Population,
+    horizon: Option<f64>,
+) -> Result<(), String> {
+    use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord};
+    let is_ode_tte = |cmt: &usize| {
+        matches!(
+            model.endpoints.get(cmt),
+            Some(EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { .. }
+            })
+        )
+    };
+    if !model.endpoints.values().any(|e| {
+        matches!(
+            e,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::OdeAccumulated { .. }
+            }
+        )
+    }) {
+        return Ok(());
+    }
+    match horizon {
+        Some(h) if h.is_finite() && h > 0.0 => {}
+        _ => {
+            return Err(
+                "ODE-accumulated TTE (joint PK-TTE) simulation requires a finite, positive \
+                 administrative horizon: set `[simulation] horizon` (or `SimulateOptions.horizon`). \
+                 A drug-driven hazard can vanish, so there is no implicit observation window."
+                    .to_string(),
+            );
+        }
+    }
+    for subject in &population.subjects {
+        if !subject
+            .obs_records
+            .iter()
+            .any(|r| matches!(r, ObsRecord::Event { cmt, .. } if is_ode_tte(cmt)))
+        {
+            continue;
+        }
+        if !subject.reset_times.is_empty() {
+            return Err(format!(
+                "ODE-accumulated TTE simulation does not support EVID=3/4 resets (a full reset \
+                 zeros the cumulative hazard mid-flight; selective per-state reset is a later \
+                 slice); subject '{}' has resets",
+                subject.id
+            ));
+        }
+        if let Some(ObsRecord::Event { entry_time, .. }) = subject
+            .obs_records
+            .iter()
+            .find(|r| matches!(r, ObsRecord::Event { cmt, entry_time, .. } if is_ode_tte(cmt) && *entry_time > 0.0))
+        {
+            return Err(format!(
+                "ODE-accumulated TTE simulation does not support left truncation \
+                 (entry_time={entry_time} for subject '{}'); conditional sampling past entry is \
+                 a deferred follow-up",
+                subject.id
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Simulate observations, optionally with propensity-score matching.
 ///
 /// With `opts.match_method == None` this is identical to
@@ -5186,26 +5270,13 @@ pub fn simulate_with_options(
 ) -> Result<Vec<SimulationResult>, String> {
     use rand::SeedableRng;
 
-    // ODE-accumulated (joint PK-TTE) hazards can't be event-time-sampled yet: there is
-    // no closed-form inverse-CDF, and the drug-driven ODE event-location root-finder is
-    // Slice 2.2 (#564). Reject up front so a joint PK-TTE model gets a clear error here
-    // instead of silently producing no TTE rows (`tte_cause_params` returns None for it).
+    // ODE-accumulated (joint PK-TTE) TTE simulation samples drug-driven event times
+    // via the augmented-ODE root-finder (Slice 2.2). Validate its preventable
+    // preconditions up front so a caller gets a clean Err here rather than a panic
+    // deep in sampling (a finite horizon is required; resets and left truncation are
+    // not yet supported for an ODE hazard).
     #[cfg(feature = "survival")]
-    if model.endpoints.values().any(|e| {
-        matches!(
-            e,
-            crate::types::EndpointLikelihood::Tte {
-                hazard: crate::types::HazardSpec::OdeAccumulated { .. }
-            }
-        )
-    }) {
-        return Err(
-            "simulate does not yet support ODE-accumulated TTE hazards (joint PK-TTE); \
-             drug-driven event-time sampling lands in Slice 2.2 (#564). Use an analytic \
-             [event_model] family to simulate, or simulate the PK separately."
-                .to_string(),
-        );
-    }
+    validate_ode_tte_simulatable(model, population, opts.horizon)?;
 
     // Validate the TTE horizon on the library path too — the `.ferx` parser
     // already rejects a non-finite / non-positive horizon, but a direct caller of
@@ -5448,6 +5519,16 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // precondition once per call, as `predict()` does — `simulate()` runs no
     // data-check otherwise. #324.
     assert_modeled_doses_supported(model, population);
+
+    // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
+    // no resets / left truncation). `simulate_with_options` checks them first and
+    // returns a clean Err; the Vec-returning `simulate` / `simulate_with_seed` (and
+    // the uncertainty path) funnel through here and cannot signal an error, so
+    // enforce the identical contract as a panic rather than emitting wrong rows.
+    #[cfg(feature = "survival")]
+    if let Err(e) = validate_ode_tte_simulatable(model, population, horizon) {
+        panic!("{e}");
+    }
 
     let normal = Normal::new(0.0, 1.0).unwrap();
     let n_eta = model.n_eta;
@@ -5822,6 +5903,12 @@ pub fn simulate_with_uncertainty(
     opts: &SimulateUncertaintyOptions,
 ) -> Result<Vec<SimulationResult>, String> {
     use rand::SeedableRng;
+
+    // ODE-accumulated TTE event-time simulation needs a finite horizon, which this
+    // uncertainty path does not yet expose — validate for a clean Err here (the
+    // inner chokepoint would otherwise enforce the same contract as a panic).
+    #[cfg(feature = "survival")]
+    validate_ode_tte_simulatable(model, population, None)?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),

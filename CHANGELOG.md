@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Drug-driven event-time simulation for joint PK-TTE** (#564). `simulate()` /
+  `simulate_with_options()` now sample event times for an ODE-accumulated hazard
+  (`hazard =` in `[event_model]`), not just analytic families: the augmented ODE is
+  integrated until the cumulative hazard reaches `−log u`, with the crossing located by a
+  root-finder. A finite `[simulation] horizon` (or `SimulateOptions.horizon`) is **required**
+  for these models — a drug-driven hazard can vanish and never fire, so there is no implicit
+  observation window; EVID-3/4 resets and left truncation on an ODE-TTE subject are not yet
+  supported and are rejected with a clear error.
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose

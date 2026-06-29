@@ -379,6 +379,55 @@ pub(crate) fn ode_cumhaz_hazard(
     (cum, haz)
 }
 
+/// Draw one **ODE-accumulated** (drug-driven) TTE latent event time for a single
+/// cause: sample `u ~ U(0,1)` and root-find the augmented ODE for the first time
+/// the cumulative hazard reaches `−log u` — the event-time analogue of the analytic
+/// inverse-CDF in [`draw_tte_latent`]. Returns the crossing time, or `f64::MAX` (the
+/// shared "did not fire" sentinel) when the hazard does not reach the threshold by
+/// `horizon`, so the caller's window logic censors it exactly as for an analytic
+/// cause.
+///
+/// `horizon` must be `Some` and finite — the `simulate` entry points validate this
+/// (a drug-driven hazard can vanish, so there is no implicit window). Left
+/// truncation (`entry_time > 0`) for an ODE hazard is a deferred follow-up and is
+/// rejected up front, so the search starts at 0. A non-finite / non-monotone
+/// (negative) hazard cannot yield a meaningful event time: rather than silently
+/// censoring a broken model it **panics** — the fit path has an optimizer to steer
+/// away via a sentinel NLL, but simulation does not.
+#[cfg(feature = "survival")]
+fn draw_ode_tte_latent<R: rand::Rng>(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    theta: &[f64],
+    eta: &[f64],
+    chz_state: usize,
+    horizon: Option<f64>,
+    cmt: usize,
+    rng: &mut R,
+) -> f64 {
+    let horizon = horizon.expect(
+        "ODE-accumulated TTE simulation requires a finite horizon; the simulate entry \
+         points validate this before sampling",
+    );
+    let u: f64 = rng.sample(rand::distr::Open01);
+    let threshold = -u.ln();
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let ode = model
+        .ode_spec
+        .as_ref()
+        .expect("ODE-accumulated hazard requires an [odes] block");
+    match crate::ode::ode_solve_until_chz_threshold(
+        ode, &pk.values, subject, chz_state, threshold, horizon,
+    ) {
+        crate::ode::ThresholdOutcome::Crossed(t) => t,
+        crate::ode::ThresholdOutcome::CensoredAtHorizon => f64::MAX,
+        crate::ode::ThresholdOutcome::SolveFailed(why) => panic!(
+            "ODE-accumulated TTE simulation failed for subject '{}' (CMT={cmt}): {why}",
+            subject.id
+        ),
+    }
+}
+
 /// Draw TTE event/censoring outcomes for a subject and append them to `results`.
 ///
 /// Called from `api::simulate_inner_with_draw` after the Gaussian path. Each
@@ -422,32 +471,21 @@ pub fn simulate_tte<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<crate::api::SimulationResult>,
 ) {
-    // ODE-accumulated (joint PK-TTE) hazards have no closed-form event-time inverse;
-    // drug-driven event-time sampling needs the Slice 2.2 ODE root-finder. The
-    // Result-returning `simulate_with_options` rejects this gracefully before reaching
-    // here; the bare `simulate()` / `simulate_with_seed()` (which return a Vec and cannot
-    // otherwise signal an error) hit this backstop rather than silently emitting no rows.
-    for record in &subject.obs_records {
-        let ObsRecord::Event { cmt, .. } = record;
-        if matches!(
-            model.endpoints.get(cmt),
-            Some(EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. }
-            })
-        ) {
-            panic!(
-                "simulate() does not yet support ODE-accumulated TTE hazards (joint PK-TTE, \
-                 CMT={cmt}); drug-driven event-time sampling lands in Slice 2.2 (#564). Call \
-                 simulate_with_options(...) for a graceful error, or use an analytic \
-                 [event_model] family."
-            );
-        }
+    // Each TTE cause (a record routed to a `Tte` endpoint) carries its observation
+    // window and the kind of hazard that draws its latent event time. A subject may
+    // also carry non-TTE records; those are skipped here.
+    enum CauseKind {
+        Analytic {
+            family: HazardFamily,
+            params: Vec<f64>,
+            entry_time: f64,
+        },
+        Ode {
+            chz_state: usize,
+        },
     }
 
-    // Gather this subject's TTE causes — records routed to a `Tte` endpoint —
-    // with each cause's drawn-parameter vector, entry time and window. (A subject
-    // may also carry non-TTE records; those are skipped here.)
-    let mut causes: Vec<(usize, HazardFamily, Vec<f64>, f64, f64)> = Vec::new();
+    let mut causes: Vec<(usize, f64, CauseKind)> = Vec::new(); // (cmt, window, kind)
     for record in &subject.obs_records {
         let ObsRecord::Event {
             cmt,
@@ -455,18 +493,24 @@ pub fn simulate_tte<R: rand::Rng>(
             time,
             event_type,
         } = record;
-        let Some(endpoint) = model.endpoints.get(cmt) else {
-            continue;
-        };
-        let Some((family, params)) = tte_cause_params(endpoint, theta, eta, &subject.covariates)
-        else {
+        let Some(EndpointLikelihood::Tte { hazard }) = model.endpoints.get(cmt) else {
             continue;
         };
         // With an explicit `horizon`, every cause shares it as the administrative
         // window (#522); otherwise only a right-censored record marks a horizon and
         // an event record draws uncensored (+∞) — see `observation_window`.
         let window = horizon.unwrap_or_else(|| observation_window(event_type, *time));
-        causes.push((*cmt, family, params, *entry_time, window));
+        let kind = match hazard {
+            HazardSpec::Analytic { family, param_fn } => CauseKind::Analytic {
+                family: *family,
+                params: param_fn(theta, eta, &subject.covariates),
+                entry_time: *entry_time,
+            },
+            HazardSpec::OdeAccumulated { chz_state } => CauseKind::Ode {
+                chz_state: *chz_state,
+            },
+        };
+        causes.push((*cmt, window, kind));
     }
 
     let push = |cmt: usize, time: f64, observed: bool, results: &mut Vec<_>| {
@@ -483,19 +527,40 @@ pub fn simulate_tte<R: rand::Rng>(
 
     match causes.as_slice() {
         [] => {}
-        // Single endpoint: administrative censoring at its own window. (Draws one
-        // uniform, preserving the RNG sequence of the pre-competing-risks path.)
-        [(cmt, family, params, entry_time, window)] => {
-            let (t, observed) = draw_tte_outcome(*family, params, *entry_time, *window, rng);
+        // Single endpoint: administrative censoring at its own window. Analytic
+        // stays on `draw_tte_outcome` (byte-identical RNG to the pre-ODE path); an
+        // ODE hazard root-finds its latent, then applies the same window rule.
+        [(cmt, window, kind)] => {
+            let (t, observed) = match kind {
+                CauseKind::Analytic {
+                    family,
+                    params,
+                    entry_time,
+                } => draw_tte_outcome(*family, params, *entry_time, *window, rng),
+                CauseKind::Ode { chz_state } => {
+                    let latent = draw_ode_tte_latent(
+                        model, subject, theta, eta, *chz_state, horizon, *cmt, rng,
+                    );
+                    let observed = latent < *window && latent < f64::MAX;
+                    (if observed { latent } else { *window }, observed)
+                }
+            };
             push(*cmt, t, observed, results);
         }
-        // Competing risks: earliest latent event wins; the rest censor at that
-        // time. Draw in record order so the RNG sequence stays deterministic.
+        // Competing risks: earliest latent event wins; the rest censor at that time.
+        // Draw in record order so the RNG sequence stays deterministic across the mix.
         _ => {
             let latents: Vec<f64> = causes
                 .iter()
-                .map(|(_, family, params, entry_time, _)| {
-                    draw_tte_latent(*family, params, *entry_time, rng)
+                .map(|(cmt, _, kind)| match kind {
+                    CauseKind::Analytic {
+                        family,
+                        params,
+                        entry_time,
+                    } => draw_tte_latent(*family, params, *entry_time, rng),
+                    CauseKind::Ode { chz_state } => draw_ode_tte_latent(
+                        model, subject, theta, eta, *chz_state, horizon, *cmt, rng,
+                    ),
                 })
                 .collect();
             // Shared administrative horizon across causes. `observation_window`
@@ -510,7 +575,7 @@ pub fn simulate_tte<R: rand::Rng>(
             // re-introducing the VPC bias #494 removed for single endpoints.
             let window = causes
                 .iter()
-                .map(|(_, _, _, _, w)| *w)
+                .map(|(_, w, _)| *w)
                 .fold(f64::NEG_INFINITY, f64::max);
             let (win_idx, obs_time, event) = resolve_competing_risks(&latents, window);
             for (i, (cmt, ..)) in causes.iter().enumerate() {
