@@ -5656,7 +5656,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 }
 
 // ======================================================================
-// Adaptive (state-reactive / feedback) dosing — epic #391, experimental.
+// Adaptive (state-reactive / feedback) dosing — epic #391, beta.
 //
 // Two public entry points wrap the `pub(crate)` reactive driver
 // (`ode_predictions_adaptive_impl`) with shared per-(subject, replicate)
@@ -6026,7 +6026,7 @@ where
 }
 
 /// Simulate a declarative `[adaptive_dosing]` block over a population — the
-/// file-driven counterpart to [`simulate_adaptive`] (epic #391, **experimental**).
+/// file-driven counterpart to [`simulate_adaptive`] (epic #391, **beta**).
 ///
 /// Where [`simulate_adaptive`] takes a hand-written controller closure, this entry
 /// point takes the parsed `[adaptive_dosing]` `spec` and compiles it into the

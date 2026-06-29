@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Platelet-ladder adaptive-dosing example + mrgsolve external anchor** (#391, S2.5a). A new
+  bundled model `examples/adaptive_platelet_ladder.ferx` exercises the reactive
+  `[adaptive_dosing]` `levels` ladder on an oncology dose-modification scenario — a Friberg
+  myelosuppression model whose simulated platelet count titrates the dose down a discrete ladder
+  (100 → 75 → 50 → 25 mg). It is cross-validated against an external **mrgsolve** run, the
+  apples-to-apples comparator for feedback dosing (NONMEM has none), which ferx reproduces
+  dose-for-dose (reference kit in `tests/reference/platelet_mrgsolve/`, slow-gated
+  `tests/adaptive_platelet_anchor.rs`). With this external anchor, adaptive (feedback) dosing
+  graduates from **experimental** to **beta**. See [Adaptive dosing](model-file/adaptive-dosing.qmd).
 - **Per-subject outcome metrics for adaptive dosing** (#391, S2.4). `simulate_adaptive()` and
   `simulate_adaptive_from_spec()` now return a `metrics` field on `AdaptiveSimulationResult` —
   one `AdaptiveSubjectMetrics` row per realized `(subject, draw, sim)` run: cumulative dose,
