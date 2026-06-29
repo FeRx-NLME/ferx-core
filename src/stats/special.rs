@@ -1,10 +1,12 @@
-//! Special functions: erf, normal CDF, log normal CDF (M3 BLOQ likelihood), and
-//! ln Γ (Lanczos) — the latter for the transit-compartment absorption model.
+//! Special functions: erf, normal CDF, log normal CDF (M3 BLOQ likelihood),
+//! ln Γ (Lanczos), and the regularized lower incomplete gamma `P(a, x)` — the
+//! last two for the transit-compartment absorption model.
 //!
-//! These are implemented from polynomial/rational approximations (Abramowitz &
-//! Stegun 7.1.26 for erf) using only `+`, `-`, `*`, `/`, and `.exp()`, so a
-//! generic `PkNum`/`Dual2` instantiation differentiates them cleanly (no
-//! `f64::max`/`min` branch ambiguity).
+//! The differentiable ones are built from polynomial/rational approximations
+//! (Abramowitz & Stegun 7.1.26 for erf) and elementary operations only —
+//! `+ − * /`, `.exp()`, `.ln()`, and `ln Γ` — with no `f64::max`/`min` branch
+//! ambiguity, so a generic `PkNum`/`Dual2` instantiation differentiates them
+//! cleanly. (`normal_inv_cdf` is `f64`-only and off the gradient path.)
 
 use crate::sens::num::PkNum;
 
@@ -343,12 +345,24 @@ fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
     const EPS: f64 = 1e-15;
     const FPMIN: f64 = 1e-300;
     const MAX_ITER: usize = 300;
+    /// Consecutive converged steps required before breaking. Numerical Recipes
+    /// breaks the f64 CF on a single `|del−1| < EPS` step, but **differentiating**
+    /// the truncated CF needs more care: near the switch `x ≈ a + 1` the CF *value*
+    /// converges several iterations before its parameter-derivative jets (`∂/∂a`,
+    /// `∂²/∂a²`) do, and the single-step test can even fire at iteration 1 for
+    /// integer `a` — there `aₙ = −n·(n − a) = 0` makes `del ≡ 1` while the value is
+    /// exact only by coincidence and the jet is far from converged. Requiring the
+    /// step to stay converged for a sustained streak runs the extra iterations the
+    /// jets need (empirically ≤ ~95 total at the worst near-seam point; the FD
+    /// gradient floor ~3e-9 is reached by a streak of 15, so 20 carries margin).
+    const SETTLE: usize = 20;
     let one = T::from_f64(1.0);
     let two = T::from_f64(2.0);
     let mut b = x + one - a;
     let mut c = T::from_f64(1.0 / FPMIN);
     let mut d = one / b;
     let mut h = d;
+    let mut settled = 0usize;
     for i in 1..=MAX_ITER {
         let ai = T::from_f64(i as f64);
         let an = -ai * (ai - a); // aₙ = −n·(n − a)
@@ -368,7 +382,12 @@ fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
         let del = d * c;
         h = h * del;
         if (del.val() - 1.0).abs() < EPS {
-            break;
+            settled += 1;
+            if settled >= SETTLE {
+                break;
+            }
+        } else {
+            settled = 0;
         }
     }
     h * gamma_pref(a, x)
@@ -698,8 +717,9 @@ mod tests {
     fn regularized_gamma_p_dual_gradients_match_central_fd() {
         use crate::sens::dual2::Dual2;
         let p = |av: f64, xv: f64| regularized_gamma_p::<f64>(av, xv);
-        // (a, x): series (x<a+1), CF (x≥a+1), and transit-like large x.
-        for &(av, xv) in &[(2.0, 1.0), (3.5, 2.0), (4.0, 9.0), (1.5, 6.0), (6.0, 6.5)] {
+        // (a, x): series (x<a+1) for (2,1)/(3.5,2), CF (x≥a+1) for the rest incl.
+        // transit-like large x (6,16). (Near-seam CF is covered by its own test below.)
+        for &(av, xv) in &[(2.0, 1.0), (3.5, 2.0), (4.0, 9.0), (1.5, 6.0), (6.0, 16.0)] {
             let dual = regularized_gamma_p(Dual2::<2>::var(av, 0), Dual2::<2>::var(xv, 1));
             assert_relative_eq!(dual.value, p(av, xv), max_relative = 1e-12);
 
@@ -740,6 +760,37 @@ mod tests {
             let h2 = 1e-3;
             let fd2 = (f(theta + h2, xv) - 2.0 * f(theta, xv) + f(theta - h2, xv)) / (h2 * h2);
             assert_relative_eq!(dual.hess[0][0], fd2, max_relative = 2e-3, epsilon = 1e-6);
+        }
+    }
+
+    /// Regression for the continued-fraction `SETTLE` streak (see `gamma_q_cf`): just
+    /// inside the CF branch (`x` barely above `a + 1`) the CF *value* converges several
+    /// iterations before its `∂/∂a` jet, and for **integer `a`** the naive single-step
+    /// `|del−1| < EPS` break fires at iteration 1 (`aₙ = −n·(n − a) = 0 ⇒ del ≡ 1`),
+    /// truncating the jet. This pins both 1st- and 2nd-order `∂/∂a` (the transit-`N`
+    /// gradient direction) against central FD in exactly that regime. Without the streak
+    /// fix, `∂P/∂a` at `(1, 2.001)` is wrong by ~1.8e-3 (≈0.8% relative) — this test
+    /// fails; the deeper-CF points of the test above do not exercise it.
+    #[test]
+    fn regularized_gamma_p_dual_da_accurate_just_inside_cf_seam() {
+        use crate::sens::dual2::Dual2;
+        let p = |av: f64, xv: f64| regularized_gamma_p::<f64>(av, xv);
+        // Integer `a` (the aₙ=0 trap) and a non-integer, each just inside the CF branch.
+        for &(av, xv) in &[
+            (1.0, 2.001),
+            (2.0, 3.001),
+            (4.0, 5.02),
+            (1.0, 2.5),
+            (3.0, 4.1),
+        ] {
+            assert!(xv >= av + 1.0, "case ({av},{xv}) must be in the CF branch");
+            let dual = regularized_gamma_p(Dual2::<2>::var(av, 0), Dual2::<2>::var(xv, 1));
+            let h = 1e-6;
+            let dpda = (p(av + h, xv) - p(av - h, xv)) / (2.0 * h);
+            assert_relative_eq!(dual.grad[0], dpda, max_relative = 1e-4, epsilon = 1e-7);
+            let h2 = 1e-3;
+            let d2a = (p(av + h2, xv) - 2.0 * p(av, xv) + p(av - h2, xv)) / (h2 * h2);
+            assert_relative_eq!(dual.hess[0][0], d2a, max_relative = 5e-3, epsilon = 1e-5);
         }
     }
 }
