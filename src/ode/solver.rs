@@ -298,6 +298,217 @@ pub fn solve_ode_with_stats(
     results
 }
 
+/// Outcome of [`solve_ode_until_threshold`] over a single integration span.
+///
+/// This is the **segment-level** primitive behind the TTE event-time sampler
+/// (plan §8.8.3): the simulation entry point drives it once per dose segment
+/// (mirroring [`crate::ode::ode_dense_solve_states`]), carrying the *absolute*
+/// monitored threshold and the end-of-segment state across segments. The public
+/// wrapper maps a terminal [`ReachedEnd`](ThresholdCrossing::ReachedEnd) (the
+/// monitor never reached the threshold by the horizon) to a right-censored draw,
+/// [`Crossed`](ThresholdCrossing::Crossed) to an event, and
+/// [`Failed`](ThresholdCrossing::Failed) to a hard error — a failed solve must
+/// never be laundered into a censored subject.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThresholdCrossing {
+    /// The monitored state reached `threshold` at this time within the span.
+    Crossed(f64),
+    /// Integrated cleanly to the end of the span without crossing; the caller's
+    /// `u` now holds the state at `t_end` (carry it into the next segment).
+    ReachedEnd,
+    /// No meaningful crossing can be reported: a non-finite monitored state, a
+    /// monitored state that *decreased* over a step (non-monotone accumulator ⇒ a
+    /// negative rate — for TTE, a negative hazard, which invalidates the crossing
+    /// argument), or the step budget exhausted before reaching `t_end`. The
+    /// message names the cause.
+    Failed(String),
+}
+
+/// Integrate `rhs` over `t_span`, **halting at the first time `u[monitor]` reaches
+/// `threshold`** — a one-sided upward crossing, for a monitored state expected to
+/// be monotone non-decreasing (a cumulative-hazard accumulator `dCHZ/dt = h ≥ 0`).
+///
+/// `u` is the state at `t_span.0` on entry and is advanced **in place** to the
+/// state at `t_span.1` on [`ReachedEnd`](ThresholdCrossing::ReachedEnd) (so a
+/// segmented caller can carry it into the next dose segment); on `Crossed` /
+/// `Failed` its final value is unspecified.
+///
+/// Localization within the crossing step is **bracketed bisection on the cubic
+/// Hermite interpolant** of the monitored component (the step endpoints plus the
+/// FSAL stage derivatives `k1`, `k7`) — *not* Newton, because a Hermite cubic can
+/// overshoot even when the true trajectory is monotone, whereas the accepted step
+/// already proves the bracket `y0 < threshold ≤ y1`, on which bisection is
+/// unconditionally robust.
+///
+/// This is a **separate** stepper from [`solve_ode_with_stats`] (rather than a
+/// flag on it) so the FOCEI hot path stays bit-identical; the Butcher constants
+/// are shared module-level items, so only the stepping loop is restated.
+pub fn solve_ode_until_threshold(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u: &mut [f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    opts: &OdeSolverOptions,
+    monitor: usize,
+    threshold: f64,
+) -> ThresholdCrossing {
+    let n = u.len();
+    let (t0, tf) = t_span;
+
+    // Already at/above threshold at the span start (e.g. threshold ≈ 0 from u≈1,
+    // or a non-zero initial accumulator). Catch before stepping so the loop's
+    // crossing test can assume `y0 < threshold`.
+    if u[monitor] >= threshold {
+        return ThresholdCrossing::Crossed(t0);
+    }
+    if (tf - t0).abs() < 1e-15 {
+        return ThresholdCrossing::ReachedEnd;
+    }
+
+    let mut t = t0;
+    let mut dt = opts.initial_dt.min((tf - t0) / 10.0).max(opts.min_dt);
+
+    let mut k1 = vec![0.0; n];
+    let mut k2 = vec![0.0; n];
+    let mut k3 = vec![0.0; n];
+    let mut k4 = vec![0.0; n];
+    let mut k5 = vec![0.0; n];
+    let mut k6 = vec![0.0; n];
+    let mut k7 = vec![0.0; n];
+    let mut u_tmp = vec![0.0; n];
+    let mut u5 = vec![0.0; n];
+
+    // FSAL + memoryless I-controller, identical to `solve_ode_with_stats` (see the
+    // step-control notes there); no `saveat` clamp here — this stepper saves
+    // nothing, it only watches `monitor`, so its step sequence is not perturbed by
+    // observation times.
+    let mut have_k1 = false;
+    const I_EXP: f64 = 1.0 / 5.0;
+
+    for _step in 0..opts.max_steps {
+        if t >= tf - 1e-15 {
+            return ThresholdCrossing::ReachedEnd;
+        }
+
+        let dt_eff = dt.min(tf - t);
+
+        if !have_k1 {
+            rhs(u, params, t, &mut k1);
+            have_k1 = true;
+        }
+        for i in 0..n {
+            u_tmp[i] = u[i] + dt_eff * B21 * k1[i];
+        }
+        rhs(&u_tmp, params, t + A2 * dt_eff, &mut k2);
+        for i in 0..n {
+            u_tmp[i] = u[i] + dt_eff * (B31 * k1[i] + B32 * k2[i]);
+        }
+        rhs(&u_tmp, params, t + A3 * dt_eff, &mut k3);
+        for i in 0..n {
+            u_tmp[i] = u[i] + dt_eff * (B41 * k1[i] + B42 * k2[i] + B43 * k3[i]);
+        }
+        rhs(&u_tmp, params, t + A4 * dt_eff, &mut k4);
+        for i in 0..n {
+            u_tmp[i] = u[i] + dt_eff * (B51 * k1[i] + B52 * k2[i] + B53 * k3[i] + B54 * k4[i]);
+        }
+        rhs(&u_tmp, params, t + A5 * dt_eff, &mut k5);
+        for i in 0..n {
+            u_tmp[i] = u[i]
+                + dt_eff * (B61 * k1[i] + B62 * k2[i] + B63 * k3[i] + B64 * k4[i] + B65 * k5[i]);
+        }
+        rhs(&u_tmp, params, t + dt_eff, &mut k6);
+        for i in 0..n {
+            u5[i] = u[i]
+                + dt_eff * (B71 * k1[i] + B73 * k3[i] + B74 * k4[i] + B75 * k5[i] + B76 * k6[i]);
+        }
+        rhs(&u5, params, t + dt_eff, &mut k7);
+
+        let mut err_norm = 0.0;
+        for i in 0..n {
+            let err_i = dt_eff
+                * (E1 * k1[i] + E3 * k3[i] + E4 * k4[i] + E5 * k5[i] + E6 * k6[i] + E7 * k7[i]);
+            let scale = opts.abstol + opts.reltol * u5[i].abs().max(u[i].abs());
+            err_norm += (err_i / scale) * (err_i / scale);
+        }
+        err_norm = (err_norm / n as f64).sqrt();
+
+        let accepted = err_norm <= 1.0 || dt_eff <= opts.min_dt;
+        if accepted {
+            // Monitored value + derivative at the step's start (y0,d0) and end
+            // (y1,d1) — captured before the FSAL swap and the `u <- u5` advance.
+            let y0 = u[monitor];
+            let d0 = k1[monitor];
+            let y1 = u5[monitor];
+            let d1 = k7[monitor];
+
+            if !y1.is_finite() {
+                return ThresholdCrossing::Failed(format!(
+                    "monitored state {monitor} became non-finite at t={:.6}",
+                    t + dt_eff
+                ));
+            }
+            // Scale-aware monotonicity floor: a real negative rate produces a
+            // decrease ≫ this; only round-off sits below it.
+            let mono_tol = opts.abstol + opts.reltol * y0.abs().max(y1.abs());
+            if y1 < y0 - mono_tol {
+                return ThresholdCrossing::Failed(format!(
+                    "monitored state {monitor} decreased ({y0:.6} → {y1:.6}) over \
+                     [{t:.6}, {:.6}]: non-monotone accumulator (negative rate / hazard)",
+                    t + dt_eff
+                ));
+            }
+
+            if y1 >= threshold {
+                // Crossing in (t, t+dt_eff]; bisect the Hermite cubic on the bracket
+                // the accepted step proves (y0 < threshold ≤ y1). 64 halvings drives
+                // the bracket below machine precision of the step — cubic evals only.
+                let h = dt_eff;
+                let hermite = |s: f64| {
+                    let s2 = s * s;
+                    let s3 = s2 * s;
+                    (2.0 * s3 - 3.0 * s2 + 1.0) * y0
+                        + (s3 - 2.0 * s2 + s) * h * d0
+                        + (-2.0 * s3 + 3.0 * s2) * y1
+                        + (s3 - s2) * h * d1
+                };
+                let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+                for _ in 0..64 {
+                    let mid = 0.5 * (lo + hi);
+                    if hermite(mid) < threshold {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                return ThresholdCrossing::Crossed(t + 0.5 * (lo + hi) * h);
+            }
+
+            t += dt_eff;
+            u.copy_from_slice(&u5);
+            std::mem::swap(&mut k1, &mut k7);
+        }
+
+        let safety = 0.9;
+        // Finite-error branch is identical to `solve_ode_with_stats`; a *non-finite*
+        // err_norm (diverging / NaN RHS) shrinks toward `min_dt` instead of growing,
+        // so the step is force-accepted at `min_dt` and the non-finite guard above
+        // fires with a clear cause rather than silently burning the step budget.
+        let factor = if !err_norm.is_finite() {
+            0.2
+        } else if err_norm > 1e-15 {
+            safety * err_norm.powf(-I_EXP)
+        } else {
+            5.0
+        };
+        dt = (dt_eff * factor.clamp(0.2, 5.0)).max(opts.min_dt);
+    }
+
+    ThresholdCrossing::Failed(format!(
+        "step budget ({}) exhausted before reaching t_end={tf:.6} (reached t={t:.6})",
+        opts.max_steps
+    ))
+}
+
 /// Generic solution point for the [`solve_ode_g`] sensitivity path.
 #[derive(Debug, Clone)]
 pub struct SolPointG<T> {
@@ -572,6 +783,140 @@ mod tests {
         let result = solve_ode(&rhs, &[42.0], (5.0, 5.0), &[], &saveat, &opts);
         assert_eq!(result.len(), 1);
         assert_relative_eq!(result[0].u[0], 42.0, epsilon = 1e-12);
+    }
+
+    /// Primitive-level degenerate oracle: a constant accumulation rate `λ` is the
+    /// ODE form of a constant hazard, whose analytic event time for `CHZ = −log u`
+    /// is `t* = −log(u)/λ`. Here `dCHZ/dt = 2`, `threshold = 10` ⇒ exact crossing at
+    /// `t* = 5`. The Hermite interpolant is exact on a linear trajectory, so the
+    /// bisection should hit `5` to round-off.
+    #[test]
+    fn until_threshold_constant_rate_is_exact() {
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = 2.0;
+        };
+        let opts = OdeSolverOptions::default();
+        let mut u = [0.0];
+        match solve_ode_until_threshold(&rhs, &mut u, (0.0, 100.0), &[], &opts, 0, 10.0) {
+            ThresholdCrossing::Crossed(t) => assert_relative_eq!(t, 5.0, epsilon = 1e-9),
+            other => panic!("expected Crossed(5.0), got {other:?}"),
+        }
+    }
+
+    /// Drug-driven hazard with a closed form: a decaying drug `dC/dt = −0.5·C`,
+    /// `C(0)=10`, feeds `dCHZ/dt = 0.1·C` ⇒ `CHZ(t) = 2·(1 − e^{−0.5t})`. Solving
+    /// `CHZ = 1` gives `t* = 2·ln 2 ≈ 1.386294`. Exercises a non-zero monitor index
+    /// (`CHZ` is state 1) and a genuinely curved accumulator.
+    #[test]
+    fn until_threshold_decaying_drug_hazard_matches_closed_form() {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -0.5 * u[0]; // concentration
+            du[1] = 0.1 * u[0]; // cumulative hazard
+        };
+        let opts = OdeSolverOptions {
+            abstol: 1e-10,
+            reltol: 1e-9,
+            ..OdeSolverOptions::default()
+        };
+        let mut u = [10.0, 0.0];
+        match solve_ode_until_threshold(&rhs, &mut u, (0.0, 1000.0), &[], &opts, 1, 1.0) {
+            ThresholdCrossing::Crossed(t) => {
+                assert_relative_eq!(t, 2.0 * std::f64::consts::LN_2, epsilon = 1e-5)
+            }
+            other => panic!("expected Crossed, got {other:?}"),
+        }
+    }
+
+    /// Threshold never reached within the span ⇒ `ReachedEnd`, and `u` is advanced
+    /// in place to the end-of-span state (so a segmented caller can carry it).
+    #[test]
+    fn until_threshold_not_reached_advances_state() {
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = 1.0;
+        };
+        let opts = OdeSolverOptions::default();
+        let mut u = [0.0];
+        let outcome = solve_ode_until_threshold(&rhs, &mut u, (0.0, 10.0), &[], &opts, 0, 1000.0);
+        assert_eq!(outcome, ThresholdCrossing::ReachedEnd);
+        assert_relative_eq!(u[0], 10.0, epsilon = 1e-6);
+    }
+
+    /// A decreasing monitored state (negative rate ⇒ negative hazard) is not a
+    /// censor — it invalidates the crossing argument and must be a hard failure.
+    #[test]
+    fn until_threshold_negative_rate_fails() {
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -1.0;
+        };
+        let opts = OdeSolverOptions::default();
+        let mut u = [5.0];
+        match solve_ode_until_threshold(&rhs, &mut u, (0.0, 10.0), &[], &opts, 0, 100.0) {
+            ThresholdCrossing::Failed(msg) => assert!(msg.contains("non-monotone"), "msg: {msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// Already at/above the threshold at the span start ⇒ `Crossed(t0)` without
+    /// stepping (the `u ≈ 1 ⇒ threshold ≈ 0` edge, or a non-zero initial state).
+    #[test]
+    fn until_threshold_already_crossed_at_start() {
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = 1.0;
+        };
+        let opts = OdeSolverOptions::default();
+        let mut u = [5.0];
+        match solve_ode_until_threshold(&rhs, &mut u, (2.0, 10.0), &[], &opts, 0, 3.0) {
+            ThresholdCrossing::Crossed(t) => assert_relative_eq!(t, 2.0, epsilon = 1e-12),
+            other => panic!("expected Crossed(2.0), got {other:?}"),
+        }
+    }
+
+    /// A non-finite trajectory cannot yield a meaningful crossing ⇒ hard failure,
+    /// not a silent censor at the horizon.
+    #[test]
+    fn until_threshold_non_finite_fails() {
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = f64::NAN;
+        };
+        let opts = OdeSolverOptions::default();
+        let mut u = [0.0];
+        match solve_ode_until_threshold(&rhs, &mut u, (0.0, 10.0), &[], &opts, 0, 10.0) {
+            ThresholdCrossing::Failed(_) => {}
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// A zero-width span reaches its end immediately, without stepping.
+    #[test]
+    fn until_threshold_zero_span_reaches_end() {
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = 1.0;
+        };
+        let opts = OdeSolverOptions::default();
+        let mut u = [0.0];
+        assert_eq!(
+            solve_ode_until_threshold(&rhs, &mut u, (5.0, 5.0), &[], &opts, 0, 10.0),
+            ThresholdCrossing::ReachedEnd
+        );
+    }
+
+    /// Exhausting the step budget before reaching `t_end` is a failure, not a
+    /// censor — a censored draw requires a *clean* integration to the horizon.
+    #[test]
+    fn until_threshold_step_budget_exhausted_fails() {
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = 1.0;
+        };
+        let opts = OdeSolverOptions {
+            max_steps: 2,
+            ..OdeSolverOptions::default()
+        };
+        let mut u = [0.0];
+        // Threshold far beyond what 2 steps can reach within the (huge) span.
+        match solve_ode_until_threshold(&rhs, &mut u, (0.0, 1e6), &[], &opts, 0, 1e9) {
+            ThresholdCrossing::Failed(msg) => assert!(msg.contains("budget"), "msg: {msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     /// `solve_ode_g` over `Dual2` must reproduce the closed-form sensitivities of
