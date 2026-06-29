@@ -866,6 +866,29 @@ mod tests {
         );
     }
 
+    /// And for an interval-censored record whose cumulative hazard is non-monotone
+    /// *before* the interval (`H(left) < H(entry)`): the guard fires before the
+    /// `delta` check, so this exercises the interval arm's monotonicity branch
+    /// (distinct from the degenerate `right ≤ left` case above).
+    #[test]
+    fn tte_nll_from_curves_rejects_non_monotone_interval() {
+        let records = vec![ObsRecord::Event {
+            time: 0.0,
+            event_type: EventType::IntervalCensored {
+                left: 5.0,
+                right: 10.0,
+            },
+            entry_time: 2.0,
+            cmt: 3,
+        }];
+        // H(entry=2) = 1.0 but H(left=5) = 0.2 < H(entry): non-monotone ⇒ sentinel.
+        let nll = tte_nll_from_curves(&records, |t| if t < 3.0 { 1.0 } else { 0.2 }, |_t| 0.1);
+        assert_eq!(
+            nll, 1e20,
+            "non-monotone CHZ before an interval must be sentinel-guarded"
+        );
+    }
+
     #[test]
     fn tte_data_term_exact_event_exponential() {
         use crate::types::HazardFamily;
