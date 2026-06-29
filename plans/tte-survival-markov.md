@@ -1,8 +1,14 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Phase 1 **and Phase 1b complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 Slice 2.1 (Joint PK-TTE, ODE hazard accumulator, fit path) COMPLETE — #564 via PR #567 (squash `657800ee`) merged 2026-06-28; ferx-r pin bump = draft PR #208.** Open follow-ups: `predict_survival` R wrapper + R-side TTE test; #469 (FOCEI nonlinear-frailty ω² ~17% high vs NONMEM, spin-off of #440, PR #571); #570 (joint-fit double-solve perf — *not urgent*: full 120-subj fit is 5 s in release). **NEXT: Phase 2 Slice 2.2 — drug-driven event-time simulation (`integrate_until_threshold` root-finder + SSE).**  
+**Status:** Phase 1 **and Phase 1b complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 Slice 2.1 (Joint PK-TTE, ODE hazard accumulator, fit path) COMPLETE — #564 via PR #567 (squash `657800ee`) merged 2026-06-28; ferx-r pin bump PR #208 merged.** Open follow-ups: ferx-r bundled `pktte_joint` example + TTE-sim exposure — **tracked in ferx-r#210** (the `predict_survival` wrapper + an R-side TTE test already shipped in Phase 1, so that part of the original line was stale); #469 (FOCEI nonlinear-frailty ω² ~17% high vs NONMEM, spin-off of #440, PR #571); #570 (joint-fit double-solve perf — *not urgent*: full 120-subj fit is 5 s in release; **sequenced as its own PR after Slice 2.2-A — see Phase 2**). **NEXT: Phase 2 Slice 2.2 — drug-driven event-time simulation (`integrate_until_threshold` root-finder + SSE).**  
 **Scope:** Active implementation — Phase 2 Slice 2.2 (simulation; Slice 2.1 merged)  
-**Revised:** 2026-06-28 (Slice 2.1 #564 merged via #567; three-way anchor ferx≈NONMEM≈nlmixr2 landed + a theta-SE back-transform bug it caught was fixed; ferx-r#208 pin bump kicked off; Slice 2.2 now active; #440 spun off #469; markov/categorical phases untouched)
+**Revised:** 2026-06-29 (Slice 2.2 scope hardened — adversarial/"no-happy-path" pass: typed
+root-finder outcome separating censor from solve-failure, mandatory finite horizon, non-negative-
+hazard guard on both sim and fit paths, conditional-sampling left-truncation, deterministic RNG
+ordering, EVID=3-reset assertion; #570 re-sequenced as its own post-Slice-2.2-A PR to protect the
+2.1 anchor; ferx-r follow-ups corrected → ferx-r#210. Prior 2026-06-28: Slice 2.1 #564 merged via
+#567; three-way anchor ferx≈NONMEM≈nlmixr2 + theta-SE back-transform fix; #440 spun off #469;
+markov/categorical phases untouched)
 
 ---
 
@@ -1527,18 +1533,44 @@ Analytic inverse-CDF closed forms (no root-finding needed):
 For drug-driven hazard there is no closed-form inverse. Integrate the augmented ODE (which
 already carries `dCHZ/dt = h(t)`) and **halt at the first t where CHZ(t) = −log(u)**. The
 RK45 solver needs root detection: after each accepted step, test whether the monitored state
-crossed the target; if so, locate the crossing by bisection / Hermite-interpolant root-find
-within the step. This is the single largest new simulation piece and is reusable for any
+crossed the target; if so, locate the crossing by **bracketed bisection** within the step (a
+Hermite cubic can overshoot, so bisect the bracket the step already proves rather than trusting
+monotonicity). This is the single largest new simulation piece and is reusable for any
 threshold-crossing need.
+
+The return type must distinguish **censoring from failure** — collapsing them is a
+silent-wrong-answer bug (manufactures censored subjects from failed solves):
 
 ```rust
 // ode/solver.rs — new capability
+pub enum ThresholdOutcome { Crossed(f64), CensoredAtHorizon, SolveFailed(String) }
+
 pub fn integrate_until_threshold(
     deriv: impl Fn(f64, &[f64]) -> Vec<f64>,
-    y0: &[f64], t0: f64, t_max: f64,
+    y0: &[f64], t0: f64, t_max: f64,    // t_max MUST be finite for ODE-TTE (see Phase 2 §2.2)
     monitor_state: usize, threshold: f64,
-) -> Option<f64>;   // crossing time, or None if not reached by t_max → censor at t_max
+) -> ThresholdOutcome;
+// Crossed(t)         — CHZ reached threshold at t ∈ (t0, t_max]
+// CensoredAtHorizon  — integrated cleanly to t_max, CHZ < threshold throughout
+// SolveFailed(why)   — max_steps exhausted, min_dt-clamp storm, h < 0 (CHZ non-monotone),
+//                      or non-finite CHZ. A negative/NaN hazard invalidates the crossing
+//                      argument and must error, not censor — guarded on the fit path too.
 ```
+
+**This signature is the low-level *primitive* — it is NOT the simulation entry point.** Verified
+against `ode_dense_solve_states` (`ode/predictions.rs:2881`): doses, lag, infusions, EVID=3/4
+resets and zero-order windows are applied by **break-time segmentation** (the `break_times.windows(2)`
+loop calls `solve_ode` once *per segment* with `u` carried across boundaries — so CHZ accumulates
+across doses for free). A bare-`deriv` `integrate_until_threshold` used directly would **silently
+ignore every dose**. So simulation calls a *segmented wrapper* (mirror `ode_dense_solve_states`,
+swap the inner per-segment `solve_ode` for the threshold-watching stepper, carry the absolute CHZ
+threshold across segments, return `ThresholdOutcome`). The primitive is added to `solver.rs` as a
+**separate function** from `solve_ode_with_stats`, not an in-place flag, so the FOCEI hot path stays
+bit-identical (the Butcher constants are module-level, so only the ~40-line stepping loop is shared
+knowledge, not duplicated coefficients). The hazard guard's two paths differ in *kind*: the **fit**
+path already *softly* steers away via the `1e20` NLL sentinel (`survival/mod.rs:79`), but
+**simulation has no optimizer to steer** — a non-monotone CHZ silently corrupts the draw — so sim
+needs a **hard** `SolveFailed` error.
 
 #### 8.8.4 Simulation horizon & observation schedule
 
@@ -2307,13 +2339,96 @@ user-written accumulator. Expression compiles in the ODE-RHS namespace (reuses #
 - **ferx-r:** pin bump to ferx-core `9fb6cb27` + NEWS = draft PR #208 (bundled `pktte_joint` R
   example/test still to add — local R build is gfortran-blocked, wants CI/toolchain validation).
 
-**Slice 2.2 — simulation (NEXT):**
-- **ODE event-location root-finder** `integrate_until_threshold` (§8.8.3) — shared infra
-- **Simulation**: drug-driven hazard event-time sampling via the root-finder (lift the typed
-  `simulate` guard added in 2.1)
-- **Tier-3 SSE** (simulate → fit → recover); Tier-3 convergence already in place from 2.1
-- Optionally fold in #570 here (share the Gaussian+TTE ODE solve so the FD-Hessian doesn't
-  double-integrate) — perf only, not blocking.
+**Slice 2.2 — simulation (NEXT).** Build pieces:
+- **A. ODE event-location root-finder** `integrate_until_threshold` (§8.8.3) — the long pole;
+  shared infra. Bracketed-bisection localization inside each accepted step (see robustness note
+  below); runs *through* the dose-event segmentation of `ode_dense_solve_states`, not a naïve
+  single integration, carrying the absolute CHZ threshold across dose segments.
+- **B. Wire sampling**: branch `survival::simulate_tte` on `HazardSpec` — `OdeAccumulated` draws
+  `u`, root-finds `chz_state` to `−log u`; analytic causes keep the closed-form inverse-CDF;
+  competing/mixed causes reuse the earliest-wins `resolve_competing_risks`. This *replaces* the
+  2.1 guards (`api.rs` typed error + `simulate_tte` panic) with real error propagation, not a
+  plain deletion — every failure mode below must surface through `simulate_with_options`'s
+  `Result`, and the Vec-returning `simulate()`/`simulate_with_seed()` must panic with the same
+  message (they cannot signal otherwise).
+- **C. Tier-3 SSE** + edge tests (see validation below).
+
+**Robustness requirements (these are the point — do not ship the happy path):**
+- **Failure ≠ censor.** The root-finder must return a *typed result*, not a bare `Option<f64>`:
+  (i) crossing found → event time; (ii) integrated cleanly to `horizon`, no crossing → legitimate
+  right-censor; (iii) `max_steps` exhausted, `min_dt`-clamp storm, or **non-finite CHZ** → **solve
+  failure → error**. Collapsing (ii) and (iii) into "censor at `t_max`" is a silent-wrong-answer
+  bug (it manufactures censored subjects out of failed solves).
+- **Finite horizon is mandatory** for ODE-accumulated TTE simulation. A drug-driven hazard can
+  vanish (drug washed out, no baseline term) and then *never* fire — the analytic path's `+∞`
+  tolerance (closed-form inverse-CDF always fires for λ>0) does **not** transfer. Error at the api
+  layer if an `OdeAccumulated` endpoint is simulated without `[simulation] horizon`.
+- **Non-negative-hazard guard on BOTH paths.** `h = dCHZ/dt` is a user expression; nothing forces
+  `h ≥ 0`. A negative `h` makes CHZ non-monotone and *invalidates the entire crossing argument*
+  (it can dip back below threshold). Detect `h < 0` / non-finite CHZ and error with one shared
+  message — and add the same guard to the **fit** path (`survival::ode_cumhaz_hazard`), where a
+  negative/NaN hazard is equally ill-posed (`−log h` on an exact event blows up). Catch it once,
+  consistently; don't let sim be the only place it's noticed.
+- **Bracketed bisection, not Newton-from-monotonicity.** A cubic Hermite through (value, deriv) at
+  both step ends can overshoot even when true CHZ is monotone; localize by bisection on the
+  bracket the accepted step already proves (`u[mon] < thr ≤ u5[mon]`), which is unconditionally
+  robust. Guard the `t0`-already-crossed case (`u≈1 ⇒ thr≈0`) before stepping.
+- **Left-truncation: guard now, conditional-sample later.** Left-truncation+ODE stays deferred
+  (see Deferred below), so Slice 2.2 must **assert `entry_time == 0`** for ODE-TTE simulation
+  rather than silently sampling unconditionally from 0 (which would bias the event-time
+  distribution upward). Recipe for when it lands: integrate from 0, capture `CHZ(entry)` in the
+  same pass, arm the detector at `CHZ_abs = CHZ(entry) − log u` (event ⇔ `CHZ(t) − CHZ(entry) =
+  −log u`) — not a free second solve.
+- **Deterministic RNG contract.** Draw all per-cause uniforms up front in record order (mirroring
+  the analytic competing-risks loop) *before* any integration, so switching a cause analytic↔ODE,
+  or a mixed competing-risks subject, never reorders the stream — the SSE/characterization tests
+  depend on this.
+- **EVID=3 reset interaction.** Selective per-state reset is Phase 3 (§8.8.6); until then a full
+  `Subject::reset_times` would zero CHZ mid-flight and corrupt the draw. Assert/​error if an
+  ODE-TTE subject carries reset times rather than silently mis-sampling.
+- **One η draw feeds both endpoints.** The simulated PK trajectory and the event-time root-find
+  must use the same sampled η and (ideally) the same solve, or the simulated concentration and
+  event time are physically inconsistent. Centralize the draw in `simulate_inner_with_draw`.
+- Honor the `[simulation] horizon` override (#522) identically to the analytic branch.
+
+**#570 — folded into this slice's plan, but sequenced as its own PR *after* A (not bundled).**
+Rationale (this is a sustainability call, not laziness): the only "free" fusion enlarges the
+Gaussian solve's `saveat` to include the TTE times, but the save-overshoot clamp
+(`solver.rs:199`) *changes the adaptive step sequence*, which shifts the FOCEI FD-gradient noise
+floor and can move OFV/estimates — exactly the failure the I-controller note (`solver.rs:180`)
+warns about, and a direct threat to the Slice 2.1 NONMEM anchor. The safe form reuses Piece A's
+in-step Hermite interpolation to read CHZ at arbitrary times **without** adding hard save points;
+that only exists once A lands. So: land sim first (new code, cannot regress existing fits), then
+#570 as a separate PR gated on a before/after bit-stability check of `tests/reference/pktte_joint`.
+Note also that #570 removes only the *redundant at-mode* augmented solve and the free
+`tte_nll_at_mode`; the FD-Hessian's `2·n(n+1)` perturbed-η solves are intrinsic to finite
+differencing and remain (true elimination needs analytic CHZ η-sensitivities — separate, larger).
+
+**Validation (Slice 2.2):**
+- **Degenerate oracle (unit):** constant-hazard ODE (`dCHZ/dt = λ`) sampled via the root-finder
+  vs. the analytic Exponential inverse-CDF, **same seed**, compared per-draw to a tolerance tied
+  to solver `abstol`/`reltol` + the bisection tol — directly pins root-finder accuracy.
+- **PIT / KS goodness-of-fit (the decisive sampler validator, gated `slow-tests`):** for a
+  **fixed-effects** joint PK-TTE truth, simulate N event times with the production root-finder,
+  then probability-integral-transform each — `V_i = exp(−Ĥ(T_i))` where `Ĥ` is an **independent**
+  closed-form-PK + trapezoid cumulative-hazard oracle (no shared code with the sampler) — and KS-test
+  `{V_i}` against Uniform(0,1) at the 5% level. This validates that the sampler draws from the
+  model's *own* survival, and is **immune to the (H0,BETA) collinear ridge** (no estimation) and to
+  FOCEI-Laplace bias. `joint_pktte_event_times_match_model_survival` (observed KS D ≈ 0.040 ≈ the
+  `0.87/√N` expectation for a correct sampler, N=500).
+- **Tier-3 SSE** (gated `slow-tests`): simulate joint PK-TTE from known (θ, Ω) → fit → recover.
+  Fixed seed; assert tight **truth recovery of the identifiable params** (CL, V, KA, ω²(CL), pinned
+  by the continuous obs) + finite OFV + a non-degenerate event/censor mix. **Do NOT band H0/BETA to
+  truth:** they are collinear at any single-occasion design and exposure spread does *not* break it
+  (confirmed: doses {20,40,80} still give max |ΔS(t)| ≈ 0.16, H0/BETA off-truth along the ridge —
+  the same finding as 2.1's corr −0.91 across NONMEM/nlmixr2). A wide "sane-range" band on a
+  non-identified parameter passes for the wrong reason; hazard correctness is the PIT/KS test's job.
+- **Edge tests:** all-censored (hazard≈0 to horizon), all-immediate (huge hazard),
+  `entry_time ≥ horizon` (empty risk window), no-horizon-set, and a negative-hazard model — each
+  asserting the *specific* error/outcome, not just `is_err()`.
+- **External anchor (CLAUDE.md numerical-feature requirement):** KM / KS cross-check of
+  ferx-simulated event times vs. NONMEM `$SIM` (or rxode2 `rxSolve`) for one drug-driven hazard
+  from identical (θ, PK profile); lands in `tests/reference/` + `docs/estimation/tte.qmd`.
 
 **Slice 2.3 — docs/example polish + comparison table.** (The anchor comparison table already
 exists in `tests/reference/pktte_joint/expected.md`; 2.3 surfaces it into `docs/estimation/tte.qmd`.)
@@ -2321,7 +2436,9 @@ exists in `tests/reference/pktte_joint/expected.md`; 2.3 surfaces it into `docs/
 **Deferred:**
 - **Selective per-state ODE reset** (§8.8.6) → Phase 3 (clock-reset RTTE; no Phase 2 consumer;
   sub-integration fallback available)
-- `IntervalCensored`+ODE and left-truncation (`entry_time>0`)+ODE → small follow-ups after 2.1
+- `IntervalCensored`+ODE and left-truncation (`entry_time>0`)+ODE → small follow-ups after 2.1.
+  Slice 2.2 **asserts** these are unsupported for ODE-TTE sim (clear error, not silent
+  mis-sampling); lifting the assertion is the follow-up.
 - **Harden `cif_curves` against NaN cause-rows** in competing-risks `predict_survival` (a failed ODE
   solve at a grid node freezes all-cause survival and zeroes later CIF nodes) — niche; pairs with
   first-classing multi-hazard-ODE competing risks.

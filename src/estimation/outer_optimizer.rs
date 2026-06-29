@@ -1,4 +1,4 @@
-use crate::estimation::inner_optimizer::{find_ebe, run_inner_loop_warm};
+use crate::estimation::inner_optimizer::{find_ebe, run_inner_loop_warm, InnerLoopStats};
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{foce_population_nll, foce_population_nll_iov};
 use crate::types::*;
@@ -361,6 +361,31 @@ struct NloptState {
 /// `enabled = false` disables the guard entirely: never latches and never
 /// reports stagnation, so the optimizer runs to its own termination
 /// criterion (or to `outer_maxiter`).
+/// Whether the EBE convergence guard rejects this outer trial. Two independent triggers:
+///
+/// 1. **Hard reject** — any subject was rejected at its inner start (a pathological ODE+IOV
+///    warm-start NLL). Its returned `(η, H)` is a degenerate placeholder, so the trial must
+///    be rejected regardless of `max_unconverged_frac` or the `min_obs` filter, otherwise a
+///    zero H-matrix would corrupt an *accepted* OFV (#603 review #1/#2).
+/// 2. **Too many unconverged** — the fraction of (long-enough-record) subjects whose inner
+///    optimizer failed exceeds `max_unconverged_frac` and the OFV is finite.
+///
+/// A negative `max_unconverged_frac` disables the fraction trigger (but never the hard
+/// reject). Centralising the predicate keeps the five evaluation sites in this module from
+/// drifting (#603 review #8).
+fn ebe_guard_rejects(
+    stats: &InnerLoopStats,
+    n_subj: usize,
+    raw_ofv: f64,
+    max_unconverged_frac: f64,
+) -> bool {
+    if stats.n_start_rejected > 0 {
+        return true;
+    }
+    let frac = stats.n_unconverged as f64 / (n_subj as f64).max(1.0);
+    raw_ofv.is_finite() && frac > max_unconverged_frac && max_unconverged_frac >= 0.0
+}
+
 fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
     if !enabled {
         return false;
@@ -507,10 +532,7 @@ fn run_global_presearch(
             options.interaction,
         );
         let raw = 2.0 * nll;
-        let frac = ebe_stats.n_unconverged as f64 / (n_subj as f64).max(1.0);
-        let guarded = raw.is_finite()
-            && frac > options.max_unconverged_frac
-            && options.max_unconverged_frac >= 0.0;
+        let guarded = ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac);
         if !raw.is_finite() || guarded {
             1e20
         } else {
@@ -559,10 +581,8 @@ fn run_global_presearch(
         );
         let raw_ofv = 2.0 * nll;
 
-        let unconverged_frac = ebe_stats.n_unconverged as f64 / (n_subj as f64).max(1.0);
-        let ebe_guard = raw_ofv.is_finite()
-            && unconverged_frac > options.max_unconverged_frac
-            && options.max_unconverged_frac >= 0.0;
+        let ebe_guard =
+            ebe_guard_rejects(&ebe_stats, n_subj, raw_ofv, options.max_unconverged_frac);
         let ofv = if ebe_guard {
             1e20
         } else if raw_ofv.is_finite() {
@@ -953,11 +973,10 @@ fn optimize_nlopt(
         );
         let raw_ofv = 2.0 * nll;
 
-        // EBE convergence guard: reject step when too many subjects unconverged.
-        let unconverged_frac = ebe_stats.n_unconverged as f64 / (n_subj as f64).max(1.0);
-        let ebe_guard_triggered = raw_ofv.is_finite()
-            && unconverged_frac > options.max_unconverged_frac
-            && options.max_unconverged_frac >= 0.0;
+        // EBE convergence guard: reject step when too many subjects unconverged or any
+        // subject was hard-rejected at its inner start.
+        let ebe_guard_triggered =
+            ebe_guard_rejects(&ebe_stats, n_subj, raw_ofv, options.max_unconverged_frac);
         {
             let mut acc = ebe_accum_cl.lock().unwrap();
             if acc.max_unconverged < ebe_stats.n_unconverged {
@@ -980,58 +999,58 @@ fn optimize_nlopt(
         // Compute gradient if requested (central FD with fixed EBEs)
         let mut grad_norm_for_trace: Option<f64> = None;
         if let Some(g) = grad {
-            // If OFV is non-finite, gradient is meaningless — use steepest ascent
-            // toward center of bounds to nudge optimizer back
-            if !raw_ofv.is_finite() {
+            // A rejected or non-finite point has no useful population gradient: steepest
+            // ascent toward bounds center nudges the optimizer back. Fall through (no early
+            // return) so the eval is still traced and prev_x / stagnation stay correct,
+            // just skipping the expensive population gradient (#603 review #5).
+            if ebe_guard_triggered || !raw_ofv.is_finite() {
                 for i in 0..g.len() {
                     let center_s = (lower_s[i] + upper_s[i]) / 2.0;
                     g[i] = 100.0 * (xs[i] - center_s);
                 }
-                state.n_evals += 1;
-                n_evals_cl.fetch_add(1, Ordering::Relaxed);
-                return ofv;
-            }
-            // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-            let grad_raw = population_gradient(
-                &x,
-                n_subj,
-                init_params,
-                model,
-                population,
-                &ehs,
-                &hms,
-                &kappas,
-                &bounds,
-                options,
-                &mut state.n_grad_evals,
-            );
-            let mut sq = 0.0_f64;
-            for k in 0..g.len() {
-                let gi = if grad_raw[k].is_finite() {
-                    grad_raw[k] * scale[k]
-                } else {
-                    0.0
-                };
-                g[k] = gi;
-                sq += gi * gi;
-            }
-            grad_norm_for_trace = Some(sq.sqrt());
-            if matches!(algo, nlopt::Algorithm::Slsqp) {
-                cap_slsqp_gradient(g, &lower_s, &upper_s);
-            }
-            // Gate on the global best (same reason as the `best_seen` update
-            // below): `state.best_ofv` resets to INFINITY when the SLSQP
-            // fallback starts, so using it here would let the fallback's first
-            // eval overwrite a better gradient found by the primary run.
-            {
-                let global_best = best_seen_cl
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|(_, o)| *o)
-                    .unwrap_or(f64::INFINITY);
-                if ofv < global_best {
-                    *last_gradient_cl.lock().unwrap() = Some(grad_raw.clone());
+            } else {
+                // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
+                let grad_raw = population_gradient(
+                    &x,
+                    n_subj,
+                    init_params,
+                    model,
+                    population,
+                    &ehs,
+                    &hms,
+                    &kappas,
+                    &bounds,
+                    options,
+                    &mut state.n_grad_evals,
+                );
+                let mut sq = 0.0_f64;
+                for k in 0..g.len() {
+                    let gi = if grad_raw[k].is_finite() {
+                        grad_raw[k] * scale[k]
+                    } else {
+                        0.0
+                    };
+                    g[k] = gi;
+                    sq += gi * gi;
+                }
+                grad_norm_for_trace = Some(sq.sqrt());
+                if matches!(algo, nlopt::Algorithm::Slsqp) {
+                    cap_slsqp_gradient(g, &lower_s, &upper_s);
+                }
+                // Gate on the global best (same reason as the `best_seen` update
+                // below): `state.best_ofv` resets to INFINITY when the SLSQP
+                // fallback starts, so using it here would let the fallback's first
+                // eval overwrite a better gradient found by the primary run.
+                {
+                    let global_best = best_seen_cl
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|(_, o)| *o)
+                        .unwrap_or(f64::INFINITY);
+                    if ofv < global_best {
+                        *last_gradient_cl.lock().unwrap() = Some(grad_raw.clone());
+                    }
                 }
             }
         }
@@ -1277,10 +1296,8 @@ fn optimize_nlopt(
             );
             let raw_ofv = 2.0 * nll;
 
-            let unconverged_frac2 = ebe_stats2.n_unconverged as f64 / (n_subj as f64).max(1.0);
-            let ebe_guard2 = raw_ofv.is_finite()
-                && unconverged_frac2 > options.max_unconverged_frac
-                && options.max_unconverged_frac >= 0.0;
+            let ebe_guard2 =
+                ebe_guard_rejects(&ebe_stats2, n_subj, raw_ofv, options.max_unconverged_frac);
             {
                 let mut acc = ebe_accum_cl2.lock().unwrap();
                 if acc.max_unconverged < ebe_stats2.n_unconverged {
@@ -1301,54 +1318,57 @@ fn optimize_nlopt(
 
             let mut grad_norm_for_trace: Option<f64> = None;
             if let Some(g) = grad {
-                if !raw_ofv.is_finite() {
+                // Mirror the primary closure: a guard-rejected or non-finite point gets a
+                // steepest-ascent nudge instead of a population gradient (the iteration-6
+                // stall this PR targets also reaches the SLSQP fallback — #603 review #3),
+                // and falls through to the shared bookkeeping so the eval stays traced
+                // (#603 review #5).
+                if ebe_guard2 || !raw_ofv.is_finite() {
                     for i in 0..g.len() {
                         let center_s = (lower_s[i] + upper_s[i]) / 2.0;
                         g[i] = 100.0 * (xs[i] - center_s);
                     }
-                    state.n_evals += 1;
-                    n_evals_cl2.fetch_add(1, Ordering::Relaxed);
-                    return ofv;
-                }
-                // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-                let grad_raw = population_gradient(
-                    &x,
-                    n_subj,
-                    init_params,
-                    model,
-                    population,
-                    &ehs,
-                    &hms,
-                    &kappas,
-                    &bounds,
-                    options,
-                    &mut state.n_grad_evals,
-                );
-                let mut sq = 0.0_f64;
-                for k in 0..g.len() {
-                    let gi = if grad_raw[k].is_finite() {
-                        grad_raw[k] * scale[k]
-                    } else {
-                        0.0
-                    };
-                    g[k] = gi;
-                    sq += gi * gi;
-                }
-                grad_norm_for_trace = Some(sq.sqrt());
-                // SLSQP overshoot guard (issue #55) — this fallback
-                // closure is unconditionally SLSQP.
-                cap_slsqp_gradient(g, &lower_s, &upper_s);
-                // See `best_seen` comment in the primary closure — gate on the
-                // global accumulator, not `state.best_ofv` which is fresh here.
-                {
-                    let global_best = best_seen_cl2
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|(_, o)| *o)
-                        .unwrap_or(f64::INFINITY);
-                    if ofv < global_best {
-                        *last_gradient_cl2.lock().unwrap() = Some(grad_raw.clone());
+                } else {
+                    // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
+                    let grad_raw = population_gradient(
+                        &x,
+                        n_subj,
+                        init_params,
+                        model,
+                        population,
+                        &ehs,
+                        &hms,
+                        &kappas,
+                        &bounds,
+                        options,
+                        &mut state.n_grad_evals,
+                    );
+                    let mut sq = 0.0_f64;
+                    for k in 0..g.len() {
+                        let gi = if grad_raw[k].is_finite() {
+                            grad_raw[k] * scale[k]
+                        } else {
+                            0.0
+                        };
+                        g[k] = gi;
+                        sq += gi * gi;
+                    }
+                    grad_norm_for_trace = Some(sq.sqrt());
+                    // SLSQP overshoot guard (issue #55) — this fallback
+                    // closure is unconditionally SLSQP.
+                    cap_slsqp_gradient(g, &lower_s, &upper_s);
+                    // See `best_seen` comment in the primary closure — gate on the
+                    // global accumulator, not `state.best_ofv` which is fresh here.
+                    {
+                        let global_best = best_seen_cl2
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .map(|(_, o)| *o)
+                            .unwrap_or(f64::INFINITY);
+                        if ofv < global_best {
+                            *last_gradient_cl2.lock().unwrap() = Some(grad_raw.clone());
+                        }
                     }
                 }
             }
@@ -2059,9 +2079,8 @@ fn reconverged_fd_gradient(
                 &kappas,
                 options.interaction,
             );
-        let frac = ebe_stats.n_unconverged as f64 / (n_subj as f64).max(1.0);
         if !raw.is_finite()
-            || (options.max_unconverged_frac >= 0.0 && frac > options.max_unconverged_frac)
+            || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
         {
             1e20
         } else {
@@ -4004,6 +4023,32 @@ pub(crate) fn invert_psd_with_floor(sym: &DMatrix<f64>) -> Option<RegularizedInv
 mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
+
+    /// #603 review #1/#2/#8: the centralised EBE guard. A hard reject forces rejection
+    /// unconditionally; otherwise the fraction trigger behaves as before.
+    #[test]
+    fn ebe_guard_rejects_on_hard_reject_and_fraction() {
+        let stats = |n_unconverged, n_start_rejected| InnerLoopStats {
+            n_unconverged,
+            n_fallback: 0,
+            n_start_rejected,
+        };
+
+        // A single hard reject forces rejection even with a finite OFV, zero unconverged
+        // fraction, and the fraction trigger disabled (negative threshold).
+        assert!(ebe_guard_rejects(&stats(0, 1), 100, 1234.5, -1.0));
+
+        // No hard reject, fraction below threshold → not rejected.
+        assert!(!ebe_guard_rejects(&stats(5, 0), 100, 1234.5, 0.1)); // 0.05 <= 0.10
+
+        // No hard reject, fraction above threshold with finite OFV → rejected.
+        assert!(ebe_guard_rejects(&stats(20, 0), 100, 1234.5, 0.1)); // 0.20 > 0.10
+
+        // Fraction trigger needs a finite OFV (non-finite is handled by the caller's
+        // `!raw.is_finite()` branch), and a negative threshold disables it.
+        assert!(!ebe_guard_rejects(&stats(20, 0), 100, f64::NAN, 0.1));
+        assert!(!ebe_guard_rejects(&stats(99, 0), 100, 1234.5, -1.0));
+    }
 
     /// `outer_ftol` auto-selection (#469): pure-TTE tightens to 1e-8; ODE/PK/LTBS
     /// and TTE-on-ODE keep 1e-6; an explicit override always wins.

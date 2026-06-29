@@ -104,6 +104,46 @@ mod survival_smoke {
   scale  = TVLAMBDA_B * exp(ETA_F)
 ";
 
+    /// Joint PK-TTE with a **drug-driven (ODE-accumulated)** hazard (Slice 2.2):
+    /// 1-cpt oral PK, hazard rising with central concentration. PK on CMT 2, event
+    /// on CMT 3 (as `examples/pktte_joint.ferx`). Used to exercise the event-time
+    /// *simulation* path (root-finder + `simulate_tte` ODE branch).
+    const ODE_TTE_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.03, 1e-5, 10.0)
+  theta TVBETA(0.25, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 1
+";
+
     // ── Population helpers ───────────────────────────────────────────────────
 
     // The one-record-per-subject `(time, dv)` TTE builder lives in the shared
@@ -983,6 +1023,99 @@ mod survival_smoke {
             horizon: Some(8.0),
         };
         assert!(simulate_with_options(&model, &pop, &model.default_params, 1, &above).is_ok());
+    }
+
+    // ── Slice 2.2: ODE-accumulated (joint PK-TTE) event-time simulation ──────
+
+    /// A **drug-driven (ODE-accumulated)** hazard is event-time-sampled via the
+    /// augmented-ODE root-finder. 200 dosed subjects under a horizon: the
+    /// root-finder yields a mix of observed events (the cumulative hazard reaches
+    /// `−log u` before the horizon) and administrative censors (it does not).
+    /// Exercises the full `simulate_tte` ODE branch end-to-end; the crossing /
+    /// censor mechanics are unit-tested in `ode::predictions` (`until_chz_*`).
+    #[test]
+    fn simulate_ode_tte_samples_drug_driven_events() {
+        use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
+        const H: f64 = 30.0;
+        let model = parse_model_string(ODE_TTE_MODEL).expect("ODE-TTE model parses");
+        // Censored-at-H templates carrying a depot dose (CMT 1); the horizon drives
+        // the window and the root-finder draws each subject's event time.
+        let mut pop = common::tte_pop_from_pairs(&vec![(H, 0u8); 200]);
+        for s in pop.subjects.iter_mut() {
+            s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+            s.obs_records = vec![ObsRecord::Event {
+                time: H,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 3,
+            }];
+        }
+        let opts = SimulateOptions {
+            seed: Some(17),
+            match_method: None,
+            horizon: Some(H),
+        };
+        let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect("ODE-accumulated TTE simulation must succeed");
+
+        let (mut events, mut censored) = (0usize, 0usize);
+        for r in &sims {
+            match r.outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert_eq!(r.cmt, 3, "TTE row on the cause CMT");
+                    assert!(time <= H + 1e-9, "outcome {time} within the horizon");
+                    if observed {
+                        assert!(time < H, "an observed event precedes the horizon: {time}");
+                        events += 1;
+                    } else {
+                        assert!(
+                            (time - H).abs() < 1e-9,
+                            "a censor sits at the horizon: {time}"
+                        );
+                        censored += 1;
+                    }
+                }
+                ref other => panic!("expected an Event outcome, got {other:?}"),
+            }
+        }
+        assert_eq!(events + censored, 200, "one TTE outcome per subject");
+        assert!(
+            events > 0,
+            "the ODE root-finder must produce drug-driven events (got {events})"
+        );
+        assert!(
+            censored > 0,
+            "some subjects must survive to the horizon (got {censored})"
+        );
+    }
+
+    /// ODE-accumulated TTE simulation rejects EVID-3/4 resets (a full reset would
+    /// zero the cumulative-hazard accumulator mid-flight; selective per-state reset
+    /// is a later slice) with a clean Err.
+    #[test]
+    fn simulate_ode_tte_with_resets_errors() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(ODE_TTE_MODEL).expect("ODE-TTE model parses");
+        let mut pop = common::tte_pop_from_pairs(&[(30.0, 0u8)]);
+        // Route the record to the model's TTE CMT (3) and give the subject a reset.
+        pop.subjects[0].obs_records = vec![ObsRecord::Event {
+            time: 30.0,
+            event_type: EventType::RightCensored,
+            entry_time: 0.0,
+            cmt: 3,
+        }];
+        pop.subjects[0].reset_times = vec![10.0];
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("ODE-accumulated TTE simulation with resets must error");
+        assert!(
+            err.contains("reset"),
+            "error must name the unsupported resets: {err}"
+        );
     }
 
     /// `predict_survival` must keep the partition invariant `Σ_k CIF_k + S_all = 1`
@@ -2358,11 +2491,15 @@ mod survival_smoke {
         );
     }
 
+    /// Slice 2.2: `simulate_with_options` now SUPPORTS an ODE-accumulated hazard
+    /// given a horizon (it previously rejected it outright). Without a horizon it
+    /// still errors clearly — a drug-driven hazard has no implicit window.
     #[test]
-    fn simulate_with_options_rejects_ode_hazard() {
-        use ferx_core::{simulate_with_options, SimulateOptions};
+    fn simulate_with_options_ode_hazard_requires_horizon() {
+        use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
         let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
         let pop = joint_pktte_pop();
+        // No horizon → clean Err naming it.
         let err = simulate_with_options(
             &model,
             &pop,
@@ -2370,18 +2507,32 @@ mod survival_smoke {
             1,
             &SimulateOptions::default(),
         )
-        .expect_err("simulate must reject an ODE-accumulated hazard");
+        .expect_err("ODE-accumulated TTE simulation without a horizon must error");
         assert!(
-            err.contains("ODE-accumulated") && err.contains("Slice 2.2"),
-            "error should explain the ODE-hazard limitation; got: {err}"
+            err.contains("horizon"),
+            "error must name the required horizon; got: {err}"
+        );
+        // With a horizon → Ok, producing TTE event/censor outcomes.
+        let opts = SimulateOptions {
+            seed: Some(5),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect("ODE-accumulated TTE simulation with a horizon must succeed");
+        assert!(
+            sims.iter()
+                .any(|r| matches!(r.outcome, SimOutcome::Event { .. })),
+            "must produce TTE event/censor outcomes"
         );
     }
 
     #[test]
-    #[should_panic(expected = "ODE-accumulated")]
+    #[should_panic(expected = "horizon")]
     fn simulate_seed_ode_hazard_panics() {
-        // The Vec-returning convenience entry can't signal an Err, so it hits the
-        // simulate_tte backstop panic rather than silently emitting no TTE rows.
+        // The Vec-returning convenience entry can't signal an Err, so an
+        // ODE-accumulated TTE model without a horizon panics at the shared
+        // validation chokepoint rather than emitting wrong / no TTE rows.
         let model = parse_model_string(JOINT_PKTTE_MODEL).expect("joint PK-TTE model must parse");
         let pop = joint_pktte_pop();
         let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 7);

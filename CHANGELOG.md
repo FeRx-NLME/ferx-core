@@ -29,6 +29,14 @@ section of the SDLC for the versioning policy).
   observed signal fell in the band; `high` may be `inf` for a one-sided target) — it reports a metric only and never
   influences dosing. Every metric is derived from the realized dose ledger and decision log alone.
   See [Adaptive dosing](model-file/adaptive-dosing.qmd).
+- **Drug-driven event-time simulation for joint PK-TTE** (#564). `simulate()` /
+  `simulate_with_options()` now sample event times for an ODE-accumulated hazard
+  (`hazard =` in `[event_model]`), not just analytic families: the augmented ODE is
+  integrated until the cumulative hazard reaches `−log u`, with the crossing located by a
+  root-finder. A finite `[simulation] horizon` (or `SimulateOptions.horizon`) is **required**
+  for these models — a drug-driven hazard can vanish and never fire, so there is no implicit
+  observation window; EVID-3/4 resets and left truncation on an ODE-TTE subject are not yet
+  supported and are rejected with a clear error.
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose
@@ -266,6 +274,13 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
+- **Joint PK-TTE fit now rejects a non-monotone (negative) cumulative hazard** (#564).
+  A drug-driven `hazard =` expression is unconstrained, so a sign-flipped hazard could make
+  the cumulative hazard *decrease* — implying a survival `S(t) > 1`. The right-censored and
+  exact-event likelihood terms previously accepted this silently (a finite, spuriously low
+  objective that could pull the optimizer into the ill-posed region); they now return the
+  same `1e20` sentinel as the other ill-defined cases. This matches the simulation path,
+  which already hard-errors on a non-monotone cumulative hazard.
 - ODE+IOV fits now report their actual analytic-vs-finite-difference inner-gradient route,
   including subject-level fallback reasons, instead of using the non-IOV gradient probe
   for diagnostics (#590).
@@ -281,6 +296,12 @@ section of the SDLC for the versioning policy).
 - Wide ODE+IOV analytic gradients now run on larger Rayon worker stacks, avoiding
   native stack-overflow crashes in R/CLI release builds for PNA-scale occasion counts
   (#590).
+- ODE+IOV fits no longer launch Nelder-Mead EBE fallback searches for bad outer
+  trial points, and RK45 now exits repeated **non-finite** minimum-step clamps early,
+  avoiding apparent stalls after rejected LBFGS steps in PNA-scale models while leaving
+  finite-but-stiff segments to integrate normally (#590, #603). Subjects rejected at a
+  pathological inner start now force the outer trial to be rejected outright — including
+  in the SLSQP fallback — so a degenerate EBE can no longer bias an accepted OFV (#603).
 - Standard errors for `theta` parameters with a **negative lower bound** (estimated on
   the natural scale — e.g. exposure–hazard slopes, covariate exponents) are no longer
   mis-scaled (#564). The delta-method back-transform `SE(θ) = θ·SE(log θ)` was applied to

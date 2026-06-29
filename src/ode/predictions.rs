@@ -3051,6 +3051,186 @@ pub fn ode_predictions_event_driven_with_states(
     (ipreds, states)
 }
 
+/// Build the sorted, deduped dose-segment break times for a subject — the points
+/// where the integrator must stop and re-apply boundary events (dose pulses, lags,
+/// infusion ends, SS-record seeds, EVID-3/4 resets, zero-order windows). `terminal`
+/// is the final break: the last `saveat` for the dense solve, or the horizon for
+/// the event-time search. Shared by [`ode_dense_solve_states`] and
+/// [`ode_solve_until_chz_threshold`] so the two segment the timeline identically
+/// (a divergence here would make a simulated event time inconsistent with the
+/// fitted hazard).
+fn build_segment_break_times(
+    subject: &Subject,
+    dose_lagtimes: &[f64],
+    dose_f_bio: &[f64],
+    zo_windows: &[ZeroOrderWindow],
+    terminal: f64,
+) -> Vec<f64> {
+    // Integration starts at the subject's first event, not a phantom t=0 (#573) —
+    // shared by the dense fit path and the TTE event-time search so both segment
+    // the timeline identically.
+    let mut break_times: Vec<f64> = vec![subject_integration_start(subject)];
+    for (i, dose) in subject.doses.iter().enumerate() {
+        let lag = dose_lagtimes[i];
+        break_times.push(dose.time + lag);
+        if is_real_infusion(dose) {
+            // F-scaled infusion end (#419): rate-defined -> F·duration window.
+            let (_, dur_eff) = dose.bioavailable_infusion(dose_f_bio[i]);
+            break_times.push(dose.time + lag + dur_eff);
+        }
+        if lag > 0.0 && dose.ss && dose.ii > 0.0 {
+            break_times.push(dose.time);
+        }
+    }
+    // EVID=3/4 resets must be break-points so the re-seed happens at the exact boundary.
+    for &rt in &subject.reset_times {
+        break_times.push(rt);
+    }
+    push_zero_order_break_times(&mut break_times, zo_windows);
+    break_times.push(terminal);
+    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    break_times
+}
+
+/// Owned per-segment forcings produced by [`apply_segment_boundary`]: everything
+/// `wrap_rhs_with_forcings` needs for one dose segment, returned by value so the
+/// caller can build (and borrow into) the wrapped RHS without a dangling borrow.
+struct SegmentForcings {
+    reset_floor: f64,
+    gated: Vec<(usize, f64, f64, f64)>,
+    zero_order: Vec<(usize, f64)>,
+    prepared: Vec<PreparedInputRate>,
+}
+
+/// Apply a dose segment's boundary events and resolve its forcings — the shared
+/// core of the per-segment loop used by both [`ode_dense_solve_states`] (the
+/// fit-path dense solve) and [`ode_solve_until_chz_threshold`] (the TTE event-time
+/// search), so the two cannot drift. Mutates `u` (EVID-3/4 reset re-seed, SS-lag
+/// seeding, bolus additions), `active_infusions` (activation + expiry), and
+/// `ext_params` (the TAD anchor slot), then returns this `[t_start, t_end)`
+/// segment's forcings for the caller to build the wrapped RHS and integrate.
+#[allow(clippy::too_many_arguments)]
+fn apply_segment_boundary(
+    ode: &OdeSpec,
+    subject: &Subject,
+    dose_lagtimes: &[f64],
+    dose_f_bio: &[f64],
+    zo_windows: &[ZeroOrderWindow],
+    pk_params_flat: &[f64],
+    n: usize,
+    opts: &OdeSolverOptions,
+    t_start: f64,
+    t_end: f64,
+    u: &mut Vec<f64>,
+    active_infusions: &mut Vec<(usize, f64, f64)>,
+    ext_params: &mut [f64],
+) -> SegmentForcings {
+    // EVID=3/4 reset: re-seed compartments before processing doses at this time.
+    // Resets sort before doses at the same time (mirroring Kind::Reset < Kind::Dose).
+    for &rt in &subject.reset_times {
+        if (rt - t_start).abs() < 1e-10 {
+            *u = ode.initial_state(pk_params_flat);
+            active_infusions.clear();
+            break;
+        }
+    }
+
+    // SS + lagtime: at the dose *record* time (before the lagged pulse arrives)
+    // seed the previous interval's steady-state tail, mirroring ode_predictions.
+    for (i, dose) in subject.doses.iter().enumerate() {
+        let lag = dose_lagtimes[i];
+        if lag > 0.0 && dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
+            *u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lag, opts);
+        }
+    }
+
+    for (dose_idx, dose) in subject.doses.iter().enumerate() {
+        let t_eff = dose.time + dose_lagtimes[dose_idx];
+        if (t_eff - t_start).abs() < 1e-10 {
+            let f = dose_f_bio[dose_idx];
+            if dose.ss && dose.ii > 0.0 {
+                // Lagged arrival: pre-lag seeding already done above.
+                *u = equilibrate_ss_state(ode, pk_params_flat, dose, opts);
+            }
+            if !is_real_infusion(dose) {
+                if !input_rate_consumes_cmt(ode, dose.cmt) {
+                    // dose.cmt is 1-based; CMT=0 means no compartment — ignore.
+                    if dose.cmt > 0 {
+                        let cmt = dose.cmt - 1;
+                        if cmt < n {
+                            u[cmt] += dose.amt * f;
+                        }
+                    }
+                }
+                // else: the dose feeds a built-in input-rate function
+                // (transit/etc.) and is delivered as R_in over time by the
+                // wrapped RHS below — no bolus here (would double-count).
+            } else {
+                // F-scaled infusion end (#419), matching the break-time list.
+                let (_, dur_eff) = dose.bioavailable_infusion(f);
+                let end_t = t_eff + dur_eff;
+                active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
+                active_infusions.push((dose_idx, t_eff, end_t));
+            }
+        }
+    }
+
+    // TAD anchor: SS-aware, matching ode_predictions (rem_euclid wraps the elapsed
+    // time back into [0, II)).
+    ext_params[crate::types::MAX_PK_PARAMS + 1] = {
+        let last_dose_eff = subject
+            .doses
+            .iter()
+            .enumerate()
+            .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
+            .map(|(i, d)| {
+                let lag = dose_lagtimes[i];
+                if d.ss && d.ii > 0.0 {
+                    let elapsed = t_start - (d.time + lag);
+                    t_start - elapsed.rem_euclid(d.ii)
+                } else {
+                    d.time + lag
+                }
+            })
+            .fold(f64::NEG_INFINITY, f64::max);
+        if last_dose_eff.is_finite() {
+            last_dose_eff
+        } else {
+            f64::NAN
+        }
+    };
+
+    active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
+    // Resolve to (cmt_idx, F·rate, t_start, t_end) for the seam's time-gated
+    // injection (CMT=0 / out-of-range dropped).
+    let gated = gated_infusions(active_infusions, &subject.doses, dose_f_bio, n);
+
+    // Doses delivered before the most recent reset (EVID=3/4) at or before this
+    // segment are off for the input-rate forcing — mirroring how the reset clears
+    // `active_infusions` and re-seeds `u` above.
+    let reset_floor = subject
+        .reset_times
+        .iter()
+        .cloned()
+        .filter(|&rt| rt <= t_start + 1e-12)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    // Zero-order absorption windows covering this segment (#504): constant
+    // `F·amt/dur`, reset-aware via the same `reset_floor` (a window opened
+    // pre-reset is off), injected alongside the gated infusions.
+    let zero_order = active_zero_order_inputs(zo_windows, t_start, t_end, reset_floor);
+    // Hoist the input-rate constants once per segment (#322 #7).
+    let prepared = prepare_input_rates(ode, ext_params);
+
+    SegmentForcings {
+        reset_floor,
+        gated,
+        zero_order,
+        prepared,
+    }
+}
+
 /// Run the ODE solver with an arbitrary set of `saveat` time points and
 /// return the full state vector at each requested time.
 ///
@@ -3118,34 +3298,14 @@ pub fn ode_dense_solve_states(
     }
 
     let t_last = saveat.iter().cloned().fold(0.0f64, f64::max);
-    let mut break_times: Vec<f64> = vec![subject_integration_start(subject)];
-    for (i, dose) in subject.doses.iter().enumerate() {
-        let lag = dose_lagtimes[i];
-        break_times.push(dose.time + lag);
-        if is_real_infusion(dose) {
-            // F-scaled infusion end (#419): rate-defined -> F·duration window.
-            let (_, dur_eff) = dose.bioavailable_infusion(dose_f_bio[i]);
-            break_times.push(dose.time + lag + dur_eff);
-        }
-        if lag > 0.0 && dose.ss && dose.ii > 0.0 {
-            break_times.push(dose.time);
-        }
-    }
-    // EVID=3/4 resets must be break-points so the re-seed happens at the exact boundary.
-    for &rt in &subject.reset_times {
-        break_times.push(rt);
-    }
-    // Zero-order windows for this subject (#504): the dense paths have a single
-    // PK snapshot, so the per-dose `dur`/`F`/`lag` come from `pk_params_flat`.
-    // Break at each window end so segments align with the cutoff, and reuse the
-    // same windows for the per-segment constant-rate injection below.
+    // Zero-order absorption windows for this subject (#504): a single PK snapshot,
+    // so per-dose `dur`/`F`/`lag` come from `pk_params_flat`. Reused for both the
+    // segment break points and the per-segment constant-rate injection.
     let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
         zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
     });
-    push_zero_order_break_times(&mut break_times, &zo_windows);
-    break_times.push(t_last);
-    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    let break_times =
+        build_segment_break_times(subject, &dose_lagtimes, &dose_f_bio, &zo_windows, t_last);
 
     let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
 
@@ -3155,57 +3315,25 @@ pub fn ode_dense_solve_states(
             continue;
         }
 
-        // EVID=3/4 reset: re-seed compartments before processing doses at this time.
-        // Resets sort before doses at the same time (mirroring Kind::Reset < Kind::Dose).
-        for &rt in &subject.reset_times {
-            if (rt - t_start).abs() < 1e-10 {
-                u = ode.initial_state(pk_params_flat);
-                active_infusions.clear();
-                break;
-            }
-        }
+        let forcings = apply_segment_boundary(
+            ode,
+            subject,
+            &dose_lagtimes,
+            &dose_f_bio,
+            &zo_windows,
+            pk_params_flat,
+            n,
+            &opts,
+            t_start,
+            t_end,
+            &mut u,
+            &mut active_infusions,
+            &mut ext_params,
+        );
 
-        // SS + lagtime: at the dose *record* time (before the lagged pulse arrives)
-        // seed the previous interval's steady-state tail, mirroring ode_predictions.
-        for (i, dose) in subject.doses.iter().enumerate() {
-            let lag = dose_lagtimes[i];
-            if lag > 0.0 && dose.ss && dose.ii > 0.0 && (dose.time - t_start).abs() < 1e-12 {
-                u = ss_state_at_phase(ode, pk_params_flat, dose, dose.ii - lag, &opts);
-            }
-        }
-
-        for (dose_idx, dose) in subject.doses.iter().enumerate() {
-            let t_eff = dose.time + dose_lagtimes[dose_idx];
-            if (t_eff - t_start).abs() < 1e-10 {
-                let f = dose_f_bio[dose_idx];
-                if dose.ss && dose.ii > 0.0 {
-                    // Lagged arrival: pre-lag seeding already done above.
-                    u = equilibrate_ss_state(ode, pk_params_flat, dose, &opts);
-                }
-                if !is_real_infusion(dose) {
-                    if !input_rate_consumes_cmt(ode, dose.cmt) {
-                        // dose.cmt is 1-based; CMT=0 means no compartment — ignore.
-                        if dose.cmt > 0 {
-                            let cmt = dose.cmt - 1;
-                            if cmt < n {
-                                u[cmt] += dose.amt * f;
-                            }
-                        }
-                    }
-                    // else: the dose feeds a built-in input-rate function
-                    // (transit/etc.) and is delivered as R_in over time by the
-                    // wrapped RHS below — no bolus here (would double-count).
-                } else {
-                    // F-scaled infusion end (#419), matching the break-time list.
-                    let (_, dur_eff) = dose.bioavailable_infusion(f);
-                    let end_t = t_eff + dur_eff;
-                    active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
-                    active_infusions.push((dose_idx, t_eff, end_t));
-                }
-            }
-        }
-
-        // Saveat points at t_start (after dose, matching ode_predictions convention)
+        // Saveat points at t_start (after dose, matching ode_predictions convention).
+        // `u` here is the post-dose state; `apply_segment_boundary` set ext_params and
+        // resolved forcings but did not touch `u` after the dose pulses.
         if let Some(idxs) = saveat_map.get(&t_start.to_bits()) {
             for &i in idxs {
                 result[i] = u.clone();
@@ -3228,61 +3356,15 @@ pub fn ode_dense_solve_states(
         seg_saveat.sort_by(|a, b| a.partial_cmp(b).unwrap());
         seg_saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
-        // TAD anchor: SS-aware, matching ode_predictions (rem_euclid wraps
-        // the elapsed time back into [0, II)).
-        ext_params[crate::types::MAX_PK_PARAMS + 1] = {
-            let last_dose_eff = subject
-                .doses
-                .iter()
-                .enumerate()
-                .filter(|(i, d)| d.time + dose_lagtimes[*i] <= t_start + 1e-12)
-                .map(|(i, d)| {
-                    let lag = dose_lagtimes[i];
-                    if d.ss && d.ii > 0.0 {
-                        let elapsed = t_start - (d.time + lag);
-                        t_start - elapsed.rem_euclid(d.ii)
-                    } else {
-                        d.time + lag
-                    }
-                })
-                .fold(f64::NEG_INFINITY, f64::max);
-            if last_dose_eff.is_finite() {
-                last_dose_eff
-            } else {
-                f64::NAN
-            }
-        };
-
-        active_infusions.retain(|(_, _, e)| *e > t_start + 1e-12);
-        // Resolve to (cmt_idx, F·rate, t_start, t_end) for the seam's time-gated
-        // injection (CMT=0 / out-of-range dropped).
-        let gated = gated_infusions(&active_infusions, &subject.doses, &dose_f_bio, n);
-
-        // Doses delivered before the most recent reset (EVID=3/4) at or before
-        // this segment are off for the input-rate forcing — mirroring how the
-        // reset clears `active_infusions` and re-seeds `u` above.
-        let reset_floor = subject
-            .reset_times
-            .iter()
-            .cloned()
-            .filter(|&rt| rt <= t_start + 1e-12)
-            .fold(f64::NEG_INFINITY, f64::max);
-
-        // Zero-order absorption windows covering this segment (#504): constant
-        // `F·amt/dur`, reset-aware via the same `reset_floor` (a window opened
-        // pre-reset is off), injected alongside the gated infusions.
-        let zero_order = active_zero_order_inputs(&zo_windows, t_start, t_end, reset_floor);
-        // Hoist the input-rate constants once per segment (#322 #7).
-        let prepared = prepare_input_rates(ode, &ext_params);
         let wrapped_rhs = wrap_rhs_with_forcings(
             ode,
             &subject.doses,
             &dose_lagtimes,
             &dose_f_bio,
-            reset_floor,
-            &prepared,
-            InfusionInput::Gated(gated),
-            &zero_order,
+            forcings.reset_floor,
+            &forcings.prepared,
+            InfusionInput::Gated(forcings.gated),
+            &forcings.zero_order,
         );
 
         let sol = solve_ode(
@@ -3315,6 +3397,160 @@ pub fn ode_dense_solve_states(
     let _ = (theta, eta);
 
     result
+}
+
+/// Whole-horizon outcome of the drug-driven TTE event-time search (plan §8.8.3,
+/// wrapper level). Maps from the per-segment
+/// [`crate::ode::solver::ThresholdCrossing`]: a `Crossed` in any dose segment ⇒
+/// [`Crossed`](ThresholdOutcome::Crossed); every segment reaching its end up to
+/// `horizon` ⇒ [`CensoredAtHorizon`](ThresholdOutcome::CensoredAtHorizon); any
+/// segment failing ⇒ [`SolveFailed`](ThresholdOutcome::SolveFailed) — a failed
+/// solve is **never** reported as a censored subject.
+#[cfg(feature = "survival")]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThresholdOutcome {
+    /// The cumulative hazard reached `−log(u)` (an event) at this time.
+    Crossed(f64),
+    /// Integrated cleanly to `horizon` without the hazard reaching the threshold:
+    /// the draw is administratively right-censored at `horizon`.
+    CensoredAtHorizon,
+    /// The integration cannot yield a meaningful event time (non-monotone /
+    /// non-finite hazard, or step budget exhausted). The message names the cause.
+    SolveFailed(String),
+}
+
+/// Integrate a subject's augmented ODE from `0` to `horizon`, applying doses /
+/// infusions / EVID-3 resets via the **same break-time segmentation as
+/// [`ode_dense_solve_states`]**, and halt at the first time `u[chz_state]` reaches
+/// `threshold` (the cumulative-hazard accumulator hitting `−log u`). This is the
+/// segmented driver behind drug-driven TTE event-time sampling (plan §8.8.3): the
+/// CHZ accumulator runs continuously across dose boundaries (it is *not* reset),
+/// and the absolute `threshold` is held across segments.
+///
+/// `horizon` must be finite — a drug-driven hazard can vanish and never fire, so an
+/// unbounded search is ill-posed; the `simulate` layer enforces this before calling.
+///
+/// **Why this mirrors `ode_dense_solve_states` and not `integrate_segment`:** the
+/// fit-path cumulative hazard is computed by `ode_dense_solve_states` (via
+/// `survival::ode_cumhaz_hazard`), which uses the `Gated` infusion strategy and the
+/// inline segment loop. Simulation must reproduce *that* orchestration so a
+/// simulated event time is consistent with the hazard the fit integrated. The
+/// physics is the shared helpers (`resolve_subject_doses`, `ss_state_at_phase`,
+/// `equilibrate_ss_state`, `gated_infusions`, `zero_order_windows`,
+/// `prepare_input_rates`, `wrap_rhs_with_forcings`); only the segment *loop* is
+/// restated, and it is pinned against drift by the `until_chz_threshold` parity
+/// test (the crossing time it returns must satisfy `CHZ_dense(t) ≈ threshold`).
+#[cfg(feature = "survival")]
+pub(crate) fn ode_solve_until_chz_threshold(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    subject: &Subject,
+    chz_state: usize,
+    threshold: f64,
+    horizon: f64,
+) -> ThresholdOutcome {
+    use crate::ode::solver::{solve_ode_until_threshold, ThresholdCrossing};
+
+    let n = ode.n_states;
+    let opts = ode.solver_opts;
+    let mut u = ode.initial_state(pk_params_flat);
+
+    // Resolve modeled-RATE doses once, exactly as the dense path (#324).
+    let resolved = resolve_subject_doses(subject, &ode.dose_attr_map, pk_params_flat);
+    let subject: &Subject = &resolved;
+
+    let dose_lagtimes: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
+        .collect();
+    let dose_f_bio: Vec<f64> = subject
+        .doses
+        .iter()
+        .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
+        .collect();
+
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
+    ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
+    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
+        first_dose_time
+    } else {
+        f64::NAN
+    };
+
+    // Zero-order windows, reused for the break points and the per-segment injection
+    // (same as the dense path). The terminal break is the horizon; doses scheduled
+    // after it are dropped — they can never bring an event forward.
+    let zo_windows = zero_order_windows(&subject.doses, &dose_lagtimes, &dose_f_bio, |_, d| {
+        zero_order_dur_and_frac_for_dose(ode, d, pk_params_flat)
+    });
+    let mut break_times =
+        build_segment_break_times(subject, &dose_lagtimes, &dose_f_bio, &zo_windows, horizon);
+    break_times.retain(|&t| t <= horizon + 1e-15);
+
+    let mut active_infusions: Vec<(usize, f64, f64)> = Vec::new();
+
+    for w in break_times.windows(2) {
+        let (t_start, t_end) = (w[0], w[1]);
+        if (t_end - t_start).abs() < 1e-15 {
+            continue;
+        }
+
+        // Same per-segment boundary handling as the fit-path dense solve — shared so
+        // a simulated event time is consistent with the fitted hazard. (A full EVID-3
+        // reset would zero CHZ; the `simulate` layer asserts ODE-TTE subjects carry
+        // none — selective per-state reset is Phase 3, §8.8.6.)
+        let forcings = apply_segment_boundary(
+            ode,
+            subject,
+            &dose_lagtimes,
+            &dose_f_bio,
+            &zo_windows,
+            pk_params_flat,
+            n,
+            &opts,
+            t_start,
+            t_end,
+            &mut u,
+            &mut active_infusions,
+            &mut ext_params,
+        );
+
+        let wrapped_rhs = wrap_rhs_with_forcings(
+            ode,
+            &subject.doses,
+            &dose_lagtimes,
+            &dose_f_bio,
+            forcings.reset_floor,
+            &forcings.prepared,
+            InfusionInput::Gated(forcings.gated),
+            &forcings.zero_order,
+        );
+
+        // The absolute CHZ threshold is held across segments — `u[chz_state]`
+        // accumulates continuously, so a crossing in any segment is the event.
+        match solve_ode_until_threshold(
+            &wrapped_rhs,
+            &mut u,
+            (t_start, t_end),
+            &ext_params,
+            &opts,
+            chz_state,
+            threshold,
+        ) {
+            ThresholdCrossing::Crossed(t) => return ThresholdOutcome::Crossed(t),
+            ThresholdCrossing::ReachedEnd => {} // u advanced; carry into next segment
+            ThresholdCrossing::Failed(why) => return ThresholdOutcome::SolveFailed(why),
+        }
+    }
+
+    ThresholdOutcome::CensoredAtHorizon
 }
 
 #[cfg(test)]
@@ -3374,6 +3610,142 @@ mod tests {
             fremtype: Vec::new(),
             #[cfg(feature = "survival")]
             obs_records: vec![],
+        }
+    }
+
+    /// 1-cpt IV bolus + a cumulative-hazard accumulator: state 0 = central
+    /// (`dC/dt = -ke·C`, `ke = CL/V`), state 1 = CHZ (`dCHZ/dt = 0.1·C`). With a
+    /// bolus `amt` at t=0 this has the closed form `C(t) = amt·e^{-ke t}`,
+    /// `CHZ(t) = 0.1·amt·(1 - e^{-ke t})/ke`.
+    #[cfg(feature = "survival")]
+    fn one_cpt_chz_ode_spec() -> OdeSpec {
+        OdeSpec {
+            rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ke * y[0];
+                dy[1] = 0.1 * y[0];
+            }),
+            n_states: 2,
+            state_names: vec!["central".into(), "chz".into()],
+            readout: OdeReadout::ObsCmt(0),
+            diffusion_var: Vec::new(),
+            solver_opts: OdeSolverOptions {
+                abstol: 1e-10,
+                reltol: 1e-9,
+                ..OdeSolverOptions::default()
+            },
+            input_rate: Vec::new(),
+            rhs_program: None,
+            readout_program: None,
+            indiv_param_program: None,
+            dose_attr_map: Default::default(),
+            init_fn: None,
+        }
+    }
+
+    /// Bolus-driven crossing matches the closed form: `amt=100`, `CL=10`, `V=100`
+    /// ⇒ `ke=0.1`, `CHZ(t)=100(1-e^{-0.1t})`; solving `CHZ=50` gives `t = 10·ln2`.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn until_chz_threshold_bolus_crossing_matches_closed_form() {
+        let ode = one_cpt_chz_ode_spec();
+        let subject = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![]);
+        let pk = pk_one(10.0, 100.0);
+        match ode_solve_until_chz_threshold(&ode, &pk.values, &subject, 1, 50.0, 1000.0) {
+            ThresholdOutcome::Crossed(t) => {
+                assert_relative_eq!(t, 10.0 * std::f64::consts::LN_2, epsilon = 1e-4)
+            }
+            other => panic!("expected Crossed, got {other:?}"),
+        }
+    }
+
+    /// Parity pin against the fit-path orchestration: the crossing time the wrapper
+    /// returns, fed back through `ode_dense_solve_states`, must read a CHZ equal to
+    /// the threshold. If the restated segment loop ever drifts from the dense one,
+    /// `CHZ_dense(t_cross) ≠ threshold` and this fails.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn until_chz_threshold_parity_with_dense_solve() {
+        let ode = one_cpt_chz_ode_spec();
+        let subject = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![]);
+        let pk = pk_one(10.0, 100.0);
+        let threshold = 37.0;
+        let t =
+            match ode_solve_until_chz_threshold(&ode, &pk.values, &subject, 1, threshold, 1000.0) {
+                ThresholdOutcome::Crossed(t) => t,
+                other => panic!("expected Crossed, got {other:?}"),
+            };
+        let states = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[t]);
+        assert_relative_eq!(states[0][1], threshold, epsilon = 1e-4);
+    }
+
+    /// A threshold above the asymptotic cumulative hazard (`CHZ → 100`) is never
+    /// reached ⇒ the draw is censored at the horizon, not failed.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn until_chz_threshold_censors_when_unreached() {
+        let ode = one_cpt_chz_ode_spec();
+        let subject = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![]);
+        let pk = pk_one(10.0, 100.0);
+        assert_eq!(
+            ode_solve_until_chz_threshold(&ode, &pk.values, &subject, 1, 200.0, 50.0),
+            ThresholdOutcome::CensoredAtHorizon
+        );
+    }
+
+    /// An infusion input is handled like the dense path: a 100-unit infusion over
+    /// 10 h (`rate = 10`) gives the same total exposure as the bolus, so the same
+    /// asymptotic `CHZ → 100`. The crossing time reads back (via the dense solve) a
+    /// CHZ equal to the threshold — the parity pin, now over the infusion branch.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn until_chz_threshold_infusion_parity_with_dense_solve() {
+        let ode = one_cpt_chz_ode_spec();
+        let subject = make_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0)],
+            vec![],
+        );
+        let pk = pk_one(10.0, 100.0);
+        let threshold = 50.0;
+        let t =
+            match ode_solve_until_chz_threshold(&ode, &pk.values, &subject, 1, threshold, 1000.0) {
+                ThresholdOutcome::Crossed(t) => t,
+                other => panic!("expected Crossed, got {other:?}"),
+            };
+        let states = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &[t]);
+        assert_relative_eq!(states[0][1], threshold, epsilon = 1e-4);
+    }
+
+    /// 1-cpt with an *invalid* negative hazard (`dCHZ/dt = -0.1·C`): the accumulator
+    /// decreases, so a crossing can never be well-defined.
+    #[cfg(feature = "survival")]
+    fn one_cpt_neg_chz_ode_spec() -> OdeSpec {
+        let mut ode = one_cpt_chz_ode_spec();
+        ode.rhs = Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+            let cl = p[crate::types::PK_IDX_CL];
+            let v = p[crate::types::PK_IDX_V];
+            let ke = if v > 0.0 { cl / v } else { 0.0 };
+            dy[0] = -ke * y[0];
+            dy[1] = -0.1 * y[0];
+        });
+        ode
+    }
+
+    /// A negative hazard propagates the primitive's `Failed` to a `SolveFailed` —
+    /// never a silent censor (the wrapper's failure arm).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn until_chz_threshold_negative_hazard_fails() {
+        let ode = one_cpt_neg_chz_ode_spec();
+        let subject = make_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![]);
+        let pk = pk_one(10.0, 100.0);
+        match ode_solve_until_chz_threshold(&ode, &pk.values, &subject, 1, 5.0, 1000.0) {
+            ThresholdOutcome::SolveFailed(msg) => {
+                assert!(msg.contains("non-monotone"), "msg: {msg}")
+            }
+            other => panic!("expected SolveFailed, got {other:?}"),
         }
     }
 

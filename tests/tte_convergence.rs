@@ -130,6 +130,112 @@ const COMPETING_FIXED: &str = r"
   scale  = TVLAMBDA_B
 ";
 
+/// Joint PK-TTE **data-generating ("truth")** model (Slice 2.2 SSE): 1-cpt oral
+/// PK with a drug-driven (ODE-accumulated) hazard rising with central
+/// concentration, sharing the CL random effect. PK on CMT 2, event on CMT 3.
+const ODE_TTE_TRUTH: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.02, 1e-5, 10.0)
+  theta TVBETA(0.30, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// Joint PK-TTE **fit** model, initialised away from the truth (CL/KA high, V/H0
+/// low, BETA at 0, variance ~halved) so recovery is a real test.
+const ODE_TTE_FIT: &str = r"
+[parameters]
+  theta TVCL(1.5, 0.01, 100.0)
+  theta TVV(7.0, 0.1, 500.0)
+  theta TVKA(0.7, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.03 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// Joint PK-TTE truth for the **sampler goodness-of-fit** test — identical PK +
+/// drug-driven hazard as `ODE_TTE_TRUTH` but **fixed-effects** (no `ETA_CL`, no
+/// residual error: there are no continuous observations). With `n_eta = 0` every
+/// subject shares one deterministic concentration trajectory, so the closed-form
+/// cumulative-hazard oracle (`cumhaz_grid`) is a single curve and the
+/// probability-integral transform needs no per-subject random effect.
+const ODE_TTE_PIT_TRUTH: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.02, 1e-5, 10.0)
+  theta TVBETA(0.30, -10.0, 10.0)
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL   = TVCL
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn fit_opts() -> FitOptions {
@@ -218,6 +324,317 @@ fn competing_pop_from_sims(sims: &[SimulationResult]) -> Population {
         exclusions: None,
         warnings: vec![],
     }
+}
+
+/// Joint PK-TTE `simulate()` template: `n` dosed subjects, each with PK sampling
+/// times on CMT 2 (central) and a right-censored TTE placeholder on CMT 3 at the
+/// `horizon`. The dose level is rotated across {20, 40, 80} so the central
+/// concentration spans a range across subjects — this informs the *PK* fit, but it
+/// does NOT make the hazard parameters separately identifiable: `H0·exp(BETA·Cc)` is
+/// collinear in (H0, BETA) at any single-occasion design (Slice 2.1 `expected.md`:
+/// corr ≈ −0.91 even across NONMEM / nlmixr2, off-truth at a shared optimum). The
+/// sampler itself is validated distribution-free by the PIT/KS goodness-of-fit test
+/// (`joint_pktte_event_times_match_model_survival`), not by H0/BETA recovery here.
+fn joint_pktte_sim_template(n: usize, horizon: f64) -> Population {
+    use ferx_core::types::{DoseEvent, EventType, ObsRecord};
+    let pk_times = vec![0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0];
+    let dose_levels = [20.0, 40.0, 80.0];
+    let subjects = (0..n)
+        .map(|i| {
+            let amt = dose_levels[i % dose_levels.len()];
+            let mut s = common::subject(
+                &i.to_string(),
+                vec![DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0)],
+                pk_times.clone(),
+                vec![0.0; pk_times.len()], // placeholder DVs, overwritten by sim
+                vec![2; pk_times.len()],   // PK observed on central (CMT 2)
+            );
+            s.obs_records = vec![ObsRecord::Event {
+                time: horizon,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 3,
+            }];
+            s
+        })
+        .collect();
+    Population {
+        subjects,
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    }
+}
+
+/// Rebuild a fittable joint PK-TTE population from `simulate()` output: keep the
+/// template's doses / sampling design and fill in the simulated continuous PK
+/// observations (CMT 2, in `obs_times` order) and the simulated event outcome
+/// (CMT 3 → `ObsRecord::Event`, exact when observed, right-censored otherwise).
+fn joint_pktte_pop_from_sims(template: &Population, sims: &[SimulationResult]) -> Population {
+    use ferx_core::types::{EventType, ObsRecord};
+    use std::collections::BTreeMap;
+    let mut pk_by_id: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let mut ev_by_id: BTreeMap<String, (f64, bool, usize)> = BTreeMap::new();
+    for r in sims {
+        match r.outcome {
+            SimOutcome::Continuous { value } => {
+                pk_by_id.entry(r.id.clone()).or_default().push(value)
+            }
+            SimOutcome::Event { time, observed } => {
+                ev_by_id.insert(r.id.clone(), (time, observed, r.cmt));
+            }
+        }
+    }
+    let mut pop = template.clone();
+    for s in pop.subjects.iter_mut() {
+        if let Some(vals) = pk_by_id.get(&s.id) {
+            assert_eq!(
+                vals.len(),
+                s.observations.len(),
+                "simulated PK obs count must match the template sampling design"
+            );
+            s.observations = vals.clone();
+        }
+        if let Some((time, observed, cmt)) = ev_by_id.get(&s.id) {
+            s.obs_records = vec![ObsRecord::Event {
+                time: *time,
+                event_type: if *observed {
+                    EventType::Exact
+                } else {
+                    EventType::RightCensored
+                },
+                entry_time: 0.0,
+                cmt: *cmt,
+            }];
+        }
+    }
+    pop
+}
+
+/// Grid spacing for the cumulative-hazard oracle (`cumhaz_grid` / `interp_at`). At
+/// 0.01 the trapezoid error on the smooth hazard is ~1e-6, negligible against the
+/// KS statistic.
+const PIT_GRID_STEP: f64 = 0.01;
+
+/// Independent cumulative-hazard oracle for the drug-driven hazard, on the uniform
+/// grid `t_k = k·PIT_GRID_STEP`, `k = 0..=⌈horizon/step⌉`. The concentration is the
+/// **closed-form** 1-cpt oral solution `Cc(t) = dose·KA/(V(KA−ke))·(e^{−ke t} −
+/// e^{−KA t})`, `ke = CL/V`, F = 1 — the same solution `tests/reference/
+/// pktte_joint/simulate.R` uses — and `H(t) = ∫₀ᵗ H0·exp(BETA·Cc)` is accumulated by
+/// trapezoid. This deliberately shares **no code** with the production augmented-ODE
+/// root-finder, so feeding the simulated event times back through it is a genuine
+/// cross-check of the sampler (not a tautology).
+fn cumhaz_grid(dose: f64, cl: f64, v: f64, ka: f64, h0: f64, beta: f64, horizon: f64) -> Vec<f64> {
+    let step = PIT_GRID_STEP;
+    let ke = cl / v;
+    let haz = |t: f64| {
+        let cc = dose * ka / (v * (ka - ke)) * ((-ke * t).exp() - (-ka * t).exp());
+        h0 * (beta * cc).exp()
+    };
+    let n = (horizon / step).ceil() as usize;
+    let mut hgrid = Vec::with_capacity(n + 1);
+    hgrid.push(0.0);
+    let (mut acc, mut h_prev) = (0.0_f64, haz(0.0));
+    for k in 1..=n {
+        let h = haz(k as f64 * step);
+        acc += 0.5 * (h + h_prev) * step;
+        hgrid.push(acc);
+        h_prev = h;
+    }
+    hgrid
+}
+
+/// Linear interpolation of a `cumhaz_grid` at an arbitrary `t` (clamped to the grid).
+fn interp_at(hgrid: &[f64], t: f64) -> f64 {
+    let x = (t / PIT_GRID_STEP).max(0.0);
+    let k = x.floor() as usize;
+    if k + 1 >= hgrid.len() {
+        return *hgrid.last().unwrap();
+    }
+    let frac = x - k as f64;
+    hgrid[k] * (1.0 - frac) + hgrid[k + 1] * frac
+}
+
+/// **Slice 2.2 sampler goodness-of-fit** — the decisive, estimation-free validator
+/// for drug-driven event-time simulation. For a **fixed-effects** joint PK-TTE truth
+/// (every subject shares one survival curve), simulate `N` event times with the
+/// production augmented-ODE root-finder, then probability-integral-transform each:
+/// `V_i = exp(−Ĥ(T_i))`, where `Ĥ` is the **independent** closed-form-PK + trapezoid
+/// oracle (`cumhaz_grid`, no shared code with the sampler). If the root-finder
+/// correctly inverts `CHZ(T) = −log U`, the `V_i` are Uniform(0,1); a
+/// Kolmogorov–Smirnov test against Uniform must pass at the 5% level.
+///
+/// This is what actually validates the new Slice 2.2 code: unlike the SSE fit below,
+/// it is **immune to the (H0, BETA) collinear ridge** (no estimation) and to any
+/// FOCEI-Laplace bias — a wrong crossing, a dropped dose in the segmentation, or a
+/// mis-scaled hazard shifts the `V_i` off Uniform and fails here directly.
+#[test]
+fn joint_pktte_event_times_match_model_survival() {
+    use ferx_core::types::{DoseEvent, EventType, ObsRecord};
+    use ferx_core::{simulate_with_options, SimulateOptions};
+    const N: usize = 500;
+    const DOSE: f64 = 100.0;
+    // S(HORIZON) = exp(−H(600)) ≈ e^{−12}: no subject censors, so the PIT reference
+    // is the full (untruncated) Uniform(0,1) and the standard KS critical applies.
+    const HORIZON: f64 = 600.0;
+    const SEED: u64 = 20260629;
+    // Must match ODE_TTE_PIT_TRUTH (the oracle re-derives the same hazard).
+    const CL: f64 = 1.0;
+    const V: f64 = 10.0;
+    const KA: f64 = 1.0;
+    const H0: f64 = 0.02;
+    const BETA: f64 = 0.30;
+
+    let truth = parse_model_string(ODE_TTE_PIT_TRUTH).expect("PIT truth model must parse");
+
+    // Minimal template: one depot dose (CMT 1) + a TTE placeholder censored at the
+    // horizon (CMT 3). No continuous observations — this isolates the event sampler.
+    let mut template = common::tte_pop_from_pairs(&vec![(HORIZON, 0u8); N]);
+    for s in template.subjects.iter_mut() {
+        s.doses = vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)];
+        s.obs_records = vec![ObsRecord::Event {
+            time: HORIZON,
+            event_type: EventType::RightCensored,
+            entry_time: 0.0,
+            cmt: 3,
+        }];
+    }
+    let opts = SimulateOptions {
+        seed: Some(SEED),
+        match_method: None,
+        horizon: Some(HORIZON),
+    };
+    let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
+        .expect("PIT simulation must succeed");
+
+    // Every draw must be an observed event at this horizon (a censor would truncate
+    // the PIT reference and silently weaken the GOF).
+    let times: Vec<f64> = sims
+        .iter()
+        .map(|r| match r.outcome {
+            SimOutcome::Event { time, observed } => {
+                assert!(
+                    observed,
+                    "HORIZON={HORIZON} must admit no censoring; got a censor at {time}"
+                );
+                time
+            }
+            ref o => panic!("expected an Event outcome, got {o:?}"),
+        })
+        .collect();
+    assert_eq!(times.len(), N, "one event per template subject");
+
+    // PIT: V_i = exp(−Ĥ(T_i)) via the independent oracle; sorted for the KS sweep.
+    let hgrid = cumhaz_grid(DOSE, CL, V, KA, H0, BETA, HORIZON);
+    let mut u: Vec<f64> = times
+        .iter()
+        .map(|&t| (-interp_at(&hgrid, t)).exp())
+        .collect();
+    u.sort_by(|a, b| a.partial_cmp(b).expect("event times are finite"));
+
+    // Kolmogorov–Smirnov statistic against the FULLY-SPECIFIED Uniform(0,1) (truth
+    // parameters, not estimated ⇒ the standard 1.36/√N critical is exact; no
+    // Lilliefors correction).
+    let n = u.len() as f64;
+    let mut d = 0.0_f64;
+    for (i, &ui) in u.iter().enumerate() {
+        let upper = (i as f64 + 1.0) / n - ui;
+        let lower = ui - i as f64 / n;
+        d = d.max(upper).max(lower);
+    }
+    let crit = 1.36 / n.sqrt(); // two-sided KS, α = 0.05
+    eprintln!("[PIT-ODE] N={N} KS D={d:.4} vs 5% critical {crit:.4}");
+    assert!(
+        d < crit,
+        "simulated event times fail the KS goodness-of-fit against the model survival: \
+         D={d:.4} ≥ {crit:.4} — the ODE event-time sampler does not reproduce S(t)"
+    );
+}
+
+/// **Slice 2.2 SSE** — license-free round-trip validator for the joint PK-TTE
+/// generative path. Simulate a dataset from known (θ, Ω) with ferx's own ODE
+/// event-time sampler, rebuild a fit population, and refit from a perturbed start.
+///
+/// Scope: this asserts recovery of the **identifiable** parameters — the PK fixed
+/// effects (CL, V, KA) and ω²(CL), which the continuous observations pin sharply —
+/// and that the whole pipeline (root-finder → `simulate_tte` ODE branch →
+/// sim→Population → joint FOCEI fit) runs to a finite OFV. It deliberately does
+/// **not** assert recovery of (H0, BETA): they are collinear at a single-occasion
+/// design (Slice 2.1 `expected.md`; this seed lands at H0≈0.010 / BETA≈0.43, off the
+/// 0.02 / 0.30 truth along the ridge, max |ΔS(t)|≈0.16). Hazard-sampler correctness
+/// is validated distribution-free by `joint_pktte_event_times_match_model_survival`
+/// (and cross-tool by the NONMEM `$SIM` / nlmixr2 anchors), NOT by an H0/BETA band
+/// here — a wide "sane-range" band on a non-identified parameter is exactly the kind
+/// of pass-for-the-wrong-reason guard this suite avoids (cf. the Weibull ω² note).
+#[test]
+fn joint_pktte_sse_recovers_pk_and_omega() {
+    use ferx_core::{simulate_with_options, SimulateOptions};
+    const N: usize = 300;
+    const HORIZON: f64 = 24.0;
+    const SEED: u64 = 20260629;
+
+    let truth = parse_model_string(ODE_TTE_TRUTH).expect("truth model must parse");
+    let template = joint_pktte_sim_template(N, HORIZON);
+
+    let opts = SimulateOptions {
+        seed: Some(SEED),
+        match_method: None,
+        horizon: Some(HORIZON),
+    };
+    let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
+        .expect("joint PK-TTE simulation must succeed");
+
+    // The drug-driven hazard must produce a non-degenerate event/censor mix.
+    let n_events = sims
+        .iter()
+        .filter(|r| matches!(r.outcome, SimOutcome::Event { observed: true, .. }))
+        .count();
+    eprintln!("[SSE-ODE] events = {n_events}/{N}");
+    assert!(
+        n_events > N / 10 && n_events < N - N / 10,
+        "expected a mix of events and censors; got {n_events}/{N}"
+    );
+
+    let fit_pop = joint_pktte_pop_from_sims(&template, &sims);
+    let model = parse_model_string(ODE_TTE_FIT).expect("fit model must parse");
+    let r =
+        fit(&model, &fit_pop, &model.default_params, &fit_opts()).expect("SSE fit must succeed");
+
+    let (cl, v, ka, h0, beta) = (r.theta[0], r.theta[1], r.theta[2], r.theta[3], r.theta[4]);
+    let omega2 = r.omega[(0, 0)];
+    eprintln!(
+        "[SSE-ODE] CL={cl:.4}(1.0) V={v:.4}(10) KA={ka:.4}(1) H0={h0:.5}(0.02; collinear) \
+         BETA={beta:.4}(0.30; collinear) omega^2={omega2:.4}(0.09) OFV={:.3}",
+        r.ofv
+    );
+
+    // PK fixed effects + ω²(CL) are sharply identified by the continuous observations
+    // and recover tightly (truth recovery; bands bracket the seed-fixed deterministic
+    // estimate with the truth inside). A gross sim→fit pipeline break (wrong PK
+    // forcing, scrambled obs write-back) breaks these.
+    assert!(
+        (0.93..1.06).contains(&cl),
+        "CL not recovered: {cl} (truth 1.0)"
+    );
+    assert!((9.0..10.2).contains(&v), "V not recovered: {v} (truth 10)");
+    assert!(
+        (0.92..1.08).contains(&ka),
+        "KA not recovered: {ka} (truth 1.0)"
+    );
+    assert!(
+        (0.05..0.13).contains(&omega2),
+        "omega^2(CL) not recovered: {omega2} (truth 0.09)"
+    );
+    // (H0, BETA) are intentionally not band-checked here — see the doc comment and
+    // `joint_pktte_event_times_match_model_survival`. Only require they stayed in the
+    // feasible region (a NaN / sign-blown hazard would surface as a non-finite OFV).
+    assert!(
+        h0 > 0.0 && beta.is_finite(),
+        "hazard params must stay feasible"
+    );
+    assert!(r.ofv.is_finite(), "joint PK-TTE SSE OFV must be finite");
 }
 
 const REF_CSV: &str = concat!(

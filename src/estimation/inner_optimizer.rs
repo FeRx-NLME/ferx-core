@@ -393,6 +393,13 @@ pub struct EbeResult {
     /// `kappas[k]` corresponds to the k-th unique occasion (same order as
     /// `iov_occasion_groups`).
     pub kappas: Vec<DVector<f64>>,
+    /// True when the subject was hard-rejected at its inner start (a pathological
+    /// ODE+IOV warm-start NLL — see [`reject_ode_iov_inner_start`]). The returned
+    /// `eta`/`h_matrix` are then a degenerate placeholder (off-mode η, zero H), so the
+    /// outer loop must reject the whole trial rather than fold them into an accepted
+    /// OFV. Unlike plain non-convergence this forces rejection regardless of
+    /// `max_unconverged_frac` or the `min_obs` filter (#603 review #1/#2).
+    pub hard_reject: bool,
 }
 
 /// Aggregate statistics from running the inner loop over all subjects.
@@ -402,6 +409,10 @@ pub struct InnerLoopStats {
     pub n_unconverged: usize,
     /// Subjects for which the BFGS→Nelder-Mead fallback was triggered.
     pub n_fallback: usize,
+    /// Subjects hard-rejected at their inner start (pathological ODE+IOV warm-start
+    /// NLL). Any non-zero count forces the outer EBE guard to reject the trial,
+    /// regardless of `max_unconverged_frac` or the `min_obs` filter (#603 review #1/#2).
+    pub n_start_rejected: usize,
 }
 
 /// Inner-EBE fallback shared by [`find_ebe`] and [`find_ebe_iov`], invoked when the inner
@@ -451,6 +462,38 @@ fn argmin_inner_fallback(
         eta_nm
     };
     (best, nm_ok)
+}
+
+/// An ODE-based model that also carries IOV (`κ`) random effects. The inner EBE path for
+/// these models is the expensive one this module special-cases (per-vertex ODE +
+/// steady-state work), so both the Nelder-Mead skip and the start-rejection gate key off
+/// this single classifier (#603 review #8).
+fn is_ode_iov(model: &CompiledModel) -> bool {
+    model.ode_spec.is_some() && model.n_kappa > 0
+}
+
+/// Nelder-Mead is a useful last-resort recovery for low-dimensional closed-form EBEs, but
+/// it is not a practical recovery strategy for ODE+IOV. A single bad outer line-search
+/// point can otherwise launch simplex searches where each vertex is a full ODE and
+/// steady-state prediction. Keep the BFGS partial and report the subject unconverged
+/// instead; the outer EBE guard can then reject the trial.
+fn skip_ode_iov_nm_fallback(model: &CompiledModel) -> bool {
+    is_ode_iov(model)
+}
+
+const ODE_IOV_START_REJECT_NLL_PER_OBS: f64 = 250.0;
+const ODE_IOV_START_REJECT_NLL_MIN: f64 = 1_000.0;
+
+fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> bool {
+    if !is_ode_iov(model) {
+        return false;
+    }
+    if !nll.is_finite() {
+        return true;
+    }
+    let threshold =
+        ODE_IOV_START_REJECT_NLL_MIN.max(ODE_IOV_START_REJECT_NLL_PER_OBS * n_obs.max(1) as f64);
+    nll > threshold
 }
 
 /// Find Empirical Bayes Estimates (EBEs) for a single subject via BFGS.
@@ -761,6 +804,7 @@ pub fn find_ebe(
         grad_norm: 0.0, // not computed to avoid extra FD calls; available via nll.is_finite()
         nll,
         kappas: Vec::new(),
+        hard_reject: false,
     }
 }
 
@@ -884,6 +928,38 @@ fn find_ebe_iov(
             None => gradient_fd(&obj, p, n_flat),
         }
     };
+
+    let start_nll = obj(&x);
+    let has_informative_warm_start = eta_init
+        .map(|warm| warm.iter().any(|v| v.abs() > 1e-8))
+        .unwrap_or(false);
+    if has_informative_warm_start
+        && reject_ode_iov_inner_start(model, subject.obs_times.len(), start_nll)
+    {
+        let bsv_eta: Vec<f64> = x[..n_eta]
+            .iter()
+            .zip(mu.iter())
+            .map(|(p, m)| p - m)
+            .collect();
+        let kappas_vec: Vec<DVector<f64>> = (0..k_occasions)
+            .map(|k| DVector::from_column_slice(&x[n_eta + k * n_kappa..n_eta + (k + 1) * n_kappa]))
+            .collect();
+        // Degenerate placeholder: the η/κ here are the (un-optimized) warm start and the
+        // H-matrix is zero — folding them into an OFV would corrupt the FOCEI curvature
+        // term. `hard_reject` makes the outer guard reject the whole trial rather than
+        // average this in, so the placeholder is never compared as a real OFV (#603 #1/#2).
+        return EbeResult {
+            eta: DVector::from_column_slice(&bsv_eta),
+            h_matrix: DMatrix::zeros(subject.obs_times.len(), n_eta),
+            converged: false,
+            used_fallback: false,
+            grad_norm: 0.0,
+            nll: start_nll,
+            kappas: kappas_vec,
+            hard_reject: true,
+        };
+    }
+
     let bfgs_converged = inner_minimize_with_grad(
         &obj,
         &agrad,
@@ -904,7 +980,9 @@ fn find_ebe_iov(
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
         cold[..n_eta].copy_from_slice(&mu);
-        if enable_stall {
+        if skip_ode_iov_nm_fallback(model) {
+            (false, false)
+        } else if enable_stall {
             let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
             x = best;
             (ok, true)
@@ -978,6 +1056,7 @@ fn find_ebe_iov(
         grad_norm: 0.0,
         nll,
         kappas: kappas_vec,
+        hard_reject: false,
     }
 }
 
@@ -2422,6 +2501,9 @@ pub fn run_inner_loop_warm(
             .filter(|(r, s)| !r.converged && s.observations.len() >= min_obs.max(1))
             .count(),
         n_fallback: results.iter().filter(|r| r.used_fallback).count(),
+        // No `min_obs` filter: a hard reject forces trial rejection even for a single
+        // short-record subject, which the `n_unconverged` filter would otherwise drop.
+        n_start_rejected: results.iter().filter(|r| r.hard_reject).count(),
     };
     let eta_hats: Vec<DVector<f64>> = results.iter().map(|r| r.eta.clone()).collect();
     let h_matrices: Vec<DMatrix<f64>> = results.iter().map(|r| r.h_matrix.clone()).collect();
@@ -2931,6 +3013,7 @@ mod tests {
             grad_norm: 0.0,
             nll: 1.5,
             kappas: Vec::new(),
+            hard_reject: false,
         };
         assert!(r.converged);
         assert!(!r.used_fallback);
@@ -2951,6 +3034,7 @@ mod tests {
                 grad_norm: 0.0,
                 nll: 1.0,
                 kappas: Vec::new(),
+                hard_reject: false,
             },
             EbeResult {
                 eta: nalgebra::DVector::zeros(1),
@@ -2960,6 +3044,7 @@ mod tests {
                 grad_norm: 0.0,
                 nll: 2.0,
                 kappas: Vec::new(),
+                hard_reject: false,
             },
         ];
         // Simulate filter: first subject has 1 obs (below min_obs=2), second has 3 obs.
@@ -2975,6 +3060,39 @@ mod tests {
         assert_eq!(n_unconverged, 1);
         // Both fallback counts regardless of min_obs.
         assert_eq!(n_fallback, 1);
+    }
+
+    /// #603 review #1/#2: a hard-rejected subject must be counted even with a short record,
+    /// so a single one forces the outer guard to reject the trial. Mirrors the `n_start_rejected`
+    /// derivation in `run_inner_loop_warm` (no `min_obs` filter, unlike `n_unconverged`).
+    #[test]
+    fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
+        let make = |hard_reject: bool| EbeResult {
+            eta: nalgebra::DVector::zeros(1),
+            h_matrix: nalgebra::DMatrix::zeros(1, 1),
+            converged: false,
+            used_fallback: false,
+            grad_norm: 0.0,
+            nll: 1.0,
+            kappas: Vec::new(),
+            hard_reject,
+        };
+        // One hard-rejected subject with a single observation, one normal subject.
+        let results = [make(true), make(false)];
+        let obs_counts = [1_usize, 5_usize];
+        let min_obs = 3_usize;
+
+        // The `min_obs` filter would drop the 1-obs subject from `n_unconverged` …
+        let n_unconverged = results
+            .iter()
+            .zip(obs_counts.iter())
+            .filter(|(r, &n_obs)| !r.converged && n_obs >= min_obs.max(1))
+            .count();
+        assert_eq!(n_unconverged, 1); // only the 5-obs subject
+
+        // … but `n_start_rejected` counts the hard reject regardless of obs count.
+        let n_start_rejected = results.iter().filter(|r| r.hard_reject).count();
+        assert_eq!(n_start_rejected, 1);
     }
 
     #[test]
@@ -3864,6 +3982,40 @@ mod iov_tests {
             "warm seed held the deep well, got {eta4:?}"
         );
         set_ebe_warm_start(false);
+    }
+
+    #[test]
+    fn ode_iov_skips_nelder_mead_inner_fallback() {
+        use crate::parser::model_parser::parse_model_string;
+        let ode_iov = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+        assert!(skip_ode_iov_nm_fallback(&ode_iov));
+
+        let closed_form_iov = make_iov_model();
+        assert!(!skip_ode_iov_nm_fallback(&closed_form_iov));
+    }
+
+    #[test]
+    fn ode_iov_start_rejects_only_pathological_ode_iov_nll() {
+        use crate::parser::model_parser::parse_model_string;
+        let ode_iov = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
+        )
+        .expect("parse ODE IOV");
+        let closed_form_iov = make_iov_model();
+
+        assert!(!reject_ode_iov_inner_start(&ode_iov, 4, 999.0));
+        assert!(reject_ode_iov_inner_start(&ode_iov, 4, 1_001.0));
+        assert!(!reject_ode_iov_inner_start(&ode_iov, 20, 4_999.0));
+        assert!(reject_ode_iov_inner_start(&ode_iov, 20, 5_001.0));
+        assert!(reject_ode_iov_inner_start(&ode_iov, 20, f64::NAN));
+        assert!(!reject_ode_iov_inner_start(
+            &closed_form_iov,
+            4,
+            1_000_000.0
+        ));
     }
 
     /// Closed-form IOV + `iiv_on_ruv` (#4b): the analytic stacked-η inner gradient
