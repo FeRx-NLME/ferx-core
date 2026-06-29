@@ -1,8 +1,11 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Phase 1 **and Phase 1b complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 Slice 2.1 (Joint PK-TTE, ODE hazard accumulator, fit path) COMPLETE — #564 via PR #567 (squash `657800ee`) merged 2026-06-28; ferx-r pin bump PR #208 merged.** Open follow-ups: ferx-r bundled `pktte_joint` example + TTE-sim exposure — **tracked in ferx-r#210** (the `predict_survival` wrapper + an R-side TTE test already shipped in Phase 1, so that part of the original line was stale); #469 (FOCEI nonlinear-frailty ω² ~17% high vs NONMEM, spin-off of #440, PR #571); #570 (joint-fit double-solve perf — *not urgent*: full 120-subj fit is 5 s in release; **sequenced as its own PR after Slice 2.2-A — see Phase 2**). **NEXT: Phase 2 Slice 2.2 — drug-driven event-time simulation (`integrate_until_threshold` root-finder + SSE).**  
-**Scope:** Active implementation — Phase 2 Slice 2.2 (simulation; Slice 2.1 merged)  
-**Revised:** 2026-06-29 (Slice 2.2 scope hardened — adversarial/"no-happy-path" pass: typed
+**Status:** Phase 1, Phase 1b, **and Phase 2 complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 (Joint PK-TTE, ODE hazard accumulator) COMPLETE — Slice 2.1 fit path via PR #567 (squash `657800ee`) merged 2026-06-28, plus Slice 2.2 drug-driven event-time simulation + Slice 2.3 docs via PR #595 (squash `3f58c7d3`) merged 2026-06-29; both closing #564. ferx-r pin bump PR #208 merged.** Open follow-ups: **ferx-r#210** (bundled `pktte_joint` example + ODE-TTE simulation exposure — now sample-able after #595); **#570** (joint-fit double-solve perf — *not urgent*: full 120-subj fit is 5 s in release; **now unblocked** since Slice 2.2-A's in-step Hermite interpolation landed — sequence as its own PR gated on a bit-stability check of the Slice 2.1 anchor); #469 (FOCEI nonlinear-frailty ω²) **CLOSED via #571**. **NEXT: Phase 3 — RTTE (repeated TTE; `clock = forward | reset`; SAEM primary; selective per-state ODE reset §8.8.6), optionally alongside Phase 3b (SAEM Laplace proposal).**  
+**Scope:** Phase 2 complete; next active phase = Phase 3 (RTTE)  
+**Revised:** 2026-06-29 (**Phase 2 complete** — PR #595 (`3f58c7d3`) merged Slice 2.2 drug-driven
+event-time simulation + Slice 2.3 docs; status markers flipped to done across the header, §5.5, and
+§12/§18, #469 marked closed via #571, NEXT advanced to Phase 3. Earlier 2026-06-29: Slice 2.2 scope
+hardened — adversarial/"no-happy-path" pass: typed
 root-finder outcome separating censor from solve-failure, mandatory finite horizon, non-negative-
 hazard guard on both sim and fit paths, conditional-sampling left-truncation, deterministic RNG
 ordering, EVID=3-reset assertion; #570 re-sequenced as its own post-Slice-2.2-A PR to protect the
@@ -911,10 +914,12 @@ for competing risks; `loghr` PH term). PR #206: `[structural_model]`, `[error_mo
 `[individual_parameters]` all optional when `[event_model]` is the sole endpoint.
 Binary/ordinal/count/Markov rate-matrix blocks deferred to Phase 4+.
 
-### 5.5 Cumulative hazard integration *(open — Phase 2)*
+### 5.5 Cumulative hazard integration ✅ *Resolved — PRs #567, #595*
 
-Must add CHZ as an extra ODE state for ODE-linked hazard (joint PK-TTE). The existing
-RK45 handles augmented states; wiring is Phase 2 work.
+CHZ added as an extra ODE state for ODE-linked hazard (joint PK-TTE): the `[event_model]`
+parser auto-appends `__chz_<cmt>' = hazard` to `OdeSpec` (init 0). The existing RK45 handles the
+augmented state on both the fit path (#567, Slice 2.1) and the simulation path (#595, Slice 2.2 —
+`solve_ode_until_threshold` root-finder for drug-driven event times).
 
 ### 5.6 Matrix exponential *(open — Phase 5)*
 
@@ -2261,8 +2266,9 @@ and the `predict_survival` R wrapper remain.
   reads ~0.13 vs FOCEI 0.34). Likelihood is exact (fixed-effects matches `survreg`); structural params
   recover. Confirms §3.3/§13 (SAEM/IMP preferred for TTE). FOCEI on a *linear* rate (Exponential) is
   near-unbiased (−7%). **Spun off as #469** (FOCEI nonlinear-frailty ω² reads ~17% above NONMEM/nlmixr2
-  on identical data — inner-Hessian accuracy lead, still OPEN). Candidate Phase 3/3b follow-up:
-  SAEM/IMP comparison + Shi FD-step audit (§9.3). Validation issue **#440 CLOSED 2026-06-27** — the
+  on identical data — inner-Hessian accuracy lead). **#469 CLOSED via #571** (root cause: premature
+  BOBYQA stop on the flat ω² ridge; fix: TTE-scoped `outer_ftol` auto-tightening). Validation issue
+  **#440 CLOSED 2026-06-27** — the
   3-tool comparison (ferx FOCEI + `survreg` + nlmixr2 + NONMEM LAPLACIAN) is fully filled and committed;
   residual frailty work lives in #469.
 
@@ -2307,7 +2313,7 @@ behaviour change.
 — it needs IPCW weighting and is numerically unstable for sparse data. Cause-specific hazard
 covers the standard pharmacometric use case.
 
-### Phase 2 — Joint PK-TTE, ODE hazard accumulator — Slice 2.1 DONE; Slice 2.2 NEXT
+### Phase 2 — Joint PK-TTE, ODE hazard accumulator — ✅ complete (Slice 2.1 fit #567 · Slice 2.2 sim + 2.3 docs #595)
 
 **Scope:** Drug-dependent hazard; CHZ as extra ODE state; shared ETA; PK + TTE simultaneously.
 
@@ -2339,7 +2345,7 @@ user-written accumulator. Expression compiles in the ODE-RHS namespace (reuses #
 - **ferx-r:** pin bump to ferx-core `9fb6cb27` + NEWS = draft PR #208 (bundled `pktte_joint` R
   example/test still to add — local R build is gfortran-blocked, wants CI/toolchain validation).
 
-**Slice 2.2 — simulation (NEXT).** Build pieces:
+**Slice 2.2 — simulation ✅ DONE (PR #595, `3f58c7d3`, merged 2026-06-29).** Built pieces (as shipped):
 - **A. ODE event-location root-finder** `integrate_until_threshold` (§8.8.3) — the long pole;
   shared infra. Bracketed-bisection localization inside each accepted step (see robustness note
   below); runs *through* the dose-event segmentation of `ode_dense_solve_states`, not a naïve
@@ -2430,8 +2436,9 @@ differencing and remain (true elimination needs analytic CHZ η-sensitivities �
   ferx-simulated event times vs. NONMEM `$SIM` (or rxode2 `rxSolve`) for one drug-driven hazard
   from identical (θ, PK profile); lands in `tests/reference/` + `docs/estimation/tte.qmd`.
 
-**Slice 2.3 — docs/example polish + comparison table.** (The anchor comparison table already
-exists in `tests/reference/pktte_joint/expected.md`; 2.3 surfaces it into `docs/estimation/tte.qmd`.)
+**Slice 2.3 — docs/example polish + comparison table ✅ DONE (PR #595).** The anchor comparison table
+from `tests/reference/pktte_joint/expected.md` plus the `$SIM` cross-tool anchor
+(`tests/reference/pktte_joint_sim/`) were surfaced into `docs/estimation/tte.qmd`.
 
 **Deferred:**
 - **Selective per-state ODE reset** (§8.8.6) → Phase 3 (clock-reset RTTE; no Phase 2 consumer;
@@ -2817,10 +2824,10 @@ for TTE/categorical is **default-on**.
 2. **Phase 1b** ✅ — Competing risks (cause-specific hazard)  
    No new infrastructure; multiple TTE endpoints. (#494/#501/#526; cleanup #531 via #563)
 
-3. **Phase 2** — Joint PK-TTE, ODE hazard accumulator ← **IN PROGRESS** (Slice 2.1 fit path ✅ #564/#567; Slice 2.2 simulation NEXT)  
+3. **Phase 2** ✅ — Joint PK-TTE, ODE hazard accumulator (Slice 2.1 fit path #564/#567; Slice 2.2 simulation + 2.3 docs #595)  
    Most clinically demanded. Extends Phase 1 via ODE.
 
-4. **Phase 3** — RTTE + **Phase 3b** SAEM proposal option  
+4. **Phase 3** — RTTE + **Phase 3b** SAEM proposal option ← **NEXT**  
    RTTE validates non-Gaussian SAEM. `saem_proposal` option improves all SAEM globally.
 
 5. **Phase 4** — Binary + Ordinal + Poisson + NB  
