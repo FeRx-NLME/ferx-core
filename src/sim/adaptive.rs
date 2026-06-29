@@ -478,8 +478,31 @@ pub struct AdaptiveDosingSpec {
     pub rules: Vec<AdaptiveRule>,
 }
 
+/// Validate a `[adaptive_dosing]` float list is non-empty, all-finite, and
+/// strictly increasing — the shared contract of the `levels` ladder and an
+/// explicit `at` decision list. Called from BOTH the block parser and
+/// [`AdaptiveDosingSpec::validate`] so the file-driven and programmatic paths
+/// enforce it identically (a single source of truth, not two that can drift).
+/// `what` names the list in the error (e.g. `"levels"`, `` "`at` times" ``).
+pub(crate) fn validate_increasing_finite(xs: &[f64], what: &str) -> Result<(), String> {
+    if xs.is_empty() {
+        return Err(format!(
+            "[adaptive_dosing]: {what} must be a non-empty list"
+        ));
+    }
+    if !xs.iter().all(|x| x.is_finite()) {
+        return Err(format!("[adaptive_dosing]: {what} must all be finite"));
+    }
+    if xs.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(format!(
+            "[adaptive_dosing]: {what} must be strictly increasing"
+        ));
+    }
+    Ok(())
+}
+
 impl AdaptiveDosingSpec {
-    /// Enforce every cross-field invariant the block parser checks, in one place.
+    /// Enforce every invariant the block parser checks, in one place.
     ///
     /// The struct is `pub` with `pub` fields, so a programmatically-built spec can
     /// reach the controller without going through the parser. The parser calls
@@ -488,7 +511,8 @@ impl AdaptiveDosingSpec {
     /// it again as the safety net for hand-built specs — so neither path can drive
     /// the controller with a contradiction (a `Level` step without a `levels`
     /// ladder, a `start_dose` outside `dose_bounds`, a rung outside `dose_bounds`,
-    /// …) the other would have rejected.
+    /// an empty or unsorted `at`/`levels`, a `confirm` of 0, …) the other would
+    /// have rejected.
     pub fn validate(&self) -> Result<(), String> {
         if self.rules.is_empty() {
             return Err(
@@ -512,6 +536,23 @@ impl AdaptiveDosingSpec {
                 "[adaptive_dosing]: start_dose {} is outside dose_bounds [{lo}, {hi}]",
                 self.start_dose
             ));
+        }
+        // The decision schedule must be a non-empty, finite, strictly-increasing
+        // list of non-negative times. The parser enforces this on the way in;
+        // re-check here so a hand-built spec can't silently run with no doses
+        // (empty `at`) or a permuted decision log (unsorted `at`).
+        validate_increasing_finite(&self.at, "`at` times")?;
+        if self.at[0] < 0.0 {
+            // Strictly increasing ⇒ `at[0]` is the minimum.
+            return Err(format!(
+                "[adaptive_dosing]: `at` times must be >= 0: {}",
+                self.at[0]
+            ));
+        }
+        if self.confirm < 1 {
+            return Err(
+                "[adaptive_dosing]: confirm must be >= 1 (1 acts on the first breach)".to_string(),
+            );
         }
         // Exactly one signal source. `observe` is the latent (Ipred) signal — a
         // free-form expression with no measurement noise. `with_assay_error = true`
@@ -570,6 +611,11 @@ impl AdaptiveDosingSpec {
         });
         match &self.levels {
             Some(l) => {
+                // Non-empty, finite, strictly increasing: a `Level` step indexes
+                // this ladder and assumes ascending order — on a descending list
+                // `increase` would *lower* the dose. The parser checks this on the
+                // way in; re-check for hand-built specs.
+                validate_increasing_finite(l, "levels")?;
                 if has_percent {
                     return Err("[adaptive_dosing]: percentage actions (`increase N%`) are not \
                                 allowed with `levels`; use bare `increase`/`decrease` to step one level"
@@ -819,6 +865,47 @@ mod tests {
         s.levels = Some(vec![100.0, 150.0]);
         s.rules = level_rule();
         assert!(s.validate().unwrap_err().contains("outside dose_bounds"));
+    }
+
+    #[test]
+    fn validate_rejects_schedule_and_levels_ordering() {
+        // These single-field invariants are enforced by the block parser; `validate`
+        // is the safety net for a hand-built `pub` spec that never saw the parser.
+        // Without them a programmatic spec drives a silent wrong result through the
+        // public `simulate_adaptive_from_spec`.
+
+        // empty `at` — would otherwise run a silent no-dose simulation.
+        let mut s = base_spec();
+        s.at = vec![];
+        assert!(s.validate().unwrap_err().contains("non-empty"));
+
+        // unsorted `at` — would permute the decision log.
+        let mut s = base_spec();
+        s.at = vec![48.0, 24.0];
+        assert!(s.validate().unwrap_err().contains("strictly increasing"));
+
+        // negative decision time.
+        let mut s = base_spec();
+        s.at = vec![-1.0, 24.0];
+        assert!(s.validate().unwrap_err().contains(">= 0"));
+
+        // confirm = 0 (the parser requires >= 1).
+        let mut s = base_spec();
+        s.confirm = 0;
+        assert!(s.validate().unwrap_err().contains("confirm"));
+
+        // Descending `levels` — the regression that motivated this: a `Level` step
+        // on a non-ascending ladder makes `increase` *lower* the dose. `validate`
+        // must reject it rather than let the controller silently invert.
+        let mut s = base_spec();
+        s.start_dose = 200.0;
+        s.levels = Some(vec![200.0, 100.0, 50.0]);
+        s.rules = vec![AdaptiveRule {
+            op: Comparison::Lt,
+            threshold: 10.0,
+            action: AdaptiveAction::Increase(DoseStep::Level),
+        }];
+        assert!(s.validate().unwrap_err().contains("strictly increasing"));
     }
 
     #[test]

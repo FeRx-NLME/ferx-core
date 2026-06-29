@@ -1,5 +1,6 @@
 use crate::sim::adaptive::{
-    AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, DoseStep,
+    validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
+    Comparison, DoseStep,
 };
 use crate::types::*;
 use regex::Regex;
@@ -3971,27 +3972,6 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     };
     spec.validate()?;
     Ok(spec)
-}
-
-/// Validate a `[adaptive_dosing]` float list is non-empty, all-finite, and
-/// strictly increasing — the shared contract of the `levels` ladder and an
-/// explicit `at` decision list, so the two can't drift apart. `what` names the
-/// list in the error (e.g. `"levels"`, `` "`at` times" ``).
-fn validate_increasing_finite(xs: &[f64], what: &str) -> Result<(), String> {
-    if xs.is_empty() {
-        return Err(format!(
-            "[adaptive_dosing]: {what} must be a non-empty list"
-        ));
-    }
-    if !xs.iter().all(|x| x.is_finite()) {
-        return Err(format!("[adaptive_dosing]: {what} must all be finite"));
-    }
-    if xs.windows(2).any(|w| w[1] <= w[0]) {
-        return Err(format!(
-            "[adaptive_dosing]: {what} must be strictly increasing"
-        ));
-    }
-    Ok(())
 }
 
 /// Parse an `at =` decision schedule: either an explicit list `[t1, t2, …]` or an
