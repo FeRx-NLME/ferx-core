@@ -451,6 +451,17 @@ pub struct AdaptiveDosingSpec {
 }
 
 impl AdaptiveDosingSpec {
+    /// Whether `observe` is a multi-token *expression* (so its measured endpoint is
+    /// not self-evident) rather than a bare endpoint (a state name or compartment
+    /// number). The single classifier behind both the parse-time
+    /// `with_assay_error` ambiguity check ([`AdaptiveDosingSpec::validate`]) and the
+    /// compile-time endpoint resolver
+    /// ([`resolve_observe_cmt`](crate::sim::adaptive_control)), so the two can't
+    /// disagree about what counts as an expression.
+    pub(crate) fn observe_is_expression(&self) -> bool {
+        self.observe.chars().any(|c| "+-*/() ".contains(c))
+    }
+
     /// Enforce every cross-field invariant the block parser checks, in one place.
     ///
     /// The struct is `pub` with `pub` fields, so a programmatically-built spec can
@@ -494,10 +505,7 @@ impl AdaptiveDosingSpec {
         // ambiguous (which endpoint's σ?). A bare endpoint can be resolved against
         // the model in S2.2; an expression cannot, so it must designate `assay_cmt`
         // — else a typed error, never a guessed σ.
-        if self.with_assay_error
-            && self.assay_cmt.is_none()
-            && self.observe.chars().any(|c| "+-*/() ".contains(c))
-        {
+        if self.with_assay_error && self.assay_cmt.is_none() && self.observe_is_expression() {
             return Err(format!(
                 "[adaptive_dosing]: with_assay_error on an expression observe (`{}`) is \
                  ambiguous — which endpoint's residual error applies? Designate it with `assay_cmt = N`.",

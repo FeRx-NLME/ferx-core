@@ -1588,7 +1588,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
     }
     if decision_times.len() > max_decisions {
         return Err(format!(
-            "decision schedule has {} points, exceeding max_decisions = {} (runaway guard)",
+            "decision schedule has {} points, exceeding max_decisions = {} (runaway guard); \
+             raise `max_decisions` in the simulate options if the schedule is intentional",
             decision_times.len(),
             max_decisions
         ));

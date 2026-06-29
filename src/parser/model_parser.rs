@@ -3938,19 +3938,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
             "levels" => {
                 let l = parse_float_array(val)
                     .map_err(|e| format!("[adaptive_dosing]: bad levels: {e}"))?;
-                if l.is_empty() {
-                    return Err("[adaptive_dosing]: levels must be a non-empty list".to_string());
-                }
-                if !l.iter().all(|x| x.is_finite()) {
-                    return Err(format!(
-                        "[adaptive_dosing]: levels must all be finite: {val}"
-                    ));
-                }
-                if l.windows(2).any(|w| w[1] <= w[0]) {
-                    return Err(format!(
-                        "[adaptive_dosing]: levels must be strictly increasing: {val}"
-                    ));
-                }
+                validate_increasing_finite(&l, "levels")?;
                 levels = Some(l);
             }
             other => return Err(format!("[adaptive_dosing]: unknown key `{other}`")),
@@ -3983,6 +3971,27 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     Ok(spec)
 }
 
+/// Validate a `[adaptive_dosing]` float list is non-empty, all-finite, and
+/// strictly increasing — the shared contract of the `levels` ladder and an
+/// explicit `at` decision list, so the two can't drift apart. `what` names the
+/// list in the error (e.g. `"levels"`, `` "`at` times" ``).
+fn validate_increasing_finite(xs: &[f64], what: &str) -> Result<(), String> {
+    if xs.is_empty() {
+        return Err(format!(
+            "[adaptive_dosing]: {what} must be a non-empty list"
+        ));
+    }
+    if !xs.iter().all(|x| x.is_finite()) {
+        return Err(format!("[adaptive_dosing]: {what} must all be finite"));
+    }
+    if xs.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(format!(
+            "[adaptive_dosing]: {what} must be strictly increasing"
+        ));
+    }
+    Ok(())
+}
+
 /// Parse an `at =` decision schedule: either an explicit list `[t1, t2, …]` or an
 /// arithmetic sequence `every <Δ> from <t0> to <t1>` (inclusive), expanded to
 /// explicit times. The `to` bound is required (an open-ended schedule has no
@@ -3996,19 +4005,7 @@ fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
             ));
         }
         let times = parse_float_array(v).map_err(|e| format!("[adaptive_dosing]: bad at: {e}"))?;
-        if times.is_empty() {
-            return Err("[adaptive_dosing]: `at` schedule is empty".to_string());
-        }
-        if !times.iter().all(|t| t.is_finite()) {
-            return Err(format!(
-                "[adaptive_dosing]: `at` times must be finite: {val}"
-            ));
-        }
-        if times.windows(2).any(|w| w[1] <= w[0]) {
-            return Err(format!(
-                "[adaptive_dosing]: `at` times must be strictly increasing: {val}"
-            ));
-        }
+        validate_increasing_finite(&times, "`at` times")?;
         // Strictly increasing ⇒ the first element is the minimum; reject a
         // negative decision time (start_dose / dose_bounds reject < 0 too).
         if times[0] < 0.0 {
@@ -4048,8 +4045,12 @@ fn parse_decision_schedule(val: &str) -> Result<Vec<f64>, String> {
     let ratio = (t1 - t0) / step;
     let n_f = (ratio + 1e-9 * ratio.max(1.0)).floor();
     if n_f > 100_000.0 {
+        // Hard parse-time expansion bound (avoids allocating a runaway `Vec` here);
+        // distinct from, and far above, the runtime `max_decisions` cap. Tighten the
+        // range or step rather than relying on either as a policy knob.
         return Err(
-            "[adaptive_dosing]: `at` schedule expands to too many decision times (> 100000)"
+            "[adaptive_dosing]: `at` schedule expands to too many decision times (> 100000); \
+             tighten the range or step"
                 .to_string(),
         );
     }

@@ -267,11 +267,22 @@ fn resolve_observe_cmt(model: &CompiledModel, spec: &AdaptiveDosingSpec) -> Resu
             return Ok(idx + 1);
         }
     }
-    Err(format!(
-        "[adaptive_dosing] with_assay_error: cannot determine which endpoint's residual error \
-         applies to observe `{}` — set `assay_cmt = N`",
-        spec.observe
-    ))
+    // Use the same classifier the parser's ambiguity check uses, so an expression
+    // (normally rejected at parse) and a bare-but-unresolvable name give coherent
+    // guidance instead of two unrelated messages.
+    if spec.observe_is_expression() {
+        Err(format!(
+            "[adaptive_dosing] with_assay_error on an expression observe (`{}`) is ambiguous — \
+             which endpoint's residual error applies? Designate it with `assay_cmt = N`",
+            spec.observe
+        ))
+    } else {
+        Err(format!(
+            "[adaptive_dosing] with_assay_error: cannot resolve observe `{}` to a model endpoint \
+             (neither a compartment number nor a declared state) — set `assay_cmt = N`",
+            spec.observe
+        ))
+    }
 }
 
 /// Everything needed to drive a declarative `[adaptive_dosing]` block through the
@@ -773,8 +784,12 @@ mod tests {
             3
         );
         // an expression with no assay_cmt cannot designate an endpoint → typed error
+        // (the same "ambiguous" classifier the parser's check uses)
         let err = resolve_observe_cmt(&model, &mk_spec("central / V", true, None)).unwrap_err();
-        assert!(err.contains("cannot determine"), "got: {err}");
+        assert!(err.contains("ambiguous"), "got: {err}");
+        // a bare name that is neither a number nor a declared state
+        let err = resolve_observe_cmt(&model, &mk_spec("conc", true, None)).unwrap_err();
+        assert!(err.contains("cannot resolve observe"), "got: {err}");
     }
 
     #[test]
