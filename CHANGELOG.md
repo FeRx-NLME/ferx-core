@@ -298,17 +298,19 @@ section of the SDLC for the versioning policy).
   then discarded the correct estimate and restarted Nelder–Mead from η=0, which on a
   multimodal inner objective (e.g. `obs_scale = V1` with `V1 = … · exp(ETA_V1)`) settled
   in a worse local minimum and inflated the FOCEI objective (≈370 OFV on the
-  `two_cpt_oral_cov` example; its analytical twin was unaffected). Two changes fix it:
-  the inner fallback (both the BSV and the IOV paths) now keeps the **lower-objective** of
-  the BFGS partial and the Nelder–Mead restart instead of blindly overwriting with NM; and
-  the inner BFGS gained an objective-stall stop (active only for ODE models, so analytical
-  and finite-difference fits are bit-identical to before) so it converges at the mode
-  rather than spinning. The ODE form's OFV-at-init now matches its analytical twin
-  (`−1193.59`, previously `−823.05`), at the default ODE tolerance, and affected subjects
-  converge in far fewer inner iterations. *Note:* with `ebe_warm_start` off (the default), a
-  fit that hits the inner fallback with a BFGS partial that beats the η=0 restart now
-  returns that partial rather than the NM-from-0 result, so a previously fallback-stalled
-  EBE/OFV may shift toward the better optimum.
+  `two_cpt_oral_cov` example; its analytical twin was unaffected). Two changes fix it, both
+  scoped to ODE objectives so analytical, event-driven, FREM and finite-difference fits stay
+  bit-identical to before: for ODE models the inner fallback (both the BSV and the IOV paths)
+  now keeps the **lower-objective** of the BFGS partial and the Nelder–Mead restart instead
+  of blindly overwriting with NM, and the inner BFGS gained an objective-stall stop so it
+  converges at the mode rather than spinning. Exact objectives have no gradient-noise floor,
+  so a BFGS failure there is genuine non-convergence and the historical NM-from-η=0 recovery
+  is retained. The ODE form's OFV-at-init now matches its analytical twin (`−1193.59`,
+  previously `−823.05`), at the default ODE tolerance, and affected subjects converge in far
+  fewer inner iterations. *Note:* with `ebe_warm_start` off (the default), an **ODE** fit that
+  hits the inner fallback with a BFGS partial that beats the η=0 restart now returns that
+  partial rather than the NM-from-0 result, so a previously fallback-stalled EBE/OFV may shift
+  toward the better optimum.
 - **Form C (`[scaling] y = <expr>`) ODE readouts now use per-observation covariate
   snapshots** (#535, #538). The explicit-output readout is evaluated against the
   covariate values on each observation's own data row rather than the subject's

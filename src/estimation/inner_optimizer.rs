@@ -547,16 +547,32 @@ pub fn find_ebe(
         enable_stall,
     );
 
-    // If BFGS failed, fall back to Nelder-Mead — keeping the lower-objective of the BFGS
-    // partial and the NM restart rather than blindly overwriting with NM (#555). See
-    // [`argmin_inner_fallback`] for the rationale; the cold seed is η=0.
+    // If BFGS failed, fall back to Nelder-Mead. The recovery policy depends on whether the
+    // objective carries a gradient-noise floor (ODE) or is exact (analytical / event-driven /
+    // FREM):
+    //   * ODE (#555): the "failure" is usually a *certification* failure — the adaptive RK45
+    //     gradient-noise floor blocks `gnorm < tol` at a genuine mode. Keep the lower-objective
+    //     of {BFGS partial, NM-from-0} so a correct, lower-objective partial is never discarded
+    //     for a worse NM basin (the #555 bug). See [`argmin_inner_fallback`].
+    //   * Exact objectives: there is no noise floor, so a BFGS failure is genuine
+    //     non-convergence and the partial may be a non-stationary, merely-low-objective point
+    //     (e.g. run out along a FREM covariate pseudo-obs flat direction). Keeping it would
+    //     mis-center the FREM/IMP proposal, so recover with NM from η=0 (or the warm partial)
+    //     exactly as prior releases — bit-identical for analytical/FREM fits.
     let bfgs_converged = result;
     let (nm_converged, used_fallback) = if !bfgs_converged {
         let partial = eta.clone();
         let cold = vec![0.0; n_eta];
-        let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
-        eta = best;
-        (ok, true)
+        if enable_stall {
+            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+            eta = best;
+            (ok, true)
+        } else {
+            let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
+            eta = if warm { partial } else { cold };
+            let nm_ok = nelder_mead_minimize(&obj, &mut eta, n_eta, max_iter * 5, tol);
+            (nm_ok, true)
+        }
     } else {
         (false, false)
     };
@@ -755,17 +771,25 @@ fn find_ebe_iov(
         None,
         enable_stall,
     );
-    // On BFGS failure, keep the lower-objective of the BFGS partial and a Nelder–Mead
-    // restart (cold seed = prior mode `bsv_psi = μ`, κ = 0) rather than blindly overwriting
-    // with NM — the same #555 argmin policy as the non-IOV `find_ebe`, so the IOV inner
-    // loop no longer discards a correct η̂ when its gradient floors above `tol`.
+    // On BFGS failure, recover with the same ODE-gated policy as the non-IOV `find_ebe`
+    // (cold seed = prior mode `bsv_psi = μ`, κ = 0): for ODE objectives keep the
+    // lower-objective of {BFGS partial, NM restart} so a correct η̂ floored above `tol` by
+    // solver noise is never discarded (#555); for exact objectives recover with NM from the
+    // cold seed, as prior releases, so a non-stationary low-objective partial can't be kept.
     let (nm_converged, used_fallback) = if !bfgs_converged {
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
         cold[..n_eta].copy_from_slice(&mu);
-        let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
-        x = best;
-        (ok, true)
+        if enable_stall {
+            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
+            x = best;
+            (ok, true)
+        } else {
+            let warm = ebe_warm_start_enabled() && partial.iter().all(|v| v.is_finite());
+            x = if warm { partial } else { cold };
+            let nm_ok = nelder_mead_minimize(&obj, &mut x, n_flat, max_iter * 5, tol);
+            (nm_ok, true)
+        }
     } else {
         (false, false)
     };
