@@ -241,14 +241,25 @@ the same augmented system at the typical values (its `mean_survival` is `NaN` �
 `∫₀^∞ S` summary for ODE hazards is a follow-up; `median_survival` is interpolated from
 the cumulative-hazard grid).
 
+### Simulating drug-driven event times
+
+`simulate()` draws event times from a drug-driven hazard by integrating the augmented
+PK + cumulative-hazard system until `H(T) = −log U` — the ODE analogue of the analytic
+inverse-CDF — localizing the crossing inside the solver step. Because a drug-driven
+hazard can vanish (the drug clears, the hazard falls toward baseline, and an event may
+never fire), an ODE-TTE simulation **requires a finite `[simulation] horizon`**; a
+subject that has not crossed by the horizon is right-censored there. EVID-3/4 resets and
+left-truncated entry (`entry_time > 0`) are not yet supported for ODE-TTE simulation and
+raise a clear error rather than mis-sampling. A negative or non-finite hazard fails loudly
+during sampling — it is never silently treated as a censor.
+
 ::: {.callout-note}
 ## Current limitations
 The hazard expression lives in the `[odes]` RHS namespace (ODE states + individual
-parameters — route thetas/covariates through `[individual_parameters]`); inter-occasion
-variability (IOV) is rejected; and `simulate()` of an ODE hazard returns an error
-(drug-driven event-time sampling needs the forthcoming ODE root-finder). Joint PK-TTE is
-the standard NONMEM `$DES` + cumulative-hazard construct; recovery against
-NONMEM / nlmixr2 is tracked in issue #564. See `examples/pktte_joint.ferx`.
+parameters — route thetas/covariates through `[individual_parameters]`), and inter-occasion
+variability (IOV) is rejected. Joint PK-TTE is the standard NONMEM `$DES` +
+cumulative-hazard construct; recovery against NONMEM / nlmixr2 is tracked in issue #564.
+See `examples/pktte_joint.ferx`.
 :::
 
 ## Competing risks (cause-specific hazards)
@@ -458,6 +469,41 @@ The same validation kit exists for Weibull (`tests/reference/tte_weibull/`) and 
 > parameters, as in the standard pharmacometric guidance; FOCEI on a *linear* rate (exponential)
 > is near-unbiased and all three tools agree there (ω² 0.286–0.293).
 
+### Joint PK-TTE — fit and simulation
+
+The drug-driven joint model is anchored against NONMEM and nlmixr2 on a shared dataset
+(`tests/reference/pktte_joint/`, N=120; oral 1-cpt PK + `h = H0·exp(BETA·Cc)`).
+
+**Fit.** All three tools recover the PK fixed effects and variance components closely:
+
+| Parameter | Truth | ferx FOCEI | nlmixr2 FOCEI | NONMEM LAPLACE |
+|-----------|------:|-----------:|--------------:|---------------:|
+| CL        | 1.0   | 1.039      | 1.026         | 1.031          |
+| V         | 10.0  | 9.879      | 9.946         | 9.897          |
+| KA        | 1.0   | 0.978      | 0.994         | 0.980          |
+| ω²(CL)    | 0.09  | 0.083      | 0.080         | 0.081          |
+| H0        | 0.015 | 0.0145     | 0.0210        | 0.0149         |
+| BETA      | 0.25  | 0.256      | 0.201         | 0.251          |
+
+The baseline hazard `H0` and the exposure slope `BETA` are **collinear** — `H0·exp(BETA·Cc)`
+trades baseline against slope over the narrow single-occasion concentration range. ferx and
+NONMEM (both truth-started) sit near truth; nlmixr2 lands at the other end of the *same* flat
+ridge — all valid optima of an under-determined likelihood, with corr(H0, BETA) = −0.93 (ferx) /
+−0.91 (NONMEM). So the PK block is the cross-tool agreement check; `H0` and `BETA` are jointly,
+not individually, identified. (The objective value is not cross-tool comparable here — different
+`F_FLAG` likelihood normalization — so compare ΔOFV between nested models, not absolutes.)
+
+**Simulation.** ferx's `simulate()` event-time distribution is validated two ways
+(`tests/reference/pktte_joint_sim/`):
+
+- *Goodness-of-fit (in-tree, license-free):* simulated event times, probability-integral-
+  transformed against the model's own survival via an **independent** integrator, pass a
+  Kolmogorov–Smirnov test against Uniform(0,1) — D = 0.040 vs the 5% critical 0.061 at N=500,
+  ≈ the value expected for an exactly-correct sampler. This is immune to the H0/BETA ridge
+  (no estimation), so it is the decisive sampler check.
+- *Cross-tool (NONMEM `$SIM`):* ferx's Kaplan–Meier survival matches NONMEM's analytic marginal
+  survival `mean_i exp(−CHZ_i(t))` to **max |ΔS(t)| = 0.044** across the horizon (N=500).
+
 ## See also
 
 - `examples/tte_exponential.ferx` — minimal worked example
@@ -465,6 +511,10 @@ The same validation kit exists for Weibull (`tests/reference/tte_weibull/`) and 
 - `tests/reference/tte_exponential/` — 100-subject validation dataset (`tte_exp.csv`),
   reference scripts (`simulate.R`, `survreg.R`, `nlmixr2.R`, `nonmem.ctl`), `README.md`
   (NONMEM/nlmixr2 hand-off) and `expected.md` (filled comparison)
+- `examples/pktte_joint.ferx` — joint PK-TTE worked example (drug-driven ODE hazard)
+- `tests/reference/pktte_joint/` — joint PK-TTE **fit** anchor (ferx / NONMEM / nlmixr2)
+- `tests/reference/pktte_joint_sim/` — joint PK-TTE **simulation** anchor (ferx vs NONMEM
+  `$SIM`: `make_template.py`, `sim.ctl`, `compare.R`, `expected.md`)
 - `tests/tte_smoke.rs` — Tier-2 parse and short-run smoke tests
 - `tests/tte_convergence.rs` — Tier-3 convergence + SSE tests (`--features survival,slow-tests`)
 - `plans/tte-survival-markov.md` — full multi-phase roadmap
