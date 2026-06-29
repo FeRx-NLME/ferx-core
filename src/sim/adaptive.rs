@@ -1084,6 +1084,41 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_inverted_or_nan_target_window() {
+        // `target_window` only feeds the `pct_time_in_window` metric, but a bad band
+        // must still be rejected: the parser checks it on the way in, and `validate`
+        // is the safety net for a hand-built `pub` spec reaching
+        // `simulate_adaptive_from_spec` without ever seeing the parser. Mirrors the
+        // parser's check (low finite, low <= high, high may be +inf).
+
+        // high < low (inverted).
+        let mut s = base_spec();
+        s.target_window = Some((20.0, 10.0));
+        assert!(s.validate().unwrap_err().contains("target_window"));
+
+        // non-finite low (NaN and +inf both rejected — low must be finite).
+        let mut s = base_spec();
+        s.target_window = Some((f64::NAN, 20.0));
+        assert!(s.validate().unwrap_err().contains("target_window"));
+        let mut s = base_spec();
+        s.target_window = Some((f64::INFINITY, 20.0));
+        assert!(s.validate().unwrap_err().contains("target_window"));
+
+        // NaN high.
+        let mut s = base_spec();
+        s.target_window = Some((10.0, f64::NAN));
+        assert!(s.validate().unwrap_err().contains("target_window"));
+
+        // Valid bands pass: a closed band and a one-sided "at or above low".
+        let mut s = base_spec();
+        s.target_window = Some((10.0, 20.0));
+        assert!(s.validate().is_ok());
+        let mut s = base_spec();
+        s.target_window = Some((10.0, f64::INFINITY));
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
     fn validate_enforces_one_signal_source() {
         // `observe` (latent) and `with_assay_error` (noised model output) are
         // mutually exclusive; exactly one is required.
