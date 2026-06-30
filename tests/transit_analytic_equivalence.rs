@@ -13,7 +13,7 @@
 //! closed form; a `fit()`-level check would conflate it with the estimator.
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::types::{DoseEvent, FitOptions, Population};
+use ferx_core::types::{DoseEvent, EstimationMethod, FitOptions, Population};
 use ferx_core::{fit, predict};
 
 mod common;
@@ -357,4 +357,130 @@ fn transit_depot_init_rejected_central_ok() {
     // Positive control: a central initial amount is supported and parses.
     parse_full_model(&model_src("  init(central) = 2.0"))
         .expect("transit central init should parse");
+}
+
+/// Short FOCEI fit (a couple of outer iterations) — this is the test that actually
+/// drives the analytic **sensitivity** path for transit: `run_obs` / `run_obs_grad`'s
+/// transit branch, `one_cpt_transit_conc_g`, `slot_to_dim` for `n`/`mtt`, and the
+/// `ExKind` arm. (The fixed-eta OFV test above evaluates `individual_nll` and does *not*
+/// go through the sens provider, so those exact `∂f/∂{cl,v,n,mtt}` jets the estimator
+/// seeds were otherwise only exercised by an uncommitted benchmark.) Tier-2: returns
+/// after a handful of iterations with a finite OFV, not convergence.
+#[test]
+fn transit_short_fit_drives_analytic_sens() {
+    let (an_src, _) = build_pair(false, false);
+    let model = parse_full_model(&an_src).unwrap().model;
+    let obs_t = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
+    let base = population(vec![bolus(0.0, 100.0)], obs_t.clone());
+    let preds = predict(&model, &base, &model.default_params);
+    let n = obs_t.len();
+    let subjects: Vec<_> = [0.9_f64, 1.0, 1.1]
+        .into_iter()
+        .enumerate()
+        .map(|(i, fac)| {
+            let mut s = common::subject(
+                &format!("{}", i + 1),
+                vec![bolus(0.0, 100.0)],
+                obs_t.clone(),
+                vec![0.0; n],
+                vec![2; n],
+            );
+            s.observations = preds.iter().map(|p| (p.pred * fac).max(1e-6)).collect();
+            s
+        })
+        .collect();
+    let pop = Population { subjects, ..base };
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceI;
+    opts.outer_maxiter = 2;
+    opts.run_covariance_step = false;
+    let r = fit(&model, &pop, &model.default_params, &opts)
+        .expect("short transit FOCEI fit should return Ok");
+    assert!(r.ofv.is_finite(), "transit fit OFV not finite: {}", r.ofv);
+}
+
+/// `predict()` / `simulate()` panic (rather than silently mis-predict) on an unsupported
+/// transit configuration — the `Vec`-returning entry points use `assert_transit_support`.
+#[test]
+#[should_panic(expected = "one_cpt_transit")]
+fn transit_ss_dose_panics_in_predict() {
+    let (an_src, _) = build_pair(false, false);
+    let model = parse_full_model(&an_src).unwrap().model;
+    let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0); // SS dose
+    let pop = population(vec![ss], vec![1.0, 4.0, 8.0]);
+    let _ = predict(&model, &pop, &model.default_params);
+}
+
+/// Committed benchmark (slow): the analytic `pk one_cpt_transit` and the ODE `transit()`
+/// forcing must converge to the **same** estimates on identical simulated data — a
+/// fit-level equivalence stronger than the fixed-parameter OFV check, and the permanent
+/// record of the speed-up (#386). Runtimes are logged for the nightly record; the analytic
+/// path is the fast one (~28× locally at 50×12). Gated out of the per-PR job.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn transit_analytic_vs_ode_fit_benchmark() {
+    use ferx_core::simulate_with_seed;
+    use std::time::Instant;
+    let (an_src, ode_src) = build_pair(false, false);
+    let an = parse_full_model(&an_src).unwrap().model;
+    let ode = parse_full_model(&ode_src).unwrap().model;
+    let obs_t = vec![
+        0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0,
+    ];
+    let n = obs_t.len();
+    let subjects: Vec<_> = (1..=30)
+        .map(|i| {
+            common::subject(
+                &format!("{i}"),
+                vec![bolus(0.0, 100.0)],
+                obs_t.clone(),
+                vec![0.0; n],
+                vec![2; n],
+            )
+        })
+        .collect();
+    let mut pop = Population {
+        subjects,
+        ..population(vec![bolus(0.0, 100.0)], obs_t.clone())
+    };
+    let sims = simulate_with_seed(&ode, &pop, &ode.default_params, 1, 12345);
+    for s in pop.subjects.iter_mut() {
+        s.observations = sims
+            .iter()
+            .filter(|x| x.id == s.id)
+            .map(|x| x.outcome.continuous_value().max(1e-6))
+            .collect();
+    }
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceI;
+    opts.run_covariance_step = false;
+    let t = Instant::now();
+    let ra = fit(&an, &pop, &an.default_params, &opts).expect("analytic transit fit ok");
+    let ta = t.elapsed();
+    let t = Instant::now();
+    let ro = fit(&ode, &pop, &ode.default_params, &opts).expect("ode transit fit ok");
+    let to = t.elapsed();
+    eprintln!(
+        "[transit fit benchmark] analytic {:.2?} OFV={:.3} | ODE {:.2?} OFV={:.3} | speedup {:.1}x",
+        ta,
+        ra.ofv,
+        to,
+        ro.ofv,
+        to.as_secs_f64() / ta.as_secs_f64().max(1e-9)
+    );
+    assert!(
+        (ra.ofv - ro.ofv).abs() < 0.1,
+        "fit OFV mismatch: analytic {} vs ODE {}",
+        ra.ofv,
+        ro.ofv
+    );
+    for (a, b) in ra.theta.iter().zip(&ro.theta) {
+        assert!(
+            (a - b).abs() / b.abs().max(1.0) < 5e-3,
+            "fit theta mismatch: analytic {a} vs ODE {b}"
+        );
+    }
 }

@@ -425,6 +425,29 @@ mod tests {
         }
     }
 
+    /// Out-of-domain / invalid params return `0.0` (the sibling closed forms'
+    /// invalid-parameter convention): bad `n`/`mtt`, and the flip-flop
+    /// `ke = CL/V ≥ KTR = (n+1)/mtt`.
+    #[test]
+    fn one_cpt_transit_amt_guards_return_zero() {
+        let z = 0.0_f64;
+        // n < 0 → invalid-param guard
+        assert_eq!(
+            one_cpt_transit_g::<f64>(100.0, 1.0, 1.0, 10.0, -0.5, 1.5, 1.0),
+            z
+        );
+        // mtt = 0 → invalid-param guard
+        assert_eq!(
+            one_cpt_transit_g::<f64>(100.0, 1.0, 1.0, 10.0, 3.0, 0.0, 1.0),
+            z
+        );
+        // ke = CL/V = 3.0 ≥ KTR = (3+1)/1.5 ≈ 2.67 → flip-flop guard
+        assert_eq!(
+            one_cpt_transit_g::<f64>(100.0, 1.0, 30.0, 10.0, 3.0, 1.5, 1.0),
+            z
+        );
+    }
+
     /// Force the full `f+grad+hess` of an IV-bolus sensitivity at dual width `N`
     /// (seed CL@0, V@1; the other N−2 dims stay zero but still cost O(N²) work).
     /// Returns a reduction over every component so nothing is optimised away.

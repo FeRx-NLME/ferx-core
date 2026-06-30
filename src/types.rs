@@ -629,12 +629,6 @@ impl PkParams {
         if let Some(&v) = map.get("lagtime").or_else(|| map.get("alag")) {
             p.values[PK_IDX_LAGTIME] = v;
         }
-        if let Some(&v) = map.get("n") {
-            p.values[PK_IDX_N] = v;
-        }
-        if let Some(&v) = map.get("mtt") {
-            p.values[PK_IDX_MTT] = v;
-        }
         p
     }
 }
@@ -5208,6 +5202,14 @@ pub(crate) mod test_helpers {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// Transit (`OneCptTransit`) descriptors: canonical name, the analytic 2-state
+    /// `[depot, central]` layout, and no modeled-duration infusions (#386).
+    #[test]
+    fn one_cpt_transit_descriptors() {
+        assert_eq!(PkModel::OneCptTransit.canonical_name(), "one_cpt_transit");
+        assert!(PkModel::OneCptTransit.infusable_compartments().is_empty());
+    }
 
     /// `sim_residual_variance` must split FREM covariate pseudo-observations
     /// (FREMTYPE>0) off the PK error model: they use the additive covariate

@@ -2965,6 +2965,25 @@ mod tests {
         );
     }
 
+    /// Transit is a 2-state `[depot, central]` model: `single_dose_states` must return the
+    /// lumped unabsorbed-chain "depot" amount and the central concentration for a bolus
+    /// (the `[derived]` / compartment-amount path), #386.
+    #[test]
+    fn single_dose_states_transit_returns_depot_and_central() {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = 0.5;
+        p.values[crate::types::PK_IDX_V] = 10.0;
+        p.values[crate::types::PK_IDX_N] = 3.0;
+        p.values[crate::types::PK_IDX_MTT] = 1.5;
+        let d = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let states = single_dose_states(PkModel::OneCptTransit, &d, 2.0, &p);
+        assert_eq!(states.len(), 2, "transit exposes [depot, central]");
+        assert!(
+            states[0] > 0.0 && states[1] > 0.0,
+            "both amounts positive mid-absorption: {states:?}"
+        );
+    }
+
     /// Regression: `single_dose_concentration` and `single_dose_states[central]` must
     /// agree for OneCptOral infusion doses.  Before the fix both functions used the
     /// oral Bateman formula for infusions (which bypass the depot), so both returned
