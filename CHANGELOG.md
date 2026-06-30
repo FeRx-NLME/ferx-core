@@ -367,6 +367,17 @@ section of the SDLC for the versioning policy).
   reworded to state the non-interaction (Sheiner–Beal) semantics accurately (#599).
 
 ### Fixed
+- **TTE non-monotone-hazard guard now tracks the ODE solver tolerance** (#618). For a
+  drug-driven `[odes]` `hazard =` expression (no `h >= 0` constraint), the cumulative-
+  hazard monotonicity check rejected a negative increment `H(b) < H(a)` only past a fixed
+  `1e-3*|H|` round-off floor - 10x looser than the solver's default `reltol` (1e-4) and
+  growing without bound as `H` accumulates, so a genuinely negative step up to ~0.1% of a
+  large accumulated `H` slipped through as round-off (admitting `S = exp(-ΔH) > 1` and
+  biasing the optimizer toward the negative-hazard region). The floor is now tied to the
+  model's *configured* `ode_reltol`/`ode_abstol` (`abstol + reltol*|H|`, mirroring the
+  integrator's own per-step monotonicity tolerance), and the analytic closed-form path
+  uses a tight fixed floor. Such a step now correctly folds into the `1e20` sentinel,
+  while legitimate solver round-off on a flat/slow `H` stays finite.
 - **Estimation-method chains now run the covariance step only once, at the end of
   the chain** (#615). When a chain ended in a *default (estimating)* IMP stage
   (e.g. `methods = [saem, imp]`), both the preceding estimator and the IMP stage
