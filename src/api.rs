@@ -6226,10 +6226,23 @@ where
             // `auc_target = None` (the AUC pass is skipped) — so a dose issued *at* a
             // stop never coincides with this metric. If that ever changes (a
             // dose-on-stop reaching the AUC pass), the final dose's window would need
-            // explicit handling; the `..._after_discontinuation` test pins the
+            // explicit handling — the `debug_assert!` in the match arm below is the
+            // tripwire for exactly that, and `sim::adaptive::run_has_dose_on_stop` (with
+            // its unit test plus the `..._after_discontinuation` test) pins the
             // dose-free-`Stop` invariant this relies on.
             let window_aucs: Vec<f64> = match (auc_target, monitors.first()) {
                 (Some(_), Some(mon)) => {
+                    // Tripwire (see the note above): realized-window scoring is exact only
+                    // while no `Stop` carries a dose. Unreachable today; this fires in
+                    // debug/test builds if a future change ever routes a dose-on-stop here,
+                    // rather than silently under-reporting that final dose's exposure.
+                    debug_assert!(
+                        !crate::sim::adaptive::run_has_dose_on_stop(&run.decisions),
+                        "auc_target_attainment: a Stop carried a final dose (`[dose, Stop]`); \
+                         its post-stop exposure window is unscored under realized-window \
+                         scoring — the dose-free-Stop invariant no longer holds, so that \
+                         window now needs explicit handling"
+                    );
                     let realized_decision_times: Vec<f64> =
                         run.decisions.iter().map(|d| d.time).collect();
                     crate::ode::adaptive_window_signal_aucs(
