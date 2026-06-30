@@ -5004,13 +5004,23 @@ fn build_obs_scale_spec(
 /// compartment index for an **analytical** `pk_model`, validating that an
 /// initial amount in that compartment is supported (issue #521).
 ///
-/// Accepted names: `central` (every model), `depot` (oral models, cmt 1), or a
-/// 1-based integer index. Peripheral compartments are rejected — seeding a
-/// peripheral needs the cross-compartment Green's function, which the closed
-/// forms don't expose; use an ODE model for that.
+/// Accepted names: `central` (every model), `depot` (first-order oral models,
+/// cmt 1), or a 1-based integer index. Peripheral compartments are rejected —
+/// seeding a peripheral needs the cross-compartment Green's function, which the
+/// closed forms don't expose; use an ODE model for that.
 fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
     let is_oral = pk_model.is_oral();
     let central = if is_oral { 2 } else { 1 };
+    // A pre-loaded *depot* amount is delivered to central by a first-order
+    // absorption Green's function, which only the oral models expose. The analytic
+    // `one_cpt_transit` model is `is_oral()` (absorption layout, central = cmt 2)
+    // but its "depot" is a lumped Gamma-convolution memory with no closed form for
+    // a seeded amount, so a transit depot init is rejected here — otherwise
+    // `analytical_init_concentration_g`'s depot arm would silently drop it (#386).
+    let depot_seedable = matches!(
+        pk_model,
+        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+    );
     let lname = name.trim().to_lowercase();
 
     let cmt = if let Ok(n) = lname.parse::<usize>() {
@@ -5018,7 +5028,16 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
     } else {
         match lname.as_str() {
             "central" => central,
-            "depot" if is_oral => 1,
+            "depot" if depot_seedable => 1,
+            "depot" if matches!(pk_model, PkModel::OneCptTransit) => {
+                return Err(format!(
+                    "[initial_conditions]: `{}` (analytic transit) does not support a `depot` \
+                     initial amount — its transit chain is a lumped convolution with no closed \
+                     form for a pre-loaded depot. Use `central`, or an ODE transit model \
+                     (transit() forcing in [odes]) for a depot initial condition.",
+                    pk_model.canonical_name()
+                ));
+            }
             "depot" => {
                 return Err(format!(
                     "[initial_conditions]: `depot` is only valid for oral models; \
@@ -5031,21 +5050,34 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
                     "[initial_conditions]: unknown compartment `{}`. Use `central`{}, \
                      or a 1-based CMT index.",
                     name,
-                    if is_oral { " or `depot`" } else { "" }
+                    if depot_seedable { " or `depot`" } else { "" }
                 ));
             }
         }
     };
 
-    if cmt == central || (is_oral && cmt == 1) {
+    if cmt == central || (depot_seedable && cmt == 1) {
         Ok(cmt)
+    } else if matches!(pk_model, PkModel::OneCptTransit) && cmt == 1 {
+        // Numeric `init(1)` on transit: same lumped-convolution limitation as
+        // the named `depot` form above (#386).
+        Err(format!(
+            "[initial_conditions]: `{}` (analytic transit) does not support a depot (cmt 1) \
+             initial amount — its transit chain is a lumped convolution with no closed form \
+             for a pre-loaded depot. Use `central` (cmt 2), or an ODE transit model.",
+            pk_model.canonical_name()
+        ))
     } else {
         Err(format!(
             "[initial_conditions]: initial amounts are only supported in the central \
              compartment{} (got compartment {}). A peripheral-compartment initial amount \
              needs the cross-compartment impulse response, which the analytical closed \
              forms don't expose — use an ODE model with `init(...)` in [odes] (issue #521).",
-            if is_oral { " or the oral depot" } else { "" },
+            if depot_seedable {
+                " or the oral depot"
+            } else {
+                ""
+            },
             cmt
         ))
     }

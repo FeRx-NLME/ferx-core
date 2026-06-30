@@ -324,3 +324,37 @@ fn transit_ode_template_matches_pk() {
         );
     }
 }
+
+/// A `depot` (cmt 1) `[initial_conditions]` amount on the analytic transit model
+/// must be **rejected at parse**, not silently dropped (#386). The transit model
+/// is `is_oral()` (absorption layout), which the init-compartment resolver used to
+/// read as "has a seedable depot" — but the runtime init dispatch has no transit
+/// depot arm, so the amount would vanish with no error. `central` is still
+/// accepted (an amount pre-loaded in central just decays as a 1-cpt IV bolus).
+#[test]
+fn transit_depot_init_rejected_central_ok() {
+    let model_src = |ic: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(0.13, 0.001, 10.0)\n  \
+             theta TVV(8.0, 0.1, 500.0)\n  theta TVNTR(3.0, 0.0, 20.0)\n  \
+             theta TVMTT(1.5, 0.05, 50.0)\n  omega ETA_CL ~ 0.09\n  \
+             sigma PROP ~ 0.01 (sd)\n\n[individual_parameters]\n  \
+             CL = TVCL * exp(ETA_CL)\n  V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n\n\
+             [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
+             [error_model]\n  DV ~ proportional(PROP)\n\n[initial_conditions]\n{ic}\n"
+        )
+    };
+    // Named `depot` and numeric `init(1)` both name the lumped transit depot.
+    for ic in ["  init(depot) = 50.0", "  init(1) = 50.0"] {
+        let e = parse_full_model(&model_src(ic))
+            .err()
+            .unwrap_or_else(|| panic!("transit `{ic}` init should be rejected at parse"));
+        assert!(
+            e.contains("transit") && (e.contains("depot") || e.contains("cmt 1")),
+            "expected a transit depot-init rejection, got: {e}"
+        );
+    }
+    // Positive control: a central initial amount is supported and parses.
+    parse_full_model(&model_src("  init(central) = 2.0"))
+        .expect("transit central init should parse");
+}

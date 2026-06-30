@@ -154,9 +154,10 @@ absorption with `ka = 1/MTT`.
 optimiser is kept inside this region automatically.
 
 **Scope (first version).** This analytic model supports single and multiple
-**bolus** doses, bioavailability, and lag time. **Steady-state doses, IOV,
-time-varying covariates, and infusions are rejected** with an actionable message —
-use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
+**bolus** doses, bioavailability, lag time, and a `central` initial amount.
+**Steady-state doses, IOV, time-varying covariates, infusions, and a `depot`
+initial amount are rejected** with an actionable message — use the `transit()`
+ODE forcing above for those. The two paths agree to ODE-solver
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
 

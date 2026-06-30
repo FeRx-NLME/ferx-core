@@ -26,8 +26,8 @@ section of the SDLC for the versioning policy).
   FOCE/FOCEI sensitivities `∂C/∂{CL,V,N,MTT,F,η}` and no ODE solve — the fast analytic counterpart
   to the `transit()` ODE forcing, with continuous (estimable) `N`. Supports single/multiple bolus
   doses, bioavailability, and lag time; with `N = 0` it reduces exactly to first-order (Bateman)
-  oral absorption. Steady-state doses, IOV, time-varying covariates, and infusions are rejected
-  with an actionable message (use an ODE transit model for those). See
+  oral absorption. Steady-state doses, IOV, time-varying covariates, infusions, and a `depot`
+  initial amount are rejected with an actionable message (use an ODE transit model for those). See
   `examples/one_cpt_transit.ferx`.
 - `TIME`/`time` are now built-in event-time values in `[individual_parameters]`
   expressions and direct analytical `pk(...=TIME)` mappings, enabling
