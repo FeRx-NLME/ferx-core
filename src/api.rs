@@ -6144,6 +6144,17 @@ where
             // a clean "of the windows we dosed, how many hit target", on the same
             // realized basis as `pct_time_in_window`. For a run that never
             // discontinues the two decision lists are identical.
+            //
+            // Dropping the post-`Stop` windows loses no *dosed* window: a declarative
+            // `Stop` is dose-free (`adaptive_control::Controller::apply` maps it to
+            // `[DoseAction::Stop]`, never `[dose, Stop]`), so the last realized window
+            // already covers the last dose. The one controller that *can* dose-then-
+            // stop is the programmatic `Vec<DoseAction>` API, and that path runs with
+            // `auc_target = None` (the AUC pass is skipped) — so a dose issued *at* a
+            // stop never coincides with this metric. If that ever changes (a
+            // dose-on-stop reaching the AUC pass), the final dose's window would need
+            // explicit handling; the `..._after_discontinuation` test pins the
+            // dose-free-`Stop` invariant this relies on.
             let window_aucs: Vec<f64> = match (auc_target, monitors.first()) {
                 (Some(_), Some(mon)) => {
                     let realized_decision_times: Vec<f64> =
@@ -12191,7 +12202,15 @@ mod adaptive_sim_tests {
         // Only the realized decisions are logged (decision 0 dosed, decision 1
         // stopped); the 13 later scheduled decisions never occurred.
         assert_eq!(res.decisions.len(), 2, "only realized decisions logged");
-        assert_eq!(res.ledger.len(), 1, "one realized dose, at t=0");
+        // One realized dose, at t=0: the `Stop` at decision 1 is DOSE-FREE. This is
+        // the invariant that makes realized-window scoring lose no dosed window — a
+        // declarative `Stop` never carries a final dose, so there is no dose issued
+        // *at* the stop whose (dropped) post-stop window would have mattered.
+        assert_eq!(
+            res.ledger.len(),
+            1,
+            "one realized dose; the Stop dosed nothing"
+        );
 
         // Scored over the ONE realized window [0, 24] ⇒ 1.0. (Old planned-horizon
         // behavior: ~3 of 14 scheduled windows in band ⇒ ~0.214, so this fails on it.)
