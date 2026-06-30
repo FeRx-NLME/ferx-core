@@ -183,7 +183,7 @@ pub fn solve_ode_with_stats(
 /// This is the single owner of the f64 stepping loop; [`solve_ode`] /
 /// [`solve_ode_with_stats`] are the `interp_at = &[]` wrappers.
 #[allow(clippy::too_many_arguments)]
-fn solve_ode_dense(
+pub(crate) fn solve_ode_dense(
     rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
     u0: &[f64],
     t_span: (f64, f64),

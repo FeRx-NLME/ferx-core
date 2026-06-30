@@ -7,7 +7,7 @@
 //! infusion's end time and adding `+rate` to the corresponding compartment's
 //! derivative for the duration of the infusion via an RHS wrapper.
 
-use crate::ode::solver::{solve_ode, solve_ode_with_stats, OdeSolverOptions, OdeSolverStats};
+use crate::ode::solver::{solve_ode, solve_ode_dense, OdeSolverOptions, OdeSolverStats};
 use crate::pk::absorption::PreparedInputRate;
 use crate::sim::adaptive::{
     assay_standard_normal, AdaptiveMonitor, AdaptiveRun, AssayNoise, ControllerCtx,
@@ -1106,7 +1106,13 @@ fn integrate_segment(
     obs_map: &HashMap<u64, Vec<usize>>,
     predictions: &mut [f64],
     stats: Option<&mut OdeSolverStats>,
-) {
+    // #570: soft (Hermite-interpolated) sample times within this segment — e.g. TTE
+    // event/censor times — read off the *same* integration as the observations,
+    // without clamping the step sequence. The returned observation predictions and
+    // the advanced `u` are therefore bit-identical to a `chz_times = &[]` call.
+    // Must be sorted ascending and lie in `(t_start, t_end]`; the caller filters.
+    chz_times: &[f64],
+) -> Vec<Vec<f64>> {
     let opts = ode.solver_opts;
 
     // Observation times in this segment (t_start < t <= t_end)
@@ -1124,7 +1130,7 @@ fn integrate_segment(
     saveat.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
     if (t_end - t_start).abs() < 1e-15 {
-        return;
+        return Vec::new();
     }
 
     // Update TAD anchor (slot MAX_PK_PARAMS+1): last effective dose time
@@ -1189,12 +1195,13 @@ fn integrate_segment(
         InfusionInput::Spanning(active),
         &zero_order,
     );
-    let sol = solve_ode_with_stats(
+    let (sol, soft) = solve_ode_dense(
         &wrapped_rhs,
         u,
         (t_start, t_end),
         ext_params,
         &saveat,
+        chz_times,
         &opts,
         stats,
     );
@@ -1221,6 +1228,11 @@ fn integrate_segment(
     if let Some(last) = sol.last() {
         u.copy_from_slice(&last.u);
     }
+
+    // #570: full interpolated state at each requested soft time, in `chz_times`
+    // order. Empty (just an empty Vec, no heap alloc) on the `chz_times = &[]` hot
+    // path, so existing callers ignore a no-op return.
+    soft.into_iter().map(|p| p.u).collect()
 }
 
 /// Dose events are handled as state discontinuities between integration segments.
@@ -1231,7 +1243,54 @@ pub fn ode_predictions(
     eta: &[f64],
     subject: &Subject,
 ) -> Vec<f64> {
-    ode_predictions_with_extra_breaks_and_stats(ode, pk_params_flat, theta, eta, subject, &[], None)
+    ode_predictions_with_extra_breaks_and_stats(
+        ode,
+        pk_params_flat,
+        theta,
+        eta,
+        subject,
+        &[],
+        None,
+        &[],
+    )
+    .0
+}
+
+/// #570: one augmented-ODE integration yielding **both** the Gaussian predictions
+/// and the cumulative-hazard state at `chz_times` (a joint PK-TTE subject's
+/// event/censor/entry times), so the joint fit no longer integrates the augmented
+/// system a second time to read `H`/`h`.
+///
+/// The predictions are **bit-identical** to [`ode_predictions`] — the observation
+/// `saveat` (which clamps the step sequence) is untouched; the CHZ states are read
+/// by in-step cubic Hermite interpolation, which does not perturb the steps.
+/// `chz_times` must be **sorted ascending and unique**. Returns `(ipred, chz_states)`
+/// where `chz_states[i]` is the full ODE state at `chz_times[i]` — NaN-filled for any
+/// time before the integration start (matching the dedicated `ode_dense_solve_states`
+/// path, which the TTE NLL maps to its `1e20` sentinel). `ipred` is the raw observable
+/// readout; callers apply `[scaling]` / log-transform exactly as for `ode_predictions`.
+///
+/// Gated on `survival` — its only consumer is the joint PK-TTE fit path, so the
+/// default build neither compiles nor flags it.
+#[cfg(feature = "survival")]
+pub(crate) fn ode_predictions_and_chz(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+    chz_times: &[f64],
+) -> (Vec<f64>, Vec<Vec<f64>>) {
+    ode_predictions_with_extra_breaks_and_stats(
+        ode,
+        pk_params_flat,
+        theta,
+        eta,
+        subject,
+        &[],
+        None,
+        chz_times,
+    )
 }
 
 /// [`ode_predictions`] plus aggregate RK45 step counters across all integration
@@ -1250,7 +1309,7 @@ pub fn ode_predictions_with_solver_stats(
     subject: &Subject,
 ) -> (Vec<f64>, OdeSolverStats) {
     let mut stats = OdeSolverStats::default();
-    let predictions = ode_predictions_with_extra_breaks_and_stats(
+    let (predictions, _chz) = ode_predictions_with_extra_breaks_and_stats(
         ode,
         pk_params_flat,
         theta,
@@ -1258,6 +1317,7 @@ pub fn ode_predictions_with_solver_stats(
         subject,
         &[],
         Some(&mut stats),
+        &[],
     );
     (predictions, stats)
 }
@@ -1293,7 +1353,9 @@ pub(crate) fn ode_predictions_with_extra_breaks(
         subject,
         extra_breaks,
         None,
+        &[],
     )
+    .0
 }
 
 fn ode_predictions_with_extra_breaks_and_stats(
@@ -1304,10 +1366,21 @@ fn ode_predictions_with_extra_breaks_and_stats(
     subject: &Subject,
     extra_breaks: &[f64],
     mut stats: Option<&mut OdeSolverStats>,
-) -> Vec<f64> {
+    // #570: soft (Hermite-interpolated) sample times — e.g. TTE event/censor times —
+    // read off this same Gaussian integration. Sorted ascending. Empty for every
+    // ipred-only caller, in which case the second return value is empty and the
+    // predictions are bit-identical to before.
+    chz_times: &[f64],
+) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
     let opts = ode.solver_opts;
+    // #570: full state at each `chz_times[i]`, pre-filled NaN so a soft time before
+    // the integration start (or otherwise uncovered by a segment) reads NaN → the TTE
+    // 1e20 sentinel — exactly as the dedicated `ode_dense_solve_states` path does
+    // today. `chz_times` is sorted-unique (caller contract), enabling the binary
+    // search that maps each segment's soft samples back to their global slot.
+    let mut chz_states: Vec<Vec<f64>> = vec![vec![f64::NAN; n]; chz_times.len()];
 
     // Seed compartments from `init(state) = expr` (zeros when none declared).
     let mut u = ode.initial_state(pk_params_flat);
@@ -1369,7 +1442,15 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // Break timeline at lagtime-shifted dose times — and, for infusions,
     // at lagtime-shifted infusion-end times too, so each segment is
     // either fully inside or fully outside every infusion window.
-    let t_last = subject.obs_times.iter().cloned().fold(0.0f64, f64::max);
+    // #570: also reach any soft (TTE) time past the last observation. This only
+    // *appends* a final segment after the last obs — earlier breaks and every
+    // observation prediction are untouched, so ipred stays bit-identical.
+    let t_last = subject
+        .obs_times
+        .iter()
+        .chain(chz_times.iter())
+        .cloned()
+        .fold(0.0f64, f64::max);
     let mut break_times: Vec<f64> = vec![subject_integration_start(subject)];
     for (i, dose) in subject.doses.iter().enumerate() {
         let lag = dose_lagtimes[i];
@@ -1482,7 +1563,14 @@ fn ode_predictions_with_extra_breaks_and_stats(
         // left-boundary discontinuities and the `t_start` observation were applied
         // above; `integrate_segment` owns only the integration — the piece a
         // reactive (state-dependent) driver reuses unchanged (#391 S1.2).
-        integrate_segment(
+        // #570: soft (TTE) times inside this open interval `(t_start, t_end]`, read
+        // off the same integration. `chz_times` is sorted, so this slice is too.
+        let seg_chz: Vec<f64> = chz_times
+            .iter()
+            .copied()
+            .filter(|&t| t > t_start + 1e-12 && t <= t_end + 1e-12)
+            .collect();
+        let soft = integrate_segment(
             ode,
             &mut u,
             t_start,
@@ -1497,7 +1585,15 @@ fn ode_predictions_with_extra_breaks_and_stats(
             &obs_map,
             &mut predictions,
             stats.as_deref_mut(),
+            &seg_chz,
         );
+        // Place each soft sample at its global `chz_times` index (NaN slots left for
+        // any time no segment covered).
+        for (t, state) in seg_chz.iter().zip(soft) {
+            if let Ok(gi) = chz_times.binary_search_by(|x| x.partial_cmp(t).unwrap()) {
+                chz_states[gi] = state;
+            }
+        }
     }
 
     // Clamp negative predictions to zero (ODE solver overshoot guard).
@@ -1513,7 +1609,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
         }
     }
 
-    predictions
+    (predictions, chz_states)
 }
 
 /// Insert a dynamically-discovered break time — an infusion end the reactive
@@ -2104,6 +2200,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &obs_map,
                 &mut predictions,
                 None,
+                &[],
             );
         }
 
@@ -3681,6 +3778,46 @@ mod tests {
         assert_relative_eq!(states[0][1], threshold, epsilon = 1e-4);
     }
 
+    /// #570 driver-level share: `ode_predictions_and_chz` returns the Gaussian
+    /// predictions **bit-identical** to `ode_predictions` (the obs `saveat` / step
+    /// sequence is untouched) and the cumulative-hazard state at the event times
+    /// equal to the dedicated `ode_dense_solve_states` read it replaces — proving one
+    /// integration now serves both consumers. Covers event times between, on, and
+    /// **after** the last observation (33 > 30, exercising the `t_last` extension).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ode_predictions_and_chz_shares_one_solve() {
+        let ode = one_cpt_chz_ode_spec();
+        let subject = make_subject(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            vec![0.5, 2.0, 6.0, 12.0, 24.5, 30.0],
+        );
+        let pk = pk_one(10.0, 100.0);
+        // Sorted, unique TTE event/censor times — interior, on-grid, and past last obs.
+        let chz_times = vec![1.0, 6.0, 18.0, 33.0];
+
+        let (ipred, chz_states) =
+            ode_predictions_and_chz(&ode, &pk.values, &[], &[], &subject, &chz_times);
+        let ipred_ref = ode_predictions(&ode, &pk.values, &[], &[], &subject);
+        let chz_ref = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &chz_times);
+
+        // (1) Predictions bit-identical — the shared solve does not move the fit ipred.
+        assert_eq!(
+            ipred, ipred_ref,
+            "ode_predictions_and_chz must not change the predictions"
+        );
+
+        // (2) CHZ (state index 1) at each event time matches the dedicated clamped
+        // solve to solver tolerance (the Hermite read-back substitutes for it).
+        assert_eq!(chz_states.len(), chz_times.len());
+        for (i, st) in chz_states.iter().enumerate() {
+            assert_relative_eq!(st[1], chz_ref[i][1], max_relative = 1e-5);
+        }
+    }
+
     /// A threshold above the asymptotic cumulative hazard (`CHZ → 100`) is never
     /// reached ⇒ the draw is censored at the horizon, not failed.
     #[cfg(feature = "survival")]
@@ -3788,6 +3925,7 @@ mod tests {
             &obs_map,
             &mut predictions,
             None,
+            &[],
         );
 
         assert_eq!(u, vec![10.0], "zero-length segment must not change state");
@@ -3826,6 +3964,7 @@ mod tests {
             &obs_map,
             &mut predictions,
             None,
+            &[],
         );
 
         let expected = 10.0 * (-1.0f64).exp(); // 10·e^{-ke·10}, ke = 0.1
@@ -5566,6 +5705,7 @@ mod tests {
             &obs_map,
             &mut predictions,
             None,
+            &[],
         );
 
         // TAD anchor must be the dose time (0.0), not NaN.
