@@ -183,3 +183,5 @@ both.
 ## Pull Requests
 
 When creating a PR in this repo, always read `.github/PULL_REQUEST_TEMPLATE.md` and fill every section before calling `gh pr create`.
+
+After code-reviewing a PR, always post your comments on the PR.

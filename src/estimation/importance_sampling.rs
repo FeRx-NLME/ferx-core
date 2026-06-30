@@ -1957,6 +1957,29 @@ pub(crate) fn compute_posterior_hessian(
     }
     let ipreds =
         compute_predictions_with_tv_into(model, subject, theta, eta_hat.as_slice(), scratch);
+    // block_sigma: build the proposal precision from the FULL residual covariance,
+    // `H_post = Ω⁻¹ + Jᵀ R⁻¹ J`, so the Student-t proposal reflects the correlated
+    // posterior shape (a diagonal-R proposal still yields correct importance
+    // weights — those use the dense data term — but inflates the weight variance /
+    // lowers ESS). block_sigma is rejected with FREM and iiv_on_ruv, so no R
+    // overrides or residual-eta curvature apply. A non-PD R falls through to the
+    // diagonal approximation below.
+    if !model.residual_correlations.is_empty() {
+        let r = crate::stats::residual_error::compute_r_matrix_with_correlations(
+            &model.error_spec,
+            &ipreds,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma,
+            &model.residual_correlations,
+        );
+        if let Some(chol) = r.cholesky() {
+            let r_inv = chol.inverse();
+            return omega_inv + jacobian.transpose() * &r_inv * jacobian;
+        }
+    }
     let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
     // IIV on residual error (#409): scale the PK residual variance at the mode by
     // exp(2·η̂_ruv) so the Laplace proposal precision reflects the per-subject

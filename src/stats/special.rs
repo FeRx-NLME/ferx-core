@@ -103,20 +103,30 @@ pub fn inv_mills(z: f64) -> f64 {
 }
 
 /// Shared M3-censored kernel at a censored row with limit `y`, prediction `f`,
-/// residual variance `v` and `dv_df = ∂v/∂f`: returns `(h, z, m)` where
-/// `z = (y − f)/√v`, `h = φ(z)/Φ(z)` ([`inv_mills`]), and
-/// `m = 1/√v + (y − f)·dv_df / (2·v^{3/2})`.
+/// residual variance `v`, `dv_df = ∂v/∂f`, and censoring sign `cens` (NONMEM
+/// convention: `cens > 0` = below-LLOQ / lower tail, `cens < 0` = above-ULOQ /
+/// upper tail). Returns the **signed** `(h, z, m)` where, with `σ = sign(cens)`
+/// (`+1` for left, `−1` for right):
+/// `z = σ·(y − f)/√v` is the tail argument the objective scores
+/// (`−logΦ(z)`, matching [`m3_logcdf`](crate::stats::likelihood::m3_logcdf)),
+/// `h = φ(z)/Φ(z)` ([`inv_mills`]), and the signed
+/// `m = σ·[1/√v + (y − f)·dv_df / (2·v^{3/2})]`.
 ///
-/// These three feed every censored derivative so they cannot drift:
-/// the data-term f-coefficient `∂(−logΦ)/∂f = h·m`; the `iiv_on_ruv` residual-η
-/// column `∂(−logΦ)/∂η_ruv = h·z`; and the censored × residual-η cross
-/// coefficients via `C = h·(z² + h·z − 1)` (`C·z`, `C·m`).
+/// Signing `z` and `m` together keeps every downstream censored derivative
+/// tail-correct with **no** per-caller branch: the data-term f-coefficient
+/// `∂(−logΦ)/∂f = h·m`; the `iiv_on_ruv` residual-η column
+/// `∂(−logΦ)/∂η_ruv = h·z`; and the censored × residual-η cross coefficients via
+/// `C = h·(z² + h·z − 1)` (`C·z`, `C·m`). (The second-order f-curvature `g2` in
+/// [`m3_censored_outer`](crate::estimation::sens_outer_gradient) also signs its
+/// `∂m/∂f` term by the same `σ`.) For the lower tail (`cens ≥ 0`) `σ = +1` and
+/// these reduce to the historical unsigned forms.
 #[inline]
-pub fn m3_censored_kernel(y: f64, f: f64, v: f64, dv_df: f64) -> (f64, f64, f64) {
+pub fn m3_censored_kernel(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> (f64, f64, f64) {
     let w = v.sqrt();
-    let z = (y - f) / w;
+    let sgn = if cens < 0 { -1.0 } else { 1.0 };
+    let z = sgn * (y - f) / w;
     let h = inv_mills(z);
-    let m = 1.0 / w + (y - f) * dv_df / (2.0 * v * w);
+    let m = sgn * (1.0 / w + (y - f) * dv_df / (2.0 * v * w));
     (h, z, m)
 }
 

@@ -937,6 +937,11 @@ fn parse_subject(
     _tentry_col: Option<usize>,
 ) -> Result<(Subject, usize, usize, SubjectExclusion, Vec<String>, usize), String> {
     let mut doses = Vec::new();
+    // File-order record index (position in `rows`) of each dose / observation,
+    // parallel to `doses` (pre-sort) and `obs_times`. Used after the loop to
+    // honor NONMEM record order at equal TIME (see the obs/dose tie-break pass).
+    let mut dose_rec: Vec<usize> = Vec::new();
+    let mut obs_rec: Vec<usize> = Vec::new();
     let mut obs_times = Vec::new();
     let mut obs_raw_times = Vec::new();
     let mut observations = Vec::new();
@@ -1059,7 +1064,7 @@ fn parse_subject(
     // map; numeric-only filters never touch it, so skip the per-row allocation.
     let needs_str_cov = filter.is_some_and(|f| f.needs_str_covariates());
 
-    for row in rows {
+    for (row_seq, row) in rows.iter().enumerate() {
         // Update LOCF state from this row's TV-covariate values *before*
         // classifying the event, matching NONMEM's "$PK runs at the record
         // with this record's covariate values" semantics.
@@ -1270,6 +1275,7 @@ fn parse_subject(
                     DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode)
                 }
             });
+            dose_rec.push(row_seq);
             if occ_col.is_some() {
                 dose_occasions.push(occ);
             }
@@ -1316,6 +1322,7 @@ fn parse_subject(
                             false, // expanded doses are never SS themselves
                             ii,
                         ));
+                        dose_rec.push(row_seq);
                         if occ_col.is_some() {
                             dose_occasions.push(occ);
                         }
@@ -1473,6 +1480,7 @@ fn parse_subject(
                     .map(|s| parse_cens(s))
                     .unwrap_or(0);
                 obs_times.push(time);
+                obs_rec.push(row_seq);
                 obs_raw_times.push(raw_time);
                 observations.push(dv);
                 obs_cmts.push(cmt);
@@ -1529,6 +1537,7 @@ fn parse_subject(
     let mut perm: Vec<usize> = (0..n_doses).collect();
     perm.sort_by(|&a, &b| doses[a].time.partial_cmp(&doses[b].time).unwrap());
     let sorted_doses: Vec<DoseEvent> = perm.iter().map(|&i| doses[i].clone()).collect();
+    let sorted_dose_rec: Vec<usize> = perm.iter().map(|&i| dose_rec[i]).collect();
     let sorted_dose_occ: Vec<u32> = if occ_col.is_some() {
         perm.iter().map(|&i| dose_occasions[i]).collect()
     } else {
@@ -1543,6 +1552,46 @@ fn parse_subject(
     // Reset events are recorded in row order, which is usually time order;
     // sort defensively so the event-driven propagators see them in order.
     reset_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // ── Honor NONMEM record order for a same-TIME observation/dose ──────────
+    // NONMEM processes data records in file order: an observation listed BEFORE
+    // a dose at the *same* TIME is a pre-dose (trough) sample and must not see
+    // that dose; one listed AFTER is a post-dose sample that does. ferx's
+    // solvers instead order events by time, and at equal time place the dose
+    // first — both the event-driven sort (`kind_order`: Dose < Obs) and the
+    // analytical superposition gate (`t_eff <= t`, so a dose at exactly the obs
+    // time contributes). That turns every coincident trough into a post-dose
+    // peak (e.g. infliximab run55: eval OFV 3751 vs NONMEM 662), railing fits to
+    // their bounds.
+    //
+    // We restore record-order semantics by nudging a pre-dose observation one
+    // ULP below the coincident dose time, so both solver paths evaluate it just
+    // before the dose. The change is numerically inert for the prediction (a
+    // single ULP) and leaves `obs_raw_times` — the user-clock value reported in
+    // sdtab/covtab and by predict()/simulate() — untouched.
+    //
+    // Only a "pure trough" is nudged: every coincident dose is non-SS and comes
+    // *after* the observation in the file. If any coincident dose precedes the
+    // observation (a genuine post-dose sample, or a rare dose/obs/dose straddle)
+    // it is left alone. SS doses are excluded: a sub-dose-time sample would read
+    // 0 instead of the periodic pre-arrival trough the SS closed form supplies.
+    for j in 0..obs_times.len() {
+        let t = obs_times[j];
+        let mut later_nonss = false;
+        let mut earlier_any = false;
+        for d in 0..sorted_doses.len() {
+            if sorted_doses[d].time == t && !sorted_doses[d].ss {
+                if sorted_dose_rec[d] > obs_rec[j] {
+                    later_nonss = true;
+                } else if sorted_dose_rec[d] < obs_rec[j] {
+                    earlier_any = true;
+                }
+            }
+        }
+        if later_nonss && !earlier_any {
+            obs_times[j] = t.next_down();
+        }
+    }
 
     // Flush any remaining pending TTE left-bounds as right-censored events.
     // This handles the common case: final row is a right-censored DV=0 with no
@@ -2184,6 +2233,59 @@ mod tests {
         assert_eq!(subj.doses.len(), 2);
         assert!(subj.doses.iter().any(|d| d.time == 10.0 && d.amt == 200.0));
         assert_eq!(subj.obs_times, vec![1.0, 11.0]);
+    }
+
+    #[test]
+    fn test_obs_before_same_time_dose_is_pre_dose_trough() {
+        // NONMEM record order: an observation listed BEFORE a dose at the same
+        // TIME is a pre-dose trough and must sort strictly before that dose.
+        // The reader nudges its engine-clock time one ULP below the dose time;
+        // the raw user-clock time is preserved for diagnostics.
+        let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,14,5.0,0,.\n\
+                   1,14,.,1,100\n\
+                   1,28,3.0,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert!(subj.doses.iter().any(|d| d.time == 14.0));
+        // First obs nudged just below the coincident dose at t=14.
+        assert_eq!(subj.obs_times[0], 14.0_f64.next_down());
+        assert!(subj.obs_times[0] < 14.0);
+        // Raw user-clock time is untouched.
+        assert_eq!(subj.obs_raw_times[0], 14.0);
+        // A non-coincident obs is left exactly as-is.
+        assert_eq!(subj.obs_times[1], 28.0);
+    }
+
+    #[test]
+    fn test_dose_before_same_time_obs_stays_post_dose() {
+        // Reverse record order: the dose row precedes the obs row at t=14, so the
+        // observation is a post-dose sample and its time is NOT nudged.
+        let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,14,.,1,100\n\
+                   1,14,5.0,0,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.obs_times, vec![14.0]);
+    }
+
+    #[test]
+    fn test_obs_before_ss_dose_is_not_nudged() {
+        // An SS dose carries its own periodic pre-arrival tail; a sub-dose-time
+        // sample would read 0 instead of the SS trough, so SS doses are excluded
+        // from the record-order nudge even when the obs precedes them in the file.
+        let csv = "ID,TIME,DV,EVID,AMT,SS,II\n\
+                   1,0,.,1,100,1,24\n\
+                   1,24,5.0,0,.,.,.\n\
+                   1,24,.,1,100,1,24\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.obs_times, vec![24.0]);
     }
 
     #[test]

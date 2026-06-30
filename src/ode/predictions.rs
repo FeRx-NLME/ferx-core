@@ -2220,6 +2220,132 @@ pub(crate) fn verify_adaptive_frozen_replay(
     Ok(())
 }
 
+/// Number of trapezoid panels per inter-decision window for the metrics-only
+/// signal-AUC (#391 S2.5b). A fixed *subdivision count* (unit-agnostic — not a step
+/// in time units), generous enough that the trapezoid discretization error on a
+/// smooth PK curve sits well below the cross-engine solver agreement. This is the
+/// AUC machinery's **own** grid: it deliberately does not touch the reactive
+/// driver's `saveat`, because the stepper clamps `dt` to land on each save point
+/// (`solver.rs`), so adding points there would perturb the bit-aligned trajectory
+/// and the default-on frozen-replay verifier.
+const ADAPTIVE_AUC_PANELS: usize = 128;
+
+/// Per-(inter-decision)-window AUC of the **latent** monitored signal — the input
+/// to the `auc_target_attainment` metric (#391 S2.5b).
+///
+/// Metrics-only: the exposure never feeds the controller (the `when` rules titrate
+/// on the point `signal`), so it is computed here — *after* the reactive run, from
+/// the realized `ledger` — rather than inline in the hot loop. Like
+/// [`verify_adaptive_frozen_replay`] it rebuilds the static dose schedule from the
+/// run's `ledger` and replays it through the trusted dense-state engine
+/// ([`ode_dense_solve_states`]); each window is integrated on its **own** uniform
+/// sub-grid and reduced with the shared trapezoid rule ([`crate::api::trapezoid`]).
+///
+/// **Window convention — left-closed / right-open.** Each window
+/// `[decision_times[k], decision_times[k+1]]` includes the dose at its left edge
+/// `a` (the post-dose state there is the true start of this window's exposure) but
+/// **not** the dose at its right edge `b`, which belongs to the next window.
+/// [`ode_dense_solve_states`] saves the *post-dose* state at a save point that
+/// coincides with a dose time, so the windows cannot share one grid + one solve:
+/// that folds the next window's dose into this window's right endpoint — a spurious
+/// jump of ≈ ½·Δsignal·(window ⁄ panels) for an instantaneous (bolus) dose (an
+/// infusion delivers ≈0 at its start instant and is unaffected, but the convention
+/// must be correct for both). So each window is solved against a static subject that
+/// drops every dose after `a` — future doses cannot affect `[a, b]`, so this is
+/// exact — leaving `b` a plain pre-dose decay point.
+///
+/// **Cost — `O(m²)`, deliberately.** This is one dense solve per window, and
+/// because [`ode_dense_solve_states`] always starts from `t = 0` (it cannot resume
+/// from a saved state), window `k` re-integrates `[0, decision_times[k+1]]` — so the
+/// pass is quadratic in the decision count `m` (`1 + 2 + … + (m−1)`), versus `O(m)`
+/// for a single shared solve. That is an accepted trade for correctness: the pass
+/// runs **only** when `auc_target` is declared and **only after** the reactive run
+/// (a per-(subject, replicate) reporting step, never inside the fit/inner loop), so
+/// for the intended TDM scale (tens of decisions, a microsecond each) the quadratic
+/// factor is negligible. Collapsing it back to `O(m)` would require a solver entry
+/// point that resumes from a mid-trajectory state, or a dense readout of the
+/// *pre-dose* value at a dose instant — both larger changes to the shared engine,
+/// left as a follow-up rather than bundled into the boundary fix.
+///
+/// Returns one AUC per **closed** window `[decision_times[k], decision_times[k+1]]`
+/// (length `decision_times.len() − 1`; empty for a single decision — there is no
+/// window to integrate over). The signal is the latent readout the driver itself
+/// would resolve: the compiled `observe` expression when present (the `Ipred`
+/// path), else the model's `monitor_cmt` readout (the `Dv` path's underlying
+/// latent — the AUC is always over the un-noised signal, never the assay draw).
+///
+/// `base_subject` is the dose-free subject the run was driven from; only its doses
+/// are replaced (its covariates carry over — the reactive driver is BSV-only in
+/// this slice, so a single static covariate snapshot is exact).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn adaptive_window_signal_aucs(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    base_subject: &Subject,
+    decision_times: &[f64],
+    ledger: &[DoseLedgerEntry],
+    observe: Option<&OdeOutputFn>,
+    monitor_cmt: usize,
+) -> Vec<f64> {
+    let m = decision_times.len();
+    if m < 2 {
+        return Vec::new();
+    }
+
+    let panels = ADAPTIVE_AUC_PANELS;
+    // BSV-only ⇒ the subject's static covariate snapshot applies at every grid time.
+    let cov = &base_subject.covariates;
+
+    // One closed window at a time (see "Window convention" above): integrate
+    // `[a, b]` against a static subject carrying only the doses at or before the
+    // window's left edge `a`, so the dose at the right edge `b` (the next window's)
+    // never folds into this window's endpoint.
+    (0..m - 1)
+        .map(|k| {
+            let (a, b) = (decision_times[k], decision_times[k + 1]);
+
+            // Doses at or before `a` (nominal amt/rate; F/lag re-apply downstream
+            // exactly as for a scheduled dose). A dose exactly at `a` is THIS
+            // window's own dose and is kept; the `1e-9` only guards float equality
+            // at the boundary, far below any real decision spacing.
+            let mut sub = base_subject.clone();
+            sub.doses = ledger
+                .iter()
+                .filter(|e| e.time <= a + 1e-9)
+                .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+                .collect();
+
+            // The window's own uniform sub-grid: `panels + 1` points, `grid[0] == a`
+            // (post-dose) and `grid[panels] == b` (pre-dose decay).
+            let span = b - a;
+            let grid: Vec<f64> = (0..=panels)
+                .map(|i| a + span * (i as f64) / (panels as f64))
+                .collect();
+
+            let states = ode_dense_solve_states(ode, pk_params_flat, theta, eta, &sub, &grid);
+
+            // Latent signal at each grid point (the same readout the driver resolves
+            // at a decision), then trapezoid the window.
+            let pts: Vec<(f64, f64)> = states
+                .iter()
+                .enumerate()
+                .map(|(i, u)| {
+                    let s = match observe {
+                        Some(f) => f(u, pk_params_flat, theta, eta, cov),
+                        None => {
+                            read_observable(ode, u, pk_params_flat, theta, eta, cov, monitor_cmt)
+                        }
+                    };
+                    (grid[i], s)
+                })
+                .collect();
+            crate::api::trapezoid(&pts)
+        })
+        .collect()
+}
+
 /// ODE-based predictions with per-event PK parameters (time-varying-covariate
 /// aware). Walks the merged dose+obs+pk-only timeline, integrating each
 /// segment `[cur_t, t_event]` with the PK params evaluated at `t_event` —
@@ -3747,6 +3873,138 @@ mod tests {
             }
             other => panic!("expected SolveFailed, got {other:?}"),
         }
+    }
+
+    /// A bolus dose-ledger row, for the signal-AUC pass test below.
+    fn ledger_bolus(time: f64, amt: f64, cmt: usize) -> DoseLedgerEntry {
+        DoseLedgerEntry {
+            subject: "1".into(),
+            draw: 0,
+            sim: 0,
+            dose_idx: 0,
+            time,
+            amt,
+            cmt,
+            rate: 0.0,
+            decision_idx: 0,
+            rule_fired: "bolus".into(),
+            observed_signals: Vec::new(),
+            pre_state: None,
+            post_state: None,
+            f_applied: 1.0,
+        }
+    }
+
+    /// Analytic accuracy check for the metrics-only signal-AUC pass
+    /// ([`adaptive_window_signal_aucs`], #391 S2.5b). For a 1-cpt model with a single
+    /// IV bolus `D` at t = 0, the amount readout is `A(t) = D·e^{-ke t}` (ke = CL/V),
+    /// so the exposure over a window `[a, b]` *after* the dose is the closed form
+    /// `∫ₐᵇ A dt = (D/ke)(e^{-ke a} − e^{-ke b})`. The window is placed strictly after
+    /// the bolus so every grid edge sits in the smooth decay phase (no dose
+    /// discontinuity to straddle), and the trapezoid converges to that closed form.
+    #[test]
+    fn adaptive_window_signal_aucs_matches_closed_form() {
+        let ode = one_cpt_ode_spec(); // readout = ObsCmt(0): the central amount
+        let pk = pk_one(10.0, 100.0); // ke = CL/V = 0.1
+        let (ke, d) = (0.1_f64, 100.0_f64);
+        let base = make_subject(vec![], vec![]); // dose-free; the pass uses its own grid
+        let ledger = vec![ledger_bolus(0.0, d, 1)];
+        let auc = |a: f64, b: f64| (d / ke) * ((-ke * a).exp() - (-ke * b).exp());
+
+        // Single window [2, 10], entirely in the decay phase.
+        let one = adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[2.0, 10.0],
+            &ledger,
+            None,
+            1,
+        );
+        assert_eq!(one.len(), 1);
+        // 128-panel trapezoid of a smooth decay ⇒ ~3e-6 relative to the closed form.
+        assert_relative_eq!(one[0], auc(2.0, 10.0), max_relative = 1e-4);
+
+        // Two windows [2,6],[6,10]: exercises per-window splitting *and* state
+        // continuity across the shared boundary (the second window must resume the
+        // decay, not restart from the initial state).
+        let two = adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[2.0, 6.0, 10.0],
+            &ledger,
+            None,
+            1,
+        );
+        assert_eq!(two.len(), 2);
+        assert_relative_eq!(two[0], auc(2.0, 6.0), max_relative = 1e-4);
+        assert_relative_eq!(two[1], auc(6.0, 10.0), max_relative = 1e-4);
+        // The two windows partition [2, 10], so their exposures sum to the total.
+        assert_relative_eq!(two[0] + two[1], auc(2.0, 10.0), max_relative = 1e-4);
+
+        // Fewer than two decisions ⇒ no closed window ⇒ empty (the metric is `None`).
+        let none = adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[2.0],
+            &ledger,
+            None,
+            1,
+        );
+        assert!(none.is_empty());
+    }
+
+    /// Regression (#391 S2.5b): a dose landing exactly on a window's **right**
+    /// boundary belongs to the *next* window and must not inflate this one. Because
+    /// [`ode_dense_solve_states`] saves the post-dose state at a save point on a dose
+    /// time, an earlier single-grid implementation folded the next bolus's jump into
+    /// the preceding window's right endpoint (≈ ½·Δsignal·(window ⁄ panels)). With a
+    /// bolus at *every* decision time, each window must integrate only the doses at
+    /// or before its own left edge. This test fails on that earlier implementation.
+    #[test]
+    fn adaptive_window_signal_aucs_excludes_boundary_dose() {
+        let ode = one_cpt_ode_spec(); // readout = central amount, RHS = -ke·y
+        let pk = pk_one(10.0, 100.0); // ke = CL/V = 0.1
+        let (ke, d) = (0.1_f64, 100.0_f64);
+        let base = make_subject(vec![], vec![]);
+        // A bolus at each decision time 0, 24, 48 ⇒ windows [0,24] and [24,48].
+        let ledger = vec![
+            ledger_bolus(0.0, d, 1),
+            ledger_bolus(24.0, d, 1),
+            ledger_bolus(48.0, d, 1),
+        ];
+        let aucs = adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[0.0, 24.0, 48.0],
+            &ledger,
+            None,
+            1,
+        );
+        assert_eq!(aucs.len(), 2);
+
+        // Window 0 = [0,24]: exposure from the t=0 bolus ONLY (the t=24 bolus is the
+        // next window's). Post-dose A(0) = D, so ∫₀²⁴ = (D/ke)(1 − e^{−24ke}). The
+        // buggy single-grid version reported ≈ +9.4 (≈ +1%) here from the t=24 jump.
+        let w0 = (d / ke) * (1.0 - (-ke * 24.0).exp());
+        assert_relative_eq!(aucs[0], w0, max_relative = 1e-4);
+
+        // Window 1 = [24,48]: superposition of the t=0 and t=24 boluses, decaying
+        // from the post-dose amount A(24⁺) = D·e^{−24ke} + D; the t=48 bolus excluded.
+        let a24 = d * (-ke * 24.0).exp() + d;
+        let w1 = (a24 / ke) * (1.0 - (-ke * 24.0).exp());
+        assert_relative_eq!(aucs[1], w1, max_relative = 1e-4);
     }
 
     /// Build the per-segment `obs_time -> indices` map the integrator uses.

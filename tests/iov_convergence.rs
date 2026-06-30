@@ -221,6 +221,10 @@ fn iov_saem_smoke_returns_finite_ofv() {
 // `resolve_scaling`): with it, pure FOCEI/SLSQP from the cold default start reaches
 // OFV 307.84 and omega_iov climbs to ≈0.046, matching the default BOBYQA.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn iov_pure_slsqp_from_cold_start_reaches_minimum() {
     let focei = run_single(EstimationMethod::FoceI, Optimizer::Slsqp);
     assert!(
@@ -303,6 +307,255 @@ fn iov_iiv_on_ruv_analytic_matches_fd_estimates() {
     assert!(
         (analytic.ofv - fd.ofv).abs() < 1.0,
         "analytic OFV {:.4} vs FD OFV {:.4} should agree (same marginal)",
+        analytic.ofv,
+        fd.ofv
+    );
+    for k in 0..analytic.theta.len() {
+        let (a, f) = (analytic.theta[k], fd.theta[k]);
+        assert!(
+            (a - f).abs() <= 0.03 * f.abs().max(1e-3),
+            "theta[{k}]: analytic {a:.5} vs FD {f:.5} diverge beyond 3%"
+        );
+    }
+}
+
+/// Estimate-level validation for **M3 BLOQ + IOV** (#4a/#580): the new analytic FOCEI
+/// gradient must drive the optimizer to the *same MLE* as the finite-difference gradient.
+/// Both differentiate the identical M3-promoted FOCEI marginal `foce_subject_nll_iov`
+/// (censored rows enter as `−logΦ`, excluded from `H̃`), so the converged OFV and θ must
+/// agree — confirming the FD→analytic swap does not move the optimum. The FD path is the
+/// reference: the IOV FD gradient is NONMEM-anchored on warfarin_iov (≈307.8 vs NONMEM
+/// 308.83, see the module header / `tests/warfarin_iov_nonmem.rs`), and the M3 censored
+/// term is NONMEM-anchored on the non-IOV warfarin_bloq fit (`tests/bloq_convergence.rs`);
+/// the analytic M3+IOV fit inherits both anchors transitively by landing on the same
+/// optimum. Data: `data/warfarin_iov_bloq.csv` = warfarin_iov with a CENS column
+/// (LLOQ = 1.5 left-censors the 23 sub-limit observations, ~10%).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn iov_m3_analytic_matches_fd_estimates() {
+    let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method      = focei
+  iov_column  = OCC
+  bloq_method = m3
+  covariance  = false
+"#;
+    let model =
+        ferx_core::parser::model_parser::parse_model_string(src).expect("IOV + M3 model parses");
+    assert!(matches!(
+        model.bloq_method,
+        ferx_core::types::BloqMethod::M3
+    ));
+    // Gate: M3 + IOV (no iiv_on_ruv) is analytic on both loops.
+    assert!(ferx_core::sens::provider::iov_analytical_supported(&model));
+    let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
+        .expect("warfarin_iov_bloq data loads");
+    assert!(
+        pop.subjects.iter().any(|s| s.cens.iter().any(|&c| c != 0)),
+        "dataset must carry censored rows"
+    );
+
+    let run = |gm: ferx_core::GradientMethod| -> FitResult {
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::FoceI;
+        opts.interaction = true;
+        opts.optimizer = Optimizer::Slsqp;
+        opts.gradient_method = gm;
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        fit(&model, &pop, &model.default_params, &opts).expect("IOV + M3 fit runs")
+    };
+    let analytic = run(ferx_core::GradientMethod::Auto);
+    let fd = run(ferx_core::GradientMethod::Fd);
+
+    // Same objective ⇒ same optimum (allowing for optimizer-path noise).
+    assert!(
+        (analytic.ofv - fd.ofv).abs() < 1.0,
+        "analytic OFV {:.4} vs FD OFV {:.4} should agree (same marginal)",
+        analytic.ofv,
+        fd.ofv
+    );
+    for k in 0..analytic.theta.len() {
+        let (a, f) = (analytic.theta[k], fd.theta[k]);
+        assert!(
+            (a - f).abs() <= 0.03 * f.abs().max(1e-3),
+            "theta[{k}]: analytic {a:.5} vs FD {f:.5} diverge beyond 3%"
+        );
+    }
+}
+
+/// Estimate-level validation for the **triple** M3 + IOV + `iiv_on_ruv` (#591): the
+/// analytic FOCEI gradient must drive the optimizer to the same MLE as the FD gradient.
+/// The closed-form assembly already carried the censored residual-eta cross coefficients
+/// `(C·z, C·m)` over the stacked layout (#4c); #591 opens the gate, so both gradients now
+/// differentiate the identical M3-censored, `exp(2·η_ruv)`-scaled FOCEI marginal. The FD
+/// path inherits the IOV (warfarin_iov ≈307.8 vs NONMEM 308.83) and non-IOV M3 (warfarin
+/// BLOQ) anchors; the analytic fit inherits both by landing on the same optimum. Data:
+/// `data/warfarin_iov_bloq.csv` (LLOQ = 1.5, ~10% left-censored).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn iov_m3_iiv_on_ruv_analytic_matches_fd_estimates() {
+    let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  omega ETA_RUV ~ 0.05
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method      = focei
+  iov_column  = OCC
+  bloq_method = m3
+  covariance  = false
+"#;
+    let model = ferx_core::parser::model_parser::parse_model_string(src)
+        .expect("triple M3 + IOV + iiv_on_ruv model parses");
+    assert_eq!(model.residual_error_eta, Some(3));
+    assert!(matches!(
+        model.bloq_method,
+        ferx_core::types::BloqMethod::M3
+    ));
+    // Gate: the closed-form triple is analytic on both loops as of #591.
+    assert!(ferx_core::sens::provider::iov_analytical_supported(&model));
+    let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
+        .expect("warfarin_iov_bloq data loads");
+    assert!(
+        pop.subjects.iter().any(|s| s.cens.iter().any(|&c| c != 0)),
+        "dataset must carry censored rows"
+    );
+
+    let run = |gm: ferx_core::GradientMethod| -> FitResult {
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::FoceI;
+        opts.interaction = true;
+        opts.optimizer = Optimizer::Slsqp;
+        opts.gradient_method = gm;
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        fit(&model, &pop, &model.default_params, &opts).expect("triple fit runs")
+    };
+    let analytic = run(ferx_core::GradientMethod::Auto);
+    let fd = run(ferx_core::GradientMethod::Fd);
+
+    assert!(
+        (analytic.ofv - fd.ofv).abs() < 1.0,
+        "analytic OFV {:.4} vs FD OFV {:.4} should agree (same marginal)",
+        analytic.ofv,
+        fd.ofv
+    );
+    for k in 0..analytic.theta.len() {
+        let (a, f) = (analytic.theta[k], fd.theta[k]);
+        assert!(
+            (a - f).abs() <= 0.03 * f.abs().max(1e-3),
+            "theta[{k}]: analytic {a:.5} vs FD {f:.5} diverge beyond 3%"
+        );
+    }
+}
+
+/// Estimate-level validation for **FOCE-IOV-M3** (#591): under non-interaction FOCE, M3
+/// censoring no longer promotes the subject to interaction — the whole subject keeps a
+/// consistent Sheiner–Beal objective (censored rows re-enter as `−logΦ` at the population
+/// variance). The analytic FOCE IOV gradient (now carrying the censored SB term over the
+/// stacked layout) must drive the optimizer to the same MLE as FD of that same FOCE
+/// marginal. FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different optima (cf. the non-IOV
+/// warfarin-BLOQ FOCE-vs-FOCEI split, `tests/bloq_convergence.rs`). Data:
+/// `data/warfarin_iov_bloq.csv`.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn iov_m3_foce_analytic_matches_fd_estimates() {
+    let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method      = foce
+  iov_column  = OCC
+  bloq_method = m3
+  covariance  = false
+"#;
+    let model = ferx_core::parser::model_parser::parse_model_string(src)
+        .expect("FOCE IOV + M3 model parses");
+    assert!(matches!(
+        model.bloq_method,
+        ferx_core::types::BloqMethod::M3
+    ));
+    assert!(ferx_core::sens::provider::iov_analytical_supported(&model));
+    let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
+        .expect("warfarin_iov_bloq data loads");
+    assert!(
+        pop.subjects.iter().any(|s| s.cens.iter().any(|&c| c != 0)),
+        "dataset must carry censored rows"
+    );
+
+    let run = |gm: ferx_core::GradientMethod| -> FitResult {
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::Foce;
+        opts.interaction = false;
+        opts.optimizer = Optimizer::Slsqp;
+        opts.gradient_method = gm;
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        fit(&model, &pop, &model.default_params, &opts).expect("FOCE IOV + M3 fit runs")
+    };
+    let analytic = run(ferx_core::GradientMethod::Auto);
+    let fd = run(ferx_core::GradientMethod::Fd);
+
+    assert!(
+        (analytic.ofv - fd.ofv).abs() < 1.0,
+        "analytic OFV {:.4} vs FD OFV {:.4} should agree (same FOCE marginal)",
         analytic.ofv,
         fd.ofv
     );

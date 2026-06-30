@@ -279,6 +279,130 @@ pub fn compute_r_matrix_with_correlations_scaled(
     r
 }
 
+/// `∂R/∂f_m` matrices of the dense residual covariance built by
+/// [`compute_r_matrix_with_correlations`] (or its `_scaled` variant) — one
+/// symmetric `n×n` matrix per observation `m`.
+///
+/// `dr[m]` is nonzero only in row/column `m`, because every entry of `R`
+/// depends on the prediction vector only through the two observations it
+/// couples, and each sigma loading coefficient is affine in `f` (proportional
+/// slot loads `f`, additive slot a constant). So:
+///
+/// * diagonal: `∂R_mm/∂f_m` — the `f`-derivative of `variance_at_scaled`,
+///   including any within-observation `block_sigma` cross term;
+/// * off-diagonal `(m,k)` in the same residual block: `∂R_mk/∂f_m`, which —
+///   because [`cross_observation_covariance`] is bilinear in the two
+///   observations' loadings — is exactly that cross-covariance evaluated with
+///   observation `m`'s *slope* loadings ([`ErrorSpec::sigma_loading_slopes`])
+///   in place of its value loadings.
+///
+/// Feeds the FOCEI interaction Hessian term
+/// `B_kl = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l)` with `∂R/∂η_k = Σ_m H[m,k]·dr[m]`.
+/// `mult` is the #484 per-observation magnitude matrix (`None` ⇒ all ones),
+/// applied identically to the value and slope loadings so the derivative tracks
+/// the magnitude-scaled `R`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_dr_df_matrices(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<DMatrix<f64>> {
+    let n = ipreds.len();
+    let empty: Vec<f64> = Vec::new();
+    let mrow = |j: usize| -> &[f64] {
+        mult.and_then(|m| m.get(j))
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty)
+    };
+    let m_at = |j: usize, idx: usize| -> f64 { mrow(j).get(idx).copied().unwrap_or(1.0) };
+    let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
+
+    // Per-observation value loadings (coeff·mult) and slope loadings
+    // (∂coeff/∂f·mult). The slope loadings carry the SAME slot presence as the
+    // value loadings (additive slots appear with slope 0), so the bilinear
+    // cross-covariance and its within-observation skip logic behave identically.
+    let vload: Vec<Vec<(usize, f64)>> = (0..n)
+        .map(|j| {
+            error_spec
+                .sigma_loadings(cmt_at(j), ipreds[j], sigma_values.len())
+                .into_iter()
+                .map(|(idx, c)| (idx, c * m_at(j, idx)))
+                .collect()
+        })
+        .collect();
+    let sload: Vec<Vec<(usize, f64)>> = (0..n)
+        .map(|j| {
+            error_spec
+                .sigma_loading_slopes(cmt_at(j), sigma_values.len())
+                .into_iter()
+                .map(|(idx, s)| (idx, s * m_at(j, idx)))
+                .collect()
+        })
+        .collect();
+
+    let mut out = vec![DMatrix::<f64>::zeros(n, n); n];
+    for m in 0..n {
+        if vload[m].is_empty() {
+            continue;
+        }
+        out[m][(m, m)] = diag_self_deriv(&vload[m], &sload[m], sigma_values, correlations);
+        for k in 0..n {
+            if k == m
+                || vload[k].is_empty()
+                || !same_residual_block(obs_times, obs_raw_times, occasions, m, k)
+            {
+                continue;
+            }
+            let d = cross_observation_covariance(&sload[m], &vload[k], sigma_values, correlations);
+            out[m][(m, k)] = d;
+            out[m][(k, m)] = d;
+        }
+    }
+    out
+}
+
+/// `∂R_mm/∂f_m`: the `f`-derivative of the diagonal residual variance
+/// [`ErrorSpec::variance_at_scaled`], built from observation `m`'s value
+/// loadings and their `f`-slopes (both already magnitude-scaled).
+///
+/// `V_mm = Σ_s (c_s σ_s)² + Σ_corr 2 c_i c_j ρ σ_i σ_j` (the within-observation
+/// `block_sigma` cross term), so with `c_s' = slope_s`:
+/// `∂V_mm/∂f = Σ_s 2 c_s c_s' σ_s² + Σ_corr 2 ρ σ_i σ_j (c_i' c_j + c_i c_j')`.
+/// The `.max(1e-12)` variance floor is treated as inactive here, matching the
+/// diagonal interaction path's [`ErrorSpec::dvar_df`].
+fn diag_self_deriv(
+    vload: &[(usize, f64)],
+    sload: &[(usize, f64)],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> f64 {
+    let coeff = |loads: &[(usize, f64)], slot: usize| -> Option<f64> {
+        loads.iter().find(|(i, _)| *i == slot).map(|(_, c)| *c)
+    };
+    let sig = |idx: usize| -> f64 { sigma_values.get(idx).copied().unwrap_or(0.0) };
+    let mut d = 0.0;
+    for &(idx, c) in vload {
+        let s = coeff(sload, idx).unwrap_or(0.0);
+        let sg = sig(idx);
+        d += 2.0 * c * s * sg * sg;
+    }
+    for corr in correlations {
+        let (Some(ci), Some(cj)) = (coeff(vload, corr.sigma_i), coeff(vload, corr.sigma_j)) else {
+            continue;
+        };
+        let si_s = coeff(sload, corr.sigma_i).unwrap_or(0.0);
+        let sj_s = coeff(sload, corr.sigma_j).unwrap_or(0.0);
+        d += 2.0 * corr.rho * sig(corr.sigma_i) * sig(corr.sigma_j) * (si_s * cj + ci * sj_s);
+    }
+    d
+}
+
 /// Individual weighted residual: IWRES_j = (y_j - f_j) / sqrt(V_j)
 pub fn iwres(obs: f64, ipred: f64, error_model: ErrorModel, sigma_values: &[f64]) -> f64 {
     let v = residual_variance(error_model, ipred, sigma_values);
@@ -549,6 +673,183 @@ mod tests {
         assert_relative_eq!(r[(0, 1)], 50.0 * 5.0 * 0.5 * 0.3 * 0.2, epsilon = 1e-12);
         assert_relative_eq!(r[(1, 0)], r[(0, 1)], epsilon = 1e-12);
         assert_eq!(r[(0, 2)], 0.0);
+    }
+
+    // Central-difference check: ∂R/∂f_m from `compute_dr_df_matrices` must match
+    // a finite-difference perturbation of `compute_r_matrix_with_correlations` for
+    // every observation, on a paired-endpoint cross-correlated model.
+    #[test]
+    fn test_compute_dr_df_matrices_matches_finite_difference_paired() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Combined,
+                    sigma_idx: vec![0, 2],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0, 4.0];
+        let cmts = [1usize, 2, 1, 2];
+        let times = [1.0, 1.0, 2.0, 2.0];
+        let sigma = [0.2, 0.3, 1.5];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.4,
+        };
+        let dr = compute_dr_df_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+            None,
+        );
+        let n = ipreds.len();
+        let r_at = |f: &[f64]| {
+            compute_r_matrix_with_correlations(&spec, f, &cmts, &times, &[], &[], &sigma, &[corr])
+        };
+        let h = 1e-4;
+        for m in 0..n {
+            let mut fp = ipreds.to_vec();
+            let mut fm = ipreds.to_vec();
+            fp[m] += h;
+            fm[m] -= h;
+            let fd = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
+            for p in 0..n {
+                for q in 0..n {
+                    assert_relative_eq!(
+                        dr[m][(p, q)],
+                        fd[(p, q)],
+                        epsilon = 1e-5,
+                        max_relative = 1e-4
+                    );
+                }
+            }
+        }
+    }
+
+    // With a #484 per-observation magnitude matrix, ∂R/∂f must track the
+    // *scaled* covariance `compute_r_matrix_with_correlations_scaled`.
+    #[test]
+    fn test_compute_dr_df_matrices_matches_finite_difference_scaled() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0, 4.0];
+        let cmts = [1usize, 2, 1, 2];
+        let times = [1.0, 1.0, 2.0, 2.0];
+        let sigma = [0.2, 0.3];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.4,
+        };
+        // Non-trivial per-observation, per-slot multipliers.
+        let mult = vec![
+            vec![1.0, 1.2],
+            vec![0.8, 1.0],
+            vec![1.1, 0.9],
+            vec![1.3, 1.0],
+        ];
+        let dr = compute_dr_df_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+            Some(&mult),
+        );
+        let n = ipreds.len();
+        let r_at = |f: &[f64]| {
+            compute_r_matrix_with_correlations_scaled(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &sigma,
+                &[corr],
+                &mult,
+            )
+        };
+        let h = 1e-4;
+        for m in 0..n {
+            let mut fp = ipreds.to_vec();
+            let mut fm = ipreds.to_vec();
+            fp[m] += h;
+            fm[m] -= h;
+            let fd = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
+            for p in 0..n {
+                for q in 0..n {
+                    assert_relative_eq!(
+                        dr[m][(p, q)],
+                        fd[(p, q)],
+                        epsilon = 1e-5,
+                        max_relative = 1e-4
+                    );
+                }
+            }
+        }
+    }
+
+    // The diagonal self-derivative must include a *within-observation*
+    // `block_sigma` cross term (combined error with σ_prop ↔ σ_add correlated),
+    // which `dvar_df` alone omits.
+    #[test]
+    fn test_compute_dr_df_matrices_within_obs_cross_term() {
+        let spec = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.3, 1.2];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.5,
+        };
+        let ipreds = [40.0];
+        let cmts = [1usize];
+        let times = [1.0];
+        let dr = compute_dr_df_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+            None,
+        );
+        // V = (f·σ0)² + σ1² + 2·f·1·ρ·σ0·σ1; ∂V/∂f = 2·f·σ0² + 2·ρ·σ0·σ1.
+        let expected = 2.0 * 40.0 * 0.3 * 0.3 + 2.0 * 0.5 * 0.3 * 1.2;
+        assert_relative_eq!(dr[0][(0, 0)], expected, epsilon = 1e-10);
     }
 
     #[test]

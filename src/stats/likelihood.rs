@@ -655,9 +655,6 @@ pub fn foce_subject_nll(
     let frem_r_override =
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
 
-    let m3_active =
-        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
-
     // TTE Laplace correction: when the subject has TTE obs_records, we compute
     // the FD Hessian of the TTE data term w.r.t. η and add it to hrh inside
     // the interaction path so log|H̃| includes both Gaussian and TTE curvature.
@@ -713,9 +710,16 @@ pub fn foce_subject_nll(
             &p_obs,
             tte_nll_at_mode,
             tte_h,
-            // Promote to interaction when M3 censoring is active, matching the
-            // non-TTE branch below so M3 subjects always get the CᵀC correction.
-            interaction || m3_active,
+            // FOCE/FOCEI is selected by the `interaction` flag alone — M3 no longer
+            // force-promotes to interaction (mirrors the non-TTE branch below and the
+            // IOV `foce_subject_nll_iov`, #367/#591), so FOCE-M3 keeps non-interaction
+            // (no CᵀC) semantics here too. NOTE: the censored data term on this TTE path
+            // still rides `gaussian_foce_accum` at the conditional (η̂) variance, not the
+            // population-variance Sheiner–Beal `foce_subject_nll_standard` the non-TTE
+            // FOCE-M3 path uses; reconciling that (a `*_standard_with_tte` censored term)
+            // is a follow-up — joint analytic-`family` TTE + M3 + FOCE is the only path
+            // affected.
+            interaction,
             model.residual_error_eta,
             ruv_mult.as_deref(),
         );
@@ -726,30 +730,43 @@ pub fn foce_subject_nll(
     // entering the standard path as `−logΦ` terms (excluded from R̃). FOCEI still
     // takes the interaction path. This matches NONMEM `METHOD=1 LAPLACE` with vs
     // without INTER (FOCE-M3 and FOCEI-M3 are genuinely different optima).
-    let _ = m3_active;
-    // block_sigma cross-endpoint residual covariance is only carried by the
-    // non-interaction (Sheiner–Beal) path via `compute_r_matrix_with_correlations`;
-    // the interaction accumulator builds R diagonally and would silently drop the
-    // off-diagonal covariance. FOCEI + block_sigma is rejected up front
-    // (E_BLOCK_SIGMA_METHOD_UNSUPPORTED), and SAEM — which evaluates this OFV with
-    // `interaction = true` for AIC/BIC comparability — has no interaction-aware
-    // correlated objective to match, so route any correlated model through the
-    // FOCE objective instead of returning a correlation-free OFV (#557).
-    if interaction && model.residual_correlations.is_empty() {
-        foce_subject_nll_interaction(
-            subject,
-            &ipreds,
-            eta_hat,
-            h_matrix,
-            omega,
-            sigma_values,
-            &model.error_spec,
-            model.bloq_method,
-            &p_obs,
-            frem_r_override.as_deref(),
-            model.residual_error_eta,
-            ruv_mult.as_deref(),
-        )
+    // Interaction (FOCEI, and SAEM's AIC/BIC-comparable OFV which evaluates this
+    // with `interaction = true`) routes by whether the residual covariance is
+    // diagonal. A correlated (`block_sigma`) model uses the dense-R interaction
+    // marginal [`foce_subject_nll_interaction_dense`] (#616); the diagonal
+    // accumulator [`foce_subject_nll_interaction`] would silently drop the
+    // off-diagonal covariance. The non-interaction (Sheiner–Beal) branch carries
+    // the dense R for both cases via `compute_r_matrix_with_correlations`.
+    if interaction {
+        if model.residual_correlations.is_empty() {
+            foce_subject_nll_interaction(
+                subject,
+                &ipreds,
+                eta_hat,
+                h_matrix,
+                omega,
+                sigma_values,
+                &model.error_spec,
+                model.bloq_method,
+                &p_obs,
+                frem_r_override.as_deref(),
+                model.residual_error_eta,
+                ruv_mult.as_deref(),
+            )
+        } else {
+            foce_subject_nll_interaction_dense(
+                subject,
+                &ipreds,
+                eta_hat,
+                h_matrix,
+                omega,
+                sigma_values,
+                &model.error_spec,
+                &model.residual_correlations,
+                &p_obs,
+                ruv_mult.as_deref(),
+            )
+        }
     } else {
         // FOCE (no interaction): evaluate the residual variance R at the
         // population prediction f(η=0) — NONMEM's no-interaction semantics —
@@ -923,9 +940,13 @@ pub fn foce_subject_nll_standard(
     let mut bloq_term = 0.0;
     if m3 {
         for j in 0..n_obs {
-            if subject.cens.get(j).copied().unwrap_or(0) != 0 {
-                let z = (subject.observations[j] - ipreds[j]) / r_diag[j].sqrt();
-                bloq_term += -2.0 * log_normal_cdf(z);
+            let cens = subject.cens.get(j).copied().unwrap_or(0);
+            if cens != 0 {
+                // `m3_logcdf` selects the tail from the CENS sign: lower tail for
+                // below-LLOQ (`cens > 0`), upper tail `(f − ULOQ)/sd` for above-ULOQ
+                // (`cens < 0`). `subject.observations[j]` holds the censoring limit.
+                bloq_term +=
+                    -2.0 * m3_logcdf(subject.observations[j], ipreds[j], r_diag[j].sqrt(), cens);
             }
         }
     }
@@ -1055,6 +1076,153 @@ pub fn foce_subject_nll_interaction(
     };
 
     0.5 * (g.data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
+}
+
+/// FOCEI INTER per-subject −2·log marginal for a **correlated** (`block_sigma`)
+/// residual covariance — the dense-`R` generalisation of
+/// [`foce_subject_nll_interaction`].
+///
+/// The diagonal interaction path forms `R` one observation at a time and so
+/// silently drops the `block_sigma` off-diagonals. This path instead carries the
+/// full residual covariance `R` (from [`compute_r_matrix_with_correlations`],
+/// the same matrix the FOCE non-interaction and SAEM paths use), giving the
+/// Almquist 2015 first-order conditional Hessian
+///
+/// ```text
+///   data_ll(η̂) = rᵀ R⁻¹ r + log|R|
+///   H̃          = Hᵀ R⁻¹ H + ½·B + Ω⁻¹
+///   B_{kl}      = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l),  ∂R/∂η_k = Σ_m H[m,k]·∂R/∂f_m
+/// ```
+///
+/// where `H = ∂f/∂η` (`h_matrix`) and the per-observation `∂R/∂f_m` come from
+/// [`crate::stats::residual_error::compute_dr_df_matrices`].
+///
+/// Reduces **exactly** to [`foce_subject_nll_interaction`] when `R` is diagonal
+/// (ρ = 0): `Hᵀ diag(1/V) H = Σ_m a_m a_mᵀ/V_m` (`hrh`) and, since each `∂R/∂f_m`
+/// is then the single diagonal entry `∂V_m/∂f_m`, `R⁻¹ ∂R/∂η_k` is diagonal with
+/// entries `c̃_{m,k} = (∂V_m/∂η_k)/V_m`, so `B = c̃ᵀc̃` (`ctc`). The dispatcher
+/// keeps ρ = 0 on the diagonal path, so that function stays the bit-for-bit
+/// reference and this one runs only when correlations are present.
+///
+/// `block_sigma` is rejected up front together with M3, FREM, IOV (κ), and
+/// `iiv_on_ruv`, so none of those appear here; `p_obs` (SDE EKF process noise)
+/// inflates the `R` diagonal as an η-independent term, matching the diagonal
+/// interaction path (and excluded from `∂R/∂η`).
+#[allow(clippy::too_many_arguments)]
+pub fn foce_subject_nll_interaction_dense(
+    subject: &Subject,
+    ipreds: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    error_spec: &ErrorSpec,
+    correlations: &[ResidualCorrelation],
+    p_obs: &[f64],
+    // Per-observation custom residual magnitude (#484); `None` on the legacy path.
+    ruv_mult: Option<&[Vec<f64>]>,
+) -> f64 {
+    let n_obs = subject.observations.len();
+    let n_eta = eta_hat.len();
+
+    // Dense R at η̂ (+ SDE process noise on the diagonal), assembled exactly as
+    // the data term and FOCE-standard path assemble it.
+    let mut r = match ruv_mult {
+        Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
+            error_spec,
+            ipreds,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            correlations,
+            mult,
+        ),
+        None => compute_r_matrix_with_correlations(
+            error_spec,
+            ipreds,
+            &subject.obs_cmts,
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            sigma_values,
+            correlations,
+        ),
+    };
+    for (j, v) in p_obs.iter().enumerate() {
+        if j < r.nrows() {
+            r[(j, j)] += *v;
+        }
+    }
+
+    let chol = match r.clone().cholesky() {
+        Some(c) => c,
+        None => return 1e20,
+    };
+    let r_inv = chol.inverse();
+
+    // data_ll = rᵀ R⁻¹ r + log|R|.
+    let residuals = DVector::from_iterator(
+        n_obs,
+        subject
+            .observations
+            .iter()
+            .zip(ipreds.iter())
+            .map(|(&y, &f)| y - f),
+    );
+    let solved = chol.solve(&residuals);
+    let data_ll = residuals.dot(&solved) + chol_log_det(&chol.l());
+
+    // First-order conditional Hessian terms.
+    // term1 = Hᵀ R⁻¹ H.
+    let term1 = h_matrix.transpose() * &r_inv * h_matrix;
+
+    // B_{kl} = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l). Build M_k = R⁻¹ ∂R/∂η_k once per η,
+    // then B_{kl} = tr(M_k M_l) = Σ_{p,q} M_k[p,q]·M_l[q,p].
+    let dr = crate::stats::residual_error::compute_dr_df_matrices(
+        error_spec,
+        ipreds,
+        &subject.obs_cmts,
+        &subject.obs_times,
+        &subject.obs_raw_times,
+        &subject.occasions,
+        sigma_values,
+        correlations,
+        ruv_mult,
+    );
+    let mut m_mats: Vec<DMatrix<f64>> = Vec::with_capacity(n_eta);
+    for k in 0..n_eta {
+        let mut dr_k = DMatrix::<f64>::zeros(n_obs, n_obs);
+        for (m, dr_m) in dr.iter().enumerate() {
+            let h_mk = h_matrix[(m, k)];
+            if h_mk != 0.0 {
+                dr_k += h_mk * dr_m;
+            }
+        }
+        m_mats.push(&r_inv * dr_k);
+    }
+    let mut b = DMatrix::<f64>::zeros(n_eta, n_eta);
+    for k in 0..n_eta {
+        for l in 0..n_eta {
+            let mut t = 0.0;
+            for p in 0..n_obs {
+                for q in 0..n_obs {
+                    t += m_mats[k][(p, q)] * m_mats[l][(q, p)];
+                }
+            }
+            b[(k, l)] = t;
+        }
+    }
+
+    let htilde = term1 + 0.5 * b + &omega.inv;
+    let log_det_htilde = match htilde.cholesky() {
+        Some(c) => chol_log_det(&c.l()),
+        None => return 1e20,
+    };
+    let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
+
+    0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde)
 }
 
 /// FOCEI NLL with both Gaussian interaction terms and a TTE Laplace correction.
@@ -1448,8 +1616,18 @@ pub fn foce_subject_nll_iov(
     // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
     // integrated out through R̃ exactly like η, so no separate κ prior is
     // added (doing so would double-count the random-effect penalty).
-    let m3_active =
-        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
+    // M3 no longer force-promotes IOV-FOCE subjects to interaction (#591, mirroring the
+    // non-IOV `foce_subject_nll` change in #367/8abadbb7): plain FOCE keeps a consistent
+    // FOCE (Sheiner–Beal) objective for the whole subject — the censored rows leave the
+    // linearized augmented marginal and re-enter through `foce_subject_nll_standard` as
+    // `−logΦ((LLOQ−f̂)/√R⁰)` data terms with the population (η=0, κ=0) variance. FOCEI still
+    // takes the interaction path. FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different
+    // optima, matching NONMEM METHOD=1 LAPLACE with vs without INTER. (Previously a
+    // censored subject was silently evaluated with η-interaction even under FOCE, mixing a
+    // Sheiner–Beal marginal with a FOCEI censored term.) The censored rows are now routed
+    // by the `interaction` flag alone — `foce_subject_nll_standard` carries the M3 `−logΦ`
+    // term for the non-interaction path — so there is no `m3_active` gate here (the non-IOV
+    // `foce_subject_nll`, including its TTE branch, drops the promotion the same way).
     let p_obs_iov = if model.is_sde() {
         ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
     } else {
@@ -1463,7 +1641,7 @@ pub fn foce_subject_nll_iov(
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
-    if interaction || m3_active {
+    if interaction {
         foce_subject_nll_interaction(
             subject,
             &ipreds,
@@ -2327,6 +2505,78 @@ mod tests {
             (small - large).abs() > 1e-6,
             "Ω_iov must change the marginal OFV (small={small}, large={large})"
         );
+    }
+
+    /// The dense-`R` FOCEI interaction marginal must reduce **exactly** to the
+    /// diagonal accumulator [`foce_subject_nll_interaction`] when there is no
+    /// `block_sigma` correlation (ρ = 0), across a multi-η proportional model.
+    /// This anchors the dense generalisation against the bit-for-bit reference.
+    #[test]
+    fn dense_interaction_reduces_to_diagonal_when_uncorrelated() {
+        let subject = make_simple_subject(); // 6 obs, single proportional endpoint
+        let sigma = vec![0.2];
+        let error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+        let ipreds = vec![50.0, 40.0, 30.0, 45.0, 35.0, 25.0];
+        let eta_hat = DVector::from_vec(vec![0.15, -0.1]);
+        let omega =
+            OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["ETA_CL".into(), "ETA_V".into()]);
+        let h_matrix = DMatrix::from_row_slice(
+            6,
+            2,
+            &[
+                5.0, 1.0, //
+                4.0, 1.5, //
+                3.0, 2.0, //
+                4.5, 1.2, //
+                3.5, 1.8, //
+                2.5, 2.2,
+            ],
+        );
+
+        let diag = foce_subject_nll_interaction(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h_matrix,
+            &omega,
+            &sigma,
+            &error_spec,
+            BloqMethod::Drop,
+            &[],
+            None,
+            None,
+            None,
+        );
+        let dense = foce_subject_nll_interaction_dense(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h_matrix,
+            &omega,
+            &sigma,
+            &error_spec,
+            &[], // ρ = 0 → diagonal R, must match the reference exactly
+            &[],
+            None,
+        );
+        approx::assert_relative_eq!(dense, diag, max_relative = 1e-10);
+
+        // The #484 magnitude path (Some(mult)) with an all-ones multiplier must
+        // reproduce the bare path (modulo the documented ~1 ULP reassociation).
+        let ones_mult: Vec<Vec<f64>> = vec![vec![1.0]; 6];
+        let dense_mult = foce_subject_nll_interaction_dense(
+            &subject,
+            &ipreds,
+            &eta_hat,
+            &h_matrix,
+            &omega,
+            &sigma,
+            &error_spec,
+            &[],
+            &[],
+            Some(&ones_mult),
+        );
+        approx::assert_relative_eq!(dense_mult, dense, max_relative = 1e-9);
     }
 
     /// Regression for the FOCE+proportional fix: the residual variance must be

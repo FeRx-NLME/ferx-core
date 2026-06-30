@@ -1311,13 +1311,19 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
 
     if !model.residual_correlations.is_empty() {
         for &m in &chain {
-            if !matches!(m, EstimationMethod::Foce | EstimationMethod::Saem) {
+            if !matches!(
+                m,
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::Saem
+                    | EstimationMethod::Imp
+            ) {
                 diags.push(
                     Diagnostic::error(
                         "E_BLOCK_SIGMA_METHOD_UNSUPPORTED",
                         "block_sigma correlated residual errors are currently supported for \
-                         method = foce and method = saem only. FOCEI, GN, and \
-                         importance-sampling paths still use diagonal residual-error derivatives.",
+                         method = foce, focei, saem, and imp only. The gn / gn_hybrid \
+                         Gauss-Newton paths still use diagonal residual-error derivatives.",
                     )
                     .with_block("fit_options"),
                 );
@@ -2438,7 +2444,11 @@ fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> Has
 /// Trapezoid integration over (time, value) pairs.
 /// Observation times are not guaranteed to be sorted (preserved in input row
 /// order), so sort by time before integrating to prevent negative dt windows.
-fn trapezoid(points: &[(f64, f64)]) -> f64 {
+///
+/// `pub(crate)` so the reactive-dosing signal-AUC pass
+/// ([`crate::ode::adaptive_window_signal_aucs`], #391 S2.5b) shares this one
+/// implementation rather than carrying a second copy of the rule.
+pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
     if points.len() < 2 {
         return f64::NAN;
     }
@@ -3147,6 +3157,31 @@ pub(crate) fn compute_extra_output_columns(
     }
 }
 
+fn saem_non_mu_referenced_individual_params_warning(model: &CompiledModel) -> Option<String> {
+    let mut names = Vec::new();
+    for (param_name, &eta_idx) in model.indiv_param_names.iter().zip(model.eta_map.iter()) {
+        if eta_idx < 0 {
+            continue;
+        }
+        let Some(eta_name) = model.eta_names.get(eta_idx as usize) else {
+            continue;
+        };
+        if !model.mu_refs.contains_key(eta_name) {
+            names.push(param_name.as_str());
+        }
+    }
+
+    if names.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "individual parameter(s) not mu-referenced: {}. This can strongly \
+             affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
+            names.join(", ")
+        ))
+    }
+}
+
 fn fit_inner(
     model: &CompiledModel,
     population: &Population,
@@ -3155,14 +3190,29 @@ fn fit_inner(
 ) -> Result<FitResult, String> {
     let fit_start = Instant::now();
     let chain = options.method_chain();
+    let n_stages = chain.len();
     // Compute up-front so we can both surface the warnings before the fit
     // starts (a long-running fit shouldn't bury a "this option is unused"
     // notice at the end) and carry them through into FitResult.warnings.
-    let mut unsupported_warnings = options.unsupported_keys_warnings();
+    let mut pre_run_warnings = options.unsupported_keys_warnings();
     // Surface a "no method specified, defaulting to FOCEI" notice through the
     // same channel so it reaches both stderr and FitResult.warnings.
     if let Some(w) = options.method_default_warning() {
-        unsupported_warnings.push(w);
+        pre_run_warnings.push(w);
+    }
+    // Emitted whenever the chain runs SAEM, independent of `options.mu_referencing`:
+    // the non-mu-referenced case is *most* at risk under SAEM when mu-centering is
+    // off, so gating on the opt-in flag would silence the warning exactly when it
+    // matters most (#621). This is assembled before the startup banner so verbose
+    // runs show it before SAEM begins.
+    if chain.iter().any(|&m| m == EstimationMethod::Saem) {
+        if let Some(w) = saem_non_mu_referenced_individual_params_warning(model) {
+            pre_run_warnings.push(if n_stages > 1 {
+                format!("[SAEM] {w}")
+            } else {
+                format!("SAEM: {w}")
+            });
+        }
     }
 
     // Capture thread count before chain runs (current_num_threads() reports
@@ -3199,9 +3249,9 @@ fn fit_inner(
         // otherwise the global pool. So this stays accurate in both paths.
         let n_threads = rayon::current_num_threads();
         let thread_word = if n_threads == 1 { "thread" } else { "threads" };
-        if !unsupported_warnings.is_empty() {
+        if !pre_run_warnings.is_empty() {
             eprintln!("--- Warnings ---");
-            for w in &unsupported_warnings {
+            for w in &pre_run_warnings {
                 eprintln!("  * {}", w);
             }
             eprintln!();
@@ -3309,11 +3359,10 @@ fn fit_inner(
     };
 
     // Run each stage in sequence, feeding params forward.
-    let n_stages = chain.len();
     let mut stage_params: ModelParameters = init_params.clone();
     let mut result: Option<crate::estimation::outer_optimizer::OuterResult> = None;
     let mut accumulated_warnings: Vec<String> = model.parse_warnings.clone();
-    accumulated_warnings.extend(unsupported_warnings);
+    accumulated_warnings.extend(pre_run_warnings);
     // Data-reader warnings (W_ADDL_MISSING_II, W_IOV_OCC_MISSING) accumulated
     // by read_nonmem_csv into population.warnings.
     accumulated_warnings.extend(population.warnings.iter().cloned());
@@ -3430,14 +3479,10 @@ fn fit_inner(
             EstimationMethod::Foce => stage_opts.interaction = false,
             _ => {}
         }
-        // Run the covariance step on the last *estimating* stage. IMP is a
-        // likelihood evaluation (NONMEM EONLY=1 equivalent), not an estimator,
-        // so when IMP follows an estimator the preceding stage is effectively
-        // the final estimating stage and should compute covariance / SIR.
-        let is_last_estimating = is_last
-            || chain[stage_idx + 1..]
-                .iter()
-                .all(|&m| m == EstimationMethod::Imp);
+        // Run the covariance step (and SIR) only on the last *estimating* stage,
+        // so a chain doesn't recompute the expensive FD covariance after every
+        // method (#615). See `is_last_estimating_stage` for the eval-only-IMP rule.
+        let is_last_estimating = is_last_estimating_stage(&chain, stage_idx, options.imp_eval_only);
         if !is_last_estimating {
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
@@ -3875,24 +3920,13 @@ fn fit_inner(
         }
     }
 
-    // Report detected mu-referencing relationships (only when feature is enabled)
-    if options.mu_referencing && !model.mu_refs.is_empty() {
-        let mut names: Vec<&String> = model.mu_refs.keys().collect();
-        names.sort();
-        warnings.push(format!(
-            "mu-ref: {}",
-            names
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-
-    // When M3 censoring is combined with non-interaction FOCE, mixing linearized
-    // Gaussian residuals with non-linearized log Φ terms gives inconsistent
-    // OFVs near the LOQ boundary. The FOCE dispatcher routes affected
-    // subjects through FOCEI internally — surface the promotion to the user.
+    // M3 censoring under non-interaction FOCE is a consistent Sheiner–Beal fit (the
+    // censored rows leave the linearized marginal and re-enter as `−logΦ` at the
+    // population variance; plain FOCE no longer promotes censored subjects to interaction
+    // — non-IOV since #367, IOV since #591). It is a *different optimum* from FOCEI-M3,
+    // mirroring NONMEM `METHOD=1 LAPLACE` with vs without `INTER`. Since M3 is run with
+    // interaction in most practice, surface the non-interaction choice so a user does not
+    // report FOCE-M3 estimates while expecting the FOCEI-M3 ones (#599).
     if matches!(model.bloq_method, BloqMethod::M3)
         && matches!(
             options.method,
@@ -3905,9 +3939,9 @@ fn fit_inner(
             .any(|s| s.has_censored_observation())
     {
         warnings.push(
-            "M3 censoring handling requires FOCEI semantics; subjects with CENS!=0 \
-             rows were evaluated with η-interaction. Set method=focei explicitly \
-             to silence this notice."
+            "M3 censoring under FOCE uses non-interaction (Sheiner–Beal) semantics; \
+             FOCE-M3 and FOCEI-M3 are different optima (as in NONMEM METHOD=1 LAPLACE \
+             with vs without INTER). Set method=focei for interaction semantics."
                 .to_string(),
         );
     }
@@ -4382,6 +4416,28 @@ fn compute_param_corr(
         }
     }
     Some(corr)
+}
+
+/// Whether `stage_idx` is the last *estimating* stage of `chain` — the single
+/// stage that owns the covariance / SIR step. Running it on every stage is
+/// wasteful and not expected (#615); only the final estimate needs SEs.
+///
+/// An evaluation-only IMP (`imp_eval_only`, NONMEM `IMP EONLY=1`) is a likelihood
+/// evaluation, not an estimator, so trailing eval-only IMP stages cede the
+/// covariance step to the preceding estimator. A default (estimating) IMP is a
+/// real estimator that owns the step itself, so it must not be skipped. Split out
+/// of `fit()` so the per-stage gating is unit-testable.
+fn is_last_estimating_stage(
+    chain: &[EstimationMethod],
+    stage_idx: usize,
+    imp_eval_only: bool,
+) -> bool {
+    let is_last = stage_idx + 1 == chain.len();
+    let trailing_eval_only_imp = imp_eval_only
+        && chain[stage_idx + 1..]
+            .iter()
+            .all(|&m| m == EstimationMethod::Imp);
+    is_last || trailing_eval_only_imp
 }
 
 /// Resolve the reported [`CovarianceStatus`] from the three signals that
@@ -4979,6 +5035,51 @@ mod tests {
         assert!(eps_shrinkage_warning(-0.05).is_none());
         // NaN — no warning.
         assert!(eps_shrinkage_warning(f64::NAN).is_none());
+    }
+
+    #[test]
+    fn saem_non_mu_referenced_warning_lists_individual_params_with_unmapped_eta() {
+        let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Auto);
+        model.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
+        model.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
+        model.eta_map = vec![0, 1, -1];
+        model.mu_refs.insert(
+            "ETA_CL".into(),
+            MuRef {
+                theta_name: "TVCL".into(),
+                log_transformed: true,
+            },
+        );
+
+        let warning =
+            saem_non_mu_referenced_individual_params_warning(&model).expect("expected warning");
+        assert!(warning.contains("not mu-referenced: V."));
+        assert!(!warning.contains("not mu-referenced: CL"));
+        assert!(!warning.contains("KA"));
+    }
+
+    #[test]
+    fn saem_non_mu_referenced_warning_is_none_when_all_eta_params_are_muref() {
+        let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Auto);
+        model.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
+        model.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
+        model.eta_map = vec![0, 1, -1];
+        model.mu_refs.insert(
+            "ETA_CL".into(),
+            MuRef {
+                theta_name: "TVCL".into(),
+                log_transformed: true,
+            },
+        );
+        model.mu_refs.insert(
+            "ETA_V".into(),
+            MuRef {
+                theta_name: "TVV".into(),
+                log_transformed: true,
+            },
+        );
+
+        assert!(saem_non_mu_referenced_individual_params_warning(&model).is_none());
     }
 
     // ── kappa shrinkage ──────────────────────────────────────────────────────
@@ -5951,6 +6052,9 @@ where
         // Programmatic path: no declarative block, so no target band — the
         // window-dependent metric (`pct_time_in_window`) is left unreported.
         None,
+        // ...and no `auc_target`, so the signal-AUC pass is skipped and
+        // `auc_target_attainment` is left unreported.
+        None,
         opts,
     )
 }
@@ -5981,6 +6085,7 @@ fn run_adaptive_population<F, C>(
     monitors: &[crate::sim::adaptive::AdaptiveMonitor],
     make_controller: F,
     target_window: Option<(f64, f64)>,
+    auc_target: Option<(f64, f64)>,
     opts: &AdaptiveSimulateOptions,
 ) -> Result<AdaptiveSimulationResult, String>
 where
@@ -6097,11 +6202,30 @@ where
                 });
             }
 
+            // Signal-AUC pass for the exposure metric (#391 S2.5b): run only when an
+            // `auc_target` is declared (its sole consumer) and a monitor exists. It
+            // re-integrates the realized ledger on its own dense grid — separate from,
+            // and never perturbing, the reactive run + verifier above.
+            let window_aucs: Vec<f64> = match (auc_target, monitors.first()) {
+                (Some(_), Some(mon)) => crate::ode::adaptive_window_signal_aucs(
+                    ode,
+                    &pk.values,
+                    &params.theta,
+                    &eta_slice,
+                    subject,
+                    decision_times,
+                    &run.ledger,
+                    mon.observe,
+                    mon.spec.cmt,
+                ),
+                _ => Vec::new(),
+            };
+
             // Per-subject outcome metrics for this run, computed from its realized
-            // ledger + decision log (S2.4). Taken before the rows are moved into the
-            // population vectors below; the `(subject, draw, sim)` key is stamped here
-            // rather than read from the rows (whose tags the single-subject driver
-            // still leaves at 0).
+            // ledger + decision log (S2.4) and the window AUC series (S2.5b). Taken
+            // before the rows are moved into the population vectors below; the
+            // `(subject, draw, sim)` key is stamped here rather than read from the
+            // rows (whose tags the single-subject driver still leaves at 0).
             metrics.push(crate::sim::adaptive::compute_subject_metrics(
                 &subject.id,
                 1,
@@ -6109,6 +6233,8 @@ where
                 &run.ledger,
                 &run.decisions,
                 target_window,
+                auc_target,
+                &window_aucs,
             ));
 
             // Stamp the replicate tags onto the ledger + decision rows — the
@@ -6243,6 +6369,9 @@ pub fn simulate_adaptive_from_spec(
         // The declarative block's optional therapeutic band feeds the
         // `pct_time_in_window` metric (it never influences dosing).
         spec.target_window,
+        // ...and the optional exposure band feeds `auc_target_attainment` (likewise
+        // metrics-only); `Some` here is what turns on the signal-AUC pass.
+        spec.auc_target,
         opts,
     )
 }
@@ -7182,8 +7311,9 @@ mod iov_integration {
         assert!(super::check_model_options(&model, &ok_opts).is_empty());
     }
 
-    // block_sigma correlated residual errors are wired into ordinary Gaussian
-    // FOCE and SAEM; every other method in the chain must be rejected up front.
+    // block_sigma correlated residual errors are wired into the Gaussian FOCE,
+    // FOCEI, SAEM, and IMP paths; the Gauss-Newton (gn / gn_hybrid) methods still
+    // use diagonal residual-error derivatives and must be rejected up front.
     #[test]
     fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
         let mut model =
@@ -7194,28 +7324,39 @@ mod iov_integration {
             rho: 0.5,
         }];
 
-        // FOCEI is rejected.
-        let opts = fast_opts(EstimationMethod::FoceI, Optimizer::Bobyqa, true);
+        // gn (Gauss-Newton) is rejected.
+        let opts = fast_opts(EstimationMethod::FoceGn, Optimizer::Bobyqa, true);
         let diags = super::check_model_options(&model, &opts);
         let d = diags
             .iter()
             .find(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED")
-            .expect("expected E_BLOCK_SIGMA_METHOD_UNSUPPORTED for FOCEI");
-        assert!(d.is_error() && d.message.contains("method = foce") && d.message.contains("saem"));
+            .expect("expected E_BLOCK_SIGMA_METHOD_UNSUPPORTED for gn");
+        assert!(d.is_error() && d.message.contains("focei") && d.message.contains("gn"));
 
-        // SAEM is accepted for the ordinary Gaussian subset.
-        let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
-        assert!(!super::check_model_options(&model, &saem)
+        // gn_hybrid is likewise rejected.
+        let hybrid = fast_opts(EstimationMethod::FoceGnHybrid, Optimizer::Bobyqa, false);
+        assert!(super::check_model_options(&model, &hybrid)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
 
-        // Plain FOCE is accepted (no block_sigma diagnostic).
-        let foce = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
-        assert!(!super::check_model_options(&model, &foce)
-            .iter()
-            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+        // FOCE, FOCEI, SAEM, and IMP are all accepted (no method diagnostic).
+        for method in [
+            EstimationMethod::Foce,
+            EstimationMethod::FoceI,
+            EstimationMethod::Saem,
+            EstimationMethod::Imp,
+        ] {
+            let opts = fast_opts(method, Optimizer::Bobyqa, false);
+            assert!(
+                !super::check_model_options(&model, &opts)
+                    .iter()
+                    .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"),
+                "block_sigma must be accepted for {method:?}"
+            );
+        }
 
         model.n_kappa = 1;
+        let saem = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
         assert!(super::check_model_options(&model, &saem)
             .iter()
             .any(|d| d.code == "E_BLOCK_SIGMA_IOV_UNSUPPORTED"));
@@ -7368,6 +7509,98 @@ mod iov_integration {
         assert!(result.ofv.is_finite(), "SAEM OFV must be finite");
     }
 
+    // Importance sampling must accept a correlated $SIGMA block: the weights use
+    // the dense residual covariance (obs_nll_subject_into) and the Student-t
+    // proposal precision is built from R⁻¹ (compute_posterior_hessian dense
+    // branch). A short evaluation-only run must produce a finite marginal.
+    #[test]
+    fn test_imp_accepts_block_sigma_cross_endpoint() {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0) FIX
+  theta TVV(10.0, 1.0, 100.0) FIX
+  omega ETA_CL ~ 0.04 FIX
+  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
+    0.04,
+    0.01, 0.09
+  ]
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y[CMT=1] = 2.0 * central / V
+  y[CMT=2] = central / V
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
+  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
+",
+        )
+        .expect("cross-endpoint block_sigma ODE model parses");
+
+        let mut subjects = Vec::new();
+        for (id, dose_amt, obs) in [
+            ("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]),
+            ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
+        ] {
+            subjects.push(Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 1.0, 2.0, 2.0],
+                obs_raw_times: Vec::new(),
+                observations: obs,
+                obs_cmts: vec![1, 2, 1, 2],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 4],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            });
+        }
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        // No method diagnostic for IMP + block_sigma.
+        let mut opts = fast_opts(EstimationMethod::Imp, Optimizer::Bobyqa, false);
+        assert!(!super::check_model_options(&model, &opts)
+            .iter()
+            .any(|d| d.code == "E_BLOCK_SIGMA_METHOD_UNSUPPORTED"));
+
+        // Evaluation-only marginal at the initial params (fast + deterministic).
+        opts.imp_eval_only = true;
+        opts.imp_samples = 200;
+        opts.imp_iterations = 1;
+        opts.imp_seed = Some(7);
+        let result = fit(&model, &population, &model.default_params, &opts)
+            .expect("IMP eval with cross-endpoint block_sigma should succeed");
+        assert!(result.ofv.is_finite(), "IMP block_sigma OFV must be finite");
+    }
+
     // Regression: the SAEM final OFV (computed via `2·pop_nll` with
     // `interaction = true`) must include the block_sigma cross-endpoint
     // covariance. The interaction Laplace accumulator builds R diagonally, so
@@ -7463,6 +7696,98 @@ mod iov_integration {
         assert!(
             (saem_ofv - foce_ofv).abs() < 1e-3,
             "SAEM OFV {saem_ofv} must match FOCE OFV {foce_ofv} (block_sigma correlation dropped?)"
+        );
+    }
+
+    // FOCEI with a correlated $SIGMA block must (a) evaluate to a finite OFV and
+    // (b) genuinely apply the interaction correction — i.e. differ from the FOCE
+    // (non-interaction) OFV on an f-dependent (combined) error model. Before #616
+    // the only correlated objective was the FOCE marginal, so the interaction term
+    // was unavailable (FOCEI was rejected up front). Fixed params → maxiter 0 just
+    // evaluates the OFV at the typical values, so this stays fast.
+    #[test]
+    fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(1.0, 0.01, 10.0) FIX
+  theta TVV(10.0, 0.1, 100.0) FIX
+  omega ETA_CL ~ 0.04 FIX
+  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP_ERR, ADD_ERR)
+",
+        )
+        .expect("fixed-param block_sigma combined model parses");
+
+        let mut subjects = Vec::new();
+        for (id, obs) in [
+            ("1", vec![9.5, 8.0, 6.2]),
+            ("2", vec![10.5, 7.4, 5.6]),
+            ("3", vec![8.8, 7.9, 6.7]),
+        ] {
+            subjects.push(Subject {
+                id: id.into(),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                obs_times: vec![1.0, 2.0, 4.0],
+                obs_raw_times: Vec::new(),
+                observations: obs,
+                obs_cmts: vec![1, 1, 1],
+                covariates: HashMap::new(),
+                dose_covariates: Vec::new(),
+                obs_covariates: Vec::new(),
+                pk_only_times: Vec::new(),
+                pk_only_covariates: Vec::new(),
+                reset_times: Vec::new(),
+                cens: vec![0; 3],
+                occasions: Vec::new(),
+                dose_occasions: Vec::new(),
+                fremtype: Vec::new(),
+                #[cfg(feature = "survival")]
+                obs_records: vec![],
+            });
+        }
+        let population = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let eval = |method, interaction| {
+            let mut opts = fast_opts(method, Optimizer::Bobyqa, false);
+            opts.outer_maxiter = 0;
+            opts.interaction = interaction;
+            fit(&model, &population, &model.default_params, &opts)
+                .expect("block_sigma evaluation succeeds")
+                .ofv
+        };
+
+        let focei_ofv = eval(EstimationMethod::FoceI, true);
+        let foce_ofv = eval(EstimationMethod::Foce, false);
+
+        assert!(
+            focei_ofv.is_finite(),
+            "FOCEI block_sigma OFV must be finite"
+        );
+        // The interaction term (½·log|H̃| with the dense ∂R/∂η curvature) shifts
+        // the OFV away from the non-interaction marginal on a combined model.
+        assert!(
+            (focei_ofv - foce_ofv).abs() > 1e-4,
+            "FOCEI OFV {focei_ofv} must differ from FOCE OFV {foce_ofv} (interaction dropped?)"
         );
     }
 
@@ -8113,6 +8438,53 @@ mod tests_cov_diagnostics {
             resolve_covariance_status(true, false, false),
             CovarianceStatus::Failed
         );
+    }
+
+    // ── is_last_estimating_stage: covariance runs once, at chain end (#615) ──
+    use EstimationMethod::*;
+
+    #[test]
+    fn cov_stage_single_method_is_last() {
+        assert!(is_last_estimating_stage(&[Foce], 0, false));
+    }
+
+    #[test]
+    fn cov_stage_only_final_estimator_in_plain_chain() {
+        // [foce, saem]: covariance only on saem (the last stage), never on foce.
+        let chain = [Foce, Saem];
+        assert!(!is_last_estimating_stage(&chain, 0, false));
+        assert!(is_last_estimating_stage(&chain, 1, false));
+    }
+
+    #[test]
+    fn cov_stage_estimating_imp_owns_step_not_predecessor() {
+        // [saem, imp] with estimating IMP (imp_eval_only = false): the trailing
+        // IMP is a real estimator and owns the covariance step, so saem must NOT
+        // also run it — otherwise covariance is computed twice (#615).
+        let chain = [Saem, Imp];
+        assert!(!is_last_estimating_stage(&chain, 0, false));
+        assert!(is_last_estimating_stage(&chain, 1, false));
+    }
+
+    #[test]
+    fn cov_stage_eval_only_imp_cedes_step_to_predecessor() {
+        // [saem, imp] with imp_eval_only = true: trailing IMP is a likelihood
+        // evaluation, so saem is the last estimating stage and owns covariance.
+        let chain = [Saem, Imp];
+        assert!(is_last_estimating_stage(&chain, 0, true));
+        // The eval-only IMP stage itself never runs the covariance step (handled
+        // by the eval-only branch in fit), but as the last stage it still reports
+        // as last-estimating; gating there is a no-op since it skips covariance.
+        assert!(is_last_estimating_stage(&chain, 1, true));
+    }
+
+    #[test]
+    fn cov_stage_three_method_chain_estimating_imp() {
+        // [foce, saem, imp] estimating: only the final imp owns covariance.
+        let chain = [Foce, Saem, Imp];
+        assert!(!is_last_estimating_stage(&chain, 0, false));
+        assert!(!is_last_estimating_stage(&chain, 1, false));
+        assert!(is_last_estimating_stage(&chain, 2, false));
     }
 }
 
@@ -11465,6 +11837,7 @@ mod adaptive_sim_tests {
             confirm: 1,
             levels: None,
             target_window: None,
+            auc_target: None,
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 50.0,
@@ -11555,6 +11928,7 @@ mod adaptive_sim_tests {
             confirm: 1,
             levels: None,
             target_window: None,
+            auc_target: None,
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 50.0,
@@ -11766,6 +12140,47 @@ mod adaptive_sim_tests {
             .filter(|d| (8.0..=13.0).contains(&d.observed_signals[0].value))
             .count();
         assert_eq!(m.pct_time_in_window, Some(in_band as f64 / n as f64));
+        // No `auc_target` on this spec ⇒ the signal-AUC pass is skipped and the
+        // exposure metric stays unreported.
+        assert_eq!(m.auc_target_attainment, None);
+    }
+
+    #[test]
+    fn from_spec_reports_auc_target_attainment() {
+        // End-to-end wiring of the exposure metric (#391 S2.5b): declaring
+        // `auc_target` turns on the signal-AUC pass in `run_adaptive_population`,
+        // which feeds `auc_target_attainment`. The exact AUCs are pinned by the
+        // analytic unit test (`adaptive_window_signal_aucs_matches_closed_form`); here
+        // two *extreme* bands make the attainment deterministic regardless of the
+        // realized AUCs, so the run/pass/metric chain is exercised without re-deriving
+        // the integral: an all-covering band attains 1, an unreachable band attains 0.
+        let parsed = parse_full_model(SPEC_TITRATE).expect("parse titrating block");
+        let mut spec = parsed.adaptive_dosing.clone().expect("block present");
+        let pop = population(vec![subj("P", vec![342.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(3),
+            ..Default::default()
+        };
+        let run = |spec: &crate::sim::adaptive::AdaptiveDosingSpec| {
+            simulate_adaptive_from_spec(
+                &parsed.model,
+                &pop,
+                &parsed.model.default_params,
+                1,
+                spec,
+                &opts,
+            )
+            .expect("titration runs")
+        };
+
+        // Every inter-decision exposure is non-negative, so `[0, +∞)` is always met.
+        spec.auc_target = Some((0.0, f64::INFINITY));
+        assert_eq!(run(&spec).metrics[0].auc_target_attainment, Some(1.0));
+
+        // An exposure no finite window can reach ⇒ 0 attainment (not `None`: the
+        // band *is* declared and there *are* windows).
+        spec.auc_target = Some((1e18, f64::INFINITY));
+        assert_eq!(run(&spec).metrics[0].auc_target_attainment, Some(0.0));
     }
 
     #[test]
@@ -11891,6 +12306,7 @@ mod adaptive_sim_tests {
             confirm: 1,
             levels: None,
             target_window: None,
+            auc_target: None,
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 50.0,

@@ -3858,6 +3858,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     let mut confirm: u32 = 1;
     let mut levels: Option<Vec<f64>> = None;
     let mut target_window: Option<(f64, f64)> = None;
+    let mut auc_target: Option<(f64, f64)> = None;
     let mut rules: Vec<AdaptiveRule> = Vec::new();
 
     for line in lines {
@@ -3971,6 +3972,28 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
                 }
                 target_window = Some((lo, hi));
             }
+            "auc_target" => {
+                // Exposure band `[low, high]` for the `auc_target_attainment` metric
+                // only — it does not affect dosing. It is the AUC of a non-negative
+                // signal, so `low` must be finite *and* `>= 0`; `high` may be `inf`
+                // for a one-sided "at or above low" target. Mirrors
+                // `AdaptiveDosingSpec::validate`.
+                let b = parse_float_array(val)
+                    .map_err(|e| format!("[adaptive_dosing]: bad auc_target: {e}"))?;
+                if b.len() != 2 {
+                    return Err(format!(
+                        "[adaptive_dosing]: auc_target must be `[low, high]`: {val}"
+                    ));
+                }
+                let (lo, hi) = (b[0], b[1]);
+                if !lo.is_finite() || lo < 0.0 || hi.is_nan() || hi < lo {
+                    return Err(format!(
+                        "[adaptive_dosing]: auc_target must be `[low, high]` with low finite, \
+                         0 <= low <= high (high may be `inf`): {val}"
+                    ));
+                }
+                auc_target = Some((lo, hi));
+            }
             other => return Err(format!("[adaptive_dosing]: unknown key `{other}`")),
         }
     }
@@ -3998,6 +4021,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
         confirm,
         levels,
         target_window,
+        auc_target,
         rules,
     };
     spec.validate()?;
@@ -8725,6 +8749,17 @@ fn build_pk_param_fn(
         n_eta_extended,
     );
 
+    // Detect use of the `TIME` built-in BEFORE `resolve_variable_indices`
+    // bytecode-compiles the statements: that pass replaces each `Expression::Time`
+    // node with an `Op::PushTime` bytecode op and an `Expression::Literal(0.0)`
+    // placeholder, after which `stmts_use_time_builtin` (an AST walker) can no
+    // longer see it. Computing the flag here, on the intact AST, is what makes a
+    // time-dependent individual parameter expressed as a conditional RHS
+    // (`STEP = if (TIME > 5) 1 else 0`) route through the per-event evaluation
+    // path. (A genuine `if`-statement block survives resolution and was detected
+    // either way; the conditional-expression form regressed silently — #610.)
+    let stmts_use_time = stmts_use_time_builtin(&stmts_resolved);
+
     resolve_variable_indices(&mut stmts_resolved, &var_idx, &cov_idx, None);
 
     let stmts_owned = stmts_resolved;
@@ -8852,7 +8887,7 @@ fn build_pk_param_fn(
         ode_assignment_mapping.clone()
     };
     let pk_slot_indices = pk_var_slots.iter().map(|&(slot, _)| slot).collect();
-    let uses_time_builtin = stmts_use_time_builtin(&stmts_owned) || !pk_time_mapping.is_empty();
+    let uses_time_builtin = stmts_use_time || !pk_time_mapping.is_empty();
     let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
@@ -17229,6 +17264,56 @@ mod tests {
     }
 
     #[test]
+    fn test_time_builtin_in_conditional_rhs_sets_uses_time_flag() {
+        // Regression: the `TIME` built-in used inside a conditional-expression
+        // RHS (`STEP = if (TIME > 5) 1 else 0`) must flag the model as using
+        // TIME, so a time-dependent individual parameter routes through the
+        // per-event evaluation path. The flag was computed AFTER
+        // `resolve_variable_indices` bytecode-compiled the statements, which
+        // erased the `Expression::Time` node the scan looks for — so it read
+        // false and the analytical path evaluated PK params once at t=0 (the
+        // parameter never switched; e.g. infliximab's maintenance-phase CL
+        // multiplier became unidentifiable).
+        let model = "[parameters]\n  \
+                       theta TVCL (1.0, 0.01, 100.0)\n  \
+                       theta TVV (10.0, 0.1, 500.0)\n  \
+                       omega ETA_CL ~ 0.1\n  \
+                       sigma PROP ~ 0.1\n\
+                     [individual_parameters]\n  \
+                       STEP = if (TIME > 5) 1 else 0\n  \
+                       CL = TVCL * (1 + STEP) * exp(ETA_CL)\n  \
+                       V = TVV\n\
+                     [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+                     [error_model]\n  DV ~ proportional(PROP)\n";
+        let compiled = parse_model_string(model).unwrap();
+        assert!(
+            compiled_model_uses_time_builtin(&compiled),
+            "TIME inside a conditional-expression RHS must set uses_time_builtin"
+        );
+    }
+
+    #[test]
+    fn test_no_time_builtin_leaves_uses_time_flag_unset() {
+        // Counterpart: a model with no TIME reference must not be flagged (it
+        // stays on the cheap single-snapshot analytical path).
+        let model = "[parameters]\n  \
+                       theta TVCL (1.0, 0.01, 100.0)\n  \
+                       theta TVV (10.0, 0.1, 500.0)\n  \
+                       omega ETA_CL ~ 0.1\n  \
+                       sigma PROP ~ 0.1\n\
+                     [individual_parameters]\n  \
+                       CL = TVCL * exp(ETA_CL)\n  \
+                       V = TVV\n\
+                     [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+                     [error_model]\n  DV ~ proportional(PROP)\n";
+        let compiled = parse_model_string(model).unwrap();
+        assert!(
+            !compiled_model_uses_time_builtin(&compiled),
+            "a model with no TIME reference must not set uses_time_builtin"
+        );
+    }
+
+    #[test]
     fn test_covariates_referenced_but_undeclared_warns_not_errors() {
         // CL uses WT, but only SEX is declared. This is allowed (WT is still
         // usable) — the parser warns rather than erroring.
@@ -24877,6 +24962,56 @@ mod adaptive_dosing_tests {
             let err = parse_adaptive_dosing_block(&b).expect_err("expected a typed parse error");
             assert!(
                 err.starts_with("[adaptive_dosing]:") && err.contains("target_window"),
+                "`{bad}` gave: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn auc_target_parses_band_and_one_sided() {
+        // Default: no `auc_target` ⇒ `None` (the signal-AUC pass is skipped and
+        // `auc_target_attainment` is unreported).
+        let none = parse_adaptive_dosing_block(&without("nothing")).expect("valid_min parses");
+        assert_eq!(none.auc_target, None);
+
+        // Two-sided AUC₂₄ band (the vancomycin 400–600 mg·h/L target).
+        let band = parse_adaptive_dosing_block(&{
+            let mut b = without("nothing");
+            b.push("auc_target = [400, 600]".into());
+            b
+        })
+        .expect("two-sided auc_target parses");
+        assert_eq!(band.auc_target, Some((400.0, 600.0)));
+
+        // One-sided "at or above 400": `high = inf` is allowed.
+        let one_sided = parse_adaptive_dosing_block(&{
+            let mut b = without("nothing");
+            b.push("auc_target = [400, inf]".into());
+            b
+        })
+        .expect("one-sided auc_target parses");
+        let (lo, hi) = one_sided.auc_target.expect("Some");
+        assert_eq!(lo, 400.0);
+        assert!(hi.is_infinite() && hi > 0.0);
+    }
+
+    #[test]
+    fn auc_target_bad_band_errors() {
+        // Inverted, negative/non-finite low, and wrong arity each reject loudly,
+        // naming the key. Unlike `target_window`, a *negative* low is also rejected
+        // (an AUC of a non-negative signal cannot be < 0).
+        for bad in [
+            "auc_target = [600, 400]", // high < low
+            "auc_target = [-1, 600]",  // low must be >= 0
+            "auc_target = [nan, 600]",
+            "auc_target = [inf, 600]", // low must be finite
+            "auc_target = [400]",      // not [low, high]
+        ] {
+            let mut b = without("nothing");
+            b.push(bad.into());
+            let err = parse_adaptive_dosing_block(&b).expect_err("expected a typed parse error");
+            assert!(
+                err.starts_with("[adaptive_dosing]:") && err.contains("auc_target"),
                 "`{bad}` gave: {err}"
             );
         }

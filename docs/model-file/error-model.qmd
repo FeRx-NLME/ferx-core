@@ -290,31 +290,49 @@ occasion. In the cross-endpoint case ferx builds a subject-level residual
 covariance matrix, so paired rows such as total/unbound assays receive the
 NONMEM-style covariance term `f_total * f_unbound * Cov(EPS_total, EPS_unbound)`.
 
-Current scope: `block_sigma` is supported for ordinary Gaussian `method = foce`
-and `method = saem` fits. FOCEI/GN, importance-sampling paths, M3
-censored-observation likelihoods, FREM covariate pseudo-observations,
-`iiv_on_ruv`, TTE endpoints, and IOV reject correlated residual sigma blocks
-until their residual-error derivative code is extended beyond diagonal RUV.
-SDE/EKF process-noise models carry the correlation under `method = foce` (the
-EKF variance is added to the dense `R`) but are rejected under `method = saem`,
-whose M-step data term does not yet include the process-noise inflation.
+Current scope: `block_sigma` is supported for the Gaussian `method = foce`,
+`method = focei`, `method = saem`, and `method = imp` fits. The Gauss-Newton
+optimizers (`gn` / `gn_hybrid`), M3 censored-observation likelihoods, FREM
+covariate pseudo-observations, `iiv_on_ruv`, TTE endpoints, and IOV reject
+correlated residual sigma blocks until their residual-error derivative code is
+extended beyond diagonal RUV. SDE/EKF process-noise models carry the correlation
+under `method = foce` / `method = focei` (the EKF variance is added to the dense
+`R`) but are rejected under `method = saem`, whose M-step data term does not yet
+include the process-noise inflation.
+
+Under `method = focei` the off-diagonal covariance enters the interaction
+correction as well as the data term: the Almquist 2015 conditional Hessian
+becomes `H̃ = HᵀR⁻¹H + ½·B + Ω⁻¹` with `B_{kl} = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l)`
+over the full dense residual covariance `R` (it reduces to the diagonal FOCEI
+`a'diag(1/R)a + ½c̃'c̃` when the correlation is zero). Under `method = imp` the
+importance weights already use the dense `R`; the Student-t proposal precision is
+also built from `R⁻¹` so the correlated posterior shape is sampled efficiently.
 
 Validation: `examples/correlated_residual_combined.ferx` and
 `nonmem_anchor/correlated_residual_combined.ctl` run the same fixed-parameter
 one-compartment IV model with `$SIGMA BLOCK(2) FIX`. On
 `data/correlated_residual_combined.csv`, NONMEM 7.5.1 (`METHOD=1 MAXEVAL=0`)
 reports OFV 18.715849 and ferx FOCE reports OFV 18.727365 (difference 0.0115).
+Adding `INTER` to that control file (`METHOD=1 INTER MAXEVAL=0`) reports OFV
+18.722087, and ferx `method = focei` reports OFV 18.722087 — agreement to
+better than 1e-5, since the FOCEI Laplace marginal evaluates `R` at the
+conditional mode η̂ exactly as NONMEM's INTER does (no Sheiner–Beal
+linearization point to disagree on).
 
 The SAEM path reuses the same dense residual-covariance likelihood
 (`dense_residual_data_term`) for its E-step Metropolis acceptance and its
-theta/sigma M-step objective, and its reported OFV (the FOCE-approximation
-`2·pop_nll` used for AIC/BIC comparability) is routed through the
-correlation-aware non-interaction objective. On the same fixed-parameter model
-ferx SAEM reports OFV 18.7274 — matching ferx FOCE to 4 decimals — against
-NONMEM's importance-sampling marginal −2LL at the reference parameters
-(`METHOD=IMP EONLY=1`, 30 000 samples) of 18.68. Dropping the off-diagonal
-covariance (a diagonal `$SIGMA`) lowers all three engines to ≈14.62, so the
-≈4-OFV gap is the cross-endpoint correlation being correctly accounted for.
+theta/sigma M-step objective. Its reported OFV (the FOCE-approximation
+`2·pop_nll` used for AIC/BIC comparability) now follows the `interaction` flag
+exactly like FOCE/FOCEI: with interaction on (the default) it reports the dense
+**interaction** marginal — ferx SAEM OFV 18.7221, matching ferx FOCEI and NONMEM
+`METHOD=1 INTER` — and with `interaction = false` it reports the non-interaction
+marginal (18.7274, matching ferx FOCE). Previously SAEM always fell back to the
+non-interaction marginal for correlated models regardless of the flag; the
+correlation itself was, and is, carried in both cases. As a marginal-likelihood
+sanity check, NONMEM's importance-sampling −2LL at these reference parameters
+(`METHOD=IMP EONLY=1`, 30 000 samples) is 18.68; dropping the off-diagonal
+covariance (a diagonal `$SIGMA`) lowers all engines to ≈14.62, so the ≈4-OFV gap
+is the cross-endpoint correlation being correctly accounted for.
 
 ## IIV on residual error (`iiv_on_ruv`)
 

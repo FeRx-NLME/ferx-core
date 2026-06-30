@@ -53,6 +53,7 @@ with the run, never with a fitted model's parameters.
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. |
 | `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
+| `auc_target` | | Exposure band `[low, high]` for the **area under the monitored signal** over each inter-decision window (e.g. vancomycin AUC₂₄ when decisions are daily), used **only** to report the `auc_target_attainment` outcome metric — like `target_window` it does **not** influence dosing. `low` must be `≥ 0`; `high` may be `inf`. Declaring it turns on a signal-AUC pass that re-integrates the realized doses on a dense grid; omit it to skip that pass and leave `auc_target_attainment` unreported. |
 | `with_assay_error` | signal¹ | Titrate on the **noised measurement** of a model output (named by `assay_cmt`) instead of a latent expression (default `false`). The signal's value comes from that output's `[scaling]` readout and its σ from that output's `[error_model]`, so the two are always on the same scale — there is no re-typed `observe` expression to mis-scale. Mutually exclusive with `observe`. |
 | `assay_cmt` | | The 1-based compartment of the model output measured under `with_assay_error` — its `[scaling]` readout is the signal value and its `[error_model]` σ the noise. **Required** with `with_assay_error`. |
 
@@ -195,14 +196,19 @@ The result bundles four tidy, long-form artifacts — each tagged by
   record rather than inferred from gaps in the ledger.
 - `metrics` — one per-subject `AdaptiveSubjectMetrics` row per realized run:
   cumulative dose, dose-increase / -decrease / hold / discontinuation counts,
-  time-to-discontinuation, the observed-signal summary (min / max / mean), and
-  `pct_time_in_window` when the block declares a `target_window`. Every field is
-  derived from `ledger` + `decisions` alone, so it is auditable against those rows
-  (no re-integration). Increases / decreases are counted by realized dose change,
-  not by which rule fired — a `decrease` clamped at the lower bound re-issues the
-  same dose and is not counted. The signal summary is over the troughs/peaks the
-  controller saw at the decision times (a decision-grid summary, not a
-  dense-trajectory extremum). Population summaries **with uncertainty bands** ride
+  time-to-discontinuation, the observed-signal summary (min / max / mean),
+  `pct_time_in_window` when the block declares a `target_window`, and
+  `auc_target_attainment` when it declares an `auc_target`. The point fields are
+  derived from `ledger` + `decisions` alone, so they are auditable against those
+  rows (no re-integration). Increases / decreases are counted by realized dose
+  change, not by which rule fired — a `decrease` clamped at the lower bound
+  re-issues the same dose and is not counted. The signal summary is over the
+  troughs/peaks the controller saw at the decision times (a decision-grid summary,
+  not a dense-trajectory extremum). `auc_target_attainment` is the one
+  integrated-exposure field: the fraction of inter-decision windows whose area
+  under the monitored signal falls in the `auc_target` band, computed by a separate
+  signal-AUC pass that re-integrates the realized doses on a dense grid (it never
+  perturbs the reactive run). Population summaries **with uncertainty bands** ride
   with the uncertainty slice, where bands carry meaning.
 
 ## Verification (on by default)
@@ -242,10 +248,12 @@ family. It is validated instead by:
   exactly the engine the programmatic API exercises);
 - a **closed-loop** check — a titration that starts below its target band drives
   the trough into the band and holds it there;
-- for genuinely reactive behaviour, reproduction of an external **mrgsolve**
-  dynamic-dosing run (the apples-to-apples external comparator, since mrgsolve
-  does do feedback dosing) — see [The platelet-ladder anchor](#the-platelet-ladder-anchor)
-  below.
+- for genuinely reactive behaviour, reproduction of external **mrgsolve**
+  dynamic-dosing runs (the apples-to-apples external comparator, since mrgsolve
+  does do feedback dosing) — one for each titration mode: the discrete `levels`
+  ladder, in [The platelet-ladder anchor](#the-platelet-ladder-anchor), and
+  continuous (percentage) titration plus the AUC-exposure metric, in
+  [The vancomycin AUC-TDM anchor](#the-vancomycin-auc-tdm-anchor).
 
 ### The platelet-ladder anchor
 
@@ -276,6 +284,39 @@ is robust. The model is `examples/adaptive_platelet_ladder.ferx`; the mrgsolve
 model, R driver, and frozen output live in `tests/reference/platelet_mrgsolve/`,
 exercised by the slow-gated `tests/adaptive_platelet_anchor.rs` (nightly + on push
 to `main`).
+
+### The vancomycin AUC-TDM anchor
+
+Continuous (percentage) titration **and** the `auc_target` exposure metric are
+cross-checked against **mrgsolve 1.7.2** on a vancomycin TDM scenario — a
+1-compartment IV model dosed once daily by a 1-h infusion. At the start of each
+day the controller reads the pre-dose trough and titrates the dose ±25 % to hold
+the trough in `[10, 15]` mg/L (the control law), while the *reported* outcome is
+AUC₂₄ attainment against the guideline band `[400, 600]` mg·h/L — the real
+trough-vs-AUC vancomycin tension, where dosing follows a single timed level but
+efficacy is judged on the daily exposure. The empiric start is subtherapeutic, so
+the dose climbs (seven 25 % steps) and holds once the trough enters the band:
+
+| Day | Trough (mg/L) | Dose (mg) | AUC₂₄ (mg·h/L) | On AUC target |
+|---:|---:|---:|---:|:--:|
+| 0   | 0.0  | 625  | 108 | no |
+| 4   | 6.2  | 1526 | 350 | no |
+| 5   | 7.8  | 1907 | 438 | **yes** |
+| 6   | 9.7  | 2384 | 548 | **yes** |
+| 7   | 12.1 | 2384 | 581 | **yes** |
+| 8–12| 12.9–13.2 | 2384 | 592–596 | **yes** |
+
+ferx reproduces every dose **exactly** (the titration is exact `f64` arithmetic
+shared with the R loop), every trough to a small cross-solver tolerance, and the
+AUC-target attainment fraction (**8 of 13 daily windows**) exactly. ferx
+integrates the daily exposure by a 128-panel trapezoid per window while mrgsolve
+uses an AUC compartment; the two agree to ~10⁻⁵ relative, far inside the margin
+from each AUC₂₄ to the band edges, so the in/out classification — hence
+attainment — is identical. (The exact AUC-pass accuracy is pinned separately by an
+analytic unit test against the closed form `(D/k)(e^{-k a} − e^{-k b})`.) The
+model is `examples/adaptive_vanco_auc.ferx`; the mrgsolve model, R driver, and
+frozen output live in `tests/reference/vanco_mrgsolve/`, exercised by the
+slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
 
 ## Current scope and limits
 

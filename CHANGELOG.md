@@ -29,6 +29,24 @@ section of the SDLC for the versioning policy).
   oral absorption. Steady-state doses, IOV, time-varying covariates, infusions, and a `depot`
   initial amount are rejected with an actionable message (use an ODE transit model for those). See
   `examples/one_cpt_transit.ferx`.
+- `block_sigma` correlated residual errors are now supported under
+  `method = focei` and `method = imp`, not just `foce` and `saem` (#616). FOCEI
+  carries the off-diagonal residual covariance through the Almquist interaction
+  Hessian (`H̃ = HᵀR⁻¹H + ½·tr(R⁻¹∂R/∂η R⁻¹∂R/∂η) + Ω⁻¹`), and IMP builds its
+  Student-t proposal precision from the dense `R⁻¹`. On the committed
+  `correlated_residual_combined` anchor, ferx FOCEI OFV 18.722087 matches NONMEM
+  `METHOD=1 INTER` (18.722087) to better than 1e-5. The Gauss-Newton
+  (`gn` / `gn_hybrid`) paths remain diagonal-only and are still rejected.
+- **AUC-target attainment metric + vancomycin AUC-TDM example/anchor** (#391, S2.5b). A new
+  optional `[adaptive_dosing] auc_target = [low, high]` key adds `auc_target_attainment` to
+  `AdaptiveSubjectMetrics` — the fraction of inter-decision windows whose area under the monitored
+  signal (e.g. vancomycin AUC₂₄) falls in the band (`high` may be `inf`). Like `target_window` it
+  reports a metric only and never influences dosing; declaring it turns on a signal-AUC pass that
+  re-integrates the realized doses on a dense grid (trapezoid), leaving the reactive run untouched.
+  A new bundled model `examples/adaptive_vanco_auc.ferx` titrates a once-daily infusion on the
+  pre-dose trough and reports AUC₂₄ attainment, cross-validated against an external **mrgsolve** run
+  (reference kit in `tests/reference/vanco_mrgsolve/`, slow-gated `tests/adaptive_vanco_anchor.rs`).
+  See [Adaptive dosing](model-file/adaptive-dosing.qmd).
 - `TIME`/`time` are now built-in event-time values in `[individual_parameters]`
   expressions and direct analytical `pk(...=TIME)` mappings, enabling
   NONMEM-style time-dependent PK parameter switches without declaring `TIME` as
@@ -64,6 +82,21 @@ section of the SDLC for the versioning policy).
   for these models — a drug-driven hazard can vanish and never fire, so there is no implicit
   observation window; EVID-3/4 resets and left truncation on an ODE-TTE subject are not yet
   supported and are rejected with a clear error.
+- **Exact analytic gradients for M3 BLOQ + IOV models — full FOCEI/FOCE matrix**
+  (closed-form 1/2/3-cpt, #580/#591/#486). An inter-occasion-variability model with M3
+  below-limit handling now runs on exact analytic sensitivities instead of finite
+  differences across the whole estimator matrix: **FOCEI**, **non-interaction FOCE**, and
+  the triple **M3 + IOV + `iiv_on_ruv`**. The censored data term `−logΦ((LLOQ−f)/√v)` and
+  its `f`-derivatives ride the stacked `[η_bsv, κ]` layout — censored rows enter the data
+  gradient and the true inner Hessian but stay excluded from the Laplace `H̃`/`log|H̃|`
+  (matching `foce_subject_nll_iov`); for `iiv_on_ruv` the censored residual-eta cross
+  coefficients `(C·z, C·m)` enter the true inner Hessian and the `h·z` residual-eta column
+  enters the inner gradient. The FOCE path differentiates the augmented Sheiner–Beal
+  marginal with censored rows re-entering as `−logΦ` at the population (η=0, κ=0) variance.
+  Inner stacked-η gradients match central FD of the IOV inner objective and outer packed
+  gradients match Richardson reconverged FD of the corresponding marginal, all to ~1e-3;
+  estimate-level tests confirm the analytic fits land on the FD (NONMEM-anchored) optima.
+  Only the **ODE** M3 + IOV + `iiv_on_ruv` triple still routes to FD.
 - **Parallel / mixed dual-pathway absorption — `first_order(ka)` composition** (#505). A new
   built-in `first_order(ka)` input-rate function exposes the classic first-order (Bateman)
   absorption for composition in `[odes]`, so two absorption pathways can be split by a dose
@@ -300,7 +333,85 @@ section of the SDLC for the versioning policy).
   sdtab/predict/simulate output, and the survival left-truncation `TENTRY` all
   report the value in the data file; no per-subject time shift is applied.
 
+### Changed
+- For `block_sigma` correlated residual models, the SAEM reported OFV (the
+  FOCE-approximation used for AIC/BIC) now follows the `interaction` flag like
+  FOCE/FOCEI instead of always using the non-interaction marginal: with
+  interaction on (the default) it reports the dense interaction marginal
+  (e.g. 18.7221 on the `correlated_residual_combined` anchor, matching ferx
+  FOCEI) rather than the previous non-interaction value (18.7274) (#616). The
+  off-diagonal correlation is carried in both cases; only the marginal's
+  curvature term changed.
+- **SAEM now warns on non-mu-referenced individual parameters instead of listing detected
+  mu-referencing** (#621). The broad `mu-ref: ...` info notice is replaced by a SAEM-only
+  warning that names any individual parameter whose random effect is not mu-referenced
+  (e.g. `CL = TVCL + ETA_CL` rather than `CL = TVCL * exp(ETA_CL)`), since such forms can
+  strongly slow SAEM convergence. The warning fires whenever the estimation chain runs SAEM,
+  independent of the `mu_referencing` fit option.
+- **IOV occasions with doses but no observations now contribute their own κ random-effect
+  axis** (#590). Occasion grouping (`iov_occasion_groups`) now includes every occasion in
+  the dose record, not only those carrying sampled observations, so a dose-only occasion
+  (e.g. a loading dose with no PK samples) adds an IOV κ axis and a `k_occasions·log|Ω_iov|`
+  prior term. This shifts converged OFV / estimates / SEs for datasets with dose-only
+  occasions versus prior versions; it is intended (carryover means such an occasion's κ is
+  still informed by later observations).
+- **FOCE + M3 BLOQ + IOV no longer silently promotes censored subjects to interaction**
+  (#591). Under `method = foce` (non-interaction), an IOV subject with `CENS != 0` rows is
+  now scored with a consistent Sheiner–Beal objective for the whole subject — the censored
+  rows leave the linearized marginal and re-enter as `−logΦ((LLOQ−f)/√R⁰)` at the
+  population (η=0, κ=0) variance — instead of being evaluated with η-interaction. This
+  mirrors the non-IOV FOCE-M3 change (#367) and matches NONMEM `METHOD=1 LAPLACE` with vs
+  without `INTER`: FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different optima. **Fits that
+  relied on the old auto-promotion should set `method = focei` explicitly.** The FOCE-M3
+  notice — which described the now-removed promotion ("evaluated with η-interaction") — is
+  reworded to state the non-interaction (Sheiner–Beal) semantics accurately (#599).
+
 ### Fixed
+- **Estimation-method chains now run the covariance step only once, at the end of
+  the chain** (#615). When a chain ended in a *default (estimating)* IMP stage
+  (e.g. `methods = [saem, imp]`), both the preceding estimator and the IMP stage
+  computed the (expensive) finite-difference covariance matrix — the trailing-IMP
+  heuristic incorrectly treated every trailing IMP as an evaluation-only stage.
+  The covariance / SIR step now runs only on the last *estimating* stage;
+  evaluation-only IMP (`imp_eval_only`) still cedes the step to the preceding
+  estimator as before. Plain chains without IMP were already correct.
+- **M3 BLOQ above-ULOQ (right-censored, `CENS = -1`) handling under FOCE and the analytic
+  gradients** (#591). The non-interaction FOCE marginal (`foce_subject_nll_standard`) and
+  the analytic FOCE/FOCEI censored-row sensitivities (inner EBE gradient, outer
+  θ/Ω/σ gradient, and the `iiv_on_ruv` cross-terms) hardcoded the lower (below-LLOQ) tail,
+  so an above-ULOQ observation was scored and differentiated with the wrong normal tail —
+  giving a wrong FOCE objective and a wrong-signed EBE/parameter gradient for any dataset
+  with `CENS = -1` rows. The censored kernels and the FOCE marginal are now tail-aware
+  (selecting `z = (f − ULOQ)/√v` for `CENS < 0`, matching `m3_logcdf`). This also repairs
+  the pre-existing **non-IOV** M3 right-censored gradient/objective (the bug predated the
+  IOV work). Left-censored (`CENS = 1`) results are unchanged.
+- **A time-dependent individual parameter written with the `TIME` built-in
+  inside a conditional-expression RHS now switches** (e.g.
+  `MAINT = if (TIME > 45) 1 else 0`). The "uses TIME" flag that routes such a
+  model through the per-event evaluation path was computed *after* the
+  individual-parameter statements were bytecode-compiled — a step that replaces
+  the `TIME` node with an `Op::PushTime` op the flag's AST scan can no longer
+  see. The flag therefore read `false`, the analytical path evaluated PK
+  parameters once at `t = 0`, and the parameter never changed over time (the
+  effect collapsed and its θ became unidentifiable). The flag is now computed on
+  the pre-compilation AST. A `TIME` reference inside a full `if { … }` statement
+  block was unaffected; only the conditional-expression form regressed
+  (introduced with the `TIME` built-in in #610).
+- **A trough observation listed before a same-TIME dose is now evaluated
+  pre-dose**, matching NONMEM's record-order semantics. The data reader ordered
+  events by time and, at an equal TIME, placed the dose first on every path (the
+  event-driven sort and the analytical superposition gate alike), so an
+  observation sharing a dose's timestamp was scored as a post-dose peak instead
+  of the pre-dose trough the data intended. On trough-rich datasets this railed
+  fits to their bounds. The reader now honors data record order: an observation
+  written before its coincident dose sorts just before that dose, while a
+  post-dose observation (dose row first) and steady-state doses are unchanged.
+  The raw user-clock TIME reported in sdtab/covtab and by
+  `predict()`/`simulate()` is unaffected. With both fixes the infliximab run55
+  benchmark — which had railed to its bounds (eval-at-NONMEM-estimates OFV 3751
+  vs NONMEM 662; FOCEI and SAEM both converging to nonsense) — reproduces NONMEM:
+  FOCEI OFV 664.0 vs 662.2, TVCL 0.198 vs 0.199, maintenance-phase CL multiplier
+  1.41 vs 1.40.
 - **Joint PK-TTE fit now rejects a non-monotone (negative) cumulative hazard** (#564).
   A drug-driven `hazard =` expression is unconstrained, so a sign-flipped hazard could make
   the cumulative hazard *decrease* — implying a survival `S(t) > 1`. The right-censored and

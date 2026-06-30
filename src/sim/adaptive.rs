@@ -350,7 +350,13 @@ pub struct AdaptiveRun {
 /// **decision-grid** summary, not a dense-trajectory extremum, and (when several
 /// monitors are declared) summarizes the first one. When the run recorded no signal
 /// at any decision, the summary fields are `None`.
+///
+/// `#[non_exhaustive]`: new outcome metrics (#391 S2.x) land additively without a
+/// breaking change. Within `ferx-core` it is still constructed normally (only
+/// [`compute_subject_metrics`] builds it); the attribute forces downstream crates
+/// (`ferx-r`) to read fields rather than rely on an exhaustive struct literal.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct AdaptiveSubjectMetrics {
     /// Subject id (matches [`DoseLedgerEntry::subject`]).
     pub subject: String,
@@ -395,6 +401,26 @@ pub struct AdaptiveSubjectMetrics {
     /// (or no signal was recorded) — never a band guessed from the rule
     /// thresholds (#584).
     pub pct_time_in_window: Option<f64>,
+    /// Fraction of the **closed inter-decision windows** whose exposure (the area
+    /// under the latent monitored signal over the window) fell within the spec's
+    /// `auc_target` band `[lo, hi]` (inclusive), in `[0, 1]` — e.g. the share of
+    /// daily windows whose vancomycin AUC₂₄ is on target (#391 S2.5b). The
+    /// denominator is the number of windows between consecutive **scheduled**
+    /// decisions (`decisions − 1`), so a run with fewer than two decisions has no
+    /// window and the metric is `None`. `None` also when no `auc_target` is declared
+    /// (the signal-AUC pass is then skipped). Unlike the point summary above, this is
+    /// an **integrated-exposure** quantity: it is computed by re-integrating the
+    /// realized dose ledger on a dense grid (the AUC pass never perturbs the
+    /// reactive run), not reduced from the decision-grid signals.
+    ///
+    /// This is a **planned-horizon** measure: it scores every scheduled window,
+    /// including any after a `Stop`/discontinuation — those integrate the decaying
+    /// tail of the last realized dose, so they (correctly) read as under-exposed and
+    /// off-target. It therefore uses a different decision basis from the
+    /// realized-decision point metric [`Self::pct_time_in_window`]; the two agree
+    /// when the run never discontinues (the common case, and what the bundled
+    /// example exercises).
+    pub auc_target_attainment: Option<f64>,
 }
 
 /// Compute the [`AdaptiveSubjectMetrics`] for one realized run from its dose
@@ -402,10 +428,15 @@ pub struct AdaptiveSubjectMetrics {
 ///
 /// `ledger` and `decisions` are the artifacts of a **single** `(subject, draw,
 /// sim)` run (the rows the per-subject driver emits), in emission order: `ledger`
-/// in dose order and `decisions` in schedule order. The function is pure — it
-/// re-integrates nothing — so it is unit-testable on hand-built rows. `target_window`
-/// comes from the [`AdaptiveDosingSpec`] (the file-driven path); the programmatic
-/// path passes `None`, leaving `pct_time_in_window` unreported.
+/// in dose order and `decisions` in schedule order. `window_aucs` is that run's
+/// per-(inter-decision)-window signal AUC series (one entry per closed window,
+/// `decisions − 1` long), supplied by the caller's signal-AUC pass — `&[]` when
+/// no `auc_target` is declared (the pass is skipped). The function is **pure**: it
+/// re-integrates nothing, treating `window_aucs` as just another input artifact, so
+/// it stays unit-testable on hand-built rows. `target_window` / `auc_target` come
+/// from the [`AdaptiveDosingSpec`] (the file-driven path); the programmatic path
+/// passes `None` / `&[]`, leaving `pct_time_in_window` / `auc_target_attainment`
+/// unreported.
 pub(crate) fn compute_subject_metrics(
     subject: &str,
     draw: usize,
@@ -413,6 +444,8 @@ pub(crate) fn compute_subject_metrics(
     ledger: &[DoseLedgerEntry],
     decisions: &[DecisionLogEntry],
     target_window: Option<(f64, f64)>,
+    auc_target: Option<(f64, f64)>,
+    window_aucs: &[f64],
 ) -> AdaptiveSubjectMetrics {
     let cumulative_dose: f64 = ledger.iter().map(|e| e.amt).sum();
     let n_doses = ledger.len();
@@ -470,6 +503,18 @@ pub(crate) fn compute_subject_metrics(
         _ => None,
     };
 
+    // Exposure attainment: the fraction of inter-decision windows whose signal AUC
+    // is in band. The denominator is the number of windows the AUC pass produced
+    // (`decisions − 1`); `window_aucs` is empty when no `auc_target` is declared (or
+    // there is fewer than one window), so both leave the metric `None`.
+    let auc_target_attainment = match auc_target {
+        Some((lo, hi)) if !window_aucs.is_empty() => {
+            let n_in = window_aucs.iter().filter(|&&a| a >= lo && a <= hi).count();
+            Some(n_in as f64 / window_aucs.len() as f64)
+        }
+        _ => None,
+    };
+
     AdaptiveSubjectMetrics {
         subject: subject.to_string(),
         draw,
@@ -485,6 +530,7 @@ pub(crate) fn compute_subject_metrics(
         signal_max,
         signal_mean,
         pct_time_in_window,
+        auc_target_attainment,
     }
 }
 
@@ -636,6 +682,17 @@ pub struct AdaptiveDosingSpec {
     /// thresholds (which conflates the control law with the clinical target). See
     /// [`crate::AdaptiveSubjectMetrics`].
     pub target_window: Option<(f64, f64)>,
+    /// Optional target band `[low, high]` (inclusive) for the **exposure** — the
+    /// area under the latent monitored signal over each inter-decision window
+    /// (e.g. vancomycin AUC₂₄ when decisions are daily). Like
+    /// [`AdaptiveDosingSpec::target_window`] it feeds **only** an outcome metric
+    /// ([`AdaptiveSubjectMetrics::auc_target_attainment`], #391 S2.5b) and never
+    /// influences dosing. `low` must be finite and `≥ 0` (an AUC of a non-negative
+    /// signal cannot be negative); `high` may be `+∞` for a one-sided "at or above
+    /// `low`" target. `None` leaves the metric unreported (the signal-AUC pass is
+    /// then skipped entirely — it is the metric's only consumer). See
+    /// [`AdaptiveSubjectMetrics::auc_target_attainment`].
+    pub auc_target: Option<(f64, f64)>,
     /// The first-matching-rule ladder, in file order.
     pub rules: Vec<AdaptiveRule>,
 }
@@ -708,6 +765,20 @@ impl AdaptiveDosingSpec {
                 return Err(format!(
                     "[adaptive_dosing]: target_window must be [low, high] with low finite and \
                      low <= high (high may be inf): [{wlo}, {whi}]"
+                ));
+            }
+        }
+        // `auc_target` (metrics only): the exposure band for `auc_target_attainment`.
+        // `low` must be finite *and non-negative* (the AUC of a non-negative signal
+        // cannot be < 0, so a negative target is a modelling error), `low <= high`,
+        // and `high` may be +∞ (one-sided "at or above low"). Checked here too, not
+        // just in the parser, so a hand-built spec can't reach metrics with an
+        // inverted/NaN/negative band.
+        if let Some((alo, ahi)) = self.auc_target {
+            if !alo.is_finite() || alo < 0.0 || ahi.is_nan() || ahi < alo {
+                return Err(format!(
+                    "[adaptive_dosing]: auc_target must be [low, high] with low finite and \
+                     0 <= low <= high (high may be inf): [{alo}, {ahi}]"
                 ));
             }
         }
@@ -994,6 +1065,7 @@ mod tests {
             confirm: 1,
             levels: None,
             target_window: None,
+            auc_target: None,
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 10.0,
@@ -1440,7 +1512,7 @@ mod tests {
             decision(120.0, Some(45.0), DecisionOutcome::Stop { dosed: 0 }),
         ];
 
-        let m = compute_subject_metrics("S", 1, 2, &ledger, &decisions, None);
+        let m = compute_subject_metrics("S", 1, 2, &ledger, &decisions, None, None, &[]);
 
         assert_eq!(m.subject, "S");
         assert_eq!((m.draw, m.sim), (1, 2));
@@ -1458,6 +1530,7 @@ mod tests {
         assert_eq!(m.signal_max, Some(45.0));
         assert_eq!(m.signal_mean, Some(19.0)); // (8+5+22+15+45)/5
         assert_eq!(m.pct_time_in_window, None, "no target_window declared");
+        assert_eq!(m.auc_target_attainment, None, "no auc_target declared");
     }
 
     #[test]
@@ -1471,11 +1544,28 @@ mod tests {
             decision(96.0, Some(45.0), DecisionOutcome::Dosed { n: 1 }),
         ];
         // Two-sided band [10, 20]: only 15 is in band ⇒ 1/5.
-        let band = compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)));
+        let band = compute_subject_metrics(
+            "S",
+            1,
+            1,
+            &ledger,
+            &decisions,
+            Some((10.0, 20.0)),
+            None,
+            &[],
+        );
         assert_eq!(band.pct_time_in_window, Some(0.2));
         // One-sided "at or above 10" ([10, +∞]): 22, 15, 45 ⇒ 3/5.
-        let one_sided =
-            compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, f64::INFINITY)));
+        let one_sided = compute_subject_metrics(
+            "S",
+            1,
+            1,
+            &ledger,
+            &decisions,
+            Some((10.0, f64::INFINITY)),
+            None,
+            &[],
+        );
         assert_eq!(one_sided.pct_time_in_window, Some(0.6));
     }
 
@@ -1489,7 +1579,7 @@ mod tests {
             decision(24.0, Some(3.0), DecisionOutcome::Dosed { n: 1 }),
             decision(48.0, Some(3.0), DecisionOutcome::Dosed { n: 1 }),
         ];
-        let m = compute_subject_metrics("S", 1, 1, &ledger, &decisions, None);
+        let m = compute_subject_metrics("S", 1, 1, &ledger, &decisions, None, None, &[]);
         assert_eq!(m.n_increases, 0);
         assert_eq!(m.n_decreases, 0);
         assert_eq!(m.n_holds, 0);
@@ -1502,7 +1592,16 @@ mod tests {
     fn metrics_empty_run_has_no_signal_summary() {
         // No doses, no decisions: counts are zero and the signal summary is `None`
         // (not a NaN), even when a target_window is set (no signal to score).
-        let m = compute_subject_metrics("S", 1, 1, &[], &[], Some((10.0, 20.0)));
+        let m = compute_subject_metrics(
+            "S",
+            1,
+            1,
+            &[],
+            &[],
+            Some((10.0, 20.0)),
+            Some((1.0, 2.0)),
+            &[],
+        );
         assert_eq!(m.cumulative_dose, 0.0);
         assert_eq!(m.n_doses, 0);
         assert_eq!(m.n_increases, 0);
@@ -1514,6 +1613,9 @@ mod tests {
         assert_eq!(m.signal_max, None);
         assert_eq!(m.signal_mean, None);
         assert_eq!(m.pct_time_in_window, None);
+        // An `auc_target` was set, but the AUC pass produced no windows (no run), so
+        // the exposure metric is `None` rather than a 0/0 NaN.
+        assert_eq!(m.auc_target_attainment, None);
     }
 
     #[test]
@@ -1532,7 +1634,16 @@ mod tests {
             decision(48.0, Some(8.0), DecisionOutcome::Dosed { n: 1 }), // below band
             decision(72.0, None, DecisionOutcome::Hold),                // no signal
         ];
-        let m = compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)));
+        let m = compute_subject_metrics(
+            "S",
+            1,
+            1,
+            &ledger,
+            &decisions,
+            Some((10.0, 20.0)),
+            None,
+            &[],
+        );
 
         // Summary spans only the two decisions that recorded a signal (12 and 8),
         // not the two signal-less ones.
@@ -1545,5 +1656,93 @@ mod tests {
         // Holds are counted over all decisions, independent of whether a signal
         // was recorded, so the signal-less Hold still registers.
         assert_eq!(m.n_holds, 1);
+    }
+
+    #[test]
+    fn metrics_auc_target_attainment_counts_windows_in_band() {
+        // `auc_target_attainment` is a pure reduction of the caller's per-window AUC
+        // series against the band — exercise it directly on a hand-built series (the
+        // AUC pass that produces it is integration-tested separately). Four windows
+        // with AUCs [380, 450, 520, 610]; the band is the vancomycin AUC₂₄ target.
+        let ledger = vec![ledger_entry(100.0)];
+        let decisions = vec![decision(0.0, Some(10.0), DecisionOutcome::Dosed { n: 1 })];
+        let window_aucs = [380.0, 450.0, 520.0, 610.0];
+
+        // Two-sided [400, 600]: 450 and 520 are in band ⇒ 2/4.
+        let m = compute_subject_metrics(
+            "S",
+            1,
+            1,
+            &ledger,
+            &decisions,
+            None,
+            Some((400.0, 600.0)),
+            &window_aucs,
+        );
+        assert_eq!(m.auc_target_attainment, Some(0.5));
+        assert_eq!(m.pct_time_in_window, None, "no target_window declared");
+
+        // One-sided "at or above 400" ([400, +∞]): 450, 520, 610 ⇒ 3/4.
+        let one_sided = compute_subject_metrics(
+            "S",
+            1,
+            1,
+            &ledger,
+            &decisions,
+            None,
+            Some((400.0, f64::INFINITY)),
+            &window_aucs,
+        );
+        assert_eq!(one_sided.auc_target_attainment, Some(0.75));
+
+        // A declared band but no windows (single-decision run) ⇒ `None`, not 0/0.
+        let no_windows = compute_subject_metrics(
+            "S",
+            1,
+            1,
+            &ledger,
+            &decisions,
+            None,
+            Some((400.0, 600.0)),
+            &[],
+        );
+        assert_eq!(no_windows.auc_target_attainment, None);
+
+        // Windows present but no band declared ⇒ unreported (the pass would be
+        // skipped upstream; the reduction still yields `None`).
+        let no_band =
+            compute_subject_metrics("S", 1, 1, &ledger, &decisions, None, None, &window_aucs);
+        assert_eq!(no_band.auc_target_attainment, None);
+    }
+
+    #[test]
+    fn validate_rejects_inverted_or_negative_auc_target() {
+        // `auc_target` only feeds `auc_target_attainment`, but — like `target_window`
+        // — a malformed band must be rejected at both the parser and `validate` (the
+        // safety net for a hand-built `pub` spec). It is an AUC of a non-negative
+        // signal, so `low` must additionally be `>= 0`.
+        let mut s = base_spec();
+        s.auc_target = Some((600.0, 400.0)); // inverted
+        assert!(s.validate().unwrap_err().contains("auc_target"));
+
+        let mut s = base_spec();
+        s.auc_target = Some((-1.0, 600.0)); // negative low
+        assert!(s.validate().unwrap_err().contains("auc_target"));
+
+        let mut s = base_spec();
+        s.auc_target = Some((f64::NAN, 600.0)); // non-finite low
+        assert!(s.validate().unwrap_err().contains("auc_target"));
+
+        let mut s = base_spec();
+        s.auc_target = Some((400.0, f64::NAN)); // NaN high
+        assert!(s.validate().unwrap_err().contains("auc_target"));
+
+        // Valid: a closed band and a one-sided "at or above low".
+        let mut s = base_spec();
+        s.auc_target = Some((400.0, 600.0));
+        assert!(s.validate().is_ok());
+        let mut s = base_spec();
+        s.auc_target = Some((400.0, f64::INFINITY));
+        assert!(s.validate().is_ok());
     }
 }
