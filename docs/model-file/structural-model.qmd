@@ -20,6 +20,7 @@ Each `VALUE` is either a parameter defined in `[individual_parameters]` or a num
 |---------------|--------------|-------|---------------------|
 | `one_cpt_iv` | 1 | IV (bolus and/or infusion) | `cl`, `v` |
 | `one_cpt_oral` | 1 | Oral | `cl`, `v`, `ka` |
+| `one_cpt_transit` | 1 | Oral (Savic transit, analytic closed form) | `cl`, `v`, `n`, `mtt` |
 | `two_cpt_iv` | 2 | IV (bolus and/or infusion) | `cl`, `v1`, `q`, `v2` |
 | `two_cpt_oral` | 2 | Oral | `cl`, `v1`, `q`, `v2`, `ka` |
 | `three_cpt_iv` | 3 | IV (bolus and/or infusion) | `cl`, `v1`, `q2`, `v2`, `q3`, `v3` |

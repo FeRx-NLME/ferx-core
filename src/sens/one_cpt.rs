@@ -7,6 +7,7 @@
 
 use super::dual2::Dual2;
 use super::num::PkNum;
+use crate::pk::analytical_absorption::{convolve_1cpt, TransitAbsorption};
 use crate::types::DoseEvent;
 
 // ── Generic closed-form single-dose solutions ────────────────────────────────
@@ -48,6 +49,37 @@ pub fn one_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, ka: T, f_bio: T) 
     } else {
         (d * ka / (v * (ka - k))) * ((-(k * t)).exp() - (-(ka * t)).exp())
     }
+}
+
+/// 1-cpt with Savic transit-compartment absorption (`n` transit compartments,
+/// mean transit time `mtt`) — the analytic closed form of #386. Like
+/// [`one_cpt_oral_g`] this is the single exact `Dual2`-differentiable model; it
+/// routes through [`convolve_1cpt`] over a [`TransitAbsorption`] (Gamma) density,
+/// so `T = f64` gives the concentration and `T = Dual2<N>` gives exact
+/// `∂C/∂{cl,v,n,mtt,f}` (+ 2nd order). With `n = 0` it reduces to first-order oral.
+pub fn one_cpt_transit_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T {
+    one_cpt_transit_amt_g(T::from_f64(amt), t, cl, v, n, mtt, f_bio)
+}
+
+/// As [`one_cpt_transit_g`] but with a generic amount `amt` (issue #524 init path).
+///
+/// Domain: the exponential-tilting closed form converges only for `ke = CL/V` below
+/// the transit rate `KTR = (n+1)/mtt` (the absorption-rate-limited regime). Outside
+/// it — invalid params, or flip-flop `ke ≥ KTR` — this returns `0.0`, matching the
+/// sibling closed forms' invalid-parameter convention (penalising the optimiser back
+/// into the valid region rather than letting `convolve_1cpt` emit a NaN; `mgf`'s own
+/// `debug_assert` then never fires on this guarded path).
+pub fn one_cpt_transit_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T {
+    if t.val() < 0.0 || v.val() <= 0.0 || cl.val() <= 0.0 || n.val() < 0.0 || mtt.val() <= 0.0 {
+        return T::from_f64(0.0);
+    }
+    let ke = cl / v;
+    let ktr = (n + T::from_f64(1.0)) / mtt;
+    if ke.val() >= ktr.val() {
+        return T::from_f64(0.0);
+    }
+    let abs = TransitAbsorption { n, mtt };
+    convolve_1cpt(&abs, t, ke, (f_bio * amt) / v)
 }
 
 /// 1-cpt infusion (zero-order input of duration `dur`, rate `rate`).
@@ -197,6 +229,24 @@ pub fn one_cpt_conc_g<T: PkNum>(
     } else {
         raw * f_bio // IV bolus / infusion: linear in dose, scale by `F`
     }
+}
+
+/// Transit-absorption counterpart to [`one_cpt_conc_g`] for the analytic
+/// `one_cpt_transit` model (#386). Transit rejects infusion and SS doses at parse,
+/// so only the absorbed-bolus route exists — a thin wrapper over
+/// [`one_cpt_transit_amt_g`] with `F` baked into the kernel (no post-multiply, the
+/// `oral_bolus` branch of [`one_cpt_conc_g`]). Generic over [`PkNum`] so prediction
+/// (`T = f64`) and the `Dual2` sensitivity share one definition.
+pub fn one_cpt_transit_conc_g<T: PkNum>(
+    dose: &DoseEvent,
+    t: T,
+    cl: T,
+    v: T,
+    n: T,
+    mtt: T,
+    f_bio: T,
+) -> T {
+    one_cpt_transit_amt_g(T::from_f64(dose.amt), t, cl, v, n, mtt, f_bio)
 }
 
 // ── Sensitivity extraction (seed the active PK params as Dual2 variables) ─────

@@ -1127,6 +1127,72 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
     }
 }
 
+/// Features the analytic `one_cpt_transit` model does not support in its first
+/// version (#386): the exponential-tilting closed form is a constant-parameter
+/// bolus superposition, so steady-state doses, IOV, within-subject time-varying
+/// covariates, and infusion doses are rejected up front — otherwise they would
+/// silently mis-predict or hit an `unreachable!` in the superposition dispatch.
+/// `fit()` surfaces this as an `Err`; `predict()`/`simulate()` panic via
+/// [`assert_transit_support`], mirroring [`assert_modeled_doses_supported`].
+/// Returns the first offending feature's message, or `None` when compatible.
+pub(crate) fn check_transit_support(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<String> {
+    if model.pk_model != PkModel::OneCptTransit {
+        return None;
+    }
+    if model.n_kappa > 0 {
+        return Some(
+            "one_cpt_transit does not support IOV (n_kappa > 0): the transit closed form \
+             assumes constant disposition over each absorption window. Use an ODE transit \
+             model (transit() forcing in [odes]) for IOV."
+                .to_string(),
+        );
+    }
+    for subject in &population.subjects {
+        if subject.has_tv_covariates() {
+            return Some(format!(
+                "one_cpt_transit does not support within-subject time-varying covariates \
+                 (subject {}): the transit closed form assumes constant parameters over each \
+                 absorption window. Use an ODE transit model.",
+                subject.id
+            ));
+        }
+        for dose in &subject.doses {
+            if dose.ss {
+                return Some(format!(
+                    "one_cpt_transit does not support steady-state (SS) doses yet (subject \
+                     {}): the periodic-sum SS closed form is a follow-up. Use a non-SS \
+                     multiple-dose schedule, or an ODE transit model.",
+                    subject.id
+                ));
+            }
+            if dose.is_infusion() {
+                return Some(format!(
+                    "one_cpt_transit does not support infusion doses (subject {}): the transit \
+                     closed form absorbs an instantaneous bolus through the transit chain. Use \
+                     an ODE transit model for a zero-order input.",
+                    subject.id
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Panic on an unsupported `one_cpt_transit` model/data combination, for the
+/// `Vec`-returning `predict()`/`simulate()` paths (mirrors
+/// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
+pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Population) {
+    if let Some(msg) = check_transit_support(model, population) {
+        panic!(
+            "predict()/simulate() received a model/data combination one_cpt_transit cannot \
+             honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+        );
+    }
+}
+
 /// Model + estimation-option *compatibility* checks that don't depend on data:
 /// estimation method vs an SDE (`[diffusion]`) model, IMP chain placement, and
 /// optimizer vs IOV. These mirror the guards at the top of `fit_inner`, so a
@@ -1930,6 +1996,11 @@ pub fn fit(
     // is a no-op unless the user pinned `inner_optimizer`.
     crate::estimation::inner_optimizer::set_inner_optimizer(options.inner_optimizer);
     crate::estimation::inner_optimizer::set_ebe_warm_start(options.ebe_warm_start);
+    // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
+    // before any prediction reaches the superposition dispatch's `unreachable!` arms.
+    if let Some(e) = check_transit_support(model, population) {
+        return Err(e);
+    }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
     // enforces these for `.ferx` models, but a Rust caller could otherwise set
     // `log_transform = true` together with a proportional/combined error or a
@@ -5381,6 +5452,7 @@ pub fn simulate_with_options(
     // guard. Asserting here makes both branches fail with the same actionable
     // diagnostic; it is a no-op O(doses) scan on the common all-`Fixed` dataset.
     assert_modeled_doses_supported(model, population);
+    assert_transit_support(model, population);
 
     let method = match opts.match_method {
         Some(m) => m,
@@ -5577,6 +5649,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // precondition once per call, as `predict()` does — `simulate()` runs no
     // data-check otherwise. #324.
     assert_modeled_doses_supported(model, population);
+    assert_transit_support(model, population);
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
     // no resets / left truncation). `simulate_with_options` checks them first and
@@ -6253,6 +6326,7 @@ pub fn predict(
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
+    assert_transit_support(model, population);
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();

@@ -716,6 +716,7 @@ fn state_layout_g(pk_model: PkModel) -> (usize, usize) {
     match pk_model {
         PkModel::OneCptIv => (1, 0),
         PkModel::OneCptOral => (2, 1),
+        PkModel::OneCptTransit => (2, 1),
         PkModel::TwoCptIv => (2, 0),
         PkModel::TwoCptOral => (3, 1),
         PkModel::ThreeCptIv => (3, 0),
@@ -807,6 +808,11 @@ fn propagate_bounds_g<T: PkNum>(
             }
         }
         match pk_model {
+            // See event_driven::propagate — transit cannot be state-propagated; the
+            // Dual2 superposition path serves its sensitivities instead (#386).
+            PkModel::OneCptTransit => unreachable!(
+                "one_cpt_transit uses closed-form superposition, not the event-driven walk"
+            ),
             PkModel::OneCptIv => propagate_one_cpt_g(state, dt, pk.cl, pk.v, rate_central),
             PkModel::OneCptOral => {
                 propagate_one_cpt_oral_g(state, dt, pk.cl, pk.v, pk.ka, rate_central, rate_depot)

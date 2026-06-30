@@ -318,6 +318,12 @@ pub const PK_IDX_F: usize = 5;
 pub const PK_IDX_Q3: usize = 6;
 pub const PK_IDX_V3: usize = 7;
 pub const PK_IDX_LAGTIME: usize = 8;
+/// Transit-compartment count `n` (Savic continuous-N) for the analytic
+/// `one_cpt_transit` absorption model (#386). Lives in the spare slot region
+/// (≥9); only that model reads it, so it does not shrink ODE structural headroom.
+pub const PK_IDX_N: usize = 9;
+/// Mean transit time `mtt` for the analytic `one_cpt_transit` model (#386).
+pub const PK_IDX_MTT: usize = 10;
 
 /// The engine-reserved PK slots: bioavailability (`F`) and absorption lag
 /// (`lagtime`). `ode_param_slots` keeps these free for an undeclared F/lagtime
@@ -522,6 +528,15 @@ impl PkParams {
     pub fn ka(&self) -> f64 {
         self.values[PK_IDX_KA]
     }
+    /// Transit-compartment count `n` (Savic continuous-N) for the analytic
+    /// `one_cpt_transit` model (#386); `0` for every other model.
+    pub fn n_transit(&self) -> f64 {
+        self.values[PK_IDX_N]
+    }
+    /// Mean transit time `mtt` for the analytic `one_cpt_transit` model (#386).
+    pub fn mtt(&self) -> f64 {
+        self.values[PK_IDX_MTT]
+    }
     pub fn f_bio(&self) -> f64 {
         self.values[PK_IDX_F]
     }
@@ -571,6 +586,9 @@ impl PkParams {
             "q3" => Some(PK_IDX_Q3),
             "v3" => Some(PK_IDX_V3),
             "lagtime" | "alag" => Some(PK_IDX_LAGTIME),
+            // Savic transit-absorption params for `pk one_cpt_transit` (#386).
+            "n" => Some(PK_IDX_N),
+            "mtt" => Some(PK_IDX_MTT),
             _ => None,
         }
     }
@@ -610,6 +628,12 @@ impl PkParams {
         }
         if let Some(&v) = map.get("lagtime").or_else(|| map.get("alag")) {
             p.values[PK_IDX_LAGTIME] = v;
+        }
+        if let Some(&v) = map.get("n") {
+            p.values[PK_IDX_N] = v;
+        }
+        if let Some(&v) = map.get("mtt") {
+            p.values[PK_IDX_MTT] = v;
         }
         p
     }
@@ -1176,6 +1200,10 @@ impl ModelParameters {
 pub enum PkModel {
     OneCptIv,
     OneCptOral,
+    /// 1-cpt with Savic transit-compartment absorption via the analytic
+    /// exponential-tilting closed form (#386). Requires `cl`, `v`, `n` (transit
+    /// count), `mtt` (mean transit time); `f`/`lagtime` optional as for oral.
+    OneCptTransit,
     TwoCptIv,
     TwoCptOral,
     ThreeCptIv,
@@ -1196,6 +1224,12 @@ impl PkModel {
         match self {
             PkModel::OneCptIv => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v")],
             PkModel::OneCptOral => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v"), (PK_IDX_KA, "ka")],
+            PkModel::OneCptTransit => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v"),
+                (PK_IDX_N, "n"),
+                (PK_IDX_MTT, "mtt"),
+            ],
             PkModel::TwoCptIv => &[
                 (PK_IDX_CL, "cl"),
                 (PK_IDX_V, "v1"),
@@ -1240,6 +1274,7 @@ impl PkModel {
         match self {
             PkModel::OneCptIv => "one_cpt_iv",
             PkModel::OneCptOral => "one_cpt_oral",
+            PkModel::OneCptTransit => "one_cpt_transit",
             PkModel::TwoCptIv => "two_cpt_iv",
             PkModel::TwoCptOral => "two_cpt_oral",
             PkModel::ThreeCptIv => "three_cpt_iv",
@@ -1265,6 +1300,10 @@ impl PkModel {
             // Oral: cmt 1 = depot (zero-order-into-depot, #400), cmt 2 = central
             // (depot-bypassing infusion).
             PkModel::OneCptOral => &[1, 2],
+            // Transit models a bolus absorbed through the Gamma transit chain;
+            // modeled-duration infusions are unsupported in v1, so a `D{cmt}` on a
+            // transit model is rejected at parse (#386).
+            PkModel::OneCptTransit => &[],
             PkModel::TwoCptIv => &[1, 2],
             PkModel::TwoCptOral => &[1, 2],
             PkModel::ThreeCptIv => &[1, 2, 3],
@@ -1286,6 +1325,7 @@ impl PkModel {
         match name {
             "one_cpt_iv" | "one_compartment_iv" => Some(PkModel::OneCptIv),
             "one_cpt_oral" | "one_compartment_oral" => Some(PkModel::OneCptOral),
+            "one_cpt_transit" | "one_compartment_transit" => Some(PkModel::OneCptTransit),
             "two_cpt_iv" | "two_compartment_iv" => Some(PkModel::TwoCptIv),
             "two_cpt_oral" | "two_compartment_oral" => Some(PkModel::TwoCptOral),
             "three_cpt_iv" | "three_compartment_iv" => Some(PkModel::ThreeCptIv),
@@ -1294,13 +1334,21 @@ impl PkModel {
         }
     }
 
-    /// Whether this is a first-order-absorption (oral) model. Oral models read
-    /// `ka`; IV models do not. (`f` is read by every model since #327 — it scales
-    /// IV bolus/infusion doses too.) The canonical home for this predicate.
+    /// Whether this is an **absorption** model — the dose enters an input
+    /// compartment (cmt 1) and is absorbed into central (cmt 2), as opposed to IV
+    /// (dose directly into central, cmt 1). True for first-order oral *and* the
+    /// `one_cpt_transit` model. The name is historical: what it gates is the
+    /// compartment layout / dose routing, not `ka` specifically (oral reads `ka`,
+    /// transit reads `n`/`mtt`; which slots a model actually consumes is
+    /// [`PkModel::consumes_pk_slot`] via [`PkModel::required_pk_params`], not this
+    /// predicate). (`f` is read by every model since #327 — it scales IV doses too.)
     pub(crate) fn is_oral(&self) -> bool {
         matches!(
             self,
-            PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+            PkModel::OneCptOral
+                | PkModel::OneCptTransit
+                | PkModel::TwoCptOral
+                | PkModel::ThreeCptOral
         )
     }
 
@@ -2889,6 +2937,7 @@ impl CompiledModel {
         match self.pk_model {
             PkModel::OneCptIv => names!(ONE_CMT_IV, "central"),
             PkModel::OneCptOral => names!(ONE_CMT_ORAL, "depot", "central"),
+            PkModel::OneCptTransit => names!(ONE_CMT_TRANSIT, "depot", "central"),
             PkModel::TwoCptIv => names!(TWO_CMT_IV, "central", "peripheral"),
             PkModel::TwoCptOral => names!(TWO_CMT_ORAL, "depot", "central", "peripheral"),
             PkModel::ThreeCptIv => names!(THREE_CMT_IV, "central", "peripheral1", "peripheral2"),

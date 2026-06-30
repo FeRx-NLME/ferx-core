@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Analytic transit-compartment absorption** (#386). A new `pk one_cpt_transit(cl, v, n, mtt)`
+  structural model evaluates Savic (2007) transit absorption into a one-compartment disposition as
+  an exponential-tilting closed form (the incomplete-gamma `convolve_1cpt`), with exact `Dual2`
+  FOCE/FOCEI sensitivities `∂C/∂{CL,V,N,MTT,F,η}` and no ODE solve — the fast analytic counterpart
+  to the `transit()` ODE forcing, with continuous (estimable) `N`. Supports single/multiple bolus
+  doses, bioavailability, and lag time; with `N = 0` it reduces exactly to first-order (Bateman)
+  oral absorption. Steady-state doses, IOV, time-varying covariates, and infusions are rejected
+  with an actionable message (use an ODE transit model for those). See
+  `examples/one_cpt_transit.ferx`.
 - **Per-subject outcome metrics for adaptive dosing** (#391, S2.4). `simulate_adaptive()` and
   `simulate_adaptive_from_spec()` now return a `metrics` field on `AdaptiveSimulationResult` —
   one `AdaptiveSubjectMetrics` row per realized `(subject, draw, sim)` run: cumulative dose,

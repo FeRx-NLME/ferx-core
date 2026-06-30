@@ -123,6 +123,50 @@ mis-modeled:
 > them, so run `ferx check` (or `fit()`) on a new model before relying on
 > `predict`/`simulate` output.
 
+## Analytic closed form — `pk one_cpt_transit(cl, v, n, mtt)`
+
+The `transit()` forcing above runs on the numerical **ODE** path. For a
+**one-compartment** disposition there is also a fast **analytic** transit model,
+`pk one_cpt_transit(...)`, that needs no ODE solver:
+
+```
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+```
+
+It evaluates the exponential-tilting closed form of the Savic transit input
+absorbed directly into central,
+
+```
+  C(t) = (F·Dose/V) · M(ke) · exp(−ke·t) · P(N+1, (KTR−ke)·t),   ke = CL/V
+```
+
+where `M` is the Gamma moment-generating function and `P` the regularized lower
+incomplete gamma. The closed form carries **exact `Dual2` FOCE/FOCEI sensitivities**
+`∂C/∂{CL, V, N, MTT, F, η}` — the same gradients the estimator uses — so a transit
+fit avoids both the ODE solve and finite differences. `N` is continuous (the
+absorption *shape* is estimable), and `F` / `lagtime` map exactly as for
+`one_cpt_oral`. With `N = 0` the model reduces exactly to first-order (Bateman) oral
+absorption with `ka = 1/MTT`.
+
+**Domain.** The closed form converges for `ke = CL/V` below the transit rate
+`KTR = (N+1)/MTT` (the absorption-rate-limited regime — the usual case); the
+optimiser is kept inside this region automatically.
+
+**Scope (first version).** This analytic model supports single and multiple
+**bolus** doses, bioavailability, and lag time. **Steady-state doses, IOV,
+time-varying covariates, and infusions are rejected** with an actionable message —
+use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
+tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
+drop-in choice when you need a feature the closed form does not yet cover.
+
+[`examples/one_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_transit.ferx)
+is a complete self-contained analytic transit model:
+
+```bash
+cargo run --release -- examples/one_cpt_transit.ferx --simulate
+```
+
 ## Worked example
 
 [`examples/transit_savic.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/transit_savic.ferx)

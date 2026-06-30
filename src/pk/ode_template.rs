@@ -60,7 +60,7 @@ pub fn generate(
     let model = PkModel::from_name(model_name).ok_or_else(|| {
         format!(
             "Unknown ode_template model: {model_name}. Valid names are one_cpt_iv, \
-             one_cpt_oral, two_cpt_iv, two_cpt_oral, three_cpt_iv, three_cpt_oral."
+             one_cpt_oral, one_cpt_transit, two_cpt_iv, two_cpt_oral, three_cpt_iv, three_cpt_oral."
         )
     })?;
     let name = model.canonical_name();
@@ -100,6 +100,20 @@ pub fn generate(
     let dt = |state: &str, rhs: String| (state.to_string(), format!("d/dt({state}) = {rhs}"));
 
     let (states, obs_scale, odes): (Vec<&str>, &str, Vec<(String, String)>) = match model {
+        PkModel::OneCptTransit => {
+            // The analytic `pk one_cpt_transit` desugars to the Savic transit forcing
+            // delivered straight into central (#386), the ODE analogue of the
+            // exponential-tilting closed form.
+            let (cl, v, n, mtt) = (g("cl"), g("v"), g("n"), g("mtt"));
+            (
+                vec!["central"],
+                v,
+                vec![dt(
+                    "central",
+                    format!("transit(n={n}, mtt={mtt}) - ({cl}/{v}) * central"),
+                )],
+            )
+        }
         PkModel::OneCptIv => {
             let (cl, v) = (g("cl"), g("v"));
             (

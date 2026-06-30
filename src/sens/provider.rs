@@ -34,12 +34,13 @@
 use super::dual1::Dual1;
 use super::dual2::Dual2;
 use super::num::PkNum;
-use super::one_cpt::one_cpt_conc_g;
+use super::one_cpt::{one_cpt_conc_g, one_cpt_transit_conc_g};
 use super::three_cpt::three_cpt_conc_g;
 use super::two_cpt::two_cpt_conc_g;
 use crate::types::{
     CompiledModel, DoseEvent, GradientMethod, PkModel, ScalingSpec, Subject, PK_IDX_CL, PK_IDX_F,
-    PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
+    PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_MTT, PK_IDX_N, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2,
+    PK_IDX_V3,
 };
 
 /// Exact sensitivities of one observation w.r.t. η and θ. Hessian-shaped fields
@@ -80,12 +81,19 @@ fn slot_to_dim(slot: usize) -> Option<usize> {
         PK_IDX_Q3 => Some(6),
         PK_IDX_V3 => Some(7),
         PK_IDX_LAGTIME => Some(8),
+        // Transit `n`/`mtt` (#386); the analytic `one_cpt_transit` closed form reads
+        // them, so they are differentiated like the other structural slots.
+        PK_IDX_N => Some(9),
+        PK_IDX_MTT => Some(10),
         _ => None,
     }
 }
 
-/// Number of seeded dimensions (`CL, V1, Q2, V2, KA, F, Q3, V3, LAGTIME`).
-const N_PK: usize = 9;
+/// Width of the per-model PK-slot lookup tables (`CL, V1, Q2, V2, KA, F, Q3, V3,
+/// LAGTIME`, plus the transit `N`/`MTT` slots, #386). This is the slot-space size,
+/// not the per-model dual width `M` (the compact count of *seeded* params — e.g.
+/// `Dual2<4>` for a 2-cpt IV).
+const N_PK: usize = 11;
 
 /// True when the compiled `[individual_parameters]` program emits a differentiable
 /// row for every structural PK output `model` requires — the precondition for
@@ -203,6 +211,7 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
         model.pk_model,
         PkModel::OneCptIv
             | PkModel::OneCptOral
+            | PkModel::OneCptTransit
             | PkModel::TwoCptIv
             | PkModel::TwoCptOral
             | PkModel::ThreeCptIv
@@ -1889,6 +1898,7 @@ fn subject_eta_grad_impl(
     );
     let two_cpt = matches!(model.pk_model, PkModel::TwoCptIv | PkModel::TwoCptOral);
     let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
+    let transit = matches!(model.pk_model, PkModel::OneCptTransit);
 
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
 
@@ -1939,7 +1949,7 @@ fn subject_eta_grad_impl(
         ($($n:literal),+) => {
             match slots.len() {
                 $($n => Some(run_obs_grad::<$n>(
-                    &seed_dim, &pk, oral, two_cpt, three_cpt, subject, &dp_deta, n_eta,
+                    &seed_dim, &pk, oral, two_cpt, three_cpt, transit, subject, &dp_deta, n_eta,
                 )),)+
                 _ => None,
             }
@@ -2038,6 +2048,7 @@ fn run_obs_grad<const N: usize>(
     oral: bool,
     two_cpt: bool,
     three_cpt: bool,
+    transit: bool,
     subject: &Subject,
     dp_deta: &[Vec<f64>],
     n_eta: usize,
@@ -2070,6 +2081,9 @@ fn run_obs_grad<const N: usize>(
     // (`elapsed = (t_obs − dose.time) − lagtime`), so seed it as its own dual axis.
     let lag_val = pk.lagtime();
     let lag_d = dv(PK_IDX_LAGTIME, lag_val);
+    // Transit `n`/`mtt` (#386), seeded like the other structural params.
+    let n_d = dv(PK_IDX_N, pk.n_transit());
+    let mtt_d = dv(PK_IDX_MTT, pk.mtt());
 
     let mut out = Vec::with_capacity(subject.obs_times.len());
     for &t_obs in subject.obs_times.iter() {
@@ -2092,7 +2106,9 @@ fn run_obs_grad<const N: usize>(
             let Some(elapsed) = lagged_elapsed(dose, t_obs, lag_val, lag_d) else {
                 continue;
             };
-            let c = if three_cpt {
+            let c = if transit {
+                one_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, n_d, mtt_d, f_d)
+            } else if three_cpt {
                 three_cpt_conc_g(
                     dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
                 )
@@ -2765,6 +2781,7 @@ fn subject_sensitivities_impl(
     );
     let two_cpt = matches!(model.pk_model, PkModel::TwoCptIv | PkModel::TwoCptOral);
     let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
+    let transit = matches!(model.pk_model, PkModel::OneCptTransit);
 
     // PK parameter values at (θ, η): pk_s = tv_s·exp(sel·η). pk_param_fn folds η.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
@@ -2836,15 +2853,16 @@ fn subject_sensitivities_impl(
     let explicit_kind = if explicit_sens_disabled() || model.has_lagtime() || f_affects_non_oral {
         None
     } else {
-        let kind = match model.pk_model {
-            PkModel::OneCptIv => ExKind::OneCptIv,
-            PkModel::OneCptOral => ExKind::OneCptOral,
-            PkModel::TwoCptIv => ExKind::TwoCptIv,
-            PkModel::TwoCptOral => ExKind::TwoCptOral,
-            PkModel::ThreeCptIv => ExKind::ThreeCptIv,
-            PkModel::ThreeCptOral => ExKind::ThreeCptOral,
-        };
-        Some(kind)
+        match model.pk_model {
+            PkModel::OneCptIv => Some(ExKind::OneCptIv),
+            PkModel::OneCptOral => Some(ExKind::OneCptOral),
+            PkModel::TwoCptIv => Some(ExKind::TwoCptIv),
+            PkModel::TwoCptOral => Some(ExKind::TwoCptOral),
+            PkModel::ThreeCptIv => Some(ExKind::ThreeCptIv),
+            PkModel::ThreeCptOral => Some(ExKind::ThreeCptOral),
+            // Transit has no hand-written explicit kernel; use the generic Dual2 path.
+            PkModel::OneCptTransit => None,
+        }
     };
 
     // Dispatch on the differentiated-parameter count so the dual width is
@@ -2854,8 +2872,8 @@ fn subject_sensitivities_impl(
             match slots.len() {
                 $($n => Some(SubjectSens {
                     obs: run_obs::<$n>(
-                        &seed_dim, &pk, oral, two_cpt, three_cpt, explicit_kind, subject, &pd,
-                        n_eta, n_theta,
+                        &seed_dim, &pk, oral, two_cpt, three_cpt, transit, explicit_kind, subject,
+                        &pd, n_eta, n_theta,
                     ),
                 }),)+
                 _ => None,
@@ -2991,6 +3009,7 @@ fn run_obs<const N: usize>(
     oral: bool,
     two_cpt: bool,
     three_cpt: bool,
+    transit: bool,
     explicit_kind: Option<ExKind>,
     subject: &Subject,
     pd: &crate::sens::ode_provider::ParamDerivs,
@@ -3060,6 +3079,9 @@ fn run_obs<const N: usize>(
             // argument; seed it as its own dual axis (`∂elapsed/∂lagtime = −1`).
             let lag_val = pk.lagtime();
             let lag_d = dv(PK_IDX_LAGTIME, lag_val);
+            // Transit `n`/`mtt` (#386), seeded like the other structural params.
+            let n_d = dv(PK_IDX_N, pk.n_transit());
+            let mtt_d = dv(PK_IDX_MTT, pk.mtt());
 
             // Superpose dose contributions: f = Σ conc(dose, elapsed), restricted
             // to the current reset segment (`dose.time >= reset_floor`); `elapsed`
@@ -3073,7 +3095,9 @@ fn run_obs<const N: usize>(
                 let Some(elapsed) = lagged_elapsed(dose, t_obs, lag_val, lag_d) else {
                     continue;
                 };
-                let c = if three_cpt {
+                let c = if transit {
+                    one_cpt_transit_conc_g(dose, elapsed, cl_d, v1_d, n_d, mtt_d, f_d)
+                } else if three_cpt {
                     three_cpt_conc_g(
                         dose, elapsed, cl_d, v1_d, q_d, v2_d, q3_d, v3_d, ka_d, f_d, oral,
                     )

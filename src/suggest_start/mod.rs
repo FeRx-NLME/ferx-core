@@ -378,7 +378,10 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
     }
 
     let per_subject: Vec<SubjectNca> = match model.pk_model {
-        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral => population
+        PkModel::OneCptOral
+        | PkModel::OneCptTransit
+        | PkModel::TwoCptOral
+        | PkModel::ThreeCptOral => population
             .subjects
             .par_iter()
             .map(nca_one_cpt_oral)

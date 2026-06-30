@@ -307,7 +307,8 @@ pub fn supports_event_driven(pk_model: PkModel) -> bool {
 fn state_layout(pk_model: PkModel) -> (usize, usize) {
     match pk_model {
         PkModel::OneCptIv => (1, 0),
-        PkModel::OneCptOral => (2, 1), // [depot, central]
+        PkModel::OneCptOral => (2, 1),    // [depot, central]
+        PkModel::OneCptTransit => (2, 1), // [depot (lumped transit), central]
         PkModel::TwoCptIv => (2, 0),
         PkModel::TwoCptOral => (3, 1), // [depot, central, periph]
         PkModel::ThreeCptIv => (3, 0),
@@ -895,6 +896,12 @@ fn propagate_with_bounds(
             propagate_two_cpt_oral_core_g,
         };
         match pk_model {
+            // Transit's continuous-n convolution memory is not a finite state vector,
+            // so it never uses the event-driven walk — it is restricted to closed-form
+            // superposition (SS/IOV/TV/modeled-infusion are rejected at parse, #386).
+            PkModel::OneCptTransit => unreachable!(
+                "one_cpt_transit uses closed-form superposition, not the event-driven walk"
+            ),
             PkModel::OneCptIv => {
                 propagate_one_cpt(state, dt, pk, rate_central);
             }

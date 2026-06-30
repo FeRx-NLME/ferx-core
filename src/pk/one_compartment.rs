@@ -1,7 +1,8 @@
 use crate::sens::one_cpt::{
     one_cpt_infusion_g, one_cpt_infusion_ss_g, one_cpt_iv_bolus_g, one_cpt_iv_bolus_ss_g,
-    one_cpt_oral_g, one_cpt_oral_ss_g,
+    one_cpt_oral_g, one_cpt_oral_ss_g, one_cpt_transit_g,
 };
+use crate::stats::special::regularized_gamma_p;
 use crate::types::DoseEvent;
 
 // The closed forms below are the single source of truth: they live once, generic
@@ -36,6 +37,43 @@ pub fn one_cpt_oral(dose: &DoseEvent, t: f64, cl: f64, v: f64, ka: f64) -> f64 {
 #[inline]
 pub fn one_cpt_oral_f(dose: &DoseEvent, t: f64, cl: f64, v: f64, ka: f64, f_bio: f64) -> f64 {
     one_cpt_oral_g::<f64>(dose.amt, t, cl, v, ka, f_bio)
+}
+
+/// One-compartment Savic transit absorption with bioavailability (#386). `F` is
+/// baked into the kernel, so the superposition path takes the `1.0` `route_f_scale`
+/// branch (like the oral-depot form). Transit rejects infusion/SS doses at parse,
+/// so only the absorbed-bolus route exists here.
+#[inline]
+pub fn one_cpt_transit_f(
+    dose: &DoseEvent,
+    t: f64,
+    cl: f64,
+    v: f64,
+    n: f64,
+    mtt: f64,
+    f_bio: f64,
+) -> f64 {
+    one_cpt_transit_g::<f64>(dose.amt, t, cl, v, n, mtt, f_bio)
+}
+
+/// Unabsorbed amount still in the transit chain for a single bolus at elapsed time
+/// `tau`: `F·Dose·(1 − P(n+1, KTR·tau))`, with `KTR = (n+1)/mtt`. This is the analytic
+/// transit's only depot-side state (the lumped mass not yet delivered to central),
+/// used for `[derived]` compartment amounts (#386). Returns 0 for invalid params or
+/// infusion doses (which transit rejects at parse).
+pub(crate) fn one_cpt_transit_depot(
+    dose: &DoseEvent,
+    tau: f64,
+    n: f64,
+    mtt: f64,
+    f_bio: f64,
+) -> f64 {
+    if tau < 0.0 || n < 0.0 || mtt <= 0.0 || dose.is_infusion() {
+        return 0.0;
+    }
+    let ktr = (n + 1.0) / mtt;
+    let absorbed_frac = regularized_gamma_p::<f64>(n + 1.0, ktr * tau);
+    f_bio * dose.amt * (1.0 - absorbed_frac)
 }
 
 /// Predict concentration from a single dose at elapsed time t using 1-cmt model.
@@ -138,6 +176,66 @@ mod tests {
     fn ss_numerical_sum<F: Fn(f64) -> f64>(t: f64, ii: f64, c_single: F) -> f64 {
         const N: usize = 200;
         (0..N).map(|n| c_single(t + (n as f64) * ii)).sum()
+    }
+
+    // --- Transit absorption (#386) ---
+
+    /// `n = 0` transit absorption is first-order with `ka = KTR = 1/mtt`, so the
+    /// unabsorbed-chain ("depot") mass must equal the Bateman oral-depot amount.
+    #[test]
+    fn transit_depot_n0_matches_oral_depot() {
+        let dose = bolus_dose(100.0);
+        let mtt = 2.0;
+        let ka = 1.0 / mtt; // KTR for n = 0
+        let f = 0.8;
+        for &t in &[0.0, 0.5, 1.0, 3.0, 8.0] {
+            let transit_depot = one_cpt_transit_depot(&dose, t, 0.0, mtt, f);
+            let oral_depot = one_cpt_oral_depot(&dose, t, ka, f);
+            assert_relative_eq!(
+                transit_depot,
+                oral_depot,
+                max_relative = 1e-9,
+                epsilon = 1e-12
+            );
+        }
+    }
+
+    #[test]
+    fn transit_depot_boundaries() {
+        let dose = bolus_dose(100.0);
+        let f = 0.7;
+        // t = 0: nothing absorbed yet → the full bioavailable dose sits in transit.
+        assert_relative_eq!(
+            one_cpt_transit_depot(&dose, 0.0, 3.0, 1.5, f),
+            f * 100.0,
+            epsilon = 1e-9
+        );
+        // Large t: fully absorbed → ~0.
+        assert!(one_cpt_transit_depot(&dose, 1e4, 3.0, 1.5, f) < 1e-6);
+        // Invalid params / infusion dose → 0 (transit rejects infusions at parse).
+        assert_eq!(one_cpt_transit_depot(&dose, -1.0, 3.0, 1.5, f), 0.0);
+        assert_eq!(
+            one_cpt_transit_depot(&infusion_dose(100.0, 50.0), 1.0, 3.0, 1.5, f),
+            0.0
+        );
+    }
+
+    /// `transit_f` central concentration must reduce to the Bateman oral form at
+    /// `n = 0` (a second check of the f64 prediction wrapper, independent of the
+    /// integration equivalence suite).
+    #[test]
+    fn transit_f_n0_matches_oral_f() {
+        let dose = bolus_dose(100.0);
+        let (cl, v, mtt, f) = (0.13, 8.0, 2.0, 0.9);
+        let ka = 1.0 / mtt;
+        for &t in &[0.5, 1.0, 4.0, 12.0] {
+            assert_relative_eq!(
+                one_cpt_transit_f(&dose, t, cl, v, 0.0, mtt, f),
+                one_cpt_oral_f(&dose, t, cl, v, ka, f),
+                max_relative = 1e-9,
+                epsilon = 1e-12
+            );
+        }
     }
 
     // --- IV Bolus ---

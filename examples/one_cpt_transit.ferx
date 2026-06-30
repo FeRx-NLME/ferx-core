@@ -1,0 +1,68 @@
+# One-compartment transit-compartment absorption — analytic closed form (#386)
+#
+# Savic et al. (2007) transit-chain absorption delivered DIRECTLY into the central
+# compartment, as a fast analytical `pk` model (no ODE solve). The dose's
+# absorption time is Gamma(shape = N+1, rate = KTR), with KTR = (N+1)/MTT, so the
+# central concentration is the exponential-tilting closed form
+#
+#   C(t) = (F·Dose/V) · M(ke) · e^{-ke·t} · P(N+1, (KTR-ke)·t),   ke = CL/V
+#
+# (M = the Gamma MGF, P = the regularized lower incomplete gamma). It is evaluated
+# with exact Dual2 sensitivities ∂C/∂{CL,V,N,MTT,F,η} — the same gradients
+# FOCE/FOCEI use — with no finite differences and no ODE solver.
+#
+# Contrast examples/transit_savic.ferx, which models a transit chain feeding a
+# *first-order* depot on the numerical ODE path; here the transit chain feeds
+# central directly and the whole model is closed form. With N = 0 it reduces
+# exactly to first-order (Bateman) oral absorption with ka = 1/MTT.
+#
+# Domain / scope: the closed form needs ke = CL/V below the transit rate
+# KTR = (N+1)/MTT (the absorption-rate-limited regime). Steady-state doses, IOV,
+# time-varying covariates, and infusion doses are not supported by this analytic
+# model in its first version — use an ODE transit model (examples/transit_savic.ferx)
+# for those (it errors with an actionable message otherwise).
+#
+# ── Unit convention ──────────────────────────────────────────────────────────
+#   CMT=1  depot    — oral dose lands here; absorbed through the transit chain
+#   CMT=2  central  — concentration (mg/L) = amount / V
+#
+# Self-contained: the [simulation] block below lets you run it with no data file
+#   cargo run --release -- examples/one_cpt_transit.ferx --simulate
+# which simulates an oral 100 mg dose into CMT=1, observed as concentration, and
+# fits it back. True simulation parameters: TVCL=5, TVV=50, TVMTT=1.0, TVN=3,
+#   omega_CL=omega_V=0.09, sigma_prop=0.15.
+
+[parameters]
+  theta TVCL(5.0,   0.1, 100.0)   # typical clearance (L/h)
+  theta TVV(50.0,   5.0, 500.0)   # typical central volume (L)
+  theta TVMTT(1.0, 0.05,  24.0)   # mean transit time (h); KTR = (N+1)/MTT
+  theta TVN(3.0,    0.0,  30.0)   # number of transit compartments (continuous)
+
+  omega ETA_CL ~ 0.09             # IIV on CL (~30% CV)
+  omega ETA_V  ~ 0.09             # IIV on V  (~30% CV)
+
+  sigma PROP_ERR ~ 0.15 (sd)      # proportional residual error (~15% CV)
+
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  MTT = TVMTT
+  NTR = TVN
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method     = focei
+  maxiter    = 500
+  covariance = true
+
+[simulation]
+  n_subjects = 12
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0]
+  seed       = 7

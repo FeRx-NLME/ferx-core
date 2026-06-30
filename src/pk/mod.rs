@@ -233,7 +233,9 @@ pub(crate) fn analytical_init_concentration_g<T: crate::sens::num::PkNum>(
     if cmt == central {
         // IV-bolus impulse directly into the central compartment.
         match pk_model {
-            PkModel::OneCptIv | PkModel::OneCptOral => one_cpt_iv_bolus_amt_g(a0, t, cl, v),
+            PkModel::OneCptIv | PkModel::OneCptOral | PkModel::OneCptTransit => {
+                one_cpt_iv_bolus_amt_g(a0, t, cl, v)
+            }
             PkModel::TwoCptIv | PkModel::TwoCptOral => two_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2),
             PkModel::ThreeCptIv | PkModel::ThreeCptOral => {
                 three_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2, q3, v3)
@@ -717,6 +719,11 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
 
     let raw = if dose.ss && dose.ii > 0.0 {
         match pk_model {
+            // Transit rejects SS doses at parse (#386); the periodic-sum SS closed
+            // form is a follow-up, so this arm is unreachable for a valid model.
+            PkModel::OneCptTransit => {
+                unreachable!("one_cpt_transit does not support SS doses (rejected at parse)")
+            }
             PkModel::OneCptIv => {
                 if infusion {
                     one_cpt_infusion_ss(dose, tau, cl, v)
@@ -792,6 +799,10 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
                 } else {
                     one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio())
                 }
+            }
+            PkModel::OneCptTransit => {
+                // Transit rejects infusions at parse, so only the absorbed bolus exists.
+                one_cpt_transit_f(dose, tau, cl, v, p.n_transit(), p.mtt(), p.f_bio())
             }
             PkModel::TwoCptIv => {
                 if infusion {
@@ -877,6 +888,10 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
     // SS dispatch here (they lack the internal guard in their non-SS variants).
     let mut state = if dose.ss && dose.ii > 0.0 {
         match pk_model {
+            // Transit rejects SS doses at parse (#386) — unreachable for a valid model.
+            PkModel::OneCptTransit => {
+                unreachable!("one_cpt_transit does not support SS doses (rejected at parse)")
+            }
             PkModel::OneCptIv => {
                 let c = if infusion {
                     one_cpt_infusion_ss(dose, tau, cl, v)
@@ -995,6 +1010,14 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                     vec![depot, central]
                 }
             }
+            PkModel::OneCptTransit => {
+                // [depot = lumped in-transit mass, central]; transit rejects infusions
+                // at parse, so only the absorbed bolus exists.
+                let depot = one_cpt_transit_depot(dose, tau, p.n_transit(), p.mtt(), p.f_bio());
+                let central =
+                    one_cpt_transit_f(dose, tau, cl, v, p.n_transit(), p.mtt(), p.f_bio());
+                vec![depot, central]
+            }
             PkModel::TwoCptIv => {
                 let central = if infusion {
                     two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
@@ -1099,6 +1122,7 @@ pub fn analytical_state_at_times(
     let n_states = match pk_model {
         PkModel::OneCptIv => 1,
         PkModel::OneCptOral => 2,
+        PkModel::OneCptTransit => 2,
         PkModel::TwoCptIv => 2,
         PkModel::TwoCptOral => 3,
         PkModel::ThreeCptIv => 3,
