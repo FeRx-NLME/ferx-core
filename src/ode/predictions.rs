@@ -2254,6 +2254,19 @@ const ADAPTIVE_AUC_PANELS: usize = 128;
 /// drops every dose after `a` — future doses cannot affect `[a, b]`, so this is
 /// exact — leaving `b` a plain pre-dose decay point.
 ///
+/// **Cost — `O(m²)`, deliberately.** This is one dense solve per window, and
+/// because [`ode_dense_solve_states`] always starts from `t = 0` (it cannot resume
+/// from a saved state), window `k` re-integrates `[0, decision_times[k+1]]` — so the
+/// pass is quadratic in the decision count `m` (`1 + 2 + … + (m−1)`), versus `O(m)`
+/// for a single shared solve. That is an accepted trade for correctness: the pass
+/// runs **only** when `auc_target` is declared and **only after** the reactive run
+/// (a per-(subject, replicate) reporting step, never inside the fit/inner loop), so
+/// for the intended TDM scale (tens of decisions, a microsecond each) the quadratic
+/// factor is negligible. Collapsing it back to `O(m)` would require a solver entry
+/// point that resumes from a mid-trajectory state, or a dense readout of the
+/// *pre-dose* value at a dose instant — both larger changes to the shared engine,
+/// left as a follow-up rather than bundled into the boundary fix.
+///
 /// Returns one AUC per **closed** window `[decision_times[k], decision_times[k+1]]`
 /// (length `decision_times.len() − 1`; empty for a single decision — there is no
 /// window to integrate over). The signal is the latent readout the driver itself
