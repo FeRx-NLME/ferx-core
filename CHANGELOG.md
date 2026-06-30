@@ -431,6 +431,15 @@ section of the SDLC for the versioning policy).
   (#474)
 
 ### Performance
+- **Joint PK-TTE fits integrate the augmented PK + cumulative-hazard ODE once per
+  inner likelihood evaluation instead of twice** (#570). For a drug-driven hazard
+  (`[event_model] hazard = …`), the cumulative hazard at the event/censor times is now
+  read off the *same* integration as the Gaussian predictions by in-step cubic Hermite
+  interpolation, rather than a second dedicated solve. The predictions are bit-identical
+  and the hazard term is unchanged to integrator tolerance, so estimates and OFV are
+  unaffected within the solver's accuracy — the only difference is speed. Applies to
+  plain ODE PK-TTE subjects (no time-varying covariates, EVID-3/4 resets, SDE, or FREM,
+  which keep the previous path).
 - **Analytic sensitivity gradients for ODE IOV models with an `ExpressionScale`
   `obs_scale` divisor** (#575). An `[odes]` model combining IOV (occasion `kappa`)
   with an η-dependent `obs_scale = expr` (e.g. `obs_scale = V1`) previously routed
