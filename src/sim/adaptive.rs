@@ -405,13 +405,21 @@ pub struct AdaptiveSubjectMetrics {
     /// under the latent monitored signal over the window) fell within the spec's
     /// `auc_target` band `[lo, hi]` (inclusive), in `[0, 1]` — e.g. the share of
     /// daily windows whose vancomycin AUC₂₄ is on target (#391 S2.5b). The
-    /// denominator is the number of windows between consecutive decisions
-    /// (`decisions − 1`), so a run with fewer than two decisions has no window and
-    /// the metric is `None`. `None` also when no `auc_target` is declared (the
-    /// signal-AUC pass is then skipped). Unlike the point summary above, this is an
-    /// **integrated-exposure** quantity: it is computed by re-integrating the
+    /// denominator is the number of windows between consecutive **scheduled**
+    /// decisions (`decisions − 1`), so a run with fewer than two decisions has no
+    /// window and the metric is `None`. `None` also when no `auc_target` is declared
+    /// (the signal-AUC pass is then skipped). Unlike the point summary above, this is
+    /// an **integrated-exposure** quantity: it is computed by re-integrating the
     /// realized dose ledger on a dense grid (the AUC pass never perturbs the
     /// reactive run), not reduced from the decision-grid signals.
+    ///
+    /// This is a **planned-horizon** measure: it scores every scheduled window,
+    /// including any after a `Stop`/discontinuation — those integrate the decaying
+    /// tail of the last realized dose, so they (correctly) read as under-exposed and
+    /// off-target. It therefore uses a different decision basis from the
+    /// realized-decision point metric [`Self::pct_time_in_window`]; the two agree
+    /// when the run never discontinues (the common case, and what the bundled
+    /// example exercises).
     pub auc_target_attainment: Option<f64>,
 }
 
