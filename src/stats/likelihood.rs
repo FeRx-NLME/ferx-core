@@ -213,9 +213,18 @@ fn try_joint_pktte_shared_solve(
     eta: &[f64],
 ) -> Option<JointPkTteSolve> {
     let ode = model.ode_spec.as_ref()?;
+    // The share computes the Gaussian predictions via `ode_predictions_and_chz`, i.e.
+    // the plain no-TV `ode_predictions` with a single t=0 PK snapshot. It is only
+    // equivalent when the standalone prediction path (`compute_predictions_with_tv_*`)
+    // takes that same snapshot route. Reject every case it routes elsewhere: a `TIME`
+    // built-in (`compiled_model_uses_time_builtin`) or time-varying covariates send it
+    // through the per-event `ode_predictions_event_driven` (pk/mod.rs); EVID-3/4 resets
+    // also need the event-driven walker; SDE adds EKF process noise; FREM rewrites the
+    // pseudo-observation predictions. Each keeps the established two-solve fallback.
     if subject.obs_records.is_empty()
         || subject.has_tv_covariates()
         || subject.has_resets()
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
         || model.is_sde()
         || subject.fremtype.iter().any(|&f| f > 0)
     {
@@ -3218,6 +3227,93 @@ mod tests {
         assert!(
             (shared_tte - dedicated_tte).abs() <= 1e-4 * dedicated_tte.abs().max(1.0),
             "shared TTE NLL {shared_tte} must match dedicated {dedicated_tte} to solver tol"
+        );
+    }
+
+    /// #570 guard regression (found by an independent review of #613): a joint PK-TTE
+    /// model whose `[individual_parameters]` references the `TIME` built-in must NOT
+    /// take the shared single-solve path. The standalone prediction path routes such a
+    /// model through the per-event, TIME-resolved `ode_predictions_event_driven`
+    /// (`pk/mod.rs`), so the share's single t=0 PK snapshot would be silently wrong
+    /// (~30–50% off on a time-switching parameter — no error, no NaN, just a wrong
+    /// OFV). The guard must return `None` so the established two-solve path runs.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn joint_pktte_share_rejects_time_builtin_model() {
+        use crate::parser::model_parser::parse_model_string;
+        use crate::types::{EventType, ObsRecord};
+
+        // Same joint PK-TTE shape as `joint_pktte_ode_hazard_nll_paths_finite`, but CL
+        // switches on TIME, so the prediction path is genuinely time-dependent.
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta TVH0(0.01, 1e-5, 10.0)
+  theta TVBETA(0.5, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  STEP = if (TIME > 3) 1 else 0
+  CL   = TVCL * (1 + STEP) * exp(ETA_CL)
+  V    = TVV
+  KA   = TVKA
+  H0   = TVH0
+  BETA = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - (CL/V) * central
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(src).expect("TIME-using joint PK-TTE model must parse");
+        // Sanity: the fixture really does trip the TIME built-in detector.
+        assert!(
+            crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
+            "fixture must use the TIME built-in"
+        );
+        let mut subject = make_simple_subject();
+        subject.obs_records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        }];
+        let p = &model.default_params;
+
+        // The guard must reject the share → established two-solve fallback.
+        assert!(
+            try_joint_pktte_shared_solve(&model, &subject, &p.theta, &[0.0]).is_none(),
+            "a TIME-using joint PK-TTE model must not take the #570 shared-solve path"
+        );
+        // The fallback still yields a finite NLL (and η still moves it).
+        let nll = individual_nll(
+            &model,
+            &subject,
+            &p.theta,
+            &[0.0],
+            &p.omega,
+            &p.sigma.values,
+        );
+        let moved = individual_nll(
+            &model,
+            &subject,
+            &p.theta,
+            &[0.3],
+            &p.omega,
+            &p.sigma.values,
+        );
+        assert!(
+            nll.is_finite() && moved.is_finite() && (nll - moved).abs() > 1e-9,
+            "fallback joint NLL must be finite and η-sensitive (nll={nll}, moved={moved})"
         );
     }
 }
