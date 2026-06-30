@@ -208,8 +208,12 @@ The result bundles four tidy, long-form artifacts — each tagged by
   integrated-exposure field: the fraction of inter-decision windows whose area
   under the monitored signal falls in the `auc_target` band, computed by a separate
   signal-AUC pass that re-integrates the realized doses on a dense grid (it never
-  perturbs the reactive run). Population summaries **with uncertainty bands** ride
-  with the uncertainty slice, where bands carry meaning.
+  perturbs the reactive run). It is scored over the windows between **realized**
+  decisions, so if a run discontinues (a `Stop`) the later, dose-free scheduled
+  windows are not counted — discontinuation is already its own metric, and folding
+  it in here too would double-count it; this keeps `auc_target_attainment` on the
+  same realized basis as `pct_time_in_window`. Population summaries **with
+  uncertainty bands** ride with the uncertainty slice, where bands carry meaning.
 
 ## Verification (on by default)
 

@@ -405,21 +405,24 @@ pub struct AdaptiveSubjectMetrics {
     /// under the latent monitored signal over the window) fell within the spec's
     /// `auc_target` band `[lo, hi]` (inclusive), in `[0, 1]` — e.g. the share of
     /// daily windows whose vancomycin AUC₂₄ is on target (#391 S2.5b). The
-    /// denominator is the number of windows between consecutive **scheduled**
-    /// decisions (`decisions − 1`), so a run with fewer than two decisions has no
-    /// window and the metric is `None`. `None` also when no `auc_target` is declared
-    /// (the signal-AUC pass is then skipped). Unlike the point summary above, this is
-    /// an **integrated-exposure** quantity: it is computed by re-integrating the
-    /// realized dose ledger on a dense grid (the AUC pass never perturbs the
+    /// denominator is the number of windows between consecutive **realized**
+    /// decisions (`realized_decisions − 1`), so a run with fewer than two decisions
+    /// has no window and the metric is `None`. `None` also when no `auc_target` is
+    /// declared (the signal-AUC pass is then skipped). Unlike the point summary above,
+    /// this is an **integrated-exposure** quantity: it is computed by re-integrating
+    /// the realized dose ledger on a dense grid (the AUC pass never perturbs the
     /// reactive run), not reduced from the decision-grid signals.
     ///
-    /// This is a **planned-horizon** measure: it scores every scheduled window,
-    /// including any after a `Stop`/discontinuation — those integrate the decaying
-    /// tail of the last realized dose, so they (correctly) read as under-exposed and
-    /// off-target. It therefore uses a different decision basis from the
-    /// realized-decision point metric [`Self::pct_time_in_window`]; the two agree
-    /// when the run never discontinues (the common case, and what the bundled
-    /// example exercises).
+    /// **Scored over realized decisions only.** If the controller `Stop`s, the later
+    /// *scheduled* decisions never happen, and their dose-free, washed-out windows are
+    /// **not** counted — discontinuation is already a first-class outcome
+    /// ([`Self::discontinued`] / [`Self::time_to_discontinuation`]), so folding it in
+    /// here too would double-count one event into two metrics and silently drag the
+    /// attainment down. So this stays a clean "of the windows we actually dosed, how
+    /// many hit the exposure target", on the same realized basis as the point metric
+    /// [`Self::pct_time_in_window`]. For a run that never discontinues, realized and
+    /// scheduled decisions coincide (the common case, and what the bundled example
+    /// exercises).
     pub auc_target_attainment: Option<f64>,
 }
 

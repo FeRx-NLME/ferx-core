@@ -6133,18 +6133,33 @@ where
             // `auc_target` is declared (its sole consumer) and a monitor exists. It
             // re-integrates the realized ledger on its own dense grid — separate from,
             // and never perturbing, the reactive run + verifier above.
+            //
+            // Windowed over the **realized** decision times (`run.decisions`), NOT the
+            // full scheduled `decision_times`: after a `Stop` the controller
+            // discontinues and the later scheduled decisions never happen, so scoring
+            // their dose-free, washed-out windows would fold discontinuation — already
+            // a first-class outcome (`discontinued` / `time_to_discontinuation`) — into
+            // the exposure metric as silent misses (double-counting one event into two
+            // metrics). Confining to realized decisions keeps `auc_target_attainment`
+            // a clean "of the windows we dosed, how many hit target", on the same
+            // realized basis as `pct_time_in_window`. For a run that never
+            // discontinues the two decision lists are identical.
             let window_aucs: Vec<f64> = match (auc_target, monitors.first()) {
-                (Some(_), Some(mon)) => crate::ode::adaptive_window_signal_aucs(
-                    ode,
-                    &pk.values,
-                    &params.theta,
-                    &eta_slice,
-                    subject,
-                    decision_times,
-                    &run.ledger,
-                    mon.observe,
-                    mon.spec.cmt,
-                ),
+                (Some(_), Some(mon)) => {
+                    let realized_decision_times: Vec<f64> =
+                        run.decisions.iter().map(|d| d.time).collect();
+                    crate::ode::adaptive_window_signal_aucs(
+                        ode,
+                        &pk.values,
+                        &params.theta,
+                        &eta_slice,
+                        subject,
+                        &realized_decision_times,
+                        &run.ledger,
+                        mon.observe,
+                        mon.spec.cmt,
+                    )
+                }
                 _ => Vec::new(),
             };
 
@@ -12107,6 +12122,80 @@ mod adaptive_sim_tests {
         // band *is* declared and there *are* windows).
         spec.auc_target = Some((1e18, f64::INFINITY));
         assert_eq!(run(&spec).metrics[0].auc_target_attainment, Some(0.0));
+    }
+
+    #[test]
+    fn auc_attainment_is_scored_over_realized_windows_after_discontinuation() {
+        // Regression: under discontinuation, `auc_target_attainment` must score only
+        // the windows between REALIZED decisions, not the full scheduled horizon.
+        // After a `Stop` the later scheduled decisions never happen; counting their
+        // dose-free, washed-out windows would fold discontinuation (already reported
+        // by `discontinued` / `time_to_discontinuation`) into the exposure metric as
+        // silent misses. Here the model doses once at decision 0; the pre-dose trough
+        // then rises above the stop threshold at decision 1 → discontinue. Of the 15
+        // SCHEDULED daily decisions only 2 are realized, so there is exactly ONE
+        // realized window [0, 24] — well above the one-sided `[1, ∞)` floor ⇒
+        // attainment 1.0. The old planned-horizon behavior scored all 14 scheduled
+        // windows, the washout tail dragging attainment to ~3/14, so it fails here.
+        let src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 336
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 5 : increase 25%
+  when signal > 5 : stop
+"#;
+        let parsed = parse_full_model(src).expect("parse stop block");
+        let mut spec = parsed.adaptive_dosing.clone().expect("block present");
+        // One-sided floor: every dosed window clears it; the post-stop washout windows
+        // (which the old behavior would have scored) fall below it.
+        spec.auc_target = Some((1.0, f64::INFINITY));
+
+        let pop = population(vec![subj("P", vec![342.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        let res = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            &spec,
+            &opts,
+        )
+        .expect("discontinuing run");
+
+        // It actually discontinues, at the second decision (t = 24).
+        let m = &res.metrics[0];
+        assert!(m.discontinued, "run should hit the stop rule");
+        assert_eq!(m.time_to_discontinuation, Some(24.0));
+        // Only the realized decisions are logged (decision 0 dosed, decision 1
+        // stopped); the 13 later scheduled decisions never occurred.
+        assert_eq!(res.decisions.len(), 2, "only realized decisions logged");
+        assert_eq!(res.ledger.len(), 1, "one realized dose, at t=0");
+
+        // Scored over the ONE realized window [0, 24] ⇒ 1.0. (Old planned-horizon
+        // behavior: ~3 of 14 scheduled windows in band ⇒ ~0.214, so this fails on it.)
+        assert_eq!(m.auc_target_attainment, Some(1.0));
     }
 
     #[test]
