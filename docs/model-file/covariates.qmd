@@ -33,6 +33,9 @@ The equivalent terser `TYPE: NAME, ...` form:
 ```
 
 Covariate names are **case-sensitive** and must match the CSV header exactly.
+The built-ins `TIME` and `time` are not covariates and should not be declared
+here; they are always available in `[individual_parameters]` expressions and as
+direct `pk(...=TIME)` / `pk(...=time)` mappings.
 
 ## Semantics
 

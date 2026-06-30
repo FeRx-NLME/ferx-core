@@ -7617,7 +7617,7 @@ mod tests {
             crate::sim::adaptive_control::compile_adaptive(&model, &spec).expect("compiles");
         let theta = model.default_params.theta.clone();
         let eta = vec![0.0; model.n_eta + model.n_kappa];
-        let pk = (model.pk_param_fn)(&theta, &eta, &HashMap::new());
+        let pk = (model.pk_param_fn)(&theta, &eta, &HashMap::new(), 0.0);
         let subject = make_subject(vec![], spec.at.clone());
         let mut controller = (compiled.make_controller)();
         let monitors = vec![crate::sim::adaptive::AdaptiveMonitor {

@@ -148,7 +148,7 @@ fn savic_transit_1e9_rk45_stats_are_accepted_step_dominated() {
     let mut n_pred = 0usize;
 
     for subject in &pop.subjects {
-        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
         let (pred, subject_stats) = ode_predictions_with_solver_stats(
             model.ode_spec.as_ref().unwrap(),
             &pk.values,

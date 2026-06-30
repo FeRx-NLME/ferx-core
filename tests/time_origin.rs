@@ -168,3 +168,99 @@ fn single_obs_no_dose_off_zero_still_records() {
         preds[0].pred,
     );
 }
+
+// A `$PK IF(TIME.GT.t)`-style switch on an analytical 1-cpt IV bolus. The switch
+// is exercised numerically below; the constant-parameter twins are the oracle.
+const CL_SWITCH_ANALYTICAL: &str = "
+[parameters]
+  theta CL_E(1.0, 0.01, 100.0)
+  theta CL_L(5.0, 0.01, 100.0)
+  theta V(10.0, 0.1, 1000.0)
+  omega ETA_V ~ 0.09
+  sigma ADD_ERR ~ 1.0
+[individual_parameters]
+  if (TIME > 10.0) {
+    CL = CL_L
+  } else {
+    CL = CL_E
+  }
+  V = V * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR)
+";
+
+fn const_cl_analytical(cl: f64) -> String {
+    format!(
+        "
+[parameters]
+  theta CL({cl}, 0.01, 100.0)
+  theta V(10.0, 0.1, 1000.0)
+  omega ETA_V ~ 0.09
+  sigma ADD_ERR ~ 1.0
+[individual_parameters]
+  CL = CL
+  V = V * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR)
+"
+    )
+}
+
+/// Numerical anchor for the `TIME` event-time built-in (#607/#610) against the
+/// NONMEM `$PK IF (TIME.GT.45) ...` convention. NONMEM re-evaluates `$PK` at each
+/// event and advances the (analytical) amount across each inter-event interval
+/// with the parameters in effect *at the interval's end event*. With a dose at
+/// t=0 and observations at t=5 and t=20, the `CL` switch at `TIME = 10` therefore
+/// applies `CL_E` over `[0, 5]` (obs@5 sees TIME=5 ⇒ CL_E) and `CL_L` over
+/// `[5, 20]` (obs@20 sees TIME=20 ⇒ CL_L), giving closed forms:
+///   C(5)  = (100/10)·exp(−(CL_E/V)·5)            = 10·exp(−0.5)
+///   C(20) = C(5)·V·exp(−(CL_L/V)·15) / V         = 10·exp(−(0.1·5 + 0.5·15))
+///                                                = 10·exp(−8.0)
+/// These are exactly what NONMEM produces for the same `$PK IF(TIME.GT.10)` run.
+/// With the pre-#610 bug (TIME frozen at 0) the switch never fires and C(20)
+/// would be 10·exp(−2) ≈ 1.35 — three orders of magnitude off — so this pins the
+/// event-time semantics, not just "a switch happened".
+#[test]
+fn time_builtin_cl_switch_matches_nonmem_event_time_semantics() {
+    let switch = parse_model_string(CL_SWITCH_ANALYTICAL).expect("switch model parses");
+    let early = parse_model_string(&const_cl_analytical(1.0)).expect("CL_E twin parses");
+
+    // Dose 100 mg IV bolus at t=0; observations straddling the TIME=10 switch.
+    let data = b"ID,TIME,DV,EVID,MDV,AMT,CMT\n\
+                 1,0,0,1,1,100,1\n\
+                 1,5,0,0,0,0,1\n\
+                 1,20,0,0,0,0,1\n";
+    let pop = read_csv(data);
+
+    let ps = predict(&switch, &pop, &switch.default_params);
+    let pe = predict(&early, &pop, &early.default_params);
+    assert_eq!(ps.len(), 2, "two observations");
+
+    // Obs @ t=5 (< 10): CL = CL_E ⇒ the closed form and the constant-CL_E twin.
+    let c5 = 10.0 * (-0.5_f64).exp();
+    assert_eq!(ps[0].time, 5.0);
+    assert!(
+        (ps[0].pred - c5).abs() < 1e-9 && (ps[0].pred - pe[0].pred).abs() < 1e-9,
+        "pre-switch obs must be 10·exp(−0.5)={c5}; got {} (CL_E twin {})",
+        ps[0].pred,
+        pe[0].pred,
+    );
+
+    // Obs @ t=20 (> 10): CL_E over [0,5] then CL_L over [5,20] ⇒ 10·exp(−8).
+    let c20 = 10.0 * (-8.0_f64).exp();
+    assert_eq!(ps[1].time, 20.0);
+    assert!(
+        (ps[1].pred - c20).abs() < 1e-12,
+        "post-switch obs must be the NONMEM event-driven 10·exp(−8)={c20}; got {}",
+        ps[1].pred,
+    );
+    // And it must NOT be the no-switch value (10·exp(−2)) — the #610 bug signature.
+    assert!(
+        (ps[1].pred - 10.0 * (-2.0_f64).exp()).abs() > 1e-3,
+        "post-switch obs must differ from the frozen-TIME no-switch prediction",
+    );
+}

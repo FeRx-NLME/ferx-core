@@ -177,14 +177,15 @@ fn build_warfarin_model() -> CompiledModel {
         omega_iov: None,
         kappa_fixed: Vec::new(),
     };
-    let pk_param_fn: PkParamFn =
-        Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+    let pk_param_fn: PkParamFn = Box::new(
+        |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
             let mut p = PkParams::default();
             p.values[PK_IDX_CL] = theta[0] * eta[0].exp();
             p.values[PK_IDX_V] = theta[1] * eta[1].exp();
             p.values[PK_IDX_KA] = theta[2] * eta[2].exp();
             p
-        });
+        },
+    );
     CompiledModel {
         name: "warfarin".into(),
         pk_model: PkModel::OneCptOral,
@@ -303,15 +304,16 @@ fn generate_two_cpt_iv() {
         omega_iov: None,
         kappa_fixed: Vec::new(),
     };
-    let pk_param_fn: PkParamFn =
-        Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+    let pk_param_fn: PkParamFn = Box::new(
+        |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
             let mut p = PkParams::default();
             p.values[PK_IDX_CL] = theta[0] * eta[0].exp();
             p.values[PK_IDX_V] = theta[1] * eta[1].exp();
             p.values[PK_IDX_Q] = theta[2] * eta[2].exp();
             p.values[PK_IDX_V2] = theta[3] * eta[3].exp();
             p
-        });
+        },
+    );
     let model = CompiledModel {
         name: "two_cpt_iv".into(),
         pk_model: PkModel::TwoCptIv,
@@ -422,8 +424,8 @@ fn generate_two_cpt_oral_cov() {
         omega_iov: None,
         kappa_fixed: Vec::new(),
     };
-    let pk_param_fn: PkParamFn =
-        Box::new(|theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>| {
+    let pk_param_fn: PkParamFn = Box::new(
+        |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
             let wt = cov.get("wt").copied().unwrap_or(70.0);
             let crcl = cov.get("crcl").copied().unwrap_or(100.0);
             let mut p = PkParams::default();
@@ -436,7 +438,8 @@ fn generate_two_cpt_oral_cov() {
             p.values[PK_IDX_V2] = theta[3] * eta[3].exp();
             p.values[PK_IDX_KA] = theta[4] * eta[4].exp();
             p
-        });
+        },
+    );
     let model = CompiledModel {
         name: "two_cpt_oral_cov".into(),
         pk_model: PkModel::TwoCptOral,
@@ -605,15 +608,16 @@ fn generate_mm_oral() {
         omega_iov: None,
         kappa_fixed: Vec::new(),
     };
-    let pk_param_fn: PkParamFn =
-        Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
+    let pk_param_fn: PkParamFn = Box::new(
+        |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
             let mut p = PkParams::default();
             p.values[0] = theta[0] * eta[0].exp(); // VMAX
             p.values[1] = theta[1]; // KM
             p.values[2] = theta[2] * eta[1].exp(); // V
             p.values[4] = theta[3]; // KA
             p
-        });
+        },
+    );
     let ode_rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
         Box::new(|u: &[f64], params: &[f64], _t: f64, du: &mut [f64]| {
             let (depot, central) = (u[0], u[1]);

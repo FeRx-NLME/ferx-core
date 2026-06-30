@@ -553,7 +553,12 @@ fn ekf_p_obs(
         }
     }
 
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // The EKF is a single-pass filter over the whole subject timeline with a
+    // constant PK-parameter vector (no per-event recompute), so the `TIME`
+    // built-in resolves at the integration start (t=0) — the same convention as
+    // the single-pass ODE prediction path. (Time-varying *ODE-RHS* `TIME` is
+    // still honoured: the integrator supplies its own clock.) #610.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     // EKF process-noise variance uses a single error model. This is sound: a
     // per-CMT (multi-endpoint) error model needs a Form C `y[CMT=N]` readout to
     // observe multiple compartments, and the parser rejects Form C on SDE
@@ -1940,12 +1945,14 @@ mod tests {
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
-                let mut p = PkParams::default();
-                p.values[0] = theta[0] * eta[0].exp(); // CL uses combined eta[0]
-                p.values[1] = theta[1]; // V
-                p
-            }),
+            pk_param_fn: Box::new(
+                |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                    let mut p = PkParams::default();
+                    p.values[0] = theta[0] * eta[0].exp(); // CL uses combined eta[0]
+                    p.values[1] = theta[1]; // V
+                    p
+                },
+            ),
             n_theta: 2,
             n_eta: 1,
             n_epsilon: 1,
@@ -2235,13 +2242,15 @@ mod tests {
     /// `foce_subject_nll` path (which passes a length-1 eta) doesn't panic.
     fn make_iov_kappa_model() -> CompiledModel {
         let mut model = make_model();
-        model.pk_param_fn = Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
-            let mut p = PkParams::default();
-            let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
-            p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL
-            p.values[1] = theta[1]; // V
-            p
-        });
+        model.pk_param_fn = Box::new(
+            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                let mut p = PkParams::default();
+                let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
+                p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL
+                p.values[1] = theta[1]; // V
+                p
+            },
+        );
         model
     }
 

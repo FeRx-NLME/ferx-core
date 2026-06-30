@@ -1437,8 +1437,8 @@ impl Default for ErrorSpec {
 /// quantities that do **not** depend on the random effects (η) or the
 /// prediction beyond the built-in proportional loading, so the multiplier is
 /// constant across the inner EBE loop for a fixed θ. The covariate map must
-/// supply `TIME` (the parser injects it as a covariate reference) plus any
-/// model covariates the expression names.
+/// supply any model covariates the expression names; `TIME` is provided by the
+/// parser's event-time built-in.
 pub type RuvMagFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64) -> f64 + Send + Sync>;
 
 /// Custom residual-error magnitude (#484): one optional multiplier per flat
@@ -1896,8 +1896,18 @@ pub struct EtaParamInfo {
     pub individual_param_name: String,
 }
 
-/// PK parameter function: maps (theta, eta, covariates) -> PkParams
-pub type PkParamFn = Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> PkParams + Send + Sync>;
+/// PK parameter function: maps `(theta, eta, covariates, time)` -> PkParams.
+///
+/// `time` is the event/observation time on the PK timeline. It feeds the `TIME`
+/// built-in (`Expression::Time`) and the analytical `pk_time_mapping` slots: the
+/// closure sets the model-time thread-local from it for the duration of the
+/// evaluation. Threading it through the signature (rather than relying on the
+/// caller to wrap in `with_model_time`) makes the compiler force every call site
+/// to supply the time, so no path can silently evaluate `TIME` at `0.0` (#610).
+/// Callers for which `TIME` is irrelevant (the model does not use the built-in)
+/// may pass any value, e.g. `0.0`.
+pub type PkParamFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>, f64) -> PkParams + Send + Sync>;
 
 /// Closure signature for `[scaling] obs_scale = <expr>` (Form B). Receives
 /// `(theta, eta, covariates, pk_params)` and returns the per-subject scale
@@ -4993,7 +5003,7 @@ pub(crate) mod test_helpers {
             error_model: ErrorModel::Additive,
             error_spec: ErrorSpec::Single(ErrorModel::Additive),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|_, _, _| PkParams::default()),
+            pk_param_fn: Box::new(|_, _, _, _| PkParams::default()),
             n_theta: 1,
             n_eta: 1,
             n_epsilon: 1,
@@ -5109,13 +5119,15 @@ pub(crate) mod test_helpers {
             error_model: ErrorModel::Proportional,
             error_spec: ErrorSpec::Single(ErrorModel::Proportional),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
-                let mut p = PkParams::default();
-                let wt = cov.get("WT").copied().unwrap_or(70.0);
-                p.values[0] = theta[0] * (wt / 70.0);
-                p.values[1] = theta[1];
-                p
-            }),
+            pk_param_fn: Box::new(
+                |theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
+                    let mut p = PkParams::default();
+                    let wt = cov.get("WT").copied().unwrap_or(70.0);
+                    p.values[0] = theta[0] * (wt / 70.0);
+                    p.values[1] = theta[1];
+                    p
+                },
+            ),
             n_theta: 2,
             n_eta: 0,
             n_epsilon: 1,

@@ -207,6 +207,9 @@ enum ExKind {
 /// Per-subject gates (TV covariates) are checked separately in
 /// [`subject_sensitivities`].
 pub fn analytical_supported(model: &CompiledModel) -> bool {
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
+        return false;
+    }
     matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -614,6 +617,9 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if model.n_kappa == 0 || model.ode_spec.is_some() {
         return false;
     }
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
+        return false;
+    }
     // M3 BLOQ: the IOV objective promotes M3 to the interaction (censored) marginal
     // (`foce_subject_nll_iov`), but the IOV analytic gradient assembly carries no
     // censored-row term — it would differentiate a different function than it
@@ -878,7 +884,7 @@ fn build_iov_sources(
             let g = *occ_to_k.get(&occ)?;
             let combined = combined_for(g);
             let cov = subject.dose_cov(d);
-            let pk = (model.pk_param_fn)(theta, &combined, cov);
+            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
             let cd = cd_at(&combined, cov)?;
             dose_src[d] = sources.len();
             sources.push((pk, cd, Some(g)));
@@ -888,14 +894,14 @@ fn build_iov_sources(
             let g = *occ_to_k.get(&occ)?;
             let combined = combined_for(g);
             let cov = subject.obs_cov(j);
-            let pk = (model.pk_param_fn)(theta, &combined, cov);
+            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
             let cd = cd_at(&combined, cov)?;
             obs_src[j] = sources.len();
             sources.push((pk, cd, Some(g)));
         }
         for m in 0..subject.pk_only_times.len() {
             let cov = subject.pk_only_cov(m);
-            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov);
+            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, 0.0);
             let cd = cd_at(&combined_pk_only, cov)?;
             pkonly_src[m] = sources.len();
             sources.push((pk, cd, None));
@@ -905,7 +911,7 @@ fn build_iov_sources(
         let mut group_source = vec![usize::MAX; k_groups];
         for g in 0..k_groups {
             let combined = combined_for(g);
-            let pk = (model.pk_param_fn)(theta, &combined, cov_static);
+            let pk = (model.pk_param_fn)(theta, &combined, cov_static, 0.0);
             let cd = cd_at(&combined, cov_static)?;
             group_source[g] = sources.len();
             sources.push((pk, cd, Some(g)));
@@ -919,7 +925,7 @@ fn build_iov_sources(
             obs_src[j] = group_source[*occ_to_k.get(&occ)?];
         }
         if !subject.pk_only_times.is_empty() {
-            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static);
+            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
             let cd = cd_at(&combined_pk_only, cov_static)?;
             let idx = sources.len();
             sources.push((pk, cd, None));
@@ -1432,7 +1438,7 @@ fn run_obs_tvcov<const M: usize>(
     // the IOV / scale seeders.
     let mk = |cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual2<M>> {
         let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
-        let pk = (model.pk_param_fn)(theta, eta, cov);
+        let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
         let seed_row = |i: usize, val: f64| -> Dual2<M> {
             let mut grad = [0.0; M];
             let mut hess = [[0.0; M]; M];
@@ -1654,7 +1660,7 @@ fn run_obs_grad_tvcov<const N: usize>(
         // `None` above the param-derivative dispatch cap (n_axes > 16): decline so
         // the inner loop falls back to FD rather than panicking (#449 review #1).
         let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
-        let pk = (model.pk_param_fn)(theta, eta, cov);
+        let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
         let seed_row = |i: usize, val: f64| -> Dual1<N> {
             let mut grad = [0.0; N];
             for k in 0..n_eta {
@@ -1900,7 +1906,7 @@ fn subject_eta_grad_impl(
     let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
     let transit = matches!(model.pk_model, PkModel::OneCptTransit);
 
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
 
     // First-order `∂p_i/∂η_k`, exact for ANY parameterization — the η-block of the
     // same `pd` the full provider builds. The compiled `[individual_parameters]`
@@ -2784,7 +2790,7 @@ fn subject_sensitivities_impl(
     let transit = matches!(model.pk_model, PkModel::OneCptTransit);
 
     // PK parameter values at (θ, η): pk_s = tv_s·exp(sel·η). pk_param_fn folds η.
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
 
     // `∂p/∂(θ,η)` (and second order) plus `slots`: the PK slot each `pd` row maps
     // to, in `pd`-row order. Analytical where possible: evaluate the compiled
@@ -3461,6 +3467,168 @@ mod tests {
         ruv_m3.residual_error_eta = Some(0);
         ruv_m3.bloq_method = crate::types::BloqMethod::M3;
         assert!(analytic_outer_gradient_available(&ruv_m3));
+    }
+
+    /// The `TIME` built-in routes a model through the event-driven per-event PK
+    /// path, which the closed-form `Dual2`/`Dual1` sensitivity providers do not
+    /// cover. `analytical_supported`, `iov_analytical_supported`, and
+    /// `ode_analytical_supported` must therefore all decline (→ FD) for any model
+    /// whose `[individual_parameters]` read `TIME` — otherwise the analytic fast
+    /// path would evaluate every parameter at a single frozen time and silently
+    /// disagree with the event-driven predictor. The non-`TIME` twin of each
+    /// model must still be supported, proving the guard is specific (#610).
+    #[test]
+    fn time_builtin_indiv_params_force_fd_fallback() {
+        // Analytical 1-cpt IV: a `$PK IF(TIME...)`-style switch on CL.
+        const ANALYTICAL_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(5.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const ANALYTICAL_NO_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        // IOV (n_kappa > 0) 1-cpt oral with the same switch.
+        const IOV_TIME: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVCL_LATE(0.1, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  if (TIME > 24.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+        // ODE 1-cpt with the switch in the individual parameters (so the
+        // uses_time_builtin flag is set, not merely the ODE-RHS clock).
+        const ODE_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(5.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const ODE_NO_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin;
+        let ode_supported = crate::sens::ode_provider::ode_analytical_supported;
+
+        let ana_t = parse_model_string(ANALYTICAL_TIME).expect("parses analytical TIME");
+        let ana_n = parse_model_string(ANALYTICAL_NO_TIME).expect("parses analytical control");
+        assert!(
+            uses_time(&ana_t),
+            "TIME switch sets the uses_time_builtin flag"
+        );
+        assert!(!uses_time(&ana_n), "control model must not set the flag");
+        assert!(
+            !analytical_supported(&ana_t),
+            "analytic FOCEI must decline for TIME"
+        );
+        assert!(
+            analytical_supported(&ana_n),
+            "non-TIME twin stays analytic (guard is specific)"
+        );
+
+        let iov_t = parse_model_string(IOV_TIME).expect("parses IOV TIME");
+        let iov_n = parse_model_string(WARFARIN_IOV).expect("parses IOV control");
+        assert!(
+            iov_t.n_kappa > 0 && iov_n.n_kappa > 0,
+            "both IOV models carry a kappa"
+        );
+        assert!(
+            !iov_analytical_supported(&iov_t),
+            "IOV analytic must decline for TIME"
+        );
+        assert!(
+            iov_analytical_supported(&iov_n),
+            "non-TIME IOV twin stays analytic"
+        );
+
+        let ode_t = parse_model_string(ODE_TIME).expect("parses ODE TIME");
+        let ode_n = parse_model_string(ODE_NO_TIME).expect("parses ODE control");
+        assert!(
+            uses_time(&ode_t),
+            "ODE indiv-param TIME switch sets the flag"
+        );
+        assert!(
+            !ode_supported(&ode_t),
+            "ODE analytic must decline for indiv-param TIME"
+        );
+        assert!(ode_supported(&ode_n), "non-TIME ODE twin stays analytic");
     }
 
     /// A TTE (`[event_model]`) objective has no analytic outer gradient (the

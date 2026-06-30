@@ -240,6 +240,9 @@ fn expression_scale_axes_admissible(
 /// count within [`MAX_ODE_SENS_DIM`]. Per-subject gates (bolus-only doses, no TV
 /// covariates/resets) are checked in [`ode_subject_sensitivities`].
 pub fn ode_analytical_supported(model: &CompiledModel) -> bool {
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
+        return false;
+    }
     let Some(ode) = model.ode_spec.as_ref() else {
         return false;
     };
@@ -693,7 +696,7 @@ pub fn ode_subject_sensitivities(
     // lagtime is excluded by `ode_subject_supported`, so no runtime short-circuit is
     // needed here. `pk` and `pd` are each evaluated once and threaded into the drivers,
     // so neither recomputes them.
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     // (reset+absorption FD fallback is enforced by the shared `ode_subject_supported`
     // gate above, so both the outer and inner paths decline it together — #430 review #1.)
     // Individual-parameter η/θ derivatives (cheap: one dual eval, no integration).
@@ -861,7 +864,7 @@ pub fn ode_subject_eta_grad(
     // light walk doesn't recompute them — and the `ExpressionScale` quotient below reuses
     // the same `dp_deta` rather than running the individual-parameter Dual1 program a
     // second time in the inner BFGS hot loop (#534 review #3).
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let dp_deta = param_eta_derivatives(model, subject, theta, eta)?;
     macro_rules! dispatch {
         ($($n:literal),+) => {
@@ -1658,7 +1661,7 @@ fn seed_pk_dual2<const M: usize>(
     // while saving only the cheap f64 eval (the M²-Hessian dual eval dominates, and the
     // covariate-snapshot dedup already elides repeats). Not worth that trade.
     let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
-    let pk = (model.pk_param_fn)(theta, eta, cov);
+    let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
     let mut out: Vec<Dual2<M>> = pk.values.iter().map(|&v| Dual2::constant(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
         let mut grad = [0.0; M];
@@ -2162,7 +2165,7 @@ fn run_subject_iov<const M: usize>(
     let seed_group_cov =
         |g: usize, cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual2<M>>> {
             let combined = combined_for(g);
-            let pk = (model.pk_param_fn)(theta, &combined, cov);
+            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
             let cd = crate::sens::provider::iov_combined_derivs_dyn(
                 prog, n_theta, n_eff, n_rows, cov, theta, &combined,
             )?;
@@ -2183,7 +2186,7 @@ fn run_subject_iov<const M: usize>(
     let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual2<M>>> {
         let combined_pk_only =
             crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
-        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov);
+        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, 0.0);
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog,
             n_theta,
@@ -2440,7 +2443,7 @@ fn run_subject_iov_eta<const N: usize>(
     let seed_group_cov =
         |g: usize, cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual1<N>>> {
             let combined = combined_for(g);
-            let pk = (model.pk_param_fn)(theta, &combined, cov);
+            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
             let cd = crate::sens::provider::iov_combined_derivs_dyn(
                 prog, n_theta, n_eff, n_rows, cov, theta, &combined,
             )?;
@@ -2459,7 +2462,7 @@ fn run_subject_iov_eta<const N: usize>(
     let seed_pk_only_cov = |cov: &std::collections::HashMap<String, f64>| -> Option<Vec<Dual1<N>>> {
         let combined_pk_only =
             crate::stats::likelihood::iov_combined_pk_only(stacked_eta, n_eta, n_kappa);
-        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov);
+        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, 0.0);
         let cd = crate::sens::provider::iov_combined_derivs_dyn(
             prog,
             n_theta,
@@ -2593,7 +2596,7 @@ fn seed_pk_dual1<const N: usize>(
     // — flat loop (#449 review #15).
     debug_assert_eq!(N, n_eta);
     let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
-    let pk = (model.pk_param_fn)(theta, eta, cov);
+    let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
     let mut out: Vec<Dual1<N>> = pk.values.iter().map(|&v| Dual1::constant(v)).collect();
     for (i, &slot) in model.pk_indices.iter().enumerate() {
         let mut grad = [0.0; N];
@@ -5410,7 +5413,7 @@ mod tests {
 
             // Full reference: force the 4-axis `Dual2` path directly.
             let pd = param_derivatives(&model, &subject, &theta, &eta).expect("pd");
-            let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
+            let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
             let full =
                 run_subject::<4>(&model, &subject, &theta, &eta, &pk.values, &pd).expect("full");
             // Mixed path via the dispatcher: na = 2 (CL, V1) < n = 4 routes to
@@ -5477,7 +5480,7 @@ mod tests {
         let eta = vec![0.1];
 
         let pd = param_derivatives(&model, &subject, &theta, &eta).expect("pd");
-        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
         let full = run_subject::<3>(&model, &subject, &theta, &eta, &pk.values, &pd).expect("full");
         // na = 1 (CL) < n = 3 → run_subject_mixed::<1, 3> (2 IIV-free params).
         let mixed = ode_subject_sensitivities(&model, &subject, &theta, &eta).expect("mixed");
@@ -5514,7 +5517,7 @@ mod tests {
         let theta = vec![4.0, 12.0, 2.0, 25.0];
         let eta = vec![0.12, -0.08];
         let pd = param_derivatives(&model, &subject, &theta, &eta).expect("pd");
-        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates);
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
         let iiv = vec![0usize, 1]; // CL, V1
         let axis_of = vec![0usize, 1, 2, 3]; // identity (IIV declared first)
 

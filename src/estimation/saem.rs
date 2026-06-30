@@ -2892,13 +2892,15 @@ mod tests {
             error_model: ErrorModel::Proportional,
             error_spec: ErrorSpec::Single(ErrorModel::Proportional),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
-                let mut p = PkParams::default();
-                let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
-                p.values[0] = theta[0] * (eta[0] + kappa).exp();
-                p.values[1] = theta[1];
-                p
-            }),
+            pk_param_fn: Box::new(
+                |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                    let mut p = PkParams::default();
+                    let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
+                    p.values[0] = theta[0] * (eta[0] + kappa).exp();
+                    p.values[1] = theta[1];
+                    p
+                },
+            ),
             n_theta: 2,
             n_eta: 1,
             n_epsilon: 1,

@@ -386,7 +386,11 @@ pub(crate) fn ode_cumhaz_hazard(
     let Some(ode) = model.ode_spec.as_ref() else {
         return (cum, haz);
     };
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // Single-pass hazard integration with a constant PK-parameter vector. A
+    // time-dependent hazard RHS (e.g. a Weibull `TIME` term) is honoured by the
+    // integrator clock; the individual-parameter snapshot resolves the `TIME`
+    // built-in at the integration start (t=0). #610.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let states = crate::ode::ode_dense_solve_states(ode, &pk.values, theta, eta, subject, times);
     if states.len() != n {
         return (cum, haz);
@@ -435,7 +439,10 @@ fn draw_ode_tte_latent<R: rand::Rng>(
     );
     let u: f64 = rng.sample(rand::distr::Open01);
     let threshold = -u.ln();
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // Single-pass hazard integration (see `ode_accumulated_hazard`): the hazard
+    // RHS `TIME` is honoured by the integrator clock; the PK-parameter snapshot
+    // resolves the `TIME` built-in at the integration start (t=0). #610.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let ode = model
         .ode_spec
         .as_ref()

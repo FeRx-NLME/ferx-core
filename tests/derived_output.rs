@@ -435,6 +435,42 @@ fn output_covariate_case_insensitive_echo() {
     }
 }
 
+/// Regression for #610: a `[derived]` column that references the `TIME` built-in
+/// must evaluate `TIME` at each observation's event time, not the 0.0 model-time
+/// default. Before the fix `[derived]` evaluated `Expression::Time` against an
+/// unset thread-local, so every row read 0.0 — a silently wrong diagnostic.
+#[test]
+fn derived_time_builtin_echoes_per_observation_time() {
+    let src = base_with_extra("[derived]\n  T_ECHO = TIME");
+    let model = parse_model_string(&src).expect("model with [derived] TIME parses");
+    let pop = one_dose_population(); // obs_times = [1, 4, 12, 24]
+    let expected = [1.0, 4.0, 12.0, 24.0];
+
+    let mut opts = FitOptions::default();
+    opts.verbose = false;
+    opts.outer_maxiter = 1;
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("short fit must not error");
+
+    let sr = &result.subjects[0];
+    let col = sr
+        .extra_columns
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("T_ECHO"))
+        .expect("derived column T_ECHO present");
+    assert_eq!(
+        col.1.len(),
+        expected.len(),
+        "one T_ECHO value per observation"
+    );
+    for (got, want) in col.1.iter().zip(expected) {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "T_ECHO must equal the observation TIME (got {got}, want {want}); \
+             a value of 0.0 is the pre-#610 frozen-time bug"
+        );
+    }
+}
+
 /// Parser must reject step=0 and step negative in [derived] integral().
 #[test]
 fn integral_step_zero_is_rejected_at_parse() {
