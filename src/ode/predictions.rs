@@ -1558,13 +1558,33 @@ fn ode_predictions_with_extra_breaks_and_stats(
             }
         }
 
+        // #570: a soft (CHZ) time coinciding with this segment's *left* boundary is
+        // read here, as the post-dose / initial state `u` — the exact analogue of the
+        // observation-at-`t_start` read just above, and of how the dedicated
+        // `ode_dense_solve_states` records a `saveat` at a break (post-dose `u`, see its
+        // `t_start` handler). `integrate_segment` integrates the *open* interval
+        // `(t_start, t_end]`, so without this a CHZ time equal to the integration start
+        // (e.g. an interval-censored `left = 0`, or an event at the first dose time)
+        // would never be read → NaN → the TTE `1e20` sentinel; and one equal to an
+        // *interior* dose time would be read pre-dose. For an interior break this
+        // overwrites the previous segment's `t_end` soft sample with the post-dose state
+        // — matching the dedicated path, whose next-segment `t_start` handler does the
+        // same. The `> t_start + 1e-12` filter below excludes `t == t_start`, so a soft
+        // time is never written twice within one iteration.
+        for (gi, &t) in chz_times.iter().enumerate() {
+            if (t - t_start).abs() < 1e-12 {
+                chz_states[gi] = u.clone();
+            }
+        }
+
         // Integrate the open interval `(t_start, t_end]` from the carried state,
         // recording observations inside it and advancing `u` to `t_end`. The
         // left-boundary discontinuities and the `t_start` observation were applied
         // above; `integrate_segment` owns only the integration — the piece a
         // reactive (state-dependent) driver reuses unchanged (#391 S1.2).
-        // #570: soft (TTE) times inside this open interval `(t_start, t_end]`, read
-        // off the same integration. `chz_times` is sorted, so this slice is too.
+        // #570: soft (TTE) times in the *half-open* interval `(t_start, t_end]`, read
+        // off the same integration (the closed `t_start` boundary was handled above).
+        // `chz_times` is sorted, so this slice is too.
         let seg_chz: Vec<f64> = chz_times
             .iter()
             .copied()
@@ -3780,10 +3800,20 @@ mod tests {
 
     /// #570 driver-level share: `ode_predictions_and_chz` returns the Gaussian
     /// predictions **bit-identical** to `ode_predictions` (the obs `saveat` / step
-    /// sequence is untouched) and the cumulative-hazard state at the event times
-    /// equal to the dedicated `ode_dense_solve_states` read it replaces — proving one
-    /// integration now serves both consumers. Covers event times between, on, and
-    /// **after** the last observation (33 > 30, exercising the `t_last` extension).
+    /// sequence is untouched) and the **full** ODE state at every event time equal to
+    /// the dedicated `ode_dense_solve_states` read it replaces — proving one
+    /// integration now serves both consumers.
+    ///
+    /// The event times deliberately exercise the boundary cases the open-interval soft
+    /// filter alone gets wrong (regression for the two bugs in the #613 review):
+    ///   - `0.0` = the integration start (a segment's *left* boundary). The open
+    ///     `(t_start, t_end]` solve never reads it, so before the left-boundary handler
+    ///     it stayed NaN → the TTE `1e20` sentinel (e.g. an interval-censored `left=0`).
+    ///   - `24.0` = an *interior dose time*. The shared state must be **post-dose** (the
+    ///     dedicated path overwrites with the post-dose state); reading the pre-dose
+    ///     value would move the instantaneous hazard `h = dCHZ/dt` for an event there.
+    /// plus interior (`1/6/18`), on the obs grid (`6`), and **past** the last obs
+    /// (`33 > 30`, exercising the `t_last` extension).
     #[cfg(feature = "survival")]
     #[test]
     fn ode_predictions_and_chz_shares_one_solve() {
@@ -3796,25 +3826,33 @@ mod tests {
             vec![0.5, 2.0, 6.0, 12.0, 24.5, 30.0],
         );
         let pk = pk_one(10.0, 100.0);
-        // Sorted, unique TTE event/censor times — interior, on-grid, and past last obs.
-        let chz_times = vec![1.0, 6.0, 18.0, 33.0];
+        // Sorted, unique TTE times: integration start, interior, on-grid, interior dose
+        // time, and past last obs.
+        let chz_times = vec![0.0, 1.0, 6.0, 18.0, 24.0, 33.0];
 
         let (ipred, chz_states) =
             ode_predictions_and_chz(&ode, &pk.values, &[], &[], &subject, &chz_times);
         let ipred_ref = ode_predictions(&ode, &pk.values, &[], &[], &subject);
         let chz_ref = ode_dense_solve_states(&ode, &pk.values, &[], &[], &subject, &chz_times);
 
-        // (1) Predictions bit-identical — the shared solve does not move the fit ipred.
+        // (1) Predictions bit-identical — the shared solve does not move the fit ipred,
+        // even with a soft time at the integration start and on an interior dose break.
         assert_eq!(
             ipred, ipred_ref,
             "ode_predictions_and_chz must not change the predictions"
         );
 
-        // (2) CHZ (state index 1) at each event time matches the dedicated clamped
-        // solve to solver tolerance (the Hermite read-back substitutes for it).
+        // (2) The full state (PK compartment *and* the CHZ accumulator) at each event
+        // time matches the dedicated clamped solve to solver tolerance. Checking both
+        // components is what catches the interior-dose case: CHZ (slot 1) is continuous
+        // across a dose, but the PK compartment (slot 0) jumps, so a pre- vs post-dose
+        // read only shows up there.
         assert_eq!(chz_states.len(), chz_times.len());
         for (i, st) in chz_states.iter().enumerate() {
-            assert_relative_eq!(st[1], chz_ref[i][1], max_relative = 1e-5);
+            assert_eq!(st.len(), ode.n_states, "state {i} must be fully populated");
+            for j in 0..ode.n_states {
+                assert_relative_eq!(st[j], chz_ref[i][j], max_relative = 1e-5);
+            }
         }
     }
 
