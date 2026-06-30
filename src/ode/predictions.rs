@@ -2220,6 +2220,102 @@ pub(crate) fn verify_adaptive_frozen_replay(
     Ok(())
 }
 
+/// Number of trapezoid panels per inter-decision window for the metrics-only
+/// signal-AUC (#391 S2.5b). A fixed *subdivision count* (unit-agnostic — not a step
+/// in time units), generous enough that the trapezoid discretization error on a
+/// smooth PK curve sits well below the cross-engine solver agreement. This is the
+/// AUC machinery's **own** grid: it deliberately does not touch the reactive
+/// driver's `saveat`, because the stepper clamps `dt` to land on each save point
+/// (`solver.rs`), so adding points there would perturb the bit-aligned trajectory
+/// and the default-on frozen-replay verifier.
+const ADAPTIVE_AUC_PANELS: usize = 128;
+
+/// Per-(inter-decision)-window AUC of the **latent** monitored signal — the input
+/// to the `auc_target_attainment` metric (#391 S2.5b).
+///
+/// Metrics-only: the exposure never feeds the controller (the `when` rules titrate
+/// on the point `signal`), so it is computed here — *after* the reactive run, from
+/// the realized `ledger` — rather than inline in the hot loop. This mirrors
+/// [`verify_adaptive_frozen_replay`]: rebuild the static dose schedule from the
+/// run's `ledger` and integrate it through the trusted dense-state engine
+/// ([`ode_dense_solve_states`]) on the AUC machinery's own uniform sub-grid, then
+/// integrate the signal with the shared trapezoid rule ([`crate::api::trapezoid`]).
+///
+/// Returns one AUC per **closed** window `[decision_times[k], decision_times[k+1]]`
+/// (length `decision_times.len() − 1`; empty for a single decision — there is no
+/// window to integrate over). The signal is the latent readout the driver itself
+/// would resolve: the compiled `observe` expression when present (the `Ipred`
+/// path), else the model's `monitor_cmt` readout (the `Dv` path's underlying
+/// latent — the AUC is always over the un-noised signal, never the assay draw).
+///
+/// `base_subject` is the dose-free subject the run was driven from; only its doses
+/// are replaced (its covariates carry over — the reactive driver is BSV-only in
+/// this slice, so a single static covariate snapshot is exact).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn adaptive_window_signal_aucs(
+    ode: &OdeSpec,
+    pk_params_flat: &[f64],
+    theta: &[f64],
+    eta: &[f64],
+    base_subject: &Subject,
+    decision_times: &[f64],
+    ledger: &[DoseLedgerEntry],
+    observe: Option<&OdeOutputFn>,
+    monitor_cmt: usize,
+) -> Vec<f64> {
+    let m = decision_times.len();
+    if m < 2 {
+        return Vec::new();
+    }
+
+    // Static subject carrying the realized doses (nominal amt/rate; F/lag re-apply
+    // downstream exactly as for a scheduled dose) — the verifier's reconstruction.
+    let mut static_subject = base_subject.clone();
+    static_subject.doses = ledger
+        .iter()
+        .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+        .collect();
+
+    // Uniform sub-grid: window k (0-based) occupies grid indices
+    // `[k*panels ..= (k+1)*panels]`. Built by appending only the `panels` *new*
+    // points of each window after the first, so each shared boundary is stored once
+    // and the per-window index ranges are exact — no float-keyed lookup, and no
+    // endpoint-rounding mismatch between `a + span` and the next window's `a`.
+    let panels = ADAPTIVE_AUC_PANELS;
+    let mut grid: Vec<f64> = Vec::with_capacity((m - 1) * panels + 1);
+    grid.push(decision_times[0]);
+    for w in decision_times.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let span = b - a;
+        for i in 1..=panels {
+            grid.push(a + span * (i as f64) / (panels as f64));
+        }
+    }
+
+    let states = ode_dense_solve_states(ode, pk_params_flat, theta, eta, &static_subject, &grid);
+
+    // Latent signal at each grid point (the same readout the driver resolves at a
+    // decision). BSV-only ⇒ the subject's static covariate snapshot applies at every
+    // grid time.
+    let cov = &base_subject.covariates;
+    let signal: Vec<f64> = states
+        .iter()
+        .map(|u| match observe {
+            Some(f) => f(u, pk_params_flat, theta, eta, cov),
+            None => read_observable(ode, u, pk_params_flat, theta, eta, cov, monitor_cmt),
+        })
+        .collect();
+
+    // Trapezoid each window over its own `panels + 1` grid points.
+    (0..m - 1)
+        .map(|k| {
+            let (lo, hi) = (k * panels, (k + 1) * panels); // inclusive `hi`
+            let pts: Vec<(f64, f64)> = (lo..=hi).map(|i| (grid[i], signal[i])).collect();
+            crate::api::trapezoid(&pts)
+        })
+        .collect()
+}
+
 /// ODE-based predictions with per-event PK parameters (time-varying-covariate
 /// aware). Walks the merged dose+obs+pk-only timeline, integrating each
 /// segment `[cur_t, t_event]` with the PK params evaluated at `t_event` —
@@ -3747,6 +3843,93 @@ mod tests {
             }
             other => panic!("expected SolveFailed, got {other:?}"),
         }
+    }
+
+    /// A bolus dose-ledger row, for the signal-AUC pass test below.
+    fn ledger_bolus(time: f64, amt: f64, cmt: usize) -> DoseLedgerEntry {
+        DoseLedgerEntry {
+            subject: "1".into(),
+            draw: 0,
+            sim: 0,
+            dose_idx: 0,
+            time,
+            amt,
+            cmt,
+            rate: 0.0,
+            decision_idx: 0,
+            rule_fired: "bolus".into(),
+            observed_signals: Vec::new(),
+            pre_state: None,
+            post_state: None,
+            f_applied: 1.0,
+        }
+    }
+
+    /// Analytic accuracy check for the metrics-only signal-AUC pass
+    /// ([`adaptive_window_signal_aucs`], #391 S2.5b). For a 1-cpt model with a single
+    /// IV bolus `D` at t = 0, the amount readout is `A(t) = D·e^{-ke t}` (ke = CL/V),
+    /// so the exposure over a window `[a, b]` *after* the dose is the closed form
+    /// `∫ₐᵇ A dt = (D/ke)(e^{-ke a} − e^{-ke b})`. The window is placed strictly after
+    /// the bolus so every grid edge sits in the smooth decay phase (no dose
+    /// discontinuity to straddle), and the trapezoid converges to that closed form.
+    #[test]
+    fn adaptive_window_signal_aucs_matches_closed_form() {
+        let ode = one_cpt_ode_spec(); // readout = ObsCmt(0): the central amount
+        let pk = pk_one(10.0, 100.0); // ke = CL/V = 0.1
+        let (ke, d) = (0.1_f64, 100.0_f64);
+        let base = make_subject(vec![], vec![]); // dose-free; the pass uses its own grid
+        let ledger = vec![ledger_bolus(0.0, d, 1)];
+        let auc = |a: f64, b: f64| (d / ke) * ((-ke * a).exp() - (-ke * b).exp());
+
+        // Single window [2, 10], entirely in the decay phase.
+        let one = adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[2.0, 10.0],
+            &ledger,
+            None,
+            1,
+        );
+        assert_eq!(one.len(), 1);
+        // 128-panel trapezoid of a smooth decay ⇒ ~3e-6 relative to the closed form.
+        assert_relative_eq!(one[0], auc(2.0, 10.0), max_relative = 1e-4);
+
+        // Two windows [2,6],[6,10]: exercises per-window splitting *and* state
+        // continuity across the shared boundary (the second window must resume the
+        // decay, not restart from the initial state).
+        let two = adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[2.0, 6.0, 10.0],
+            &ledger,
+            None,
+            1,
+        );
+        assert_eq!(two.len(), 2);
+        assert_relative_eq!(two[0], auc(2.0, 6.0), max_relative = 1e-4);
+        assert_relative_eq!(two[1], auc(6.0, 10.0), max_relative = 1e-4);
+        // The two windows partition [2, 10], so their exposures sum to the total.
+        assert_relative_eq!(two[0] + two[1], auc(2.0, 10.0), max_relative = 1e-4);
+
+        // Fewer than two decisions ⇒ no closed window ⇒ empty (the metric is `None`).
+        let none = adaptive_window_signal_aucs(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &[2.0],
+            &ledger,
+            None,
+            1,
+        );
+        assert!(none.is_empty());
     }
 
     /// Build the per-segment `obs_time -> indices` map the integrator uses.

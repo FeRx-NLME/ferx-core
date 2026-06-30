@@ -3858,6 +3858,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
     let mut confirm: u32 = 1;
     let mut levels: Option<Vec<f64>> = None;
     let mut target_window: Option<(f64, f64)> = None;
+    let mut auc_target: Option<(f64, f64)> = None;
     let mut rules: Vec<AdaptiveRule> = Vec::new();
 
     for line in lines {
@@ -3971,6 +3972,28 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
                 }
                 target_window = Some((lo, hi));
             }
+            "auc_target" => {
+                // Exposure band `[low, high]` for the `auc_target_attainment` metric
+                // only — it does not affect dosing. It is the AUC of a non-negative
+                // signal, so `low` must be finite *and* `>= 0`; `high` may be `inf`
+                // for a one-sided "at or above low" target. Mirrors
+                // `AdaptiveDosingSpec::validate`.
+                let b = parse_float_array(val)
+                    .map_err(|e| format!("[adaptive_dosing]: bad auc_target: {e}"))?;
+                if b.len() != 2 {
+                    return Err(format!(
+                        "[adaptive_dosing]: auc_target must be `[low, high]`: {val}"
+                    ));
+                }
+                let (lo, hi) = (b[0], b[1]);
+                if !lo.is_finite() || lo < 0.0 || hi.is_nan() || hi < lo {
+                    return Err(format!(
+                        "[adaptive_dosing]: auc_target must be `[low, high]` with low finite, \
+                         0 <= low <= high (high may be `inf`): {val}"
+                    ));
+                }
+                auc_target = Some((lo, hi));
+            }
             other => return Err(format!("[adaptive_dosing]: unknown key `{other}`")),
         }
     }
@@ -3998,6 +4021,7 @@ fn parse_adaptive_dosing_block(lines: &[String]) -> Result<AdaptiveDosingSpec, S
         confirm,
         levels,
         target_window,
+        auc_target,
         rules,
     };
     spec.validate()?;
@@ -24845,6 +24869,56 @@ mod adaptive_dosing_tests {
             let err = parse_adaptive_dosing_block(&b).expect_err("expected a typed parse error");
             assert!(
                 err.starts_with("[adaptive_dosing]:") && err.contains("target_window"),
+                "`{bad}` gave: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn auc_target_parses_band_and_one_sided() {
+        // Default: no `auc_target` ⇒ `None` (the signal-AUC pass is skipped and
+        // `auc_target_attainment` is unreported).
+        let none = parse_adaptive_dosing_block(&without("nothing")).expect("valid_min parses");
+        assert_eq!(none.auc_target, None);
+
+        // Two-sided AUC₂₄ band (the vancomycin 400–600 mg·h/L target).
+        let band = parse_adaptive_dosing_block(&{
+            let mut b = without("nothing");
+            b.push("auc_target = [400, 600]".into());
+            b
+        })
+        .expect("two-sided auc_target parses");
+        assert_eq!(band.auc_target, Some((400.0, 600.0)));
+
+        // One-sided "at or above 400": `high = inf` is allowed.
+        let one_sided = parse_adaptive_dosing_block(&{
+            let mut b = without("nothing");
+            b.push("auc_target = [400, inf]".into());
+            b
+        })
+        .expect("one-sided auc_target parses");
+        let (lo, hi) = one_sided.auc_target.expect("Some");
+        assert_eq!(lo, 400.0);
+        assert!(hi.is_infinite() && hi > 0.0);
+    }
+
+    #[test]
+    fn auc_target_bad_band_errors() {
+        // Inverted, negative/non-finite low, and wrong arity each reject loudly,
+        // naming the key. Unlike `target_window`, a *negative* low is also rejected
+        // (an AUC of a non-negative signal cannot be < 0).
+        for bad in [
+            "auc_target = [600, 400]", // high < low
+            "auc_target = [-1, 600]",  // low must be >= 0
+            "auc_target = [nan, 600]",
+            "auc_target = [inf, 600]", // low must be finite
+            "auc_target = [400]",      // not [low, high]
+        ] {
+            let mut b = without("nothing");
+            b.push(bad.into());
+            let err = parse_adaptive_dosing_block(&b).expect_err("expected a typed parse error");
+            assert!(
+                err.starts_with("[adaptive_dosing]:") && err.contains("auc_target"),
                 "`{bad}` gave: {err}"
             );
         }

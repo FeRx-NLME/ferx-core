@@ -1,0 +1,64 @@
+# Adaptive (feedback) dosing — vancomycin AUC-guided TDM titration (epic #391)
+#
+# The continuous-titration counterpart of the oncology platelet-ladder example
+# (adaptive_platelet_ladder.ferx). A 1-compartment IV vancomycin model is dosed
+# once daily by a 1-h infusion. At the start of each day the controller reads the
+# pre-dose trough concentration (CENT/V) and titrates the dose by +/-25% to keep
+# the trough in a target band — the operational control law — while the *reported*
+# outcome is AUC24 target attainment (the guideline endpoint, 400–600 mg·h/L).
+# This is the real trough-vs-AUC vancomycin TDM tension: dosing is driven by a
+# single timed level, but efficacy/safety is judged on the daily exposure.
+#
+# `auc_target` is metrics-only: like `target_window` it never influences dosing
+# (the `when` rules do). It turns on the signal-AUC pass that scores each day's
+# exposure and reports `auc_target_attainment` (epic #391 S2.5b).
+#
+# Run with `simulate_adaptive_from_spec()` (not the plain forward `simulate()`).
+# This is the genuinely-reactive continuous-titration case validated against an
+# external mrgsolve reference; see tests/reference/vanco_mrgsolve/.
+#
+# Negligible IIV / no covariates: an effectively typical-value patient, so the
+# realized ladder is reproducible and bit-comparable to the mrgsolve run.
+#
+# See docs/model-file/adaptive-dosing.qmd for the block reference.
+
+[parameters]
+  theta TVCL(4.0,  0.1,  50.0)   # vancomycin clearance (L/h)
+  theta TVV(80.0,  5.0, 300.0)   # central volume (L); CENT/V is the concentration
+
+  # Negligible IIV: the engine requires at least one omega, so CL carries a
+  # vanishing variance (SD ~ 1e-5). The patient is effectively typical-value, the
+  # controller titrates on the latent trough, and the ladder is reproducible /
+  # bit-comparable to the typical-value mrgsolve run.
+  omega ETA_CL ~ 1e-10
+
+  sigma ADD ~ 1.0                # nominal additive error (concentration); the latent
+                                 # `observe` signal is un-noised, so it never enters
+                                 # the dose decisions.
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[CENT])
+
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT  # 1-cpt IV; infusions enter CENT via the route
+
+[scaling]
+  y = CENT / V                   # observed/predicted endpoint: concentration (mg/L)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[adaptive_dosing]
+  observe       = CENT / V               # titrate on the latent trough concentration
+  at            = every 24 from 0 to 312 # a decision at the start of each day
+  start_dose    = 500                    # empiric start (mg/day): subtherapeutic -> climbs
+  route         = infuse(cmt=1, over=1)  # 1-h IV infusion into the drug compartment
+  dose_bounds   = [250, 4000]            # mg/day
+  target_window = [10, 15]               # report % of days with trough in [10, 15] mg/L
+  auc_target    = [400, 600]             # report % of days with AUC24 in [400, 600] mg·h/L
+  when signal < 10 : increase 25%        # subtherapeutic trough -> raise the dose
+  when signal > 15 : decrease 25%        # supratherapeutic trough -> lower the dose

@@ -2367,7 +2367,11 @@ fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> Has
 /// Trapezoid integration over (time, value) pairs.
 /// Observation times are not guaranteed to be sorted (preserved in input row
 /// order), so sort by time before integrating to prevent negative dt windows.
-fn trapezoid(points: &[(f64, f64)]) -> f64 {
+///
+/// `pub(crate)` so the reactive-dosing signal-AUC pass
+/// ([`crate::ode::adaptive_window_signal_aucs`], #391 S2.5b) shares this one
+/// implementation rather than carrying a second copy of the rule.
+pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
     if points.len() < 2 {
         return f64::NAN;
     }
@@ -5878,6 +5882,9 @@ where
         // Programmatic path: no declarative block, so no target band — the
         // window-dependent metric (`pct_time_in_window`) is left unreported.
         None,
+        // ...and no `auc_target`, so the signal-AUC pass is skipped and
+        // `auc_target_attainment` is left unreported.
+        None,
         opts,
     )
 }
@@ -5908,6 +5915,7 @@ fn run_adaptive_population<F, C>(
     monitors: &[crate::sim::adaptive::AdaptiveMonitor],
     make_controller: F,
     target_window: Option<(f64, f64)>,
+    auc_target: Option<(f64, f64)>,
     opts: &AdaptiveSimulateOptions,
 ) -> Result<AdaptiveSimulationResult, String>
 where
@@ -6024,11 +6032,30 @@ where
                 });
             }
 
+            // Signal-AUC pass for the exposure metric (#391 S2.5b): run only when an
+            // `auc_target` is declared (its sole consumer) and a monitor exists. It
+            // re-integrates the realized ledger on its own dense grid — separate from,
+            // and never perturbing, the reactive run + verifier above.
+            let window_aucs: Vec<f64> = match (auc_target, monitors.first()) {
+                (Some(_), Some(mon)) => crate::ode::adaptive_window_signal_aucs(
+                    ode,
+                    &pk.values,
+                    &params.theta,
+                    &eta_slice,
+                    subject,
+                    decision_times,
+                    &run.ledger,
+                    mon.observe,
+                    mon.spec.cmt,
+                ),
+                _ => Vec::new(),
+            };
+
             // Per-subject outcome metrics for this run, computed from its realized
-            // ledger + decision log (S2.4). Taken before the rows are moved into the
-            // population vectors below; the `(subject, draw, sim)` key is stamped here
-            // rather than read from the rows (whose tags the single-subject driver
-            // still leaves at 0).
+            // ledger + decision log (S2.4) and the window AUC series (S2.5b). Taken
+            // before the rows are moved into the population vectors below; the
+            // `(subject, draw, sim)` key is stamped here rather than read from the
+            // rows (whose tags the single-subject driver still leaves at 0).
             metrics.push(crate::sim::adaptive::compute_subject_metrics(
                 &subject.id,
                 1,
@@ -6036,6 +6063,8 @@ where
                 &run.ledger,
                 &run.decisions,
                 target_window,
+                auc_target,
+                &window_aucs,
             ));
 
             // Stamp the replicate tags onto the ledger + decision rows — the
@@ -6170,6 +6199,9 @@ pub fn simulate_adaptive_from_spec(
         // The declarative block's optional therapeutic band feeds the
         // `pct_time_in_window` metric (it never influences dosing).
         spec.target_window,
+        // ...and the optional exposure band feeds `auc_target_attainment` (likewise
+        // metrics-only); `Some` here is what turns on the signal-AUC pass.
+        spec.auc_target,
         opts,
     )
 }
@@ -11391,6 +11423,7 @@ mod adaptive_sim_tests {
             confirm: 1,
             levels: None,
             target_window: None,
+            auc_target: None,
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 50.0,
@@ -11481,6 +11514,7 @@ mod adaptive_sim_tests {
             confirm: 1,
             levels: None,
             target_window: None,
+            auc_target: None,
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 50.0,
@@ -11692,6 +11726,47 @@ mod adaptive_sim_tests {
             .filter(|d| (8.0..=13.0).contains(&d.observed_signals[0].value))
             .count();
         assert_eq!(m.pct_time_in_window, Some(in_band as f64 / n as f64));
+        // No `auc_target` on this spec ⇒ the signal-AUC pass is skipped and the
+        // exposure metric stays unreported.
+        assert_eq!(m.auc_target_attainment, None);
+    }
+
+    #[test]
+    fn from_spec_reports_auc_target_attainment() {
+        // End-to-end wiring of the exposure metric (#391 S2.5b): declaring
+        // `auc_target` turns on the signal-AUC pass in `run_adaptive_population`,
+        // which feeds `auc_target_attainment`. The exact AUCs are pinned by the
+        // analytic unit test (`adaptive_window_signal_aucs_matches_closed_form`); here
+        // two *extreme* bands make the attainment deterministic regardless of the
+        // realized AUCs, so the run/pass/metric chain is exercised without re-deriving
+        // the integral: an all-covering band attains 1, an unreachable band attains 0.
+        let parsed = parse_full_model(SPEC_TITRATE).expect("parse titrating block");
+        let mut spec = parsed.adaptive_dosing.clone().expect("block present");
+        let pop = population(vec![subj("P", vec![342.0], vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(3),
+            ..Default::default()
+        };
+        let run = |spec: &crate::sim::adaptive::AdaptiveDosingSpec| {
+            simulate_adaptive_from_spec(
+                &parsed.model,
+                &pop,
+                &parsed.model.default_params,
+                1,
+                spec,
+                &opts,
+            )
+            .expect("titration runs")
+        };
+
+        // Every inter-decision exposure is non-negative, so `[0, +∞)` is always met.
+        spec.auc_target = Some((0.0, f64::INFINITY));
+        assert_eq!(run(&spec).metrics[0].auc_target_attainment, Some(1.0));
+
+        // An exposure no finite window can reach ⇒ 0 attainment (not `None`: the
+        // band *is* declared and there *are* windows).
+        spec.auc_target = Some((1e18, f64::INFINITY));
+        assert_eq!(run(&spec).metrics[0].auc_target_attainment, Some(0.0));
     }
 
     #[test]
@@ -11817,6 +11892,7 @@ mod adaptive_sim_tests {
             confirm: 1,
             levels: None,
             target_window: None,
+            auc_target: None,
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 50.0,

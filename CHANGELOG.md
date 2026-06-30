@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **AUC-target attainment metric + vancomycin AUC-TDM example/anchor** (#391, S2.5b). A new
+  optional `[adaptive_dosing] auc_target = [low, high]` key adds `auc_target_attainment` to
+  `AdaptiveSubjectMetrics` — the fraction of inter-decision windows whose area under the monitored
+  signal (e.g. vancomycin AUC₂₄) falls in the band (`high` may be `inf`). Like `target_window` it
+  reports a metric only and never influences dosing; declaring it turns on a signal-AUC pass that
+  re-integrates the realized doses on a dense grid (trapezoid), leaving the reactive run untouched.
+  A new bundled model `examples/adaptive_vanco_auc.ferx` titrates a once-daily infusion on the
+  pre-dose trough and reports AUC₂₄ attainment, cross-validated against an external **mrgsolve** run
+  (reference kit in `tests/reference/vanco_mrgsolve/`, slow-gated `tests/adaptive_vanco_anchor.rs`).
+  See [Adaptive dosing](model-file/adaptive-dosing.qmd).
 - `TIME`/`time` are now built-in event-time values in `[individual_parameters]`
   expressions and direct analytical `pk(...=TIME)` mappings, enabling
   NONMEM-style time-dependent PK parameter switches without declaring `TIME` as
