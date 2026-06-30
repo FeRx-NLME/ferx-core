@@ -147,6 +147,10 @@ pub fn solve_ode(
 /// The counters are intentionally local to this integration segment. Higher
 /// layers that split by dose/observation boundaries can aggregate across calls
 /// to classify a full subject or fit.
+///
+/// Thin wrapper over [`solve_ode_dense`] with no soft-sampling (`interp_at`
+/// empty) — the soft-sampling loop is then never entered, so the returned hard
+/// saves are bit-identical to the historical stepper.
 pub fn solve_ode_with_stats(
     rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
     u0: &[f64],
@@ -154,16 +158,52 @@ pub fn solve_ode_with_stats(
     params: &[f64],
     saveat: &[f64],
     opts: &OdeSolverOptions,
-    mut stats: Option<&mut OdeSolverStats>,
+    stats: Option<&mut OdeSolverStats>,
 ) -> Vec<SolPoint> {
+    solve_ode_dense(rhs, u0, t_span, params, saveat, &[], opts, stats).0
+}
+
+/// Core Dormand–Prince RK45 stepper with **dense soft-sampling**.
+///
+/// Returns `(hard, soft)`. `hard` holds the state at every `saveat` time — each
+/// clamps the step to land on it, preserving the historical adaptive step
+/// sequence. `soft` holds the **full state at every `interp_at` time**, obtained
+/// by in-step cubic Hermite interpolation that reads the FSAL stage derivatives of
+/// the step already accepted and so does **not** perturb the step sequence — the
+/// whole point of #570: read a cumulative-hazard state at event times off the
+/// Gaussian solve without changing the Gaussian predictions.
+///
+/// `interp_at` must be sorted ascending; each point is interpolated within the
+/// accepted step whose half-open span `(t, t+dt]` contains it (a point coinciding
+/// with a `saveat`/step boundary lands at `s = 1`, the exact saved state). Any
+/// point left unreached when the span ends — or in the zero-width-span early
+/// return — is filled with the final state, mirroring the `saveat` fill so the two
+/// outputs stay length-consistent (`soft.len() == interp_at.len()`).
+///
+/// This is the single owner of the f64 stepping loop; [`solve_ode`] /
+/// [`solve_ode_with_stats`] are the `interp_at = &[]` wrappers.
+#[allow(clippy::too_many_arguments)]
+fn solve_ode_dense(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u0: &[f64],
+    t_span: (f64, f64),
+    params: &[f64],
+    saveat: &[f64],
+    interp_at: &[f64],
+    opts: &OdeSolverOptions,
+    mut stats: Option<&mut OdeSolverStats>,
+) -> (Vec<SolPoint>, Vec<SolPoint>) {
     let n = u0.len();
     let (t0, tf) = t_span;
 
     if (tf - t0).abs() < 1e-15 {
-        return saveat
-            .iter()
-            .map(|&t| SolPoint { t, u: u0.to_vec() })
-            .collect();
+        let at = |times: &[f64]| -> Vec<SolPoint> {
+            times
+                .iter()
+                .map(|&t| SolPoint { t, u: u0.to_vec() })
+                .collect()
+        };
+        return (at(saveat), at(interp_at));
     }
 
     let mut u = u0.to_vec();
@@ -183,6 +223,9 @@ pub fn solve_ode_with_stats(
 
     let mut results: Vec<SolPoint> = Vec::with_capacity(saveat.len());
     let mut save_idx = 0;
+    // Soft (Hermite-interpolated) samples — empty/no-op on the wrapper hot path.
+    let mut interp_results: Vec<SolPoint> = Vec::with_capacity(interp_at.len());
+    let mut interp_idx = 0;
 
     // FSAL (First Same As Last): in DP-RK45, k7 of an accepted step is evaluated
     // at the same (u, t) the next step's k1 would use. We carry it across via a
@@ -276,6 +319,22 @@ pub fn solve_ode_with_stats(
             s.record(accepted, err_norm, dt_eff, opts.min_dt);
         }
         if accepted {
+            // Dense soft-sampling: interpolate the full state at every `interp_at`
+            // time lying in this just-accepted step's half-open span `(t, t+dt_eff]`,
+            // using the FSAL derivatives (`k1` at the step start, `k7` at the end)
+            // *before* the swap and `u <- u5` advance below consume them. This only
+            // reads already-committed step data, so it cannot affect the step
+            // sequence; the loop is a no-op (`interp_at` empty) on the wrapper path.
+            while interp_idx < interp_at.len() && interp_at[interp_idx] <= t + dt_eff + 1e-12 {
+                let ti = interp_at[interp_idx];
+                let s = ((ti - t) / dt_eff).clamp(0.0, 1.0);
+                let ui: Vec<f64> = (0..n)
+                    .map(|j| hermite_scalar(s, dt_eff, u[j], k1[j], u5[j], k7[j]))
+                    .collect();
+                interp_results.push(SolPoint { t: ti, u: ui });
+                interp_idx += 1;
+            }
+
             // Accept step
             t += dt_eff;
             u.copy_from_slice(&u5);
@@ -326,8 +385,17 @@ pub fn solve_ode_with_stats(
         });
         save_idx += 1;
     }
+    // Same for any soft-sample times the span ended before reaching (e.g. a
+    // pathological-divergence break) — keeps `soft.len() == interp_at.len()`.
+    while interp_idx < interp_at.len() {
+        interp_results.push(SolPoint {
+            t: interp_at[interp_idx],
+            u: u.clone(),
+        });
+        interp_idx += 1;
+    }
 
-    results
+    (results, interp_results)
 }
 
 /// Outcome of [`solve_ode_until_threshold`] over a single integration span.
@@ -354,6 +422,23 @@ pub enum ThresholdCrossing {
     /// argument), or the step budget exhausted before reaching `t_end`. The
     /// message names the cause.
     Failed(String),
+}
+
+/// Cubic Hermite interpolation of one state component across a single accepted
+/// DP-RK45 step. `s ∈ [0, 1]` is the normalized position within the step, `h` the
+/// step length, `(y0, d0)` / `(y1, d1)` the value and derivative at the step's
+/// start and end — the FSAL `k1` / `k7` stage slots. Shared by the in-step
+/// crossing localization in [`solve_ode_until_threshold`] and the dense
+/// soft-sampling in [`solve_ode_dense`], so the interpolant exists in exactly one
+/// place.
+#[inline]
+fn hermite_scalar(s: f64, h: f64, y0: f64, d0: f64, y1: f64, d1: f64) -> f64 {
+    let s2 = s * s;
+    let s3 = s2 * s;
+    (2.0 * s3 - 3.0 * s2 + 1.0) * y0
+        + (s3 - 2.0 * s2 + s) * h * d0
+        + (-2.0 * s3 + 3.0 * s2) * y1
+        + (s3 - s2) * h * d1
 }
 
 /// Integrate `rhs` over `t_span`, **halting at the first time `u[monitor]` reaches
@@ -495,14 +580,7 @@ pub fn solve_ode_until_threshold(
                 // the accepted step proves (y0 < threshold ≤ y1). 64 halvings drives
                 // the bracket below machine precision of the step — cubic evals only.
                 let h = dt_eff;
-                let hermite = |s: f64| {
-                    let s2 = s * s;
-                    let s3 = s2 * s;
-                    (2.0 * s3 - 3.0 * s2 + 1.0) * y0
-                        + (s3 - 2.0 * s2 + s) * h * d0
-                        + (-2.0 * s3 + 3.0 * s2) * y1
-                        + (s3 - s2) * h * d1
-                };
+                let hermite = |s: f64| hermite_scalar(s, h, y0, d0, y1, d1);
                 let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
                 for _ in 0..64 {
                     let mid = 0.5 * (lo + hi);
@@ -830,6 +908,152 @@ mod tests {
         let result = solve_ode(&rhs, &[42.0], (5.0, 5.0), &[], &saveat, &opts);
         assert_eq!(result.len(), 1);
         assert_relative_eq!(result[0].u[0], 42.0, epsilon = 1e-12);
+    }
+
+    // ---- #570: dense soft-sampling (`solve_ode_dense`) ----
+
+    /// The decisive #570 guarantee: requesting soft (Hermite) samples must **not**
+    /// change the hard `saveat` outputs. The soft channel only reads already-
+    /// accepted step data, so the adaptive step sequence — and thus every hard save
+    /// — is **bit-identical** to the no-soft-sampling wrapper. Without this, the
+    /// Gaussian predictions in a shared joint PK-TTE solve would move (the exact
+    /// regression #570 must avoid). Asserts exact f64 equality, not `approx`.
+    #[test]
+    fn solve_ode_dense_soft_samples_do_not_perturb_hard_saves() {
+        // Two-state system (decay + a CHZ-like accumulator) so steps actually adapt.
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -0.3 * u[0];
+            du[1] = 0.3 * u[0];
+        };
+        let saveat = vec![1.0, 3.0, 7.0, 12.0];
+        let interp_at = vec![0.5, 2.2, 4.9, 8.1, 11.3];
+        let opts = OdeSolverOptions::default();
+
+        let reference = solve_ode(&rhs, &[1.0, 0.0], (0.0, 12.0), &[], &saveat, &opts);
+        let (hard, soft) = solve_ode_dense(
+            &rhs,
+            &[1.0, 0.0],
+            (0.0, 12.0),
+            &[],
+            &saveat,
+            &interp_at,
+            &opts,
+            None,
+        );
+
+        assert_eq!(hard.len(), saveat.len());
+        assert_eq!(soft.len(), interp_at.len());
+        for (a, b) in hard.iter().zip(reference.iter()) {
+            assert_eq!(a.t, b.t);
+            assert_eq!(a.u, b.u, "soft sampling perturbed a hard save");
+        }
+    }
+
+    /// Soft samples reproduce the trajectory: pinned tightly against the analytic
+    /// solution at small step size (the interpolant itself), and shown to match an
+    /// independent clamped solve to within solver tolerance at production tolerance
+    /// (the real operating point of the joint PK-TTE share — CHZ read at event
+    /// times off the obs-clamped Gaussian solve instead of a dedicated TTE solve).
+    #[test]
+    fn solve_ode_dense_soft_samples_are_accurate() {
+        // u0 = e^{-0.2 t}; u1 = 1 − e^{-0.2 t} (a cumulative accumulator).
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -0.2 * u[0];
+            du[1] = 0.2 * u[0];
+        };
+        let saveat = vec![2.0, 6.0, 10.0];
+        let interp_at = vec![1.0, 6.0, 8.5]; // between, on, and off the saveat grid
+
+        // Tight tolerance ⇒ small steps ⇒ the Hermite read-back is near-exact, so
+        // this pins the *interpolant* rather than the solver's own truncation.
+        let tight = OdeSolverOptions {
+            abstol: 1e-10,
+            reltol: 1e-9,
+            ..Default::default()
+        };
+        let (_h, soft) = solve_ode_dense(
+            &rhs,
+            &[1.0, 0.0],
+            (0.0, 10.0),
+            &[],
+            &saveat,
+            &interp_at,
+            &tight,
+            None,
+        );
+        for (i, s) in soft.iter().enumerate() {
+            let t = interp_at[i];
+            assert_relative_eq!(s.t, t, epsilon = 1e-12);
+            assert_relative_eq!(s.u[0], (-0.2 * t).exp(), epsilon = 1e-6);
+            assert_relative_eq!(s.u[1], 1.0 - (-0.2 * t).exp(), epsilon = 1e-6);
+        }
+
+        // Production tolerance (reltol 1e-4): the read-back matches an independent
+        // clamped solve to within solver tolerance even where the obs grid is coarse
+        // (the 8.5 point sits inside a large 6→10 step). 1e-3 covers Hermite-over-a-
+        // large-step error while still catching a broken interpolant (≫ 1e-3 off).
+        let prod = OdeSolverOptions::default();
+        let (_h2, soft2) = solve_ode_dense(
+            &rhs,
+            &[1.0, 0.0],
+            (0.0, 10.0),
+            &[],
+            &saveat,
+            &interp_at,
+            &prod,
+            None,
+        );
+        let clamped = solve_ode(&rhs, &[1.0, 0.0], (0.0, 10.0), &[], &interp_at, &prod);
+        for (i, s) in soft2.iter().enumerate() {
+            assert_relative_eq!(s.u[0], clamped[i].u[0], epsilon = 1e-3);
+            assert_relative_eq!(s.u[1], clamped[i].u[1], epsilon = 1e-3);
+        }
+    }
+
+    /// Edge cases: a soft point coinciding with a `saveat`/step boundary lands at
+    /// `s = 1` (the exact saved state); a point at the span start clamps to `u0`.
+    #[test]
+    fn solve_ode_dense_soft_boundary_and_start() {
+        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+            du[0] = -u[0];
+        };
+        let saveat = vec![4.0];
+        let interp_at = vec![0.0, 4.0];
+        let opts = OdeSolverOptions::default();
+        let (hard, soft) = solve_ode_dense(
+            &rhs,
+            &[1.0],
+            (0.0, 4.0),
+            &[],
+            &saveat,
+            &interp_at,
+            &opts,
+            None,
+        );
+        assert_eq!(soft.len(), 2);
+        assert_relative_eq!(soft[0].u[0], 1.0, epsilon = 1e-12); // t=0 → u0
+        assert_eq!(soft[1].u[0], hard[0].u[0]); // t=4 boundary == hard save (exact)
+    }
+
+    /// Zero-width span: the early-return path must populate the soft channel too,
+    /// keeping `soft.len() == interp_at.len()`.
+    #[test]
+    fn solve_ode_dense_zero_span_fills_soft() {
+        let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = 1.0;
+        let opts = OdeSolverOptions::default();
+        let (hard, soft) = solve_ode_dense(
+            &rhs,
+            &[7.0],
+            (3.0, 3.0),
+            &[],
+            &[3.0],
+            &[3.0, 3.0],
+            &opts,
+            None,
+        );
+        assert_eq!(hard.len(), 1);
+        assert_eq!(soft.len(), 2);
+        assert!(soft.iter().all(|p| (p.u[0] - 7.0).abs() < 1e-12));
     }
 
     /// Primitive-level degenerate oracle: a constant accumulation rate `λ` is the
