@@ -794,6 +794,17 @@ pub fn foce_subject_nll(
     interaction: bool,
 ) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
+    // #570: at the EBE mode the Gaussian `ipreds` solve and the at-mode TTE-term solve
+    // are both at `eta_hat`; when the subject qualifies, share one augmented integration
+    // (the FD-Hessian's perturbed-η TTE solves below are at different η and stay separate).
+    #[cfg(feature = "survival")]
+    let joint_share = try_joint_pktte_shared_solve(model, subject, theta, eta_hat.as_slice());
+    #[cfg(feature = "survival")]
+    let ipreds = match &joint_share {
+        Some(s) => s.preds.clone(),
+        None => model_predictions(model, subject, theta, eta_hat.as_slice()),
+    };
+    #[cfg(not(feature = "survival"))]
     let ipreds = model_predictions(model, subject, theta, eta_hat.as_slice());
 
     // Per-observation custom residual magnitude (#484). η-independent, so one
@@ -851,7 +862,17 @@ pub fn foce_subject_nll(
                 let tte_fn = |eta_eval: &[f64]| -> f64 {
                     tte_endpoint_nll(model, subject, hazard, &records_for_cmt, theta, eta_eval)
                 };
-                tte_nll_at_mode += tte_fn(eta_hat.as_slice());
+                // #570: at the mode, read H/h off the shared solve when available; the
+                // FD-Hessian below still calls `tte_fn` at perturbed η (intrinsic to FD).
+                tte_nll_at_mode += match (joint_share.as_ref(), hazard) {
+                    (Some(s), HazardSpec::OdeAccumulated { chz_state }) => tte_ode_nll_from_shared(
+                        model.ode_spec.as_ref().expect("joint share ⟹ ode_spec"),
+                        s,
+                        *chz_state,
+                        &records_for_cmt,
+                    ),
+                    _ => tte_fn(eta_hat.as_slice()),
+                };
                 if n_eta > 0 {
                     let steps = shi_step_sizes(&tte_fn, eta_hat.as_slice());
                     tte_h += data_term_hessian_fd(&tte_fn, eta_hat.as_slice(), &steps);
