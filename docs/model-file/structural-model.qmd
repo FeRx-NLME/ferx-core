@@ -12,7 +12,7 @@ For standard compartmental models, use the `pk` keyword with a model function:
 pk MODEL_NAME(param=VALUE, param=VALUE, ...)
 ```
 
-Each `VALUE` is either a parameter defined in `[individual_parameters]` or a numeric constant (e.g. `ka=1.0` fixes absorption at 1.0). Referencing a name that is **not** a defined parameter is a parse error — ferx does not silently default the slot to 0.0 (which previously produced a "converged" but structurally broken fit, #261). An unrecognized `param` key (e.g. the typo `clx=`) is likewise rejected.
+Each `VALUE` is either a parameter defined in `[individual_parameters]`, a numeric constant (e.g. `ka=1.0` fixes absorption at 1.0), or the event-time built-in `TIME`/`time`. Referencing any other undefined name is a parse error — ferx does not silently default the slot to 0.0 (which previously produced a "converged" but structurally broken fit, #261). An unrecognized `param` key (e.g. the typo `clx=`) is likewise rejected.
 
 ### Available Models
 
@@ -62,6 +62,17 @@ Three-compartment IV (note that `q2`/`q3` and `v2`/`v3` distinguish the two peri
 [structural_model]
   pk three_cpt_iv(cl=CL, v1=V1, q2=Q2, v2=V2, q3=Q3, v3=V3)
 ```
+
+Direct event-time mappings are accepted when the `pk(...)` grammar only needs a
+single value:
+
+```
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=time)
+```
+
+For more complex time-dependent relationships, define the expression in
+`[individual_parameters]` and map the resulting parameter name here.
 
 ### Bioavailability
 

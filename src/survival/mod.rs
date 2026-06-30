@@ -93,6 +93,9 @@ pub fn tte_nll_from_curves(
     // `reltol` defaults to 1e-4) so a near-zero hazard's quadrature noise on a flat `H`
     // is tolerated. The simulation path hard-errors on the same non-monotone CHZ; here,
     // with an optimizer to steer, it folds into the shared 1e20 sentinel.
+    // NOTE(#618): the relative term scales with the accumulated `|H|`, so for a large `H`
+    // a genuine negative increment up to ~0.1%·H can slip past as round-off. Decouple the
+    // floor from the cumulative magnitude (tie to `reltol` / a local increment scale).
     let monotone_violation = |hi: f64, lo: f64| hi - lo < -(1e-6 + 1e-3 * hi.abs().max(lo.abs()));
 
     for record in records {
@@ -386,7 +389,11 @@ pub(crate) fn ode_cumhaz_hazard(
     let Some(ode) = model.ode_spec.as_ref() else {
         return (cum, haz);
     };
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // Single-pass hazard integration with a constant PK-parameter vector. A
+    // time-dependent hazard RHS (e.g. a Weibull `TIME` term) is honoured by the
+    // integrator clock; the individual-parameter snapshot resolves the `TIME`
+    // built-in at the integration start (t=0). #610.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let states = crate::ode::ode_dense_solve_states(ode, &pk.values, theta, eta, subject, times);
     if states.len() != n {
         return (cum, haz);
@@ -435,7 +442,10 @@ fn draw_ode_tte_latent<R: rand::Rng>(
     );
     let u: f64 = rng.sample(rand::distr::Open01);
     let threshold = -u.ln();
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // Single-pass hazard integration (see `ode_accumulated_hazard`): the hazard
+    // RHS `TIME` is honoured by the integrator clock; the PK-parameter snapshot
+    // resolves the `TIME` built-in at the integration start (t=0). #610.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let ode = model
         .ode_spec
         .as_ref()

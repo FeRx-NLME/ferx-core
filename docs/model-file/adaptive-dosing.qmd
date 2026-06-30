@@ -1,6 +1,6 @@
 # Adaptive (Feedback) Dosing
 
-> **Maturity: experimental** — see [Feature Maturity](../maturity.qmd) for what this means.
+> **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
 
 Adaptive dosing simulates regimens where **future doses depend on the simulated
 state** — therapeutic-drug-monitoring (TDM) target attainment, oncology
@@ -242,10 +242,40 @@ family. It is validated instead by:
   exactly the engine the programmatic API exercises);
 - a **closed-loop** check — a titration that starts below its target band drives
   the trough into the band and holds it there;
-- for genuinely reactive behaviour, reproduction of a published **mrgsolve**
-  dynamic-dosing example (the apples-to-apples external comparator, since mrgsolve
-  does do feedback dosing) — the external anchor lands in a later slice of epic
-  #391.
+- for genuinely reactive behaviour, reproduction of an external **mrgsolve**
+  dynamic-dosing run (the apples-to-apples external comparator, since mrgsolve
+  does do feedback dosing) — see [The platelet-ladder anchor](#the-platelet-ladder-anchor)
+  below.
+
+### The platelet-ladder anchor
+
+The `levels` ladder is cross-checked against **mrgsolve 1.7.2** on an oncology
+dose-modification scenario — a Friberg semi-mechanistic myelosuppression model
+(Friberg et al., *J Clin Oncol* 2002) driven by a 1-compartment IV drug.
+Circulating platelets are read at the start of each weekly cycle; the dose steps
+down a discrete ladder (100 → 75 → 50 → 25 mg) on thrombocytopenia, with a severe
+floor that stops treatment. ferx (RK45) and mrgsolve (LSODA) integrate the
+identical ODE system and an R loop mirrors the controller semantics exactly, so
+the two engines must reach the same decisions. Under the top dose the platelets
+fall, the controller de-escalates two levels (100 → 75 → 50 mg), and platelets
+recover and hold:
+
+| Cycle | Platelet (×10⁹/L) | Dose (mg) | Action |
+|---:|---:|---:|:---|
+| 0    | 250.0   | 100 | start |
+| 1    | 169.6   | 100 | continue |
+| 2    | 94.3    | 75  | **decrease** |
+| 3    | 98.7    | 50  | **decrease** |
+| 4    | 151.3   | 50  | continue |
+| 5–9  | 158–179 | 50  | continue |
+
+ferx reproduces every dose **exactly** and every platelet value to
+&lt; 0.01 ×10⁹/L — a cross-solver difference ~3 × 10⁻⁵ relative, far below the
+~25-unit margin from each decision to its rule threshold, so every dose decision
+is robust. The model is `examples/adaptive_platelet_ladder.ferx`; the mrgsolve
+model, R driver, and frozen output live in `tests/reference/platelet_mrgsolve/`,
+exercised by the slow-gated `tests/adaptive_platelet_anchor.rs` (nightly + on push
+to `main`).
 
 ## Current scope and limits
 

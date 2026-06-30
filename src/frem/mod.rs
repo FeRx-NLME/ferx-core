@@ -938,7 +938,7 @@ mod tests {
             error_model: ErrorModel::Proportional,
             error_spec: ErrorSpec::Single(ErrorModel::Proportional),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|_, _, _| PkParams::default()),
+            pk_param_fn: Box::new(|_, _, _, _t: f64| PkParams::default()),
             n_theta: 3,
             n_eta: 3,
             n_epsilon: 1,

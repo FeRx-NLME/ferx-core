@@ -266,7 +266,9 @@ fn try_joint_pktte_shared_solve(
     times.dedup();
 
     // One augmented integration: Gaussian observable readout + CHZ at `times`.
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // `pk_param_fn`'s 4th arg is the evaluation time (#591); the share is guarded to
+    // no-TV subjects, so a single snapshot at t=0 matches `ode_cumhaz_hazard`'s call.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let (mut preds, chz_states) =
         crate::ode::ode_predictions_and_chz(ode, &pk.values, theta, eta, subject, &times);
     // Apply exactly the post-processing the standalone no-TV ODE prediction path does
@@ -716,7 +718,12 @@ fn ekf_p_obs(
         }
     }
 
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    // The EKF is a single-pass filter over the whole subject timeline with a
+    // constant PK-parameter vector (no per-event recompute), so the `TIME`
+    // built-in resolves at the integration start (t=0) — the same convention as
+    // the single-pass ODE prediction path. (Time-varying *ODE-RHS* `TIME` is
+    // still honoured: the integrator supplies its own clock.) #610.
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     // EKF process-noise variance uses a single error model. This is sound: a
     // per-CMT (multi-endpoint) error model needs a Form C `y[CMT=N]` readout to
     // observe multiple compartments, and the parser rejects Form C on SDE
@@ -824,9 +831,6 @@ pub fn foce_subject_nll(
     let frem_r_override =
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
 
-    let m3_active =
-        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
-
     // TTE Laplace correction: when the subject has TTE obs_records, we compute
     // the FD Hessian of the TTE data term w.r.t. η and add it to hrh inside
     // the interaction path so log|H̃| includes both Gaussian and TTE curvature.
@@ -892,9 +896,16 @@ pub fn foce_subject_nll(
             &p_obs,
             tte_nll_at_mode,
             tte_h,
-            // Promote to interaction when M3 censoring is active, matching the
-            // non-TTE branch below so M3 subjects always get the CᵀC correction.
-            interaction || m3_active,
+            // FOCE/FOCEI is selected by the `interaction` flag alone — M3 no longer
+            // force-promotes to interaction (mirrors the non-TTE branch below and the
+            // IOV `foce_subject_nll_iov`, #367/#591), so FOCE-M3 keeps non-interaction
+            // (no CᵀC) semantics here too. NOTE: the censored data term on this TTE path
+            // still rides `gaussian_foce_accum` at the conditional (η̂) variance, not the
+            // population-variance Sheiner–Beal `foce_subject_nll_standard` the non-TTE
+            // FOCE-M3 path uses; reconciling that (a `*_standard_with_tte` censored term)
+            // is a follow-up — joint analytic-`family` TTE + M3 + FOCE is the only path
+            // affected.
+            interaction,
             model.residual_error_eta,
             ruv_mult.as_deref(),
         );
@@ -905,7 +916,6 @@ pub fn foce_subject_nll(
     // entering the standard path as `−logΦ` terms (excluded from R̃). FOCEI still
     // takes the interaction path. This matches NONMEM `METHOD=1 LAPLACE` with vs
     // without INTER (FOCE-M3 and FOCEI-M3 are genuinely different optima).
-    let _ = m3_active;
     // block_sigma cross-endpoint residual covariance is only carried by the
     // non-interaction (Sheiner–Beal) path via `compute_r_matrix_with_correlations`;
     // the interaction accumulator builds R diagonally and would silently drop the
@@ -1102,9 +1112,13 @@ pub fn foce_subject_nll_standard(
     let mut bloq_term = 0.0;
     if m3 {
         for j in 0..n_obs {
-            if subject.cens.get(j).copied().unwrap_or(0) != 0 {
-                let z = (subject.observations[j] - ipreds[j]) / r_diag[j].sqrt();
-                bloq_term += -2.0 * log_normal_cdf(z);
+            let cens = subject.cens.get(j).copied().unwrap_or(0);
+            if cens != 0 {
+                // `m3_logcdf` selects the tail from the CENS sign: lower tail for
+                // below-LLOQ (`cens > 0`), upper tail `(f − ULOQ)/sd` for above-ULOQ
+                // (`cens < 0`). `subject.observations[j]` holds the censoring limit.
+                bloq_term +=
+                    -2.0 * m3_logcdf(subject.observations[j], ipreds[j], r_diag[j].sqrt(), cens);
             }
         }
     }
@@ -1627,8 +1641,18 @@ pub fn foce_subject_nll_iov(
     // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
     // integrated out through R̃ exactly like η, so no separate κ prior is
     // added (doing so would double-count the random-effect penalty).
-    let m3_active =
-        matches!(model.bloq_method, BloqMethod::M3) && subject.has_censored_observation();
+    // M3 no longer force-promotes IOV-FOCE subjects to interaction (#591, mirroring the
+    // non-IOV `foce_subject_nll` change in #367/8abadbb7): plain FOCE keeps a consistent
+    // FOCE (Sheiner–Beal) objective for the whole subject — the censored rows leave the
+    // linearized augmented marginal and re-enter through `foce_subject_nll_standard` as
+    // `−logΦ((LLOQ−f̂)/√R⁰)` data terms with the population (η=0, κ=0) variance. FOCEI still
+    // takes the interaction path. FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different
+    // optima, matching NONMEM METHOD=1 LAPLACE with vs without INTER. (Previously a
+    // censored subject was silently evaluated with η-interaction even under FOCE, mixing a
+    // Sheiner–Beal marginal with a FOCEI censored term.) The censored rows are now routed
+    // by the `interaction` flag alone — `foce_subject_nll_standard` carries the M3 `−logΦ`
+    // term for the non-interaction path — so there is no `m3_active` gate here (the non-IOV
+    // `foce_subject_nll`, including its TTE branch, drops the promotion the same way).
     let p_obs_iov = if model.is_sde() {
         ekf_p_obs(model, subject, theta, eta_hat.as_slice(), sigma_values)
     } else {
@@ -1642,7 +1666,7 @@ pub fn foce_subject_nll_iov(
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
-    if interaction || m3_active {
+    if interaction {
         foce_subject_nll_interaction(
             subject,
             &ipreds,
@@ -2124,12 +2148,14 @@ mod tests {
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
-                let mut p = PkParams::default();
-                p.values[0] = theta[0] * eta[0].exp(); // CL uses combined eta[0]
-                p.values[1] = theta[1]; // V
-                p
-            }),
+            pk_param_fn: Box::new(
+                |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                    let mut p = PkParams::default();
+                    p.values[0] = theta[0] * eta[0].exp(); // CL uses combined eta[0]
+                    p.values[1] = theta[1]; // V
+                    p
+                },
+            ),
             n_theta: 2,
             n_eta: 1,
             n_epsilon: 1,
@@ -2419,13 +2445,15 @@ mod tests {
     /// `foce_subject_nll` path (which passes a length-1 eta) doesn't panic.
     fn make_iov_kappa_model() -> CompiledModel {
         let mut model = make_model();
-        model.pk_param_fn = Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
-            let mut p = PkParams::default();
-            let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
-            p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL
-            p.values[1] = theta[1]; // V
-            p
-        });
+        model.pk_param_fn = Box::new(
+            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                let mut p = PkParams::default();
+                let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
+                p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL
+                p.values[1] = theta[1]; // V
+                p
+            },
+        );
         model
     }
 

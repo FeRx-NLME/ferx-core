@@ -199,6 +199,9 @@ enum ExKind {
 /// Per-subject gates (TV covariates) are checked separately in
 /// [`subject_sensitivities`].
 pub fn analytical_supported(model: &CompiledModel) -> bool {
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
+        return false;
+    }
     matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -605,24 +608,39 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if model.n_kappa == 0 || model.ode_spec.is_some() {
         return false;
     }
-    // M3 BLOQ: the IOV objective promotes M3 to the interaction (censored) marginal
-    // (`foce_subject_nll_iov`), but the IOV analytic gradient assembly carries no
-    // censored-row term — it would differentiate a different function than it
-    // minimises. Route IOV+M3 to the FD/Laplace path until the censored IOV
-    // gradient lands. (Non-IOV M3 is fully analytic.)
-    if matches!(model.bloq_method, crate::types::BloqMethod::M3) {
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
         return false;
     }
+    // M3 BLOQ + IOV is analytic as of #580. The IOV objective promotes M3 to the
+    // censored marginal (`foce_subject_nll_iov` / `individual_nll_iov`, data term
+    // `−logΦ(z)`), and the analytic gradient now differentiates that same function:
+    // the censored-row coefficients ride the stacked `[η_bsv, κ]` layout via the
+    // shared `prepare_stacked` (true inner Hessian + `mixed_eta_theta` + `sigma_block`;
+    // censored rows carry `p = β = 0`, so they leave `H̃`/`log|H̃|` exactly as in the
+    // non-IOV assembly and as `foce_subject_nll_iov` builds it) and the IOV inner
+    // gradient `analytic_eta_nll_gradient_iov` (censored `h·m` coefficient over the
+    // stacked Jacobian).
+    //
+    // The triple **M3 + IOV + `iiv_on_ruv`** is analytic too as of #591. The closed-form
+    // assembly already carried the censored residual-eta cross coefficients `(C·z, C·m)`
+    // generically (#4c added them to `prepare_stacked` over any random-effect dimension):
+    // the censored row's `H[η_ruv,η_ruv] += C·z`, `H[η_ruv,l] += C·m·a_l` enter the true
+    // inner Hessian, `mixed_eta_theta`/`sigma_block` read the `C·m`/`C·z` cross-terms, and
+    // the IOV inner gradient's `residual_inner_obs` emits the `h·z` residual-eta column —
+    // all keyed on the residual-eta index, which lives in the BSV block of the stacked
+    // layout. So opening the gate lights up both loops; the censored rows still leave
+    // `H̃`/`log|H̃|` (no `c̃` residual-eta column), matching the objective. Only the
+    // **ODE** M3 + `iiv_on_ruv` triple stays FD (via `iiv_on_ruv_forces_fd`, which is
+    // `ode_spec`-gated).
+    //
     // IIV on residual error (`iiv_on_ruv`) IS analytic for closed-form IOV models:
     // `η_ruv` enters only through the variance (`v = R(f)·exp(2·η_ruv)`, `∂f/∂η_ruv = 0`),
     // and both halves now carry that scaling — the IOV inner gradient
     // (`analytic_eta_nll_gradient_iov`) scales `v`/`dv_df` and adds the `η_ruv` variance
     // column, and the IOV outer assembly threads `ruv = residual_error_eta` into
     // `prepare_stacked` (the residual-eta `c̃` column rides the stacked `[η_bsv, κ]`
-    // layout). Mirrors the non-IOV `iiv_on_ruv` path (#474). Only IOV + M3-BLOQ still
-    // forces FD — the censored residual-eta second derivatives are not assembled (gated by
-    // the M3 check above, and by `iiv_on_ruv_forces_fd`). (ODE IOV + `iiv_on_ruv` stays FD
-    // via `ode_iov_supported`, which is unchanged.)
+    // layout). Mirrors the non-IOV `iiv_on_ruv` path (#474). (ODE IOV + `iiv_on_ruv`
+    // stays FD via `ode_iov_supported`, which is unchanged.)
     // FREM + IOV: the analytic IOV inner gradient uses the ordinary residual variance for
     // every observation row, never the FREM covariate pseudo-obs variance the objective
     // (`individual_nll_iov`) uses for those rows; and the IOV objective returns a `1e18`
@@ -869,7 +887,7 @@ fn build_iov_sources(
             let g = *occ_to_k.get(&occ)?;
             let combined = combined_for(g);
             let cov = subject.dose_cov(d);
-            let pk = (model.pk_param_fn)(theta, &combined, cov);
+            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
             let cd = cd_at(&combined, cov)?;
             dose_src[d] = sources.len();
             sources.push((pk, cd, Some(g)));
@@ -879,14 +897,14 @@ fn build_iov_sources(
             let g = *occ_to_k.get(&occ)?;
             let combined = combined_for(g);
             let cov = subject.obs_cov(j);
-            let pk = (model.pk_param_fn)(theta, &combined, cov);
+            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
             let cd = cd_at(&combined, cov)?;
             obs_src[j] = sources.len();
             sources.push((pk, cd, Some(g)));
         }
         for m in 0..subject.pk_only_times.len() {
             let cov = subject.pk_only_cov(m);
-            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov);
+            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, 0.0);
             let cd = cd_at(&combined_pk_only, cov)?;
             pkonly_src[m] = sources.len();
             sources.push((pk, cd, None));
@@ -896,7 +914,7 @@ fn build_iov_sources(
         let mut group_source = vec![usize::MAX; k_groups];
         for g in 0..k_groups {
             let combined = combined_for(g);
-            let pk = (model.pk_param_fn)(theta, &combined, cov_static);
+            let pk = (model.pk_param_fn)(theta, &combined, cov_static, 0.0);
             let cd = cd_at(&combined, cov_static)?;
             group_source[g] = sources.len();
             sources.push((pk, cd, Some(g)));
@@ -910,7 +928,7 @@ fn build_iov_sources(
             obs_src[j] = group_source[*occ_to_k.get(&occ)?];
         }
         if !subject.pk_only_times.is_empty() {
-            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static);
+            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
             let cd = cd_at(&combined_pk_only, cov_static)?;
             let idx = sources.len();
             sources.push((pk, cd, None));
@@ -1423,7 +1441,7 @@ fn run_obs_tvcov<const M: usize>(
     // the IOV / scale seeders.
     let mk = |cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual2<M>> {
         let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
-        let pk = (model.pk_param_fn)(theta, eta, cov);
+        let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
         let seed_row = |i: usize, val: f64| -> Dual2<M> {
             let mut grad = [0.0; M];
             let mut hess = [[0.0; M]; M];
@@ -1645,7 +1663,7 @@ fn run_obs_grad_tvcov<const N: usize>(
         // `None` above the param-derivative dispatch cap (n_axes > 16): decline so
         // the inner loop falls back to FD rather than panicking (#449 review #1).
         let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
-        let pk = (model.pk_param_fn)(theta, eta, cov);
+        let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
         let seed_row = |i: usize, val: f64| -> Dual1<N> {
             let mut grad = [0.0; N];
             for k in 0..n_eta {
@@ -1890,7 +1908,7 @@ fn subject_eta_grad_impl(
     let two_cpt = matches!(model.pk_model, PkModel::TwoCptIv | PkModel::TwoCptOral);
     let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
 
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
 
     // First-order `∂p_i/∂η_k`, exact for ANY parameterization — the η-block of the
     // same `pd` the full provider builds. The compiled `[individual_parameters]`
@@ -2767,7 +2785,7 @@ fn subject_sensitivities_impl(
     let three_cpt = matches!(model.pk_model, PkModel::ThreeCptIv | PkModel::ThreeCptOral);
 
     // PK parameter values at (θ, η): pk_s = tv_s·exp(sel·η). pk_param_fn folds η.
-    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
 
     // `∂p/∂(θ,η)` (and second order) plus `slots`: the PK slot each `pd` row maps
     // to, in `pd`-row order. Analytical where possible: evaluate the compiled
@@ -3437,6 +3455,168 @@ mod tests {
         ruv_m3.residual_error_eta = Some(0);
         ruv_m3.bloq_method = crate::types::BloqMethod::M3;
         assert!(analytic_outer_gradient_available(&ruv_m3));
+    }
+
+    /// The `TIME` built-in routes a model through the event-driven per-event PK
+    /// path, which the closed-form `Dual2`/`Dual1` sensitivity providers do not
+    /// cover. `analytical_supported`, `iov_analytical_supported`, and
+    /// `ode_analytical_supported` must therefore all decline (→ FD) for any model
+    /// whose `[individual_parameters]` read `TIME` — otherwise the analytic fast
+    /// path would evaluate every parameter at a single frozen time and silently
+    /// disagree with the event-driven predictor. The non-`TIME` twin of each
+    /// model must still be supported, proving the guard is specific (#610).
+    #[test]
+    fn time_builtin_indiv_params_force_fd_fallback() {
+        // Analytical 1-cpt IV: a `$PK IF(TIME...)`-style switch on CL.
+        const ANALYTICAL_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(5.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const ANALYTICAL_NO_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        // IOV (n_kappa > 0) 1-cpt oral with the same switch.
+        const IOV_TIME: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVCL_LATE(0.1, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  if (TIME > 24.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+        // ODE 1-cpt with the switch in the individual parameters (so the
+        // uses_time_builtin flag is set, not merely the ODE-RHS clock).
+        const ODE_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(5.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const ODE_NO_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin;
+        let ode_supported = crate::sens::ode_provider::ode_analytical_supported;
+
+        let ana_t = parse_model_string(ANALYTICAL_TIME).expect("parses analytical TIME");
+        let ana_n = parse_model_string(ANALYTICAL_NO_TIME).expect("parses analytical control");
+        assert!(
+            uses_time(&ana_t),
+            "TIME switch sets the uses_time_builtin flag"
+        );
+        assert!(!uses_time(&ana_n), "control model must not set the flag");
+        assert!(
+            !analytical_supported(&ana_t),
+            "analytic FOCEI must decline for TIME"
+        );
+        assert!(
+            analytical_supported(&ana_n),
+            "non-TIME twin stays analytic (guard is specific)"
+        );
+
+        let iov_t = parse_model_string(IOV_TIME).expect("parses IOV TIME");
+        let iov_n = parse_model_string(WARFARIN_IOV).expect("parses IOV control");
+        assert!(
+            iov_t.n_kappa > 0 && iov_n.n_kappa > 0,
+            "both IOV models carry a kappa"
+        );
+        assert!(
+            !iov_analytical_supported(&iov_t),
+            "IOV analytic must decline for TIME"
+        );
+        assert!(
+            iov_analytical_supported(&iov_n),
+            "non-TIME IOV twin stays analytic"
+        );
+
+        let ode_t = parse_model_string(ODE_TIME).expect("parses ODE TIME");
+        let ode_n = parse_model_string(ODE_NO_TIME).expect("parses ODE control");
+        assert!(
+            uses_time(&ode_t),
+            "ODE indiv-param TIME switch sets the flag"
+        );
+        assert!(
+            !ode_supported(&ode_t),
+            "ODE analytic must decline for indiv-param TIME"
+        );
+        assert!(ode_supported(&ode_n), "non-TIME ODE twin stays analytic");
     }
 
     /// A TTE (`[event_model]`) objective has no analytic outer gradient (the
@@ -5663,6 +5843,35 @@ mod tests {
   method     = foce
   iov_column = OCC
 "#;
+
+    /// M3 BLOQ + IOV scope (#580): a closed-form IOV model with M3 BLOQ is analytic
+    /// (the censored coefficients ride the stacked `[η_bsv, κ]` layout). The triple
+    /// **M3 + IOV + `iiv_on_ruv`** is analytic too as of #591 — the closed-form assembly
+    /// already carried the censored residual-eta cross coefficients `(C·z, C·m)`, so
+    /// `iov_analytical_supported` admits it (and `analytic_outer_gradient_available`
+    /// follows). Only the *ODE* triple stays FD (via `iiv_on_ruv_forces_fd`). Plain IOV
+    /// and IOV + `iiv_on_ruv` (no M3) stay analytic.
+    #[test]
+    fn iov_analytical_supported_admits_m3_but_not_the_ruv_triple() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
+        // Plain IOV: analytic.
+        assert!(iov_analytical_supported(&model));
+        // M3 + IOV (no iiv_on_ruv): analytic as of #580.
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(iov_analytical_supported(&model));
+        assert!(analytic_outer_gradient_available(&model));
+        // M3 + IOV + iiv_on_ruv (the triple): analytic as of #591 (the closed-form
+        // assembly carried the censored residual-eta cross coefficients all along).
+        model.residual_error_eta = Some(0);
+        assert!(iov_analytical_supported(&model));
+        assert!(analytic_outer_gradient_available(&model));
+        // Only the *ODE* triple stays FD, gated by `iiv_on_ruv_forces_fd` (ode_spec-only);
+        // the closed-form triple here does not trip it.
+        assert!(!model.iiv_on_ruv_forces_fd());
+        // IOV + iiv_on_ruv without M3: analytic (#4b).
+        model.bloq_method = crate::types::BloqMethod::Drop;
+        assert!(iov_analytical_supported(&model));
+    }
 
     /// Two-occasion IOV subject: a dose + observations in occasion 1, then a dose +
     /// observations in occasion 2 (no washout — carryover spans the boundary).

@@ -725,7 +725,7 @@ mod tests {
         let theta = model.default_params.theta.clone();
         let eta = vec![0.0; model.n_eta + model.n_kappa];
         let cov = HashMap::new();
-        let pk = (model.pk_param_fn)(&theta, &eta, &cov);
+        let pk = (model.pk_param_fn)(&theta, &eta, &cov, 0.0);
         // central amount = 200, V = 50 ⇒ concentration 4.0 — NOT the raw amount 200.
         let v = observe(&[200.0], &pk.values, &theta, &eta, &cov);
         assert!(

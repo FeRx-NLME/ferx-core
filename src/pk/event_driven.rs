@@ -113,8 +113,14 @@ pub struct EventSchedule {
     /// Merged + sorted event list. Tie-break order is
     /// `Reset < Dose < PkOnly < Obs` so a system reset zeros the state
     /// before a same-time dose lands (EVID=4), and covariate-change markers
-    /// run after a dose at the same time but before an observation (matches
-    /// NONMEM `$PK` semantics).
+    /// run after a dose at the same time but before an observation.
+    ///
+    /// NONMEM record order (an observation written before its same-TIME dose is
+    /// a pre-dose trough) is *not* expressed here — this tie-break alone would
+    /// always score such a sample post-dose. The data reader handles it upstream
+    /// by nudging a pre-dose observation one ULP below the coincident dose time
+    /// (see `io::datareader::parse_subject`), so by the time events reach this
+    /// sort the obs already carries a strictly-earlier time and orders correctly.
     ///
     /// Dose event times are `subject.doses[k].time + dose_lagtimes[k]`
     /// so the schedule already reflects per-dose lagtime.

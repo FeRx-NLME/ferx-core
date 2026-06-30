@@ -953,7 +953,14 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     'subjects: for subject in &population.subjects {
-        let pk = (model.pk_param_fn)(&model.default_params.theta, &zero_eta, &subject.covariates);
+        // Typical-value snapshot for an ODE-forcing-rate diagnostic: TIME at the
+        // start of the record (t=0).
+        let pk = (model.pk_param_fn)(
+            &model.default_params.theta,
+            &zero_eta,
+            &subject.covariates,
+            0.0,
+        );
         for forcing in &ode.input_rate {
             if let Err(msg) = forcing.validate(&pk.values) {
                 diags.push(
@@ -1447,7 +1454,8 @@ pub fn check_model_data_warnings(
         // than hit `resolve_rate`'s slot `.expect`.
         let attr_map = model.active_dose_attr_map();
         if attr_map.indexed_slot(attr, d.cmt).is_some() {
-            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates);
+            // Initial-estimate warning pass: typical values at t=0.
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates, 0.0);
             d.resolve_rate(attr_map, &pk.values).duration
         } else {
             0.0
@@ -1535,7 +1543,8 @@ pub fn check_model_data_warnings(
                 };
                 if let Some(slot) = attr_map.indexed_slot(attr, d.cmt) {
                     let pk = pk_at_init.get_or_insert_with(|| {
-                        (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates)
+                        // Initial-estimate warning pass: typical values at t=0.
+                        (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates, 0.0)
                     });
                     if pk.values[slot] <= floor {
                         match attr {
@@ -1606,7 +1615,9 @@ pub fn check_model_data_warnings(
     if model.has_lagtime() {
         if let Some(first_subj) = population.subjects.first() {
             let zero_eta = vec![0.0_f64; model.n_eta];
-            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates);
+            // Negative-lag warning at the initial point: typical values at t=0.
+            let pk =
+                (model.pk_param_fn)(&init_params.theta, &zero_eta, &first_subj.covariates, 0.0);
             if pk.lagtime() < 0.0 {
                 diags.push(Diagnostic::warning(
                     "W_NEGATIVE_LAGTIME",
@@ -2441,7 +2452,14 @@ pub(crate) fn compute_extra_output_columns(
                 .map(|d| {
                     let occ = subject.dose_occasions.get(d).copied().unwrap_or(0);
                     let eta_d = combined_for(occ);
-                    let pk_d = (model.pk_param_fn)(theta, &eta_d, subject.dose_cov(d));
+                    // Evaluate at this dose's time so a `TIME`-dependent lag (or
+                    // any TIME-built-in parameter) is honoured per dose (#610).
+                    let pk_d = (model.pk_param_fn)(
+                        theta,
+                        &eta_d,
+                        subject.dose_cov(d),
+                        subject.doses[d].time,
+                    );
                     // On ODE models the lag is keyed by dose compartment (`ALAGn`;
                     // issue #369), so resolve through `dose_attr_map` — the same
                     // single source of truth the prediction paths use — rather than
@@ -2468,7 +2486,9 @@ pub(crate) fn compute_extra_output_columns(
 
         for (j, eta_full) in per_obs_eta_full.iter().enumerate() {
             let cov_j = subject.obs_cov(j);
-            let pk_j = (model.pk_param_fn)(theta, eta_full, cov_j);
+            // Evaluate at this observation's time so the sdtab individual-parameter
+            // columns honour the `TIME` built-in per row, matching IPRED (#610).
+            let pk_j = (model.pk_param_fn)(theta, eta_full, cov_j, subject.obs_times[j]);
             let indiv_j = build_indiv_map(&pk_j, &model.indiv_param_names, &model.pk_indices);
             let (tafd_j, tad_j) = tafd_tad_for_subject(subject, j, &dose_lagtimes);
             per_obs_cov.push(cov_j);
@@ -2820,8 +2840,21 @@ pub(crate) fn compute_extra_output_columns(
                                 // consistent with per-obs compartment_states being empty
                                 // for IOV subjects. W_DERIVED_CMT_IOV_UNSUPPORTED explains why.
                                 vec![]
+                            } else if crate::parser::model_parser::compiled_model_uses_time_builtin(
+                                model,
+                            ) {
+                                // TIME built-in in the individual parameters: a single
+                                // fixed PK snapshot (grid_cov at one time) cannot
+                                // represent parameters that vary along the grid, while
+                                // ipred honours each event's time via the event-driven
+                                // path. Return empty so every grid point evaluates to
+                                // NaN — the same convention as IOV/TV/reset above, and
+                                // consistent with compute_predictions_with_states (#610).
+                                vec![]
                             } else if let Some(ref ode) = model.ode_spec {
-                                let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
+                                // Time-independent params: one snapshot (t=0) is exact
+                                // across the grid; the ODE solver supplies its own clock.
+                                let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov, 0.0);
                                 crate::ode::ode_dense_solve_states(
                                     ode,
                                     &pk_j.values,
@@ -2865,7 +2898,9 @@ pub(crate) fn compute_extra_output_columns(
                                 // and the W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL warning.
                                 vec![]
                             } else {
-                                let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov);
+                                // Time-independent params: one snapshot (t=0) is exact
+                                // across the grid (uses_time handled above).
+                                let pk_j = (model.pk_param_fn)(theta, grid_eta_full, grid_cov, 0.0);
                                 crate::pk::analytical_state_at_times(
                                     model.pk_model,
                                     subject,
@@ -3324,14 +3359,10 @@ fn fit_inner(
             EstimationMethod::Foce => stage_opts.interaction = false,
             _ => {}
         }
-        // Run the covariance step on the last *estimating* stage. IMP is a
-        // likelihood evaluation (NONMEM EONLY=1 equivalent), not an estimator,
-        // so when IMP follows an estimator the preceding stage is effectively
-        // the final estimating stage and should compute covariance / SIR.
-        let is_last_estimating = is_last
-            || chain[stage_idx + 1..]
-                .iter()
-                .all(|&m| m == EstimationMethod::Imp);
+        // Run the covariance step (and SIR) only on the last *estimating* stage,
+        // so a chain doesn't recompute the expensive FD covariance after every
+        // method (#615). See `is_last_estimating_stage` for the eval-only-IMP rule.
+        let is_last_estimating = is_last_estimating_stage(&chain, stage_idx, options.imp_eval_only);
         if !is_last_estimating {
             stage_opts.run_covariance_step = false;
             stage_opts.sir = false;
@@ -3783,10 +3814,13 @@ fn fit_inner(
         ));
     }
 
-    // When M3 censoring is combined with non-interaction FOCE, mixing linearized
-    // Gaussian residuals with non-linearized log Φ terms gives inconsistent
-    // OFVs near the LOQ boundary. The FOCE dispatcher routes affected
-    // subjects through FOCEI internally — surface the promotion to the user.
+    // M3 censoring under non-interaction FOCE is a consistent Sheiner–Beal fit (the
+    // censored rows leave the linearized marginal and re-enter as `−logΦ` at the
+    // population variance; plain FOCE no longer promotes censored subjects to interaction
+    // — non-IOV since #367, IOV since #591). It is a *different optimum* from FOCEI-M3,
+    // mirroring NONMEM `METHOD=1 LAPLACE` with vs without `INTER`. Since M3 is run with
+    // interaction in most practice, surface the non-interaction choice so a user does not
+    // report FOCE-M3 estimates while expecting the FOCEI-M3 ones (#599).
     if matches!(model.bloq_method, BloqMethod::M3)
         && matches!(
             options.method,
@@ -3799,9 +3833,9 @@ fn fit_inner(
             .any(|s| s.has_censored_observation())
     {
         warnings.push(
-            "M3 censoring handling requires FOCEI semantics; subjects with CENS!=0 \
-             rows were evaluated with η-interaction. Set method=focei explicitly \
-             to silence this notice."
+            "M3 censoring under FOCE uses non-interaction (Sheiner–Beal) semantics; \
+             FOCE-M3 and FOCEI-M3 are different optima (as in NONMEM METHOD=1 LAPLACE \
+             with vs without INTER). Set method=focei for interaction semantics."
                 .to_string(),
         );
     }
@@ -4276,6 +4310,28 @@ fn compute_param_corr(
         }
     }
     Some(corr)
+}
+
+/// Whether `stage_idx` is the last *estimating* stage of `chain` — the single
+/// stage that owns the covariance / SIR step. Running it on every stage is
+/// wasteful and not expected (#615); only the final estimate needs SEs.
+///
+/// An evaluation-only IMP (`imp_eval_only`, NONMEM `IMP EONLY=1`) is a likelihood
+/// evaluation, not an estimator, so trailing eval-only IMP stages cede the
+/// covariance step to the preceding estimator. A default (estimating) IMP is a
+/// real estimator that owns the step itself, so it must not be skipped. Split out
+/// of `fit()` so the per-stage gating is unit-testable.
+fn is_last_estimating_stage(
+    chain: &[EstimationMethod],
+    stage_idx: usize,
+    imp_eval_only: bool,
+) -> bool {
+    let is_last = stage_idx + 1 == chain.len();
+    let trailing_eval_only_imp = imp_eval_only
+        && chain[stage_idx + 1..]
+            .iter()
+            .all(|&m| m == EstimationMethod::Imp);
+    is_last || trailing_eval_only_imp
 }
 
 /// Resolve the reported [`CovarianceStatus`] from the three signals that
@@ -5656,7 +5712,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 }
 
 // ======================================================================
-// Adaptive (state-reactive / feedback) dosing — epic #391, experimental.
+// Adaptive (state-reactive / feedback) dosing — epic #391, beta.
 //
 // Two public entry points wrap the `pub(crate)` reactive driver
 // (`ode_predictions_adaptive_impl`) with shared per-(subject, replicate)
@@ -5916,7 +5972,8 @@ where
             let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
-            let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates);
+            // Baseline PK snapshot at the start of the simulation horizon (t=0).
+            let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates, 0.0);
 
             // Controller-assay capability for any `Dv` monitor: resolve the
             // endpoint's residual variance by CMT (scaled by this subject's
@@ -6026,7 +6083,7 @@ where
 }
 
 /// Simulate a declarative `[adaptive_dosing]` block over a population — the
-/// file-driven counterpart to [`simulate_adaptive`] (epic #391, **experimental**).
+/// file-driven counterpart to [`simulate_adaptive`] (epic #391, **beta**).
 ///
 /// Where [`simulate_adaptive`] takes a hand-written controller closure, this entry
 /// point takes the parsed `[adaptive_dosing]` `spec` and compiles it into the
@@ -6527,13 +6584,15 @@ mod iov_integration {
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             residual_correlations: Vec::new(),
             // pk_param_fn: eta[0]=BSV for CL, eta[1]=KAPPA_CL (appended by IOV path)
-            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
-                let mut p = PkParams::default();
-                let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
-                p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL = TVCL * exp(ETA_CL + KAPPA_CL)
-                p.values[1] = theta[1]; // V
-                p
-            }),
+            pk_param_fn: Box::new(
+                |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                    let mut p = PkParams::default();
+                    let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
+                    p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL = TVCL * exp(ETA_CL + KAPPA_CL)
+                    p.values[1] = theta[1]; // V
+                    p
+                },
+            ),
             n_theta: 2,
             n_eta: 1,
             n_epsilon: 1,
@@ -8002,6 +8061,53 @@ mod tests_cov_diagnostics {
             CovarianceStatus::Failed
         );
     }
+
+    // ── is_last_estimating_stage: covariance runs once, at chain end (#615) ──
+    use EstimationMethod::*;
+
+    #[test]
+    fn cov_stage_single_method_is_last() {
+        assert!(is_last_estimating_stage(&[Foce], 0, false));
+    }
+
+    #[test]
+    fn cov_stage_only_final_estimator_in_plain_chain() {
+        // [foce, saem]: covariance only on saem (the last stage), never on foce.
+        let chain = [Foce, Saem];
+        assert!(!is_last_estimating_stage(&chain, 0, false));
+        assert!(is_last_estimating_stage(&chain, 1, false));
+    }
+
+    #[test]
+    fn cov_stage_estimating_imp_owns_step_not_predecessor() {
+        // [saem, imp] with estimating IMP (imp_eval_only = false): the trailing
+        // IMP is a real estimator and owns the covariance step, so saem must NOT
+        // also run it — otherwise covariance is computed twice (#615).
+        let chain = [Saem, Imp];
+        assert!(!is_last_estimating_stage(&chain, 0, false));
+        assert!(is_last_estimating_stage(&chain, 1, false));
+    }
+
+    #[test]
+    fn cov_stage_eval_only_imp_cedes_step_to_predecessor() {
+        // [saem, imp] with imp_eval_only = true: trailing IMP is a likelihood
+        // evaluation, so saem is the last estimating stage and owns covariance.
+        let chain = [Saem, Imp];
+        assert!(is_last_estimating_stage(&chain, 0, true));
+        // The eval-only IMP stage itself never runs the covariance step (handled
+        // by the eval-only branch in fit), but as the last stage it still reports
+        // as last-estimating; gating there is a no-op since it skips covariance.
+        assert!(is_last_estimating_stage(&chain, 1, true));
+    }
+
+    #[test]
+    fn cov_stage_three_method_chain_estimating_imp() {
+        // [foce, saem, imp] estimating: only the final imp owns covariance.
+        let chain = [Foce, Saem, Imp];
+        assert!(!is_last_estimating_stage(&chain, 0, false));
+        assert!(!is_last_estimating_stage(&chain, 1, false));
+        assert!(is_last_estimating_stage(&chain, 2, false));
+    }
 }
 
 #[cfg(test)]
@@ -8308,12 +8414,14 @@ mod simulate_with_uncertainty_tests {
             error_model: ErrorModel::Proportional,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>| {
-                let mut p = PkParams::default();
-                p.values[0] = theta[0] * eta[0].exp();
-                p.values[1] = theta[1];
-                p
-            }),
+            pk_param_fn: Box::new(
+                |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                    let mut p = PkParams::default();
+                    p.values[0] = theta[0] * eta[0].exp();
+                    p.values[1] = theta[1];
+                    p
+                },
+            ),
             n_theta: 2,
             n_eta: 1,
             n_epsilon: 1,
@@ -9122,13 +9230,15 @@ mod tests_sdtab_tv_cov {
             // `obs_covariates` / `dose_covariates`. With WT changing per obs
             // the TV path produces a profile that the (broken) no-TV path
             // can't match.
-            pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>| {
-                let mut p = PkParams::default();
-                let wt = cov.get("WT").copied().unwrap_or(70.0);
-                p.values[0] = theta[0] * eta[0].exp() * (wt / 70.0);
-                p.values[1] = theta[1];
-                p
-            }),
+            pk_param_fn: Box::new(
+                |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
+                    let mut p = PkParams::default();
+                    let wt = cov.get("WT").copied().unwrap_or(70.0);
+                    p.values[0] = theta[0] * eta[0].exp() * (wt / 70.0);
+                    p.values[1] = theta[1];
+                    p
+                },
+            ),
             n_theta: 2,
             n_eta: 1,
             n_epsilon: 1,
@@ -9249,6 +9359,7 @@ mod tests_sdtab_tv_cov {
             &default_params.theta,
             eta_hats[0].as_slice(),
             &subject.covariates,
+            0.0,
         );
         let ipred_no_tv = model_preds(
             &model,
@@ -9306,7 +9417,7 @@ mod tests_sdtab_tv_cov {
             &zero_eta,
         );
         let pk_pred_no_tv =
-            (model.pk_param_fn)(&default_params.theta, &zero_eta, &subject.covariates);
+            (model.pk_param_fn)(&default_params.theta, &zero_eta, &subject.covariates, 0.0);
         let pred_no_tv = model_preds(
             &model,
             &subject,
@@ -9450,13 +9561,15 @@ mod tests_sdtab_tv_cov {
             error_model: ErrorModel::Proportional,
             error_spec: ErrorSpec::Single(ErrorModel::Proportional),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
-                let mut p = PkParams::default();
-                let wt = cov.get("WT").copied().unwrap_or(70.0);
-                p.values[0] = theta[0] * (wt / 70.0);
-                p.values[1] = theta[1];
-                p
-            }),
+            pk_param_fn: Box::new(
+                |theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
+                    let mut p = PkParams::default();
+                    let wt = cov.get("WT").copied().unwrap_or(70.0);
+                    p.values[0] = theta[0] * (wt / 70.0);
+                    p.values[1] = theta[1];
+                    p
+                },
+            ),
             n_theta: 2,
             n_eta: 0,
             n_epsilon: 1,
@@ -9536,7 +9649,7 @@ mod tests_sdtab_tv_cov {
 
         let reference =
             crate::pk::compute_predictions_with_tv(&model, &subject, &default_params.theta, &[]);
-        let pk_no_tv = (model.pk_param_fn)(&default_params.theta, &[], &subject.covariates);
+        let pk_no_tv = (model.pk_param_fn)(&default_params.theta, &[], &subject.covariates, 0.0);
         let no_tv = model_preds(&model, &subject, &pk_no_tv, &default_params.theta, &[]);
         let gap: f64 = reference
             .iter()
@@ -9600,7 +9713,7 @@ mod tests_derived_session_clock {
             error_model: ErrorModel::Additive,
             error_spec: ErrorSpec::Single(ErrorModel::Additive),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|_, _, _| PkParams::default()),
+            pk_param_fn: Box::new(|_, _, _, _t: f64| PkParams::default()),
             n_theta: 0,
             n_eta: 0,
             n_epsilon: 1,
@@ -9984,12 +10097,14 @@ mod tests_derived_iov_kappa {
             error_model: ErrorModel::Additive,
             error_spec: ErrorSpec::Single(ErrorModel::Additive),
             residual_correlations: Vec::new(),
-            pk_param_fn: Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
-                let kappa = eta.get(1).copied().unwrap_or(0.0);
-                let mut p = PkParams::default();
-                p.values[0] = 10.0 * kappa.exp(); // CL slot
-                p
-            }),
+            pk_param_fn: Box::new(
+                |_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>, _t: f64| {
+                    let kappa = eta.get(1).copied().unwrap_or(0.0);
+                    let mut p = PkParams::default();
+                    p.values[0] = 10.0 * kappa.exp(); // CL slot
+                    p
+                },
+            ),
             n_theta: 0,
             n_eta: 1,
             n_epsilon: 1,
@@ -10219,12 +10334,14 @@ mod tests_derived_iov_kappa {
         model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
         model.pk_indices = vec![0, PK_IDX_LAGTIME];
         // Drive the absorption lag (slot PK_IDX_LAGTIME) from the occasion kappa.
-        model.pk_param_fn = Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| {
-            let kappa = eta.get(1).copied().unwrap_or(0.0);
-            let mut p = PkParams::default();
-            p.values[PK_IDX_LAGTIME] = 1.0 + kappa;
-            p
-        });
+        model.pk_param_fn = Box::new(
+            |_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>, _t: f64| {
+                let kappa = eta.get(1).copied().unwrap_or(0.0);
+                let mut p = PkParams::default();
+                p.values[PK_IDX_LAGTIME] = 1.0 + kappa;
+                p
+            },
+        );
 
         let subject = Subject {
             fremtype: Vec::new(),
@@ -10444,11 +10561,13 @@ mod tests_derived_iov_kappa {
         // PK_IDX_LAGTIME; bare lag evaluates negative.
         model.indiv_param_names = vec!["CL".into(), "LAGTIME".into()];
         model.pk_indices = vec![0, PK_IDX_LAGTIME];
-        model.pk_param_fn = Box::new(|_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>| {
-            let mut p = PkParams::default();
-            p.values[PK_IDX_LAGTIME] = -1.0;
-            p
-        });
+        model.pk_param_fn = Box::new(
+            |_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>, _time: f64| {
+                let mut p = PkParams::default();
+                p.values[PK_IDX_LAGTIME] = -1.0;
+                p
+            },
+        );
         assert!(model.has_lagtime() && model.ode_spec.is_none());
 
         let subject = Subject {
@@ -10635,11 +10754,13 @@ mod tests_derived_iov_kappa {
         model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
         model.pk_indices = vec![0, PK_IDX_LAGTIME];
         // Lag = LAGCOV covariate (time-varying); independent of eta/kappa.
-        model.pk_param_fn = Box::new(|_theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
-            let mut p = PkParams::default();
-            p.values[PK_IDX_LAGTIME] = cov.get("LAGCOV").copied().unwrap_or(0.0);
-            p
-        });
+        model.pk_param_fn = Box::new(
+            |_theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
+                let mut p = PkParams::default();
+                p.values[PK_IDX_LAGTIME] = cov.get("LAGCOV").copied().unwrap_or(0.0);
+                p
+            },
+        );
 
         let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
         let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
