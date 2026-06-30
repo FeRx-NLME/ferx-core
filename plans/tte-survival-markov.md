@@ -1,6 +1,6 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
-**Status:** Phase 1, Phase 1b, **and Phase 2 complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 (Joint PK-TTE, ODE hazard accumulator) COMPLETE — Slice 2.1 fit path via PR #567 (squash `657800ee`) merged 2026-06-28, plus Slice 2.2 drug-driven event-time simulation + Slice 2.3 docs via PR #595 (squash `3f58c7d3`) merged 2026-06-29; both closing #564. ferx-r pin bump PR #208 merged.** Open follow-ups: **ferx-r#210** (bundled `pktte_joint` example + ODE-TTE simulation exposure — now sample-able after #595); **#570** (joint-fit double-solve perf — *not urgent*: full 120-subj fit is 5 s in release; **now unblocked** since Slice 2.2-A's in-step Hermite interpolation landed — sequence as its own PR gated on a bit-stability check of the Slice 2.1 anchor); #469 (FOCEI nonlinear-frailty ω²) **CLOSED via #571**. **NEXT: Phase 3 — RTTE (repeated TTE; `clock = forward | reset`; SAEM primary; selective per-state ODE reset §8.8.6), optionally alongside Phase 3b (SAEM Laplace proposal).**  
+**Status:** Phase 1, Phase 1b, **and Phase 2 complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 (Joint PK-TTE, ODE hazard accumulator) COMPLETE — Slice 2.1 fit path via PR #567 (squash `657800ee`) merged 2026-06-28, plus Slice 2.2 drug-driven event-time simulation + Slice 2.3 docs via PR #595 (squash `3f58c7d3`) merged 2026-06-29; both closing #564. ferx-r pin bump PR #208 merged.** Open follow-ups: **ferx-r#210** (bundled `pktte_joint` example + ODE-TTE simulation exposure — now sample-able after #595); **#570** (joint-fit double-solve perf) **SHIPPED via PR #613** — inner-NLL EBE + FOCEI at-mode now share one augmented solve (`solve_ode_dense` Hermite read-back, predictions bit-identical); the FD-Hessian's analytic CHZ η-sensitivities are split out as #626; #469 (FOCEI nonlinear-frailty ω²) **CLOSED via #571**. **NEXT: Phase 3 — RTTE (repeated TTE; `clock = forward | reset`; SAEM primary; selective per-state ODE reset §8.8.6), optionally alongside Phase 3b (SAEM Laplace proposal).**  
 **Scope:** Phase 2 complete; next active phase = Phase 3 (RTTE)  
 **Revised:** 2026-06-29 (**Phase 2 complete** — PR #595 (`3f58c7d3`) merged Slice 2.2 drug-driven
 event-time simulation + Slice 2.3 docs; status markers flipped to done across the header, §5.5, and
@@ -2397,18 +2397,18 @@ user-written accumulator. Expression compiles in the ODE-RHS namespace (reuses #
   event time are physically inconsistent. Centralize the draw in `simulate_inner_with_draw`.
 - Honor the `[simulation] horizon` override (#522) identically to the analytic branch.
 
-**#570 — folded into this slice's plan, but sequenced as its own PR *after* A (not bundled).**
-Rationale (this is a sustainability call, not laziness): the only "free" fusion enlarges the
-Gaussian solve's `saveat` to include the TTE times, but the save-overshoot clamp
-(`solver.rs:199`) *changes the adaptive step sequence*, which shifts the FOCEI FD-gradient noise
-floor and can move OFV/estimates — exactly the failure the I-controller note (`solver.rs:180`)
-warns about, and a direct threat to the Slice 2.1 NONMEM anchor. The safe form reuses Piece A's
-in-step Hermite interpolation to read CHZ at arbitrary times **without** adding hard save points;
-that only exists once A lands. So: land sim first (new code, cannot regress existing fits), then
-#570 as a separate PR gated on a before/after bit-stability check of `tests/reference/pktte_joint`.
-Note also that #570 removes only the *redundant at-mode* augmented solve and the free
-`tte_nll_at_mode`; the FD-Hessian's `2·n(n+1)` perturbed-η solves are intrinsic to finite
-differencing and remain (true elimination needs analytic CHZ η-sensitivities — separate, larger).
+**#570 — SHIPPED as PR #613.** A joint PK-TTE fit integrated the augmented PK+CHZ system *twice*
+per likelihood eval at the same η; #613 makes it integrate *once* at **both** hot spots — the inner
+EBE evaluation AND the FOCEI at-mode — by reading CHZ at the event times off the Gaussian solve via
+in-step cubic Hermite interpolation (`solve_ode_dense`), guarded to plain ODE PK-TTE (TV-cov /
+resets / SDE / FREM / `TIME`-builtin keep the established two-solve fallback). The naive "enlarge
+the Gaussian `saveat`" fusion was rejected: the save-overshoot clamp changes the adaptive step
+sequence, which shifts the FOCEI FD-gradient noise floor and threatens the Slice 2.1 NONMEM anchor
+(the I-controller lesson) — so the Hermite read-back keeps the Gaussian predictions **bit-identical**
+and only the TTE term moves, within integrator tolerance (re-anchor green; bit-identity + faithfulness
+unit tests; one bug each caught by a parallel `/review` and an independent fresh-context review, both
+fixed + regression-tested). The FD-Hessian's `2·n(n+1)` perturbed-η solves are intrinsic to finite
+differencing and remain; true elimination needs analytic CHZ η-sensitivities — split out as **#626**.
 
 **Validation (Slice 2.2):**
 - **Degenerate oracle (unit):** constant-hazard ODE (`dCHZ/dt = λ`) sampled via the root-finder
