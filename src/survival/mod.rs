@@ -46,7 +46,14 @@ pub struct MonoTol {
 }
 
 impl MonoTol {
-    /// Tight floor for closed-form hazard families (only f64 arithmetic round-off).
+    /// Tight floor for closed-form hazard families. Their `H(t)` is evaluated in closed
+    /// form (no ODE solve), so the only round-off is f64 arithmetic - a few ULPs, i.e.
+    /// ~1e-15 relative. Valid families are monotone by construction, so this floor mainly
+    /// guards against sign-flipped parameters. `1e-9` is used for *both* terms, giving a
+    /// floor `1e-9 + 1e-9*|H|` that scales with `H` (so it does not over-reject a large
+    /// closed-form `H`) yet sits ~6 orders above the true round-off - tight enough to
+    /// still catch any genuine negative increment, loose enough never to fire on a
+    /// legitimate fit.
     pub fn analytic() -> Self {
         Self {
             reltol: 1e-9,
