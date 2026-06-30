@@ -150,7 +150,7 @@ pub fn tte_nll_from_curves(
     // and ignored a user-tightened `ode_reltol`, so a genuine negative step up to ~0.1%·H
     // slipped past as round-off; tying the floor to `tol` closes that gap.
     let monotone_violation =
-        |hi: f64, lo: f64| hi - lo < -(tol.abstol + tol.reltol * hi.abs().max(lo.abs()));
+        |hi: f64, lo: f64| hi - lo < -crate::ode::scale_tol(tol.abstol, tol.reltol, hi, lo);
 
     for record in records {
         let ObsRecord::Event {
