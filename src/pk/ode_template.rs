@@ -60,7 +60,8 @@ pub fn generate(
     let model = PkModel::from_name(model_name).ok_or_else(|| {
         format!(
             "Unknown ode_template model: {model_name}. Valid names are one_cpt_iv, \
-             one_cpt_oral, one_cpt_transit, two_cpt_iv, two_cpt_oral, three_cpt_iv, three_cpt_oral."
+             one_cpt_oral, one_cpt_transit, two_cpt_iv, two_cpt_oral, two_cpt_transit, \
+             three_cpt_iv, three_cpt_oral."
         )
     })?;
     let name = model.canonical_name();
@@ -161,6 +162,29 @@ pub fn generate(
                         "central",
                         format!(
                             "{ka} * depot - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph"
+                        ),
+                    ),
+                    dt(
+                        "periph",
+                        format!("({q}/{v1}) * central - ({q}/{v2}) * periph"),
+                    ),
+                ],
+            )
+        }
+        PkModel::TwoCptTransit => {
+            // The analytic `pk two_cpt_transit` desugars to the Savic transit forcing
+            // delivered straight into central, on a 2-cpt disposition (#386 PR D) —
+            // the ODE analogue of the exponential-tilting closed form.
+            let (cl, v1, q, v2, n, mtt) = (g("cl"), g("v1"), g("q"), g("v2"), g("n"), g("mtt"));
+            (
+                vec!["central", "periph"],
+                v1,
+                vec![
+                    dt(
+                        "central",
+                        format!(
+                            "transit(n={n}, mtt={mtt}) \
+                             - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph"
                         ),
                     ),
                     dt(

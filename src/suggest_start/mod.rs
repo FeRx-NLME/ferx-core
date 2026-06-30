@@ -381,6 +381,7 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
         PkModel::OneCptOral
         | PkModel::OneCptTransit
         | PkModel::TwoCptOral
+        | PkModel::TwoCptTransit
         | PkModel::ThreeCptOral => population
             .subjects
             .par_iter()

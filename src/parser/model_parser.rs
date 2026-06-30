@@ -5037,10 +5037,11 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
     let central = if is_oral { 2 } else { 1 };
     // A pre-loaded *depot* amount is delivered to central by a first-order
     // absorption Green's function, which only the oral models expose. The analytic
-    // `one_cpt_transit` model is `is_oral()` (absorption layout, central = cmt 2)
-    // but its "depot" is a lumped Gamma-convolution memory with no closed form for
-    // a seeded amount, so a transit depot init is rejected here — otherwise
-    // `analytical_init_concentration_g`'s depot arm would silently drop it (#386).
+    // transit models (`one_cpt_transit`, `two_cpt_transit`) are `is_oral()`
+    // (absorption layout, central = cmt 2) but their "depot" is a lumped
+    // Gamma-convolution memory with no closed form for a seeded amount, so a transit
+    // depot init is rejected here — otherwise `analytical_init_concentration_g`'s
+    // depot arm would silently drop it (#386).
     let depot_seedable = matches!(
         pk_model,
         PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
@@ -5053,7 +5054,7 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
         match lname.as_str() {
             "central" => central,
             "depot" if depot_seedable => 1,
-            "depot" if matches!(pk_model, PkModel::OneCptTransit) => {
+            "depot" if matches!(pk_model, PkModel::OneCptTransit | PkModel::TwoCptTransit) => {
                 return Err(format!(
                     "[initial_conditions]: `{}` (analytic transit) does not support a `depot` \
                      initial amount — its transit chain is a lumped convolution with no closed \
@@ -5082,7 +5083,7 @@ fn analytical_init_cmt(pk_model: PkModel, name: &str) -> Result<usize, String> {
 
     if cmt == central || (depot_seedable && cmt == 1) {
         Ok(cmt)
-    } else if matches!(pk_model, PkModel::OneCptTransit) && cmt == 1 {
+    } else if matches!(pk_model, PkModel::OneCptTransit | PkModel::TwoCptTransit) && cmt == 1 {
         // Numeric `init(1)` on transit: same lumped-convolution limitation as
         // the named `depot` form above (#386).
         Err(format!(

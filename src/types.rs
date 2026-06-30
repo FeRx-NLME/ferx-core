@@ -1200,6 +1200,11 @@ pub enum PkModel {
     OneCptTransit,
     TwoCptIv,
     TwoCptOral,
+    /// 2-cpt with Savic transit-compartment absorption via the analytic
+    /// exponential-tilting closed form (#386 PR D). Requires `cl`, `v1`, `q`,
+    /// `v2`, `n` (transit count), `mtt` (mean transit time); `f`/`lagtime`
+    /// optional as for oral.
+    TwoCptTransit,
     ThreeCptIv,
     ThreeCptOral,
 }
@@ -1237,6 +1242,14 @@ impl PkModel {
                 (PK_IDX_V2, "v2"),
                 (PK_IDX_KA, "ka"),
             ],
+            PkModel::TwoCptTransit => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_N, "n"),
+                (PK_IDX_MTT, "mtt"),
+            ],
             PkModel::ThreeCptIv => &[
                 (PK_IDX_CL, "cl"),
                 (PK_IDX_V, "v1"),
@@ -1271,6 +1284,7 @@ impl PkModel {
             PkModel::OneCptTransit => "one_cpt_transit",
             PkModel::TwoCptIv => "two_cpt_iv",
             PkModel::TwoCptOral => "two_cpt_oral",
+            PkModel::TwoCptTransit => "two_cpt_transit",
             PkModel::ThreeCptIv => "three_cpt_iv",
             PkModel::ThreeCptOral => "three_cpt_oral",
         }
@@ -1300,6 +1314,9 @@ impl PkModel {
             PkModel::OneCptTransit => &[],
             PkModel::TwoCptIv => &[1, 2],
             PkModel::TwoCptOral => &[1, 2],
+            // Like the 1-cpt transit: modeled-duration infusions unsupported in v1,
+            // so a `D{cmt}` on a 2-cpt transit model is rejected at parse (#386).
+            PkModel::TwoCptTransit => &[],
             PkModel::ThreeCptIv => &[1, 2, 3],
             PkModel::ThreeCptOral => &[1, 2],
         }
@@ -1322,6 +1339,7 @@ impl PkModel {
             "one_cpt_transit" | "one_compartment_transit" => Some(PkModel::OneCptTransit),
             "two_cpt_iv" | "two_compartment_iv" => Some(PkModel::TwoCptIv),
             "two_cpt_oral" | "two_compartment_oral" => Some(PkModel::TwoCptOral),
+            "two_cpt_transit" | "two_compartment_transit" => Some(PkModel::TwoCptTransit),
             "three_cpt_iv" | "three_compartment_iv" => Some(PkModel::ThreeCptIv),
             "three_cpt_oral" | "three_compartment_oral" => Some(PkModel::ThreeCptOral),
             _ => None,
@@ -1342,6 +1360,7 @@ impl PkModel {
             PkModel::OneCptOral
                 | PkModel::OneCptTransit
                 | PkModel::TwoCptOral
+                | PkModel::TwoCptTransit
                 | PkModel::ThreeCptOral
         )
     }
@@ -3013,6 +3032,7 @@ impl CompiledModel {
             PkModel::OneCptTransit => names!(ONE_CMT_TRANSIT, "depot", "central"),
             PkModel::TwoCptIv => names!(TWO_CMT_IV, "central", "peripheral"),
             PkModel::TwoCptOral => names!(TWO_CMT_ORAL, "depot", "central", "peripheral"),
+            PkModel::TwoCptTransit => names!(TWO_CMT_TRANSIT, "depot", "central", "peripheral"),
             PkModel::ThreeCptIv => names!(THREE_CMT_IV, "central", "peripheral1", "peripheral2"),
             PkModel::ThreeCptOral => names!(
                 THREE_CMT_ORAL,
@@ -5280,6 +5300,30 @@ mod tests {
     fn one_cpt_transit_descriptors() {
         assert_eq!(PkModel::OneCptTransit.canonical_name(), "one_cpt_transit");
         assert!(PkModel::OneCptTransit.infusable_compartments().is_empty());
+    }
+
+    /// Transit (`TwoCptTransit`) descriptors: canonical name + alias round-trip, the
+    /// analytic 3-state `[depot, central, peripheral]` layout, required params
+    /// (cl/v1/q/v2/n/mtt), oral routing, and no modeled-duration infusions (#386 PR D).
+    #[test]
+    fn two_cpt_transit_descriptors() {
+        assert_eq!(PkModel::TwoCptTransit.canonical_name(), "two_cpt_transit");
+        assert_eq!(
+            PkModel::from_name("two_cpt_transit"),
+            Some(PkModel::TwoCptTransit)
+        );
+        assert_eq!(
+            PkModel::from_name("two_compartment_transit"),
+            Some(PkModel::TwoCptTransit)
+        );
+        assert!(PkModel::TwoCptTransit.is_oral());
+        assert!(PkModel::TwoCptTransit.infusable_compartments().is_empty());
+        let req: Vec<&str> = PkModel::TwoCptTransit
+            .required_pk_params()
+            .iter()
+            .map(|(_, n)| *n)
+            .collect();
+        assert_eq!(req, vec!["cl", "v1", "q", "v2", "n", "mtt"]);
     }
 
     /// `sim_residual_variance` must split FREM covariate pseudo-observations

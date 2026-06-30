@@ -316,7 +316,8 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
         PkModel::OneCptOral => (2, 1),    // [depot, central]
         PkModel::OneCptTransit => (2, 1), // [depot (lumped transit), central]
         PkModel::TwoCptIv => (2, 0),
-        PkModel::TwoCptOral => (3, 1), // [depot, central, periph]
+        PkModel::TwoCptOral => (3, 1),    // [depot, central, periph]
+        PkModel::TwoCptTransit => (3, 1), // [depot (lumped transit), central, periph]
         PkModel::ThreeCptIv => (3, 0),
         PkModel::ThreeCptOral => (4, 1), // [depot, central, periph1, periph2]
     }
@@ -907,6 +908,9 @@ fn propagate_with_bounds(
             // superposition (SS/IOV/TV/modeled-infusion are rejected at parse, #386).
             PkModel::OneCptTransit => unreachable!(
                 "one_cpt_transit uses closed-form superposition, not the event-driven walk"
+            ),
+            PkModel::TwoCptTransit => unreachable!(
+                "two_cpt_transit uses closed-form superposition, not the event-driven walk"
             ),
             PkModel::OneCptIv => {
                 propagate_one_cpt(state, dt, pk, rate_central);

@@ -27,8 +27,8 @@
 //! Any density that is *closed under tilting* — its tilted form stays in the same
 //! family with a closed-form CDF — therefore gives an elementary `C(t)`. The
 //! [`TiltedAbsorption`] trait captures the two pieces `M` and `G`; [`convolve_1cpt`]
-//! assembles them. (2-cpt disposition — `convolve_2cpt` — follows in the #386
-//! Phase-3 PR D.)
+//! assembles them. A 2-cpt disposition decomposes into the same tilting form at
+//! its two macro-rates `α`, `β` — see [`convolve_2cpt`] (#386 Phase-3 PR D).
 //!
 //! ## Generic over `PkNum`
 //!
@@ -52,8 +52,8 @@ use crate::stats::special::regularized_gamma_p;
 
 /// An absorption-time distribution that is **closed under exponential tilting**:
 /// both its MGF `M(k) = E[e^{kX}]` and the CDF of the `e^{kt}`-tilted density have
-/// closed forms. Implementors plug into [`convolve_1cpt`] (and, in #386 PR D,
-/// `convolve_2cpt`) to give an elementary central-compartment concentration.
+/// closed forms. Implementors plug into [`convolve_1cpt`] / [`convolve_2cpt`]
+/// to give an elementary central-compartment concentration.
 ///
 /// Generic over the numeric type `T` so one implementation serves both the
 /// scalar prediction (`T = f64`) and its `Dual2` sensitivities.
@@ -134,6 +134,74 @@ pub fn convolve_1cpt<T: PkNum, A: TiltedAbsorption<T>>(
     f_dose_over_v: T,
 ) -> T {
     f_dose_over_v * abs.mgf(ke) * (-(ke * t)).exp() * abs.tilted_cdf(t, ke)
+}
+
+/// Central-compartment concentration at time `t` for a single dose absorbed into a
+/// **2-cpt** disposition through `abs`, with macro-rate constants `α ≥ β` and
+/// peripheral micro-rate `k21` (all from
+/// [`crate::sens::two_cpt::macro_rates_g`]):
+///
+/// ```text
+///   C(t) = (F·Dose/V1) · [ cα·M(α)·e^{-α t}·G(t; α) + cβ·M(β)·e^{-β t}·G(t; β) ],
+///   cα = (α−k21)/(α−β),   cβ = (k21−β)/(α−β)    (cα + cβ = 1).
+/// ```
+///
+/// The 2-cpt IV-bolus central impulse response is the bi-exponential
+/// `(1/V1)[cα e^{-αt} + cβ e^{-βt}]` (the same `cα`, `cβ` as
+/// [`crate::sens::two_cpt::two_cpt_iv_bolus_amt_g`]); convolving each disposition
+/// exponential with the absorption density turns `e^{-rate·t}` into the tilting
+/// form `M(rate)·e^{-rate·t}·G(t; rate)`, so each term is one [`convolve_1cpt`]
+/// call. With a degenerate absorption (`M ≡ 1`, `G ≡ 1`, e.g. transit `mtt → 0`)
+/// it reduces to the IV bolus; with first-order absorption (transit `n = 0`) it
+/// reduces to [`crate::sens::two_cpt::two_cpt_oral_amt_g`].
+///
+/// `f_dose_over_v1 = F·Dose/V1`. Requires **both** macro-rates below `abs`'s MGF
+/// abscissa; since `α ≥ β`, the caller's single `α < KTR` guard
+/// ([`crate::sens::two_cpt::two_cpt_transit_amt_g`]) suffices. The caller also
+/// excludes the confluent `α = β` case (`diff → 0`).
+#[inline]
+pub fn convolve_2cpt<T: PkNum, A: TiltedAbsorption<T>>(
+    abs: &A,
+    t: T,
+    alpha: T,
+    beta: T,
+    k21: T,
+    f_dose_over_v1: T,
+) -> T {
+    let diff = alpha - beta;
+    let c_alpha = (alpha - k21) / diff;
+    let c_beta = (k21 - beta) / diff;
+    // Each term is c·M(rate)·e^{-rate·t}·G(t;rate) — one convolve_1cpt with the
+    // coefficient passed as its `f_dose_over_v` weight; the shared F·Dose/V1 scales
+    // the sum. No second copy of the tilting algebra.
+    f_dose_over_v1 * (convolve_1cpt(abs, t, alpha, c_alpha) + convolve_1cpt(abs, t, beta, c_beta))
+}
+
+/// Peripheral-compartment **concentration** at time `t` (`A2(t)/V2`) for a single
+/// dose absorbed into a 2-cpt disposition through `abs`, with macro-rates `α ≥ β`
+/// and central→peripheral micro-rate `k12 = Q/V1`:
+///
+/// ```text
+///   C2(t) = (F·Dose/V2) · (k12/(α−β)) · [ M(β)·e^{-β t}·G(t; β) − M(α)·e^{-α t}·G(t; α) ].
+/// ```
+///
+/// The peripheral IV-bolus impulse response (amount) is
+/// `(k12/(α−β))·(e^{-βt} − e^{-αt})`; convolving with the absorption density and
+/// dividing by `V2` gives the two-term tilting form above (each a [`convolve_1cpt`]
+/// call with the shared coefficient). Used only for `[derived]` peripheral amounts
+/// — the likelihood needs only the central concentration ([`convolve_2cpt`]).
+/// Same domain requirement and `α ≠ β` exclusion as [`convolve_2cpt`].
+#[inline]
+pub fn convolve_2cpt_peripheral<T: PkNum, A: TiltedAbsorption<T>>(
+    abs: &A,
+    t: T,
+    alpha: T,
+    beta: T,
+    k12: T,
+    f_dose_over_v2: T,
+) -> T {
+    let coeff = f_dose_over_v2 * k12 / (alpha - beta);
+    convolve_1cpt(abs, t, beta, coeff) - convolve_1cpt(abs, t, alpha, coeff)
 }
 
 #[cfg(test)]
@@ -380,5 +448,178 @@ mod tests {
             max_relative = 1e-12
         );
         assert_relative_eq!(d.hess[0][0], 0.0, epsilon = 1e-12);
+    }
+
+    // ── convolve_2cpt (2-cpt disposition) ────────────────────────────────────
+
+    use crate::sens::two_cpt::{macro_rates_g, two_cpt_oral_amt_g};
+
+    /// `f64` central concentration for a 2-cpt transit model, `F·Dose/V1` folded
+    /// in from `amt`/`f_bio` so seeding `v1` captures the full `∂C/∂v1`.
+    fn tc(cl: f64, v1: f64, q: f64, v2: f64, n: f64, mtt: f64, t: f64, amt: f64) -> f64 {
+        let (a, b, k21) = macro_rates_g(cl, v1, q, v2);
+        let abs = TransitAbsorption { n, mtt };
+        convolve_2cpt(&abs, t, a, b, k21, amt / v1)
+    }
+
+    /// Same with all six PK params seeded as `Dual2<6>` vars (cl,v1,q,v2,n,mtt =
+    /// dims 0..6), so `.grad`/`.hess` carry the exact derivatives.
+    fn tc_dual(cl: f64, v1: f64, q: f64, v2: f64, n: f64, mtt: f64, t: f64, amt: f64) -> Dual2<6> {
+        let cld = Dual2::<6>::var(cl, 0);
+        let v1d = Dual2::<6>::var(v1, 1);
+        let qd = Dual2::<6>::var(q, 2);
+        let v2d = Dual2::<6>::var(v2, 3);
+        let nd = Dual2::<6>::var(n, 4);
+        let mttd = Dual2::<6>::var(mtt, 5);
+        let (a, b, k21) = macro_rates_g(cld, v1d, qd, v2d);
+        let abs = TransitAbsorption { n: nd, mtt: mttd };
+        convolve_2cpt(
+            &abs,
+            Dual2::<6>::from_f64(t),
+            a,
+            b,
+            k21,
+            Dual2::<6>::from_f64(amt) / v1d,
+        )
+    }
+
+    /// With `n = 0` the transit chain is first-order absorption with
+    /// `ka = KTR = 1/mtt`, so the 2-cpt convolution must reproduce the independent,
+    /// already-validated `two_cpt_oral_amt_g` (the 2-cpt oral Bateman) **exactly** —
+    /// the strongest check of the `cα`/`cβ` bi-exponential decomposition. Params are
+    /// chosen absorption-rate-limited (`ka = 1/mtt > α`, i.e. `α < KTR`) so the
+    /// tilting closed form converges — small `mtt` makes absorption faster than the
+    /// fast disposition macro-rate.
+    #[test]
+    fn convolve_2cpt_n0_recovers_two_cpt_oral() {
+        let amt = 100.0;
+        // (cl, v1, q, v2, mtt) with ka = 1/mtt ABOVE the fast macro-rate α (n=0 ⇒
+        // KTR = 1/mtt; the tilting form needs α < KTR).
+        for &(cl, v1, q, v2, mtt) in &[
+            (5.0, 20.0, 10.0, 40.0, 0.3), // α≈0.93 < ka≈3.33
+            (3.0, 30.0, 6.0, 60.0, 0.5),  // α≈0.37 < ka=2.0
+            (8.0, 50.0, 20.0, 30.0, 0.4), // α≈1.13 < ka=2.5
+        ] {
+            let ka = 1.0 / mtt;
+            for &t in &[0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0] {
+                let got = tc(cl, v1, q, v2, 0.0, mtt, t, amt);
+                let want = two_cpt_oral_amt_g::<f64>(amt, t, cl, v1, q, v2, ka, 1.0);
+                assert_relative_eq!(got, want, max_relative = 1e-10, epsilon = 1e-12);
+            }
+        }
+    }
+
+    /// The 2-cpt closed form must equal the defining convolution
+    /// `(F·Dose/V1) ∫₀ᵗ f(u)(cα e^{-α(t-u)} + cβ e^{-β(t-u)}) du` with `f` the
+    /// `Gamma(n+1, KTR)` transit density — fine quadrature, *non-integer* `n` (so this
+    /// is independent of the `n=0 ↔ two_cpt_oral` identity).
+    #[test]
+    fn convolve_2cpt_matches_numerical_convolution() {
+        let amt = 100.0;
+        for &(cl, v1, q, v2, n, mtt) in &[
+            (5.0, 20.0, 10.0, 40.0, 2.5, 1.0),
+            (3.0, 30.0, 6.0, 60.0, 1.3, 0.7),
+            (8.0, 50.0, 20.0, 30.0, 4.0, 2.0),
+        ] {
+            let (alpha, beta, k21) = macro_rates_g::<f64>(cl, v1, q, v2);
+            let diff = alpha - beta;
+            let c_alpha = (alpha - k21) / diff;
+            let c_beta = (k21 - beta) / diff;
+            let ktr = (n + 1.0) / mtt;
+            let ln_norm = (n + 1.0) * ktr.ln() - ln_gamma(n + 1.0);
+            let dens = |u: f64| (ln_norm + n * u.ln() - ktr * u).exp();
+            for &t in &[0.5, 1.0, 2.0, 4.0, 8.0] {
+                let steps = 200_000usize;
+                let h = t / steps as f64;
+                let mut acc = 0.0;
+                for i in 0..=steps {
+                    let u = i as f64 * h;
+                    let kernel =
+                        c_alpha * (-alpha * (t - u)).exp() + c_beta * (-beta * (t - u)).exp();
+                    let integrand = if u == 0.0 { 0.0 } else { dens(u) * kernel };
+                    let w = if i == 0 || i == steps { 0.5 } else { 1.0 };
+                    acc += w * integrand;
+                }
+                let numeric = (amt / v1) * acc * h;
+                assert_relative_eq!(
+                    tc(cl, v1, q, v2, n, mtt, t, amt),
+                    numeric,
+                    max_relative = 1e-4,
+                    epsilon = 1e-9
+                );
+            }
+        }
+    }
+
+    /// Exact `Dual2` `∂C/∂{cl,v1,q,v2,n,mtt}` (the FOCE/FOCEI gradients) vs a central
+    /// difference of the `f64` value, plus the six diagonal 2nd derivatives vs a
+    /// central difference of the exact dual 1st-derivative (the two-rung ladder that
+    /// avoids the `1/h²` value-difference blow-up).
+    #[test]
+    fn convolve_2cpt_dual_gradients_match_fd() {
+        let amt = 100.0;
+        let p = [5.0, 20.0, 10.0, 40.0, 2.5, 1.0]; // cl,v1,q,v2,n,mtt
+        for &t in &[1.0, 3.0, 6.0] {
+            let d = tc_dual(p[0], p[1], p[2], p[3], p[4], p[5], t, amt);
+            let h = 1e-6;
+            for dim in 0..6 {
+                let mut pp = p;
+                let mut pm = p;
+                pp[dim] += h;
+                pm[dim] -= h;
+                let fd = (tc(pp[0], pp[1], pp[2], pp[3], pp[4], pp[5], t, amt)
+                    - tc(pm[0], pm[1], pm[2], pm[3], pm[4], pm[5], t, amt))
+                    / (2.0 * h);
+                assert_relative_eq!(d.grad[dim], fd, max_relative = 1e-4, epsilon = 1e-7);
+                // 2nd-order diagonal vs central difference of the exact dual grad.
+                let h2 = 1e-4;
+                let mut qp = p;
+                let mut qm = p;
+                qp[dim] += h2;
+                qm[dim] -= h2;
+                let gp = tc_dual(qp[0], qp[1], qp[2], qp[3], qp[4], qp[5], t, amt).grad[dim];
+                let gm = tc_dual(qm[0], qm[1], qm[2], qm[3], qm[4], qm[5], t, amt).grad[dim];
+                assert_relative_eq!(
+                    d.hess[dim][dim],
+                    (gp - gm) / (2.0 * h2),
+                    max_relative = 2e-4,
+                    epsilon = 1e-6
+                );
+            }
+        }
+    }
+
+    /// The peripheral concentration `C2 = A2/V2` must equal its defining convolution
+    /// `(F·Dose/V2)(k12/(α−β)) ∫₀ᵗ f(u)(e^{-β(t-u)} − e^{-α(t-u)}) du` (the peripheral
+    /// IV-bolus impulse response convolved with the transit density), `k12 = Q/V1`.
+    #[test]
+    fn convolve_2cpt_peripheral_matches_numerical() {
+        let amt = 100.0;
+        for &(cl, v1, q, v2, n, mtt) in &[
+            (5.0, 20.0, 10.0, 40.0, 2.5, 1.0),
+            (3.0, 30.0, 6.0, 60.0, 1.3, 0.7),
+        ] {
+            let (alpha, beta, _k21) = macro_rates_g::<f64>(cl, v1, q, v2);
+            let k12 = q / v1;
+            let abs = TransitAbsorption { n, mtt };
+            let ktr = (n + 1.0) / mtt;
+            let ln_norm = (n + 1.0) * ktr.ln() - ln_gamma(n + 1.0);
+            let dens = |u: f64| (ln_norm + n * u.ln() - ktr * u).exp();
+            for &t in &[0.5, 1.0, 2.0, 4.0, 8.0] {
+                let steps = 200_000usize;
+                let h = t / steps as f64;
+                let mut acc = 0.0;
+                for i in 0..=steps {
+                    let u = i as f64 * h;
+                    let kernel = (-beta * (t - u)).exp() - (-alpha * (t - u)).exp();
+                    let integrand = if u == 0.0 { 0.0 } else { dens(u) * kernel };
+                    let w = if i == 0 || i == steps { 0.5 } else { 1.0 };
+                    acc += w * integrand;
+                }
+                let numeric = (amt / v2) * (k12 / (alpha - beta)) * acc * h;
+                let got = convolve_2cpt_peripheral(&abs, t, alpha, beta, k12, amt / v2);
+                assert_relative_eq!(got, numeric, max_relative = 1e-4, epsilon = 1e-9);
+            }
+        }
     }
 }

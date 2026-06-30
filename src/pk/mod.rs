@@ -257,7 +257,9 @@ pub(crate) fn analytical_init_concentration_g<T: crate::sens::num::PkNum>(
             PkModel::OneCptIv | PkModel::OneCptOral | PkModel::OneCptTransit => {
                 one_cpt_iv_bolus_amt_g(a0, t, cl, v)
             }
-            PkModel::TwoCptIv | PkModel::TwoCptOral => two_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2),
+            PkModel::TwoCptIv | PkModel::TwoCptOral | PkModel::TwoCptTransit => {
+                two_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2)
+            }
             PkModel::ThreeCptIv | PkModel::ThreeCptOral => {
                 three_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2, q3, v3)
             }
@@ -784,6 +786,9 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
             PkModel::OneCptTransit => {
                 unreachable!("one_cpt_transit does not support SS doses (rejected at parse)")
             }
+            PkModel::TwoCptTransit => {
+                unreachable!("two_cpt_transit does not support SS doses (rejected at parse)")
+            }
             PkModel::OneCptIv => {
                 if infusion {
                     one_cpt_infusion_ss(dose, tau, cl, v)
@@ -863,6 +868,20 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
             PkModel::OneCptTransit => {
                 // Transit rejects infusions at parse, so only the absorbed bolus exists.
                 one_cpt_transit_f(dose, tau, cl, v, p.n_transit(), p.mtt(), p.f_bio())
+            }
+            PkModel::TwoCptTransit => {
+                // Transit rejects infusions at parse, so only the absorbed bolus exists.
+                two_cpt_transit_f(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.n_transit(),
+                    p.mtt(),
+                    p.f_bio(),
+                )
             }
             PkModel::TwoCptIv => {
                 if infusion {
@@ -951,6 +970,9 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
             // Transit rejects SS doses at parse (#386) — unreachable for a valid model.
             PkModel::OneCptTransit => {
                 unreachable!("one_cpt_transit does not support SS doses (rejected at parse)")
+            }
+            PkModel::TwoCptTransit => {
+                unreachable!("two_cpt_transit does not support SS doses (rejected at parse)")
             }
             PkModel::OneCptIv => {
                 let c = if infusion {
@@ -1078,6 +1100,34 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                     one_cpt_transit_f(dose, tau, cl, v, p.n_transit(), p.mtt(), p.f_bio());
                 vec![depot, central]
             }
+            PkModel::TwoCptTransit => {
+                // [depot = lumped in-transit mass, central, peripheral]; transit rejects
+                // infusions at parse, so only the absorbed bolus exists.
+                let depot = two_cpt_transit_depot(dose, tau, p.n_transit(), p.mtt(), p.f_bio());
+                let central = two_cpt_transit_f(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.n_transit(),
+                    p.mtt(),
+                    p.f_bio(),
+                );
+                let periph = two_cpt_transit_peripheral(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.n_transit(),
+                    p.mtt(),
+                    p.f_bio(),
+                );
+                vec![depot, central, periph]
+            }
             PkModel::TwoCptIv => {
                 let central = if infusion {
                     two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
@@ -1185,6 +1235,7 @@ pub fn analytical_state_at_times(
         PkModel::OneCptTransit => 2,
         PkModel::TwoCptIv => 2,
         PkModel::TwoCptOral => 3,
+        PkModel::TwoCptTransit => 3,
         PkModel::ThreeCptIv => 3,
         PkModel::ThreeCptOral => 4,
     };
@@ -2982,6 +3033,60 @@ mod tests {
             states[0] > 0.0 && states[1] > 0.0,
             "both amounts positive mid-absorption: {states:?}"
         );
+    }
+
+    /// 2-cpt transit is a 3-state `[depot, central, peripheral]` model:
+    /// `single_dose_states` must return the lumped unabsorbed-chain depot, the central
+    /// concentration (matching `single_dose_concentration`), and the peripheral
+    /// concentration — covering `two_cpt_transit_depot` / `_peripheral` (#386 PR D).
+    #[test]
+    fn single_dose_states_two_cpt_transit_returns_depot_central_periph() {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = 0.5;
+        p.values[crate::types::PK_IDX_V] = 10.0; // V1
+        p.values[crate::types::PK_IDX_Q] = 1.0;
+        p.values[crate::types::PK_IDX_V2] = 20.0;
+        p.values[crate::types::PK_IDX_N] = 3.0;
+        p.values[crate::types::PK_IDX_MTT] = 1.5;
+        let d = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let states = single_dose_states(PkModel::TwoCptTransit, &d, 2.0, &p);
+        assert_eq!(
+            states.len(),
+            3,
+            "2-cpt transit exposes [depot, central, periph]"
+        );
+        assert!(
+            states.iter().all(|&x| x > 0.0),
+            "all three amounts positive mid-absorption: {states:?}"
+        );
+        // Central state must equal the standalone concentration entry point.
+        let c = single_dose_concentration(PkModel::TwoCptTransit, &d, 2.0, &p);
+        assert!(
+            (states[1] - c).abs() <= 1e-9 * c.abs().max(1.0),
+            "central state {} vs single_dose_concentration {}",
+            states[1],
+            c
+        );
+    }
+
+    /// SS doses are rejected at parse for transit (`check_transit_support`), so the
+    /// SS arm of `single_dose_concentration` is `unreachable!`; calling it directly
+    /// with an SS dose must hit that guard (covers the defensive arm + its message).
+    #[test]
+    #[should_panic(expected = "two_cpt_transit does not support SS")]
+    fn single_dose_concentration_two_cpt_transit_ss_unreachable() {
+        let p = PkParams::default();
+        let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+        let _ = single_dose_concentration(PkModel::TwoCptTransit, &ss, 2.0, &p);
+    }
+
+    /// The mirror SS `unreachable!` arm in `single_dose_states`.
+    #[test]
+    #[should_panic(expected = "two_cpt_transit does not support SS")]
+    fn single_dose_states_two_cpt_transit_ss_unreachable() {
+        let p = PkParams::default();
+        let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+        let _ = single_dose_states(PkModel::TwoCptTransit, &ss, 2.0, &p);
     }
 
     /// Regression: `single_dose_concentration` and `single_dose_states[central]` must
