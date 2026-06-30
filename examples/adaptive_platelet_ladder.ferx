@@ -1,0 +1,82 @@
+# Adaptive (feedback) dosing — oncology platelet-ladder dose modification (epic #391)
+#
+# The toxicity-driven counterpart of the TDM titration example
+# (adaptive_tdm_titration.ferx). A semi-mechanistic Friberg myelosuppression
+# model (Friberg et al., J Clin Oncol 2002) is driven by a 1-compartment IV
+# drug; circulating platelets (CIRC, x10^9/L) are read at the start of each
+# weekly cycle, and the dose steps DOWN a discrete level when platelets fall into
+# thrombocytopenia (a `decrease` rung), with a severe-toxicity floor that STOPS
+# treatment. The controller titrates on the latent platelet count (`observe`,
+# un-noised) so the realized dose ladder is deterministic.
+#
+# Run with `simulate_adaptive_from_spec()` (not the plain forward `simulate()`).
+# This is the genuinely-reactive case validated against an external mrgsolve
+# reference (epic #391 S2.5a); see tests/reference/platelet_mrgsolve/.
+#
+# Negligible IIV / no covariates: an effectively typical-value patient, so the
+# realized ladder is reproducible and bit-comparable to the mrgsolve run.
+#
+# See docs/model-file/adaptive-dosing.qmd for the block reference.
+
+[parameters]
+  theta TVCL(0.22,   0.01,  10.0)    # drug clearance (L/h)
+  theta TVV(15.0,    1.0,  200.0)    # drug volume (L)
+  theta TVCIRC0(250.0, 10.0, 1000.0) # baseline platelets (x10^9/L)
+  theta TVMTT(120.0, 10.0, 1000.0)   # mean transit time of maturation (h)
+  theta TVGAMMA(0.20, 0.01,   2.0)   # rebound feedback exponent
+  theta TVSLOPE(0.06, 0.001,  1.0)   # linear drug effect on proliferation (per mg/L)
+
+  # Negligible IIV: the engine requires at least one omega, so CL carries a
+  # vanishing variance (SD ~ 1e-5). The patient is effectively typical-value, the
+  # controller titrates on the latent platelet count, and the dose ladder is
+  # reproducible / bit-comparable to the typical-value mrgsolve run.
+  omega ETA_CL ~ 1e-10
+
+  sigma ADD ~ 1.0                    # nominal additive error (platelets); the latent
+                                     # `observe` signal is un-noised, so it never
+                                     # enters the dose decisions.
+
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL)
+  V     = TVV
+  CIRC0 = TVCIRC0
+  KTR   = 4 / TVMTT                  # (n+1)/MTT with n = 3 transit compartments
+  GAMMA = TVGAMMA
+  SLOPE = TVSLOPE
+
+[structural_model]
+  ode(states=[CENT, PROL, TR1, TR2, TR3, CIRC])
+
+[odes]
+  # Maturation chain starts at the platelet baseline (drug compartment at 0).
+  init(PROL) = CIRC0
+  init(TR1)  = CIRC0
+  init(TR2)  = CIRC0
+  init(TR3)  = CIRC0
+  init(CIRC) = CIRC0
+
+  # 1-cpt IV drug; proliferation is suppressed by EDRUG = SLOPE * (CENT/V) and
+  # rebounds via the (CIRC0/CIRC)^GAMMA feedback.
+  d/dt(CENT) = -(CL / V) * CENT
+  d/dt(PROL) = KTR * PROL * (1 - SLOPE * (CENT / V)) * (CIRC0 / CIRC)^GAMMA - KTR * PROL
+  d/dt(TR1)  = KTR * (PROL - TR1)
+  d/dt(TR2)  = KTR * (TR1 - TR2)
+  d/dt(TR3)  = KTR * (TR2 - TR3)
+  d/dt(CIRC) = KTR * TR3 - KTR * CIRC
+
+[scaling]
+  y = CIRC                           # observed/predicted endpoint: platelet count
+
+[error_model]
+  DV ~ additive(ADD)
+
+[adaptive_dosing]
+  observe        = CIRC                     # titrate on the latent platelet count
+  at             = every 168 from 0 to 1512 # a decision at the start of each weekly cycle
+  start_dose     = 100                      # top of the ladder (mg)
+  route          = bolus(cmt=1)             # IV bolus into the drug compartment (CENT)
+  levels         = [25, 50, 75, 100]        # discrete dose ladder (strictly increasing)
+  dose_bounds    = [25, 100]                # every rung lies within these bounds
+  target_window  = [100, inf]               # report % of decisions with platelets >= 100
+  when signal < 30  : stop                  # severe thrombocytopenia floor -> discontinue
+  when signal < 120 : decrease              # thrombocytopenia -> step one level down
