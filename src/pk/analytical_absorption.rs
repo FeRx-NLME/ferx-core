@@ -192,7 +192,7 @@ pub fn convolve_2cpt<T: PkNum, A: TiltedAbsorption<T>>(
 /// — the likelihood needs only the central concentration ([`convolve_2cpt`]).
 /// Same domain requirement and `α ≠ β` exclusion as [`convolve_2cpt`].
 #[inline]
-pub fn convolve_2cpt_peripheral<T: PkNum, A: TiltedAbsorption<T>>(
+pub(crate) fn convolve_2cpt_peripheral<T: PkNum, A: TiltedAbsorption<T>>(
     abs: &A,
     t: T,
     alpha: T,
