@@ -96,6 +96,7 @@ fn setup_frem(dir: &Path) -> FremPrepareResult {
         None, // default output model path
         None, // default output data path
         None, // default missing value (-99)
+        None, // no prior fit to seed inits from
     )
     .expect("prepare_frem should succeed")
 }

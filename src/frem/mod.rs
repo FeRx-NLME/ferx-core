@@ -13,8 +13,29 @@
 //! 4. Fit the resulting FREM model normally
 
 use crate::types::{CompiledModel, Population};
+use nalgebra::DMatrix;
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Prior-fit parameter values used to seed a generated FREM model's initial
+/// values, instead of the base model's declared inits (issue #239). Typically
+/// built from a completed [`crate::types::FitResult`] of the base model: its
+/// `theta`/`theta_names` and `omega`/`eta_names` carry exactly this shape.
+///
+/// Names are matched case-insensitively against the base model's declared
+/// theta/eta names; a name with no match is left at its declared init value,
+/// so a fit from a slightly different model (extra or missing parameters)
+/// degrades gracefully rather than erroring.
+#[derive(Debug, Clone)]
+pub struct FremFitInit {
+    /// Theta name -> fitted value.
+    pub theta: Vec<(String, f64)>,
+    /// Eta names, parallel to the rows/columns of `omega`.
+    pub eta_names: Vec<String>,
+    /// Fitted omega (BSV) covariance matrix, indexed by `eta_names`.
+    pub omega: DMatrix<f64>,
+}
 
 /// Statistics and metadata from the FREM data transformation.
 #[derive(Debug, Clone)]
@@ -412,6 +433,7 @@ pub fn generate_frem_model(
     base_model: &CompiledModel,
     frem_info: &FremDataInfo,
     output_data_path: &Path,
+    fit_init: Option<&FremFitInit>,
 ) -> Result<String, String> {
     // Parse the base model text to extract blocks.
     let blocks = parse_blocks(base_model_text)?;
@@ -422,12 +444,20 @@ pub fn generate_frem_model(
     model.push_str("# FREM model (auto-generated)\n\n");
     model.push_str("[parameters]\n");
 
-    // Copy base thetas.
+    // Copy base thetas, substituting the init value with the prior fit's
+    // estimate when one is supplied (issue #239) so a subsequent fit of the
+    // FREM model warm-starts from converged PK parameters instead of the
+    // original declared inits.
+    let theta_init_re = Regex::new(r"(?i)^\s*theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)").unwrap();
     if let Some(params_lines) = blocks.get("parameters") {
         for line in params_lines {
             let trimmed = line.trim();
             if trimmed.starts_with("theta ") {
-                model.push_str(&format!("  {}\n", trimmed));
+                let out = match fit_init {
+                    Some(fi) => override_theta_init(trimmed, fi, &theta_init_re),
+                    None => trimmed.to_string(),
+                };
+                model.push_str(&format!("  {}\n", out));
             }
         }
     }
@@ -456,10 +486,16 @@ pub fn generate_frem_model(
     // Build the omega matrix: PK diagonal from base, COV diagonal from variance,
     // off-diagonals = small scaled values.
     let mut omega_matrix = vec![vec![0.0f64; n_total]; n_total];
-    // PK-PK block from base model.
+    // PK-PK block from base model, overridden entry-by-entry with the prior
+    // fit's omega (issue #239) when a matching eta pair is present.
     for i in 0..n_pk {
         for j in 0..n_pk {
-            omega_matrix[i][j] = base_model.default_params.omega.matrix[(i, j)];
+            let declared = base_model.default_params.omega.matrix[(i, j)];
+            omega_matrix[i][j] = fit_init
+                .and_then(|fi| {
+                    fit_omega_value(fi, &base_model.eta_names[i], &base_model.eta_names[j])
+                })
+                .unwrap_or(declared);
         }
     }
     // COV-COV diagonal from sample variances.
@@ -618,6 +654,47 @@ pub fn generate_frem_model(
     Ok(model)
 }
 
+/// Look up the fitted omega value for an eta pair by name (case-insensitive).
+/// Returns `None` when either name is absent from `fit_init`, so the caller
+/// falls back to the base model's declared omega.
+fn fit_omega_value(fit_init: &FremFitInit, name_i: &str, name_j: &str) -> Option<f64> {
+    let idx_i = fit_init
+        .eta_names
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(name_i))?;
+    let idx_j = fit_init
+        .eta_names
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(name_j))?;
+    Some(fit_init.omega[(idx_i, idx_j)])
+}
+
+/// Rewrite a `theta NAME(init, ...)` declaration line, substituting `init`
+/// with the value from a prior fit (issue #239) when the fit has an entry
+/// for `NAME`. Bounds, `FIX` flags, and trailing comments are left byte-for-byte
+/// untouched — only the numeric init token matched by `re` is replaced.
+fn override_theta_init(line: &str, fit_init: &FremFitInit, re: &Regex) -> String {
+    let Some(caps) = re.captures(line) else {
+        return line.to_string();
+    };
+    let name = &caps[1];
+    let value = match fit_init
+        .theta
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+    {
+        Some((_, v)) => *v,
+        None => return line.to_string(),
+    };
+    let init_span = caps.get(2).unwrap();
+    format!(
+        "{}{}{}",
+        &line[..init_span.start()],
+        value,
+        &line[init_span.end()..]
+    )
+}
+
 /// Resolve which covariates (and their categorical/continuous split) go into the
 /// FREM model. The model's `[covariates]` block is the source of truth: it
 /// declares the covariates and tags each continuous or categorical.
@@ -736,6 +813,13 @@ fn resolve_frem_covariates(
 ///
 /// `categorical_covariates` is an optional override for the categorical split;
 /// when `None`/empty the split is taken from each selected declaration's `kind`.
+///
+/// `fit_init` optionally seeds the generated FREM model's PK theta and omega
+/// init values from a completed fit of the base model (issue #239), so a
+/// subsequent fit of the FREM model warm-starts from converged parameters
+/// instead of the base model file's declared inits. `None` preserves the
+/// prior behaviour of copying the declared inits verbatim.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_frem(
     model_path: &Path,
     data_path: &Path,
@@ -744,6 +828,7 @@ pub fn prepare_frem(
     output_model_path: Option<&Path>,
     output_data_path: Option<&Path>,
     missing_value: Option<f64>,
+    fit_init: Option<&FremFitInit>,
 ) -> Result<FremPrepareResult, String> {
     use crate::io::datareader::read_nonmem_csv;
     use crate::parser::model_parser::parse_full_model_file;
@@ -788,7 +873,7 @@ pub fn prepare_frem(
         .map_err(|e| format!("Failed to read model file: {}", e))?;
 
     // Generate FREM model.
-    let model_text = generate_frem_model(&base_text, base_model, &frem_info, out_data)?;
+    let model_text = generate_frem_model(&base_text, base_model, &frem_info, out_data, fit_init)?;
 
     // Write outputs.
     std::fs::write(out_data, &csv_content)
@@ -817,6 +902,34 @@ pub fn prepare_frem(
              fit with FOCEI.",
             no_eta.join(", ")
         ));
+    }
+
+    // Advise when `fit_init` was supplied but shares no names with the base
+    // model — most likely a fit of a different model was passed in, so the
+    // generated FREM model silently fell back to the declared inits.
+    if let Some(fi) = fit_init {
+        let theta_matched = base_model
+            .theta_names
+            .iter()
+            .any(|n| fi.theta.iter().any(|(fn_, _)| fn_.eq_ignore_ascii_case(n)));
+        if !base_model.theta_names.is_empty() && !fi.theta.is_empty() && !theta_matched {
+            warnings.push(
+                "FREM conversion: the supplied `fit` has no theta names matching the base \
+                 model, so the model file's declared theta init values were used instead."
+                    .to_string(),
+            );
+        }
+        let eta_matched = base_model
+            .eta_names
+            .iter()
+            .any(|n| fi.eta_names.iter().any(|fn_| fn_.eq_ignore_ascii_case(n)));
+        if !base_model.eta_names.is_empty() && !fi.eta_names.is_empty() && !eta_matched {
+            warnings.push(
+                "FREM conversion: the supplied `fit`'s omega has no eta names matching the \
+                 base model, so the model file's declared omega init values were used instead."
+                    .to_string(),
+            );
+        }
     }
 
     Ok(FremPrepareResult {
@@ -1112,7 +1225,13 @@ mod tests {
         let covs = vec!["WT".to_string(), "AGE".to_string()];
         let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
 
-        let result = generate_frem_model(base_text, &model, &info, Path::new("test_frem_data.csv"));
+        let result = generate_frem_model(
+            base_text,
+            &model,
+            &info,
+            Path::new("test_frem_data.csv"),
+            None,
+        );
         assert!(result.is_ok());
 
         let model_text = result.unwrap();
@@ -1170,7 +1289,7 @@ mod tests {
         let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
 
         let model_text =
-            generate_frem_model(base_text, &model, &info, Path::new("test.csv")).unwrap();
+            generate_frem_model(base_text, &model, &info, Path::new("test.csv"), None).unwrap();
 
         // 3 PK etas + 1 cov eta = 4 total, lower triangle has 4*(4+1)/2 = 10 values
         let block_start = model_text.find("block_omega").unwrap();
@@ -1182,6 +1301,104 @@ mod tests {
             .filter(|s| !s.trim().is_empty())
             .count();
         assert_eq!(n_values, 10); // 4*(4+1)/2
+    }
+
+    #[test]
+    fn test_generate_frem_model_uses_fit_init_theta_and_omega() {
+        // Issue #239: when a prior fit is supplied, its theta/omega estimates
+        // seed the generated FREM model's PK init values instead of the base
+        // model file's declared inits.
+        let base_text = r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+        let pop = make_test_population();
+        let model = make_test_model();
+        let covs = vec!["WT".to_string()];
+        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
+
+        let fit_init = FremFitInit {
+            theta: vec![
+                ("TVCL".to_string(), 0.321),
+                ("TVV".to_string(), 12.7),
+                ("TVKA".to_string(), 1.42),
+            ],
+            eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
+            omega: DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.11, 0.05, 0.28])),
+        };
+
+        let model_text = generate_frem_model(
+            base_text,
+            &model,
+            &info,
+            Path::new("test.csv"),
+            Some(&fit_init),
+        )
+        .unwrap();
+
+        // Fitted theta values replace the declared inits, bounds untouched.
+        assert!(
+            model_text.contains("theta TVCL(0.321, 0.001, 10.0)"),
+            "expected fitted TVCL init, got:\n{model_text}"
+        );
+        assert!(
+            model_text.contains("theta TVV(12.7, 0.1, 500.0)"),
+            "expected fitted TVV init, got:\n{model_text}"
+        );
+        assert!(
+            model_text.contains("theta TVKA(1.42, 0.01, 50.0)"),
+            "expected fitted TVKA init, got:\n{model_text}"
+        );
+
+        // Fitted omega diagonal (0.11, 0.05, 0.28) replaces the declared
+        // (0.09, 0.04, 0.30) on the PK-PK block of the block_omega lower
+        // triangle: rows 0, 2, 5 (1-indexed diagonal positions 1, 3, 6).
+        let block_start = model_text.find("block_omega").unwrap();
+        let bracket_start = model_text[block_start..].find('[').unwrap() + block_start;
+        let bracket_end = model_text[bracket_start..].find(']').unwrap() + bracket_start;
+        let rows: Vec<Vec<f64>> = model_text[bracket_start + 1..bracket_end]
+            .lines()
+            .map(|l| l.trim().trim_end_matches(','))
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                l.split(',')
+                    .map(|v| v.trim().parse::<f64>().unwrap())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            (rows[0][0] - 0.11).abs() < 1e-9,
+            "ETA_CL diag: {:?}",
+            rows[0]
+        );
+        assert!(
+            (rows[1][1] - 0.05).abs() < 1e-9,
+            "ETA_V diag: {:?}",
+            rows[1]
+        );
+        assert!(
+            (rows[2][2] - 0.28).abs() < 1e-9,
+            "ETA_KA diag: {:?}",
+            rows[2]
+        );
     }
 
     #[test]
@@ -1220,7 +1437,7 @@ mod tests {
         let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
 
         let model_text =
-            generate_frem_model(base_text, &model, &info, Path::new("test.csv")).unwrap();
+            generate_frem_model(base_text, &model, &info, Path::new("test.csv"), None).unwrap();
 
         assert!(
             model_text.contains("[scaling]"),

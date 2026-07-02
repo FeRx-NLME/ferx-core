@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`prepare_frem()` accepts a prior fit to seed FREM init values** (#239). The new
+  optional `fit_init: Option<&FremFitInit>` parameter carries a completed fit's theta
+  and omega estimates; when supplied, the generated FREM model's PK theta inits and
+  PK-PK omega block are seeded from those converged values instead of the base
+  model file's declared inits, so a subsequent fit of the FREM model warm-starts
+  closer to convergence. Names are matched case-insensitively against the base
+  model; unmatched names fall back to the declared inits. `None` preserves the
+  prior behaviour unchanged.
 - **Covariate-selected residual error models (`if/else` in `[error_model]`)** (#658).
   The `[error_model]` block can now select a residual error model per observation
   by an arbitrary covariate condition — e.g. a free-vs-total assay switched by a
