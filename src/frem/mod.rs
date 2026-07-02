@@ -656,7 +656,10 @@ pub fn generate_frem_model(
 
 /// Look up the fitted omega value for an eta pair by name (case-insensitive).
 /// Returns `None` when either name is absent from `fit_init`, so the caller
-/// falls back to the base model's declared omega.
+/// falls back to the base model's declared omega. Also returns `None` (rather
+/// than panicking) when a matched name index falls outside `omega` — i.e. a
+/// malformed `FremFitInit` whose `eta_names` is longer than the matrix is
+/// dimensioned — so an inconsistent public-API input degrades gracefully.
 fn fit_omega_value(fit_init: &FremFitInit, name_i: &str, name_j: &str) -> Option<f64> {
     let idx_i = fit_init
         .eta_names
@@ -666,6 +669,9 @@ fn fit_omega_value(fit_init: &FremFitInit, name_i: &str, name_j: &str) -> Option
         .eta_names
         .iter()
         .position(|n| n.eq_ignore_ascii_case(name_j))?;
+    if idx_i >= fit_init.omega.nrows() || idx_j >= fit_init.omega.ncols() {
+        return None;
+    }
     Some(fit_init.omega[(idx_i, idx_j)])
 }
 
@@ -1396,6 +1402,90 @@ mod tests {
         );
         assert!(
             (rows[2][2] - 0.28).abs() < 1e-9,
+            "ETA_KA diag: {:?}",
+            rows[2]
+        );
+    }
+
+    #[test]
+    fn test_generate_frem_model_tolerates_fit_init_omega_dim_mismatch() {
+        // Regression: a malformed `FremFitInit` whose `eta_names` is longer than
+        // its `omega` is dimensioned must degrade gracefully (fall back to the
+        // declared omega) instead of panicking on an out-of-bounds index inside
+        // `fit_omega_value`. The base model has 3 PK etas; here `omega` is only
+        // 2x2, so the ETA_KA lookup (index 2) is out of range.
+        let base_text = r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+        let pop = make_test_population();
+        let model = make_test_model();
+        let covs = vec!["WT".to_string()];
+        let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
+
+        // eta_names names all 3 PK etas, but omega is only 2x2 (ETA_KA -> idx 2
+        // is out of bounds).
+        let fit_init = FremFitInit {
+            theta: vec![("TVCL".to_string(), 0.321)],
+            eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
+            omega: DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.11, 0.05])),
+        };
+
+        // Must not panic; the in-range ETA_CL/ETA_V entries are seeded from the
+        // fit, ETA_KA falls back to the declared 0.30.
+        let model_text = generate_frem_model(
+            base_text,
+            &model,
+            &info,
+            Path::new("test.csv"),
+            Some(&fit_init),
+        )
+        .unwrap();
+
+        let block_start = model_text.find("block_omega").unwrap();
+        let bracket_start = model_text[block_start..].find('[').unwrap() + block_start;
+        let bracket_end = model_text[bracket_start..].find(']').unwrap() + bracket_start;
+        let rows: Vec<Vec<f64>> = model_text[bracket_start + 1..bracket_end]
+            .lines()
+            .map(|l| l.trim().trim_end_matches(','))
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                l.split(',')
+                    .map(|v| v.trim().parse::<f64>().unwrap())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            (rows[0][0] - 0.11).abs() < 1e-9,
+            "ETA_CL diag: {:?}",
+            rows[0]
+        );
+        assert!(
+            (rows[1][1] - 0.05).abs() < 1e-9,
+            "ETA_V diag: {:?}",
+            rows[1]
+        );
+        // ETA_KA out of range in fit omega -> declared 0.30 retained.
+        assert!(
+            (rows[2][2] - 0.30).abs() < 1e-9,
             "ETA_KA diag: {:?}",
             rows[2]
         );
