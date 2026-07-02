@@ -675,6 +675,40 @@ fn fit_omega_value(fit_init: &FremFitInit, name_i: &str, name_j: &str) -> Option
     Some(fit_init.omega[(idx_i, idx_j)])
 }
 
+/// Advisory warnings for a `fit_init` that shares no theta / eta names with the
+/// base model — the likely sign a fit of a *different* model was passed in, so
+/// the generated FREM model silently fell back to the declared inits (issue
+/// #239). Returns one message per axis (theta, eta) that has candidate names on
+/// both sides yet matches none; an empty vec means the fit lines up (or has
+/// nothing to compare). Pure over its inputs so it is unit-testable without the
+/// file IO of [`prepare_frem`].
+fn fit_init_name_warnings(base_model: &CompiledModel, fi: &FremFitInit) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let theta_matched = base_model
+        .theta_names
+        .iter()
+        .any(|n| fi.theta.iter().any(|(fn_, _)| fn_.eq_ignore_ascii_case(n)));
+    if !base_model.theta_names.is_empty() && !fi.theta.is_empty() && !theta_matched {
+        warnings.push(
+            "FREM conversion: the supplied `fit` has no theta names matching the base \
+             model, so the model file's declared theta init values were used instead."
+                .to_string(),
+        );
+    }
+    let eta_matched = base_model
+        .eta_names
+        .iter()
+        .any(|n| fi.eta_names.iter().any(|fn_| fn_.eq_ignore_ascii_case(n)));
+    if !base_model.eta_names.is_empty() && !fi.eta_names.is_empty() && !eta_matched {
+        warnings.push(
+            "FREM conversion: the supplied `fit`'s omega has no eta names matching the \
+             base model, so the model file's declared omega init values were used instead."
+                .to_string(),
+        );
+    }
+    warnings
+}
+
 /// Rewrite a `theta NAME(init, ...)` declaration line, substituting `init`
 /// with the value from a prior fit (issue #239) when the fit has an entry
 /// for `NAME`. Bounds, `FIX` flags, and trailing comments are left byte-for-byte
@@ -914,28 +948,7 @@ pub fn prepare_frem(
     // model — most likely a fit of a different model was passed in, so the
     // generated FREM model silently fell back to the declared inits.
     if let Some(fi) = fit_init {
-        let theta_matched = base_model
-            .theta_names
-            .iter()
-            .any(|n| fi.theta.iter().any(|(fn_, _)| fn_.eq_ignore_ascii_case(n)));
-        if !base_model.theta_names.is_empty() && !fi.theta.is_empty() && !theta_matched {
-            warnings.push(
-                "FREM conversion: the supplied `fit` has no theta names matching the base \
-                 model, so the model file's declared theta init values were used instead."
-                    .to_string(),
-            );
-        }
-        let eta_matched = base_model
-            .eta_names
-            .iter()
-            .any(|n| fi.eta_names.iter().any(|fn_| fn_.eq_ignore_ascii_case(n)));
-        if !base_model.eta_names.is_empty() && !fi.eta_names.is_empty() && !eta_matched {
-            warnings.push(
-                "FREM conversion: the supplied `fit`'s omega has no eta names matching the \
-                 base model, so the model file's declared omega init values were used instead."
-                    .to_string(),
-            );
-        }
+        warnings.extend(fit_init_name_warnings(base_model, fi));
     }
 
     Ok(FremPrepareResult {
@@ -1489,6 +1502,98 @@ mod tests {
             "ETA_KA diag: {:?}",
             rows[2]
         );
+    }
+
+    #[test]
+    fn test_fit_init_name_warnings() {
+        let model = make_test_model(); // thetas TVCL/TVV/TVKA, etas ETA_CL/V/KA
+
+        // Names line up (case-insensitively) -> no advisory.
+        let ok = FremFitInit {
+            theta: vec![("tvcl".into(), 0.3)],
+            eta_names: vec!["eta_cl".into()],
+            omega: DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.1])),
+        };
+        assert!(fit_init_name_warnings(&model, &ok).is_empty());
+
+        // A different model's fit: no theta and no eta names match -> two
+        // advisories, one per axis.
+        let wrong = FremFitInit {
+            theta: vec![("FOO".into(), 1.0)],
+            eta_names: vec!["ETA_BAR".into()],
+            omega: DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.1])),
+        };
+        let w = fit_init_name_warnings(&model, &wrong);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("theta names"));
+        assert!(w[1].contains("eta names"));
+
+        // Theta matches but eta does not -> only the eta advisory.
+        let theta_only = FremFitInit {
+            theta: vec![("TVCL".into(), 0.3)],
+            eta_names: vec!["ETA_BAR".into()],
+            omega: DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.1])),
+        };
+        let w = fit_init_name_warnings(&model, &theta_only);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("eta names"));
+
+        // Nothing to compare (empty fit) -> no advisory.
+        let empty = FremFitInit {
+            theta: vec![],
+            eta_names: vec![],
+            omega: DMatrix::zeros(0, 0),
+        };
+        assert!(fit_init_name_warnings(&model, &empty).is_empty());
+    }
+
+    #[test]
+    fn test_override_theta_init_fallbacks() {
+        let re = Regex::new(r"(?i)^\s*theta\s+(\w+)\s*\(\s*([0-9eE.+-]+)").unwrap();
+        let fit = FremFitInit {
+            theta: vec![("TVCL".into(), 0.321)],
+            eta_names: vec![],
+            omega: DMatrix::zeros(0, 0),
+        };
+
+        // Matched name -> init token replaced, bounds untouched.
+        assert_eq!(
+            override_theta_init("theta TVCL(0.2, 0.001, 10.0)", &fit, &re),
+            "theta TVCL(0.321, 0.001, 10.0)"
+        );
+        // Name not present in the fit -> line returned unchanged.
+        assert_eq!(
+            override_theta_init("theta TVV(10.0, 0.1, 500.0)", &fit, &re),
+            "theta TVV(10.0, 0.1, 500.0)"
+        );
+        // Line the regex cannot parse -> returned unchanged.
+        assert_eq!(
+            override_theta_init("theta MALFORMED", &fit, &re),
+            "theta MALFORMED"
+        );
+    }
+
+    #[test]
+    fn test_fit_omega_value_lookup_and_bounds() {
+        let fit = FremFitInit {
+            theta: vec![],
+            eta_names: vec!["ETA_CL".into(), "ETA_V".into()],
+            omega: DMatrix::from_row_slice(2, 2, &[0.11, 0.02, 0.02, 0.05]),
+        };
+        // In-range, case-insensitive, symmetric.
+        assert_eq!(fit_omega_value(&fit, "eta_cl", "eta_v"), Some(0.02));
+        assert_eq!(fit_omega_value(&fit, "ETA_V", "ETA_V"), Some(0.05));
+        // Name absent -> None.
+        assert_eq!(fit_omega_value(&fit, "ETA_CL", "ETA_KA"), None);
+
+        // Name present but index outside the (smaller) omega -> None, no panic.
+        let mismatched = FremFitInit {
+            theta: vec![],
+            eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
+            omega: DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.11, 0.05])),
+        };
+        assert_eq!(fit_omega_value(&mismatched, "ETA_KA", "ETA_KA"), None);
+        assert_eq!(fit_omega_value(&mismatched, "ETA_CL", "ETA_KA"), None);
     }
 
     #[test]
