@@ -4576,6 +4576,34 @@ pub struct FitOptions {
     /// raises the per-subject ESS floor by ≈`alpha` (so `imp_low_ess_threshold`
     /// flags fewer subjects).
     pub imp_defensive_alpha: f64,
+    /// Convex-blend weight, in `(0.0, 1.0]`, on IMPMAP's fresh per-iteration
+    /// joint-MAP estimate vs. its own previous iteration's joint-MAP estimate,
+    /// when centering the FREM Rao-Blackwell proposal (issue #678, only
+    /// consulted on the `impmap` estimating stage). IMPMAP's "MAP re-centered
+    /// every iteration" semantics come from a fresh joint (PK + covariate)
+    /// mode search each step; the Rao-Blackwell math conditions on the
+    /// covariate etas landing exactly at their pinned data deviation, while
+    /// the joint search co-optimizes them freely, so that fresh estimate is
+    /// not fully self-consistent with the Rao-Blackwell conditional the
+    /// proposal is built for and can drift/wobble between comparable local
+    /// optima or noisy curvature estimates from iteration to iteration — a
+    /// per-subject ISCALE pilot search (`iscale_min`/`iscale_max`) can't
+    /// correct this on its own, since it only rescales proposal *width*
+    /// around a shifting center/shape. Setting a value below `1.0` blends
+    /// that fresh estimate toward the previous iteration's own raw joint-MAP
+    /// output (mode and posterior Hessian, from the inner-loop optimizer) to
+    /// damp the drift; `0.0` centers purely on the previous iteration's
+    /// estimate. Default `1.0` (no blend, reproducing the estimator's
+    /// original behaviour) — **this stabilization is opt-in** because its
+    /// benefit has not been validated against a real high-dimensional FREM
+    /// fit; an earlier internal design that blended against the previous
+    /// iteration's *importance-weighted empirical moments* instead made
+    /// convergence measurably worse under low ESS (a collapsed
+    /// self-normalized weight makes the empirical covariance collapse toward
+    /// zero, and inverting it explodes into a garbage precision), so treat
+    /// this as an experimental knob to try on a real low-ESS FREM fit rather
+    /// than a proven fix. Must be in `(0.0, 1.0]`.
+    pub impmap_rb_recenter_blend: f64,
     /// How LOQ-censored observations are handled.
     /// See [`BloqMethod`]. Defaults to `Drop` (backward-compatible: no effect
     /// when the data has no CENS column).
@@ -4864,6 +4892,7 @@ impl Default for FitOptions {
             iscale_min: 0.1,
             iscale_max: 10.0,
             imp_defensive_alpha: 0.0,
+            impmap_rb_recenter_blend: 1.0,
             bloq_method: BloqMethod::Drop,
             npde_nsim: 0,
             npde_seed: None,
@@ -5427,6 +5456,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             // "unsupported" (issue #528).
             "impmap_defensive_alpha",
             "imp_defensive_alpha",
+            "impmap_rb_recenter_blend",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",

@@ -111,23 +111,27 @@ section of the SDLC for the versioning policy).
   Mirrors the ISCALE rescue the full-dimensional sampler already had. Applies to
   the iterative MCEM E-step only; the eval-only / final-marginal IS report keeps
   a fixed proposal for run-to-run reproducibility.
-- **IMPMAP's FREM Rao-Blackwell proposal now damps its per-iteration re-centering
-  against the previous iteration's actual importance-weighted draws** (#678,
-  #676 follow-up). IMPMAP re-solves the full joint (PK + covariate) MAP mode
-  every MCEM iteration, but the RB math conditions on the covariate etas
-  landing exactly at their pinned data deviation, so that fresh joint estimate
-  is not fully self-consistent with the RB conditional the proposal is built
-  for — it can wobble between comparable local optima or noisy curvature
-  estimates from one iteration to the next, which a per-subject ISCALE rescale
-  alone can't correct since it only rescales width around a shifting center.
-  The proposal center/curvature is now an even blend of the fresh per-iteration
-  estimate and the previous iteration's actual RB-draws-derived empirical
-  moments (the same self-correcting signal IMP's `SampleMoments` recenter
-  already relies on), damping the drift while keeping IMPMAP's
-  re-center-every-iteration behaviour. Plain (non-FREM) IMPMAP and IMP are
-  unaffected.
 
 ### Added
+- **`impmap_rb_recenter_blend` fit option (experimental, opt-in)** for IMPMAP's
+  FREM Rao-Blackwell E-step (#678, #676 follow-up). IMPMAP re-solves the full
+  joint (PK + covariate) MAP mode every MCEM iteration, but the RB math
+  conditions on the covariate etas landing exactly at their pinned data
+  deviation, so that fresh joint estimate is not fully self-consistent with
+  the RB conditional the proposal is built for — it can wobble between
+  comparable local optima or noisy curvature estimates from one iteration to
+  the next, which a per-subject ISCALE rescale alone can't correct since it
+  only rescales width around a shifting center. Setting a value below the
+  default `1.0` blends the fresh per-iteration joint-MAP estimate with the
+  previous iteration's own joint-MAP estimate (mode and posterior Hessian,
+  straight from the inner-loop optimizer) to damp that drift. This is opt-in,
+  not a default behaviour change: an earlier internal design that blended
+  against the previous iteration's *importance-weighted empirical moments*
+  instead made convergence measurably worse under low ESS (inverting a
+  collapsed self-normalized weight's near-zero empirical covariance produced
+  an exploding, garbage precision), and this option's benefit has not yet
+  been validated against a real high-dimensional FREM fit. See
+  [`impmap_rb_recenter_blend`](https://ferx-nlme.github.io/ferx-core/model-file/fit-options.html).
 - **Log-transform-both-sides (LTBS) combined with time-varying covariates** now gets an exact
   analytic FOCE/FOCEI **outer** (θ/Ω/σ) gradient on the closed-form (analytical 1-/2-/3-cpt)
   models instead of finite differences (#486). The event-driven TV-cov walk applies the same

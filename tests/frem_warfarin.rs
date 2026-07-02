@@ -255,6 +255,87 @@ fn frem_impmap_rao_blackwell_runs_finite() {
     );
 }
 
+/// `impmap_rb_recenter_blend` (issue #678) is opt-in and defaults to `1.0` (no
+/// blend). A fit that never touches the option must reproduce the same result
+/// as one that explicitly disables it (`1.0`), and must differ from one that
+/// turns the blend on (`0.5`) — proving both that the default is a true no-op
+/// and that the field is actually load-bearing.
+#[test]
+fn frem_impmap_rb_recenter_blend_default_is_a_no_op() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = setup_frem(tmp.path());
+    let model = parse_model_file(&result.model_path).unwrap();
+    let pop = read_nonmem_csv(&result.data_path, None, None).unwrap();
+
+    let run = |opts: FitOptions| fit(&model, &pop, &model.default_params, &opts).expect("fit ok");
+
+    let mut default_opts = FitOptions::default();
+    default_opts.method = ferx_core::EstimationMethod::Impmap;
+    default_opts.impmap_iterations = 5;
+    default_opts.impmap_samples = 200;
+    default_opts.run_covariance_step = false;
+    default_opts.verbose = false;
+    // `impmap_rb_recenter_blend` deliberately left untouched.
+
+    let mut explicit_disabled = default_opts.clone();
+    explicit_disabled.impmap_rb_recenter_blend = 1.0;
+
+    let mut enabled = default_opts.clone();
+    enabled.impmap_rb_recenter_blend = 0.5;
+
+    assert_eq!(default_opts.impmap_rb_recenter_blend, 1.0);
+    let default_fit = run(default_opts);
+    let explicit_fit = run(explicit_disabled);
+    let enabled_fit = run(enabled);
+
+    assert_eq!(
+        default_fit.ofv, explicit_fit.ofv,
+        "untouched default must match explicit 1.0"
+    );
+    assert_ne!(
+        default_fit.ofv, enabled_fit.ofv,
+        "0.5 must actually change the result — the option must be load-bearing"
+    );
+}
+
+/// Regression test for a real bug caught during manual validation of issue
+/// #678: an earlier internal design blended the FREM Rao-Blackwell IMPMAP
+/// proposal against the *importance-weighted empirical moments* from the
+/// previous iteration's actual draws. Under forced low ESS (a collapsed
+/// self-normalized weight), that empirical covariance collapsed toward zero
+/// and inverting it exploded into a garbage precision — the final OFV blew up
+/// to ~4x10^5 on this exact scenario (20 iterations, `impmap_samples = 50` to
+/// force low ESS). The corrected design blends against the previous
+/// iteration's *raw joint-MAP output* instead (mode + posterior Hessian from
+/// the inner-loop optimizer, never inverted from a covariance), which cannot
+/// explode this way — bounded by construction because it's a convex
+/// combination of two already-legitimate precision matrices.
+#[test]
+fn frem_impmap_rb_recenter_blend_stays_bounded_under_forced_low_ess() {
+    let tmp = tempfile::tempdir().unwrap();
+    let result = setup_frem(tmp.path());
+    let model = parse_model_file(&result.model_path).unwrap();
+    let pop = read_nonmem_csv(&result.data_path, None, None).unwrap();
+
+    let mut opts = FitOptions::default();
+    opts.method = ferx_core::EstimationMethod::Impmap;
+    opts.impmap_iterations = 20;
+    opts.impmap_samples = 50; // deliberately small — forces low ESS
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+    opts.impmap_rb_recenter_blend = 0.5;
+
+    let fit_result = fit(&model, &pop, &model.default_params, &opts)
+        .expect("FREM IMPMAP fit with recenter blending should not error");
+
+    assert!(
+        fit_result.ofv.is_finite() && fit_result.ofv < 1.0e5,
+        "blended IMPMAP OFV under forced low ESS should stay bounded (reverted \
+         design reached ~4x10^5 here), got {}",
+        fit_result.ofv
+    );
+}
+
 /// The defensive mixture (`imp_defensive_alpha > 0`, issue #528) must also apply
 /// on the FREM Rao-Blackwell E-step — its covering component is the conditional
 /// PK prior `N(μ, P_pp⁻¹)`. A few IMPMAP iterations with the mixture enabled must

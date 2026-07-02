@@ -4969,6 +4969,18 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
             opts.imp_defensive_alpha = v;
         }
+        // Opt-in FREM Rao-Blackwell IMPMAP proposal stabilization (issue #678).
+        // Default `1.0` (no blend) reproduces the estimator's original
+        // behaviour exactly; see the field doc for why this isn't on by default.
+        "impmap_rb_recenter_blend" => {
+            let v = parse_f64("impmap_rb_recenter_blend")?;
+            if !(0.0..=1.0).contains(&v) || v == 0.0 {
+                return Err(format!(
+                    "fit option `impmap_rb_recenter_blend` must be in (0, 1], got {v}"
+                ));
+            }
+            opts.impmap_rb_recenter_blend = v;
+        }
         "npde_nsim" => opts.npde_nsim = parse_usize("npde_nsim")?,
         "npde_seed" => opts.npde_seed = parse_u64_opt("npde_seed")?,
         "mu_referencing" => opts.mu_referencing = parse_bool("mu_referencing")?,
@@ -17394,6 +17406,28 @@ mod tests {
         assert!(parse_fit_options(&["imp_defensive_alpha = 1.0".to_string()]).is_err());
         assert!(parse_fit_options(&["imp_defensive_alpha = -0.1".to_string()]).is_err());
         assert!(parse_fit_options(&["impmap_defensive_alpha = 1.0".to_string()]).is_err());
+    }
+
+    #[test]
+    fn test_parse_impmap_rb_recenter_blend() {
+        // Default is opt-out (no blend, the estimator's original behaviour) —
+        // this stabilization is experimental (issue #678).
+        assert_eq!(
+            parse_fit_options(&[]).unwrap().impmap_rb_recenter_blend,
+            1.0
+        );
+        let opts = parse_fit_options(&["impmap_rb_recenter_blend = 0.5".to_string()]).unwrap();
+        assert_eq!(opts.impmap_rb_recenter_blend, 0.5);
+        assert_eq!(
+            parse_fit_options(&["impmap_rb_recenter_blend = 1.0".to_string()])
+                .unwrap()
+                .impmap_rb_recenter_blend,
+            1.0
+        );
+        // Out of (0, 1] is rejected at parse time.
+        assert!(parse_fit_options(&["impmap_rb_recenter_blend = 0.0".to_string()]).is_err());
+        assert!(parse_fit_options(&["impmap_rb_recenter_blend = -0.1".to_string()]).is_err());
+        assert!(parse_fit_options(&["impmap_rb_recenter_blend = 1.1".to_string()]).is_err());
     }
 
     #[test]
