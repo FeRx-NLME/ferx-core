@@ -111,6 +111,21 @@ section of the SDLC for the versioning policy).
   Mirrors the ISCALE rescue the full-dimensional sampler already had. Applies to
   the iterative MCEM E-step only; the eval-only / final-marginal IS report keeps
   a fixed proposal for run-to-run reproducibility.
+- **IMPMAP's FREM Rao-Blackwell proposal now damps its per-iteration re-centering
+  against the previous iteration's actual importance-weighted draws** (#678,
+  #676 follow-up). IMPMAP re-solves the full joint (PK + covariate) MAP mode
+  every MCEM iteration, but the RB math conditions on the covariate etas
+  landing exactly at their pinned data deviation, so that fresh joint estimate
+  is not fully self-consistent with the RB conditional the proposal is built
+  for — it can wobble between comparable local optima or noisy curvature
+  estimates from one iteration to the next, which a per-subject ISCALE rescale
+  alone can't correct since it only rescales width around a shifting center.
+  The proposal center/curvature is now an even blend of the fresh per-iteration
+  estimate and the previous iteration's actual RB-draws-derived empirical
+  moments (the same self-correcting signal IMP's `SampleMoments` recenter
+  already relies on), damping the drift while keeping IMPMAP's
+  re-center-every-iteration behaviour. Plain (non-FREM) IMPMAP and IMP are
+  unaffected.
 
 ### Added
 - **Log-transform-both-sides (LTBS) combined with time-varying covariates** now gets an exact

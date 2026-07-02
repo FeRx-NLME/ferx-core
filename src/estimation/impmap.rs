@@ -87,6 +87,30 @@ const AUTO_SAMPLES_MAX: usize = 10_000;
 /// and collapse the ESS (the very rich-data failure mode that motivates IMPMAP).
 const IMP_PROPOSAL_COV_FLOOR: f64 = 1e-10;
 
+/// Convex-blend weight on the fresh per-iteration joint-MAP estimate vs. the
+/// previous iteration's actual RB-draws-derived empirical moments, when
+/// centering the FREM Rao-Blackwell IMPMAP proposal (issue #678). IMPMAP's
+/// "MAP re-centered every iteration" semantics come from a fresh joint
+/// (PK + covariate) mode search each step; the RB math conditions on the
+/// covariate etas landing exactly at their pinned deviation `d`, while the
+/// joint search co-optimizes them freely, so that fresh estimate is not fully
+/// self-consistent with the RB conditional the proposal is built for and can
+/// drift/wobble between comparable local optima or noisy curvature estimates
+/// — #676's own reprex still showed ~450/475 low-ESS subjects on the IMPMAP
+/// stage after fixing ISCALE alone, because a scalar proposal-width rescale
+/// cannot correct a shifting center/shape. IMP's `SampleMoments` recenter
+/// does not have this problem: after seeding, it centers purely on the
+/// previous iteration's actual importance-weighted RB draws — a
+/// self-correcting signal built from the true sampling distribution. Blending
+/// that same signal into IMPMAP's per-iteration re-anchor damps the drift
+/// while keeping the "re-center every iteration" property IMPMAP needs to
+/// track a moving θ/Ω. `0.5` is an even, unweighted blend; there is no NONMEM
+/// equivalent to calibrate against (this is a ferx-specific stabilization,
+/// not something NONMEM's IMPMAP does), so this is a deliberately
+/// conservative starting point pending validation against a real
+/// high-dimensional FREM reprex.
+const FREM_RB_MAP_RECENTER_BLEND: f64 = 0.5;
+
 /// Objective ceiling beyond which an estimation run is declared diverged rather
 /// than converged (issue #528). A collapsed-weight runaway pins θ to the
 /// parameter bounds and the final FOCE-Laplace OFV blows up to ~1e35 — a finite
@@ -157,6 +181,28 @@ fn covariance_to_proposal_hessian(
         Some(ch) => ch.inverse(),
         None => DMatrix::zeros(n, n),
     }
+}
+
+/// Blend IMPMAP's fresh per-iteration joint-MAP proposal estimate with the
+/// previous iteration's actual RB-draws-derived empirical moments (issue
+/// #678 — see [`FREM_RB_MAP_RECENTER_BLEND`] for the rationale). `weight =
+/// 1.0` reproduces the pre-#678 pure-fresh estimate; `weight = 0.0`
+/// reproduces IMP's `SampleMoments` recenter exactly (pure previous-moments),
+/// via the same [`covariance_to_proposal_hessian`] IMP already uses.
+fn blend_rb_map_recenter(
+    center: &DVector<f64>,
+    h_post: &DMatrix<f64>,
+    prev: &SubjectDraws,
+    omega_matrix: &DMatrix<f64>,
+    weight: f64,
+) -> (DVector<f64>, DMatrix<f64>) {
+    let prev_mean = DVector::from_row_slice(&prev.mean);
+    let prev_cov = &prev.second_moment - &prev_mean * prev_mean.transpose();
+    let prev_h = covariance_to_proposal_hessian(&prev_cov, omega_matrix, IMP_PROPOSAL_COV_FLOOR);
+    (
+        center.scale(weight) + prev_mean.scale(1.0 - weight),
+        h_post.scale(weight) + prev_h.scale(1.0 - weight),
+    )
 }
 
 /// Log-transformed mu-referencing pairs `(theta_idx, eta_idx)`. For these the
@@ -802,14 +848,31 @@ fn run_mcem(
                                 cov_idx,
                             )
                         {
+                            // IMPMAP-only: damp the fresh joint-MAP center/curvature
+                            // toward the previous iteration's actual RB-draws moments
+                            // (issue #678, `FREM_RB_MAP_RECENTER_BLEND`). `prev_draws`
+                            // is `None` on the first iteration (pure fresh estimate,
+                            // same as before this fix) and always `None` for IMP here
+                            // (IMP only reaches this branch on its own seeding
+                            // iteration, before any draws exist).
+                            let (center_rb, h_post_rb) = match (recenter, prev_draws.as_ref()) {
+                                (ProposalRecenter::Map, Some(pd)) => blend_rb_map_recenter(
+                                    &center,
+                                    &h_post,
+                                    &pd[i],
+                                    &params_k.omega.matrix,
+                                    FREM_RB_MAP_RECENTER_BLEND,
+                                ),
+                                _ => (center.clone(), h_post.clone()),
+                            };
                             let rb_iscale =
                                 crate::estimation::importance_sampling::find_optimal_iscale_frem_rb(
                                     model,
                                     subject,
                                     &params_k.theta,
                                     &params_k.sigma.values,
-                                    &center,
-                                    &h_post,
+                                    &center_rb,
+                                    &h_post_rb,
                                     &omega_inv,
                                     &params_k.omega.matrix,
                                     &sampled,
@@ -828,8 +891,8 @@ fn run_mcem(
                                     subject,
                                     &params_k.theta,
                                     &params_k.sigma.values,
-                                    &center,
-                                    &h_post,
+                                    &center_rb,
+                                    &h_post_rb,
                                     &omega_inv,
                                     &params_k.omega.matrix,
                                     &sampled,
@@ -1053,10 +1116,14 @@ fn run_mcem(
             last_eta_hats = eta_hats;
         }
 
-        // IMP recenters the next iteration's proposal from these draws; IMPMAP
-        // never reads them, so retain only for `SampleMoments` to avoid holding
-        // K·n_subjects samples for the MAP path.
-        if recenter == ProposalRecenter::SampleMoments {
+        // IMP recenters the next iteration's proposal from these draws. Plain
+        // IMPMAP never reads them, so they're dropped there to avoid holding
+        // K·n_subjects samples for the MAP path — except on the FREM
+        // Rao-Blackwell path, where IMPMAP blends them into its own recenter
+        // to damp joint-mode drift (issue #678, `FREM_RB_MAP_RECENTER_BLEND`).
+        if recenter == ProposalRecenter::SampleMoments
+            || (recenter == ProposalRecenter::Map && frem_rb.is_some())
+        {
             prev_draws = Some(draws);
         }
 
@@ -1484,6 +1551,115 @@ mod tests {
         assert!(!objective_converged(1e35));
         assert!(!objective_converged(1e20));
         assert!(!objective_converged(OFV_DIVERGENCE_CAP));
+    }
+
+    /// Bare-bones `SubjectDraws` carrying only the fields `blend_rb_map_recenter`
+    /// reads (`mean`, `second_moment`); the IS-diagnostic fields are unused here.
+    fn draws_with_moments(mean: Vec<f64>, second_moment: DMatrix<f64>) -> SubjectDraws {
+        SubjectDraws {
+            log_marginal: 0.0,
+            ess_fraction: 1.0,
+            etas: Vec::new(),
+            weights: Vec::new(),
+            mean,
+            second_moment,
+        }
+    }
+
+    #[test]
+    fn blend_rb_map_recenter_weight_one_is_pure_fresh() {
+        // Issue #678: `weight = 1.0` must reproduce the pre-fix behaviour
+        // (proposal centred purely at the fresh joint-MAP estimate) exactly,
+        // regardless of what the previous iteration's draws looked like.
+        let center = DVector::from_column_slice(&[1.0, -2.0]);
+        let h_post = DMatrix::from_row_slice(2, 2, &[4.0, 0.0, 0.0, 9.0]);
+        let prev = draws_with_moments(
+            vec![10.0, -10.0],
+            DMatrix::from_row_slice(2, 2, &[101.0, 100.0, 100.0, 101.0]),
+        );
+        let omega = DMatrix::<f64>::identity(2, 2);
+        let (c, h) = blend_rb_map_recenter(&center, &h_post, &prev, &omega, 1.0);
+        assert!((c - &center).norm() < 1e-12);
+        assert!((h - &h_post).norm() < 1e-12);
+    }
+
+    #[test]
+    fn blend_rb_map_recenter_weight_zero_matches_sample_moments_math() {
+        // `weight = 0.0` must reproduce IMP's `SampleMoments` recenter exactly:
+        // centre at the previous draws' weighted mean, scale from
+        // `covariance_to_proposal_hessian` on the previous weighted covariance —
+        // the same call IMP's own recenter branch makes.
+        let center = DVector::from_column_slice(&[1.0, -2.0]);
+        let h_post = DMatrix::from_row_slice(2, 2, &[4.0, 0.0, 0.0, 9.0]);
+        let mean = vec![0.3, -0.1];
+        let mean_v = DVector::from_row_slice(&mean);
+        let second_moment = DMatrix::from_row_slice(2, 2, &[0.2, 0.01, 0.01, 0.05]);
+        let prev = draws_with_moments(mean.clone(), second_moment.clone());
+        let omega = DMatrix::<f64>::identity(2, 2) * 0.5;
+
+        let (c, h) = blend_rb_map_recenter(&center, &h_post, &prev, &omega, 0.0);
+
+        assert!((c - &mean_v).norm() < 1e-12);
+        let expected_cov = &second_moment - &mean_v * mean_v.transpose();
+        let expected_h =
+            covariance_to_proposal_hessian(&expected_cov, &omega, IMP_PROPOSAL_COV_FLOOR);
+        assert!((h - &expected_h).norm() < 1e-12);
+    }
+
+    #[test]
+    fn blend_rb_map_recenter_damps_oscillation_between_two_modes() {
+        // Issue #678's diagnosed failure mode: IMPMAP's fresh joint-MAP estimate
+        // wobbles between two comparable local optima from iteration to
+        // iteration. Simulate that by alternating the "fresh" center between two
+        // fixed points and feeding each blended result back in as next
+        // iteration's `prev` (as `run_mcem` does via `prev_draws`) — the blend
+        // should settle into a periodic steady state whose swing is strictly
+        // smaller than the raw fresh alternation, matching the closed-form
+        // damping ratio `w / (2 - w)` for a period-2 forcing.
+        let a = 2.0_f64;
+        let b = -3.0_f64;
+        let w = FREM_RB_MAP_RECENTER_BLEND;
+        let h_fixed = DMatrix::from_row_slice(1, 1, &[1.0]);
+        let omega = DMatrix::<f64>::identity(1, 1) * 5.0;
+        // Fixed small "previous covariance" each round (0.1), isolating the
+        // mean-blending dynamics the closed-form ratio predicts.
+        let fixed_var = 0.1_f64;
+
+        let mut u = 0.0_f64;
+        // Run enough periods to reach the periodic steady state.
+        for iter in 0..60 {
+            let fresh = if iter % 2 == 0 { a } else { b };
+            let fresh_center = DVector::from_column_slice(&[fresh]);
+            let prev =
+                draws_with_moments(vec![u], DMatrix::from_row_slice(1, 1, &[u * u + fixed_var]));
+            let (c, _h) = blend_rb_map_recenter(&fresh_center, &h_fixed, &prev, &omega, w);
+            u = c[0];
+        }
+
+        // One more full period, after settling, to measure the steady swing.
+        let mut xs = Vec::new();
+        for iter in 0..4 {
+            let fresh = if iter % 2 == 0 { a } else { b };
+            let fresh_center = DVector::from_column_slice(&[fresh]);
+            let prev =
+                draws_with_moments(vec![u], DMatrix::from_row_slice(1, 1, &[u * u + fixed_var]));
+            let (c, _h) = blend_rb_map_recenter(&fresh_center, &h_fixed, &prev, &omega, w);
+            u = c[0];
+            xs.push(u);
+        }
+        let amplitude = (xs[3] - xs[2]).abs();
+        let expected_amplitude = (a - b).abs() * (w / (2.0 - w));
+        assert!(
+            (amplitude - expected_amplitude).abs() < 1e-6,
+            "steady-state swing {amplitude} should match closed-form w/(2-w) prediction {expected_amplitude}"
+        );
+        // The whole point of the blend: the damped swing must be markedly
+        // smaller than the raw fresh alternation it's replacing.
+        assert!(
+            amplitude < (a - b).abs() * 0.5,
+            "blended swing {amplitude} should be well under half the raw fresh swing {}",
+            (a - b).abs()
+        );
     }
 
     #[test]
