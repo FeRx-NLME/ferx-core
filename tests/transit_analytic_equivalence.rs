@@ -284,6 +284,24 @@ fn transit_tv_covariate_rejected() {
     );
 }
 
+#[test]
+fn transit_reset_rejected() {
+    // A system reset (EVID=3/4) zeros compartment amounts mid-profile, which the
+    // superposition closed form cannot express — `fit()` (superposition) would then
+    // silently disagree with the sensitivity path (which washes out pre-reset doses),
+    // so it must be rejected up front (#634 review finding 1).
+    let (an_src, _) = build_pair(false, false);
+    let model = parse_full_model(&an_src).expect("parses").model;
+    let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
+    pop.subjects[0].reset_times = vec![2.0];
+    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("transit + system reset should be rejected");
+    assert!(
+        e.contains("reset") && e.contains("EVID"),
+        "expected a reset-rejection message, got: {e}"
+    );
+}
+
 /// `ode_template one_cpt_transit(...)` desugars to the `transit()` forcing ODE
 /// (#386), so it must `predict()` identically to the analytic `pk` form. Covers the
 /// `ode_template` transit arm and pins the lowering to the closed form.
@@ -700,6 +718,54 @@ fn two_cpt_transit_ss_dose_rejected() {
     assert!(
         e.contains("two_cpt_transit") && (e.contains("steady-state") || e.contains("SS")),
         "expected a two_cpt_transit SS-rejection message, got: {e}"
+    );
+}
+
+/// Flip-flop regime (fast macro-rate `α ≥ KTR`): the analytic 2-cpt transit closed
+/// form returns an identically-zero profile, which silently degenerates a
+/// proportional-error objective. `check_model_data_warnings` must surface a
+/// `W_TRANSIT_FLIP_FLOP` typical-value warning (#634 review finding 3). A huge MTT
+/// (→ tiny `KTR = (n+1)/mtt`) pushes the typical disposition into that regime.
+#[test]
+fn two_cpt_transit_flip_flop_warns() {
+    use ferx_core::api::check_model_data_warnings;
+    let (an_src, _) = build_pair_2cpt(false, false);
+    let mut model = parse_full_model(&an_src).expect("parses").model;
+    let mtt_i = model
+        .default_params
+        .theta_names
+        .iter()
+        .position(|n| n == "TVMTT")
+        .expect("has TVMTT");
+    model.default_params.theta[mtt_i] = 50.0; // KTR = 4/50 = 0.08 < α ≈ 0.19
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 8.0]);
+    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
+    assert!(
+        diags.iter().any(|d| d.code == "W_TRANSIT_FLIP_FLOP"),
+        "expected W_TRANSIT_FLIP_FLOP, got: {:?}",
+        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+    );
+    // And the valid default (small MTT) must *not* warn.
+    let clean = parse_full_model(&an_src).expect("parses").model;
+    let ok = check_model_data_warnings(&clean, &pop, &clean.default_params);
+    assert!(
+        !ok.iter().any(|d| d.code == "W_TRANSIT_FLIP_FLOP"),
+        "in-domain params must not warn flip-flop"
+    );
+}
+
+/// The reset guard also covers the 2-cpt model, naming it (#634 review finding 1).
+#[test]
+fn two_cpt_transit_reset_rejected() {
+    let (an_src, _) = build_pair_2cpt(false, false);
+    let model = parse_full_model(&an_src).expect("parses").model;
+    let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
+    pop.subjects[0].reset_times = vec![2.0];
+    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("2cpt transit + system reset should be rejected");
+    assert!(
+        e.contains("two_cpt_transit") && e.contains("reset"),
+        "expected a two_cpt_transit reset-rejection message, got: {e}"
     );
 }
 

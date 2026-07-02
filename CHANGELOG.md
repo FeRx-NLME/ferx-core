@@ -28,15 +28,20 @@ section of the SDLC for the versioning policy).
   doses, bioavailability, and lag time; with `N = 0` it reduces exactly to first-order (Bateman)
   oral absorption. Steady-state doses, IOV, time-varying covariates, infusions, and a `depot`
   initial amount are rejected with an actionable message (use an ODE transit model for those). See
-  `examples/one_cpt_transit.ferx`.
+  `examples/one_cpt_transit.ferx`. System resets (EVID=3/4) are also rejected, since the
+  superposition closed form cannot express mid-profile compartment zeroing (#634). A typical-value
+  warning (`W_TRANSIT_FLIP_FLOP`) now fires when the disposition rate exceeds the transit rate
+  `KTR = (n+1)/mtt` (the flip-flop regime, where the closed form returns an identically-zero profile
+  that would silently degenerate the objective) (#634).
 - **Analytic transit absorption into a two-compartment disposition** (#386). A new
   `pk two_cpt_transit(cl, v1, q, v2, n, mtt)` structural model extends the closed form to a 2-cpt
   disposition: the Gamma(N+1, KTR) absorption time is convolved with the bi-exponential disposition
   (`convolve_2cpt` — two `convolve_1cpt` terms at the macro-rates α, β), again with exact `Dual2`
   FOCE/FOCEI sensitivities `∂C/∂{CL,V1,Q,V2,N,MTT,F,η}` and no ODE solve. With `N = 0` it reduces
   exactly to 2-cpt first-order oral absorption. Same scope/limits as `one_cpt_transit` (bolus doses,
-  bioavailability, lag time; SS/IOV/TV-covariate/infusion/`depot`-init rejected). See
-  `examples/two_cpt_transit.ferx`.
+  bioavailability, lag time; SS/IOV/TV-covariate/infusion/`depot`-init/resets rejected, flip-flop
+  warning). NCA initial-estimate seeding now peels Q/V2 and seeds the lag time for the transit
+  models too (#634). See `examples/two_cpt_transit.ferx`.
 - `block_sigma` correlated residual errors are now supported under
   `method = focei` and `method = imp`, not just `foce` and `saem` (#616). FOCEI
   carries the off-diagonal residual covariance through the Almquist interaction

@@ -1170,6 +1170,16 @@ pub(crate) fn check_transit_support(
                 subject.id
             ));
         }
+        if subject.has_resets() {
+            return Some(format!(
+                "{name} does not support system resets (EVID=3/4) (subject {}): resets zero \
+                 compartment amounts mid-profile, which the transit superposition closed form \
+                 cannot express (it silently ignores the reset while the sensitivity path washes \
+                 out pre-reset doses, so fit() and predict() would disagree). Use an ODE transit \
+                 model.",
+                subject.id
+            ));
+        }
         for dose in &subject.doses {
             if dose.ss {
                 return Some(format!(
@@ -1731,6 +1741,55 @@ pub fn check_model_data_warnings(
                         ));
                     }
                 }
+            }
+        }
+    }
+
+    // Analytic transit flip-flop diagnostic (#634 review finding 3). The transit
+    // closed forms converge only when the disposition rate is below the transit
+    // rate `KTR = (n+1)/mtt` (for 2-cpt, the *fast* macro-rate `α`; for 1-cpt,
+    // `ke = CL/V`). Outside that domain the closed form returns an identically-zero
+    // profile — which is parameter-dependent, so `check_transit_support` can't
+    // reject it up front, and with a proportional error model an all-zero IPRED
+    // silently degenerates the likelihood with no other diagnostic. The 2-cpt case
+    // hits this readily (a slow-absorption depot drug with large MTT easily has
+    // `α ≥ KTR`). Evaluated on typical values (η = 0) per subject so a covariate on
+    // MTT/CL that pushes the typical profile into the flip-flop regime is caught.
+    // Reported once, naming the first affected subject.
+    if matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit
+    ) {
+        for subject in &population.subjects {
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
+            let (cl, v1, n, mtt) = (pk.cl(), pk.v(), pk.n_transit(), pk.mtt());
+            if !(mtt > 0.0 && n >= 0.0 && v1 > 0.0 && cl > 0.0) {
+                continue; // invalid params are a separate (fatal) domain check
+            }
+            let ktr = (n + 1.0) / mtt;
+            let disp_rate = match model.pk_model {
+                PkModel::TwoCptTransit => {
+                    crate::sens::two_cpt::macro_rates_g::<f64>(cl, v1, pk.q(), pk.v2()).0
+                }
+                _ => cl / v1,
+            };
+            if disp_rate >= ktr {
+                diags.push(Diagnostic::warning(
+                    "W_TRANSIT_FLIP_FLOP",
+                    format!(
+                        "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
+                         typical values (subject {}): the analytic transit closed form is outside \
+                         its convergence domain and returns an identically-zero concentration \
+                         profile, which silently degenerates the objective (a proportional error \
+                         model collapses `(σ·pred)²` to 0). This is the flip-flop regime — check \
+                         the MTT / CL starting estimates, or use an ODE transit model.",
+                        model.pk_model.canonical_name(),
+                        disp_rate,
+                        ktr,
+                        subject.id
+                    ),
+                ));
+                break;
             }
         }
     }

@@ -36,6 +36,46 @@ pub(crate) fn macro_rates_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> (T, T, T) {
     (alpha, beta, k21)
 }
 
+/// Shared domain guard for the analytic 2-cpt transit closed forms (#386 PR D):
+/// the central concentration ([`two_cpt_transit_amt_g`]) and the peripheral / depot
+/// `[derived]` amounts (`crate::pk::two_compartment`) must reject the *same*
+/// parameter region or they drift out of mass balance (#634 review findings 4/7).
+/// Returns the macro-rates `(α, β, k21)` when the disposition params are physical,
+/// the eigenvalues are distinct (non-confluent — `convolve_2cpt`'s `1/(α−β)`
+/// residues are otherwise undefined), and the fast macro-rate is inside the
+/// convergence domain `α < KTR = (n+1)/mtt` (since `α ≥ β`, guarding `α` suffices);
+/// returns `None` otherwise. The `α < KTR` test is written `!(α < KTR)` so a
+/// transient `NaN` macro-rate (an additive-η / wide-FD excursion on a mis-specified
+/// fit) short-circuits to `None` rather than slipping past a `α >= KTR` form into
+/// `mgf`'s `debug_assert`.
+pub(crate) fn transit_2cpt_domain_ok<T: PkNum>(
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    n: T,
+    mtt: T,
+) -> Option<(T, T, T)> {
+    if v1.val() <= 0.0
+        || cl.val() <= 0.0
+        || q.val() < 0.0
+        || v2.val() <= 0.0
+        || n.val() < 0.0
+        || mtt.val() <= 0.0
+    {
+        return None;
+    }
+    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+    if (alpha - beta).val().abs() < 1e-12 {
+        return None;
+    }
+    let ktr = (n + T::from_f64(1.0)) / mtt;
+    if !(alpha.val() < ktr.val()) {
+        return None;
+    }
+    Some((alpha, beta, k21))
+}
+
 /// 2-cpt IV bolus: `C = A·e^{−αt} + B·e^{−βt}`. `t` is generic so the caller can
 /// seed it as a dual carrying the lagtime sensitivity (`∂t/∂lagtime = −1`).
 pub fn two_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T) -> T {
@@ -191,28 +231,14 @@ pub fn two_cpt_transit_amt_g<T: PkNum>(
     mtt: T,
     f_bio: T,
 ) -> T {
-    if t.val() < 0.0
-        || v1.val() <= 0.0
-        || cl.val() <= 0.0
-        || q.val() < 0.0
-        || v2.val() <= 0.0
-        || n.val() < 0.0
-        || mtt.val() <= 0.0
-    {
+    if t.val() < 0.0 {
         return T::from_f64(0.0);
     }
-    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
-    // Confluent eigenvalues (α≈β): convolve_2cpt's 1/(α−β) residues are undefined;
-    // measure-zero for physical params, return 0 (mirrors two_cpt_oral_amt_g).
-    if (alpha - beta).val().abs() < 1e-12 {
+    // Shared disposition-domain guard (params valid, non-confluent, α<KTR, NaN-safe);
+    // central and peripheral read the same helper so they can't drift (#634 finding 7).
+    let Some((alpha, beta, k21)) = transit_2cpt_domain_ok(cl, v1, q, v2, n, mtt) else {
         return T::from_f64(0.0);
-    }
-    let ktr = (n + T::from_f64(1.0)) / mtt;
-    // NaN-safe: proceed only when α < KTR is *definitely* true (`!(α < KTR)` also
-    // catches a NaN α/KTR, which `α >= KTR` would let slip through).
-    if !(alpha.val() < ktr.val()) {
-        return T::from_f64(0.0);
-    }
+    };
     let abs = TransitAbsorption { n, mtt };
     convolve_2cpt(&abs, t, alpha, beta, k21, (f_bio * amt) / v1)
 }

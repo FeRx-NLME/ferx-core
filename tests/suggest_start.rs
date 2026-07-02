@@ -183,6 +183,42 @@ fn test_nca_sweep_moves_unwritten_thetas() {
     );
 }
 
+/// `two_cpt_transit` must get the same biexponential-peel Q/V2 seeding as the
+/// otherwise-equivalent `two_cpt_oral` (#634 review finding 2). Before the fix the
+/// peel dispatch skipped `TwoCptTransit`, so Q/V2 silently stayed at their model
+/// defaults. Perturb the Q/V2 defaults away from the simulation truth (Q=10, V2=100)
+/// and confirm the NCA peel moves them back off those bad defaults.
+#[test]
+fn test_suggest_start_two_cpt_transit_peels_q_v2() {
+    let mut model = parse_model_file(Path::new("examples/two_cpt_transit.ferx"))
+        .expect("two_cpt_transit model must parse");
+    let population = read_nonmem_csv(Path::new("data/transit_2cpt.csv"), None, None)
+        .expect("transit_2cpt data must load");
+
+    let theta_idx = |name: &str| {
+        model
+            .default_params
+            .theta_names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("model must carry a {name} theta"))
+    };
+    let (q_i, v2_i) = (theta_idx("TVQ"), theta_idx("TVV2"));
+    // Perturb well away from truth but inside the declared bounds (Q∈[0.5,200], V2∈[5,1000]).
+    let (bad_q, bad_v2) = (150.0, 800.0);
+    model.default_params.theta[q_i] = bad_q;
+    model.default_params.theta[v2_i] = bad_v2;
+
+    let result = inits_from_nca(&model, &population, NcaInit::Nca);
+    assert!(
+        (result.params.theta[q_i] - bad_q).abs() > 1e-6
+            || (result.params.theta[v2_i] - bad_v2).abs() > 1e-6,
+        "two_cpt_transit NCA must peel Q/V2 off the (bad) default, got Q={} V2={}",
+        result.params.theta[q_i],
+        result.params.theta[v2_i]
+    );
+}
+
 /// When a model uses block_omega (correlated etas), updating the CL omega from
 /// NCA CV² must not discard the off-diagonal entries.
 #[test]

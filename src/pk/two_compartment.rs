@@ -1,9 +1,9 @@
 use crate::pk::analytical_absorption::{convolve_2cpt_peripheral, TransitAbsorption};
+use crate::pk::one_compartment::one_cpt_transit_depot;
 use crate::sens::two_cpt::{
-    two_cpt_infusion_g, two_cpt_infusion_ss_g, two_cpt_iv_bolus_g, two_cpt_iv_bolus_ss_g,
-    two_cpt_oral_g, two_cpt_oral_ss_g, two_cpt_transit_g,
+    transit_2cpt_domain_ok, two_cpt_infusion_g, two_cpt_infusion_ss_g, two_cpt_iv_bolus_g,
+    two_cpt_iv_bolus_ss_g, two_cpt_oral_g, two_cpt_oral_ss_g, two_cpt_transit_g,
 };
-use crate::stats::special::regularized_gamma_p;
 use crate::types::DoseEvent;
 
 // The 2-cpt single-dose concentration closed forms are the single source of truth
@@ -76,22 +76,29 @@ pub fn two_cpt_transit_f(
 
 /// Unabsorbed amount still in the transit chain for a single bolus at elapsed time
 /// `tau`: `F·Dose·(1 − P(n+1, KTR·tau))`, `KTR = (n+1)/mtt`. The lumped depot-side
-/// state of the analytic 2-cpt transit model — identical to the 1-cpt transit chain
-/// (only the downstream disposition differs). Used for `[derived]` compartment
-/// amounts. Returns 0 for invalid params or infusion doses (rejected at parse).
+/// state of the analytic 2-cpt transit model. The unabsorbed-chain mass is
+/// disposition-independent, so this reuses the 1-cpt transit depot verbatim (#634
+/// review finding 6) rather than duplicating the gamma algebra. Used for `[derived]`
+/// compartment amounts. Returns 0 for invalid params or infusion doses (rejected at
+/// parse) — and, so `[derived]` mass stays balanced, also in the confluent /
+/// flip-flop `α ≥ KTR` regime where the central and peripheral closed forms both
+/// collapse to 0 (#634 review finding 4).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn two_cpt_transit_depot(
     dose: &DoseEvent,
     tau: f64,
+    cl: f64,
+    v1: f64,
+    q: f64,
+    v2: f64,
     n: f64,
     mtt: f64,
     f_bio: f64,
 ) -> f64 {
-    if tau < 0.0 || n < 0.0 || mtt <= 0.0 || dose.is_infusion() {
+    if transit_2cpt_domain_ok(cl, v1, q, v2, n, mtt).is_none() {
         return 0.0;
     }
-    let ktr = (n + 1.0) / mtt;
-    let absorbed_frac = regularized_gamma_p::<f64>(n + 1.0, ktr * tau);
-    f_bio * dose.amt * (1.0 - absorbed_frac)
+    one_cpt_transit_depot(dose, tau, n, mtt, f_bio)
 }
 
 /// Peripheral-compartment concentration `A2/V2` for a single 2-cpt transit bolus at
@@ -112,25 +119,13 @@ pub(crate) fn two_cpt_transit_peripheral(
     mtt: f64,
     f_bio: f64,
 ) -> f64 {
-    if tau < 0.0
-        || v1 <= 0.0
-        || v2 <= 0.0
-        || cl <= 0.0
-        || q < 0.0
-        || n < 0.0
-        || mtt <= 0.0
-        || dose.is_infusion()
-    {
+    if tau < 0.0 || dose.is_infusion() {
         return 0.0;
     }
-    let (alpha, beta, _k21) = macro_rates(cl, v1, q, v2);
-    if (alpha - beta).abs() < 1e-12 {
+    // Same shared disposition-domain guard as the central path (#634 finding 7).
+    let Some((alpha, beta, _k21)) = transit_2cpt_domain_ok(cl, v1, q, v2, n, mtt) else {
         return 0.0;
-    }
-    let ktr = (n + 1.0) / mtt;
-    if !(alpha < ktr) {
-        return 0.0;
-    }
+    };
     let abs = TransitAbsorption { n, mtt };
     let k12 = q / v1;
     convolve_2cpt_peripheral(&abs, tau, alpha, beta, k12, (f_bio * dose.amt) / v2)
@@ -402,14 +397,29 @@ mod tests {
         let (cl, v1, q, v2, n, mtt) = (0.13, 8.0, 0.5, 4.0, 3.0, 0.3);
         let d = bolus_dose(100.0);
         // Valid: unabsorbed chain mass and peripheral amount both positive at t=2.
-        assert!(two_cpt_transit_depot(&d, 2.0, n, mtt, 1.0) > 0.0);
+        assert!(two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, n, mtt, 1.0) > 0.0);
         assert!(two_cpt_transit_peripheral(&d, 2.0, cl, v1, q, v2, n, mtt, 1.0) > 0.0);
         // Depot guards: tau<0, n<0, mtt≤0, infusion ⇒ 0.
-        assert_eq!(two_cpt_transit_depot(&d, -1.0, n, mtt, 1.0), 0.0);
-        assert_eq!(two_cpt_transit_depot(&d, 2.0, -1.0, mtt, 1.0), 0.0);
-        assert_eq!(two_cpt_transit_depot(&d, 2.0, n, 0.0, 1.0), 0.0);
         assert_eq!(
-            two_cpt_transit_depot(&infusion_dose(100.0, 50.0), 2.0, n, mtt, 1.0),
+            two_cpt_transit_depot(&d, -1.0, cl, v1, q, v2, n, mtt, 1.0),
+            0.0
+        );
+        assert_eq!(
+            two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, -1.0, mtt, 1.0),
+            0.0
+        );
+        assert_eq!(
+            two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, n, 0.0, 1.0),
+            0.0
+        );
+        assert_eq!(
+            two_cpt_transit_depot(&infusion_dose(100.0, 50.0), 2.0, cl, v1, q, v2, n, mtt, 1.0),
+            0.0
+        );
+        // Flip-flop α≥KTR (large mtt ⇒ tiny KTR): depot zeroes to match the central /
+        // peripheral collapse, keeping [derived] mass balanced (#634 finding 4).
+        assert_eq!(
+            two_cpt_transit_depot(&d, 2.0, cl, v1, q, v2, 0.0, 50.0, 1.0),
             0.0
         );
         // Peripheral guards: invalid params, infusion, and flip-flop α≥KTR ⇒ 0.

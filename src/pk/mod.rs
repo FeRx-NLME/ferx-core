@@ -1103,7 +1103,17 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
             PkModel::TwoCptTransit => {
                 // [depot = lumped in-transit mass, central, peripheral]; transit rejects
                 // infusions at parse, so only the absorbed bolus exists.
-                let depot = two_cpt_transit_depot(dose, tau, p.n_transit(), p.mtt(), p.f_bio());
+                let depot = two_cpt_transit_depot(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.n_transit(),
+                    p.mtt(),
+                    p.f_bio(),
+                );
                 let central = two_cpt_transit_f(
                     dose,
                     tau,
