@@ -2773,16 +2773,6 @@ pub struct CompiledModel {
     /// covariates / theta; the FOCE/FOCEI likelihood then scales each
     /// observation's sigma loadings by [`RuvMagnitude::eval_obs`].
     pub ruv_magnitude: Option<RuvMagnitude>,
-    /// A synthesized ODE representation of an analytical model that carries one, used as a
-    /// runtime fallback when the closed form cannot serve a particular subject. Currently
-    /// only `one_cpt_transit`: the closed form assumes constant parameters over each
-    /// absorption window, so a mid-profile `TIME` switch or time-varying covariates route to
-    /// this exact ODE `transit()` equivalent instead (kept a boxed full model so it reuses
-    /// the whole ODE prediction/sensitivity path unchanged). `None` when the model needs no
-    /// fallback (not transit, or a transit form outside the desugar's scope). See
-    /// [`crate::sens::provider::effective_model_for`] and the parser's
-    /// `transit_ode_equivalent_source` (#486).
-    pub transit_ode_equivalent: Option<Box<CompiledModel>>,
 }
 
 /// FREM (Full Random Effects Model) configuration.
@@ -2839,26 +2829,6 @@ impl CompiledModel {
     /// Returns true when this model uses ODE integration; false for analytical PK.
     pub fn is_ode_based(&self) -> bool {
         self.ode_spec.is_some()
-    }
-
-    /// The model that should actually serve `subject`'s predictions / sensitivities.
-    ///
-    /// For a `one_cpt_transit` model whose closed form cannot cope with this subject — a
-    /// `TIME`-dependent structural parameter or time-varying covariates make the disposition
-    /// switch mid-absorption, which the per-dose Gamma convolution assumes constant — return
-    /// its exact ODE `transit()` equivalent (`transit_ode_equivalent`, built at parse time);
-    /// otherwise `self`. Constant-parameter transit subjects keep the fast, exact closed form.
-    /// The equivalent shares this model's θ/η layout, so callers pass the same parameter
-    /// vector (#486). A no-op (`self`) for every non-transit model.
-    pub fn effective_for<'a>(&'a self, subject: &Subject) -> &'a CompiledModel {
-        if let Some(eq) = &self.transit_ode_equivalent {
-            if crate::parser::model_parser::compiled_model_uses_time_builtin(self)
-                || subject.has_tv_covariates()
-            {
-                return eq;
-            }
-        }
-        self
     }
 
     /// The compartment-indexed dose-attribute map (`D{cmt}` for `RATE=-2`, …) for
@@ -5364,7 +5334,6 @@ pub(crate) mod test_helpers {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
         }
     }
 
@@ -5453,7 +5422,6 @@ pub(crate) mod test_helpers {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
         };
 
         let mut baseline_cov = HashMap::new();

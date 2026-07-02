@@ -1160,36 +1160,12 @@ pub(crate) fn check_transit_support(
                 .to_string(),
         );
     }
-    // A `TIME`-built-in structural parameter makes the disposition switch mid-profile — the
-    // transit closed form assumes constant parameters over each absorption window, so it
-    // cannot serve it. The plain `cl/v/n/mtt` form carries a `transit_ode_equivalent`
-    // (built at parse time), which the runtime dispatch routes such subjects to, so it is
-    // NOT rejected. Only a form outside the desugar's scope (a `lagtime=`/`f=` mapping or a
-    // custom `[scaling]` — no equivalent) is rejected here rather than mis-predict.
-    if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
-        && model.transit_ode_equivalent.is_none()
-    {
-        return Some(
-            "one_cpt_transit with a lagtime/bioavailability mapping or custom scaling does \
-             not support a TIME-dependent structural parameter: the transit closed form \
-             assumes constant parameters over each absorption window, and this form is \
-             outside the automatic ODE-equivalent rewrite. Write the model as an ODE \
-             transit() forcing in [odes] directly."
-                .to_string(),
-        );
-    }
     for subject in &population.subjects {
-        // Time-varying covariates make the disposition switch mid-absorption, which the
-        // closed form cannot serve. The plain form's `transit_ode_equivalent` handles it
-        // (the runtime dispatch routes TV-cov subjects there), so reject only the
-        // out-of-scope forms that carry no equivalent.
-        if subject.has_tv_covariates() && model.transit_ode_equivalent.is_none() {
+        if subject.has_tv_covariates() {
             return Some(format!(
-                "one_cpt_transit with a lagtime/bioavailability mapping or custom scaling does \
-                 not support within-subject time-varying covariates (subject {}): the transit \
-                 closed form assumes constant parameters over each absorption window, and this \
-                 form is outside the automatic ODE-equivalent rewrite. Write the model as an \
-                 ODE transit() forcing in [odes] directly.",
+                "one_cpt_transit does not support within-subject time-varying covariates \
+                 (subject {}): the transit closed form assumes constant parameters over each \
+                 absorption window. Use an ODE transit model.",
                 subject.id
             ));
         }
@@ -6981,7 +6957,6 @@ mod iov_integration {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
         }
     }
 
@@ -9024,61 +8999,7 @@ mod simulate_with_uncertainty_tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
         }
-    }
-
-    /// A `one_cpt_transit` + `TIME` model that the ODE desugar does NOT cover — here because
-    /// of a `lagtime=` mapping (the desugar is scoped to the plain `cl/v/n/mtt` form) — stays
-    /// on the closed form and must be rejected up front rather than silently freezing `TIME`
-    /// at the first record. (The plain form is instead rewritten to the ODE `transit()`
-    /// equivalent and works; see the parser test `transit_time_desugars_to_ode_equivalent`.)
-    #[test]
-    fn transit_with_time_and_lagtime_is_rejected() {
-        use crate::parser::model_parser::parse_model_string;
-        const TRANSIT_TIME_LAG: &str = r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 100.0)
-  theta TVCL_LATE(7.0, 0.1, 100.0)
-  theta TVV(50.0, 5.0, 500.0)
-  theta TVMTT(1.0, 0.05, 24.0)
-  theta TVN(3.0, 0.0, 30.0)
-  theta TVLAG(0.3, 0.0, 5.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP_ERR ~ 0.15 (sd)
-[individual_parameters]
-  if (TIME > 12.0) {
-    CL = TVCL_LATE * exp(ETA_CL)
-  } else {
-    CL = TVCL * exp(ETA_CL)
-  }
-  V   = TVV
-  MTT = TVMTT
-  NTR = TVN
-  LAGTIME = TVLAG
-[structural_model]
-  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-[fit_options]
-  method = focei
-"#;
-        let model = parse_model_string(TRANSIT_TIME_LAG).expect("parse transit+TIME+lag");
-        assert_eq!(
-            model.pk_model,
-            crate::types::PkModel::OneCptTransit,
-            "the lagtime= form is outside the desugar scope, so it stays closed-form"
-        );
-        assert!(
-            crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
-            "fixture must use the TIME built-in"
-        );
-        let msg = check_transit_support(&model, &tiny_population())
-            .expect("transit + TIME (lagtime form) must be rejected up front");
-        assert!(
-            msg.contains("TIME"),
-            "rejection message must name the TIME limitation: {msg}"
-        );
     }
 
     fn tiny_population() -> Population {
@@ -9896,7 +9817,6 @@ mod tests_sdtab_tv_cov {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -10229,7 +10149,6 @@ mod tests_sdtab_tv_cov {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -10390,7 +10309,6 @@ mod tests_derived_session_clock {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
         }
     }
 
@@ -10711,7 +10629,6 @@ mod tests_derived_iov_kappa {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,

@@ -2457,7 +2457,6 @@ mod tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
         }
     }
 

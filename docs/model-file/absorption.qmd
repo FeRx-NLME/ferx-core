@@ -492,12 +492,10 @@ moving end `d.time + lag + dur` (and, under lagtime, its moving start) injected 
 same rate-on / rate-off saltations used for infusions. Under a covariate that varies
 *across* the window end the rate-off uses the general `g⁻ − g⁺` saltation (the RHS
 Jacobian jumps across the boundary too, not just the forcing). Because the IOV walk is
-the same event-driven walk, **every** absorption forcing is analytic under **IOV** too
-(#486 — the smooth densities `igd`/`transit`/`weibull`/`first_order`, the moving-window
-`zero_order`, and any composition `mixed`/`parallel`; each forcing's rate/window is rebuilt
-from its dose's own occasion-seeded PK jet); the only IOV holdouts are `weibull` + lagtime
-(β<1 onset divergence) and any forcing combined with a **steady-state** dose (the dual SS
-equilibration does not spread the forcing over the cycle).
+the same event-driven walk, `zero_order`/`mixed` are analytic under **IOV** too (#486 —
+each forcing's rate/window is rebuilt from its dose's own occasion-seeded PK jet); only
+their combination with a **steady-state** dose stays on finite differences (the dual SS
+equilibration does not spread a periodic zero-order window over the cycle).
 See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
 
 The **smooth-density forcings** (`igd`, `transit`, `weibull`, `first_order`) have a
@@ -600,11 +598,10 @@ event-driven walk; **`mixed`** because that walk now also carries the `zero_orde
 term's moving-boundary window (delivered as a per-segment constant, with rate-on /
 rate-off saltations at its moving start / end). In the `mixed` case the two forcings
 switch on together at the lagged arrival, so their onset saltations sum on the shared
-compartment. The **IOV** path shares this same event-driven walk, so **all** of these
-families (`igd`/`transit`/`weibull`/`first_order`, `zero_order`, `mixed`, `parallel`) are
-analytic under IOV too (#486); the only holdouts are `weibull` + lagtime and any forcing
-combined with a **steady-state** dose (the dual SS equilibration does not spread the
-forcing over the cycle).
+compartment. The **IOV** path shares this same event-driven walk, so `zero_order` /
+`mixed` (and `parallel`) are analytic under IOV too (#486); only their combination with
+a **steady-state** dose keeps a model on finite differences (the dual SS equilibration
+does not spread a periodic zero-order window / first-order tail over the cycle).
 
 ### Worked examples
 

@@ -741,41 +741,27 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // Built-in absorption input-rate forcing under IOV (#486). The shared
     // `integrate_tvcov_g` walk delivers each forcing per-occasion — its rate/window is
     // rebuilt from that dose's own occasion-seeded `pk_at_dose[k]` jet, so κ rides through
-    // exactly as η/θ do. So EVERY kind the non-IOV gate carries is analytic under IOV too:
-    // the smooth densities `igd`/`transit`/`weibull`/`first_order` (pointwise `R_in`), the
-    // moving-window `zero_order`, and any composition (`mixed`, `parallel`). Mirror the
-    // non-IOV `ode_analytical_supported`'s kind-agnostic `supported_over_dual()` gate exactly,
-    // so the IOV input-rate scope tracks the non-IOV scope rather than an arbitrary
-    // `{ZeroOrder, FirstOrder}` subset (#486 IOV-scope parity). (The SS × input-rate
-    // combination is still declined per subject in `ode_iov_subject_supported` — the SS dual
-    // equilibration has no built-in-forcing channel; that is a real gap, not this decision.)
-    if ode.input_rate.iter().any(|f| !f.kind.supported_over_dual()) {
+    // exactly as η/θ do — so `zero_order(dur)` and `first_order` are analytic under IOV,
+    // and hence so is any composition of them: a `mixed` `FR·first_order + FR·zero_order`
+    // dose and a `parallel` two-`first_order` pathway (both encoded as multiple
+    // `ZeroOrder`/`FirstOrder` forcings), mirroring the non-IOV TV-cov walk (#653/#586).
+    // Only the smooth-density kinds (igd / transit / weibull) under IOV stay unaudited → FD;
+    // the SS × input-rate combination is declined per subject in `ode_iov_subject_supported`
+    // (the SS dual equilibration's zero-order/forcing handling is not yet validated under κ).
+    if ode.input_rate.iter().any(|f| {
+        !matches!(
+            f.kind,
+            crate::pk::absorption::InputRateKind::ZeroOrder
+                | crate::pk::absorption::InputRateKind::FirstOrder
+        )
+    }) {
         return false;
     }
-    // `Weibull` + estimated lagtime stays FD on every path (IOV included): its onset diverges
-    // for shape `β < 1` (an integrable spike, no finite rate-on saltation), exactly as the
-    // non-IOV gate declines it above. Every other kind composes with lagtime under IOV.
-    // Mirror the non-IOV `ode_analytical_supported` lagtime gate's exhaustive *whitelist*
-    // (not a `== Weibull` blacklist), so a future `InputRateKind` variant defaults to the FD
-    // fallback on both paths rather than being silently admitted here (#486 IOV-scope parity).
-    if model.has_lagtime()
-        && ode.input_rate.iter().any(|f| {
-            !matches!(
-                f.kind,
-                crate::pk::absorption::InputRateKind::Transit
-                    | crate::pk::absorption::InputRateKind::InverseGaussian
-                    | crate::pk::absorption::InputRateKind::FirstOrder
-                    | crate::pk::absorption::InputRateKind::ZeroOrder
-            )
-        })
-    {
-        return false;
-    }
-    // No constant `ScalarScale`/LTBS output transform. Estimated **lagtime IS supported**
-    // (bare and compartment-indexed `ALAG{cmt}`, see below): the IOV walk runs through
-    // `integrate_tvcov_readout`/`integrate_tvcov_g`, which applies the dose-time shift +
-    // event-time saltation per occasion-seeded dose (#439 lagtime × IOV).
-    // (The per-subject gate
+    // No constant `ScalarScale`/LTBS, no per-cmt/indexed F, no seeded initial state (the
+    // bolus walk seeds compartments at zero). Estimated **lagtime IS supported**: the IOV
+    // walk runs through `integrate_tvcov_readout`/`integrate_tvcov_g`, which applies the
+    // dose-time shift + event-time saltation per occasion-seeded dose (#439 lagtime × IOV).
+    // (`ode_analytical_supported` excludes indexed `ALAGn`. The per-subject gate
     // `ode_iov_subject_supported` now ADMITS finite-duration infusions, EVID 3/4 resets,
     // and EVID=2 pk-only breakpoints
     // — the shared `integrate_tvcov_g` walk carries the rate-boundary saltation and the
@@ -786,31 +772,30 @@ pub fn ode_iov_supported(model: &CompiledModel) -> bool {
     // supported (#575): like the non-IOV ODE static walk (#534) it is applied as a
     // post-walk quotient on the final `(θ, stacked-η)` jet — here per occasion group,
     // since the divisor depends on the group's κ through the PK params (see
-    // `apply_expression_scale_iov` / `run_subject_iov`). A constant `ScalarScale k` divisor
-    // is supported too (#486 IOV-scope parity): unlike `ExpressionScale`, it is
-    // κ-independent, so `resolve_obs_readout`/`apply_output_transform` already divide the
-    // in-walk readout `p/k` over the stacked `(θ, η, κ)` dual — the exact same in-walk step
-    // the non-IOV walk uses (`ode_analytical_supported` admits it), needing no post-walk
-    // handling. LTBS still stays FD (the in-walk log can't compose with the per-group
-    // post-walk `ExpressionScale` quotient). Allowlist, not denylist, so a future scaling
-    // variant can only narrow scope.
+    // `apply_expression_scale_iov` / `run_subject_iov`). Constant `ScalarScale` and LTBS
+    // stay FD (their in-walk output transform isn't validated for the IOV path — separate
+    // gap). Allowlist, not denylist, so a future scaling variant can only narrow scope.
     match &model.scaling {
-        // `None`/`ScalarScale` only when NOT LTBS: the IOV walk applies the LTBS log in
-        // PK-param space *before* the η/θ/κ chain, so the production scale-then-log order
-        // can't be reproduced post-walk — LTBS (`log(DV) ~ additive`) stays FD for IOV,
-        // matching the pre-#575 `|| model.log_transform` guard.
-        ScalingSpec::None | ScalingSpec::ScalarScale(_) if !model.log_transform => {}
+        // `None` only when NOT LTBS: the IOV walk applies the LTBS log in PK-param
+        // space *before* the η/θ/κ chain, so the production scale-then-log order
+        // can't be reproduced post-walk — LTBS (`log(DV) ~ additive`, no obs_scale)
+        // stays FD for IOV, matching the pre-#575 `|| model.log_transform` guard.
+        ScalingSpec::None if !model.log_transform => {}
         ScalingSpec::ExpressionScale { deriv: Some(p), .. }
             if expression_scale_axes_admissible(p, model) => {}
         _ => return false,
     }
-    // Compartment-indexed bioavailability `F{cmt}` and lagtime `ALAG{cmt}` ARE supported under
-    // IOV (#486 IOV-scope parity): the shared `integrate_tvcov_readout`/`integrate_tvcov_g`
-    // walk resolves each dose's own compartment slot — `f_bio_slot(ode, d.cmt)` and
-    // `dose_lag_slot = attr_map.lag_slot(d.cmt)` — exactly as the non-IOV
-    // `ode_analytical_supported` walk does (an indexed slot is an ordinary individual-parameter
-    // output seeded per occasion by `seed_pk_dual2_iov`). The old bail here assumed a single
-    // `PK_IDX_LAGTIME` slot the walk never actually used.
+    // Bare lagtime only — a compartment-indexed `ALAGn` gives per-dose differing shifts
+    // the single `PK_IDX_LAGTIME` walk cannot represent (same as indexed `F`).
+    if model
+        .active_dose_attr_map()
+        .has_indexed_attr(crate::types::DoseAttr::F)
+        || model
+            .active_dose_attr_map()
+            .has_indexed_attr(crate::types::DoseAttr::Lag)
+    {
+        return false;
+    }
     // `init(...)` initial conditions are analytic on the ODE IOV walk too (#486): the IOV
     // outer/inner (`run_subject_iov` / `_eta`) run through the SAME `integrate_tvcov_readout`
     // the non-IOV walk uses, which seeds `init` via `tvcov_init_state` at the first-record

@@ -1655,11 +1655,6 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     scratch: &mut EventPkParams,
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
-    // A `one_cpt_transit` subject that the closed form can't serve (TIME switch / TV
-    // covariates) routes to the exact ODE `transit()` equivalent, which takes the ODE branch
-    // below (that branch ignores the cached analytical `schedule`, so a stale one is
-    // harmless); every other model is unchanged (#486).
-    let model = model.effective_for(subject);
     let has_tv = subject.has_tv_covariates();
     let uses_time = model_uses_time_builtin(model);
 
@@ -2139,7 +2134,6 @@ mod tests {
             analytical_init: Vec::new(),
             analytic_readout: None,
             ruv_magnitude: None,
-            transit_ode_equivalent: None,
         }
     }
 

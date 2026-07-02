@@ -75,24 +75,6 @@ section of the SDLC for the versioning policy).
   per-event `TIME` already carries the absorption `R_in` forcing (since #643) and seeds the
   `init(...)` state (since #662), so the model-level decline for those combinations was stale;
   it has been removed. Validated against finite differences of the production predictor.
-- **Several inter-occasion-variability (IOV) analytic-gradient cells that were arbitrarily
-  narrower than their non-IOV counterparts are now analytic** (#486, "IOV-scope parity"),
-  closing gates that were more restrictive than the walk actually required:
-  - **All built-in absorption input-rate kinds under IOV** — the smooth densities
-    `igd`/`transit`/`weibull` now get exact analytic FOCE/FOCEI sensitivities under IOV, not
-    just `zero_order`/`first_order`/`mixed`/`parallel`. The IOV gate now mirrors the non-IOV
-    kind-agnostic rule exactly; only `weibull` + estimated lagtime (β<1 onset divergence) and
-    any forcing combined with a steady-state dose remain on finite differences.
-  - **Compartment-indexed bioavailability `F{cmt}` and lagtime `ALAG{cmt}` under IOV** — the
-    event-driven walk already resolves each dose's own compartment slot, so these no longer
-    fall back to finite differences.
-  - **A constant `ScalarScale` `obs_scale` divisor under IOV on both engines** — the trivial
-    covariate-independent case of the `ExpressionScale` quotient the IOV walk already applies:
-    on the closed-form models the final jet is divided uniformly, and on ODE models the
-    in-walk readout already divides `p/k` over the stacked dual.
-
-  All validated against finite differences of the production `predict_iov` (value, gradient,
-  and Hessian over the stacked `[η, κ]` vector).
 - **Built-in absorption forcings (`zero_order(dur)`, `first_order`, and `mixed`) combined
   with inter-occasion variability (IOV)** now get exact analytic FOCE/FOCEI sensitivities on
   the ODE path instead of finite differences (#486), closing the last zero-order gap. The IOV
@@ -103,8 +85,8 @@ section of the SDLC for the versioning policy).
   Hessian over the stacked `[η, κ]` vector), including a κ-coupled `DUR` axis-placement check,
   a `parallel` two-`first_order` pathway, and the `first_order` + estimated-lagtime and
   `+ EVID 3/4 reset` combinations. The smooth-density input-rate kinds (igd / transit /
-  weibull) under IOV are now analytic as well (see the IOV-scope-parity entry above); only a
-  built-in forcing combined with a steady-state dose under IOV remains on finite differences.
+  weibull) under IOV, and any built-in forcing combined with a steady-state dose under IOV,
+  remain on finite differences.
 - **Modeled-duration/rate doses (`RATE=-1`/`-2`) combined with steady-state dosing on the
   closed-form (analytical 1-/2-/3-cpt) models** now get exact analytic FOCE/FOCEI
   sensitivities instead of finite differences (#486), the last modeled-dose gap after #652
@@ -573,20 +555,6 @@ section of the SDLC for the versioning policy).
   report the value in the data file; no per-subject time shift is applied.
 
 ### Fixed
-- **A `one_cpt_transit` model with a `TIME`-dependent structural parameter or time-varying
-  covariates now works** (#486). The transit closed form assumes constant parameters over
-  each absorption window, so it cannot serve a subject whose parameters switch mid-profile;
-  previously such a model was rejected (`TIME` / TV covariates) or, on one internal path,
-  produced a silently wrong all-zero gradient. For a plain `cl/v/n/mtt` transit model the
-  parser now builds its exact ODE `transit()` equivalent — `d/dt(central) = transit(n, mtt)
-  − (CL/V)·central`, `obs_scale = V`, validated to predict identically to the hand-written
-  ODE twin — and the prediction / gradient dispatch routes only the subjects the closed form
-  cannot serve (a `TIME` switch, or time-varying covariates) to it, keeping the fast, exact
-  closed form for every constant-parameter subject. Transit forms outside the equivalent's
-  scope (a `lagtime=`/`f=` mapping, a custom `[scaling]`, or an `[initial_conditions]` block)
-  carry no equivalent and are still rejected up front (`fit()` errors; `predict()`/
-  `simulate()` panic) rather than mis-predict — write the ODE `transit()` model directly for
-  those.
 - **Finite / modeled-duration infusions combined with a time-varying covariate that
   changes across the infusion's end** now get an exact analytic second-order gradient
   (#486). The rate-off boundary sits between records, so the RHS Jacobian jumps there;
