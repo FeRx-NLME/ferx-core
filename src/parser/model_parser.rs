@@ -23341,18 +23341,19 @@ if (WT > 70) {
     /// drift from it.
     #[test]
     fn ode_free_slot_count_reports_headroom() {
-        // 16 slots − 2 reserved (F, lagtime) = 14 usable.
-        assert_eq!(ode_free_slot_count(&[]), 14);
-        // CL→0, V→1 are non-reserved canonical slots, leaving 12.
+        // MAX_PK_PARAMS slots minus the reserved ones (F, lagtime) are usable.
+        let usable = MAX_PK_PARAMS - RESERVED_PK_SLOTS.len();
+        assert_eq!(ode_free_slot_count(&[]), usable);
+        // CL→0, V→1 are non-reserved canonical slots, leaving `usable - 2`.
         assert_eq!(
             ode_free_slot_count(&["CL".to_string(), "V".to_string()]),
-            12
+            usable - 2
         );
-        // 14 non-canonical params exactly fill the layout → 0 free; one more still 0
-        // (`ode_param_slots` errors, and the headroom is reported as full).
-        let full: Vec<String> = (0..14).map(|i| format!("EXTRA{i}")).collect();
+        // `usable` non-canonical params exactly fill the layout → 0 free; one more
+        // still 0 (`ode_param_slots` errors, and the headroom is reported as full).
+        let full: Vec<String> = (0..usable).map(|i| format!("EXTRA{i}")).collect();
         assert_eq!(ode_free_slot_count(&full), 0);
-        let over: Vec<String> = (0..15).map(|i| format!("EXTRA{i}")).collect();
+        let over: Vec<String> = (0..usable + 1).map(|i| format!("EXTRA{i}")).collect();
         assert_eq!(ode_free_slot_count(&over), 0);
     }
 
@@ -23373,14 +23374,19 @@ if (WT > 70) {
     }
 
     /// #486 regression: a model that previously parsed (direct-θ readout served by the
-    /// FD fallback) must not start failing the 16-slot PK layout once desugaring is
+    /// FD fallback) must not start failing the PK-slot layout once desugaring is
     /// available. When the synthetic param has no free slot, the readout falls back to
     /// FD (its prior behaviour) with a warning, instead of erroring.
     #[test]
     fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
-        // CL, V, KA take 3 of the 14 usable slots; 11 extra top-level params fill the
-        // remaining 11 → zero headroom. A direct-θ readout would need one more.
-        let extras: String = (0..11).map(|i| format!("  EXTRA{i} = TVV\n")).collect();
+        // CL, V, KA take 3 of the (MAX_PK_PARAMS − reserved) usable slots; the
+        // remaining are filled by EXTRA params → zero headroom. A direct-θ readout
+        // would need one more.
+        let usable = MAX_PK_PARAMS - RESERVED_PK_SLOTS.len();
+        let n_extras = usable - 3;
+        let extras: String = (0..n_extras)
+            .map(|i| format!("  EXTRA{i} = TVV\n"))
+            .collect();
         let src = format!(
             "\
 [parameters]
