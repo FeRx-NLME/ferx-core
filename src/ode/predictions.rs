@@ -3318,7 +3318,10 @@ pub fn ode_predictions_event_driven_with_states(
     //
     // A future improvement: duplicate the event-driven loop to capture `u` at each
     // obs time directly — exact states, but ~2× the integration work post-fit.
-    let pk_flat = &pk_at_obs.first().map(|p| p.values).unwrap_or_default();
+    let pk_flat = &pk_at_obs
+        .first()
+        .map(|p| p.values)
+        .unwrap_or([0.0; crate::types::MAX_PK_PARAMS]);
     let states = ode_dense_solve_states(ode, pk_flat, theta, eta, subject, &subject.obs_times);
 
     (ipreds, states)
