@@ -5945,8 +5945,14 @@ fn emit_subject_rows<R: rand::Rng>(
     // builds (`compute_r_matrix_with_correlations`), so the simulated data
     // reproduces the fitted covariance instead of independent per-row draws.
     // FREM covariate pseudo-observations don't participate in the correlation
-    // (mirrors the identical `has_frem_rows` gate in
-    // `stats/likelihood.rs::individual_nll_into_with_schedule`).
+    // (mirrors the `has_frem_rows` gate in
+    // `stats/likelihood.rs::individual_nll_into_with_schedule`). That gate also
+    // carries a `!has_censored_m3` term we deliberately drop here: it exists so
+    // the likelihood's M3 BLOQ integral falls back to the scalar path, whereas
+    // simulate() draws the residual first and applies censoring afterwards, so a
+    // to-be-censored row should still be drawn from the correlated R. (A
+    // `block_sigma` + M3 model is rejected at fit by `check_model_options`
+    // regardless, so the two paths can only differ on an unfitted fixed model.)
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !model.residual_correlations.is_empty() && !has_frem_rows && !ipreds.is_empty() {
         emit_correlated_residual_rows(
@@ -6012,6 +6018,11 @@ fn emit_subject_rows<R: rand::Rng>(
 /// same matrix FOCE/FOCEI/SAEM/`imp` evaluate the likelihood against), instead
 /// of the per-row independent draw `emit_subject_rows` otherwise uses. Callers
 /// must already have excluded FREM rows and the empty-correlation case.
+///
+/// R is factored with a PSD-safe symmetric-eigen square root, so a singular
+/// (e.g. `rho = ±1`) or mildly indefinite fixed `block_sigma` yields a valid
+/// draw instead of a Cholesky panic. Subjects whose R is diagonal (no paired
+/// rows) take a cheap per-row draw and skip the factorization entirely.
 #[allow(clippy::too_many_arguments)]
 fn emit_correlated_residual_rows<R: rand::Rng>(
     model: &CompiledModel,
@@ -6054,15 +6065,35 @@ fn emit_correlated_residual_rows<R: rand::Rng>(
         r *= ruv_scale;
     }
     let n = ipreds.len();
-    let chol = r.clone().cholesky().unwrap_or_else(|| {
-        panic!(
-            "simulate: subject {} residual covariance R (block_sigma) is not \
-             positive-definite — check the fitted/fixed sigma and rho values",
-            subject.id
-        )
-    });
+    // z ~ N(0, Iₙ); the correlated residual is a matrix square-root factor of R
+    // times z (`Cov(F·z) = F·Fᵀ = R`).
     let z = DVector::from_iterator(n, (0..n).map(|_| rng.sample(normal)));
-    let eps = chol.l() * z;
+    // Fast path: if R has no nonzero off-diagonal the subject has no actually
+    // paired rows (every observation sits in its own residual block), so R is
+    // diagonal and the draw is the same independent per-row draw the scalar
+    // path uses. Skip the O(n³) factorization — this keeps a densely-sampled
+    // endpoint of a `block_sigma` model cheap, and reproduces the scalar path's
+    // RNG-for-RNG output for such subjects.
+    let has_offdiag = (0..n).any(|j| ((j + 1)..n).any(|k| r[(j, k)] != 0.0));
+    let eps = if !has_offdiag {
+        DVector::from_iterator(n, (0..n).map(|j| r[(j, j)].max(0.0).sqrt() * z[j]))
+    } else {
+        // A fitted or fixed `block_sigma` can be positive-SEMIdefinite rather
+        // than strictly positive-definite — a perfect cross-endpoint
+        // correlation (`rho = ±1`, which the parser accepts on the inclusive
+        // [-1, 1] range) makes R singular, so a Cholesky factor doesn't exist
+        // and would panic the whole simulation. Use the symmetric-eigen square
+        // root `V·diag(√max(λ,0))`, which is well defined for any PSD R and
+        // clamps tiny negative eigenvalues (round-off, or a mildly indefinite
+        // fixed R) to zero instead of aborting.
+        let eig = r.symmetric_eigen();
+        let mut factor = eig.eigenvectors;
+        for (k, &lambda) in eig.eigenvalues.iter().enumerate() {
+            let s = lambda.max(0.0).sqrt();
+            factor.column_mut(k).scale_mut(s);
+        }
+        factor * z
+    };
     for (j, &ipred) in ipreds.iter().enumerate() {
         let value = ipred + eps[j];
         results.push(SimulationResult {
@@ -8335,6 +8366,87 @@ mod iov_integration {
                  to within floating-point rounding"
             );
         }
+    }
+
+    // #672 regression: a fixed `block_sigma` with a perfect cross-endpoint
+    // correlation (`rho = 1`) makes each paired subject's R singular. The
+    // original Cholesky draw panicked the whole simulation; the PSD
+    // symmetric-eigen square root must instead produce a valid,
+    // perfectly-correlated draw (empirical rho ≈ 1).
+    #[test]
+    fn test_simulate_singular_rho_one_does_not_panic() {
+        let (mut model, population) = block_sigma_selected_model_and_population();
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 1.0,
+        }];
+
+        let n_sim = 20_000;
+        let results = simulate_with_seed(&model, &population, &model.default_params, n_sim, 11);
+        assert_eq!(results.len(), 2 * n_sim);
+
+        let mut resid_total = Vec::with_capacity(n_sim);
+        let mut resid_unbound = Vec::with_capacity(n_sim);
+        for pair in results.chunks(2) {
+            resid_total.push(pair[0].outcome.continuous_value() - pair[0].ipred);
+            resid_unbound.push(pair[1].outcome.continuous_value() - pair[1].ipred);
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let (m0, m1) = (mean(&resid_total), mean(&resid_unbound));
+        let n = n_sim as f64;
+        let cov = resid_total
+            .iter()
+            .zip(&resid_unbound)
+            .map(|(a, b)| (a - m0) * (b - m1))
+            .sum::<f64>()
+            / n;
+        let var0 = resid_total.iter().map(|a| (a - m0).powi(2)).sum::<f64>() / n;
+        let var1 = resid_unbound.iter().map(|a| (a - m1).powi(2)).sum::<f64>() / n;
+        let empirical_rho = cov / (var0.sqrt() * var1.sqrt());
+        assert!(
+            (empirical_rho - 1.0).abs() < 0.01,
+            "rho=1 singular block_sigma must draw perfectly-correlated residuals \
+             (no panic), got empirical rho {empirical_rho}"
+        );
+    }
+
+    // Cover the custom-magnitude (`Some(mult)`) R-build branch and the
+    // `ruv_scale != 1.0` scaling inside `emit_correlated_residual_rows`. The
+    // model-driven simulate() path can't reach these for a supported
+    // `block_sigma` model (block_sigma + iiv_on_ruv is rejected at fit), so call
+    // the helper directly with a hand-built per-observation multiplier and a
+    // non-unit scale and assert it draws both rows without panicking.
+    #[test]
+    fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
+        use rand::SeedableRng;
+        let (model, population) = block_sigma_selected_model_and_population();
+        let subject = &population.subjects[0];
+        let ipreds = vec![10.0_f64, 10.0];
+        // [obs][sigma-slot] multiplier (all ones here — the point is to exercise
+        // the `_scaled` builder and the `ruv_scale` multiply, not a specific
+        // magnitude value).
+        let mult = vec![vec![1.0_f64, 1.0], vec![1.0, 1.0]];
+        let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut results = Vec::new();
+        super::emit_correlated_residual_rows(
+            &model,
+            subject,
+            &model.default_params,
+            &ipreds,
+            2.0, // ruv_scale != 1.0
+            Some(&mult),
+            0,
+            0,
+            normal,
+            &mut rng,
+            &mut results,
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|r| r.outcome.continuous_value().is_finite()));
     }
 
     #[test]
