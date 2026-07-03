@@ -91,10 +91,15 @@ differences. Covariate changes carried by EVID=2 records between observations ar
 supported, as are combinations with EVID 3/4 resets, **steady-state dosing**, a
 **constant `obs_scale` divisor**, and **inter-occasion variability (IOV)** (the
 covariate and κ both switch the individual parameters across occasions, including
-subject-static expression `obs_scale` divisors since #590). Two combinations still
-fall back to the finite-difference gradient: time-varying covariates with **dose
-lagtime**, and non-IOV ODE time-varying covariates with **expression-based output
-scaling** (`obs_scale = <expr>` that references parameters or covariates). (See
+subject-static expression `obs_scale` divisors since #590). A non-IOV **ODE** model
+with time-varying covariates now also stays analytic when combined with an
+**expression-based output scaling** (`obs_scale = <expr>`, applied as a
+subject-static post-walk quotient), an **`EVID=2` covariate-only breakpoint**, or
+**`init(...)` initial conditions** (seeded at the subject's first-record covariate
+snapshot, all since #486). Time-varying covariates with **dose lagtime** on the
+closed-form analytical models still fall back to the finite-difference gradient, as
+does an ODE model that combines `init(...)` with an **EVID 3/4 reset** (production
+re-seeds `init` at the reset-event snapshot). (See
 [FOCE/FOCEI](../estimation/foce.qmd) for the optimizer/gradient interaction.)
 
 ## Covariate table

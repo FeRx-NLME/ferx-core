@@ -65,6 +65,63 @@ pub struct SubjectSens {
     pub obs: Vec<ObsSens>,
 }
 
+/// Constant `ScalarScale` output divisor `f_scaled = f/k` on the **full** `(θ, η)` jet:
+/// every derivative is linear in `f` and `k` is constant (`∂k/∂η = ∂k/∂θ = 0`), so value,
+/// gradient, and both Hessian blocks divide by the same `k`. Matches `pk::apply_scaling`
+/// (`pred /= s`). No-op at `k == 1.0` (identity scale — skip the per-observation multiply,
+/// as the ODE and closed-form twins do). Shared by the closed-form, TV-cov, and IOV outer
+/// walks so the field set stays in sync across paths (#486).
+#[inline]
+fn scale_obs_sens_full(obs: &mut [ObsSens], k: f64) {
+    if k == 1.0 {
+        return;
+    }
+    // Match `pk::apply_scaling` / `ScalingSpec::build_obs_scale_array`: a non-positive or
+    // non-finite scale is invalid and NaN-outs the prediction (loud-failure semantics).
+    // Multiplying by a NaN reciprocal NaNs out the whole jet (value + every derivative),
+    // keeping the analytic path in lock-step with the production predictor the FD oracle
+    // differentiates — rather than emitting an `inf`/sign-flipped jet for `k <= 0`.
+    let inv = if k.is_finite() && k > 0.0 {
+        1.0 / k
+    } else {
+        f64::NAN
+    };
+    for o in obs.iter_mut() {
+        o.f *= inv;
+        for v in o
+            .df_deta
+            .iter_mut()
+            .chain(o.d2f_deta2.iter_mut())
+            .chain(o.df_dtheta.iter_mut())
+            .chain(o.d2f_deta_dtheta.iter_mut())
+        {
+            *v *= inv;
+        }
+    }
+}
+
+/// Constant `ScalarScale` divisor on the **η-only** first-order jet (inner EBE walks):
+/// `f` and each `∂f/∂η` divide by the η-independent `k`; there is no θ / Hessian block to
+/// scale here (these walks emit [`ObsGrad`], not [`ObsSens`]). The grad-only counterpart of
+/// [`scale_obs_sens_full`]; same `k == 1.0` no-op and same `pk::apply_scaling` parity (#486).
+#[inline]
+fn scale_obs_sens_grad(obs: &mut [ObsGrad], k: f64) {
+    if k == 1.0 {
+        return;
+    }
+    // Invalid (`k <= 0` / non-finite) scale NaN-outs the jet, matching `pk::apply_scaling`
+    // (see `scale_obs_sens_full`).
+    let inv = if k.is_finite() && k > 0.0 {
+        1.0 / k
+    } else {
+        f64::NAN
+    };
+    for o in obs.iter_mut() {
+        o.f *= inv;
+        o.df_deta.iter_mut().for_each(|x| *x *= inv);
+    }
+}
+
 /// Map a fixed PK slot to its seed dimension. The analytical 1-/2-/3-cpt
 /// solutions read `CL, V1, Q2, V2, KA, F, Q3, V3` (slots 0,1,2,3,4,5,6,7) — an
 /// identity map; `LAGTIME` (slot 8) is differentiated too, entering each dose's
@@ -89,11 +146,14 @@ fn slot_to_dim(slot: usize) -> Option<usize> {
     }
 }
 
-/// Width of the per-model PK-slot lookup tables (`CL, V1, Q2, V2, KA, F, Q3, V3,
-/// LAGTIME`, plus the transit `N`/`MTT` slots, #386). This is the slot-space size,
-/// not the per-model dual width `M` (the compact count of *seeded* params — e.g.
-/// `Dual2<4>` for a 2-cpt IV).
-const N_PK: usize = 11;
+/// Width of the per-model PK-slot lookup tables — spans the full PK slot space
+/// (`CL, V1, Q2, V2, KA, F, Q3, V3, LAGTIME`, the transit `N`/`MTT` slots #386, and
+/// the modeled `D{cmt}`/`R{cmt}` slots the parser assigns from `PK_IDX_LAGTIME+1`
+/// upward, #486). Sized to [`crate::types::MAX_PK_PARAMS`] so a subject with three or
+/// more modeled infusions (slots ≥ 11) is indexed in-bounds rather than panicking
+/// (#486 review #1). This is the slot-space size, not the per-model dual width `M`
+/// (the compact count of *seeded* params — e.g. `Dual2<4>` for a 2-cpt IV).
+const N_PK: usize = crate::types::MAX_PK_PARAMS;
 
 /// True when the compiled `[individual_parameters]` program emits a differentiable
 /// row for every structural PK output `model` requires — the precondition for
@@ -206,10 +266,33 @@ enum ExKind {
 /// 1-/2-/3-cpt model (IV bolus/infusion + oral), `tv_fn` present, no ODE.
 /// Per-subject gates (TV covariates) are checked separately in
 /// [`subject_sensitivities`].
+///
+/// A model that reads the event-time built-in `TIME` in a structural parameter
+/// (`compiled_model_uses_time_builtin`) IS admitted here: the parameter is then
+/// piecewise/time-varying, so — like a time-varying covariate — the subject is
+/// routed through the per-event event-driven `Dual2` walk
+/// ([`subject_sensitivities_tvcov`]) rather than dose superposition, which can't
+/// express a mid-decay parameter switch. The routing (`uses_time_builtin`) is in
+/// [`subject_sensitivities_impl`] / [`subject_eta_grad_impl`] (#486 / #610).
 pub fn analytical_supported(model: &CompiledModel) -> bool {
-    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
-        return false;
-    }
+    // A `TIME` model does NOT use the static dose-superposition path — its subjects
+    // route through the per-event event-driven walk. So being model-level "analytic"
+    // additionally requires that walk to serve it (`tvcov_analytical_supported`);
+    // otherwise the direct `pk(...=TIME)` mapping (whose mapped slot is not desugared
+    // into the program's `pk_slots`, so `tvcov_analytical_supported` declines it) would
+    // report "analytic" through `sens_supported` / `analytic_outer_gradient_available` /
+    // `analytic_inner_grad_supported_model` while every subject actually falls back to FD
+    // — a route/report drift (#637 review #1). `tvcov_analytical_supported` calls the
+    // non-recursive [`analytical_supported_core`], so there is no cycle.
+    analytical_supported_core(model)
+        && (!crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+            || tvcov_analytical_supported(model))
+}
+
+/// The model-level closed-form scope check shared by [`analytical_supported`] and
+/// [`tvcov_analytical_supported`] — everything except the `TIME`-routing clause, so the
+/// two can compose without recursion (#637 review #1).
+fn analytical_supported_core(model: &CompiledModel) -> bool {
     matches!(
         model.pk_model,
         PkModel::OneCptIv
@@ -225,9 +308,161 @@ pub fn analytical_supported(model: &CompiledModel) -> bool {
         && model.n_kappa == 0
         && scaling_supported(model)
         && init_supported(model)
-        // Every individual-parameter slot must be one we differentiate. A
-        // LAGTIME (slot 8) routes to fall back.
+        && analytic_readout_dual_supported(model)
+        // Every individual-parameter slot must be one we differentiate; a slot outside
+        // `slot_to_dim`'s map (e.g. a modeled-dose `D{cmt}`/`R{cmt}` slot) routes to FD.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
+}
+
+/// Whether an analytic Form C readout (`[scaling] y = <expr>`, #650), if present,
+/// is one the Dual2 provider differentiates exactly. `true` when there is no
+/// readout (the built-in concentration output), or when the readout is:
+/// - a **uniform** `Single` readout (per-CMT `y[CMT=N]` routes to FD for now),
+/// - carrying a **dual-evaluable** program (no bare θ/η / NN output — those are
+///   left un-desugared on the analytic path, so they fall back to FD), and
+/// - not referencing the oral **depot** amount (the static superposition jet
+///   reconstructs the central amount as `conc × V` but not the depot amount),
+///   and the model has no `[initial_conditions]` baseline (the init impulse is
+///   layered onto the concentration, not the post-readout output).
+///
+/// When `false`, the model's Form C readout routes to the finite-difference
+/// gradient — which differentiates the readout-aware f64 predictor, so it is
+/// correct, just slower (a documented fallback, not silent: the parser attaches
+/// a warning). Keeping the check here means `analytical_supported` reports FD
+/// honestly rather than claiming analytic and then FD-ing every subject (#637).
+fn analytic_readout_dual_supported(model: &CompiledModel) -> bool {
+    let Some(ar) = &model.analytic_readout else {
+        return true;
+    };
+    if !model.analytical_init.is_empty() {
+        return false;
+    }
+    match (&ar.readout, &ar.program) {
+        (crate::ode::OdeReadout::Single(_), Some(prog)) => {
+            // Depot is state slot 0 only in the first-order-oral
+            // `["depot", "central"]` layout. IV models (and the transit model,
+            // whose analytic layout is central-only) have no depot slot, so their
+            // slot 0 is `central` — guard the depot check on the layout, not on
+            // `is_oral()` (which also matches transit).
+            let has_depot_slot = matches!(
+                model.pk_model,
+                PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+            );
+            prog.is_dual_evaluable() && !(has_depot_slot && prog.references_state(0))
+        }
+        _ => false,
+    }
+}
+
+/// Whether an analytic Form C readout can be served analytically on the
+/// **tv-covariate / oral-infusion / TIME** event-walk path (#650). The walk seeds
+/// only the eight structural `PkDual` slots (`CL..V3`), so in addition to the
+/// static-path scope ([`analytic_readout_dual_supported`]) every parameter the
+/// readout references must map to a slot `<= PK_IDX_V3`. A readout referencing a
+/// higher slot (only reachable when many non-structural readout params are
+/// allocated) falls back to FD on this path — the static path still serves it.
+fn readout_tvcov_supported(model: &CompiledModel) -> bool {
+    let Some(ar) = &model.analytic_readout else {
+        return true;
+    };
+    match &ar.program {
+        Some(prog) => {
+            analytic_readout_dual_supported(model)
+                && prog.max_indiv_pk_slot().is_none_or(|s| s <= PK_IDX_V3)
+        }
+        None => false,
+    }
+}
+
+/// Evaluate an analytic Form C readout jet at one observation (#650), generic over
+/// the [`PkNum`](crate::sens::num::PkNum) dual type.
+///
+/// Reconstructs the compartment-amount state the readout expects — the central
+/// amount is `conc × V` (`params[PK_IDX_V]`), any depot slot is left at zero
+/// (depot-referencing readouts route to FD, so the walks never reach here with
+/// one) — then runs the readout program. Shared by the four dual paths
+/// (`run_obs` / `run_obs_grad` static, `run_obs_tvcov` / `run_obs_grad_tvcov`
+/// event-walk) so the value and gradient jets cannot drift. `params` is the flat
+/// PK-slot dual vector; `ro_state` / `ro_vars` / `ro_stack` are caller-owned
+/// scratch, cleared here.
+#[inline]
+fn eval_readout_jet<T: crate::sens::num::PkNum>(
+    prog: &crate::parser::model_parser::OdeOutputProgram,
+    conc: T,
+    params: &[T],
+    cov: &std::collections::HashMap<String, f64>,
+    ro_state: &mut Vec<T>,
+    ro_vars: &mut Vec<T>,
+    ro_stack: &mut Vec<T>,
+) -> T {
+    let n_states = prog.n_states();
+    let central_slot = n_states.saturating_sub(1);
+    ro_state.clear();
+    ro_state.resize(n_states, T::from_f64(0.0));
+    ro_state[central_slot] = conc * params[PK_IDX_V];
+    prog.eval_output_g::<T>(ro_state, params, cov, ro_vars, ro_stack)
+}
+
+/// κ = 0 (BSV-only) readout-parameter snapshots for the analytic IOV walk (#655).
+/// Production's [`crate::pk::apply_analytic_readout`] builds the readout PK params from
+/// `eta_bsv` (no κ) — only the concentration carries the occasion κ — so these snapshots
+/// carry `∂/∂(θ, η_bsv)` and zero `∂/∂κ`. When covariates / `TIME` vary across observations
+/// the snapshot is per-observation; otherwise a single shared snapshot suffices (the readout
+/// param jet is then identical across rows, so a per-obs `Vec` would deep-clone the nested
+/// `CombinedDerivs` `N − 1` times per gradient eval on a hot path — `bsv_amount` already
+/// carries a single snapshot for the same reason).
+enum ReadoutSnapshots {
+    Static((crate::types::PkParams, CombinedDerivs)),
+    PerObs(Vec<(crate::types::PkParams, CombinedDerivs)>),
+}
+
+impl ReadoutSnapshots {
+    /// The κ = 0 readout snapshot for observation `j` (the shared one when `Static`).
+    #[inline]
+    fn at(&self, j: usize) -> &(crate::types::PkParams, CombinedDerivs) {
+        match self {
+            Self::Static(s) => s,
+            Self::PerObs(v) => &v[j],
+        }
+    }
+}
+
+/// Evaluate the analytic Form C readout at one IOV observation (#655) — shared by the outer
+/// (`Dual2`) and inner (`Dual1`) walks so the κ = 0 seeding convention lives in one place.
+/// Seeds the readout PK params from the BSV-only snapshot (`group = None`, so the κ axes are
+/// dropped) via the caller's monomorphized `seed`, then runs the readout jet under this
+/// observation's model time.
+///
+/// `conc` **must already be clamped to ≥ 0** — production clamps `conc.max(0.0)` *before* the
+/// readout ([`crate::pk::event_driven`] → [`crate::pk::apply_analytic_readout`]) and returns
+/// the readout output unclamped, so the caller clamps the concentration jet and does not
+/// re-clamp the result. A readout referencing `TIME` resolves `Op::PushTime` from the
+/// model-time thread-local, so it is entered at `obs_time` to match the guard
+/// `apply_analytic_readout` sets (a no-op read for a `TIME`-free readout).
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn eval_readout_at_obs<T: crate::sens::num::PkNum>(
+    prog: &crate::parser::model_parser::OdeOutputProgram,
+    conc: T,
+    snapshot: &(crate::types::PkParams, CombinedDerivs),
+    slot_row: &[Option<usize>; N_PK],
+    cov: &std::collections::HashMap<String, f64>,
+    obs_time: f64,
+    seed: impl Fn(&CombinedDerivs, Option<usize>, usize, f64) -> T,
+    ro_state: &mut Vec<T>,
+    ro_vars: &mut Vec<T>,
+    ro_stack: &mut Vec<T>,
+) -> T {
+    let (pk_ro, cd_ro) = snapshot;
+    let params: [T; N_PK] = std::array::from_fn(|s| {
+        let val = pk_ro.values.get(s).copied().unwrap_or(0.0);
+        match slot_row[s] {
+            Some(i) => seed(cd_ro, None, i, val),
+            None => T::from_f64(val),
+        }
+    });
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(obs_time);
+    eval_readout_jet::<T>(prog, conc, &params, cov, ro_state, ro_vars, ro_stack)
 }
 
 /// Whether the model's `[initial_conditions]` baseline (#521) is one the Dual2
@@ -360,21 +595,53 @@ pub fn sens_supported(model: &CompiledModel) -> bool {
 /// `docs/estimation/tte.qmd`).
 pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
     !matches!(model.gradient_method, GradientMethod::Fd)
-        && model.residual_correlations.is_empty()
+        // Correlated residual (`block_sigma`, #627) now has an analytic outer gradient
+        // for the analytical (diagonal-R) scope: the dense Almquist assembly reduces to
+        // the scalar path fed correlation-aware `(r,d,d2)` (`corr_residual_diag`). A rare
+        // off-diagonal-R subject bails per-subject to FD via `corr_residual_diag` → `None`.
         && !model.has_tte()
-        // Custom residual-error magnitude (#484): θ-dependent variance not yet in
-        // the analytic outer θ/σ kernels — FD gradient only (it is magnitude-aware).
-        && !model.has_custom_ruv_magnitude()
+        // Custom / time-varying residual-error magnitude (#484/#576/#486): `mult(θ)`
+        // makes `R` depend on θ directly, which `sens_outer_gradient::theta_block`
+        // now carries via a `Dual1`-differentiated direct-θ channel — bounded by the
+        // same `Dual1<M>` dispatch table `ScaleDerivProgram`/`ExpressionScale` uses
+        // (`MAX_RUV_MAG_AXES`). Beyond that axis count, or combined with a **correlated**
+        // residual (`block_sigma`, #627 — the dense assembly does not thread the
+        // magnitude's direct-θ channel), still routes to FD. `iiv_on_ruv` is now analytic
+        // combined with the magnitude (the residual-eta `c̃`-column coupling `d/R` gets its
+        // direct-θ terms in `theta_block`). (An M3-censored row's `−logΦ(z)` direct-θ chain
+        // is threaded per-subject too now; where it can't be — a subject with censored rows
+        // under the FOCEI magnitude path — `prepare_stacked` bails at runtime, not here.)
+        && (!model.has_custom_ruv_magnitude()
+            || (model.n_theta <= crate::parser::model_parser::MAX_RUV_MAG_AXES
+                && model.residual_correlations.is_empty()))
         // `iov_sens_supported` (not just the closed-form `iov_analytical_supported`) so
         // the predicate also recognizes the ODE IOV outer gradient (#439 ODE IOV / #466).
         && (sens_supported(model) || iov_sens_supported(model))
-        // IIV on residual error (#474): the analytic gradient (inner η-column +
-        // outer θ/Ω/σ variance terms) is provider-agnostic, so it serves the
-        // closed-form AND ODE paths. IOV and M3-BLOQ `iiv_on_ruv` keep the FD
-        // gradient on BOTH loops — the IOV inner gradient does not carry the
-        // variance scaling, and the residual-eta censored second derivatives are
-        // not assembled.
-        && !model.iiv_on_ruv_forces_fd()
+    // IIV on residual error (#474) needs no gate here: the analytic gradient (inner η-column +
+    // outer θ/Ω/σ variance terms) is provider-agnostic, so it serves every `iiv_on_ruv`
+    // combination — closed-form and ODE, plain / IOV / M3-BLOQ including the triples
+    // (#474/#4b/#591/#623/#677) — with no FD carve-out.
+}
+
+/// [`analytic_outer_gradient_available`], kept as the shared entry point that
+/// [`crate::types::Optimizer::resolve_auto`] and `build_info::gradient_method_outer`
+/// consult so `auto`'s pick and the reported gradient method can never disagree
+/// with the outer loop's actual dispatch.
+///
+/// As of the FOCE σ-magnitude work (#486), a custom / time-varying residual-error
+/// magnitude (`σ = expr(TIME, cov, θ)`) is analytic on **both** loops — the
+/// Sheiner–Beal FOCE (non-interaction) assembly (`subject_packed_gradient_foce` /
+/// `subject_packed_gradient_foce_iov`) now threads `mult(θ)` through its marginal
+/// `R⁰` (value + direct-θ derivative), matching the FOCEI direct-θ channel. So the
+/// predicate no longer narrows by `interaction`: every exclusion in
+/// `analytic_outer_gradient_available` is interaction-independent (a magnitude
+/// combined with an M3-censored row is a *per-subject* FD fallback, as under
+/// FOCEI, not a model-level decline). The `interaction` parameter is retained for
+/// call-site stability and in case a future interaction-only channel must
+/// re-narrow here.
+pub fn analytic_outer_gradient_for_interaction(model: &CompiledModel, interaction: bool) -> bool {
+    let _ = interaction;
+    analytic_outer_gradient_available(model)
 }
 
 /// Whether the light **ODE inner** η-gradient (`Dual1`) serves this model+subject:
@@ -528,6 +795,7 @@ fn lognormal_param_derivatives(
 /// both seed the same compiled `[individual_parameters]` program over the combined
 /// axes, then scatter onto a stacked-η dual; only the downstream walk (closed-form
 /// vs RK45) differs (#439 ODE IOV).
+#[derive(Clone)]
 pub(crate) struct CombinedDerivs {
     /// `∂p_i/∂(η_bsv, κ)`, row-major `n_rows × n_eff`.
     pub(crate) deta: Vec<Vec<f64>>,
@@ -618,9 +886,10 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     if model.n_kappa == 0 || model.ode_spec.is_some() {
         return false;
     }
-    if crate::parser::model_parser::compiled_model_uses_time_builtin(model) {
-        return false;
-    }
+    // A `TIME`-built-in structural parameter is served analytically: `build_iov_sources`
+    // seeds each occasion's PK-param value AND its `CombinedDerivs` at that event's time
+    // (per-event branch, gated on `uses_time_builtin`), so both IOV loops evaluate the
+    // switch at the right time (#486). No early-return needed.
     // M3 BLOQ + IOV is analytic as of #580. The IOV objective promotes M3 to the
     // censored marginal (`foce_subject_nll_iov` / `individual_nll_iov`, data term
     // `−logΦ(z)`), and the analytic gradient now differentiates that same function:
@@ -639,9 +908,9 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     // the IOV inner gradient's `residual_inner_obs` emits the `h·z` residual-eta column —
     // all keyed on the residual-eta index, which lives in the BSV block of the stacked
     // layout. So opening the gate lights up both loops; the censored rows still leave
-    // `H̃`/`log|H̃|` (no `c̃` residual-eta column), matching the objective. Only the
-    // **ODE** M3 + `iiv_on_ruv` triple stays FD (via `iiv_on_ruv_forces_fd`, which is
-    // `ode_spec`-gated).
+    // `H̃`/`log|H̃|` (no `c̃` residual-eta column), matching the objective. The ODE *IOV*
+    // triple is analytic too (#486); the **non-IOV ODE** M3 + `iiv_on_ruv` combo is analytic
+    // as well (#623) — every `iiv_on_ruv` combination is served, with no FD carve-out.
     //
     // IIV on residual error (`iiv_on_ruv`) IS analytic for closed-form IOV models:
     // `η_ruv` enters only through the variance (`v = R(f)·exp(2·η_ruv)`, `∂f/∂η_ruv = 0`),
@@ -669,16 +938,58 @@ pub fn iov_analytical_supported(model: &CompiledModel) -> bool {
     ) {
         return false;
     }
-    if !matches!(model.scaling, ScalingSpec::None) || model.log_transform || model.has_lagtime() {
+    // Output scaling: `None` (raw jet), a constant `ScalarScale` divisor, or a differentiable
+    // `ExpressionScale` `obs_scale` divisor whose (θ, η) axis counts match the model and fit
+    // the scale dispatch table. The `ExpressionScale` quotient is a per-occasion-group
+    // post-walk step in `run_obs_iov` / `run_obs_iov_eta` (the closed-form twin of the ODE-IOV
+    // path, #575/#590); a constant `ScalarScale k` is the trivial case of that quotient — a
+    // covariate/η/κ-independent `f/k` applied uniformly to every jet entry (#486 IOV-scope
+    // parity, mirroring the non-IOV `f_scaled = f/k`). LTBS composes with the OUTER gradient
+    // now (#486): `subject_sensitivities_iov` applies the `ln(f)` jet LAST — after the in-walk
+    // scale quotient — reproducing production's scale-then-log order `ln(f/s)` (`predict_iov`
+    // logs last, after `apply_scaling`). The inner IOV EBE gradient stays on FD for LTBS
+    // (`analytic_inner_common_bail`'s `log_transform && n_kappa > 0` clause), so this gate
+    // admits `log_transform` while only the outer θ/Ω/σ loop serves it.
+    match &model.scaling {
+        ScalingSpec::None | ScalingSpec::ScalarScale(_) => {}
+        ScalingSpec::ExpressionScale { deriv: Some(p), .. }
+            if p.n_theta_axis() == model.n_theta
+                && p.n_eta_axis() == model.n_eta
+                && (1..=MAX_SCALE_AXES).contains(&p.n_axes()) => {}
+        _ => return false,
+    }
+    // `has_lagtime` still declines (the elapsed-time saltation is not carried on this walk).
+    if model.has_lagtime() {
         return false;
     }
-    // Initial-compartment amounts (#521) ARE differentiable by the analytic kernels
-    // now (#524), but only on the dose-superposition path: the init impulse is
-    // layered per-subject in `subject_sensitivities` / `subject_eta_grad`, not in the
-    // IOV event-driven walk, which would have to re-seed the `A₀·kernel` baseline into
-    // each occasion block. Until that occasion-block seeding lands, an IOV + init
-    // model falls back to FD (see `analytical_supported` for the non-IOV exact path).
-    if !model.analytical_init.is_empty() {
+    // Initial-compartment amounts (#521) are now differentiable on the IOV event-driven walk
+    // too (#486): `run_obs_iov` / `run_obs_iov_eta` layer the `A₀·kernel(t, pk)` impulse per
+    // occasion — the amount `A₀` from the BSV-only snapshot (`bsv_amount`, κ = 0) and the decay
+    // kernel from each observation's occasion source — mirroring production's
+    // `add_analytical_init_with(..., amount_pk = BSV, Some(obs_params))` in `predict_iov`.
+    // A hand-built init with no `amount_deriv` program still routes to FD (the impulse loop
+    // would otherwise silently drop it), so require every init to carry its amount program; the
+    // stacked axis count `n_theta + n_stacked` is bounded by the walk's `1..=24` dispatch (out
+    // of range → the walk returns `None` → FD).
+    if model
+        .analytical_init
+        .iter()
+        .any(|i| i.amount_deriv.is_none())
+    {
+        return false;
+    }
+    // Analytic Form C readout (`[scaling] y = <expr>`, #655): served on the IOV
+    // event-driven walk when it fits the eight structural `PkDual` slots — the same
+    // walk-capable scope the TV-cov path uses (`readout_tvcov_supported`: a uniform
+    // dual-evaluable `Single` readout, no depot reference, no `[initial_conditions]`,
+    // no slot past `PK_IDX_V3`). `run_obs_iov` / `run_obs_iov_eta` seed the readout PK
+    // params from the κ = 0 (BSV-only) per-obs snapshot while the walk's concentration
+    // carries κ, matching production `apply_analytic_readout(..., eta_bsv, ...)`. A
+    // readout outside that scope (per-CMT, depot, direct θ/η, slot overflow) declines to
+    // FD here so the reported method stays honest — the closed-form IOV twin of
+    // `analytical_supported_core`'s `analytic_readout_dual_supported` clause.
+    // `readout_tvcov_supported` is `true` for a plain (no-readout) model.
+    if !readout_tvcov_supported(model) {
         return false;
     }
     let n_eff = model.n_eta + model.n_kappa;
@@ -763,6 +1074,13 @@ pub fn subject_sensitivities_iov(
     if !iov_analytical_supported(model) {
         return None;
     }
+    // Analytic Form C readout program (#655), threaded into the walk to replace each
+    // observation's central concentration with `y = <expr>`. `iov_analytical_supported`
+    // has already confirmed the readout (if any) fits the walk. `None` for a plain model.
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     let s = build_iov_sources(model, subject, theta, stacked_eta)?;
     // Run the walk over `Dual2<M>` (M = n_theta + n_stacked); the dual width tracks
     // the *unknowns* (n_eta + K·n_kappa + n_theta), not the PK axes, so it stays
@@ -772,14 +1090,25 @@ pub fn subject_sensitivities_iov(
         ($($m:literal),+) => {
             match m_dim {
                 $($m => run_obs_iov::<$m>(
-                    model, subject, &s.sources, &s.dose_src, &s.obs_src, &s.pkonly_src,
-                    &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked, s.n_theta,
+                    model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
+                    &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_eff, s.n_stacked,
+                    s.n_theta, s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
+                    readout, s.readout_obs.as_ref(),
                 ),)+
                 _ => None,
             }
         };
     }
-    disp!(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+    let mut sens = disp!(
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+    )?;
+    // LTBS (#486): apply the `ln(f)` jet LAST — after the in-walk scale quotient / Form C
+    // readout / init impulse — so the outer θ/Ω/σ gradient matches production's scale-then-log
+    // `ln(f/s)` (`predict_iov` logs last, after `apply_scaling`). Post-walk on the full stacked
+    // jet, so it is dimension-generic over the κ axes; a no-op when `log_transform` is false.
+    // The inner IOV EBE gradient stays on FD for LTBS (`analytic_inner_common_bail`).
+    apply_ltbs_transform_outer(&mut sens, model.log_transform);
+    Some(sens)
 }
 
 /// Per-event seed sources for the analytical IOV walk — the per-subject gates, the
@@ -801,6 +1130,33 @@ struct IovSources {
     n_eff: usize,
     n_stacked: usize,
     n_theta: usize,
+    /// For an `ExpressionScale` `obs_scale` divisor: one `(pk, combined-derivs)` per
+    /// occasion group, evaluated at the **subject-static covariate snapshot** (`t = 0`),
+    /// so the walk can build a per-group scale jet. `None` when the model carries no
+    /// differentiable `ExpressionScale`. The scale divisor is subject-static under IOV
+    /// (production `predict_iov` calls `apply_scaling` at `t = 0` inside each occasion),
+    /// so it is built at static cov even for a TV-covariate subject whose event sources
+    /// are per-event — the closed-form twin of the ODE-IOV `build_all_groups` scale seed
+    /// (#575/#590, ported in #486).
+    scale_groups: Option<Vec<(crate::types::PkParams, CombinedDerivs)>>,
+    /// For an `[initial_conditions]` baseline under IOV (#486): the `(pk, combined-derivs)`
+    /// at the **BSV-only** snapshot (`κ = 0`, subject-static covariates, `t = 0`), driving the
+    /// baseline *amount* `A₀`. Production's `predict_iov` evaluates the amount with `eta_bsv`
+    /// (no κ) while the *decay* kernel uses each observation's occasion PK params, so the amount
+    /// carries `∂A₀/∂(θ, η_bsv)` but zero `∂A₀/∂κ`. `None` when the model has no
+    /// `[initial_conditions]`.
+    bsv_amount: Option<(crate::types::PkParams, CombinedDerivs)>,
+    /// For an analytic Form C readout (`[scaling] y = <expr>`) under IOV (#655): one
+    /// **BSV-only** (`κ = 0`) `(pk, combined-derivs)` snapshot per observation,
+    /// evaluated at that observation's covariate / `TIME` snapshot. Production's
+    /// `apply_analytic_readout` builds the readout PK params (the amount's `V`, plus
+    /// non-structural `BMAX`/`KD`) from `eta_bsv` (no κ) — only the concentration jet
+    /// carries κ — so this snapshot drives the readout param jet with `∂/∂(θ, η_bsv)`
+    /// and zero `∂/∂κ` (seeded `group = None`), while the walk's κ-bearing concentration
+    /// supplies the central amount. `Static` when covariates / `TIME` are subject-static
+    /// (one shared snapshot), `PerObs` otherwise; `None` when the model has no analytic
+    /// readout. See [`ReadoutSnapshots`].
+    readout_obs: Option<ReadoutSnapshots>,
 }
 
 fn build_iov_sources(
@@ -826,9 +1182,12 @@ fn build_iov_sources(
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
-    // Modeled-duration doses (`RATE=-2`) are read unresolved here; route to FD
-    // (mirrors the non-IOV provider gate).
-    if !subject.all_doses_fixed() {
+    // Modeled-`RATE=-1/-2` doses are served analytically now (#486): the walk carries
+    // the dual rate + moving infusion-end boundary (`run_obs_iov` resolves each dose at
+    // its occasion's PK jet). The steady-state combination is analytic too (#486:
+    // `equilibrate_ss_g` threads the per-occasion modeled-window jet into its per-cycle
+    // active/quiet split); only the missing-slot case declines to FD via the shared gate.
+    if !modeled_dose_analytic_gate(model, subject) {
         return None;
     }
 
@@ -872,9 +1231,15 @@ fn build_iov_sources(
         }
     }
 
-    // Combined derivatives at `(theta, combined)` evaluated at covariate map `cov`,
-    // dispatching the program-eval width `MP = n_theta + n_eff`.
-    let cd_at = |combined: &[f64], cov: &std::collections::HashMap<String, f64>| {
+    // Combined derivatives at `(theta, combined)` evaluated at covariate map `cov`
+    // and event time `time`, dispatching the program-eval width `MP = n_theta +
+    // n_eff`. The `TIME` built-in resolves `Op::PushTime` from the model-time
+    // thread-local, which `iov_combined_derivs`' `Dual2` walk reads; seed it with the
+    // per-event time (gated on `uses_time`, like the f64 `pk_param_fn` closure) so
+    // each occasion's PK-param derivatives are evaluated at that event's TIME (#486).
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    let cd_at = |time: f64, combined: &[f64], cov: &std::collections::HashMap<String, f64>| {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         crate::sens::provider::iov_combined_derivs_dyn(
             prog, n_theta, n_eff, n_diff, cov, theta, combined,
         )
@@ -884,21 +1249,47 @@ fn build_iov_sources(
     // at that event's covariate snapshot, so a time-varying covariate is exact (no
     // per-group caching across events). When covariates are subject-static, one source
     // per occasion group is built and shared, preserving the non-TV cost.
-    let has_tv = subject.has_tv_covariates();
+    // A `TIME`-built-in structural parameter is per-event dynamic even with no TV
+    // covariates, so it must take the per-event branch (the one-source-per-group
+    // fast path below would freeze every occasion at `t = 0`) — mirroring the
+    // non-IOV `run_obs_tvcov` and the f64 `compute_event_pk_params_into` (#486).
+    // `has_tv_covariates()` covers dose/obs snapshots but NOT EVID=2 pk-only snapshots,
+    // so include them explicitly — otherwise a subject whose only per-event covariates
+    // are on pk-only records would take the shared static source and evaluate those
+    // events at the wrong covariates (matches the ODE `seed_iov_events` per-event gate;
+    // #637 Copilot #1).
+    let has_tv = subject.has_tv_covariates() || !subject.pk_only_covariates.is_empty();
+    let per_event = has_tv || uses_time;
     let cov_static = &subject.covariates;
     let mut sources: Vec<(crate::types::PkParams, CombinedDerivs, Option<usize>)> = Vec::new();
     let mut dose_src = vec![0usize; subject.doses.len()];
     let mut obs_src = vec![0usize; subject.obs_times.len()];
     let mut pkonly_src = vec![0usize; subject.pk_only_times.len()];
 
-    if has_tv {
+    // `ExpressionScale` `obs_scale`: one `(pk, cd)` reference per occasion group at the
+    // subject-static covariate snapshot (`t = 0`) — the divisor depends on the group's κ
+    // through the PK params, but not on the per-event covariate/time, matching production
+    // `predict_iov`'s subject-static `apply_scaling` inside each occasion. Built (with
+    // `theta`/`combined_for`/`cd_at` in scope) branch-side and consumed dual-typed in the
+    // walk fns. In the static-covariate branch the per-group sources ARE that `t = 0`
+    // snapshot, so reuse them rather than recomputing `k_groups` full-order `cd_at`
+    // on every gradient call (#651 review #3); the per-event branch has no such snapshot
+    // in `sources` (those sit at each event's own covariate/time) and builds it fresh.
+    let want_scale = matches!(
+        &model.scaling,
+        ScalingSpec::ExpressionScale { deriv: Some(_), .. }
+    );
+    let mut scale_groups: Option<Vec<(crate::types::PkParams, CombinedDerivs)>> = None;
+
+    if per_event {
         for d in 0..subject.doses.len() {
             let occ = subject.dose_occasions.get(d).copied()?;
             let g = *occ_to_k.get(&occ)?;
             let combined = combined_for(g);
             let cov = subject.dose_cov(d);
-            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
-            let cd = cd_at(&combined, cov)?;
+            let t = subject.doses[d].time;
+            let pk = (model.pk_param_fn)(theta, &combined, cov, t);
+            let cd = cd_at(t, &combined, cov)?;
             dose_src[d] = sources.len();
             sources.push((pk, cd, Some(g)));
         }
@@ -907,17 +1298,29 @@ fn build_iov_sources(
             let g = *occ_to_k.get(&occ)?;
             let combined = combined_for(g);
             let cov = subject.obs_cov(j);
-            let pk = (model.pk_param_fn)(theta, &combined, cov, 0.0);
-            let cd = cd_at(&combined, cov)?;
+            let t = subject.obs_times[j];
+            let pk = (model.pk_param_fn)(theta, &combined, cov, t);
+            let cd = cd_at(t, &combined, cov)?;
             obs_src[j] = sources.len();
             sources.push((pk, cd, Some(g)));
         }
         for m in 0..subject.pk_only_times.len() {
             let cov = subject.pk_only_cov(m);
-            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, 0.0);
-            let cd = cd_at(&combined_pk_only, cov)?;
+            let t = subject.pk_only_times[m];
+            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, t);
+            let cd = cd_at(t, &combined_pk_only, cov)?;
             pkonly_src[m] = sources.len();
             sources.push((pk, cd, None));
+        }
+        if want_scale {
+            let mut groups = Vec::with_capacity(k_groups);
+            for g in 0..k_groups {
+                let combined = combined_for(g);
+                let pk = (model.pk_param_fn)(theta, &combined, cov_static, 0.0);
+                let cd = cd_at(0.0, &combined, cov_static)?;
+                groups.push((pk, cd));
+            }
+            scale_groups = Some(groups);
         }
     } else {
         // One source per occasion group, at the subject-static covariates.
@@ -925,7 +1328,7 @@ fn build_iov_sources(
         for g in 0..k_groups {
             let combined = combined_for(g);
             let pk = (model.pk_param_fn)(theta, &combined, cov_static, 0.0);
-            let cd = cd_at(&combined, cov_static)?;
+            let cd = cd_at(0.0, &combined, cov_static)?;
             group_source[g] = sources.len();
             sources.push((pk, cd, Some(g)));
         }
@@ -939,14 +1342,66 @@ fn build_iov_sources(
         }
         if !subject.pk_only_times.is_empty() {
             let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
-            let cd = cd_at(&combined_pk_only, cov_static)?;
+            let cd = cd_at(0.0, &combined_pk_only, cov_static)?;
             let idx = sources.len();
             sources.push((pk, cd, None));
             for m in 0..subject.pk_only_times.len() {
                 pkonly_src[m] = idx;
             }
         }
+        if want_scale {
+            // Reuse the per-group static sources (identical `(pk, cd)` at `t = 0`) —
+            // clone is a Vec copy, far cheaper than re-evaluating the derivative program.
+            scale_groups = Some(
+                (0..k_groups)
+                    .map(|g| {
+                        let (pk, cd, _) = &sources[group_source[g]];
+                        (*pk, cd.clone())
+                    })
+                    .collect(),
+            );
+        }
     }
+
+    // `[initial_conditions]` baseline amount snapshot (#486): the BSV-only effect
+    // (`combined_pk_only` = `[η_bsv, κ = 0]`) at the subject-static covariates and `t = 0`,
+    // matching production's `add_analytical_init_with(..., amount_pk = pk_param_fn(θ, eta_bsv,
+    // subject.covariates, 0), ...)`. The decay kernel uses each observation's occasion source
+    // (built above); only the amount uses this κ-less snapshot.
+    let bsv_amount = if model.analytical_init.is_empty() {
+        None
+    } else {
+        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
+        let cd = cd_at(0.0, &combined_pk_only, cov_static)?;
+        Some((pk, cd))
+    };
+
+    // Analytic Form C readout param snapshots (#655): one κ = 0 (BSV-only) `(pk, cd)`
+    // per observation, matching production `apply_analytic_readout(..., eta_bsv,
+    // obs_cov(j), obs_time(j))`. Per-event when covariates / `TIME` vary (each obs at its
+    // own snapshot); otherwise one static snapshot reused across observations (the
+    // derivative-program eval is the cost, so clone the shared `cd`). Built only when a
+    // readout is present — such a model is init-free with no `[scaling]` divisor, so
+    // `bsv_amount`/`scale_groups` are `None` and the post-walk transform blocks are inert.
+    let readout_obs = if model.analytic_readout.is_none() {
+        None
+    } else if per_event {
+        let mut v = Vec::with_capacity(subject.obs_times.len());
+        for j in 0..subject.obs_times.len() {
+            let cov = subject.obs_cov(j);
+            let t = subject.obs_times[j];
+            let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov, t);
+            let cd = cd_at(t, &combined_pk_only, cov)?;
+            v.push((pk, cd));
+        }
+        Some(ReadoutSnapshots::PerObs(v))
+    } else {
+        // Subject-static covariates / `TIME`: one shared snapshot, so the walk reads the same
+        // κ = 0 readout params at every observation (no per-obs `CombinedDerivs` clone).
+        let pk = (model.pk_param_fn)(theta, &combined_pk_only, cov_static, 0.0);
+        let cd = cd_at(0.0, &combined_pk_only, cov_static)?;
+        Some(ReadoutSnapshots::Static((pk, cd)))
+    };
 
     Some(IovSources {
         sources,
@@ -959,6 +1414,9 @@ fn build_iov_sources(
         n_eff,
         n_stacked,
         n_theta,
+        scale_groups,
+        bsv_amount,
+        readout_obs,
     })
 }
 
@@ -977,14 +1435,22 @@ fn subject_eta_grad_iov_analytical(
     if !iov_analytical_supported(model) {
         return None;
     }
+    // Analytic Form C readout program (#655); `iov_analytical_supported` has already
+    // confirmed the readout (if any) fits the walk. `None` for a plain model.
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     let s = build_iov_sources(model, subject, theta, stacked_eta)?;
     let n_dim = s.n_stacked;
     macro_rules! disp {
         ($($n:literal),+) => {
             match n_dim {
                 $($n => run_obs_iov_eta::<$n>(
-                    model, subject, &s.sources, &s.dose_src, &s.obs_src, &s.pkonly_src,
-                    &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
+                    model, subject, theta, stacked_eta, &s.sources, &s.dose_src, &s.obs_src,
+                    &s.pkonly_src, &s.slot_row, s.n_eta, s.n_kappa, s.n_stacked,
+                    s.scale_groups.as_deref(), s.bsv_amount.as_ref(),
+                    readout, s.readout_obs.as_ref(),
                 ),)+
                 _ => None,
             }
@@ -1010,6 +1476,8 @@ fn subject_eta_grad_iov_analytical(
 fn run_obs_iov<const M: usize>(
     model: &CompiledModel,
     subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
     sources: &[(crate::types::PkParams, CombinedDerivs, Option<usize>)],
     dose_src: &[usize],
     obs_src: &[usize],
@@ -1020,9 +1488,13 @@ fn run_obs_iov<const M: usize>(
     n_eff: usize,
     n_stacked: usize,
     n_theta: usize,
+    scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
+    bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
+    readout_obs: Option<&ReadoutSnapshots>,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
-    use crate::sens::propagate::{event_driven_sens_g, PkDual};
+    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
 
     // Build the `Dual2<M>` for a differentiated PK row `i` of source `cd`/`group`,
     // carrying `val` and `∂/∂(θ, stacked-η)`. The combined column `c` maps to a
@@ -1114,48 +1586,222 @@ fn run_obs_iov<const M: usize>(
 
     // No lagtime in IOV scope → zero dose lagtimes.
     let dose_lagtimes = vec![0.0; subject.doses.len()];
-    let schedule =
-        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
-    let conc = event_driven_sens_g::<Dual2<M>>(
+    // Modeled-`RATE=-1/-2` doses (#486): resolve each dose at its occasion's PK jet
+    // (`sources[dose_src[k]].0` is already `pk_param_fn` at that occasion's combined
+    // effect) for the schedule's break times — shared with the non-IOV walk via
+    // `resolve_eff_doses` — and build the per-dose duals seeded on the stacked
+    // `(η_bsv, κ)` axes (via the same `seed` used for the PkDuals). Fixed subjects
+    // borrow `subject.doses` and pass no duals.
+    let eff_doses = resolve_eff_doses(model, subject, |k| sources[dose_src[k]].0);
+    // Distinct-slot coincident infusion ends aren't representable by the single-`dt`
+    // walk — decline to FD (#486 review #2).
+    if !modeled_ends_separable(model, subject, &eff_doses) {
+        return None;
+    }
+    let dose_inf_dual = modeled_dose_inf_duals::<Dual2<M>>(model, subject, |k, dr_slot| {
+        let (pk, cd, group) = &sources[dose_src[k]];
+        let val = pk.values.get(dr_slot).copied().unwrap_or(0.0);
+        match slot_row.get(dr_slot).copied().flatten() {
+            Some(i) => seed(cd, *group, i, val),
+            None => Dual2::<M>::constant(val),
+        }
+    });
+    let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
+    let conc = event_driven_sens_with_doses_g::<Dual2<M>>(
         model.pk_model,
         subject,
         &schedule,
+        &eff_doses,
+        &dose_inf_dual,
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
     );
 
+    // Analytic Form C readout (#655): scratch for the per-observation dual eval.
+    let mut ro_state: Vec<Dual2<M>> = Vec::new();
+    let mut ro_vars: Vec<Dual2<M>> = Vec::new();
+    let mut ro_stack: Vec<Dual2<M>> = Vec::new();
+
     let mut obs_out = Vec::with_capacity(conc.len());
-    for c in &conc {
-        // Clamp parity with production `conc.max(0.0)`: a negative value's
-        // derivatives vanish (consistency with the OFV).
-        let neg = c.value < 0.0;
+    for (j, c) in conc.iter().enumerate() {
+        // Clamp the concentration jet to ≥ 0 BEFORE any readout — production clamps
+        // `conc.max(0.0)` in `event_driven_predictions` and only then applies the readout
+        // (which is returned unclamped). A negative value's derivatives vanish, matching the
+        // OFV. For a plain (no-readout) model this reproduces the old post-loop clamp exactly
+        // (`constant(0.0)` has zero grad/hess).
+        let c_clamped: Dual2<M> = if c.value < 0.0 {
+            Dual2::<M>::constant(0.0)
+        } else {
+            *c
+        };
+        // Analytic Form C readout (#655): replace the (clamped) central concentration jet
+        // with `y = <expr>`. The concentration carries the occasion κ (through the walk);
+        // the readout PK params come from the κ = 0 (BSV-only) snapshot (`readout_obs.at(j)`,
+        // seeded `group = None`), matching production `apply_analytic_readout(..., eta_bsv)`.
+        // The readout output is NOT re-clamped (production does not re-clamp it).
+        let c: Dual2<M> = match (readout, readout_obs) {
+            (Some(ro), Some(ro_obs)) => eval_readout_at_obs::<Dual2<M>>(
+                ro,
+                c_clamped,
+                ro_obs.at(j),
+                slot_row,
+                subject.obs_cov(j),
+                subject.obs_times[j],
+                &seed,
+                &mut ro_state,
+                &mut ro_vars,
+                &mut ro_stack,
+            ),
+            _ => c_clamped,
+        };
+        let c = &c;
         let mut df_deta = vec![0.0; n_stacked];
         let mut df_dtheta = vec![0.0; n_theta];
         let mut d2f_deta2 = vec![0.0; n_stacked * n_stacked];
         let mut d2f_deta_dtheta = vec![0.0; n_stacked * n_theta];
-        if !neg {
-            for p in 0..n_stacked {
-                df_deta[p] = c.grad[n_theta + p];
-                for q in 0..n_stacked {
-                    d2f_deta2[p * n_stacked + q] = c.hess[n_theta + p][n_theta + q];
-                }
-                for m in 0..n_theta {
-                    d2f_deta_dtheta[p * n_theta + m] = c.hess[n_theta + p][m];
-                }
+        for p in 0..n_stacked {
+            df_deta[p] = c.grad[n_theta + p];
+            for q in 0..n_stacked {
+                d2f_deta2[p * n_stacked + q] = c.hess[n_theta + p][n_theta + q];
             }
             for m in 0..n_theta {
-                df_dtheta[m] = c.grad[m];
+                d2f_deta_dtheta[p * n_theta + m] = c.hess[n_theta + p][m];
             }
         }
+        for m in 0..n_theta {
+            df_dtheta[m] = c.grad[m];
+        }
         obs_out.push(ObsSens {
-            f: if neg { 0.0 } else { c.value },
+            f: c.value,
             df_deta,
             d2f_deta2,
             df_dtheta,
             d2f_deta_dtheta,
         });
     }
+
+    // Analytic `[initial_conditions]` impulse under IOV (#486): layer `A₀·kernel(t, pk)` onto
+    // every pre-reset observation BEFORE scaling — the closed-form IOV twin of the non-IOV
+    // `apply_analytical_init_outer` and of production's `add_analytical_init_with(..., amount_pk
+    // = BSV snapshot, Some(obs_params))`. The amount `A₀` is built from the BSV-only snapshot
+    // (`bsv_amount`, κ = 0), so it carries `∂A₀/∂(θ, η_bsv)` but zero `∂A₀/∂κ`; the decay kernel
+    // uses each observation's occasion source (`sources[obs_src[j]]`), so it carries the
+    // occasion κ. Their `Dual2<M>` product on the stacked axes is exact.
+    if let Some((pk_bsv, cd_bsv)) = bsv_amount {
+        let first_reset = subject
+            .reset_times
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let eta_bsv = &stacked_eta[..n_eta];
+        let cov = &subject.covariates;
+        for init in &model.analytical_init {
+            let Some(prog) = &init.amount_deriv else {
+                continue;
+            };
+            // Baseline amount `A₀` seeded on the stacked axes from the BSV snapshot (group
+            // `None` → κ axes dropped, matching production's κ-less amount). `eval_scale_dual`
+            // seeds direct θ/η references on axes `0..n_theta` / `n_theta..n_theta+n_eta` — the
+            // stacked η_bsv block — so the amount's jet lands on the correct axes.
+            let a0_var_duals: Vec<Dual2<M>> = prog
+                .var_to_pk_slot()
+                .iter()
+                .map(|&s| match slot_row[s] {
+                    Some(i) => seed(
+                        cd_bsv,
+                        None,
+                        i,
+                        pk_bsv.values.get(s).copied().unwrap_or(0.0),
+                    ),
+                    None => Dual2::<M>::constant(pk_bsv.values.get(s).copied().unwrap_or(0.0)),
+                })
+                .collect();
+            let a0 = prog.eval_scale_dual::<M>(theta, eta_bsv, cov, &a0_var_duals);
+            if !a0.value.is_finite() {
+                continue;
+            }
+            for (j, o) in obs_out.iter_mut().enumerate() {
+                let t = subject.obs_times[j];
+                if t < 0.0 || t >= first_reset {
+                    continue;
+                }
+                // Decay kernel PK duals at observation `j`'s own occasion source (κ carried).
+                let (pk_d, cd_d, group_d) = &sources[obs_src[j]];
+                let dv = |slot: usize, val: f64| -> Dual2<M> {
+                    match slot_row[slot] {
+                        Some(i) => seed(cd_d, *group_d, i, val),
+                        None => Dual2::<M>::constant(val),
+                    }
+                };
+                let c = crate::pk::analytical_init_concentration_g::<Dual2<M>>(
+                    model.pk_model,
+                    init.cmt,
+                    a0,
+                    Dual2::<M>::constant(t),
+                    dv(PK_IDX_CL, pk_d.cl()),
+                    dv(PK_IDX_V, pk_d.v()),
+                    dv(PK_IDX_Q, pk_d.q()),
+                    dv(PK_IDX_V2, pk_d.v2()),
+                    dv(PK_IDX_KA, pk_d.ka()),
+                    dv(PK_IDX_Q3, pk_d.q3()),
+                    dv(PK_IDX_V3, pk_d.v3()),
+                );
+                o.f += c.value;
+                for p in 0..n_stacked {
+                    o.df_deta[p] += c.grad[n_theta + p];
+                    for q in 0..n_stacked {
+                        o.d2f_deta2[p * n_stacked + q] += c.hess[n_theta + p][n_theta + q];
+                    }
+                    for m in 0..n_theta {
+                        o.d2f_deta_dtheta[p * n_theta + m] += c.hess[n_theta + p][m];
+                    }
+                }
+                for m in 0..n_theta {
+                    o.df_dtheta[m] += c.grad[m];
+                }
+            }
+        }
+    }
+
+    // η-dependent `ExpressionScale` `obs_scale` divisor: one scale jet per occasion group
+    // (the divisor depends on the group's κ through the PK params), applied as a post-walk
+    // quotient over the stacked `(θ, η_bsv, κ)` axes — the closed-form twin of the ODE-IOV
+    // per-group quotient (#575/#590). The scale reference `(pk, cd)` is at the subject-static
+    // covariate snapshot (`t = 0`), matching production `predict_iov`'s `apply_scaling`.
+    if let Some(scale_groups) = scale_groups {
+        let ScalingSpec::ExpressionScale {
+            deriv: Some(sprog), ..
+        } = &model.scaling
+        else {
+            return None; // gate guarantees this arm; defensive
+        };
+        let eta_bsv = &stacked_eta[..n_eta];
+        let cov = &subject.covariates;
+        // Per-group scale jets, seeding the `(θ, η_bsv, κ_g)` axes (mirroring
+        // `seed_pk_dual2_iov`) — shared with the inner walk via `build_iov_group_scale_jets`.
+        let group_scale = build_iov_group_scale_jets::<Dual2<M>>(
+            scale_groups,
+            slot_row,
+            sprog.var_to_pk_slot(),
+            |cd, g, i, v| seed(cd, Some(g), i, v),
+            |var_duals| sprog.eval_scale_dual::<M>(theta, eta_bsv, cov, var_duals),
+        );
+        let mut fk: Vec<f64> = Vec::with_capacity(n_stacked);
+        let mut fm: Vec<f64> = Vec::with_capacity(n_theta);
+        for (j, o) in obs_out.iter_mut().enumerate() {
+            let g = sources[obs_src[j]].2?;
+            apply_scale_quotient_row::<M>(o, &group_scale[g], n_theta, n_stacked, &mut fk, &mut fm);
+        }
+    }
+
+    // Constant `ScalarScale` output divisor `f/k`: covariate/η/κ-independent, so every jet
+    // entry (value, gradient, Hessian) divides by the same `k` — the IOV twin of the non-IOV
+    // `f_scaled = f/k` and production `apply_scaling` (#486 IOV-scope parity).
+    if let ScalingSpec::ScalarScale(k) = model.scaling {
+        scale_obs_sens_full(&mut obs_out, k);
+    }
+
     Some(SubjectSens { obs: obs_out })
 }
 
@@ -1169,6 +1815,8 @@ fn run_obs_iov<const M: usize>(
 fn run_obs_iov_eta<const N: usize>(
     model: &CompiledModel,
     subject: &Subject,
+    theta: &[f64],
+    stacked_eta: &[f64],
     sources: &[(crate::types::PkParams, CombinedDerivs, Option<usize>)],
     dose_src: &[usize],
     obs_src: &[usize],
@@ -1177,9 +1825,13 @@ fn run_obs_iov_eta<const N: usize>(
     n_eta: usize,
     n_kappa: usize,
     n_stacked: usize,
+    scale_groups: Option<&[(crate::types::PkParams, CombinedDerivs)]>,
+    bsv_amount: Option<&(crate::types::PkParams, CombinedDerivs)>,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
+    readout_obs: Option<&ReadoutSnapshots>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
-    use crate::sens::propagate::{event_driven_sens_g, PkDual};
+    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
 
     // First-order stacked-η seed (no θ axes): η_bsv column `c` → axis `c`; κ column
     // `c` (group g) → `n_eta + g·n_kappa + (c−n_eta)`, dropped when `group` is `None`
@@ -1243,33 +1895,178 @@ fn run_obs_iov_eta<const N: usize>(
     }
 
     let dose_lagtimes = vec![0.0; subject.doses.len()];
-    let schedule =
-        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
-    let conc = event_driven_sens_g::<Dual1<N>>(
+    // Modeled-`RATE=-1/-2` doses (#486): resolve each dose at its occasion's PK jet
+    // (shared with the non-IOV walk via `resolve_eff_doses`) and build the per-dose
+    // duals seeded on the stacked-η axes (η-only, the inner mirror of `run_obs_iov`).
+    // Fixed subjects borrow `subject.doses` and pass no duals.
+    let eff_doses = resolve_eff_doses(model, subject, |k| sources[dose_src[k]].0);
+    // Distinct-slot coincident infusion ends aren't representable by the single-`dt`
+    // walk — decline to FD (#486 review #2).
+    if !modeled_ends_separable(model, subject, &eff_doses) {
+        return None;
+    }
+    let dose_inf_dual = modeled_dose_inf_duals::<Dual1<N>>(model, subject, |k, dr_slot| {
+        let (pk, cd, group) = &sources[dose_src[k]];
+        let val = pk.values.get(dr_slot).copied().unwrap_or(0.0);
+        match slot_row.get(dr_slot).copied().flatten() {
+            Some(i) => seed(cd, *group, i, val),
+            None => Dual1::<N>::constant(val),
+        }
+    });
+    let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
+    let conc = event_driven_sens_with_doses_g::<Dual1<N>>(
         model.pk_model,
         subject,
         &schedule,
+        &eff_doses,
+        &dose_inf_dual,
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
     );
 
+    // Analytic Form C readout (#655): scratch for the per-observation dual eval.
+    let mut ro_state: Vec<Dual1<N>> = Vec::new();
+    let mut ro_vars: Vec<Dual1<N>> = Vec::new();
+    let mut ro_stack: Vec<Dual1<N>> = Vec::new();
+
     let mut out = Vec::with_capacity(conc.len());
-    for c in &conc {
-        // Clamp parity with production `conc.max(0.0)`: a negative value's derivatives
-        // vanish (consistency with the OFV / the Dual2 walk).
-        let neg = c.value < 0.0;
+    for (j, c) in conc.iter().enumerate() {
+        // Clamp the concentration jet to ≥ 0 BEFORE the readout (production ordering), then
+        // apply the Form C readout unclamped — the η-only mirror of the `run_obs_iov` step.
+        // The readout PK params come from the κ = 0 (BSV-only) snapshot (`readout_obs.at(j)`,
+        // `group = None`) while the clamped concentration supplies the κ-bearing central amount.
+        let c_clamped: Dual1<N> = if c.value < 0.0 {
+            Dual1::<N>::constant(0.0)
+        } else {
+            *c
+        };
+        let c: Dual1<N> = match (readout, readout_obs) {
+            (Some(ro), Some(ro_obs)) => eval_readout_at_obs::<Dual1<N>>(
+                ro,
+                c_clamped,
+                ro_obs.at(j),
+                slot_row,
+                subject.obs_cov(j),
+                subject.obs_times[j],
+                &seed,
+                &mut ro_state,
+                &mut ro_vars,
+                &mut ro_stack,
+            ),
+            _ => c_clamped,
+        };
+        let c = &c;
         let mut df_deta = vec![0.0; n_stacked];
-        if !neg {
-            for (p, df) in df_deta.iter_mut().enumerate() {
-                *df = c.grad[p];
-            }
+        for (p, df) in df_deta.iter_mut().enumerate() {
+            *df = c.grad[p];
         }
         out.push(ObsGrad {
-            f: if neg { 0.0 } else { c.value },
+            f: c.value,
             df_deta,
         });
     }
+
+    // Analytic `[initial_conditions]` impulse under IOV — η-gradient only (#486): the inner
+    // twin of the `run_obs_iov` outer impulse. Amount `A₀` from the BSV snapshot (`bsv_amount`,
+    // κ = 0) via `eval_scale_dual1` (seeds η_bsv on axes `0..n_eta`), decay kernel per obs from
+    // that observation's occasion source (κ carried); their `Dual1<N>` product's `∂/∂stacked-η`
+    // is folded onto every pre-reset observation's η-gradient, keeping the inner EBE gradient
+    // consistent with the outer walk and with production's `add_analytical_init_with`.
+    if let Some((pk_bsv, cd_bsv)) = bsv_amount {
+        let first_reset = subject
+            .reset_times
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let eta_bsv = &stacked_eta[..n_eta];
+        let cov = &subject.covariates;
+        for init in &model.analytical_init {
+            let Some(prog) = &init.amount_deriv else {
+                continue;
+            };
+            let a0_var_duals: Vec<Dual1<N>> = prog
+                .var_to_pk_slot()
+                .iter()
+                .map(|&s| match slot_row[s] {
+                    Some(i) => seed(
+                        cd_bsv,
+                        None,
+                        i,
+                        pk_bsv.values.get(s).copied().unwrap_or(0.0),
+                    ),
+                    None => Dual1::<N>::constant(pk_bsv.values.get(s).copied().unwrap_or(0.0)),
+                })
+                .collect();
+            let a0 = prog.eval_scale_dual1::<N>(theta, eta_bsv, cov, &a0_var_duals);
+            if !a0.value.is_finite() {
+                continue;
+            }
+            for (j, o) in out.iter_mut().enumerate() {
+                let t = subject.obs_times[j];
+                if t < 0.0 || t >= first_reset {
+                    continue;
+                }
+                let (pk_d, cd_d, group_d) = &sources[obs_src[j]];
+                let dv = |slot: usize, val: f64| -> Dual1<N> {
+                    match slot_row[slot] {
+                        Some(i) => seed(cd_d, *group_d, i, val),
+                        None => Dual1::<N>::constant(val),
+                    }
+                };
+                let c = crate::pk::analytical_init_concentration_g::<Dual1<N>>(
+                    model.pk_model,
+                    init.cmt,
+                    a0,
+                    Dual1::<N>::constant(t),
+                    dv(PK_IDX_CL, pk_d.cl()),
+                    dv(PK_IDX_V, pk_d.v()),
+                    dv(PK_IDX_Q, pk_d.q()),
+                    dv(PK_IDX_V2, pk_d.v2()),
+                    dv(PK_IDX_KA, pk_d.ka()),
+                    dv(PK_IDX_Q3, pk_d.q3()),
+                    dv(PK_IDX_V3, pk_d.v3()),
+                );
+                o.f += c.value;
+                for p in 0..n_stacked {
+                    o.df_deta[p] += c.grad[p];
+                }
+            }
+        }
+    }
+
+    // η-only `ExpressionScale` `obs_scale` quotient, one scale jet per occasion group —
+    // the first-order counterpart of the `run_obs_iov` post-walk step (#575/#590).
+    if let Some(scale_groups) = scale_groups {
+        let ScalingSpec::ExpressionScale {
+            deriv: Some(sprog), ..
+        } = &model.scaling
+        else {
+            return None; // gate guarantees this arm; defensive
+        };
+        let eta_bsv = &stacked_eta[..n_eta];
+        let cov = &subject.covariates;
+        // η-only per-group scale jets — same seeding as the outer walk (shared helper),
+        // over the stacked-η axes only.
+        let group_scale = build_iov_group_scale_jets::<Dual1<N>>(
+            scale_groups,
+            slot_row,
+            sprog.var_to_pk_slot(),
+            |cd, g, i, v| seed(cd, Some(g), i, v),
+            |var_duals| sprog.eval_scale_dual1::<N>(theta, eta_bsv, cov, var_duals),
+        );
+        for (j, o) in out.iter_mut().enumerate() {
+            let g = sources[obs_src[j]].2?;
+            apply_scale_quotient_grad_iov::<N>(o, &group_scale[g], n_stacked);
+        }
+    }
+
+    // Constant `ScalarScale` output divisor `f/k` (first-order): `f` and each `∂f/∂stacked-η`
+    // divide by `k` (#486 IOV-scope parity — the inner twin of the `run_obs_iov` step).
+    if let ScalingSpec::ScalarScale(k) = model.scaling {
+        scale_obs_sens_grad(&mut out, k);
+    }
+
     Some(out)
 }
 
@@ -1290,20 +2087,22 @@ fn run_obs_iov_eta<const N: usize>(
 /// event's* covariate snapshot via
 /// [`pd_from_program`](crate::sens::ode_provider::pd_from_program).
 pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
-    if !analytical_supported(model) || model.has_lagtime() || model.log_transform {
+    // `analytical_supported_core` (not `analytical_supported`) so a `TIME` model doesn't
+    // recurse: `analytical_supported` calls back here for the `uses_time_builtin` case
+    // (#637 review #1).
+    if !analytical_supported_core(model) || model.has_lagtime() {
         return false;
     }
-    // The TV-cov event-driven walk does not yet layer the analytic
-    // `[initial_conditions]` impulse — #524 added exact init gradients only to the
-    // dose-superposition path (`subject_sensitivities` / `subject_eta_grad`), not to
-    // `run_obs_tvcov`. Production's `compute_predictions_with_tv`, however, always
-    // adds the `A₀·kernel` baseline. Admitting an init model here would walk a
-    // gradient that omits the init while the objective keeps it — a silent mismatch
-    // that biases the FOCE/FOCEI gradient (outer and inner). Decline init models so
-    // their TV-cov / oral-infusion subjects fall back to FD (which differentiates the
-    // true objective); their non-TV-cov subjects still take the exact init path. Lift
-    // this once the walk carries the init impulse (#524 follow-up).
-    if !model.analytical_init.is_empty() {
+    // The TV-cov event-driven walk now layers the analytic `[initial_conditions]` impulse
+    // (#486, branch H): `subject_sensitivities_tvcov` / `subject_eta_grad_tvcov` fold in
+    // `A₀·kernel(t, pk)` via `apply_tvcov_init_{outer,inner}` — the exact `(θ,η)` jet at the
+    // subject-static `t = 0` snapshot — BEFORE scaling, matching production's
+    // `add_analytical_init` on `compute_predictions_with_tv` (which uses that same snapshot for
+    // both amount and decay, so the impulse is independent of the TV-cov switching). Require
+    // `init_supported` so the `(θ,η)` axis count fits the `dispatch_init_impulse!` table (the
+    // impulse dispatch's `_` arm would otherwise silently drop it); a hand-built init with no
+    // `amount_deriv` program still routes to FD there.
+    if !init_supported(model) {
         return false;
     }
     // Bound total axes to the dual-walk dispatch cap so the outer (`m_dim`) and inner
@@ -1312,13 +2111,27 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     if model.n_theta + model.n_eta > MAX_TVCOV_AXES {
         return false;
     }
-    // Constant `ScalarScale` is a covariate-independent divisor (applied to the
-    // whole jet below); `ExpressionScale` / `PerCmt` need a per-event scale jet
-    // and route to FD for now.
-    if !matches!(
-        model.scaling,
-        ScalingSpec::None | ScalingSpec::ScalarScale(_)
-    ) {
+    // Output scaling: `None` / constant `ScalarScale` (a uniform per-jet divisor), or an
+    // η-dependent `ExpressionScale` whose subject-static quotient is applied post-walk by
+    // `subject_sensitivities_tvcov` / `subject_eta_grad_tvcov` (the same shared
+    // `apply_expression_scale_outer` / `_inner_dispatch` the dose-superposition path uses,
+    // #486 — closes the TV-cov + expression-scale gap). `scaling_supported` bounds the
+    // scale program to the dispatch table; `PerCmt` still routes to FD. LTBS is now admitted
+    // (#486): `subject_sensitivities_tvcov` applies the `ln(f)` jet transform LAST, after any
+    // scale quotient — reproducing production's scale-then-log order `ln(f/s)` exactly (the
+    // whole transform is post-walk on the closed-form path, unlike the ODE in-walk log). The
+    // inner EBE gradient is served analytically here too (`subject_eta_grad_tvcov` applies the
+    // same `ln(f)` inner jet LAST, #673); LTBS × IOV is the only combination whose inner stays
+    // on FD (`analytic_inner_common_bail`'s `log_transform && n_kappa > 0` clause).
+    if !scaling_supported(model) {
+        return false;
+    }
+    // An analytic Form C readout must also fit the event-walk's structural
+    // `PkDual` slots here (#650). Without this, a readout whose params spill past
+    // `PK_IDX_V3` would make `analytical_supported` (via the `uses_time` clause)
+    // report "analytic" while every event-walk subject silently falls back to FD —
+    // exactly the route/report drift #637 guards against.
+    if !readout_tvcov_supported(model) {
         return false;
     }
     match model.indiv_param_partials.indiv_param_program.as_ref() {
@@ -1329,6 +2142,150 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
         }
         None => false,
     }
+}
+
+/// Clamp a **dual** modeled `D`/`R` to its domain floor, keeping the jet in the
+/// interior and dropping it at the wall — the dual mirror of
+/// [`crate::types::clamp_above_floor`] used by the f64 [`DoseEvent::resolve_rate`].
+/// A converged fit is interior, so this is the identity there; it only keeps a
+/// transient `D ≤ 0` / `R ≤ 0` from turning `amt/D` into a non-finite rate (#486).
+#[inline]
+fn clamp_dual_floor<T: crate::sens::num::PkNum>(x: T, floor: f64) -> T {
+    if x.val() > floor {
+        x
+    } else {
+        T::from_f64(floor)
+    }
+}
+
+/// True when every modeled `RATE=-1/-2` dose on `subject` has its backing
+/// `D{cmt}`/`R{cmt}` PK slot declared. A modeled dose with no slot is an invalid
+/// model (`check_model_data` rejects it upstream), but the analytic providers still
+/// guard it here so they decline to FD rather than panicking in
+/// [`DoseEvent::resolve_rate`]'s slot `.expect` (#486). Fixed subjects are trivially
+/// `true`. Mirrors the ODE `ode_tvcov_supported` slot-presence clause.
+fn modeled_doses_resolvable(model: &CompiledModel, subject: &Subject) -> bool {
+    if subject.all_doses_fixed() {
+        return true;
+    }
+    let attr_map = model.active_dose_attr_map();
+    subject
+        .doses
+        .iter()
+        .all(|d| d.is_fixed() || crate::sens::ode_provider::modeled_slot_for(attr_map, d).is_some())
+}
+
+/// Resolve each dose's modeled `RATE=-1/-2` (`R{cmt}`/`D{cmt}`) to a concrete
+/// `rate`/`duration` for the walk's **value** path (the schedule's infusion break
+/// times + the per-sub-interval active-window checks), using the caller-supplied f64
+/// PK params at each dose (`dose_pk(k)`). A fixed subject borrows `subject.doses`
+/// unchanged (#486). Single-sourced across the non-IOV and IOV walks — each supplies
+/// `dose_pk` from its own already-evaluated per-dose params (so `pk_param_fn` is not
+/// re-run here, #486 review). The matching derivative twin is
+/// [`modeled_dose_inf_duals`].
+fn resolve_eff_doses<'a>(
+    model: &CompiledModel,
+    subject: &'a Subject,
+    dose_pk: impl Fn(usize) -> crate::types::PkParams,
+) -> std::borrow::Cow<'a, [crate::types::DoseEvent]> {
+    if subject.all_doses_fixed() {
+        return std::borrow::Cow::Borrowed(&subject.doses);
+    }
+    let attr_map = model.active_dose_attr_map();
+    std::borrow::Cow::Owned(
+        (0..subject.doses.len())
+            .map(|k| subject.doses[k].resolve_rate(attr_map, &dose_pk(k).values))
+            .collect(),
+    )
+}
+
+/// Shared FD-fallback gate for modeled `RATE=-1/-2` doses on the analytic closed-form
+/// walk (#486, deduped from the per-provider guards). Returns `false` (⇒ decline to
+/// FD) when a modeled dose has no backing `D{cmt}`/`R{cmt}` slot — an invalid model
+/// `check_model_data` rejects upstream, guarded here so the provider declines rather
+/// than panics in [`DoseEvent::resolve_rate`].
+///
+/// A modeled dose combined with a **steady-state** dose is now analytic too (#486):
+/// [`crate::sens::propagate::equilibrate_ss_g`] threads the per-dose modeled-window dual
+/// `(rate_bare, dur_bare)` into each equilibration cycle's active/quiet split, so the
+/// moving infusion-end jet flows through the SS trough exactly as it does through the
+/// current pulse (matching the ODE provider's `equilibrate_ss_state_g`).
+fn modeled_dose_analytic_gate(model: &CompiledModel, subject: &Subject) -> bool {
+    modeled_doses_resolvable(model, subject)
+}
+
+/// True when the modeled-infusion **end** times are separable — no two modeled doses
+/// backed by *distinct* `D`/`R` PK slots resolve to the same infusion-end time. The
+/// dual-`dt` walk encodes each moving end as one break carrying that dose's window
+/// jet; two distinct-slot ends coinciding would need the single sub-interval to carry
+/// two different dual lengths (one per compartment), which it cannot — so such a
+/// (degenerate, measure-zero) subject declines to FD to stay exact (#486 review #2).
+/// Same-slot coincident ends are fine: they share the `D`/`R` value ⇒ an identical
+/// jet ⇒ they move together, and the walk's first-match `dual_pos` is exact. `eff`
+/// are the resolved doses the walk sees; the modeled-slot identity is read from the
+/// original `subject.doses` (`resolve_rate` erases `rate_mode` to `Fixed`).
+fn modeled_ends_separable(
+    model: &CompiledModel,
+    subject: &Subject,
+    eff: &[crate::types::DoseEvent],
+) -> bool {
+    let attr_map = model.active_dose_attr_map();
+    let mut ends: Vec<(f64, usize)> = Vec::new();
+    for (k, d) in subject.doses.iter().enumerate() {
+        if let Some((_mode, slot)) = crate::sens::ode_provider::modeled_slot_for(attr_map, d) {
+            let end = eff[k].time + eff[k].duration;
+            if ends
+                .iter()
+                .any(|&(e, s)| s != slot && (e - end).abs() < 1e-9)
+            {
+                return false;
+            }
+            ends.push((end, slot));
+        }
+    }
+    true
+}
+
+/// Per-dose modeled-infusion duals `(rate_bare, dur_bare)` for the event walk
+/// ([`crate::sens::propagate::event_driven_sens_with_doses_g`], #486): `None` for a
+/// fixed dose (or a fixed subject → empty), `Some` for a modeled `RATE=-1/-2` dose.
+/// `rate_bare` is the F-agnostic infusion rate (`amt/D` for `RATE=-2`, `R` for
+/// `RATE=-1`) whose PK-param jet feeds the injected rate magnitude; `dur_bare` is
+/// the window length (`D`, or `amt/R`) whose jet makes the infusion **end** a moving
+/// boundary. `slot_dual(dose_k, pk_slot)` supplies the seeded dual of the `D`/`R` PK
+/// slot at dose `k`'s snapshot (`Dual2<M>` outer, `Dual1<N>` inner). A transient
+/// non-positive `D`/`R` is clamped to its floor, mirroring the f64
+/// [`DoseEvent::resolve_rate`].
+fn modeled_dose_inf_duals<T: crate::sens::num::PkNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    slot_dual: impl Fn(usize, usize) -> T,
+) -> Vec<Option<(T, T)>> {
+    if subject.all_doses_fixed() {
+        return Vec::new();
+    }
+    let attr_map = model.active_dose_attr_map();
+    subject
+        .doses
+        .iter()
+        .enumerate()
+        .map(|(k, d)| {
+            let (mode, slot) = crate::sens::ode_provider::modeled_slot_for(attr_map, d)?;
+            let sd = slot_dual(k, slot);
+            let amt = T::from_f64(d.amt);
+            match mode {
+                crate::types::RateMode::ModeledDuration => {
+                    let dur = clamp_dual_floor(sd, crate::types::DoseEvent::DURATION_FLOOR);
+                    Some((amt / dur, dur))
+                }
+                crate::types::RateMode::ModeledRate => {
+                    let rate = clamp_dual_floor(sd, crate::types::DoseEvent::RATE_FLOOR);
+                    Some((rate, amt / rate))
+                }
+                crate::types::RateMode::Fixed => None,
+            }
+        })
+        .collect()
 }
 
 /// Exact analytic sensitivities for an analytical subject with **time-varying
@@ -1344,6 +2301,124 @@ pub fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
 /// `compute_predictions_with_tv` does over `f64`. EVID=2 (`pk_only`) covariate
 /// breakpoints between observations are seeded and walked too. Returns `None`
 /// outside the supported scope (caller falls back to FD).
+/// Layer the analytic `[initial_conditions]` impulse onto a **TV-cov walk**'s `SubjectSens`
+/// (#486, branch H — the closed-form analogue of #649's ODE `tvcov_init_state`). Production's
+/// `add_analytical_init` (`pk/mod.rs`) adds `A₀·kernel(t, pk)` with a single subject-static
+/// `t = 0` snapshot — `pk_param_fn(θ, η, subject.covariates, 0)` — for both the baseline amount
+/// and its decay kernel, even for a TV-cov subject (the init impulse is independent of the
+/// time-varying-covariate switching). So compute that snapshot's `ParamDerivs` and fold in the
+/// impulse via the SAME [`apply_analytical_init_outer`] the dose-superposition provider uses,
+/// BEFORE scaling. Returns `Some(())` (no-op) when the model has no `[initial_conditions]`, and
+/// `None` when the exact `∂p/∂(θ,η)` can't be built (non-log-normal η with no program) so the
+/// caller falls back to FD. `tvcov_analytical_supported`'s `init_supported` clause bounds the
+/// axis count to the `dispatch_init_impulse!` table, so the `_` arm never silently drops it.
+fn apply_tvcov_init_outer(
+    sens: &mut SubjectSens,
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<()> {
+    if model.analytical_init.is_empty() {
+        return Some(());
+    }
+    let n_theta = model.n_theta;
+    let n_eta = model.n_eta;
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let (pd, slots): (crate::sens::ode_provider::ParamDerivs, Vec<usize>) = match model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .filter(|prog| prog_covers_required_pk_slots(model, prog))
+        .and_then(|prog| {
+            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
+                .map(|pd| (pd, prog.pk_slots()))
+        }) {
+        Some(v) => v,
+        None => {
+            if !model
+                .eta_param_info
+                .iter()
+                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
+            {
+                return None;
+            }
+            let pd = lognormal_param_derivatives(model, subject, theta, &pk);
+            (pd, model.pk_indices.clone())
+        }
+    };
+    dispatch_init_impulse!(
+        n_theta + n_eta,
+        apply_analytical_init_outer,
+        sens,
+        model,
+        subject,
+        &pk,
+        &pd,
+        &slots,
+        theta,
+        eta,
+        &subject.covariates,
+        n_theta,
+        n_eta
+    );
+    Some(())
+}
+
+/// Inner (`Dual1`, η-gradient only) counterpart of [`apply_tvcov_init_outer`] — layers the
+/// analytic `[initial_conditions]` impulse onto a TV-cov walk's `ObsGrad` list before scaling,
+/// via [`apply_analytical_init_inner`] on the subject-static `t = 0` snapshot's `∂p/∂η`.
+fn apply_tvcov_init_inner(
+    out: &mut [ObsGrad],
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<()> {
+    if model.analytical_init.is_empty() {
+        return Some(());
+    }
+    let n_eta = model.n_eta;
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let (dp_deta, slots): (Vec<Vec<f64>>, Vec<usize>) = match model
+        .indiv_param_partials
+        .indiv_param_program
+        .as_ref()
+        .filter(|prog| prog_covers_required_pk_slots(model, prog))
+        .and_then(|prog| {
+            crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)
+                .map(|pd| (pd.dp_deta, prog.pk_slots()))
+        }) {
+        Some(v) => v,
+        None => {
+            if !model
+                .eta_param_info
+                .iter()
+                .all(|e| e.param_type == crate::types::EtaParamType::LogNormal)
+            {
+                return None;
+            }
+            let pd = lognormal_param_derivatives(model, subject, theta, &pk);
+            (pd.dp_deta, model.pk_indices.clone())
+        }
+    };
+    dispatch_init_impulse!(
+        n_eta,
+        apply_analytical_init_inner,
+        out,
+        model,
+        subject,
+        &pk,
+        &dp_deta,
+        &slots,
+        theta,
+        eta,
+        &subject.covariates,
+        n_eta
+    );
+    Some(())
+}
+
 pub fn subject_sensitivities_tvcov(
     model: &CompiledModel,
     subject: &Subject,
@@ -1351,10 +2426,18 @@ pub fn subject_sensitivities_tvcov(
     eta: &[f64],
 ) -> Option<SubjectSens> {
     // Routed here for time-varying covariates *or* oral infusion (#350/#400) — both
-    // need the state-propagating walk rather than dose superposition.
-    if !tvcov_analytical_supported(model)
-        || !(subject.has_tv_covariates() || subject_has_oral_infusion(model, subject))
-    {
+    // need the state-propagating walk rather than dose superposition. A structural
+    // parameter reading the `TIME` built-in is piecewise/time-varying for the same
+    // reason, so it routes here too even with no TV covariates (#486 / #610).
+    if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
+        return None;
+    }
+    // Analytic Form C readout (#650) on a TV-cov / oral-infusion / TIME subject:
+    // the event-driven Dual2 walk carries the compartment amount as a dual, so the
+    // readout is served analytically here — provided every parameter it references
+    // fits the eight structural `PkDual` slots (`readout_tvcov_supported`).
+    // Otherwise fall back to FD (correct via the readout-aware f64 predictor).
+    if model.analytic_readout.is_some() && !readout_tvcov_supported(model) {
         return None;
     }
     // Steady-state doses equilibrate per-event in the walk (`equilibrate_ss_g`,
@@ -1363,6 +2446,13 @@ pub fn subject_sensitivities_tvcov(
     // which a mid-record reset contradicts, so a subject mixing SS with resets
     // falls back to FD — mirroring the non-IOV / IOV providers.
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
+        return None;
+    }
+    // Modeled-`RATE=-1/-2` doses — including combined with steady state (#486:
+    // `equilibrate_ss_g` threads the modeled-window jet into its per-cycle active/quiet
+    // split) — are served analytically below via the per-dose duals; only the
+    // missing-slot case declines to FD via the shared gate.
+    if !modeled_dose_analytic_gate(model, subject) {
         return None;
     }
 
@@ -1385,11 +2475,17 @@ pub fn subject_sensitivities_tvcov(
         }
     }
 
+    // Analytic Form C readout program (#650); `readout_tvcov_supported` (checked at
+    // the gate) guarantees it fits the eight structural `PkDual` slots here.
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     macro_rules! disp {
         ($($m:literal),+) => {
             match m_dim {
                 $($m => run_obs_tvcov::<$m>(
-                    model, subject, theta, eta, prog, &slot_row, n_eta, n_theta,
+                    model, subject, theta, eta, prog, &slot_row, n_eta, n_theta, readout,
                 ),)+
                 _ => None,
             }
@@ -1399,27 +2495,28 @@ pub fn subject_sensitivities_tvcov(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
     )?;
 
+    // Analytic `[initial_conditions]` impulse (#486): layer `A₀·kernel(t, pk)` and its exact
+    // `(θ,η)` jet onto every pre-reset observation BEFORE scaling — the same insertion order as
+    // the f64 `pk::add_analytical_init` on the production TV-cov path (`compute_predictions_with_tv`).
+    apply_tvcov_init_outer(&mut sens, model, subject, theta, eta)?;
+
     // Constant `ScalarScale` output divisor `f_scaled = f/k`: every derivative is
     // linear in `f` and `k` is constant, so the whole jet divides by `k` — matches
-    // `pk::apply_scaling` (`pred /= s`) on the production TV-cov path. The gate
-    // admits only `None` / `ScalarScale`, so no other scaling reaches here.
+    // `pk::apply_scaling` (`pred /= s`) on the production TV-cov path.
     if let ScalingSpec::ScalarScale(k) = model.scaling {
-        if k != 1.0 {
-            let inv = 1.0 / k;
-            for o in sens.obs.iter_mut() {
-                o.f *= inv;
-                for v in o
-                    .df_deta
-                    .iter_mut()
-                    .chain(o.d2f_deta2.iter_mut())
-                    .chain(o.df_dtheta.iter_mut())
-                    .chain(o.d2f_deta_dtheta.iter_mut())
-                {
-                    *v *= inv;
-                }
-            }
-        }
+        scale_obs_sens_full(&mut sens.obs, k);
     }
+    // η-dependent `ExpressionScale` divisor `s(θ, η)`: apply the subject-static quotient
+    // `scaled_f = f/s` on the walked jet — the SAME shared quotient the dose-superposition
+    // path uses (#486, closing the TV-cov + expression-scale gap). Production
+    // `pk::apply_scaling` evaluates the scale once at the subject-static covariates and
+    // `t = 0` params, mirrored inside the helper.
+    apply_event_walk_expression_scale_outer(&mut sens, model, subject, prog, theta, eta)?;
+    // LTBS: transform the walked (and scaled) jet to `g = ln(f)` LAST, via the same shared
+    // helper the dose-superposition outer uses — so the two paths cannot drift, and the
+    // scale-then-log order matches production `ln(f/s)` (#486). The inner EBE gradient stays
+    // on FD for LTBS (covariance stability), so there is no inner counterpart.
+    apply_ltbs_transform_outer(&mut sens, model.log_transform);
     Some(sens)
 }
 
@@ -1439,19 +2536,31 @@ fn run_obs_tvcov<const M: usize>(
     slot_row: &[Option<usize>; N_PK],
     n_eta: usize,
     n_theta: usize,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Option<SubjectSens> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::ode_provider::pd_from_program;
-    use crate::sens::propagate::{event_driven_sens_g, PkDual};
+    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
+
+    // PK slot order the program differentiates (for seeding the modeled `D`/`R`
+    // slot dual via `pk_slot_dual_outer`, #486).
+    let slots = prog.pk_slots_ref();
 
     // Build the per-event PK-param duals at a covariate snapshot: evaluate the
     // program's `∂p/∂(θ, η)` (+ 2nd order) at `cov`, then seed each differentiated
     // PK slot on its `(θ, η)` dual axis (`θ_m → m`, `η_k → n_theta + k`); constants
     // otherwise. The θ-θ Hessian block is unused downstream (left zero), mirroring
     // the IOV / scale seeders.
-    let mk = |cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual2<M>> {
+    // A `TIME`-built-in structural parameter resolves `Op::PushTime` from the
+    // model-time thread-local, which `pd_from_program`'s `Dual2` walk reads. Seed
+    // it with the per-event time (gated on `uses_time`, exactly like the f64
+    // `pk_param_fn` closure) so each event's PK-param duals — value AND derivatives
+    // — are evaluated at that event's `TIME` (#486 / #610).
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    let mk = |time: f64, cov: &std::collections::HashMap<String, f64>| -> PkDual<Dual2<M>> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
-        let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
+        let pk = (model.pk_param_fn)(theta, eta, cov, time);
         let seed_row = |i: usize, val: f64| -> Dual2<M> {
             let mut grad = [0.0; M];
             let mut hess = [[0.0; M]; M];
@@ -1503,53 +2612,138 @@ fn run_obs_tvcov<const M: usize>(
     // covariate snapshot (the `*_cov` accessors fall back to the static map when a
     // particular event carries no snapshot).
     let pk_at_dose: Vec<PkDual<Dual2<M>>> = (0..subject.doses.len())
-        .map(|k| mk(subject.dose_cov(k)))
+        .map(|k| mk(subject.doses[k].time, subject.dose_cov(k)))
         .collect();
     let pk_at_obs: Vec<PkDual<Dual2<M>>> = (0..subject.obs_times.len())
-        .map(|j| mk(subject.obs_cov(j)))
+        .map(|j| mk(subject.obs_times[j], subject.obs_cov(j)))
         .collect();
     let pk_at_pk_only: Vec<PkDual<Dual2<M>>> = (0..subject.pk_only_times.len())
-        .map(|m| mk(subject.pk_only_cov(m)))
+        .map(|m| mk(subject.pk_only_times[m], subject.pk_only_cov(m)))
         .collect();
 
     // No lagtime in TV-cov scope → zero dose lagtimes.
     let dose_lagtimes = vec![0.0; subject.doses.len()];
-    let schedule =
-        EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
-    let conc = event_driven_sens_g::<Dual2<M>>(
+    // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration for the
+    // schedule's break times, and build the per-dose duals so the injected rate and
+    // the moving infusion-end boundary carry their `(θ,η)` jets. The per-dose f64 PK
+    // params are evaluated once (`dose_pk`) and shared by the resolved window and the
+    // dual's value, rather than re-running `pk_param_fn` per dose (#486 review #4).
+    // Fixed subjects borrow `subject.doses` and pass no duals (identical to the
+    // pre-#486 path).
+    let dose_pk: Vec<crate::types::PkParams> = (0..subject.doses.len())
+        .map(|k| {
+            let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(
+                uses_time,
+                subject.doses[k].time,
+            );
+            (model.pk_param_fn)(theta, eta, subject.dose_cov(k), subject.doses[k].time)
+        })
+        .collect();
+    let eff_doses = resolve_eff_doses(model, subject, |k| dose_pk[k]);
+    // Distinct-slot coincident infusion ends aren't representable by the single-`dt`
+    // walk — decline to FD (#486 review #2).
+    if !modeled_ends_separable(model, subject, &eff_doses) {
+        return None;
+    }
+    let schedule = EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
+    let dose_inf_dual = modeled_dose_inf_duals::<Dual2<M>>(model, subject, |k, dr_slot| {
+        let cov = subject.dose_cov(k);
+        let _guard =
+            crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, subject.doses[k].time);
+        let pd = pd_from_program::<M>(prog, model, cov, theta, eta);
+        pk_slot_dual_outer::<M>(
+            dr_slot,
+            dose_pk[k].values.get(dr_slot).copied().unwrap_or(0.0),
+            &pd,
+            slots,
+            n_theta,
+            n_eta,
+        )
+    });
+    let conc = event_driven_sens_with_doses_g::<Dual2<M>>(
         model.pk_model,
         subject,
         &schedule,
+        &eff_doses,
+        &dose_inf_dual,
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
     );
 
+    // Analytic Form C readout (#650): scratch for the per-observation dual eval.
+    let mut ro_state: Vec<Dual2<M>> = Vec::new();
+    let mut ro_vars: Vec<Dual2<M>> = Vec::new();
+    let mut ro_stack: Vec<Dual2<M>> = Vec::new();
+
     let mut obs_out = Vec::with_capacity(conc.len());
-    for c in &conc {
-        // Clamp parity with production `conc.max(0.0)`: a negative value's
-        // derivatives vanish (consistency with the OFV).
-        let neg = c.value < 0.0;
+    for (j, c) in conc.iter().enumerate() {
+        // Clamp the concentration jet to ≥ 0 BEFORE any readout — production clamps
+        // `conc.max(0.0)` and only then applies the readout (returned unclamped). For a
+        // plain model this reproduces the old post-loop clamp (`constant(0.0)` zeros grad/hess).
+        let c_clamped: Dual2<M> = if c.value < 0.0 {
+            Dual2::<M>::constant(0.0)
+        } else {
+            *c
+        };
+        // Analytic Form C readout: replace the (clamped) central concentration jet with
+        // `y = <expr>`. The per-observation PK duals (`pk_at_obs[j]`) already carry each
+        // parameter's `∂/∂(θ,η)` in the walk basis — including a non-structural `BMAX`/`KD`
+        // seeded into its allocated structural slot — so the readout's derivatives compose
+        // directly. The central amount is `concentration × V`; the output is not re-clamped.
+        let c: Dual2<M> = if let Some(ro) = readout {
+            let pkd = &pk_at_obs[j];
+            // Flat PK-slot dual vector for `eval_output_g`'s `indiv_to_pk` lookups;
+            // the eight structural slots come from the walk's `PkDual`, every higher
+            // slot is a static constant (`readout_tvcov_supported` guarantees no
+            // readout param maps past `PK_IDX_V3`).
+            let params: [Dual2<M>; N_PK] = std::array::from_fn(|s| match s {
+                PK_IDX_CL => pkd.cl,
+                PK_IDX_V => pkd.v,
+                PK_IDX_Q => pkd.q,
+                PK_IDX_V2 => pkd.v2,
+                PK_IDX_KA => pkd.ka,
+                PK_IDX_F => pkd.f,
+                PK_IDX_Q3 => pkd.q3,
+                PK_IDX_V3 => pkd.v3,
+                _ => Dual2::<M>::constant(0.0),
+            });
+            // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
+            // thread-local; enter this observation's time to match production's
+            // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
+            let _time_guard =
+                crate::parser::model_parser::ModelTimeGuard::enter(subject.obs_times[j]);
+            eval_readout_jet::<Dual2<M>>(
+                ro,
+                c_clamped,
+                &params,
+                subject.obs_cov(j),
+                &mut ro_state,
+                &mut ro_vars,
+                &mut ro_stack,
+            )
+        } else {
+            c_clamped
+        };
+        let c = &c;
         let mut df_deta = vec![0.0; n_eta];
         let mut df_dtheta = vec![0.0; n_theta];
         let mut d2f_deta2 = vec![0.0; n_eta * n_eta];
         let mut d2f_deta_dtheta = vec![0.0; n_eta * n_theta];
-        if !neg {
-            for k in 0..n_eta {
-                df_deta[k] = c.grad[n_theta + k];
-                for l in 0..n_eta {
-                    d2f_deta2[k * n_eta + l] = c.hess[n_theta + k][n_theta + l];
-                }
-                for m in 0..n_theta {
-                    d2f_deta_dtheta[k * n_theta + m] = c.hess[n_theta + k][m];
-                }
+        for k in 0..n_eta {
+            df_deta[k] = c.grad[n_theta + k];
+            for l in 0..n_eta {
+                d2f_deta2[k * n_eta + l] = c.hess[n_theta + k][n_theta + l];
             }
             for m in 0..n_theta {
-                df_dtheta[m] = c.grad[m];
+                d2f_deta_dtheta[k * n_theta + m] = c.hess[n_theta + k][m];
             }
         }
+        for m in 0..n_theta {
+            df_dtheta[m] = c.grad[m];
+        }
         obs_out.push(ObsSens {
-            f: if neg { 0.0 } else { c.value },
+            f: c.value,
             df_deta,
             d2f_deta2,
             df_dtheta,
@@ -1586,15 +2780,28 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
     eta: &[f64],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
-    if !tvcov_analytical_supported(model)
-        || !(subject.has_tv_covariates() || subject_has_oral_infusion(model, subject))
-    {
+    if !tvcov_analytical_supported(model) || !subject_routes_to_event_walk(model, subject) {
+        return None;
+    }
+    // LTBS on the TV-cov inner walk is now analytic (#665 follow-up): the `g = ln(f)` jet
+    // is applied LAST below (after the init impulse and scale quotient), mirroring the outer
+    // TV-cov path (`subject_sensitivities_tvcov` → `apply_ltbs_transform_outer`). Reproduces
+    // production's scale-then-log order; the covariance step reconverges these EBEs at the
+    // tighter `cov_inner_tol` (closed-form non-IOV LTBS), so the SEs stay clean.
+    // Analytic Form C readout (#650): served analytically on the event-walk when it
+    // fits the structural `PkDual` slots (matches the outer gate); otherwise FD.
+    if model.analytic_readout.is_some() && !readout_tvcov_supported(model) {
         return None;
     }
     if subject.has_resets() && subject.doses.iter().any(|d| d.ss) {
         return None;
     }
-    if !subject.all_doses_fixed() {
+    // Modeled-`RATE=-1/-2` doses are served analytically by the walk now (#486): the
+    // dual rate + moving infusion-end boundary (`run_obs_grad_tvcov` builds the
+    // per-dose duals). The steady-state combination is analytic too (#486:
+    // `equilibrate_ss_g` threads the modeled-window jet into its per-cycle active/quiet
+    // split); only the missing-slot case declines to FD via the shared gate.
+    if !modeled_dose_analytic_gate(model, subject) {
         return None;
     }
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
@@ -1615,10 +2822,14 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
         }
     }
 
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     macro_rules! disp {
         ($($n:literal),+) => {
             match n_eta {
-                $($n => run_obs_grad_tvcov::<$n>(model, subject, theta, eta, prog, &slot_row, n_eta, cached_schedule),)+
+                $($n => run_obs_grad_tvcov::<$n>(model, subject, theta, eta, prog, &slot_row, n_eta, cached_schedule, readout),)+
                 _ => None,
             }
         };
@@ -1631,19 +2842,24 @@ pub(crate) fn subject_eta_grad_tvcov_with_schedule(
         1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
     )?;
 
+    // Analytic `[initial_conditions]` impulse (#486): η-gradient only, layered BEFORE scaling —
+    // the inner twin of the outer TV-cov init impulse (keeps the inner EBE gradient consistent
+    // with the outer, and with production's `add_analytical_init`).
+    apply_tvcov_init_inner(&mut out, model, subject, theta, eta)?;
+
     // Constant `ScalarScale` divisor: `∂(f/k)/∂η = (∂f/∂η)/k` (η-independent `k`),
-    // matching the outer TV-cov path and `pk::apply_scaling`. (LTBS / ExpressionScale
-    // keep the FD inner — gated upstream in `analytic_inner_grad_supported_model`.)
+    // matching the outer TV-cov path and `pk::apply_scaling`. (LTBS keeps the FD inner —
+    // gated upstream; `ExpressionScale` is applied below.)
     if let ScalingSpec::ScalarScale(k) = model.scaling {
-        if k != 1.0 {
-            for o in out.iter_mut() {
-                o.f /= k;
-                for g in o.df_deta.iter_mut() {
-                    *g /= k;
-                }
-            }
-        }
+        scale_obs_sens_grad(&mut out, k);
     }
+    // η-dependent `ExpressionScale` divisor: the η-only quotient — the light counterpart
+    // of the outer path, matching the static inner path (#486). Subject-static scale from
+    // `pk`/`∂p/∂η` at `t = 0`, applied to every observation (shared helper).
+    apply_event_walk_expression_scale_inner(&mut out, model, subject, prog, theta, eta)?;
+    // LTBS `g = ln(f)` LAST — after the init impulse and scale quotient — mirroring the
+    // outer TV-cov path (#665 follow-up). Shared inner helper; no-op when not LTBS.
+    apply_ltbs_transform_inner(&mut out, model.log_transform);
     Some(out)
 }
 
@@ -1660,20 +2876,32 @@ fn run_obs_grad_tvcov<const N: usize>(
     slot_row: &[Option<usize>; N_PK],
     n_eta: usize,
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Option<Vec<ObsGrad>> {
     use crate::pk::event_driven::EventSchedule;
     use crate::sens::ode_provider::param_derivatives_at_cov;
-    use crate::sens::propagate::{event_driven_sens_g, PkDual};
+    use crate::sens::propagate::{event_driven_sens_with_doses_g, PkDual};
 
     // The dispatch sizes `N = n_eta` exactly, so the `.min(N)` clamps below are
     // no-ops — flat `0..n_eta` loops (#449 re-review #5, mirroring #15).
     debug_assert_eq!(N, n_eta);
 
-    let mk = |cov: &std::collections::HashMap<String, f64>| -> Option<PkDual<Dual1<N>>> {
+    // PK slot order the program differentiates (for the modeled `D`/`R` slot dual).
+    let slots = prog.pk_slots_ref();
+
+    // Seed the model-time thread-local with the per-event time so a `TIME`-built-in
+    // structural parameter resolves to that event's time in both the f64 value and
+    // the `Dual1` η-derivative walk (gated on `uses_time`, like the f64 closure;
+    // #486 / #610).
+    let uses_time = crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    let mk = |time: f64,
+              cov: &std::collections::HashMap<String, f64>|
+     -> Option<PkDual<Dual1<N>>> {
+        let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, time);
         // `None` above the param-derivative dispatch cap (n_axes > 16): decline so
         // the inner loop falls back to FD rather than panicking (#449 review #1).
         let pd = param_derivatives_at_cov(prog, model, cov, theta, eta)?;
-        let pk = (model.pk_param_fn)(theta, eta, cov, 0.0);
+        let pk = (model.pk_param_fn)(theta, eta, cov, time);
         let seed_row = |i: usize, val: f64| -> Dual1<N> {
             let mut grad = [0.0; N];
             for k in 0..n_eta {
@@ -1700,49 +2928,122 @@ fn run_obs_grad_tvcov<const N: usize>(
     };
 
     let pk_at_dose: Vec<PkDual<Dual1<N>>> = (0..subject.doses.len())
-        .map(|k| mk(subject.dose_cov(k)))
+        .map(|k| mk(subject.doses[k].time, subject.dose_cov(k)))
         .collect::<Option<Vec<_>>>()?;
     let pk_at_obs: Vec<PkDual<Dual1<N>>> = (0..subject.obs_times.len())
-        .map(|j| mk(subject.obs_cov(j)))
+        .map(|j| mk(subject.obs_times[j], subject.obs_cov(j)))
         .collect::<Option<Vec<_>>>()?;
     let pk_at_pk_only: Vec<PkDual<Dual1<N>>> = (0..subject.pk_only_times.len())
-        .map(|m| mk(subject.pk_only_cov(m)))
+        .map(|m| mk(subject.pk_only_times[m], subject.pk_only_cov(m)))
         .collect::<Option<Vec<_>>>()?;
 
-    // The event schedule is invariant across inner BFGS steps (it depends only on the
-    // subject + doses + zero lagtimes, not on η). Reuse the schedule the inner
-    // optimizer cached once per subject when available, instead of rebuilding it every
-    // gradient step; fall back to building it locally otherwise (#449 re-review #6).
+    // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration and build
+    // the per-dose duals (dual rate + moving infusion-end boundary). A modeled dose's
+    // resolved window varies with η across inner BFGS steps, so its schedule cannot be
+    // cached — rebuild from the resolved `eff_doses` each call. Fixed subjects keep the
+    // cached (η-invariant) schedule.
+    // The per-dose f64 PK params are evaluated once (`dose_pk`) and shared by the
+    // resolved window and the dual's value, rather than re-running `pk_param_fn` per
+    // dose on the inner hot path (#486 review #4).
+    let dose_pk: Vec<crate::types::PkParams> = (0..subject.doses.len())
+        .map(|k| {
+            let _guard = crate::parser::model_parser::ModelTimeGuard::enter_if(
+                uses_time,
+                subject.doses[k].time,
+            );
+            (model.pk_param_fn)(theta, eta, subject.dose_cov(k), subject.doses[k].time)
+        })
+        .collect();
+    let eff_doses = resolve_eff_doses(model, subject, |k| dose_pk[k]);
+    // Distinct-slot coincident infusion ends aren't representable by the single-`dt`
+    // walk — decline to FD (#486 review #2).
+    if !modeled_ends_separable(model, subject, &eff_doses) {
+        return None;
+    }
+    let dose_inf_dual = modeled_dose_inf_duals::<Dual1<N>>(model, subject, |k, dr_slot| {
+        let cov = subject.dose_cov(k);
+        let _guard =
+            crate::parser::model_parser::ModelTimeGuard::enter_if(uses_time, subject.doses[k].time);
+        let val = dose_pk[k].values.get(dr_slot).copied().unwrap_or(0.0);
+        match param_derivatives_at_cov(prog, model, cov, theta, eta) {
+            Some(pd) => pk_slot_dual_inner::<N>(dr_slot, val, &pd.dp_deta, slots, n_eta),
+            None => Dual1::constant(val),
+        }
+    });
+
+    // The event schedule is invariant across inner BFGS steps for a fixed subject (it
+    // depends only on the subject + doses + zero lagtimes, not on η). Reuse the schedule
+    // the inner optimizer cached once per subject when available; rebuild locally for
+    // modeled doses (window depends on η) or when no cache was passed (#449 / #486).
     let owned_schedule;
     let schedule: &EventSchedule = match cached_schedule {
-        Some(s) => s,
-        None => {
+        Some(s) if subject.all_doses_fixed() => s,
+        _ => {
             let dose_lagtimes = vec![0.0; subject.doses.len()];
             owned_schedule =
-                EventSchedule::for_subject(subject, model.pk_model, &subject.doses, &dose_lagtimes);
+                EventSchedule::for_subject(subject, model.pk_model, &eff_doses, &dose_lagtimes);
             &owned_schedule
         }
     };
-    let conc = event_driven_sens_g::<Dual1<N>>(
+    let conc = event_driven_sens_with_doses_g::<Dual1<N>>(
         model.pk_model,
         subject,
         schedule,
+        &eff_doses,
+        &dose_inf_dual,
         &pk_at_dose,
         &pk_at_obs,
         &pk_at_pk_only,
     );
 
+    // Analytic Form C readout (#650): per-observation dual eval scratch (Dual1).
+    let mut ro_state: Vec<Dual1<N>> = Vec::new();
+    let mut ro_vars: Vec<Dual1<N>> = Vec::new();
+    let mut ro_stack: Vec<Dual1<N>> = Vec::new();
+
     let mut out = Vec::with_capacity(conc.len());
-    for c in &conc {
-        let neg = c.value < 0.0;
+    for (j, c) in conc.iter().enumerate() {
+        // Clamp conc ≥ 0 BEFORE the readout (production ordering), then apply the readout
+        // unclamped — the η-gradient mirror of the outer `run_obs_tvcov` over `Dual1<N>`.
+        // Central amount = concentration × V; `∂y/∂η` composes from the per-obs PK duals.
+        let c_clamped: Dual1<N> = if c.value < 0.0 {
+            Dual1::<N>::constant(0.0)
+        } else {
+            *c
+        };
+        let c: Dual1<N> = if let Some(ro) = readout {
+            let pkd = &pk_at_obs[j];
+            let params: [Dual1<N>; N_PK] = std::array::from_fn(|s| match s {
+                PK_IDX_CL => pkd.cl,
+                PK_IDX_V => pkd.v,
+                PK_IDX_Q => pkd.q,
+                PK_IDX_V2 => pkd.v2,
+                PK_IDX_KA => pkd.ka,
+                PK_IDX_F => pkd.f,
+                PK_IDX_Q3 => pkd.q3,
+                PK_IDX_V3 => pkd.v3,
+                _ => Dual1::<N>::constant(0.0),
+            });
+            let _time_guard =
+                crate::parser::model_parser::ModelTimeGuard::enter(subject.obs_times[j]);
+            eval_readout_jet::<Dual1<N>>(
+                ro,
+                c_clamped,
+                &params,
+                subject.obs_cov(j),
+                &mut ro_state,
+                &mut ro_vars,
+                &mut ro_stack,
+            )
+        } else {
+            c_clamped
+        };
         let mut df_deta = vec![0.0; n_eta];
-        if !neg {
-            for k in 0..n_eta {
-                df_deta[k] = c.grad[k];
-            }
+        for k in 0..n_eta {
+            df_deta[k] = c.grad[k];
         }
         out.push(ObsGrad {
-            f: if neg { 0.0 } else { c.value },
+            f: c.value,
             df_deta,
         });
     }
@@ -1854,6 +3155,10 @@ fn subject_eta_grad_impl(
     eta: &[f64],
     cached_schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> Option<Vec<ObsGrad>> {
+    // Transit subject the closed form can't serve → its ODE `transit()` equivalent, which
+    // takes the ODE-provider branch below (that branch ignores the analytical
+    // `cached_schedule`, so a stale one is harmless). Unchanged for every other model (#486).
+    let model = model.effective_for(subject);
     // ODE models: the light `Dual1` inner η-gradient (#410), gated by the master
     // switch. Out-of-scope ODE subjects decline (→ FD inner), the same per-subject
     // scope the outer provider uses, so inner and outer stay on the same route.
@@ -1866,7 +3171,9 @@ fn subject_eta_grad_impl(
     // TV-cov / oral infusion: the light event-driven walk (#447). The outer gradient
     // already serves these via `subject_sensitivities_tvcov`; route the inner to the
     // matching `Dual1` walk (out-of-scope cases return `None` → FD per point).
-    if subject.has_tv_covariates() || subject_has_oral_infusion(model, subject) {
+    // A `TIME`-built-in structural parameter routes through the per-event walk
+    // too (piecewise/time-varying), mirroring the outer provider (#486 / #610).
+    if subject_routes_to_event_walk(model, subject) {
         return subject_eta_grad_tvcov_with_schedule(model, subject, theta, eta, cached_schedule);
     }
     // Same model/subject scope as the full provider …
@@ -1895,20 +3202,13 @@ fn subject_eta_grad_impl(
     // `apply_expression_scale`. `scaling_supported` (checked inside
     // `analytical_supported`) already bounded the scale program to the dispatch table.
     //
-    // EXCEPT LTBS + η-dependent `ExpressionScale`: route that combination to the FD inner
-    // Jacobian (#534 review #5). The EBE itself already converges on FD for any LTBS model
-    // (`analytic_inner_common_bail` includes `log_transform`); `find_ebe` then builds the
-    // covariance H-matrix from this provider's Jacobian (`subject_eta_jacobian`, gated only
-    // on `Some`/`None`). Returning the analytic scale+log Jacobian here would pair it with
-    // that FD-converged EBE — and under the `g = ln(f)` wrap the closed-form EBE's ~1e-9
-    // offset is exactly what corrupts the covariance Hessian (the reason LTBS reverts the
-    // inner gradient at all). Declining restores the pre-#486 behaviour for this combo and
-    // matches the ODE path's `!log_transform` gate for `ExpressionScale`. (Plain LTBS and
-    // plain `ExpressionScale` are unaffected; the analytic *outer* gradient still serves
-    // LTBS + `ExpressionScale`.)
-    if model.log_transform && matches!(model.scaling, ScalingSpec::ExpressionScale { .. }) {
-        return None;
-    }
+    // LTBS + η-dependent `ExpressionScale` is now analytic on the inner loop too (#665
+    // follow-up): the `ExpressionScale` η-quotient is applied below, then the `g = ln(f)`
+    // jet LAST — reproducing production's scale-then-log order `ln(f/s)`, mirroring the
+    // outer path (`apply_expression_scale_outer` → `apply_ltbs_transform_outer`). The
+    // covariance step reconverges these EBEs at the tighter `cov_inner_tol` (LTBS is a
+    // closed-form non-IOV path here), so the ~1e-9 provider-vs-`compute_predictions`
+    // offset does not corrupt the Hessian.
 
     let n_eta = model.n_eta;
     let oral = matches!(
@@ -1965,12 +3265,18 @@ fn subject_eta_grad_impl(
         }
     }
 
+    // Analytic Form C readout program (#650); the gate guarantees it is dual-
+    // evaluable and depot-free, so the inner `run_obs_grad` serves it exactly.
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     macro_rules! disp {
         ($($n:literal),+) => {
             match slots.len() {
                 $($n => Some(run_obs_grad::<$n>(
                     &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit, subject,
-                    &dp_deta, n_eta,
+                    &dp_deta, n_eta, readout,
                 )),)+
                 _ => None,
             }
@@ -2002,14 +3308,7 @@ fn subject_eta_grad_impl(
     // linear in `f` so it divides by the same `k` (η-independent). Matches
     // `pk::apply_scaling` (`pred /= s`). Other scaling variants are gated out.
     if let ScalingSpec::ScalarScale(k) = model.scaling {
-        if k != 1.0 {
-            for o in out.iter_mut() {
-                o.f /= k;
-                for g in o.df_deta.iter_mut() {
-                    *g /= k;
-                }
-            }
-        }
+        scale_obs_sens_grad(&mut out, k);
     }
     // η-dependent `ExpressionScale` output divisor `s(θ, η)`: `f_scaled = f/s`, with the
     // η-only quotient rule `∂(f/s)/∂η_k = (∂f/∂η_k)/s − f·(∂s/∂η_k)/s²`. The light
@@ -2035,27 +3334,9 @@ fn subject_eta_grad_impl(
             n_eta,
         );
     }
-    // LTBS: `g = ln(f)`, so `∂g/∂η = ∂f/∂η / f`. Applied after scaling. The value
-    // half goes through the shared `pk::ltbs_log_g` — the same floor-then-log the f64
-    // predictor and the ODE dual walk use — so the analytical gradient can't silently
-    // drift from production either (#451 review #5). The gradient still keys on the
-    // strict `> LTBS_FLOOR` boundary: below the floor the transform clamps to a
-    // constant, so the gradient vanishes.
-    if model.log_transform {
-        for o in out.iter_mut() {
-            if o.f > crate::pk::LTBS_FLOOR {
-                let inv = 1.0 / o.f;
-                for g in o.df_deta.iter_mut() {
-                    *g *= inv;
-                }
-            } else {
-                for g in o.df_deta.iter_mut() {
-                    *g = 0.0;
-                }
-            }
-            o.f = crate::pk::ltbs_log_g(o.f);
-        }
-    }
+    // LTBS: `g = ln(f)`, applied LAST (after any scale quotient) via the shared inner
+    // helper — same floor-then-log as the f64 predictor / ODE dual walk (#451 review #5).
+    apply_ltbs_transform_inner(&mut out, model.log_transform);
     Some(out)
 }
 
@@ -2074,6 +3355,7 @@ fn run_obs_grad<const N: usize>(
     subject: &Subject,
     dp_deta: &[Vec<f64>],
     n_eta: usize,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Vec<ObsGrad> {
     let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
         pk.cl(),
@@ -2107,8 +3389,22 @@ fn run_obs_grad<const N: usize>(
     let n_d = dv(PK_IDX_N, pk.n_transit());
     let mtt_d = dv(PK_IDX_MTT, pk.mtt());
 
+    // Analytic Form C readout (#650): PK-slot dual vector + scratch, built once
+    // (subject-static). Mirrors the outer `run_obs`, on `Dual1<N>` (η-grad only).
+    let ro_pk_duals: Option<[Dual1<N>; N_PK]> = readout.map(|_| {
+        std::array::from_fn(|s| {
+            let val = pk.values.get(s).copied().unwrap_or(0.0);
+            match seed_dim[s] {
+                Some(k) => Dual1::<N>::var(val, k),
+                None => Dual1::<N>::constant(val),
+            }
+        })
+    });
+    let mut ro_state: Vec<Dual1<N>> = Vec::new();
+    let mut ro_vars: Vec<Dual1<N>> = Vec::new();
+    let mut ro_stack: Vec<Dual1<N>> = Vec::new();
     let mut out = Vec::with_capacity(subject.obs_times.len());
-    for &t_obs in subject.obs_times.iter() {
+    for (obs_i, &t_obs) in subject.obs_times.iter().enumerate() {
         let reset_floor = subject
             .reset_times
             .iter()
@@ -2150,6 +3446,34 @@ fn run_obs_grad<const N: usize>(
             (0.0, [0.0; N])
         } else {
             (fd.value, fd.grad)
+        };
+
+        // Analytic Form C readout (#650): replace the central concentration with
+        // `y = <expr>` over `Dual1<N>` (central amount = conc × V), mirroring the
+        // outer `run_obs`. Its `∂y/∂pk` then rides the `dp_deta` chain below.
+        let (fval, g) = if let (Some(prog), Some(pkd)) = (readout, ro_pk_duals.as_ref()) {
+            let conc = Dual1::<N> {
+                value: fval,
+                grad: g,
+            };
+            // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
+            // thread-local; enter this observation's time to match production's
+            // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
+            let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
+                subject.obs_times.get(obs_i).copied().unwrap_or(0.0),
+            );
+            let y = eval_readout_jet::<Dual1<N>>(
+                prog,
+                conc,
+                pkd,
+                subject.obs_cov(obs_i),
+                &mut ro_state,
+                &mut ro_vars,
+                &mut ro_stack,
+            );
+            (y.value, y.grad)
+        } else {
+            (fval, g)
         };
 
         let mut df_deta = vec![0.0; n_eta];
@@ -2307,6 +3631,62 @@ pub(crate) fn apply_scale_quotient_row<const M: usize>(
     o.f = f * inv;
 }
 
+/// First-order, η-only counterpart of [`apply_scale_quotient_row`] for the inner EBE
+/// gradient: `∂(f/s)/∂η_k = (∂f/∂η_k)/s − f·(∂s/∂η_k)/s²` over the stacked η axes
+/// (`s.grad[k]`, no `n_theta` offset — the inner scale jet has no θ block). Shared by the
+/// closed-form IOV inner ([`run_obs_iov_eta`]) and the ODE IOV inner
+/// ([`crate::sens::ode_provider::run_subject_iov_eta`]) — the IOV analogue of the η-block
+/// of `apply_expression_scale_inner` (#575/#590).
+pub(crate) fn apply_scale_quotient_grad_iov<const N: usize>(
+    o: &mut ObsGrad,
+    s: &Dual1<N>,
+    n_stacked: usize,
+) {
+    let f = o.f;
+    let inv = 1.0 / s.value;
+    let inv2 = inv * inv;
+    for k in 0..n_stacked {
+        o.df_deta[k] = o.df_deta[k] * inv - f * s.grad[k] * inv2;
+    }
+    o.f = f * inv;
+}
+
+/// Build one `ExpressionScale` scale jet per occasion group for the closed-form IOV
+/// walk. For each group's static-snapshot `(pk, cd)` it seeds a slot-indexed PK-param
+/// dual vector — constant everywhere except the slots that carry a random effect
+/// (`slot_row[slot] = Some(row)`), which are differentiated via `seed_slot(cd, group,
+/// row, value)` — then hands the vector to the shared [`build_iov_scale_jets`] to
+/// evaluate the scale program's dual. Single source for the per-group seeding shared by
+/// the `Dual2` outer ([`run_obs_iov`]) and `Dual1` inner ([`run_obs_iov_eta`]) walks, so
+/// a change to how a group's scale jet is seeded (a new PK slot, a snapshot fix) applies
+/// to both at once and the inner/outer scale handling cannot silently diverge (#651
+/// review #2). `seed_slot` and `eval` supply the dual-type-specific pieces (θ+η+κ vs
+/// η-only seeding; `eval_scale_dual` vs `eval_scale_dual1`).
+///
+/// [`build_iov_scale_jets`]: crate::sens::ode_provider::build_iov_scale_jets
+fn build_iov_group_scale_jets<T: crate::sens::num::PkNum>(
+    scale_groups: &[(crate::types::PkParams, CombinedDerivs)],
+    slot_row: &[Option<usize>; N_PK],
+    var_to_pk_slot: &[usize],
+    seed_slot: impl Fn(&CombinedDerivs, usize, usize, f64) -> T,
+    eval: impl FnMut(&[T]) -> T,
+) -> Vec<T> {
+    let groups: Vec<Vec<T>> = scale_groups
+        .iter()
+        .enumerate()
+        .map(|(g, (pk, cd))| {
+            let mut seeded: Vec<T> = pk.values.iter().map(|&v| T::from_f64(v)).collect();
+            for slot in 0..N_PK {
+                if let Some(i) = slot_row[slot] {
+                    seeded[slot] = seed_slot(cd, g, i, pk.values[slot]);
+                }
+            }
+            seeded
+        })
+        .collect();
+    crate::sens::ode_provider::build_iov_scale_jets::<T>(&groups, var_to_pk_slot, eval)
+}
+
 /// Apply an `ExpressionScale` divisor to a subject's `(θ, η)`-space [`SubjectSens`],
 /// monomorphising [`apply_expression_scale`] on the scale program's axis count
 /// `prog.n_axes()` (`= n_theta + n_eta`) over the shared `1..=MAX_SCALE_AXES` dispatch
@@ -2346,6 +3726,87 @@ pub(crate) fn apply_expression_scale_outer(
         n_theta,
         n_eta
     );
+}
+
+/// Apply an η-dependent `ExpressionScale` `obs_scale` to an already-walked **outer** jet
+/// on the event-driven path (time-varying covariate / `TIME`). Builds the subject-static
+/// scale reference — `pk` (value) AND `pd` (`∂p/∂(θ,η)`) at the subject covariates and
+/// `t = 0`, both under one explicit [`ModelTimeGuard`] so a nested outer guard can never
+/// leave the value pinned at `t = 0` while the derivative reads a stale `TIME` (#637
+/// review #3) — then applies the shared quotient. A no-op unless the model carries a
+/// differentiable `ExpressionScale`; `None` if the scale program's axis count is outside
+/// the dispatch table (caller falls back to FD). One home for the `t = 0` wiring shared by
+/// the closed-form (`subject_sensitivities_tvcov`) and ODE (`run_subject_tvcov`) walks so
+/// a future change lands in one place (#637 review #6).
+pub(crate) fn apply_event_walk_expression_scale_outer(
+    sens: &mut SubjectSens,
+    model: &CompiledModel,
+    subject: &Subject,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<()> {
+    let ScalingSpec::ExpressionScale {
+        deriv: Some(scale_prog),
+        ..
+    } = &model.scaling
+    else {
+        return Some(());
+    };
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(0.0);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let pd =
+        crate::sens::ode_provider::param_derivatives_from_prog(prog, model, subject, theta, eta)?;
+    apply_expression_scale_outer(
+        sens,
+        scale_prog,
+        &pk,
+        &pd,
+        prog.pk_slots_ref(),
+        theta,
+        eta,
+        &subject.covariates,
+        model.n_theta,
+        model.n_eta,
+    );
+    Some(())
+}
+
+/// Inner (`Dual1`, η-only) counterpart of [`apply_event_walk_expression_scale_outer`] —
+/// the `∂(f/s)/∂η` quotient on the light gradient, same `t = 0` guarded reference (#637
+/// review #3 / #6).
+pub(crate) fn apply_event_walk_expression_scale_inner(
+    out: &mut [ObsGrad],
+    model: &CompiledModel,
+    subject: &Subject,
+    prog: &crate::parser::model_parser::IndivParamProgram,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<()> {
+    let ScalingSpec::ExpressionScale {
+        deriv: Some(scale_prog),
+        ..
+    } = &model.scaling
+    else {
+        return Some(());
+    };
+    let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(0.0);
+    let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+    let dp_deta = crate::sens::ode_provider::param_eta_derivatives_from_prog(
+        prog, model, subject, theta, eta,
+    )?;
+    apply_expression_scale_inner_dispatch(
+        out,
+        scale_prog,
+        &pk,
+        &dp_deta,
+        prog.pk_slots_ref(),
+        theta,
+        eta,
+        &subject.covariates,
+        model.n_eta,
+    );
+    Some(())
 }
 
 /// Build the `Dual2<M>` for PK slot `slot` in `(θ, η)`-axis layout (axes
@@ -2734,12 +4195,52 @@ pub(crate) fn subject_has_oral_infusion(model: &CompiledModel, subject: &Subject
     ) && subject.doses.iter().any(|d| d.is_infusion())
 }
 
+/// True when a subject must be served by the event-driven per-event walk rather than
+/// dose superposition: it carries **time-varying covariates**, an **oral infusion**
+/// (#350/#400 forced responses), or the model reads the **`TIME` built-in** in a
+/// structural parameter — all of which make the PK parameters per-event dynamic. Single
+/// source of truth so the outer gradient (`subject_sensitivities_impl`), the inner EBE
+/// gradient (`subject_eta_grad_impl` and `inner_optimizer::analytic_inner_grad_supported`),
+/// and the two TV-walk triggers cannot drift to different routing decisions (#637 round-2
+/// review #3).
+pub(crate) fn subject_routes_to_event_walk(model: &CompiledModel, subject: &Subject) -> bool {
+    // Only models the event-driven walk can state-propagate take that route — mirror
+    // production's `compute_predictions_with_tv`, which gates the event-driven predictor on
+    // `supports_event_driven` and otherwise falls to the t=0 static superposition.
+    // `one_cpt_transit` is analytical (core-supported) but NOT walk-supported: its
+    // continuous-`N` Gamma absorption is a closed-form convolution, not a finite linear
+    // state (`propagate::walk_supports` / `event_driven::supports_event_driven` both omit
+    // it). Routing a transit subject here would hit the walk's unsupported-model
+    // early-return, which yields all-ZERO predictions and sensitivities (a zero `Vec`, not
+    // an error). Declining here keeps transit on the dose-superposition analytic path
+    // (`run_obs`), whose t=0 snapshot reproduces production's transit prediction exactly —
+    // so a transit subject with time-varying covariates / a `TIME` switch stays analytic
+    // (matching production), rather than silently zeroing or dropping to FD.
+    if !crate::pk::event_driven::supports_event_driven(model.pk_model) {
+        return false;
+    }
+    subject.has_tv_covariates()
+        || subject_has_oral_infusion(model, subject)
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+        // A modeled-`RATE=-1/-2` dose (`R{cmt}`/`D{cmt}`) resolves its rate/window
+        // from PK params, so the infusion *end* is a moving boundary — the
+        // event-driven walk carries it via the exact dual window length, which
+        // dose superposition can't (#486). This is the closed-form twin of the ODE
+        // `ode_tvcov_supported`'s `has_modeled_dose` clause. An oral modeled infusion
+        // is already covered by `subject_has_oral_infusion`; this adds the IV route.
+        || !subject.all_doses_fixed()
+}
+
 fn subject_sensitivities_impl(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> Option<SubjectSens> {
+    // A `one_cpt_transit` subject the closed form can't serve (TIME switch / TV covariates)
+    // routes to its exact ODE `transit()` equivalent, which then takes the ODE-provider
+    // branch below; every other model is unchanged (#486).
+    let model = model.effective_for(subject);
     // ODE models route to the ODE sensitivity provider (issue #367, Option A;
     // armed in #410) when in its supported scope; out-of-scope ODE subjects return
     // `None` and fall back to the prior path (gradient-free outer, FD inner). The
@@ -2767,14 +4268,6 @@ fn subject_sensitivities_impl(
     if model.has_bioavailability() && subject.has_rate_defined_infusion() {
         return None;
     }
-    // Modeled-duration doses (`RATE=-2` → `D{cmt}`) resolve `rate`/`duration` from
-    // the PK params in the prediction path; the provider reads `subject.doses`
-    // directly, so the unresolved dose would be a bolus/zero-input surrogate. Route
-    // to FD (matches the early gate in `subject_eta_grad_impl`, so the inner
-    // gradient and Jacobian stay on the same scope).
-    if !subject.all_doses_fixed() {
-        return None;
-    }
     // Time-varying covariates make the PK parameters switch mid-decay, which dose
     // superposition can't express — route them to the event-driven Dual2 walk
     // (IOV-minus-κ). The same walk carries the oral-infusion forced responses
@@ -2783,7 +4276,12 @@ fn subject_sensitivities_impl(
     // production's `compute_predictions` dispatch. The returned `SubjectSens` has
     // the same `(η, θ)` shape, so the outer gradient / inner Jacobian consume it
     // identically.
-    if subject.has_tv_covariates() || subject_has_oral_infusion(model, subject) {
+    //
+    // A `TIME`-built-in structural parameter is piecewise/time-varying too — it
+    // must route through the per-event walk even with no TV covariates, since the
+    // dose-superposition path below would freeze it at one `t=0` snapshot (#486 /
+    // #610).
+    if subject_routes_to_event_walk(model, subject) {
         return subject_sensitivities_tvcov(model, subject, theta, eta);
     }
     // EVID=3/4 resets are handled by restricting dose superposition to the
@@ -2892,13 +4390,20 @@ fn subject_sensitivities_impl(
 
     // Dispatch on the differentiated-parameter count so the dual width is
     // right-sized. `pk_indices.len()` ≤ `N_PK` (the fixed PK slot table).
+    // Analytic Form C readout program (#650), if this model has one; the
+    // `analytical_supported` gate guarantees it is `Single` + dual-evaluable and
+    // does not read the depot amount, so `run_obs` can serve it exactly.
+    let readout = model
+        .analytic_readout
+        .as_ref()
+        .and_then(|ar| ar.program.as_ref());
     macro_rules! disp {
         ($($n:literal),+) => {
             match slots.len() {
                 $($n => Some(SubjectSens {
                     obs: run_obs::<$n>(
                         &seed_dim, &pk, oral, two_cpt, three_cpt, transit, two_cpt_transit,
-                        explicit_kind, subject, &pd, n_eta, n_theta,
+                        explicit_kind, subject, &pd, n_eta, n_theta, readout,
                     ),
                 }),)+
                 _ => None,
@@ -2932,21 +4437,7 @@ fn subject_sensitivities_impl(
     // linear in `f` and `k` is constant (`∂k/∂η = ∂k/∂θ = 0`), so the whole jet
     // divides by `k`. Matches `pk::apply_scaling` (`pred /= s`).
     if let ScalingSpec::ScalarScale(k) = model.scaling {
-        if k != 1.0 {
-            let inv = 1.0 / k;
-            for o in sens.obs.iter_mut() {
-                o.f *= inv;
-                for v in o
-                    .df_deta
-                    .iter_mut()
-                    .chain(o.d2f_deta2.iter_mut())
-                    .chain(o.df_dtheta.iter_mut())
-                    .chain(o.d2f_deta_dtheta.iter_mut())
-                {
-                    *v *= inv;
-                }
-            }
-        }
+        scale_obs_sens_full(&mut sens.obs, k);
     }
     // ExpressionScale: divide by a per-subject scale `s(θ, η)` whose own jet is
     // computed exactly from the differentiable scale program; quotient-combine
@@ -2969,58 +4460,102 @@ fn subject_sensitivities_impl(
             n_eta,
         );
     }
-    // LTBS: transform the full jet to `g = ln(f)` (after scaling), mirroring
-    // `pk::apply_log_transform`. With `inv = 1/f`:
-    //   g          = ln(f)
-    //   ∂g/∂x      = inv · ∂f/∂x
-    //   ∂²g/∂x∂y   = inv · ∂²f/∂x∂y − inv² · ∂f/∂x · ∂f/∂y     (x,y ∈ {η,θ})
-    // Second derivatives are computed from the *original* first derivatives, so
-    // those are read before `df_deta`/`df_dtheta` are overwritten. The value half
-    // goes through the shared `pk::ltbs_log_g` (same floor-then-log as the f64
-    // predictor and the ODE dual walk), applied after the jet is transformed
-    // (#451 review #5). Below the floor the transform clamps to a constant ⇒ all
-    // derivatives vanish.
-    if model.log_transform {
-        let n_eta = sens.obs.first().map_or(0, |o| o.df_deta.len());
-        let n_theta = sens.obs.first().map_or(0, |o| o.df_dtheta.len());
-        for o in sens.obs.iter_mut() {
-            if o.f > crate::pk::LTBS_FLOOR {
-                let inv = 1.0 / o.f;
-                let inv2 = inv * inv;
-                // η–η Hessian: g_kl = inv·f_kl − inv²·f_k·f_l.
-                for k in 0..n_eta {
-                    for l in 0..n_eta {
-                        let idx = k * n_eta + l;
-                        o.d2f_deta2[idx] =
-                            inv * o.d2f_deta2[idx] - inv2 * o.df_deta[k] * o.df_deta[l];
-                    }
-                }
-                // η–θ cross: g_km = inv·f_km − inv²·f_k(η)·f_m(θ).
-                for k in 0..n_eta {
-                    for m in 0..n_theta {
-                        let idx = k * n_theta + m;
-                        o.d2f_deta_dtheta[idx] =
-                            inv * o.d2f_deta_dtheta[idx] - inv2 * o.df_deta[k] * o.df_dtheta[m];
-                    }
-                }
-                for g in o.df_deta.iter_mut().chain(o.df_dtheta.iter_mut()) {
-                    *g *= inv;
-                }
-            } else {
-                for v in o
-                    .df_deta
-                    .iter_mut()
-                    .chain(o.d2f_deta2.iter_mut())
-                    .chain(o.df_dtheta.iter_mut())
-                    .chain(o.d2f_deta_dtheta.iter_mut())
-                {
-                    *v = 0.0;
+    // LTBS: transform the full jet to `g = ln(f)` (after scaling), via the shared helper
+    // that the TV-cov event-driven outer (`subject_sensitivities_tvcov`) also uses. Applied
+    // last, matching production's scale-then-log order.
+    apply_ltbs_transform_outer(&mut sens, model.log_transform);
+    Some(sens)
+}
+
+/// Apply the log-transform-both-sides (LTBS) `g = ln(f)` output transform to an outer
+/// [`SubjectSens`] jet in place, mirroring `pk::apply_log_transform`. With `inv = 1/f`:
+///   g          = ln(f)
+///   ∂g/∂x      = inv · ∂f/∂x
+///   ∂²g/∂x∂y   = inv · ∂²f/∂x∂y − inv² · ∂f/∂x · ∂f/∂y     (x, y ∈ {η, θ})
+/// The second derivatives read the *original* first derivatives, so they are computed
+/// before `df_deta`/`df_dtheta` are overwritten. The value half goes through the shared
+/// `pk::ltbs_log_g` (same floor-then-log as the f64 predictor and the ODE dual walk, #451),
+/// applied after the jet is transformed; below `LTBS_FLOOR` the transform clamps to a
+/// constant so all derivatives vanish. A no-op when `log_transform` is false. Shared by the
+/// dose-superposition outer (`subject_sensitivities_impl`) and the TV-cov event-driven outer
+/// (`subject_sensitivities_tvcov`), so the two paths cannot drift (#486). Applied last, after
+/// any `ScalarScale`/`ExpressionScale` quotient, matching production's scale-then-log order.
+/// The inner EBE gradient stays on finite differences for LTBS (covariance-Hessian stability,
+/// `analytic_inner_common_bail`), so no inner counterpart exists.
+fn apply_ltbs_transform_outer(sens: &mut SubjectSens, log_transform: bool) {
+    if !log_transform {
+        return;
+    }
+    let n_eta = sens.obs.first().map_or(0, |o| o.df_deta.len());
+    let n_theta = sens.obs.first().map_or(0, |o| o.df_dtheta.len());
+    for o in sens.obs.iter_mut() {
+        if o.f > crate::pk::LTBS_FLOOR {
+            let inv = 1.0 / o.f;
+            let inv2 = inv * inv;
+            // η–η Hessian: g_kl = inv·f_kl − inv²·f_k·f_l.
+            for k in 0..n_eta {
+                for l in 0..n_eta {
+                    let idx = k * n_eta + l;
+                    o.d2f_deta2[idx] = inv * o.d2f_deta2[idx] - inv2 * o.df_deta[k] * o.df_deta[l];
                 }
             }
-            o.f = crate::pk::ltbs_log_g(o.f);
+            // η–θ cross: g_km = inv·f_km − inv²·f_k(η)·f_m(θ).
+            for k in 0..n_eta {
+                for m in 0..n_theta {
+                    let idx = k * n_theta + m;
+                    o.d2f_deta_dtheta[idx] =
+                        inv * o.d2f_deta_dtheta[idx] - inv2 * o.df_deta[k] * o.df_dtheta[m];
+                }
+            }
+            for g in o.df_deta.iter_mut().chain(o.df_dtheta.iter_mut()) {
+                *g *= inv;
+            }
+        } else {
+            for v in o
+                .df_deta
+                .iter_mut()
+                .chain(o.d2f_deta2.iter_mut())
+                .chain(o.df_dtheta.iter_mut())
+                .chain(o.d2f_deta_dtheta.iter_mut())
+            {
+                *v = 0.0;
+            }
         }
+        o.f = crate::pk::ltbs_log_g(o.f);
     }
-    Some(sens)
+}
+
+/// Inner (η-gradient) counterpart of [`apply_ltbs_transform_outer`]: applies the
+/// `g = ln(f)` jet to a `Dual1` inner gradient in place — `∂g/∂η = ∂f/∂η / f`, with the
+/// same floor-then-log as the f64 predictor (`pk::ltbs_log_g`). Below `LTBS_FLOOR` the
+/// transform clamps to a constant so the gradient vanishes. Applied LAST, after any scale
+/// quotient (so `g = ln(f/s)` matches production's scale-then-log order). Shared by the
+/// plain (`subject_eta_grad_impl`) and TV-cov (`subject_eta_grad_tvcov_with_schedule`)
+/// inner paths; a no-op when `log_transform` is false.
+///
+/// `#[inline(never)]` keeps this a real, attributable coverage region: the coverage
+/// profile inherits `release` (opt-level 3), so without it this small helper is inlined
+/// into every call site and its body records zero direct executions — reading as
+/// uncovered on Codecov even though the unit test and the LTBS FD-parity tests exercise
+/// both branches.
+#[inline(never)]
+fn apply_ltbs_transform_inner(out: &mut [ObsGrad], log_transform: bool) {
+    if !log_transform {
+        return;
+    }
+    for o in out.iter_mut() {
+        if o.f > crate::pk::LTBS_FLOOR {
+            let inv = 1.0 / o.f;
+            for g in o.df_deta.iter_mut() {
+                *g *= inv;
+            }
+        } else {
+            for g in o.df_deta.iter_mut() {
+                *g = 0.0;
+            }
+        }
+        o.f = crate::pk::ltbs_log_g(o.f);
+    }
 }
 
 /// Per-observation value/grad/Hessian chain at a right-sized dual width `N`
@@ -3041,6 +4576,7 @@ fn run_obs<const N: usize>(
     pd: &crate::sens::ode_provider::ParamDerivs,
     n_eta: usize,
     n_theta: usize,
+    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Vec<ObsSens> {
     let (cl, v1, q, v2, ka, f_bio, q3, v3) = (
         pk.cl(),
@@ -3052,8 +4588,23 @@ fn run_obs<const N: usize>(
         pk.q3(),
         pk.v3(),
     );
+    // Analytic Form C readout (#650): the PK-parameter dual vector (indexed by PK
+    // slot, so `eval_output_g` can pull `V`, binding constants, … via its
+    // `indiv_to_pk` plan) and reusable scratch. Subject-static, so built once.
+    let ro_pk_duals: Option<[Dual2<N>; N_PK]> = readout.map(|_| {
+        std::array::from_fn(|s| {
+            let val = pk.values.get(s).copied().unwrap_or(0.0);
+            match seed_dim[s] {
+                Some(k) => Dual2::<N>::var(val, k),
+                None => Dual2::<N>::constant(val),
+            }
+        })
+    });
+    let mut ro_state: Vec<Dual2<N>> = Vec::new();
+    let mut ro_vars: Vec<Dual2<N>> = Vec::new();
+    let mut ro_stack: Vec<Dual2<N>> = Vec::new();
     let mut out = Vec::with_capacity(subject.obs_times.len());
-    for &t_obs in subject.obs_times.iter() {
+    for (obs_i, &t_obs) in subject.obs_times.iter().enumerate() {
         // Reset segment: the most recent EVID=3/4 reset at or before this
         // observation (−∞ when the subject has no resets). Doses before it were
         // zeroed out of the compartments, so they're excluded from the
@@ -3147,6 +4698,38 @@ fn run_obs<const N: usize>(
         // objective it differentiates (PR #381 review finding #5).
         let (fval, g, h) = if fval < 0.0 {
             (0.0, [0.0; N], [[0.0; N]; N])
+        } else {
+            (fval, g, h)
+        };
+
+        // Analytic Form C readout (#650): replace the central concentration jet
+        // with `y = <expr>` over `Dual2<N>`. The central compartment **amount** is
+        // `concentration × V` (so a `central / V` readout recovers the
+        // concentration and an additive term layers on); the readout's `∂y/∂pk` /
+        // `∂²y/∂pk²` then ride the same `pd` chain to `(θ, η)` below. Covariates
+        // come from the per-observation snapshot (a per-row `FREE`-style flag).
+        let (fval, g, h) = if let (Some(prog), Some(pkd)) = (readout, ro_pk_duals.as_ref()) {
+            let conc = Dual2::<N> {
+                value: fval,
+                grad: g,
+                hess: h,
+            };
+            // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
+            // thread-local; enter this observation's time to match production's
+            // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
+            let _time_guard = crate::parser::model_parser::ModelTimeGuard::enter(
+                subject.obs_times.get(obs_i).copied().unwrap_or(0.0),
+            );
+            let y = eval_readout_jet::<Dual2<N>>(
+                prog,
+                conc,
+                pkd,
+                subject.obs_cov(obs_i),
+                &mut ro_state,
+                &mut ro_vars,
+                &mut ro_stack,
+            );
+            (y.value, y.grad, y.hess)
         } else {
             (fval, g, h)
         };
@@ -3482,25 +5065,53 @@ mod tests {
         ruv.residual_error_eta = Some(0);
         assert!(analytic_outer_gradient_available(&ruv));
         // …and closed-form M3 BLOQ + `iiv_on_ruv` is now analytic too (#4c — the
-        // censored × residual-eta cross-terms are assembled). Only ODE M3 +
-        // `iiv_on_ruv` keeps FD (via `iiv_on_ruv_forces_fd`, which gates on
-        // `ode_spec.is_some()`).
+        // censored × residual-eta cross-terms are assembled). The ODE M3 +
+        // `iiv_on_ruv` combo is analytic as well (#623), so every combination is served.
         let mut ruv_m3 = test_helpers::analytical_model(GradientMethod::Auto);
         ruv_m3.residual_error_eta = Some(0);
         ruv_m3.bloq_method = crate::types::BloqMethod::M3;
         assert!(analytic_outer_gradient_available(&ruv_m3));
+        // Correlated residual (`block_sigma`) is now analytic on the outer loop (#627):
+        // the dense assembly reduces to the scalar path fed correlation-aware `(r,d,d2)`.
+        // (Previously this predicate short-circuited to FD on any residual correlation.)
+        let block_sigma = parse_model_string(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 10.0)\n  theta TVV(10.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05, 1.00]\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse block_sigma model");
+        assert!(!block_sigma.residual_correlations.is_empty());
+        assert!(analytic_outer_gradient_available(&block_sigma));
     }
 
-    /// The `TIME` built-in routes a model through the event-driven per-event PK
-    /// path, which the closed-form `Dual2`/`Dual1` sensitivity providers do not
-    /// cover. `analytical_supported`, `iov_analytical_supported`, and
-    /// `ode_analytical_supported` must therefore all decline (→ FD) for any model
-    /// whose `[individual_parameters]` read `TIME` — otherwise the analytic fast
-    /// path would evaluate every parameter at a single frozen time and silently
-    /// disagree with the event-driven predictor. The non-`TIME` twin of each
-    /// model must still be supported, proving the guard is specific (#610).
+    /// The `TIME` built-in makes a structural parameter piecewise/time-varying, so
+    /// the subject routes through the event-driven per-event PK walk rather than
+    /// dose superposition. As of #486 every analytic provider seeds the per-event time
+    /// and serves TIME: **closed-form non-IOV** (`analytical_supported` /
+    /// `tvcov_analytical_supported`), **closed-form IOV** (`iov_analytical_supported`),
+    /// **non-IOV ODE** (`ode_analytical_supported`), and **ODE IOV** (`ode_iov_supported`,
+    /// via the per-event stacked walk) — each validated against FD of production
+    /// (`time_builtin_provider_matches_fd_of_production`,
+    /// `iov_time_builtin_provider_matches_fd_of_predict_iov`,
+    /// `ode_time_builtin_provider_matches_fd_of_production`,
+    /// `ode_iov_time_builtin_provider_matches_fd_of_predict_iov`).
+    ///
+    /// `TIME` composes with an η-dependent `ExpressionScale` obs_scale too — the
+    /// event-driven walk applies the subject-static scale quotient post-walk (validated
+    /// in `expression_scale_on_event_walk_matches_fd_closed_form`,
+    /// `ode_expression_scale_on_event_walk_matches_production`, and
+    /// `ode_iov_time_expression_scale_matches_fd_of_predict_iov`). The direct
+    /// `pk(...=TIME)` mapping is now desugared into a synthetic `__ferx_pktime_*`
+    /// individual parameter and served analytically too (see the `ANALYTICAL_TIME_DIRECT`
+    /// block below and `time_builtin_direct_pk_mapping_matches_fd_of_production`). `TIME`
+    /// combined with an ODE `init(...)` baseline (#662) or a built-in input-rate forcing
+    /// (#643) is now analytic on the event-driven walk too — the old model-level declines
+    /// were stale once those features landed (validated by `ode_time_builtin_with_init_*`
+    /// and `ode_time_builtin_with_first_order_*`); this test now pins the analytic route for
+    /// `TIME + init(...)` at the model gate. The pre-existing scale fallbacks (LTBS +
+    /// `ExpressionScale`; closed-form IOV + any scaling) are unchanged and independent of
+    /// `TIME`. The non-`TIME` twin of each model must stay supported, proving the guards
+    /// are specific (#486 / #610).
     #[test]
-    fn time_builtin_indiv_params_force_fd_fallback() {
+    fn time_builtin_indiv_params_analytic_routes() {
         // Analytical 1-cpt IV: a `$PK IF(TIME...)`-style switch on CL.
         const ANALYTICAL_TIME: &str = r#"
 [parameters]
@@ -3616,9 +5227,15 @@ mod tests {
             "TIME switch sets the uses_time_builtin flag"
         );
         assert!(!uses_time(&ana_n), "control model must not set the flag");
+        // Closed-form non-IOV now serves TIME via the per-event walk (#486): the
+        // model is admitted and routes through `tvcov_analytical_supported`.
         assert!(
-            !analytical_supported(&ana_t),
-            "analytic FOCEI must decline for TIME"
+            analytical_supported(&ana_t),
+            "closed-form non-IOV now admits TIME (routed to the per-event walk)"
+        );
+        assert!(
+            tvcov_analytical_supported(&ana_t),
+            "TIME routes through the TV-cov event-driven walk"
         );
         assert!(
             analytical_supported(&ana_n),
@@ -3631,9 +5248,11 @@ mod tests {
             iov_t.n_kappa > 0 && iov_n.n_kappa > 0,
             "both IOV models carry a kappa"
         );
+        // Closed-form IOV now serves TIME (per-event stacked seeding in
+        // `build_iov_sources`, #486).
         assert!(
-            !iov_analytical_supported(&iov_t),
-            "IOV analytic must decline for TIME"
+            iov_analytical_supported(&iov_t),
+            "closed-form IOV now serves TIME via the per-event walk"
         );
         assert!(
             iov_analytical_supported(&iov_n),
@@ -3646,11 +5265,653 @@ mod tests {
             uses_time(&ode_t),
             "ODE indiv-param TIME switch sets the flag"
         );
+        // Non-IOV ODE now serves TIME via the event-driven TV-cov walk (#486).
         assert!(
-            !ode_supported(&ode_t),
-            "ODE analytic must decline for indiv-param TIME"
+            ode_supported(&ode_t),
+            "non-IOV ODE now serves indiv-param TIME via the per-event walk"
         );
         assert!(ode_supported(&ode_n), "non-TIME ODE twin stays analytic");
+
+        // ODE **IOV** now serves TIME via the per-event stacked walk (#486). Build an
+        // ODE + kappa + TIME model to pin `ode_iov_supported == true`.
+        const ODE_IOV_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(5.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+        let ode_iov_t = parse_model_string(ODE_IOV_TIME).expect("parses ODE IOV TIME");
+        assert!(ode_iov_t.n_kappa > 0 && uses_time(&ode_iov_t));
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&ode_iov_t),
+            "ODE IOV now serves TIME via the per-event stacked walk (#486)"
+        );
+
+        // #486: a TIME + `init(...)` ODE model is now analytic at the model level. TIME forces
+        // the event-driven walk (`integrate_tvcov_g`), which now seeds a non-zero `init(...)`
+        // state (#662) alongside the per-event TIME seeding (#637) — so the model reports
+        // analytic, not FD. (The old #637 round-2 decline assumed the walk seeded compartments
+        // at zero, which was true before #662.)
+        const ODE_TIME_INIT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(5.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = 1000.0 / V
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let ode_time_init = parse_model_string(ODE_TIME_INIT).expect("parses ODE TIME init");
+        assert!(uses_time(&ode_time_init) && ode_time_init.ode_spec.is_some());
+        assert!(
+            ode_supported(&ode_time_init),
+            "TIME + init(...) ODE is analytic on the event-driven walk now (#486)"
+        );
+        assert!(
+            analytic_outer_gradient_available(&ode_time_init),
+            "TIME + init(...) ODE outer route is analytic now (#486)"
+        );
+
+        // Direct `pk(...=TIME)` mapping (not an `[individual_parameters]` statement): the
+        // parser now desugars the `=TIME` binding into a synthetic
+        // `__ferx_pktime_<slot> = TIME` individual parameter (mirroring the #631 Form-C
+        // readout desugaring), so the mapped slot enters the program's `pk_slots` and
+        // rides the same per-event analytic walk as an `[individual_parameters]` TIME
+        // switch — no longer FD (#486 direct-mapping follow-up). Use a 2-cpt `q=TIME`
+        // mapping so the mapped slot is not a denominator (a `v=TIME` model divides by
+        // `V = 0` at the `t = 0` dose — a user degeneracy, not a gate concern).
+        const ANALYTICAL_TIME_DIRECT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let direct = parse_model_string(ANALYTICAL_TIME_DIRECT).expect("parses direct pk=TIME");
+        assert!(
+            uses_time(&direct),
+            "direct pk(...=TIME) mapping sets the uses_time_builtin flag"
+        );
+        assert!(
+            analytical_supported(&direct) && tvcov_analytical_supported(&direct),
+            "direct pk(...=TIME) mapping is now served by the per-event analytic walk (desugared)"
+        );
+        assert!(
+            analytic_outer_gradient_available(&direct),
+            "direct pk(...=TIME) outer gradient route is now analytic"
+        );
+    }
+
+    /// The closed-form non-IOV provider's exact value/∂η/∂²η/∂θ/∂²η∂θ for a model
+    /// whose structural parameter reads the `TIME` built-in must match central
+    /// finite differences of the production predictor `compute_predictions_with_tv`
+    /// (the independent f64 event-driven path that threads the same per-event TIME).
+    /// No TV covariates are present — the subject is routed to the per-event walk
+    /// purely by `uses_time_builtin` (#486 / #610). Covers a `$PK IF(TIME...)` switch
+    /// (1-cpt IV, 2-cpt IV) and a continuous `TVCL + c·TIME` term (1-cpt oral).
+    #[test]
+    fn time_builtin_provider_matches_fd_of_production() {
+        // (a) 1-cpt IV: CL switches at TIME = 45 (NONMEM `IF (TIME.GE.45) CL=...`).
+        const ONECPT_IV_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(6.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        // (b) 1-cpt oral: CL varies continuously with TIME (`TVCL + 0.05·TIME`), so
+        // both ∂CL/∂TVCL and the TIME-scaled ∂CL/∂ETA_CL are exercised per event.
+        const ONECPT_ORAL_TIME: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 200.0)
+  theta TVKA(1.5, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 0.10
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = (TVCL + 0.05 * TIME) * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        // (c) 2-cpt IV: same TIME switch on CL, widening the dual to M = 7.
+        const TWOCPT_IV_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(6.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(5.0, 0.5, 50.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let iv_bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+        // Observations straddle the TIME = 45 switch so both arms of the `if` drive
+        // at least one prediction (the switch is data-driven, so it is fixed under
+        // the η/θ perturbation — the prediction is smooth in η/θ within each arm).
+        let straddle = [10.0, 30.0, 50.0, 70.0, 90.0];
+
+        let cases: Vec<(CompiledModel, Subject, Vec<f64>, Vec<f64>)> = vec![
+            {
+                let m = parse_model_string(ONECPT_IV_TIME).expect("parse 1cpt iv TIME");
+                let s = subject_with_doses_and_resets(vec![iv_bolus(0.0)], &straddle, Vec::new());
+                (m, s, vec![10.0, 6.0, 50.0], vec![0.15, -0.10])
+            },
+            {
+                let m = parse_model_string(ONECPT_ORAL_TIME).expect("parse 1cpt oral TIME");
+                let s = subject_with_doses_and_resets(
+                    vec![iv_bolus(0.0)],
+                    &[1.0, 4.0, 10.0, 24.0, 48.0],
+                    Vec::new(),
+                );
+                (m, s, vec![1.0, 10.0, 1.5], vec![0.15, -0.10, 0.20])
+            },
+            {
+                let m = parse_model_string(TWOCPT_IV_TIME).expect("parse 2cpt iv TIME");
+                let s = subject_with_doses_and_resets(vec![iv_bolus(0.0)], &straddle, Vec::new());
+                (m, s, vec![10.0, 6.0, 50.0, 5.0, 100.0], vec![0.15, -0.10])
+            },
+        ];
+
+        for (m, s, theta, eta) in &cases {
+            assert!(
+                crate::parser::model_parser::compiled_model_uses_time_builtin(m),
+                "fixture must read the TIME built-in"
+            );
+            assert!(
+                !s.has_tv_covariates(),
+                "fixture must stay on the no-TV path (routed purely by uses_time_builtin)"
+            );
+            assert!(
+                tvcov_analytical_supported(m),
+                "TIME model must be provider-supported via the per-event walk"
+            );
+            assert!(
+                subject_sensitivities(m, s, theta, eta).is_some(),
+                "TIME subject must take the analytic per-event provider"
+            );
+            check_full_provider_vs_fd(m, s, theta, eta);
+        }
+    }
+
+    /// #486 (PR #665 review): a `TIME`-built-in structural parameter combined with
+    /// **LTBS** (`log(DV) ~ additive(...)`). Removing the `log_transform` bail from
+    /// [`tvcov_analytical_supported`] flips this combination from FD to the analytic
+    /// per-event walk, and `analytical_supported` short-circuits every
+    /// `uses_time_builtin` model to that gate — so the outer FOCE/FOCEI population
+    /// gradient is now served by the event-driven walk plus the post-walk `ln(f)`
+    /// transform ([`apply_ltbs_transform_outer`]). The other LTBS + TV-cov coverage
+    /// (`ltbs_tvcov_outer_matches_production`) uses a real time-varying covariate;
+    /// this test pins the *TIME-built-in* route, where the piecewise parameter is
+    /// seeded per event by [`ModelTimeGuard`] rather than by a covariate snapshot,
+    /// so the log transform must compose with that per-event seeding. Covers the
+    /// same three fixture shapes as [`time_builtin_provider_matches_fd_of_production`]
+    /// (IV switch, continuous `TVCL + c·TIME`, and a switch under an
+    /// `ExpressionScale obs_scale` to exercise scale-then-log `ln(f/s)`), each on the
+    /// no-TV path (routed purely by `uses_time_builtin`).
+    #[test]
+    fn ltbs_time_builtin_outer_matches_fd_of_production() {
+        // (a) 1-cpt IV: CL switches at TIME = 45, LTBS error.
+        const ONECPT_IV_TIME_LTBS: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(6.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma ADD_ERR ~ 0.04 (sd)
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  log(DV) ~ additive(ADD_ERR)
+"#;
+        // (b) 1-cpt oral: CL varies continuously with TIME, LTBS error.
+        const ONECPT_ORAL_TIME_LTBS: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 200.0)
+  theta TVKA(1.5, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 0.10
+  sigma ADD_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = (TVCL + 0.05 * TIME) * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  log(DV) ~ additive(ADD_ERR)
+"#;
+        // (c) 1-cpt oral: TIME switch on CL under an `ExpressionScale obs_scale`,
+        // LTBS error — exercises the scale-then-log order `ln(f/s)` on the TIME route.
+        const ONECPT_ORAL_TIME_SCALED_LTBS: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVCL_LATE(0.6, 0.1, 50.0)
+  theta TVV(10.0, 1.0, 200.0)
+  theta TVKA(1.5, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_KA ~ 0.10
+  sigma ADD_ERR ~ 0.04 (sd)
+[individual_parameters]
+  if (TIME > 24.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = 1000 / V
+[error_model]
+  log(DV) ~ additive(ADD_ERR)
+"#;
+        let bolus = |t: f64| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+        // Observations straddle the switch so both arms of the `if` drive at least
+        // one prediction (the switch is data-driven, so it is fixed under the η/θ
+        // perturbation — the prediction is smooth in η/θ within each arm).
+        let straddle = [10.0, 30.0, 50.0, 70.0, 90.0];
+
+        let cases: Vec<(CompiledModel, Subject, Vec<f64>, Vec<f64>)> = vec![
+            {
+                let m = parse_model_string(ONECPT_IV_TIME_LTBS).expect("parse 1cpt iv TIME LTBS");
+                let s = subject_with_doses_and_resets(vec![bolus(0.0)], &straddle, Vec::new());
+                (m, s, vec![10.0, 6.0, 50.0], vec![0.15, -0.10])
+            },
+            {
+                let m =
+                    parse_model_string(ONECPT_ORAL_TIME_LTBS).expect("parse 1cpt oral TIME LTBS");
+                let s = subject_with_doses_and_resets(
+                    vec![bolus(0.0)],
+                    &[1.0, 4.0, 10.0, 24.0, 48.0],
+                    Vec::new(),
+                );
+                (m, s, vec![1.0, 10.0, 1.5], vec![0.15, -0.10, 0.20])
+            },
+            {
+                let m = parse_model_string(ONECPT_ORAL_TIME_SCALED_LTBS)
+                    .expect("parse 1cpt oral TIME scaled LTBS");
+                let s = subject_with_doses_and_resets(
+                    vec![bolus(0.0)],
+                    &[1.0, 4.0, 10.0, 24.0, 48.0],
+                    Vec::new(),
+                );
+                (m, s, vec![1.0, 0.6, 10.0, 1.5], vec![0.15, -0.10, 0.20])
+            },
+        ];
+
+        for (m, s, theta, eta) in &cases {
+            assert!(
+                crate::parser::model_parser::compiled_model_uses_time_builtin(m),
+                "fixture must read the TIME built-in"
+            );
+            assert!(m.log_transform, "fixture must be LTBS");
+            assert!(
+                !s.has_tv_covariates(),
+                "fixture must stay on the no-TV path (routed purely by uses_time_builtin)"
+            );
+            assert!(
+                tvcov_analytical_supported(m),
+                "TIME + LTBS must be on the analytic OUTER path via the per-event walk (#486)"
+            );
+            // Outer analytic vs FD of the log-scale production predictor.
+            check_full_provider_vs_fd(m, s, theta, eta);
+            // Inner TIME + LTBS is now analytic too (Tier-1 follow-up — the event-driven
+            // walk applies the `ln f` jet): inner η-gradient must equal the outer η-block.
+            let full = subject_sensitivities(m, s, theta, eta).expect("outer");
+            let light = subject_eta_grad(m, s, theta, eta).expect("inner TIME + LTBS");
+            assert_eq!(full.obs.len(), light.len());
+            for (fo, lo) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-12);
+                for k in 0..m.n_eta {
+                    approx::assert_relative_eq!(
+                        fo.df_deta[k],
+                        lo.df_deta[k],
+                        max_relative = 1e-10,
+                        epsilon = 1e-12
+                    );
+                }
+            }
+        }
+    }
+
+    /// #486: the light `Dual1` inner η-gradient must equal the full `Dual2` outer
+    /// `df_deta` (η-block) for a `TIME`-built-in subject — both run the same
+    /// event-driven walk, and the outer is FD-validated by
+    /// [`time_builtin_provider_matches_fd_of_production`].
+    #[test]
+    fn time_builtin_eta_grad_matches_full() {
+        const ONECPT_IV_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVCL_LATE(6.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(ONECPT_IV_TIME).expect("parse 1cpt iv TIME");
+        let s = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[10.0, 30.0, 50.0, 70.0, 90.0],
+            Vec::new(),
+        );
+        let theta = [10.0, 6.0, 50.0];
+        let eta = [0.15, -0.10];
+        let full = subject_sensitivities(&m, &s, &theta, &eta).expect("full provider");
+        let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light inner provider");
+        assert_eq!(full.obs.len(), light.len());
+        for (o, g) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(o.f, g.f, max_relative = 1e-12, epsilon = 1e-12);
+            for (a, b) in o.df_deta.iter().zip(g.df_deta.iter()) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-10, epsilon = 1e-12);
+            }
+        }
+    }
+
+    /// #486: a **direct `pk(...=TIME)` structural mapping** (here `q=TIME` on a 2-cpt IV,
+    /// so the mapped slot is not a denominator — `v=TIME` would divide by `V = 0` at the
+    /// `t = 0` dose). The parser desugars it into a synthetic `__ferx_pktime_q = TIME`
+    /// individual parameter, so `Q` = event time per event (`∂Q/∂θ = ∂Q/∂η = 0`) while
+    /// `CL`/`V1`'s derivatives stay exact. value + ∂η + ∂²η + ∂θ + ∂²η∂θ must match central
+    /// FD of production (which threads the same per-event TIME through the desugared param).
+    #[test]
+    fn time_builtin_direct_pk_mapping_matches_fd_of_production() {
+        const DIRECT_Q_TIME: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(DIRECT_Q_TIME).expect("parse direct q=TIME");
+        assert!(crate::parser::model_parser::compiled_model_uses_time_builtin(&m));
+        assert!(
+            tvcov_analytical_supported(&m),
+            "direct pk(q=TIME) desugars to an indiv-param → analytic"
+        );
+        let s = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[1.0, 4.0, 10.0, 24.0, 48.0],
+            Vec::new(),
+        );
+        assert!(!s.has_tv_covariates());
+        check_full_provider_vs_fd(&m, &s, &[10.0, 50.0, 100.0], &[0.10, -0.05]);
+    }
+
+    /// #486: the direct `pk(q=TIME)` desugaring must be *exactly* the explicit
+    /// `[individual_parameters] QT = TIME; pk(q=QT)` form — a pure rename into a synthetic
+    /// parameter. This ties the direct mapping to the `[individual_parameters]` TIME path
+    /// that #637 validated live against NONMEM (`METHOD=1 INTER`, ~5 sig figs), so the
+    /// direct form inherits that numerical validation by transitivity. All sensitivity
+    /// outputs (value + ∂η + ∂θ + 2nd-order) must agree to 1e-12.
+    #[test]
+    fn time_builtin_direct_pk_mapping_equivalent_to_explicit_indiv_param() {
+        const DIRECT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const EXPLICIT: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  V2 = TVV2
+  QT = TIME
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=QT, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m_direct = parse_model_string(DIRECT).expect("parse direct");
+        let m_explicit = parse_model_string(EXPLICIT).expect("parse explicit");
+        let s = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[1.0, 4.0, 10.0, 24.0, 48.0],
+            Vec::new(),
+        );
+        let theta = [10.0, 50.0, 100.0];
+        let eta = [0.10, -0.05];
+        let sd = subject_sensitivities(&m_direct, &s, &theta, &eta).expect("direct sens");
+        let se = subject_sensitivities(&m_explicit, &s, &theta, &eta).expect("explicit sens");
+        assert_eq!(sd.obs.len(), se.obs.len());
+        for (a, b) in sd.obs.iter().zip(se.obs.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-12, epsilon = 1e-13);
+            for (x, y) in a.df_deta.iter().zip(b.df_deta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+            for (x, y) in a.df_dtheta.iter().zip(b.df_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+            for (x, y) in a.d2f_deta2.iter().zip(b.d2f_deta2.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+            // The mixed η-θ second derivative feeds the FOCEI Laplace `log|H̃|`
+            // θ-gradient this work targets, so it must match too.
+            for (x, y) in a.d2f_deta_dtheta.iter().zip(b.d2f_deta_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-12, epsilon = 1e-13);
+            }
+        }
+    }
+
+    /// #486: an η-dependent `ExpressionScale` `obs_scale` on the **event-driven walk** —
+    /// for a `TIME` switch AND a time-varying covariate. The walk now applies the same
+    /// subject-static scale quotient (`apply_expression_scale_outer` / `_inner_dispatch`)
+    /// the dose-superposition path uses, so value/∂η/∂²η/∂θ/∂²η∂θ must match FD of
+    /// production and the light inner must track the outer η-block. (Closes the TV-cov +
+    /// expression-scale gap, not just the TIME one.)
+    #[test]
+    fn expression_scale_on_event_walk_matches_fd_closed_form() {
+        const IV_TIME_SCALED: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.05, 50.0)
+  theta TVCL_LATE(0.5, 0.05, 50.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  if (TIME > 45.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  obs_scale = 1000 / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        const IV_TVCOV_SCALED: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.05, 50.0)
+  theta TVV(20.0, 1.0, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[covariates]
+  WT continuous
+[scaling]
+  obs_scale = 1000 / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let check_parity = |m: &CompiledModel, s: &Subject, theta: &[f64], eta: &[f64]| {
+            assert!(
+                matches!(m.scaling, ScalingSpec::ExpressionScale { .. }),
+                "fixture must carry an ExpressionScale obs_scale"
+            );
+            assert!(
+                tvcov_analytical_supported(m),
+                "ExpressionScale event-walk model must be provider-supported"
+            );
+            check_full_provider_vs_fd(m, s, theta, eta);
+            // Light inner η-gradient must track the outer η-block (both apply the scale).
+            let full = subject_sensitivities(m, s, theta, eta).expect("outer");
+            let light = subject_eta_grad(m, s, theta, eta).expect("inner");
+            for (o, g) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(o.f, g.f, max_relative = 1e-12, epsilon = 1e-12);
+                for (a, b) in o.df_deta.iter().zip(g.df_deta.iter()) {
+                    approx::assert_relative_eq!(a, b, max_relative = 1e-10, epsilon = 1e-12);
+                }
+            }
+        };
+        // TIME switch + obs_scale (no TV covariates → routed by uses_time_builtin).
+        let m_time = parse_model_string(IV_TIME_SCALED).expect("parse IV TIME scaled");
+        let s_time = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[10.0, 30.0, 50.0, 70.0, 90.0],
+            Vec::new(),
+        );
+        check_parity(&m_time, &s_time, &[1.0, 0.5, 20.0], &[0.15, -0.10]);
+        // Time-varying covariate + obs_scale (the broader gap this closes).
+        let m_tv = parse_model_string(IV_TVCOV_SCALED).expect("parse IV tvcov scaled");
+        let s_tv = tvcov_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[70.0],
+            &[1.0, 2.0, 4.0, 8.0, 24.0],
+            &[70.0, 72.0, 80.0, 85.0, 90.0],
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        assert!(s_tv.has_tv_covariates());
+        check_parity(&m_tv, &s_tv, &[1.0, 20.0, 0.75], &[0.15, -0.10]);
     }
 
     /// A TTE (`[event_model]`) objective has no analytic outer gradient (the
@@ -3679,7 +5940,7 @@ mod tests {
             "TTE objective is FD-only: no analytic outer gradient"
         );
         assert_eq!(
-            Optimizer::Auto.resolve_auto(&m),
+            Optimizer::Auto.resolve_auto(&m, true),
             Optimizer::Bobyqa,
             "auto must resolve to derivative-free Bobyqa for a TTE model"
         );
@@ -3984,27 +6245,28 @@ mod tests {
   DV ~ proportional(PROP_ERR)
 "#;
 
-    /// #527/#524 review (finding #1): an `[initial_conditions]` model whose subject
-    /// has time-varying covariates must fall back to FD, because the TV-cov walk
-    /// never layers the init impulse. Before the fix `tvcov_analytical_supported`
-    /// returned `true` for the model and the walk silently dropped the `A₀·kernel`
-    /// baseline from the FOCE/FOCEI gradient (outer and inner) while the objective —
-    /// which uses the init-aware f64 predictor — kept it, biasing the estimates. The
-    /// non-TV-cov subjects of the same model must still take the exact init path.
+    /// **Closed-form `init(...)` on the event-driven TV-cov walk** (#486, branch H). An
+    /// `init(central) = TVC0·V` baseline under a WT covariate on CL (TV-cov). Production's
+    /// `compute_predictions_with_tv` layers `A₀·kernel(t, pk)` with the subject-static `t = 0`
+    /// snapshot; the TV-cov provider now folds in the same impulse via `apply_tvcov_init_outer` /
+    /// `apply_tvcov_init_inner`. The full provider's value / `∂η` / `∂²η` / `∂θ` / `∂²η∂θ` must
+    /// match FD of the production predictor (which keeps the init), the inner `∂f/∂η` must equal
+    /// the outer η-block, and a static-covariate subject of the same model still takes the exact
+    /// dose-superposition init path.
     #[test]
-    fn analytical_init_tvcov_subject_falls_back_to_fd() {
+    fn analytical_init_tvcov_subject_matches_fd() {
         let m = parse_model_string(ONECPT_IV_TVCOV_INIT).expect("parse");
         assert_eq!(m.analytical_init.len(), 1, "init parsed");
         assert!(
-            !tvcov_analytical_supported(&m),
-            "init model must decline TV-cov analytic support (walk omits the init)"
+            tvcov_analytical_supported(&m),
+            "init model is now analytic on the TV-cov walk (#486)"
         );
 
         let theta = vec![0.2, 10.0, 0.75, 4.0];
         let eta = vec![0.15, -0.10];
 
-        // TV-cov subject (WT changes across records): outer full provider AND inner
-        // η-gradient must decline so the caller falls back to FD.
+        // (a) TV-cov subject (WT changes across records): outer full provider matches FD of
+        // production (which includes the init), and the inner η-gradient matches the outer.
         let tv = tvcov_subject(
             vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             &[70.0],
@@ -4016,16 +6278,44 @@ mod tests {
         );
         assert!(tv.has_tv_covariates(), "fixture must carry TV covariates");
         assert!(
-            subject_sensitivities(&m, &tv, &theta, &eta).is_none(),
-            "TV-cov init subject must fall back to FD, not the init-less walk"
+            subject_sensitivities(&m, &tv, &theta, &eta).is_some(),
+            "TV-cov init subject now takes the analytic provider (#486)"
         );
-        assert!(
-            subject_eta_grad(&m, &tv, &theta, &eta).is_none(),
-            "inner η-gradient must fall back to FD too"
-        );
+        check_full_provider_vs_fd(&m, &tv, &theta, &eta);
+        let outer = subject_sensitivities_tvcov(&m, &tv, &theta, &eta).expect("outer tvcov init");
+        let inner = subject_eta_grad_tvcov(&m, &tv, &theta, &eta).expect("inner tvcov init");
+        assert_eq!(outer.obs.len(), inner.len());
+        for (o, i) in outer.obs.iter().zip(inner.iter()) {
+            approx::assert_relative_eq!(o.f, i.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..m.n_eta {
+                approx::assert_relative_eq!(
+                    o.df_deta[k],
+                    i.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-10
+                );
+            }
+        }
 
-        // A static-covariate subject of the SAME model still takes the exact analytic
-        // init path (dose superposition + layered impulse).
+        // (b) TV-cov + EVID 3/4 reset: the closed-form init impulse contributes only to
+        // observations strictly before the first reset (production `add_analytical_init`), and
+        // the reset itself is carried by the TV-cov walk — the combination must still match FD.
+        let tv_reset = tvcov_subject(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &[70.0, 90.0],
+            &[2.0, 6.0, 13.0, 18.0],
+            &[70.0, 70.0, 90.0, 90.0],
+            vec![12.0],
+            Vec::new(),
+            &[],
+        );
+        check_full_provider_vs_fd(&m, &tv_reset, &theta, &eta);
+
+        // (c) A static-covariate subject of the SAME model still takes the exact analytic init
+        // path (dose superposition + layered impulse).
         let mut stat = oral_subject(&[1.0, 2.0, 4.0, 8.0]);
         stat.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
         stat.covariates = wt_map(70.0);
@@ -4393,6 +6683,583 @@ mod tests {
         assert!(
             subject_sensitivities(&iv, &subj, &theta, &eta).is_none(),
             "modeled-duration dose must fall back to FD (full provider)"
+        );
+    }
+
+    /// 1-cpt IV closed-form model with a **modeled-duration** dose (`RATE=-2` → `D1`),
+    /// `D1 = TVD1·exp(ETA_D1)`. The infusion window end `t_dose + D1` is a moving
+    /// boundary in `D1`; the event-driven walk carries it via the exact dual window
+    /// length (#486). Used by the analytic-vs-FD and routing tests below.
+    const ONECPT_IV_MODELED_DUR: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// A modeled-duration `RATE=-2` subject must now route to the event-driven walk
+    /// and be served analytically (the closed-form twin of the ODE #635 path), not
+    /// fall back to FD (#486). Both the full outer provider and the light inner
+    /// gradient must accept it.
+    #[test]
+    fn provider_modeled_duration_routes_to_event_walk() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0],
+        );
+        assert!(!subject.all_doses_fixed(), "dose must be modeled");
+        assert!(
+            subject_routes_to_event_walk(&model, &subject),
+            "a modeled-RATE subject must route to the event-driven walk (#486)"
+        );
+        assert!(
+            subject_sensitivities(&model, &subject, &[10.0, 50.0, 2.0], &[0.1, -0.05, 0.05])
+                .is_some(),
+            "modeled-duration dose must be served analytically by the walk (full provider)"
+        );
+        assert!(
+            subject_eta_grad(&model, &subject, &[10.0, 50.0, 2.0], &[0.1, -0.05, 0.05]).is_some(),
+            "modeled-duration dose must be served analytically (light inner provider)"
+        );
+    }
+
+    /// The exact outer `(η, θ)` sensitivities of a modeled-duration `RATE=-2` dose must
+    /// match central finite differences of the production predictor
+    /// (`compute_predictions_with_tv`, which resolves `D1` per evaluation). Observations
+    /// straddle the window end (`D1 ≈ 2.1`: `t = 0.5, 1.5` inside; `t = 3, 6` after), so
+    /// the moving infusion-end boundary is genuinely exercised (#486).
+    #[test]
+    fn provider_modeled_duration_iv_matches_fd_of_production() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0],
+        );
+        check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 2.0], &[0.12, -0.08, 0.05]);
+    }
+
+    /// Modeled **rate** (`RATE=-1` → `R1`), the sign-mirror: `duration = amt/R1`, so the
+    /// window end still moves with the PK param. Analytic outer sensitivities vs FD of
+    /// production (#486).
+    #[test]
+    fn provider_modeled_rate_iv_matches_fd_of_production() {
+        const ONECPT_IV_MODELED_RATE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVR1(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_R1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  R1 = TVR1 * exp(ETA_R1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(ONECPT_IV_MODELED_RATE).expect("parse");
+        // amt=1000, R1≈500 → window ≈ 2h. Obs straddle it.
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledRate,
+            ),
+            &[0.5, 1.5, 3.0, 6.0],
+        );
+        check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 500.0], &[0.12, -0.08, 0.05]);
+    }
+
+    /// The light inner η-gradient (`subject_eta_grad`) for a modeled-duration dose must
+    /// match the `df_deta` block of the FD-validated full outer provider
+    /// (`subject_sensitivities`) — the inner and outer walks must agree (#486).
+    #[test]
+    fn provider_modeled_duration_inner_matches_outer() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0],
+        );
+        let theta = [10.0, 50.0, 2.0];
+        let eta = [0.12, -0.08, 0.05];
+        let outer = subject_sensitivities(&model, &subject, &theta, &eta).expect("outer some");
+        let inner = subject_eta_grad(&model, &subject, &theta, &eta).expect("inner some");
+        assert_eq!(outer.obs.len(), inner.len());
+        for (o, i) in outer.obs.iter().zip(inner.iter()) {
+            approx::assert_relative_eq!(o.f, i.f, max_relative = 1e-9, epsilon = 1e-12);
+            for (a, b) in o.df_deta.iter().zip(i.df_deta.iter()) {
+                approx::assert_relative_eq!(a, b, max_relative = 1e-9, epsilon = 1e-12);
+            }
+        }
+    }
+
+    /// **Bit-parity cross-check vs the ODE twin.** The closed-form modeled-duration
+    /// walk and the ODE `[odes]` modeled-duration walk (already analytic + NONMEM-
+    /// anchored via #630/#635) are two independent implementations of the same
+    /// moving-boundary sensitivity. Their outer `(η, θ)` jets must agree to ODE
+    /// integration tolerance — the strongest confirmation the closed-form saltation is
+    /// right (#486).
+    #[test]
+    fn provider_modeled_duration_matches_ode_twin() {
+        const ODE_TWIN: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let cf = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse cf");
+        let ode = parse_model_string(ODE_TWIN).expect("parse ode twin");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0],
+        );
+        let theta = [10.0, 50.0, 2.0];
+        let eta = [0.12, -0.08, 0.05];
+        let s_cf = subject_sensitivities(&cf, &subject, &theta, &eta).expect("cf some");
+        let s_ode = subject_sensitivities(&ode, &subject, &theta, &eta).expect("ode some");
+        assert_eq!(s_cf.obs.len(), s_ode.obs.len());
+        for (a, b) in s_cf.obs.iter().zip(s_ode.obs.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-6, epsilon = 1e-8);
+            for (x, y) in a.df_deta.iter().zip(b.df_deta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-7);
+            }
+            for (x, y) in a.df_dtheta.iter().zip(b.df_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-7);
+            }
+            for (x, y) in a.d2f_deta2.iter().zip(b.d2f_deta2.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-4, epsilon = 1e-6);
+            }
+        }
+    }
+
+    /// **Closed-form modeled-duration dose × steady state** (#486 — the last modeled-dose
+    /// gap after #652). The SS trough is equilibrated by `equilibrate_ss_g`, which now threads
+    /// the modeled window dual `(rate_bare, dur_bare)` into each cycle's active/quiet split, so
+    /// the moving infusion-end jet (`∂D1`) flows through the SS trough exactly as it does
+    /// through the current pulse. `D1 ≈ 2.1 < II = 12`; obs straddle the window end within the
+    /// SS interval (0.5, 1.5 inside; 3, 6, 11 after). Validated vs central FD of the production
+    /// predictor (`compute_predictions_with_tv`, which resolves `D1` per evaluation and
+    /// equilibrates the same SS train).
+    #[test]
+    fn provider_modeled_duration_ss_matches_fd_of_production() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0, 11.0],
+        );
+        assert!(subject.has_periodic_ss_dose());
+        assert!(
+            subject_sensitivities(&model, &subject, &[10.0, 50.0, 2.0], &[0.12, -0.08, 0.05])
+                .is_some(),
+            "modeled-duration + SS must be served analytically now (#486)"
+        );
+        check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 2.0], &[0.12, -0.08, 0.05]);
+    }
+
+    /// Modeled **rate** (`RATE=-1`) × steady state — the sign-mirror of the duration case,
+    /// same `equilibrate_ss_g` window-jet path (`duration = amt/R1` moves the SS window end).
+    #[test]
+    fn provider_modeled_rate_ss_matches_fd_of_production() {
+        const ONECPT_IV_MODELED_RATE: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVR1(500.0, 10.0, 5000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_R1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  R1 = TVR1 * exp(ETA_R1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(ONECPT_IV_MODELED_RATE).expect("parse");
+        // amt=1000, R1≈500 → window ≈ 2h < II = 12. Obs straddle the SS window end.
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledRate,
+            ),
+            &[0.5, 1.5, 3.0, 6.0, 11.0],
+        );
+        check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 500.0], &[0.12, -0.08, 0.05]);
+    }
+
+    /// **Bit-parity cross-check vs the ODE twin for SS + modeled-duration.** The ODE
+    /// `[odes]` SS + modeled-duration path is already analytic (#642) and independently
+    /// NONMEM-anchored, so its outer `(η, θ)` jets are a strong oracle for the closed-form
+    /// SS window-jet just added — they must agree to ODE integration tolerance (#486).
+    #[test]
+    fn provider_modeled_duration_ss_matches_ode_twin() {
+        const ODE_TWIN: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let cf = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse cf");
+        let ode = parse_model_string(ODE_TWIN).expect("parse ode twin");
+        let subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[0.5, 1.5, 3.0, 6.0, 11.0],
+        );
+        let theta = [10.0, 50.0, 2.0];
+        let eta = [0.12, -0.08, 0.05];
+        let s_cf = subject_sensitivities(&cf, &subject, &theta, &eta).expect("cf some");
+        let s_ode = subject_sensitivities(&ode, &subject, &theta, &eta).expect("ode some");
+        assert_eq!(s_cf.obs.len(), s_ode.obs.len());
+        for (a, b) in s_cf.obs.iter().zip(s_ode.obs.iter()) {
+            approx::assert_relative_eq!(a.f, b.f, max_relative = 1e-6, epsilon = 1e-8);
+            for (x, y) in a.df_deta.iter().zip(b.df_deta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-7);
+            }
+            for (x, y) in a.df_dtheta.iter().zip(b.df_dtheta.iter()) {
+                approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-7);
+            }
+        }
+    }
+
+    /// **Closed-form modeled-duration × SS under IOV — κ-coupled window** (#486 review #1).
+    /// The relaxed `modeled_dose_analytic_gate` is shared by the closed-form **IOV** entry
+    /// (`build_iov_sources`), so a modeled SS dose is now analytic there too. Here `D1` is
+    /// κ-coupled (`D1 = TVD1·exp(ETA_D1 + KAPPA_D1)`), so each occasion's SS window length
+    /// differs — this pins that the per-occasion modeled-window jet threaded into
+    /// `equilibrate_ss_g` lands in the correct stacked-κ axis. FD of `predict_iov` is the
+    /// independent oracle.
+    #[test]
+    fn provider_modeled_duration_ss_iov_kappa_coupled_matches_fd_of_predict_iov() {
+        const CF_IOV_MODELED_SS: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_D1 ~ 0.04
+  kappa KAPPA_D1 ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1 + KAPPA_D1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+        let model = parse_model_string(CF_IOV_MODELED_SS).expect("parse cf IOV modeled SS");
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                24.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        let theta = [0.2, 10.0, 5.0];
+        // stacked = [η_cl, η_v, η_d1, κ_g0, κ_g1]; κ on D1 → each occasion's SS window differs.
+        let stacked = [0.12, -0.08, 0.05, 0.06, -0.11];
+        assert!(
+            subject_sensitivities_iov(&model, &subject, &theta, &stacked).is_some(),
+            "closed-form IOV modeled-duration + SS must be analytic now (#486)"
+        );
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    }
+
+    /// **Closed-form modeled-duration × SS under time-varying covariates** (#486 review #1).
+    /// The relaxed gate is also shared by the non-IOV TV-cov entry
+    /// (`subject_sensitivities_tvcov`); a covariate (`WT` on `CL`) varies across the records
+    /// of a single SS modeled dose. Validated vs central FD of `compute_predictions_with_tv`
+    /// (which resolves `D1` and equilibrates the SS train per evaluation).
+    #[test]
+    fn provider_modeled_duration_ss_tvcov_matches_fd_of_production() {
+        const CF_TVCOV_MODELED_SS: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  theta THETA_WT(0.75, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  omega ETA_D1 ~ 0.04
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(CF_TVCOV_MODELED_SS).expect("parse cf tvcov modeled SS");
+        let mut subject = subject_with_dose(
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            &[1.0, 4.0, 6.0, 8.0, 11.0],
+        );
+        let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
+        subject.dose_covariates = vec![wt(60.0)];
+        subject.obs_covariates = vec![wt(65.0), wt(70.0), wt(75.0), wt(80.0), wt(85.0)];
+        assert!(subject.has_tv_covariates());
+        assert!(
+            subject_sensitivities(
+                &model,
+                &subject,
+                &[10.0, 50.0, 2.0, 0.75],
+                &[0.12, -0.08, 0.05]
+            )
+            .is_some(),
+            "closed-form TV-cov modeled-duration + SS must be analytic now (#486)"
+        );
+        check_full_provider_vs_fd(
+            &model,
+            &subject,
+            &[10.0, 50.0, 2.0, 0.75],
+            &[0.12, -0.08, 0.05],
+        );
+    }
+
+    /// **Reset regression (#486 review #3).** A modeled-duration dose that starts
+    /// *before* an EVID3/4 reset must not thread its window jet into the post-reset
+    /// sub-intervals: the walk's rate loop drops a pre-reset dose (`t_start <
+    /// reset_floor`), and `dual_pos` must drop it too — otherwise the post-reset window
+    /// length carries a spurious `∂D`. The first infusion (`t = 0`, `D1 ≈ 2.1`) ends
+    /// *after* the reset at `t = 1`, so its stale infusion-end break at `≈ 2.1` lands in
+    /// a post-reset interval that the obs at `t = 2.5` straddles; a fresh modeled dose at
+    /// the reset supplies the legitimate post-reset moving boundary. Validated against FD
+    /// of the production predictor (which cancels the pre-reset infusion at the reset).
+    #[test]
+    fn provider_modeled_duration_reset_matches_fd_of_production() {
+        let model = parse_model_string(ONECPT_IV_MODELED_DUR).expect("parse");
+        let doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                1.0,
+                800.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        let subject = subject_with_doses_and_resets(doses, &[0.5, 1.5, 2.5, 4.0], vec![1.0]);
+        assert!(subject.has_resets(), "subject must carry a reset");
+        assert!(!subject.all_doses_fixed(), "doses must be modeled");
+        check_full_provider_vs_fd(&model, &subject, &[10.0, 50.0, 2.0], &[0.12, -0.08, 0.05]);
+    }
+
+    /// **Separability guard (#486 review #2).** Two modeled-duration doses into
+    /// *distinct* compartments (`D1` into cmt 1, `D2` into cmt 2) whose infusion ends
+    /// coincide can't be represented by the single-`dt` walk — each end wants a different
+    /// per-compartment dual window length — so the subject declines to FD
+    /// (`subject_sensitivities` → `None`). Moving `D2` so the ends separate restores the
+    /// analytic path. Same-slot coincidences (identical jet) are unaffected.
+    #[test]
+    fn provider_modeled_distinct_slot_coincident_ends_decline() {
+        const TWOCPT_IV_D1_D2: &str = r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV1(50.0, 5.0, 500.0)
+  theta TVQ(5.0, 0.5, 50.0)
+  theta TVV2(100.0, 10.0, 1000.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  theta TVD2(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  D1 = TVD1
+  D2 = TVD2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let model = parse_model_string(TWOCPT_IV_D1_D2).expect("parse");
+        let doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                1000.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                0.0,
+                800.0,
+                2,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        // TVD1 == TVD2 == 2.0, both doses at t=0 → both infusions end at t=2 with
+        // distinct backing slots ⇒ not separable ⇒ decline to FD.
+        let coincident = subject_with_doses_and_resets(doses.clone(), &[0.5, 1.5, 3.0], Vec::new());
+        assert!(
+            subject_sensitivities(
+                &model,
+                &coincident,
+                &[10.0, 50.0, 5.0, 100.0, 2.0, 2.0],
+                &[0.1, -0.05]
+            )
+            .is_none(),
+            "distinct-slot coincident infusion ends must decline to FD (#486 review #2)"
+        );
+        // TVD2 = 3.0 → ends at t=2 (cmt1) and t=3 (cmt2), separable ⇒ analytic path.
+        assert!(
+            subject_sensitivities(
+                &model,
+                &coincident,
+                &[10.0, 50.0, 5.0, 100.0, 2.0, 3.0],
+                &[0.1, -0.05]
+            )
+            .is_some(),
+            "separable infusion ends must be served analytically"
         );
     }
 
@@ -4812,6 +7679,283 @@ mod tests {
         check_full_provider_vs_fd(&model, &subject, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
     }
 
+    // ── analytic Form C readout (#650) exact sensitivities ───────────────────
+
+    /// A nonlinear analytic Form C readout — a saturable protein-binding total
+    /// concentration `y = C + BMAX·C/(KD + C)` with `C = central/V` — must be
+    /// differentiated exactly by the provider: value, `∂/∂η`, `∂²/∂η²`, `∂/∂θ`,
+    /// and `∂²/∂η∂θ` all match central FD of the readout-aware production
+    /// predictor. The readout carries η through both `C` (via CL, V) and the
+    /// `central/V` amount→conc map, and θ through BMAX/KD/CL/V. The `.expect`
+    /// inside the harness also asserts the analytic path is taken (not FD).
+    const ONECPT_IV_BINDING_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BMAX * (central / V) / (KD + central / V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn form_c_binding_readout_provider_matches_fd() {
+        let m = parse_model_string(ONECPT_IV_BINDING_READOUT).expect("parse binding readout");
+        // Must be in the analytic Dual2 scope (not routed to FD).
+        assert!(
+            analytical_supported(&m),
+            "central-only dual-evaluable Form C readout must stay analytic"
+        );
+        let s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0],
+        );
+        let theta = [0.2, 10.0, 3.0, 2.0];
+        let eta = [0.12, -0.08];
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+
+        // Light inner η-gradient must agree with the full provider's η block.
+        let full = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+        // The θ-gradient for the non-structural BMAX (θ index 2) and KD (θ index 3)
+        // must be non-zero — proving they are first-class differentiable params
+        // (#650 basis extension), not aliased onto CL. Before the fix they read the
+        // CL slot, so ∂y/∂θ_BMAX / ∂y/∂θ_KD were identically zero.
+        let max_bmax = full
+            .obs
+            .iter()
+            .map(|o| o.df_dtheta[2].abs())
+            .fold(0.0_f64, f64::max);
+        let max_kd = full
+            .obs
+            .iter()
+            .map(|o| o.df_dtheta[3].abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_bmax > 1e-6,
+            "∂y/∂BMAX must be non-zero (BMAX is a real readout param, not aliased to CL)"
+        );
+        assert!(
+            max_kd > 1e-6,
+            "∂y/∂KD must be non-zero (KD is a real readout param, not aliased to CL)"
+        );
+        let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light supported");
+        assert_eq!(light.len(), full.obs.len());
+        for (lo, fo) in light.iter().zip(full.obs.iter()) {
+            for k in 0..m.n_eta {
+                approx::assert_relative_eq!(
+                    lo.df_deta[k],
+                    fo.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+
+    /// The fluconazole case: a readout gated on a **per-row** covariate (`FREE`)
+    /// makes the subject a time-varying-covariate subject, so it routes to the
+    /// event-walk provider. The readout is served analytically there too (#650):
+    /// value + all η/θ first/second derivatives match FD of the (event-walk)
+    /// production predictor, and BMAX/KD (non-structural, in their allocated slots)
+    /// stay differentiable through the walk.
+    #[test]
+    fn form_c_binding_readout_tvcov_matches_fd() {
+        let m = parse_model_string(ONECPT_IV_BINDING_READOUT_FREE).expect("parse");
+        let mut s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0],
+        );
+        // Alternating per-row FREE flag → per-observation covariate snapshots, so
+        // the subject routes to the event-walk (TV-cov) provider.
+        s.obs_covariates = vec![
+            HashMap::from([("FREE".to_string(), 0.0)]),
+            HashMap::from([("FREE".to_string(), 1.0)]),
+            HashMap::from([("FREE".to_string(), 0.0)]),
+            HashMap::from([("FREE".to_string(), 1.0)]),
+        ];
+        assert!(s.has_tv_covariates(), "fixture must be a TV-cov subject");
+        assert!(
+            readout_tvcov_supported(&m),
+            "central-only binding readout fits PkDual slots"
+        );
+        let theta = [0.2, 10.0, 3.0, 2.0];
+        let eta = [0.12, -0.08];
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+    }
+
+    const ONECPT_IV_BINDING_READOUT_FREE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = if (FREE == 0) central / V + BMAX * (central / V) / (KD + central / V) else central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    /// An **oral** Form C readout `y = central / V` (central at state slot 1,
+    /// depot slot 0 unreferenced) must also differentiate exactly.
+    #[test]
+    fn form_c_oral_readout_provider_matches_fd() {
+        let src = WARFARIN.replace(
+            "[error_model]",
+            "[scaling]\n  y = central / V\n[error_model]",
+        );
+        let m = parse_model_string(&src).expect("parse oral readout");
+        assert!(
+            analytical_supported(&m),
+            "oral central-only readout stays analytic"
+        );
+        let s = oral_subject(&[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        check_full_provider_vs_fd(&m, &s, &[0.2, 10.0, 1.5], &[0.15, -0.10, 0.25]);
+    }
+
+    /// A readout that references the oral **depot** amount is out of the static
+    /// jet's scope (the depot amount isn't reconstructed as a dual), so the model
+    /// routes to the FD gradient — `analytical_supported` reports that honestly.
+    #[test]
+    fn form_c_depot_readout_routes_to_fd() {
+        let src = WARFARIN.replace(
+            "[error_model]",
+            "[scaling]\n  y = central / V + depot / V\n[error_model]",
+        );
+        let m = parse_model_string(&src).expect("parse depot readout");
+        assert!(
+            !analytical_supported(&m),
+            "a depot-referencing analytic readout must fall back to FD (no dual depot amount)"
+        );
+        // The FD path still predicts correctly (readout applied in the f64 predictor).
+        let s = oral_subject(&[1.0, 4.0]);
+        let preds = compute_predictions_with_tv(&m, &s, &[0.2, 10.0, 1.5], &[0.0, 0.0, 0.0]);
+        assert!(preds.iter().all(|p| p.is_finite()));
+    }
+
+    /// #650 review: a readout whose **non-structural** parameter depends on a
+    /// time-varying covariate (`BMAX = TVBMAX·WT/70`, WT per row) must be read
+    /// **per observation** by the f64 predictor, matching the per-observation
+    /// snapshot the event-walk provider differentiates. Before the fix the
+    /// predictor froze `BMAX` at the t=0 covariate while the analytic gradient used
+    /// the per-row value, so `check_full_provider_vs_fd` (analytic vs FD-of-predictor)
+    /// diverged. The `.expect` inside the harness also asserts the analytic path is
+    /// taken (BMAX→slot 2, KD→slot 3, both ≤ V3, so `readout_tvcov_supported`).
+    #[test]
+    fn form_c_tvcov_readout_param_matches_fd() {
+        const SRC: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX * (WT / 70)
+  KD   = TVKD
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BMAX * (central / V) / (KD + central / V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+        let m = parse_model_string(SRC).expect("parse tv-cov readout param");
+        let mut s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0],
+        );
+        // Per-row body weight → time-varying covariate → event-walk provider, and a
+        // readout parameter (BMAX) that actually moves between rows.
+        s.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 60.0)]),
+            HashMap::from([("WT".to_string(), 80.0)]),
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 95.0)]),
+        ];
+        assert!(s.has_tv_covariates(), "fixture must be a TV-cov subject");
+        assert!(readout_tvcov_supported(&m), "BMAX/KD fit the PkDual slots");
+        check_full_provider_vs_fd(&m, &s, &[0.2, 10.0, 3.0, 2.0], &[0.12, -0.08]);
+    }
+
+    /// #650 review: a readout that references the oral **depot** amount is rejected
+    /// on a subject carrying an EVID=3/4 reset (superposition can't restart the
+    /// depot across the reset), rather than silently reading a zero depot. A
+    /// `central`-only readout on the same reset subject is accepted (the central
+    /// concentration is already reset-correct).
+    #[test]
+    fn depot_readout_with_reset_is_rejected() {
+        let depot_src = WARFARIN.replace(
+            "[error_model]",
+            "[scaling]\n  y = central / V + depot / V\n[error_model]",
+        );
+        let depot_m = parse_model_string(&depot_src).expect("parse depot readout");
+        assert!(
+            depot_m
+                .analytic_readout
+                .as_ref()
+                .expect("analytic readout")
+                .references_depot(),
+            "readout must be detected as depot-referencing"
+        );
+        let reset_subj = subject_with_doses_and_resets(
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &[1.0, 4.0, 8.0],
+            vec![5.0],
+        );
+        let pop = crate::types::Population {
+            subjects: vec![reset_subj],
+            covariate_names: Vec::new(),
+            dv_column: "DV".to_string(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        assert!(
+            crate::api::check_analytic_readout_support(&depot_m, &pop).is_some(),
+            "depot readout + reset subject must be rejected"
+        );
+
+        // Central-only readout is fine on the very same reset subject.
+        let central_src = WARFARIN.replace(
+            "[error_model]",
+            "[scaling]\n  y = central / V\n[error_model]",
+        );
+        let central_m = parse_model_string(&central_src).expect("parse central readout");
+        assert!(
+            crate::api::check_analytic_readout_support(&central_m, &pop).is_none(),
+            "central-only readout must be accepted on a reset subject"
+        );
+    }
+
     /// Regression for #455/#456: an analytical model whose `[individual_parameters]`
     /// block has **intermediate** assignments before the structural PK outputs must
     /// drive the exact program-based sensitivity path even on a **static-covariate**
@@ -4950,6 +8094,87 @@ mod tests {
                         lo.df_deta[k],
                         max_relative = 1e-12,
                         epsilon = 1e-14
+                    );
+                }
+            }
+        }
+    }
+
+    /// **LTBS combined with time-varying covariates** (#486). LTBS on a TV-cov subject
+    /// previously routed BOTH loops to FD; the outer θ/Ω/σ gradient is now analytic on the
+    /// event-driven walk (`subject_sensitivities_tvcov` applies the shared post-walk `ln f`
+    /// transform LAST, after scaling — the same helper the dose-superposition outer uses).
+    /// Validated over plain LTBS and LTBS + an `ExpressionScale` `obs_scale = 1000/V` divisor
+    /// (production's scale-then-log order `ln(f/s)` is reproduced post-walk) against central
+    /// FD of the log-scale production predictor. The inner EBE gradient stays on FD for LTBS
+    /// (covariance stability), asserted below.
+    #[test]
+    fn ltbs_tvcov_outer_matches_production() {
+        let ltbs = |src: &str| {
+            src.replace(
+                "[error_model]\n  DV ~ proportional(PROP_ERR)",
+                "[error_model]\n  log(DV) ~ additive(PROP_ERR)",
+            )
+        };
+        // ExpressionScale (`obs_scale = 1000/V`) + LTBS + TV-cov: exercises scale-then-log.
+        const ONECPT_ORAL_TVCOV_EXPR: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = 1000 / V
+[covariates]
+  WT continuous
+[error_model]
+  log(DV) ~ additive(PROP_ERR)
+"#;
+        let subject = tvcov_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[70.0],
+            &[1.0, 2.0, 4.0, 8.0, 24.0],
+            &[70.0, 72.0, 80.0, 85.0, 90.0],
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        let theta = vec![0.2, 10.0, 1.5, 0.75];
+        let eta = vec![0.15, -0.10, 0.25];
+
+        for src in [ltbs(ONECPT_ORAL_TVCOV), ONECPT_ORAL_TVCOV_EXPR.to_string()] {
+            let model = parse_model_string(&src).expect("parse LTBS TV-cov");
+            assert!(model.log_transform && subject.has_tv_covariates());
+            assert!(
+                tvcov_analytical_supported(&model),
+                "LTBS + TV-cov must be on the analytic OUTER path now (#486)"
+            );
+            // Outer analytic vs FD of the log-scale production predictor.
+            check_full_provider_vs_fd(&model, &subject, &theta, &eta);
+            // Inner LTBS + TV-cov is now analytic too (Tier-1 follow-up): the light inner
+            // provider's η-gradient must equal the full outer provider's df_deta η-block.
+            let full = subject_sensitivities(&model, &subject, &theta, &eta).expect("outer");
+            let light =
+                subject_eta_grad(&model, &subject, &theta, &eta).expect("inner LTBS + TV-cov");
+            assert_eq!(full.obs.len(), light.len());
+            for (fo, lo) in full.obs.iter().zip(light.iter()) {
+                approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-12);
+                for k in 0..model.n_eta {
+                    approx::assert_relative_eq!(
+                        fo.df_deta[k],
+                        lo.df_deta[k],
+                        max_relative = 1e-10,
+                        epsilon = 1e-12
                     );
                 }
             }
@@ -5342,37 +8567,119 @@ mod tests {
         }
     }
 
-    /// LTBS combined with an η-dependent `ExpressionScale` routes the **inner** gradient to
-    /// FD (#534 review #5): the analytic outer still serves it, but the light provider
-    /// declines so the covariance H-matrix Jacobian (`subject_eta_jacobian`, gated only on
-    /// `Some`/`None`) isn't built from an analytic scale+log jet paired with the
-    /// FD-converged LTBS EBE. Restores the pre-#486 behaviour for this combo and matches the
-    /// ODE path's `!log_transform` gate.
+    /// Unit-covers `apply_ltbs_transform_inner` directly: the `g = ln(f)`, `∂g/∂η = ∂f/∂η/f`
+    /// normal branch; the below-`LTBS_FLOOR` clamp (grads zeroed, value floored); and the
+    /// no-op when `log_transform` is false.
     #[test]
-    fn ltbs_plus_expression_scale_inner_falls_back_to_fd() {
+    fn apply_ltbs_transform_inner_branches() {
+        let mut out = vec![
+            ObsGrad {
+                f: 2.0,
+                df_deta: vec![4.0, -2.0],
+            },
+            ObsGrad {
+                f: crate::pk::LTBS_FLOOR * 0.5, // below the floor → clamp
+                df_deta: vec![9.0, 9.0],
+            },
+        ];
+        apply_ltbs_transform_inner(&mut out, true);
+        // Row 0: f > FLOOR → g = ln f, df_deta /= f.
+        approx::assert_relative_eq!(out[0].f, 2.0_f64.ln(), epsilon = 1e-12);
+        approx::assert_relative_eq!(out[0].df_deta[0], 2.0, epsilon = 1e-12);
+        approx::assert_relative_eq!(out[0].df_deta[1], -1.0, epsilon = 1e-12);
+        // Row 1: below floor → grads zeroed, value = floored log.
+        assert_eq!(out[1].df_deta, vec![0.0, 0.0]);
+        approx::assert_relative_eq!(
+            out[1].f,
+            crate::pk::ltbs_log_g(crate::pk::LTBS_FLOOR * 0.5),
+            epsilon = 1e-12
+        );
+        // No-op when `log_transform` is false.
+        let mut out2 = vec![ObsGrad {
+            f: 3.0,
+            df_deta: vec![1.0, 2.0],
+        }];
+        apply_ltbs_transform_inner(&mut out2, false);
+        approx::assert_relative_eq!(out2[0].f, 3.0, epsilon = 1e-12);
+        assert_eq!(out2[0].df_deta, vec![1.0, 2.0]);
+    }
+
+    /// Plain closed-form LTBS now takes the analytic **inner** gradient (PR #665): the
+    /// light provider applies the same `g = ln(f)` jet as the outer, so its η-gradient must
+    /// equal the full outer provider's `df_deta` η-block. (The covariance step reconverges
+    /// these EBEs at the tighter `cov_inner_tol` so the `ln`-amplified EBE offset does not
+    /// corrupt the SEs — see `FitOptions::effective_cov_inner_tol`.)
+    #[test]
+    fn ltbs_plain_inner_eta_grad_matches_outer() {
         let src = WARFARIN.replace(
             "[error_model]\n  DV ~ proportional(PROP_ERR)",
-            "[error_model]\n  DV ~ proportional(PROP_ERR)\n[scaling]\n  obs_scale = 1000 / V",
+            "[error_model]\n  log(DV) ~ additive(PROP_ERR)",
         );
-        let mut model = parse_model_string(&src).expect("parse");
-        model.log_transform = true;
+        let model = parse_model_string(&src).expect("parse LTBS warfarin");
+        assert!(model.log_transform, "fixture must be LTBS");
         let subject = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
         let theta = [0.2, 10.0, 1.5];
         let eta = [0.15, -0.10, 0.25];
-        // Inner declines → FD H-matrix, matching the model-level gate.
+        // Plain LTBS (no scale) is now in analytic inner scope.
         assert!(
-            subject_eta_grad(&model, &subject, &theta, &eta).is_none(),
-            "LTBS + ExpressionScale inner gradient must fall back to FD"
+            crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(&model),
+            "plain LTBS must now be served by the analytic inner gradient (PR #665)"
         );
+        let full = subject_sensitivities(&model, &subject, &theta, &eta).expect("outer");
+        let light = subject_eta_grad(&model, &subject, &theta, &eta)
+            .expect("inner analytic gradient serves plain LTBS");
+        assert_eq!(full.obs.len(), light.len());
+        for (fo, lo) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    fo.df_deta[k],
+                    lo.df_deta[k],
+                    max_relative = 1e-10,
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+
+    /// LTBS combined with an η-dependent `ExpressionScale obs_scale` now takes the analytic
+    /// **inner** gradient too (Tier-1 follow-up to #665): the η-quotient is applied, then the
+    /// `g = ln(f)` jet LAST (reproducing `ln(f/s)`), so the inner η-gradient must equal the
+    /// full outer provider's `df_deta` η-block.
+    #[test]
+    fn ltbs_plus_expression_scale_inner_matches_outer() {
+        let src = WARFARIN.replace(
+            "[error_model]\n  DV ~ proportional(PROP_ERR)",
+            "[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  log(DV) ~ additive(PROP_ERR)",
+        );
+        let model = parse_model_string(&src).expect("parse");
+        assert!(model.log_transform, "fixture must be LTBS");
         assert!(
-            !crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(&model),
-            "LTBS keeps the model out of analytic inner scope"
+            matches!(model.scaling, ScalingSpec::ExpressionScale { .. }),
+            "fixture must carry an η-dependent ExpressionScale obs_scale"
         );
-        // The analytic OUTER gradient still serves LTBS + ExpressionScale.
+        let subject = oral_subject(&[1.0, 2.0, 4.0, 8.0, 24.0]);
+        let theta = [0.2, 10.0, 1.5];
+        let eta = [0.15, -0.10, 0.25];
         assert!(
-            subject_sensitivities(&model, &subject, &theta, &eta).is_some(),
-            "analytic outer gradient still serves LTBS + ExpressionScale"
+            crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(&model),
+            "LTBS + ExpressionScale is now in analytic inner scope"
         );
+        let full = subject_sensitivities(&model, &subject, &theta, &eta).expect("outer");
+        let light = subject_eta_grad(&model, &subject, &theta, &eta)
+            .expect("inner analytic gradient serves LTBS + ExpressionScale");
+        assert_eq!(full.obs.len(), light.len());
+        for (fo, lo) in full.obs.iter().zip(light.iter()) {
+            approx::assert_relative_eq!(fo.f, lo.f, max_relative = 1e-12, epsilon = 1e-12);
+            for k in 0..model.n_eta {
+                approx::assert_relative_eq!(
+                    fo.df_deta[k],
+                    lo.df_deta[k],
+                    max_relative = 1e-10,
+                    epsilon = 1e-12
+                );
+            }
+        }
     }
 
     // ── Time-varying covariate analytic sensitivities ─────────────────
@@ -5580,6 +8887,94 @@ mod tests {
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
+    }
+
+    const ONECPT_TRANSIT_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  MTT = TVMTT
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+
+    /// A `one_cpt_transit` subject with time-varying covariates is served by the model's ODE
+    /// `transit()` equivalent (`effective_for` routes it there), NOT the closed form — the
+    /// closed form assumes constant parameters over each absorption window, and the
+    /// event-driven walk can't state-propagate the continuous-`N` Gamma absorption
+    /// (`subject_routes_to_event_walk` omits transit for that reason). The gradient is
+    /// analytic (a non-`None` `SubjectSens`, non-zero — the old silent all-zero bug is gone);
+    /// its numerical agreement with the production predictor is covered end-to-end by the ODE
+    /// equivalence suite (`tests/transit_analytic_equivalence.rs`). A constant-parameter
+    /// transit subject keeps the fast closed form (`effective_for` returns the model itself).
+    #[test]
+    fn transit_with_tvcov_routes_to_ode_equivalent() {
+        let m = parse_model_string(ONECPT_TRANSIT_MODEL).expect("parse transit");
+        assert_eq!(m.pk_model, PkModel::OneCptTransit);
+        assert!(
+            m.transit_ode_equivalent.is_some(),
+            "a plain transit model carries an ODE equivalent"
+        );
+        let theta = [5.0, 50.0, 1.0, 3.0];
+        let eta = [0.1, -0.05];
+
+        // TV-cov subject → routed to the ODE equivalent, analytic and non-zero.
+        let tv = tvcov_subject(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[70.0],
+            &[1.0, 2.0, 4.0, 8.0, 24.0],
+            &[70.0, 72.0, 80.0, 85.0, 90.0],
+            Vec::new(),
+            Vec::new(),
+            &[],
+        );
+        assert!(tv.has_tv_covariates());
+        assert!(
+            std::ptr::eq(
+                m.effective_for(&tv),
+                m.transit_ode_equivalent.as_ref().unwrap().get_or_build()
+            ),
+            "TV-cov transit subject must be served by the ODE equivalent"
+        );
+        assert!(
+            !subject_routes_to_event_walk(&m, &tv),
+            "transit never routes to the closed-form event walk"
+        );
+        let sens = subject_sensitivities(&m, &tv, &theta, &eta)
+            .expect("transit + TV-cov is analytic via the ODE equivalent (was silent zeros)");
+        assert!(
+            sens.obs.iter().any(|o| o.f.abs() > 1e-6),
+            "predictions must be non-zero"
+        );
+        assert!(
+            subject_eta_grad(&m, &tv, &theta, &eta).is_some(),
+            "inner analytic too"
+        );
+
+        // Constant-parameter subject → keeps the fast closed form (served by the model itself).
+        let flat = subject_with_doses_and_resets(
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[1.0, 2.0, 4.0, 8.0, 24.0],
+            Vec::new(),
+        );
+        assert!(!flat.has_tv_covariates());
+        assert!(
+            std::ptr::eq(m.effective_for(&flat), &m),
+            "constant-parameter transit subject keeps the closed form"
+        );
     }
 
     /// The TV-covariate provider's exact value/∂η/∂²η/∂θ/∂²η∂θ must match central
@@ -5883,8 +9278,8 @@ mod tests {
     /// **M3 + IOV + `iiv_on_ruv`** is analytic too as of #591 — the closed-form assembly
     /// already carried the censored residual-eta cross coefficients `(C·z, C·m)`, so
     /// `iov_analytical_supported` admits it (and `analytic_outer_gradient_available`
-    /// follows). Only the *ODE* triple stays FD (via `iiv_on_ruv_forces_fd`). Plain IOV
-    /// and IOV + `iiv_on_ruv` (no M3) stay analytic.
+    /// follows). The ODE IOV triple is analytic too (#486), as is the *non-IOV ODE* triple
+    /// (#623). Plain IOV and IOV + `iiv_on_ruv` (no M3) stay analytic.
     #[test]
     fn iov_analytical_supported_admits_m3_but_not_the_ruv_triple() {
         let mut model = parse_model_string(WARFARIN_IOV).expect("parse warfarin IOV");
@@ -5899,9 +9294,6 @@ mod tests {
         model.residual_error_eta = Some(0);
         assert!(iov_analytical_supported(&model));
         assert!(analytic_outer_gradient_available(&model));
-        // Only the *ODE* triple stays FD, gated by `iiv_on_ruv_forces_fd` (ode_spec-only);
-        // the closed-form triple here does not trip it.
-        assert!(!model.iiv_on_ruv_forces_fd());
         // IOV + iiv_on_ruv without M3: analytic (#4b).
         model.bloq_method = crate::types::BloqMethod::Drop;
         assert!(iov_analytical_supported(&model));
@@ -5936,6 +9328,69 @@ mod tests {
             #[cfg(feature = "survival")]
             obs_records: vec![],
         }
+    }
+
+    // 1-cpt IV closed-form IOV with an `init(central) = TVC0·V` baseline (#486, branch
+    // G-closed-form). `CL = TVCL·exp(ETA_CL + KAPPA_CL)` carries the occasion κ, so the init
+    // *decay* kernel depends on κ (via each observation's occasion clearance) while the init
+    // *amount* `A₀ = TVC0·V` is BSV-only (no κ) — exactly production's split in `predict_iov`
+    // (`add_analytical_init_with(amount_pk = BSV, Some(obs_params))`).
+    const WARFARIN_IOV_INIT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVC0(5.0, 0.1, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[initial_conditions]
+  init(central) = TVC0 * V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// **`init(...)` × IOV on the closed-form walk** (#486, branch G-closed-form). The IOV
+    /// provider now layers the `A₀·kernel(t, pk)` init impulse per occasion: the amount from the
+    /// BSV snapshot (κ = 0), the decay from each observation's occasion clearance (κ carried).
+    /// The full provider's value / `∂(stacked-η)` / Hessian / `∂θ` must match FD of `predict_iov`
+    /// (which includes the init), and the inner η-gradient must equal the outer η-block.
+    #[test]
+    fn iov_init_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_INIT).expect("parse warfarin IOV+init");
+        assert_eq!(model.n_kappa, 1);
+        assert_eq!(model.analytical_init.len(), 1, "init parsed");
+        assert!(model.ode_spec.is_none(), "closed-form model");
+        assert!(
+            iov_analytical_supported(&model),
+            "closed-form IOV + init must be analytic (#486)"
+        );
+        let subject = iov_subject();
+        // θ = [TVCL, TVV, TVC0]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    #[test]
+    fn iov_init_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_INIT).expect("parse warfarin IOV+init"),
+            &iov_subject(),
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
     }
 
     const WARFARIN_IOV_2CPT: &str = r#"
@@ -6099,6 +9554,399 @@ mod tests {
         );
     }
 
+    // 1-cpt IV closed-form IOV with a saturable-binding analytic Form C readout
+    // `y = C + BMAX·C/(KD + C)`, `C = central/V` (#655). `CL = TVCL·exp(ETA_CL + KAPPA_CL)`
+    // carries the occasion κ through the concentration, while production applies the
+    // readout with the κ = 0 (BSV-only) PK params (`apply_analytic_readout(..., eta_bsv)`)
+    // — so the readout param jet (V, BMAX, KD) is κ-less and only `C` carries κ, exactly
+    // the split `run_obs_iov` seeds from `readout_obs`.
+    const WARFARIN_IOV_BINDING_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BMAX * (central / V) / (KD + central / V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// **Analytic Form C readout × IOV on the closed-form walk** (#655). The IOV provider
+    /// now replaces each observation's concentration jet with `y = <expr>`, seeding the
+    /// readout PK params from the κ = 0 (BSV-only) per-obs snapshot while the walk's
+    /// concentration carries κ — matching production `predict_iov`'s
+    /// `apply_analytic_readout(..., eta_bsv, ...)`. The full provider's value /
+    /// `∂(stacked-η)` / Hessian / `∂θ` must match FD of `predict_iov` (which applies the
+    /// readout), and the non-structural BMAX/KD must be first-class differentiable.
+    #[test]
+    fn iov_form_c_binding_readout_provider_matches_fd() {
+        let model =
+            parse_model_string(WARFARIN_IOV_BINDING_READOUT).expect("parse warfarin IOV readout");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_none(), "closed-form model");
+        assert!(model.analytic_readout.is_some(), "Form C readout parsed");
+        assert!(
+            iov_analytical_supported(&model),
+            "closed-form IOV + central-only dual-evaluable Form C readout must be analytic (#655)"
+        );
+        let subject = iov_subject();
+        // θ = [TVCL, TVV, TVBMAX, TVKD]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+        let theta = [0.2, 10.0, 3.0, 2.0];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+
+        // BMAX (θ 2) / KD (θ 3) are non-structural readout params (basis extension) — their
+        // θ-gradient must be non-zero, proving they are differentiated under IOV, not aliased.
+        let full =
+            subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("supported");
+        let max_bmax = full
+            .obs
+            .iter()
+            .map(|o| o.df_dtheta[2].abs())
+            .fold(0.0_f64, f64::max);
+        let max_kd = full
+            .obs
+            .iter()
+            .map(|o| o.df_dtheta[3].abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_bmax > 1e-6, "∂y/∂BMAX must be non-zero under IOV");
+        assert!(max_kd > 1e-6, "∂y/∂KD must be non-zero under IOV");
+    }
+
+    #[test]
+    fn iov_form_c_binding_readout_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_BINDING_READOUT).expect("parse"),
+            &iov_subject(),
+            &[0.2, 10.0, 3.0, 2.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    // As `WARFARIN_IOV_BINDING_READOUT`, but the readout is gated on a **per-row** covariate
+    // (`FREE`) — the free-vs-total assay pattern (#650/#655). A per-observation `FREE` flag
+    // makes the subject a TV-covariate subject, so `build_iov_sources` takes the per-event
+    // branch and builds one κ = 0 readout snapshot per observation (`readout_obs`), each at
+    // that observation's covariate — the branch the plain (static-covariate) case above does
+    // not exercise.
+    const WARFARIN_IOV_BINDING_READOUT_FREE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = if (FREE == 0) central / V + BMAX * (central / V) / (KD + central / V) else central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// Covariate-gated Form C readout × IOV: the per-row `FREE` flag routes the subject
+    /// through the per-event `readout_obs` branch (one κ = 0 snapshot per observation, at
+    /// that obs's covariate). Value + all stacked-η/θ first/second derivatives must match
+    /// FD of `predict_iov`, and the inner η-gradient must equal the outer η-block.
+    #[test]
+    fn iov_form_c_readout_tvcov_gated_matches_fd() {
+        let model = parse_model_string(WARFARIN_IOV_BINDING_READOUT_FREE).expect("parse");
+        let mut subject = iov_subject();
+        // Alternating per-row FREE flag → per-observation covariate snapshots.
+        subject.obs_covariates = (0..subject.obs_times.len())
+            .map(|j| HashMap::from([("FREE".to_string(), (j % 2) as f64)]))
+            .collect();
+        assert!(
+            subject.has_tv_covariates(),
+            "FREE flag makes it a TV-cov subject"
+        );
+        assert!(
+            iov_analytical_supported(&model),
+            "covariate-gated Form C readout × IOV must be analytic (#655)"
+        );
+        let theta = [0.2, 10.0, 3.0, 2.0];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+        check_iov_inner_matches_outer(&model, &subject, &theta, &stacked);
+    }
+
+    // A readout that references the `TIME` builtin directly (`y = central/V + BETA·TIME`).
+    // `TIME` resolves `Op::PushTime` from the model-time thread-local, so both the analytic
+    // readout jet and production `apply_analytic_readout` must enter each observation's time
+    // (Copilot #670 review). `BETA = TVBETA` is a non-structural readout param, so
+    // `∂y/∂TVBETA = TIME` — a direct probe that the observation time (not a stale 0) is used.
+    const WARFARIN_IOV_TIME_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBETA(0.05, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  BETA = TVBETA
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BETA * TIME
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// A `TIME`-referencing Form C readout under IOV must evaluate `TIME` at each
+    /// observation. FD-of-`predict_iov` parity ties the analytic path to the (now equally
+    /// guarded) production predictor, and `∂y/∂TVBETA` must equal each observation's time
+    /// (it would be 0 everywhere if the readout read a stale model-time of 0).
+    #[test]
+    fn iov_form_c_time_readout_evaluated_at_obs_time() {
+        let model = parse_model_string(WARFARIN_IOV_TIME_READOUT).expect("parse");
+        assert!(
+            iov_analytical_supported(&model),
+            "TIME readout × IOV analytic (#655)"
+        );
+        let subject = iov_subject();
+        let theta = [0.2, 10.0, 0.05];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+        let full =
+            subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("supported");
+        for (j, o) in full.obs.iter().enumerate() {
+            // ∂(central/V + TVBETA·TIME)/∂TVBETA = TIME at observation j.
+            approx::assert_relative_eq!(
+                o.df_dtheta[2],
+                subject.obs_times[j],
+                max_relative = 1e-6,
+                epsilon = 1e-9
+            );
+        }
+    }
+
+    // A baseline-subtracted readout `y = central/V - E0` that is negative at every observation
+    // (E0 exceeds the concentration). Production clamps the *concentration* to ≥ 0 before the
+    // readout and returns the readout output **unclamped**; the provider must do the same
+    // rather than zeroing a negative output (user #670 review finding #1).
+    const WARFARIN_IOV_NEG_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVE0(100.0, 0.01, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  E0 = TVE0
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V - E0
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// A negative-valued Form C readout under IOV: the readout output is returned unclamped
+    /// (matching production), so the provider value/gradient match FD of `predict_iov` on
+    /// rows where `y < 0` — the case the inverted clamp (zeroing the output) got wrong.
+    #[test]
+    fn iov_form_c_negative_output_readout_not_clamped() {
+        let model = parse_model_string(WARFARIN_IOV_NEG_READOUT).expect("parse");
+        assert!(iov_analytical_supported(&model));
+        let subject = iov_subject();
+        let theta = [0.2, 10.0, 100.0];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        let full =
+            subject_sensitivities_iov(&model, &subject, &theta, &stacked).expect("supported");
+        assert!(
+            full.obs.iter().all(|o| o.f < 0.0),
+            "readout must stay negative (unclamped), not zeroed"
+        );
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+        check_iov_inner_matches_outer(&model, &subject, &theta, &stacked);
+    }
+
+    // Non-IOV counterpart of the TIME-readout probe — exercises the static `run_obs` /
+    // `run_obs_grad` readout guard (and the shared production guard) added in the #670 review.
+    const ONECPT_IV_TIME_READOUT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBETA(0.05, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP_ERR ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BETA = TVBETA
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = central / V + BETA * TIME
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+    #[test]
+    fn form_c_time_readout_evaluated_at_obs_time() {
+        let m = parse_model_string(ONECPT_IV_TIME_READOUT).expect("parse");
+        assert!(analytical_supported(&m), "TIME readout stays analytic");
+        let s = subject_with_dose(
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            &[0.5, 2.0, 6.0, 12.0],
+        );
+        let theta = [0.2, 10.0, 0.05];
+        let eta = [0.12, -0.08];
+        check_full_provider_vs_fd(&m, &s, &theta, &eta);
+        let full = subject_sensitivities(&m, &s, &theta, &eta).expect("supported");
+        let light = subject_eta_grad(&m, &s, &theta, &eta).expect("light supported");
+        for (j, o) in full.obs.iter().enumerate() {
+            approx::assert_relative_eq!(
+                o.df_dtheta[2],
+                s.obs_times[j],
+                max_relative = 1e-6,
+                epsilon = 1e-9
+            );
+        }
+        for (lo, fo) in light.iter().zip(full.obs.iter()) {
+            for k in 0..m.n_eta {
+                approx::assert_relative_eq!(
+                    lo.df_deta[k],
+                    fo.df_deta[k],
+                    max_relative = 1e-9,
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+
+    /// Closed-form **IOV + modeled-duration** dose (`RATE=-2` → `D1`, #486). The
+    /// per-occasion `D1` sets each infusion window; the walk resolves it from the
+    /// occasion's stacked PK jet and the moving infusion-end boundary carries `∂/∂D1`
+    /// over θ, η, and κ. Doses at 0 and 24 (`D1 ≈ 5`), obs straddling each window end
+    /// (1 inside / 6 after; 25 inside / 30 after). Validated vs central FD of
+    /// `predict_iov` (which resolves `D1` per occasion) — the closed-form twin of the
+    /// ODE `ode_iov_modeled_duration_provider_matches_fd_of_predict_iov` (#635).
+    const WARFARIN_IOV_MODELED_DUR: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_D1 ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+
+    fn iov_modeled_dur_subject() -> Subject {
+        let mut s = iov_subject();
+        s.doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                24.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        s
+    }
+
+    #[test]
+    fn iov_modeled_duration_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_MODELED_DUR).expect("parse modeled-dur IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert_eq!(model.n_eta, 3);
+        assert!(model.ode_spec.is_none(), "must be a closed-form model");
+        let subject = iov_modeled_dur_subject();
+        assert!(!subject.all_doses_fixed(), "doses must be modeled");
+        // stacked = [η_cl, η_v, η_d1, κ_g0, κ_g1] (n_eta = 3, n_kappa = 1, K = 2).
+        assert!(
+            subject_sensitivities_iov(
+                &model,
+                &subject,
+                &[0.2, 10.0, 5.0],
+                &[0.12, -0.08, 0.05, 0.05, -0.10],
+            )
+            .is_some(),
+            "modeled-duration closed-form IOV subject (no SS) must be served analytically (#486)"
+        );
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.05, -0.10],
+        );
+    }
+
+    /// Inner (`Dual1`) IOV modeled-duration walk must match the FD-validated outer.
+    #[test]
+    fn iov_modeled_duration_inner_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_MODELED_DUR).expect("parse modeled-dur IOV"),
+            &iov_modeled_dur_subject(),
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.05, -0.10],
+        );
+    }
+
     /// The closed-form **inner** IOV walk (`Dual1`, `subject_eta_grad_iov_analytical`)
     /// must produce the same per-observation value and `∂f/∂(stacked-η)` as the
     /// **outer** walk (`Dual2`, `subject_sensitivities_iov`) — whose `df_deta` is
@@ -6129,7 +9977,426 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------------------------
+    // Closed-form IOV + `ExpressionScale` `obs_scale` (#486): the closed-form twin of the
+    // ODE-IOV path (#575/#590). The scale divisor is a per-occasion-group post-walk quotient
+    // on the stacked `(θ, η_bsv, κ)` axes; each group's divisor rides its κ through the PK
+    // params. Validated against central FD of `predict_iov` (the independent production f64
+    // path), inner-vs-outer parity, and bit-parity with the ODE-IOV twin.
+    // ------------------------------------------------------------------------------------
+
+    /// 1-cpt oral closed-form IOV (κ on CL) with an η-dependent `obs_scale = V` divisor.
+    const WARFARIN_IOV_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// 2-cpt oral closed-form IOV (κ on CL) with an `obs_scale = V` divisor — exercises the
+    /// per-group quotient over the wider PK-param chain.
+    const WARFARIN_IOV_EXPRSCALE_2CPT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(20.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v=V, q=Q, v2=V2, ka=KA)
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// 1-cpt oral closed-form IOV + **WT-on-CL time-varying covariate** + `obs_scale = CL`.
+    /// The scale references a covariate-carrying PK param, but the divisor is still built at
+    /// the subject-static covariate snapshot (`t = 0`) — matching production `predict_iov`.
+    const WARFARIN_IOV_TVCOV_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[scaling]
+  obs_scale = CL
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// 1-cpt IV closed-form IOV (κ on CL) with `obs_scale = V` — the closed-form half of the
+    /// bit-parity twin with the ODE-IOV path. Closed-form `one_cpt_iv` yields `A/V`
+    /// (concentration), so `obs_scale = V` gives `A/V²`.
+    const WARFARIN_IOV_IV_EXPRSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+
+    /// The gate admits a closed-form IOV model carrying a differentiable `ExpressionScale`
+    /// `obs_scale`, but keeps declining LTBS, `ScalarScale`, and lagtime (out of scope for
+    /// the post-walk quotient) — the closed-form mirror of `ode_iov_expr_scale_supported_and_gated`.
+    #[test]
+    fn iov_analytical_expr_scale_supported_and_gated() {
+        let model = parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse expr-scale IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert!(
+            matches!(model.scaling, ScalingSpec::ExpressionScale { .. }),
+            "fixture must use an expression obs_scale"
+        );
+        assert!(
+            iov_analytical_supported(&model),
+            "closed-form IOV + ExpressionScale obs_scale must be on the analytic path (#486)"
+        );
+        assert!(analytic_outer_gradient_available(&model));
+        // + LTBS is served on the OUTER gradient now (#486): `subject_sensitivities_iov`
+        // applies the `ln(f)` jet after the in-walk scale quotient, reproducing `ln(f/s)`.
+        // (The inner EBE gradient still declines via `analytic_inner_common_bail`.)
+        let mut ltbs = parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse");
+        ltbs.log_transform = true;
+        assert!(
+            iov_analytical_supported(&ltbs),
+            "ExpressionScale + LTBS under closed-form IOV is served on the outer gradient (#486)"
+        );
+        // A constant `ScalarScale` under IOV is now analytic too (#486 IOV-scope parity):
+        // `f/k` is the trivial covariate/η/κ-independent case of the post-walk quotient,
+        // divided uniformly into every jet entry — matching the non-IOV `f_scaled = f/k`.
+        let mut scalar = parse_model_string(WARFARIN_IOV).expect("parse");
+        scalar.scaling = ScalingSpec::ScalarScale(2.0);
+        assert!(
+            iov_analytical_supported(&scalar),
+            "ScalarScale under closed-form IOV is now on the analytic path (#486 parity)"
+        );
+    }
+
+    /// **Closed-form IOV + constant `ScalarScale` `obs_scale`** (#486 IOV-scope parity). A
+    /// uniform output divisor `f/k` under IOV, validated (value + gradient + Hessian over the
+    /// stacked `[η, κ]` vector + θ) against central FD of `predict_iov` (whose `apply_scaling`
+    /// applies the same `pred /= k`). Before this fix, `ScalarScale × IOV` declined to FD even
+    /// though the constant divide is strictly simpler than the `ExpressionScale` quotient the
+    /// IOV walk already applies.
+    #[test]
+    fn iov_analytical_scalar_scale_matches_fd() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse WARFARIN_IOV");
+        model.scaling = ScalingSpec::ScalarScale(2.5);
+        assert!(iov_analytical_supported(&model));
+        check_iov_provider_vs_fd(
+            &model,
+            &iov_subject(),
+            &[0.2, 10.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// The closed-form IOV **inner** η-gradient (`Dual1`, `run_obs_iov_eta`) with a constant
+    /// `ScalarScale` divisor must track the FD-validated **outer** walk's first-order block —
+    /// the inner twin of `iov_analytical_scalar_scale_matches_fd`, which only exercises the
+    /// outer `Dual2` path. Without this the inner `ScalarScale` divide (`f/k`, `∂f/∂η ÷ k`)
+    /// carries no coverage (#486 IOV-scope parity, review follow-up). The `k = 1.0` case
+    /// additionally pins the identity-scale no-op branch of the shared scaling helpers.
+    #[test]
+    fn iov_analytical_scalar_scale_inner_eta_grad_matches_outer() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse WARFARIN_IOV");
+        model.scaling = ScalingSpec::ScalarScale(2.5);
+        assert!(iov_analytical_supported(&model));
+        check_iov_inner_matches_outer(
+            &model,
+            &iov_subject(),
+            &[0.2, 10.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+        // Identity scale `k = 1.0`: the divide is a no-op on both walks, so inner still
+        // tracks outer (covers the `k == 1.0` early-return arm of `scale_obs_sens_*`).
+        model.scaling = ScalingSpec::ScalarScale(1.0);
+        check_iov_inner_matches_outer(
+            &model,
+            &iov_subject(),
+            &[0.2, 10.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// An **invalid** constant `ScalarScale` (`k <= 0` or non-finite) must NaN-out the whole
+    /// analytic IOV jet — value AND every derivative, on both the outer and inner walks —
+    /// matching `pk::apply_scaling` / `build_obs_scale_array`, which encode an invalid scale
+    /// as a `NaN` prediction (loud-failure semantics). Guards against the analytic path
+    /// emitting an `inf`/sign-flipped jet that would diverge from the production predictor the
+    /// FD oracle differentiates (Copilot review, #663).
+    #[test]
+    fn iov_scalar_scale_invalid_k_nans_the_jet() {
+        let mut model = parse_model_string(WARFARIN_IOV).expect("parse WARFARIN_IOV");
+        model.scaling = ScalingSpec::ScalarScale(-2.0);
+        assert!(iov_analytical_supported(&model));
+        let theta = [0.2, 10.0, 1.5];
+        let stacked = [0.12, -0.08, 0.20, 0.05, -0.10];
+        let outer =
+            subject_sensitivities_iov(&model, &iov_subject(), &theta, &stacked).expect("supported");
+        assert!(
+            outer.obs.iter().all(|o| o.f.is_nan()
+                && o.df_deta.iter().all(|x| x.is_nan())
+                && o.df_dtheta.iter().all(|x| x.is_nan())
+                && o.d2f_deta2.iter().all(|x| x.is_nan())
+                && o.d2f_deta_dtheta.iter().all(|x| x.is_nan())),
+            "invalid ScalarScale must NaN-out the whole outer jet"
+        );
+        let inner =
+            subject_eta_grad_iov(&model, &iov_subject(), &theta, &stacked).expect("supported");
+        assert!(
+            inner
+                .iter()
+                .all(|o| o.f.is_nan() && o.df_deta.iter().all(|x| x.is_nan())),
+            "invalid ScalarScale must NaN-out the whole inner jet"
+        );
+    }
+
+    /// **ODE IOV + constant `ScalarScale` `obs_scale`** (#486 IOV-scope parity — the ODE twin
+    /// of `iov_analytical_scalar_scale_matches_fd`). On the ODE path the divide is even
+    /// simpler than closed-form: `resolve_obs_readout` → `apply_output_transform` already
+    /// divides the in-walk readout `p/k` over the stacked `(θ, η, κ)` dual (the same in-walk
+    /// step the non-IOV walk uses), so admitting `ScalarScale` in the ODE-IOV gate needs no
+    /// run-loop change. Validated vs central FD of `predict_iov`.
+    #[test]
+    fn ode_iov_scalar_scale_matches_fd_of_predict_iov() {
+        const ODE_IOV_SCALARSCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V)*central
+[scaling]
+  obs_scale = 40
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(ODE_IOV_SCALARSCALE).expect("parse ODE IOV ScalarScale");
+        assert!(
+            matches!(model.scaling, ScalingSpec::ScalarScale(_)),
+            "fixture must use a constant obs_scale"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + constant ScalarScale must be on the analytic path (#486 parity)"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
+        check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.06, -0.11]);
+    }
+
+    /// Outer packed sensitivities of a closed-form IOV + `obs_scale = V` model must match
+    /// central FD of `predict_iov` (value, `∂f/∂stacked`, `∂f/∂θ`, and both Hessian blocks)
+    /// over `[η_bsv, κ_g0, κ_g1]` + θ — 1-cpt and 2-cpt oral.
+    #[test]
+    fn iov_analytical_expr_scale_outer_matches_fd() {
+        check_iov_provider_vs_fd(
+            &parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse 1cpt expr-scale IOV"),
+            &iov_subject(),
+            &[0.2, 10.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+        check_iov_provider_vs_fd(
+            &parse_model_string(WARFARIN_IOV_EXPRSCALE_2CPT).expect("parse 2cpt expr-scale IOV"),
+            &iov_subject(),
+            &[0.2, 10.0, 0.5, 20.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// Closed-form IOV + **TV covariate** + `obs_scale = CL`: the scale divisor stays
+    /// subject-static (built at `t = 0`) even though the walk seeds each event per-covariate.
+    /// Value/grad/Hessian over `[η_bsv, κ_g0, κ_g1]` + θ (incl. `THETA_WT`) vs FD of `predict_iov`.
+    #[test]
+    fn iov_analytical_tvcov_expr_scale_outer_matches_fd() {
+        let model =
+            parse_model_string(WARFARIN_IOV_TVCOV_EXPRSCALE).expect("parse TV-cov expr-scale IOV");
+        let subject = iov_tvcov_subject(false);
+        assert!(subject.has_tv_covariates(), "fixture must carry TV cov");
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.5, 0.75],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// The closed-form IOV **inner** η-gradient (`Dual1`) with an `obs_scale` divisor must
+    /// track the FD-validated **outer** walk's first-order block — plain and TV-cov.
+    #[test]
+    fn iov_analytical_expr_scale_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_EXPRSCALE).expect("parse expr-scale IOV"),
+            &iov_subject(),
+            &[0.2, 10.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_TVCOV_EXPRSCALE).expect("parse TV-cov expr-scale IOV"),
+            &iov_tvcov_subject(false),
+            &[0.2, 10.0, 1.5, 0.75],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// **Bit-parity with the ODE-IOV twin (#575/#590).** Closed-form `one_cpt_iv` + `obs_scale
+    /// = V` computes `A/V²`; the same physical model as a user `[odes]` model reaches `A/V²`
+    /// two independent, already-analytic ways: an `obs_scale = V*V` divisor (the ODE half of
+    /// the very quotient this PR ports) and a Form-C readout `y = central/(V*V)` (the in-walk
+    /// division). Per-observation value and `∂f/∂stacked` must agree across all three paths —
+    /// confirming the closed-form quotient reproduces the NONMEM-validated ODE result.
+    #[test]
+    fn iov_analytical_expr_scale_equals_ode_twin() {
+        const ODE_OBS_SCALE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V * V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        const ODE_FORMC: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / (V * V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+"#;
+        let cf = parse_model_string(WARFARIN_IOV_IV_EXPRSCALE).expect("parse closed-form IV");
+        let ode_scale = parse_model_string(ODE_OBS_SCALE).expect("parse ODE obs_scale twin");
+        let ode_formc = parse_model_string(ODE_FORMC).expect("parse ODE Form-C twin");
+        assert!(iov_analytical_supported(&cf));
+        assert!(crate::sens::ode_provider::ode_iov_supported(&ode_scale));
+        assert!(crate::sens::ode_provider::ode_iov_supported(&ode_formc));
+        let subject = iov_subject();
+        let theta = [0.2, 10.0];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        let a = subject_sensitivities_iov(&cf, &subject, &theta, &stacked).expect("closed-form");
+        for twin in [&ode_scale, &ode_formc] {
+            let b = subject_sensitivities_iov(twin, &subject, &theta, &stacked).expect("ODE twin");
+            assert_eq!(a.obs.len(), b.obs.len());
+            for (oa, ob) in a.obs.iter().zip(b.obs.iter()) {
+                approx::assert_relative_eq!(oa.f, ob.f, max_relative = 1e-6, epsilon = 1e-9);
+                for (x, y) in oa.df_deta.iter().zip(ob.df_deta.iter()) {
+                    approx::assert_relative_eq!(x, y, max_relative = 1e-5, epsilon = 1e-8);
+                }
+            }
+        }
+    }
+
     /// 1-cpt IV IOV written as a user `[odes]` model (κ on CL, Form-C readout
+    /// `y = central/V`). Routes through `subject_sensitivities_iov` → the ODE IOV
     /// `y = central/V`). Routes through `subject_sensitivities_iov` → the ODE IOV
     /// provider, validated against central FD of the production `predict_iov` (which
     /// integrates the same ODE via `ode_predictions_event_driven`). This is the ODE
@@ -6174,6 +10441,60 @@ mod tests {
         let subject = iov_subject();
         // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
+    }
+
+    /// #486: a `TIME`-switched CL on an **ODE IOV** model (Form-C `y = central/V`
+    /// readout). With no TV covariates the per-event stacked walk is reached purely by
+    /// `uses_time_builtin`; the value/∂/∂² over `[η_bsv, κ_g0, κ_g1]` + θ must match
+    /// central FD of `predict_iov` (which threads the same per-event TIME through the
+    /// ODE event-driven predictor).
+    #[test]
+    fn ode_iov_time_builtin_provider_matches_fd_of_predict_iov() {
+        const WARFARIN_IOV_ODE_TIME: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVCL_LATE(0.1, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  if (TIME > 20.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(WARFARIN_IOV_ODE_TIME).expect("parse ODE IOV TIME");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_some());
+        assert!(!iov_subject().has_tv_covariates());
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV TIME (Form-C readout) must be provider-supported"
+        );
+        // obs [1,6,12 | 25,30,36] straddle TIME=20. stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &iov_subject(),
+            &[0.2, 0.1, 10.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
     }
 
     #[test]
@@ -6350,6 +10671,702 @@ mod tests {
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
     }
 
+    /// 1-cpt IV ODE IOV with a **modeled-duration** dose (`RATE=-2` → `D1`). `D1` is a
+    /// structural individual parameter (`D1 = TVD1·exp(ETA_D1)`), so the infusion window
+    /// end `t_dose + D1` is a moving boundary in `D1`; the per-occasion rate-off saltation
+    /// carries its derivative on the IOV stacked axes exactly as on the non-IOV TV-cov walk
+    /// (#486 / #530). κ rides on CL here (the modeled slot itself is η-only).
+    const WARFARIN_IOV_ODE_MODELED_DUR: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_D1 ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **ODE IOV + modeled-duration dose** (#486, design A). A two-occasion IOV subject
+    /// whose per-occasion modeled `D1` sets each infusion's window length. The walk resolves
+    /// `D1` from the per-occasion stacked PK jet (`inf_eff` → `pk_at_dose[k][slot]`) and the
+    /// moving infusion-end saltation carries `∂/∂D1` over θ, η, and κ. Validated vs central
+    /// FD of `predict_iov` (which resolves `D1` per occasion). Observations straddle each
+    /// window end (`D1 ≈ 5`: obs at 1 inside, 6 after the first window; 25 inside, 30 after
+    /// the second) so the moving boundary is genuinely exercised.
+    #[test]
+    fn ode_iov_modeled_duration_provider_matches_fd_of_predict_iov() {
+        let model =
+            parse_model_string(WARFARIN_IOV_ODE_MODELED_DUR).expect("parse modeled-dur IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert_eq!(model.n_eta, 3);
+        assert!(model.ode_spec.is_some());
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                24.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        assert!(
+            !subject.all_doses_fixed(),
+            "doses must be modeled, not fixed"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model,
+                &subject,
+                &[0.2, 10.0, 5.0],
+                &[0.12, -0.08, 0.05, 0.05, -0.10],
+            )
+            .is_some(),
+            "modeled-duration ODE IOV subject (no SS) must be served analytically (#486)"
+        );
+        // stacked = [η_cl, η_v, η_d1, κ_g0, κ_g1] (n_eta = 3, n_kappa = 1, K = 2).
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.05, -0.10],
+        );
+    }
+
+    /// **ODE IOV + κ-coupled modeled-duration dose** (#486, design A — the κ-coupling guard).
+    /// Here the modeled window itself varies by occasion: `D1 = TVD1·exp(ETA_D1 + KAPPA_D1)`,
+    /// so each occasion's infusion has a *different* length. This pins the concern that the
+    /// `∂/∂D1` moving-boundary column lands in the correct κ-group axis — `inf_eff` reads the
+    /// per-occasion `seed_pk_dual2_iov` jet, and central FD of `predict_iov` (which rebuilds
+    /// `D1` from each occasion's κ) is the independent oracle.
+    #[test]
+    fn ode_iov_modeled_duration_kappa_coupled_matches_fd_of_predict_iov() {
+        const KCOUPLED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVD1(5.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_D1 ~ 0.04
+  kappa KAPPA_D1 ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  D1 = TVD1 * exp(ETA_D1 + KAPPA_D1)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(KCOUPLED).expect("parse kappa-coupled modeled-dur IOV");
+        assert_eq!(model.n_kappa, 1);
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                24.0,
+                100.0,
+                1,
+                false,
+                0.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        // stacked = [η_cl, η_v, η_d1, κ_g0, κ_g1]; κ on D1 → each occasion's window differs.
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.06, -0.11],
+        );
+    }
+
+    /// **Still-FD edge: modeled-duration dose + steady-state** (#486, design B not yet done).
+    /// The dual SS equilibration reads a fixed per-cycle `t_inf` with no modeled-window jet,
+    /// so a modeled + SS subject must route to FD on BOTH the outer sensitivity walk and the
+    /// inner η-gradient (scope parity). Pins the `has_ss` arm of the relaxed IOV gate.
+    /// **ODE IOV + modeled-duration dose × steady-state is now analytic (#486, PR3
+    /// sub-case (d)).** `equilibrate_ss_state_g` threads the per-occasion `inf_eff` jet
+    /// (`D1` seeded per occasion group, same as the non-SS modeled-duration IOV test) into
+    /// its per-cycle active/quiet split. Validated vs central FD of `predict_iov` (both
+    /// outer and inner, scope parity).
+    #[test]
+    fn ode_iov_modeled_duration_ss_matches_fd_of_predict_iov() {
+        let model =
+            parse_model_string(WARFARIN_IOV_ODE_MODELED_DUR).expect("parse modeled-dur IOV");
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::modeled(
+                0.0,
+                100.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+            DoseEvent::modeled(
+                24.0,
+                100.0,
+                1,
+                true,
+                12.0,
+                crate::types::RateMode::ModeledDuration,
+            ),
+        ];
+        let theta = [0.2, 10.0, 5.0];
+        let stacked = [0.12, -0.08, 0.05, 0.05, -0.10];
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked
+            )
+            .is_some(),
+            "modeled-duration + SS must be analytic now (outer, #486)"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_subject_eta_grad_iov(&model, &subject, &theta, &stacked)
+                .is_some(),
+            "modeled-duration + SS must be analytic now (inner, scope parity)"
+        );
+        // stacked = [η_cl, η_v, η_d1, κ_g0, κ_g1] (n_eta = 3, n_kappa = 1, K = 2).
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    }
+
+    const ZERO_ORDER_IOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVDUR(5.0, 0.1, 24.0)
+  omega ETA_CL  ~ 0.09
+  omega ETA_V   ~ 0.04
+  omega ETA_DUR ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL + KAPPA_CL)
+  V   = TVV  * exp(ETA_V)
+  DUR = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **ODE IOV + `zero_order(dur)` absorption** (#486). The last zero-order gap after
+    /// #653 ported the moving-boundary window to the non-IOV event-driven walk: the IOV
+    /// walk is the *same* `integrate_tvcov_g`, so once `ode_iov_supported` admits a
+    /// `ZeroOrder` forcing the κ-coupled window rides through — its rate `F·amt/dur` and
+    /// window end `t_dose + dur` are rebuilt from each dose's own per-occasion stacked PK
+    /// jet (`pk_at_dose[k]`, seeded by `seed_pk_dual2_iov`). Validated vs central FD of
+    /// `predict_iov`. `DUR ≈ 5`, so obs at 1 (inside) / 6 (after) straddle the first window
+    /// end and 25 / 30 the second, exercising the rate-off saltation per occasion.
+    #[test]
+    fn ode_iov_zero_order_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(ZERO_ORDER_IOV_ODE).expect("parse zero_order IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert_eq!(model.n_eta, 3);
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "zero_order model must be admitted under IOV (#486)"
+        );
+        let subject = iov_subject();
+        let theta = [0.2, 10.0, 5.0];
+        // stacked = [η_cl, η_v, η_dur, κ_g0, κ_g1] (n_eta = 3, n_kappa = 1, K = 2).
+        let stacked = [0.12, -0.08, 0.05, 0.05, -0.10];
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked
+            )
+            .is_some(),
+            "zero_order ODE IOV subject (no SS) must be served analytically (#486)"
+        );
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    }
+
+    /// **ODE IOV + κ-coupled `zero_order(dur)`** (#486 — the κ-axis-placement guard). Here
+    /// the window itself varies by occasion (`DUR = TVDUR·exp(ETA_DUR + KAPPA_DUR)`), so each
+    /// occasion's zero-order window has a different length. This pins that the `∂/∂DUR`
+    /// rate-off column lands in the correct κ-group axis of the stacked vector (central FD of
+    /// `predict_iov`, which rebuilds `DUR` from each occasion's κ, is the independent oracle).
+    #[test]
+    fn ode_iov_zero_order_kappa_coupled_matches_fd_of_predict_iov() {
+        const KCOUPLED: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVDUR(5.0, 0.1, 24.0)
+  omega ETA_CL  ~ 0.09
+  omega ETA_V   ~ 0.04
+  omega ETA_DUR ~ 0.04
+  kappa KAPPA_DUR ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV  * exp(ETA_V)
+  DUR = TVDUR * exp(ETA_DUR + KAPPA_DUR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(KCOUPLED).expect("parse κ-coupled zero_order IOV");
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, η_dur, κ_g0, κ_g1]; κ on DUR → each occasion's window differs.
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.06, -0.11],
+        );
+    }
+
+    const MIXED_IOV_ODE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVFZO(0.4, 0.05, 0.95)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVDUR(5.0, 0.1, 24.0)
+  omega ETA_CL  ~ 0.09
+  omega ETA_DUR ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL + KAPPA_CL)
+  V    = TVV
+  FZO  = TVFZO
+  FZO1 = 1 - TVFZO
+  KA   = TVKA
+  DUR  = TVDUR * exp(ETA_DUR)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **ODE IOV + `mixed` (first-order + zero-order) absorption** (#486). Exercises both
+    /// admitted forcing kinds together: the pointwise first-order `R_in` and the zero-order
+    /// window are delivered concurrently per occasion, and the `frac` (FZO / FZO1) multiplier
+    /// rides each rate. Validated vs central FD of `predict_iov`.
+    #[test]
+    fn ode_iov_mixed_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(MIXED_IOV_ODE).expect("parse mixed IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert_eq!(model.n_eta, 2);
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "mixed (first_order + zero_order) must be admitted under IOV (#486)"
+        );
+        let subject = iov_subject();
+        let theta = [0.2, 10.0, 0.4, 1.0, 5.0];
+        // stacked = [η_cl, η_dur, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
+        let stacked = [0.12, 0.05, 0.06, -0.11];
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    }
+
+    /// **Still-FD edge: built-in absorption + steady state under IOV** (#486). The dual SS
+    /// equilibration (`equilibrate_ss_state_g`) seeds a bolus/infusion trough and does not
+    /// spread a periodic zero-order window (or a first-order `R_in` tail) over the cycle, so
+    /// a `zero_order` + SS subject routes to FD on BOTH loops. (The `weibull` + lagtime FD
+    /// case is pinned separately by `ode_iov_weibull_lagtime_falls_back_to_fd`.)
+    #[test]
+    fn ode_iov_zero_order_ss_falls_back_to_fd() {
+        let model = parse_model_string(ZERO_ORDER_IOV_ODE).expect("parse zero_order IOV");
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, true, 12.0),
+        ];
+        let theta = [0.2, 10.0, 5.0];
+        let stacked = [0.12, -0.08, 0.05, 0.05, -0.10];
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked
+            )
+            .is_none(),
+            "zero_order + SS must route to FD under IOV (outer, #486)"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_subject_eta_grad_iov(&model, &subject, &theta, &stacked)
+                .is_none(),
+            "zero_order + SS must route to FD under IOV (inner, scope parity)"
+        );
+    }
+
+    /// **ODE IOV + `parallel` dual-pathway absorption** (#486 review — the multi-forcing
+    /// case). Two concurrent `first_order` forcings (`FR1·first_order(ka1) +
+    /// FR2·first_order(ka2)`) feed the central compartment. The gate admits it (both kinds
+    /// are `FirstOrder`); this pins that the per-occasion accumulation of two `R_in`
+    /// contributions stays analytic and matches central FD of `predict_iov`.
+    #[test]
+    fn ode_iov_parallel_provider_matches_fd_of_predict_iov() {
+        const PARALLEL_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA1(1.5, 0.05, 24.0)
+  theta TVKA2(0.3, 0.01, 24.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL + KAPPA_CL)
+  V   = TVV  * exp(ETA_V)
+  KA1 = TVKA1
+  KA2 = TVKA2
+  FR1 = TVFR1
+  FR2 = 1 - TVFR1
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(PARALLEL_IOV).expect("parse parallel IOV");
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "parallel (two first_order) must be admitted under IOV (#486)"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.5, 0.3, 0.6],
+            &[0.12, -0.08, 0.06, -0.11],
+        );
+    }
+
+    /// **ODE IOV + `first_order` absorption × estimated (bare) lagtime** (#486 review). The
+    /// non-IOV path admits `first_order` + lagtime (#643 onset saltation `Δr = R_in(0⁺)`);
+    /// the IOV walk is the same, so it must too. Pins that the per-occasion rate-on onset
+    /// saltation at the lagged arrival stays analytic under κ (FD of `predict_iov` is the
+    /// oracle). Uses a **bare** `LAGTIME`; the compartment-indexed `ALAG{cmt}` case is now
+    /// analytic too and covered by `ode_iov_indexed_lag_and_f_match_fd_of_predict_iov`.
+    #[test]
+    fn ode_iov_first_order_lagtime_matches_fd_of_predict_iov() {
+        const FO_LAG_IOV: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL + KAPPA_CL)
+  V       = TVV  * exp(ETA_V)
+  KA      = TVKA
+  LAGTIME = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(FO_LAG_IOV).expect("parse first_order+lag IOV");
+        assert!(model.has_lagtime());
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "first_order + lagtime must be admitted under IOV (#486)"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.0, 0.5],
+            &[0.12, -0.08, 0.06, -0.11],
+        );
+    }
+
+    /// **ODE IOV + `zero_order` absorption × EVID 3/4 reset** (#486 review). Resets are
+    /// admitted by `ode_iov_subject_supported` and the zero-order window is kind-agnostic to
+    /// the `reset_floor` cutoff (#653), so the combination stays analytic under IOV. A reset
+    /// at `t = 15` (after the first window, before the second dose) zeros the state; central
+    /// FD of `predict_iov` (which cancels the pre-reset trajectory) is the oracle.
+    #[test]
+    fn ode_iov_zero_order_reset_matches_fd_of_predict_iov() {
+        let model = parse_model_string(ZERO_ORDER_IOV_ODE).expect("parse zero_order IOV");
+        let mut subject = iov_subject();
+        subject.reset_times = vec![15.0];
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 5.0],
+            &[0.12, -0.08, 0.05, 0.05, -0.10],
+        );
+    }
+
+    // #486 IOV-scope parity: build a 1-cpt-depot ODE IOV model whose depot is fed by one
+    // smooth-density absorption forcing `<forcing>`, κ on CL. These were declined under IOV
+    // before the gate mirrored the non-IOV `supported_over_dual()` allowlist.
+    fn smooth_forcing_iov_model(forcing: &str) -> String {
+        format!(
+            r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVP(1.5, 0.05, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA
+  PP = TVP
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = {forcing} - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#
+        )
+    }
+
+    /// **ODE IOV + `igd` / `transit` / `weibull` absorption** (#486 IOV-scope parity). The
+    /// non-IOV gate admits every input-rate kind via the kind-agnostic `supported_over_dual()`;
+    /// the IOV walk is the *same* `integrate_tvcov_g`, so it must too. Before this parity fix
+    /// the IOV gate hard-restricted to `{ZeroOrder, FirstOrder}`, declining these smooth
+    /// densities for no technical reason. Each is validated (value + gradient + Hessian over
+    /// the stacked `[η, κ]` vector) against central FD of `predict_iov`.
+    #[test]
+    fn ode_iov_smooth_density_forcings_match_fd_of_predict_iov() {
+        for forcing in [
+            "igd(mat=PP, cv2=KA)",
+            "transit(n=PP, mtt=KA)",
+            "weibull(td=KA, beta=PP)",
+        ] {
+            let src = smooth_forcing_iov_model(forcing);
+            let model = parse_model_string(&src).unwrap_or_else(|e| panic!("parse {forcing}: {e}"));
+            assert!(
+                crate::sens::ode_provider::ode_iov_supported(&model),
+                "{forcing} must be admitted under IOV (#486 parity)"
+            );
+            let subject = iov_subject();
+            // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
+            check_iov_provider_vs_fd(
+                &model,
+                &subject,
+                &[0.2, 10.0, 1.0, 1.5],
+                &[0.12, -0.08, 0.06, -0.11],
+            );
+        }
+    }
+
+    /// **`weibull` + estimated lagtime stays FD under IOV** (#486 parity — the one input-rate
+    /// kind that stays FD with lagtime on every path, its onset diverging for shape `β < 1`).
+    /// Mirrors the non-IOV decline; pins that broadening the IOV input-rate allowlist did not
+    /// accidentally admit this divergent combination.
+    #[test]
+    fn ode_iov_weibull_lagtime_falls_back_to_fd() {
+        let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVTD(2.0, 0.05, 24.0)
+  theta TVBETA(1.5, 0.1, 10.0)
+  theta TVLAG(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL      = TVCL * exp(ETA_CL + KAPPA_CL)
+  V       = TVV  * exp(ETA_V)
+  TD      = TVTD
+  BETA    = TVBETA
+  LAGTIME = TVLAG
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = weibull(td=TD, beta=BETA) - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+"#;
+        let model = parse_model_string(src).expect("parse weibull+lag IOV");
+        assert!(model.has_lagtime());
+        assert!(
+            !crate::sens::ode_provider::ode_iov_supported(&model),
+            "weibull + lagtime must stay FD under IOV (β<1 onset divergence, #486)"
+        );
+    }
+
+    /// **ODE IOV + compartment-indexed `ALAG{cmt}` / `F{cmt}`** (#486 IOV-scope parity). The
+    /// old gate declined indexed lag/F under IOV on the (mistaken) premise that the walk uses
+    /// a single `PK_IDX_LAGTIME`/F slot; in fact `integrate_tvcov_readout` resolves each dose's
+    /// own compartment slot (`f_bio_slot`/`lag_slot`), and the non-IOV path already serves
+    /// both. An oral (depot→central) model with `ALAG1` (lag on the depot) and `F1` (depot
+    /// bioavailability), κ on CL, validated against central FD of `predict_iov`.
+    #[test]
+    fn ode_iov_indexed_lag_and_f_match_fd_of_predict_iov() {
+        let src = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.05, 24.0)
+  theta TVLAG(0.4, 0.01, 5.0)
+  theta TVF1(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL + KAPPA_CL)
+  V     = TVV  * exp(ETA_V)
+  KA    = TVKA
+  ALAG1 = TVLAG
+  F1    = TVF1
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA*depot
+  d/dt(central) =  KA*depot - (CL/V)*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(src).expect("parse indexed-lag/F IOV");
+        assert!(model.has_lagtime());
+        assert!(
+            model
+                .active_dose_attr_map()
+                .has_indexed_attr(crate::types::DoseAttr::Lag),
+            "model must declare an indexed ALAG1"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "indexed ALAG1/F1 must be admitted under IOV (#486 parity)"
+        );
+        let mut subject = iov_subject();
+        // Dose into the depot (cmt 1) so ALAG1/F1 apply.
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        // stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 1.0, 0.4, 0.7],
+            &[0.12, -0.08, 0.06, -0.11],
+        );
+    }
+
     /// Regression (#575 review): a plain `ScalingSpec::None` IOV ODE model under LTBS
     /// (`log_transform`, no `obs_scale`) must stay on FD. The #575 gate rewrite replaced
     /// the `|| model.log_transform` bail with a `match`, and the `None` arm initially
@@ -6424,12 +11441,101 @@ mod tests {
         );
     }
 
+    /// ODE M3 BLOQ + IOV + `iiv_on_ruv` scope (#486): the ODE-path counterpart of
+    /// [`iov_analytical_supported_admits_m3_but_not_the_ruv_triple`]. After the gate flips,
+    /// `ode_iov_supported` admits M3, `iiv_on_ruv`, and the full **triple** M3 + IOV +
+    /// `iiv_on_ruv` — all provider-agnostic over the stacked `[η_bsv, κ]` layout (the ODE
+    /// walk emits a zero `∂f/∂η_ruv` column; the shared assembly applies the variance
+    /// scaling and the residual-eta column). The **non-IOV** ODE M3 + `iiv_on_ruv` combo is
+    /// analytic as well (#623), so every combination is served. LTBS still declines.
+    #[test]
+    fn ode_iov_supported_admits_m3_and_the_ruv_triple() {
+        let mut model = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_some(), "must be an ODE model");
+        // Plain ODE IOV: analytic.
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        // ODE IOV + iiv_on_ruv (no M3): analytic as of #486.
+        model.residual_error_eta = Some(1);
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + iiv_on_ruv must be on the analytic path (#486)"
+        );
+        // The full triple M3 + ODE IOV + iiv_on_ruv: analytic as of #486.
+        model.bloq_method = crate::types::BloqMethod::M3;
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + M3 + iiv_on_ruv (the triple) must be analytic (#486)"
+        );
+        assert!(
+            iov_sens_supported(&model),
+            "iov_sens_supported follows ode_iov_supported"
+        );
+        // LTBS still declines (the in-walk transform is not composed with the post-walk
+        // quotient on the IOV path).
+        let mut ltbs = parse_model_string(WARFARIN_IOV_ODE).expect("parse ODE IOV");
+        ltbs.residual_error_eta = Some(1);
+        ltbs.bloq_method = crate::types::BloqMethod::M3;
+        ltbs.log_transform = true;
+        assert!(
+            !crate::sens::ode_provider::ode_iov_supported(&ltbs),
+            "ODE IOV + M3 + iiv_on_ruv + LTBS stays FD"
+        );
+    }
+
     #[test]
     fn ode_iov_expr_scale_provider_matches_fd_of_predict_iov() {
         let model = parse_model_string(WARFARIN_IOV_ODE_EXPRSCALE).expect("parse expr-scale IOV");
         let subject = iov_subject();
         // stacked = [η_cl, η_v, κ_g0, κ_g1] (n_eta = 2, n_kappa = 1, K = 2).
         check_iov_provider_vs_fd(&model, &subject, &[0.2, 10.0], &[0.12, -0.08, 0.05, -0.10]);
+    }
+
+    /// #486: ODE IOV + `TIME` switch + η-dependent `ExpressionScale` `obs_scale = V`.
+    /// The per-event stacked walk (TIME) composes with the per-occasion post-walk scale
+    /// quotient (built at `t = 0`, matching production's `apply_scaling`); value/∂/∂²
+    /// over `[η_bsv, κ_g0, κ_g1]` + θ must match FD of `predict_iov`.
+    #[test]
+    fn ode_iov_time_expression_scale_matches_fd_of_predict_iov() {
+        const M: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVCL_LATE(0.1, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  if (TIME > 20.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(M).expect("parse ODE IOV TIME expr-scale");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        // obs [1,6,12 | 25,30,36] straddle TIME=20. stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &iov_subject(),
+            &[0.2, 0.1, 10.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
     }
 
     #[test]
@@ -6580,6 +11686,93 @@ mod tests {
             &[0.2, 10.0, 0.5],
             &[0.12, -0.08, 0.05, -0.10],
         );
+    }
+
+    /// **IOV × steady-state × estimated lagtime is now analytic (#486, PR3 sub-case (a)).**
+    /// Each occasion's SS dose gets its own `K_SS_SEED` pre-arrival seed (phase `II − lag`,
+    /// `ss_state_at_phase_g` seeded with that occasion's κ) — validated against the dense
+    /// (non-event-driven) predictor for this exact combination in
+    /// `ode_provider_ss_lagtime_matches_production`/`..._infusion_...` (including an
+    /// observation strictly inside the pre-arrival window). `predict_iov`, this test's
+    /// oracle, has no such seed of its own (a pre-existing, orthogonal gap — it would read
+    /// zero for a pre-arrival observation regardless of gate/gradient correctness), so this
+    /// test uses the default `iov_subject()` times (post-arrival only) to isolate the SS
+    /// dose's own event-time saltation under IOV.
+    #[test]
+    fn ode_iov_ss_lagtime_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_LAG_ODE).expect("parse ODE IOV+lag");
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + bare lagtime must be supported"
+        );
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, true, 12.0),
+        ];
+        assert!(subject.doses[0].ss && subject.doses[0].ii > 0.0);
+        let theta = [0.2, 10.0, 0.5];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked,
+            )
+            .is_some(),
+            "SS + lagtime IOV subject must be analytic now (#486)"
+        );
+        // stacked = [η_cl, η_v, κ_g0, κ_g1]; θ = [TVCL, TVV, TVLAG].
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
+    }
+
+    /// **IOV × rate-defined SS infusion under bioavailability `F ≠ 1` is now analytic**
+    /// (#486, PR3 sub-case (b)). `equilibrate_ss_state_g` reads the per-occasion `inf_eff`
+    /// jet (window `F·duration`, rate held) instead of the fixed raw duration.
+    #[test]
+    fn ode_iov_ss_rate_defined_infusion_under_f_matches_fd_of_predict_iov() {
+        const WARFARIN_IOV_SS_F_ODE: &str = r#"
+[parameters]
+  theta TVCL(0.13, 0.01, 1.0)
+  theta TVV(8.0, 1.0, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  iov_column OCC
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV * exp(ETA_V)
+  F  = TVF
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+        let model = parse_model_string(WARFARIN_IOV_SS_F_ODE).expect("parse IOV+SS+F ODE");
+        assert!(crate::sens::ode_provider::ode_iov_supported(&model));
+        let mut subject = iov_subject();
+        subject.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 50.0, true, 12.0),
+            DoseEvent::new(24.0, 100.0, 1, 50.0, true, 12.0),
+        ];
+        assert!(subject.doses[0].ss && subject.has_rate_defined_infusion());
+        let theta = [0.13, 8.0, 0.7];
+        let stacked = [0.12, -0.08, 0.05, -0.10];
+        assert!(
+            crate::sens::ode_provider::ode_subject_sensitivities_iov(
+                &model, &subject, &theta, &stacked,
+            )
+            .is_some(),
+            "rate-defined SS infusion under F IOV subject must be analytic now (#486)"
+        );
+        check_iov_provider_vs_fd(&model, &subject, &theta, &stacked);
     }
 
     /// **IOV × lagtime × infusion × reset** — the combined path through `integrate_tvcov_g`
@@ -6779,6 +11972,145 @@ mod tests {
         );
     }
 
+    // 1-cpt IV ODE IOV + TV-cov with a **κ-coupled `init(...)` baseline**: `init(central) =
+    // BASE` where `BASE = TVBASE·exp(ETA_V + KAPPA_CL)` carries η_v *and* the occasion κ, so the
+    // event-driven IOV walk's `tvcov_init_state` seed (built from the first-record snapshot's
+    // stacked `(θ, η_bsv, κ)` duals) must fold `∂init/∂κ` onto the correct occasion axis (#486).
+    const WARFARIN_IOV_ODE_INIT: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVBASE(40.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  BASE = TVBASE * exp(ETA_V + KAPPA_CL)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central) = -(CL/V) * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **`init(...)` × IOV on the ODE walk** (#486, branch G-ODE). A κ-coupled `init(central) =
+    /// BASE` baseline (`BASE = TVBASE·exp(ETA_V + KAPPA_CL)`) on a 1-cpt IV ODE IOV + TV-cov
+    /// subject. The IOV outer/inner run through the same `integrate_tvcov_readout` the non-IOV
+    /// walk uses, so `tvcov_init_state` already seeds `init` from the first-record snapshot's
+    /// stacked `(θ, η_bsv, κ)` duals — the Taylor deltas carry `∂init/∂κ` onto the correct
+    /// occasion axis with no IOV-specific code. Validated against FD of `predict_iov` over the
+    /// full stacked layout, plus inner/outer η-parity.
+    #[test]
+    fn ode_iov_init_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE_INIT).expect("parse ODE IOV+init");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_some());
+        assert!(
+            model.ode_spec.as_ref().unwrap().init_fn.is_some(),
+            "fixture must declare an init(...)"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + init must be analytic (#486)"
+        );
+        let subject = iov_tvcov_subject(false);
+        // θ = [TVCL, TVV, THETA_WT, TVBASE]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75, 40.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    #[test]
+    fn ode_iov_init_inner_eta_grad_matches_outer() {
+        check_iov_inner_matches_outer(
+            &parse_model_string(WARFARIN_IOV_ODE_INIT).expect("parse ODE IOV+init"),
+            &iov_tvcov_subject(false),
+            &[0.2, 10.0, 0.75, 40.0],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
+    // ODE IOV with a `first_order` input-rate forcing AND a κ-coupled `init(central) = BASE`
+    // baseline — the composition the #660 (`FirstOrder` under IOV) and #486 (`init` under IOV)
+    // gate relaxations jointly admit. Both ride the same `integrate_tvcov_readout` walk: the
+    // dose feeds `R_in = KA·(remaining)` and the init baseline is seeded from the first-record
+    // stacked snapshot, so the two are orthogonal. This pins that they compose correctly.
+    const WARFARIN_IOV_ODE_INIT_FO: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta THETA_WT(0.75, 0.01, 2.0)
+  theta TVBASE(40.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.01, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL   = TVCL * (WT/70)^THETA_WT * exp(ETA_CL + KAPPA_CL)
+  V    = TVV  * exp(ETA_V)
+  KA   = TVKA
+  BASE = TVBASE * exp(ETA_V + KAPPA_CL)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  init(central) = BASE
+  d/dt(central)  = first_order(ka=KA) - (CL/V) * central
+[covariates]
+  WT continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// **`init(...)` × `first_order` input-rate forcing × IOV on the ODE walk** (#486, the
+    /// combination the #660 and #486 IOV relaxations jointly admit). Validated against FD of
+    /// `predict_iov` over the stacked layout, plus inner/outer parity.
+    #[test]
+    fn ode_iov_init_first_order_provider_matches_fd_of_predict_iov() {
+        let model = parse_model_string(WARFARIN_IOV_ODE_INIT_FO).expect("parse ODE IOV+init+FO");
+        assert!(!model.ode_spec.as_ref().unwrap().input_rate.is_empty());
+        assert!(model.ode_spec.as_ref().unwrap().init_fn.is_some());
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "ODE IOV + init + first_order must be analytic"
+        );
+        let subject = iov_tvcov_subject(false);
+        // θ = [TVCL, TVV, THETA_WT, TVBASE, TVKA]; stacked = [η_cl, η_v, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75, 40.0, 1.2],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+        check_iov_inner_matches_outer(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.75, 40.0, 1.2],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
     /// **Static-covariate** ODE IOV subject with an EVID=2 pk-only breakpoint. The TV-cov
     /// pk-only tests above always take `seed_iov_events`' per-event (TV) branch; a subject
     /// with no dose/obs TV covariates **and an empty `pk_only_covariates`** instead takes the
@@ -6972,6 +12304,76 @@ mod tests {
         );
     }
 
+    /// 1-cpt IV IOV `[odes]` model whose Form-C readout references a θ (`TVBASE`) **and**
+    /// an η (`ETA_CL`) directly (#486). The parser desugars each bare θ/η into a synthetic
+    /// individual parameter (`__ferx_ro_*`); under IOV those synthetics ride the stacked
+    /// `(θ, η_bsv, κ)` chain like any other individual parameter. `ETA_CL` is the BSV η that
+    /// also carries the per-occasion κ, so the readout's `∂y/∂η_cl` couples the explicit
+    /// `(1 + ETA_CL)` term with the κ-driven state — exercising the synthetic-param seeding
+    /// on the IOV walk (the path the #631 review flagged as previously FD-only).
+    const WARFARIN_IOV_ODE_DIRECT_THETA_ETA: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBASE(0.5, 0.0, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V * (1.0 + ETA_CL) + TVBASE
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  iov_column = OCC
+  ode_reltol = 1e-10
+  ode_abstol = 1e-12
+"#;
+
+    /// #486 + #439: a direct-θ/η Form-C readout under **IOV** must take the analytic ODE
+    /// IOV path and match FD of `predict_iov` (value, η-Hessian, θ-grad, η×θ cross). Before
+    /// #631 such a readout was not `dual_evaluable`, so `ode_iov_supported` returned false
+    /// and the subject fell back to finite differences; this confirms the synthetic
+    /// readout parameters seed the stacked `(θ, η_bsv, κ)` chain correctly on the IOV walk.
+    #[test]
+    fn ode_iov_form_c_direct_theta_eta_matches_production() {
+        let model = parse_model_string(WARFARIN_IOV_ODE_DIRECT_THETA_ETA)
+            .expect("parse ODE IOV direct θ/η");
+        assert_eq!(model.n_kappa, 1);
+        assert!(model.ode_spec.is_some());
+        // 2 real (CL, V) + 2 synthetic (__ferx_ro_th2, __ferx_ro_eta0) individual params,
+        // and no new omega for the direct η reference.
+        assert_eq!(
+            model.n_eta, 2,
+            "direct ETA_CL reuses the existing BSV η (no new omega)"
+        );
+        assert_eq!(
+            model.pk_indices.len(),
+            4,
+            "CL, V + 2 synthetic readout params"
+        );
+        assert!(
+            crate::sens::ode_provider::ode_iov_supported(&model),
+            "direct-θ/η Form-C readout under IOV should be analytic (#486)"
+        );
+        let subject = iov_subject();
+        // stacked = [η_cl, η_v, κ_g0, κ_g1]; θ = [TVCL, TVV, TVBASE].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 10.0, 0.5],
+            &[0.12, -0.08, 0.05, -0.10],
+        );
+    }
+
     /// The light **inner** IOV walk (`Dual1`, via the `subject_eta_grad_iov` dispatch —
     /// ODE or closed-form) must produce the same per-observation value and
     /// `∂f/∂(stacked-η)` as the **outer** walk (`Dual2`, `subject_sensitivities_iov`),
@@ -7099,6 +12501,59 @@ mod tests {
             &model,
             &subject,
             &[0.2, 10.0, 0.5, 20.0, 1.5],
+            &[0.12, -0.08, 0.20, 0.05, -0.10],
+        );
+    }
+
+    /// #486: a `TIME`-switched CL on a **closed-form IOV** model. With no TV
+    /// covariates the subject routes to the per-event stacked walk purely by
+    /// `uses_time_builtin`; the value/∂/∂² over `[η_bsv, κ_g0, κ_g1]` + θ must match
+    /// central FD of `predict_iov` (which threads the same per-event TIME).
+    #[test]
+    fn iov_time_builtin_provider_matches_fd_of_predict_iov() {
+        const IOV_ORAL_TIME: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVCL_LATE(0.1, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  if (TIME > 20.0) {
+    CL = TVCL_LATE * exp(ETA_CL + KAPPA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  }
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = foce
+  iov_column = OCC
+"#;
+        let model = parse_model_string(IOV_ORAL_TIME).expect("parse IOV oral TIME");
+        assert_eq!(model.n_kappa, 1);
+        let subject = iov_subject(); // obs [1,6,12 | 25,30,36] straddle TIME=20
+        assert!(
+            !subject.has_tv_covariates(),
+            "no TV cov: routed by uses_time only"
+        );
+        assert!(
+            iov_analytical_supported(&model),
+            "closed-form IOV TIME must be provider-supported"
+        );
+        // θ = [TVCL, TVCL_LATE, TVV, TVKA]; stacked = [η_cl, η_v, η_ka, κ_g0, κ_g1].
+        check_iov_provider_vs_fd(
+            &model,
+            &subject,
+            &[0.2, 0.1, 10.0, 1.5],
             &[0.12, -0.08, 0.20, 0.05, -0.10],
         );
     }

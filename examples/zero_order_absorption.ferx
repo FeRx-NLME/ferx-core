@@ -16,8 +16,10 @@
 # `zero_order()` has a hard cutoff at tad = DUR. Its value is closed-form (it is a
 # zero-order infusion), but it ships on the explicit ODE path here; it cannot be
 # combined with an analytical `pk ...` (which errors, pointing at `ode_template`).
-# The `∂/∂DUR` sensitivity is a moving boundary, so it is computed by finite
-# differences (the analytic boundary-impulse route is follow-up #530).
+# The `∂/∂DUR` sensitivity crosses the moving boundary at tad = DUR; it is computed
+# analytically via the rate-off saltation at the cutoff (#530). It reverts to finite
+# differences only when combined with an estimated lagtime, an EVID 3/4 reset, or
+# time-varying covariates.
 #
 # ── Unit convention (Form C: amount ODE + [scaling]) ─────────────────────────
 #   CMT=1  central  — drug AMOUNT (mg); receives R_in(tad), elimination CL/V

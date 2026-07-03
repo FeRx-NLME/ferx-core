@@ -70,6 +70,10 @@ impl TraceWriter {
             fmt_opt_usize(n_ebe_unconverged),
             fmt_opt_usize(n_ebe_fallback),
         );
+        // Flush each row so live consumers (e.g. the trace UI) see iterations
+        // as they happen. Gradient methods emit few rows (< the BufWriter's
+        // buffer), so without this the file would not appear until finish().
+        let _ = self.writer.flush();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -100,6 +104,7 @@ impl TraceWriter {
             fmt_opt_usize(n_ebe_unconverged),
             fmt_opt_usize(n_ebe_fallback),
         );
+        let _ = self.writer.flush();
     }
 
     pub fn write_saem_row(
@@ -118,6 +123,7 @@ impl TraceWriter {
             "{},saem,{},{:.6},{},NA,NA,NA,NA,NA,NA,NA,{:.6},{:.6},{:.4},NA,NA",
             iter, phase, cond_nll, wall_ms, cond_nll, gamma, mh_accept_rate
         );
+        let _ = self.writer.flush();
     }
 
     pub fn flush(&mut self) {

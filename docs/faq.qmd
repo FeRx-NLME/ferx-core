@@ -219,14 +219,26 @@ Use the `[scaling]` block. The convention is divisive
 ```
 
 The block also supports expression-form scales (`obs_scale = WT / 70`)
-and an ODE-only Form C that replaces the state readout entirely:
+and a full Form C readout that replaces the built-in output entirely — on
+ODE **and** analytical (closed-form) PK models (#650):
 
 ```
 [structural_model]
-  ode(states=[depot, central])
+  ode(states=[depot, central])   # or: pk one_cpt_iv(cl=CL, v=V)
 
 [scaling]
-  y = central / V           # central holds amount; observe as concentration
+  y = central / V           # central holds the amount; observe as concentration
+```
+
+On an analytical model the readout can express a nonlinear multi-DV output such
+as a saturable free-vs-total protein-binding correction switched by a per-row
+covariate, and stays analytic in the FOCEI/FOCE gradient (including
+non-structural readout parameters like a binding `BMAX`/`KD`):
+
+```
+[scaling]
+  y = if (FREE == 0) central / V + BMAX * (central / V) / (KD + central / V) \
+      else           central / V
 ```
 
 For models with multiple observed compartments (parent + metabolite,

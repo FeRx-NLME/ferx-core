@@ -186,14 +186,6 @@ fn assert_covariance_se_matches_nonmem(method: EstimationMethod, interaction: bo
     opts.interaction = interaction;
     opts.outer_maxiter = 300;
     opts.run_covariance_step = true;
-    if interaction {
-        // The plain proportional Warfarin FOCEI anchor has no block_sigma
-        // residual correlations. Keep this NONMEM MATRIX=R check on the
-        // analytical R path; the OFV second-difference override is noisier at
-        // the current L-BFGS solution and can explode the TVCL SE even though
-        // the diagonal residual model itself is unchanged.
-        opts.covariance_ofv_hessian = false;
-    }
     opts.verbose = false;
 
     let result = fit(&model, &pop, &model.default_params, &opts).expect("warfarin fit runs");

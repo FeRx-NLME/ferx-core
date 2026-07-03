@@ -79,7 +79,7 @@ pub fn optimize_population(
     // of the outer loop (optimize_nlopt re-reads `options.optimizer` for its own
     // branching). Every other variant is returned unchanged, so this is a no-op
     // unless the user left the default `auto` in place.
-    let resolved = options.optimizer.resolve_auto(model);
+    let resolved = options.optimizer.resolve_auto(model, options.interaction);
     let owned_opts;
     let options = if resolved == options.optimizer {
         options
@@ -386,6 +386,34 @@ fn ebe_guard_rejects(
     raw_ofv.is_finite() && frac > max_unconverged_frac && max_unconverged_frac >= 0.0
 }
 
+/// Objective value for a guard-rejected outer step, **consistent** with the center-push
+/// gradient `g[i] = 100·(xs[i] − c[i])` (`c` = scaled bound midpoint) returned alongside it.
+///
+/// NLopt's gradient line search (More-Thuente) reconciles `f` and `∇f`: it interpolates on
+/// both, so the returned objective must integrate the returned gradient. The historical
+/// pairing — flat `f = 1e20` with a non-zero center-push gradient — violates that
+/// (`∇(const) = 0 ≠ center-push`), and on a stiff objective whose **first** optimizer step
+/// overshoots straight into the EBE guard (ODE + `iiv_on_ruv`: a large step diverges the
+/// inner EBEs and overflows the `exp(2·η_ruv)` marginal) the line search fails on iteration
+/// one, before any curvature is built. Returning the quadratic bowl `BASE + 50·Σ(xs − c)²`
+/// — whose gradient is exactly the `100·(xs − c)` center-push — lets the line search
+/// backtrack to a feasible step. `BASE` is a wall far above any feasible OFV yet low enough
+/// that the quadratic term stays f64-resolvable (the old `1e20` swamped it). Only the
+/// gradient optimizers need this; derivative-free BOBYQA keeps the flat `1e20` wall.
+fn guard_penalty_value(xs: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
+    const BASE: f64 = 1e12;
+    let pen: f64 = xs
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| {
+            let c = (lower_s[i] + upper_s[i]) / 2.0;
+            let d = x - c;
+            d * d
+        })
+        .sum();
+    BASE + 50.0 * pen
+}
+
 fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
     if !enabled {
         return false;
@@ -414,23 +442,6 @@ fn detect_stagnation(state: &mut NloptState, n: usize, enabled: bool) -> bool {
     } else {
         false
     }
-}
-
-/// Decide whether to run the SLSQP fallback after the primary NLopt run.
-///
-/// The fallback retries from the current point with SLSQP when the primary
-/// optimizer did not report a clean convergence code. It is suppressed when the
-/// stop was `MaxEvalReached` (#499): a spent evaluation budget is not a failure a
-/// second optimizer can fix — the user needs a larger `maxiter` — so re-running a
-/// fresh full-budget SLSQP would just double the cost. It is also suppressed when
-/// the run already used SLSQP (nothing to switch to) or the user cancelled.
-fn should_run_slsqp_fallback(
-    converged: bool,
-    already_slsqp: bool,
-    cancelled: bool,
-    max_eval_reached: bool,
-) -> bool {
-    !converged && !already_slsqp && !cancelled && !max_eval_reached
 }
 
 fn new_nlopt_state(n_subj: usize, n_eta: usize, x0: &[f64]) -> NloptState {
@@ -988,12 +999,19 @@ fn optimize_nlopt(
             }
         }
 
-        let ofv = if ebe_guard_triggered {
-            1e20
-        } else if raw_ofv.is_finite() {
-            raw_ofv
+        // Guard-rejected (EBE guard or non-finite OFV). For the gradient optimizers return
+        // a quadratic penalty consistent with the center-push gradient below, so NLopt's
+        // line search can backtrack instead of failing on a first-step overshoot (#486; see
+        // `guard_penalty_value`). Derivative-free BOBYQA (`grad` is `None`) keeps the wall.
+        let guarded = ebe_guard_triggered || !raw_ofv.is_finite();
+        let ofv = if guarded {
+            if grad.is_some() {
+                guard_penalty_value(xs, &lower_s, &upper_s)
+            } else {
+                1e20
+            }
         } else {
-            1e20
+            raw_ofv
         };
 
         // Compute gradient if requested (central FD with fixed EBEs)
@@ -1003,7 +1021,7 @@ fn optimize_nlopt(
             // ascent toward bounds center nudges the optimizer back. Fall through (no early
             // return) so the eval is still traced and prev_x / stagnation stay correct,
             // just skipping the expensive population gradient (#603 review #5).
-            if ebe_guard_triggered || !raw_ofv.is_finite() {
+            if guarded {
                 for i in 0..g.len() {
                     let center_s = (lower_s[i] + upper_s[i]) / 2.0;
                     g[i] = 100.0 * (xs[i] - center_s);
@@ -1037,10 +1055,8 @@ fn optimize_nlopt(
                 if matches!(algo, nlopt::Algorithm::Slsqp) {
                     cap_slsqp_gradient(g, &lower_s, &upper_s);
                 }
-                // Gate on the global best (same reason as the `best_seen` update
-                // below): `state.best_ofv` resets to INFINITY when the SLSQP
-                // fallback starts, so using it here would let the fallback's first
-                // eval overwrite a better gradient found by the primary run.
+                // Gate on the global best (same tracker as the `best_seen` update
+                // below) so `last_gradient` always reflects the best point seen.
                 {
                     let global_best = best_seen_cl
                         .lock()
@@ -1066,11 +1082,9 @@ fn optimize_nlopt(
                 eprintln!("Eval {:>4}: OFV = {:.6}", state.n_evals, ofv);
             }
         }
-        // `best_seen` is global across the primary run and any SLSQP fallback.
-        // Gate on the externally-tracked best (not `state.best_ofv`, which
-        // resets to INFINITY when the fallback starts fresh) so the first
-        // fallback eval at the drifted post-primary x0 can't clobber a
-        // better point found earlier.
+        // `best_seen` tracks the global minimum across the whole run so the
+        // final restore (issue #59) lands on the true best point, even when the
+        // optimizer drifts away from it before terminating.
         {
             let mut bs = best_seen_cl.lock().unwrap();
             if bs.as_ref().is_none_or(|(_, prev)| ofv < *prev) {
@@ -1189,42 +1203,38 @@ fn optimize_nlopt(
     // Run optimization
     let result = opt.optimize(&mut x0);
 
-    // `max_eval_reached` is tracked separately from `converged` (#499): hitting
-    // the eval budget is not a failure that a fresh SLSQP run can fix — the user
-    // simply needs a larger `maxiter` — so it must not trigger the fallback.
+    // `max_eval_reached` distinguishes a spent evaluation budget from other
+    // non-convergence: it gets its own warning ("increase maxiter") rather than
+    // the generic "did not converge" message.
     let mut max_eval_reached = false;
-    let (mut converged, first_algo) = match &result {
+    let converged = match &result {
         Ok((status, _)) => {
             if options.verbose {
                 eprintln!("NLopt finished: {:?}", status);
             }
             max_eval_reached = matches!(status, nlopt::SuccessState::MaxEvalReached);
-            (
-                matches!(
-                    status,
-                    nlopt::SuccessState::Success
-                        | nlopt::SuccessState::FtolReached
-                        | nlopt::SuccessState::XtolReached
-                        | nlopt::SuccessState::StopValReached
-                ),
-                algo,
+            matches!(
+                status,
+                nlopt::SuccessState::Success
+                    | nlopt::SuccessState::FtolReached
+                    | nlopt::SuccessState::XtolReached
+                    | nlopt::SuccessState::StopValReached
             )
         }
         Err((fail, _)) => {
             if options.verbose {
                 eprintln!("NLopt stopped: {:?}", fail);
             }
-            (matches!(fail, nlopt::FailState::RoundoffLimited), algo)
+            matches!(fail, nlopt::FailState::RoundoffLimited)
         }
     };
 
     drop(opt);
 
-    // Fallback: retry with SLSQP from the current point when the primary
-    // optimizer did not converge cleanly — except on `MaxEvalReached`, which is a
-    // spent eval budget, not a failure a second optimizer can fix (#499).
-    let already_slsqp = matches!(first_algo, nlopt::Algorithm::Slsqp);
-    let cancelled = crate::cancel::is_cancelled(&options.cancel);
+    // A spent evaluation budget gets a targeted "increase maxiter" warning; every
+    // other non-convergence falls through to the generic "did not converge"
+    // warning below. There is no automatic second optimization — a user who wants
+    // SLSQP sets `optimizer = slsqp` as the primary (issue #657).
     if max_eval_reached {
         warnings.push(format!(
             "Outer optimization hit the evaluation budget (maxiter = {}) before \
@@ -1234,244 +1244,10 @@ fn optimize_nlopt(
         if options.verbose {
             eprintln!(
                 "NLopt hit the evaluation budget (maxiter = {}) without converging — \
-                 increase maxiter for a tighter fit. Skipping the SLSQP fallback \
-                 (it cannot fix a spent budget).",
+                 increase maxiter for a tighter fit.",
                 options.outer_maxiter,
             );
         }
-    }
-    if should_run_slsqp_fallback(converged, already_slsqp, cancelled, max_eval_reached) {
-        if options.verbose {
-            eprintln!("Retrying with NLopt SLSQP from current point...");
-        }
-
-        let state2 = new_nlopt_state(n_subj, n_eta, &x0);
-
-        let n_evals_cl2 = Arc::clone(&n_evals_outer);
-        let ebe_accum_cl2 = Arc::clone(&ebe_accum);
-        let best_seen_cl2 = Arc::clone(&best_seen);
-        let last_gradient_cl2 = Arc::clone(&last_gradient);
-        // SLSQP fallback also operates in scaled xs space (same scale as primary opt).
-        let objective2 = |xs: &[f64], grad: Option<&mut [f64]>, state: &mut NloptState| -> f64 {
-            if crate::cancel::is_cancelled(&options.cancel) {
-                if let Some(g) = grad {
-                    for gi in g.iter_mut() {
-                        *gi = 0.0;
-                    }
-                }
-                return 1e20;
-            }
-            // Stagnation guard — see primary closure for rationale.
-            if state.stagnation_stopped {
-                if let Some(g) = grad {
-                    for gi in g.iter_mut() {
-                        *gi = 0.0;
-                    }
-                }
-                state.n_evals += 1;
-                n_evals_cl2.fetch_add(1, Ordering::Relaxed);
-                return state.best_ofv;
-            }
-            let x: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
-            let params = unpack_params(&x, init_params);
-            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-            let (ehs, hms, ebe_stats2, kappas) = run_inner_loop_warm(
-                model,
-                population,
-                &params,
-                options.inner_maxiter,
-                options.inner_tol,
-                Some(&state.cached_etas),
-                Some(&mu_k),
-                options.min_obs_for_convergence_check as usize,
-            );
-            let nll = pop_nll(
-                model,
-                population,
-                &params,
-                &ehs,
-                &hms,
-                &kappas,
-                options.interaction,
-            );
-            let raw_ofv = 2.0 * nll;
-
-            let ebe_guard2 =
-                ebe_guard_rejects(&ebe_stats2, n_subj, raw_ofv, options.max_unconverged_frac);
-            {
-                let mut acc = ebe_accum_cl2.lock().unwrap();
-                if acc.max_unconverged < ebe_stats2.n_unconverged {
-                    acc.max_unconverged = ebe_stats2.n_unconverged;
-                }
-                acc.total_fallback += ebe_stats2.n_fallback;
-                if ebe_guard2 {
-                    acc.n_convergence_warnings += 1;
-                }
-            }
-            let ofv = if ebe_guard2 {
-                1e20
-            } else if raw_ofv.is_finite() {
-                raw_ofv
-            } else {
-                1e20
-            };
-
-            let mut grad_norm_for_trace: Option<f64> = None;
-            if let Some(g) = grad {
-                // Mirror the primary closure: a guard-rejected or non-finite point gets a
-                // steepest-ascent nudge instead of a population gradient (the iteration-6
-                // stall this PR targets also reaches the SLSQP fallback — #603 review #3),
-                // and falls through to the shared bookkeeping so the eval stays traced
-                // (#603 review #5).
-                if ebe_guard2 || !raw_ofv.is_finite() {
-                    for i in 0..g.len() {
-                        let center_s = (lower_s[i] + upper_s[i]) / 2.0;
-                        g[i] = 100.0 * (xs[i] - center_s);
-                    }
-                } else {
-                    // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-                    let grad_raw = population_gradient(
-                        &x,
-                        n_subj,
-                        init_params,
-                        model,
-                        population,
-                        &ehs,
-                        &hms,
-                        &kappas,
-                        &bounds,
-                        options,
-                        &mut state.n_grad_evals,
-                    );
-                    let mut sq = 0.0_f64;
-                    for k in 0..g.len() {
-                        let gi = if grad_raw[k].is_finite() {
-                            grad_raw[k] * scale[k]
-                        } else {
-                            0.0
-                        };
-                        g[k] = gi;
-                        sq += gi * gi;
-                    }
-                    grad_norm_for_trace = Some(sq.sqrt());
-                    // SLSQP overshoot guard (issue #55) — this fallback
-                    // closure is unconditionally SLSQP.
-                    cap_slsqp_gradient(g, &lower_s, &upper_s);
-                    // See `best_seen` comment in the primary closure — gate on the
-                    // global accumulator, not `state.best_ofv` which is fresh here.
-                    {
-                        let global_best = best_seen_cl2
-                            .lock()
-                            .unwrap()
-                            .as_ref()
-                            .map(|(_, o)| *o)
-                            .unwrap_or(f64::INFINITY);
-                        if ofv < global_best {
-                            *last_gradient_cl2.lock().unwrap() = Some(grad_raw.clone());
-                        }
-                    }
-                }
-            }
-
-            state.cached_etas = ehs;
-            state.cached_h_mats = hms;
-            state.n_evals += 1;
-            n_evals_cl2.fetch_add(1, Ordering::Relaxed);
-            if ofv < state.best_ofv {
-                state.best_ofv = ofv;
-                if verbose {
-                    eprintln!("Eval {:>4}: OFV = {:.6} (SLSQP)", state.n_evals, ofv);
-                }
-            }
-            // See `best_seen` comment in the primary closure — gate on the
-            // global accumulator, not `state.best_ofv` which is fresh here.
-            {
-                let mut bs = best_seen_cl2.lock().unwrap();
-                if bs.as_ref().is_none_or(|(_, prev)| ofv < *prev) {
-                    *bs = Some((xs.to_vec(), ofv));
-                }
-            }
-            if detect_stagnation(state, n, options.stagnation_guard) && verbose {
-                eprintln!(
-                    "Eval {:>4}: SLSQP fallback stopping early — OFV has converged \
-                     (no improvement above 1e-3 in last window). This is normal \
-                     convergence behaviour, not an error: further evaluations are \
-                     unlikely to find a better solution.",
-                    state.n_evals,
-                );
-            }
-
-            // Optimizer trace (SLSQP fallback, step_norm in scaled space)
-            if crate::estimation::trace::is_active() {
-                let step_norm = {
-                    let sq: f64 = xs
-                        .iter()
-                        .zip(&state.prev_x)
-                        .map(|(a, b)| (a - b).powi(2))
-                        .sum();
-                    let n = sq.sqrt();
-                    if n > 0.0 {
-                        Some(n)
-                    } else {
-                        None
-                    }
-                };
-                let method_str = match options.method {
-                    EstimationMethod::FoceI => "focei",
-                    _ => "foce",
-                };
-                crate::estimation::trace::write_foce(
-                    state.n_evals,
-                    method_str,
-                    ofv,
-                    grad_norm_for_trace,
-                    step_norm,
-                    "slsqp",
-                    Some(ebe_stats2.n_unconverged),
-                    Some(ebe_stats2.n_fallback),
-                );
-            }
-            state.prev_x = xs.to_vec();
-
-            ofv
-        };
-
-        let mut opt2 = nlopt::Nlopt::new(
-            nlopt::Algorithm::Slsqp,
-            n,
-            objective2,
-            nlopt::Target::Minimize,
-            state2,
-        );
-        opt2.set_lower_bounds(&lower_s).unwrap();
-        opt2.set_upper_bounds(&upper_s).unwrap();
-        opt2.set_maxeval(options.outer_maxiter as u32 * (n as u32 + 1))
-            .unwrap();
-        opt2.set_xtol_rel(1e-12).unwrap();
-        opt2.set_ftol_rel(1e-12).unwrap();
-
-        let result2 = opt2.optimize(&mut x0);
-        converged = match &result2 {
-            Ok((status, _)) => {
-                if options.verbose {
-                    eprintln!("NLopt SLSQP finished: {:?}", status);
-                }
-                matches!(
-                    status,
-                    nlopt::SuccessState::Success
-                        | nlopt::SuccessState::FtolReached
-                        | nlopt::SuccessState::XtolReached
-                        | nlopt::SuccessState::StopValReached
-                )
-            }
-            Err((fail, _)) => {
-                if options.verbose {
-                    eprintln!("NLopt SLSQP stopped: {:?}", fail);
-                }
-                matches!(fail, nlopt::FailState::RoundoffLimited)
-            }
-        };
-        drop(opt2);
     }
 
     // Restore the best-seen point (issue #59). NLopt returns the last
@@ -3116,8 +2892,8 @@ fn assemble_score_cross_product(
     // Unlike the FD-built R-matrix — which reconverges η̂ at every perturbed point
     // and so captures the `log|H̃|` EBE-response `½·∂log|H̃|/∂η̂·dη̂/dθ` — the raw
     // analytic gradient holds η̂ fixed and drops it. Add it back here (the #274
-    // `tᵢ` term, in −logL units; `point_grad` adds `2·tᵢ` to the −2logL gradient)
-    // so the score matches how NONMEM differences the individual objective with
+    // `tᵢ` term, in −logL units; in −2logL units this contributes `2·tᵢ` to the
+    // gradient) so the score matches how NONMEM differences the individual objective with
     // its conditional estimate responding to θ. This is what makes the FOCEI
     // S/RSR match NONMEM (warfarin RSR ≈ 1.8% with it, ≈ 5% without); the
     // alternative `∂a/∂θ` "a-response" was tested and is NOT what NONMEM's S
@@ -3254,13 +3030,21 @@ pub(crate) fn compute_covariance(
     // warfarin, which previously forced eigenvalue clipping (#129) and inflated
     // the SEs.
     //
-    // This single helper is the reconvergence used by all three covariance paths
-    // — the base-OFV evaluation, the non-IOV gradient-FD `point_grad`, and the
-    // IOV scalar-FD `serial_ofv` — so they cannot drift apart (#298). It is
+    // This single helper is the reconvergence used by both covariance-OFV
+    // evaluations — the base-OFV evaluation and the second-difference stencil's
+    // `serial_ofv` (which now serves the non-IOV and IOV cases alike, since the
+    // FD-of-OFV Hessian is the sole R stencil) — so they cannot drift apart
+    // (#298). It is
     // serial (not the parallel `run_inner_loop_warm`) because the covariance step
     // parallelises over perturbed POINTS, not subjects; nested parallelism is
     // what #256 removed. `find_ebe` is deterministic per subject, so the
     // per-subject EBEs are bit-identical to the parallel loop.
+    // The covariance step reconverges EBEs at its own tolerance (`cov_inner_tol`),
+    // decoupled from the fit's `inner_tol`: the second-difference-of-OFV R-matrix is
+    // far more sensitive to EBE precision than the fit, so LTBS tightens it by default
+    // (the `g = ln(f)` Hessian needs it) and any model can opt in. Defaults to
+    // `inner_tol` for non-LTBS (byte-identical). See `FitOptions::effective_cov_inner_tol`.
+    let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
     let reconverge_point = |xv: &[f64]| -> (
         ModelParameters,
         Vec<DVector<f64>>,
@@ -3278,7 +3062,7 @@ pub(crate) fn compute_covariance(
                 &population.subjects[i],
                 &params,
                 options.inner_maxiter,
-                options.inner_tol,
+                cov_inner_tol,
                 Some(eta_hats[i].as_slice()),
                 Some(&mu_k),
             );
@@ -3386,206 +3170,21 @@ pub(crate) fn compute_covariance(
     }
 
     let mut hess = DMatrix::zeros(n, n);
-    let is_iov = kappas.iter().any(|k| !k.is_empty());
-    // Route non-interaction FOCE with f-dependent error (proportional/combined)
-    // through the OFV second-difference stencil (the IOV path), which builds
-    // the true Hessian of the actual marginal. The analytical SB gradient is an
-    // envelope approximation with no EBE-response Δ (that correction exists only
-    // for FOCEI, #274), so its central-FD Hessian comes out indefinite on the
-    // f-dependent FOCE surface. Additive FOCE keeps the cheap analytical path
-    // (the Δ vanishes for f-independent variance, and it already matches NONMEM).
-    // Route through the OFV second-difference Hessian when: (a) f-dependent FOCE
-    // (the analytical SB gradient comes out indefinite there), or (b) the user
-    // opts in via `covariance_ofv_hessian`. The latter trades speed for an R
-    // that recomputes `a = ∂f/∂η` at every perturbed point, capturing the
-    // `∂a/∂θ` curvature the analytical stencil drops — which removes the
-    // weakly-identified-θ SE bias (e.g. warfarin TVKA ~9% high vs a Richardson
-    // FD-of-OFV ground truth).
-    // IIV on residual error (#409): the analytical point-grad stencil has no
-    // rule for the per-subject `exp(2·η_ruv)` variance scaling or its θ/σ/η
-    // curvature, so take the OFV second-difference Hessian (it FD-differences
-    // the real scaled marginal end-to-end).
-    let force_ofv_hessian = (!options.interaction && model.error_spec.has_f_dependent_variance())
-        || options.covariance_ofv_hessian
-        || model.residual_error_eta.is_some();
-    let use_analytical = !is_iov && !force_ofv_hessian;
 
     // Track FD failures at source so diagnostics name the right cause (a NaN/Inf
     // stencil result is not a genuine zero curvature). HashSet for O(1) ops.
     let mut fd_diag_nan: HashSet<usize> = HashSet::new();
     let mut fd_offdiag_nan: HashSet<usize> = HashSet::new();
 
-    if use_analytical {
-        // Issue #209 + #256 + #274: central FD of the analytical population
-        // gradient, as one flat `par_iter` over the 2·n_free perturbed points.
-        //   H[:,k] ≈ (g(x̂ + hₖ·eₖ) − g(x̂ − hₖ·eₖ)) / 2hₖ
-        // `point_grad` reconverges the EBEs serially at each perturbed point, so
-        // the curvature includes the EBE response (and the determinant curvature).
-        //
-        // #256: the work-list is point-level, not the per-subject `par_iter` the
-        // gradient used to fan out into. Each point runs its subjects serially, so
-        // there is no nested parallelism, and the parallel width (2·n_free)
-        // saturates the pool even when n_subj < n_cores — removing the fork/join
-        // overhead of firing 4·n_free rayon barriers in series (~9–11× faster).
-        //
-        // #274: for FOCEI the per-point gradient adds the dropped `log|H̃|`
-        // EBE-response term `2·Σᵢ tᵢ` (`subject_eta_response_correction`). The
-        // fixed-η̂ analytic gradient invokes the envelope theorem, which zeros only
-        // the inner objective — not `log|H̃|` — so without this term the non-IOV
-        // FD Hessian omits the determinant EBE-response curvature `Δ` that the IOV
-        // scalar-OFV stencil captures. Adding it makes the two stencils consistent
-        // and recovers ∇²(−2logL). Mu-ref θ block only; vanishes for additive error.
-        // Count subject-points where the FOCEI Δ correction was skipped because
-        // the Laplace gradient fell back to FD (non-PD H̃) — those contributions
-        // keep the pre-#274 fixed-η̂ curvature, so a non-zero count is surfaced as
-        // a diagnostic (#298).
-        let delta_skips = std::sync::atomic::AtomicUsize::new(0);
-        let point_grad = |xv: &[f64]| -> Vec<f64> {
-            let (_, ehs, hms, _) = reconverge_point(xv);
-            let np = xv.len();
-            // Gradient of `2·pop_nll` (no omega-prior add-back; both the SB and
-            // Laplace marginals already carry Ω — issue #243/#249).
-            //
-            // Build the per-subject gradients serially (subjects are serial inside
-            // each point — the #256 flatten parallelises over points, not subjects)
-            // and reduce through `assemble_population_gradient`, the same reduction
-            // `ad_population_gradient` uses — so the summation order matches and the
-            // FOCE covariance stays bit-identical to the pre-#256 serial stencil.
-            // The Δ correction below is kept as a separate loop (NOT fused): summing
-            // `2·tᵢ` after `2·Σ gᵢ` preserves that reduction order exactly.
-            //
-            // `subject_nll_pop_grad_with_cache` also hands back the per-subject
-            // Laplace intermediates (when this subject took the FOCEI analytical
-            // path); the Δ loop below reuses them so it does not recompute the
-            // predictions or re-factorise H̃.
-            let mut grads: Vec<Vec<f64>> = Vec::with_capacity(n_subj_cov);
-            let mut caches: Vec<Option<crate::estimation::gauss_newton::LaplaceGradCache>> =
-                Vec::with_capacity(n_subj_cov);
-            for i in 0..n_subj_cov {
-                let (_, gi, ci) = crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
-                    xv,
-                    template,
-                    model,
-                    population,
-                    i,
-                    &ehs[i],
-                    &hms[i],
-                    &[],
-                    &bounds,
-                    options,
-                );
-                grads.push(gi);
-                caches.push(ci);
-            }
-            let mut g = assemble_population_gradient(&grads, np);
-            // #274 Δ correction (FOCEI only); summed in subject order to match.
-            if options.interaction {
-                for i in 0..n_subj_cov {
-                    match crate::estimation::gauss_newton::subject_eta_response_correction(
-                        caches[i].as_ref(),
-                        xv,
-                        template,
-                        model,
-                        population,
-                        i,
-                        &ehs[i],
-                        &hms[i],
-                        &bounds,
-                        options,
-                    ) {
-                        Some(ti) => {
-                            for (gk, tk) in g.iter_mut().zip(ti.iter()) {
-                                *gk += 2.0 * *tk;
-                            }
-                        }
-                        None => {
-                            delta_skips.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                }
-            }
-            g
-        };
-
-        // One (k, hₖ) spec per free parameter; the two perturbed points (±hₖ) are
-        // kept adjacent so `chunks_exact(2)` re-pairs (g₊, g₋) structurally — the
-        // pairing is no longer a positional `2·pair` index that a reordering of
-        // the point build could silently desync (#298).
-        let specs: Vec<(usize, f64)> = free_idx
-            .iter()
-            .map(|&k| (k, eps * (1.0 + x_hat[k].abs())))
-            .collect();
-        let pts: Vec<Vec<f64>> = specs
-            .iter()
-            .flat_map(|&(k, hk)| {
-                let mut x_p = x_hat.to_vec();
-                x_p[k] += hk;
-                let mut x_m = x_hat.to_vec();
-                x_m[k] -= hk;
-                [x_p, x_m]
-            })
-            .collect();
-        let report = cov_progress("Hessian", pts.len(), options.verbose);
-        let point_grads: Vec<Vec<f64>> = pts
-            .par_iter()
-            .map(|xv| {
-                // Cooperative cancel: skip this point's serial subject sweep and
-                // return a NaN gradient so the queue drains; bailed on below.
-                if crate::cancel::is_cancelled(&options.cancel) {
-                    report();
-                    return vec![f64::NAN; n];
-                }
-                let g = point_grad(xv);
-                report();
-                g
-            })
-            .collect();
-        if crate::cancel::is_cancelled(&options.cancel) {
-            return CovarianceStepResult::Unusable(COV_CANCELLED_MSG.to_string());
-        }
-        for (&(k, hk), pair) in specs.iter().zip(point_grads.chunks_exact(2)) {
-            let (g_p, g_m) = (&pair[0], &pair[1]);
-            for &j in &free_idx {
-                let h_jk = (g_p[j] - g_m[j]) / (2.0 * hk);
-                if h_jk.is_finite() {
-                    hess[(j, k)] = h_jk;
-                } else if j == k {
-                    fd_diag_nan.insert(k);
-                } else {
-                    fd_offdiag_nan.insert(k);
-                    fd_offdiag_nan.insert(j);
-                }
-            }
-        }
-        let skipped = delta_skips.load(std::sync::atomic::Ordering::Relaxed);
-        if options.interaction && skipped > 0 && options.verbose {
-            eprintln!(
-                "  [covariance] log|H̃| EBE-response correction skipped at {} subject-point(s) \
-                 where the Laplace gradient fell back to FD (non-PD H̃); those contributions \
-                 retain the pre-#274 fixed-η̂ curvature.",
-                skipped
-            );
-        }
-        // Symmetrise: each column is differenced independently, so H[j,k] and
-        // H[k,j] can differ slightly; average before inversion.
-        for &i in &free_idx {
-            for &j in &free_idx {
-                if j > i {
-                    let avg = (hess[(i, j)] + hess[(j, i)]) * 0.5;
-                    hess[(i, j)] = avg;
-                    hess[(j, i)] = avg;
-                }
-            }
-        }
-    } else {
-        // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
-        // off-diagonal), reconverging the EBEs at each perturbed point. Taken
-        // when the analytical fixed-EBE gradient does not cover the true marginal
-        // curvature: (a) IOV — no analytical gradient covers the kappa block; or
-        // (b) `force_ofv_hessian` — non-IOV FOCE with f-dependent error, whose SB
-        // gradient lacks the EBE-response Δ and yields an indefinite analytical
-        // Hessian. `pop_nll` dispatches on the kappa count, so this stencil is
-        // correct for both the IOV (joint η, κ) and the non-IOV (η-only) cases.
+    // Reconverged-OFV second-difference Hessian (3-point diagonal, 4-point
+    // off-diagonal), reconverging the EBEs at each perturbed point. The sole
+    // covariance R stencil: it recomputes the marginal curvature end-to-end
+    // (`a = ∂f/∂η` and the `log|H̃|` EBE-response included) at every perturbed
+    // point, so it serves FOCE, FOCEI and IOV, and additive/proportional/combined
+    // error uniformly — no envelope approximation, no held-fixed `a`.
+    {
+        // `pop_nll` dispatches on the kappa count, so this stencil is correct for
+        // both the IOV (joint η, κ) and the non-IOV (η-only) cases.
         //
         // #256: flattened to one `par_iter` over all ~2·n_free² perturbed OFV
         // points (subjects iterated serially inside `serial_ofv`) instead of the
@@ -4024,6 +3623,43 @@ mod tests {
     use super::*;
     use crate::estimation::parameterization::{compute_bounds, pack_params};
 
+    /// The guard-rejected objective (`guard_penalty_value`) must **integrate** the
+    /// center-push gradient `g[i] = 100·(xs[i] − c[i])` the closures return alongside it —
+    /// otherwise NLopt's More-Thuente line search cannot reconcile `f` and `∇f` and fails on
+    /// a first-step overshoot (#486, the ODE + `iiv_on_ruv` LBFGS failure). Pin the
+    /// consistency (central FD of the value matches the center-push) and the wall height.
+    #[test]
+    fn guard_penalty_value_integrates_the_center_push_gradient() {
+        let lower = vec![-2.0, -1.0, 0.0, -5.0];
+        let upper = vec![2.0, 3.0, 4.0, 1.0];
+        let xs = vec![0.5, -0.3, 1.7, -2.1];
+        let n = xs.len();
+        let centers: Vec<f64> = (0..n).map(|i| (lower[i] + upper[i]) / 2.0).collect();
+        for i in 0..n {
+            // The center-push gradient the closures pair with the penalty value.
+            let analytic = 100.0 * (xs[i] - centers[i]);
+            // Central FD of the exactly-quadratic penalty is exact at any step; use a large
+            // `h` so the penalty change clears the f64 ULP floor of the `1e12` base
+            // (a tiny `h` would lose the derivative to catastrophic cancellation).
+            let h = 0.25;
+            let mut xp = xs.clone();
+            xp[i] += h;
+            let mut xm = xs.clone();
+            xm[i] -= h;
+            let fd = (guard_penalty_value(&xp, &lower, &upper)
+                - guard_penalty_value(&xm, &lower, &upper))
+                / (2.0 * h);
+            approx::assert_relative_eq!(analytic, fd, max_relative = 1e-3, epsilon = 1e-2);
+        }
+        // A wall: far above any feasible OFV, so a guarded point is never mistaken for best.
+        assert!(guard_penalty_value(&xs, &lower, &upper) > 1e11);
+        // Minimised at the bound midpoint (the center-push fixed point).
+        assert!(
+            guard_penalty_value(&centers, &lower, &upper)
+                < guard_penalty_value(&xs, &lower, &upper)
+        );
+    }
+
     /// #603 review #1/#2/#8: the centralised EBE guard. A hard reject forces rejection
     /// unconditionally; otherwise the fraction trigger behaves as before.
     #[test]
@@ -4064,23 +3700,6 @@ mod tests {
         // Explicit override wins regardless of model shape.
         assert_eq!(resolve_outer_ftol(true, false, Some(1e-5)), 1e-5);
         assert_eq!(resolve_outer_ftol(false, false, Some(1e-10)), 1e-10);
-    }
-
-    /// SLSQP-fallback gate (#499): fall back only when the primary run did not
-    /// converge and did not exhaust its eval budget, is not already SLSQP, and was
-    /// not cancelled. `MaxEvalReached` (budget spent) must suppress it.
-    #[test]
-    fn slsqp_fallback_gate() {
-        // Genuine non-convergence (not MaxEvalReached) → fall back.
-        assert!(should_run_slsqp_fallback(false, false, false, false));
-
-        // Hit the eval budget → skip (needs larger maxiter, not another optimizer).
-        assert!(!should_run_slsqp_fallback(false, false, false, true));
-
-        // Already converged, already SLSQP, or cancelled → never fall back.
-        assert!(!should_run_slsqp_fallback(true, false, false, false));
-        assert!(!should_run_slsqp_fallback(false, true, false, false));
-        assert!(!should_run_slsqp_fallback(false, false, true, false));
     }
 
     /// Covariance progress reporter math (the pure pieces behind `cov_progress`).
@@ -4667,116 +4286,6 @@ mod tests {
         );
     }
 
-    /// Build the near-optimum synthetic inputs shared by the analytical
-    /// gradient-FD covariance tests: 8 subjects, fixed Ω/Σ, EBEs at zero.
-    /// `covariance_ofv_hessian = false` + `interaction = true` + non-IOV routes
-    /// `compute_covariance` through the analytical `point_grad` Hessian stencil
-    /// (`use_analytical = true`), distinct from the OFV second-difference path
-    /// the `_cancelled` test above exercises.
-    #[allow(clippy::type_complexity)]
-    fn analytical_cov_fixture() -> (
-        CompiledModel,
-        Population,
-        ModelParameters,
-        Vec<f64>,
-        Vec<DVector<f64>>,
-        Vec<DMatrix<f64>>,
-        Vec<Vec<DVector<f64>>>,
-    ) {
-        let model = make_model();
-        let mut population = make_population(8);
-        for s in &mut population.subjects {
-            s.observations = vec![1.80967, 1.34064, 0.89866];
-        }
-        let mut template = model.default_params.clone();
-        template.omega_fixed = vec![true];
-        template.sigma_fixed = vec![true];
-        let x = pack_params(&template);
-
-        let (n_subj, n_eta, n_obs) = (8, 1, 3);
-        let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
-        let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
-            .map(|_| DMatrix::from_element(n_obs, n_eta, 0.1))
-            .collect();
-        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
-        (model, population, template, x, eta_hats, h_matrices, kappas)
-    }
-
-    /// Analytical gradient-FD Hessian path runs the perturbed-point sweep to
-    /// completion (no cancel): exercises `cov_progress("Hessian", …)` and the
-    /// `point_grad` map that the default OFV-Hessian path skips. The fixed-Ω/Σ
-    /// near-optimum fixture yields a usable (PD) free-block, so the result is
-    /// `Success` with a finite covariance matrix.
-    #[test]
-    fn test_compute_covariance_analytical_path() {
-        use crate::types::FitOptions;
-        let (model, population, template, x, eta_hats, h_matrices, kappas) =
-            analytical_cov_fixture();
-
-        let mut options = FitOptions::default();
-        options.interaction = true; // FOCEI
-        options.covariance_ofv_hessian = false; // → analytical `point_grad` stencil
-        options.verbose = true; // drive the progress reporter closure
-
-        let result = compute_covariance(
-            &x,
-            &template,
-            &model,
-            &population,
-            &eta_hats,
-            &h_matrices,
-            &kappas,
-            &options,
-        );
-        // The fixed-Ω/Σ near-optimum yields a PD free-block, so the analytical
-        // stencil returns a finite `Success`. A single `matches!` keeps the
-        // other variants from becoming dead (uncoverable) arms.
-        assert!(
-            matches!(
-                &result,
-                CovarianceStepResult::Success(out) if out.matrix.iter().all(|v| v.is_finite())
-            ),
-            "analytical-path covariance must be a finite Success"
-        );
-    }
-
-    /// As `test_compute_covariance_cancelled`, but on the analytical
-    /// `point_grad` path (`covariance_ofv_hessian = false`): a pre-set cancel
-    /// flag short-circuits every perturbed point (each returns a NaN gradient
-    /// via the in-loop cancel check) and the post-loop bail returns
-    /// `Unusable(cancelled)` rather than inverting a NaN-laden Hessian.
-    #[test]
-    fn test_compute_covariance_analytical_cancelled() {
-        use crate::cancel::CancelFlag;
-        use crate::types::FitOptions;
-        let (model, population, template, x, eta_hats, h_matrices, kappas) =
-            analytical_cov_fixture();
-
-        let flag = CancelFlag::new();
-        flag.cancel(); // pre-cancel: every perturbed point short-circuits
-
-        let mut options = FitOptions::default();
-        options.interaction = true;
-        options.covariance_ofv_hessian = false; // → analytical `point_grad` stencil
-        options.verbose = true;
-        options.cancel = Some(flag);
-
-        let result = compute_covariance(
-            &x,
-            &template,
-            &model,
-            &population,
-            &eta_hats,
-            &h_matrices,
-            &kappas,
-            &options,
-        );
-        assert!(
-            matches!(&result, CovarianceStepResult::Unusable(msg) if msg.contains("cancelled")),
-            "cancelled analytical-path covariance must be Unusable(cancelled)"
-        );
-    }
-
     /// Empty matrix is a valid zero-dimensional input (all-FIX parameter
     /// case). Returns a 0×0 inverse without clipping.
     #[test]
@@ -5051,7 +4560,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -5257,7 +4768,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
         check_gradient(&model, &make_population(3), 2);
     }
@@ -5675,7 +5188,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
             name: "iov_cov_test".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Proportional,
@@ -6432,6 +5947,58 @@ mod tests {
             r.ofv < init_ofv - 1e-6,
             "with a budget the optimizer should improve the OFV: {} vs init {init_ofv}",
             r.ofv
+        );
+    }
+
+    /// Non-convergence is reported directly and runs exactly one outer
+    /// optimization — there is no automatic SLSQP retry from the stop point
+    /// (issue #657, which removed `should_run_slsqp_fallback` and the second
+    /// `nlopt::Nlopt` run). A gradient optimizer with a tiny `outer_maxiter`
+    /// stops non-converged at its eval budget; the total objective-evaluation
+    /// count must stay within a *single* optimization's budget
+    /// (`outer_maxiter * (n + 1)`), so a re-added second optimization from the
+    /// current point would blow this bound.
+    #[test]
+    fn non_convergence_reports_directly_without_second_optimization() {
+        let model = make_model();
+        let population = make_population(3);
+        let template = &model.default_params;
+        let n = pack_params(template).len();
+
+        // A non-SLSQP gradient primary (`nlopt_lbfgs`) with a tiny budget: its
+        // xtol/ftol are set unreachably tight, so `outer_maxiter * (n + 1)` evals
+        // is the stop criterion and it cannot converge. Pre-#657 exactly this
+        // shape (non-converged, non-SLSQP) is what an unguarded fallback re-add
+        // would retry with SLSQP.
+        let outer_maxiter = 2;
+        let o = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::NloptLbfgs,
+            outer_maxiter,
+            run_covariance_step: false,
+            mu_referencing: true,
+            ..FitOptions::default()
+        };
+        let r = optimize_population(&model, &population, template, &o);
+
+        assert!(
+            !r.converged,
+            "test setup: a {outer_maxiter}-iter budget must not converge (OFV = {})",
+            r.ofv
+        );
+        assert!(
+            r.warnings.iter().any(|w| w.contains("did not converge")),
+            "non-convergence must surface the warning directly; got {:?}",
+            r.warnings
+        );
+        // One optimization only: no automatic second run from the stop point.
+        let single_budget = outer_maxiter as usize * (n + 1);
+        assert!(
+            r.n_iterations <= single_budget,
+            "expected a single optimization (<= {single_budget} evals), got {} — \
+             a second optimization (SLSQP fallback) appears to have run",
+            r.n_iterations
         );
     }
 }

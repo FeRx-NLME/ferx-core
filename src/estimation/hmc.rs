@@ -299,7 +299,7 @@ mod tests {
     /// plain LTBS. Guards the `hmc.rs` ↔ `analytic_eta_nll_gradient` contract against a
     /// silent regression as the provider's scope changes.
     #[test]
-    fn hmc_engages_for_expression_scale_and_declines_under_ltbs() {
+    fn hmc_engages_for_expression_scale_and_ltbs() {
         use crate::parser::model_parser::parse_model_string;
         use rand::rngs::StdRng;
         use rand::SeedableRng;
@@ -332,15 +332,21 @@ mod tests {
             "closed-form ExpressionScale must take the gradient-based HMC path (#486)"
         );
 
-        // LTBS + ExpressionScale: no consistent analytic gradient → MH fallback (`None`).
+        // LTBS + ExpressionScale now has a consistent analytic inner gradient (Tier-1
+        // follow-up to #665 — the η-quotient then the `ln f` jet), so HMC takes the
+        // gradient-based path instead of falling back to MH. Recompute `nll` for the LTBS
+        // objective so the leapfrog energy and gradient evaluate the *same* model (else a
+        // broken LTBS objective could be masked by a stale non-LTBS `nll`).
         model.log_transform = true;
+        let nll_ltbs =
+            crate::stats::likelihood::individual_nll(&model, &subject, theta, &eta, &omega, &sigma);
         let mut rng = StdRng::seed_from_u64(1);
         let stepped_ltbs = hmc_step(
-            &subject, &eta, nll, &model, theta, &omega, &sigma, 0.05, 5, &mut rng,
+            &subject, &eta, nll_ltbs, &model, theta, &omega, &sigma, 0.05, 5, &mut rng,
         );
         assert!(
-            stepped_ltbs.is_none(),
-            "LTBS + ExpressionScale must decline HMC and fall back to MH"
+            stepped_ltbs.is_some(),
+            "LTBS + ExpressionScale now takes the gradient-based HMC path"
         );
     }
 

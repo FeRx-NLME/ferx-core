@@ -31,7 +31,7 @@ pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, Severity};
 pub use estimation::run_sir::run_sir;
 pub use estimation::uncertainty_samples::UncertaintyMethod;
-pub use frem::{prepare_frem, FremDataInfo, FremPrepareResult};
+pub use frem::{prepare_frem, FremDataInfo, FremFitInit, FremPrepareResult};
 pub use io::datareader::{read_nonmem_csv, read_nonmem_csv_with_covariates};
 pub use parser::model_parser::{parse_full_model_file, parse_model_file, parse_model_string};
 pub use propensity_match::MatchMethod;

@@ -114,15 +114,56 @@ validated against the production predictor + finite differences, including the 2
 Hessian blocks used for covariance/SEs). Both SS **bolus** and SS **infusion** are covered,
 and SS composes with time-varying covariates, IOV, and EVID 3/4 resets.
 
-A few SS sub-cases still route to the finite-difference fallback (correct, just slower):
+This also covers the dosing forms below (all closed by #486):
 
-- **SS + estimated lagtime** — the pre-arrival window `[t_dose, t_dose+lag]` must read the
-  previous interval's steady-state tail, not yet seeded by the dual walk.
-- **SS + a rate-defined infusion under `F ≠ 1`** — the equilibration window would need to
-  scale with `F` (a moving boundary not yet carried per cycle).
+- **A modeled-duration/rate dose** (`RATE=-1`/`-2` → `R{cmt}`/`D{cmt}`) combined with SS —
+  `equilibrate_ss_state_g` rebuilds the effective rate/window from the resolved PK slot each
+  cycle, the same jet the non-SS event-driven walk uses. The **closed-form** (analytical
+  1-/2-/3-cpt) path now mirrors this: its `equilibrate_ss_g` threads the modeled-window dual
+  into each cycle's active/quiet split, so a modeled dose × SS is analytic on the analytical
+  models too (#486).
+- **A rate-defined infusion under bioavailability `F ≠ 1`** — NONMEM holds the rate and scales
+  the window to `F·amt/rate`; the per-cycle equilibration now injects the same rate-off
+  event-time saltation the main walk uses at an ordinary infusion's window end.
+- **An estimated lagtime** — the dose arrives at `t_dose + lag`, so observations in the
+  pre-arrival window `[t_dose, t_dose+lag)` must read the *previous* interval's steady-state
+  tail; the walk seeds it at the dose's record time from the trough advanced to phase
+  `II − lag`, mirroring the production predictor's own pre-arrival seed. The dose's own
+  arrival still gets the same event-time saltation as any other lagged dose — the trough's
+  *value* doesn't depend on `lag` (an autonomous RHS, see below, makes the periodic
+  recurrence anchored to the pulse, not wall-clock time), but a later observation's elapsed
+  time since arrival still does, and the saltation captures exactly that.
+
+One SS sub-case still routes to the finite-difference fallback (and always will):
+
 - **SS + a non-autonomous RHS** (one that reads the `TIME`/`TAFD`/`TAD` builtins) — the
   equilibration expands a *time-invariant* pulse train, so a time/`TAD`-dependent RHS breaks
   the steady-state cycle recurrence; such models stay on FD.
+
+### Numeric cross-check against NONMEM 7.5.1 (SS + modeled-duration dose)
+
+For a 1-cpt IV ODE model with an SS=1 dose whose infusion *duration* is modeled
+(`RATE=-2` → `D1`, `D1 = TVD1·exp(ETA_D1)`, `II=12`, 35 simulated subjects), a live FOCEI
+fit driven by the new analytic gradient matches NONMEM 7.5.1 (`ADVAN1 TRANS2`,
+`METHOD=1 INTER`) to the same optimum:
+
+| Parameter    | ferx FOCEI (± SE)   | NONMEM 7.5.1 FOCEI |
+|--------------|--------------------:|-------------------:|
+| OFV (−2LL)   | −454.4806           | −454.9867           |
+| TVCL         | 4.0698 ± 0.129      | 4.1070              |
+| TVV          | 30.760 ± 0.941      | 30.389              |
+| TVD1         | 1.8876 ± 0.056      | 1.8752              |
+| ω²CL         | 0.0410              | 0.0405              |
+| ω²V          | 0.0329              | 0.0326              |
+| ω²D1         | 0.0698              | 0.0751              |
+| σ² (prop)    | 0.01110             | 0.01075             |
+
+All estimates agree to within a few percent — consistent with finite-sample noise and
+different optimizers (NONMEM's own quasi-Newton vs ferx's `optimizer = lbfgs`), not a
+discrepancy. The SS + estimated-lagtime sub-case is corroborated instead by the
+already-committed NONMEM PRED-only anchor for SS + `ALAG1` — see
+[Estimated lagtime](lagtime.qmd) — plus the local FD-vs-production and
+Hessian-vs-FD-of-gradient test suite.
 
 ### Why `N = 50`?
 

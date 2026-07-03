@@ -273,14 +273,16 @@ impl InputRateKind {
             // pointwise like the three above — exact `Dual2` forcing sensitivities
             // for `ka` and the pathway fraction `frac` (#505).
             InputRateKind::FirstOrder => true,
-            // Zero-order has a hard cutoff at `tad = dur`; `∂R_in/∂dur` carries a
-            // Leibniz boundary term (a dual-channel impulse at the cutoff) that the
-            // smooth pointwise `rate(tad) → Dual2` walk misses. Until that impulse
-            // is built (#530, shared with #384's modeled-duration `Dn` infusion),
-            // `dur` is differentiated by FD — so this kind is *not* lifted, and
-            // `prepare_dual` returns `None` for it (pinned by
+            // Zero-order has a hard cutoff at `tad = dur`. The *magnitude* part of
+            // `∂R_in/∂dur` is smooth (`R_in = F·amt·frac/dur`) and rides the pointwise
+            // dual, but the *boundary* part is a Leibniz impulse at the moving cutoff.
+            // The analytic ODE provider delivers the window as a per-segment constant
+            // (like an infusion) and injects the rate-off **saltation** at `tad = dur`
+            // for that boundary term (#530, the sign-mirror of estimated-lagtime's
+            // dose-start saltation) — so this kind is now lifted, and `prepare_dual`
+            // returns `Some` for it (pinned by
             // `supported_over_dual_agrees_with_prepare_dual`).
-            InputRateKind::ZeroOrder => false,
+            InputRateKind::ZeroOrder => true,
         }
     }
 }
@@ -414,9 +416,13 @@ impl InputRateForcing {
                 self.arg(params, 0, 1.0),
                 self.arg(params, 1, 1.0),
             )),
-            // Not lifted: the cutoff at `tad = dur` makes `∂/∂dur` a boundary
-            // impulse the pointwise dual walk can't carry (#530). FD fallback.
-            InputRateKind::ZeroOrder => None,
+            // Lifted (#530): the pointwise `dur` jet carries the smooth magnitude
+            // term; the analytic provider's `integrate_g` delivers the window as a
+            // per-segment constant and injects the rate-off saltation at the cutoff
+            // for the moving-boundary term. The `dur` field threads `∂/∂dur` into both.
+            InputRateKind::ZeroOrder => {
+                Some(PreparedInputRate::zero_order(self.arg(params, 0, 1.0)))
+            }
             // Lifted: a smooth `exp`-only density, exact `Dual2` like the others.
             InputRateKind::FirstOrder => {
                 Some(PreparedInputRate::first_order(self.arg(params, 0, 1.0)))
@@ -565,12 +571,12 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// the optimiser can climb back to the interior, and the converged optimum is
     /// interior so reported estimates are unaffected. `NaN` falls to the floor.
     ///
-    /// Generic over `T` for uniformity with the other constructors, but unlike
-    /// them the `dur` parameter's gradient is **not** exact here: the cutoff at
-    /// `tad = dur` ([`Self::rate`]) is a moving boundary whose `∂/∂dur` impulse the
-    /// pointwise dual walk misses, so a `zero_order()` model is gated to the FD
-    /// fallback ([`InputRateKind::supported_over_dual`] = `false`) and this is
-    /// reached only for `T = f64` (and the consistency test's `T = f64` probe).
+    /// Generic over `T` (the `sens/` `*_g<T>` convention). The pointwise `rate`
+    /// below carries the smooth *magnitude* part of `∂R_in/∂dur` via the `dur`/
+    /// `inv_dur` jets; the moving-boundary part at the `tad = dur` cutoff is supplied
+    /// separately by the analytic provider's rate-off saltation (`integrate_g`, #530),
+    /// so a `zero_order()` model is now served analytically
+    /// ([`InputRateKind::supported_over_dual`] = `true`).
     #[inline]
     fn zero_order(dur: T) -> Self {
         let dur = dur.guard_floor(Self::MIN_PARAM);
@@ -669,6 +675,59 @@ impl<T: PkNum> PreparedInputRate<T> {
             // `Dual2` sensitivities for `ka` with no special function. As tad → 0⁺
             // it is finite (R_in → dose·ka); there is no singularity to guard.
             PreparedInputRate::FirstOrder { ka } => dose * ka * (-(ka * tad)).exp(),
+        }
+    }
+
+    /// The right-hand limit `lim_{tad→0⁺} R_in(tad, dose)` — the forcing's onset
+    /// value, needed by the event-driven ODE sensitivity walk to inject an exact
+    /// rate-on **saltation** when a dose's own arrival is a moving boundary (an
+    /// estimated lagtime, #486): [`Self::rate`]'s domain guard returns a flat zero
+    /// *at* `tad = 0` by convention ("not yet started"), so the jump at onset is
+    /// computed here, separately, and injected once at the dose event (see
+    /// `inject_rate_saltation` in `sens/ode_provider.rs`) — the continuous
+    /// `∂R_in/∂lag` for `tad > 0` still flows through [`Self::rate`] itself when
+    /// `tad` carries the lag sensitivity.
+    ///
+    /// `Transit` vanishes at onset for any `n > 0` (the Γ-density `n·ln(tad) → −∞`
+    /// dominates) and degenerates to `ktr·dose` at `n = 0` (pure first-order);
+    /// `InverseGaussian` vanishes at onset for *every* valid `(mat, cv2)` (the
+    /// essential singularity `−mat/(2·cv2·tad) → −∞` always dominates); `FirstOrder`
+    /// is finite (`dose·ka`) with no boundary case. `Weibull`'s onset **diverges**
+    /// for shape `β < 1` (an integrable spike, not a finite jump) — callers must
+    /// exclude that combination rather than call this (see
+    /// `ode_analytical_supported`'s lagtime gate). `ZeroOrder`'s own onset/cutoff is
+    /// handled entirely by its separate moving-window mechanism (#530), not this
+    /// path.
+    #[inline]
+    pub(crate) fn rate_at_zero(&self, dose: T) -> T {
+        if dose.val() <= 0.0 {
+            return T::from_f64(0.0);
+        }
+        match *self {
+            PreparedInputRate::Transit { ktr, n, .. } => {
+                if n.val() <= 0.0 {
+                    dose * ktr
+                } else {
+                    T::from_f64(0.0)
+                }
+            }
+            PreparedInputRate::InverseGaussian { .. } => T::from_f64(0.0),
+            PreparedInputRate::Weibull { beta, c0, .. } => {
+                let b = beta.val();
+                if b > 1.0 {
+                    T::from_f64(0.0)
+                } else if b == 1.0 {
+                    dose * c0.exp()
+                } else {
+                    // β < 1: the true onset is +∞ (an integrable spike). Callers
+                    // must not reach this arm (excluded upstream) — a NaN/∞ here
+                    // would poison the whole subject's prediction, not just its
+                    // gradient.
+                    T::from_f64(f64::NAN)
+                }
+            }
+            PreparedInputRate::ZeroOrder { .. } => T::from_f64(0.0),
+            PreparedInputRate::FirstOrder { ka } => dose * ka,
         }
     }
 }
@@ -1509,12 +1568,14 @@ mod tests {
         assert!(forcing.validate(&bad).unwrap_err().contains("dur"));
     }
 
-    /// Zero-order is **not** lifted over `Dual2` (its moving-boundary `∂/∂dur` is
-    /// FD-only, #530): the gate must say so and `prepare_dual` must return `None`,
-    /// so the ODE provider keeps a `zero_order()` subject on the FD fallback.
+    /// Zero-order **is** now lifted over `Dual2` (#530): the gate says so and
+    /// `prepare_dual` returns `Some`, so the ODE provider admits a `zero_order()`
+    /// subject and `integrate_g` delivers the window with the rate-off saltation
+    /// carrying the moving-boundary `∂/∂dur`. The pointwise `dur` field carries the
+    /// smooth magnitude jet; the boundary impulse is added by the provider, not here.
     #[test]
-    fn zero_order_is_not_lifted_over_dual() {
-        assert!(!InputRateKind::ZeroOrder.supported_over_dual());
+    fn zero_order_is_lifted_over_dual() {
+        assert!(InputRateKind::ZeroOrder.supported_over_dual());
         let forcing = InputRateForcing {
             cmt: 0,
             kind: InputRateKind::ZeroOrder,
@@ -1522,15 +1583,15 @@ mod tests {
             frac_slot: None,
         };
         let params = vec![1.0; crate::types::MAX_PK_PARAMS];
-        assert!(forcing.prepare_dual::<f64>(&params).is_none());
+        assert!(forcing.prepare_dual::<f64>(&params).is_some());
     }
 
-    /// `prepare_dual` lifts the **smooth** forcings (IG, transit, Weibull,
-    /// first-order) to a `PkNum` type (here `T = f64`), reproducing the scalar
-    /// `prepare` exactly — the `T = f64` byte-identity that lets the analytic ODE
-    /// provider evaluate them over `Dual2` without drifting from the production
-    /// predictor (#430; Weibull = Phase 2; first-order = #505). Zero-order is the
-    /// one non-lifted kind, checked separately (`zero_order_is_not_lifted_over_dual`).
+    /// `prepare_dual` lifts every forcing kind to a `PkNum` type (here `T = f64`),
+    /// reproducing the scalar `prepare` exactly — the `T = f64` byte-identity that lets
+    /// the analytic ODE provider evaluate them over `Dual2` without drifting from the
+    /// production predictor (#430; Weibull = Phase 2; first-order = #505; zero-order =
+    /// #530, with its moving-boundary term added by the provider's saltation, checked in
+    /// `zero_order_is_lifted_over_dual`).
     #[test]
     fn prepare_dual_lifts_all_kinds() {
         let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
@@ -1798,5 +1859,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Direct Tier-1 coverage of every `rate_at_zero` match arm (#486 review): the
+    /// function's only caller (the event-driven walk's onset saltation, gated on
+    /// `has_lagtime`) currently reaches just `Transit`/`InverseGaussian`/`FirstOrder`
+    /// (`ode_analytical_supported`'s lagtime gate excludes `Weibull`/`ZeroOrder` from
+    /// that combination), so the `Weibull` and `ZeroOrder` arms — and `Transit`'s
+    /// degenerate `n ≤ 0` case — are otherwise never exercised, direct or indirect.
+    /// Pinning them here means a future gate relaxation that makes one of them live
+    /// inherits a regression test instead of shipping untested.
+    #[test]
+    fn rate_at_zero_transit_arms() {
+        let dose = 100.0;
+        // n = 0 (Bateman-degenerate): finite jump to dose·ktr.
+        let ktr = 2.0;
+        let prep = PreparedInputRate::transit(0.0, 1.0 / ktr);
+        assert_relative_eq!(prep.rate_at_zero(dose), dose * ktr, max_relative = 1e-12);
+        // n > 0: vanishes (the Γ-density dominates to zero at onset).
+        let prep = PreparedInputRate::transit(3.0, 2.0);
+        assert_eq!(prep.rate_at_zero(dose), 0.0);
+        // n < 0 (transient domain excursion, clamped to 0 by the constructor): same
+        // finite jump as the n = 0 case.
+        let prep = PreparedInputRate::transit(-1.0, 1.0 / ktr);
+        assert_relative_eq!(prep.rate_at_zero(dose), dose * ktr, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn rate_at_zero_inverse_gaussian_always_vanishes() {
+        let dose = 100.0;
+        for &(mat, cv2) in &[(1.0, 0.5), (5.0, 0.1), (0.2, 2.0)] {
+            let prep = PreparedInputRate::inverse_gaussian(mat, cv2);
+            assert_eq!(
+                prep.rate_at_zero(dose),
+                0.0,
+                "IG onset must vanish for every valid (mat, cv2), got mat={mat}, cv2={cv2}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_at_zero_zero_order_is_zero() {
+        // ZeroOrder's own onset/cutoff is handled by its separate moving-window
+        // mechanism (#530), not this path — always 0 here regardless of `dur`.
+        let prep = PreparedInputRate::zero_order(3.0);
+        assert_eq!(prep.rate_at_zero(100.0), 0.0);
+    }
+
+    #[test]
+    fn rate_at_zero_first_order_is_finite_jump() {
+        let dose = 100.0;
+        for &ka in &[0.1, 1.0, 5.0] {
+            let prep = PreparedInputRate::first_order(ka);
+            assert_relative_eq!(prep.rate_at_zero(dose), dose * ka, max_relative = 1e-12);
+        }
+    }
+
+    #[test]
+    fn rate_at_zero_zero_dose_is_zero() {
+        // The `dose.val() <= 0.0` guard short-circuits every variant to 0.
+        let prep = PreparedInputRate::first_order(1.0);
+        assert_eq!(prep.rate_at_zero(0.0), 0.0);
+        assert_eq!(prep.rate_at_zero(-5.0), 0.0);
+    }
+
+    /// Weibull's three onset sub-cases (`β > 1` finite-zero, `β = 1` finite-jump,
+    /// `β < 1` divergent) are currently unreachable from any caller (the lagtime
+    /// gate excludes Weibull entirely, see [`rate_at_zero`]'s doc comment), so this
+    /// is their only test coverage. `β = 1` branches on **exact** `f64` equality —
+    /// pinned deliberately here (not loosened to an epsilon tolerance) so a caller
+    /// that one day admits Weibull to this path inherits a visible, documented
+    /// discontinuity at `β = 1 ± ε` rather than a silent one.
+    #[test]
+    fn rate_at_zero_weibull_arms() {
+        let dose = 100.0;
+        let td = 2.0;
+        // β > 1: vanishes.
+        let prep = PreparedInputRate::weibull(td, 1.5);
+        assert_eq!(prep.rate_at_zero(dose), 0.0);
+        // β = 1: finite jump to dose/td (c0 = ln(β) − ln(td) = −ln(td) at β = 1).
+        let prep = PreparedInputRate::weibull(td, 1.0);
+        assert_relative_eq!(prep.rate_at_zero(dose), dose / td, max_relative = 1e-12);
+        // β < 1: the true onset is +∞ (an integrable spike) — this arm returns NaN
+        // by design (callers must not reach it; see the doc comment).
+        let prep = PreparedInputRate::weibull(td, 0.5);
+        assert!(prep.rate_at_zero(dose).is_nan());
+        // The β = 1 branch is an exact-equality check: β = 1 + f64::EPSILON already
+        // takes the `β > 1` (vanishes) arm, not the finite-jump one — a real
+        // discontinuity at the boundary, not just in the divergent direction.
+        let prep = PreparedInputRate::weibull(td, 1.0 + f64::EPSILON);
+        assert_eq!(prep.rate_at_zero(dose), 0.0);
     }
 }

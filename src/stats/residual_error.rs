@@ -403,6 +403,137 @@ fn diag_self_deriv(
     d
 }
 
+/// Second-order `∂²R/∂f_a∂f_b` tensor of the dense residual covariance — the
+/// curvature companion to [`compute_dr_df_matrices`], returned as `d2r[a][b]`,
+/// an `n×n` symmetric matrix per ordered prediction pair `(a, b)`
+/// (`d2r[a][b] == d2r[b][a]` by equality of mixed partials).
+///
+/// Every sigma loading coefficient is *affine* in `f` (proportional slot loads
+/// `f`, additive slot is constant), so the second `f`-derivative of any loading
+/// is zero. Combined with the fact that each `R` entry couples at most two
+/// observations, only two families of second derivatives survive:
+///
+/// * `d2r[m][m]` has a single nonzero entry at `(m, m)`:
+///   `∂²R_mm/∂f_m²` — the second `f`-derivative of `variance_at_scaled`. With
+///   `c_s` the value loading, `c_s' = slope_s`, `c_s'' = 0`, the within-obs
+///   `block_sigma` cross term `2 ρ σ_i σ_j c_i c_j` differentiates twice to
+///   `4 ρ σ_i σ_j c_i' c_j'` (see [`diag_self_second_deriv`]). The off-diagonal
+///   entries of `R` have `∂²R_mk/∂f_m² = cross(c_m'', c_k) = 0`, so they do not
+///   appear here.
+/// * `d2r[m][k]` for `m ≠ k` in the same residual block has nonzero entries at
+///   `(m, k)` and `(k, m)`: `∂²R_mk/∂f_m∂f_k`. Because
+///   [`cross_observation_covariance`] is bilinear in the two observations'
+///   loadings, this mixed partial is exactly that cross-covariance evaluated
+///   with *both* observations' slope loadings — `cross(slope_m, slope_k)`.
+///
+/// Feeds the dense FOCEI outer-gradient curvature coefficients (the `β`/`α'`
+/// reservoir in `sens_outer_gradient`) and the inner Hessian response
+/// correction, via `∂²R/∂η_k∂η_l = Σ_{m,m'} H[m,k] H[m',l] · d2r[m][m']`
+/// (plus the `Σ_m (∂²f_m/∂η_k∂η_l) · ∂R/∂f_m` term carried by the first-order
+/// [`compute_dr_df_matrices`]). `mult` is the #484 per-observation magnitude
+/// matrix, applied to the slope loadings identically to the first-order path.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_d2r_df2_matrices(
+    error_spec: &ErrorSpec,
+    ipreds: &[f64],
+    obs_cmts: &[usize],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    occasions: &[u32],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+    mult: Option<&[Vec<f64>]>,
+) -> Vec<Vec<DMatrix<f64>>> {
+    let n = ipreds.len();
+    let empty: Vec<f64> = Vec::new();
+    let mrow = |j: usize| -> &[f64] {
+        mult.and_then(|m| m.get(j))
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty)
+    };
+    let m_at = |j: usize, idx: usize| -> f64 { mrow(j).get(idx).copied().unwrap_or(1.0) };
+    let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
+
+    // Value loadings gate the emptiness skip exactly as `compute_dr_df_matrices`
+    // (an observation with no sigma loadings contributes nothing); slope
+    // loadings carry the math (the only nonzero second derivatives).
+    let vload: Vec<Vec<(usize, f64)>> = (0..n)
+        .map(|j| {
+            error_spec
+                .sigma_loadings(cmt_at(j), ipreds[j], sigma_values.len())
+                .into_iter()
+                .map(|(idx, c)| (idx, c * m_at(j, idx)))
+                .collect()
+        })
+        .collect();
+    let sload: Vec<Vec<(usize, f64)>> = (0..n)
+        .map(|j| {
+            error_spec
+                .sigma_loading_slopes(cmt_at(j), sigma_values.len())
+                .into_iter()
+                .map(|(idx, s)| (idx, s * m_at(j, idx)))
+                .collect()
+        })
+        .collect();
+
+    let mut out = vec![vec![DMatrix::<f64>::zeros(n, n); n]; n];
+    for m in 0..n {
+        if vload[m].is_empty() {
+            continue;
+        }
+        // Diagonal curvature ∂²R_mm/∂f_m².
+        out[m][m][(m, m)] = diag_self_second_deriv(&sload[m], sigma_values, correlations);
+        // Mixed partial ∂²R_mk/∂f_m∂f_k for the off-diagonal cross-covariance.
+        for k in (m + 1)..n {
+            if vload[k].is_empty()
+                || !same_residual_block(obs_times, obs_raw_times, occasions, m, k)
+            {
+                continue;
+            }
+            let d = cross_observation_covariance(&sload[m], &sload[k], sigma_values, correlations);
+            if d != 0.0 {
+                out[m][k][(m, k)] = d;
+                out[m][k][(k, m)] = d;
+                out[k][m][(m, k)] = d;
+                out[k][m][(k, m)] = d;
+            }
+        }
+    }
+    out
+}
+
+/// `∂²R_mm/∂f_m²`: the second `f`-derivative of the diagonal residual variance.
+/// With value loadings affine in `f` (`c_s'' = 0`),
+/// `∂²V_mm/∂f² = Σ_s 2 (c_s')² σ_s² + Σ_corr 4 ρ σ_i σ_j c_i' c_j'`,
+/// i.e. the slope-only companion of [`diag_self_deriv`]. The slope loadings
+/// carry the same slot presence as the value loadings (additive slots appear
+/// with slope 0), so iterating them is sufficient.
+fn diag_self_second_deriv(
+    sload: &[(usize, f64)],
+    sigma_values: &[f64],
+    correlations: &[ResidualCorrelation],
+) -> f64 {
+    let slope = |slot: usize| -> f64 {
+        sload
+            .iter()
+            .find(|(i, _)| *i == slot)
+            .map(|(_, s)| *s)
+            .unwrap_or(0.0)
+    };
+    let sig = |idx: usize| -> f64 { sigma_values.get(idx).copied().unwrap_or(0.0) };
+    let mut d = 0.0;
+    for &(idx, s) in sload {
+        let sg = sig(idx);
+        d += 2.0 * s * s * sg * sg;
+    }
+    for corr in correlations {
+        let si_s = slope(corr.sigma_i);
+        let sj_s = slope(corr.sigma_j);
+        d += 4.0 * corr.rho * sig(corr.sigma_i) * sig(corr.sigma_j) * si_s * sj_s;
+    }
+    d
+}
+
 /// Individual weighted residual: IWRES_j = (y_j - f_j) / sqrt(V_j)
 pub fn iwres(obs: f64, ipred: f64, error_model: ErrorModel, sigma_values: &[f64]) -> f64 {
     let v = residual_variance(error_model, ipred, sigma_values);
@@ -816,6 +947,161 @@ mod tests {
                         epsilon = 1e-5,
                         max_relative = 1e-4
                     );
+                }
+            }
+        }
+    }
+
+    // ∂²R/∂f_a∂f_b must match a central difference of the first-order
+    // ∂R/∂f machinery: d2r[a][b] ≈ (dr(f+h·e_b)[a] − dr(f−h·e_b)[a]) / 2h.
+    // Mixed CMTs (proportional + combined) and a cross-endpoint block_sigma
+    // correlation exercise both the diagonal-curvature and the bilinear
+    // off-diagonal mixed-partial branches.
+    #[test]
+    fn test_compute_d2r_df2_matrices_matches_finite_difference_paired() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Combined,
+                    sigma_idx: vec![0, 2],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0, 4.0];
+        let cmts = [1usize, 2, 1, 2];
+        let times = [1.0, 1.0, 2.0, 2.0];
+        let sigma = [0.2, 0.3, 1.5];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.4,
+        };
+        let d2r = compute_d2r_df2_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+            None,
+        );
+        let n = ipreds.len();
+        let dr_at = |f: &[f64]| {
+            compute_dr_df_matrices(&spec, f, &cmts, &times, &[], &[], &sigma, &[corr], None)
+        };
+        let h = 1e-4;
+        for b in 0..n {
+            let mut fp = ipreds.to_vec();
+            let mut fm = ipreds.to_vec();
+            fp[b] += h;
+            fm[b] -= h;
+            let drp = dr_at(&fp);
+            let drm = dr_at(&fm);
+            for a in 0..n {
+                let fd = (&drp[a] - &drm[a]) / (2.0 * h);
+                for p in 0..n {
+                    for q in 0..n {
+                        assert_relative_eq!(
+                            d2r[a][b][(p, q)],
+                            fd[(p, q)],
+                            epsilon = 1e-5,
+                            max_relative = 1e-4
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Same FD check with a #484 per-observation magnitude matrix: ∂²R/∂f²
+    // must track the *scaled* covariance through `compute_dr_df_matrices`.
+    #[test]
+    fn test_compute_d2r_df2_matrices_matches_finite_difference_scaled() {
+        let spec = ErrorSpec::PerCmt(HashMap::from([
+            (
+                1,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![1],
+                },
+            ),
+            (
+                2,
+                EndpointError {
+                    error_model: ErrorModel::Proportional,
+                    sigma_idx: vec![0],
+                },
+            ),
+        ]));
+        let ipreds = [50.0, 5.0, 40.0, 4.0];
+        let cmts = [1usize, 2, 1, 2];
+        let times = [1.0, 1.0, 2.0, 2.0];
+        let sigma = [0.2, 0.3];
+        let corr = crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.4,
+        };
+        let mult = vec![
+            vec![1.0, 1.2],
+            vec![0.8, 1.0],
+            vec![1.1, 0.9],
+            vec![1.3, 1.0],
+        ];
+        let d2r = compute_d2r_df2_matrices(
+            &spec,
+            &ipreds,
+            &cmts,
+            &times,
+            &[],
+            &[],
+            &sigma,
+            &[corr],
+            Some(&mult),
+        );
+        let n = ipreds.len();
+        let dr_at = |f: &[f64]| {
+            compute_dr_df_matrices(
+                &spec,
+                f,
+                &cmts,
+                &times,
+                &[],
+                &[],
+                &sigma,
+                &[corr],
+                Some(&mult),
+            )
+        };
+        let h = 1e-4;
+        for b in 0..n {
+            let mut fp = ipreds.to_vec();
+            let mut fm = ipreds.to_vec();
+            fp[b] += h;
+            fm[b] -= h;
+            let drp = dr_at(&fp);
+            let drm = dr_at(&fm);
+            for a in 0..n {
+                let fd = (&drp[a] - &drm[a]) / (2.0 * h);
+                for p in 0..n {
+                    for q in 0..n {
+                        assert_relative_eq!(
+                            d2r[a][b][(p, q)],
+                            fd[(p, q)],
+                            epsilon = 1e-5,
+                            max_relative = 1e-4
+                        );
+                    }
                 }
             }
         }

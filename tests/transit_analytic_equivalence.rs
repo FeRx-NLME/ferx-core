@@ -143,6 +143,104 @@ fn transit_multidose_matches_ode() {
     );
 }
 
+/// A transit model with a mid-profile `TIME` switch on CL. The closed-form shorthand
+/// `pk one_cpt_transit(...)` cannot honour it, so it is desugared to the ODE `transit()`
+/// twin (#486). Written by hand as that same ODE, the two must predict identically — the
+/// desugar produces exactly the twin, and the observation times straddle the switch (t=6)
+/// so the `TIME` dependence is actually exercised.
+#[test]
+fn transit_time_desugar_matches_hand_written_ode() {
+    let header = "\
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVCL_LATE(0.30, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(1.5, 0.05, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  if (TIME > 6.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+";
+    let shorthand = format!(
+        "{header}\n[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let hand_ode = format!(
+        "{header}\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let sh = parse_full_model(&shorthand)
+        .expect("shorthand transit+TIME parses")
+        .model;
+    let hd = parse_full_model(&hand_ode).expect("hand ODE parses").model;
+    // The shorthand stays a closed-form transit model but carries the ODE equivalent that
+    // predict()/the gradient route TIME/TV-cov subjects to.
+    assert!(
+        sh.ode_spec.is_none() && sh.transit_ode_equivalent.is_some(),
+        "transit + TIME shorthand carries an ODE equivalent (primary stays closed-form)"
+    );
+
+    let pop = population(
+        vec![bolus(0.0, 100.0)],
+        vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0],
+    );
+    let ps = predict(&sh, &pop, &sh.default_params);
+    let ph = predict(&hd, &pop, &hd.default_params);
+    assert_eq!(ps.len(), ph.len());
+    assert!(!ps.is_empty());
+    for (x, y) in ps.iter().zip(ph.iter()) {
+        assert!(
+            (x.pred - y.pred).abs() <= 1e-9 + 1e-9 * x.pred.abs(),
+            "t={:.3}: desugared {:.6} vs hand ODE {:.6}",
+            x.time,
+            x.pred,
+            y.pred
+        );
+    }
+    assert!(
+        ps.iter().any(|p| p.time > 6.0) && ps.iter().any(|p| p.time < 6.0),
+        "observations must straddle the TIME switch"
+    );
+
+    // Compartment/state columns (sdtab `[derived]`) must ALSO route to the equivalent — the
+    // analytical states path has no valid states for a TIME/TV-cov transit subject and would
+    // return NaN. They must be finite and match the hand-written ODE twin's states.
+    let subj = &pop.subjects[0];
+    let eta = vec![0.0; sh.n_eta];
+    let (_, sh_states) =
+        ferx_core::pk::compute_predictions_with_states(&sh, subj, &sh.default_params.theta, &eta);
+    let (_, hd_states) =
+        ferx_core::pk::compute_predictions_with_states(&hd, subj, &hd.default_params.theta, &eta);
+    assert!(
+        !sh_states.is_empty()
+            && sh_states
+                .iter()
+                .all(|s| !s.is_empty() && s.iter().all(|x| x.is_finite())),
+        "transit + TIME compartment states must be finite (not the NaN the analytical path returns)"
+    );
+    assert_eq!(sh_states.len(), hd_states.len());
+    for (a, b) in sh_states.iter().zip(hd_states.iter()) {
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!(
+                (x - y).abs() <= ATOL + RTOL * x.abs(),
+                "state mismatch: desugared {x:.6} vs hand ODE {y:.6}"
+            );
+        }
+    }
+}
+
 #[test]
 fn transit_with_lagtime_matches_ode() {
     let pop = population(
@@ -266,22 +364,28 @@ fn transit_iov_rejected() {
     );
 }
 
+/// A plain `one_cpt_transit` model with time-varying covariates now **works**: the closed
+/// form can't serve a subject whose parameters switch mid-absorption, so the runtime dispatch
+/// routes it to the model's exact ODE `transit()` equivalent (built at parse time). It is no
+/// longer rejected. (A transit form outside the equivalent's scope — a `lagtime=`/`f=`
+/// mapping, custom scaling, or an init block — carries no equivalent and is still rejected.)
 #[test]
-fn transit_tv_covariate_rejected() {
+fn transit_tv_covariate_now_served_by_ode_equivalent() {
     let (an_src, _) = build_pair(false, false);
     let model = parse_full_model(&an_src).expect("parses").model;
+    assert!(
+        model.transit_ode_equivalent.is_some(),
+        "plain transit carries an ODE equivalent"
+    );
     let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
     // Give the subject time-varying covariates (non-empty per-observation maps).
     pop.subjects[0].obs_covariates = vec![
         std::collections::HashMap::from([("WT".to_string(), 70.0)]),
         std::collections::HashMap::from([("WT".to_string(), 72.0)]),
     ];
-    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
-        .expect_err("transit + time-varying covariates should be rejected");
-    assert!(
-        e.contains("time-varying"),
-        "expected a TV-covariate rejection message, got: {e}"
-    );
+    assert!(pop.subjects[0].has_tv_covariates());
+    fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect("transit + time-varying covariates now fits via the ODE equivalent");
 }
 
 #[test]

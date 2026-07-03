@@ -754,8 +754,12 @@ fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> Vec<PreparedInputRate> 
 /// serves both the production `f64` predictor (`T = f64`, byte-identical to the
 /// original) and the analytic ODE sensitivity provider's dual walk (`T = Dual*`),
 /// instead of `sens/ode_provider.rs` hand-maintaining a second copy (#430 review
-/// #4 / #451). The dual caller passes `dose_lagtimes = &[]` (lagtime gated off) and
-/// `reset_floor = NEG_INFINITY` (reset gated off), so those branches are inert there.
+/// #4 / #451). The two dual callers each feed one branch live: the TV-cov
+/// event-driven walk (`integrate_tvcov_g`) passes the tracked dual `dose_lagtimes`
+/// for an in-scope estimated lagtime (#486), and the static walk (`integrate_g`)
+/// passes the tracked `reset_floor` for an in-scope EVID 3/4 reset (#486).
+/// `integrate_g` still passes `dose_lagtimes = &[]` (its gate excludes lagtime
+/// subjects, which always route to the TV-cov walk instead).
 ///
 /// `params` is the flat individual-parameter vector the `prepared` constants were
 /// built from; it is read here only for the optional pathway-fraction multiplier
@@ -768,7 +772,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
     prepared: &[PreparedInputRate<T>],
     params: &[T],
     doses: &[DoseEvent],
-    dose_lagtimes: &[f64],
+    dose_lagtimes: &[T],
     dose_f_bio: &[T],
     reset_floor: f64,
     t: f64,
@@ -791,20 +795,27 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
             if d.cmt.saturating_sub(1) != forcing.cmt {
                 continue;
             }
-            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
-            let t_eff = d.time + lag;
+            // `dose_lagtimes[k]` (`T`, not `f64`) carries the exact `∂t_eff/∂lag = 1`
+            // sensitivity when the caller's lag is itself an estimated parameter (an
+            // event-driven walk with an in-scope lagtime, #486) — `T::from_f64(0.0)`
+            // (zero jet) for every other caller (production `f64`, or a dual walk with
+            // no lagtime), so `tad` below reduces to the pre-#486 constant-boundary
+            // computation there. The gating comparisons use `.val()` (the boundary
+            // itself never needs a jet — see `rate_at_zero`'s jump for that).
+            let lag = dose_lagtimes.get(k).copied().unwrap_or(T::from_f64(0.0));
+            let t_eff = T::from_f64(d.time) + lag;
             // Doses delivered before the most recent reset are off — the reset
             // zeroed the compartments, same rule as `active_infusions`.
-            if t_eff < reset_floor - INFUSION_EPS {
+            if t_eff.val() < reset_floor - INFUSION_EPS {
                 continue;
             }
-            let tad = t - t_eff;
-            if tad <= 0.0 {
+            let tad = T::from_f64(t) - t_eff;
+            if tad.val() <= 0.0 {
                 continue;
             }
             let dose_mass =
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
-            acc = acc + prep.rate(T::from_f64(tad), dose_mass);
+            acc = acc + prep.rate(tad, dose_mass);
         }
         // Pathway fraction (#388): a `FR*fn(...)` term scales its whole `R_in` by
         // the declared fraction `FR`; `frac = 1` for an unfractioned single-pathway
@@ -930,6 +941,36 @@ pub struct PerCmtReadout {
     pub program: Option<crate::parser::model_parser::OdeOutputProgram>,
 }
 
+impl OdeReadout {
+    /// Evaluate the readout at one observation given the compartment `state`
+    /// vector, the flat PK-parameter slice, θ/η, the covariate snapshot, and the
+    /// observation's 1-based CMT. Shared by the ODE predictor ([`read_observable`])
+    /// and the analytic Form C path (`pk::apply_analytic_readout`, #650) so the
+    /// two dispatch/NaN-guard conventions cannot drift. A `PerCmt` map miss (or an
+    /// out-of-range `ObsCmt`) yields `NaN` — the loud guard that propagates to a
+    /// NaN OFV rather than silently mis-reading, since parser + fit-time validation
+    /// already guarantee every observed CMT has an entry.
+    #[inline]
+    pub(crate) fn eval(
+        &self,
+        state: &[f64],
+        pk_params_flat: &[f64],
+        theta: &[f64],
+        eta: &[f64],
+        covariates: &HashMap<String, f64>,
+        obs_cmt: usize,
+    ) -> f64 {
+        match self {
+            OdeReadout::ObsCmt(idx) => state[*idx],
+            OdeReadout::Single(out_fn) => out_fn(state, pk_params_flat, theta, eta, covariates),
+            OdeReadout::PerCmt(map) => match map.get(&obs_cmt) {
+                Some(r) => (r.out_fn)(state, pk_params_flat, theta, eta, covariates),
+                None => f64::NAN,
+            },
+        }
+    }
+}
+
 /// Read the observable value at observation `obs_idx`.
 ///
 /// `subject.obs_cmts[obs_idx]` selects the per-CMT readout when
@@ -944,19 +985,8 @@ fn read_observable(
     covariates: &HashMap<String, f64>,
     obs_cmt: usize,
 ) -> f64 {
-    match &ode.readout {
-        OdeReadout::ObsCmt(idx) => u[*idx],
-        OdeReadout::Single(out_fn) => out_fn(u, pk_params_flat, theta, eta, covariates),
-        OdeReadout::PerCmt(map) => match map.get(&obs_cmt) {
-            Some(r) => (r.out_fn)(u, pk_params_flat, theta, eta, covariates),
-            // Parser + fit-time validation guarantee every observed CMT
-            // has an entry. NaN here is a defensive guard against
-            // hand-constructed CompiledModels that bypassed validation —
-            // it propagates to NaN OFV so the bad config is loud, not
-            // silent.
-            None => f64::NAN,
-        },
-    }
+    ode.readout
+        .eval(u, pk_params_flat, theta, eta, covariates, obs_cmt)
 }
 
 /// ODE specification for a model

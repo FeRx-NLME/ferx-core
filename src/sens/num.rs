@@ -15,6 +15,10 @@ pub trait PkNum:
     + Div<Output = Self>
     + Neg<Output = Self>
 {
+    /// Whether this type carries a second-order (Hessian) jet. `false` for `f64` and the
+    /// gradient-only `Dual1`, `true` for the `Dual2`/`DualMixed` outer type. Lets a caller
+    /// skip building a Hessian it would discard (e.g. `tvcov_init_state` on the inner walk).
+    const SECOND_ORDER: bool;
     /// Lift a constant into the numeric type (zero derivatives for duals).
     fn from_f64(x: f64) -> Self;
     /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
@@ -51,6 +55,7 @@ pub trait PkNum:
 }
 
 impl PkNum for f64 {
+    const SECOND_ORDER: bool = false;
     #[inline]
     fn from_f64(x: f64) -> Self {
         x
@@ -110,6 +115,7 @@ impl PkNum for f64 {
 }
 
 impl<const N: usize> PkNum for Dual1<N> {
+    const SECOND_ORDER: bool = false;
     #[inline]
     fn from_f64(x: f64) -> Self {
         Dual1::constant(x)
@@ -177,6 +183,7 @@ impl<const N: usize> PkNum for Dual1<N> {
 }
 
 impl<const NA: usize, const N: usize> PkNum for DualMixed<NA, N> {
+    const SECOND_ORDER: bool = true;
     #[inline]
     fn from_f64(x: f64) -> Self {
         DualMixed::constant(x)

@@ -102,9 +102,19 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
 - The `TIME` fed to the expression is the raw data-file time (matching NONMEM's
   `$ERROR`).
 - Supported for `method = foce` and `method = focei` only. SAEM, GN, GN-hybrid,
-  and importance-sampling are rejected up front. When a custom magnitude is
-  active the analytic outer/inner gradients fall back to finite differences
-  (which are magnitude-aware), so fits are correct but slightly slower.
+  and importance-sampling are rejected up front.
+- **Analytic gradient (#576/#486).** The inner EBE η-gradient and the outer
+  θ/σ population gradient are both analytic for a magnitude-active model under
+  **FOCE and FOCEI** — the magnitude is η-independent, so the inner loop just
+  threads its per-observation multiplier into the variance/its `f`-derivative;
+  the outer loop differentiates the magnitude program itself (a new *direct*-θ
+  term in `∂R/∂θ`, since `mult(θ)` enters the residual variance independent of
+  the prediction). For plain (non-interaction) **FOCE** the same magnitude enters
+  the Sheiner–Beal marginal through its typical-value residual variance `R⁰`
+  (value and direct-θ derivative), on both the non-IOV and IOV paths. A few
+  combinations still fall back to finite differences (which remain
+  magnitude-aware, so fits stay correct, just slower): `block_sigma` correlated
+  residual error, `iiv_on_ruv`, an M3-BLOQ censored row, and more than 32 thetas.
 
 ## Log-transform-both-sides (LTBS)
 
@@ -215,6 +225,106 @@ proportional error on the plasma endpoint and additive error on the PD
 endpoint. The per-CMT *readout* (which compartment/expression each `CMT` maps
 to) is configured in the [`[scaling]`](scaling.qmd) block.
 
+## Covariate-selected error models (`if/else`)
+
+Per-CMT dispatch keys on the dataset's `CMT` column. When two endpoints share
+the *same* compartment/readout but need different residual error — a classic
+example is a **free-vs-total** assay, where both measurements are the same
+concentration readout but carry different proportional error — select the error
+model with an arbitrary covariate `if/else` instead, exactly as the
+[`[scaling]`](scaling.qmd) block selects a readout (Form C):
+
+```
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_ERR_TOTAL)
+  } else {
+    DV ~ proportional(PROP_ERR_UNBOUND)
+  }
+```
+
+Each observation's residual error model is chosen by evaluating the conditions
+top-to-bottom against that row's covariate snapshot and taking the first match;
+the mandatory final `else` catches every remaining row. `else if` chains any
+number of branches:
+
+```
+[error_model]
+  if (ASSAY == 1) {
+    DV ~ proportional(PROP_LCMS)
+  } else if (ASSAY == 2) {
+    DV ~ combined(PROP_ELISA, ADD_ELISA)
+  } else {
+    DV ~ additive(ADD_OTHER)
+  }
+```
+
+This mirrors an analytic Form C readout that switches on the same per-row flag,
+so a model can express both the readout **and** its residual error against one
+covariate without recoding the flag into a synthetic `CMT` column:
+
+```
+[scaling]
+  y = if (FREE == 0) central/V1 + BMAX*(central/V1)/(KD + central/V1) else central/V1
+
+[error_model]
+  if (FREE == 0) { DV ~ proportional(PROP_ERR_TOTAL) }
+  else           { DV ~ proportional(PROP_ERR_UNBOUND) }
+```
+
+Rules and restrictions:
+
+- **Analytical *and* ODE models.** Unlike per-CMT error (ODE-only), covariate
+  selection works on closed-form analytical PK models too — the selection is a
+  per-observation covariate constant, so it flows through the same analytic
+  FOCE/FOCEI σ-gradient channel once the endpoint is chosen.
+- **A final `else` is required** so every observation maps to a declared error
+  model (no silent fall-through).
+- **The selector covariate is a required data column.** A covariate named in a
+  condition must be present in the data, or `fit()` fails with
+  `E_MISSING_COVARIATE` (it is never silently read as 0). Declaring it in
+  [`[covariates]`](covariates.qmd) is recommended.
+- **Estimation method.** Supported with FOCE/FOCEI, the Gauss-Newton
+  optimizers, SAEM, and importance sampling — every likelihood/gradient path
+  dispatches on the selected endpoint.
+- **`block_sigma` correlated residuals are supported** together with a
+  covariate-selected error model (#669). Each observation resolves to a branch
+  per row, loads that branch's sigmas, and rows sharing a subject time and
+  occasion pick up the `block_sigma` cross covariance in the dense residual `R`
+  — exactly the pairing rule used for per-CMT endpoints. Two co-temporal rows
+  resolving to *different* branches (e.g. a total `FREE=0` and an unbound
+  `FREE=1` measurement of the same sample) get the honest cross-branch
+  covariance `ρ·σ_i·σ_j` from each row's own loadings. The method restrictions
+  on `block_sigma` (see the [Sigma scale](#sigma-scale) section) apply
+  unchanged.
+- **LTBS** (`log(DV) ~ ...` / `log_additive`) is not supported inside a branch.
+- **SDE / `[diffusion]` models are not supported.** The EKF measurement-noise
+  path uses a single error model and cannot switch per observation, so the
+  combination is rejected at parse time. Use a single-endpoint error model.
+- **Adaptive dosing** (`simulate_adaptive*`) is not supported: the assay keys
+  residual error by the monitored compartment, whereas a selected error model
+  keys endpoints by covariate branch — the combination is rejected.
+- **`simulate()` validates the selector covariate** the same way `fit()` does: a
+  selector covariate absent from the data is a hard `E_MISSING_COVARIATE` error,
+  never silently read as 0.
+
+### Comparison with NONMEM
+
+The equivalent NONMEM `$ERROR` block selects the residual error with `IF`:
+
+```fortran
+IF (FREE.EQ.0) THEN
+   Y = IPRED*(1 + EPS(1))     ; total: PROP_ERR_TOTAL = SD of EPS(1)
+ELSE
+   Y = IPRED*(1 + EPS(2))     ; unbound: PROP_ERR_UNBOUND = SD of EPS(2)
+ENDIF
+```
+
+ferx's `if (FREE == 0) { DV ~ proportional(PROP_ERR_TOTAL) } else { DV ~
+proportional(PROP_ERR_UNBOUND) }` produces the same per-row residual variance
+`(IPRED·σ)²` with `σ` selected by `FREE`, and the same joint FOCEI objective —
+no synthetic `CMT` recoding required on either side.
+
 ## Sigma scale
 
 **All sigma parameters are estimated and reported on the standard-deviation scale**, not the variance scale. This is true for both proportional and additive components, and for both elements of a combined error model.
@@ -285,10 +395,12 @@ $$
 The diagonal sigma SDs are estimated unless marked `FIX`; the off-diagonal
 covariance is always converted to a fixed correlation. A nonzero `block_sigma`
 covariance can connect sigmas that co-load on the same `combined(...)` endpoint,
-or sigmas used by different CMT endpoints measured at the same subject time and
-occasion. In the cross-endpoint case ferx builds a subject-level residual
-covariance matrix, so paired rows such as total/unbound assays receive the
-NONMEM-style covariance term `f_total * f_unbound * Cov(EPS_total, EPS_unbound)`.
+or sigmas used by different endpoints measured at the same subject time and
+occasion — whether those endpoints are selected by the CMT column (per-CMT) or
+by a covariate `if/else` selector (#669). In the cross-endpoint case ferx builds
+a subject-level residual covariance matrix, so paired rows such as total/unbound
+assays receive the NONMEM-style covariance term
+`f_total * f_unbound * Cov(EPS_total, EPS_unbound)`.
 
 Current scope: `block_sigma` is supported for the Gaussian `method = foce`,
 `method = focei`, `method = saem`, and `method = imp` fits. The Gauss-Newton
@@ -300,6 +412,14 @@ under `method = foce` / `method = focei` (the EKF variance is added to the dense
 `R`) but are rejected under `method = saem`, whose M-step data term does not yet
 include the process-noise inflation.
 
+`simulate()` draws each observation's residual independently and does **not**
+reproduce a `block_sigma` off-diagonal covariance — simulated total/unbound (or
+cross-branch, for a covariate-selected model) rows are uncorrelated even though
+the estimation objective honours the correlation. A VPC or posterior-predictive
+check of the correlated endpoints will therefore understate the residual
+covariance; this applies to every `block_sigma` model, per-CMT and
+covariate-selected alike (tracked in issue #672).
+
 Under `method = focei` the off-diagonal covariance enters the interaction
 correction as well as the data term: the Almquist 2015 conditional Hessian
 becomes `H̃ = HᵀR⁻¹H + ½·B + Ω⁻¹` with `B_{kl} = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l)`
@@ -307,6 +427,18 @@ over the full dense residual covariance `R` (it reduces to the diagonal FOCEI
 `a'diag(1/R)a + ½c̃'c̃` when the correlation is zero). Under `method = imp` the
 importance weights already use the dense `R`; the Student-t proposal precision is
 also built from `R⁻¹` so the correlated posterior shape is sampled efficiently.
+
+Both loops of a `foce` / `focei` correlated fit run **exact analytic gradients**
+(no finite differences): the within-observation cross term is carried through the
+same dense-`R` derivative kernels the objective uses (`compute_dr_df_matrices`,
+`compute_d2r_df2_matrices`), so the inner EBE η-gradient and the outer θ/Ω/σ
+gradient are noise-free and the `auto` optimizer resolves to a gradient-based
+method. The OFV is unchanged (Eval 1 on the anchor below is still 18.722087). In
+the analytic scope (analytical 1-/2-/3-cpt, single endpoint) the correlation only
+couples the σ-loadings *within* one observation, so `R` stays diagonal and the
+dense assembly reduces to the scalar contractions fed correlation-aware `(R, ∂R/∂f,
+∂²R/∂f²)`; a genuine cross-endpoint off-diagonal `R` (which needs a per-CMT /
+Form-C readout) falls back to per-subject finite differences.
 
 Validation: `examples/correlated_residual_combined.ferx` and
 `nonmem_anchor/correlated_residual_combined.ctl` run the same fixed-parameter

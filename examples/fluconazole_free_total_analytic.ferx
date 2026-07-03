@@ -1,0 +1,49 @@
+# Analytic 1-compartment PK with a full Form C output readout (#650).
+#
+# Total-vs-free concentration readout switched by a per-row data covariate `FREE`:
+#   FREE == 0 rows report the TOTAL concentration, with a saturable
+#             albumin/BMAX binding correction added to the free concentration;
+#   FREE == 1 rows report the FREE (unbound) concentration.
+#
+# This is a parent/metabolite-style multi-DV pattern that was previously
+# expressible only on an ODE model. On the analytic PK path the readout replaces
+# the built-in concentration output; it references the central compartment AMOUNT
+# (`central` = concentration x V), the individual parameters V / BMAX / KD, and the
+# per-observation covariate FREE. FOCEI/FOCE gradients flow through it analytically
+# (BMAX and KD are first-class differentiable parameters).
+
+[parameters]
+  theta TVCL(0.8, 0.01, 20.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVBMAX(30.0, 0.1, 500.0)   # binding capacity (mg/L-equivalent)
+  theta TVKD(8.0, 0.1, 200.0)      # dissociation constant (mg/L)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+
+  sigma PROP ~ 0.02 (sd)
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[scaling]
+  # C = free concentration = central amount / V.
+  # FREE==0 (total assay): free conc + saturable-bound conc BMAX*C/(KD+C).
+  # FREE==1 (free assay):  free conc only.
+  y = if (FREE == 0) central / V + BMAX * (central / V) / (KD + central / V) else central / V
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[simulation]
+  n_subjects = 6
+  dose_amt   = 400.0
+  dose_cmt   = 1
+  times      = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]
+  seed       = 42

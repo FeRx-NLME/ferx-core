@@ -159,30 +159,77 @@ fn extract_eta_indices(expr: &Expression) -> Vec<usize> {
 /// tree, including conditional branches *and* the condition itself, so any
 /// appearance of a kappa name (e.g. `if (KAPPA_CL > 0) ...`) is caught.
 fn expr_references_kappa(expr: &Expression, kappa_names: &[String]) -> Option<String> {
-    fn walk(e: &Expression, kappa: &[String]) -> Option<String> {
+    expr_references_any(expr, kappa_names)
+}
+
+/// First name in `names` referenced anywhere in `expr` (as a bare `Variable` or
+/// `Covariate` leaf), in walk order — or `None`. The generic core behind
+/// [`expr_references_kappa`] and the analytic Form C peripheral-rejection scan
+/// (issue #650), so both agree on what "references a forbidden name" means.
+fn expr_references_any(expr: &Expression, names: &[String]) -> Option<String> {
+    fn walk(e: &Expression, names: &[String]) -> Option<String> {
         match e {
             Expression::Variable(n) | Expression::Covariate(n) => {
-                kappa.iter().find(|k| *k == n).cloned()
+                names.iter().find(|k| *k == n).cloned()
             }
-            Expression::BinOp(l, _, r) => walk(l, kappa).or_else(|| walk(r, kappa)),
-            Expression::UnaryFn(_, a) => walk(a, kappa),
-            Expression::Power(b, e) => walk(b, kappa).or_else(|| walk(e, kappa)),
-            Expression::Conditional(cond, t, els) => walk_cond(cond, kappa)
-                .or_else(|| walk(t, kappa))
-                .or_else(|| walk(els, kappa)),
+            Expression::BinOp(l, _, r) => walk(l, names).or_else(|| walk(r, names)),
+            Expression::UnaryFn(_, a) => walk(a, names),
+            Expression::Power(b, e) => walk(b, names).or_else(|| walk(e, names)),
+            Expression::Conditional(cond, t, els) => walk_cond(cond, names)
+                .or_else(|| walk(t, names))
+                .or_else(|| walk(els, names)),
             _ => None,
         }
     }
-    fn walk_cond(c: &Condition, kappa: &[String]) -> Option<String> {
+    fn walk_cond(c: &Condition, names: &[String]) -> Option<String> {
         match c {
-            Condition::Compare(l, _, r) => walk(l, kappa).or_else(|| walk(r, kappa)),
+            Condition::Compare(l, _, r) => walk(l, names).or_else(|| walk(r, names)),
             Condition::And(l, r) | Condition::Or(l, r) => {
-                walk_cond(l, kappa).or_else(|| walk_cond(r, kappa))
+                walk_cond(l, names).or_else(|| walk_cond(r, names))
             }
-            Condition::Not(c) => walk_cond(c, kappa),
+            Condition::Not(c) => walk_cond(c, names),
         }
     }
-    walk(expr, kappa_names)
+    walk(expr, names)
+}
+
+/// Canonical compartment state names for an **analytic** Form C readout (issue
+/// #650), and the peripheral/absorption names that are *rejected* in that scope.
+///
+/// Returns `(allowed, forbidden)`:
+/// - `allowed` is the `state[]` layout the predictor reconstructs amounts into —
+///   `["central"]` for IV models, `["depot", "central"]` for first-order oral
+///   models (where the depot amount has the closed form `F·D·exp(-ka·t)`).
+/// - `forbidden` lists compartment-ish names that have no closed-form amount with
+///   cross-compartment sensitivity: every peripheral, plus `depot` on models that
+///   are not first-order oral (IV models have none; the transit "depot" is a
+///   lumped Gamma-convolution memory with no seeded-amount closed form — #386).
+///   Referencing any of these fails the parse with a pointer to an ODE model,
+///   mirroring the `[initial_conditions]` scope decision (`analytical_init_cmt`).
+fn analytic_readout_state_names(pk_model: PkModel) -> (Vec<String>, Vec<String>) {
+    let depot_ok = matches!(
+        pk_model,
+        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+    );
+    let allowed: Vec<String> = if depot_ok {
+        vec!["depot".into(), "central".into()]
+    } else {
+        vec!["central".into()]
+    };
+    let mut forbidden: Vec<String> = vec![
+        "peripheral".into(),
+        "periph".into(),
+        "peripheral1".into(),
+        "periph1".into(),
+        "peripheral2".into(),
+        "periph2".into(),
+    ];
+    if !depot_ok {
+        // `depot` is not a valid amount here (no closed form): reject it loudly
+        // rather than let it fall through to a silent covariate lookup.
+        forbidden.push("depot".into());
+    }
+    (allowed, forbidden)
 }
 
 /// All variable names assigned anywhere in the statement tree, in
@@ -928,6 +975,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // the rest of this function — including ODE detection below — sees a normal
     // ODE model with no special-casing.
     apply_ode_template(&mut extracted)?;
+    // Prepare the `one_cpt_transit` ODE-equivalent (#486): the transit closed form assumes
+    // constant parameters over each absorption window, so it cannot serve a subject whose
+    // parameters switch mid-profile (a `TIME`-dependent parameter or time-varying covariates).
+    // For a plain-form transit model we reconstruct its exact ODE `transit()` equivalent
+    // *source* here and stash it on the model; `CompiledModel::effective_for` compiles it
+    // lazily and routes only the subjects that need it to this fallback, so a plain transit
+    // fit whose subjects never need it keeps its fast, exact closed form at zero extra cost.
+    // Non-transit / out-of-scope forms yield `None`. (The equivalent is a normal ODE model
+    // with no `pk one_cpt_transit`, so building it later does not re-enter this branch.)
+    let transit_ode_equivalent: Option<crate::types::TransitOdeEquivalent> =
+        transit_ode_equivalent_source(&extracted).map(crate::types::TransitOdeEquivalent::new);
     // Keep the historical `blocks` binding for unnamed blocks so the rest of
     // this (large) function reads unchanged. Named blocks are pulled from
     // `extracted.named` directly where they're consumed below.
@@ -1122,7 +1180,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             collect_referenced_identifiers(lines, &mut downstream_refs);
         }
     }
-    let indiv_var_names: Vec<String> = unconditionally_assigned_vars(&pre_stmts)
+    let mut indiv_var_names: Vec<String> = unconditionally_assigned_vars(&pre_stmts)
         .into_iter()
         .filter(|n| {
             top_level_names.iter().any(|t| t == n)
@@ -1131,12 +1189,89 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         .collect();
     let indiv_ctx =
         ParseCtx::new(&theta_names, &eta_names, &all_assigned).with_nn_specs(&nn_specs_for_ctx);
-    let indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
+    let mut indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
 
     // Detect ODE vs analytical model
     let is_ode = struct_lines
         .iter()
         .any(|l| l.starts_with("ode(") || l.starts_with("ode "));
+
+    // #486 — desugar a bare θ/η in a Form-C `y = expr` readout into a synthetic
+    // individual parameter (`__ferx_ro_th{i} = THETA(i)` / `…eta{k} = ETA(k)`). The
+    // readout (rewritten in `parse_scaling_block` below) then references that
+    // parameter, so its direct θ/η dependence rides the validated
+    // individual-parameter sensitivity chain rather than dropping the subject to FD.
+    // Must run *before* `ode_param_slots` / `build_ode_spec` / `build_pk_param_fn`
+    // (which all consume `indiv_var_names` / `indiv_stmts`) so the synthetic params
+    // get slots, values, and partials like any individual parameter. Only `y`
+    // readouts are scanned; `obs_scale` θ/η stays with `ScaleDerivProgram`.
+    let mut readout_synth_params: Vec<ReadoutSynthParam> = if is_ode {
+        match blocks.get("scaling") {
+            Some(lines) => collect_readout_theta_eta_synth(lines, &theta_names, &eta_names)?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    // #486 — the `__ferx_ro_` (Form-C readout) and `__ferx_pktime_` (direct `pk(...=TIME)`
+    // mapping) prefixes are reserved for synthetic individual parameters. Reject a
+    // user/generated parameter that carries either rather than silently misclassifying it
+    // as internal (it would vanish from EBE/sdtab output and be rejected as an unknown
+    // output column by `is_synthetic_readout_param`). This runs before either desugaring
+    // appends its own synthetic params, so `all_assigned`/`theta_names`/`eta_names` hold
+    // only user names here.
+    if let Some(bad) = all_assigned
+        .iter()
+        .chain(theta_names.iter())
+        .chain(eta_names.iter())
+        .find(|n| is_synthetic_readout_param(n.as_str()))
+    {
+        let (prefix, reserved_for) = if bad.starts_with(PKTIME_SYNTH_PREFIX) {
+            (
+                PKTIME_SYNTH_PREFIX,
+                "internal `pk(...=TIME)` mapping parameters",
+            )
+        } else {
+            (READOUT_SYNTH_PREFIX, "internal Form-C readout parameters")
+        };
+        return Err(format!(
+            "parameter name `{bad}` uses the reserved `{prefix}` prefix, which ferx \
+             reserves for {reserved_for} (#486). Rename it."
+        ));
+    }
+    // #486 slot headroom: each synthetic readout param consumes a PK slot. A model
+    // that previously parsed via the FD fallback (where a direct θ/η in the readout
+    // took no slot) must not start failing the fixed PK-slot layout now. If
+    // the synthetics would overflow, keep the readout on the FD fallback (its prior
+    // behaviour) instead of erroring, and note it.
+    let mut readout_fd_fallback_note: Option<String> = None;
+    if !readout_synth_params.is_empty() {
+        let free = ode_free_slot_count(&indiv_var_names);
+        if readout_synth_params.len() > free {
+            let short = readout_synth_params.len() - free;
+            readout_fd_fallback_note = Some(format!(
+                "[scaling] y: a direct THETA/ETA reference in the readout needs {short} more PK \
+                 slot(s) than the {}-slot layout has free; the readout falls back to \
+                 finite-difference sensitivities. For analytic sensitivities, free up {short} \
+                 individual-parameter slot(s).",
+                crate::types::MAX_PK_PARAMS,
+            ));
+            readout_synth_params.clear();
+        }
+    }
+    for s in &readout_synth_params {
+        // The synthetic name carries the reserved `__ferx_ro_` prefix (rejected for
+        // user params by the guard above) and is BTreeSet-deduped, so it cannot
+        // collide; append it as a trailing individual parameter (value = θ_i / η_k,
+        // ∂p/∂θ_i = 1 / ∂p/∂η_k = 1).
+        indiv_var_names.push(s.name.clone());
+        let rhs = if s.is_eta {
+            Expression::Eta(s.idx)
+        } else {
+            Expression::Theta(s.idx)
+        };
+        indiv_stmts.push(Statement::Assign(s.name.clone(), rhs));
+    }
 
     // The error rule (#322 Phase 0b): an ODE-only absorption input-rate function
     // (`transit`/`igd`/`weibull`) has no closed form, so it cannot ride on an
@@ -1176,7 +1311,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
     let (
         pk_model,
-        pk_param_map,
+        mut pk_param_map,
         mut ode_spec,
         diffusion_theta_names,
         diffusion_theta_inits,
@@ -1287,6 +1422,36 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         )
     };
 
+    // #486 — desugar a direct `pk(...=TIME)` structural mapping into a synthetic
+    // individual parameter (`__ferx_pktime_<pk_name> = TIME`), mirroring the Form-C
+    // readout θ/η desugaring (#631). A bare `pk(v=TIME)` binding otherwise leaves the
+    // mapped PK slot out of the individual-parameter program's `pk_slots`, so
+    // `prog_covers_required_pk_slots` declines and the whole model routes to FD (#637
+    // follow-up). Rewriting the binding to reference the synthetic parameter makes the
+    // slot ride the validated per-event `TIME` sensitivity chain (value = event time via
+    // `Op::PushTime`, ∂/∂θ = ∂/∂η = 0). Runs before `pk_indices` / `build_pk_param_fn`
+    // consume `indiv_var_names` / `indiv_stmts`.
+    {
+        let mut time_bound: Vec<String> = pk_param_map
+            .iter()
+            .filter(|(_, v)| v.as_str() == "TIME" || v.as_str() == "time")
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !time_bound.is_empty() {
+            // A user parameter carrying the reserved `__ferx_pktime_` prefix is already
+            // rejected by the shared synthetic-prefix guard above (it runs before either
+            // desugaring adds its own synthetic params, so it sees only user names).
+            // Sorted for deterministic slot/var order across runs.
+            time_bound.sort();
+            for pk_name in time_bound {
+                let synth = format!("{PKTIME_SYNTH_PREFIX}{}", pk_name.to_lowercase());
+                indiv_var_names.push(synth.clone());
+                indiv_stmts.push(Statement::Assign(synth.clone(), Expression::Time));
+                pk_param_map.insert(pk_name, synth);
+            }
+        }
+    }
+
     // Build the CovariateNn handles up front (before build_pk_param_fn, which
     // captures them in the pk_param_fn closure). The same vector is also
     // appended to CompiledModel.covariate_nns further down — see the diffusion
@@ -1392,6 +1557,24 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
     }
 
+    // #650: non-structural individual parameters referenced by an analytic Form C
+    // readout (e.g. `BMAX`/`KD` in a saturable-binding total-conc readout) get free
+    // differentiable PK slots so they are written by `pk_param_fn` and differentiated
+    // by the individual-parameter program — instead of aliasing the `CL` slot. Empty
+    // for ODE models and for models without such a readout.
+    let structural_vars: std::collections::HashSet<String> =
+        pk_param_map.values().cloned().collect();
+    let readout_extra_slots = allocate_readout_extra_slots(
+        blocks.get("scaling"),
+        &theta_names,
+        &eta_names,
+        &indiv_var_names,
+        &structural_vars,
+        &analytical_modeled_slots,
+        pk_model,
+        is_ode,
+    )?;
+
     let (pk_param_fn, referenced_covariates, mut indiv_param_partials, indiv_param_program) =
         build_pk_param_fn(
             indiv_stmts.clone(),
@@ -1399,6 +1582,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &indiv_var_names,
             &ode_slot_map,
             &analytical_modeled_slots,
+            &readout_extra_slots,
             thetas.len(),
             n_eta_extended_for_partials,
             #[cfg(feature = "nn")]
@@ -1547,7 +1731,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // validate the magnitude expressions).
     let single_error_args: Option<(ErrorModel, Vec<String>)> = match &parsed_error_model {
         ParsedErrorModel::Single(em, args) => Some((*em, args.clone())),
-        ParsedErrorModel::PerCmt(_) => None,
+        ParsedErrorModel::PerCmt(_) | ParsedErrorModel::Selected { .. } => None,
+    };
+    // Covariates the #658 error selector references become required data columns
+    // (validated as E_MISSING_COVARIATE at fit setup). Capture before
+    // `build_error_spec` consumes the parsed model.
+    let selector_covariates: Vec<String> = match &parsed_error_model {
+        ParsedErrorModel::Selected { covariates, .. } => covariates.clone(),
+        _ => Vec::new(),
     };
     let (error_model, error_spec) = build_error_spec(parsed_error_model, &sigma_names, is_ode)?;
     let residual_correlations = build_residual_correlations(&block_sigmas, &sigma_names)?;
@@ -1710,12 +1901,20 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .iter()
             .map(|(pk_name, var_name)| (var_name.to_uppercase(), pk_name.clone()))
             .collect();
+        // #650: readout-referenced non-structural params get their allocated slot
+        // (so the readout program's `indiv_to_pk` points at the value `pk_param_fn`
+        // writes), instead of aliasing the `CL` slot via the `unwrap_or(0)` below.
+        let extra_slot: HashMap<&str, usize> = readout_extra_slots
+            .iter()
+            .map(|(n, s)| (n.as_str(), *s))
+            .collect();
         indiv_var_names
             .iter()
             .map(|var_name| {
                 var_to_pk
                     .get(&var_name.to_uppercase())
                     .and_then(|pk_name| PkParams::name_to_index(pk_name))
+                    .or_else(|| extra_slot.get(var_name.as_str()).copied())
                     .unwrap_or(0)
             })
             .collect()
@@ -1829,8 +2028,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         residual_error_eta,
         // Populated below from the optional [initial_conditions] block (#521).
         analytical_init: Vec::new(),
+        analytic_readout: None,
         // Populated below from the [error_model] magnitude expressions (#484).
         ruv_magnitude: None,
+        transit_ode_equivalent: None,
     };
 
     // ── Optional blocks ──
@@ -1987,7 +2188,9 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             &pk_indices_for_scaling,
             &state_names_for_scaling,
             is_ode_model,
+            model.pk_model,
             &model.kappa_names,
+            &readout_synth_params,
         )?;
 
         // AD compatibility check (Phase 2.5):
@@ -1995,14 +2198,52 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // (`gradient = ad` no longer needs a Form-C-specific guard here: it is
         // retired and rejected unconditionally by `check_model_options`.)
 
-        // Form C wiring: replace the ODE readout (which was set to the
-        // `NEEDS_FORM_C = usize::MAX` sentinel by `build_ode_spec` if the
-        // user omitted `obs_cmt=`) with the parsed Single/PerCmt readout.
+        // Form C wiring. ODE: replace the ODE readout (set to the
+        // `NEEDS_FORM_C = usize::MAX` sentinel by `build_ode_spec` if the user
+        // omitted `obs_cmt=`) with the parsed Single/PerCmt readout. Analytic
+        // (#650): store the readout on `model.analytic_readout`, where the
+        // closed-form predictor and the analytic sensitivity provider pick it up
+        // (analytical models have `ode_spec == None`).
         if let Some(new_readout) = output_fn {
-            let ode_spec = model.ode_spec.as_mut().expect("guarded by is_ode_model");
-            ode_spec.readout = new_readout;
-            // Form C sensitivity program (issue #367); `None` for per-CMT.
-            ode_spec.readout_program = output_program;
+            if is_ode_model {
+                let ode_spec = model.ode_spec.as_mut().expect("guarded by is_ode_model");
+                ode_spec.readout = new_readout;
+                // Form C sensitivity program (issue #367); `None` for per-CMT.
+                ode_spec.readout_program = output_program;
+            } else {
+                let (state_names, _forbidden) = analytic_readout_state_names(model.pk_model);
+                // Warn (not silent) when the readout can't ride the analytic Dual2
+                // provider — it stays correct via FD of the readout-aware predictor,
+                // but the user loses the analytic-gradient speedup (#650). The
+                // dual-evaluable case (indiv-params/covariates only) is served
+                // analytically by the static superposition path.
+                let has_depot_slot = matches!(
+                    model.pk_model,
+                    PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
+                );
+                let dual_ok = model.analytical_init.is_empty()
+                    && matches!(
+                        (&new_readout, &output_program),
+                        (crate::ode::OdeReadout::Single(_), Some(p))
+                            if p.is_dual_evaluable() && !(has_depot_slot && p.references_state(0))
+                    );
+                if !dual_ok {
+                    model.parse_warnings.push(
+                        "[scaling] y: this analytic Form C readout (a per-CMT readout, a \
+                         direct THETA/ETA reference, a neural-network output, or a model with \
+                         [initial_conditions]) falls back to finite-difference gradients. The \
+                         prediction is exact; only the analytic-gradient speedup is lost. Use \
+                         individual-parameter / covariate references in the readout to keep it \
+                         analytic. See issue #650."
+                            .to_string(),
+                    );
+                }
+                model.analytic_readout = Some(crate::types::AnalyticReadout {
+                    readout: new_readout,
+                    program: output_program,
+                    state_names,
+                });
+            }
         }
 
         for cov in scaling_covariates {
@@ -2012,6 +2253,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         }
         model.referenced_covariates.sort();
         model.scaling = scaling;
+    }
+
+    // Covariate-selected [error_model] (issue #658): the selector's covariates
+    // are required data columns, so register them like scaling covariates.
+    if !selector_covariates.is_empty() {
+        for cov in &selector_covariates {
+            if !model.referenced_covariates.contains(cov) {
+                model.referenced_covariates.push(cov.clone());
+            }
+        }
+        model.referenced_covariates.sort();
     }
 
     // ── [initial_conditions] block (issue #521) ──
@@ -2070,6 +2322,22 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     "[scaling] is not yet supported on SDE / [diffusion] models — the EKF \
                      variance and `r_obs` paths run in the unscaled observation space and \
                      would need separate threading of the scale factor (Phase 1.5)."
+                        .into(),
+                );
+            }
+            // Covariate-selected error models (#658) are multi-endpoint: the EKF
+            // `p_obs` measurement-noise closure (`stats/likelihood.rs`) binds a
+            // single representative `error_model` (branch 0) and cannot switch per
+            // row, so a `Selected` spec would silently score every observation with
+            // branch 0's sigma. The `debug_assert!` there is a release no-op — reject
+            // at parse instead. (Per-CMT/Form-C is already rejected via the ObsCmt
+            // readout guard above; this closes the remaining multi-endpoint case.)
+            if matches!(model.error_spec, ErrorSpec::Selected { .. }) {
+                return Err(
+                    "covariate-selected `[error_model]` (`if (COV …) { … } else { … }`) is not \
+                     supported on SDE / [diffusion] models — the EKF measurement-noise path uses \
+                     a single error model and cannot switch per observation. Use a single-endpoint \
+                     error model, or drop the [diffusion] block."
                         .into(),
                 );
             }
@@ -2210,17 +2478,23 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // Compile per-sigma magnitude multipliers now that covariate names are
     // known (they validate the magnitude expressions). `None` for the common
     // case of bare sigmas — the legacy variance path is then taken verbatim.
-    {
+    let ruv_magnitude_used_thetas: std::collections::HashSet<usize> = {
         let ruv_theta_names = model.theta_names.clone();
         let ruv_eta_names = model.eta_names.clone();
-        model.ruv_magnitude = build_ruv_magnitude(
+        let (rm, used_thetas) = build_ruv_magnitude(
             &single_error_args,
             &ruv_sigma_names,
             &ruv_theta_names,
             &ruv_eta_names,
             &covariate_decls,
         )?;
-    }
+        model.ruv_magnitude = rm;
+        used_thetas
+    };
+
+    // Attach the `one_cpt_transit` ODE-equivalent sub-model built above (`None` for
+    // non-transit / out-of-scope forms). The runtime dispatch reads it off the model.
+    model.transit_ode_equivalent = transit_ode_equivalent;
 
     // ── [event_model] / [event_model NAME] blocks ──────────────────────────────
     // Unnamed: `[event_model]` — one TTE endpoint.
@@ -2283,7 +2557,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
 
     // Warn about declared-but-unused parameters. Runs here (after [event_model]
     // parsing) so that parameters used only in [event_model] are not falsely
-    // reported as unused in mixed PK+TTE models.
+    // reported as unused in mixed PK+TTE models. A theta referenced only from a
+    // custom RUV magnitude expression (#484/#576, e.g. `RUV_LATE`) is unioned in
+    // too, the same way — it is meaningfully estimated (the analytic θ/σ gradient
+    // now carries its direct-θ channel), just never seen by `indiv_stmts`.
+    event_model_used_thetas.extend(ruv_magnitude_used_thetas);
+    // #486 — surface the FD fallback when a direct-θ/η readout could not be
+    // desugared because the PK-slot layout was full (see the headroom check above).
+    if let Some(note) = readout_fd_fallback_note.take() {
+        model.parse_warnings.push(note);
+    }
+
     model.parse_warnings.extend(check_unused_parameters(
         &thetas,
         &eta_names_bsv,
@@ -2375,6 +2659,12 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .iter()
             .enumerate()
             .filter(|(_, name)| token_counts.get(name.as_str()).copied().unwrap_or(0) <= 1)
+            // Individual parameters the parser synthesized for a direct-θ/η Form-C
+            // readout (`__ferx_ro_*`, #486) are referenced by the readout via the
+            // post-census rewrite (`rewrite_readout_synth`), not in the raw block
+            // text the census tokenizes — so they always look "dead" here. They are
+            // load-bearing (the readout reads them), so exempt them.
+            .filter(|(_, name)| !is_synthetic_readout_param(name))
             // Exempt parameters the *engine* applies to a dose without a textual
             // reference, so their absence from the RHS / `pk(...)` mapping does not
             // make them dead:
@@ -3405,6 +3695,13 @@ fn parse_event_model_block(
             // unintended.  Use a per-CMT error model (`DV[CMT=N] ~ ...`) to get unambiguous
             // parse-time validation.
         }
+        ErrorSpec::Selected { .. } => {
+            // A covariate-selected error model (#658) keys its endpoints by the per-row
+            // selector branch, not by CMT, so — like `Single` — it carries no CMT
+            // information to collide against the TTE CMT at parse time.  The data reader's
+            // two-path routing still keeps Gaussian and TTE observations from
+            // double-counting; use a per-CMT error model for parse-time collision checks.
+        }
     }
 
     // ODE-accumulated hazard path (joint PK-TTE, Slice 2.1): `hazard = <expr>` was
@@ -4405,6 +4702,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "maxiter" => opts.outer_maxiter = parse_usize("maxiter")?,
         "inner_maxiter" => opts.inner_maxiter = parse_usize("inner_maxiter")?,
         "inner_tol" => opts.inner_tol = parse_f64("inner_tol")?,
+        "cov_inner_tol" => opts.cov_inner_tol = Some(parse_f64("cov_inner_tol")?),
         "outer_xtol" => {
             let v = parse_f64("outer_xtol")?;
             if v <= 0.0 || !v.is_finite() {
@@ -4483,9 +4781,6 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 ));
             }
             opts.fd_hessian_step = v;
-        }
-        "covariance_ofv_hessian" => {
-            opts.covariance_ofv_hessian = parse_bool("covariance_ofv_hessian")?
         }
         "verbose" => opts.verbose = parse_bool("verbose")?,
         "optimizer" => {
@@ -5249,6 +5544,8 @@ pub(crate) fn build_y_output_fn(
     pk_indices: &[usize],
     state_names: &[String],
     kappa_names: &[String],
+    readout_synth: &[ReadoutSynthParam],
+    forbidden_state_names: &[String],
 ) -> Result<(crate::ode::OdeOutputFn, OdeOutputProgram, Vec<String>), String> {
     // Form C: expression may reference state names, individual params,
     // thetas, etas, and covariates. ParseCtx::new + theta/eta in scope.
@@ -5259,7 +5556,29 @@ pub(crate) fn build_y_output_fn(
         }
     }
     let ctx = ParseCtx::new(theta_names, eta_names, &defined);
-    let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("{context}: {e}"))?;
+    let mut expr = parse_scalar_expression(value, ctx).map_err(|e| format!("{context}: {e}"))?;
+
+    // Analytic Form C (#650): reject a readout that references a peripheral (or a
+    // depot/transit amount with no closed form) — the analytical solutions don't
+    // expose those amounts with cross-compartment sensitivity. Empty for ODE
+    // callers (any state name is integrated), so this is a no-op there. Point the
+    // user at an ODE model, mirroring `[initial_conditions]`'s scope.
+    if let Some(name) = expr_references_any(&expr, forbidden_state_names) {
+        return Err(format!(
+            "{context}: compartment `{name}` is not available in an analytic Form C \
+             readout — the closed forms don't expose a peripheral (or transit/IV depot) \
+             amount with cross-compartment sensitivity. Reference the central compartment \
+             amount (`central`, plus the oral `depot` for first-order oral models), or use \
+             an ODE model with `ode(states=[...])` in [odes]. See issue #650."
+        ));
+    }
+    // #486: rewrite the bare θ/η references the parser desugared into synthetic
+    // individual parameters (`__ferx_ro_*`, already appended to `indiv_var_names`)
+    // back to `Variable(synthetic_name)`. The readout then compiles to `Op::PushVar`
+    // and its θ/η dependence rides the individual-parameter sensitivity chain — so the
+    // analytic provider serves it instead of dropping the subject to FD. Any θ/η left
+    // un-desugared (none, in practice) keeps `dual_evaluable` false → FD fallback.
+    rewrite_readout_synth(&mut expr, readout_synth);
 
     // Reject KAPPA_* (IOV) references in a Form C ODE output expression: the
     // readout is evaluated once per observation with a single eta, so under IOV
@@ -5332,7 +5651,6 @@ pub(crate) fn build_y_output_fn(
     // Rewrite Variable → VariableIdx and Covariate → CovariateIdx in place,
     // then compile to bytecode so the per-observation hot path is a tight
     // op-tag loop rather than a recursive `Box<Expression>` walk.
-    let mut expr = expr;
     resolve_expr_indices(&mut expr, &var_idx, &cov_idx);
     let bc = compile_bytecode(&expr);
 
@@ -5340,8 +5658,16 @@ pub(crate) fn build_y_output_fn(
     // path (issue #367): same bytecode + layout, evaluated over `Dual2<N>`. It is
     // dual-evaluable when the expression references only states / individual
     // parameters / covariates / constants — covariates thread in as constants
-    // from the per-observation snapshot (#540), so only a direct θ/η/NN reference
-    // (which would need extra chain terms) disqualifies the analytic readout.
+    // from the per-observation snapshot (#540), and a direct θ/η reference is
+    // *normally* desugared above into a synthetic individual parameter (#486).
+    //
+    // The `PushTheta`/`PushEta` arms below are still load-bearing and must not be
+    // removed: when the synthetic readout params overflow the fixed PK-slot layout,
+    // the parser clears `readout_synth_params` and leaves the bare θ/η ops in the
+    // bytecode (the documented FD fallback). Those arms are what keep `dual_evaluable`
+    // `false` on that path; dropping them would wrongly route a slot-overflowed
+    // direct-θ/η readout onto the analytic walk. `PushNnOutput` is the other
+    // disqualifier (an NN output is never desugared).
     let output_dual_evaluable = !bc.ops.iter().any(|op| {
         matches!(
             op,
@@ -5456,7 +5782,9 @@ fn parse_scaling_block(
     pk_indices: &[usize],
     state_names: &[String],
     is_ode: bool,
+    pk_model: PkModel,
     kappa_names: &[String],
+    readout_synth: &[ReadoutSynthParam],
 ) -> Result<
     (
         ScalingSpec,
@@ -5485,34 +5813,10 @@ fn parse_scaling_block(
         if trimmed.is_empty() {
             continue;
         }
-        // Split on the first `=` OUTSIDE any `[...]` bracket. A naive
-        // `splitn(2, '=')` would split inside `obs_scale[CMT=1]` and treat
-        // `obs_scale[CMT` as the key. Walk the string tracking bracket
-        // depth and split at the first depth-0 `=`.
-        let mut depth: i32 = 0;
-        let mut split_at: Option<usize> = None;
-        for (i, ch) in trimmed.char_indices() {
-            match ch {
-                '[' => depth += 1,
-                ']' => depth -= 1,
-                '=' if depth == 0 => {
-                    split_at = Some(i);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let split_at = match split_at {
-            Some(p) => p,
-            None => {
-                return Err(format!(
-                    "[scaling]: expected `key = value`, got: `{}`",
-                    trimmed
-                ));
-            }
-        };
-        let key = trimmed[..split_at].trim();
-        let value = trimmed[split_at + 1..].trim();
+        // Split on the first `=` OUTSIDE any `[...]` bracket (a naive
+        // `splitn(2, '=')` would split inside `obs_scale[CMT=1]`). Shared with the
+        // #486 readout θ/η pre-scan (`collect_readout_theta_eta_synth`).
+        let (key, value) = split_scaling_entry(trimmed)?;
         let (base, cmt_opt) = parse_scaling_key(key)?;
 
         match base {
@@ -5553,11 +5857,16 @@ fn parse_scaling_block(
                 }
             }
             "y" => {
-                if !is_ode {
-                    return Err("[scaling]: `y = <expr>` (Form C) requires an ODE model — \
-                         use `obs_scale = <expr>` for analytical PK"
-                        .into());
-                }
+                // Form C readout. On ODE models the state names come from
+                // `ode(states=[...])` and any state is integrable (no forbidden
+                // set). On analytical models (#650) we synthesize the canonical
+                // compartment names the closed forms expose (`central`, plus the
+                // oral `depot`) and forbid peripheral / no-closed-form amounts.
+                let (y_state_names, forbidden): (Vec<String>, Vec<String>) = if is_ode {
+                    (state_names.to_vec(), Vec::new())
+                } else {
+                    analytic_readout_state_names(pk_model)
+                };
                 let (out_fn, out_program, cov_names) = build_y_output_fn(
                     value,
                     "[scaling] y",
@@ -5565,8 +5874,10 @@ fn parse_scaling_block(
                     eta_names,
                     indiv_var_names,
                     pk_indices,
-                    state_names,
+                    &y_state_names,
                     kappa_names,
+                    readout_synth,
+                    &forbidden,
                 )?;
                 for cov in cov_names {
                     if !y_covariates.contains(&cov) {
@@ -5631,6 +5942,21 @@ fn parse_scaling_block(
     } else {
         None
     };
+
+    // Analytic Form C replaces the built-in concentration readout; a divisive
+    // `obs_scale` alongside it would double-apply on the same output. Reject the
+    // combination on analytical models so intent is explicit (#650). ODE keeps
+    // its historical behaviour.
+    if !is_ode && readout.is_some() && !matches!(scaling, ScalingSpec::None) {
+        return Err(
+            "[scaling]: cannot combine a Form C `y = <expr>` readout with a \
+             divisive `obs_scale` on an analytical model — the readout already replaces \
+             the built-in concentration output. Fold any unit conversion into `y` \
+             (e.g. `y = central / V / 1000`)."
+                .into(),
+        );
+    }
+
     y_covariates.sort();
     Ok((scaling, readout, readout_program, y_covariates))
 }
@@ -5838,6 +6164,96 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
         .or_insert_with(|| vec![format!("obs_scale = {}", generated.obs_scale)]);
 
     Ok(())
+}
+
+/// For a closed-form `pk one_cpt_transit(cl, v, n, mtt)` model, build the full `.ferx`
+/// source of its exact ODE `transit()` equivalent — otherwise `None`.
+///
+/// The transit closed form assumes constant parameters over each absorption window, so it
+/// cannot serve a subject whose parameters switch mid-profile (a `TIME`-dependent structural
+/// parameter, or time-varying covariates). The ODE twin
+/// `d/dt(central) = transit(n, mtt) − (CL/V)·central` with `obs_scale = V` is the exact
+/// numerical equivalent (validated in `tests/transit_analytic_equivalence.rs`) and carries
+/// those per-event through the event-driven walk (analytically for `TIME` since #664). The
+/// parser compiles this source into a sub-model stored on
+/// [`CompiledModel::transit_ode_equivalent`]; the runtime dispatch
+/// ([`CompiledModel::effective_for`]) uses it only for the subjects that need
+/// it, so a plain transit fit keeps its fast, exact closed form (#486).
+///
+/// The equivalent shares the model's `[parameters]`/`[individual_parameters]`/… blocks
+/// verbatim and swaps only the disposition, so its θ/η layout matches the closed-form model
+/// exactly (the dispatch can hand it the same parameter vector). Scoped to the plain
+/// `cl/v/n/mtt` form with no `lagtime=`/`f=` mapping and no user `[odes]`/`[scaling]` block;
+/// anything else returns `None` (and stays closed-form, still rejected up front for the
+/// features it cannot serve) — extending it is a follow-up.
+fn transit_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> {
+    let transit_re = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
+    let args_str = extracted
+        .unnamed
+        .get("structural_model")?
+        .iter()
+        .find_map(|l| transit_re.captures(l.trim()))?
+        .get(1)?
+        .as_str()
+        .to_string();
+    // A user-written [odes]/[scaling] block is outside the plain-form scope. An
+    // [initial_conditions] block is too: the equivalent's single `central` state cannot carry
+    // a transit `depot` seed, and transit-init has its own parse-time validation on the
+    // primary model — building the equivalent would pre-empt that with a confusing error.
+    if extracted.unnamed.contains_key("odes")
+        || extracted.unnamed.contains_key("scaling")
+        || extracted.unnamed.contains_key("initial_conditions")
+    {
+        return None;
+    }
+    let roles = parse_role_pairs(&args_str, "pk one_cpt_transit").ok()?;
+    let allowed = ["cl", "v", "n", "mtt"];
+    if roles.keys().any(|k| !allowed.contains(&k.as_str())) {
+        return None; // a lagtime=/f= (or other) mapping — outside the scope.
+    }
+    let (cl, v, n, mtt) = (
+        roles.get("cl")?,
+        roles.get("v")?,
+        roles.get("n")?,
+        roles.get("mtt")?,
+    );
+    // Re-emit every block verbatim except the disposition (deterministic order), then append
+    // the ODE twin. Parsing this source yields a normal ODE model — it contains no
+    // `pk one_cpt_transit`, so it does not recurse into this desugar.
+    let mut src = String::new();
+    let mut names: Vec<&String> = extracted.unnamed.keys().collect();
+    names.sort();
+    for name in names {
+        if matches!(name.as_str(), "structural_model" | "odes" | "scaling") {
+            continue;
+        }
+        src.push_str(&format!("[{name}]\n"));
+        for line in &extracted.unnamed[name] {
+            src.push_str(line);
+            src.push('\n');
+        }
+        src.push('\n');
+    }
+    let mut named: Vec<(&String, &String, &Vec<String>)> = extracted
+        .named
+        .iter()
+        .flat_map(|(block, insts)| insts.iter().map(move |(inst, lines)| (block, inst, lines)))
+        .collect();
+    named.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    for (block, inst, lines) in named {
+        src.push_str(&format!("[{block} {inst}]\n"));
+        for line in lines {
+            src.push_str(line);
+            src.push('\n');
+        }
+        src.push('\n');
+    }
+    src.push_str("[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n");
+    src.push_str(&format!(
+        "[odes]\n  d/dt(central) = transit(n={n}, mtt={mtt}) - ({cl}/{v}) * central\n\n"
+    ));
+    src.push_str(&format!("[scaling]\n  obs_scale = {v}\n\n"));
+    Some(src)
 }
 
 // ── [structural_model] ODE variant parser ───────────────────────────────────
@@ -6197,6 +6613,27 @@ fn ode_param_slots(names: &[String]) -> Result<Vec<usize>, String> {
     }
 
     Ok(slots)
+}
+
+/// Number of additional individual parameters that can still be assigned a
+/// non-reserved PK slot, given the already-declared `names`. Returns 0 if `names`
+/// itself does not fit (the real error then surfaces in `ode_param_slots`).
+/// Reuses `ode_param_slots` so the headroom can never drift from the real
+/// assignment. Used by the #486 readout desugaring to fall back to FD rather than
+/// fail a model that previously parsed, when synthetic readout params would
+/// overflow the layout.
+fn ode_free_slot_count(names: &[String]) -> usize {
+    let slots = match ode_param_slots(names) {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut taken = [false; MAX_PK_PARAMS];
+    for s in slots {
+        taken[s] = true;
+    }
+    (0..MAX_PK_PARAMS)
+        .filter(|s| !taken[*s] && !RESERVED_PK_SLOTS.contains(s))
+        .count()
 }
 
 /// Find `name(` at a word boundary in `s` (ASCII), returning the index of `name`.
@@ -8079,13 +8516,25 @@ fn validate_residual_correlations(
         return Ok(());
     }
 
+    // Covariate-selected residual error (#658) with block_sigma correlated
+    // residuals (#669): the pairing rule is the same as `PerCmt`. Each
+    // observation resolves to an endpoint per-row via the covariate selector
+    // (`ErrorSpec::obs_keys`), loads that endpoint's sigmas, and rows sharing a
+    // subject time+occasion receive the `block_sigma` cross covariance from
+    // `cross_observation_covariance`. Two paired rows resolving to *different*
+    // branches get the honest cross-branch covariance `rho·σ_i·σ_j` built from
+    // each row's own loadings — exactly the total/unbound cross-endpoint case
+    // the `PerCmt` path already handles. The whole residual runtime is generic
+    // over the endpoint key, so `Selected` needs no special casing here; the
+    // reference-validity check below already dispatches through the shared
+    // `PerCmt | Selected { endpoints: map, .. }` arm.
     let endpoint_loadings: Vec<Vec<usize>> = match error_spec {
         ErrorSpec::Single(_) => vec![error_spec
             .sigma_loadings(0, 1.0, sigma_names.len())
             .into_iter()
             .map(|(idx, _)| idx)
             .collect()],
-        ErrorSpec::PerCmt(map) => map
+        ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => map
             .keys()
             .map(|&cmt| {
                 error_spec
@@ -8238,6 +8687,18 @@ enum ParsedErrorModel {
     /// Per-CMT error models (every line prefixed `CMT=N:`). One entry per line,
     /// in source order; duplicates are rejected here.
     PerCmt(Vec<(usize, ErrorModel, Vec<String>)>),
+    /// Covariate-selected error models (issue #658): an `if (cov …) { DV ~ … }
+    /// [else if …]* else { DV ~ … }` block. `branches` holds the conditional
+    /// endpoints in source order; `default` is the mandatory final `else`
+    /// endpoint. `covariates` lists the covariate names the conditions
+    /// reference (added to `referenced_covariates` so they become required data
+    /// columns). Sigma references are still names here; `build_error_spec`
+    /// resolves them to flat-sigma indices.
+    Selected {
+        branches: Vec<(Condition, ErrorModel, Vec<String>)>,
+        default: (ErrorModel, Vec<String>),
+        covariates: Vec<String>,
+    },
 }
 
 /// Log-transform-both-sides (LTBS) flags extracted from the `[error_model]`
@@ -8277,9 +8738,253 @@ fn split_top_level_args(s: &str) -> Vec<String> {
     out
 }
 
+/// Does `s[i..]` begin with the keyword `kw`, terminated by a non-identifier
+/// character (so `if` matches but `iffy` does not)?
+fn starts_with_keyword(s: &str, i: usize, kw: &str) -> bool {
+    let rest = &s[i..];
+    if !rest.starts_with(kw) {
+        return false;
+    }
+    match rest[kw.len()..].chars().next() {
+        Some(c) => !(c.is_alphanumeric() || c == '_'),
+        None => true,
+    }
+}
+
+/// Advance past ASCII whitespace (spaces, tabs, newlines) from byte offset `i`.
+fn skip_ascii_ws(s: &str, i: usize) -> usize {
+    let bytes = s.as_bytes();
+    let mut i = i;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Given `s` where byte `open` is an opening delimiter `open_ch`, return the
+/// byte index of the matching closing delimiter `close_ch`, honouring nesting.
+fn match_delim(s: &str, open: usize, open_ch: u8, close_ch: u8) -> Result<usize, String> {
+    let bytes = s.as_bytes();
+    debug_assert_eq!(bytes[open], open_ch);
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == open_ch {
+            depth += 1;
+        } else if b == close_ch {
+            depth -= 1;
+            if depth == 0 {
+                return Ok(i);
+            }
+        }
+        i += 1;
+    }
+    Err(format!(
+        "[error_model] unbalanced `{}` … `{}` in if/else block",
+        open_ch as char, close_ch as char
+    ))
+}
+
+/// Parse one `DV ~ TYPE(sigmas)` statement that forms an if/else branch body
+/// into `(ErrorModel, sigma_names)`. Rejects LTBS forms (`log(DV) ~ …` /
+/// `log_additive`) and multi-statement bodies — a covariate-selected branch is
+/// a single ordinary error model (LTBS + covariate selection is out of scope).
+fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), String> {
+    let body = body.trim();
+    let log_lhs_re = Regex::new(r"^\s*log\s*\(\s*\w+\s*\)\s*~").unwrap();
+    if log_lhs_re.is_match(body) {
+        return Err(
+            "[error_model] log-transform-both-sides (`log(DV) ~ …`) is not supported inside a \
+             covariate-selected if/else block"
+                .to_string(),
+        );
+    }
+    let re = Regex::new(r"^(\w+)\s*~\s*(\w+)\s*\((.+)\)$").unwrap();
+    let caps = re.captures(body).ok_or_else(|| {
+        format!(
+            "[error_model] expected a single `DV ~ TYPE(...)` statement inside an if/else branch, \
+             got `{}`",
+            body
+        )
+    })?;
+    let error_type = caps[2].to_lowercase();
+    if error_type == "log_additive" {
+        return Err(
+            "[error_model] `log_additive` (log-transform-both-sides) is not supported inside a \
+             covariate-selected if/else block"
+                .to_string(),
+        );
+    }
+    let error_model = match error_type.as_str() {
+        "additive" => ErrorModel::Additive,
+        "proportional" => ErrorModel::Proportional,
+        "combined" => ErrorModel::Combined,
+        other => return Err(format!("Unknown error model: {}", other)),
+    };
+    let sigma_names = split_top_level_args(&caps[3]);
+    if sigma_names.len() != error_model.n_sigma() {
+        return Err(format!(
+            "[error_model] {} model expects {} sigma(s) but {} given: {}",
+            error_type,
+            error_model.n_sigma(),
+            sigma_names.len(),
+            body
+        ));
+    }
+    Ok((error_model, sigma_names))
+}
+
+/// Detect and parse a covariate-selected `[error_model]` (issue #658):
+///
+/// ```text
+/// if (FREE == 0) { DV ~ proportional(PROP_TOTAL) }
+/// else           { DV ~ proportional(PROP_UNBOUND) }
+/// ```
+///
+/// Returns `Ok(None)` when the block is not an `if/else` form (the caller then
+/// falls back to the line-based single / per-CMT parsing). The condition uses
+/// the shared `parse_condition`; each branch body reuses the ordinary
+/// `DV ~ TYPE(...)` grammar via [`parse_error_endpoint_body`]. A final `else`
+/// is required so every observation resolves to a declared endpoint.
+#[allow(clippy::type_complexity)]
+fn parse_selected_error_model(
+    lines: &[String],
+) -> Result<
+    Option<(
+        Vec<(Condition, ErrorModel, Vec<String>)>,
+        (ErrorModel, Vec<String>),
+        Vec<String>,
+    )>,
+    String,
+> {
+    // Join comment-stripped lines; the if/else spans multiple physical lines.
+    let joined: String = lines
+        .iter()
+        .map(|l| l.split('#').next().unwrap_or("").trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let s = joined.trim().to_string();
+    let start = skip_ascii_ws(&s, 0);
+    if !starts_with_keyword(&s, start, "if") {
+        return Ok(None);
+    }
+
+    // Covariate-only condition context: every bare identifier is a covariate.
+    let no_names: [String; 0] = [];
+    let no_nn: [(String, Vec<String>); 0] = [];
+    let cond_ctx = ParseCtx {
+        theta_names: &no_names,
+        eta_names: &no_names,
+        defined_vars: &no_names,
+        fallback_covariate: true,
+        nn_specs: &no_nn,
+        ode_state_names: &no_names,
+    };
+
+    let bytes = s.as_bytes();
+    let mut i = start;
+    let mut branches: Vec<(Condition, ErrorModel, Vec<String>)> = Vec::new();
+    let default: (ErrorModel, Vec<String>);
+
+    loop {
+        // `if`
+        i = skip_ascii_ws(&s, i);
+        if !starts_with_keyword(&s, i, "if") {
+            return Err("[error_model] expected `if` in covariate-selected block".to_string());
+        }
+        i += 2;
+        // `( cond )`
+        i = skip_ascii_ws(&s, i);
+        if i >= bytes.len() || bytes[i] != b'(' {
+            return Err("[error_model] expected `(` after `if`".to_string());
+        }
+        let close = match_delim(&s, i, b'(', b')')?;
+        let cond_str = &s[i + 1..close];
+        let toks = tokenize(cond_str)?;
+        let (cond, cp) = parse_condition(&toks, 0, cond_ctx)?;
+        if skip_newlines(&toks, cp) != toks.len() {
+            return Err(format!(
+                "[error_model] trailing tokens in if-condition `{}`",
+                cond_str
+            ));
+        }
+        i = close + 1;
+        // `{ body }`
+        i = skip_ascii_ws(&s, i);
+        if i >= bytes.len() || bytes[i] != b'{' {
+            return Err("[error_model] expected `{` after if-condition".to_string());
+        }
+        let bclose = match_delim(&s, i, b'{', b'}')?;
+        let (em, names) = parse_error_endpoint_body(&s[i + 1..bclose])?;
+        branches.push((cond, em, names));
+        i = bclose + 1;
+
+        // `else` (required — either `else if` chains or `else { … }` terminates)
+        i = skip_ascii_ws(&s, i);
+        if !starts_with_keyword(&s, i, "else") {
+            return Err(
+                "[error_model] a covariate-selected if/else must end with a final `else { DV ~ … }` \
+                 so every observation maps to an error model"
+                    .to_string(),
+            );
+        }
+        i += 4;
+        i = skip_ascii_ws(&s, i);
+        if starts_with_keyword(&s, i, "if") {
+            continue; // else-if: parse another branch
+        }
+        if i >= bytes.len() || bytes[i] != b'{' {
+            return Err(
+                "[error_model] `else` must be followed by `if (...) {...}` or `{...}`".to_string(),
+            );
+        }
+        let eclose = match_delim(&s, i, b'{', b'}')?;
+        default = parse_error_endpoint_body(&s[i + 1..eclose])?;
+        i = eclose + 1;
+        break;
+    }
+
+    let tail = skip_ascii_ws(&s, i);
+    if tail != s.len() {
+        return Err(format!(
+            "[error_model] unexpected content after covariate-selected if/else: `{}`",
+            s[tail..].trim()
+        ));
+    }
+
+    // Covariate names referenced by any branch condition become required data
+    // columns (validated as E_MISSING_COVARIATE at fit setup).
+    let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (cond, _, _) in &branches {
+        visit_condition_nodes(cond, &mut |e| {
+            if let Expression::Covariate(name) = e {
+                cov_set.insert(name.clone());
+            }
+        });
+    }
+    let mut covariates: Vec<String> = cov_set.into_iter().collect();
+    covariates.sort();
+
+    Ok(Some((branches, default, covariates)))
+}
+
 fn parse_error_model(
     lines: &[String],
 ) -> Result<(ParsedErrorModel, LtbsFlags, Option<String>), String> {
+    // Covariate-selected if/else form (issue #658) — detected and parsed first;
+    // falls through to the line-based single / per-CMT grammar when absent.
+    if let Some((branches, default, covariates)) = parse_selected_error_model(lines)? {
+        return Ok((
+            ParsedErrorModel::Selected {
+                branches,
+                default,
+                covariates,
+            },
+            LtbsFlags::default(),
+            None,
+        ));
+    }
     // Single-endpoint:
     //   DV ~ proportional(SIGMA_NAME)
     //   DV ~ additive(SIGMA_NAME)
@@ -8513,6 +9218,61 @@ fn build_error_spec(
                 ErrorSpec::PerCmt(map),
             ))
         }
+        ParsedErrorModel::Selected {
+            branches, default, ..
+        } => {
+            // Resolve one endpoint's sigma names to flat-sigma indices.
+            let resolve = |em: ErrorModel, names: &[String]| -> Result<EndpointError, String> {
+                let mut sigma_idx = Vec::with_capacity(names.len());
+                for nm in names {
+                    let idx = sigma_names.iter().position(|s| s == nm).ok_or_else(|| {
+                        format!(
+                            "[error_model] references unknown sigma '{}' \
+                             (declare it in [parameters])",
+                            nm
+                        )
+                    })?;
+                    sigma_idx.push(idx);
+                }
+                Ok(EndpointError {
+                    error_model: em,
+                    sigma_idx,
+                })
+            };
+            // Assign 0-based keys in source order; the `else` endpoint is the
+            // final key. The selector evaluates conditions in order and returns
+            // the first match, falling back to the `else` key.
+            let representative = branches.first().map(|(_, em, _)| *em).unwrap_or(default.0);
+            let mut endpoints: HashMap<usize, EndpointError> = HashMap::new();
+            let mut conds: Vec<(Condition, usize)> = Vec::with_capacity(branches.len());
+            let mut labels: Vec<String> = Vec::with_capacity(branches.len() + 1);
+            for (k, (cond, em, names)) in branches.into_iter().enumerate() {
+                endpoints.insert(k, resolve(em, &names)?);
+                labels.push(format!("branch{k}"));
+                conds.push((cond, k));
+            }
+            let default_key = endpoints.len();
+            endpoints.insert(default_key, resolve(default.0, &default.1)?);
+            labels.push("else".to_string());
+            let selector = crate::types::ErrorSelector {
+                eval: Box::new(move |cov: &HashMap<String, f64>| {
+                    for (cond, key) in &conds {
+                        if eval_condition(cond, &[], &[], cov, &HashMap::new(), &[]) {
+                            return *key;
+                        }
+                    }
+                    default_key
+                }),
+                branch_labels: labels,
+            };
+            Ok((
+                representative,
+                ErrorSpec::Selected {
+                    selector,
+                    endpoints,
+                },
+            ))
+        }
     }
 }
 
@@ -8603,38 +9363,103 @@ fn validate_ruv_expr(
     }
 }
 
+/// Lower a parsed magnitude expression to a `Dual1`-differentiable
+/// [`RuvMagDerivProgram`] over `θ` only (#576/#486): the magnitude is validated
+/// ([`validate_ruv_expr`]) to never reference `η`, an individual parameter, or an
+/// NN output, so — unlike [`compile_scale_deriv_program`] — there is no `η` axis
+/// and no `var_to_pk_slot` to feed in. The scaled sigma resolves to var slot `0`,
+/// pinned to the constant `1.0` at eval time (mirroring the runtime closure's
+/// `vars.insert(sigma_name, 1.0)`); covariates are sorted cov slots; `TIME` reads
+/// the event-time built-in. The input `expr` is cloned, so the caller keeps its
+/// AST for the runtime closure.
+fn compile_ruv_mag_deriv_program(
+    expr: &Expression,
+    sigma_name: &str,
+    n_theta: usize,
+) -> RuvMagDerivProgram {
+    let mut e = expr.clone();
+    // Slot 0 = the pinned scaled sigma (bound to 1.0 at eval time). Slot 1 =
+    // `MACHEPS`, which `validate_ruv_expr` explicitly permits inside a magnitude
+    // expression alongside the scaled sigma. `eval_expression` (the runtime
+    // f64 closure) special-cases the `MACHEPS` name string at eval time, but
+    // bytecode compilation resolves every `Variable` name to a fixed slot up
+    // front — so without a reserved slot here, `resolve_expr_indices` would map
+    // `MACHEPS` to `VariableIdx(usize::MAX)`, which silently evaluates to `0.0`
+    // instead of `f64::EPSILON` (mirrors the ODE var builder's `macheps_slot`).
+    let var_idx: HashMap<String, usize> = [
+        (sigma_name.to_string(), 0),
+        ("MACHEPS".to_string(), 1),
+        ("macheps".to_string(), 1),
+    ]
+    .into_iter()
+    .collect();
+    let mut cov_set = std::collections::HashSet::new();
+    collect_covariates(&e, &mut cov_set);
+    let mut cov_names: Vec<String> = cov_set.into_iter().collect();
+    cov_names.sort();
+    let cov_idx: HashMap<String, usize> = cov_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), i))
+        .collect();
+    resolve_expr_indices(&mut e, &var_idx, &cov_idx);
+    RuvMagDerivProgram {
+        bc: compile_bytecode(&e),
+        n_theta,
+        cov_names,
+    }
+}
+
 /// Build the custom residual-error magnitude (#484) from the single-endpoint
-/// `[error_model]` arguments, once covariate names are known. Returns `None`
+/// `[error_model]` arguments, once covariate names are known. Returns `(None, {})`
 /// when every argument is a bare sigma (the legacy variance path is then taken
 /// verbatim). Each non-bare argument compiles to a per-observation multiplier
-/// closure over `(theta, observation covariates, TIME)`.
+/// closure over `(theta, observation covariates, TIME)`, plus a `Dual1`
+/// θ-derivative program (#576/#486) so the analytic outer θ/σ gradient can
+/// differentiate the magnitude exactly instead of falling back to FD.
+///
+/// The second element is the set of theta indices any magnitude expression
+/// references — a theta that appears *only* in `[error_model]` (e.g. `RUV_LATE`)
+/// would otherwise trip `check_unused_parameters`'s "not referenced" warning,
+/// mirroring how `[event_model]` thetas are unioned in.
 fn build_ruv_magnitude(
     single_error_args: &Option<(ErrorModel, Vec<String>)>,
     sigma_names: &[String],
     theta_names: &[String],
     eta_names: &[String],
     covariate_decls: &Option<Vec<CovariateDecl>>,
-) -> Result<Option<RuvMagnitude>, String> {
+) -> Result<(Option<RuvMagnitude>, std::collections::HashSet<usize>), String> {
+    let mut used_thetas = std::collections::HashSet::new();
     let Some((_em, args)) = single_error_args else {
-        return Ok(None);
+        return Ok((None, used_thetas));
     };
     let allowed_covs: Option<Vec<String>> = covariate_decls
         .as_ref()
         .map(|d| d.iter().map(|c| c.name.clone()).collect());
     let mut per_sigma: Vec<Option<RuvMagFn>> = Vec::with_capacity(args.len());
+    let mut per_sigma_deriv: Vec<Option<RuvMagDerivProgram>> = Vec::with_capacity(args.len());
     let mut any = false;
     for arg in args {
         let sigma_name = arg_sigma_name(arg, sigma_names)?;
         let trimmed = arg.trim();
         if trimmed == sigma_name {
             per_sigma.push(None);
+            per_sigma_deriv.push(None);
             continue;
         }
         any = true;
         // The scaled sigma resolves to a `Variable` (bound to 1.0 at eval);
         // unknown identifiers fall back to model covariates. TIME/time parse
-        // as event-time built-ins.
-        let defined = [sigma_name.clone()];
+        // as event-time built-ins. `MACHEPS`/`macheps` must resolve to a
+        // `Variable` too (not fall through to `Covariate`) — `validate_ruv_expr`'s
+        // `Variable` arm already permits it, but without a `defined_vars` entry
+        // the parser would classify it as an (undeclared, rejected) covariate
+        // instead, since this context sets `fallback_covariate: true` (#486 review).
+        let defined = [
+            sigma_name.clone(),
+            "MACHEPS".to_string(),
+            "macheps".to_string(),
+        ];
         let ctx = ParseCtx {
             theta_names,
             eta_names,
@@ -8646,6 +9471,16 @@ fn build_ruv_magnitude(
         let expr = parse_scalar_expression(trimmed, ctx)
             .map_err(|e| format!("[error_model] magnitude `{}`: {}", trimmed, e))?;
         validate_ruv_expr(&expr, &sigma_name, allowed_covs.as_deref())?;
+        visit_expr_nodes(&expr, &mut |e: &Expression| {
+            if let Expression::Theta(i) = e {
+                used_thetas.insert(*i);
+            }
+        });
+        per_sigma_deriv.push(Some(compile_ruv_mag_deriv_program(
+            &expr,
+            &sigma_name,
+            theta_names.len(),
+        )));
         let sig = sigma_name.clone();
         let f: RuvMagFn = Box::new(move |theta, obs_cov, time| {
             let mut vars: HashMap<String, f64> = HashMap::new();
@@ -8662,11 +9497,15 @@ fn build_ruv_magnitude(
         });
         per_sigma.push(Some(f));
     }
-    if any {
-        Ok(Some(RuvMagnitude { per_sigma }))
+    let rm = if any {
+        Some(RuvMagnitude {
+            per_sigma,
+            per_sigma_deriv,
+        })
     } else {
-        Ok(None)
-    }
+        None
+    };
+    Ok((rm, used_thetas))
 }
 
 // --- Individual parameter function builder ---
@@ -8694,6 +9533,12 @@ fn build_pk_param_fn(
     // into its reserved spare slot in the analytical arm. Empty for ODE models
     // and for analytical models with no `RATE=-1`/`-2` dosing. See #324.
     analytical_modeled_slots: &[(String, usize)],
+    // Non-structural individual parameters an analytic Form C readout references,
+    // as `(var_name, PkParams slot)` (#650). Unlike `analytical_modeled_slots`,
+    // these are merged into `pk_assignment_mapping` so they are BOTH written by the
+    // closure AND carried in the program's `pk_var_slots` — the readout needs their
+    // exact `∂/∂(θ,η)`. Empty for ODE models and readout-free models.
+    readout_extra_slots: &[(String, usize)],
     n_theta_base: usize,
     n_eta_extended: usize,
     #[cfg(feature = "nn")] covariate_nns: &[crate::nn::CovariateNn],
@@ -8785,7 +9630,6 @@ fn build_pk_param_fn(
     pk_entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut pk_assignment_mapping: Vec<(usize, usize)> = Vec::with_capacity(pk_entries.len());
     let mut pk_const_mapping: Vec<(usize, f64)> = Vec::new();
-    let mut pk_time_mapping: Vec<usize> = Vec::new();
     for (pk_name, var_name) in pk_entries {
         let pk_slot = PkParams::name_to_index(pk_name).ok_or_else(|| {
             format!(
@@ -8799,9 +9643,11 @@ fn build_pk_param_fn(
             .get(var_name)
             .copied()
             .or_else(|| var_idx.get(&var_name.to_lowercase()).copied());
-        if var_name == "TIME" || var_name == "time" {
-            pk_time_mapping.push(pk_slot);
-        } else if let Some(var_slot) = var_slot {
+        // A direct `pk(...=TIME)` binding is desugared into a synthetic
+        // `__ferx_pktime_*` individual parameter upstream in `parse_full_model` (#486),
+        // so `var_name` is that synthetic name here (resolved via `var_idx` below), never
+        // a literal `TIME`.
+        if let Some(var_slot) = var_slot {
             pk_assignment_mapping.push((pk_slot, var_slot));
         } else if let Ok(c) = var_name.parse::<f64>() {
             // A numeric literal binds the slot to a constant — but `f64::from_str`
@@ -8826,6 +9672,20 @@ fn build_pk_param_fn(
         }
     }
     let is_analytical_pk = !pk_param_map.is_empty();
+
+    // #650: merge readout-referenced non-structural individual parameters into the
+    // structural mapping, so they are written by the closure below AND land in the
+    // program's `pk_var_slots` (line 9142 clones `pk_assignment_mapping`) — giving
+    // the analytic sensitivity provider their exact `∂/∂(θ,η)` for the readout.
+    for (var_name, pk_slot) in readout_extra_slots {
+        if let Some(var_slot) = var_idx
+            .get(var_name)
+            .copied()
+            .or_else(|| var_idx.get(&var_name.to_lowercase()).copied())
+        {
+            pk_assignment_mapping.push((*pk_slot, var_slot));
+        }
+    }
 
     // Resolve each analytical modeled-dose parameter's value slot once, to
     // `(PkParams write slot, var slot)`, so the hot closure is two array reads.
@@ -8883,12 +9743,26 @@ fn build_pk_param_fn(
     };
 
     let pk_var_slots = if is_analytical_pk {
-        pk_assignment_mapping.clone()
+        // Structural PK params (CL, V, …) plus any modeled-dose `D{cmt}`/`R{cmt}`
+        // slots (#486). The latter are not read by the closed-form kernels, but the
+        // analytic-sensitivity chain needs their `∂/∂(θ,η)` (+ 2nd order) rows so the
+        // event-driven walk can seed the modeled infusion rate/window dual
+        // (`pk_slot_dual_outer` looks the slot up in `pk_slots`). Appended after the
+        // structural slots so the row order stays stable; empty for a model with no
+        // modeled dose, so this is a no-op there. A fixed-dose subject of such a model
+        // routes to superposition, where the extra slot is seeded but unread (its
+        // kernel derivative is 0), so it is harmless.
+        let mut m = pk_assignment_mapping.clone();
+        m.extend(analytical_extra_mapping.iter().copied());
+        m
     } else {
         ode_assignment_mapping.clone()
     };
     let pk_slot_indices = pk_var_slots.iter().map(|&(slot, _)| slot).collect();
-    let uses_time_builtin = stmts_use_time || !pk_time_mapping.is_empty();
+    // A direct `pk(...=TIME)` mapping is desugared into a `__ferx_pktime_* = TIME`
+    // statement upstream (#486), so `stmts_use_time` already covers it — no separate
+    // literal-TIME-binding term is needed.
+    let uses_time_builtin = stmts_use_time;
     let indiv_param_program = IndivParamProgram {
         stmts: stmts_owned.clone(),
         n_vars,
@@ -8911,11 +9785,11 @@ fn build_pk_param_fn(
     let pk_param_fn: PkParamFn = Box::new(
         move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, time: f64| {
             // Resolve the `TIME` built-in from the event time the caller passed.
-            // `Expression::Time` / `Op::PushTime` and the analytical
-            // `pk_time_mapping` slots read the model-time thread-local, so set
-            // it here for the duration of this evaluation. Gated on
-            // `uses_time_builtin` so models that don't use the built-in (the
-            // common case) pay nothing for the guard (#610).
+            // `Expression::Time` / `Op::PushTime` (including the desugared
+            // `__ferx_pktime_* = TIME` parameters, #486) read the model-time
+            // thread-local, so set it here for the duration of this evaluation. Gated
+            // on `uses_time_builtin` so models that don't use the built-in (the common
+            // case) pay nothing for the guard (#610).
             let _time_guard = uses_time_builtin.then(|| ModelTimeGuard::enter(time));
             // Pre-compute each NN's forward output once per call. The
             // indexed evaluator reads `nn_outputs[nn_idx][output_idx]` for
@@ -8981,9 +9855,6 @@ fn build_pk_param_fn(
                     // per-call evaluation, just write the parsed value.
                     for &(pk_slot, c) in &pk_const_mapping {
                         p.values[pk_slot] = c;
-                    }
-                    for &pk_slot in &pk_time_mapping {
-                        p.values[pk_slot] = current_model_time();
                     }
                     // Modeled infusion duration (`D{cmt}`, RATE=-2; #394): write
                     // each duration parameter into its reserved spare slot so the
@@ -9074,6 +9945,17 @@ impl ModelTimeGuard {
     pub(crate) fn enter(time: f64) -> Self {
         let prev = MODEL_TIME.with(|cell| cell.replace(time));
         ModelTimeGuard(prev)
+    }
+
+    /// Enter the guard only when `cond` holds (typically `uses_time_builtin`),
+    /// returning `Some(guard)` that restores on drop or `None` when the model does
+    /// not read the `TIME` built-in. Collapses the repeated
+    /// `cond.then(|| ModelTimeGuard::enter(time))` idiom at the per-event seed seams so a
+    /// future widening of the gating condition (e.g. the direct `pk(...=TIME)` mapping)
+    /// updates one call each and can't silently miss a seam (#637 review #7).
+    #[inline]
+    pub(crate) fn enter_if(cond: bool, time: f64) -> Option<Self> {
+        cond.then(|| Self::enter(time))
     }
 }
 
@@ -9392,6 +10274,261 @@ fn collect_theta_eta_in_stmts(
     });
 }
 
+/// Reserved name prefix for the individual parameters the parser synthesizes when a
+/// Form-C readout `y = expr` references a θ/η **directly** (issue #486). A bare
+/// `THETA(i)` / `ETA(k)` in the readout is desugared into an individual parameter
+/// equal to it (`__ferx_ro_th{i} = THETA(i)`); the readout then references that
+/// parameter instead, so its `∂y/∂θ` / `∂y/∂η` ride the validated
+/// individual-parameter sensitivity chain (every analytic walk serves the readout
+/// without a bespoke θ/η term). The prefix lets user-facing EBE / diagnostic output
+/// suppress these internal parameters — they are not user-declared quantities.
+pub(crate) const READOUT_SYNTH_PREFIX: &str = "__ferx_ro_";
+
+/// Reserved prefix for the individual parameter synthesized by desugaring a direct
+/// `pk(...=TIME)` structural mapping (`__ferx_pktime_<pk_name> = TIME`, #486). Like the
+/// readout prefix, it lets EBE / diagnostic output suppress the internal parameter.
+pub(crate) const PKTIME_SYNTH_PREFIX: &str = "__ferx_pktime_";
+
+/// True for a ferx-internal synthetic individual parameter — either a Form-C readout θ/η
+/// desugaring ([`READOUT_SYNTH_PREFIX`]) or a direct `pk(...=TIME)` mapping desugaring
+/// ([`PKTIME_SYNTH_PREFIX`]). User-facing per-subject output skips these so the synthetic
+/// parameters never surface as sdtab / fit-output columns.
+pub(crate) fn is_synthetic_readout_param(name: &str) -> bool {
+    name.starts_with(READOUT_SYNTH_PREFIX) || name.starts_with(PKTIME_SYNTH_PREFIX)
+}
+
+/// A θ/η reference desugared out of a Form-C readout into a synthetic individual
+/// parameter (issue #486). `is_eta` selects the source axis (`Theta(idx)` when
+/// false, `Eta(idx)` when true); `name` is the `READOUT_SYNTH_PREFIX`-prefixed
+/// individual-parameter name that mirrors it.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadoutSynthParam {
+    name: String,
+    is_eta: bool,
+    idx: usize,
+}
+
+/// Split a `[scaling]` line `key = value` at the first `=` that lies OUTSIDE any
+/// `[...]` bracket, so `obs_scale[CMT=1] = expr` splits at the top-level `=`, not the
+/// one inside the bracket. Returns the trimmed key and value.
+fn split_scaling_entry(trimmed: &str) -> Result<(&str, &str), String> {
+    let mut depth: i32 = 0;
+    let mut split_at: Option<usize> = None;
+    for (i, ch) in trimmed.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            '=' if depth == 0 => {
+                split_at = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let split_at =
+        split_at.ok_or_else(|| format!("[scaling]: expected `key = value`, got: `{trimmed}`"))?;
+    Ok((trimmed[..split_at].trim(), trimmed[split_at + 1..].trim()))
+}
+
+/// Scan a `[scaling]` block's `y = ...` readout entries for bare `THETA(i)` / `ETA(k)`
+/// references and synthesize one individual parameter per distinct reference (#486).
+/// Only `y` (Form-C readout) entries are scanned — `obs_scale` θ/η is differentiated
+/// separately by `ScaleDerivProgram`. Identifiers other than θ/η (states, individual
+/// parameters) parse as permissive covariate references here and are ignored; we only
+/// collect the θ/η axes. Returns the synthetic descriptors in a stable
+/// (θ-then-η, ascending index) order.
+/// Allocate free `PkParams` slots to the **non-structural** individual parameters
+/// an analytic Form C readout references (#650), making them first-class
+/// differentiable parameters: `pk_param_fn` writes each value into its slot and the
+/// individual-parameter program carries its `∂/∂(θ,η)`, exactly as for a structural
+/// PK parameter. So a readout like `central/V + BMAX*C/(KD+C)` differentiates
+/// `BMAX`/`KD` analytically instead of aliasing them onto the `CL` slot.
+///
+/// Slots are drawn from the differentiable slot space `0..=PK_IDX_MTT` (the range
+/// `slot_to_dim` covers and `seed_dim` is sized for), restricted to slots the
+/// model's solver does **not** read (`!consumes_pk_slot`) and not already claimed by
+/// a modeled-dose parameter — so a readout param never collides with a value the
+/// closed form consumes. Structural parameters (bound to a PK role) keep their
+/// canonical slot; θ/η/covariate references are ignored. Returns `(name, slot)` in
+/// reference order, or an error if the readout references more distinct
+/// non-structural parameters than the free differentiable slots can hold.
+///
+/// ODE models get no entries here (their individual parameters already receive
+/// slots via `ode_param_slots`), and a model with no `[scaling] y` readout returns
+/// empty.
+#[allow(clippy::too_many_arguments)]
+fn allocate_readout_extra_slots(
+    scaling_lines: Option<&Vec<String>>,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_var_names: &[String],
+    structural_vars: &std::collections::HashSet<String>,
+    modeled_slots: &[(String, usize)],
+    pk_model: PkModel,
+    is_ode: bool,
+) -> Result<Vec<(String, usize)>, String> {
+    if is_ode {
+        return Ok(Vec::new());
+    }
+    let Some(lines) = scaling_lines else {
+        return Ok(Vec::new());
+    };
+    let indiv_set: std::collections::HashSet<&str> =
+        indiv_var_names.iter().map(|s| s.as_str()).collect();
+    let mut referenced: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, value) = split_scaling_entry(trimmed)?;
+        let (base, _cmt) = parse_scaling_key(key)?;
+        if base != "y" {
+            continue;
+        }
+        // Individual params in scope resolve to `Variable(name)`; θ/η/covariate
+        // references resolve elsewhere and are ignored here.
+        let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
+        let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
+        visit_expr_nodes(&expr, &mut |e: &Expression| {
+            if let Expression::Variable(name) = e {
+                if indiv_set.contains(name.as_str())
+                    && !structural_vars.contains(name)
+                    && seen.insert(name.clone())
+                {
+                    referenced.push(name.clone());
+                }
+            }
+        });
+    }
+    if referenced.is_empty() {
+        return Ok(Vec::new());
+    }
+    let used: std::collections::HashSet<usize> = modeled_slots.iter().map(|&(_, s)| s).collect();
+    let mut free: Vec<usize> = (0..=crate::types::PK_IDX_MTT)
+        .filter(|&s| !pk_model.consumes_pk_slot(s) && !used.contains(&s))
+        .collect();
+    if referenced.len() > free.len() {
+        return Err(format!(
+            "[scaling] y: the analytic readout references {} non-structural individual \
+             parameter(s) ({}), but only {} free differentiable PK slot(s) are available for \
+             this model. Reduce the number of distinct non-PK parameters referenced in the \
+             readout, or use an ODE model.",
+            referenced.len(),
+            referenced.join(", "),
+            free.len(),
+        ));
+    }
+    free.truncate(referenced.len());
+    Ok(referenced.into_iter().zip(free).collect())
+}
+
+fn collect_readout_theta_eta_synth(
+    scaling_lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+) -> Result<Vec<ReadoutSynthParam>, String> {
+    let mut thetas: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut etas: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for line in scaling_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (key, value) = split_scaling_entry(trimmed)?;
+        let (base, _cmt) = parse_scaling_key(key)?;
+        if base != "y" {
+            continue;
+        }
+        // θ/η names resolve to `Theta`/`Eta`; every other identifier falls back to a
+        // covariate (no `defined` set needed) since we only collect the θ/η axes.
+        let ctx = ParseCtx::new(theta_names, eta_names, &[]);
+        let expr = parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] y: {e}"))?;
+        visit_expr_nodes(&expr, &mut |e: &Expression| match e {
+            Expression::Theta(i) => {
+                thetas.insert(*i);
+            }
+            Expression::Eta(i) => {
+                etas.insert(*i);
+            }
+            _ => {}
+        });
+    }
+    let mut out = Vec::with_capacity(thetas.len() + etas.len());
+    for i in thetas {
+        out.push(ReadoutSynthParam {
+            name: format!("{READOUT_SYNTH_PREFIX}th{i}"),
+            is_eta: false,
+            idx: i,
+        });
+    }
+    for k in etas {
+        out.push(ReadoutSynthParam {
+            name: format!("{READOUT_SYNTH_PREFIX}eta{k}"),
+            is_eta: true,
+            idx: k,
+        });
+    }
+    Ok(out)
+}
+
+/// Rewrite the bare `THETA(i)` / `ETA(k)` nodes that the #486 desugaring covered into
+/// `Variable(synthetic_name)`, so the readout compiles to `Op::PushVar` (an ordinary
+/// individual-parameter reference) instead of `Op::PushTheta` / `Op::PushEta`. Any θ/η
+/// not in `synth` is left intact (it then keeps the readout on the FD fallback via the
+/// `dual_evaluable` gate). Mirrors [`resolve_expr_indices`]'s recursive shape.
+fn rewrite_readout_synth(expr: &mut Expression, synth: &[ReadoutSynthParam]) {
+    match expr {
+        Expression::Theta(i) => {
+            if let Some(s) = synth.iter().find(|s| !s.is_eta && s.idx == *i) {
+                *expr = Expression::Variable(s.name.clone());
+            }
+        }
+        Expression::Eta(i) => {
+            if let Some(s) = synth.iter().find(|s| s.is_eta && s.idx == *i) {
+                *expr = Expression::Variable(s.name.clone());
+            }
+        }
+        Expression::BinOp(l, _, r) => {
+            rewrite_readout_synth(l, synth);
+            rewrite_readout_synth(r, synth);
+        }
+        Expression::UnaryFn(_, a) => rewrite_readout_synth(a, synth),
+        Expression::Power(b, e) => {
+            rewrite_readout_synth(b, synth);
+            rewrite_readout_synth(e, synth);
+        }
+        Expression::Conditional(cond, t, e) => {
+            rewrite_readout_synth_cond(cond, synth);
+            rewrite_readout_synth(t, synth);
+            rewrite_readout_synth(e, synth);
+        }
+        Expression::Literal(_)
+        | Expression::Time
+        | Expression::Covariate(_)
+        | Expression::Variable(_)
+        | Expression::VariableIdx(_)
+        | Expression::CovariateIdx(_)
+        | Expression::NnOutput { .. } => {}
+    }
+}
+
+/// Condition-tree companion of [`rewrite_readout_synth`].
+fn rewrite_readout_synth_cond(cond: &mut Condition, synth: &[ReadoutSynthParam]) {
+    match cond {
+        Condition::Compare(l, _, r) => {
+            rewrite_readout_synth(l, synth);
+            rewrite_readout_synth(r, synth);
+        }
+        Condition::And(l, r) | Condition::Or(l, r) => {
+            rewrite_readout_synth_cond(l, synth);
+            rewrite_readout_synth_cond(r, synth);
+        }
+        Condition::Not(c) => rewrite_readout_synth_cond(c, synth),
+    }
+}
+
 /// Collect the sigma names referenced in a `ParsedErrorModel` (before index resolution).
 /// Collect the declared sigma names referenced anywhere in the `[error_model]`
 /// arguments. An argument may be a bare sigma name or a magnitude expression
@@ -9424,6 +10561,18 @@ fn used_sigma_names(
                 for a in args {
                     scan(a, &mut out);
                 }
+            }
+        }
+        ParsedErrorModel::Selected {
+            branches, default, ..
+        } => {
+            for (_, _, args) in branches {
+                for a in args {
+                    scan(a, &mut out);
+                }
+            }
+            for a in &default.1 {
+                scan(a, &mut out);
             }
         }
     }
@@ -11356,10 +12505,16 @@ pub struct OdeOutputProgram {
     /// in the individual-parameter dual basis the ODE provider seeds (#540).
     cov_names: Vec<String>,
     /// True when the expression references only states / individual parameters /
-    /// covariates / constants (no θ/η/NN terms) — the case the dual readout can
-    /// evaluate, threading the covariate snapshot in while leaving θ/η empty.
-    /// θ/η referenced *directly* in the readout would need extra chain terms the
-    /// ODE provider does not yet assemble, so those stay on the FD fallback.
+    /// covariates / constants — the case the dual readout can evaluate, threading
+    /// the covariate snapshot in while leaving θ/η empty. A θ/η referenced
+    /// *directly* in the readout is *normally* desugared at parse time into a
+    /// synthetic individual parameter (`__ferx_ro_*`, #486), so it reaches the
+    /// readout as an ordinary `PushVar` and rides the individual-parameter
+    /// sensitivity chain. The exception is the slot-overflow FD fallback: when the
+    /// synthetic params would exceed the PK-slot layout the parser leaves the bare
+    /// θ/η ops in place, and the `PushTheta`/`PushEta` check at the construction
+    /// site keeps this `false` so that readout stays on FD. An NN output
+    /// (`PushNnOutput`) is the other, always-FD disqualifier.
     dual_evaluable: bool,
 }
 
@@ -11367,6 +12522,35 @@ impl OdeOutputProgram {
     /// See [`OdeOutputProgram::dual_evaluable`].
     pub(crate) fn is_dual_evaluable(&self) -> bool {
         self.dual_evaluable
+    }
+
+    /// Number of compartment-state inputs in the readout's `vars[0..n_states]`
+    /// layout. For an analytic readout this is `1` (IV: `["central"]`) or `2`
+    /// (oral: `["depot", "central"]`).
+    pub(crate) fn n_states(&self) -> usize {
+        self.n_states
+    }
+
+    /// Whether the compiled readout actually references state slot `idx` (a
+    /// `PushVar(idx)` with `idx < n_states`). The analytic Dual2 provider (#650)
+    /// uses this to gate a readout that reads the oral `depot` amount — which the
+    /// static superposition jet doesn't reconstruct — onto the FD path.
+    pub(crate) fn references_state(&self, idx: usize) -> bool {
+        idx < self.n_states
+            && self
+                .bc
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::PushVar(i) if *i as usize == idx))
+    }
+
+    /// The highest PK slot any individual parameter of this readout maps to
+    /// (`indiv_to_pk`), or `None` if the readout references no individual
+    /// parameters. The tv-covariate event-walk provider (#650) seeds only the
+    /// eight `PkDual` structural slots (`CL..V3`, 0..=7), so it serves the readout
+    /// analytically only when every referenced parameter slot fits there.
+    pub(crate) fn max_indiv_pk_slot(&self) -> Option<usize> {
+        self.indiv_to_pk.iter().copied().max()
     }
 
     /// Evaluate the output expression over a dual type, generic over [`PkNum`]
@@ -11536,6 +12720,136 @@ impl ScaleDerivProgram {
         eval_bytecode_g::<Dual1<N>>(
             &self.bc, theta_d, eta_d, &cov_vec, var_duals, &empty_nn, &mut stack,
         )
+    }
+}
+
+/// Differentiable form of a custom residual-error magnitude slot (#484/#576/#486):
+/// the magnitude expression compiled to bytecode, evaluable over `Dual1<M>` seeded
+/// on `θ` only. Unlike [`ScaleDerivProgram`] the magnitude never depends on `η` or
+/// an individual parameter (`validate_ruv_expr` rejects both), so there is a single
+/// var slot — the scaled sigma, pinned to the constant `1.0` — and no
+/// `var_to_pk_slot`. This lets the analytic outer θ/σ gradient differentiate
+/// `mult(θ)` exactly (a new direct-θ term in `∂R/∂θ`) instead of falling back to
+/// FD for a custom / time-varying σ magnitude.
+pub struct RuvMagDerivProgram {
+    bc: Bytecode,
+    n_theta: usize,
+    cov_names: Vec<String>,
+}
+
+/// Axis cap for the `Dual1<M>` dispatch table in [`RuvMagDerivProgram::theta_grad`]
+/// (same const-generic-dispatch convention as `MAX_SCALE_AXES` / `MAX_ODE_AXES`,
+/// but set higher — the magnitude program's bytecode evaluator is cheap to
+/// monomorphize, and covering realistic large-θ population models keeps the
+/// magnitude direct-θ channel analytic rather than dropping to FD, #486). A model
+/// with more thetas than this falls back to FD for the magnitude's direct-θ
+/// gradient channel — `analytic_outer_gradient_available` bounds `model.n_theta`
+/// against this constant when a custom magnitude is active.
+pub(crate) const MAX_RUV_MAG_AXES: usize = 32;
+
+impl RuvMagDerivProgram {
+    /// `∂(magnitude)/∂θ` at `theta` (with the observation's covariates and raw
+    /// TIME), dispatching the const-generic `Dual1<M>` eval on `theta.len()`.
+    /// `None` when `theta.len()` exceeds [`MAX_RUV_MAG_AXES`] or does not match
+    /// the program's own `n_theta` (caller falls back to FD).
+    pub(crate) fn theta_grad(
+        &self,
+        theta: &[f64],
+        cov: &HashMap<String, f64>,
+        time: f64,
+    ) -> Option<Vec<f64>> {
+        use crate::sens::dual1::Dual1;
+        if theta.len() != self.n_theta {
+            return None;
+        }
+        if theta.is_empty() {
+            return Some(Vec::new());
+        }
+        // Mirror the runtime `RuvMagFn` closure's `TIME`/`time` covariate-map
+        // injection: a legacy pre-built expression may still carry `TIME` as an
+        // `Expression::Covariate` node (parsed models use the `Expression::Time`
+        // built-in, read directly from `time` via `Op::PushTime`, and never reach
+        // this branch) — without it, such a `cov_name` would look up the
+        // observation's covariate map (which never carries a literal "TIME" key)
+        // and silently default to `0.0` instead of the actual observation time.
+        let cov_vec: Vec<f64> = self
+            .cov_names
+            .iter()
+            .map(|n| {
+                if n.eq_ignore_ascii_case("TIME") {
+                    time
+                } else {
+                    cov.get(n).copied().unwrap_or(0.0)
+                }
+            })
+            .collect();
+        // `theta_d`/`prog_vars` are exactly `$n`-sized at each dispatch arm (unlike
+        // `ScaleDerivProgram::eval_scale_dual1`'s padded-to-N buffers), so a plain
+        // stack array avoids the sibling's per-call heap `Vec` for the axis-bounded
+        // pieces (#486 review); `cov_vec`/`stack` stay on the heap, matching that
+        // sibling's own precedent — they are not axis-bounded.
+        macro_rules! run {
+            ($n:literal) => {{
+                let mut theta_d = [Dual1::<$n>::constant(0.0); $n];
+                for (m, d) in theta_d.iter_mut().enumerate() {
+                    *d = Dual1::var(theta[m], m);
+                }
+                // Slot 0 = the pinned scaled sigma (1.0); slot 1 = MACHEPS.
+                let prog_vars = [
+                    Dual1::<$n>::constant(1.0),
+                    Dual1::<$n>::constant(f64::EPSILON),
+                ];
+                let empty_nn: Vec<Vec<f64>> = Vec::new();
+                let mut stack: Vec<Dual1<$n>> = Vec::new();
+                let d = with_model_time(time, || {
+                    eval_bytecode_g::<Dual1<$n>>(
+                        &self.bc,
+                        &theta_d,
+                        &[],
+                        &cov_vec,
+                        &prog_vars,
+                        &empty_nn,
+                        &mut stack,
+                    )
+                });
+                d.grad.to_vec()
+            }};
+        }
+        Some(match theta.len() {
+            1 => run!(1),
+            2 => run!(2),
+            3 => run!(3),
+            4 => run!(4),
+            5 => run!(5),
+            6 => run!(6),
+            7 => run!(7),
+            8 => run!(8),
+            9 => run!(9),
+            10 => run!(10),
+            11 => run!(11),
+            12 => run!(12),
+            13 => run!(13),
+            14 => run!(14),
+            15 => run!(15),
+            16 => run!(16),
+            17 => run!(17),
+            18 => run!(18),
+            19 => run!(19),
+            20 => run!(20),
+            21 => run!(21),
+            22 => run!(22),
+            23 => run!(23),
+            24 => run!(24),
+            25 => run!(25),
+            26 => run!(26),
+            27 => run!(27),
+            28 => run!(28),
+            29 => run!(29),
+            30 => run!(30),
+            31 => run!(31),
+            32 => run!(32),
+            _ => return None,
+        })
     }
 }
 
@@ -13162,6 +14476,57 @@ fn parse_if_statement(
 mod tests {
     use super::*;
 
+    /// #486: the residual-magnitude direct-θ program dispatches its `Dual1<M>`
+    /// evaluator for every axis count up to [`MAX_RUV_MAG_AXES`] (raised past 16),
+    /// and declines (`None`, caller → FD) only beyond it. `mult = θ_last · σ̂` (σ̂
+    /// pinned to 1.0), so `∂mult/∂θ_last = 1` and all other axes are 0 — a cheap
+    /// exact check that each newly-added dispatch arm is wired.
+    #[test]
+    fn ruv_mag_theta_grad_dispatches_up_to_axis_cap() {
+        use std::collections::HashMap;
+        assert!(MAX_RUV_MAG_AXES >= 17, "cap must be raised past the old 16");
+        let cov = HashMap::new();
+        // Every axis count up to the cap — exercises each `Dual1<M>` dispatch arm.
+        for n in 1..=MAX_RUV_MAG_AXES {
+            let expr = Expression::BinOp(
+                Box::new(Expression::Theta(n - 1)),
+                BinOp::Mul,
+                Box::new(Expression::Variable("PROP".to_string())),
+            );
+            let prog = compile_ruv_mag_deriv_program(&expr, "PROP", n);
+            let theta = vec![0.5f64; n];
+            let grad = prog
+                .theta_grad(&theta, &cov, 0.0)
+                .unwrap_or_else(|| panic!("theta_grad must dispatch for n_theta = {n}"));
+            assert_eq!(grad.len(), n);
+            assert!(
+                (grad[n - 1] - 1.0).abs() < 1e-9,
+                "∂mult/∂θ_last = 1 (n={n})"
+            );
+            for (i, g) in grad.iter().enumerate() {
+                if i != n - 1 {
+                    assert!(
+                        g.abs() < 1e-9,
+                        "off-axis derivative must be 0 (n={n}, i={i})"
+                    );
+                }
+            }
+        }
+        // Beyond the cap → None, so the outer gradient falls back to FD.
+        let over = MAX_RUV_MAG_AXES + 1;
+        let expr = Expression::BinOp(
+            Box::new(Expression::Theta(0)),
+            BinOp::Mul,
+            Box::new(Expression::Variable("PROP".to_string())),
+        );
+        let prog = compile_ruv_mag_deriv_program(&expr, "PROP", over);
+        assert!(
+            prog.theta_grad(&vec![0.5; over], &HashMap::new(), 0.0)
+                .is_none(),
+            "n_theta beyond MAX_RUV_MAG_AXES must decline to FD"
+        );
+    }
+
     // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
 
     /// Parse `src`, asserting it fails; returns the error message. (`ParsedModel`
@@ -13273,6 +14638,97 @@ mod tests {
         );
         let err = parse_err(&src);
         assert!(err.contains("cannot be combined"), "got: {err}");
+    }
+
+    #[test]
+    fn transit_time_desugars_to_ode_equivalent() {
+        // Plain `pk one_cpt_transit(...)` + a TIME switch is rewritten to the exact ODE
+        // transit() twin (which carries per-event TIME analytically, #664) instead of being
+        // rejected — the closed form can't honour a mid-profile parameter switch (#486).
+        const TRANSIT_TIME: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVCL_LATE(7.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  if (TIME > 12.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V   = TVV
+  MTT = TVMTT
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+        let model = parse_model_string(TRANSIT_TIME).expect("parse transit+TIME");
+        // The primary model stays the fast closed-form transit; it CARRIES an exact ODE
+        // `transit()` equivalent that the runtime dispatch uses only for the subjects the
+        // closed form can't serve (here, every subject — the model reads TIME).
+        assert_eq!(
+            model.pk_model,
+            PkModel::OneCptTransit,
+            "primary model is still the closed-form transit"
+        );
+        assert!(
+            model.ode_spec.is_none(),
+            "the primary transit model is not itself an ODE model"
+        );
+        let eq = model
+            .transit_ode_equivalent
+            .as_ref()
+            .expect("transit + TIME must carry an ODE equivalent")
+            .get_or_build();
+        let ode = eq
+            .ode_spec
+            .as_ref()
+            .expect("the equivalent is an ODE model");
+        assert_eq!(ode.state_names, vec!["central"]);
+        assert_eq!(ode.input_rate.len(), 1, "exactly one transit forcing");
+        assert!(
+            compiled_model_uses_time_builtin(&model),
+            "the TIME switch is on the model"
+        );
+
+        // A transit model WITHOUT a TIME switch keeps the fast, exact closed form as its
+        // primary representation (the equivalent is still built, but the dispatch never uses
+        // it unless a subject carries time-varying covariates).
+        const TRANSIT_PLAIN: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  MTT = TVMTT
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+        let plain = parse_model_string(TRANSIT_PLAIN).expect("parse plain transit");
+        assert_eq!(
+            plain.pk_model,
+            PkModel::OneCptTransit,
+            "no TIME switch → keep the closed-form transit"
+        );
+        assert!(plain.ode_spec.is_none());
     }
 
     #[test]
@@ -14473,6 +15929,78 @@ mod tests {
         );
     }
 
+    /// #486 regression: the synthetic `__ferx_pktime_*` parameter a direct
+    /// `pk(...=TIME)` mapping desugars into must be exempt from the "computed but never
+    /// used" census (like the `__ferx_ro_*` readout synthetics). The census tokenizes the
+    /// raw block text, which still reads `q=TIME` (never `q=__ferx_pktime_q`), so the
+    /// synthetic name looks unreferenced — only the `is_synthetic_readout_param` prefix
+    /// match keeps it from being flagged. If that exemption is ever dropped, every direct
+    /// `pk(...=TIME)` model would tell users to remove a load-bearing parameter.
+    #[test]
+    fn direct_pk_time_synth_param_not_flagged_unused() {
+        let src = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV1(10.0, 0.1, 1000.0)
+  theta TVV2(20.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1
+  V2 = TVV2
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=TIME, v2=V2)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let p = super::parse_full_model(src).expect("parse ok");
+        assert!(
+            !p.model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used")),
+            "direct pk(q=TIME) must not flag the synthetic __ferx_pktime_q as dead: {:?}",
+            p.model.parse_warnings
+        );
+    }
+
+    /// #486: a user parameter using the reserved `__ferx_pktime_` prefix is rejected, and
+    /// the message names the *correct* prefix and feature (`pk(...=TIME)`), not the Form-C
+    /// readout prefix — even though the shared guard also matches the readout prefix.
+    #[test]
+    fn reserved_pktime_prefix_rejected_with_correct_message() {
+        let src = "
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  omega ETA_CL ~ 0.1
+  sigma EPS ~ 0.01
+
+[individual_parameters]
+  __ferx_pktime_cl = TVCL * exp(ETA_CL)
+
+[structural_model]
+  pk one_cpt_iv(cl=__ferx_pktime_cl, v=10.0)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+        let err = super::parse_full_model(src)
+            .err()
+            .expect("reserved prefix must be rejected");
+        assert!(
+            err.contains(PKTIME_SYNTH_PREFIX),
+            "message must name the pktime prefix: {err}"
+        );
+        assert!(
+            err.contains("pk(...=TIME)"),
+            "message must name the pk(...=TIME) feature, not Form-C readout: {err}"
+        );
+    }
+
     #[test]
     fn test_ode_dead_indiv_param_warns() {
         // #315: an ODE [individual_parameters] entry never referenced in the
@@ -15508,7 +17036,6 @@ mod tests {
                 // are method-specific, so none must warn under any method.
                 "covariance_method = s".to_string(),
                 "covariance_fallback = sir".to_string(),
-                "covariance_ofv_hessian = true".to_string(),
                 "verbose = false".to_string(),
                 "sir = true".to_string(),
                 "bloq_method = m3".to_string(),
@@ -15687,6 +17214,17 @@ mod tests {
         let err = parse_fit_options(&["n_exploraton = 200".to_string()]).unwrap_err();
         assert!(err.contains("unknown key"), "got: {err}");
         assert!(err.contains("n_exploraton"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_fit_options_covariance_ofv_hessian_removed() {
+        // The `covariance_ofv_hessian` option was removed in #639 (the analytical-
+        // gradient covariance R stencil it selected is gone; the reconverged-OFV
+        // second difference is the sole stencil). An old model file that still sets
+        // it must now fail loudly as an unknown key, not silently be accepted.
+        let err = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap_err();
+        assert!(err.contains("unknown key"), "got: {err}");
+        assert!(err.contains("covariance_ofv_hessian"), "got: {err}");
     }
 
     #[test]
@@ -15900,12 +17438,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_parameter_scaling_and_ofv_hessian() {
+    fn test_parse_parameter_scaling() {
         use crate::types::ParameterScaling;
-        // Defaults: parameter_scaling = Auto, covariance_ofv_hessian = true.
+        // Default: parameter_scaling = Auto.
         let def = parse_fit_options(&[]).unwrap();
         assert_eq!(def.parameter_scaling, ParameterScaling::Auto);
-        assert!(def.covariance_ofv_hessian);
         // parameter_scaling keywords, case-insensitive.
         for (input, expected) in [
             ("auto", ParameterScaling::Auto),
@@ -15917,9 +17454,6 @@ mod tests {
             assert_eq!(opts.parameter_scaling, expected, "input `{input}`");
         }
         assert!(parse_fit_options(&["parameter_scaling = bogus".to_string()]).is_err());
-        // covariance_ofv_hessian bool.
-        let off = parse_fit_options(&["covariance_ofv_hessian = false".to_string()]).unwrap();
-        assert!(!off.covariance_ofv_hessian);
     }
 
     // ── mu-referencing pattern detection ─────────────────────────────────
@@ -16923,6 +18457,112 @@ mod tests {
         assert!((m_late[1] - 1.0).abs() < 1e-12);
     }
 
+    /// A theta referenced only from an `[error_model]` magnitude expression
+    /// (e.g. `RUV_LATE`, never used in `[individual_parameters]`) must not trip
+    /// the "declared but not referenced" warning — it *is* meaningfully
+    /// estimated, via the magnitude's direct-θ channel (#484/#576/#486).
+    #[test]
+    fn test_ruv_magnitude_theta_not_flagged_as_unused() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_LATE(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))
+"#;
+        let model = parse_model_string(content).unwrap();
+        assert!(model.has_custom_ruv_magnitude());
+        let warns: Vec<_> = model
+            .parse_warnings
+            .iter()
+            .filter(|w| w.contains("RUV_LATE"))
+            .collect();
+        assert!(
+            warns.is_empty(),
+            "RUV_LATE is used by the magnitude expression, got: {:?}",
+            warns
+        );
+    }
+
+    /// xhigh review: `MACHEPS` inside a magnitude expression must resolve to
+    /// `f64::EPSILON` in the `Dual1` θ-derivative program too (not just the
+    /// value-only runtime closure) — `RuvMagDerivProgram` reserves a var slot
+    /// for it now. Regression case: `WT + MACHEPS` guards a denominator; at
+    /// `WT = 0.0` the pre-fix bug (`MACHEPS` silently resolving to `0.0` in the
+    /// bytecode path) would divide by exactly zero and produce a non-finite
+    /// `∂mult/∂θ`.
+    #[test]
+    fn test_ruv_magnitude_macheps_resolves_in_theta_grad() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_LATE(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE / (WT + MACHEPS)))
+[covariates]
+  WT continuous
+"#;
+        let model = parse_model_string(content).unwrap();
+        let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+        let deriv = rm.per_sigma_deriv[0]
+            .as_ref()
+            .expect("prop slot has a deriv program");
+
+        let theta = vec![0.2, 10.0, 1.5];
+        let cov_zero = std::collections::HashMap::from([("WT".to_string(), 0.0)]);
+        let grad = deriv
+            .theta_grad(&theta, &cov_zero, 10.0)
+            .expect("theta_grad supported");
+        assert!(
+            grad.iter().all(|g| g.is_finite()),
+            "MACHEPS must guard the WT=0 denominator, got {:?}",
+            grad
+        );
+        // ∂mult/∂RUV_LATE = 1/(WT+MACHEPS) = 1/EPSILON — a large but finite value.
+        approx::assert_relative_eq!(grad[2], 1.0 / f64::EPSILON, max_relative = 1e-9);
+    }
+
+    /// xhigh review: a *legacy* pre-built magnitude expression that still
+    /// represents `TIME` as an `Expression::Covariate("TIME")` node (rather than
+    /// the `Expression::Time` built-in every parsed `.ferx` model produces) must
+    /// still resolve `TIME` to the observation time in `theta_grad`, mirroring the
+    /// runtime `RuvMagFn` closure's `cov.insert("TIME", time)` injection. Without
+    /// it, `cov_vec` would look up "TIME" in the (never-populated) observation
+    /// covariate map and silently default to `0.0`.
+    #[test]
+    fn test_ruv_magnitude_deriv_program_resolves_time_as_covariate_node() {
+        // RUV_LATE * TIME, built directly as an AST (bypassing the parser, which
+        // would emit `Expression::Time` instead) to exercise the legacy branch.
+        let expr = Expression::BinOp(
+            Box::new(Expression::Theta(0)),
+            BinOp::Mul,
+            Box::new(Expression::Covariate("TIME".to_string())),
+        );
+        let deriv = compile_ruv_mag_deriv_program(&expr, "UNUSED_SIGMA", 1);
+        let empty_cov = std::collections::HashMap::new();
+        let grad = deriv
+            .theta_grad(&[2.0], &empty_cov, 10.0)
+            .expect("theta_grad supported");
+        // d(RUV_LATE * TIME)/d(RUV_LATE) = TIME = 10.0, not 0.0.
+        approx::assert_relative_eq!(grad[0], 10.0, max_relative = 1e-12);
+    }
+
     #[test]
     fn test_ruv_magnitude_rejects_eta_dependence() {
         // A magnitude may not depend on a random effect (it must be η-independent).
@@ -17726,6 +19366,20 @@ mod tests {
 
         assert!(apply_fit_option(&mut opts, "inner_maxiter", "oops").is_err());
         assert!(apply_fit_option(&mut opts, "inner_tol", "not_a_num").is_err());
+    }
+
+    #[test]
+    fn test_apply_fit_option_cov_inner_tol() {
+        let mut opts = FitOptions::default();
+        // Default is None (falls back to inner_tol via effective_cov_inner_tol).
+        assert_eq!(FitOptions::default().cov_inner_tol, None);
+        assert_eq!(
+            apply_fit_option(&mut opts, "cov_inner_tol", "1e-9"),
+            Ok(true)
+        );
+        assert_eq!(opts.cov_inner_tol, Some(1e-9));
+        assert!(opts.user_set_keys.iter().any(|k| k == "cov_inner_tol"));
+        assert!(apply_fit_option(&mut opts, "cov_inner_tol", "not_a_num").is_err());
     }
 
     #[test]
@@ -19148,6 +20802,379 @@ if (WT > 70) {
             model.error_spec,
             ErrorSpec::Single(ErrorModel::Proportional)
         ));
+    }
+
+    // ── Covariate-selected error models (`if/else`, issue #658) ─────────────
+
+    /// Minimal **analytical** 1-cpt model whose `[error_model]` is overridden by
+    /// `error_block`. Two proportional sigmas + a `FREE` covariate let a
+    /// free-vs-total split-error `if/else` be expressed on an analytical PK model.
+    fn selected_err_model_str(error_block: &str) -> String {
+        format!(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_TOTAL   ~ 0.10 (sd)
+  sigma PROP_UNBOUND ~ 0.30 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+{}
+
+[covariates]
+  FREE continuous
+",
+            error_block
+        )
+    }
+
+    #[test]
+    fn test_selected_error_model_parses() {
+        let model = parse_full_model(&selected_err_model_str(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+        ))
+        .unwrap()
+        .model;
+
+        match &model.error_spec {
+            ErrorSpec::Selected {
+                selector,
+                endpoints,
+            } => {
+                assert_eq!(endpoints.len(), 2);
+                // Branch 0 (FREE == 0) → PROP_TOTAL (sigma idx 0).
+                let total = endpoints.get(&0).expect("branch 0 endpoint");
+                assert_eq!(total.error_model, ErrorModel::Proportional);
+                assert_eq!(total.sigma_idx, vec![0]);
+                // Else branch (key 1) → PROP_UNBOUND (sigma idx 1).
+                let unbound = endpoints.get(&1).expect("else endpoint");
+                assert_eq!(unbound.error_model, ErrorModel::Proportional);
+                assert_eq!(unbound.sigma_idx, vec![1]);
+                // Selector resolves FREE=0 → branch 0, FREE=1 → else (key 1).
+                let free0: std::collections::HashMap<String, f64> =
+                    [("FREE".to_string(), 0.0)].into_iter().collect();
+                let free1: std::collections::HashMap<String, f64> =
+                    [("FREE".to_string(), 1.0)].into_iter().collect();
+                assert_eq!((selector.eval)(&free0), 0);
+                assert_eq!((selector.eval)(&free1), 1);
+            }
+            other => panic!("expected Selected, got {:?}", other),
+        }
+
+        // The selector covariate becomes a required data column.
+        assert!(model.referenced_covariates.iter().any(|c| c == "FREE"));
+    }
+
+    #[test]
+    fn test_selected_error_model_else_if_chain() {
+        // Three-way split: FREE==0, FREE==1, else — keys 0, 1, 2 (else).
+        let model = parse_full_model(&selected_err_model_str(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else if (FREE == 1) {\n    DV ~ proportional(PROP_UNBOUND)\n  } else {\n    DV ~ additive(PROP_TOTAL)\n  }",
+        ))
+        .unwrap()
+        .model;
+        match &model.error_spec {
+            ErrorSpec::Selected {
+                selector,
+                endpoints,
+            } => {
+                assert_eq!(endpoints.len(), 3);
+                let m = |v: f64| -> usize {
+                    let cov: std::collections::HashMap<String, f64> =
+                        [("FREE".to_string(), v)].into_iter().collect();
+                    (selector.eval)(&cov)
+                };
+                assert_eq!(m(0.0), 0);
+                assert_eq!(m(1.0), 1);
+                assert_eq!(m(2.0), 2); // no branch matches → else key
+            }
+            other => panic!("expected Selected, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_selected_error_model_requires_else() {
+        let err = expect_parse_err(&selected_err_model_str(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  }",
+        ));
+        assert!(
+            err.contains("must end with a final"),
+            "expected a missing-else error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_selected_error_model_rejects_ltbs_branch() {
+        let err = expect_parse_err(&selected_err_model_str(
+            "  if (FREE == 0) {\n    log(DV) ~ additive(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+        ));
+        assert!(
+            err.contains("log-transform-both-sides"),
+            "expected an LTBS-rejected error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_selected_error_unknown_sigma_rejected() {
+        let err = expect_parse_err(&selected_err_model_str(
+            "  if (FREE == 0) {\n    DV ~ proportional(NOPE)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+        ));
+        assert!(
+            err.contains("unknown sigma"),
+            "expected an unknown-sigma error, got: {err}"
+        );
+    }
+
+    /// Shared free/total covariate-selected model with the two branch sigmas in
+    /// one `block_sigma` (#669). Used by the accept-parse and the cross-branch
+    /// R-matrix tests so the two can't drift.
+    const SELECTED_BLOCK_SIGMA_MODEL: &str = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.01, 0.005, 0.09]
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+";
+
+    #[test]
+    fn test_selected_error_model_accepts_block_sigma() {
+        // #669: block_sigma correlated residuals now parse together with a
+        // covariate-selected [error_model]. The off-diagonal couples the two
+        // branches' sigmas, and `build_residual_correlations` records it.
+        let model = parse_full_model(SELECTED_BLOCK_SIGMA_MODEL).unwrap().model;
+        assert!(matches!(model.error_spec, ErrorSpec::Selected { .. }));
+        // One off-diagonal correlation between the two branch sigmas (idx 0,1).
+        assert_eq!(model.residual_correlations.len(), 1);
+        let corr = model.residual_correlations[0];
+        let pair = (
+            corr.sigma_i.min(corr.sigma_j),
+            corr.sigma_i.max(corr.sigma_j),
+        );
+        assert_eq!(pair, (0, 1));
+        // rho = cov / (sd_i · sd_j) = 0.005 / sqrt(0.01·0.09).
+        let expected_rho = 0.005 / (0.01f64 * 0.09).sqrt();
+        assert!((corr.rho - expected_rho).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_selected_error_model_rejects_block_sigma_unused_sigma() {
+        // The reference-validity check still runs for Selected: a block_sigma
+        // off-diagonal touching a sigma no branch loads is rejected.
+        let src = r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  block_sigma (PROP_TOTAL, PROP_UNUSED) = [0.01, 0.005, 0.09]
+  sigma PROP_UNBOUND ~ 0.30 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+";
+        let err = expect_parse_err(src);
+        assert!(
+            err.contains("not used by [error_model]"),
+            "expected an unused-sigma rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_selected_error_block_sigma_cross_branch_covariance() {
+        // #669 end-to-end: two rows at the same subject time+occasion but
+        // different `FREE` flags resolve to different branches (total vs.
+        // unbound). The dense R off-diagonal must carry the block_sigma
+        // cross-branch covariance rho·σ_i·σ_j scaled by each row's proportional
+        // loading (f·σ_i)(f·σ_j) — identical to the total/unbound PerCmt case.
+        let model = parse_full_model(SELECTED_BLOCK_SIGMA_MODEL).unwrap().model;
+
+        let subject = crate::types::Subject {
+            id: "S1".to_string(),
+            doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![10.0, 10.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![
+                HashMap::from([("FREE".to_string(), 0.0)]),
+                HashMap::from([("FREE".to_string(), 1.0)]),
+            ],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        // sigma = [SD_total, SD_unbound] from the block diagonal.
+        let sd_i = 0.01f64.sqrt();
+        let sd_j = 0.09f64.sqrt();
+        let sigma = [sd_i, sd_j];
+        let f = 10.0;
+        let ipreds = [f, f];
+        let keys = model.error_spec.obs_keys(&subject);
+
+        let r = crate::stats::residual_error::compute_r_matrix_with_correlations(
+            &model.error_spec,
+            &ipreds,
+            keys.as_ref(),
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &sigma,
+            &model.residual_correlations,
+        );
+
+        // Diagonal: each row's own proportional variance from its branch sigma.
+        assert!((r[(0, 0)] - (f * sd_i).powi(2)).abs() < 1e-12);
+        assert!((r[(1, 1)] - (f * sd_j).powi(2)).abs() < 1e-12);
+        // Off-diagonal: cross-branch covariance (f·σ_i)(f·σ_j)·rho.
+        let rho = 0.005 / (sd_i * sd_j);
+        let expected_off = f * sd_i * f * sd_j * rho;
+        assert!((r[(0, 1)] - expected_off).abs() < 1e-12);
+        assert!((r[(1, 0)] - expected_off).abs() < 1e-12);
+        // Sanity: symmetric and equals the raw covariance times f².
+        assert!((r[(0, 1)] - f * f * 0.005).abs() < 1e-12);
+    }
+
+    /// End-to-end dispatch: `obs_keys` resolves each observation's covariate
+    /// snapshot to the right endpoint key, and `variance_at` then uses the
+    /// per-endpoint sigma. A total row (FREE=0) and an unbound row (FREE=1) at
+    /// the same prediction must get *different* proportional variances.
+    #[test]
+    fn test_selected_error_obs_keys_dispatch() {
+        let model = parse_full_model(&selected_err_model_str(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+        ))
+        .unwrap()
+        .model;
+
+        // Two rows in the *same* CMT (=1) but different `FREE` flags.
+        let subject = crate::types::Subject {
+            id: "S1".to_string(),
+            doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![10.0, 10.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![
+                HashMap::from([("FREE".to_string(), 0.0)]),
+                HashMap::from([("FREE".to_string(), 1.0)]),
+            ],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        let keys = model.error_spec.obs_keys(&subject);
+        assert_eq!(keys.as_ref(), &[0usize, 1usize]);
+        assert_eq!(model.error_spec.obs_key(&subject, 0), 0);
+        assert_eq!(model.error_spec.obs_key(&subject, 1), 1);
+
+        // sigma = [SD_total, SD_unbound]. Proportional variance = (f·σ)².
+        let sigma = [0.10, 0.30];
+        let f = 10.0;
+        let v_total = model.error_spec.variance_at(keys[0], f, &sigma);
+        let v_unbound = model.error_spec.variance_at(keys[1], f, &sigma);
+        assert!((v_total - (f * 0.10).powi(2)).abs() < 1e-9);
+        assert!((v_unbound - (f * 0.30).powi(2)).abs() < 1e-9);
+        assert!(v_unbound > v_total);
+    }
+
+    #[test]
+    fn test_selected_error_model_parses_on_ode_model() {
+        // Acceptance: covariate selection works on ODE models too (unlike
+        // per-CMT error, which is ODE-only for the opposite reason).
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_TOTAL   ~ 0.05 (sd)
+  sigma PROP_UNBOUND ~ 0.30 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[scaling]
+  y = central / V
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+";
+        let model = parse_full_model(src).unwrap().model;
+        assert!(model.ode_spec.is_some(), "should be an ODE model");
+        match &model.error_spec {
+            ErrorSpec::Selected { endpoints, .. } => assert_eq!(endpoints.len(), 2),
+            other => panic!("expected Selected on ODE model, got {:?}", other),
+        }
+        assert!(model.referenced_covariates.iter().any(|c| c == "FREE"));
     }
 
     // ── IIV on residual error (`iiv_on_ruv`, #409) ──────────────────────────
@@ -21074,12 +23101,39 @@ if (WT > 70) {
     }
 
     #[test]
-    fn test_parse_scaling_y_on_analytical_errors() {
-        let src = analytical_model_with_scaling(Some("  y = 1000\n"));
-        let err = parse_model_string(&src).expect_err("y on analytical must be rejected");
+    fn test_parse_scaling_y_form_c_on_analytical_accepted() {
+        // #650: a full Form C output readout is now accepted on analytical PK
+        // models; it replaces the built-in concentration and leaves `scaling` at
+        // `None` (the readout, not a divisor, carries the output map).
+        let src = analytical_model_with_scaling(Some("  y = central / V\n"));
+        let model = parse_model_string(&src).expect("analytic Form C readout must parse");
         assert!(
-            err.contains("Form C") || err.contains("ODE model"),
-            "expected Form-C-requires-ODE error, got: {}",
+            model.analytic_readout.is_some(),
+            "analytic Form C must populate analytic_readout"
+        );
+        assert!(matches!(model.scaling, ScalingSpec::None));
+    }
+
+    #[test]
+    fn test_parse_scaling_y_form_c_analytical_rejects_peripheral() {
+        // A peripheral (or other no-closed-form) compartment amount is out of
+        // scope for an analytic readout — reject with a pointer to an ODE model.
+        let src = analytical_model_with_scaling(Some("  y = central / V + periph\n"));
+        let err = parse_model_string(&src).expect_err("peripheral ref must be rejected");
+        assert!(
+            err.contains("periph") && err.contains("ODE model"),
+            "expected peripheral-out-of-scope error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_scaling_y_and_obs_scale_mix_rejected_on_analytical() {
+        let src = analytical_model_with_scaling(Some("  y = central / V\n  obs_scale = 1000\n"));
+        let err = parse_model_string(&src).expect_err("y + obs_scale mix must be rejected");
+        assert!(
+            err.contains("cannot combine") && err.contains("obs_scale"),
+            "expected mix-rejection error, got: {}",
             err
         );
     }
@@ -21214,19 +23268,171 @@ if (WT > 70) {
         };
 
         let state = vec![0.0, 50.0];
-        let mut pk = vec![0.0f64; crate::types::MAX_PK_PARAMS];
-        pk[0] = 1.0;
-        pk[1] = 50.0;
-        pk[2] = 1.0;
         let theta = vec![3.0, 50.0, 1.0]; // [TVCL=3, TVV=50, TVKA=1]
         let eta = vec![0.0];
         let cov = HashMap::new();
-        let y = out_fn(&state, &pk, &theta, &eta, &cov);
+        // The bare `TVCL` in the readout is desugared (#486) into a synthetic
+        // individual parameter, so its value flows through the PK-parameter vector
+        // `pk_param_fn` fills (the production readout call path) — not the bare
+        // `theta` slice. Build `pk` the same way production does.
+        let pk = (model.pk_param_fn)(&theta, &eta, &cov, 0.0);
+        let y = out_fn(&state, &pk.values, &theta, &eta, &cov);
         // central/V * TVCL = 50/50 * 3 = 3.
         assert!(
             (y - 3.0).abs() < 1e-12,
             "expected 3.0 (TVCL must resolve to theta[0]=3), got {}",
             y
+        );
+    }
+
+    /// #486: a Form-C readout referencing θ/η directly is desugared into synthetic
+    /// individual parameters (`__ferx_ro_*`), which makes the readout analytic
+    /// (`is_dual_evaluable`) without adding any new random effect, and the synthetic
+    /// names are suppressed from user-facing EBE output.
+    #[test]
+    fn test_form_c_direct_theta_eta_desugars_to_indiv_params() {
+        let src = ode_model_with_scaling(
+            "ode(states=[depot, central])",
+            // Bare θ (`TVCL`) and bare η (`ETA_CL`) directly in the readout.
+            Some("  y = central / V * TVCL + ETA_CL\n"),
+        );
+        let model = parse_model_string(&src).expect("direct θ/η readout parses");
+
+        // Two synthetic individual parameters were appended (θ and η source).
+        let synth: Vec<&String> = model
+            .indiv_param_names
+            .iter()
+            .filter(|n| is_synthetic_readout_param(n))
+            .collect();
+        assert_eq!(synth.len(), 2, "one synthetic param per distinct θ/η ref");
+        assert_eq!(model.indiv_param_names.len(), model.pk_indices.len());
+
+        // The desugared readout carries no bare θ/η ops, so it is dual-evaluable.
+        let ode = model.ode_spec.as_ref().unwrap();
+        let prog = ode
+            .readout_program
+            .as_ref()
+            .expect("uniform Form-C readout has a sensitivity program");
+        assert!(
+            prog.is_dual_evaluable(),
+            "a θ/η readout must be analytic after desugaring (#486)"
+        );
+
+        // The `ETA_CL` reference reuses the existing random effect — no new omega.
+        assert_eq!(
+            model.n_eta, 1,
+            "desugaring an η reference adds no random effect"
+        );
+
+        // The synthetic parameters are load-bearing (read by the readout), so the
+        // "computed but never used" census must not flag them.
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("computed but never used")),
+            "synthetic readout params must not trip the unused-parameter census, got: {:?}",
+            model.parse_warnings
+        );
+    }
+
+    /// #486 headroom helper: `ode_free_slot_count` reports how many non-reserved PK
+    /// slots remain, reusing the real `ode_param_slots` assignment so it can never
+    /// drift from it.
+    #[test]
+    fn ode_free_slot_count_reports_headroom() {
+        // 16 slots − 2 reserved (F, lagtime) = 14 usable.
+        assert_eq!(ode_free_slot_count(&[]), 14);
+        // CL→0, V→1 are non-reserved canonical slots, leaving 12.
+        assert_eq!(
+            ode_free_slot_count(&["CL".to_string(), "V".to_string()]),
+            12
+        );
+        // 14 non-canonical params exactly fill the layout → 0 free; one more still 0
+        // (`ode_param_slots` errors, and the headroom is reported as full).
+        let full: Vec<String> = (0..14).map(|i| format!("EXTRA{i}")).collect();
+        assert_eq!(ode_free_slot_count(&full), 0);
+        let over: Vec<String> = (0..15).map(|i| format!("EXTRA{i}")).collect();
+        assert_eq!(ode_free_slot_count(&over), 0);
+    }
+
+    /// #486: the `__ferx_ro_` prefix is reserved for synthetic readout params, so a
+    /// user/generated parameter carrying it is rejected at parse time rather than
+    /// being silently misclassified as internal (and dropped from output).
+    #[test]
+    fn test_form_c_reserved_prefix_param_rejected() {
+        let src =
+            ode_model_with_scaling("ode(states=[depot, central])", Some("  y = central / V\n"))
+                .replace("  KA = TVKA\n", "  KA = TVKA\n  __ferx_ro_x = TVKA\n");
+        let err = parse_model_string(&src)
+            .expect_err("a user parameter using the reserved __ferx_ro_ prefix must be rejected");
+        assert!(
+            err.contains("reserved") && err.contains("__ferx_ro_"),
+            "expected a reserved-prefix error, got: {err}"
+        );
+    }
+
+    /// #486 regression: a model that previously parsed (direct-θ readout served by the
+    /// FD fallback) must not start failing the 16-slot PK layout once desugaring is
+    /// available. When the synthetic param has no free slot, the readout falls back to
+    /// FD (its prior behaviour) with a warning, instead of erroring.
+    #[test]
+    fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
+        // CL, V, KA take 3 of the 14 usable slots; 11 extra top-level params fill the
+        // remaining 11 → zero headroom. A direct-θ readout would need one more.
+        let extras: String = (0..11).map(|i| format!("  EXTRA{i} = TVV\n")).collect();
+        let src = format!(
+            "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+{extras}
+[structural_model]
+  ode(states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) = KA * depot - CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method  = focei
+  maxiter = 10
+  gradient = fd
+
+[scaling]
+  y = central / V * TVCL
+"
+        );
+        let model = parse_model_string(&src)
+            .expect("a slot-full model with a direct-θ readout must still parse (FD fallback)");
+
+        // No synthetic param was injected — desugaring stood down for lack of a slot.
+        assert!(
+            !model
+                .indiv_param_names
+                .iter()
+                .any(|n| is_synthetic_readout_param(n)),
+            "desugaring must not consume a slot it does not have"
+        );
+        // The fallback is surfaced, not silent.
+        assert!(
+            model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("finite-difference")),
+            "the FD fallback must be warned about, got: {:?}",
+            model.parse_warnings
         );
     }
 

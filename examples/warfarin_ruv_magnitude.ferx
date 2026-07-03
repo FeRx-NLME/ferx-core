@@ -1,0 +1,42 @@
+# One-compartment oral warfarin PK model with a TIME-varying proportional
+# residual-error magnitude (#484/#576/#486): the proportional error inflates
+# linearly with TIME (scaled by 48h) via a theta, RUV_LATE. The θ/σ outer
+# gradient and η inner gradient are both analytic (#486) — this model exercises
+# the direct-θ channel `mult(θ)` adds to `∂R/∂θ`, validated against a live
+# NONMEM FOCEI fit on data simulated from this file (OFV/estimates match to
+# ~4-5 significant figures).
+
+[parameters]
+  theta TVCL(0.15, 0.001, 10.0)
+  theta TVV(8.0, 0.1, 500.0)
+  theta TVKA(1.0, 0.01, 50.0)
+  theta RUV_LATE(2.0, 0.0, 5.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))
+
+[fit_options]
+  method     = focei
+  maxiter    = 300
+  covariance = false
+
+[simulation]
+  n_subjects = 40
+  dose_amt   = 100.0
+  dose_cmt   = 1
+  times      = [0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0, 96.0, 120.0]
+  seed       = 7
