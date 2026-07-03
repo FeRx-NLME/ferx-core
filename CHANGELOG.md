@@ -20,6 +20,10 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **New `ferx summary <run.fitrx>` CLI subcommand** (#684): prints a concise,
+  `psn::sumo`-style summary (parameter estimates with SE / %RSE, OMEGA / SIGMA with
+  CV%, condition number, shrinkage, and run info) from a saved `.fitrx` bundle to
+  stdout — no re-fitting or data required.
 - **Log-transform-both-sides (LTBS) combined with IOV now gets an analytic *outer* (θ/Ω/σ)
   gradient** (#486): the closed-form IOV sensitivity walk applies the `ln(f)` jet after its
   in-walk scale quotient, reproducing production's scale-then-log order `ln(f/s)`, so LTBS × IOV

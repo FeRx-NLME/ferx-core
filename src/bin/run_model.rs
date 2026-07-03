@@ -12,10 +12,18 @@ fn main() {
         std::process::exit(run_check(&args));
     }
 
+    // `ferx summary <run.fitrx>` is a read-only reporting subcommand (like
+    // psn::sumo): load a saved fit bundle and print parameter estimates plus
+    // basic run info to stdout. Dispatch before the fit/simulate path.
+    if args.get(1).map(String::as_str) == Some("summary") {
+        std::process::exit(run_summary(&args));
+    }
+
     if args.len() < 2 {
         eprintln!("Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]]");
         eprintln!("       ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]");
         eprintln!("       ferx check <model.ferx> [--data <data.csv>] [--json]");
+        eprintln!("       ferx summary <run.fitrx>");
         eprintln!();
         eprintln!("Fits a NLME model and writes sdtab.csv with residuals.");
         eprintln!("Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)");
@@ -169,6 +177,33 @@ fn main() {
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
+        }
+    }
+}
+
+/// Run the `summary` subcommand: load a `.fitrx` bundle and print a
+/// `psn::sumo`-style summary (parameter estimates + basic run info) to stdout.
+/// Returns the process exit code: `0` = printed, `1` = load failed,
+/// `2` = usage (missing/flag-looking path).
+fn run_summary(args: &[String]) -> i32 {
+    let path = match args.get(2) {
+        Some(p) if !p.starts_with("--") => p.as_str(),
+        _ => {
+            eprintln!("Usage: ferx summary <run.fitrx>");
+            eprintln!();
+            eprintln!("Prints a psn::sumo-style summary — parameter estimates with %RSE");
+            eprintln!("plus basic run info — from a saved .fitrx fit bundle.");
+            return 2;
+        }
+    };
+    match ferx_core::io::fitrx::load_fit(std::path::Path::new(path)) {
+        Ok(loaded) => {
+            print!("{}", ferx_core::io::output::format_summary(&loaded.fit));
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: failed to load {}: {}", path, e);
+            1
         }
     }
 }
@@ -359,7 +394,7 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 mod tests {
     use super::{
         parse_check_args, parse_inits_from_nca_flag, parse_output_flag, parse_threads_flag,
-        print_check_human, run_check, CheckArgsError,
+        print_check_human, run_check, run_summary, CheckArgsError,
     };
     use ferx_core::NcaInit;
 
@@ -536,6 +571,41 @@ mod tests {
         let bad_path = bad.to_str().unwrap();
         assert_eq!(run_check(&args(&["check", bad_path])), 1);
         assert_eq!(run_check(&args(&["check", bad_path, "--json"])), 1);
+    }
+
+    // ── run_summary: in-process coverage of the `summary` subcommand ──────────
+
+    const WARFARIN_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/warfarin.ferx");
+
+    #[test]
+    fn run_summary_usage_errors_return_2() {
+        // No path, and a flag where the path should be — both usage (2).
+        assert_eq!(run_summary(&args(&["summary"])), 2);
+        assert_eq!(run_summary(&args(&["summary", "--json"])), 2);
+    }
+
+    #[test]
+    fn run_summary_missing_file_returns_1() {
+        assert_eq!(run_summary(&args(&["summary", "/no/such/file.fitrx"])), 1);
+    }
+
+    #[test]
+    fn run_summary_valid_fitrx_returns_0() {
+        // Produce a real .fitrx via simulate (fast — no optimization loop), then
+        // load and summarize it in-process so the success arm is covered.
+        let (fit, pop) = ferx_core::run_model_simulate(WARFARIN_MODEL).expect("simulate warfarin");
+        let src = std::fs::read_to_string(WARFARIN_MODEL).expect("read model");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.fitrx");
+        ferx_core::io::fitrx::save_fit(
+            &fit,
+            &pop,
+            &src,
+            &path,
+            ferx_core::io::fitrx::SaveFitOptions::default(),
+        )
+        .expect("save fitrx");
+        assert_eq!(run_summary(&args(&["summary", path.to_str().unwrap()])), 0);
     }
 
     #[test]

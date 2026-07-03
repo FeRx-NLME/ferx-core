@@ -8,6 +8,7 @@ The `ferx` command-line tool runs population PK estimation from model files and 
 ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data] [--inits-from-nca[=METHOD]]
 ferx <model.ferx> --simulate          [--output <run.fitrx>]
 ferx check <model.ferx> [--data <data.csv>] [--json]
+ferx summary <run.fitrx>
 ```
 
 ## Commands
@@ -64,6 +65,43 @@ The exit code is `0` when no errors are found (warnings alone still exit `0`),
 `1` when any error is found, and `2` on a usage error. See the
 [check report reference](file-formats/check-report.qmd) for the JSON schema and
 the full error-code table.
+
+### Summarize a Saved Fit (`summary`)
+
+```bash
+ferx summary run1.fitrx
+```
+
+Loads a saved [`.fitrx` bundle](file-formats/fitrx.qmd) and prints a concise,
+[`psn::sumo`](https://uupharmacometrics.github.io/PsN/)-style summary of the run
+to **stdout** — no re-fitting, no data required. Handy for reviewing an old run,
+diffing two fits, or piping into a report. The summary covers:
+
+- **Run status** — estimation method (or chain), convergence, iterations, and
+  the subject / observation / parameter counts.
+- **Objective function** — OFV, AIC, BIC.
+- **Parameter estimates** — the THETA table with SE and %RSE, OMEGA variances
+  with CV% and off-diagonal correlations, and SIGMA (with CV% for the
+  proportional component). `[FIX]`-flagged parameters show `---` for SE.
+- **Diagnostics** — covariance status, condition number, and η / ε shrinkage.
+- **Run info** — wall time, ferx version, and any fit warnings.
+
+```text
+============================================================
+ferx run summary — warfarin
+============================================================
+Method:     FOCEI
+Converged:  YES
+Iterations: 28
+Subjects: 32   Observations: 251   Parameters: 7
+
+--- Objective Function ---
+  OFV:  -280.1838
+  ...
+```
+
+The exit code is `0` on success, `1` if the bundle cannot be loaded, and `2` on
+a usage error (missing path).
 
 ## Output Files
 
@@ -135,8 +173,8 @@ Elapsed: 0.496s
 | Code | Meaning |
 |------|---------|
 | 0 | Success (for `check`: no errors found) |
-| 1 | Error (parse failure, data error, convergence failure; for `check`: errors found) |
-| 2 | `check` usage error (e.g. missing model path) |
+| 1 | Error (parse failure, data error, convergence failure; for `check`: errors found; for `summary`: bundle failed to load) |
+| 2 | Usage error for `check` / `summary` (e.g. missing model or bundle path) |
 
 ## Examples
 
