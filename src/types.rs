@@ -307,7 +307,16 @@ impl DoseEvent {
 /// default rather than being aliased by a structural parameter (issue #122).
 /// The headroom here therefore bounds how many structural parameters an ODE
 /// model can declare.
-pub const MAX_PK_PARAMS: usize = 16;
+///
+/// This must be a compile-time constant because the Enzyme autodiff backend
+/// requires stack-allocated arrays of statically-known size along the AD path
+/// (a `Vec` would break differentiation). The cost of a larger ceiling is
+/// purely stack: each `PkParams` holds `MAX_PK_PARAMS * 8` bytes, and a few
+/// scratch buffers in `ode/predictions.rs` size themselves the same way. At
+/// 128 that is ~1 KB per instance — negligible — while leaving room for
+/// complex multi-analyte models (e.g. simultaneous parent/metabolite systems
+/// with ~20+ structural parameters).
+pub const MAX_PK_PARAMS: usize = 128;
 
 pub const PK_IDX_CL: usize = 0;
 pub const PK_IDX_V: usize = 1;

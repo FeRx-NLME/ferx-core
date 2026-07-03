@@ -84,6 +84,15 @@ section of the SDLC for the versioning policy).
   [Scaling → Form C](https://ferx-nlme.github.io/ferx-core/model-file/scaling.html).
 
 ### Changed
+- **Bumped `MAX_PK_PARAMS` from 16 to 128**, raising the ceiling on ODE structural
+  parameters (rate constants, Emax/EC50, baselines, …) that an ODE model may declare
+  in `[individual_parameters]` from 7 to 119 (slots 0–8 remain reserved for the named
+  PK params CL, V, Q, V2, KA, F, Q3, V3, LAGTIME). Complex multi-analyte models —
+  e.g. simultaneous parent/metabolite systems with ~20+ structural parameters — that
+  previously failed the parser's "too many individual parameters" check now compile.
+  The ceiling is a compile-time constant because the Enzyme autodiff backend requires
+  stack-allocated arrays of statically-known size; the cost of the higher ceiling is
+  purely stack (`MAX_PK_PARAMS * 8` bytes per `PkParams`, ~1 KB at 128).
 - **M3 BLOQ censored rows now enter the FOCEI Laplace determinant `log|H̃|`** for a
   consistent likelihood (#486). Previously censored rows contributed to the data term and
   the true inner Hessian but were dropped from the outer `log|H̃|` — an internal
