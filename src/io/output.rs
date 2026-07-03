@@ -567,6 +567,17 @@ pub fn format_summary(result: &FitResult) -> String {
         CovarianceStatus::Failed | CovarianceStatus::SirFallback
     );
 
+    // NN weight thetas are excluded from the per-parameter table (they can
+    // number in the hundreds); `print_results` skips them the same way.
+    #[cfg(feature = "nn")]
+    let nn_theta_indices: std::collections::HashSet<usize> = result
+        .neural_networks
+        .iter()
+        .flat_map(|nn| nn.weights_offset..nn.weights_offset + nn.n_weights)
+        .collect();
+    #[cfg(not(feature = "nn"))]
+    let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
     // --- THETA ---
     let _ = writeln!(out, "\n--- THETA ---");
     let _ = writeln!(
@@ -575,6 +586,9 @@ pub fn format_summary(result: &FitResult) -> String {
         "Parameter", "Estimate", "SE", "%RSE"
     );
     for (i, name) in result.theta_names.iter().enumerate() {
+        if nn_theta_indices.contains(&i) {
+            continue;
+        }
         let est = result.theta[i];
         let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
         let label = if is_fixed {
