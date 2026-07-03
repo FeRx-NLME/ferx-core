@@ -19,6 +19,8 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-03
+
 ### Added
 - **New `ferx summary <run.fitrx>` CLI subcommand** (#684): prints a concise,
   `psn::sumo`-style summary (parameter estimates with SE / %RSE, OMEGA / SIGMA with
@@ -2200,6 +2202,7 @@ and `git log v0.1.0..v0.1.5` for details.
 Initial tagged release. See the
 [GitHub release](https://github.com/FeRx-NLME/ferx-core/releases/tag/v0.1.0).
 
-[Unreleased]: https://github.com/FeRx-NLME/ferx-core/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/FeRx-NLME/ferx-core/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/FeRx-NLME/ferx-core/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/FeRx-NLME/ferx-core/compare/v0.1.0...v0.1.5
 [0.1.0]: https://github.com/FeRx-NLME/ferx-core/releases/tag/v0.1.0
