@@ -2134,6 +2134,36 @@ mod tests {
         assert!(yaml.contains("      max:"), "max stat missing:\n{yaml}");
     }
 
+    /// Regression: `format_summary` must exclude NN weight thetas from the
+    /// THETA table (they can number in the hundreds), matching the YAML writer
+    /// and `print_results`. Without the `nn_theta_indices` skip this dumps one
+    /// row per weight.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn format_summary_excludes_nn_weight_thetas() {
+        let result = make_nn_result();
+        let s = format_summary(&result);
+
+        // The user-declared theta is still listed.
+        assert!(s.contains("TVKA"), "TVKA must appear in THETA table:\n{s}");
+
+        // None of the 17 NN-weight thetas appear.
+        for layer in 1..3 {
+            let n_l = if layer == 1 { 3 } else { 2 };
+            let n_lm1 = if layer == 1 { 2 } else { 3 };
+            for i in 1..=n_l {
+                for j in 1..=n_lm1 {
+                    let name = format!("W_TYPICAL_PK_{}_{}_{}", layer, i, j);
+                    assert!(
+                        !s.contains(&name),
+                        "NN weight `{}` should NOT appear in THETA table:\n{s}",
+                        name
+                    );
+                }
+            }
+        }
+    }
+
     /// Sanity: when no `[covariate_nn]` blocks are declared, the YAML
     /// should NOT have a `neural_networks:` section at all.
     #[cfg(feature = "nn")]
