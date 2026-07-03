@@ -1347,6 +1347,11 @@ fn parse_ebe_kappas(
 // formula as `saem_conddist::run_conditional_distribution`, giving a value
 // that matches the original bit-for-bit rather than a redundant serialized
 // copy.
+//
+// The CSV must carry exactly one row per (subject, eta): duplicate or missing
+// rows are rejected rather than silently loaded as NaN, and each COND_MODE is
+// validated against the EBE already loaded from `ebes.csv`, so a truncated or
+// hand-edited bundle fails fast.
 fn parse_conddist_csv(csv: &str, fit: &FitResult) -> Result<CondDist, FitrxError> {
     let n_subjects = fit.subjects.len();
     let n_eta = fit.eta_names.len();
@@ -1373,6 +1378,10 @@ fn parse_conddist_csv(csv: &str, fit: &FitResult) -> Result<CondDist, FitrxError
 
     let mut cond_mean = vec![vec![f64::NAN; n_eta]; n_subjects];
     let mut cond_sd = vec![vec![f64::NAN; n_eta]; n_subjects];
+    // Track which (subject, eta) cells the CSV actually filled, so a truncated
+    // or duplicate-filled bundle is rejected up front rather than silently
+    // loading NaNs (and NaN shrinkage) later.
+    let mut seen = vec![vec![false; n_eta]; n_subjects];
 
     for (i, line) in lines.enumerate() {
         if line.trim().is_empty() {
@@ -1392,6 +1401,13 @@ fn parse_conddist_csv(csv: &str, fit: &FitResult) -> Result<CondDist, FitrxError
         let ei = *by_eta.get(fields[1].as_str()).ok_or_else(|| {
             FitrxError::Corrupt(format!("conddist.csv: unknown ETA {:?}", fields[1]))
         })?;
+        if seen[si][ei] {
+            return Err(FitrxError::Corrupt(format!(
+                "conddist.csv: duplicate row for ID {:?} ETA {:?}",
+                fields[0], fields[1]
+            )));
+        }
+        seen[si][ei] = true;
         let parse_or_nan = |field: &str| -> Result<f64, FitrxError> {
             if field.is_empty() {
                 Ok(f64::NAN)
@@ -1407,7 +1423,31 @@ fn parse_conddist_csv(csv: &str, fit: &FitResult) -> Result<CondDist, FitrxError
         };
         cond_mean[si][ei] = parse_or_nan(&fields[2])?;
         cond_sd[si][ei] = parse_or_nan(&fields[3])?;
-        // fields[4] (COND_MODE) is the EBE, already on `fit.subjects[si].eta` — not re-stored.
+        // COND_MODE is the conditional mode = the EBE already carried on
+        // `fit.subjects[si].eta` (loaded from ebes.csv). It isn't re-stored, but
+        // we validate it agrees with that EBE so a mismatched or hand-edited
+        // bundle fails fast rather than passing off inconsistent data. Both are
+        // produced by the same `fmt_f64`, so a consistent bundle matches exactly.
+        let expected_mode = fmt_f64(fit.subjects[si].eta.get(ei).copied().unwrap_or(f64::NAN));
+        if fields[4] != expected_mode {
+            return Err(FitrxError::Corrupt(format!(
+                "conddist.csv: COND_MODE {:?} for ID {:?} ETA {:?} disagrees with EBE {:?}",
+                fields[4], fields[0], fields[1], expected_mode
+            )));
+        }
+    }
+
+    // Every (subject, eta) pair must be present exactly once. The duplicate
+    // check above covers "more than once"; this covers a truncated bundle.
+    for (si, s) in fit.subjects.iter().enumerate() {
+        for (ei, eta_name) in fit.eta_names.iter().enumerate() {
+            if !seen[si][ei] {
+                return Err(FitrxError::Corrupt(format!(
+                    "conddist.csv: missing row for ID {:?} ETA {:?}",
+                    s.id, eta_name
+                )));
+            }
+        }
     }
 
     let shrinkage: Vec<f64> = (0..n_eta)
@@ -2219,6 +2259,64 @@ mod tests {
         let loaded = load_fit(&path).unwrap();
         assert!(loaded.fit.cond_dist.is_none());
         assert!(!loaded.manifest.entries.iter().any(|e| e == "conddist.csv"));
+    }
+
+    // Full valid conddist.csv for a `minimal_fit_result()` fit: S1/S2 with
+    // eta_names [eta_CL, eta_V] and EBEs [0.1, 0.2] (from `dummy_subject`).
+    const VALID_CONDDIST_CSV: &str = "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+        S1,eta_CL,0.11,0.05,0.100000\n\
+        S1,eta_V,-0.19,0.06,0.200000\n\
+        S2,eta_CL,0.29,0.07,0.100000\n\
+        S2,eta_V,0.41,0.08,0.200000\n";
+
+    #[test]
+    fn parse_conddist_csv_accepts_complete_bundle() {
+        let fit = minimal_fit_result();
+        let cd = parse_conddist_csv(VALID_CONDDIST_CSV, &fit).unwrap();
+        assert_eq!(cd.cond_mean, vec![vec![0.11, -0.19], vec![0.29, 0.41]]);
+        assert_eq!(cd.cond_sd, vec![vec![0.05, 0.06], vec![0.07, 0.08]]);
+    }
+
+    #[test]
+    fn parse_conddist_csv_rejects_duplicate_row() {
+        let fit = minimal_fit_result();
+        let csv = format!("{}S1,eta_CL,0.11,0.05,0.100000\n", VALID_CONDDIST_CSV);
+        let err = parse_conddist_csv(&csv, &fit).unwrap_err();
+        assert!(
+            matches!(&err, FitrxError::Corrupt(m) if m.contains("duplicate")),
+            "expected duplicate error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_conddist_csv_rejects_missing_row() {
+        let fit = minimal_fit_result();
+        // Drop the last (S2, eta_V) row.
+        let csv = "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+            S1,eta_CL,0.11,0.05,0.100000\n\
+            S1,eta_V,-0.19,0.06,0.200000\n\
+            S2,eta_CL,0.29,0.07,0.100000\n";
+        let err = parse_conddist_csv(csv, &fit).unwrap_err();
+        assert!(
+            matches!(&err, FitrxError::Corrupt(m) if m.contains("missing")),
+            "expected missing-row error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_conddist_csv_rejects_mode_ebe_mismatch() {
+        let fit = minimal_fit_result();
+        // Corrupt one COND_MODE so it no longer matches the loaded EBE (0.1).
+        let csv = "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+            S1,eta_CL,0.11,0.05,0.999999\n\
+            S1,eta_V,-0.19,0.06,0.200000\n\
+            S2,eta_CL,0.29,0.07,0.100000\n\
+            S2,eta_V,0.41,0.08,0.200000\n";
+        let err = parse_conddist_csv(csv, &fit).unwrap_err();
+        assert!(
+            matches!(&err, FitrxError::Corrupt(m) if m.contains("COND_MODE")),
+            "expected COND_MODE mismatch error, got {err:?}"
+        );
     }
 
     #[test]
