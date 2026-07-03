@@ -9,6 +9,7 @@
 //! The dataset is fully synthetic (simulated from the model's own parameters);
 //! no proprietary data is used.
 
+use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, Population, Subject};
 use ferx_core::{fit, simulate_with_seed, EstimationMethod, FitOptions};
@@ -173,4 +174,85 @@ fn saem_conddist_keep_samples_retains_draws() {
         assert_eq!(cd.samples[i].len(), opts.saem_conddist_nsamp);
         assert_eq!(cd.samples[i][0].len(), n_eta);
     }
+}
+
+/// #675: `.fitrx` bundles must round-trip `cond_dist` (cond_mean/cond_sd) via
+/// `conddist.csv`, not silently drop it as `None` on load.
+#[test]
+fn saem_conddist_roundtrips_through_fitrx_bundle() {
+    let model = parse_model_string(MODEL).expect("model must parse");
+    let template = template_population(10);
+    let population = simulate_into(&model, &template);
+
+    let opts = short_saem_opts();
+    let result = fit(&model, &population, &model.default_params, &opts).expect("SAEM fit succeeds");
+    assert!(
+        result.cond_dist.is_some(),
+        "fixture fit must have run conddist"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("conddist_fit.fitrx");
+    save_fit(
+        &result,
+        &population,
+        MODEL,
+        &path,
+        SaveFitOptions::default(),
+    )
+    .unwrap();
+
+    let loaded = load_fit(&path).unwrap();
+    let cd = loaded
+        .fit
+        .cond_dist
+        .expect("cond_dist must round-trip through .fitrx");
+    let orig = result.cond_dist.as_ref().unwrap();
+
+    assert_eq!(cd.cond_mean.len(), orig.cond_mean.len());
+    for (a, b) in cd.cond_mean.iter().zip(orig.cond_mean.iter()) {
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-6, "cond_mean {x} vs {y}");
+        }
+    }
+    for (a, b) in cd.cond_sd.iter().zip(orig.cond_sd.iter()) {
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!((x - y).abs() < 1e-6, "cond_sd {x} vs {y}");
+        }
+    }
+
+    assert!(
+        loaded.manifest.entries.iter().any(|e| e == "conddist.csv"),
+        "manifest must list conddist.csv"
+    );
+}
+
+/// #675: a fit that never ran the conddist pass must not gain a `conddist.csv`
+/// entry, and must still load back with `cond_dist: None`.
+#[test]
+fn saem_no_conddist_omits_fitrx_entry() {
+    let model = parse_model_string(MODEL).expect("model must parse");
+    let template = template_population(6);
+    let population = simulate_into(&model, &template);
+
+    let mut opts = short_saem_opts();
+    opts.saem_conddist = false;
+
+    let result = fit(&model, &population, &model.default_params, &opts).expect("SAEM fit succeeds");
+    assert!(result.cond_dist.is_none());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("no_conddist_fit.fitrx");
+    save_fit(
+        &result,
+        &population,
+        MODEL,
+        &path,
+        SaveFitOptions::default(),
+    )
+    .unwrap();
+
+    let loaded = load_fit(&path).unwrap();
+    assert!(loaded.fit.cond_dist.is_none());
+    assert!(!loaded.manifest.entries.iter().any(|e| e == "conddist.csv"));
 }

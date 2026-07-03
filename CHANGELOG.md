@@ -122,6 +122,13 @@ section of the SDLC for the versioning policy).
   the iterative MCEM E-step only; the eval-only / final-marginal IS report keeps
   a fixed proposal for run-to-run reproducibility.
 
+### Fixed
+- **`.fitrx` bundles now carry SAEM conditional-distribution results** (#675). A fit run with
+  `conddist = true` writes a `conddist.csv` entry (`ID, ETA, COND_MEAN, COND_SD, COND_MODE`)
+  into the bundle, and loading it back now populates `FitResult.cond_dist` instead of always
+  reporting `None` — enabling the FeRx GUI's "Cond. Dist." Evaluation section to read this data
+  from a saved fit.
+
 ### Added
 - **Log-transform-both-sides (LTBS) combined with time-varying covariates** now gets an exact
   analytic FOCE/FOCEI **outer** (θ/Ω/σ) gradient on the closed-form (analytical 1-/2-/3-cpt)
