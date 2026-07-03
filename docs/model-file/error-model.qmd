@@ -412,13 +412,15 @@ under `method = foce` / `method = focei` (the EKF variance is added to the dense
 `R`) but are rejected under `method = saem`, whose M-step data term does not yet
 include the process-noise inflation.
 
-`simulate()` draws each observation's residual independently and does **not**
-reproduce a `block_sigma` off-diagonal covariance — simulated total/unbound (or
-cross-branch, for a covariate-selected model) rows are uncorrelated even though
-the estimation objective honours the correlation. A VPC or posterior-predictive
-check of the correlated endpoints will therefore understate the residual
-covariance; this applies to every `block_sigma` model, per-CMT and
-covariate-selected alike (tracked in issue #672).
+`simulate()` draws the full residual vector for each subject's paired
+observations (same subject time and occasion) from the dense covariance `R`
+built by `compute_r_matrix_with_correlations` — the same matrix FOCE/FOCEI/SAEM/
+`imp` evaluate the likelihood against — so a fitted or fixed `block_sigma`
+off-diagonal is reproduced in simulated total/unbound (or cross-branch, for a
+covariate-selected model) rows, and a VPC or posterior-predictive check of the
+correlated endpoints recovers the specified correlation (#672). FREM covariate
+pseudo-observations are excluded from the correlated draw (mirroring the
+identical exclusion in the likelihood) and stay independent.
 
 Under `method = focei` the off-diagonal covariance enters the interaction
 correction as well as the data term: the Almquist 2015 conditional Hessian

@@ -2157,6 +2157,14 @@ section of the SDLC for the versioning policy).
 - Autodiff inner gradients now flow through `EVID=3/4` resets and lag time,
   removing a large finite-difference fallback slowdown (#198).
 
+### Fixed
+- **`simulate()` now reproduces a fitted or fixed `block_sigma` cross-endpoint
+  correlation** (#672): paired rows sharing a subject time and occasion (e.g.
+  total/unbound assays, per-CMT or covariate-selected) are drawn from the dense
+  residual covariance `R` instead of independent per-row normals, so a VPC or
+  posterior-predictive check now recovers the specified residual covariance
+  instead of understating it.
+
 ## [0.1.5] - 2026-06-01
 
 Released before this changelog was started. See the

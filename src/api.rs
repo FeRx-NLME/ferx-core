@@ -13,7 +13,10 @@ use crate::propensity_match::MatchMethod;
 use crate::stats::likelihood::{
     build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
 };
-use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
+use crate::stats::residual_error::{
+    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
+    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
+};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
@@ -5937,32 +5940,56 @@ fn emit_subject_rows<R: rand::Rng>(
     // Per-observation custom residual magnitude (#484): η-independent, so build
     // the [obs][sigma-slot] matrix once per subject and index it per row.
     let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
-    for (j, &ipred) in ipreds.iter().enumerate() {
-        // FREM covariate pseudo-observations (FREMTYPE>0) use the additive
-        // covariate sigma, not the PK error model applied to the θ+η override
-        // that `compute_predictions_with_tv` now writes into FREM rows.
-        let var = model.sim_residual_variance(
+    // `block_sigma` cross-endpoint correlations (#672): draw the full
+    // multivariate residual vector from the dense `R` that estimation already
+    // builds (`compute_r_matrix_with_correlations`), so the simulated data
+    // reproduces the fitted covariance instead of independent per-row draws.
+    // FREM covariate pseudo-observations don't participate in the correlation
+    // (mirrors the identical `has_frem_rows` gate in
+    // `stats/likelihood.rs::individual_nll_into_with_schedule`).
+    let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
+    if !model.residual_correlations.is_empty() && !has_frem_rows && !ipreds.is_empty() {
+        emit_correlated_residual_rows(
+            model,
             subject,
-            j,
-            ipred,
-            &params.sigma.values,
+            params,
+            &ipreds,
             ruv_scale,
-            ruv_mult.as_ref().map(|m| m[j].as_slice()),
-        );
-        let eps: f64 = rng.sample(normal);
-        let value = ipred + var.sqrt() * eps;
-
-        results.push(SimulationResult {
+            ruv_mult.as_deref(),
             draw,
             sim,
-            id: subject.id.clone(),
-            // Raw data TIME (matches sdtab / input); `obs_times` may be
-            // the internal shifted clock for stacked reset occasions.
-            time: obs_row_time(subject, j),
-            cmt: subject.obs_cmts[j],
-            ipred,
-            outcome: SimOutcome::Continuous { value },
-        });
+            normal,
+            rng,
+            results,
+        );
+    } else {
+        for (j, &ipred) in ipreds.iter().enumerate() {
+            // FREM covariate pseudo-observations (FREMTYPE>0) use the additive
+            // covariate sigma, not the PK error model applied to the θ+η override
+            // that `compute_predictions_with_tv` now writes into FREM rows.
+            let var = model.sim_residual_variance(
+                subject,
+                j,
+                ipred,
+                &params.sigma.values,
+                ruv_scale,
+                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+            );
+            let eps: f64 = rng.sample(normal);
+            let value = ipred + var.sqrt() * eps;
+
+            results.push(SimulationResult {
+                draw,
+                sim,
+                id: subject.id.clone(),
+                // Raw data TIME (matches sdtab / input); `obs_times` may be
+                // the internal shifted clock for stacked reset occasions.
+                time: obs_row_time(subject, j),
+                cmt: subject.obs_cmts[j],
+                ipred,
+                outcome: SimOutcome::Continuous { value },
+            });
+        }
     }
 
     // TTE simulation path (requires survival feature)
@@ -5978,6 +6005,76 @@ fn emit_subject_rows<R: rand::Rng>(
         rng,
         results,
     );
+}
+
+/// Draw the correlated residual vector for one subject's Gaussian observation
+/// rows from the dense `R` built by [`compute_r_matrix_with_correlations`] (the
+/// same matrix FOCE/FOCEI/SAEM/`imp` evaluate the likelihood against), instead
+/// of the per-row independent draw `emit_subject_rows` otherwise uses. Callers
+/// must already have excluded FREM rows and the empty-correlation case.
+#[allow(clippy::too_many_arguments)]
+fn emit_correlated_residual_rows<R: rand::Rng>(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    ipreds: &[f64],
+    ruv_scale: f64,
+    ruv_mult: Option<&[Vec<f64>]>,
+    draw: usize,
+    sim: usize,
+    normal: rand_distr::Normal<f64>,
+    rng: &mut R,
+    results: &mut Vec<SimulationResult>,
+) {
+    let err_keys = model.error_spec.obs_keys(subject);
+    let mut r = match ruv_mult {
+        Some(mult) => compute_r_matrix_with_correlations_scaled(
+            &model.error_spec,
+            ipreds,
+            err_keys.as_ref(),
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &params.sigma.values,
+            &model.residual_correlations,
+            mult,
+        ),
+        None => compute_r_matrix_with_correlations(
+            &model.error_spec,
+            ipreds,
+            err_keys.as_ref(),
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &params.sigma.values,
+            &model.residual_correlations,
+        ),
+    };
+    if ruv_scale != 1.0 {
+        r *= ruv_scale;
+    }
+    let n = ipreds.len();
+    let chol = r.clone().cholesky().unwrap_or_else(|| {
+        panic!(
+            "simulate: subject {} residual covariance R (block_sigma) is not \
+             positive-definite — check the fitted/fixed sigma and rho values",
+            subject.id
+        )
+    });
+    let z = DVector::from_iterator(n, (0..n).map(|_| rng.sample(normal)));
+    let eps = chol.l() * z;
+    for (j, &ipred) in ipreds.iter().enumerate() {
+        let value = ipred + eps[j];
+        results.push(SimulationResult {
+            draw,
+            sim,
+            id: subject.id.clone(),
+            time: obs_row_time(subject, j),
+            cmt: subject.obs_cmts[j],
+            ipred,
+            outcome: SimOutcome::Continuous { value },
+        });
+    }
 }
 
 /// `matched`, when `Some((fitted_etas, omega_inv, method))`, reassigns each
@@ -7012,6 +7109,7 @@ mod survival_predict_tests {
 #[cfg(test)]
 mod iov_integration {
     use super::fit;
+    use super::simulate_with_seed;
     use crate::types::*;
 
     use std::collections::HashMap;
@@ -8084,6 +8182,159 @@ mod iov_integration {
             (focei_ofv - foce_ofv).abs() > 1e-4,
             "FOCEI OFV {focei_ofv} must differ from FOCE OFV {foce_ofv} (interaction dropped?)"
         );
+    }
+
+    /// Shared covariate-selected free/total `block_sigma` model + paired-row
+    /// subject for the `simulate()` cross-branch correlation tests (#672).
+    /// Mirrors `SELECTED_BLOCK_SIGMA_MODEL` in `parser/model_parser.rs`, which
+    /// pins the same off-diagonal on the estimation side.
+    fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0) FIX
+  theta TVV(50.0, 5.0, 500.0) FIX
+  omega ETA_CL ~ 0.09 FIX
+  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.01, 0.005, 0.09] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+",
+        )
+        .expect("selected-error block_sigma model parses");
+
+        // Two paired rows at the same subject time (total vs. unbound), the
+        // exact fixture `test_selected_error_block_sigma_cross_branch_covariance`
+        // uses to pin the estimation-side dense `R`.
+        let subject = Subject {
+            id: "S1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0, 0.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![
+                HashMap::from([("FREE".to_string(), 0.0)]),
+                HashMap::from([("FREE".to_string(), 1.0)]),
+            ],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["FREE".to_string()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        (model, population)
+    }
+
+    // #672: `simulate()` must draw the two paired rows (same subject time,
+    // different `FREE` branch) from the dense correlated `R`, not independent
+    // per-row normals — otherwise a VPC of the correlated endpoints understates
+    // the residual covariance. Large-N: the empirical correlation of the two
+    // rows' residuals (value − ipred) must recover the fixed `rho` implied by
+    // `block_sigma`'s off-diagonal.
+    #[test]
+    fn test_simulate_recovers_block_sigma_cross_branch_correlation() {
+        let (model, population) = block_sigma_selected_model_and_population();
+
+        let n_sim = 20_000;
+        let results = simulate_with_seed(&model, &population, &model.default_params, n_sim, 42);
+        assert_eq!(results.len(), 2 * n_sim);
+
+        let mut resid_total = Vec::with_capacity(n_sim);
+        let mut resid_unbound = Vec::with_capacity(n_sim);
+        for pair in results.chunks(2) {
+            resid_total.push(pair[0].outcome.continuous_value() - pair[0].ipred);
+            resid_unbound.push(pair[1].outcome.continuous_value() - pair[1].ipred);
+        }
+
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let (m0, m1) = (mean(&resid_total), mean(&resid_unbound));
+        let n = n_sim as f64;
+        let cov = resid_total
+            .iter()
+            .zip(&resid_unbound)
+            .map(|(a, b)| (a - m0) * (b - m1))
+            .sum::<f64>()
+            / n;
+        let var0 = resid_total.iter().map(|a| (a - m0).powi(2)).sum::<f64>() / n;
+        let var1 = resid_unbound.iter().map(|a| (a - m1).powi(2)).sum::<f64>() / n;
+        let empirical_rho = cov / (var0.sqrt() * var1.sqrt());
+
+        let sd_i = 0.01f64.sqrt();
+        let sd_j = 0.09f64.sqrt();
+        let expected_rho = 0.005 / (sd_i * sd_j);
+
+        assert!(
+            (empirical_rho - expected_rho).abs() < 0.03,
+            "empirical rho {empirical_rho} should recover the specified block_sigma \
+             rho {expected_rho} (simulate() ignoring the correlation would give ~0)"
+        );
+    }
+
+    // Degenerate case (#672): a `residual_correlations` entry with `rho == 0.0`
+    // makes `R` exactly diagonal, so the new dense Cholesky draw
+    // (`emit_correlated_residual_rows`) must reproduce the untouched
+    // independent per-row draw (`emit_subject_rows`'s scalar branch, taken when
+    // `model.residual_correlations` is empty) — same seed, same per-row RNG
+    // draw order in both paths. Not bit-for-bit: `compute_r_matrix_with_correlations`'s
+    // diagonal goes through `variance_at_scaled`'s `((f·f)·σ)·σ` association
+    // whenever `correlations` is non-empty (even at rho=0), versus `variance_at`'s
+    // `(f·σ)·(f·σ)` when it's empty — a pre-existing, documented ~1-ULP
+    // reassociation difference (see `residual_error::compute_r_matrix_with_correlations`),
+    // not a regression from this draw path.
+    #[test]
+    fn test_simulate_zero_rho_matches_diagonal_draw_path() {
+        let (mut model, population) = block_sigma_selected_model_and_population();
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.0,
+        }];
+        let dense_path = simulate_with_seed(&model, &population, &model.default_params, 200, 7);
+
+        model.residual_correlations.clear();
+        let scalar_path = simulate_with_seed(&model, &population, &model.default_params, 200, 7);
+
+        assert_eq!(dense_path.len(), scalar_path.len());
+        for (a, b) in dense_path.iter().zip(scalar_path.iter()) {
+            let (va, vb) = (a.outcome.continuous_value(), b.outcome.continuous_value());
+            assert!(
+                (va - vb).abs() < 1e-9 * va.abs().max(1.0),
+                "rho=0 dense-R draw {va} must match the independent scalar draw {vb} \
+                 to within floating-point rounding"
+            );
+        }
     }
 
     #[test]
