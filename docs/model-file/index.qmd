@@ -11,6 +11,7 @@ ferx-core models are defined in `.ferx` files using a declarative DSL. Each file
 | `[structural_model]` | Yes | Specify the PK model (analytical or ODE) |
 | `[error_model]` | Yes | Define the residual error model |
 | `[odes]` | If ODE | ODE right-hand-side equations |
+| `[data]` | No | Point at the dataset CSV (`$DATA` equivalent); overridden by an explicit CLI/R path |
 | `[fit_options]` | No | Configure estimation method and optimizer |
 | `[simulation]` | No | Define a simulation trial design |
 

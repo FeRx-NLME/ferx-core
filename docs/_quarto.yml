@@ -69,6 +69,7 @@ website:
           - model-file/diffusion.qmd
           - model-file/neural-networks.qmd
           - model-file/covariate-nn.qmd
+          - model-file/data.qmd
           - model-file/data-selection.qmd
           - model-file/derived.qmd
           - model-file/output.qmd

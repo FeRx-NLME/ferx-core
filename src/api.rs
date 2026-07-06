@@ -155,11 +155,45 @@ fn log_transform_observations(pop: &mut Population) -> usize {
     n_nonpos
 }
 
-/// Run a model file with a NONMEM-format CSV dataset.
+/// Resolves the dataset path a fit should use, applying override-with-warning
+/// semantics between a model file's optional `[data] path = ...` (#690) and an
+/// externally supplied path (CLI `--data`, R).
+///
+/// - Neither given → `Err` (nothing to fit against).
+/// - Only one given → that one, no warning.
+/// - Both given and equal → the shared path, no warning.
+/// - Both given and different → `external_path` wins; a warning is returned
+///   (not printed — see "Warning and Error Conventions" in CLAUDE.md) for the
+///   caller to attach to `FitResult.warnings` or a `ferx check` diagnostic.
+pub fn resolve_data_path(
+    model_data_path: Option<&str>,
+    external_data_path: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    match (external_data_path, model_data_path) {
+        (Some(ext), Some(model_p)) if ext != model_p => Ok((
+            ext.to_string(),
+            Some(format!(
+                "dataset path overridden: using `{ext}` instead of the model's \
+                 `[data] path = {model_p}`"
+            )),
+        )),
+        (Some(ext), _) => Ok((ext.to_string(), None)),
+        (None, Some(model_p)) => Ok((model_p.to_string(), None)),
+        (None, None) => Err(
+            "no dataset specified — pass a data path, or add a `[data]` block \
+             (`path = ...`) to the model file"
+                .to_string(),
+        ),
+    }
+}
+
+/// Run a model file with a NONMEM-format CSV dataset. `data_path` is `None` to
+/// rely solely on the model's own `[data]` block (#690); when both are given,
+/// `data_path` overrides the model's, with a warning recorded on the result.
 /// Returns (FitResult, Population) so caller can write sdtab.
 pub fn run_model_with_data(
     model_path: &str,
-    data_path: &str,
+    data_path: Option<&str>,
 ) -> Result<(FitResult, Population), String> {
     run_model_with_data_inits(model_path, data_path, None)
 }
@@ -170,7 +204,7 @@ pub fn run_model_with_data(
 /// when `Some(method)` it forces that NCA strategy regardless of the file.
 pub fn run_model_with_data_inits(
     model_path: &str,
-    data_path: &str,
+    data_path: Option<&str>,
     inits_override: Option<crate::suggest_start::NcaInit>,
 ) -> Result<(FitResult, Population), String> {
     use crate::parser::model_parser::parse_full_model_file;
@@ -182,6 +216,9 @@ pub fn run_model_with_data_inits(
     }
 
     eprintln!("Model: {}", parsed.model.name);
+
+    let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
+    let data_path = data_path.as_str();
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
     let sel_filter = build_selection_filter(&parsed.fit_options)?;
@@ -218,6 +255,10 @@ pub fn run_model_with_data_inits(
         &parsed.fit_options,
     )?;
     result.covariate_table = covariate_table;
+    if let Some(w) = data_path_warning {
+        result.warnings.push(w);
+        rebuild_warnings_structured(&mut result);
+    }
     // Hash both inputs *after* the fit so we don't double up disk reads
     // (the model and CSV are already in the page cache from parse + read
     // upstream). Errors here are non-fatal: the fit already succeeded, and
@@ -1955,10 +1996,12 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
 /// first, as `fit()` does). This is the engine behind the `ferx check` CLI
 /// command and is the fast `author → diagnose → fix` loop for tools and agents.
 ///
-/// When `data_path` is `None`, only parse/structural and model/option
-/// compatibility validation runs (no data is read). When it is `Some`, the CSV
-/// is read and the covariate / per-CMT / steady-state / lag-time checks run as
-/// well.
+/// When neither `data_path` nor the model's own `[data]` block (#690) resolve
+/// to a path, only parse/structural and model/option compatibility validation
+/// runs (no data is read). Otherwise the CSV is read and the covariate /
+/// per-CMT / steady-state / lag-time checks run as well. An explicit
+/// `data_path` overrides the model's `[data]` block, with a warning
+/// diagnostic when the two differ (see [`resolve_data_path`]).
 pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
     use crate::parser::model_parser::parse_full_model_file;
 
@@ -1967,18 +2010,33 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
         .and_then(|s| s.to_str())
         .unwrap_or("model")
         .to_string();
-    let data = data_path.map(|s| s.to_string());
 
     // 1. Parse. A parse failure is terminal — without an AST there is nothing
     //    further to validate, so return a report carrying just that diagnostic.
     let parsed = match parse_full_model_file(Path::new(model_path)) {
         Ok(p) => p,
         Err(e) => {
+            let data = data_path.map(|s| s.to_string());
             return CheckReport::new(model_name, data, vec![parse_error_to_diagnostic(&e)]);
         }
     };
 
+    // Resolve which dataset (if any) to check against: an explicit
+    // `data_path` wins over the model's `[data]` block; absence of both just
+    // means the data-dependent checks below are skipped, so any `Err` here
+    // (neither given) is not itself a diagnostic.
+    let (data_path, data_path_warning) =
+        match resolve_data_path(parsed.data_path.as_deref(), data_path) {
+            Ok((p, w)) => (Some(p), w),
+            Err(_) => (None, None),
+        };
+    let data_path = data_path.as_deref();
+    let data = data_path.map(|s| s.to_string());
+
     let mut diags: Vec<Diagnostic> = Vec::new();
+    if let Some(w) = data_path_warning {
+        diags.push(Diagnostic::warning("W_DATA_PATH_OVERRIDE", w));
+    }
 
     // 2a. Parse-time warnings collected during parsing (unused parameters,
     //     mu-referencing diagnostics, etc.). Each warning embeds its own block
@@ -5118,6 +5176,43 @@ pub(crate) fn eps_shrinkage_warning(shrinkage_eps: f64) -> Option<String> {
 mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
+
+    // ── resolve_data_path (#690) ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_data_path_neither_given_is_error() {
+        assert!(resolve_data_path(None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_data_path_external_only_no_warning() {
+        let (path, warning) = resolve_data_path(None, Some("cli.csv")).unwrap();
+        assert_eq!(path, "cli.csv");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_data_path_model_only_no_warning() {
+        let (path, warning) = resolve_data_path(Some("model.csv"), None).unwrap();
+        assert_eq!(path, "model.csv");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_data_path_both_equal_no_warning() {
+        let (path, warning) = resolve_data_path(Some("same.csv"), Some("same.csv")).unwrap();
+        assert_eq!(path, "same.csv");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_data_path_both_differ_external_wins_with_warning() {
+        let (path, warning) = resolve_data_path(Some("model.csv"), Some("cli.csv")).unwrap();
+        assert_eq!(path, "cli.csv");
+        let warning = warning.expect("differing paths must warn");
+        assert!(warning.contains("cli.csv"));
+        assert!(warning.contains("model.csv"));
+    }
 
     /// #658: an adaptive-dosing simulation on a covariate-selected error model
     /// must be rejected — the assay keys residual variance by CMT, but a

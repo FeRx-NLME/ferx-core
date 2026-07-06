@@ -957,7 +957,19 @@ pub fn parse_model_file(path: &Path) -> Result<CompiledModel, String> {
 pub fn parse_full_model_file(path: &Path) -> Result<ParsedModel, String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("Failed to read model file: {}", e))?;
-    parse_full_model(&content)
+    let mut parsed = parse_full_model(&content)?;
+    // A relative `[data] path` is relative to the model file's own directory
+    // (mirrors NONMEM's `$DATA` resolution against the control stream), not
+    // the process's current working directory.
+    if let Some(data_path) = &parsed.data_path {
+        let p = std::path::Path::new(data_path);
+        if p.is_relative() {
+            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+                parsed.data_path = Some(dir.join(p).to_string_lossy().into_owned());
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 /// Parse a model string and return a CompiledModel (backward compatible).
@@ -2051,6 +2063,15 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         FitOptions::default()
     };
 
+    // `[data]` block (#690, NONMEM `$DATA` analogue). Only the raw `path =`
+    // value is resolved here; `parse_full_model_file` resolves it relative to
+    // the model file's directory afterwards (this function only sees the
+    // model's text, not its path on disk).
+    let data_path = blocks
+        .get("data")
+        .map(|lines| parse_data_block(lines))
+        .transpose()?;
+
     // ── [data_selection] block ────────────────────────────────────────────────
     // Parsed after [fit_options] and merged into the same FitOptions so the
     // read-time filtering code has a single place to look.
@@ -2759,6 +2780,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         simulation,
         adaptive_dosing,
         fit_options,
+        data_path,
         covariate_decls,
         block_lines: extracted.block_lines.clone(),
     })
@@ -4590,6 +4612,29 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     } else {
         Err(format!("unknown estimation method: `{}`", token.trim()))
     }
+}
+
+/// Parse a `[data]` block (#690, NONMEM `$DATA` analogue). Returns the raw
+/// `path` value as written; `parse_full_model_file` resolves it relative to
+/// the model file's directory.
+fn parse_data_block(lines: &[String]) -> Result<String, String> {
+    let mut path: Option<String> = None;
+    for line in lines {
+        let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let (key, value) = (parts[0], parts[1].trim_matches(|c| c == '"' || c == '\''));
+        match key {
+            "path" => path = Some(value.to_string()),
+            _ => {
+                return Err(format!(
+                    "[data]: unknown key `{key}` — valid keys are: path"
+                ))
+            }
+        }
+    }
+    path.ok_or_else(|| "[data]: missing required key `path`".to_string())
 }
 
 fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
@@ -17368,6 +17413,75 @@ mod tests {
         assert_eq!(opts.saem_n_convergence, 400);
         assert!(opts.sir);
         assert_eq!(opts.sir_samples, 2000);
+    }
+
+    #[test]
+    fn test_parse_data_block_path() {
+        assert_eq!(
+            parse_data_block(&["path = warfarin.csv".to_string()]).unwrap(),
+            "warfarin.csv"
+        );
+        // Quoted paths (e.g. containing spaces) are accepted, quotes stripped.
+        assert_eq!(
+            parse_data_block(&["path = \"my data.csv\"".to_string()]).unwrap(),
+            "my data.csv"
+        );
+    }
+
+    #[test]
+    fn test_parse_data_block_missing_path_is_error() {
+        let err = parse_data_block(&[]).unwrap_err();
+        assert!(err.contains("missing required key `path`"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_data_block_unknown_key_is_error() {
+        let err = parse_data_block(&["bogus = 1".to_string()]).unwrap_err();
+        assert!(err.contains("unknown key `bogus`"), "{err}");
+    }
+
+    /// Minimal valid one-compartment IV model, used as a base by the `[data]`
+    /// block tests below (block content varies per test).
+    const MINIMAL_MODEL: &str = "\
+[parameters]
+  theta TVCL(1.0)
+  theta TVV(1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+    #[test]
+    fn test_data_block_populates_parsed_model_data_path() {
+        let content = format!("{MINIMAL_MODEL}[data]\n  path = warfarin.csv\n");
+        let parsed = parse_full_model(&content).unwrap();
+        assert_eq!(parsed.data_path.as_deref(), Some("warfarin.csv"));
+    }
+
+    #[test]
+    fn test_model_without_data_block_has_no_data_path() {
+        let parsed = parse_full_model(MINIMAL_MODEL).unwrap();
+        assert_eq!(parsed.data_path, None);
+    }
+
+    #[test]
+    fn test_parse_full_model_file_resolves_relative_data_path_against_model_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("warfarin.csv"), "ID,TIME,DV,EVID,AMT,CMT\n").unwrap();
+        let model_path = dir.path().join("m.ferx");
+        let content = format!("{MINIMAL_MODEL}[data]\n  path = warfarin.csv\n");
+        std::fs::write(&model_path, content).unwrap();
+        let parsed = parse_full_model_file(&model_path).unwrap();
+        assert_eq!(
+            parsed.data_path.as_deref(),
+            Some(dir.path().join("warfarin.csv").to_str().unwrap())
+        );
     }
 
     #[test]

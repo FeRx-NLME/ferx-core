@@ -28,6 +28,9 @@ fn main() {
         eprintln!("Fits a NLME model and writes sdtab.csv with residuals.");
         eprintln!("Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)");
         eprintln!();
+        eprintln!("--data is optional if the model file has a [data] block (path = ...);");
+        eprintln!("       an explicit --data overrides it, with a warning if they differ.");
+        eprintln!();
         eprintln!("--threads N    use N rayon workers (N > 0)");
         eprintln!("--threads 0    use rayon default (one worker per logical CPU)");
         eprintln!("--threads auto alias for --threads 0");
@@ -60,10 +63,6 @@ fn main() {
     if include_data && output_path.is_none() {
         eprintln!("Warning: --include-data has no effect without --output");
     }
-    if include_data && data_path.is_none() {
-        eprintln!("Warning: --include-data ignored (no --data file to embed)");
-    }
-
     // Honor --threads by sizing rayon's global pool (build_global() is once-per-process,
     // correct for a CLI binary) so fit()'s default pool — sized to current_num_threads()
     // — inherits the count. The 32 MiB worker stack that wide ODE+IOV analytic gradients
@@ -80,13 +79,21 @@ fn main() {
     }
 
     let t_start = Instant::now();
-    let result = if let Some(csv_path) = data_path {
-        ferx_core::run_model_with_data_inits(model_path, csv_path, inits_from_nca)
+    // Precedence: an explicit `--data` always wins (unchanged); `--simulate`
+    // is checked next (unchanged); only when neither flag is given do we fall
+    // through to `run_model_with_data_inits(.., None, ..)`, which resolves the
+    // model's own optional `[data] path = ...` (#690) and errors if that's
+    // absent too.
+    let result = if data_path.is_some() {
+        ferx_core::run_model_with_data_inits(
+            model_path,
+            data_path.map(String::as_str),
+            inits_from_nca,
+        )
     } else if simulate {
         ferx_core::run_model_simulate(model_path)
     } else {
-        eprintln!("Error: specify --data <file.csv> or --simulate");
-        std::process::exit(1);
+        ferx_core::run_model_with_data_inits(model_path, None, inits_from_nca)
     };
     let elapsed = t_start.elapsed();
 
@@ -135,8 +142,15 @@ fn main() {
 
             if let Some(out) = &output_path {
                 let model_source = std::fs::read_to_string(model_path).unwrap_or_default();
+                // Use the resolved data path from the fit result, not the raw
+                // `--data` flag: with a model-declared `[data]` block (#690)
+                // and no `--data`, the CSV that was actually fit is only known
+                // here (`run_model_with_data_inits` resolved and stamped it).
                 let include = if include_data {
-                    data_path.map(std::path::PathBuf::from)
+                    if fit_result.data_path.is_none() {
+                        eprintln!("Warning: --include-data ignored (no data file to embed)");
+                    }
+                    fit_result.data_path.as_ref().map(std::path::PathBuf::from)
                 } else {
                     None
                 };

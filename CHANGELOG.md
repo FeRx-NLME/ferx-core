@@ -19,6 +19,13 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **Optional `[data]` model-file block** (#690): a model can now declare
+  `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
+  model.ferx` and `ferx check model.ferx` work without `--data`. An explicit
+  CLI `--data`/R `data =` path still overrides the model's `[data]` block,
+  with a warning when the two differ.
+
 ## [0.2.0] - 2026-07-03
 
 ### Added

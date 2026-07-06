@@ -5465,6 +5465,13 @@ pub struct ParsedModel {
     /// in the data and be numerically coded. Drives the file-based readers and
     /// the [`FitResult::covariate_table`].
     pub covariate_decls: Option<Vec<CovariateDecl>>,
+    /// `path` from the optional `[data]` block, resolved relative to the model
+    /// file's own directory by `parse_full_model_file` (NONMEM `$DATA`
+    /// analogue, #690). `None` when the block is absent — callers must then
+    /// supply a dataset path externally, as before. An externally supplied
+    /// path (CLI `--data`, R) always overrides this — see
+    /// [`crate::api::resolve_data_path`].
+    pub data_path: Option<String>,
     /// 1-based source line of each unnamed `[block]` header, keyed by the
     /// lowercased block type (e.g. `"individual_parameters" -> 7`). Used by
     /// `ferx check` to attach a block-level location to diagnostics. Empty when
