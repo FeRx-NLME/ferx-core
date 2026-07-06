@@ -9,6 +9,7 @@ ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data] [--i
 ferx <model.ferx> --simulate          [--output <run.fitrx>]
 ferx check <model.ferx> [--data <data.csv>] [--json]
 ferx summary <run.fitrx>
+ferx --help                    # or -h; also: ferx check --help, ferx summary --help
 ```
 
 ## Commands
@@ -172,9 +173,14 @@ Elapsed: 0.496s
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success (for `check`: no errors found) |
+| 0 | Success (for `check`: no errors found; also returned by `-h`/`--help`, which prints usage to stdout) |
 | 1 | Error (parse failure, data error, convergence failure; for `check`: errors found; for `summary`: bundle failed to load) |
 | 2 | Usage error for `check` / `summary` (e.g. missing model or bundle path) |
+
+`-h`/`--help` is recognized as the first argument (`ferx --help`) and as the
+argument right after `check`/`summary` (`ferx check --help`, `ferx summary
+--help`); it prints usage to stdout and exits `0` (usage-error paths print the
+same text to stderr and exit `1`/`2`).
 
 ## Examples
 

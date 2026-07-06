@@ -5432,8 +5432,8 @@ mod tests {
         };
         let model_path = "examples/two_cpt_oral_cov.ferx";
         let data_path = "data/two_cpt_oral_cov.csv";
-        let result =
-            fit_from_files(model_path, data_path, None, Some(opts)).expect("fit should succeed");
+        let result = fit_from_files(model_path, Some(data_path), None, Some(opts))
+            .expect("fit should succeed");
 
         // Initial theta from the .ferx file: [4.0, 40.0, 8.0, 80.0, 1.0, 0.6, 0.3].
         let init = [4.0, 40.0, 8.0, 80.0, 1.0, 0.6, 0.3];

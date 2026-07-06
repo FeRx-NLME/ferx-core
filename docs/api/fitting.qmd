@@ -33,12 +33,15 @@ println!("OFV: {:.4}", result.ofv);
 
 ## `fit_from_files()`
 
-Convenience wrapper that handles parsing and data reading.
+Convenience wrapper that handles parsing and data reading. `data_path` is
+`None` to rely solely on the model's own `[data]` block (see
+[data.qmd](../model-file/data.qmd)); when both are given, `data_path`
+overrides the model's, with a warning recorded on the result.
 
 ```rust
 pub fn fit_from_files(
     model_path: &str,
-    data_path: &str,
+    data_path: Option<&str>,
     covariate_columns: Option<&[&str]>,
     options: Option<FitOptions>,
 ) -> Result<FitResult, String>
@@ -48,7 +51,7 @@ pub fn fit_from_files(
 ```rust
 let result = fit_from_files(
     "model.ferx",
-    "data.csv",
+    Some("data.csv"),
     None,          // Auto-detect covariates
     None,          // Default options
 )?;
@@ -57,11 +60,12 @@ let result = fit_from_files(
 ## `run_model_with_data()`
 
 Full pipeline: parse model file, read data, fit. Returns both the fit result and the population.
+`data_path` is `None` to rely solely on the model's own `[data]` block.
 
 ```rust
 pub fn run_model_with_data(
     model_path: &str,
-    data_path: &str,
+    data_path: Option<&str>,
 ) -> Result<(FitResult, Population), String>
 ```
 

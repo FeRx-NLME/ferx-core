@@ -155,13 +155,30 @@ fn log_transform_observations(pop: &mut Population) -> usize {
     n_nonpos
 }
 
+/// True if two paths point at the same file. The model's `[data] path` is
+/// dir-joined to the model file's directory by `parse_full_model_file`, while
+/// an externally supplied path (CLI `--data`, R) is passed through raw — so
+/// the same file can differ textually (`./warfarin.csv` vs `warfarin.csv`).
+/// Falls back to plain string equality when either path doesn't resolve on
+/// disk (e.g. fixture names in unit tests).
+fn paths_equivalent(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (Path::new(a).canonicalize(), Path::new(b).canonicalize()) {
+        (Ok(pa), Ok(pb)) => pa == pb,
+        _ => false,
+    }
+}
+
 /// Resolves the dataset path a fit should use, applying override-with-warning
 /// semantics between a model file's optional `[data] path = ...` (#690) and an
 /// externally supplied path (CLI `--data`, R).
 ///
 /// - Neither given → `Err` (nothing to fit against).
 /// - Only one given → that one, no warning.
-/// - Both given and equal → the shared path, no warning.
+/// - Both given and equal (see [`paths_equivalent`]) → the shared path, no
+///   warning.
 /// - Both given and different → `external_path` wins; a warning is returned
 ///   (not printed — see "Warning and Error Conventions" in CLAUDE.md) for the
 ///   caller to attach to `FitResult.warnings` or a `ferx check` diagnostic.
@@ -170,7 +187,7 @@ pub fn resolve_data_path(
     external_data_path: Option<&str>,
 ) -> Result<(String, Option<String>), String> {
     match (external_data_path, model_data_path) {
-        (Some(ext), Some(model_p)) if ext != model_p => Ok((
+        (Some(ext), Some(model_p)) if !paths_equivalent(ext, model_p) => Ok((
             ext.to_string(),
             Some(format!(
                 "dataset path overridden: using `{ext}` instead of the model's \
@@ -2123,9 +2140,13 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
 }
 
 /// High-level fit: model file path + data file path → FitResult
+///
+/// `data_path` is `None` to rely solely on the model's own `[data]` block
+/// (#690); when both are given, `data_path` overrides the model's, with a
+/// warning recorded on the result (see [`resolve_data_path`]).
 pub fn fit_from_files(
     model_path: &str,
-    data_path: &str,
+    data_path: Option<&str>,
     covariate_columns: Option<&[&str]>,
     options: Option<FitOptions>,
 ) -> Result<FitResult, String> {
@@ -2139,6 +2160,8 @@ pub fn fit_from_files(
     // legacy auto-detect when both are absent).
     let opts = options.unwrap_or_default();
     let sel_filter_fit = build_selection_filter_merged(&parsed.fit_options, &opts)?;
+    let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
+    let data_path = data_path.as_str();
     let (population, covariate_table) = read_population_for(
         &model,
         &parsed.covariate_decls,
@@ -2157,6 +2180,10 @@ pub fn fit_from_files(
         };
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
     result.covariate_table = covariate_table;
+    if let Some(w) = data_path_warning {
+        result.warnings.push(w);
+        rebuild_warnings_structured(&mut result);
+    }
     // Hash inputs post-fit (same pattern as `run_model_with_data`). The
     // model and CSV were already read by `parse_model_file` and
     // `read_nonmem_csv` upstream, so the OS page cache typically serves
@@ -5212,6 +5239,45 @@ mod tests {
         let warning = warning.expect("differing paths must warn");
         assert!(warning.contains("cli.csv"));
         assert!(warning.contains("model.csv"));
+    }
+
+    #[test]
+    fn resolve_data_path_same_file_different_text_no_warning() {
+        // Same on-disk file reached via textually different paths (e.g. the
+        // model's `[data] path` dir-joined vs. a raw `--data` value) must not
+        // trigger a spurious override warning.
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("warfarin.csv");
+        std::fs::write(&csv, "ID,TIME,DV,EVID,AMT,CMT\n").unwrap();
+        let model_p = csv.to_str().unwrap().to_string();
+        let external_p = format!("{}/./warfarin.csv", dir.path().to_str().unwrap());
+
+        let (path, warning) = resolve_data_path(Some(&model_p), Some(&external_p)).unwrap();
+        assert_eq!(path, external_p);
+        assert!(warning.is_none(), "same file must not warn: {:?}", warning);
+    }
+
+    #[test]
+    fn fit_from_files_uses_model_data_block_when_data_path_none() {
+        // #690 regression: fit_from_files must resolve the model's own
+        // [data] block via resolve_data_path, like run_model_with_data_inits
+        // does, rather than requiring an explicit data_path argument.
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("warfarin.csv");
+        std::fs::copy("data/warfarin.csv", &data).unwrap();
+        let model_content = std::fs::read_to_string("examples/warfarin.ferx").unwrap();
+        let model_content = format!("{model_content}\n[data]\n  path = warfarin.csv\n");
+        let model = dir.path().join("model.ferx");
+        std::fs::write(&model, model_content).unwrap();
+
+        let opts = FitOptions {
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let result = fit_from_files(model.to_str().unwrap(), None, None, Some(opts))
+            .expect("fit_from_files must honor the model's [data] block");
+        assert_eq!(result.data_path.as_deref(), Some(data.to_str().unwrap()));
     }
 
     /// #658: an adaptive-dosing simulation on a covariate-selected error model

@@ -22,9 +22,15 @@ section of the SDLC for the versioning policy).
 ### Added
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
-  model.ferx` and `ferx check model.ferx` work without `--data`. An explicit
-  CLI `--data`/R `data =` path still overrides the model's `[data]` block,
-  with a warning when the two differ.
+  model.ferx`, `ferx check model.ferx`, and the public `fit_from_files()`
+  (now `data_path: Option<&str>`) work without an explicit data path. An
+  explicit CLI `--data`/R `data =`/`fit_from_files()` path still overrides
+  the model's `[data]` block, with a warning when the two differ (path
+  equivalence, not textual equality, so a dir-joined model path and a raw
+  external path to the same file don't false-positive).
+- **`-h`/`--help` flag for the `ferx` CLI** (#688): `ferx --help`, `ferx check --help`,
+  and `ferx summary --help` now print usage to stdout and exit 0, matching standard
+  CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
 ## [0.2.0] - 2026-07-03
 
