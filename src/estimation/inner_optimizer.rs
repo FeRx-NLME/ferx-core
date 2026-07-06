@@ -426,14 +426,11 @@ pub struct EbeResult {
     /// `iov_occasion_groups`).
     pub kappas: Vec<DVector<f64>>,
     /// True when the subject was hard-rejected at its inner start (a pathological
-    /// ODE warm-start NLL — see [`reject_ode_inner_start`]). The returned
+    /// ODE+IOV warm-start NLL — see [`reject_ode_iov_inner_start`]). The returned
     /// `eta`/`h_matrix` are then a degenerate placeholder (off-mode η, zero H), so the
     /// outer loop must reject the whole trial rather than fold them into an accepted
     /// OFV. Unlike plain non-convergence this forces rejection regardless of
-    /// `max_unconverged_frac` or the `min_obs` filter (#603 review #1/#2; generalized
-    /// from ODE+IOV-only to any ODE model in #708 — a plain ODE subject stuck in a
-    /// stiff/pathological region is caught here instead of paying the full inner-loop
-    /// retry budget on every outer iteration).
+    /// `max_unconverged_frac` or the `min_obs` filter (#603 review #1/#2).
     pub hard_reject: bool,
 }
 
@@ -444,7 +441,7 @@ pub struct InnerLoopStats {
     pub n_unconverged: usize,
     /// Subjects for which the BFGS→Nelder-Mead fallback was triggered.
     pub n_fallback: usize,
-    /// Subjects hard-rejected at their inner start (pathological ODE warm-start
+    /// Subjects hard-rejected at their inner start (pathological ODE+IOV warm-start
     /// NLL). Any non-zero count forces the outer EBE guard to reject the trial,
     /// regardless of `max_unconverged_frac` or the `min_obs` filter (#603 review #1/#2).
     pub n_start_rejected: usize,
@@ -501,7 +498,8 @@ fn argmin_inner_fallback(
 
 /// An ODE-based model that also carries IOV (`κ`) random effects. The inner EBE path for
 /// these models is the expensive one this module special-cases (per-vertex ODE +
-/// steady-state work), so the Nelder-Mead skip keys off this classifier (#603 review #8).
+/// steady-state work), so both the Nelder-Mead skip and the start-rejection gate key off
+/// this single classifier (#603 review #8).
 fn is_ode_iov(model: &CompiledModel) -> bool {
     model.ode_spec.is_some() && model.n_kappa > 0
 }
@@ -515,27 +513,29 @@ fn skip_ode_iov_nm_fallback(model: &CompiledModel) -> bool {
     is_ode_iov(model)
 }
 
-const ODE_START_REJECT_NLL_PER_OBS: f64 = 250.0;
-const ODE_START_REJECT_NLL_MIN: f64 = 1_000.0;
+const ODE_IOV_START_REJECT_NLL_PER_OBS: f64 = 250.0;
+const ODE_IOV_START_REJECT_NLL_MIN: f64 = 1_000.0;
 
-/// Hard-reject a subject's inner search before it ever runs BFGS/Nelder-Mead, when its
-/// (informative) warm-started NLL is already catastrophically bad. Originally ODE+IOV-only
-/// (#603 review #1/#2); generalized to every ODE model in #708 — a plain (non-IOV) ODE
-/// subject can land in an equally pathological region (e.g. a stiff time-varying-CL term)
-/// where BFGS repeatedly fails and the `argmin_inner_fallback` NM restart re-solves the same
-/// expensive ODE `max_iter * 5` times per outer iteration for no benefit, since a warm start
-/// already this bad is not a point the fallback recovers a useful mode from. The threshold is
-/// deliberately extreme (unreachable for a subject that is merely slow to converge) so it
-/// only catches genuinely diverged starts, not ordinary non-convergence.
-fn reject_ode_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> bool {
-    if model.ode_spec.is_none() {
+/// **ODE+IOV-only, deliberately not generalized further** — a #708 investigation tried
+/// widening this to every ODE model (a plain ODE subject can be just as pathologically
+/// stuck), but this guard's `hard_reject` forces the outer EBE guard to treat the *whole
+/// trial* as infeasible (`ebe_guard_rejects`), not merely this subject as unconverged. For
+/// ODE+IOV a catastrophic warm-started NLL reliably means true pathology (e.g. steady-state
+/// blow-up), so that's safe. For a plain ODE subject a large individual NLL can be a
+/// legitimate feature of the data near the true optimum — hard-rejecting the trial then
+/// steers the outer optimizer away from the correct region, which regressed OFV by ~100
+/// units vs. NONMEM on a real pembrolizumab reproduction. Any future #708 fix needs to bound
+/// the wasted per-subject solve cost without changing which θ region the optimizer is
+/// willing to explore (e.g. a solver-level bail, not a trial-level reject).
+fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> bool {
+    if !is_ode_iov(model) {
         return false;
     }
     if !nll.is_finite() {
         return true;
     }
     let threshold =
-        ODE_START_REJECT_NLL_MIN.max(ODE_START_REJECT_NLL_PER_OBS * n_obs.max(1) as f64);
+        ODE_IOV_START_REJECT_NLL_MIN.max(ODE_IOV_START_REJECT_NLL_PER_OBS * n_obs.max(1) as f64);
     nll > threshold
 }
 
@@ -701,32 +701,6 @@ pub fn find_ebe(
             schedule.as_ref(),
         )
     };
-
-    // Hard-reject before ever running BFGS/NM when a warm-started ODE subject is already
-    // catastrophically bad (#708): a stiff/pathological subject stuck in this region would
-    // otherwise pay a full BFGS + `argmin_inner_fallback` NM-restart re-solve of the same
-    // expensive ODE every outer iteration for no benefit. Gated on an *informative* warm
-    // start so a cold-start (iteration 1) subject is never hard-rejected before it has had a
-    // chance to converge. Generalizes the ODE+IOV-only guard (#603 review #1/#2) to any ODE
-    // model — see [`reject_ode_inner_start`].
-    let has_informative_warm_start = eta_init
-        .map(|warm| warm.iter().any(|v| v.abs() > 1e-8))
-        .unwrap_or(false);
-    if has_informative_warm_start {
-        let start_nll = obj(&eta);
-        if reject_ode_inner_start(model, subject.obs_times.len(), start_nll) {
-            return EbeResult {
-                eta: DVector::from_column_slice(&eta),
-                h_matrix: DMatrix::zeros(subject.obs_times.len(), n_eta),
-                converged: false,
-                used_fallback: false,
-                grad_norm: 0.0,
-                nll: start_nll,
-                kappas: Vec::new(),
-                hard_reject: true,
-            };
-        }
-    }
 
     // BFGS with the exact analytic η-gradient from the sensitivity provider when
     // in scope (Almquist et al. 2015): one provider evaluation per inner step
@@ -1014,7 +988,7 @@ fn find_ebe_iov(
         .map(|warm| warm.iter().any(|v| v.abs() > 1e-8))
         .unwrap_or(false);
     if has_informative_warm_start
-        && reject_ode_inner_start(model, subject.obs_times.len(), start_nll)
+        && reject_ode_iov_inner_start(model, subject.obs_times.len(), start_nll)
     {
         let bsv_eta: Vec<f64> = x[..n_eta]
             .iter()
@@ -4659,7 +4633,7 @@ mod iov_tests {
     }
 
     #[test]
-    fn ode_iov_start_rejects_only_pathological_ode_nll() {
+    fn ode_iov_start_rejects_only_pathological_ode_iov_nll() {
         use crate::parser::model_parser::parse_model_string;
         let ode_iov = parse_model_string(
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
@@ -4667,35 +4641,16 @@ mod iov_tests {
         .expect("parse ODE IOV");
         let closed_form_iov = make_iov_model();
 
-        assert!(!reject_ode_inner_start(&ode_iov, 4, 999.0));
-        assert!(reject_ode_inner_start(&ode_iov, 4, 1_001.0));
-        assert!(!reject_ode_inner_start(&ode_iov, 20, 4_999.0));
-        assert!(reject_ode_inner_start(&ode_iov, 20, 5_001.0));
-        assert!(reject_ode_inner_start(&ode_iov, 20, f64::NAN));
-        assert!(!reject_ode_inner_start(&closed_form_iov, 4, 1_000_000.0));
-    }
-
-    /// #708: the start-reject guard was ODE+IOV-only; a plain (non-IOV) ODE subject that
-    /// lands on an equally pathological warm start (e.g. a stiff time-varying-CL region)
-    /// deserves the same early hard-reject instead of paying a full BFGS + NM-fallback
-    /// re-solve of the expensive ODE every outer iteration.
-    #[test]
-    fn ode_non_iov_start_rejects_only_pathological_nll() {
-        use crate::parser::model_parser::parse_model_string;
-        let plain_ode = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n",
-        )
-        .expect("parse plain ODE");
-        let closed_form = parse_model_string(
-            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n",
-        )
-        .expect("parse closed-form model");
-
-        assert!(!reject_ode_inner_start(&plain_ode, 4, 999.0));
-        assert!(reject_ode_inner_start(&plain_ode, 4, 1_001.0));
-        assert!(reject_ode_inner_start(&plain_ode, 20, f64::NAN));
-        // Never fires for a non-ODE (closed-form) model, however bad the NLL.
-        assert!(!reject_ode_inner_start(&closed_form, 4, 1_000_000.0));
+        assert!(!reject_ode_iov_inner_start(&ode_iov, 4, 999.0));
+        assert!(reject_ode_iov_inner_start(&ode_iov, 4, 1_001.0));
+        assert!(!reject_ode_iov_inner_start(&ode_iov, 20, 4_999.0));
+        assert!(reject_ode_iov_inner_start(&ode_iov, 20, 5_001.0));
+        assert!(reject_ode_iov_inner_start(&ode_iov, 20, f64::NAN));
+        assert!(!reject_ode_iov_inner_start(
+            &closed_form_iov,
+            4,
+            1_000_000.0
+        ));
     }
 
     /// Closed-form IOV + `iiv_on_ruv` (#4b): the analytic stacked-η inner gradient
