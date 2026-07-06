@@ -1,0 +1,36 @@
+# Warfarin 1-compartment oral model with IOV + M3 BLOQ (closed-form).
+#
+# Inter-occasion variability on CL (KAPPA_CL, OCC column) combined with M3
+# below-limit handling. Closed-form `one_cpt_oral` path — NONMEM-anchored via
+# the closed-form M3+IOV validation (#580/#591). The ODE counterpart
+# (warfarin_iov_ode_bloq.ferx) fits the same data and must agree to estimator
+# precision (#486).
+#
+# Dataset: data/warfarin_iov_bloq.csv (OCC occasion column, CENS below-LLOQ flag).
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method      = focei
+  iov_column  = OCC
+  bloq_method = m3
+  covariance  = false

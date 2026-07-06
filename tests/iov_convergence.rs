@@ -322,8 +322,8 @@ fn iov_iiv_on_ruv_analytic_matches_fd_estimates() {
 /// Estimate-level validation for **M3 BLOQ + IOV** (#4a/#580): the new analytic FOCEI
 /// gradient must drive the optimizer to the *same MLE* as the finite-difference gradient.
 /// Both differentiate the identical M3-promoted FOCEI marginal `foce_subject_nll_iov`
-/// (censored rows enter as `−logΦ`, excluded from `H̃`), so the converged OFV and θ must
-/// agree — confirming the FD→analytic swap does not move the optimum. The FD path is the
+/// (censored rows enter as `−logΦ` and, at FOCEI order, `H̃`/`log|H̃|`), so the converged
+/// OFV and θ must agree — confirming the FD→analytic swap does not move the optimum. The FD path is the
 /// reference: the IOV FD gradient is NONMEM-anchored on warfarin_iov (≈307.8 vs NONMEM
 /// 308.83, see the module header / `tests/warfarin_iov_nonmem.rs`), and the M3 censored
 /// term is NONMEM-anchored on the non-IOV warfarin_bloq fit (`tests/bloq_convergence.rs`);
@@ -564,6 +564,190 @@ fn iov_m3_foce_analytic_matches_fd_estimates() {
         assert!(
             (a - f).abs() <= 0.03 * f.abs().max(1e-3),
             "theta[{k}]: analytic {a:.5} vs FD {f:.5} diverge beyond 3%"
+        );
+    }
+}
+
+/// Estimate-level cross-check for **ODE M3 BLOQ + IOV** (#486, #623 review): the
+/// `[odes]`-path analytic FOCEI fit must land on the same optimum as the closed-form
+/// (1-cpt `one_cpt_oral`) analytic fit on the same IOV + M3 dataset. This is the
+/// **executable** form of the `docs/model-file/bloq.qmd` cross-check (which states the
+/// two converge to the same estimates to ~6 significant figures): it pins the new ODE leg
+/// in CI so a regression in the ODE M3+IOV path cannot pass unnoticed. The closed-form leg
+/// is itself NONMEM-anchored — `iov_m3_analytic_matches_fd_estimates` ties it to the
+/// FD/NONMEM warfarin_iov basin (≈307.8 vs NONMEM 308.83) and the non-IOV warfarin BLOQ
+/// M3 anchor — so by landing on the same optimum the ODE fit inherits that anchor
+/// transitively. (A direct ODE-vs-NONMEM numerical run additionally requires the
+/// klebsiella NONMEM server credentials and is run out-of-band; see the module header.)
+///
+/// Both legs use the **production default optimizer** (`Optimizer::Auto`, which resolves
+/// to NLopt L-BFGS here since the analytic gradient is available for both). That matters:
+/// the two engines share one objective (their predictions agree to ~1e-11 and the FOCEI
+/// marginal agrees to ~1e-9 at matched θ), but the κ-bearing `TVCL` direction is extremely
+/// flat (a 2% `TVCL` move costs only ~0.17 OFV). A gradient-based optimizer that
+/// under-converges on that flat valley (e.g. SLSQP, which stalls the closed-form leg ~0.17
+/// OFV short) lands the two legs up to ~2% / ~20% apart on `TVCL` / `ω_CL` — a pure
+/// optimizer artifact, not an engine difference. Under the default L-BFGS both legs reach
+/// the same minimum to 6 sig figs, so the tight bands below are the right guard and would
+/// catch a genuinely broken ODE path. Data: `data/warfarin_iov_bloq.csv` (LLOQ = 1.5,
+/// ~10% left-censored).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn iov_m3_ode_matches_closed_form_estimates() {
+    const CLOSED_FORM: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method      = focei
+  iov_column  = OCC
+  bloq_method = m3
+  covariance  = false
+"#;
+    const ODE: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method      = focei
+  iov_column  = OCC
+  bloq_method = m3
+  ode_reltol  = 1e-10
+  ode_abstol  = 1e-12
+  covariance  = false
+"#;
+    let cf_model = ferx_core::parser::model_parser::parse_model_string(CLOSED_FORM)
+        .expect("closed-form M3 + IOV model parses");
+    let ode_model = ferx_core::parser::model_parser::parse_model_string(ODE)
+        .expect("ODE M3 + IOV model parses");
+    assert!(
+        ode_model.is_ode_based(),
+        "ODE model must be on the ODE path"
+    );
+    // Both legs must be on the analytic gradient path (the thing the cross-check guards).
+    assert!(ferx_core::sens::provider::iov_analytical_supported(
+        &cf_model
+    ));
+    assert!(ferx_core::sens::ode_provider::ode_iov_supported(&ode_model));
+
+    let pop = read_nonmem_csv(Path::new("data/warfarin_iov_bloq.csv"), None, Some("OCC"))
+        .expect("warfarin_iov_bloq data loads");
+    assert!(
+        pop.subjects.iter().any(|s| s.cens.iter().any(|&c| c != 0)),
+        "dataset must carry censored rows"
+    );
+
+    let run = |model: &ferx_core::CompiledModel| -> FitResult {
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::FoceI;
+        opts.interaction = true;
+        opts.optimizer = Optimizer::Auto; // production default → NLopt L-BFGS for both legs
+        opts.gradient_method = ferx_core::GradientMethod::Auto;
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        // Tighten the inner EBE tolerance (default 1e-5). This dataset has one
+        // heavily-censored subject whose M3 individual objective is extremely flat;
+        // at the default tolerance the inner optimizer stops short of that subject's
+        // EBE, and — because the two engines' predictions differ at the ~1e-10 level
+        // (closed form vs RK45) — the closed-form and ODE legs stop at *different*
+        // EBEs. Since #641 folds censored rows into log|H̃|, that EBE gap is amplified
+        // into a ~0.75 OFV / ~9% ω²_KA divergence between the two legs (a single-basin
+        // under-convergence, not two optima: at 1e-11 both legs converge to an
+        // identical minimum and every component agrees to ~5 s.f.). This is an
+        // engine-consistency test, so we tighten the inner loop to remove the
+        // under-convergence confound and compare the two engines at converged EBEs.
+        opts.inner_tol = 1e-11;
+        fit(model, &pop, &model.default_params, &opts).expect("M3 + IOV fit runs")
+    };
+    let cf = run(&cf_model);
+    let ode = run(&ode_model);
+
+    eprintln!(
+        "M3+IOV closed-form vs ODE: OFV {:.5} vs {:.5}",
+        cf.ofv, ode.ofv
+    );
+    for k in 0..cf.theta.len() {
+        eprintln!(
+            "  theta[{k}]: {:.6} vs {:.6}  ({:.2}%)",
+            cf.theta[k],
+            ode.theta[k],
+            100.0 * (cf.theta[k] - ode.theta[k]).abs() / cf.theta[k].abs().max(1e-9)
+        );
+    }
+
+    // Same model, two prediction engines (closed form vs RK45) ⇒ the same optimum. With
+    // the tightened inner EBE tolerance above, both legs converge to identical estimates
+    // to ~5 sig figs (observed: TVCL/TVV/TVKA, ω_CL, ω²_KA, Ω_iov, and σ all match to
+    // ~1e-4; OFV agrees to ~1e-5). Bands are kept at 1% on θ / 2% on variance components —
+    // far tighter than the ~2%/~9% an under-converged inner EBE produces on the flat
+    // censored subject at the default 1e-5 tolerance, yet with enough slack to absorb
+    // platform/optimizer-version jitter.
+    assert!(
+        (cf.ofv - ode.ofv).abs() < 0.5,
+        "closed-form OFV {:.4} vs ODE OFV {:.4} must agree (same marginal, two engines)",
+        cf.ofv,
+        ode.ofv
+    );
+    for k in 0..cf.theta.len() {
+        let (c, o) = (cf.theta[k], ode.theta[k]);
+        assert!(
+            (c - o).abs() <= 0.01 * c.abs().max(1e-3),
+            "theta[{k}]: closed-form {c:.5} vs ODE {o:.5} diverge beyond 1%"
+        );
+    }
+    // Variance components: diagonal Ω_bsv, the shared Ω_iov, and σ.
+    for k in 0..cf.omega.nrows() {
+        let (c, o) = (cf.omega[(k, k)], ode.omega[(k, k)]);
+        assert!(
+            (c - o).abs() <= 0.02 * c.abs().max(1e-4),
+            "omega[{k}]: closed-form {c:.5} vs ODE {o:.5} diverge beyond 2%"
+        );
+    }
+    let cf_iov = cf.omega_iov.expect("closed-form omega_iov present")[(0, 0)];
+    let ode_iov = ode.omega_iov.expect("ODE omega_iov present")[(0, 0)];
+    assert!(
+        (cf_iov - ode_iov).abs() <= 0.02 * cf_iov.abs().max(1e-4),
+        "omega_iov: closed-form {cf_iov:.5} vs ODE {ode_iov:.5} diverge beyond 2%"
+    );
+    for k in 0..cf.sigma.len() {
+        let (c, o) = (cf.sigma[k], ode.sigma[k]);
+        assert!(
+            (c - o).abs() <= 0.02 * c.abs().max(1e-4),
+            "sigma[{k}]: closed-form {c:.5} vs ODE {o:.5} diverge beyond 2%"
         );
     }
 }

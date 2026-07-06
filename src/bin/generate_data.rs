@@ -249,7 +249,9 @@ fn build_warfarin_model() -> CompiledModel {
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
+        analytic_readout: None,
         ruv_magnitude: None,
+        transit_ode_equivalent: None,
     }
 }
 
@@ -376,7 +378,9 @@ fn generate_two_cpt_iv() {
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
+        analytic_readout: None,
         ruv_magnitude: None,
+        transit_ode_equivalent: None,
     };
     let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0];
     let subjects = simulate_subjects(&model, &params, 15, 100.0, 1, &obs_times, 123, None);
@@ -508,7 +512,9 @@ fn generate_two_cpt_oral_cov() {
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
+        analytic_readout: None,
         ruv_magnitude: None,
+        transit_ode_equivalent: None,
     };
 
     // Generate random covariates (matching Julia seed 456)
@@ -698,7 +704,9 @@ fn generate_mm_oral() {
         frem_config: None,
         residual_error_eta: None,
         analytical_init: Vec::new(),
+        analytic_readout: None,
         ruv_magnitude: None,
+        transit_ode_equivalent: None,
     };
     let obs_times = vec![
         0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0,

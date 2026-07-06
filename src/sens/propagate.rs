@@ -24,14 +24,14 @@ use crate::types::{DoseEvent, PkModel, Subject};
 /// 1-cpt IV/central propagator: evolve `state[0]` (central amount) over `dt` with
 /// a constant input `rate` into the central compartment. Mirror of
 /// [`crate::pk::event_driven::propagate_one_cpt`].
-pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: f64, cl: T, v: T, rate: T) {
+pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: T, cl: T, v: T, rate: T) {
     if v.val() <= 0.0 || cl.val() <= 0.0 {
         // Degenerate params: skip (the outer optimizer sees a poor OFV and steps
         // away), matching the production propagator.
         return;
     }
     let ke = cl / v;
-    let exp_term = (-(ke * T::from_f64(dt))).exp();
+    let exp_term = (-(ke * dt)).exp();
     state[0] = exp_term * state[0] + (rate / ke) * (T::from_f64(1.0) - exp_term);
 }
 
@@ -44,7 +44,7 @@ pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: f64, cl: T, v: T, rate
 /// `ka ≈ ke` L'Hôpital limit.
 pub fn propagate_one_cpt_oral_g<T: PkNum>(
     state: &mut [T],
-    dt: f64,
+    dt: T,
     cl: T,
     v: T,
     ka: T,
@@ -55,7 +55,7 @@ pub fn propagate_one_cpt_oral_g<T: PkNum>(
         return;
     }
     let ke = cl / v;
-    let dtt = T::from_f64(dt);
+    let dtt = dt;
     let one = T::from_f64(1.0);
     let e_ka = (-(ka * dtt)).exp();
     let e_ke = (-(ke * dtt)).exp();
@@ -146,13 +146,13 @@ pub fn two_cpt_eigen_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> Option<TwoCptEige
 /// the cached walk path.
 pub fn propagate_two_cpt_core_g<T: PkNum>(
     state: &mut [T],
-    dt: f64,
+    dt: T,
     e: &TwoCptEigen<T>,
     rate_central: T,
     rate_periph: T,
 ) {
     let (alpha, beta, k10, k12, k21) = (e.alpha, e.beta, e.k10, e.k12, e.k21);
-    let dtt = T::from_f64(dt);
+    let dtt = dt;
 
     let denom_ss = k21 * k10;
     let (a_ss_1, a_ss_2) = if denom_ss.val() > 1e-30 {
@@ -195,7 +195,7 @@ pub fn propagate_two_cpt_core_g<T: PkNum>(
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_two_cpt_g<T: PkNum>(
     state: &mut [T],
-    dt: f64,
+    dt: T,
     cl: T,
     v1: T,
     q: T,
@@ -219,14 +219,14 @@ pub fn propagate_two_cpt_g<T: PkNum>(
 /// / `rate_depot` are the #350/#400 infusion inputs.
 pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     state: &mut [T],
-    dt: f64,
+    dt: T,
     e: &TwoCptEigen<T>,
     ka: T,
     rate_central: T,
     rate_depot: T,
 ) {
     let (alpha, beta, k10, k12, k21) = (e.alpha, e.beta, e.k10, e.k12, e.k21);
-    let dtt = T::from_f64(dt);
+    let dtt = dt;
 
     let a_d_0 = state[0];
     let a_c_0 = state[1];
@@ -309,7 +309,7 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_two_cpt_oral_g<T: PkNum>(
     state: &mut [T],
-    dt: f64,
+    dt: T,
     cl: T,
     v1: T,
     q: T,
@@ -418,19 +418,13 @@ fn build_three_cpt_mode_g<T: PkNum>(mu: T, k12: T, k13: T, k21: T, k31: T) -> Th
 }
 
 #[inline]
-fn apply_three_cpt_mode_g<T: PkNum>(
-    m: &ThreeCptModeG<T>,
-    c: T,
-    p1: T,
-    p2: T,
-    dt: f64,
-) -> (T, T, T) {
+fn apply_three_cpt_mode_g<T: PkNum>(m: &ThreeCptModeG<T>, c: T, p1: T, p2: T, dt: T) -> (T, T, T) {
     if m.norm.val().abs() < 1e-30 {
         return (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0));
     }
     let proj = m.w[0] * c + m.w[1] * p1 + m.w[2] * p2;
     let coef = proj / m.norm;
-    let exp_term = (-(m.mu * T::from_f64(dt))).exp();
+    let exp_term = (-(m.mu * dt)).exp();
     (
         coef * m.v[0] * exp_term,
         coef * m.v[1] * exp_term,
@@ -443,7 +437,7 @@ fn apply_three_cpt_mode_g<T: PkNum>(
 /// steady-state + homogeneous pattern for constant infusion.
 pub fn propagate_three_cpt_core_g<T: PkNum>(
     state: &mut [T],
-    dt: f64,
+    dt: T,
     e: &ThreeCptEigen<T>,
     rate_central: T,
     rate_periph1: T,
@@ -476,7 +470,7 @@ pub fn propagate_three_cpt_core_g<T: PkNum>(
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_three_cpt_g<T: PkNum>(
     state: &mut [T],
-    dt: f64,
+    dt: T,
     cl: T,
     v1: T,
     q2: T,
@@ -502,7 +496,7 @@ pub fn propagate_three_cpt_g<T: PkNum>(
 /// 3-cpt oral eigenmode + depot forced-response formula.
 pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     state: &mut [T],
-    dt: f64,
+    dt: T,
     e: &ThreeCptEigen<T>,
     ka: T,
     rate_central: T,
@@ -516,7 +510,7 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     let a_p1_0 = state[2];
     let a_p2_0 = state[3];
 
-    let e_ka = (-(ka * T::from_f64(dt))).exp();
+    let e_ka = (-(ka * dt)).exp();
     state[0] = a_d_0 * e_ka;
 
     let denom_depot = (ka - alpha) * (ka - beta) * (ka - gamma);
@@ -588,7 +582,7 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_three_cpt_oral_g<T: PkNum>(
     state: &mut [T],
-    dt: f64,
+    dt: T,
     cl: T,
     v1: T,
     q2: T,
@@ -719,6 +713,7 @@ fn state_layout_g(pk_model: PkModel) -> (usize, usize) {
         PkModel::OneCptTransit => (2, 1),
         PkModel::TwoCptIv => (2, 0),
         PkModel::TwoCptOral => (3, 1),
+        PkModel::TwoCptTransit => (3, 1),
         PkModel::ThreeCptIv => (3, 0),
         PkModel::ThreeCptOral => (4, 1),
     }
@@ -759,6 +754,19 @@ fn pk_for_g<T: PkNum>(
 /// infusion per sub-interval (central / peripheral-1, per the production
 /// model→cmt map). Generic mirror of `event_driven::propagate_with_bounds` for the
 /// 1-/2-cpt models.
+///
+/// `dose_inf_dual[k] = Some((rate_bare, dur_bare))` marks a **modeled** infusion
+/// (`RATE=-1/-2` → `R{cmt}`/`D{cmt}`) whose rate and window resolve from PK params
+/// (#486): the rate magnitude carries `∂rate/∂(θ,η)` and the window **end**
+/// `t_start + dur_bare` is a *moving boundary*. The walk propagates the active and
+/// quiet sub-intervals with the exact **dual** window lengths, so the
+/// moving-boundary sensitivity flows through the closed-form flow to all orders —
+/// no explicit saltation is needed (the closed-form analogue of the ODE path's
+/// `inject_rate_saltation`). `rate_bare` is the F-agnostic rate (`amt/D` or `R`);
+/// the walk applies `F` as the existing `pk.f * rate` post-multiply, matching
+/// [`crate::types::DoseEvent::bioavailable_infusion`] for the duration-defined case.
+/// Empty (or `None` entries) recover the pre-#486 fixed-window behaviour.
+#[allow(clippy::too_many_arguments)]
 fn propagate_bounds_g<T: PkNum>(
     state: &mut [T],
     bounds: &[f64],
@@ -766,13 +774,50 @@ fn propagate_bounds_g<T: PkNum>(
     pk_model: PkModel,
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
+    dose_inf_dual: &[Option<(T, T)>],
     reset_floor: f64,
 ) {
+    // Moving infusion-end boundaries, precomputed once rather than re-scanned per
+    // sub-interval (#486 review #7): each post-reset modeled dose contributes
+    // `(end_time, dual_end)` with `dual_end = t_start + D` carrying `D`'s jet. Doses
+    // starting before a reset are skipped here exactly as the rate-accumulation loop
+    // below skips them (`t_start < reset_floor`), so a modeled infusion whose end
+    // coincides with a reset break does not thread a spurious `∂D` into the
+    // post-reset window (#486 review #3). The provider declines *distinct-slot*
+    // coincident ends to FD (`modeled_ends_separable`), so at most one entry matches a
+    // given break and same-slot coincidences share an identical `dual_end` — the
+    // first match below is therefore exact (#486 review #2).
+    let modeled_ends: Vec<(f64, T)> = doses
+        .iter()
+        .enumerate()
+        .filter_map(|(k, d)| {
+            let (_, dur_bare) = dose_inf_dual.get(k).copied().flatten()?;
+            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+            let t_start = d.time + lag;
+            if t_start < reset_floor {
+                return None;
+            }
+            Some((t_start + d.duration, T::from_f64(t_start) + dur_bare))
+        })
+        .collect();
+    // Dual clock position of a sub-interval boundary `w`. For a fixed break time it
+    // is just `w`; for the moving *end* of a modeled infusion (`t_start + D`) it
+    // carries `D`'s jet, so adjacent active/quiet windows get `±∂D` in their dual
+    // lengths and the moving-boundary sensitivity is exact (#486). The dose *start*
+    // never moves here (no lagtime in walk scope), so only the end is threaded.
+    let dual_pos = |w: f64| -> T {
+        for &(end_val, dual_end) in &modeled_ends {
+            if (w - end_val).abs() < 1e-9 {
+                return dual_end;
+            }
+        }
+        T::from_f64(w)
+    };
     for w in bounds.windows(2) {
-        let dt = w[1] - w[0];
-        if dt <= 0.0 {
+        if w[1] - w[0] <= 0.0 {
             continue;
         }
+        let dt = dual_pos(w[1]) - dual_pos(w[0]);
         let mid = 0.5 * (w[0] + w[1]);
         // Active infusion rates (F·rate) summed per the production model→cmt arms:
         // central / peripheral-1 / peripheral-2 for the disposition compartments,
@@ -789,7 +834,13 @@ fn propagate_bounds_g<T: PkNum>(
                 continue;
             }
             if d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid {
-                let r = pk.f * T::from_f64(d.rate);
+                // Modeled infusion: the dual rate (`amt/D` or `R`) carries the PK-param
+                // jet; a fixed infusion keeps its concrete `d.rate`. `pk.f` applies `F`
+                // (duration-defined) exactly as the fixed path does.
+                let r = match dose_inf_dual.get(k).copied().flatten() {
+                    Some((rate_bare, _)) => pk.f * rate_bare,
+                    None => pk.f * T::from_f64(d.rate),
+                };
                 match (pk_model, d.cmt) {
                     (PkModel::OneCptIv, 1) => rate_central = rate_central + r,
                     (PkModel::OneCptOral, 1) => rate_depot = rate_depot + r,
@@ -812,6 +863,9 @@ fn propagate_bounds_g<T: PkNum>(
             // Dual2 superposition path serves its sensitivities instead (#386).
             PkModel::OneCptTransit => unreachable!(
                 "one_cpt_transit uses closed-form superposition, not the event-driven walk"
+            ),
+            PkModel::TwoCptTransit => unreachable!(
+                "two_cpt_transit uses closed-form superposition, not the event-driven walk"
             ),
             PkModel::OneCptIv => propagate_one_cpt_g(state, dt, pk.cl, pk.v, rate_central),
             PkModel::OneCptOral => {
@@ -916,7 +970,12 @@ pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
 /// `event_driven::equilibrate_ss_state_event_driven` for the 1-/2-cpt models;
 /// overlapping SS infusions (`T_inf > II`) return the empty state, matching
 /// production's reject.
-fn equilibrate_ss_g<T: PkNum>(pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEvent) -> Vec<T> {
+fn equilibrate_ss_g<T: PkNum>(
+    pk_model: PkModel,
+    pk: &PkDual<T>,
+    dose: &DoseEvent,
+    inf: Option<(T, T)>,
+) -> Vec<T> {
     let (n_states, _) = state_layout_g(pk_model);
     let mut state = vec![T::from_f64(0.0); n_states];
     if dose.ii <= 0.0 || dose.cmt == 0 {
@@ -938,6 +997,12 @@ fn equilibrate_ss_g<T: PkNum>(pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEven
         Vec::new()
     };
     let synthetic_lag: Vec<f64> = if is_inf { vec![0.0] } else { Vec::new() };
+    // #486: for a **modeled** SS infusion (`RATE=-1/-2`), thread the window dual
+    // `(rate_bare, dur_bare)` so each equilibration cycle's active/quiet split carries the
+    // moving infusion-end jet (`∂D`/`∂R`) through `propagate_bounds_g`'s `dual_pos`, exactly
+    // as the main walk does for the current pulse — closing the closed-form SS × modeled-dose
+    // gap. `None` (a fixed-window infusion) recovers the pre-#486 f64 window behaviour.
+    let synthetic_inf: Vec<Option<(T, T)>> = if is_inf { vec![inf] } else { Vec::new() };
     let bounds: Vec<f64> = if is_inf {
         vec![0.0, dose.duration, dose.ii]
     } else {
@@ -959,6 +1024,7 @@ fn equilibrate_ss_g<T: PkNum>(pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEven
             pk_model,
             &synthetic_dose,
             &synthetic_lag,
+            &synthetic_inf,
             f64::NEG_INFINITY,
         );
         cycles_run = cycle + 1;
@@ -993,6 +1059,40 @@ pub fn event_driven_sens_g<T: PkNum>(
     pk_at_obs: &[PkDual<T>],
     pk_at_pk_only: &[PkDual<T>],
 ) -> Vec<T> {
+    // Fixed-dose entrypoint: the walk reads `subject.doses` directly and carries no
+    // modeled-window duals. Modeled-`RATE` subjects use
+    // [`event_driven_sens_with_doses_g`] with resolved `eff_doses` + per-dose duals.
+    event_driven_sens_with_doses_g(
+        pk_model,
+        subject,
+        schedule,
+        &subject.doses,
+        &[],
+        pk_at_dose,
+        pk_at_obs,
+        pk_at_pk_only,
+    )
+}
+
+/// As [`event_driven_sens_g`] but with **resolved** `eff_doses` (concrete
+/// `rate`/`duration`) and per-dose modeled-infusion duals `dose_inf_dual` (#486).
+/// The fixed path passes `&subject.doses` + `&[]`; the modeled-`RATE=-1/-2` path
+/// resolves each dose to `f64` (so the schedule's break times and the active-window
+/// checks are correct) and supplies `Some((rate_bare, dur_bare))` per modeled dose
+/// so the rate magnitude and the moving infusion-end boundary carry their PK-param
+/// jets. `eff_doses` / `dose_inf_dual` are parallel to `subject.doses`
+/// (`dose_inf_dual` may be empty, treated as all-`None`).
+#[allow(clippy::too_many_arguments)]
+pub fn event_driven_sens_with_doses_g<T: PkNum>(
+    pk_model: PkModel,
+    subject: &Subject,
+    schedule: &EventSchedule,
+    eff_doses: &[DoseEvent],
+    dose_inf_dual: &[Option<(T, T)>],
+    pk_at_dose: &[PkDual<T>],
+    pk_at_obs: &[PkDual<T>],
+    pk_at_pk_only: &[PkDual<T>],
+) -> Vec<T> {
     let n_obs = subject.obs_times.len();
     let mut preds = vec![T::from_f64(0.0); n_obs];
     if n_obs == 0 || schedule.events.is_empty() || !walk_supports(pk_model) {
@@ -1020,8 +1120,9 @@ pub fn event_driven_sens_g<T: PkNum>(
                 bounds,
                 &pk_now,
                 pk_model,
-                &subject.doses,
+                eff_doses,
                 &schedule.dose_lagtimes,
+                dose_inf_dual,
                 reset_floor,
             );
             cur_t = ev.time;
@@ -1029,9 +1130,13 @@ pub fn event_driven_sens_g<T: PkNum>(
 
         match ev.kind {
             EventKind::Dose => {
-                let d = &subject.doses[ev.orig_idx];
+                let d = &eff_doses[ev.orig_idx];
                 if d.ss && d.ii > 0.0 {
-                    state = equilibrate_ss_g(pk_model, &pk_now, d);
+                    // #486: forward this dose's modeled-window dual (if any) so the SS
+                    // equilibration threads `∂D`/`∂R` into the trough, matching the current
+                    // pulse handled by the main walk. `None` for a fixed infusion / bolus.
+                    let inf = dose_inf_dual.get(ev.orig_idx).copied().flatten();
+                    state = equilibrate_ss_g(pk_model, &pk_now, d, inf);
                 }
                 if d.rate <= 0.0 {
                     let cmt_idx = d.cmt.saturating_sub(1);
@@ -1183,7 +1288,7 @@ mod tests {
         let mut sd = [Dual2::<2>::constant(s0)];
         propagate_one_cpt_g::<Dual2<2>>(
             &mut sd,
-            dt,
+            Dual2::<2>::from_f64(dt),
             Dual2::var(cl, 0),
             Dual2::var(v, 1),
             Dual2::constant(rate),
@@ -1689,7 +1794,7 @@ mod tests {
         let mut sd = [Dual2::<2>::constant(ad), Dual2::<2>::constant(ac)];
         propagate_one_cpt_oral_g::<Dual2<2>>(
             &mut sd,
-            dt,
+            Dual2::<2>::from_f64(dt),
             Dual2::var(cl, 0),
             Dual2::var(v, 1),
             Dual2::constant(ka),

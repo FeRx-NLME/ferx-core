@@ -62,8 +62,10 @@ On the ODE path the estimated lagtime gets the **exact analytic gradient** (oute
 θ/Ω/σ and inner EBE), including in combination with time-varying covariates, IOV,
 finite-duration infusions, and EVID 3/4 resets — the dose's event time is shifted
 to `t_dose + lagtime` and its sensitivity injected as an event-time saltation. A
-lagtime combined with steady-state dosing still falls back to finite differences;
-correctness is preserved at a small performance cost.
+lagtime combined with **steady-state dosing** is analytic too (#486): the pre-arrival
+window `[t_dose, t_dose+lagtime)` is seeded from the previous interval's steady-state
+tail (see [Steady-state dosing](steady-state.qmd)), and the SS dose's own arrival gets
+the same event-time saltation as any other lagged dose.
 
 ## NONMEM equivalence
 

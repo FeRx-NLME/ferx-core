@@ -1,0 +1,87 @@
+# Data
+
+> **Maturity: beta** — see [Feature Maturity](../maturity.qmd) for what this means.
+
+The optional `[data]` block lets a model file name the dataset it should be
+fit against, so `ferx model.ferx` (no `--data`) and `ferx check model.ferx`
+(no `--data`) both work directly. It is the ferx equivalent of NONMEM's
+`$DATA` record.
+
+## Syntax
+
+```
+[data]
+  path = <path-to-csv>
+```
+
+`path` is the only key. A relative path is resolved **relative to the model
+file's own directory** — not the current working directory of the process
+running `ferx` — so a model and its dataset can be moved together as a pair.
+
+```
+[data]
+  path = warfarin.csv
+```
+
+---
+
+## Precedence: CLI / R overrides the model file
+
+An explicit dataset path always wins over the model's `[data]` block:
+
+- CLI: `ferx model.ferx --data other.csv`
+- R: `ferx_fit(model, data = "other.csv")`
+
+If the model *also* declares a `[data]` block and the two paths differ, ferx
+fits (or checks) against the explicit path and records a warning rather than
+silently picking one — it appears in `FitResult$warnings` (and the console
+output) for a fit, or as a `W_DATA_PATH_OVERRIDE` diagnostic for
+`ferx check`.
+
+```
+$ ferx model.ferx --data other.csv
+...
+Warning(s):
+  - dataset path overridden: using `other.csv` instead of the model's `[data] path = warfarin.csv`
+```
+
+When the two paths are equal, or only one of the two is given, there is no
+warning.
+
+---
+
+## When neither is given
+
+If a model has no `[data]` block and no dataset path is supplied externally,
+`ferx model.ferx` (without `--simulate`) and `fit_from_files`/`run_model_with_data*`
+without a path both fail with a clear error rather than a generic file-not-found:
+
+```
+Error: no dataset specified — pass a data path, or add a `[data]` block (`path = ...`) to the model file
+```
+
+`ferx check model.ferx` treats the absence of any dataset as "skip
+data-dependent checks" (not an error) — the same as it always has when
+`--data` is omitted.
+
+---
+
+## Limitations
+
+- One dataset per model — there is no support for multiple `[data]` blocks or
+  multiple datasets.
+- `[data]` only carries `path`; row-level filtering stays in
+  [`[data_selection]`](data-selection.qmd) (the NONMEM `IGNORE=`/`ACCEPT=`
+  analogue).
+
+---
+
+## NONMEM equivalent
+
+| NONMEM | ferx |
+|--------|------|
+| `$DATA warfarin.csv` | `[data]  path = warfarin.csv` |
+
+NONMEM has no override-with-warning concept — a `$DATA` record is the only
+source of the dataset path. ferx's CLI `--data`/R `data =` argument taking
+precedence (with a warning on conflict) has no NONMEM analogue.

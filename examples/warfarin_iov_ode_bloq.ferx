@@ -1,0 +1,43 @@
+# Warfarin 1-compartment oral model (ODE) with IOV + M3 BLOQ.
+#
+# ODE counterpart of warfarin_iov_bloq.ferx — same data, same true parameters.
+# The censored M3 likelihood gradient now rides the event-driven ODE sensitivity
+# walk analytically (#486), the last M3 holdout off finite differences. Fit must
+# agree to estimator precision with the closed-form model, which is NONMEM-anchored
+# via the closed-form M3+IOV validation (#580/#591).
+# States:
+#   CMT=1  depot   — oral dose (mg)
+#   CMT=2  central — amount; concentration = central / V via obs_cmt readout
+
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  kappa KAPPA_CL ~ 0.01
+  sigma PROP_ERR ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot / V - (CL/V) * central
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+
+[fit_options]
+  method      = focei
+  iov_column  = OCC
+  bloq_method = m3
+  ode_reltol  = 1e-10
+  ode_abstol  = 1e-12
+  covariance  = false

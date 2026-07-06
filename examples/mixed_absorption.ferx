@@ -12,10 +12,10 @@
 # explicitly: FZO1 = 1 - FZO. The two pathways together deliver exactly the dose
 # (∫ R_in dt = F·Dose); the fit-time check enforces 0 < FR ≤ 1 and Σ FR ≈ 1.
 #
-# The zero-order pathway has a hard cutoff at tad = DUR, so — like a plain
-# `zero_order()` model — the duration DUR (and the zero-order fraction FZO) are
-# differentiated by finite differences (the moving-boundary ∂/∂DUR analytic impulse
-# is follow-up #530). The first-order pathway is a smooth `exp`-only density.
+# The zero-order pathway has a hard cutoff at tad = DUR; like a plain `zero_order()`
+# model, the duration DUR (and the zero-order fraction FZO) are now differentiated
+# analytically via the rate-off saltation at the cutoff (#530). The first-order
+# pathway is a smooth `exp`-only density.
 #
 # ── Unit convention (Form C: amount ODE + [scaling]) ─────────────────────────
 #   CMT=1  central  — drug AMOUNT (mg); receives R_in(tad), elimination CL/V

@@ -787,8 +787,10 @@ fn run_mcem(
                 let subj_seed = seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32);
 
                 // FREM: Rao-Blackwellised low-dimensional PK sampling. The
-                // conditional PK proposal is well matched, so the per-subject
-                // ISCALE pilot search (a full-dimensional ESS rescue) is skipped.
+                // conditional PK proposal is usually well matched, but a
+                // per-subject ISCALE pilot search still rescues subjects where
+                // `h_pp` is a poor curvature estimate (sparse PK data) — see
+                // `find_optimal_iscale_frem_rb` (issue #406 follow-up).
                 if let Some((ref pk_idx, ref cov_idx)) = frem_rb {
                     if let Some(fc) = model.frem_config.as_ref() {
                         if let Some((sampled, observed, d)) =
@@ -800,6 +802,26 @@ fn run_mcem(
                                 cov_idx,
                             )
                         {
+                            let rb_iscale =
+                                crate::estimation::importance_sampling::find_optimal_iscale_frem_rb(
+                                    model,
+                                    subject,
+                                    &params_k.theta,
+                                    &params_k.sigma.values,
+                                    &center,
+                                    &h_post,
+                                    &omega_inv,
+                                    &params_k.omega.matrix,
+                                    &sampled,
+                                    &observed,
+                                    &d,
+                                    n_eta,
+                                    nu,
+                                    subj_seed,
+                                    scratch,
+                                    iscale_min,
+                                    iscale_max,
+                                );
                             if let Some(rb) =
                                 crate::estimation::importance_sampling::subject_is_draws_frem_rb(
                                     model,
@@ -818,7 +840,7 @@ fn run_mcem(
                                     nu,
                                     subj_seed,
                                     scratch,
-                                    1.0,
+                                    rb_iscale,
                                     use_sobol,
                                     defensive_alpha,
                                 )

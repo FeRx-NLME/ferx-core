@@ -105,7 +105,7 @@ use ferx_core::{fit_from_files, run_sir, FitOptions};
 
 let mut opts = FitOptions::default();
 opts.run_covariance_step = true;          // SIR needs the cov matrix
-let fit = fit_from_files("model.ferx", "data.csv", None, Some(opts.clone()))?;
+let fit = fit_from_files("model.ferx", Some("data.csv"), None, Some(opts.clone()))?;
 
 opts.sir_samples   = 2000;
 opts.sir_resamples = 500;

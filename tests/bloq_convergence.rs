@@ -144,71 +144,76 @@ fn bloq_m3_analytic_lbfgs_matches_nonmem() {
     );
 }
 
-/// FOCE-M3 (no interaction) on the analytic FOCE censored gradient. ferx no longer
-/// promotes M3 subjects to FOCEI — plain FOCE keeps a consistent Sheiner–Beal
-/// objective with the censored rows entering as `−logΦ((LLOQ−f̂)/√R⁰)` (excluded
-/// from R̃, population variance). FOCE-M3 is a genuinely different optimum than
-/// FOCEI-M3 (TVKA ≈ 0.71 vs 0.81), matching NONMEM `METHOD=1 LAPLACE` (no INTER):
-/// `tests/nonmem/warfarin_bloq_foce.{ctl,lst}` gives TVCL 0.131073 / TVV 7.76460 /
-/// TVKA 0.711871 / PROP(SD) 0.011148, which ferx recovers to <1%.
+/// FOCE-M3 (no interaction) on the analytic FOCE censored gradient.
+///
+/// **There is no NONMEM anchor for this estimator, by construction.** NONMEM's M3 BLOQ
+/// is the F_FLAG mixed likelihood, which *requires* the LAPLACE objective (`$EST METHOD=1
+/// LAPLACE`); NONMEM has no genuine first-order, non-interaction "FOCE M3" method to
+/// compare against. NONMEM's LAPLACE-M3 corresponds to ferx's **FOCEI**-M3, which is what
+/// `bloq_m3_analytic_lbfgs_matches_nonmem` cross-checks against `warfarin_bloq.lst`.
+///
+/// ferx additionally offers a Sheiner–Beal **FOCE**-M3 (no interaction): the censored
+/// rows enter the marginal as `−logΦ((LLOQ−f̂)/√R⁰)` (excluded from R̃, the population
+/// variance). It is a genuinely different, ferx-specific optimum from FOCEI-M3
+/// (interaction shifts TVKA up ~0.71 → ~0.81), so it is validated by **self-consistency**
+/// rather than a NONMEM cross-check: the analytic FOCE-M3 outer gradient must drive the
+/// optimizer to the same MLE as the finite-difference gradient of the *identical* marginal.
+/// (The censored inner-EBE gradient is separately FD-checked by the
+/// `analytic_inner_gradient_m3_matches_fd_on_warfarin_bloq` unit test.)
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
-    ignore = "slow + NONMEM-anchored FOCE-M3 cross-check: opt in with --features slow-tests"
+    ignore = "slow: opt in with --features slow-tests"
 )]
-fn bloq_m3_foce_analytic_matches_nonmem() {
+fn bloq_m3_foce_analytic_matches_fd() {
     let model = parse_model_file(Path::new("examples/warfarin_bloq.ferx"))
         .expect("warfarin BLOQ model must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None)
         .expect("warfarin BLOQ data must load");
 
-    // method = FOCE (no interaction) on the built-in L-BFGS analytic gradient.
-    let mut opts = FitOptions::default();
-    opts.method = EstimationMethod::Foce;
-    opts.optimizer = Optimizer::Lbfgs;
-    opts.inner_tol = 1e-8;
-    opts.outer_maxiter = 300;
-    opts.run_covariance_step = false;
-    opts.verbose = false;
+    // FOCE (no interaction) M3, driven by the analytic vs the finite-difference outer
+    // gradient of the same Sheiner–Beal marginal. Both legs share optimizer/inits, so the
+    // only difference is how the gradient is formed — they must land on the same optimum.
+    let run = |gm: ferx_core::GradientMethod| -> ferx_core::FitResult {
+        let mut opts = FitOptions::default();
+        opts.method = EstimationMethod::Foce;
+        opts.optimizer = Optimizer::Lbfgs;
+        opts.gradient_method = gm;
+        opts.inner_tol = 1e-8;
+        opts.outer_maxiter = 300;
+        opts.run_covariance_step = false;
+        opts.verbose = false;
+        fit(&model, &population, &model.default_params, &opts)
+            .expect("analytic/FD FOCE-M3 fit must succeed")
+    };
+    let analytic = run(ferx_core::GradientMethod::Auto);
+    let fd = run(ferx_core::GradientMethod::Fd);
 
-    let result = fit(&model, &population, &model.default_params, &opts)
-        .expect("analytic FOCE-M3 fit must succeed");
     assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
+        analytic.ofv.is_finite() && fd.ofv.is_finite(),
+        "OFV must be finite, got analytic {} / FD {}",
+        analytic.ofv,
+        fd.ofv
     );
-
-    // NONMEM 7.5.1 FOCE (no INTER) M3 MLE. OFV not compared (F_FLAG offset).
-    let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
-    const NM_TVCL: f64 = 0.131073;
-    const NM_TVV: f64 = 7.76460;
-    const NM_TVKA: f64 = 0.711871;
-    const NM_PROP_SD: f64 = 0.0111483;
+    // Same marginal, two gradient methods ⇒ same optimum (allowing for optimizer-path
+    // noise on the flat KA ridge).
     assert!(
-        rel(result.theta[0], NM_TVCL) < 0.01,
-        "TVCL {} vs NM {NM_TVCL}",
-        result.theta[0]
+        (analytic.ofv - fd.ofv).abs() < 1.0,
+        "analytic OFV {:.4} vs FD OFV {:.4} should agree (same FOCE-M3 marginal)",
+        analytic.ofv,
+        fd.ofv
     );
+    for k in 0..analytic.theta.len() {
+        let (a, f) = (analytic.theta[k], fd.theta[k]);
+        assert!(
+            (a - f).abs() <= 0.03 * f.abs().max(1e-3),
+            "theta[{k}]: analytic {a:.5} vs FD {f:.5} diverge beyond 3%"
+        );
+    }
+    // FOCE-M3 must be a distinct optimum from FOCEI-M3 (interaction shifts TVKA to ~0.81).
     assert!(
-        rel(result.theta[1], NM_TVV) < 0.01,
-        "TVV {} vs NM {NM_TVV}",
-        result.theta[1]
-    );
-    assert!(
-        rel(result.theta[2], NM_TVKA) < 0.02,
-        "TVKA {} vs NM {NM_TVKA}",
-        result.theta[2]
-    );
-    assert!(
-        rel(result.sigma[0], NM_PROP_SD) < 0.02,
-        "PROP {} vs NM {NM_PROP_SD}",
-        result.sigma[0]
-    );
-    // FOCE-M3 must be distinct from FOCEI-M3 (interaction shifts TVKA ~0.81).
-    assert!(
-        result.theta[2] < 0.76,
+        analytic.theta[2] < 0.76,
         "FOCE TVKA {} should be well below FOCEI ~0.81",
-        result.theta[2]
+        analytic.theta[2]
     );
 }

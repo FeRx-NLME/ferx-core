@@ -70,6 +70,7 @@ source is always available as `loaded.model_source` and can be re-parsed via
 | `fit.json` | JSON | yes | All scalars, vectors, and matrices on `FitResult` |
 | `ebes.csv` | CSV | yes | One row per subject: `ID, <eta names...>, ofv_contribution, n_obs` |
 | `ebes_kappa.csv` | CSV | only when `n_kappa > 0` | One row per (subject, occasion): `ID, OCC, <kappa names...>` |
+| `conddist.csv` | CSV | only when `[fit_options] conddist = true` (SAEM-only) | One row per (subject, eta): `ID, ETA, COND_MEAN, COND_SD, COND_MODE` |
 | `predictions.csv` | CSV | yes | One row per observation: `ID, TIME, DV, PRED, IPRED, CWRES, IWRES, EBE_OFV, N_OBS` plus optional `CENS`, `OCC` |
 | `model.ferx` | UTF-8 text | yes | Verbatim model source |
 | `warnings.txt` | UTF-8 text | no | One warning per line. Mirrors `fit.json:warnings` for grep-friendliness; loaders read warnings from `fit.json` and ignore this entry. Writers should still produce it. |
@@ -240,6 +241,31 @@ ID,OCC,kappa_CL,kappa_V
 ```
 
 `OCC` is 1-based occasion index per subject.
+
+## `conddist.csv`
+
+Present only when the fit ran the SAEM conditional-distribution pass
+(`[fit_options] conddist = true`, SAEM-only, #257) — the shrinkage-unbiased
+`p(η_i | y_i; θ̂)` estimate, the analogue of Monolix's Conditional
+Distribution task / saemix's `conddist.saemix`.
+
+```
+ID,ETA,COND_MEAN,COND_SD,COND_MODE
+1,eta_CL,0.110000,0.050000,0.098000
+1,eta_V,-0.190000,0.060000,-0.175000
+```
+
+- `COND_MEAN` / `COND_SD` — mean and SD of the retained MCMC draws for that
+  subject/eta.
+- `COND_MODE` — the EBE (same value as `ebes.csv`), included for direct
+  comparison against the conditional mean.
+- One row per (subject, eta), subject rows contiguous in fit order.
+
+The retained draws themselves (`saem_conddist_keep_samples = true`) and
+per-eta shrinkage are **not** bundled — draws live only in the sidecar
+`{model}-conddist-samples.csv` written alongside the `.fitrx`, and shrinkage
+is recomputed on load from `COND_MEAN` and `omega` (same formula the SAEM
+pass itself uses) rather than stored redundantly.
 
 ## `predictions.csv`
 

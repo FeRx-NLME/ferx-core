@@ -385,6 +385,8 @@ pub fn individual_nll_into_with_schedule(
     }
     let omega_inv = &omega.inv;
     let log_det_omega = omega.log_det;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
 
     // Eta prior: eta' * Omega_inv * eta
     let eta_vec = DVector::from_column_slice(eta);
@@ -458,7 +460,7 @@ pub fn individual_nll_into_with_schedule(
                 }
             }
             let v_resid = model.residual_variance_at_scaled(
-                subject.obs_cmts[j],
+                err_keys[j],
                 f_pred,
                 sigma_values,
                 ruv_mult.as_ref().map(|m| m[j].as_slice()),
@@ -550,11 +552,13 @@ fn dense_residual_data_term(
     p_obs: &[f64],
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> Option<f64> {
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     let mut r = match ruv_mult {
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             &model.error_spec,
             preds,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -565,7 +569,7 @@ fn dense_residual_data_term(
         None => compute_r_matrix_with_correlations(
             &model.error_spec,
             preds,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -637,6 +641,8 @@ pub(crate) fn obs_nll_subject_from_preds(
     // FREM covariate rows keep their own (unscaled) EPSCOV variance.
     let ruv_scale = model.residual_var_scale(eta);
     let ruv_mult = model.ruv_obs_mult(subject, theta);
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     let mut nll = 0.0;
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
     if !model.residual_correlations.is_empty() && !m3 && !has_frem_rows {
@@ -667,7 +673,7 @@ pub(crate) fn obs_nll_subject_from_preds(
             let v = match frem_var {
                 Some(vv) => vv.max(1e-12),
                 None => (model.residual_variance_at_scaled(
-                    subject.obs_cmts[j],
+                    err_keys[j],
                     f,
                     sigma_values,
                     ruv_mult.as_ref().map(|m| m[j].as_slice()),
@@ -1086,6 +1092,8 @@ pub fn foce_subject_nll_standard(
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
     let n_obs = subject.observations.len();
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = error_spec.obs_keys(subject);
 
     // f0 = ipred - H * eta_hat (linearized population prediction)
     let h_eta = h_matrix * eta_hat;
@@ -1104,7 +1112,7 @@ pub fn foce_subject_nll_standard(
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             error_spec,
             r_eval,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1115,7 +1123,7 @@ pub fn foce_subject_nll_standard(
         None => compute_r_matrix_with_correlations(
             error_spec,
             r_eval,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1135,9 +1143,16 @@ pub fn foce_subject_nll_standard(
 
     // M3 BLOQ under FOCE: the censored rows leave the Sheiner–Beal marginal (R̃ and
     // the quadratic form are built over the quantified rows only) and re-enter as
-    // `−logΦ((LLOQ − f(η̂))/√R⁰)` — the univariate marginal CDF, with R at the
-    // population η (no interaction). Mirrors the FOCEI handling, where censored
-    // rows are excluded from H̃ and added to the data term.
+    // the univariate marginal tail probability `−logΦ((LLOQ − f0)/√R̃ⱼⱼ)`, using the
+    // SAME linearized-marginal moments the quantified rows use: the marginal mean
+    // `f0 = f(η̂) − Hη̂` and the marginal variance `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰ⱼ` (#646).
+    // This keeps FOCE a consistent Sheiner–Beal (linearized-marginal) objective —
+    // matching Monolix's linearization likelihood and first-order/Tobit theory —
+    // in contrast to FOCEI (`foce_subject_nll_interaction`), a *conditional* first-order
+    // method whose censored term stays at the conditional `f(η̂)`/`R⁰` and instead folds
+    // the censored curvature into `H̃` (see `cens_hess`, #486) — the same conditional
+    // treatment NONMEM's LAPLACE M3 uses, at FOCEI Gauss-Newton order (dropping the
+    // `∂²f/∂η²` term full Laplace keeps).
     let m3 = matches!(bloq_method, BloqMethod::M3) && subject.has_censored_observation();
     let quant: Vec<usize> = if m3 {
         (0..n_obs)
@@ -1152,11 +1167,14 @@ pub fn foce_subject_nll_standard(
         for j in 0..n_obs {
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if cens != 0 {
-                // `m3_logcdf` selects the tail from the CENS sign: lower tail for
-                // below-LLOQ (`cens > 0`), upper tail `(f − ULOQ)/sd` for above-ULOQ
-                // (`cens < 0`). `subject.observations[j]` holds the censoring limit.
+                // Marginal variance R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰ⱼ (Hⱼ = row j of the inner
+                // Jacobian ∂f/∂η). `m3_logcdf` selects the tail from the CENS sign:
+                // lower for below-LLOQ (`cens > 0`), upper for above-ULOQ (`cens < 0`);
+                // `subject.observations[j]` holds the censoring limit.
+                let hj = h_matrix.row(j).transpose();
+                let rtilde_jj = hj.dot(&(&omega.matrix * &hj)) + r_diag[j];
                 bloq_term +=
-                    -2.0 * m3_logcdf(subject.observations[j], ipreds[j], r_diag[j].sqrt(), cens);
+                    -2.0 * m3_logcdf(subject.observations[j], f0[j], rtilde_jj.sqrt(), cens);
             }
         }
     }
@@ -1237,9 +1255,13 @@ fn model_n_eta(h_matrix: &DMatrix<f64>) -> usize {
 /// small (the negative-EPS-shrinkage symptom on jasmine peds vanco). See
 /// `[[focei-laplace-not-sheiner-beal]]` memory.
 ///
-/// With `bloq_method == M3`, censored observations are dropped from the
-/// Gaussian residual sum and the H̃ accumulation, and instead contribute
-/// the matching normal-tail likelihood evaluated at η̂.
+/// With `bloq_method == M3`, censored observations leave the Gaussian residual
+/// sum and contribute the matching normal-tail likelihood `−logΦ` evaluated at η̂
+/// (the `bloq_term`). They also enter `H̃`/`log|H̃|` at FOCEI (Gauss–Newton) order —
+/// the structural `g2·a·aᵀ` plus, under `iiv_on_ruv`, the residual-eta `C·z`/`C·m`
+/// cross terms (`cens_hess`) — consistently with the quantified rows, matching
+/// NONMEM's LAPLACE M3 Hessian (only the `g1·d2f` piece FOCEI drops for every row
+/// is dropped here too).
 pub fn foce_subject_nll_interaction(
     subject: &Subject,
     ipreds: &[f64],
@@ -1278,8 +1300,9 @@ pub fn foce_subject_nll_interaction(
 
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
-    // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.  log|H̃| via Cholesky.
-    let htilde = g.hrh + 0.5 * g.ctc + &omega.inv;
+    // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + cens_hess + Ω⁻¹.  log|H̃| via Cholesky.
+    // (`cens_hess` = 0 unless the subject has M3-censored rows.)
+    let htilde = g.hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv;
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
         None => return 1e20,
@@ -1334,6 +1357,8 @@ pub fn foce_subject_nll_interaction_dense(
 ) -> f64 {
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = error_spec.obs_keys(subject);
 
     // Dense R at η̂ (+ SDE process noise on the diagonal), assembled exactly as
     // the data term and FOCE-standard path assemble it.
@@ -1341,7 +1366,7 @@ pub fn foce_subject_nll_interaction_dense(
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             error_spec,
             ipreds,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1352,7 +1377,7 @@ pub fn foce_subject_nll_interaction_dense(
         None => compute_r_matrix_with_correlations(
             error_spec,
             ipreds,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1393,7 +1418,7 @@ pub fn foce_subject_nll_interaction_dense(
     let dr = crate::stats::residual_error::compute_dr_df_matrices(
         error_spec,
         ipreds,
-        &subject.obs_cmts,
+        err_keys.as_ref(),
         &subject.obs_times,
         &subject.obs_raw_times,
         &subject.occasions,
@@ -1496,9 +1521,14 @@ fn foce_subject_nll_interaction_with_tte(
     let hrh = g.hrh + tte_hessian;
 
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
-    // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it.
+    // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it. The censored
+    // `cens_hess` (structural `g2·a·aᵀ` + residual-eta `C·z`/`C·m`) is FOCEI-order
+    // curvature — its `g2` folds in `∂v/∂f`/`∂²v/∂f²`, and the `C·z`/`C·m` terms are
+    // pure `iiv_on_ruv` interaction — so it is gated to the interaction branch, exactly
+    // as `½·g.ctc` is. Plain FOCE (non-interaction) leaves censored rows out of `H̃`,
+    // matching `foce_subject_nll_standard`.
     let htilde = if interaction {
-        hrh + 0.5 * g.ctc + &omega.inv
+        hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv
     } else {
         hrh + &omega.inv
     };
@@ -1520,6 +1550,15 @@ struct GaussianFoceTerms {
     ctc: DMatrix<f64>,
     /// Σⱼ censored normal-tail terms (M3 method).
     bloq_term: f64,
+    /// Σⱼ censored rows' contribution to `H̃` at FOCEI (Gauss-Newton) order:
+    /// the structural curvature `g2·aⱼ'aⱼ` (`g2 = ∂²(−logΦ)/∂f²`) plus, under
+    /// `iiv_on_ruv`, the residual-eta cross terms `C·z` (diagonal) and `C·m·a`
+    /// (η_ruv coupling). This is `precise_ebe`'s censored inner-Hessian block
+    /// **minus** the `g1·d2f` term FOCEI legitimately drops (that drop is the
+    /// FOCEI-vs-LAPLACE difference; excluding the *rows* was an inconsistency).
+    /// Added directly (unscaled) to `H̃`, so censored rows enter `log|H̃|`
+    /// consistently with quantified rows. Zero when no censored rows.
+    cens_hess: DMatrix<f64>,
 }
 
 /// Shared Gaussian accumulation loop for the FOCE/FOCEI interaction path.
@@ -1551,6 +1590,8 @@ fn gaussian_foce_accum(
 ) -> Option<GaussianFoceTerms> {
     let n_obs = subject.observations.len();
     let mult_row = |j: usize| -> Option<&[f64]> { ruv_mult.map(|m| m[j].as_slice()) };
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = error_spec.obs_keys(subject);
 
     // Partition observation indices into quantified vs censored (M3 only).
     let (quant_idx, bloq_idx): (Vec<usize>, Vec<usize>) = (0..n_obs).partition(|&j| {
@@ -1577,10 +1618,9 @@ fn gaussian_foce_accum(
         } else {
             match mult_row(j) {
                 Some(m) => {
-                    error_spec.variance_at_scaled(subject.obs_cmts[j], f, sigma_values, &[], m)
-                        * ruv_scale
+                    error_spec.variance_at_scaled(err_keys[j], f, sigma_values, &[], m) * ruv_scale
                 }
-                None => error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+                None => error_spec.variance_at(err_keys[j], f, sigma_values) * ruv_scale,
             }
         };
         let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
@@ -1597,10 +1637,8 @@ fn gaussian_foce_accum(
         let aj = h_matrix.row(j);
         let dvar_df = if is_pk_row {
             match mult_row(j) {
-                Some(m) => {
-                    error_spec.dvar_df_scaled(subject.obs_cmts[j], f, sigma_values, m) * ruv_scale
-                }
-                None => error_spec.dvar_df(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+                Some(m) => error_spec.dvar_df_scaled(err_keys[j], f, sigma_values, m) * ruv_scale,
+                None => error_spec.dvar_df(err_keys[j], f, sigma_values) * ruv_scale,
             }
         } else {
             0.0 // FREM rows: additive near-zero sigma, ∂R/∂f = 0
@@ -1624,23 +1662,63 @@ fn gaussian_foce_accum(
         }
     }
 
-    // Censored contributions at η̂ (ipred-based variance).
+    // Censored contributions at η̂ (ipred-based variance). Censored rows enter both
+    // the data term (`bloq_term`) AND `H̃` (`cens_hess`) — consistently with quantified
+    // rows — at FOCEI (Gauss-Newton) order (structural `g2·a·aᵀ` + residual-eta `C·z`/`C·m`,
+    // dropping only the `g1·d2f` piece FOCEI drops for every row).
     let mut bloq_term = 0.0;
+    let mut cens_hess = DMatrix::<f64>::zeros(n_eta, n_eta);
     for &j in &bloq_idx {
         let limit = subject.observations[j];
         let f = ipreds[j];
-        let v = match mult_row(j) {
-            Some(m) => {
-                error_spec.variance_at_scaled(subject.obs_cmts[j], f, sigma_values, &[], m)
-                    * ruv_scale
-            }
-            None => error_spec.variance_at(subject.obs_cmts[j], f, sigma_values) * ruv_scale,
+        let cmt = err_keys[j];
+        // `v_resid`/`d`/`d2` all carry the same proportional-loading (`m²`) and
+        // `exp(2·η_ruv)` scaling, so the censored curvature is built from mutually
+        // consistent derivatives of one `v(f)`.
+        let (v_resid, d, d2) = match mult_row(j) {
+            Some(m) => (
+                error_spec.variance_at_scaled(cmt, f, sigma_values, &[], m) * ruv_scale,
+                error_spec.dvar_df_scaled(cmt, f, sigma_values, m) * ruv_scale,
+                error_spec.d2var_df2_scaled(cmt, sigma_values, m) * ruv_scale,
+            ),
+            None => (
+                error_spec.variance_at(cmt, f, sigma_values) * ruv_scale,
+                error_spec.dvar_df(cmt, f, sigma_values) * ruv_scale,
+                error_spec.d2var_df2(cmt, sigma_values) * ruv_scale,
+            ),
         };
+        // Inflate by the EKF process-noise term exactly as the quantified rows do
+        // (line above), so a censored row's `v` — in both the data term and `H̃` —
+        // matches its subject's Gaussian rows under an SDE model. `p_obs` is
+        // f-independent, so `d`/`d2` (∂v/∂f, ∂²v/∂f²) are unchanged.
+        let v = v_resid + p_obs.get(j).copied().unwrap_or(0.0);
         if !(v.is_finite() && v > 0.0) {
             return None;
         }
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         bloq_term += -2.0 * m3_logcdf(limit, f, v.sqrt(), cens);
+
+        // Censored curvature for `H̃` (`L = −logΦ`): structural `g2·a·aᵀ` plus, under
+        // `iiv_on_ruv`, the residual-eta coupling `C·z` on (rr,rr) and `C·m·a_l` on the
+        // (rr,l) cross terms. Single-sourced via `m3_censored_outer` (shared with the
+        // analytic outer gradient) so the two curvature copies cannot drift.
+        let (_g1, g2, cz, cm) = crate::stats::special::m3_censored_outer(limit, f, v, d, d2, cens);
+        let aj = h_matrix.row(j);
+        for a in 0..n_eta {
+            let ga = g2 * aj[a];
+            for b in 0..n_eta {
+                cens_hess[(a, b)] += ga * aj[b];
+            }
+        }
+        if let Some(rr) = residual_error_eta {
+            cens_hess[(rr, rr)] += cz;
+            for l in 0..n_eta {
+                if l != rr {
+                    cens_hess[(rr, l)] += cm * aj[l];
+                    cens_hess[(l, rr)] += cm * aj[l];
+                }
+            }
+        }
     }
 
     Some(GaussianFoceTerms {
@@ -1648,6 +1726,7 @@ fn gaussian_foce_accum(
         hrh,
         ctc,
         bloq_term,
+        cens_hess,
     })
 }
 
@@ -1829,9 +1908,10 @@ pub fn foce_subject_nll_iov(
     // M3 no longer force-promotes IOV-FOCE subjects to interaction (#591, mirroring the
     // non-IOV `foce_subject_nll` change in #367/8abadbb7): plain FOCE keeps a consistent
     // FOCE (Sheiner–Beal) objective for the whole subject — the censored rows leave the
-    // linearized augmented marginal and re-enter through `foce_subject_nll_standard` as
-    // `−logΦ((LLOQ−f̂)/√R⁰)` data terms with the population (η=0, κ=0) variance. FOCEI still
-    // takes the interaction path. FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different
+    // linearized augmented marginal and re-enter through `foce_subject_nll_standard` as the
+    // marginal tail `−logΦ((LLOQ−f0)/√R̃ⱼⱼ)`, R̃ⱼⱼ = Hⱼ Σ_b Hⱼᵀ + R⁰ⱼ over the stacked
+    // [η, κ] system (#646, the same linearized-marginal moments the quantified rows use).
+    // FOCEI still takes the interaction path. FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different
     // optima, matching NONMEM METHOD=1 LAPLACE with vs without INTER. (Previously a
     // censored subject was silently evaluated with η-interaction even under FOCE, mixing a
     // Sheiner–Beal marginal with a FOCEI censored term.) The censored rows are now routed
@@ -2000,6 +2080,8 @@ pub fn compute_cwres(
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> Vec<f64> {
     let n_obs = subject.observations.len();
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = error_spec.obs_keys(subject);
 
     // f0 = ipred - H * eta_hat
     let h_eta = h_matrix * eta_hat;
@@ -2014,7 +2096,7 @@ pub fn compute_cwres(
         Some(mult) => crate::stats::residual_error::compute_r_matrix_with_correlations_scaled(
             error_spec,
             &f0,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -2025,7 +2107,7 @@ pub fn compute_cwres(
         None => compute_r_matrix_with_correlations(
             error_spec,
             &f0,
-            &subject.obs_cmts,
+            err_keys.as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -2243,13 +2325,13 @@ pub fn individual_nll_iov(
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
     // IIV on residual error (#409): η_ruv is a BSV eta, indexed into `eta`.
     let ruv_scale = model.residual_var_scale(eta);
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = model.error_spec.obs_keys(subject);
     let mut data_ll = 0.0;
     for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
         let v = match frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x) {
             Some(vv) => vv,
-            None => {
-                model.residual_variance_at(subject.obs_cmts[j], f_pred, sigma_values) * ruv_scale
-            }
+            None => model.residual_variance_at(err_keys[j], f_pred, sigma_values) * ruv_scale,
         };
         let cens = subject.cens.get(j).copied().unwrap_or(0);
         if matches!(model.bloq_method, BloqMethod::M3) && cens != 0 {
@@ -2399,7 +2481,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -2851,6 +2935,52 @@ mod tests {
             nll_f0 - nll_override > 20.0,
             "override must change the SB marginal (R evaluated at f(η=0), not f0): \
              nll_f0={nll_f0}, nll_override={nll_override}"
+        );
+    }
+
+    /// #646: FOCE (Sheiner–Beal) M3 censored rows must use the linearized-marginal
+    /// variance `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰`, not the conditional residual `R⁰`. With the
+    /// quantified rows' Jacobian zeroed, the quant SB marginal `R̃ = R` is
+    /// Ω-independent, so the objective can only depend on Ω through the censored
+    /// row's marginal variance. The old conditional censored term (√R⁰) would give
+    /// an identical NLL for any Ω; the marginal term must not.
+    #[test]
+    fn foce_m3_censored_uses_marginal_variance() {
+        let mut subject = make_simple_subject();
+        subject.cens = vec![0, 0, 0, 0, 0, 1]; // last row below-LLOQ
+        subject.observations[5] = 5.0; // LLOQ limit
+        let sigma = vec![3.0]; // additive SD → R⁰ = 9, Ω-independent
+        let error_spec = ErrorSpec::Single(ErrorModel::Additive);
+        let ipreds = vec![50.0, 40.0, 30.0, 45.0, 35.0, 8.0];
+        let eta_hat = DVector::from_vec(vec![0.5]);
+        // Quant rows H=0 (their R̃ = R is Ω-independent); censored row H = 4 ≠ 0.
+        let h_matrix = DMatrix::from_column_slice(6, 1, &[0.0, 0.0, 0.0, 0.0, 0.0, 4.0]);
+        let call = |omega: &OmegaMatrix| {
+            foce_subject_nll_standard(
+                &subject,
+                &ipreds,
+                &eta_hat,
+                &h_matrix,
+                omega,
+                &sigma,
+                &error_spec,
+                &[],
+                BloqMethod::M3,
+                &[],
+                None,
+                None,
+                None,
+            )
+        };
+        let nll_small = call(&make_omega(0.01));
+        let nll_large = call(&make_omega(1.0));
+        assert!(nll_small.is_finite() && nll_large.is_finite());
+        // Marginal variance grows with Ω (H²·Ω = 16·Ω), widening the censored tail,
+        // so the two NLLs must differ well above FP noise. (Old conditional → equal.)
+        assert!(
+            (nll_small - nll_large).abs() > 1e-3,
+            "censored term must depend on Ω via the marginal variance (#646): \
+             nll(Ω=0.01)={nll_small}, nll(Ω=1.0)={nll_large}"
         );
     }
 

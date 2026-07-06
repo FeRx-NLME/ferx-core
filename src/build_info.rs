@@ -57,10 +57,12 @@ impl GradientMethodKind {
 /// Coarse model-level mirror of the per-subject route in
 /// [`estimation::inner_optimizer::resolve_gradient_method`]: the analytic `Dual2`
 /// gradient runs when the model has an analytical PK path (`tv_fn` populated —
-/// ODE models have none) and is in the provider's scope (not LTBS / SDE;
-/// η-dependent `ExpressionScale` is now served via the inner quotient rule), and
-/// the user did not force `gradient_method = Fd`. Otherwise FD. (The exact
-/// per-subject split is reported by `gradient_route_summary`.)
+/// ODE models have none) and is in the provider's scope (not SDE; plain LTBS is
+/// served, but LTBS + η-dependent `ExpressionScale` is not), and the user did not
+/// force `gradient_method = Fd`. Otherwise FD. This is best-case, model-level:
+/// per-subject fallbacks — including **TV-cov + LTBS**, where the event-driven
+/// inner walk declines LTBS so every such subject actually runs FD — are reported
+/// by `gradient_route_summary` (banner) and `fd_fallback_warning`.
 pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
     // Report off the *same* model-level predicates `find_ebe` / `find_ebe_iov` consult, so
     // the two can't diverge as scope grows (PR #381 review #9). Per-subject FD fallbacks
@@ -109,26 +111,38 @@ pub fn gradient_method_outer(
         EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
             GradientMethodKind::FiniteDifferences
         }
-        EstimationMethod::Foce | EstimationMethod::FoceI => match optimizer.resolve_auto(model) {
-            Optimizer::Bobyqa => GradientMethodKind::NotApplicable,
-            // `Auto` is resolved above; only its concrete results reach here.
-            Optimizer::Auto
-            | Optimizer::Bfgs
-            | Optimizer::Lbfgs
-            | Optimizer::Slsqp
-            | Optimizer::NloptLbfgs
-            | Optimizer::Mma
-            | Optimizer::TrustRegion => {
-                // Shared predicate (#490) — now IOV-aware via `iov_sens_supported`, which
-                // admits ODE IOV models too, so the reported method tracks the live outer
-                // dispatch (`outer_optimizer.rs`) for IOV as well (#466 review #4 / #439 IOV).
-                if crate::sens::provider::analytic_outer_gradient_available(model) {
-                    GradientMethodKind::Analytic
-                } else {
-                    GradientMethodKind::FiniteDifferences
+        EstimationMethod::Foce | EstimationMethod::FoceI => {
+            // `interaction` derives from `method` (the parser sets
+            // `opts.interaction = method == FoceI`, so the two never disagree),
+            // not a separate `FitOptions` field this function doesn't receive.
+            let interaction = method == EstimationMethod::FoceI;
+            match optimizer.resolve_auto(model, interaction) {
+                Optimizer::Bobyqa => GradientMethodKind::NotApplicable,
+                // `Auto` is resolved above; only its concrete results reach here.
+                Optimizer::Auto
+                | Optimizer::Bfgs
+                | Optimizer::Lbfgs
+                | Optimizer::Slsqp
+                | Optimizer::NloptLbfgs
+                | Optimizer::Mma
+                | Optimizer::TrustRegion => {
+                    // Shared predicate (#490) — now IOV-aware via `iov_sens_supported`, which
+                    // admits ODE IOV models too, so the reported method tracks the live outer
+                    // dispatch (`outer_optimizer.rs`) for IOV as well (#466 review #4 / #439 IOV).
+                    // Shared with `resolve_auto` so the reported method tracks the live outer
+                    // dispatch; a custom-magnitude model is analytic on both FOCE and FOCEI now
+                    // (#486 σ-magnitude FOCE port), so this no longer narrows by interaction.
+                    if crate::sens::provider::analytic_outer_gradient_for_interaction(
+                        model,
+                        interaction,
+                    ) {
+                        GradientMethodKind::Analytic
+                    } else {
+                        GradientMethodKind::FiniteDifferences
+                    }
                 }
             }
-        },
+        }
     }
 }
 
@@ -168,12 +182,16 @@ mod tests {
     }
 
     #[test]
-    fn inner_ltbs_model_returns_fd() {
+    fn inner_plain_ltbs_returns_analytic() {
+        // Closed-form LTBS takes the analytic inner gradient (PR #665; the Tier-1 follow-up
+        // extends it to × `ExpressionScale` and × TV-cov). The covariance step reconverges
+        // its EBEs at the tighter `cov_inner_tol`. LTBS × IOV still routes to FD (via
+        // `iov_analytical_supported`'s own gate).
         let mut m = test_helpers::analytical_model(GradientMethod::Auto);
-        m.log_transform = true; // LTBS keeps the FD inner gradient
+        m.log_transform = true;
         assert_eq!(
             gradient_method_inner(&ci_build(), &m),
-            GradientMethodKind::FiniteDifferences
+            GradientMethodKind::Analytic
         );
     }
 
@@ -256,6 +274,41 @@ mod tests {
         assert_eq!(
             gradient_method_outer(&ad_build(), EstimationMethod::FoceGn, Optimizer::Bobyqa, &m),
             GradientMethodKind::FiniteDifferences
+        );
+    }
+
+    /// #486 σ-magnitude FOCE port: a custom / time-varying residual-magnitude model
+    /// is now analytic on **both** loops (the Sheiner–Beal FOCE assembly threads
+    /// `mult(θ)` through its marginal `R⁰`), so `gradient_method_outer` reports
+    /// `Analytic` under plain `method = foce` as well as `method = focei`. Regression
+    /// test that FOCE no longer routes a magnitude model to FD.
+    #[test]
+    fn outer_custom_magnitude_reports_analytic_under_foce_and_focei() {
+        let content = "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  theta RUV_LATE(1.5, 0.0, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))\n";
+        let m = crate::parser::model_parser::parse_model_string(content).expect("parse");
+        assert!(m.has_custom_ruv_magnitude());
+        // `Optimizer::Auto` now resolves to a gradient-based optimizer under FOCE too,
+        // so the reported method is `Analytic` (not the old derivative-free bobyqa).
+        assert_eq!(
+            gradient_method_outer(&ad_build(), EstimationMethod::Foce, Optimizer::Auto, &m),
+            GradientMethodKind::Analytic,
+            "FOCE + custom magnitude now has the analytic outer gradient"
+        );
+        assert_eq!(
+            gradient_method_outer(&ad_build(), EstimationMethod::FoceI, Optimizer::Auto, &m),
+            GradientMethodKind::Analytic,
+            "FOCEI + custom magnitude has the analytic outer gradient"
+        );
+        // A user-forced concrete gradient optimizer under FOCE also reports Analytic.
+        assert_eq!(
+            gradient_method_outer(
+                &ad_build(),
+                EstimationMethod::Foce,
+                Optimizer::NloptLbfgs,
+                &m
+            ),
+            GradientMethodKind::Analytic,
+            "FOCE + magnitude with a forced gradient optimizer reports the analytic method"
         );
     }
 }

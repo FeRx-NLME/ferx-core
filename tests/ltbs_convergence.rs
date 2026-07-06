@@ -146,8 +146,9 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
 /// (value + ∂g/∂η/∂θ + Hessian). This is the gradient path the default-BOBYQA
 /// test above does *not* exercise, so it guards the LTBS jet transform in
 /// `sens::provider` end-to-end against the same NONMEM 7.5.1 reference. (The
-/// inner EBE loop deliberately stays on the FD gradient for LTBS — see
-/// `analytic_inner_grad_supported` — so the covariance OFV-Hessian stays clean.)
+/// inner EBE loop now also runs the analytic `g = ln(f)` gradient for plain LTBS;
+/// the covariance step reconverges those EBEs at the tighter `cov_inner_tol` so
+/// the covariance OFV-Hessian stays clean — see `FitOptions::effective_cov_inner_tol`.)
 ///
 /// A direct CLI run reproduces NONMEM's MLE essentially exactly:
 ///

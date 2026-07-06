@@ -8,6 +8,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use super::num::PkNum;
+use crate::pk::analytical_absorption::{convolve_2cpt, TransitAbsorption};
 use crate::types::DoseEvent;
 
 /// Macro-rate constants `(α, β, k21)` from the PK params, via Vieta's `β = d/α`
@@ -33,6 +34,46 @@ pub(crate) fn macro_rates_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> (T, T, T) {
         T::from_f64(0.0)
     };
     (alpha, beta, k21)
+}
+
+/// Shared domain guard for the analytic 2-cpt transit closed forms (#386 PR D):
+/// the central concentration ([`two_cpt_transit_amt_g`]) and the peripheral / depot
+/// `[derived]` amounts (`crate::pk::two_compartment`) must reject the *same*
+/// parameter region or they drift out of mass balance (#634 review findings 4/7).
+/// Returns the macro-rates `(α, β, k21)` when the disposition params are physical,
+/// the eigenvalues are distinct (non-confluent — `convolve_2cpt`'s `1/(α−β)`
+/// residues are otherwise undefined), and the fast macro-rate is inside the
+/// convergence domain `α < KTR = (n+1)/mtt` (since `α ≥ β`, guarding `α` suffices);
+/// returns `None` otherwise. The `α < KTR` test is written `!(α < KTR)` so a
+/// transient `NaN` macro-rate (an additive-η / wide-FD excursion on a mis-specified
+/// fit) short-circuits to `None` rather than slipping past a `α >= KTR` form into
+/// `mgf`'s `debug_assert`.
+pub(crate) fn transit_2cpt_domain_ok<T: PkNum>(
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    n: T,
+    mtt: T,
+) -> Option<(T, T, T)> {
+    if v1.val() <= 0.0
+        || cl.val() <= 0.0
+        || q.val() < 0.0
+        || v2.val() <= 0.0
+        || n.val() < 0.0
+        || mtt.val() <= 0.0
+    {
+        return None;
+    }
+    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
+    if (alpha - beta).val().abs() < 1e-12 {
+        return None;
+    }
+    let ktr = (n + T::from_f64(1.0)) / mtt;
+    if !(alpha.val() < ktr.val()) {
+        return None;
+    }
+    Some((alpha, beta, k21))
 }
 
 /// 2-cpt IV bolus: `C = A·e^{−αt} + B·e^{−βt}`. `t` is generic so the caller can
@@ -142,6 +183,85 @@ pub fn two_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v1: T, q: T, v2: T, ka:
         d * (k21 - ka) / ((alpha - ka) * (beta - ka)) * (-(ka * tt)).exp()
     };
     p + q_val + r
+}
+
+/// 2-cpt with Savic transit-compartment absorption (`n` transit compartments,
+/// mean transit time `mtt`) — the 2-cpt counterpart of
+/// [`crate::sens::one_cpt::one_cpt_transit_g`] (#386 PR D). The Gamma(n+1, KTR)
+/// absorption time feeds a 2-cpt disposition via the exponential-tilting closed
+/// form ([`convolve_2cpt`]), so `T = f64` gives the central concentration and
+/// `T = Dual2<N>` gives exact `∂C/∂{cl,v1,q,v2,n,mtt,f}` (+ 2nd order). With
+/// `n = 0` it reduces to [`two_cpt_oral_g`] with `ka = 1/mtt`.
+#[allow(clippy::too_many_arguments)]
+pub fn two_cpt_transit_g<T: PkNum>(
+    amt: f64,
+    t: T,
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    n: T,
+    mtt: T,
+    f_bio: T,
+) -> T {
+    two_cpt_transit_amt_g(T::from_f64(amt), t, cl, v1, q, v2, n, mtt, f_bio)
+}
+
+/// As [`two_cpt_transit_g`] but with a generic amount `amt` (issue #524 init path).
+///
+/// Domain: the exponential-tilting closed form converges only when **both** macro-
+/// rates lie below the transit rate `KTR = (n+1)/mtt`; since `α ≥ β`, guarding
+/// `α < KTR` suffices. Outside it — invalid params, confluent eigenvalues, or
+/// flip-flop `α ≥ KTR` — this returns `0.0`, matching the sibling closed forms'
+/// invalid-parameter convention (penalising the optimiser back into the valid
+/// region rather than letting `convolve_2cpt` emit a NaN). The `α < KTR` test is
+/// written `!(α < KTR)` so a transient `NaN` macro-rate (an additive-η / wide-FD
+/// excursion) also returns `0.0` instead of slipping past the guard into `mgf`'s
+/// `debug_assert` — the panic mode found when fitting the 1-cpt analytic transit
+/// on mis-specified data.
+#[allow(clippy::too_many_arguments)]
+pub fn two_cpt_transit_amt_g<T: PkNum>(
+    amt: T,
+    t: T,
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    n: T,
+    mtt: T,
+    f_bio: T,
+) -> T {
+    if t.val() < 0.0 {
+        return T::from_f64(0.0);
+    }
+    // Shared disposition-domain guard (params valid, non-confluent, α<KTR, NaN-safe);
+    // central and peripheral read the same helper so they can't drift (#634 finding 7).
+    let Some((alpha, beta, k21)) = transit_2cpt_domain_ok(cl, v1, q, v2, n, mtt) else {
+        return T::from_f64(0.0);
+    };
+    let abs = TransitAbsorption { n, mtt };
+    convolve_2cpt(&abs, t, alpha, beta, k21, (f_bio * amt) / v1)
+}
+
+/// Transit-absorption counterpart to [`two_cpt_oral_g`] for the analytic
+/// `two_cpt_transit` model (#386 PR D), used by the sensitivity provider. Transit
+/// rejects infusion/SS doses at parse, so only the absorbed-bolus route exists — a
+/// thin wrapper over [`two_cpt_transit_amt_g`] with `F` baked into the kernel.
+/// Generic over [`PkNum`] so prediction (`T = f64`) and the `Dual1`/`Dual2`
+/// sensitivity share one definition.
+#[allow(clippy::too_many_arguments)]
+pub fn two_cpt_transit_conc_g<T: PkNum>(
+    dose: &DoseEvent,
+    t: T,
+    cl: T,
+    v1: T,
+    q: T,
+    v2: T,
+    n: T,
+    mtt: T,
+    f_bio: T,
+) -> T {
+    two_cpt_transit_amt_g(T::from_f64(dose.amt), t, cl, v1, q, v2, n, mtt, f_bio)
 }
 
 /// SS geometric-series factor `1/(1 − e^{−λ·ii})`.
@@ -446,5 +566,56 @@ mod tests {
                 "non-finite grad for {dose:?}"
             );
         }
+    }
+
+    /// Domain / robustness guards for `two_cpt_transit_amt_g` (#386 PR D): the
+    /// flip-flop `α ≥ KTR` (the closed form diverges), invalid params, and a
+    /// transient NaN macro-rate must all yield a finite `0.0` — never a NaN nor a
+    /// `mgf` `debug_assert` panic. A valid absorption-rate-limited case is the
+    /// positive control; a `Dual2` evaluation checks the sensitivity path
+    /// (`two_cpt_transit_conc_g`) stays finite. (The equivalence suite only drives
+    /// valid params, so these guard branches are otherwise uncovered.)
+    #[test]
+    fn two_cpt_transit_amt_g_guards_and_dual_finite() {
+        let (cl, v1, q, v2) = (0.13f64, 8.0, 0.5, 4.0);
+        // Valid (small mtt ⇒ ka = 1/mtt > α): positive and finite.
+        let ok = two_cpt_transit_amt_g::<f64>(100.0, 2.0, cl, v1, q, v2, 3.0, 0.3, 1.0);
+        assert!(ok.is_finite() && ok > 0.0, "valid case = {ok}");
+        // Flip-flop α ≥ KTR (large mtt ⇒ tiny KTR) ⇒ 0, no panic.
+        let flip = two_cpt_transit_amt_g::<f64>(100.0, 2.0, cl, v1, q, v2, 0.0, 50.0, 1.0);
+        assert_eq!(flip, 0.0, "flip-flop α≥KTR must return 0");
+        // Each invalid-param guard branch ⇒ 0.
+        for p in [
+            (0.0, v1, q, v2, 3.0, 0.3),   // cl ≤ 0
+            (cl, 0.0, q, v2, 3.0, 0.3),   // v1 ≤ 0
+            (cl, v1, -0.1, v2, 3.0, 0.3), // q < 0
+            (cl, v1, q, 0.0, 3.0, 0.3),   // v2 ≤ 0
+            (cl, v1, q, v2, -1.0, 0.3),   // n < 0
+            (cl, v1, q, v2, 3.0, 0.0),    // mtt ≤ 0
+        ] {
+            let r = two_cpt_transit_amt_g::<f64>(100.0, 2.0, p.0, p.1, p.2, p.3, p.4, p.5, 1.0);
+            assert_eq!(r, 0.0, "invalid params must return 0: {p:?}");
+        }
+        // Transient NaN (NaN cl ⇒ NaN ke/α) must hit the NaN-safe `!(α < KTR)` guard,
+        // not `mgf`'s debug_assert — finite 0.0 even in a debug build.
+        let nan = two_cpt_transit_amt_g::<f64>(100.0, 2.0, f64::NAN, v1, q, v2, 3.0, 0.3, 1.0);
+        assert_eq!(nan, 0.0, "NaN cl must return 0 (NaN-safe guard), got {nan}");
+        // Dual2 sensitivity path stays finite (exercises two_cpt_transit_conc_g).
+        let d = two_cpt_transit_conc_g::<Dual2<6>>(
+            &DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            Dual2::constant(2.0),
+            Dual2::var(cl, 0),
+            Dual2::var(v1, 1),
+            Dual2::var(q, 2),
+            Dual2::var(v2, 3),
+            Dual2::var(3.0, 4),
+            Dual2::var(0.3, 5),
+            Dual2::constant(1.0),
+        );
+        assert!(
+            d.value.is_finite() && d.grad.iter().all(|g| g.is_finite()),
+            "dual transit conc not finite: value={}",
+            d.value
+        );
     }
 }

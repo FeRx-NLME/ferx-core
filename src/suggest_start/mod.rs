@@ -381,6 +381,7 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
         PkModel::OneCptOral
         | PkModel::OneCptTransit
         | PkModel::TwoCptOral
+        | PkModel::TwoCptTransit
         | PkModel::ThreeCptOral => population
             .subjects
             .par_iter()
@@ -405,7 +406,7 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
     // For 2-cpt/3-cpt models, attempt biexponential peeling on the pooled curve.
     let mut pop = pool_nca(&per_subject);
     match model.pk_model {
-        PkModel::TwoCptIv | PkModel::TwoCptOral => {
+        PkModel::TwoCptIv | PkModel::TwoCptOral | PkModel::TwoCptTransit => {
             try_biexp_peel(model, population, &mut pop, &mut warnings);
         }
         PkModel::ThreeCptIv => {
@@ -739,9 +740,13 @@ fn build_params(
         _ => {}
     }
 
-    // Write lag time (oral models only)
+    // Write lag time (oral models only, incl. transit which is oral and accepts lagtime=)
     match model.pk_model {
-        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral => {
+        PkModel::OneCptOral
+        | PkModel::TwoCptOral
+        | PkModel::ThreeCptOral
+        | PkModel::OneCptTransit
+        | PkModel::TwoCptTransit => {
             if let Some(tlag) = pop.tlag {
                 if let Some(idx) = lagtime_idx {
                     write_theta(&mut params, idx, tlag, "LAGTIME", warnings);

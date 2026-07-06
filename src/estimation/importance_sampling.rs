@@ -397,6 +397,14 @@ pub fn run_importance_sampling(
                 );
                 // FREM Rao-Blackwellised estimate (low-dim PK IS). Reuse the
                 // draws routine and keep only its marginal-LL / ESS diagnostics.
+                // Fixed iscale=1.0, matching the non-RB branch below: this is the
+                // eval-only / final-marginal path (`imp_eval_only` and the
+                // post-convergence IS report), which intentionally does not
+                // retune the proposal so the reported metric stays reproducible
+                // and comparable run-to-run. Adaptive ISCALE for the RB path is
+                // applied in the iterative MCEM E-step (`impmap.rs`) instead,
+                // where ESS quality actually drives the M-step (issue #406
+                // follow-up).
                 if let Some((ref pk_idx, ref cov_idx)) = frem_rb {
                     if let Some(fc) = model.frem_config.as_ref() {
                         if let Some((sampled, observed, d)) =
@@ -1321,6 +1329,44 @@ pub(crate) fn subject_is_draws(
     }
 }
 
+/// Shared grid-search core for a per-subject ISCALE pilot search. Tries a grid
+/// of `N_GRID` log-spaced scale factors in `[iscale_min, iscale_max]`, calling
+/// `pilot_ess(scale, pilot_seed)` for each and returning the scale with the
+/// best reported ESS fraction. `pilot_ess` returns `None` for a degenerate
+/// draw (e.g. a non-PD proposal) — that scale is skipped, not treated as best.
+/// Returns 1.0 if ISCALE is disabled (`iscale_min >= iscale_max`, or both == 1.0).
+fn iscale_pilot_grid_search(
+    iscale_min: f64,
+    iscale_max: f64,
+    seed: u64,
+    mut pilot_ess: impl FnMut(f64, u64) -> Option<f64>,
+) -> f64 {
+    if iscale_min >= iscale_max || (iscale_min == 1.0 && iscale_max == 1.0) {
+        return 1.0;
+    }
+    const N_GRID: usize = 7;
+    let log_min = iscale_min.ln();
+    let log_max = iscale_max.ln();
+    let mut best_scale = 1.0_f64;
+    let mut best_ess = f64::NEG_INFINITY;
+
+    for g in 0..N_GRID {
+        let frac = g as f64 / (N_GRID - 1) as f64;
+        let scale = (log_min + frac * (log_max - log_min)).exp();
+        // Use a different seed per scale to avoid correlations
+        let pilot_seed = seed
+            .wrapping_add(0x4953_4341_4C45_0000u64)
+            .wrapping_add(g as u64);
+        if let Some(ess) = pilot_ess(scale, pilot_seed) {
+            if ess > best_ess {
+                best_ess = ess;
+                best_scale = scale;
+            }
+        }
+    }
+    best_scale
+}
+
 /// Find the optimal ISCALE for a subject via pilot draws.
 ///
 /// Tries a grid of log-spaced scale factors in `[iscale_min, iscale_max]`
@@ -1343,24 +1389,8 @@ pub(crate) fn find_optimal_iscale(
     iscale_min: f64,
     iscale_max: f64,
 ) -> f64 {
-    if iscale_min >= iscale_max || (iscale_min == 1.0 && iscale_max == 1.0) {
-        return 1.0;
-    }
-    // Grid of 7 log-spaced scale factors from iscale_min to iscale_max
-    let n_grid = 7;
-    let n_pilot = 50;
-    let log_min = iscale_min.ln();
-    let log_max = iscale_max.ln();
-    let mut best_scale = 1.0_f64;
-    let mut best_ess = f64::NEG_INFINITY;
-
-    for g in 0..n_grid {
-        let frac = g as f64 / (n_grid - 1) as f64;
-        let scale = (log_min + frac * (log_max - log_min)).exp();
-        // Use a different seed per scale to avoid correlations
-        let pilot_seed = seed
-            .wrapping_add(0x4953_4341_4C45_0000u64)
-            .wrapping_add(g as u64);
+    const N_PILOT: usize = 50;
+    iscale_pilot_grid_search(iscale_min, iscale_max, seed, |scale, pilot_seed| {
         let draws = subject_is_draws(
             model,
             subject,
@@ -1371,7 +1401,7 @@ pub(crate) fn find_optimal_iscale(
             omega_inv,
             log_det_omega,
             d,
-            n_pilot,
+            N_PILOT,
             nu,
             pilot_seed,
             scratch,
@@ -1379,12 +1409,64 @@ pub(crate) fn find_optimal_iscale(
             false, // pilot draws don't need Sobol
             None,  // tune the narrow proposal alone; defensive mixing applies at the real draw
         );
-        if draws.ess_fraction > best_ess {
-            best_ess = draws.ess_fraction;
-            best_scale = scale;
-        }
-    }
-    best_scale
+        Some(draws.ess_fraction)
+    })
+}
+
+/// Per-subject ISCALE pilot search for the Rao-Blackwellised FREM path
+/// (issue #406 follow-up). The RB conditional PK proposal is usually
+/// well-matched, but for subjects where the inner-loop Hessian `h_pp` is a
+/// poor estimate of the true conditional curvature (sparse PK data, a mode
+/// still off from a prior iteration), a fixed `iscale = 1.0` can leave the
+/// proposal too narrow or too wide. Mirrors [`find_optimal_iscale`] (sharing
+/// its grid-search core, [`iscale_pilot_grid_search`]) but pilots through
+/// [`subject_is_draws_frem_rb`] so the grid search sees the true
+/// reduced-dimension (PK-only) ESS instead of the full-dimensional one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_optimal_iscale_frem_rb(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma: &[f64],
+    eta_hat: &DVector<f64>,
+    h_post: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    omega_matrix: &DMatrix<f64>,
+    pk_idx: &[usize],
+    cov_idx: &[usize],
+    d: &[f64],
+    n_eta: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    iscale_min: f64,
+    iscale_max: f64,
+) -> f64 {
+    const N_PILOT: usize = 50;
+    iscale_pilot_grid_search(iscale_min, iscale_max, seed, |scale, pilot_seed| {
+        subject_is_draws_frem_rb(
+            model,
+            subject,
+            theta,
+            sigma,
+            eta_hat,
+            h_post,
+            omega_inv,
+            omega_matrix,
+            pk_idx,
+            cov_idx,
+            d,
+            n_eta,
+            N_PILOT,
+            nu,
+            pilot_seed,
+            scratch,
+            scale,
+            false, // pilot draws don't need Sobol
+            0.0,   // tune the narrow proposal alone; defensive mixing applies at the real draw
+        )
+        .map(|draws| draws.ess_fraction)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,7 +1506,12 @@ fn compute_joint_posterior_hessian(
     let ipreds = predict_iov(model, subject, theta, eta_hat.as_slice(), &kappa_slices);
 
     // Compute residual variance with FREM overrides
-    let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    let mut r_diag = compute_r_diag(
+        &model.error_spec,
+        &ipreds,
+        model.error_spec.obs_keys(subject).as_ref(),
+        sigma,
+    );
     // IIV on residual error (#409): scale PK residual variance by exp(2·η̂_ruv).
     let ruv_scale = model.residual_var_scale(eta_hat.as_slice());
     if ruv_scale != 1.0 {
@@ -1611,11 +1698,12 @@ fn subject_is_estimate_joint(
         let m3 = matches!(model.bloq_method, BloqMethod::M3);
         // IIV on residual error (#409): scale by exp(2·η_ruv) for this draw's eta.
         let ruv_scale = model.residual_var_scale(eta_sample);
+        // #658: per-observation residual endpoint keys (covariate selector or CMT).
+        let err_keys = model.error_spec.obs_keys(subject);
         let mut obs_nll = 0.0_f64;
         for (j, (&y, &f)) in subject.observations.iter().zip(ipreds.iter()).enumerate() {
             let f = f.max(1e-12);
-            let v =
-                (model.residual_variance_at(subject.obs_cmts[j], f, sigma) * ruv_scale).max(1e-12);
+            let v = (model.residual_variance_at(err_keys[j], f, sigma) * ruv_scale).max(1e-12);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if m3 && cens != 0 {
                 obs_nll += -m3_logcdf(y, f, v.sqrt(), cens);
@@ -1968,7 +2056,11 @@ pub(crate) fn compute_posterior_hessian(
         let r = crate::stats::residual_error::compute_r_matrix_with_correlations(
             &model.error_spec,
             &ipreds,
-            &subject.obs_cmts,
+            // #669: selector-resolved endpoint keys (matches the diagonal
+            // fallback below), not the raw CMT column — a `Selected` spec keys
+            // endpoints by branch, so `obs_cmts` would build the proposal
+            // precision from the wrong branch's sigma.
+            model.error_spec.obs_keys(subject).as_ref(),
             &subject.obs_times,
             &subject.obs_raw_times,
             &subject.occasions,
@@ -1980,7 +2072,12 @@ pub(crate) fn compute_posterior_hessian(
             return omega_inv + jacobian.transpose() * &r_inv * jacobian;
         }
     }
-    let mut r_diag = compute_r_diag(&model.error_spec, &ipreds, &subject.obs_cmts, sigma);
+    let mut r_diag = compute_r_diag(
+        &model.error_spec,
+        &ipreds,
+        model.error_spec.obs_keys(subject).as_ref(),
+        sigma,
+    );
     // IIV on residual error (#409): scale the PK residual variance at the mode by
     // exp(2·η̂_ruv) so the Laplace proposal precision reflects the per-subject
     // residual SD. FREM rows are overwritten below with their own variance.
@@ -2515,5 +2612,240 @@ mod tests {
             let mean: f64 = draws.iter().map(|v| v[dim]).sum::<f64>() / k as f64;
             assert!(mean.abs() < 0.15, "dim {dim} mean = {mean}, expected ~0");
         }
+    }
+
+    /// Build a minimal FREM `CompiledModel` (2 PK etas: CL, V; 1 covariate eta:
+    /// WT) with a working `pk_param_fn`/`obs_nll` path, mirroring the fixture in
+    /// `inner_optimizer::test_frem_jacobian_overrides_fd_with_exact_values`.
+    fn frem_rb_test_model() -> CompiledModel {
+        use std::collections::HashMap;
+        let omega = OmegaMatrix::from_diagonal(
+            &[0.09, 0.09, 25.0],
+            vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
+        );
+        let default_params = ModelParameters {
+            theta: vec![10.0, 100.0, 90.0],
+            theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
+            theta_lower: vec![0.01, 1.0, 0.0],
+            theta_upper: vec![100.0, 500.0, 200.0],
+            theta_fixed: vec![false, false, true],
+            omega,
+            omega_fixed: vec![false, false, false],
+            sigma: SigmaVector {
+                values: vec![0.3, 1e-3],
+                names: vec!["RUV".into(), "EPSCOV".into()],
+            },
+            sigma_fixed: vec![false, true],
+            omega_iov: None,
+            kappa_fixed: vec![],
+        };
+        CompiledModel {
+            has_conditional_eta_params: false,
+            name: "frem_rb_iscale_test".into(),
+            pk_model: PkModel::OneCptIv,
+            error_model: ErrorModel::Additive,
+            error_spec: ErrorSpec::Single(ErrorModel::Additive),
+            residual_correlations: Vec::new(),
+            pk_param_fn: Box::new(
+                |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+                    let mut p = PkParams::default();
+                    p.values[0] = theta[0] * eta[0].exp(); // CL
+                    p.values[1] = theta[1] * eta[1].exp(); // V
+                    p
+                },
+            ),
+            n_theta: 3,
+            n_eta: 3,
+            n_epsilon: 2,
+            n_kappa: 0,
+            kappa_names: vec![],
+            theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
+            eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
+            indiv_param_names: vec!["CL".into(), "V".into(), "COV_WT".into()],
+            indiv_param_partials: IndivParamPartials::empty(),
+            default_params,
+            omega_init_as_sd: vec![false; 3],
+            sigma_init_as_sd: vec![false, false],
+            kappa_init_as_sd: vec![],
+            mu_refs: HashMap::new(),
+            kappa_mu_refs: HashMap::new(),
+            tv_fn: None,
+            pk_indices: vec![0, 1],
+            eta_map: vec![0, 1, 2],
+            pk_idx_f64: vec![0.0, 1.0],
+            sel_flat: vec![1.0, 0.0],
+            ode_spec: None,
+            diffusion_theta_start: None,
+            diffusion_state_indices: Vec::new(),
+            bloq_method: BloqMethod::Drop,
+            referenced_covariates: Vec::new(),
+            gradient_method: GradientMethod::default(),
+            parse_warnings: Vec::new(),
+            eta_param_info: Vec::new(),
+            theta_transform: Vec::new(),
+            #[cfg(feature = "nn")]
+            covariate_nns: Vec::new(),
+            scaling: ScalingSpec::None,
+            log_transform: false,
+            dv_pre_logged: false,
+            derived_exprs: vec![],
+            output_columns: vec![],
+            dose_attr_map: Default::default(),
+            #[cfg(feature = "survival")]
+            endpoints: HashMap::new(),
+            frem_config: Some(FremConfig {
+                fremtype_to_indices: {
+                    let mut m = HashMap::new();
+                    m.insert(100u16, (2usize, 2usize)); // TV_WT / ETA_WT_FREM
+                    m
+                },
+                covariate_sigma_index: 1,
+            }),
+            residual_error_eta: None,
+            analytical_init: Vec::new(),
+            analytic_readout: None,
+            ruv_magnitude: None,
+            transit_ode_equivalent: None,
+        }
+    }
+
+    /// Issue #406 follow-up: the RB path used to hard-code `iscale = 1.0`,
+    /// skipping the per-subject adaptive-ISCALE pilot search the full-dimensional
+    /// path gets. When the inner-loop Hessian overstates the PK conditional
+    /// curvature (plausible for sparse-data subjects — a poor `h_pp` estimate),
+    /// a fixed narrow proposal collapses ESS. `find_optimal_iscale_frem_rb`
+    /// should find a wider scale that recovers ESS, and never do worse than the
+    /// fixed-1.0 baseline.
+    #[test]
+    fn find_optimal_iscale_frem_rb_recovers_ess_from_overconfident_hessian() {
+        let model = frem_rb_test_model();
+        let subject = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0, 0.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![5.0, 3.0, 90.0],
+            obs_cmts: vec![1, 1, 1],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0, 0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: vec![0, 0, 100],
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+
+        let theta = [10.0, 100.0, 90.0];
+        let eta_hat = DVector::from_column_slice(&[0.05, -0.02, 0.0]);
+        let omega_inv = model
+            .default_params
+            .omega
+            .matrix
+            .clone()
+            .try_inverse()
+            .unwrap();
+        let omega_matrix = model.default_params.omega.matrix.clone();
+        let pk_idx = vec![0usize, 1];
+        let cov_idx = vec![2usize];
+        let d = vec![0.0_f64]; // TV_WT fixed at the observed WT=90 → d = obs - TV = 0
+
+        // Deliberately mis-scaled h_pp (500x tighter than the prior conditional
+        // precision) so the fixed iscale=1.0 proposal is mismatched with the
+        // true PK likelihood curvature — the scenario the pilot search should
+        // catch, regardless of which direction the correction runs.
+        let h_post = DMatrix::from_diagonal(&DVector::from_column_slice(&[5000.0, 5000.0, 1e6]));
+
+        let mut scratch1 = EventPkParams::default();
+        let baseline = subject_is_draws_frem_rb(
+            &model,
+            &subject,
+            &theta,
+            &model.default_params.sigma.values,
+            &eta_hat,
+            &h_post,
+            &omega_inv,
+            &omega_matrix,
+            &pk_idx,
+            &cov_idx,
+            &d,
+            3,
+            2000,
+            f64::INFINITY,
+            7,
+            &mut scratch1,
+            1.0,
+            false,
+            0.0,
+        )
+        .expect("RB draws should succeed with a well-formed partition");
+
+        let mut scratch2 = EventPkParams::default();
+        let searched_iscale = find_optimal_iscale_frem_rb(
+            &model,
+            &subject,
+            &theta,
+            &model.default_params.sigma.values,
+            &eta_hat,
+            &h_post,
+            &omega_inv,
+            &omega_matrix,
+            &pk_idx,
+            &cov_idx,
+            &d,
+            3,
+            f64::INFINITY,
+            11,
+            &mut scratch2,
+            0.1,
+            10.0,
+        );
+        assert!(
+            (searched_iscale - 1.0).abs() > 0.2,
+            "a mismatched h_pp should move the searched proposal off the fixed \
+             default of 1.0, got {searched_iscale}"
+        );
+
+        let mut scratch3 = EventPkParams::default();
+        let improved = subject_is_draws_frem_rb(
+            &model,
+            &subject,
+            &theta,
+            &model.default_params.sigma.values,
+            &eta_hat,
+            &h_post,
+            &omega_inv,
+            &omega_matrix,
+            &pk_idx,
+            &cov_idx,
+            &d,
+            3,
+            2000,
+            f64::INFINITY,
+            7,
+            &mut scratch3,
+            searched_iscale,
+            false,
+            0.0,
+        )
+        .expect("RB draws should succeed at the searched iscale");
+
+        assert!(
+            improved.ess_fraction >= baseline.ess_fraction,
+            "searched iscale {searched_iscale} (ESS {}) should not be worse than \
+             fixed iscale=1.0 (ESS {})",
+            improved.ess_fraction,
+            baseline.ess_fraction
+        );
+        assert!(
+            improved.ess_fraction > baseline.ess_fraction * 1.2,
+            "expected a meaningful ESS recovery: baseline {} -> searched {}",
+            baseline.ess_fraction,
+            improved.ess_fraction
+        );
     }
 }

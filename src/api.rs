@@ -13,7 +13,10 @@ use crate::propensity_match::MatchMethod;
 use crate::stats::likelihood::{
     build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
 };
-use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
+use crate::stats::residual_error::{
+    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
+    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
+};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
@@ -125,6 +128,9 @@ pub(crate) fn model_preds(
         );
         pk::compute_predictions(model.pk_model, &resolved, pk_params)
     };
+    // Analytic Form C readout (#650): replaces the built-in concentration. No-op
+    // for ODE models (handled inside `compute_predictions_ode`) and when unset.
+    pk::apply_analytic_readout(model, subject, theta, eta, &mut preds);
     pk::apply_scaling(model, subject, theta, eta, &mut preds);
     pk::apply_log_transform(model, &mut preds);
     preds
@@ -149,11 +155,62 @@ fn log_transform_observations(pop: &mut Population) -> usize {
     n_nonpos
 }
 
-/// Run a model file with a NONMEM-format CSV dataset.
+/// True if two paths point at the same file. The model's `[data] path` is
+/// dir-joined to the model file's directory by `parse_full_model_file`, while
+/// an externally supplied path (CLI `--data`, R) is passed through raw — so
+/// the same file can differ textually (`./warfarin.csv` vs `warfarin.csv`).
+/// Falls back to plain string equality when either path doesn't resolve on
+/// disk (e.g. fixture names in unit tests).
+fn paths_equivalent(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (Path::new(a).canonicalize(), Path::new(b).canonicalize()) {
+        (Ok(pa), Ok(pb)) => pa == pb,
+        _ => false,
+    }
+}
+
+/// Resolves the dataset path a fit should use, applying override-with-warning
+/// semantics between a model file's optional `[data] path = ...` (#690) and an
+/// externally supplied path (CLI `--data`, R).
+///
+/// - Neither given → `Err` (nothing to fit against).
+/// - Only one given → that one, no warning.
+/// - Both given and equal (see [`paths_equivalent`]) → the shared path, no
+///   warning.
+/// - Both given and different → `external_path` wins; a warning is returned
+///   (not printed — see "Warning and Error Conventions" in CLAUDE.md) for the
+///   caller to attach to `FitResult.warnings` or a `ferx check` diagnostic.
+pub fn resolve_data_path(
+    model_data_path: Option<&str>,
+    external_data_path: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    match (external_data_path, model_data_path) {
+        (Some(ext), Some(model_p)) if !paths_equivalent(ext, model_p) => Ok((
+            ext.to_string(),
+            Some(format!(
+                "dataset path overridden: using `{ext}` instead of the model's \
+                 `[data] path = {model_p}`"
+            )),
+        )),
+        (Some(ext), _) => Ok((ext.to_string(), None)),
+        (None, Some(model_p)) => Ok((model_p.to_string(), None)),
+        (None, None) => Err(
+            "no dataset specified — pass a data path, or add a `[data]` block \
+             (`path = ...`) to the model file"
+                .to_string(),
+        ),
+    }
+}
+
+/// Run a model file with a NONMEM-format CSV dataset. `data_path` is `None` to
+/// rely solely on the model's own `[data]` block (#690); when both are given,
+/// `data_path` overrides the model's, with a warning recorded on the result.
 /// Returns (FitResult, Population) so caller can write sdtab.
 pub fn run_model_with_data(
     model_path: &str,
-    data_path: &str,
+    data_path: Option<&str>,
 ) -> Result<(FitResult, Population), String> {
     run_model_with_data_inits(model_path, data_path, None)
 }
@@ -164,7 +221,7 @@ pub fn run_model_with_data(
 /// when `Some(method)` it forces that NCA strategy regardless of the file.
 pub fn run_model_with_data_inits(
     model_path: &str,
-    data_path: &str,
+    data_path: Option<&str>,
     inits_override: Option<crate::suggest_start::NcaInit>,
 ) -> Result<(FitResult, Population), String> {
     use crate::parser::model_parser::parse_full_model_file;
@@ -176,6 +233,9 @@ pub fn run_model_with_data_inits(
     }
 
     eprintln!("Model: {}", parsed.model.name);
+
+    let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
+    let data_path = data_path.as_str();
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
     let sel_filter = build_selection_filter(&parsed.fit_options)?;
@@ -212,6 +272,10 @@ pub fn run_model_with_data_inits(
         &parsed.fit_options,
     )?;
     result.covariate_table = covariate_table;
+    if let Some(w) = data_path_warning {
+        result.warnings.push(w);
+        rebuild_warnings_structured(&mut result);
+    }
     // Hash both inputs *after* the fit so we don't double up disk reads
     // (the model and CSV are already in the page cache from parse + read
     // upstream). Errors here are non-fatal: the fit already succeeded, and
@@ -525,6 +589,27 @@ fn check_covariates(model: &CompiledModel, population: &Population) -> Vec<Diagn
         ),
     )
     .with_suggestion(format!("available covariate columns: {}", available))]
+}
+
+/// Reject an adaptive-dosing simulation on a covariate-selected error model (#658).
+///
+/// The adaptive assay resolves residual variance by the monitored **compartment**
+/// number (`residual_variance_at(cmt, …)`), but `ErrorSpec::Selected`'s `endpoints`
+/// map is keyed by the selector's **0-based branch index**, not CMT. A CMT-keyed
+/// lookup misses and `variance_at` returns `NaN`, silently corrupting the assay
+/// draw. The combination has no coherent meaning today, so reject it loudly rather
+/// than emit NaN observations.
+fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Result<(), String> {
+    if matches!(model.error_spec, ErrorSpec::Selected { .. }) {
+        return Err(
+            "adaptive-dosing simulation does not support a covariate-selected `[error_model]` \
+             (`if (COV …) { … } else { … }`): the assay keys residual error by the monitored \
+             compartment, but a selected error model keys endpoints by covariate branch. Use a \
+             single-endpoint error model for the monitored signal."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Covariates referenced by the model but missing from the `[covariates]`
@@ -1134,42 +1219,76 @@ pub(crate) fn assert_modeled_doses_supported(model: &CompiledModel, population: 
     }
 }
 
-/// Features the analytic `one_cpt_transit` model does not support in its first
-/// version (#386): the exponential-tilting closed form is a constant-parameter
-/// bolus superposition, so steady-state doses, IOV, within-subject time-varying
-/// covariates, and infusion doses are rejected up front — otherwise they would
-/// silently mis-predict or hit an `unreachable!` in the superposition dispatch.
-/// `fit()` surfaces this as an `Err`; `predict()`/`simulate()` panic via
-/// [`assert_transit_support`], mirroring [`assert_modeled_doses_supported`].
-/// Returns the first offending feature's message, or `None` when compatible.
+/// Features the analytic transit models (`one_cpt_transit`, `two_cpt_transit`) do
+/// not support in their first version (#386): the exponential-tilting closed form
+/// is a constant-parameter bolus superposition, so steady-state doses, IOV,
+/// within-subject time-varying covariates, and infusion doses are rejected up
+/// front — otherwise they would silently mis-predict or hit an `unreachable!` in
+/// the superposition dispatch. `fit()` surfaces this as an `Err`;
+/// `predict()`/`simulate()` panic via [`assert_transit_support`], mirroring
+/// [`assert_modeled_doses_supported`]. Returns the first offending feature's
+/// message, or `None` when compatible.
 pub(crate) fn check_transit_support(
     model: &CompiledModel,
     population: &Population,
 ) -> Option<String> {
-    if model.pk_model != PkModel::OneCptTransit {
+    if !matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit
+    ) {
         return None;
     }
+    let name = model.pk_model.canonical_name();
     if model.n_kappa > 0 {
-        return Some(
-            "one_cpt_transit does not support IOV (n_kappa > 0): the transit closed form \
+        return Some(format!(
+            "{name} does not support IOV (n_kappa > 0): the transit closed form \
              assumes constant disposition over each absorption window. Use an ODE transit \
              model (transit() forcing in [odes]) for IOV."
-                .to_string(),
-        );
+        ));
+    }
+    // A `TIME`-built-in structural parameter makes the disposition switch mid-profile — the
+    // transit closed form assumes constant parameters over each absorption window, so it
+    // cannot serve it. The plain `cl/v/n/mtt` form carries a `transit_ode_equivalent`
+    // (built at parse time), which the runtime dispatch routes such subjects to, so it is
+    // NOT rejected. Only a form outside the desugar's scope (a `lagtime=`/`f=` mapping or a
+    // custom `[scaling]` — no equivalent) is rejected here rather than mis-predict.
+    if crate::parser::model_parser::compiled_model_uses_time_builtin(model)
+        && model.transit_ode_equivalent.is_none()
+    {
+        return Some(format!(
+            "{name} does not support a TIME-dependent structural parameter in this form: \
+             the transit closed form assumes constant parameters over each absorption \
+             window, and this form is outside the automatic ODE-equivalent rewrite. Write \
+             the model as an ODE transit() forcing in [odes] directly."
+        ));
     }
     for subject in &population.subjects {
-        if subject.has_tv_covariates() {
+        // Time-varying covariates make the disposition switch mid-absorption, which the
+        // closed form cannot serve. The plain form's `transit_ode_equivalent` handles it
+        // (the runtime dispatch routes TV-cov subjects there), so reject only the
+        // out-of-scope forms that carry no equivalent.
+        if subject.has_tv_covariates() && model.transit_ode_equivalent.is_none() {
             return Some(format!(
-                "one_cpt_transit does not support within-subject time-varying covariates \
+                "{name} does not support within-subject time-varying covariates \
                  (subject {}): the transit closed form assumes constant parameters over each \
                  absorption window. Use an ODE transit model.",
+                subject.id
+            ));
+        }
+        if subject.has_resets() {
+            return Some(format!(
+                "{name} does not support system resets (EVID=3/4) (subject {}): resets zero \
+                 compartment amounts mid-profile, which the transit superposition closed form \
+                 cannot express (it silently ignores the reset while the sensitivity path washes \
+                 out pre-reset doses, so fit() and predict() would disagree). Use an ODE transit \
+                 model.",
                 subject.id
             ));
         }
         for dose in &subject.doses {
             if dose.ss {
                 return Some(format!(
-                    "one_cpt_transit does not support steady-state (SS) doses yet (subject \
+                    "{name} does not support steady-state (SS) doses yet (subject \
                      {}): the periodic-sum SS closed form is a follow-up. Use a non-SS \
                      multiple-dose schedule, or an ODE transit model.",
                     subject.id
@@ -1177,7 +1296,7 @@ pub(crate) fn check_transit_support(
             }
             if dose.is_infusion() {
                 return Some(format!(
-                    "one_cpt_transit does not support infusion doses (subject {}): the transit \
+                    "{name} does not support infusion doses (subject {}): the transit \
                      closed form absorbs an instantaneous bolus through the transit chain. Use \
                      an ODE transit model for a zero-order input.",
                     subject.id
@@ -1188,14 +1307,60 @@ pub(crate) fn check_transit_support(
     None
 }
 
-/// Panic on an unsupported `one_cpt_transit` model/data combination, for the
+/// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
+/// the oral **depot** amount on a subject carrying an EVID=3/4 reset.
+///
+/// The depot amount is reconstructed by dose superposition (`apply_analytic_readout`),
+/// which is invalid across a reset — the closed form cannot restart the accumulation,
+/// so the readout would silently see a zero depot after the reset and mis-predict.
+/// Rather than return a subtly wrong `PRED`/OFV, fail loudly and point at an ODE
+/// model (which integrates the depot state across resets). A `central`-only readout
+/// is unaffected. Returns `None` for the common no-readout / IV / central-only case.
+pub(crate) fn check_analytic_readout_support(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<String> {
+    let ar = model.analytic_readout.as_ref()?;
+    if !ar.references_depot() {
+        return None;
+    }
+    for subject in &population.subjects {
+        if subject.has_resets() {
+            return Some(format!(
+                "[scaling] y: an analytic Form C readout that references the oral `depot` \
+                 amount is not supported on a subject with an EVID=3/4 reset (subject {}): \
+                 the depot amount is reconstructed by dose superposition, which is invalid \
+                 across a reset. Reference only the `central` amount, or use an ODE model \
+                 (`ode(states=[depot, central])`) which integrates the depot across resets. \
+                 See issue #650.",
+                subject.id
+            ));
+        }
+    }
+    None
+}
+
+/// Panic on an unsupported transit model/data combination, for the
 /// `Vec`-returning `predict()`/`simulate()` paths (mirrors
 /// [`assert_modeled_doses_supported`]). `fit()` returns these as an `Err`.
 pub(crate) fn assert_transit_support(model: &CompiledModel, population: &Population) {
     if let Some(msg) = check_transit_support(model, population) {
         panic!(
-            "predict()/simulate() received a model/data combination one_cpt_transit cannot \
-             honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+            "predict()/simulate() received a model/data combination the transit closed form \
+             cannot honour: {msg}\n(fit() reports this as an error rather than panicking.)"
+        );
+    }
+}
+
+/// Panic on a depot-referencing analytic Form C readout + reset subject, for the
+/// `Vec`-returning `predict()`/`simulate()` paths (mirrors
+/// [`assert_transit_support`]). `fit()` returns this as an `Err`.
+pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population: &Population) {
+    if let Some(msg) = check_analytic_readout_support(model, population) {
+        panic!(
+            "predict()/simulate() received a model/data combination the analytic Form C \
+             readout cannot honour: {msg}\n(fit() reports this as an error rather than \
+             panicking.)"
         );
     }
 }
@@ -1731,6 +1896,55 @@ pub fn check_model_data_warnings(
         }
     }
 
+    // Analytic transit flip-flop diagnostic (#634 review finding 3). The transit
+    // closed forms converge only when the disposition rate is below the transit
+    // rate `KTR = (n+1)/mtt` (for 2-cpt, the *fast* macro-rate `α`; for 1-cpt,
+    // `ke = CL/V`). Outside that domain the closed form returns an identically-zero
+    // profile — which is parameter-dependent, so `check_transit_support` can't
+    // reject it up front, and with a proportional error model an all-zero IPRED
+    // silently degenerates the likelihood with no other diagnostic. The 2-cpt case
+    // hits this readily (a slow-absorption depot drug with large MTT easily has
+    // `α ≥ KTR`). Evaluated on typical values (η = 0) per subject so a covariate on
+    // MTT/CL that pushes the typical profile into the flip-flop regime is caught.
+    // Reported once, naming the first affected subject.
+    if matches!(
+        model.pk_model,
+        PkModel::OneCptTransit | PkModel::TwoCptTransit
+    ) {
+        for subject in &population.subjects {
+            let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &subject.covariates, 0.0);
+            let (cl, v1, n, mtt) = (pk.cl(), pk.v(), pk.n_transit(), pk.mtt());
+            if !(mtt > 0.0 && n >= 0.0 && v1 > 0.0 && cl > 0.0) {
+                continue; // invalid params are a separate (fatal) domain check
+            }
+            let ktr = (n + 1.0) / mtt;
+            let disp_rate = match model.pk_model {
+                PkModel::TwoCptTransit => {
+                    crate::sens::two_cpt::macro_rates_g::<f64>(cl, v1, pk.q(), pk.v2()).0
+                }
+                _ => cl / v1,
+            };
+            if disp_rate >= ktr {
+                diags.push(Diagnostic::warning(
+                    "W_TRANSIT_FLIP_FLOP",
+                    format!(
+                        "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
+                         typical values (subject {}): the analytic transit closed form is outside \
+                         its convergence domain and returns an identically-zero concentration \
+                         profile, which silently degenerates the objective (a proportional error \
+                         model collapses `(σ·pred)²` to 0). This is the flip-flop regime — check \
+                         the MTT / CL starting estimates, or use an ODE transit model.",
+                        model.pk_model.canonical_name(),
+                        disp_rate,
+                        ktr,
+                        subject.id
+                    ),
+                ));
+                break;
+            }
+        }
+    }
+
     diags
 }
 
@@ -1799,10 +2013,12 @@ fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
 /// first, as `fit()` does). This is the engine behind the `ferx check` CLI
 /// command and is the fast `author → diagnose → fix` loop for tools and agents.
 ///
-/// When `data_path` is `None`, only parse/structural and model/option
-/// compatibility validation runs (no data is read). When it is `Some`, the CSV
-/// is read and the covariate / per-CMT / steady-state / lag-time checks run as
-/// well.
+/// When neither `data_path` nor the model's own `[data]` block (#690) resolve
+/// to a path, only parse/structural and model/option compatibility validation
+/// runs (no data is read). Otherwise the CSV is read and the covariate /
+/// per-CMT / steady-state / lag-time checks run as well. An explicit
+/// `data_path` overrides the model's `[data]` block, with a warning
+/// diagnostic when the two differ (see [`resolve_data_path`]).
 pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckReport {
     use crate::parser::model_parser::parse_full_model_file;
 
@@ -1811,18 +2027,33 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
         .and_then(|s| s.to_str())
         .unwrap_or("model")
         .to_string();
-    let data = data_path.map(|s| s.to_string());
 
     // 1. Parse. A parse failure is terminal — without an AST there is nothing
     //    further to validate, so return a report carrying just that diagnostic.
     let parsed = match parse_full_model_file(Path::new(model_path)) {
         Ok(p) => p,
         Err(e) => {
+            let data = data_path.map(|s| s.to_string());
             return CheckReport::new(model_name, data, vec![parse_error_to_diagnostic(&e)]);
         }
     };
 
+    // Resolve which dataset (if any) to check against: an explicit
+    // `data_path` wins over the model's `[data]` block; absence of both just
+    // means the data-dependent checks below are skipped, so any `Err` here
+    // (neither given) is not itself a diagnostic.
+    let (data_path, data_path_warning) =
+        match resolve_data_path(parsed.data_path.as_deref(), data_path) {
+            Ok((p, w)) => (Some(p), w),
+            Err(_) => (None, None),
+        };
+    let data_path = data_path.as_deref();
+    let data = data_path.map(|s| s.to_string());
+
     let mut diags: Vec<Diagnostic> = Vec::new();
+    if let Some(w) = data_path_warning {
+        diags.push(Diagnostic::warning("W_DATA_PATH_OVERRIDE", w));
+    }
 
     // 2a. Parse-time warnings collected during parsing (unused parameters,
     //     mu-referencing diagnostics, etc.). Each warning embeds its own block
@@ -1909,9 +2140,13 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
 }
 
 /// High-level fit: model file path + data file path → FitResult
+///
+/// `data_path` is `None` to rely solely on the model's own `[data]` block
+/// (#690); when both are given, `data_path` overrides the model's, with a
+/// warning recorded on the result (see [`resolve_data_path`]).
 pub fn fit_from_files(
     model_path: &str,
-    data_path: &str,
+    data_path: Option<&str>,
     covariate_columns: Option<&[&str]>,
     options: Option<FitOptions>,
 ) -> Result<FitResult, String> {
@@ -1925,6 +2160,8 @@ pub fn fit_from_files(
     // legacy auto-detect when both are absent).
     let opts = options.unwrap_or_default();
     let sel_filter_fit = build_selection_filter_merged(&parsed.fit_options, &opts)?;
+    let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)?;
+    let data_path = data_path.as_str();
     let (population, covariate_table) = read_population_for(
         &model,
         &parsed.covariate_decls,
@@ -1943,6 +2180,10 @@ pub fn fit_from_files(
         };
     let mut result = fit(&model, &population, &model.default_params, &opts)?;
     result.covariate_table = covariate_table;
+    if let Some(w) = data_path_warning {
+        result.warnings.push(w);
+        rebuild_warnings_structured(&mut result);
+    }
     // Hash inputs post-fit (same pattern as `run_model_with_data`). The
     // model and CSV were already read by `parse_model_file` and
     // `read_nonmem_csv` upstream, so the OS page cache typically serves
@@ -2016,6 +2257,12 @@ pub fn fit(
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
     if let Some(e) = check_transit_support(model, population) {
+        return Err(e);
+    }
+    // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
+    // the depot amount can't be superposed across an EVID=3/4 reset, so predicting
+    // would silently read a zero depot. Fail loudly instead.
+    if let Some(e) = check_analytic_readout_support(model, population) {
         return Err(e);
     }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
@@ -2345,16 +2592,23 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             diags.push(Diagnostic::warning("W_OUTPUT_DUPLICATE", msg));
             continue;
         }
-        // Valid if it's a covariate, indiv param, or derived name
+        // Valid if it's a covariate, indiv param, or derived name. Synthetic
+        // readout parameters (`__ferx_ro_*`, #486) are internal — not user-requestable.
         let known = cov_names.iter().any(|c| c.eq_ignore_ascii_case(col))
-            || model
-                .indiv_param_names
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(col))
+            || model.indiv_param_names.iter().any(|p| {
+                !crate::parser::model_parser::is_synthetic_readout_param(p)
+                    && p.eq_ignore_ascii_case(col)
+            })
             || derived_names.iter().any(|d| d.eq_ignore_ascii_case(col));
         if !known {
             let mut candidates: Vec<&str> = cov_names.iter().map(|s| s.as_str()).collect();
-            candidates.extend(model.indiv_param_names.iter().map(|s| s.as_str()));
+            candidates.extend(
+                model
+                    .indiv_param_names
+                    .iter()
+                    .filter(|p| !crate::parser::model_parser::is_synthetic_readout_param(p))
+                    .map(|s| s.as_str()),
+            );
             candidates.extend(derived_names.iter().copied());
             candidates.extend(OUTPUT_MANDATORY.iter().copied());
             diags.push(Diagnostic::error(
@@ -2432,13 +2686,42 @@ pub fn tafd_tad_for_subject(
 // ── Step 8: post-fit extra column computation ────────────────────────────────
 
 /// Build a per-observation HashMap mapping `model.indiv_param_names` to their
-/// values from `pk`.
+/// values from `pk`. Individual parameters the parser synthesized for a direct-θ/η
+/// Form-C readout (`__ferx_ro_*`, #486) are internal — they are skipped so they never
+/// surface as a user-facing EBE / sdtab column.
 fn build_indiv_map(pk: &PkParams, names: &[String], pk_indices: &[usize]) -> HashMap<String, f64> {
     names
         .iter()
         .zip(pk_indices.iter())
+        .filter(|(name, _)| !crate::parser::model_parser::is_synthetic_readout_param(name))
         .map(|(name, &idx)| (name.clone(), pk.values[idx]))
         .collect()
+}
+
+#[cfg(test)]
+mod build_indiv_map_tests {
+    use super::*;
+    use crate::types::PkParams;
+
+    /// #486: individual parameters the parser synthesized for a direct-θ/η Form-C
+    /// readout (`__ferx_ro_*`) are internal and must never appear in the user-facing
+    /// per-observation EBE map.
+    #[test]
+    fn synthetic_readout_params_hidden_from_indiv_map() {
+        let mut pk = PkParams::default();
+        pk.values[0] = 1.5; // real CL
+        pk.values[2] = 3.0; // synthetic readout slot
+        let names = vec!["CL".to_string(), "__ferx_ro_th0".to_string()];
+        let pk_indices = vec![0usize, 2usize];
+        let map = build_indiv_map(&pk, &names, &pk_indices);
+        assert_eq!(map.len(), 1, "only the real parameter is exposed");
+        assert_eq!(map.get("CL"), Some(&1.5));
+        assert!(
+            !map.keys()
+                .any(|k| crate::parser::model_parser::is_synthetic_readout_param(k)),
+            "synthetic readout params must be hidden from the EBE map"
+        );
+    }
 }
 
 /// Trapezoid integration over (time, value) pairs.
@@ -3188,6 +3471,25 @@ fn fit_inner(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, String> {
+    // LTBS needs the inner EBE loop converged tighter than the default for
+    // reproducible standard errors (see `FitOptions::effective_inner_tol` /
+    // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and
+    // the covariance step (which reconverges tighter still via `effective_cov_inner_tol`)
+    // work from the same tightened tolerance. `min` never loosens an explicit
+    // user setting; non-LTBS models are untouched (same `options` reference).
+    let ltbs_opts;
+    let options = {
+        let eff = options.effective_inner_tol(model.uses_closed_form_ltbs_inner());
+        if eff < options.inner_tol {
+            ltbs_opts = FitOptions {
+                inner_tol: eff,
+                ..options.clone()
+            };
+            &ltbs_opts
+        } else {
+            options
+        }
+    };
     let fit_start = Instant::now();
     let chain = options.method_chain();
     let n_stages = chain.len();
@@ -4130,7 +4432,13 @@ fn fit_inner(
         EstimationMethod::Imp => "imp-bobyqa".to_string(),
         _ => {
             if options.optimizer == Optimizer::Auto {
-                format!("auto ({})", options.optimizer.resolve_auto(model).label())
+                format!(
+                    "auto ({})",
+                    options
+                        .optimizer
+                        .resolve_auto(model, options.interaction)
+                        .label()
+                )
             } else {
                 options.optimizer.label().to_string()
             }
@@ -4634,7 +4942,7 @@ fn compute_subject_results(
             let mut iwres = compute_iwres_with_correlations(
                 &subject.observations,
                 &ipred,
-                &subject.obs_cmts,
+                model.error_spec.obs_keys(subject).as_ref(),
                 &model.error_spec,
                 &params.sigma.values,
                 &model.residual_correlations,
@@ -4895,6 +5203,134 @@ pub(crate) fn eps_shrinkage_warning(shrinkage_eps: f64) -> Option<String> {
 mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
+
+    // ── resolve_data_path (#690) ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_data_path_neither_given_is_error() {
+        assert!(resolve_data_path(None, None).is_err());
+    }
+
+    #[test]
+    fn resolve_data_path_external_only_no_warning() {
+        let (path, warning) = resolve_data_path(None, Some("cli.csv")).unwrap();
+        assert_eq!(path, "cli.csv");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_data_path_model_only_no_warning() {
+        let (path, warning) = resolve_data_path(Some("model.csv"), None).unwrap();
+        assert_eq!(path, "model.csv");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_data_path_both_equal_no_warning() {
+        let (path, warning) = resolve_data_path(Some("same.csv"), Some("same.csv")).unwrap();
+        assert_eq!(path, "same.csv");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_data_path_both_differ_external_wins_with_warning() {
+        let (path, warning) = resolve_data_path(Some("model.csv"), Some("cli.csv")).unwrap();
+        assert_eq!(path, "cli.csv");
+        let warning = warning.expect("differing paths must warn");
+        assert!(warning.contains("cli.csv"));
+        assert!(warning.contains("model.csv"));
+    }
+
+    #[test]
+    fn resolve_data_path_same_file_different_text_no_warning() {
+        // Same on-disk file reached via textually different paths (e.g. the
+        // model's `[data] path` dir-joined vs. a raw `--data` value) must not
+        // trigger a spurious override warning.
+        let dir = tempfile::tempdir().unwrap();
+        let csv = dir.path().join("warfarin.csv");
+        std::fs::write(&csv, "ID,TIME,DV,EVID,AMT,CMT\n").unwrap();
+        let model_p = csv.to_str().unwrap().to_string();
+        let external_p = format!("{}/./warfarin.csv", dir.path().to_str().unwrap());
+
+        let (path, warning) = resolve_data_path(Some(&model_p), Some(&external_p)).unwrap();
+        assert_eq!(path, external_p);
+        assert!(warning.is_none(), "same file must not warn: {:?}", warning);
+    }
+
+    #[test]
+    fn fit_from_files_uses_model_data_block_when_data_path_none() {
+        // #690 regression: fit_from_files must resolve the model's own
+        // [data] block via resolve_data_path, like run_model_with_data_inits
+        // does, rather than requiring an explicit data_path argument.
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("warfarin.csv");
+        std::fs::copy("data/warfarin.csv", &data).unwrap();
+        let model_content = std::fs::read_to_string("examples/warfarin.ferx").unwrap();
+        let model_content = format!("{model_content}\n[data]\n  path = warfarin.csv\n");
+        let model = dir.path().join("model.ferx");
+        std::fs::write(&model, model_content).unwrap();
+
+        let opts = FitOptions {
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let result = fit_from_files(model.to_str().unwrap(), None, None, Some(opts))
+            .expect("fit_from_files must honor the model's [data] block");
+        assert_eq!(result.data_path.as_deref(), Some(data.to_str().unwrap()));
+    }
+
+    /// #658: an adaptive-dosing simulation on a covariate-selected error model
+    /// must be rejected — the assay keys residual variance by CMT, but a
+    /// `Selected` spec keys endpoints by covariate branch (a CMT-keyed lookup
+    /// would miss and draw NaN). A single-endpoint error model is accepted.
+    #[test]
+    fn adaptive_rejects_selected_error_model() {
+        use crate::parser::model_parser::parse_model_string;
+        let ode_selected = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_TOTAL   ~ 0.05 (sd)
+  sigma PROP_UNBOUND ~ 0.30 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+";
+        let model = parse_model_string(ode_selected).expect("ODE+Selected model parses");
+        let err = reject_selected_error_for_adaptive(&model)
+            .expect_err("Selected error model must be rejected for adaptive dosing");
+        assert!(
+            err.to_lowercase().contains("adaptive") && err.contains("error_model"),
+            "error should cite the adaptive/error_model restriction: {err}"
+        );
+
+        // A single-endpoint error model on the same structure is accepted.
+        let ode_single = ode_selected.replace(
+            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
+            "  DV ~ proportional(PROP_TOTAL)",
+        );
+        let single = parse_model_string(&ode_single).expect("ODE+Single model parses");
+        assert!(reject_selected_error_for_adaptive(&single).is_ok());
+    }
 
     fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         let n = iwres.len();
@@ -5543,6 +5979,12 @@ pub fn simulate_with_options(
     #[cfg(feature = "survival")]
     validate_ode_tte_simulatable(model, population, opts.horizon)?;
 
+    // Parity with `fit()`: a referenced covariate absent from the data would
+    // silently read 0.0 (e.g. a `Selected` error model's `if (FREE==0)` selector
+    // would route every row to branch 0, applying the wrong residual variance
+    // with no diagnostic). Reject it here the same way `fit()` does (#658).
+    first_error(&check_covariates(model, population))?;
+
     // Validate the TTE horizon on the library path too — the `.ferx` parser
     // already rejects a non-finite / non-positive horizon, but a direct caller of
     // this API must get the same guard: a NaN window makes every `t_event < window`
@@ -5718,32 +6160,62 @@ fn emit_subject_rows<R: rand::Rng>(
     // Per-observation custom residual magnitude (#484): η-independent, so build
     // the [obs][sigma-slot] matrix once per subject and index it per row.
     let ruv_mult = model.ruv_obs_mult(subject, &params.theta);
-    for (j, &ipred) in ipreds.iter().enumerate() {
-        // FREM covariate pseudo-observations (FREMTYPE>0) use the additive
-        // covariate sigma, not the PK error model applied to the θ+η override
-        // that `compute_predictions_with_tv` now writes into FREM rows.
-        let var = model.sim_residual_variance(
+    // `block_sigma` cross-endpoint correlations (#672): draw the full
+    // multivariate residual vector from the dense `R` that estimation already
+    // builds (`compute_r_matrix_with_correlations`), so the simulated data
+    // reproduces the fitted covariance instead of independent per-row draws.
+    // FREM covariate pseudo-observations don't participate in the correlation
+    // (mirrors the `has_frem_rows` gate in
+    // `stats/likelihood.rs::individual_nll_into_with_schedule`). That gate also
+    // carries a `!has_censored_m3` term we deliberately drop here: it exists so
+    // the likelihood's M3 BLOQ integral falls back to the scalar path, whereas
+    // simulate() draws the residual first and applies censoring afterwards, so a
+    // to-be-censored row should still be drawn from the correlated R. (A
+    // `block_sigma` + M3 model is rejected at fit by `check_model_options`
+    // regardless, so the two paths can only differ on an unfitted fixed model.)
+    let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
+    if !model.residual_correlations.is_empty() && !has_frem_rows && !ipreds.is_empty() {
+        emit_correlated_residual_rows(
+            model,
             subject,
-            j,
-            ipred,
-            &params.sigma.values,
+            params,
+            &ipreds,
             ruv_scale,
-            ruv_mult.as_ref().map(|m| m[j].as_slice()),
-        );
-        let eps: f64 = rng.sample(normal);
-        let value = ipred + var.sqrt() * eps;
-
-        results.push(SimulationResult {
+            ruv_mult.as_deref(),
             draw,
             sim,
-            id: subject.id.clone(),
-            // Raw data TIME (matches sdtab / input); `obs_times` may be
-            // the internal shifted clock for stacked reset occasions.
-            time: obs_row_time(subject, j),
-            cmt: subject.obs_cmts[j],
-            ipred,
-            outcome: SimOutcome::Continuous { value },
-        });
+            normal,
+            rng,
+            results,
+        );
+    } else {
+        for (j, &ipred) in ipreds.iter().enumerate() {
+            // FREM covariate pseudo-observations (FREMTYPE>0) use the additive
+            // covariate sigma, not the PK error model applied to the θ+η override
+            // that `compute_predictions_with_tv` now writes into FREM rows.
+            let var = model.sim_residual_variance(
+                subject,
+                j,
+                ipred,
+                &params.sigma.values,
+                ruv_scale,
+                ruv_mult.as_ref().map(|m| m[j].as_slice()),
+            );
+            let eps: f64 = rng.sample(normal);
+            let value = ipred + var.sqrt() * eps;
+
+            results.push(SimulationResult {
+                draw,
+                sim,
+                id: subject.id.clone(),
+                // Raw data TIME (matches sdtab / input); `obs_times` may be
+                // the internal shifted clock for stacked reset occasions.
+                time: obs_row_time(subject, j),
+                cmt: subject.obs_cmts[j],
+                ipred,
+                outcome: SimOutcome::Continuous { value },
+            });
+        }
     }
 
     // TTE simulation path (requires survival feature)
@@ -5759,6 +6231,101 @@ fn emit_subject_rows<R: rand::Rng>(
         rng,
         results,
     );
+}
+
+/// Draw the correlated residual vector for one subject's Gaussian observation
+/// rows from the dense `R` built by [`compute_r_matrix_with_correlations`] (the
+/// same matrix FOCE/FOCEI/SAEM/`imp` evaluate the likelihood against), instead
+/// of the per-row independent draw `emit_subject_rows` otherwise uses. Callers
+/// must already have excluded FREM rows and the empty-correlation case.
+///
+/// R is factored with a PSD-safe symmetric-eigen square root, so a singular
+/// (e.g. `rho = ±1`) or mildly indefinite fixed `block_sigma` yields a valid
+/// draw instead of a Cholesky panic. Subjects whose R is diagonal (no paired
+/// rows) take a cheap per-row draw and skip the factorization entirely.
+#[allow(clippy::too_many_arguments)]
+fn emit_correlated_residual_rows<R: rand::Rng>(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    ipreds: &[f64],
+    ruv_scale: f64,
+    ruv_mult: Option<&[Vec<f64>]>,
+    draw: usize,
+    sim: usize,
+    normal: rand_distr::Normal<f64>,
+    rng: &mut R,
+    results: &mut Vec<SimulationResult>,
+) {
+    let err_keys = model.error_spec.obs_keys(subject);
+    let mut r = match ruv_mult {
+        Some(mult) => compute_r_matrix_with_correlations_scaled(
+            &model.error_spec,
+            ipreds,
+            err_keys.as_ref(),
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &params.sigma.values,
+            &model.residual_correlations,
+            mult,
+        ),
+        None => compute_r_matrix_with_correlations(
+            &model.error_spec,
+            ipreds,
+            err_keys.as_ref(),
+            &subject.obs_times,
+            &subject.obs_raw_times,
+            &subject.occasions,
+            &params.sigma.values,
+            &model.residual_correlations,
+        ),
+    };
+    if ruv_scale != 1.0 {
+        r *= ruv_scale;
+    }
+    let n = ipreds.len();
+    // z ~ N(0, Iₙ); the correlated residual is a matrix square-root factor of R
+    // times z (`Cov(F·z) = F·Fᵀ = R`).
+    let z = DVector::from_iterator(n, (0..n).map(|_| rng.sample(normal)));
+    // Fast path: if R has no nonzero off-diagonal the subject has no actually
+    // paired rows (every observation sits in its own residual block), so R is
+    // diagonal and the draw is the same independent per-row draw the scalar
+    // path uses. Skip the O(n³) factorization — this keeps a densely-sampled
+    // endpoint of a `block_sigma` model cheap, and reproduces the scalar path's
+    // RNG-for-RNG output for such subjects.
+    let has_offdiag = (0..n).any(|j| ((j + 1)..n).any(|k| r[(j, k)] != 0.0));
+    let eps = if !has_offdiag {
+        DVector::from_iterator(n, (0..n).map(|j| r[(j, j)].max(0.0).sqrt() * z[j]))
+    } else {
+        // A fitted or fixed `block_sigma` can be positive-SEMIdefinite rather
+        // than strictly positive-definite — a perfect cross-endpoint
+        // correlation (`rho = ±1`, which the parser accepts on the inclusive
+        // [-1, 1] range) makes R singular, so a Cholesky factor doesn't exist
+        // and would panic the whole simulation. Use the symmetric-eigen square
+        // root `V·diag(√max(λ,0))`, which is well defined for any PSD R and
+        // clamps tiny negative eigenvalues (round-off, or a mildly indefinite
+        // fixed R) to zero instead of aborting.
+        let eig = r.symmetric_eigen();
+        let mut factor = eig.eigenvectors;
+        for (k, &lambda) in eig.eigenvalues.iter().enumerate() {
+            let s = lambda.max(0.0).sqrt();
+            factor.column_mut(k).scale_mut(s);
+        }
+        factor * z
+    };
+    for (j, &ipred) in ipreds.iter().enumerate() {
+        let value = ipred + eps[j];
+        results.push(SimulationResult {
+            draw,
+            sim,
+            id: subject.id.clone(),
+            time: obs_row_time(subject, j),
+            cmt: subject.obs_cmts[j],
+            ipred,
+            outcome: SimOutcome::Continuous { value },
+        });
+    }
 }
 
 /// `matched`, when `Some((fitted_etas, omega_inv, method))`, reassigns each
@@ -6008,6 +6575,13 @@ where
             .to_string()
     })?;
 
+    // The adaptive assay keys residual variance by the monitored compartment
+    // number (`residual_variance_at(cmt, …)`), but a `Selected` error model's
+    // endpoints are keyed by the covariate selector's 0-based branch index, not
+    // CMT — `map.get(&cmt)` would miss and `variance_at` returns NaN, corrupting
+    // the assay draw. Reject the combination rather than emit NaN observations (#658).
+    reject_selected_error_for_adaptive(model)?;
+
     // An empty schedule means the controller is never consulted: the result is a
     // dose-free simulation that the verifier (replaying an empty ledger) passes
     // trivially. That is almost always a forgotten `decision_times` (the field
@@ -6226,10 +6800,23 @@ where
             // `auc_target = None` (the AUC pass is skipped) — so a dose issued *at* a
             // stop never coincides with this metric. If that ever changes (a
             // dose-on-stop reaching the AUC pass), the final dose's window would need
-            // explicit handling; the `..._after_discontinuation` test pins the
+            // explicit handling — the `debug_assert!` in the match arm below is the
+            // tripwire for exactly that, and `sim::adaptive::run_has_dose_on_stop` (with
+            // its unit test plus the `..._after_discontinuation` test) pins the
             // dose-free-`Stop` invariant this relies on.
             let window_aucs: Vec<f64> = match (auc_target, monitors.first()) {
                 (Some(_), Some(mon)) => {
+                    // Tripwire (see the note above): realized-window scoring is exact only
+                    // while no `Stop` carries a dose. Unreachable today; this fires in
+                    // debug/test builds if a future change ever routes a dose-on-stop here,
+                    // rather than silently under-reporting that final dose's exposure.
+                    debug_assert!(
+                        !crate::sim::adaptive::run_has_dose_on_stop(&run.decisions),
+                        "auc_target_attainment: a Stop carried a final dose (`[dose, Stop]`); \
+                         its post-stop exposure window is unscored under realized-window \
+                         scoring — the dose-free-Stop invariant no longer holds, so that \
+                         window now needs explicit handling"
+                    );
                     let realized_decision_times: Vec<f64> =
                         run.decisions.iter().map(|d| d.time).collect();
                     crate::ode::adaptive_window_signal_aucs(
@@ -6349,6 +6936,12 @@ pub fn simulate_adaptive_from_spec(
     // here rather than allowed to silently produce nothing.
     let compiled = crate::sim::adaptive_control::compile_adaptive(model, spec)
         .map_err(|e| format!("simulate_adaptive_from_spec: {e}"))?;
+    // Parity with `fit()`: model-referenced covariates (e.g. a `Selected` error
+    // model's selector) must be present too, not just the `observe` signal (#658).
+    first_error(&check_covariates(model, population))?;
+    // A `Selected` error model keys endpoints by selector branch, not CMT, so the
+    // compartment-keyed assay would draw NaN — reject it (see the helper's note, #658).
+    reject_selected_error_for_adaptive(model)?;
     // An `observe` covariate absent from the data would silently read 0.0 and
     // drive the controller off a wrong signal (`central / WT` → central / 0 = inf).
     // Apply the same loud check fits use for model covariates (`check_covariates`).
@@ -6439,6 +7032,11 @@ pub fn simulate_with_uncertainty(
     #[cfg(feature = "survival")]
     validate_ode_tte_simulatable(model, population, None)?;
 
+    // Parity with `fit()`: reject a referenced covariate absent from the data
+    // rather than silently reading it as 0.0 (a `Selected` error-model selector
+    // would otherwise route every row to branch 0). See #658.
+    first_error(&check_covariates(model, population))?;
+
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
         // Re-seed StdRng from entropy so simulate-without-seed is still
@@ -6518,6 +7116,7 @@ pub fn predict(
     // predictor unresolved (silent-wrong analytical / `.expect` panic). #324.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_analytic_readout_support(model, population);
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();
@@ -6761,6 +7360,7 @@ mod survival_predict_tests {
 #[cfg(test)]
 mod iov_integration {
     use super::fit;
+    use super::simulate_with_seed;
     use crate::types::*;
 
     use std::collections::HashMap;
@@ -6844,7 +7444,9 @@ mod iov_integration {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -6958,7 +7560,7 @@ mod iov_integration {
         let opts = fast_opts(EstimationMethod::Foce, Optimizer::Auto, false);
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
         assert_iov_fit_ok(&result);
-        let resolved = Optimizer::Auto.resolve_auto(&model);
+        let resolved = Optimizer::Auto.resolve_auto(&model, false);
         assert_eq!(result.optimizer, format!("auto ({})", resolved.label()));
         assert_eq!(resolved, Optimizer::Bobyqa);
     }
@@ -7070,7 +7672,23 @@ mod iov_integration {
             "ODE twin must be ODE-IOV-provider supported (analytic inner+outer)"
         );
         let pop = make_iov_population();
-        let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bfgs, false);
+        // Use the **default** optimizer (`Auto`) — exactly what a real user gets.
+        // For this model `Auto` resolves to the gradient-based NLopt L-BFGS
+        // (analytic outer gradient is available on both the closed-form and ODE
+        // IOV paths). The previous explicit built-in `Bfgs` was the problem: from
+        // the far default start (TVCL=5.0, true ≈0.28) its line-search overshoots
+        // TVCL to the lower bound on the *ODE* path and stalls in a worse basin
+        // (OFV ~165 vs ~148), while the closed-form twin survives the same
+        // trajectory. The objective and analytic sensitivities are correct —
+        // seeding built-in BFGS at the optimum converges fine — so it was
+        // optimizer basin-capture, not an ODE-IOV gradient defect. See #439/#486.
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&ode, false),
+            Optimizer::NloptLbfgs,
+            "ODE IOV twin should resolve `auto` to the analytic-gradient L-BFGS"
+        );
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Auto, false);
+        opts.outer_maxiter = 200;
 
         let ra = fit(&ana, &pop, &ana.default_params, &opts).expect("analytical fit");
         let ro = fit(&ode, &pop, &ode.default_params, &opts).expect("ODE fit");
@@ -7815,6 +8433,240 @@ mod iov_integration {
             (focei_ofv - foce_ofv).abs() > 1e-4,
             "FOCEI OFV {focei_ofv} must differ from FOCE OFV {foce_ofv} (interaction dropped?)"
         );
+    }
+
+    /// Shared covariate-selected free/total `block_sigma` model + paired-row
+    /// subject for the `simulate()` cross-branch correlation tests (#672).
+    /// Mirrors `SELECTED_BLOCK_SIGMA_MODEL` in `parser/model_parser.rs`, which
+    /// pins the same off-diagonal on the estimation side.
+    fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
+        use crate::parser::model_parser::parse_model_string;
+        use std::collections::HashMap;
+
+        let model = parse_model_string(
+            r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0) FIX
+  theta TVV(50.0, 5.0, 500.0) FIX
+  omega ETA_CL ~ 0.09 FIX
+  block_sigma (PROP_TOTAL, PROP_UNBOUND) = [0.01, 0.005, 0.09] FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  if (FREE == 0) {
+    DV ~ proportional(PROP_TOTAL)
+  } else {
+    DV ~ proportional(PROP_UNBOUND)
+  }
+
+[covariates]
+  FREE continuous
+",
+        )
+        .expect("selected-error block_sigma model parses");
+
+        // Two paired rows at the same subject time (total vs. unbound), the
+        // exact fixture `test_selected_error_block_sigma_cross_branch_covariance`
+        // uses to pin the estimation-side dense `R`.
+        let subject = Subject {
+            id: "S1".to_string(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 1.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0, 0.0],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![
+                HashMap::from([("FREE".to_string(), 0.0)]),
+                HashMap::from([("FREE".to_string(), 1.0)]),
+            ],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 1],
+            dose_occasions: vec![1],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["FREE".to_string()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        (model, population)
+    }
+
+    // #672: `simulate()` must draw the two paired rows (same subject time,
+    // different `FREE` branch) from the dense correlated `R`, not independent
+    // per-row normals — otherwise a VPC of the correlated endpoints understates
+    // the residual covariance. Large-N: the empirical correlation of the two
+    // rows' residuals (value − ipred) must recover the fixed `rho` implied by
+    // `block_sigma`'s off-diagonal.
+    #[test]
+    fn test_simulate_recovers_block_sigma_cross_branch_correlation() {
+        let (model, population) = block_sigma_selected_model_and_population();
+
+        let n_sim = 20_000;
+        let results = simulate_with_seed(&model, &population, &model.default_params, n_sim, 42);
+        assert_eq!(results.len(), 2 * n_sim);
+
+        let mut resid_total = Vec::with_capacity(n_sim);
+        let mut resid_unbound = Vec::with_capacity(n_sim);
+        for pair in results.chunks(2) {
+            resid_total.push(pair[0].outcome.continuous_value() - pair[0].ipred);
+            resid_unbound.push(pair[1].outcome.continuous_value() - pair[1].ipred);
+        }
+
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let (m0, m1) = (mean(&resid_total), mean(&resid_unbound));
+        let n = n_sim as f64;
+        let cov = resid_total
+            .iter()
+            .zip(&resid_unbound)
+            .map(|(a, b)| (a - m0) * (b - m1))
+            .sum::<f64>()
+            / n;
+        let var0 = resid_total.iter().map(|a| (a - m0).powi(2)).sum::<f64>() / n;
+        let var1 = resid_unbound.iter().map(|a| (a - m1).powi(2)).sum::<f64>() / n;
+        let empirical_rho = cov / (var0.sqrt() * var1.sqrt());
+
+        let sd_i = 0.01f64.sqrt();
+        let sd_j = 0.09f64.sqrt();
+        let expected_rho = 0.005 / (sd_i * sd_j);
+
+        assert!(
+            (empirical_rho - expected_rho).abs() < 0.03,
+            "empirical rho {empirical_rho} should recover the specified block_sigma \
+             rho {expected_rho} (simulate() ignoring the correlation would give ~0)"
+        );
+    }
+
+    // Degenerate case (#672): a `residual_correlations` entry with `rho == 0.0`
+    // makes `R` exactly diagonal, so the new dense Cholesky draw
+    // (`emit_correlated_residual_rows`) must reproduce the untouched
+    // independent per-row draw (`emit_subject_rows`'s scalar branch, taken when
+    // `model.residual_correlations` is empty) — same seed, same per-row RNG
+    // draw order in both paths. Not bit-for-bit: `compute_r_matrix_with_correlations`'s
+    // diagonal goes through `variance_at_scaled`'s `((f·f)·σ)·σ` association
+    // whenever `correlations` is non-empty (even at rho=0), versus `variance_at`'s
+    // `(f·σ)·(f·σ)` when it's empty — a pre-existing, documented ~1-ULP
+    // reassociation difference (see `residual_error::compute_r_matrix_with_correlations`),
+    // not a regression from this draw path.
+    #[test]
+    fn test_simulate_zero_rho_matches_diagonal_draw_path() {
+        let (mut model, population) = block_sigma_selected_model_and_population();
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 0.0,
+        }];
+        let dense_path = simulate_with_seed(&model, &population, &model.default_params, 200, 7);
+
+        model.residual_correlations.clear();
+        let scalar_path = simulate_with_seed(&model, &population, &model.default_params, 200, 7);
+
+        assert_eq!(dense_path.len(), scalar_path.len());
+        for (a, b) in dense_path.iter().zip(scalar_path.iter()) {
+            let (va, vb) = (a.outcome.continuous_value(), b.outcome.continuous_value());
+            assert!(
+                (va - vb).abs() < 1e-9 * va.abs().max(1.0),
+                "rho=0 dense-R draw {va} must match the independent scalar draw {vb} \
+                 to within floating-point rounding"
+            );
+        }
+    }
+
+    // #672 regression: a fixed `block_sigma` with a perfect cross-endpoint
+    // correlation (`rho = 1`) makes each paired subject's R singular. The
+    // original Cholesky draw panicked the whole simulation; the PSD
+    // symmetric-eigen square root must instead produce a valid,
+    // perfectly-correlated draw (empirical rho ≈ 1).
+    #[test]
+    fn test_simulate_singular_rho_one_does_not_panic() {
+        let (mut model, population) = block_sigma_selected_model_and_population();
+        model.residual_correlations = vec![crate::types::ResidualCorrelation {
+            sigma_i: 0,
+            sigma_j: 1,
+            rho: 1.0,
+        }];
+
+        let n_sim = 20_000;
+        let results = simulate_with_seed(&model, &population, &model.default_params, n_sim, 11);
+        assert_eq!(results.len(), 2 * n_sim);
+
+        let mut resid_total = Vec::with_capacity(n_sim);
+        let mut resid_unbound = Vec::with_capacity(n_sim);
+        for pair in results.chunks(2) {
+            resid_total.push(pair[0].outcome.continuous_value() - pair[0].ipred);
+            resid_unbound.push(pair[1].outcome.continuous_value() - pair[1].ipred);
+        }
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let (m0, m1) = (mean(&resid_total), mean(&resid_unbound));
+        let n = n_sim as f64;
+        let cov = resid_total
+            .iter()
+            .zip(&resid_unbound)
+            .map(|(a, b)| (a - m0) * (b - m1))
+            .sum::<f64>()
+            / n;
+        let var0 = resid_total.iter().map(|a| (a - m0).powi(2)).sum::<f64>() / n;
+        let var1 = resid_unbound.iter().map(|a| (a - m1).powi(2)).sum::<f64>() / n;
+        let empirical_rho = cov / (var0.sqrt() * var1.sqrt());
+        assert!(
+            (empirical_rho - 1.0).abs() < 0.01,
+            "rho=1 singular block_sigma must draw perfectly-correlated residuals \
+             (no panic), got empirical rho {empirical_rho}"
+        );
+    }
+
+    // Cover the custom-magnitude (`Some(mult)`) R-build branch and the
+    // `ruv_scale != 1.0` scaling inside `emit_correlated_residual_rows`. The
+    // model-driven simulate() path can't reach these for a supported
+    // `block_sigma` model (block_sigma + iiv_on_ruv is rejected at fit), so call
+    // the helper directly with a hand-built per-observation multiplier and a
+    // non-unit scale and assert it draws both rows without panicking.
+    #[test]
+    fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
+        use rand::SeedableRng;
+        let (model, population) = block_sigma_selected_model_and_population();
+        let subject = &population.subjects[0];
+        let ipreds = vec![10.0_f64, 10.0];
+        // [obs][sigma-slot] multiplier (all ones here — the point is to exercise
+        // the `_scaled` builder and the `ruv_scale` multiply, not a specific
+        // magnitude value).
+        let mult = vec![vec![1.0_f64, 1.0], vec![1.0, 1.0]];
+        let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut results = Vec::new();
+        super::emit_correlated_residual_rows(
+            &model,
+            subject,
+            &model.default_params,
+            &ipreds,
+            2.0, // ruv_scale != 1.0
+            Some(&mult),
+            0,
+            0,
+            normal,
+            &mut rng,
+            &mut results,
+        );
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .all(|r| r.outcome.continuous_value().is_finite()));
     }
 
     #[test]
@@ -8869,8 +9721,63 @@ mod simulate_with_uncertainty_tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
+    }
+
+    /// A `one_cpt_transit` + `TIME` model that the ODE desugar does NOT cover — here because
+    /// of a `lagtime=` mapping (the desugar is scoped to the plain `cl/v/n/mtt` form) — stays
+    /// on the closed form and must be rejected up front rather than silently freezing `TIME`
+    /// at the first record. (The plain form is instead rewritten to the ODE `transit()`
+    /// equivalent and works; see the parser test `transit_time_desugars_to_ode_equivalent`.)
+    #[test]
+    fn transit_with_time_and_lagtime_is_rejected() {
+        use crate::parser::model_parser::parse_model_string;
+        const TRANSIT_TIME_LAG: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVCL_LATE(7.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  if (TIME > 12.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V   = TVV
+  MTT = TVMTT
+  NTR = TVN
+  LAGTIME = TVLAG
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+"#;
+        let model = parse_model_string(TRANSIT_TIME_LAG).expect("parse transit+TIME+lag");
+        assert_eq!(
+            model.pk_model,
+            crate::types::PkModel::OneCptTransit,
+            "the lagtime= form is outside the desugar scope, so it stays closed-form"
+        );
+        assert!(
+            crate::parser::model_parser::compiled_model_uses_time_builtin(&model),
+            "fixture must use the TIME built-in"
+        );
+        let msg = check_transit_support(&model, &tiny_population())
+            .expect("transit + TIME (lagtime form) must be rejected up front");
+        assert!(
+            msg.contains("TIME"),
+            "rejection message must name the TIME limitation: {msg}"
+        );
     }
 
     fn tiny_population() -> Population {
@@ -9686,7 +10593,9 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
 
         // Subject with TV WT: subject.covariates["WT"] = 70 (the no-TV snapshot)
@@ -10017,7 +10926,9 @@ mod tests_sdtab_tv_cov {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -10176,7 +11087,9 @@ mod tests_derived_session_clock {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -10495,7 +11408,9 @@ mod tests_derived_iov_kappa {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
             name: "test_iov_kappa".into(),
             pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,

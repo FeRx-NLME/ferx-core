@@ -733,6 +733,18 @@ impl Subject {
         self.doses.iter().any(|d| d.ss)
     }
 
+    /// True when any dose is a *periodic* steady-state dose: flagged `SS=1`
+    /// **and** carrying a positive dosing interval `II > 0`. This is the precise
+    /// predicate the analytic-sensitivity gates use to decline steady-state
+    /// combinations they don't yet handle (the dual SS-equilibration needs the
+    /// `II` recurrence). Distinct from [`has_ss_doses`](Self::has_ss_doses),
+    /// which tests the `SS` flag alone; the single source of truth for the
+    /// `d.ss && d.ii > 0.0` gate scan shared by `ode_provider.rs` and
+    /// `estimation/inner_optimizer.rs`.
+    pub fn has_periodic_ss_dose(&self) -> bool {
+        self.doses.iter().any(|d| d.ss && d.ii > 0.0)
+    }
+
     /// True when every dose carries concrete (`Fixed`) `rate`/`duration` — i.e.
     /// no dose is still a modeled NONMEM coded `RATE` awaiting
     /// [`DoseEvent::resolve_rate`]. The common case (no coded doses) is `true`,
@@ -1200,6 +1212,11 @@ pub enum PkModel {
     OneCptTransit,
     TwoCptIv,
     TwoCptOral,
+    /// 2-cpt with Savic transit-compartment absorption via the analytic
+    /// exponential-tilting closed form (#386 PR D). Requires `cl`, `v1`, `q`,
+    /// `v2`, `n` (transit count), `mtt` (mean transit time); `f`/`lagtime`
+    /// optional as for oral.
+    TwoCptTransit,
     ThreeCptIv,
     ThreeCptOral,
 }
@@ -1237,6 +1254,14 @@ impl PkModel {
                 (PK_IDX_V2, "v2"),
                 (PK_IDX_KA, "ka"),
             ],
+            PkModel::TwoCptTransit => &[
+                (PK_IDX_CL, "cl"),
+                (PK_IDX_V, "v1"),
+                (PK_IDX_Q, "q"),
+                (PK_IDX_V2, "v2"),
+                (PK_IDX_N, "n"),
+                (PK_IDX_MTT, "mtt"),
+            ],
             PkModel::ThreeCptIv => &[
                 (PK_IDX_CL, "cl"),
                 (PK_IDX_V, "v1"),
@@ -1271,6 +1296,7 @@ impl PkModel {
             PkModel::OneCptTransit => "one_cpt_transit",
             PkModel::TwoCptIv => "two_cpt_iv",
             PkModel::TwoCptOral => "two_cpt_oral",
+            PkModel::TwoCptTransit => "two_cpt_transit",
             PkModel::ThreeCptIv => "three_cpt_iv",
             PkModel::ThreeCptOral => "three_cpt_oral",
         }
@@ -1300,6 +1326,9 @@ impl PkModel {
             PkModel::OneCptTransit => &[],
             PkModel::TwoCptIv => &[1, 2],
             PkModel::TwoCptOral => &[1, 2],
+            // Like the 1-cpt transit: modeled-duration infusions unsupported in v1,
+            // so a `D{cmt}` on a 2-cpt transit model is rejected at parse (#386).
+            PkModel::TwoCptTransit => &[],
             PkModel::ThreeCptIv => &[1, 2, 3],
             PkModel::ThreeCptOral => &[1, 2],
         }
@@ -1322,6 +1351,7 @@ impl PkModel {
             "one_cpt_transit" | "one_compartment_transit" => Some(PkModel::OneCptTransit),
             "two_cpt_iv" | "two_compartment_iv" => Some(PkModel::TwoCptIv),
             "two_cpt_oral" | "two_compartment_oral" => Some(PkModel::TwoCptOral),
+            "two_cpt_transit" | "two_compartment_transit" => Some(PkModel::TwoCptTransit),
             "three_cpt_iv" | "three_compartment_iv" => Some(PkModel::ThreeCptIv),
             "three_cpt_oral" | "three_compartment_oral" => Some(PkModel::ThreeCptOral),
             _ => None,
@@ -1342,6 +1372,7 @@ impl PkModel {
             PkModel::OneCptOral
                 | PkModel::OneCptTransit
                 | PkModel::TwoCptOral
+                | PkModel::TwoCptTransit
                 | PkModel::ThreeCptOral
         )
     }
@@ -1399,14 +1430,42 @@ impl ErrorModel {
     }
 }
 
+/// Covariate-driven residual-error endpoint selector (issue #658).
+///
+/// Maps one observation's covariate snapshot to a 0-based endpoint key into the
+/// `ErrorSpec::Selected.endpoints` map, resolving a user `if (COV …) { … } else
+/// { … }` in `[error_model]`. The selection depends only on covariates — never
+/// on θ/η or the prediction — so it is constant across the inner EBE loop and
+/// the FOCE/FOCEI outer iterations (the σ-gradient rides the existing per-CMT
+/// σ channel once the endpoint is chosen). The closure mirrors the boxed-closure
+/// pattern used by [`ScaleFn`]; `branch_labels` carries source-order branch
+/// descriptions purely for `Debug`/diagnostics.
+pub struct ErrorSelector {
+    /// Covariate map → 0-based endpoint key. Total: the parser requires a final
+    /// `else`, so every observation resolves to some declared endpoint.
+    pub eval: Box<dyn Fn(&HashMap<String, f64>) -> usize + Send + Sync>,
+    /// Human-readable branch descriptions (source order), for `Debug` output.
+    pub branch_labels: Vec<String>,
+}
+
+impl std::fmt::Debug for ErrorSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ErrorSelector({:?})", self.branch_labels)
+    }
+}
+
 /// Residual error specification for a model.
 ///
 /// `Single` applies one error model to every observation (the default and the
 /// only form analytical-PK models support). `PerCmt` dispatches a distinct
 /// error model per observed compartment — the multi-endpoint / simultaneous
 /// PK-PD case (issue #14). The map key is the 1-based CMT index from the data
-/// file's CMT column, matching `subject.obs_cmts[i]`.
-#[derive(Debug, Clone)]
+/// file's CMT column, matching `subject.obs_cmts[i]`. `Selected` (issue #658)
+/// dispatches on a key resolved per observation from a covariate `if/else`
+/// selector instead of the CMT column; its `endpoints` map is keyed by the
+/// selector's 0-based branch index and is otherwise identical in shape/handling
+/// to `PerCmt` (every downstream method treats the two alike — see the shared
+/// `PerCmt(map) | Selected { endpoints: map, .. }` arms).
 pub enum ErrorSpec {
     /// One error model for all observations.
     Single(ErrorModel),
@@ -1414,11 +1473,70 @@ pub enum ErrorSpec {
     /// indices into the flat global `sigma.values` vector that supply its
     /// sigmas (declaration order in the `[parameters]` block).
     PerCmt(HashMap<usize, EndpointError>),
+    /// Covariate-selected error models (issue #658). `selector` resolves each
+    /// observation's covariate snapshot to a 0-based key into `endpoints`; the
+    /// `EndpointError` values carry the same `error_model` + `sigma_idx` layout
+    /// as `PerCmt`.
+    Selected {
+        selector: ErrorSelector,
+        endpoints: HashMap<usize, EndpointError>,
+    },
+}
+
+impl std::fmt::Debug for ErrorSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrorSpec::Single(em) => f.debug_tuple("Single").field(em).finish(),
+            ErrorSpec::PerCmt(map) => f.debug_tuple("PerCmt").field(map).finish(),
+            ErrorSpec::Selected {
+                selector,
+                endpoints,
+            } => f
+                .debug_struct("Selected")
+                .field("selector", selector)
+                .field("endpoints", endpoints)
+                .finish(),
+        }
+    }
 }
 
 impl Default for ErrorSpec {
     fn default() -> Self {
         ErrorSpec::Single(ErrorModel::Additive)
+    }
+}
+
+impl ErrorSpec {
+    /// Per-observation endpoint dispatch keys for `subject`.
+    ///
+    /// For `Single`/`PerCmt` this is exactly the data CMT column
+    /// (`subject.obs_cmts`, borrowed with no allocation). For `Selected` the
+    /// covariate selector is evaluated on each observation's covariate snapshot
+    /// (`subject.obs_cov(j)`, which falls back to the subject-level covariates
+    /// when no per-observation snapshot exists — the per-row Form C semantics).
+    /// The returned keys are what every residual-dispatch method
+    /// (`variance_at`, `sigma_loadings`, `dvar_df`, …) expects as its `cmt`
+    /// argument.
+    pub fn obs_keys<'a>(&self, subject: &'a Subject) -> std::borrow::Cow<'a, [usize]> {
+        match self {
+            ErrorSpec::Selected { selector, .. } => std::borrow::Cow::Owned(
+                (0..subject.obs_cmts.len())
+                    .map(|j| (selector.eval)(subject.obs_cov(j)))
+                    .collect(),
+            ),
+            _ => std::borrow::Cow::Borrowed(&subject.obs_cmts),
+        }
+    }
+
+    /// Endpoint dispatch key for a single observation `j` of `subject`. The
+    /// `O(1)` analogue of [`obs_keys`](Self::obs_keys) for callers that resolve
+    /// one observation at a time (e.g. the per-observation simulation loop),
+    /// avoiding a full key-vector allocation per call for `Selected` specs.
+    pub fn obs_key(&self, subject: &Subject, j: usize) -> usize {
+        match self {
+            ErrorSpec::Selected { selector, .. } => (selector.eval)(subject.obs_cov(j)),
+            _ => subject.obs_cmts[j],
+        }
     }
 }
 
@@ -1440,9 +1558,23 @@ pub type RuvMagFn = Box<dyn Fn(&[f64], &HashMap<String, f64>, f64) -> f64 + Send
 /// consumption order. `per_sigma[k] == None` means slot `k` is a bare sigma
 /// (multiplier ≡ 1, the legacy path); `Some(f)` makes the slot's magnitude
 /// vary with TIME / covariates / theta.
+///
+/// `#[non_exhaustive]`: `per_sigma_deriv` (#576/#486) is the first field added
+/// since this type shipped; marking the struct non-exhaustive now means a
+/// future field addition can't again break an external struct-literal
+/// construction — build via [`Default::default()`] plus field assignment (or
+/// `..Default::default()`) instead.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct RuvMagnitude {
     pub per_sigma: Vec<Option<RuvMagFn>>,
+    /// Parallel to `per_sigma`: the compiled `Dual1` θ-derivative program for the
+    /// same non-bare slot (#576/#486), or `None` for a bare slot. Lets the
+    /// analytic outer θ/σ gradient differentiate the magnitude directly — a new
+    /// direct-θ term in `∂R/∂θ` — instead of falling back to FD. The runtime
+    /// closure in `per_sigma` still serves every value-only caller (inner loop,
+    /// IWRES, simulation).
+    pub per_sigma_deriv: Vec<Option<crate::parser::model_parser::RuvMagDerivProgram>>,
 }
 
 impl std::fmt::Debug for RuvMagnitude {
@@ -1477,6 +1609,26 @@ impl RuvMagnitude {
             .map(|slot| match slot {
                 Some(f) => f(theta, obs_covariates, time),
                 None => 1.0,
+            })
+            .collect()
+    }
+
+    /// Per-sigma `∂(multiplier)/∂θ` vector for one observation (#576/#486). Slot
+    /// `k` evaluates its `Dual1` program's gradient; a bare slot (multiplier ≡ 1)
+    /// contributes an all-zero row. `None` when any active slot's program
+    /// declines (θ-axis count mismatch / beyond `MAX_RUV_MAG_AXES`) — the caller
+    /// then falls back to FD for the magnitude's direct-θ gradient channel.
+    pub fn eval_obs_theta_grad(
+        &self,
+        theta: &[f64],
+        obs_covariates: &HashMap<String, f64>,
+        time: f64,
+    ) -> Option<Vec<Vec<f64>>> {
+        self.per_sigma_deriv
+            .iter()
+            .map(|slot| match slot {
+                Some(p) => p.theta_grad(theta, obs_covariates, time),
+                None => Some(vec![0.0; theta.len()]),
             })
             .collect()
     }
@@ -1518,33 +1670,35 @@ impl ErrorSpec {
                     out
                 }
             },
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => match ep.error_model {
-                    ErrorModel::Additive => ep
-                        .sigma_idx
-                        .first()
-                        .copied()
-                        .map(|i| vec![(i, 1.0)])
-                        .unwrap_or_default(),
-                    ErrorModel::Proportional => ep
-                        .sigma_idx
-                        .first()
-                        .copied()
-                        .map(|i| vec![(i, f)])
-                        .unwrap_or_default(),
-                    ErrorModel::Combined => {
-                        let mut out = Vec::with_capacity(2);
-                        if let Some(&i) = ep.sigma_idx.first() {
-                            out.push((i, f));
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => match ep.error_model {
+                        ErrorModel::Additive => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, 1.0)])
+                            .unwrap_or_default(),
+                        ErrorModel::Proportional => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, f)])
+                            .unwrap_or_default(),
+                        ErrorModel::Combined => {
+                            let mut out = Vec::with_capacity(2);
+                            if let Some(&i) = ep.sigma_idx.first() {
+                                out.push((i, f));
+                            }
+                            if let Some(&i) = ep.sigma_idx.get(1) {
+                                out.push((i, 1.0));
+                            }
+                            out
                         }
-                        if let Some(&i) = ep.sigma_idx.get(1) {
-                            out.push((i, 1.0));
-                        }
-                        out
-                    }
-                },
-                None => Vec::new(),
-            },
+                    },
+                    None => Vec::new(),
+                }
+            }
         }
     }
 
@@ -1587,33 +1741,35 @@ impl ErrorSpec {
                     out
                 }
             },
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => match ep.error_model {
-                    ErrorModel::Additive => ep
-                        .sigma_idx
-                        .first()
-                        .copied()
-                        .map(|i| vec![(i, 0.0)])
-                        .unwrap_or_default(),
-                    ErrorModel::Proportional => ep
-                        .sigma_idx
-                        .first()
-                        .copied()
-                        .map(|i| vec![(i, 1.0)])
-                        .unwrap_or_default(),
-                    ErrorModel::Combined => {
-                        let mut out = Vec::with_capacity(2);
-                        if let Some(&i) = ep.sigma_idx.first() {
-                            out.push((i, 1.0));
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => match ep.error_model {
+                        ErrorModel::Additive => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, 0.0)])
+                            .unwrap_or_default(),
+                        ErrorModel::Proportional => ep
+                            .sigma_idx
+                            .first()
+                            .copied()
+                            .map(|i| vec![(i, 1.0)])
+                            .unwrap_or_default(),
+                        ErrorModel::Combined => {
+                            let mut out = Vec::with_capacity(2);
+                            if let Some(&i) = ep.sigma_idx.first() {
+                                out.push((i, 1.0));
+                            }
+                            if let Some(&i) = ep.sigma_idx.get(1) {
+                                out.push((i, 0.0));
+                            }
+                            out
                         }
-                        if let Some(&i) = ep.sigma_idx.get(1) {
-                            out.push((i, 0.0));
-                        }
-                        out
-                    }
-                },
-                None => Vec::new(),
-            },
+                    },
+                    None => Vec::new(),
+                }
+            }
         }
     }
 
@@ -1705,7 +1861,7 @@ impl ErrorSpec {
                     }
                 }
             }
-            ErrorSpec::PerCmt(map) => {
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
                 for ep in map.values() {
                     let types = ep.error_model.sigma_types();
                     for (k, &idx) in ep.sigma_idx.iter().enumerate() {
@@ -1729,21 +1885,41 @@ impl ErrorSpec {
     pub fn dvar_df(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
         let (em, prop_sigma) = match self {
             ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => (
-                    ep.error_model,
-                    ep.sigma_idx
-                        .first()
-                        .and_then(|&i| sigma.get(i))
-                        .copied()
-                        .unwrap_or(0.0),
-                ),
-                None => return 0.0,
-            },
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => (
+                        ep.error_model,
+                        ep.sigma_idx
+                            .first()
+                            .and_then(|&i| sigma.get(i))
+                            .copied()
+                            .unwrap_or(0.0),
+                    ),
+                    None => return 0.0,
+                }
+            }
         };
         match em {
             ErrorModel::Additive => 0.0,
             ErrorModel::Proportional | ErrorModel::Combined => 2.0 * f * prop_sigma * prop_sigma,
+        }
+    }
+
+    /// Flat sigma-vector index of `cmt`'s proportional sigma (the slot a
+    /// magnitude multiplier scales for the `f`-derivative chain): slot `0` for
+    /// `Single`, the endpoint's first `sigma_idx` for `PerCmt`. `None` when
+    /// `PerCmt` has no endpoint registered for `cmt`, or that endpoint declares
+    /// no sigma at all — both cases the `_scaled` derivative callers treat as
+    /// "no residual error here" (`0.0`). Single source for
+    /// [`dvar_df_scaled`](Self::dvar_df_scaled) and
+    /// [`d2var_df2_scaled`](Self::d2var_df2_scaled) so the two can't resolve a
+    /// different slot for the same `(cmt, mult)` (#486 review).
+    fn prop_sigma_slot(&self, cmt: usize) -> Option<usize> {
+        match self {
+            ErrorSpec::Single(_) => Some(0),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                map.get(&cmt)?.sigma_idx.first().copied()
+            }
         }
     }
 
@@ -1757,15 +1933,8 @@ impl ErrorSpec {
     ///
     /// [`dvar_df`]: ErrorSpec::dvar_df
     pub fn dvar_df_scaled(&self, cmt: usize, f: f64, sigma: &[f64], mult: &[f64]) -> f64 {
-        let prop_slot = match self {
-            ErrorSpec::Single(_) => 0,
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => match ep.sigma_idx.first() {
-                    Some(&i) => i,
-                    None => return 0.0,
-                },
-                None => return 0.0,
-            },
+        let Some(prop_slot) = self.prop_sigma_slot(cmt) else {
+            return 0.0;
         };
         let m = mult.get(prop_slot).copied().unwrap_or(1.0);
         self.dvar_df(cmt, f, sigma) * m * m
@@ -1783,22 +1952,48 @@ impl ErrorSpec {
     pub fn d2var_df2(&self, cmt: usize, sigma: &[f64]) -> f64 {
         let (em, prop_sigma) = match self {
             ErrorSpec::Single(em) => (*em, sigma.first().copied().unwrap_or(0.0)),
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => (
-                    ep.error_model,
-                    ep.sigma_idx
-                        .first()
-                        .and_then(|&i| sigma.get(i))
-                        .copied()
-                        .unwrap_or(0.0),
-                ),
-                None => return 0.0,
-            },
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => (
+                        ep.error_model,
+                        ep.sigma_idx
+                            .first()
+                            .and_then(|&i| sigma.get(i))
+                            .copied()
+                            .unwrap_or(0.0),
+                    ),
+                    None => return 0.0,
+                }
+            }
         };
         match em {
             ErrorModel::Additive => 0.0,
             ErrorModel::Proportional | ErrorModel::Combined => 2.0 * prop_sigma * prop_sigma,
         }
+    }
+
+    /// `d²(residual variance)/d(prediction f)²` with a per-observation custom
+    /// magnitude (#484/#576) — the second-derivative analogue of [`dvar_df_scaled`].
+    ///
+    /// The proportional loading carries the multiplier `m_prop`, so the variance's
+    /// `f²·(m_prop·σ_prop)²` term differentiates twice to `2·(m_prop·σ_prop)²`,
+    /// i.e. [`d2var_df2`] scaled by `m_prop²` — exactly the `m²` factor
+    /// [`dvar_df_scaled`] applies to `dvar_df`. Keeping the same scaling here lets
+    /// the M3 censored curvature (which differentiates the same `v(f)`) stay
+    /// internally consistent under a custom RUV magnitude, and the FOCEI outer
+    /// θ/σ gradient's direct-θ channel (`sens_outer_gradient::prepare_stacked`)
+    /// consume the same magnitude-scaled second derivative. A `mult` of all ones
+    /// reproduces [`d2var_df2`].
+    ///
+    /// [`dvar_df_scaled`]: ErrorSpec::dvar_df_scaled
+    /// [`dvar_df`]: ErrorSpec::dvar_df
+    /// [`d2var_df2`]: ErrorSpec::d2var_df2
+    pub fn d2var_df2_scaled(&self, cmt: usize, sigma: &[f64], mult: &[f64]) -> f64 {
+        let Some(prop_slot) = self.prop_sigma_slot(cmt) else {
+            return 0.0;
+        };
+        let m = mult.get(prop_slot).copied().unwrap_or(1.0);
+        self.d2var_df2(cmt, sigma) * m * m
     }
 
     /// `d(residual variance)/d(log σ_k)` for one observation at `cmt`, where
@@ -1817,14 +2012,16 @@ impl ErrorSpec {
         // observation's endpoint.
         let stype = match self {
             ErrorSpec::Single(em) => em.sigma_types().get(k).copied(),
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => ep
-                    .sigma_idx
-                    .iter()
-                    .position(|&i| i == k)
-                    .and_then(|p| ep.error_model.sigma_types().get(p).copied()),
-                None => None,
-            },
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => ep
+                        .sigma_idx
+                        .iter()
+                        .position(|&i| i == k)
+                        .and_then(|p| ep.error_model.sigma_types().get(p).copied()),
+                    None => None,
+                }
+            }
         };
         match stype {
             Some(SigmaType::Proportional) => 2.0 * sk2 * f * f,
@@ -1853,7 +2050,7 @@ impl ErrorSpec {
     pub fn has_f_dependent_variance(&self) -> bool {
         match self {
             ErrorSpec::Single(em) => !matches!(em, ErrorModel::Additive),
-            ErrorSpec::PerCmt(map) => map
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => map
                 .values()
                 .any(|ep| !matches!(ep.error_model, ErrorModel::Additive)),
         }
@@ -1866,7 +2063,7 @@ impl ErrorSpec {
         match self {
             ErrorSpec::Single(ErrorModel::Combined) => vec![1],
             ErrorSpec::Single(_) => Vec::new(),
-            ErrorSpec::PerCmt(map) => {
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
                 let mut out = Vec::new();
                 for endpoint in map.values() {
                     if matches!(endpoint.error_model, ErrorModel::Combined) {
@@ -1886,23 +2083,25 @@ impl ErrorSpec {
         use crate::stats::residual_error::residual_variance;
         match self {
             ErrorSpec::Single(em) => residual_variance(*em, f_pred, sigma),
-            ErrorSpec::PerCmt(map) => match map.get(&cmt) {
-                Some(ep) => {
-                    // Slice length is tied to the endpoint's error model
-                    // (1 for additive/proportional, 2 for combined); the max
-                    // is 2, so a stack buffer avoids a per-observation alloc.
-                    let n = ep.error_model.n_sigma();
-                    let mut buf = [0.0f64; 2];
-                    for k in 0..n.min(2) {
-                        match ep.sigma_idx.get(k).and_then(|&i| sigma.get(i)) {
-                            Some(&v) => buf[k] = v,
-                            None => return f64::NAN, // malformed spec / sigma length
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                match map.get(&cmt) {
+                    Some(ep) => {
+                        // Slice length is tied to the endpoint's error model
+                        // (1 for additive/proportional, 2 for combined); the max
+                        // is 2, so a stack buffer avoids a per-observation alloc.
+                        let n = ep.error_model.n_sigma();
+                        let mut buf = [0.0f64; 2];
+                        for k in 0..n.min(2) {
+                            match ep.sigma_idx.get(k).and_then(|&i| sigma.get(i)) {
+                                Some(&v) => buf[k] = v,
+                                None => return f64::NAN, // malformed spec / sigma length
+                            }
                         }
+                        residual_variance(ep.error_model, f_pred, &buf[..n.min(2)])
                     }
-                    residual_variance(ep.error_model, f_pred, &buf[..n.min(2)])
+                    None => f64::NAN,
                 }
-                None => f64::NAN,
-            },
+            }
         }
     }
 }
@@ -2012,6 +2211,71 @@ pub struct AnalyticalInit {
     /// expression. `None` only for hand-constructed inits with no parsed
     /// expression (those keep the FD fallback).
     pub amount_deriv: Option<crate::parser::model_parser::ScaleDerivProgram>,
+}
+
+/// A full Form C output readout (`[scaling] y = <expr>`) lifted onto an
+/// **analytical** PK model (issue #650).
+///
+/// Analytical closed forms return the built-in central-compartment
+/// *concentration*. A Form C readout **replaces** that concentration with an
+/// arbitrary expression that may reference compartment **amounts** by name
+/// (`central` always; `depot` for oral models — peripheral amounts are rejected
+/// at parse, mirroring `[initial_conditions]`), individual parameters, thetas,
+/// etas, covariates, and `if/else`. This is the analytic analogue of the ODE
+/// Form C readout stored on [`crate::ode::OdeSpec::readout`]; analytical models
+/// have `ode_spec == None`, so the readout lives here instead.
+///
+/// The predictor reconstructs the compartment-amount vector (central =
+/// concentration × `V`; depot = superposed `F·D·exp(-ka·t)`) in `state_names`
+/// order and feeds it, plus individual params / covariates, to the shared
+/// `PkNum`-generic evaluator [`crate::parser::model_parser::OdeOutputProgram::eval_output_g`]
+/// — the same one the ODE provider uses — so FOCE/FOCEI sensitivities stay
+/// analytic over `Dual2`/`Dual1` (no finite-difference fallback on the
+/// supported paths).
+///
+/// `#[non_exhaustive]`: constructed only inside the crate (the parser).
+#[non_exhaustive]
+pub struct AnalyticReadout {
+    /// The compiled readout: `OdeReadout::Single` for uniform `y = <expr>`,
+    /// `OdeReadout::PerCmt` for per-CMT `y[CMT=N] = <expr>`. Reuses the ODE
+    /// readout enum and its f64 `OdeOutputFn` closure(s).
+    pub readout: crate::ode::OdeReadout,
+    /// Sensitivity program for the uniform `Single` readout (issue #650), so the
+    /// analytic provider can differentiate it over `Dual2`/`Dual1`. `None` for
+    /// per-CMT (each `PerCmtReadout` carries its own program) and for readouts
+    /// that are not dual-evaluable (those fall back to FD, matching ODE).
+    pub program: Option<crate::parser::model_parser::OdeOutputProgram>,
+    /// Canonical compartment names in `state[]` order — `["central"]` for IV
+    /// models, `["depot", "central"]` for oral. Parallel to the amount vector
+    /// the predictor builds and to the readout program's `n_states` layout.
+    pub state_names: Vec<String>,
+}
+
+impl AnalyticReadout {
+    /// Whether the readout reads the oral **depot** amount (state slot 0 in the
+    /// `["depot", "central"]` layout).
+    ///
+    /// The depot amount is reconstructed by dose superposition, which is invalid
+    /// across EVID=3/4 resets — a reset zeros the compartments and the closed
+    /// form has no way to restart the accumulation. So `fit`/`predict` reject a
+    /// depot-referencing readout on a subject that carries a reset, rather than
+    /// silently feeding a zero depot into the readout (issue #650 review). A
+    /// readout that only reads `central` is unaffected (the central concentration
+    /// is already reset-correct).
+    pub(crate) fn references_depot(&self) -> bool {
+        if self.state_names.first().map(String::as_str) != Some("depot") {
+            return false;
+        }
+        match &self.readout {
+            crate::ode::OdeReadout::ObsCmt(_) => false,
+            crate::ode::OdeReadout::Single(_) => {
+                self.program.as_ref().is_some_and(|p| p.references_state(0))
+            }
+            crate::ode::OdeReadout::PerCmt(map) => map
+                .values()
+                .any(|r| r.program.as_ref().is_some_and(|p| p.references_state(0))),
+        }
+    }
 }
 
 /// How the structural model's raw output is mapped to the observed `DV`.
@@ -2616,12 +2880,62 @@ pub struct CompiledModel {
     /// `F`-bypassed bolus impulse onto the dose-driven prediction; see
     /// [`AnalyticalInit`] and `pk::add_analytical_init`.
     pub analytical_init: Vec<AnalyticalInit>,
+    /// Full Form C output readout (`[scaling] y = <expr>`) for **analytical** PK
+    /// models (issue #650). `None` for the common case (built-in concentration
+    /// readout), for Forms A/B (`obs_scale`, stored in [`Self::scaling`]), and
+    /// for ODE models (whose Form C readout lives on `ode_spec.readout`). When
+    /// `Some`, the readout replaces the built-in concentration prediction; see
+    /// [`AnalyticReadout`].
+    pub analytic_readout: Option<AnalyticReadout>,
     /// Custom residual-error magnitude (#484). `None` for the common case where
     /// every sigma is a bare parameter (the legacy variance path). `Some` when
     /// the `[error_model]` makes a sigma's magnitude an expression of TIME /
     /// covariates / theta; the FOCE/FOCEI likelihood then scales each
     /// observation's sigma loadings by [`RuvMagnitude::eval_obs`].
     pub ruv_magnitude: Option<RuvMagnitude>,
+    /// A synthesized ODE representation of an analytical model that carries one, used as a
+    /// runtime fallback when the closed form cannot serve a particular subject. Currently
+    /// only `one_cpt_transit`: the closed form assumes constant parameters over each
+    /// absorption window, so a mid-profile `TIME` switch or time-varying covariates route to
+    /// this exact ODE `transit()` equivalent instead (a full boxed sub-model, built lazily so
+    /// it reuses the whole ODE prediction/sensitivity path unchanged and costs nothing for a
+    /// transit fit whose subjects never need it). `None` when the model needs no fallback
+    /// (not transit, or a transit form outside the desugar's scope). See
+    /// [`CompiledModel::effective_for`] and the parser's
+    /// `transit_ode_equivalent_source` (#486).
+    pub transit_ode_equivalent: Option<TransitOdeEquivalent>,
+}
+
+/// A lazily-built ODE representation of an analytical model that carries one (currently only
+/// `one_cpt_transit`). Holds the equivalent's reconstructed `.ferx` source and compiles the
+/// boxed sub-model on first use, so a transit fit whose subjects never hit the fallback
+/// (constant-parameter, non-`TIME`) pays no extra parse or allocation. See
+/// [`CompiledModel::effective_for`] (#486).
+pub struct TransitOdeEquivalent {
+    source: String,
+    built: std::sync::OnceLock<Box<CompiledModel>>,
+}
+
+impl TransitOdeEquivalent {
+    pub(crate) fn new(source: String) -> Self {
+        Self {
+            source,
+            built: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Build (once, thread-safely) and return the ODE equivalent sub-model. The source is
+    /// reconstructed from already-validated model blocks, so parsing it is infallible in
+    /// practice; a failure is an internal reconstruction bug and panics loudly rather than
+    /// silently degrading the fit.
+    pub(crate) fn get_or_build(&self) -> &CompiledModel {
+        self.built.get_or_init(|| {
+            Box::new(
+                crate::parser::model_parser::parse_model_string(&self.source)
+                    .expect("internal: one_cpt_transit ODE equivalent failed to build"),
+            )
+        })
+    }
 }
 
 /// FREM (Full Random Effects Model) configuration.
@@ -2680,6 +2994,26 @@ impl CompiledModel {
         self.ode_spec.is_some()
     }
 
+    /// The model that should actually serve `subject`'s predictions / sensitivities.
+    ///
+    /// For a `one_cpt_transit` model whose closed form cannot cope with this subject — a
+    /// `TIME`-dependent structural parameter or time-varying covariates make the disposition
+    /// switch mid-absorption, which the per-dose Gamma convolution assumes constant — return
+    /// its exact ODE `transit()` equivalent (`transit_ode_equivalent`, built at parse time);
+    /// otherwise `self`. Constant-parameter transit subjects keep the fast, exact closed form.
+    /// The equivalent shares this model's θ/η layout, so callers pass the same parameter
+    /// vector (#486). A no-op (`self`) for every non-transit model.
+    pub fn effective_for<'a>(&'a self, subject: &Subject) -> &'a CompiledModel {
+        if let Some(eq) = &self.transit_ode_equivalent {
+            if crate::parser::model_parser::compiled_model_uses_time_builtin(self)
+                || subject.has_tv_covariates()
+            {
+                return eq.get_or_build();
+            }
+        }
+        self
+    }
+
     /// The compartment-indexed dose-attribute map (`D{cmt}` for `RATE=-2`, …) for
     /// **this model's engine**: the `OdeSpec`'s map for ODE models, the analytical
     /// `dose_attr_map` field otherwise. Single source of truth for "which map
@@ -2717,6 +3051,16 @@ impl CompiledModel {
     /// Returns true when the model has a `[diffusion]` block (SDE / EKF path).
     pub fn is_sde(&self) -> bool {
         self.diffusion_theta_start.is_some()
+    }
+
+    /// True for the **closed-form, non-IOV LTBS** path — the only path that runs the
+    /// analytic `g = ln(f)` *inner* EBE gradient whose ~1e-9 provider-vs-predictor
+    /// gap makes the covariance step tolerance-sensitive (PR #665). ODE-LTBS shares
+    /// `solve_ode_g` with the objective (no gap) and LTBS + IOV routes the inner loop
+    /// to FD, so neither needs the tightened fit/covariance tolerances. Used by
+    /// [`FitOptions::effective_inner_tol`] / [`FitOptions::effective_cov_inner_tol`].
+    pub fn uses_closed_form_ltbs_inner(&self) -> bool {
+        self.log_transform && self.ode_spec.is_none() && self.n_kappa == 0
     }
 
     /// Returns true when the model has a time-to-event (`[event_model]`)
@@ -2866,6 +3210,38 @@ impl CompiledModel {
         Some(out)
     }
 
+    /// Per-observation `∂(residual-magnitude multiplier)/∂θ` for `subject` at
+    /// `theta` (#576/#486), as an `[obs][sigma-slot][theta]` tensor, or `None`
+    /// when no custom magnitude is active *or* any active slot's `Dual1` program
+    /// declines (θ-axis count beyond [`crate::parser::model_parser::MAX_RUV_MAG_AXES`]
+    /// — the analytic outer gradient's own gate,
+    /// [`crate::sens::provider::analytic_outer_gradient_available`], bounds
+    /// `model.n_theta` against the same constant, so this should only return
+    /// `None` here for a model that gate already declined). Feeds the outer θ/σ
+    /// gradient's direct-θ channel (`sens_outer_gradient::prepare_stacked`) — the
+    /// magnitude enters `R` through θ directly, not only through the prediction.
+    pub fn ruv_obs_mult_theta_grad(
+        &self,
+        subject: &Subject,
+        theta: &[f64],
+    ) -> Option<Vec<Vec<Vec<f64>>>> {
+        let rm = self.ruv_magnitude.as_ref()?;
+        if !rm.is_active() {
+            return None;
+        }
+        let n = subject.observations.len();
+        let mut out = Vec::with_capacity(n);
+        for j in 0..n {
+            let time = subject
+                .obs_raw_times
+                .get(j)
+                .copied()
+                .unwrap_or_else(|| subject.obs_times.get(j).copied().unwrap_or(0.0));
+            out.push(rm.eval_obs_theta_grad(theta, subject.obs_cov(j), time)?);
+        }
+        Some(out)
+    }
+
     /// True when a residual error model is defined for `cmt` *and* its sigmas
     /// resolve in `sigma`, so a DV (assay-noised) observation can be drawn there.
     /// False for a [`ErrorSpec::PerCmt`] spec that omits `cmt` (or whose endpoint
@@ -2890,7 +3266,37 @@ impl CompiledModel {
                 ep.sigma_idx.len() >= ep.error_model.n_sigma()
                     && ep.sigma_idx.iter().all(|&i| i < sigma.len())
             }),
+            // `Selected` dispatches on a covariate-resolved branch key, not `cmt`,
+            // so "residual error for this CMT" isn't meaningful per-CMT. Every
+            // observation resolves to some endpoint (the parser requires a final
+            // `else`), so residual error is defined iff *every* endpoint is
+            // well-formed against `sigma`. (Selected is not combined with the
+            // adaptive-dosing monitor path that consults this guard.)
+            ErrorSpec::Selected { endpoints, .. } => {
+                !endpoints.is_empty()
+                    && endpoints.values().all(|ep| {
+                        ep.sigma_idx.len() >= ep.error_model.n_sigma()
+                            && ep.sigma_idx.iter().all(|&i| i < sigma.len())
+                    })
+            }
         }
+    }
+
+    /// Whether a custom residual-error magnitude (#484) is active. The
+    /// per-observation magnitude expression makes the residual variance depend
+    /// on θ directly (not only through the prediction `f`). The analytic gradient
+    /// now carries this via a direct-θ channel (`mag_variance_dtheta` in
+    /// `sens_outer_gradient::prepare_stacked` / `theta_block`; the inner loop via
+    /// `residual_inner_obs`), so **both** loops are analytic on FOCE and FOCEI
+    /// (#644/#659) — including combined with `iiv_on_ruv` on the closed-form
+    /// (#673/#677) and ODE (#486) paths, since the outer assembly is
+    /// provider-agnostic. Per-subject FD fallbacks remain only for magnitude
+    /// combined with an M3-censored row, a correlated `block_sigma`, or more than
+    /// `MAX_RUV_MAG_AXES` θ (see #486's remaining-FD register). The FD forward NLL
+    /// is itself magnitude-aware, so those fallbacks stay exact.
+    #[inline]
+    pub fn has_custom_ruv_magnitude(&self) -> bool {
+        self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
     }
 
     /// Multiplicative factor applied to the residual *variance* for a subject
@@ -2903,46 +3309,6 @@ impl CompiledModel {
     /// `exp(2*eta_k)` is exactly equivalent to scaling the residual SD by
     /// `exp(eta_k)` — i.e. `EPS·EXP(ETA)` — for additive, proportional, and
     /// combined alike.
-    /// One predicate in the `iiv_on_ruv` × {plain | IOV | M3} × {closed-form | ODE}
-    /// routing decision: `true` only for **ODE M3 BLOQ + `iiv_on_ruv`** (the censored
-    /// × residual-eta cross-terms are implemented in the shared assembly, #4c, but the
-    /// ODE path is not yet regression-tested for that combo, so it stays on FD).
-    ///
-    /// **This is NOT the single source of truth for the full routing** — the decision
-    /// is spread across several predicates that must move together, so a future scope
-    /// change has to touch all the relevant ones in lockstep or the inner and outer
-    /// loops desync:
-    /// - this gate (consulted by [`analytic_outer_gradient_available`](crate::sens::provider::analytic_outer_gradient_available)
-    ///   and the inner bails [`analytic_inner_common_bail`] / the ODE inner gate);
-    /// - [`iov_analytical_supported`](crate::sens::provider::iov_analytical_supported)
-    ///   (closed-form IOV: declines M3, served for plain/`iiv_on_ruv`);
-    /// - [`ode_iov_supported`](crate::sens::ode_provider::ode_iov_supported)
-    ///   (ODE IOV + `iiv_on_ruv` routes to FD here, not via this gate);
-    /// - [`analytical_supported`](crate::sens::provider::analytical_supported)
-    ///   (closed-form M3 + `iiv_on_ruv`, #4c).
-    ///
-    /// Net effect today: analytic for **closed-form M3 + `iiv_on_ruv`** (#4c) and
-    /// **closed-form IOV + `iiv_on_ruv`** (#4b/#474); FD for ODE M3 + `iiv_on_ruv`
-    /// (here) and ODE IOV + `iiv_on_ruv` (via `ode_iov_supported`).
-    #[inline]
-    pub fn iiv_on_ruv_forces_fd(&self) -> bool {
-        self.residual_error_eta.is_some()
-            && matches!(self.bloq_method, BloqMethod::M3)
-            && self.ode_spec.is_some()
-    }
-
-    /// Whether a custom residual-error magnitude (#484) is active. The
-    /// per-observation magnitude expression makes the residual variance depend
-    /// on θ directly (not only through the prediction `f`), which the analytic
-    /// inner/outer gradient kernels do not yet carry — so both gradient loops
-    /// fall back to finite differences when this is `true`. The FD forward NLL
-    /// is itself magnitude-aware, so FD stays exact. Removing this gate is the
-    /// Phase 5 follow-up (AD through the magnitude program).
-    #[inline]
-    pub fn has_custom_ruv_magnitude(&self) -> bool {
-        self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
-    }
-
     #[inline]
     pub fn residual_var_scale(&self, eta: &[f64]) -> f64 {
         match self.residual_error_eta {
@@ -2989,7 +3355,8 @@ impl CompiledModel {
                 return (s * s).max(1e-12);
             }
         }
-        self.residual_variance_at_scaled(subject.obs_cmts[j], f_pred, sigma, mult) * ruv_scale
+        self.residual_variance_at_scaled(self.error_spec.obs_key(subject, j), f_pred, sigma, mult)
+            * ruv_scale
     }
 
     /// Canonical compartment names for analytical models, used in `[derived]` expressions.
@@ -3013,6 +3380,7 @@ impl CompiledModel {
             PkModel::OneCptTransit => names!(ONE_CMT_TRANSIT, "depot", "central"),
             PkModel::TwoCptIv => names!(TWO_CMT_IV, "central", "peripheral"),
             PkModel::TwoCptOral => names!(TWO_CMT_ORAL, "depot", "central", "peripheral"),
+            PkModel::TwoCptTransit => names!(TWO_CMT_TRANSIT, "depot", "central", "peripheral"),
             PkModel::ThreeCptIv => names!(THREE_CMT_IV, "central", "peripheral1", "peripheral2"),
             PkModel::ThreeCptOral => names!(
                 THREE_CMT_ORAL,
@@ -3930,6 +4298,21 @@ pub struct FitOptions {
     pub outer_ftol: Option<f64>,
     pub inner_maxiter: usize,
     pub inner_tol: f64,
+    /// Inner EBE-reconvergence tolerance used **only by the covariance step**
+    /// (`[fit_options] cov_inner_tol`), decoupled from the fit's `inner_tol`. The
+    /// covariance R-matrix is a second-difference of the reconverged OFV, and that
+    /// reconvergence is far more sensitive to EBE precision than the fit itself —
+    /// on a flat / weakly-identified surface an EBE converged only to a loose
+    /// `inner_tol` can leave enough residual noise to perturb the standard errors
+    /// (e.g. the heavily-censored M3 + IOV case in #654).
+    ///
+    /// `None` (default) uses `inner_tol`, tightened to at most
+    /// [`LTBS_COV_INNER_TOL`](Self::LTBS_COV_INNER_TOL) (`1e-8`) **for LTBS models**
+    /// (whose `g = ln(f)` covariance Hessian needs it); non-LTBS models keep
+    /// `inner_tol`, so their SEs are byte-identical. Set explicitly to opt any model
+    /// in (e.g. `cov_inner_tol = 1e-11` for the #654 heavily-censored M3 + IOV case)
+    /// or to override the LTBS default. See [`FitOptions::effective_cov_inner_tol`].
+    pub cov_inner_tol: Option<f64>,
     /// RK45 ODE solver relative tolerance (`[fit_options] ode_reltol`, or via
     /// `ferx_fit(settings = list(ode_reltol = ...))`). Default `1e-4`. Only
     /// affects ODE models. The default reproduces analytical closed forms in
@@ -3964,22 +4347,6 @@ pub struct FitOptions {
     /// (`S⁻¹`) and [`CovarianceMethod::Sandwich`] (`R⁻¹SR⁻¹`) add the per-subject
     /// score cross-product `S`; currently supported for FOCEI and IOV fits.
     pub covariance_method: CovarianceMethod,
-    /// Build the covariance R-matrix (Hessian) from second differences of the
-    /// reconverged marginal OFV, rather than from a central difference of the
-    /// analytical population gradient. **Default `true`.** The analytical stencil
-    /// holds the H-matrix `a = ∂f/∂η` fixed in the `log|H̃|` θ-gradient (it omits
-    /// `∂a/∂θ = ∂²f/∂η∂θ`), which biases the SE of *weakly-identified* structural
-    /// parameters — e.g. TVKA on warfarin reads ~9% high versus a Richardson
-    /// FD-of-OFV ground truth. The OFV-Hessian stencil recomputes `a` (and
-    /// everything else) at every perturbed point, so it captures that curvature
-    /// exactly (up to the FD step) and matches the ground truth to <1%; it is the
-    /// same stencil used for IOV and f-dependent FOCE. It costs O(n²) reconverged
-    /// OFV evaluations versus O(n) gradient evaluations, but both stencils
-    /// parallelise over perturbation points so the wall-clock cost is ≈ equal in
-    /// practice. Set `false` to force the faster analytical-gradient stencil
-    /// (e.g. on very high-dimensional models where the O(n²) point count
-    /// dominates).
-    pub covariance_ofv_hessian: bool,
     pub interaction: bool,
     pub verbose: bool,
     /// Outer-loop (population parameter) optimizer. Defaults to
@@ -4411,6 +4778,7 @@ impl Default for FitOptions {
             // only held for well-conditioned fits. Override via `inner_tol = ...`
             // in `[fit_options]` (loosen for speed; tighten with care).
             inner_tol: 1e-5,
+            cov_inner_tol: None,
             // ODE solver tolerances: match OdeSolverOptions::default() so the
             // engine default is unchanged. Opt into tighter accuracy per model
             // via `[fit_options] ode_reltol = ...` (see FitOptions::ode_reltol).
@@ -4421,7 +4789,6 @@ impl Default for FitOptions {
             fd_hessian_step: 1e-2,
             covariance_fallback: CovarianceFallback::None,
             covariance_method: CovarianceMethod::Hessian,
-            covariance_ofv_hessian: true,
             interaction: true,
             verbose: true,
             // `Auto` resolves per model (see `Optimizer::resolve_auto`): the
@@ -4667,7 +5034,14 @@ impl Optimizer {
     /// (see `build_info::gradient_method_outer`), so `auto` lands on the
     /// gradient-based optimizer exactly when there is an exact gradient to feed
     /// it (#490).
-    pub fn resolve_auto(self, model: &CompiledModel) -> Optimizer {
+    ///
+    /// `interaction` is `options.interaction` (`true` for `method = focei`,
+    /// `false` for plain `method = foce`) — a custom residual-magnitude model's
+    /// direct-θ channel is FOCEI-only (#486 review), so a magnitude-active model
+    /// under plain FOCE must still resolve to `Bobyqa` even though
+    /// `analytic_outer_gradient_available` (interaction-agnostic) says the model
+    /// is in scope.
+    pub fn resolve_auto(self, model: &CompiledModel, interaction: bool) -> Optimizer {
         if self != Optimizer::Auto {
             return self;
         }
@@ -4675,7 +5049,7 @@ impl Optimizer {
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
         // gradient.
-        if crate::sens::provider::analytic_outer_gradient_available(model) {
+        if crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction) {
             Optimizer::NloptLbfgs
         } else {
             Optimizer::Bobyqa
@@ -4746,6 +5120,62 @@ impl FitOptions {
             vec![self.method]
         } else {
             self.methods.clone()
+        }
+    }
+
+    /// Covariance-step inner EBE-reconvergence tolerance that **closed-form,
+    /// non-IOV LTBS** models tighten to when `cov_inner_tol` is unset. The
+    /// covariance R-matrix reconverges EBEs under the `g = ln(f)` wrap, which
+    /// amplifies a loosely-converged EBE into the Hessian and inflates the standard
+    /// errors (empirically ~65% on warfarin θ SEs at the `1e-5` default; correct at
+    /// `≤ 1e-8`). This is applied **only for the closed-form, non-IOV LTBS** path
+    /// that actually runs the analytic `ln(f)` inner gradient: blanket-tightening the
+    /// covariance step over-converges some ill-conditioned inner Hessians (e.g. IOV
+    /// block-Ω) into an indefinite covariance, and ODE-LTBS shares `solve_ode_g` so
+    /// it has no such gap. Set `cov_inner_tol` explicitly to opt any other model in
+    /// (e.g. the #654 M3 + IOV case).
+    pub const LTBS_COV_INNER_TOL: f64 = 1e-8;
+
+    /// Effective inner EBE-reconvergence tolerance for the covariance step: an
+    /// explicit `cov_inner_tol` when set; otherwise the fit's `inner_tol`, tightened
+    /// to at most [`LTBS_COV_INNER_TOL`](Self::LTBS_COV_INNER_TOL) only when
+    /// `ltbs_closed_form` (the closed-form, non-IOV LTBS path — see
+    /// [`CompiledModel::uses_closed_form_ltbs_inner`]). Every other model keeps
+    /// `inner_tol`, so its SEs are byte-identical.
+    pub fn effective_cov_inner_tol(&self, ltbs_closed_form: bool) -> f64 {
+        self.cov_inner_tol.unwrap_or_else(|| {
+            if ltbs_closed_form {
+                self.inner_tol.min(Self::LTBS_COV_INNER_TOL)
+            } else {
+                self.inner_tol
+            }
+        })
+    }
+
+    /// Ceiling the fit's inner EBE tolerance is tightened to for **closed-form,
+    /// non-IOV LTBS** models. That path's analytic `g = ln(f)` inner gradient makes
+    /// the marginal surface slightly noisier (the ~1e-9 provider-vs-
+    /// `compute_predictions` gap), so at the loose default the outer optimiser lands
+    /// nondeterministically on flat Ω directions and the standard errors of
+    /// weakly-identified variances become process-dependent. Converging the fit's
+    /// inner loop to at least `1e-6` pins the flat directions; the covariance step
+    /// then reconverges tighter still ([`effective_cov_inner_tol`](Self::effective_cov_inner_tol)).
+    /// ODE-LTBS (shares `solve_ode_g`, no gap) and LTBS + IOV (FD inner) do not need
+    /// this and are left at `inner_tol`.
+    pub const LTBS_FIT_INNER_TOL: f64 = 1e-6;
+
+    /// Effective **fit** inner EBE tolerance for this model: the fit's `inner_tol`,
+    /// tightened to at most [`LTBS_FIT_INNER_TOL`](Self::LTBS_FIT_INNER_TOL) for the
+    /// closed-form, non-IOV LTBS path (`ltbs_closed_form`) **unless the user set
+    /// `inner_tol` explicitly** — an explicit tolerance (e.g. the documented
+    /// accuracy-for-speed `inner_tol = 1e-4`) is always honoured. A fit already
+    /// tighter than the ceiling keeps its own value; every other model is unaffected.
+    pub fn effective_inner_tol(&self, ltbs_closed_form: bool) -> f64 {
+        let user_set_inner_tol = self.user_set_keys.iter().any(|k| k == "inner_tol");
+        if ltbs_closed_form && !user_set_inner_tol {
+            self.inner_tol.min(Self::LTBS_FIT_INNER_TOL)
+        } else {
+            self.inner_tol
         }
     }
 
@@ -4844,7 +5274,6 @@ pub fn framework_keys() -> &'static [&'static str] {
         "covariance",
         "covariance_method",
         "covariance_fallback",
-        "covariance_ofv_hessian",
         "fd_hessian_step",
         "verbose",
         "sir",
@@ -5036,6 +5465,13 @@ pub struct ParsedModel {
     /// in the data and be numerically coded. Drives the file-based readers and
     /// the [`FitResult::covariate_table`].
     pub covariate_decls: Option<Vec<CovariateDecl>>,
+    /// `path` from the optional `[data]` block, resolved relative to the model
+    /// file's own directory by `parse_full_model_file` (NONMEM `$DATA`
+    /// analogue, #690). `None` when the block is absent — callers must then
+    /// supply a dataset path externally, as before. An externally supplied
+    /// path (CLI `--data`, R) always overrides this — see
+    /// [`crate::api::resolve_data_path`].
+    pub data_path: Option<String>,
     /// 1-based source line of each unnamed `[block]` header, keyed by the
     /// lowercased block type (e.g. `"individual_parameters" -> 7`). Used by
     /// `ferx check` to attach a block-level location to diagnostics. Empty when
@@ -5149,7 +5585,9 @@ pub(crate) mod test_helpers {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -5236,7 +5674,9 @@ pub(crate) mod test_helpers {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
 
         let mut baseline_cov = HashMap::new();
@@ -5274,12 +5714,79 @@ mod tests {
     use super::*;
     use approx::assert_relative_eq;
 
+    /// `effective_cov_inner_tol` resolves the covariance-step reconvergence tolerance:
+    /// an explicit `cov_inner_tol` wins; otherwise the fit's `inner_tol`, tightened to
+    /// at most `LTBS_COV_INNER_TOL` (1e-8) for LTBS models only (non-LTBS unchanged).
+    #[test]
+    fn effective_cov_inner_tol_resolution() {
+        let mut o = FitOptions::default();
+        o.cov_inner_tol = None;
+        o.inner_tol = 1e-5;
+        // Non-LTBS: unchanged (byte-identical to before this option).
+        assert_relative_eq!(o.effective_cov_inner_tol(false), 1e-5);
+        // LTBS: tightened to the 1e-8 default.
+        assert_relative_eq!(o.effective_cov_inner_tol(true), 1e-8);
+        // A fit already tighter than 1e-8 keeps its own tolerance (LTBS).
+        o.inner_tol = 1e-10;
+        assert_relative_eq!(o.effective_cov_inner_tol(true), 1e-10);
+        // Explicit override always wins for either model kind.
+        o.inner_tol = 1e-5;
+        o.cov_inner_tol = Some(1e-5);
+        assert_relative_eq!(o.effective_cov_inner_tol(false), 1e-5);
+        assert_relative_eq!(o.effective_cov_inner_tol(true), 1e-5);
+    }
+
+    /// `effective_inner_tol` tightens the fit's inner tolerance to at most 1e-6 for the
+    /// closed-form non-IOV LTBS path (reproducible flat-direction SEs), leaves other
+    /// models untouched, never loosens an already-tighter setting, and — crucially —
+    /// honours an explicit user `inner_tol` (`user_set_keys`).
+    #[test]
+    fn effective_inner_tol_ltbs() {
+        let mut o = FitOptions::default();
+        o.inner_tol = 1e-5;
+        // Non-(closed-form LTBS): unchanged.
+        assert_relative_eq!(o.effective_inner_tol(false), 1e-5);
+        // Closed-form LTBS with the default inner_tol: tightened to the 1e-6 ceiling.
+        assert_relative_eq!(o.effective_inner_tol(true), 1e-6);
+        // A fit already tighter than 1e-6 is kept.
+        o.inner_tol = 1e-8;
+        assert_relative_eq!(o.effective_inner_tol(true), 1e-8);
+        // An EXPLICIT user inner_tol (even looser) is honoured, not overridden (#665 review).
+        o.inner_tol = 1e-4;
+        o.user_set_keys.push("inner_tol".to_string());
+        assert_relative_eq!(o.effective_inner_tol(true), 1e-4);
+    }
+
     /// Transit (`OneCptTransit`) descriptors: canonical name, the analytic 2-state
     /// `[depot, central]` layout, and no modeled-duration infusions (#386).
     #[test]
     fn one_cpt_transit_descriptors() {
         assert_eq!(PkModel::OneCptTransit.canonical_name(), "one_cpt_transit");
         assert!(PkModel::OneCptTransit.infusable_compartments().is_empty());
+    }
+
+    /// Transit (`TwoCptTransit`) descriptors: canonical name + alias round-trip, the
+    /// analytic 3-state `[depot, central, peripheral]` layout, required params
+    /// (cl/v1/q/v2/n/mtt), oral routing, and no modeled-duration infusions (#386 PR D).
+    #[test]
+    fn two_cpt_transit_descriptors() {
+        assert_eq!(PkModel::TwoCptTransit.canonical_name(), "two_cpt_transit");
+        assert_eq!(
+            PkModel::from_name("two_cpt_transit"),
+            Some(PkModel::TwoCptTransit)
+        );
+        assert_eq!(
+            PkModel::from_name("two_compartment_transit"),
+            Some(PkModel::TwoCptTransit)
+        );
+        assert!(PkModel::TwoCptTransit.is_oral());
+        assert!(PkModel::TwoCptTransit.infusable_compartments().is_empty());
+        let req: Vec<&str> = PkModel::TwoCptTransit
+            .required_pk_params()
+            .iter()
+            .map(|(_, n)| *n)
+            .collect();
+        assert_eq!(req, vec!["cl", "v1", "q", "v2", "n", "mtt"]);
     }
 
     /// `sim_residual_variance` must split FREM covariate pseudo-observations
@@ -5393,7 +5900,7 @@ mod tests {
         // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
         let m = test_helpers::analytical_model(GradientMethod::Auto);
         assert_eq!(
-            Optimizer::Auto.resolve_auto(&m),
+            Optimizer::Auto.resolve_auto(&m, true),
             Optimizer::NloptLbfgs,
             "analytic-gradient model should resolve auto → nlopt_lbfgs"
         );
@@ -5407,11 +5914,33 @@ mod tests {
         let forced_fd = test_helpers::analytical_model(GradientMethod::Fd);
         for m in [&ode, &forced_fd] {
             assert_eq!(
-                Optimizer::Auto.resolve_auto(m),
+                Optimizer::Auto.resolve_auto(m, true),
                 Optimizer::Bobyqa,
                 "FD-only model should resolve auto → bobyqa"
             );
         }
+    }
+
+    /// #486 σ-magnitude FOCE port: a custom residual-magnitude model is analytic on
+    /// **both** loops now (the Sheiner–Beal FOCE marginal threads `mult(θ)` through
+    /// its `R⁰`), so `auto` resolves to `NloptLbfgs` under plain `method = foce`
+    /// (`interaction = false`) as well as under FOCEI (`interaction = true`).
+    #[test]
+    fn resolve_auto_analytic_for_custom_magnitude_both_loops() {
+        let content = "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  theta RUV_LATE(1.5, 0.0, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))\n";
+        let m = crate::parser::model_parser::parse_model_string(content).expect("parse");
+        assert!(m.has_custom_ruv_magnitude());
+        assert!(crate::sens::provider::analytic_outer_gradient_available(&m));
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m, false),
+            Optimizer::NloptLbfgs,
+            "FOCE + custom magnitude now has the analytic gradient"
+        );
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&m, true),
+            Optimizer::NloptLbfgs,
+            "FOCEI + custom magnitude has the analytic gradient"
+        );
     }
 
     #[test]
@@ -5427,7 +5956,7 @@ mod tests {
             Optimizer::Bobyqa,
             Optimizer::TrustRegion,
         ] {
-            assert_eq!(opt.resolve_auto(&m), opt);
+            assert_eq!(opt.resolve_auto(&m, true), opt);
         }
     }
 
@@ -6044,6 +6573,22 @@ mod tests {
     }
 
     #[test]
+    fn d2var_df2_scaled_scales_by_mprop_squared() {
+        // d2var_df2 takes the same m² proportional-loading factor as dvar_df_scaled,
+        // so the M3 censored curvature is built from a consistent v(f). A unit mult
+        // reproduces the unscaled value; additive stays 0 at any mult.
+        let combined = ErrorSpec::Single(ErrorModel::Combined);
+        let sigma = [0.3, 2.0];
+        let base = combined.d2var_df2(1, &sigma);
+        assert!((combined.d2var_df2_scaled(1, &sigma, &[3.0, 1.0]) - base * 9.0).abs() < 1e-12);
+        assert!((combined.d2var_df2_scaled(1, &sigma, &[1.0, 1.0]) - base).abs() < 1e-12);
+        assert_eq!(
+            ErrorSpec::Single(ErrorModel::Additive).d2var_df2_scaled(1, &[0.5], &[4.0]),
+            0.0
+        );
+    }
+
+    #[test]
     fn error_spec_per_cmt_variance_at_out_of_range_idx_is_nan() {
         // Hand-constructed endpoint whose sigma_idx points past the sigma slice
         // must yield NaN, not panic.
@@ -6470,6 +7015,24 @@ mod tests {
         assert!(!s.has_ss_doses());
         s.doses.push(dose(true));
         assert!(s.has_ss_doses());
+    }
+
+    #[test]
+    fn subject_has_periodic_ss_dose_requires_ss_flag_and_positive_ii() {
+        let mut s = bare_subject("1");
+        // No doses → false.
+        assert!(!s.has_periodic_ss_dose());
+        // SS flag but `II = 0` (not a periodic SS dose) → false, unlike
+        // `has_ss_doses`, which keys on the flag alone.
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 0.0)];
+        assert!(s.has_ss_doses());
+        assert!(!s.has_periodic_ss_dose());
+        // Periodic SS dose (`SS=1`, `II > 0`) → true.
+        s.doses.push(DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0));
+        assert!(s.has_periodic_ss_dose());
+        // `II > 0` without the SS flag → false.
+        s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 24.0)];
+        assert!(!s.has_periodic_ss_dose());
     }
 
     #[test]

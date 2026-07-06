@@ -117,8 +117,8 @@ pub fn inv_mills(z: f64) -> f64 {
 /// `∂(−logΦ)/∂f = h·m`; the `iiv_on_ruv` residual-η column
 /// `∂(−logΦ)/∂η_ruv = h·z`; and the censored × residual-η cross coefficients via
 /// `C = h·(z² + h·z − 1)` (`C·z`, `C·m`). (The second-order f-curvature `g2` in
-/// [`m3_censored_outer`](crate::estimation::sens_outer_gradient) also signs its
-/// `∂m/∂f` term by the same `σ`.) For the lower tail (`cens ≥ 0`) `σ = +1` and
+/// [`m3_censored_outer`] also signs its `∂m/∂f` term by the same `σ`.) For the
+/// lower tail (`cens ≥ 0`) `σ = +1` and
 /// these reduce to the historical unsigned forms.
 #[inline]
 pub fn m3_censored_kernel(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> (f64, f64, f64) {
@@ -128,6 +128,43 @@ pub fn m3_censored_kernel(y: f64, f: f64, v: f64, dv_df: f64, cens: i8) -> (f64,
     let h = inv_mills(z);
     let m = sgn * (1.0 / w + (y - f) * dv_df / (2.0 * v * w));
     (h, z, m)
+}
+
+/// All M3-censored-row coefficients from a **single** [`m3_censored_kernel`] eval:
+/// `(g1, g2, cz, cm)` = `(∂L/∂f, ∂²L/∂f², C·z, C·m)` for `L = −logΦ(z)`,
+/// `z = σ·(y−f)/√v` (`σ = sign(cens)`), `(h, z, m)` the signed kernel,
+/// `C = h(z²+h·z−1)`:
+/// ```text
+///   g1 = h·m
+///   g2 = h(h+z)·m² + h·∂m/∂f,   ∂m/∂f = σ·{[−2d + (y−f)d2]/(2w³) − 3(y−f)d²/(4w⁵)}
+///   (cz, cm) = (C·z, C·m)       (residual-eta cross coefficients, `iiv_on_ruv`)
+/// ```
+/// `d = ∂v/∂f`, `d2 = ∂²v/∂f²`. `z` and `m` carry the tail sign from the kernel;
+/// `∂m/∂f` is signed here by the same `σ` so the curvature matches the upper tail
+/// for right-censored (`cens < 0`) rows. One kernel (one `erfc`/`exp` pair) per
+/// censored row. Single-sourced here so the FOCEI marginal
+/// ([`gaussian_foce_accum`](crate::stats::likelihood)) and the analytic outer
+/// gradient ([`sens_outer_gradient`](crate::estimation::sens_outer_gradient))
+/// cannot drift.
+#[inline]
+pub fn m3_censored_outer(
+    y: f64,
+    f: f64,
+    v: f64,
+    d: f64,
+    d2: f64,
+    cens: i8,
+) -> (f64, f64, f64, f64) {
+    let (h, z, m) = m3_censored_kernel(y, f, v, d, cens);
+    let sgn = if cens < 0 { -1.0 } else { 1.0 };
+    let w = v.sqrt();
+    let w3 = v * w; // w³
+    let w5 = v * v * w; // w⁵
+    let g1 = h * m;
+    let dm_df = sgn * ((-2.0 * d + (y - f) * d2) / (2.0 * w3) - 3.0 * (y - f) * d * d / (4.0 * w5));
+    let g2 = h * (h + z) * m * m + h * dm_df;
+    let c = h * (z * z + h * z - 1.0);
+    (g1, g2, c * z, c * m)
 }
 
 /// Inverse standard normal CDF (quantile / probit function): the `z` such that

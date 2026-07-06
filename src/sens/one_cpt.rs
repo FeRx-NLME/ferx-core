@@ -75,7 +75,13 @@ pub fn one_cpt_transit_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, n: T, mtt: T, 
     }
     let ke = cl / v;
     let ktr = (n + T::from_f64(1.0)) / mtt;
-    if ke.val() >= ktr.val() {
+    // NaN-safe: proceed only when `ke < KTR` is *definitely* true. Written
+    // `!(ke < ktr)` rather than `ke >= ktr` so a transient `NaN` `ke`/`KTR` (an
+    // additive-η or wide-FD excursion that yields e.g. `cl/v = ∞/∞`) also returns
+    // `0.0` — `NaN >= ktr` is false and would let the NaN slip past the guard into
+    // `mgf`'s `debug_assert`, panicking debug builds on otherwise-valid (e.g.
+    // mis-specified) fits (#386).
+    if !(ke.val() < ktr.val()) {
         return T::from_f64(0.0);
     }
     let abs = TransitAbsorption { n, mtt };

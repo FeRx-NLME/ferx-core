@@ -155,17 +155,56 @@ optimiser is kept inside this region automatically.
 
 **Scope (first version).** This analytic model supports single and multiple
 **bolus** doses, bioavailability, lag time, and a `central` initial amount.
-**Steady-state doses, IOV, time-varying covariates, infusions, and a `depot`
-initial amount are rejected** with an actionable message — use the `transit()`
-ODE forcing above for those. The two paths agree to ODE-solver
+**Steady-state doses, IOV, time-varying covariates, infusions, system resets
+(EVID=3/4), and a `depot` initial amount are rejected** with an actionable message
+— use the `transit()` ODE forcing above for those. The two paths agree to ODE-solver
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
+
+The closed form converges only when the disposition rate is below the transit rate
+`KTR = (n+1)/mtt`. Outside that domain (the **flip-flop** regime) it returns an
+identically-zero profile; a `W_TRANSIT_FLIP_FLOP` warning is emitted at the
+typical-value estimates so this fails loud rather than silently degenerating the
+objective — check the MTT / CL starting estimates, or use an ODE transit model.
 
 [`examples/one_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_transit.ferx)
 is a complete self-contained analytic transit model:
 
 ```bash
 cargo run --release -- examples/one_cpt_transit.ferx --simulate
+```
+
+## Two-compartment analytic transit — `pk two_cpt_transit(cl, v1, q, v2, n, mtt)`
+
+The same closed form extends to a **two-compartment** disposition:
+
+```
+[structural_model]
+  pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=V2, n=NTR, mtt=MTT)
+```
+
+The 2-cpt central impulse response is the bi-exponential `cα·e^{−α·t} + cβ·e^{−β·t}`
+at the disposition macro-rates `α ≥ β`; convolving each exponential with the Savic
+transit density gives the two-term tilting form
+
+```
+  C(t) = (F·Dose/V1) · [ cα·M(α)·e^{−α·t}·P(N+1,(KTR−α)·t)
+                       + cβ·M(β)·e^{−β·t}·P(N+1,(KTR−β)·t) ]
+```
+
+with `cα = (α−k21)/(α−β)`, `cβ = (k21−β)/(α−β)` (`cα + cβ = 1`). It carries the same
+**exact `Dual2` FOCE/FOCEI sensitivities** `∂C/∂{CL, V1, Q, V2, N, MTT, F, η}`, and
+with `N = 0` reduces exactly to 2-cpt first-order oral absorption with `ka = 1/MTT`.
+The **domain** (`α < KTR`, since `α ≥ β`) and **scope/limits** are identical to
+`one_cpt_transit` (bolus doses, bioavailability, lag time; SS / IOV / time-varying
+covariates / infusions / resets / `depot`-init rejected, and the same flip-flop
+`α ≥ KTR` warning — use an ODE transit model for those).
+
+[`examples/two_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/two_cpt_transit.ferx)
+is a complete self-contained example:
+
+```bash
+cargo run --release -- examples/two_cpt_transit.ferx --simulate
 ```
 
 ## Worked example
@@ -465,16 +504,53 @@ way an infusion is injected), so the absorbed mass is exact — not smeared acro
 the step.
 
 ::: {.callout-note}
-## Sensitivity of `dur` is finite-difference
+## Sensitivity of `zero_order(dur)` is analytic (#530)
 
-The other input-rate models carry **exact analytic** (`Dual2`) FOCE/FOCEI
-gradients. `zero_order` is the exception: the derivative with respect to `dur`
-crosses the moving boundary at `tad = dur` (a Leibniz boundary term), which the
-pointwise dual walk cannot express, so `dur`'s gradient is computed by **finite
-differences**. This is correct — just slightly slower and less precise than the
-analytic route. The analytic boundary-impulse mechanism (shared with the
-modeled-duration `Dn` infusion) is tracked as a follow-up
-([#530](https://github.com/FeRx-NLME/ferx-core/issues/530)).
+All input-rate models — including `zero_order(dur)` — carry **exact analytic**
+(`Dual2`) FOCE/FOCEI gradients. The derivative with respect to `dur` crosses the
+moving boundary at `tad = dur` (a Leibniz boundary term); the analytic provider
+delivers the window as a per-segment constant (like an infusion) and injects the
+**rate-off saltation** at the cutoff for that boundary term — the sign-mirror of the
+estimated-lagtime dose-start saltation. The closely-related **modeled-duration /
+modeled-rate infusion** (`RATE=−2` / `D{cmt}` and `RATE=−1` / `R{cmt}`) is analytic
+by the same mechanism, but on the *event-driven* walk.
+
+The two paths differ in what keeps them analytic. A **modeled-duration / -rate dose**
+stays analytic when composed with an estimated lagtime (the start *and* end
+saltations carry the combined `δlag + δdur` shift), an EVID 3/4 reset, time-varying
+covariates, multiple doses, **IOV**, or a **steady-state** dose (the dual SS
+equilibration threads the modeled-window jet into each cycle's active/quiet split, on
+both the ODE and closed-form paths, #486) — only a rate-defined `RATE=-1` infusion
+under `F ≠ 1` falls back to finite differences. The **`zero_order(dur)` forcing** is analytic across
+multiple doses, a mixed (zero- + first-order) pathway, and an EVID 3/4 reset (#486 —
+the reset case is kind-agnostic, so `zero_order` inherits it too) on the static walk,
+and its moving-boundary window is now also carried on the **event-driven** walk, so it
+stays analytic combined with an estimated **lagtime** or **time-varying covariates**
+(#486): the constant `F·amt·frac/dur` window is delivered per segment there, its
+moving end `d.time + lag + dur` (and, under lagtime, its moving start) injected as the
+same rate-on / rate-off saltations used for infusions. Under a covariate that varies
+*across* the window end the rate-off uses the general `g⁻ − g⁺` saltation (the RHS
+Jacobian jumps across the boundary too, not just the forcing). Because the IOV walk is
+the same event-driven walk, **every** absorption forcing is analytic under **IOV** too
+(#486 — the smooth densities `igd`/`transit`/`weibull`/`first_order`, the moving-window
+`zero_order`, and any composition `mixed`/`parallel`; each forcing's rate/window is rebuilt
+from its dose's own occasion-seeded PK jet); the only IOV holdouts are `weibull` + lagtime
+(β<1 onset divergence) and any forcing combined with a **steady-state** dose (the dual SS
+equilibration does not spread the forcing over the cycle).
+See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
+
+The **smooth-density forcings** (`igd`, `transit`, `weibull`, `first_order`) have a
+*wider* analytic scope combined with an EVID 3/4 reset or time-varying covariates:
+all four stay analytic there (#486) — the reset case turns off a dose's pre-reset
+tail exactly like the infusion rule, and the TV-cov case hoists the forcing's
+constants fresh per segment on the event-driven walk. Combined with an **estimated
+lagtime**, `igd`/`transit`/`first_order` are *also* analytic (#486): the continuous
+`∂R_in/∂lag` rides the walk's dual time-after-dose, and the forcing's onset at the
+dose's lagged arrival is injected as an exact rate-on saltation — the sign-mirror of
+the `zero_order` rate-off saltation above, generalised from a constant rate to
+`R_in(0⁺)`. `weibull` + lagtime still falls back to finite differences: its onset can
+diverge for shape `β < 1` (an integrable spike, not a finite jump), so no closed-form
+saltation exists there.
 :::
 
 ### Worked examples
@@ -550,12 +626,24 @@ feed a compartment — biphasic zero-order is rejected when the model is parsed 
 
 ### Sensitivities
 
-`parallel` (only smooth `first_order` terms) keeps **exact analytic** (`Dual2`)
-FOCE/FOCEI gradients — including the derivative with respect to the pathway fraction.
-`mixed` contains a `zero_order` term, so — exactly as for a plain `zero_order` model —
-the zero-order **duration and fraction** are differentiated by **finite differences**
-(the moving-boundary case, [#530](https://github.com/FeRx-NLME/ferx-core/issues/530));
-the first-order pathway's parameters stay analytic.
+Both `parallel` (smooth `first_order` terms) and `mixed` (a `zero_order` term
+alongside a `first_order` one) keep **exact analytic** (`Dual2`) FOCE/FOCEI
+gradients — including the derivatives with respect to the pathway fraction and the
+zero-order **duration**: the moving-boundary `∂/∂dur` is carried by the rate-off
+saltation at the cutoff
+([#530](https://github.com/FeRx-NLME/ferx-core/issues/530)). Both families are now
+analytic combined with an EVID 3/4 reset, **time-varying covariates**, *or* an
+estimated **lagtime** (#486): **`parallel`** (two `first_order` terms, no `zero_order`)
+because every forcing feeding the compartment is a smooth density carried on the
+event-driven walk; **`mixed`** because that walk now also carries the `zero_order`
+term's moving-boundary window (delivered as a per-segment constant, with rate-on /
+rate-off saltations at its moving start / end). In the `mixed` case the two forcings
+switch on together at the lagged arrival, so their onset saltations sum on the shared
+compartment. The **IOV** path shares this same event-driven walk, so **all** of these
+families (`igd`/`transit`/`weibull`/`first_order`, `zero_order`, `mixed`, `parallel`) are
+analytic under IOV too (#486); the only holdouts are `weibull` + lagtime and any forcing
+combined with a **steady-state** dose (the dual SS equilibration does not spread the
+forcing over the cycle).
 
 ### Worked examples
 

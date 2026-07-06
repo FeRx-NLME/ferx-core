@@ -118,6 +118,48 @@ the same `TIME` event clock drives ODE right-hand sides
 (`tests/time_origin.rs::ode_time_builtin_*`) and `[derived]` columns
 (`tests/derived_output.rs::derived_time_builtin_echoes_per_observation_time`).
 
+#### Analytic gradient & SE check against NONMEM (#486)
+
+On closed-form (non-IOV) 1-/2-/3-cpt models, a `TIME`-switched structural
+parameter gets the **exact analytic FOCE/FOCEI gradient** (the per-event time is
+threaded into the same event-driven `Dual2`/`Dual1` sensitivity walk used for
+time-varying covariates), not finite differences — so the optimiser, its standard
+errors, and NONMEM's `METHOD=1 INTER` agree. Fitting a 60-subject 1-cpt IV bolus
+simulated with a CL switch at `TIME = 45` (`IF (TIME.GT.45) CL = TVCL_LATE …`):
+
+| Parameter | ferx (analytic) | NONMEM `METHOD=1 INTER` |
+|-----------|----------------:|------------------------:|
+| OFV       | −3737.394       | −3737.394               |
+| `TVCL`    | 2.1029 (SE 0.0733) | 2.1029 (SE 0.0736)   |
+| `TVCL_LATE` | 1.0457 (SE 0.0381) | 1.0456 (SE 0.0383) |
+| `TVV`     | 53.107 (SE 1.364) | 53.108 (SE 1.364)     |
+| ω²(CL)    | 0.07212 (SE 0.01343) | 0.07212 (SE 0.01344) |
+| ω²(V)     | 0.03458 (SE 0.00692) | 0.03458 (SE 0.00692) |
+| `PROP_ERR`| 0.10274 (SE 0.00299) | 0.10274 (SE 0.00299) |
+
+The same dataset fit with an **ODE** version of the model (`ode(states=[central])`
+with `d/dt(central) = -(CL/V)·central` and a Form-C `[scaling] y = central/V`
+readout) reproduces the fit under its own analytic gradient — OFV −3737.395, `TVCL`
+2.1029, `TVCL_LATE` 1.0457, `TVV` 53.107, identical SEs — confirming the ODE route
+threads the per-event `TIME` the same way (the ~0.002 OFV difference is ODE-integrator
+vs NONMEM's analytic ADVAN1).
+
+Estimates match to 4–5 significant figures and standard errors to ~0.3%. The
+analytic gradient itself is pinned against central finite differences of the
+production predictor across every supported route:
+`time_builtin_provider_matches_fd_of_production` (closed-form non-IOV, 1-/2-cpt IV
+switch and 1-cpt oral), `iov_time_builtin_provider_matches_fd_of_predict_iov`
+(closed-form IOV, stacked `[η_bsv, κ]`), and
+`ode_time_builtin_provider_matches_fd_of_production` (non-IOV ODE), and
+`ode_iov_time_builtin_provider_matches_fd_of_predict_iov` (ODE IOV) — including in
+combination with an η-dependent `ExpressionScale` obs_scale (the event-driven walk
+now applies the subject-static scale quotient post-walk). A direct
+`pk(...=TIME)` structural mapping is served analytically too: the parser desugars
+the mapped slot into a hidden individual parameter (`__ferx_pktime_*`), so it is
+exactly the explicit `[individual_parameters]` form and rides the same per-event
+walk (`time_builtin_direct_pk_mapping_matches_fd_of_production`,
+`time_builtin_direct_pk_mapping_equivalent_to_explicit_indiv_param`).
+
 ### Interaction with mu-referencing
 
 When the assignment to a parameter is wrapped in an `if` block, the

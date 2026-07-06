@@ -2,8 +2,46 @@ use ferx_core::NcaInit;
 use std::env;
 use std::time::Instant;
 
+/// Top-level usage/help text, shared by the no-args error path (stderr, exit 1)
+/// and `ferx -h`/`--help` (stdout, exit 0) so the two can't drift apart.
+const MAIN_USAGE: &str = "\
+Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]]
+       ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
+       ferx check <model.ferx> [--data <data.csv>] [--json]
+       ferx summary <run.fitrx>
+
+Fits a NLME model and writes sdtab.csv with residuals.
+Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
+
+--data is optional if the model file has a [data] block (path = ...);
+       an explicit --data overrides it, with a warning if they differ.
+
+--threads N    use N rayon workers (N > 0)
+--threads 0    use rayon default (one worker per logical CPU)
+--threads auto alias for --threads 0
+
+--output PATH  also write a portable .fitrx fit bundle (zip of JSON+CSV)
+--include-data embed the input --data CSV inside the .fitrx (off by default)
+
+--inits-from-nca[=METHOD]  derive NCA-based starting values before fitting,
+               overriding the model file. METHOD is nca, nca_sweep (default),
+               or nca_ebe; a bare --inits-from-nca means nca_sweep.
+
+-h, --help     print this help and exit
+";
+
+/// True for either spelling of the help flag.
+fn is_help_flag(arg: Option<&String>) -> bool {
+    matches!(arg.map(String::as_str), Some("-h") | Some("--help"))
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    if is_help_flag(args.get(1)) {
+        print!("{MAIN_USAGE}");
+        std::process::exit(0);
+    }
 
     // `ferx check ...` is a separate, non-fitting subcommand: parse + validate a
     // model (optionally against data) and report structured diagnostics. Dispatch
@@ -12,24 +50,15 @@ fn main() {
         std::process::exit(run_check(&args));
     }
 
+    // `ferx summary <run.fitrx>` is a read-only reporting subcommand (like
+    // psn::sumo): load a saved fit bundle and print parameter estimates plus
+    // basic run info to stdout. Dispatch before the fit/simulate path.
+    if args.get(1).map(String::as_str) == Some("summary") {
+        std::process::exit(run_summary(&args));
+    }
+
     if args.len() < 2 {
-        eprintln!("Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]]");
-        eprintln!("       ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]");
-        eprintln!("       ferx check <model.ferx> [--data <data.csv>] [--json]");
-        eprintln!();
-        eprintln!("Fits a NLME model and writes sdtab.csv with residuals.");
-        eprintln!("Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)");
-        eprintln!();
-        eprintln!("--threads N    use N rayon workers (N > 0)");
-        eprintln!("--threads 0    use rayon default (one worker per logical CPU)");
-        eprintln!("--threads auto alias for --threads 0");
-        eprintln!();
-        eprintln!("--output PATH  also write a portable .fitrx fit bundle (zip of JSON+CSV)");
-        eprintln!("--include-data embed the input --data CSV inside the .fitrx (off by default)");
-        eprintln!();
-        eprintln!("--inits-from-nca[=METHOD]  derive NCA-based starting values before fitting,");
-        eprintln!("               overriding the model file. METHOD is nca, nca_sweep (default),");
-        eprintln!("               or nca_ebe; a bare --inits-from-nca means nca_sweep.");
+        eprint!("{MAIN_USAGE}");
         std::process::exit(1);
     }
 
@@ -52,10 +81,6 @@ fn main() {
     if include_data && output_path.is_none() {
         eprintln!("Warning: --include-data has no effect without --output");
     }
-    if include_data && data_path.is_none() {
-        eprintln!("Warning: --include-data ignored (no --data file to embed)");
-    }
-
     // Honor --threads by sizing rayon's global pool (build_global() is once-per-process,
     // correct for a CLI binary) so fit()'s default pool — sized to current_num_threads()
     // — inherits the count. The 32 MiB worker stack that wide ODE+IOV analytic gradients
@@ -72,13 +97,21 @@ fn main() {
     }
 
     let t_start = Instant::now();
-    let result = if let Some(csv_path) = data_path {
-        ferx_core::run_model_with_data_inits(model_path, csv_path, inits_from_nca)
+    // Precedence: an explicit `--data` always wins (unchanged); `--simulate`
+    // is checked next (unchanged); only when neither flag is given do we fall
+    // through to `run_model_with_data_inits(.., None, ..)`, which resolves the
+    // model's own optional `[data] path = ...` (#690) and errors if that's
+    // absent too.
+    let result = if data_path.is_some() {
+        ferx_core::run_model_with_data_inits(
+            model_path,
+            data_path.map(String::as_str),
+            inits_from_nca,
+        )
     } else if simulate {
         ferx_core::run_model_simulate(model_path)
     } else {
-        eprintln!("Error: specify --data <file.csv> or --simulate");
-        std::process::exit(1);
+        ferx_core::run_model_with_data_inits(model_path, None, inits_from_nca)
     };
     let elapsed = t_start.elapsed();
 
@@ -127,8 +160,18 @@ fn main() {
 
             if let Some(out) = &output_path {
                 let model_source = std::fs::read_to_string(model_path).unwrap_or_default();
+                // Use the resolved data path from the fit result, not the raw
+                // `--data` flag: with a model-declared `[data]` block (#690)
+                // and no `--data`, the CSV that was actually fit is only known
+                // here (`run_model_with_data_inits` resolved and stamped it).
+                // `--simulate` is the only case with nothing to embed: any
+                // successful non-simulate fit has `resolve_data_path`-guaranteed
+                // `Some` data path (an `Err` there exits before this point).
                 let include = if include_data {
-                    data_path.map(std::path::PathBuf::from)
+                    if simulate {
+                        eprintln!("Warning: --include-data ignored (no data file to embed)");
+                    }
+                    fit_result.data_path.as_ref().map(std::path::PathBuf::from)
                 } else {
                     None
                 };
@@ -173,6 +216,41 @@ fn main() {
     }
 }
 
+const SUMMARY_USAGE: &str = "\
+Usage: ferx summary <run.fitrx>
+
+Prints a psn::sumo-style summary — parameter estimates with %RSE
+plus basic run info — from a saved .fitrx fit bundle.
+";
+
+/// Run the `summary` subcommand: load a `.fitrx` bundle and print a
+/// `psn::sumo`-style summary (parameter estimates + basic run info) to stdout.
+/// Returns the process exit code: `0` = printed (incl. `--help`), `1` = load
+/// failed, `2` = usage (missing/flag-looking path).
+fn run_summary(args: &[String]) -> i32 {
+    if is_help_flag(args.get(2)) {
+        print!("{SUMMARY_USAGE}");
+        return 0;
+    }
+    let path = match args.get(2) {
+        Some(p) if !p.starts_with("--") => p.as_str(),
+        _ => {
+            eprint!("{SUMMARY_USAGE}");
+            return 2;
+        }
+    };
+    match ferx_core::io::fitrx::load_fit(std::path::Path::new(path)) {
+        Ok(loaded) => {
+            print!("{}", ferx_core::io::output::format_summary(&loaded.fit));
+            0
+        }
+        Err(e) => {
+            eprintln!("Error: failed to load {}: {}", path, e);
+            1
+        }
+    }
+}
+
 /// Parsed `ferx check` arguments.
 #[derive(Debug, PartialEq, Eq)]
 struct CheckArgs<'a> {
@@ -212,9 +290,23 @@ fn parse_check_args(args: &[String]) -> Result<CheckArgs<'_>, CheckArgsError> {
     Ok(CheckArgs { model, data, json })
 }
 
+const CHECK_USAGE: &str = "\
+Usage: ferx check <model.ferx> [--data <data.csv>] [--json]
+
+Validates a model file without fitting and reports structured
+diagnostics. With --data, also runs data-dependent checks
+(covariates present, per-CMT coverage, steady-state, lag time).
+--json   emit the report as JSON to stdout
+";
+
 /// Run the `check` subcommand. Returns the process exit code:
-/// `0` = valid (no errors), `1` = errors found, `2` = usage / serialization error.
+/// `0` = valid (no errors) or `--help`, `1` = errors found, `2` = usage /
+/// serialization error.
 fn run_check(args: &[String]) -> i32 {
+    if is_help_flag(args.get(2)) {
+        print!("{CHECK_USAGE}");
+        return 0;
+    }
     let parsed = match parse_check_args(args) {
         Ok(p) => p,
         Err(CheckArgsError::MissingDataValue) => {
@@ -222,12 +314,7 @@ fn run_check(args: &[String]) -> i32 {
             return 2;
         }
         Err(CheckArgsError::Usage) => {
-            eprintln!("Usage: ferx check <model.ferx> [--data <data.csv>] [--json]");
-            eprintln!();
-            eprintln!("Validates a model file without fitting and reports structured");
-            eprintln!("diagnostics. With --data, also runs data-dependent checks");
-            eprintln!("(covariates present, per-CMT coverage, steady-state, lag time).");
-            eprintln!("--json   emit the report as JSON to stdout");
+            eprint!("{CHECK_USAGE}");
             return 2;
         }
     };
@@ -358,8 +445,8 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_check_args, parse_inits_from_nca_flag, parse_output_flag, parse_threads_flag,
-        print_check_human, run_check, CheckArgsError,
+        is_help_flag, parse_check_args, parse_inits_from_nca_flag, parse_output_flag,
+        parse_threads_flag, print_check_human, run_check, run_summary, CheckArgsError,
     };
     use ferx_core::NcaInit;
 
@@ -503,6 +590,26 @@ mod tests {
     }
 
     #[test]
+    fn run_check_help_returns_0() {
+        assert_eq!(run_check(&args(&["check", "-h"])), 0);
+        assert_eq!(run_check(&args(&["check", "--help"])), 0);
+    }
+
+    #[test]
+    fn run_summary_help_returns_0() {
+        assert_eq!(run_summary(&args(&["summary", "-h"])), 0);
+        assert_eq!(run_summary(&args(&["summary", "--help"])), 0);
+    }
+
+    #[test]
+    fn is_help_flag_recognizes_both_spellings_only() {
+        assert!(is_help_flag(Some(&"-h".to_string())));
+        assert!(is_help_flag(Some(&"--help".to_string())));
+        assert!(!is_help_flag(Some(&"--json".to_string())));
+        assert!(!is_help_flag(None));
+    }
+
+    #[test]
     fn run_check_missing_data_value_returns_2() {
         assert_eq!(run_check(&args(&["check", VALID_MODEL, "--data"])), 2);
     }
@@ -536,6 +643,41 @@ mod tests {
         let bad_path = bad.to_str().unwrap();
         assert_eq!(run_check(&args(&["check", bad_path])), 1);
         assert_eq!(run_check(&args(&["check", bad_path, "--json"])), 1);
+    }
+
+    // ── run_summary: in-process coverage of the `summary` subcommand ──────────
+
+    const WARFARIN_MODEL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/warfarin.ferx");
+
+    #[test]
+    fn run_summary_usage_errors_return_2() {
+        // No path, and a flag where the path should be — both usage (2).
+        assert_eq!(run_summary(&args(&["summary"])), 2);
+        assert_eq!(run_summary(&args(&["summary", "--json"])), 2);
+    }
+
+    #[test]
+    fn run_summary_missing_file_returns_1() {
+        assert_eq!(run_summary(&args(&["summary", "/no/such/file.fitrx"])), 1);
+    }
+
+    #[test]
+    fn run_summary_valid_fitrx_returns_0() {
+        // Produce a real .fitrx via simulate (fast — no optimization loop), then
+        // load and summarize it in-process so the success arm is covered.
+        let (fit, pop) = ferx_core::run_model_simulate(WARFARIN_MODEL).expect("simulate warfarin");
+        let src = std::fs::read_to_string(WARFARIN_MODEL).expect("read model");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.fitrx");
+        ferx_core::io::fitrx::save_fit(
+            &fit,
+            &pop,
+            &src,
+            &path,
+            ferx_core::io::fitrx::SaveFitOptions::default(),
+        )
+        .expect("save fitrx");
+        assert_eq!(run_summary(&args(&["summary", path.to_str().unwrap()])), 0);
     }
 
     #[test]

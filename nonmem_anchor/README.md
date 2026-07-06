@@ -377,3 +377,79 @@ gradients) — a converged result.
 (The issue-#409 acceptance also names a FREM-workshop run6 IMPMAP −2LL ≈ 6869
 cross-check. That dataset is not in this repo; this self-contained FOCEI anchor
 is the in-repo NONMEM comparison.)
+
+---
+
+# `first_order(ka)` + estimated lagtime (`ALAG1`), PR2 of #486
+
+Cross-engine anchor for the **new rate-on saltation** the event-driven ODE
+sensitivity walk injects when a built-in absorption input-rate forcing is
+combined with an **estimated lagtime**: the forcing's onset (`R_in(0⁺)`, a
+discontinuity in `du/dt` at the dose's lagged arrival) needed a new saltation
+term beyond the existing lagged-infusion / `zero_order` rate-boundary injections
+(see `docs/model-file/absorption.qmd`). `first_order`'s onset is *always*
+finite and nonzero (`dose·ka`) — unlike `igd` (identically zero) or `transit`
+at `n > 0` (also zero) — so it is the sharpest available check of that new code.
+
+| File | Role |
+|------|------|
+| `simulate_first_order_alag.py` | Deterministic simulator (seed 486): 30 subjects, single 100 mg dose, IIV on CL/KA, proportional error; observations restricted to `t > TVLAG` (a `t < lag` point is an exact-zero-variance singularity for a proportional error model on either engine). |
+| `first_order_alag.ctl` | NONMEM control — plain `ADVAN2 TRANS2` + `ALAG1`, **no `$DES`**. |
+| `first_order_alag_nm.csv` | NONMEM's copy (dose `CMT=1`=depot, obs `CMT=2`=central). |
+| `../data/first_order_alag.csv` | Same simulation re-keyed to `CMT=1` throughout (ferx's single `central` state fed directly by the forcing) — likelihood-equivalent to the NONMEM layout. |
+| `first_order_alag_fit.ferx` | The matching ferx model. |
+| `results/first_order_alag.{ext,lst}` | Committed NONMEM output (`MINIMIZATION SUCCESSFUL`). |
+| `../tests/first_order_alag_nonmem_anchor.rs` | Slow-gated acceptance test. |
+
+## Why `ADVAN2`, not `ADVAN13 $DES`
+
+ferx's `d/dt(central) = first_order(ka=KA) - CL/V*central` (the dose feeds the
+forcing directly — no separate depot state) is mathematically **identical** to
+the classic depot→central first-order absorption: the "input into central" from
+an exponentially-decaying depot IS exactly `R_in(tad) = dose·ka·e^{-ka·tad}`. So
+this anchors against a plain `ADVAN2 TRANS2 + ALAG1` control — no `$DES`,
+no `PODO`/`TDOS` bookkeeping, no ODE solver on the NONMEM side at all.
+
+An `ADVAN13 $DES` control combining `igd()` with a manually-shifted `TDOS` (the
+same trick `freijer_ig.ctl` uses for the no-lag anchor) was tried first and
+**abandoned**: NONMEM's `LSODA` integrator choked (`ERROR IN LSODA: CODE -3`) on
+the hand-rolled `IF/THEN/ELSE` discontinuity at the lagged arrival, even after
+declaring `ALAG1` (with `F1=0`, so the dose amount itself is zero) specifically
+to force a segment break there. `igd`'s onset is identically zero anyway (no
+saltation-jump risk), so `first_order` + a closed-form `ADVAN2` control is both
+the higher-value and the more tractable anchor.
+
+## Run it
+
+```bash
+python3 nonmem_anchor/simulate_first_order_alag.py   # regenerate the two CSVs
+nmfe75 first_order_alag.ctl first_order_alag.lst      # NONMEM (from nonmem_anchor/)
+cargo test --test first_order_alag_nonmem_anchor \
+  --features slow-tests -- --nocapture                # ferx (independent FOCEI fit)
+```
+
+## RESULT — independently converged, not evaluated at a shared point
+
+Unlike the `igd`/`transit`/`weibull` anchors above (mis-specified vs their
+shared transit-simulated dataset, so evaluated at NONMEM's optimum to sidestep
+a flat-ridge optimiser-path difference), this dataset is simulated from the
+*matched* model — both engines converge cleanly from their own defaults.
+
+| Quantity | NONMEM 7.5.1 | ferx v0.1.6 | Δ (ferx vs NM) |
+|----------|-------------:|------------:|----------------|
+| OFV | −1046.6853 | −1046.6853 | **0.0000** |
+| CL | 5.17325 | 5.173217 | −0.0006% |
+| V | 49.71960 | 49.719630 | +0.00006% |
+| KA | 1.02497 | 1.024977 | +0.0007% |
+| ALAG1 | 0.49929 | 0.499291 | +0.0002% |
+| ω²(CL) | 0.066478 | 0.066477 | −0.001% |
+| ω²(KA) | 0.024357 | 0.024362 | +0.02% |
+| σ²(prop) | 0.009762 | 0.009761 (0.098799² SD) | −0.01% |
+
+**Verdict.** Both engines land at the same optimum to ~1e-4 relative on every
+fixed effect and variance component, and the OFV matches to 8 decimal places.
+This confirms the event-driven walk's new rate-on onset saltation (`Δr =
+R_in(0⁺)`) is exact — the ongoing `∂R_in/∂lag` chain rule through the dual
+time-after-dose alone (no jump correction) would have under-counted the lagtime
+gradient and pulled `ALAG1` off its true value under FOCEI's gradient-based
+inner/outer loops.

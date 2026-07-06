@@ -96,14 +96,19 @@ above — numerically equivalent, and still allocation-free.
   reconstruction does not seed it, so `[derived]` expressions referencing
   `compartments[i]` evaluate to `NaN` for baseline models (`W_DERIVED_INIT_ANALYTICAL`).
   Use an ODE model if compartment amounts are required.
-- **IOV models fall back to finite differences.** A non-IOV
-  `[initial_conditions]` model uses exact analytic FOCE/FOCEI gradients under
-  `gradient = auto` (issue #524): the `Dual2`/`Dual1` sensitivity kernels carry
-  the init impulse and its θ/η dependence, so the baseline no longer forces FD.
-  An **IOV** model (kappa) with an init baseline still uses `gradient = fd`
-  automatically — the per-occasion analytic init gradient is a planned follow-up.
-  Results are correct in both cases; for an IOV init model the startup banner
-  reports `gradient: FD [requested: auto]`.
+- **Exact analytic gradients, including under IOV and time-varying covariates.**
+  An `[initial_conditions]` baseline uses exact analytic FOCE/FOCEI gradients
+  under `gradient = auto` (issue #524): the `Dual2`/`Dual1` sensitivity kernels
+  carry the init impulse and its θ/η dependence, so the baseline never forces FD.
+  As of issue #486 this holds for the full feature set — the closed-form baseline
+  on the time-varying-covariate walk, and the baseline **under IOV** (kappa) on
+  both the closed-form and ODE engines. For an IOV baseline the amount `A₀` is
+  driven by the between-subject (BSV) parameters while the decay kernel follows
+  each occasion's clearance, matching the `predict_iov` prediction. On ODE
+  `[odes]` models the same applies when the baseline is combined with a finite
+  infusion, an estimated lagtime, a built-in input-rate forcing, steady-state
+  dosing, a modeled-duration/rate dose, or an EVID 3/4 reset (production re-applies
+  `init` at each reset, and the sensitivity walk re-seeds it there).
 
 ## NONMEM comparison
 

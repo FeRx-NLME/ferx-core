@@ -262,6 +262,11 @@ pub(crate) fn compile_observe(
         &model.pk_indices,
         &ode.state_names,
         &model.kappa_names,
+        // The latent `observe` readout is only evaluated for the simulation
+        // controller (not the analytic-sensitivity path), so no θ/η desugaring (#486).
+        &[],
+        // ODE-only path: any integrated state is valid, no forbidden names (#650).
+        &[],
     )?;
     Ok((out_fn, cov_names))
 }

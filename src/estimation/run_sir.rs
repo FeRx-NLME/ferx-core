@@ -250,7 +250,7 @@ mod tests {
 
         let fit = fit_from_files(
             model_path.to_str().unwrap(),
-            data_path.to_str().unwrap(),
+            Some(data_path.to_str().unwrap()),
             None,
             Some(quick_opts()),
         )
@@ -285,7 +285,7 @@ mod tests {
         };
         let fit = fit_from_files(
             model_path.to_str().unwrap(),
-            data_path.to_str().unwrap(),
+            Some(data_path.to_str().unwrap()),
             None,
             Some(opts.clone()),
         )
@@ -309,7 +309,7 @@ mod tests {
         let opts = quick_opts();
         let fit = fit_from_files(
             model_path.to_str().unwrap(),
-            data_path.to_str().unwrap(),
+            Some(data_path.to_str().unwrap()),
             None,
             Some(opts.clone()),
         )
@@ -342,8 +342,8 @@ mod tests {
         data_path: &str,
         opts: FitOptions,
     ) -> Option<FitResult> {
-        let fit =
-            fit_from_files(model_path, data_path, None, Some(opts)).expect("fit must converge");
+        let fit = fit_from_files(model_path, Some(data_path), None, Some(opts))
+            .expect("fit must converge");
         if fit.covariance_matrix.is_none() {
             eprintln!(
                 "[skip] covariance step did not produce a matrix (likely FD \
@@ -587,7 +587,7 @@ mod tests {
 
         let mut fit = fit_from_files(
             model_path.to_str().unwrap(),
-            data_path.to_str().unwrap(),
+            Some(data_path.to_str().unwrap()),
             None,
             Some(quick_opts()),
         )

@@ -13,7 +13,7 @@
 //! Tier 3 (full convergence) — gated behind `slow-tests`.
 
 use ferx_core::parser::model_parser::parse_model_string;
-use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
+use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
 
 /// Warfarin 1-cpt oral, proportional error — the NONMEM-validated reference model.
@@ -83,7 +83,13 @@ fn fit_warfarin(src: &str) -> ferx_core::FitResult {
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;
     opts.interaction = true;
-    opts.optimizer = Optimizer::Lbfgs;
+    // Default optimizer (`Auto` → analytic-gradient NLopt L-BFGS). The built-in
+    // `Lbfgs` stops short on the analytical warfarin surface ("did not converge"),
+    // leaving a near-saddle where the default OFV-second-difference covariance
+    // Hessian picks up a large negative eigenvalue and — after the eigenvalue
+    // floor — explodes SE(TVV) to ~50. `Auto` reaches the true stationary point,
+    // where the FD-of-OFV Hessian is well-conditioned and SE(TVV) matches NONMEM
+    // (0.240). The ODE twin already converged, hence only its SEs were sane.
     opts.outer_maxiter = 300;
     opts.run_covariance_step = true;
     opts.verbose = false;

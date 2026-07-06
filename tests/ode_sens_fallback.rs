@@ -110,24 +110,28 @@ fn armed_baseline_is_on_the_analytic_path() {
 }
 
 #[test]
-fn modeled_duration_dose_declines() {
-    // RATE=-2 (D{cmt}) arrives unresolved; the dual walk would read the raw
-    // rate/duration. Must fall back (the production path resolves per-eval).
+fn modeled_duration_dose_without_slot_declines() {
+    // #530: a modeled-duration dose IS now analytic on the event-driven walk (see the
+    // `ode_provider_modeled_duration_matches_production` unit test) — BUT only when its
+    // `D{cmt}` slot is declared. `ARMED` has no `D1` parameter, so this dose can't be
+    // resolved; the gate must decline to FD rather than emit a wrong gradient. (A real
+    // such model is rejected by `check_model_data`; this guards the defensive gate.)
     let model = parse(ARMED);
     let dose = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
     assert!(
         declines(&model, vec![dose]),
-        "modeled-duration dose must fall back to FD"
+        "modeled-duration dose with no D{{cmt}} slot must fall back to FD"
     );
 }
 
 #[test]
-fn modeled_rate_dose_declines() {
+fn modeled_rate_dose_without_slot_declines() {
+    // Mirror of the duration case (#530): analytic when `R{cmt}` is declared, else FD.
     let model = parse(ARMED);
     let dose = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledRate);
     assert!(
         declines(&model, vec![dose]),
-        "modeled-rate dose must fall back to FD"
+        "modeled-rate dose with no R{{cmt}} slot must fall back to FD"
     );
 }
 

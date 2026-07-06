@@ -100,6 +100,109 @@ pub fn apply_scaling(
     }
 }
 
+/// Apply an analytic Form C output readout (`[scaling] y = <expr>`, issue #650),
+/// **replacing** the built-in central-compartment concentration in `preds` with
+/// the readout output, evaluated per observation.
+///
+/// On entry `preds[i]` is the central concentration at observation `i` (already
+/// init-aware via [`add_analytical_init`]). The readout sees compartment
+/// **amounts**: the central amount is `concentration × V` (so a `central / V`
+/// readout recovers the concentration exactly, and an additive binding term
+/// layers on top); the oral depot amount — only reconstructed when the readout's
+/// state layout includes it — comes from [`analytical_state_at_times`] (slot 0).
+/// Individual parameters resolve from a `pk_param_fn` snapshot; θ/η are threaded
+/// (already desugared into `__ferx_ro_*` indiv params at parse for the analytic
+/// sensitivity path), and covariates use the **per-observation** snapshot
+/// (`subject.obs_cov(i)`) so a per-row flag like `FREE` selects the right branch.
+/// On a time-varying-covariate subject (or a `TIME`-builtin model) the readout's
+/// individual parameters are re-evaluated **per observation** — matching NONMEM's
+/// per-record `$ERROR` and the per-observation snapshot the analytic sensitivity
+/// provider differentiates (`run_obs_tvcov`), so the prediction and its gradient
+/// linearise about the same point. Otherwise one subject-static snapshot drives
+/// every row.
+///
+/// No-op unless `model.analytic_readout` is set (the common built-in-readout
+/// case). Called at the single post-prediction insertion point, in place of the
+/// divisive `apply_scaling` (which is `ScalingSpec::None` under Form C).
+pub fn apply_analytic_readout(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    preds: &mut [f64],
+) {
+    let Some(ar) = &model.analytic_readout else {
+        return;
+    };
+    let n_states = ar.state_names.len();
+    if n_states == 0 {
+        return;
+    }
+    // Canonical order is `["central"]` (IV) or `["depot", "central"]` (oral), so
+    // the central amount lands in the last slot and the depot (if any) in slot 0.
+    let central_slot = n_states - 1;
+    let need_depot = n_states > 1 && ar.state_names[0] == "depot";
+
+    // Re-evaluate the readout's individual parameters per observation whenever a
+    // covariate (or the `TIME` builtin) can move them between rows; otherwise a
+    // single subject-static snapshot suffices.
+    let per_obs = subject.has_tv_covariates()
+        || crate::parser::model_parser::compiled_model_uses_time_builtin(model);
+    let static_pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
+
+    // Depot amounts (oral, only when the readout references the depot). Reuse the
+    // superposition state reconstruction; slot 0 carries the depot *amount*.
+    // Superposition is invalid across EVID=3/4 resets, so a depot-referencing
+    // readout on a reset subject is rejected up front by `fit`/`predict`
+    // (`reject_depot_readout_with_resets`); we never reach the debug-asserted
+    // `analytical_state_at_times` with a reset subject here.
+    let depot_amts: Option<Vec<f64>> = if need_depot {
+        let states =
+            analytical_state_at_times(model.pk_model, subject, &static_pk, &subject.obs_times);
+        Some(
+            states
+                .iter()
+                .map(|s| s.first().copied().unwrap_or(0.0))
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let mut state = vec![0.0_f64; n_states];
+    for (i, pred) in preds.iter_mut().enumerate() {
+        let obs_pk;
+        let pk_i: &PkParams = if per_obs {
+            obs_pk = (model.pk_param_fn)(
+                theta,
+                eta,
+                subject.obs_cov(i),
+                subject.obs_times.get(i).copied().unwrap_or(0.0),
+            );
+            &obs_pk
+        } else {
+            &static_pk
+        };
+        // Central AMOUNT = concentration × V (concentration already carries the
+        // init impulse and per-event/SS dynamics).
+        state[central_slot] = *pred * pk_i.v();
+        if let Some(d) = &depot_amts {
+            state[0] = d.get(i).copied().unwrap_or(0.0);
+        }
+        let cov = subject.obs_cov(i);
+        let obs_cmt = subject.obs_cmts.get(i).copied().unwrap_or(0);
+        // A readout referencing the `TIME` builtin resolves `Op::PushTime` from the
+        // model-time thread-local; set it to this observation's time so the readout
+        // evaluates `TIME` at the observation (the analytic providers set the matching
+        // guard around their readout eval, keeping FD parity). A no-op for a readout
+        // that does not reference `TIME`.
+        let t = subject.obs_times.get(i).copied().unwrap_or(0.0);
+        *pred = crate::parser::model_parser::with_model_time(t, || {
+            ar.readout
+                .eval(&state, &pk_i.values, theta, eta, cov, obs_cmt)
+        });
+    }
+}
+
 /// Layer analytical initial-compartment amounts onto `preds` (issue #521).
 ///
 /// For an analytical (closed-form) PK model the disposition is linear, so a
@@ -257,7 +360,9 @@ pub(crate) fn analytical_init_concentration_g<T: crate::sens::num::PkNum>(
             PkModel::OneCptIv | PkModel::OneCptOral | PkModel::OneCptTransit => {
                 one_cpt_iv_bolus_amt_g(a0, t, cl, v)
             }
-            PkModel::TwoCptIv | PkModel::TwoCptOral => two_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2),
+            PkModel::TwoCptIv | PkModel::TwoCptOral | PkModel::TwoCptTransit => {
+                two_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2)
+            }
             PkModel::ThreeCptIv | PkModel::ThreeCptOral => {
                 three_cpt_iv_bolus_amt_g(a0, t, cl, v, q, v2, q3, v3)
             }
@@ -669,6 +774,11 @@ pub fn predict_iov(
             }
         }
     }
+    // Analytic Form C readout (#650) under IOV: applied once with the BSV eta
+    // (the readout is BSV-only — a κ reference is rejected at parse). The central
+    // concentration already carries the per-occasion dynamics; the readout maps
+    // it (amount = conc × V) into the observed output. No-op unless set.
+    apply_analytic_readout(model, subject, theta, eta_bsv, &mut preds);
     // LTBS log-wrap. The IOV dispatch above is total (ODE or event-driven), so
     // this is the single log-wrap point for the IOV path — predictions are
     // logged exactly once.
@@ -784,6 +894,9 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
             PkModel::OneCptTransit => {
                 unreachable!("one_cpt_transit does not support SS doses (rejected at parse)")
             }
+            PkModel::TwoCptTransit => {
+                unreachable!("two_cpt_transit does not support SS doses (rejected at parse)")
+            }
             PkModel::OneCptIv => {
                 if infusion {
                     one_cpt_infusion_ss(dose, tau, cl, v)
@@ -863,6 +976,20 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
             PkModel::OneCptTransit => {
                 // Transit rejects infusions at parse, so only the absorbed bolus exists.
                 one_cpt_transit_f(dose, tau, cl, v, p.n_transit(), p.mtt(), p.f_bio())
+            }
+            PkModel::TwoCptTransit => {
+                // Transit rejects infusions at parse, so only the absorbed bolus exists.
+                two_cpt_transit_f(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.n_transit(),
+                    p.mtt(),
+                    p.f_bio(),
+                )
             }
             PkModel::TwoCptIv => {
                 if infusion {
@@ -951,6 +1078,9 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
             // Transit rejects SS doses at parse (#386) — unreachable for a valid model.
             PkModel::OneCptTransit => {
                 unreachable!("one_cpt_transit does not support SS doses (rejected at parse)")
+            }
+            PkModel::TwoCptTransit => {
+                unreachable!("two_cpt_transit does not support SS doses (rejected at parse)")
             }
             PkModel::OneCptIv => {
                 let c = if infusion {
@@ -1078,6 +1208,44 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                     one_cpt_transit_f(dose, tau, cl, v, p.n_transit(), p.mtt(), p.f_bio());
                 vec![depot, central]
             }
+            PkModel::TwoCptTransit => {
+                // [depot = lumped in-transit mass, central, peripheral]; transit rejects
+                // infusions at parse, so only the absorbed bolus exists.
+                let depot = two_cpt_transit_depot(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.n_transit(),
+                    p.mtt(),
+                    p.f_bio(),
+                );
+                let central = two_cpt_transit_f(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.n_transit(),
+                    p.mtt(),
+                    p.f_bio(),
+                );
+                let periph = two_cpt_transit_peripheral(
+                    dose,
+                    tau,
+                    cl,
+                    v,
+                    p.q(),
+                    p.v2(),
+                    p.n_transit(),
+                    p.mtt(),
+                    p.f_bio(),
+                );
+                vec![depot, central, periph]
+            }
             PkModel::TwoCptIv => {
                 let central = if infusion {
                     two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
@@ -1185,6 +1353,7 @@ pub fn analytical_state_at_times(
         PkModel::OneCptTransit => 2,
         PkModel::TwoCptIv => 2,
         PkModel::TwoCptOral => 3,
+        PkModel::TwoCptTransit => 3,
         PkModel::ThreeCptIv => 3,
         PkModel::ThreeCptOral => 4,
     };
@@ -1261,6 +1430,12 @@ pub fn compute_predictions_with_states(
     theta: &[f64],
     eta: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
+    // A `one_cpt_transit` subject the closed form can't serve (TIME switch / TV covariates)
+    // routes to its ODE `transit()` equivalent — so the compartment/state columns come from
+    // the ODE integration (the `ode_spec` branch below) instead of the analytical
+    // superposition path, which has no valid states for those subjects and would otherwise
+    // return NaN. Matches the IPRED routing in `compute_predictions_with_tv` (#486).
+    let model = model.effective_for(subject);
     let uses_time = model_uses_time_builtin(model);
     if let Some(ref ode) = model.ode_spec {
         // ODE path: both ipred and states come from a single ODE integration.
@@ -1554,6 +1729,11 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     scratch: &mut EventPkParams,
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
+    // A `one_cpt_transit` subject that the closed form can't serve (TIME switch / TV
+    // covariates) routes to the exact ODE `transit()` equivalent, which takes the ODE branch
+    // below (that branch ignores the cached analytical `schedule`, so a stale one is
+    // harmless); every other model is unchanged (#486).
+    let model = model.effective_for(subject);
     let has_tv = subject.has_tv_covariates();
     let uses_time = model_uses_time_builtin(model);
 
@@ -1633,10 +1813,17 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // (seeded via `init_fn`) and when no `[initial_conditions]` block is present.
     add_analytical_init(model, subject, theta, eta, &mut preds);
 
+    // Analytic Form C readout (#650): replace the built-in central concentration
+    // with `y = <expr>` before scaling/log-transform. No-op unless the model has
+    // an `analytic_readout` (ODE Form C is applied inside `ode_predictions*`).
+    apply_analytic_readout(model, subject, theta, eta, &mut preds);
+
     // `[scaling]` post-multiply. Single insertion point covers FOCE/FOCEI,
     // GN, trust-region, SAEM, and IOV — they all route through here.
     // Form C (ODE `y = <expr>`) is already applied inside `ode_predictions*`
-    // via `OdeSpec::output_fn`, so `model.scaling` is `None` for those.
+    // via `OdeSpec::output_fn`, so `model.scaling` is `None` for those. Analytic
+    // Form C sets `ScalingSpec::None` too (the readout replaces the output), so
+    // `apply_scaling` is a no-op here for it.
     apply_scaling(model, subject, theta, eta, &mut preds);
     apply_log_transform(model, &mut preds);
 
@@ -2024,7 +2211,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -2387,6 +2576,159 @@ mod tests {
         let mut preds = vec![10.0, 20.0, 30.0];
         apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
         assert_eq!(preds, vec![10.0, 20.0, 30.0]);
+    }
+
+    // ── analytic Form C readout (#650) ───────────────────────────────────────
+
+    /// A degenerate `y = central / V` readout must reproduce the built-in
+    /// concentration bit-for-bit (central amount = conc × V, so `/V` recovers
+    /// conc), and an additive term must shift each prediction by exactly that
+    /// amount — proving the readout replaces the concentration output correctly.
+    #[test]
+    fn analytic_form_c_readout_matches_and_shifts_concentration() {
+        use crate::parser::model_parser::parse_model_string;
+        let base = "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let plain = parse_model_string(base).expect("plain parses");
+        let ident = parse_model_string(&format!("{base}[scaling]\n  y = central / V\n"))
+            .expect("identity readout parses");
+        let shifted = parse_model_string(&format!("{base}[scaling]\n  y = central / V + 2.0\n"))
+            .expect("shifted readout parses");
+        assert!(ident.analytic_readout.is_some());
+
+        let subj = make_subject_with_tv(HashMap::new(), Vec::new(), Vec::new(), 1, 6);
+        let theta = [1.0, 50.0];
+        let c_plain = compute_predictions_with_tv(&plain, &subj, &theta, &[0.0]);
+        let c_ident = compute_predictions_with_tv(&ident, &subj, &theta, &[0.0]);
+        let c_shift = compute_predictions_with_tv(&shifted, &subj, &theta, &[0.0]);
+
+        assert_eq!(c_plain.len(), 6);
+        for i in 0..c_plain.len() {
+            assert_relative_eq!(c_ident[i], c_plain[i], max_relative = 1e-12);
+            assert_relative_eq!(c_shift[i], c_plain[i] + 2.0, epsilon = 1e-9);
+            assert!(c_plain[i] > 0.0, "sanity: positive concentration");
+        }
+    }
+
+    /// The readout's covariate is read from the **per-observation** snapshot, so a
+    /// per-row flag (here `SEL`) selects the branch on that row — the analytic
+    /// analogue of NONMEM's per-record `$ERROR`. Rows with `SEL==0` read `central/V`
+    /// (concentration); rows with `SEL==1` read twice that.
+    #[test]
+    fn analytic_form_c_readout_uses_per_obs_covariate() {
+        use crate::parser::model_parser::parse_model_string;
+        let src = "\
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(50.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.02 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[scaling]
+  y = if (SEL == 0) central / V else 2 * central / V
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let model = parse_model_string(src).expect("parses");
+        // 4 observations, alternating SEL flag per row.
+        let obs_cov = vec![
+            HashMap::from([("SEL".to_string(), 0.0)]),
+            HashMap::from([("SEL".to_string(), 1.0)]),
+            HashMap::from([("SEL".to_string(), 0.0)]),
+            HashMap::from([("SEL".to_string(), 1.0)]),
+        ];
+        let subj = make_subject_with_tv(HashMap::new(), Vec::new(), obs_cov, 1, 4);
+        let theta = [1.0, 50.0];
+        let preds = compute_predictions_with_tv(&model, &subj, &theta, &[0.0]);
+        // Odd rows (SEL==1) are exactly double the even rows' readout only if the
+        // underlying concentration were equal — instead compare each row to its own
+        // concentration via the ratio of the SEL==1 formula (2×) applied on its conc.
+        assert_relative_eq!(
+            preds[1] / preds[0],
+            2.0 * (preds_conc(&subj, &theta, 1) / preds_conc(&subj, &theta, 0)),
+            max_relative = 1e-9
+        );
+        assert_relative_eq!(
+            preds[3] / preds[2],
+            2.0 * (preds_conc(&subj, &theta, 3) / preds_conc(&subj, &theta, 2)),
+            max_relative = 1e-9
+        );
+    }
+
+    /// Helper: the plain built-in concentration at observation `i` for the fixture
+    /// above (CL=1, V=50, single 100 mg IV bolus at t=0).
+    fn preds_conc(subj: &Subject, theta: &[f64], i: usize) -> f64 {
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = theta[0];
+        pk.values[crate::types::PK_IDX_V] = theta[1];
+        predict_concentration(PkModel::OneCptIv, &subj.doses, subj.obs_times[i], &pk)
+    }
+
+    /// **NONMEM-validation cross-check (#650).** An analytic Form C readout
+    /// computes the same output as the *ODE* Form C readout, which is validated
+    /// against NONMEM's per-record `$ERROR` (free/total protein-binding model,
+    /// `docs/model-file/scaling.qmd`). On an IV 1-cpt model the analytic central
+    /// amount (`concentration × V`) equals the ODE `central` state amount, so a
+    /// saturable-binding total-vs-free readout `y = C + BMAX·C/(KD+C)` must give
+    /// bit-for-bit-equal predictions on the analytic and ODE paths at matched
+    /// parameters — inheriting the ODE path's NONMEM anchor.
+    #[test]
+    fn analytic_form_c_matches_ode_form_c_binding_readout() {
+        use crate::parser::model_parser::parse_model_string;
+        let readout = "  y = central / V + BMAX * (central / V) / (KD + central / V)\n";
+        let params = "\
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVBMAX(3.0, 0.01, 100.0)
+  theta TVKD(2.0, 0.01, 100.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  sigma PROP ~ 0.02 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV  * exp(ETA_V)
+  BMAX = TVBMAX
+  KD   = TVKD
+";
+        let analytic = parse_model_string(&format!(
+            "{params}[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n{readout}[error_model]\n  DV ~ proportional(PROP)\n"
+        ))
+        .expect("analytic parses");
+        // Equivalent ODE: `central` is the amount, disposition -(CL/V)·central,
+        // IV bolus into central (cmt 1). Same readout replaces the state readout.
+        let ode = parse_model_string(&format!(
+            "{params}[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL / V) * central\n[scaling]\n{readout}[error_model]\n  DV ~ proportional(PROP)\n"
+        ))
+        .expect("ode parses");
+        assert!(analytic.analytic_readout.is_some());
+        assert!(ode.ode_spec.is_some());
+
+        let subj = make_subject_with_tv(HashMap::new(), Vec::new(), Vec::new(), 1, 6);
+        let theta = [0.2, 10.0, 3.0, 2.0];
+        let eta = [0.1, -0.05];
+        let a = compute_predictions_with_tv(&analytic, &subj, &theta, &eta);
+        let o = compute_predictions_with_tv(&ode, &subj, &theta, &eta);
+        assert_eq!(a.len(), o.len());
+        for (av, ov) in a.iter().zip(o.iter()) {
+            assert_relative_eq!(av, ov, max_relative = 1e-6, epsilon = 1e-9);
+        }
     }
 
     #[test]
@@ -2982,6 +3324,60 @@ mod tests {
             states[0] > 0.0 && states[1] > 0.0,
             "both amounts positive mid-absorption: {states:?}"
         );
+    }
+
+    /// 2-cpt transit is a 3-state `[depot, central, peripheral]` model:
+    /// `single_dose_states` must return the lumped unabsorbed-chain depot, the central
+    /// concentration (matching `single_dose_concentration`), and the peripheral
+    /// concentration — covering `two_cpt_transit_depot` / `_peripheral` (#386 PR D).
+    #[test]
+    fn single_dose_states_two_cpt_transit_returns_depot_central_periph() {
+        let mut p = PkParams::default();
+        p.values[crate::types::PK_IDX_CL] = 0.5;
+        p.values[crate::types::PK_IDX_V] = 10.0; // V1
+        p.values[crate::types::PK_IDX_Q] = 1.0;
+        p.values[crate::types::PK_IDX_V2] = 20.0;
+        p.values[crate::types::PK_IDX_N] = 3.0;
+        p.values[crate::types::PK_IDX_MTT] = 1.5;
+        let d = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+        let states = single_dose_states(PkModel::TwoCptTransit, &d, 2.0, &p);
+        assert_eq!(
+            states.len(),
+            3,
+            "2-cpt transit exposes [depot, central, periph]"
+        );
+        assert!(
+            states.iter().all(|&x| x > 0.0),
+            "all three amounts positive mid-absorption: {states:?}"
+        );
+        // Central state must equal the standalone concentration entry point.
+        let c = single_dose_concentration(PkModel::TwoCptTransit, &d, 2.0, &p);
+        assert!(
+            (states[1] - c).abs() <= 1e-9 * c.abs().max(1.0),
+            "central state {} vs single_dose_concentration {}",
+            states[1],
+            c
+        );
+    }
+
+    /// SS doses are rejected at parse for transit (`check_transit_support`), so the
+    /// SS arm of `single_dose_concentration` is `unreachable!`; calling it directly
+    /// with an SS dose must hit that guard (covers the defensive arm + its message).
+    #[test]
+    #[should_panic(expected = "two_cpt_transit does not support SS")]
+    fn single_dose_concentration_two_cpt_transit_ss_unreachable() {
+        let p = PkParams::default();
+        let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+        let _ = single_dose_concentration(PkModel::TwoCptTransit, &ss, 2.0, &p);
+    }
+
+    /// The mirror SS `unreachable!` arm in `single_dose_states`.
+    #[test]
+    #[should_panic(expected = "two_cpt_transit does not support SS")]
+    fn single_dose_states_two_cpt_transit_ss_unreachable() {
+        let p = PkParams::default();
+        let ss = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+        let _ = single_dose_states(PkModel::TwoCptTransit, &ss, 2.0, &p);
     }
 
     /// Regression: `single_dose_concentration` and `single_dose_states[central]` must

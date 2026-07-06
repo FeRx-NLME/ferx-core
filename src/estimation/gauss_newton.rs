@@ -757,7 +757,7 @@ fn subject_nll_pop_grad_analytical(
     let r_diag = compute_r_diag(
         &model.error_spec,
         r_pred_point,
-        &subject.obs_cmts,
+        model.error_spec.obs_keys(subject).as_ref(),
         &params.sigma.values,
     );
 
@@ -1125,6 +1125,8 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     let omega = &params.omega;
     let sigma_values = &params.sigma.values;
     let error_spec = &model.error_spec;
+    // #658: per-observation residual endpoint keys (covariate selector or CMT).
+    let err_keys = error_spec.obs_keys(subject);
 
     // ── Base quantities at the current parameter point ───────────────────────
     // ipreds, residuals, R, d = ∂R/∂f, d2 = ∂²R/∂f² per observation.
@@ -1137,13 +1139,13 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         .map(|j| subject.observations[j] - ipreds[j])
         .collect();
     let r_diag: Vec<f64> = (0..n_obs)
-        .map(|j| error_spec.variance_at(subject.obs_cmts[j], ipreds[j], sigma_values))
+        .map(|j| error_spec.variance_at(err_keys[j], ipreds[j], sigma_values))
         .collect();
     if r_diag.iter().any(|&v| !(v.is_finite() && v > 0.0)) {
         return None;
     }
     let d_vec: Vec<f64> = (0..n_obs)
-        .map(|j| error_spec.dvar_df(subject.obs_cmts[j], ipreds[j], sigma_values))
+        .map(|j| error_spec.dvar_df(err_keys[j], ipreds[j], sigma_values))
         .collect();
     // ∂²R/∂f² per observation. f-independent for additive/proportional/combined
     // (0 for additive, 2·σ_prop² otherwise), but the *per-CMT* value can differ
@@ -1154,7 +1156,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     // the cmt argument and returns the scalar value uniformly. The β_j chain
     // at line ~1095 then reads `d2_vec[j]` per obs.
     let d2_vec: Vec<f64> = (0..n_obs)
-        .map(|j| error_spec.d2var_df2(subject.obs_cmts[j], sigma_values))
+        .map(|j| error_spec.d2var_df2(err_keys[j], sigma_values))
         .collect();
 
     // Conditional Hessian H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹.
@@ -1395,7 +1397,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
             continue;
         }
         let dr_per_obs: Vec<f64> = (0..n_obs)
-            .map(|j| error_spec.dvar_dlogsigma(subject.obs_cmts[j], ks, ipreds[j], sigma_values))
+            .map(|j| error_spec.dvar_dlogsigma(err_keys[j], ks, ipreds[j], sigma_values))
             .collect();
         // ∂d/∂log σ_s. For proportional and combined, d = 2·σ_prop²·f, so
         // ∂d/∂log σ_prop = 2·d and ∂d/∂log σ_add = 0. For additive d = 0
@@ -2017,7 +2019,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 
@@ -2986,7 +2990,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         };
 
         let template = &model.default_params;
@@ -3272,7 +3278,9 @@ mod tests {
             frem_config: None,
             residual_error_eta: None,
             analytical_init: Vec::new(),
+            analytic_readout: None,
             ruv_magnitude: None,
+            transit_ode_equivalent: None,
         }
     }
 

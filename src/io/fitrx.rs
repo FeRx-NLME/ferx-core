@@ -6,6 +6,7 @@
 //! - `fit.json`          — scalars / vectors / matrices on `FitResult`
 //! - `ebes.csv`          — per-subject EBEs (`ID, eta_1..eta_n, ofv_contribution, n_obs`)
 //! - `ebes_kappa.csv`    — per-(subject, occasion) kappa EBEs (only when `n_kappa > 0`)
+//! - `conddist.csv`      — per-subject conditional η mean/SD/mode (only when `conddist = true`, SAEM-only)
 //! - `predictions.csv`   — per-observation predictions joined with TIME/DV
 //! - `model.ferx`        — verbatim model source
 //! - `warnings.txt`      — one warning per line (mirrors `fit.json` for grep)
@@ -592,6 +593,13 @@ pub fn save_fit(
         entries.push("ebes_kappa.csv".into());
     }
 
+    // --- conddist.csv (only when the SAEM conditional-distribution pass ran) ---
+    if let Some(cd) = &result.cond_dist {
+        zip.start_file("conddist.csv", zopts)?;
+        write_conddist_csv(&mut zip, result, cd)?;
+        entries.push("conddist.csv".into());
+    }
+
     // --- predictions.csv ---------------------------------------------------
     zip.start_file("predictions.csv", zopts)?;
     write_predictions_csv(&mut zip, result, population)?;
@@ -831,6 +839,31 @@ fn write_ebes_kappa_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxE
     Ok(())
 }
 
+fn write_conddist_csv<W: Write>(w: &mut W, r: &FitResult, cd: &CondDist) -> Result<(), FitrxError> {
+    writeln!(w, "ID,ETA,COND_MEAN,COND_SD,COND_MODE")?;
+    for (i, s) in r.subjects.iter().enumerate() {
+        let mean_i = cd.cond_mean.get(i);
+        let sd_i = cd.cond_sd.get(i);
+        for (j, eta_name) in r.eta_names.iter().enumerate() {
+            let mean = mean_i.and_then(|m| m.get(j)).copied().unwrap_or(f64::NAN);
+            let sd = sd_i.and_then(|v| v.get(j)).copied().unwrap_or(f64::NAN);
+            // The conditional mode is the EBE already on the subject result.
+            let mode = s.eta.get(j).copied().unwrap_or(f64::NAN);
+            let mut row = csv_escape(&s.id);
+            row.push(',');
+            row.push_str(&csv_escape(eta_name));
+            row.push(',');
+            row.push_str(&fmt_f64(mean));
+            row.push(',');
+            row.push_str(&fmt_f64(sd));
+            row.push(',');
+            row.push_str(&fmt_f64(mode));
+            writeln!(w, "{}", row)?;
+        }
+    }
+    Ok(())
+}
+
 fn write_predictions_csv<W: Write>(
     w: &mut W,
     r: &FitResult,
@@ -978,6 +1011,11 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
     } else {
         None
     };
+    let conddist_csv = if archive.file_names().any(|n| n == "conddist.csv") {
+        Some(read_text(&mut archive, "conddist.csv")?)
+    } else {
+        None
+    };
     let preds_csv = read_text(&mut archive, "predictions.csv")?;
     let model_source = read_text(&mut archive, "model.ferx")?;
 
@@ -1007,6 +1045,9 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
 
     let mut fit = wire_to_fit_result(wire, subjects, ebe_kappas)?;
     fit.model_text = Some(model_source.clone());
+    if let Some(csv) = conddist_csv.as_deref() {
+        fit.cond_dist = Some(parse_conddist_csv(csv, &fit)?);
+    }
 
     Ok(LoadedFit {
         fit,
@@ -1296,6 +1337,143 @@ fn parse_ebe_kappas(
         out.push(rows.into_iter().map(|(_, v)| v).collect());
     }
     Ok(out)
+}
+
+// Parses conddist.csv (ID,ETA,COND_MEAN,COND_SD,COND_MODE) back into a
+// `CondDist`. `samples`/`nsamp`/`burnin` aren't carried by this CSV — the
+// bundle only round-trips the mean/SD/mode summary, not retained MCMC draws —
+// so they come back empty/zero. `shrinkage` isn't stored either; it's a pure
+// function of `cond_mean` and Ω, so it's recomputed here with the same
+// formula as `saem_conddist::run_conditional_distribution`, giving a value
+// that matches the original bit-for-bit rather than a redundant serialized
+// copy.
+//
+// The CSV must carry exactly one row per (subject, eta): duplicate or missing
+// rows are rejected rather than silently loaded as NaN, and each COND_MODE is
+// validated against the EBE already loaded from `ebes.csv`, so a truncated or
+// hand-edited bundle fails fast.
+fn parse_conddist_csv(csv: &str, fit: &FitResult) -> Result<CondDist, FitrxError> {
+    let n_subjects = fit.subjects.len();
+    let n_eta = fit.eta_names.len();
+
+    let mut by_id: HashMap<&str, usize> = HashMap::new();
+    for (idx, s) in fit.subjects.iter().enumerate() {
+        by_id.insert(s.id.as_str(), idx);
+    }
+    let mut by_eta: HashMap<&str, usize> = HashMap::new();
+    for (idx, name) in fit.eta_names.iter().enumerate() {
+        by_eta.insert(name.as_str(), idx);
+    }
+
+    let mut lines = csv.lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| FitrxError::Corrupt("conddist.csv: empty".into()))?;
+    if header != "ID,ETA,COND_MEAN,COND_SD,COND_MODE" {
+        return Err(FitrxError::Corrupt(format!(
+            "conddist.csv: unexpected header {:?}",
+            header
+        )));
+    }
+
+    let mut cond_mean = vec![vec![f64::NAN; n_eta]; n_subjects];
+    let mut cond_sd = vec![vec![f64::NAN; n_eta]; n_subjects];
+    // Track which (subject, eta) cells the CSV actually filled, so a truncated
+    // or duplicate-filled bundle is rejected up front rather than silently
+    // loading NaNs (and NaN shrinkage) later.
+    let mut seen = vec![vec![false; n_eta]; n_subjects];
+
+    for (i, line) in lines.enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields = parse_csv_row(line);
+        if fields.len() != 5 {
+            return Err(FitrxError::Corrupt(format!(
+                "conddist.csv row {} has {} fields, expected 5",
+                i + 1,
+                fields.len()
+            )));
+        }
+        let si = *by_id.get(fields[0].as_str()).ok_or_else(|| {
+            FitrxError::Corrupt(format!("conddist.csv: unknown ID {:?}", fields[0]))
+        })?;
+        let ei = *by_eta.get(fields[1].as_str()).ok_or_else(|| {
+            FitrxError::Corrupt(format!("conddist.csv: unknown ETA {:?}", fields[1]))
+        })?;
+        if seen[si][ei] {
+            return Err(FitrxError::Corrupt(format!(
+                "conddist.csv: duplicate row for ID {:?} ETA {:?}",
+                fields[0], fields[1]
+            )));
+        }
+        seen[si][ei] = true;
+        let parse_or_nan = |field: &str| -> Result<f64, FitrxError> {
+            if field.is_empty() {
+                Ok(f64::NAN)
+            } else {
+                field.parse::<f64>().map_err(|_| {
+                    FitrxError::Corrupt(format!(
+                        "conddist.csv row {}: bad float {:?}",
+                        i + 1,
+                        field
+                    ))
+                })
+            }
+        };
+        cond_mean[si][ei] = parse_or_nan(&fields[2])?;
+        cond_sd[si][ei] = parse_or_nan(&fields[3])?;
+        // COND_MODE is the conditional mode = the EBE already carried on
+        // `fit.subjects[si].eta` (loaded from ebes.csv). It isn't re-stored, but
+        // we validate it agrees with that EBE so a mismatched or hand-edited
+        // bundle fails fast rather than passing off inconsistent data. Both are
+        // produced by the same `fmt_f64`, so a consistent bundle matches exactly.
+        let expected_mode = fmt_f64(fit.subjects[si].eta.get(ei).copied().unwrap_or(f64::NAN));
+        if fields[4] != expected_mode {
+            return Err(FitrxError::Corrupt(format!(
+                "conddist.csv: COND_MODE {:?} for ID {:?} ETA {:?} disagrees with EBE {:?}",
+                fields[4], fields[0], fields[1], expected_mode
+            )));
+        }
+    }
+
+    // Every (subject, eta) pair must be present exactly once. The duplicate
+    // check above covers "more than once"; this covers a truncated bundle.
+    for (si, s) in fit.subjects.iter().enumerate() {
+        for (ei, eta_name) in fit.eta_names.iter().enumerate() {
+            if !seen[si][ei] {
+                return Err(FitrxError::Corrupt(format!(
+                    "conddist.csv: missing row for ID {:?} ETA {:?}",
+                    s.id, eta_name
+                )));
+            }
+        }
+    }
+
+    let shrinkage: Vec<f64> = (0..n_eta)
+        .map(|j| {
+            if n_subjects < 2 {
+                return f64::NAN;
+            }
+            let omega_jj = fit.omega[(j, j)];
+            if omega_jj < crate::estimation::saem::SAEM_OMEGA_DIAG_FLOOR {
+                return f64::NAN;
+            }
+            let m: f64 = cond_mean.iter().map(|cm| cm[j]).sum::<f64>() / n_subjects as f64;
+            let var: f64 = cond_mean.iter().map(|cm| (cm[j] - m).powi(2)).sum::<f64>()
+                / (n_subjects - 1) as f64;
+            1.0 - var.sqrt() / omega_jj.sqrt()
+        })
+        .collect();
+
+    Ok(CondDist {
+        cond_mean,
+        cond_sd,
+        samples: vec![Vec::new(); n_subjects],
+        shrinkage,
+        nsamp: 0,
+        burnin: 0,
+    })
 }
 
 // Validate every "parallel array" invariant in the wire layout so that
@@ -1623,8 +1801,8 @@ fn wire_to_fit_result(
         total_ebe_fallbacks: w.total_ebe_fallbacks,
         covariance_status: covariance_status_from_str(&w.covariance_status)?,
         shrinkage_eta: w.omega.shrinkage,
-        // The conditional-distribution pass is not persisted to .fitrx yet
-        // (#257); a loaded fit reports `None` for it.
+        // Populated by `load_fit` from conddist.csv when present (#675);
+        // fit.json/FitWire carries no cond_dist field of its own.
         cond_dist: None,
         shrinkage_eps: w.shrinkage_eps,
         iwres_lag1_r: w.iwres_lag1_r,
@@ -2030,6 +2208,115 @@ mod tests {
         assert_eq!(loaded.fit.ebe_kappas[0].len(), 2);
         assert!((loaded.fit.ebe_kappas[0][0][0] - 0.01).abs() < 1e-9);
         assert_eq!(loaded.fit.ebe_kappas[1].len(), 1);
+    }
+
+    #[test]
+    fn roundtrip_with_conddist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conddist.fitrx");
+        let mut r = minimal_fit_result();
+        r.cond_dist = Some(CondDist {
+            cond_mean: vec![vec![0.11, -0.19], vec![0.29, 0.41]],
+            cond_sd: vec![vec![0.05, 0.06], vec![0.07, 0.08]],
+            samples: vec![Vec::new(), Vec::new()],
+            shrinkage: vec![0.2, 0.3],
+            nsamp: 500,
+            burnin: 100,
+        });
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        let cd = loaded.fit.cond_dist.expect("cond_dist should round-trip");
+        assert_eq!(cd.cond_mean, r.cond_dist.as_ref().unwrap().cond_mean);
+        assert_eq!(cd.cond_sd, r.cond_dist.as_ref().unwrap().cond_sd);
+        // samples/nsamp/burnin aren't carried by conddist.csv — they come back
+        // empty/zero rather than the original values.
+        assert!(cd.samples.iter().all(|s| s.is_empty()));
+        assert_eq!(cd.nsamp, 0);
+        assert_eq!(cd.burnin, 0);
+        // shrinkage is recomputed from cond_mean + omega, not stored verbatim,
+        // but for this fixture (2 subjects, well-conditioned omega) it should
+        // reproduce the same values the original formula would give.
+        for j in 0..2 {
+            let m: f64 = (cd.cond_mean[0][j] + cd.cond_mean[1][j]) / 2.0;
+            let var = ((cd.cond_mean[0][j] - m).powi(2) + (cd.cond_mean[1][j] - m).powi(2)) / 1.0;
+            let expected = 1.0 - var.sqrt() / r.omega[(j, j)].sqrt();
+            assert!((cd.shrinkage[j] - expected).abs() < 1e-9);
+        }
+
+        assert!(loaded.manifest.entries.iter().any(|e| e == "conddist.csv"));
+    }
+
+    #[test]
+    fn roundtrip_omits_conddist_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_conddist.fitrx");
+        let r = minimal_fit_result(); // cond_dist: None by default
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        assert!(loaded.fit.cond_dist.is_none());
+        assert!(!loaded.manifest.entries.iter().any(|e| e == "conddist.csv"));
+    }
+
+    // Full valid conddist.csv for a `minimal_fit_result()` fit: S1/S2 with
+    // eta_names [eta_CL, eta_V] and EBEs [0.1, 0.2] (from `dummy_subject`).
+    const VALID_CONDDIST_CSV: &str = "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+        S1,eta_CL,0.11,0.05,0.100000\n\
+        S1,eta_V,-0.19,0.06,0.200000\n\
+        S2,eta_CL,0.29,0.07,0.100000\n\
+        S2,eta_V,0.41,0.08,0.200000\n";
+
+    #[test]
+    fn parse_conddist_csv_accepts_complete_bundle() {
+        let fit = minimal_fit_result();
+        let cd = parse_conddist_csv(VALID_CONDDIST_CSV, &fit).unwrap();
+        assert_eq!(cd.cond_mean, vec![vec![0.11, -0.19], vec![0.29, 0.41]]);
+        assert_eq!(cd.cond_sd, vec![vec![0.05, 0.06], vec![0.07, 0.08]]);
+    }
+
+    #[test]
+    fn parse_conddist_csv_rejects_duplicate_row() {
+        let fit = minimal_fit_result();
+        let csv = format!("{}S1,eta_CL,0.11,0.05,0.100000\n", VALID_CONDDIST_CSV);
+        let err = parse_conddist_csv(&csv, &fit).unwrap_err();
+        assert!(
+            matches!(&err, FitrxError::Corrupt(m) if m.contains("duplicate")),
+            "expected duplicate error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_conddist_csv_rejects_missing_row() {
+        let fit = minimal_fit_result();
+        // Drop the last (S2, eta_V) row.
+        let csv = "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+            S1,eta_CL,0.11,0.05,0.100000\n\
+            S1,eta_V,-0.19,0.06,0.200000\n\
+            S2,eta_CL,0.29,0.07,0.100000\n";
+        let err = parse_conddist_csv(csv, &fit).unwrap_err();
+        assert!(
+            matches!(&err, FitrxError::Corrupt(m) if m.contains("missing")),
+            "expected missing-row error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_conddist_csv_rejects_mode_ebe_mismatch() {
+        let fit = minimal_fit_result();
+        // Corrupt one COND_MODE so it no longer matches the loaded EBE (0.1).
+        let csv = "ID,ETA,COND_MEAN,COND_SD,COND_MODE\n\
+            S1,eta_CL,0.11,0.05,0.999999\n\
+            S1,eta_V,-0.19,0.06,0.200000\n\
+            S2,eta_CL,0.29,0.07,0.100000\n\
+            S2,eta_V,0.41,0.08,0.200000\n";
+        let err = parse_conddist_csv(csv, &fit).unwrap_err();
+        assert!(
+            matches!(&err, FitrxError::Corrupt(m) if m.contains("COND_MODE")),
+            "expected COND_MODE mismatch error, got {err:?}"
+        );
     }
 
     #[test]

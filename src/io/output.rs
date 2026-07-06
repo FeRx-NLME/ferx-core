@@ -518,6 +518,259 @@ pub fn print_results(result: &FitResult) {
     eprintln!("{}\n", "=".repeat(60));
 }
 
+/// Render a concise, `psn::sumo`-style summary of a completed fit as a
+/// `String`: parameter estimates plus basic run information. Unlike
+/// [`print_results`] (which streams the full, kitchen-sink report to stderr),
+/// this *returns text* so it can be sent to stdout, redirected to a file, or
+/// asserted on in a test. It stays focused on the headline numbers a modeller
+/// scans first — convergence, objective function, the parameter table with
+/// %RSE, key diagnostics (condition number, shrinkage) and run metadata — and
+/// is what the `ferx summary <run.fitrx>` subcommand prints.
+pub fn format_summary(result: &FitResult) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let bar = "=".repeat(60);
+
+    let _ = writeln!(out, "{bar}");
+    let _ = writeln!(out, "ferx run summary — {}", result.model_name);
+    let _ = writeln!(out, "{bar}");
+
+    // --- Run status ---
+    if result.method_chain.len() > 1 {
+        let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
+        let _ = writeln!(out, "Method:     {}", chain.join(" → "));
+    } else {
+        let _ = writeln!(out, "Method:     {}", result.method.label());
+    }
+    let _ = writeln!(
+        out,
+        "Converged:  {}",
+        if result.converged { "YES" } else { "NO" }
+    );
+    let _ = writeln!(out, "Iterations: {}", result.n_iterations);
+    let _ = writeln!(
+        out,
+        "Subjects: {}   Observations: {}   Parameters: {}",
+        result.n_subjects, result.n_obs, result.n_parameters
+    );
+
+    // --- Objective function ---
+    let _ = writeln!(out, "\n--- Objective Function ---");
+    let _ = writeln!(out, "  OFV:  {:.4}", result.ofv);
+    let _ = writeln!(out, "  AIC:  {:.4}", result.aic);
+    let _ = writeln!(out, "  BIC:  {:.4}", result.bic);
+
+    // Failed / SIR-fallback covariance make the SE columns meaningless, so we
+    // suppress the derived CV% (mirrors `print_results`).
+    let show_cv = !matches!(
+        result.covariance_status,
+        CovarianceStatus::Failed | CovarianceStatus::SirFallback
+    );
+
+    // NN weight thetas are excluded from the per-parameter table (they can
+    // number in the hundreds); `print_results` skips them the same way.
+    #[cfg(feature = "nn")]
+    let nn_theta_indices: std::collections::HashSet<usize> = result
+        .neural_networks
+        .iter()
+        .flat_map(|nn| nn.weights_offset..nn.weights_offset + nn.n_weights)
+        .collect();
+    #[cfg(not(feature = "nn"))]
+    let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    // --- THETA ---
+    let _ = writeln!(out, "\n--- THETA ---");
+    let _ = writeln!(
+        out,
+        "  {:<16} {:>12} {:>12} {:>8}",
+        "Parameter", "Estimate", "SE", "%RSE"
+    );
+    for (i, name) in result.theta_names.iter().enumerate() {
+        if nn_theta_indices.contains(&i) {
+            continue;
+        }
+        let est = result.theta[i];
+        let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
+        let label = if is_fixed {
+            fixed_label(name)
+        } else {
+            name.clone()
+        };
+        let (se_str, rse_str) = if is_fixed {
+            ("---".to_string(), "---".to_string())
+        } else {
+            match &result.se_theta {
+                Some(se) => {
+                    let se_val = se[i];
+                    let rse = if est.abs() > 1e-12 {
+                        (se_val / est.abs()) * 100.0
+                    } else {
+                        f64::NAN
+                    };
+                    (format!("{:.6}", se_val), format!("{:.1}", rse))
+                }
+                None => ("N/A".to_string(), "N/A".to_string()),
+            }
+        };
+        let _ = writeln!(
+            out,
+            "  {:<16} {:>12.6} {:>12} {:>8}",
+            label, est, se_str, rse_str
+        );
+    }
+
+    // --- OMEGA ---
+    let n_eta = result.omega.nrows();
+    if n_eta > 0 {
+        let _ = writeln!(out, "\n--- OMEGA ---");
+        for i in 0..n_eta {
+            let var = result.omega[(i, i)];
+            let name = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
+            let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
+            let label = if is_fixed {
+                fixed_label(name)
+            } else {
+                name.to_string()
+            };
+            let se_str = if is_fixed {
+                "---".to_string()
+            } else {
+                match crate::types::omega_se_at(&result.se_omega, n_eta, i, i) {
+                    Some(s) => format!("{:.6}", s),
+                    None => "N/A".to_string(),
+                }
+            };
+            if show_cv {
+                let cv = if var > 0.0 { var.sqrt() * 100.0 } else { 0.0 };
+                let _ = writeln!(
+                    out,
+                    "  {:<16} = {:.6}  (CV% = {:.1})  SE = {}",
+                    label, var, cv, se_str
+                );
+            } else {
+                let _ = writeln!(out, "  {:<16} = {:.6}  SE = {}", label, var, se_str);
+            }
+        }
+        // Off-diagonal correlations (block omega).
+        let has_offdiag = (0..n_eta).any(|i| (0..i).any(|j| result.omega[(i, j)].abs() > 1e-15));
+        if has_offdiag {
+            for i in 0..n_eta {
+                for j in 0..i {
+                    let cov = result.omega[(i, j)];
+                    if cov.abs() <= 1e-15 {
+                        continue;
+                    }
+                    let ni = result.eta_names.get(i).map(|s| s.as_str()).unwrap_or("ETA");
+                    let nj = result.eta_names.get(j).map(|s| s.as_str()).unwrap_or("ETA");
+                    let corr = result
+                        .omega_param_corr
+                        .as_ref()
+                        .map(|m| m[(i, j)])
+                        .unwrap_or_else(|| {
+                            let vi = result.omega[(i, i)];
+                            let vj = result.omega[(j, j)];
+                            if vi > 0.0 && vj > 0.0 {
+                                cov / (vi.sqrt() * vj.sqrt())
+                            } else {
+                                0.0
+                            }
+                        });
+                    let _ = writeln!(out, "  corr({}, {}) = {:.4}", ni, nj, corr);
+                }
+            }
+        }
+    }
+
+    // --- SIGMA ---
+    let err_type = match result.error_model {
+        ErrorModel::Additive => "additive",
+        ErrorModel::Proportional => "proportional",
+        ErrorModel::Combined => "combined",
+    };
+    let _ = writeln!(out, "\n--- SIGMA ({}) ---", err_type);
+    for (i, &s) in result.sigma.iter().enumerate() {
+        let name = result
+            .sigma_names
+            .get(i)
+            .map(|n| n.as_str())
+            .unwrap_or("EPS");
+        let is_fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
+        let label = if is_fixed {
+            fixed_label(name)
+        } else {
+            name.to_string()
+        };
+        let se_str = if is_fixed {
+            "---".to_string()
+        } else {
+            match &result.se_sigma {
+                Some(se) if i < se.len() => format!("{:.6}", se[i]),
+                _ => "N/A".to_string(),
+            }
+        };
+        match result.sigma_types.get(i).copied() {
+            Some(SigmaType::Proportional) => {
+                let _ = writeln!(
+                    out,
+                    "  {:<16} = {:.6}  (CV% = {:.1})  SE = {}",
+                    label,
+                    s,
+                    s * 100.0,
+                    se_str
+                );
+            }
+            _ => {
+                let _ = writeln!(out, "  {:<16} = {:.6}  SE = {}", label, s, se_str);
+            }
+        }
+    }
+
+    // --- Diagnostics ---
+    let _ = writeln!(out, "\n--- Diagnostics ---");
+    let cov_str = match result.covariance_status {
+        CovarianceStatus::Computed => "computed",
+        CovarianceStatus::Failed => "FAILED",
+        CovarianceStatus::NotRequested => "not requested",
+        CovarianceStatus::SirFallback => "SIR fallback",
+    };
+    let _ = writeln!(out, "  Covariance: {}", cov_str);
+    if let Some(cn) = result.cov_condition_number {
+        let _ = writeln!(out, "  Condition number: {:.1}", cn);
+    }
+    if !result.shrinkage_eta.is_empty() {
+        let parts: Vec<String> = result
+            .shrinkage_eta
+            .iter()
+            .enumerate()
+            .filter(|(_, sh)| sh.is_finite())
+            .map(|(k, sh)| {
+                let name = result.eta_names.get(k).map(|s| s.as_str()).unwrap_or("ETA");
+                format!("{} {:.1}%", name, sh * 100.0)
+            })
+            .collect();
+        if !parts.is_empty() {
+            let _ = writeln!(out, "  Eta shrinkage: {}", parts.join(", "));
+        }
+    }
+    if result.shrinkage_eps.is_finite() {
+        let _ = writeln!(out, "  EPS shrinkage: {:.1}%", result.shrinkage_eps * 100.0);
+    }
+
+    // --- Run info ---
+    let _ = writeln!(out, "\n--- Run Info ---");
+    let _ = writeln!(out, "  Wall time: {:.1}s", result.wall_time_secs);
+    let _ = writeln!(out, "  ferx v{}", result.ferx_version);
+    if !result.warnings.is_empty() {
+        let _ = writeln!(out, "  Warnings: {}", result.warnings.len());
+        for w in &result.warnings {
+            let _ = writeln!(out, "    * {}", w);
+        }
+    }
+    let _ = writeln!(out, "{bar}");
+
+    out
+}
+
 /// Generate SDTAB-like output as vectors of (header, values) pairs
 pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f64>)> {
     let n_total: usize = result.subjects.iter().map(|s| s.ipred.len()).sum();
@@ -1656,6 +1909,111 @@ mod tests {
         }
     }
 
+    #[test]
+    fn format_summary_contains_key_sections() {
+        // Build a small-but-representative fit: two thetas (one fixed), a
+        // diagonal 2×2 omega, one proportional sigma, a condition number,
+        // shrinkage, and a warning — enough to exercise every section and the
+        // fixed-label / CV% / %RSE branches.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.method = EstimationMethod::FoceI;
+        r.method_chain = vec![EstimationMethod::FoceI];
+        r.converged = true;
+        r.ofv = 123.45;
+        r.aic = 130.0;
+        r.bic = 140.0;
+        r.n_subjects = 12;
+        r.n_obs = 96;
+        r.n_parameters = 4;
+        r.n_iterations = 7;
+        r.theta = vec![1.5, 10.0];
+        r.theta_names = vec!["CL".into(), "V".into()];
+        r.theta_fixed = vec![false, true];
+        r.se_theta = Some(vec![0.15, 0.0]);
+        r.omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.0, 0.0, 0.04]);
+        r.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
+        r.omega_fixed = vec![false, false];
+        r.covariance_status = CovarianceStatus::Computed;
+        r.cov_condition_number = Some(42.0);
+        r.shrinkage_eta = vec![0.05, 0.10];
+        r.shrinkage_eps = 0.08;
+        r.wall_time_secs = 3.2;
+        r.warnings = vec!["heads up".into()];
+
+        let s = format_summary(&r);
+        assert!(s.contains("ferx run summary — test"));
+        assert!(s.contains("Method:     FOCEI"));
+        assert!(s.contains("Converged:  YES"));
+        assert!(s.contains("Subjects: 12   Observations: 96   Parameters: 4"));
+        assert!(s.contains("OFV:  123.4500"));
+        assert!(s.contains("--- THETA ---"));
+        assert!(s.contains("%RSE"));
+        // Free theta shows an SE; fixed theta is labelled and SE-suppressed.
+        assert!(s.contains("CL"));
+        assert!(s.contains("V [FIX]"));
+        assert!(s.contains("--- OMEGA ---"));
+        assert!(s.contains("ETA_CL"));
+        assert!(s.contains("(CV% ="));
+        assert!(s.contains("--- SIGMA (proportional) ---"));
+        assert!(s.contains("Condition number: 42.0"));
+        assert!(s.contains("Eta shrinkage:"));
+        assert!(s.contains("EPS shrinkage: 8.0%"));
+        assert!(s.contains("Warnings: 1"));
+        assert!(s.contains("heads up"));
+    }
+
+    #[test]
+    fn format_summary_block_omega_shows_correlation() {
+        // A correlated (block) omega must surface a `corr(...)` line.
+        let mut r = make_sigma_only_result(ErrorModel::Additive, vec![1.0]);
+        r.theta = vec![2.0];
+        r.theta_names = vec!["CL".into()];
+        r.theta_fixed = vec![false];
+        r.omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.03, 0.03, 0.04]);
+        r.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
+        r.omega_fixed = vec![false, false];
+
+        let s = format_summary(&r);
+        assert!(s.contains("corr(ETA_V, ETA_CL) ="));
+    }
+
+    #[test]
+    fn format_summary_no_cov_suppresses_cv_and_rse() {
+        // Failed covariance → no SE table, CV% suppressed, method chain shown,
+        // fixed omega/sigma labelled, no condition number, no warnings.
+        let mut r = make_sigma_only_result(ErrorModel::Additive, vec![0.5]);
+        r.method = EstimationMethod::FoceI;
+        r.method_chain = vec![EstimationMethod::Saem, EstimationMethod::FoceI];
+        r.converged = false;
+        r.theta = vec![1.5];
+        r.theta_names = vec!["CL".into()];
+        r.theta_fixed = vec![false];
+        r.se_theta = None;
+        r.omega = DMatrix::from_row_slice(1, 1, &[0.09]);
+        r.eta_names = vec!["ETA_CL".into()];
+        r.omega_fixed = vec![true];
+        r.sigma_fixed = vec![true];
+        r.covariance_status = CovarianceStatus::Failed;
+        r.cov_condition_number = None;
+        r.shrinkage_eta = vec![f64::NAN];
+        r.shrinkage_eps = f64::NAN;
+
+        let s = format_summary(&r);
+        // Method chain joined with the arrow.
+        assert!(s.contains("SAEM → FOCEI"));
+        assert!(s.contains("Converged:  NO"));
+        // No se_theta → N/A in the %RSE column, no CV% under failed covariance.
+        assert!(s.contains("N/A"));
+        assert!(!s.contains("CV% ="));
+        // Fixed omega/sigma are [FIX]-labelled; condition number omitted.
+        assert!(s.contains("ETA_CL [FIX]"));
+        assert!(!s.contains("Condition number"));
+        // No finite shrinkage or warnings → those lines are absent.
+        assert!(!s.contains("Eta shrinkage:"));
+        assert!(!s.contains("EPS shrinkage:"));
+        assert!(!s.contains("Warnings:"));
+    }
+
     fn yaml_for(error_model: ErrorModel, sigma: Vec<f64>) -> String {
         let result = make_sigma_only_result(error_model, sigma);
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1774,6 +2132,36 @@ mod tests {
         );
         assert!(yaml.contains("      min:"), "min stat missing:\n{yaml}");
         assert!(yaml.contains("      max:"), "max stat missing:\n{yaml}");
+    }
+
+    /// Regression: `format_summary` must exclude NN weight thetas from the
+    /// THETA table (they can number in the hundreds), matching the YAML writer
+    /// and `print_results`. Without the `nn_theta_indices` skip this dumps one
+    /// row per weight.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn format_summary_excludes_nn_weight_thetas() {
+        let result = make_nn_result();
+        let s = format_summary(&result);
+
+        // The user-declared theta is still listed.
+        assert!(s.contains("TVKA"), "TVKA must appear in THETA table:\n{s}");
+
+        // None of the 17 NN-weight thetas appear.
+        for layer in 1..3 {
+            let n_l = if layer == 1 { 3 } else { 2 };
+            let n_lm1 = if layer == 1 { 2 } else { 3 };
+            for i in 1..=n_l {
+                for j in 1..=n_lm1 {
+                    let name = format!("W_TYPICAL_PK_{}_{}_{}", layer, i, j);
+                    assert!(
+                        !s.contains(&name),
+                        "NN weight `{}` should NOT appear in THETA table:\n{s}",
+                        name
+                    );
+                }
+            }
+        }
     }
 
     /// Sanity: when no `[covariate_nn]` blocks are declared, the YAML
