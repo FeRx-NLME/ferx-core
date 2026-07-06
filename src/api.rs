@@ -976,17 +976,16 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // subject, so a covariate relationship that pushes a subject's typical
     // parameter out of range is caught too. Reported once — a single fatal
     // error already halts the fit.
-    // Pathway-fraction structural check (#388, model-level): fractions must
-    // *partition* the dose on a compartment. ≥2 input-rate terms on one compartment
-    // therefore must **each** carry a fraction (`FR*fn(...)`); a bare term alongside
-    // a fractioned one (or two bare terms) would deliver the full `F·Dose` more than
-    // once. A fraction is only meaningful across ≥2 partitioning terms, so a *lone*
-    // fractioned term is rejected too (a single pathway is written bare).
-    //
-    // (The companion structural rule — **at most one zero-order forcing per
-    // compartment** — is enforced earlier, in the parser's `build_ode_spec`, so it
-    // also guards the `simulate()` / `predict()` paths that never reach this
-    // data-level check; #505.)
+    // Pathway-fraction **value** checks (below) read a per-compartment term/fraction
+    // tally: `frac_count` maps each input-rate compartment to `(total terms,
+    // fractioned terms)`, and the Σ ≈ 1 gate uses it to run only on a genuine
+    // ≥2-pathway split. The companion **structural** rules — every term on a
+    // ≥2-pathway compartment must carry a fraction, and a *lone* fractioned term is
+    // rejected — are enforced earlier, in the parser's `build_ode_spec` (alongside
+    // the at-most-one-zero-order rule, #505), so they also guard the `simulate()` /
+    // `predict()` paths that never reach this data-level check (#388, #588). By the
+    // time a model reaches here its fractions are therefore structurally well-formed;
+    // only the value ranges remain.
     use std::collections::BTreeMap;
     let mut frac_count: BTreeMap<usize, (usize, usize)> = BTreeMap::new(); // cmt -> (total, fractioned)
     for f in &ode.input_rate {
@@ -994,45 +993,6 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
         e.0 += 1;
         if f.frac_slot.is_some() {
             e.1 += 1;
-        }
-    }
-
-    for (&cmt, &(total, fractioned)) in &frac_count {
-        if total >= 2 && fractioned != total {
-            diags.push(
-                Diagnostic::error(
-                    "E_ABSORPTION_FRACTION",
-                    format!(
-                        "Compartment {} has {total} built-in absorption input-rate terms but \
-                         only {fractioned} carry a pathway fraction. When more than one term \
-                         feeds a compartment, each must be written `FR*fn(...)` with the \
-                         fractions summing to 1 — otherwise the dose mass is counted more than \
-                         once.",
-                        cmt + 1
-                    ),
-                )
-                .with_block("odes"),
-            );
-        } else if total == 1 && fractioned == 1 {
-            // A *lone* fractioned term can't partition anything: `FR*fn(...)` as the
-            // only input on a compartment is only ever valid at `FR = 1` (≡ a bare
-            // term), so reject it here with a precise message instead of letting the
-            // per-subject sum-check below report the confusing "fractions sum to 0.6,
-            // not 1" (review #1). A single pathway is written bare; `F` handles
-            // partial absorption.
-            diags.push(
-                Diagnostic::error(
-                    "E_ABSORPTION_FRACTION",
-                    format!(
-                        "Compartment {} has a single input-rate term carrying a pathway fraction \
-                         (`FR*fn(...)`). A pathway fraction only applies when ≥2 terms split the \
-                         dose across a compartment — write a single pathway as a bare \
-                         `+ fn(...)`, and use bioavailability `F` for partial absorption.",
-                        cmt + 1
-                    ),
-                )
-                .with_block("odes"),
-            );
         }
     }
 
@@ -1361,6 +1321,27 @@ pub(crate) fn assert_analytic_readout_support(model: &CompiledModel, population:
             "predict()/simulate() received a model/data combination the analytic Form C \
              readout cannot honour: {msg}\n(fit() reports this as an error rather than \
              panicking.)"
+        );
+    }
+}
+
+/// Panic on a malformed built-in **absorption input-rate** model/data combination —
+/// a pathway-fraction value out of `(0, 1]` or not summing to 1, an out-of-domain
+/// forcing parameter, or an SS / infusion / `[diffusion]` dose into an input-rate
+/// compartment — for the `Vec`-returning `predict()` / `simulate()` paths (mirrors
+/// [`assert_transit_support`]). `fit()` (and `ferx check`) surface these as an `Err`
+/// via [`check_model_data`], but the simulate/predict paths run no data-check, so
+/// without this a malformed multi-pathway model would be simulated with silently
+/// wrong dose delivery (#588). The data-independent *structural* fraction rules are
+/// enforced even earlier, at parse time in `build_ode_spec`; this reuses
+/// [`check_absorption_dosing`] for the *value* / domain checks that need data. A
+/// no-op for any model with no built-in input-rate forcing (the common case).
+pub(crate) fn assert_absorption_dosing_supported(model: &CompiledModel, population: &Population) {
+    if let Err(msg) = first_error(&check_absorption_dosing(model, population)) {
+        panic!(
+            "predict()/simulate() received a model/data combination the built-in absorption \
+             input-rate machinery cannot honour: {msg}\n(fit() reports this as an error rather \
+             than panicking.)"
         );
     }
 }
@@ -6353,6 +6334,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // data-check otherwise. #324.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_absorption_dosing_supported(model, population);
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
     // no resets / left truncation). `simulate_with_options` checks them first and
@@ -7117,6 +7099,7 @@ pub fn predict(
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
     assert_analytic_readout_support(model, population);
+    assert_absorption_dosing_supported(model, population);
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     let mut results = Vec::new();

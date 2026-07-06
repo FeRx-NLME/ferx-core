@@ -32,6 +32,15 @@ section of the SDLC for the versioning policy).
   and `ferx summary --help` now print usage to stdout and exit 0, matching standard
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
+### Fixed
+- **Built-in absorption pathway-fraction validation now covers `simulate()` and
+  `predict()`** (#588): a multi-pathway model with malformed fractions — a bare term
+  alongside a fractioned one, a lone `FR*fn(...)`, a fraction outside `(0, 1]`, or
+  fractions not summing to 1 — was rejected by `fit()` / `ferx check` but could be
+  simulated or predicted with silently wrong dose delivery. The data-independent
+  *structural* rules now fire at parse time (so every entry point rejects them), and
+  the typical-value *value* checks are enforced on the `predict`/`simulate` paths too.
+
 ## [0.2.0] - 2026-07-03
 
 ### Added

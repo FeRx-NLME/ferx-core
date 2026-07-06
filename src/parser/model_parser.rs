@@ -7203,6 +7203,52 @@ fn build_ode_spec(
         }
     }
 
+    // Structural invariant (compile-time, #388/#588): built-in absorption **pathway
+    // fractions must partition the dose on a compartment**. When ≥2 input-rate terms
+    // feed one compartment they must *each* carry a fraction (`FR*fn(...)`) — a bare
+    // term alongside a fractioned one (or two bare terms) would deliver the full
+    // `F·Dose` more than once. And a *lone* fractioned term is rejected: a fraction
+    // only partitions across ≥2 terms, so a single pathway is written bare (`F`
+    // handles partial absorption). Enforced here, in the parser (mirroring the
+    // at-most-one-zero-order rule above), rather than only in the data-level
+    // `api::check_absorption_dosing`, so the `simulate()` / `predict()` paths — which
+    // never run that fit-init check — reject a malformed multi-pathway model too
+    // (every entry point parses the model first). The companion **value** checks
+    // (each fraction in (0, 1], Σ ≈ 1) depend on typical parameter values, so they
+    // stay data-level; the simulate/predict paths reach them via
+    // `assert_absorption_dosing_supported`.
+    {
+        let mut frac_count: std::collections::BTreeMap<usize, (usize, usize)> =
+            std::collections::BTreeMap::new(); // cmt -> (total, fractioned)
+        for f in &input_rate {
+            let e = frac_count.entry(f.cmt).or_insert((0, 0));
+            e.0 += 1;
+            if f.frac_slot.is_some() {
+                e.1 += 1;
+            }
+        }
+        for (&cmt, &(total, fractioned)) in &frac_count {
+            if total >= 2 && fractioned != total {
+                return Err(format!(
+                    "[odes]: compartment {} has {total} built-in absorption input-rate terms \
+                     but only {fractioned} carry a pathway fraction. When more than one term \
+                     feeds a compartment, each must be written `FR*fn(...)` with the fractions \
+                     summing to 1 — otherwise the dose mass is counted more than once.",
+                    cmt + 1
+                ));
+            }
+            if total == 1 && fractioned == 1 {
+                return Err(format!(
+                    "[odes]: compartment {} has a single input-rate term carrying a pathway \
+                     fraction (`FR*fn(...)`). A pathway fraction only applies when ≥2 terms \
+                     split the dose across a compartment — write a single pathway as a bare \
+                     `+ fn(...)`, and use bioavailability `F` for partial absorption.",
+                    cmt + 1
+                ));
+            }
+        }
+    }
+
     // For ODE RHS expressions, states + individual params get injected into the
     // `vars` map at eval time, so every bare identifier should resolve to a
     // Variable (not a Covariate). ParseCtx::ode() flips the fallback accordingly.

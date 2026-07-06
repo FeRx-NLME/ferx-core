@@ -117,11 +117,15 @@ mis-modeled:
   (`E_ABSORPTION_DIFFUSION`) — the EKF propagation does not yet carry the
   input-rate forcing.
 
-> **Note:** these guards run at `fit()` time (and via `ferx check`), which is
-> where model–data compatibility is validated. The lower-level `predict()` and
-> `simulate()` entry points assume an already-checked model and do not re-run
-> them, so run `ferx check` (or `fit()`) on a new model before relying on
-> `predict`/`simulate` output.
+> **Note:** these built-in-absorption guards run at `fit()` time and via `ferx
+> check` — where full model–data compatibility is validated — **and on the
+> lower-level `predict()` / `simulate()` paths too**: a combination `fit()` reports
+> as an `Err` becomes a **panic** there, since those `Vec`-returning entry points
+> cannot return an error (#588). The data-independent *structural* rules (e.g. the
+> pathway-fraction partition below) fire even earlier, at parse time, so *every*
+> entry point rejects a malformed model. Other, non-absorption data checks are
+> still only run by `fit()` / `ferx check`, so validate a new model there before
+> relying on `predict`/`simulate` output.
 
 ## Analytic closed form — `pk one_cpt_transit(cl, v, n, mtt)`
 
@@ -326,9 +330,13 @@ Rules for the fraction multiplier:
   (`FR2 = 1 - TVFR1`) so each term binds to one parameter. This also lets the
   fraction carry IIV/covariates and keeps its gradient exact (analytic `Dual2`).
 - The dose is **partitioned**, not duplicated: when more than one input-rate term
-  feeds a compartment, **each** must carry a fraction, and the fractions are
-  checked at fit-init to lie in `(0, 1]` and sum to ≈ 1 (`E_ABSORPTION_FRACTION`).
-  Two pathways together still deliver exactly `F·Dose` (`∫ Σ FRᵢ·R_inᵢ dt = F·Dose`).
+  feeds a compartment, **each** must carry a fraction (and a *lone* fractioned term
+  is rejected — a single pathway is written bare). This *structural* rule is checked
+  at **parse time**, so it fires for every entry point. The *value* checks — each
+  fraction in `(0, 1]` and the fractions summing to ≈ 1 (`E_ABSORPTION_FRACTION`) —
+  are evaluated at typical values by `fit()` / `ferx check`, and enforced on
+  `predict()` / `simulate()` as well (#588). Two pathways together still deliver
+  exactly `F·Dose` (`∫ Σ FRᵢ·R_inᵢ dt = F·Dose`).
 - The same multiplier works for `transit`/`weibull`/`first_order` terms, and on
   `zero_order(...)` as part of a `mixed` model — see
   [Parallel / mixed absorption](#parallel-mixed)

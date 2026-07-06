@@ -18,7 +18,7 @@
 mod common;
 
 use ferx_core::parser::model_parser::parse_full_model;
-use ferx_core::{predict, DoseEvent, Population};
+use ferx_core::{predict, simulate_with_seed, DoseEvent, Population};
 
 /// One-compartment model with built-in inverse-Gaussian absorption straight
 /// into central (no first-order `ka`). central (CMT 1) holds the drug AMOUNT
@@ -226,7 +226,14 @@ fn biphasic_igd_recovers_dose_auc() {
 }
 
 #[test]
-fn biphasic_igd_fraction_validation() {
+fn biphasic_igd_fraction_value_validation() {
+    // **Value** fraction checks — each fraction in (0, 1], and the fractions on a
+    // compartment sum to ≈ 1 — depend on the typical parameter values (η = 0), so
+    // they live in the data-level `check_model_data` (reached by `fit()` / `ferx
+    // check`, and now by `simulate()` / `predict()` via
+    // `assert_absorption_dosing_supported`, #588). Each model here is *structurally*
+    // well-formed (both pathways carry a fraction), so it parses; only the value is
+    // wrong.
     use ferx_core::check_model_data;
     let pop = pop_single_igd(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
     let has_fraction_err = |src: &str| {
@@ -251,17 +258,66 @@ fn biphasic_igd_fraction_validation() {
         BIPHASIC_ODES,
         "  FR1 = TVFR1 * 2.5\n  FR2 = TVFR2"
     )));
-    // (a) Structural: a bare term alongside a fractioned one on the same compartment
-    //     (the dose would be over-delivered) is rejected.
-    assert!(has_fraction_err(&biphasic_model(
+}
+
+#[test]
+fn biphasic_igd_fraction_structural_rejected_at_parse() {
+    // **Structural** fraction rules — every term on a ≥2-pathway compartment must
+    // carry a fraction, and a *lone* fractioned term is rejected — are data-independent,
+    // so they are enforced at parse time in `build_ode_spec` (mirroring the
+    // at-most-one-zero-order rule). This fires for *every* entry point, including the
+    // `simulate()` / `predict()` paths that never reach `check_model_data` (#388, #588).
+    let parse_err = |src: &str| {
+        parse_full_model(src)
+            .err()
+            .expect("structurally malformed pathway fractions must be rejected at parse")
+    };
+
+    // (a) A bare term alongside a fractioned one on the same compartment (the dose
+    //     would be over-delivered) is rejected.
+    let err = parse_err(&biphasic_model(
         "d/dt(central) = FR1*igd(mat=MAT1, cv2=CV2_1) + igd(mat=MAT2, cv2=CV2_2) - CL/V*central",
         "  FR1 = TVFR1",
-    )));
+    ));
+    assert!(
+        err.contains("pathway fraction") && err.contains("compartment 1"),
+        "all-or-none violation should name the fraction rule and compartment, got: {err}"
+    );
+
     // (d) A *lone* fractioned term (a single pathway carrying a fraction) is rejected:
     //     a fraction only partitions a dose across ≥2 terms, so a single pathway must
-    //     be written bare (review #1). Caught structurally, before the sum-check.
-    assert!(has_fraction_err(&biphasic_model(
+    //     be written bare.
+    let err = parse_err(&biphasic_model(
         "d/dt(central) = FR1*igd(mat=MAT1, cv2=CV2_1) - CL/V*central",
         "  FR1 = TVFR1",
-    )));
+    ));
+    assert!(
+        err.contains("single input-rate term carrying a pathway fraction"),
+        "lone fractioned term should be rejected with a precise message, got: {err}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "absorption input-rate machinery cannot honour")]
+fn biphasic_igd_fraction_value_error_panics_on_predict() {
+    // #588: the value fraction checks now guard the `Vec`-returning `predict()` path.
+    // A structurally-valid but value-malformed multi-pathway model (both fractions
+    // 0.6 → Σ = 1.2, silently over-delivering the dose) is rejected loudly instead of
+    // predicted wrong. `fit()` reports the same as an `Err` via `check_model_data`.
+    let src = biphasic_model(BIPHASIC_ODES, "  FR1 = TVFR1\n  FR2 = TVFR1");
+    let model = parse_full_model(&src).expect("model parses").model;
+    let pop = pop_single_igd(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
+    let _ = predict(&model, &pop, &model.default_params);
+}
+
+#[test]
+#[should_panic(expected = "absorption input-rate machinery cannot honour")]
+fn biphasic_igd_fraction_value_error_panics_on_simulate() {
+    // #588 (simulate path): the same value-malformed multi-pathway model is rejected
+    // when *simulated*, via the `simulate_inner_with_draw` chokepoint guard — the exact
+    // path the fit-init-only `check_model_data` left open to silently-wrong delivery.
+    let src = biphasic_model(BIPHASIC_ODES, "  FR1 = TVFR1\n  FR2 = TVFR1");
+    let model = parse_full_model(&src).expect("model parses").model;
+    let pop = pop_single_igd(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
+    let _ = simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
 }
