@@ -33,6 +33,9 @@ section of the SDLC for the versioning policy).
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
 ### Fixed
+- **CLI flags in `--flag=value` form are no longer silently ignored** (#693):
+  `--data`, `--output`, `--threads` (and any other value-taking flag) now accept
+  `=` the same as a space, e.g. `ferx model.ferx --data=d.csv --threads=4`.
 - **TTE non-monotone-hazard guard now tracks the ODE solver tolerance** (#618). For a
   drug-driven `[odes]` `hazard =` expression (no `h >= 0` constraint), the cumulative-
   hazard monotonicity check rejected a negative increment `H(b) < H(a)` only past a fixed
