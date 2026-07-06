@@ -32,6 +32,11 @@ section of the SDLC for the versioning policy).
   and `ferx summary --help` now print usage to stdout and exit 0, matching standard
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
+### Fixed
+- **CLI flags in `--flag=value` form are no longer silently ignored** (#693):
+  `--data`, `--output`, `--threads` (and any other value-taking flag) now accept
+  `=` the same as a space, e.g. `ferx model.ferx --data=d.csv --threads=4`.
+
 ## [0.2.0] - 2026-07-03
 
 ### Added
