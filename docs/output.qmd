@@ -145,12 +145,12 @@ covariance_matrix:
     sigma_1:         [0.000000e+0, 0.000000e+0, 0.000000e+0, 0.000000e+0, 7.890123e-7]
 estimation:
   wall_time_secs: 12.345678
-  n_threads: 8
+  n_threads_used: 8
 environment:
   os: linux
   arch: x86_64
-  docker: true
-  username: ron
+  in_docker: true
+  username: "ron"
   ferx_version: 0.2.0
 ```
 
@@ -174,16 +174,19 @@ not log-transformed).
 - **cv_pct**: Coefficient of variation for omega (sqrt(variance) * 100)
 
 The `estimation:` block replaces the standalone `{model}-timing.txt` file
-(removed in #704): `wall_time_secs` measures only the estimation step (not
-parsing or data reading), and `n_threads` is the Rayon worker count used.
-The `environment:` block is a snapshot of the machine and account the fit
-ran under — `os`/`arch` from the running binary's target, `docker` (whether
-`/.dockerenv` or `/proc/1/cgroup` indicate a container), `username`
-(`$USER`/`%USERNAME%`), and `ferx_version`.
+(removed in #704): `wall_time_secs` measures only the estimation step itself
+(not model parsing or data reading — the old timing file's `elapsed_seconds`
+covered the whole CLI run, so the two are not a like-for-like replacement,
+just the closest equivalent), and `n_threads_used` is the Rayon worker count
+used. The `environment:` block is a snapshot of the machine and account the
+fit ran under — `os`/`arch` from the running binary's target, `in_docker`
+(whether `/.dockerenv`, `KUBERNETES_SERVICE_HOST`, or `/proc/1/cgroup`
+indicate a container), `username` (`$USER`/`%USERNAME%`, quoted/escaped since
+it's free-form text), and `ferx_version`.
 
 ## FitResult Fields (Rust API / console)
 
-The following fields are populated on the `FitResult` struct returned by `fit()` and printed by `print_results()`. They are **not** currently written to the fit YAML — read them programmatically or from the console summary.
+The following fields are populated on the `FitResult` struct returned by `fit()` and printed by `print_results()`. Except for `wall_time_secs`, `n_threads_used`, and `environment` (written to the `estimation:`/`environment:` blocks above), they are **not** currently written to the fit YAML — read them programmatically or from the console summary.
 
 ### Shrinkage
 
@@ -277,8 +280,13 @@ When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption 
 |-------|-------------|
 | `os` | Target OS family (`std::env::consts::OS`), e.g. `"linux"`, `"macos"`, `"windows"` |
 | `arch` | Target CPU architecture (`std::env::consts::ARCH`), e.g. `"x86_64"`, `"aarch64"` |
-| `in_docker` | `true` when `/.dockerenv` exists or `/proc/1/cgroup` names a container runtime |
+| `in_docker` | `true` when `/.dockerenv` exists, `KUBERNETES_SERVICE_HOST` is set, or `/proc/1/cgroup` names a container runtime |
 | `username` | OS username the fit ran under (`$USER`/`%USERNAME%`), `"unknown"` if neither is set |
+
+Container detection is best-effort: a cgroup-v2 host with a cgroup namespace
+(common under containerd/CRI-O) hides the pod's own cgroup path, which is why
+the Kubernetes env var check exists as a fallback alongside the `/.dockerenv`
+marker and cgroup substring match.
 
 `.fitrx` bundles saved before this field existed load with an `"unknown"`
 placeholder rather than the *loading* machine's environment.

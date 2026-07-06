@@ -170,14 +170,14 @@ fn fit_with_data_writes_outputs_and_bundle() {
         "yaml missing estimation: {yaml}"
     );
     assert!(yaml.contains("  wall_time_secs:"));
-    assert!(yaml.contains("  n_threads:"));
+    assert!(yaml.contains("  n_threads_used:"));
     assert!(
         yaml.contains("\nenvironment:"),
         "yaml missing environment: {yaml}"
     );
     assert!(yaml.contains("  os:"));
     assert!(yaml.contains("  arch:"));
-    assert!(yaml.contains("  docker:"));
+    assert!(yaml.contains("  in_docker:"));
     assert!(yaml.contains("  username:"));
     assert!(yaml.contains("  ferx_version:"));
 }

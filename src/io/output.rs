@@ -1183,6 +1183,15 @@ fn fmt_cov_entry(v: f64) -> String {
     s
 }
 
+/// Quote and escape a free-form string for embedding as a YAML scalar value
+/// (backslash and double-quote are the two characters significant inside a
+/// double-quoted YAML string). Used for values sourced from the OS/environment
+/// (e.g. `environment.username`) that aren't under ferx's control and may
+/// contain YAML-significant characters like `:`.
+fn yaml_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Build the ordered parameter name list that matches `pack_params` layout:
 /// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
 ///
@@ -1737,16 +1746,25 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     }
 
     // Run timing + thread count (#704 — replaces the separate `-timing.txt` file).
+    // Key names match `FitResult`/`.fitrx` field names (`n_threads_used`,
+    // `in_docker`) so the same data isn't spelled two different ways across formats.
     writeln!(f, "\nestimation:").map_err(|e| e.to_string())?;
     writeln!(f, "  wall_time_secs: {:.6}", result.wall_time_secs).map_err(|e| e.to_string())?;
-    writeln!(f, "  n_threads: {}", result.n_threads_used).map_err(|e| e.to_string())?;
+    writeln!(f, "  n_threads_used: {}", result.n_threads_used).map_err(|e| e.to_string())?;
 
     // System/account info the fit ran under, for troubleshooting (#704).
     writeln!(f, "\nenvironment:").map_err(|e| e.to_string())?;
     writeln!(f, "  os: {}", result.environment.os).map_err(|e| e.to_string())?;
     writeln!(f, "  arch: {}", result.environment.arch).map_err(|e| e.to_string())?;
-    writeln!(f, "  docker: {}", result.environment.in_docker).map_err(|e| e.to_string())?;
-    writeln!(f, "  username: {}", result.environment.username).map_err(|e| e.to_string())?;
+    writeln!(f, "  in_docker: {}", result.environment.in_docker).map_err(|e| e.to_string())?;
+    // Quoted/escaped: an OS username is free-form text and may contain YAML-
+    // significant characters (e.g. a colon in a Windows domain account).
+    writeln!(
+        f,
+        "  username: {}",
+        yaml_quote(&result.environment.username)
+    )
+    .map_err(|e| e.to_string())?;
     writeln!(f, "  ferx_version: {}", result.ferx_version).map_err(|e| e.to_string())?;
 
     Ok(())
@@ -2999,13 +3017,33 @@ mod tests {
         // #704: estimation timing/threads + environment snapshot.
         assert!(yaml.contains("\nestimation:"));
         assert!(yaml.contains("  wall_time_secs:"));
-        assert!(yaml.contains("  n_threads:"));
+        assert!(yaml.contains("  n_threads_used:"));
         assert!(yaml.contains("\nenvironment:"));
         assert!(yaml.contains(&format!("  os: {}", r.environment.os)));
         assert!(yaml.contains(&format!("  arch: {}", r.environment.arch)));
-        assert!(yaml.contains(&format!("  docker: {}", r.environment.in_docker)));
-        assert!(yaml.contains(&format!("  username: {}", r.environment.username)));
+        assert!(yaml.contains(&format!("  in_docker: {}", r.environment.in_docker)));
+        assert!(yaml.contains(&format!(
+            "  username: {}",
+            yaml_quote(&r.environment.username)
+        )));
         assert!(yaml.contains(&format!("  ferx_version: {}", r.ferx_version)));
+    }
+
+    #[test]
+    fn write_yaml_escapes_username_with_yaml_significant_characters() {
+        // #704 review: an OS username is free-form text (e.g. a Windows domain
+        // account) and may contain a colon or quote, which would otherwise
+        // corrupt the YAML document.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.environment.username = "DOMAIN\\svc: build \"prod\"".to_string();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(
+            yaml.contains("  username: \"DOMAIN\\\\svc: build \\\"prod\\\"\""),
+            "username not properly quoted/escaped:\n{yaml}"
+        );
     }
 
     #[test]
