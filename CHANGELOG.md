@@ -33,6 +33,9 @@ section of the SDLC for the versioning policy).
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
 ### Fixed
+- **CLI flags in `--flag=value` form are no longer silently ignored** (#693):
+  `--data`, `--output`, `--threads` (and any other value-taking flag) now accept
+  `=` the same as a space, e.g. `ferx model.ferx --data=d.csv --threads=4`.
 - **Built-in absorption pathway-fraction validation now covers `simulate()` and
   `predict()`** (#588): a multi-pathway model with malformed fractions — a bare term
   alongside a fractioned one, a lone `FR*fn(...)`, a fraction outside `(0, 1]`, or

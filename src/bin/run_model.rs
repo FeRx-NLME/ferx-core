@@ -35,8 +35,33 @@ fn is_help_flag(arg: Option<&String>) -> bool {
     matches!(arg.map(String::as_str), Some("-h") | Some("--help"))
 }
 
+/// Rewrites `--flag=value` into separate `--flag`, `value` elements so the
+/// rest of the parsing below (which matches flags by exact string, then reads
+/// the following element as the value) sees `--data=d.csv` the same way it
+/// already sees `--data d.csv` (#693 — `=`-style args were silently dropped).
+/// `--inits-from-nca=METHOD` is left untouched: `parse_inits_from_nca_flag`
+/// parses that combined form itself, deliberately never consuming a following
+/// positional for the bare-flag case.
+fn normalize_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .flat_map(|a| {
+            if a.starts_with("--inits-from-nca") {
+                return vec![a.clone()];
+            }
+            match a.strip_prefix("--").and_then(|rest| rest.find('=')) {
+                Some(eq) => {
+                    let (flag, value) = a.split_at(eq + 2);
+                    vec![flag.to_string(), value[1..].to_string()]
+                }
+                None => vec![a.clone()],
+            }
+        })
+        .collect()
+}
+
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
+    let args = normalize_args(&raw_args);
 
     if is_help_flag(args.get(1)) {
         print!("{MAIN_USAGE}");
@@ -445,8 +470,9 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 #[cfg(test)]
 mod tests {
     use super::{
-        is_help_flag, parse_check_args, parse_inits_from_nca_flag, parse_output_flag,
-        parse_threads_flag, print_check_human, run_check, run_summary, CheckArgsError,
+        is_help_flag, normalize_args, parse_check_args, parse_inits_from_nca_flag,
+        parse_output_flag, parse_threads_flag, print_check_human, run_check, run_summary,
+        CheckArgsError,
     };
     use ferx_core::NcaInit;
 
@@ -455,6 +481,65 @@ mod tests {
             .chain(extra.iter().copied())
             .map(String::from)
             .collect()
+    }
+
+    #[test]
+    fn normalize_args_splits_eq_form() {
+        assert_eq!(
+            normalize_args(&args(&["model.ferx", "--data=d.csv", "--threads=4"])),
+            args(&["model.ferx", "--data", "d.csv", "--threads", "4"])
+        );
+    }
+
+    #[test]
+    fn normalize_args_leaves_space_form_and_bare_flags_alone() {
+        assert_eq!(
+            normalize_args(&args(&["model.ferx", "--data", "d.csv", "--simulate"])),
+            args(&["model.ferx", "--data", "d.csv", "--simulate"])
+        );
+    }
+
+    #[test]
+    fn normalize_args_preserves_extra_eq_signs_in_value() {
+        assert_eq!(
+            normalize_args(&args(&["--output=a=b.fitrx"])),
+            args(&["--output", "a=b.fitrx"])
+        );
+    }
+
+    #[test]
+    fn normalize_args_does_not_split_inits_from_nca() {
+        // parse_inits_from_nca_flag parses the combined `--inits-from-nca=X`
+        // form itself; normalize_args must leave it intact rather than
+        // splitting it like other `--flag=value` args.
+        assert_eq!(
+            normalize_args(&args(&["--inits-from-nca=nca_ebe"])),
+            args(&["--inits-from-nca=nca_ebe"])
+        );
+    }
+
+    #[test]
+    fn threads_flag_accepts_eq_form_after_normalize() {
+        assert_eq!(
+            parse_threads_flag(&normalize_args(&args(&["--threads=4"]))),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn output_flag_accepts_eq_form_after_normalize() {
+        assert_eq!(
+            parse_output_flag(&normalize_args(&args(&["--output=run1.fitrx"]))),
+            Some("run1.fitrx".to_string())
+        );
+    }
+
+    #[test]
+    fn check_args_data_accepts_eq_form_after_normalize() {
+        let argv = normalize_args(&args(&["check", "model.ferx", "--data=d.csv", "--json"]));
+        let a = parse_check_args(&argv).unwrap();
+        assert_eq!(a.data, Some("d.csv"));
+        assert!(a.json);
     }
 
     #[test]
