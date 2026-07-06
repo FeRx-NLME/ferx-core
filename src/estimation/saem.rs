@@ -2313,6 +2313,25 @@ mod tests {
     use crate::types::test_helpers::analytical_model;
     use crate::types::{GradientMethod, MuRef};
 
+    #[test]
+    fn fold_nll_grad_sums_nll_and_grad_elementwise_in_input_order() {
+        let per_subj = vec![
+            (1.0, vec![1.0, 10.0]),
+            (2.0, vec![2.0, 20.0]),
+            (3.0, vec![3.0, 30.0]),
+        ];
+        let (nll, grad) = fold_nll_grad(per_subj, 2);
+        assert_eq!(nll, 6.0);
+        assert_eq!(grad, vec![6.0, 60.0]);
+    }
+
+    #[test]
+    fn fold_nll_grad_of_empty_input_is_zero() {
+        let (nll, grad) = fold_nll_grad(vec![], 3);
+        assert_eq!(nll, 0.0);
+        assert_eq!(grad, vec![0.0, 0.0, 0.0]);
+    }
+
     /// Pin the SAEM M-step optimizer choice.
     ///
     /// BOBYQA (derivative-free trust-region) was chosen over the prior SLSQP

@@ -13,11 +13,11 @@
 //! `FitOptions::threads` runs the whole fit inside a scoped rayon pool of the
 //! requested size, so this exercises the exact user-facing knob from the issue.
 //!
-//! Three tests cover the three estimators this PR patched: FOCEI
+//! Four tests cover every function this PR patched: FOCEI
 //! (`foce_population_nll`/`_iov` in `src/stats/likelihood.rs`), SAEM
-//! (`obs_nll_sum`/`_iov` and `theta_sigma_mstep_light` in
-//! `src/estimation/saem.rs`), and IMPMAP (`theta_sigma_weighted_mstep` in
-//! `src/estimation/impmap.rs`).
+//! non-IOV and IOV (`obs_nll_sum`/`_iov` and both branches of
+//! `theta_sigma_mstep_light` in `src/estimation/saem.rs`), and IMPMAP
+//! (`theta_sigma_weighted_mstep` in `src/estimation/impmap.rs`).
 
 use std::path::Path;
 
@@ -116,6 +116,44 @@ fn saem_ofv_is_independent_of_thread_count() {
     let ofv_4 = run_saem_with_threads(4);
     let ofv_15 = run_saem_with_threads(15);
     assert_bit_identical_across_threads("SAEM", ofv_1, ofv_4, ofv_15);
+}
+
+fn warfarin_iov() -> (
+    ferx_core::types::CompiledModel,
+    ferx_core::types::Population,
+) {
+    let model = parse_model_file(Path::new("examples/warfarin_iov_saem.ferx"))
+        .expect("warfarin_iov_saem model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+        .expect("warfarin_iov data must load");
+    (model, population)
+}
+
+fn run_saem_iov_with_threads(n: usize) -> f64 {
+    let (model, population) = warfarin_iov();
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::Saem;
+    opts.saem_n_exploration = 5;
+    opts.saem_n_convergence = 5;
+    opts.saem_seed = Some(267);
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+    opts.threads = Some(n);
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("SAEM IOV fit must succeed");
+    result.ofv
+}
+
+/// IOV variant of the SAEM check above: exercises `obs_nll_sum_iov` and the
+/// `obs_nll_subject_grad_iov` branch of `theta_sigma_mstep_light`, the one
+/// pair of patched functions the non-IOV `warfarin.ferx` fixture above never
+/// reaches (it has no `kappa` block).
+#[test]
+fn saem_iov_ofv_is_independent_of_thread_count() {
+    let ofv_1 = run_saem_iov_with_threads(1);
+    let ofv_4 = run_saem_iov_with_threads(4);
+    let ofv_15 = run_saem_iov_with_threads(15);
+    assert_bit_identical_across_threads("SAEM IOV", ofv_1, ofv_4, ofv_15);
 }
 
 fn run_impmap_with_threads(n: usize) -> f64 {
