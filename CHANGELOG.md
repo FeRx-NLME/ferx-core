@@ -42,6 +42,16 @@ section of the SDLC for the versioning policy).
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
 ### Fixed
+- **A pathological ODE subject (e.g. a stiff time-varying-clearance term) no longer stalls a
+  FOCEI fit for many minutes on a handful of cores** (#708). A bad L-BFGS line-search trial
+  point can make the per-subject ODE genuinely expensive to integrate for several subjects at
+  once; the inner-loop Nelder-Mead fallback (`argmin_inner_fallback`) was re-solving that same
+  expensive ODE up to `max_iter * 5` times per subject per outer iteration trying to recover,
+  for no benefit. The fallback's NM-restart budget is now bounded (not removed) for any ODE
+  model — cut from `max_iter * 5` to `max_iter` — capping the pathological case's cost at a
+  fifth while still giving the common (non-pathological) BFGS near-miss a chance to recover, so
+  the outer optimizer keeps making progress instead of stalling or (an earlier attempt) needing
+  the whole trial rejected.
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point

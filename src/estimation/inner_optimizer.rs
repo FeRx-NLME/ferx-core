@@ -459,6 +459,11 @@ pub struct InnerLoopStats {
 /// for non-IOV, `[μ, 0…]` for IOV — the historical reset point). Exactly **one** NM solve
 /// runs, so enabling `ebe_warm_start` is never slower than leaving it off.
 ///
+/// `nm_iter_multiplier` scales `max_iter` into the NM restart's iteration budget (historically
+/// a fixed `5`; see [`ode_nm_fallback_multiplier`] for why #708 made it variable). A `0`
+/// multiplier skips the NM restart entirely and returns the BFGS partial unconditionally
+/// (`nm_ok = false`) without ever calling `obj` again.
+///
 /// Returns `(eta, nm_converged)`. The **value** is the lower-objective of the BFGS partial
 /// and the NM restart — the substantive #555 fix: the previous code overwrote `eta` with the
 /// NM restart unconditionally, discarding a correct partial that BFGS had reached but not
@@ -473,16 +478,20 @@ fn argmin_inner_fallback(
     n: usize,
     max_iter: usize,
     tol: f64,
+    nm_iter_multiplier: usize,
 ) -> (Vec<f64>, bool) {
     let partial_f = obj(partial);
     let partial_usable = partial_f.is_finite();
+    if nm_iter_multiplier == 0 {
+        return (partial.to_vec(), false);
+    }
     let warm = ebe_warm_start_enabled() && partial_usable;
     let mut eta_nm = if warm {
         partial.to_vec()
     } else {
         cold_seed.to_vec()
     };
-    let nm_ok = nelder_mead_minimize(obj, &mut eta_nm, n, max_iter * 5, tol);
+    let nm_ok = nelder_mead_minimize(obj, &mut eta_nm, n, max_iter * nm_iter_multiplier, tol);
     let f_nm = obj(&eta_nm);
     // Keep the partial unless NM is *strictly* better. Written as a positive comparison so a
     // non-finite `f_nm` (NM diverged) leaves `nm_strictly_better = false` and the finite
@@ -498,35 +507,56 @@ fn argmin_inner_fallback(
 
 /// An ODE-based model that also carries IOV (`κ`) random effects. The inner EBE path for
 /// these models is the expensive one this module special-cases (per-vertex ODE +
-/// steady-state work), so both the Nelder-Mead skip and the start-rejection gate key off
-/// this single classifier (#603 review #8).
+/// steady-state work), so the start-rejection gate keys off this classifier (#603 review #8).
 fn is_ode_iov(model: &CompiledModel) -> bool {
     model.ode_spec.is_some() && model.n_kappa > 0
 }
 
-/// Nelder-Mead is a useful last-resort recovery for low-dimensional closed-form EBEs, but
-/// it is not a practical recovery strategy for ODE+IOV. A single bad outer line-search
-/// point can otherwise launch simplex searches where each vertex is a full ODE and
-/// steady-state prediction. Keep the BFGS partial and report the subject unconverged
-/// instead; the outer EBE guard can then reject the trial.
-fn skip_ode_iov_nm_fallback(model: &CompiledModel) -> bool {
-    is_ode_iov(model)
+/// `argmin_inner_fallback`'s NM-restart iteration multiplier for `model`, keyed on how
+/// expensive a per-vertex re-solve is:
+///
+/// - **ODE+IOV → 0 (full skip).** A single bad outer line-search point can launch simplex
+///   searches where each vertex is a full ODE *and* steady-state prediction (#603 review #8) —
+///   the most expensive per-vertex case, so recovery isn't worth it and the BFGS partial is
+///   kept as-is.
+/// - **plain ODE → 1 (bounded, not skipped).** #708: profiling a real reproduction
+///   (pembrolizumab model066) traced its stall to *many* plain-ODE subjects simultaneously
+///   stuck in `find_ebe → argmin_inner_fallback → nelder_mead_minimize`, each burning the
+///   historical `max_iter * 5` budget, at a bad L-BFGS line-search trial point (not near the
+///   true optimum). But a **full skip** for plain ODE was tried and regressed badly on the
+///   same model: `argmin_inner_fallback` also re-certifies the common #555 case (BFGS is
+///   actually fine but fails the strict `gnorm < tol` test on the solver's noise floor) —
+///   skipping it entirely turned that into a permanent `unconverged`, which tripped
+///   `ebe_guard_rejects`'s `max_unconverged_frac` fraction trigger on nearly every trial and
+///   the outer optimizer never took a step. A **bounded** restart (`max_iter`, not
+///   `max_iter * 5`) still gives that cheap re-certification a chance while capping the
+///   pathological case's cost at 1/5th.
+/// - **not an ODE model → 5 (unchanged).** `argmin_inner_fallback` is only ever reached when
+///   `enable_stall` (`model.ode_spec.is_some()`) is true, so this arm is unreachable today;
+///   kept as the historical default in case that gate ever loosens.
+fn ode_nm_fallback_multiplier(model: &CompiledModel) -> usize {
+    if is_ode_iov(model) {
+        0
+    } else if model.ode_spec.is_some() {
+        1
+    } else {
+        5
+    }
 }
 
 const ODE_IOV_START_REJECT_NLL_PER_OBS: f64 = 250.0;
 const ODE_IOV_START_REJECT_NLL_MIN: f64 = 1_000.0;
 
-/// **ODE+IOV-only, deliberately not generalized further** — a #708 investigation tried
-/// widening this to every ODE model (a plain ODE subject can be just as pathologically
-/// stuck), but this guard's `hard_reject` forces the outer EBE guard to treat the *whole
-/// trial* as infeasible (`ebe_guard_rejects`), not merely this subject as unconverged. For
-/// ODE+IOV a catastrophic warm-started NLL reliably means true pathology (e.g. steady-state
-/// blow-up), so that's safe. For a plain ODE subject a large individual NLL can be a
-/// legitimate feature of the data near the true optimum — hard-rejecting the trial then
-/// steers the outer optimizer away from the correct region, which regressed OFV by ~100
-/// units vs. NONMEM on a real pembrolizumab reproduction. Any future #708 fix needs to bound
-/// the wasted per-subject solve cost without changing which θ region the optimizer is
-/// willing to explore (e.g. a solver-level bail, not a trial-level reject).
+/// **ODE+IOV-only, deliberately not generalized further** (#603 review #1/#2). A #708
+/// investigation tried widening this to every ODE model, but `hard_reject` forces the outer
+/// EBE guard to treat the *whole trial* as infeasible (`ebe_guard_rejects`), not merely this
+/// subject as unconverged. For ODE+IOV a catastrophic warm-started NLL reliably means true
+/// pathology (e.g. steady-state blow-up), so that's safe. For a plain ODE subject a large
+/// individual NLL can be a legitimate feature of the data near the true optimum — hard-
+/// rejecting the trial then steers the outer optimizer away from the correct region, which
+/// regressed OFV by ~100 units vs. NONMEM on a real pembrolizumab reproduction. See
+/// [`ode_nm_fallback_multiplier`] for the generalized (safe, bounded-not-skipped) guard
+/// instead.
 fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> bool {
     if !is_ode_iov(model) {
         return false;
@@ -780,7 +810,15 @@ pub fn find_ebe(
         let partial = eta.clone();
         let cold = vec![0.0; n_eta];
         if enable_stall {
-            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_eta, max_iter, tol);
+            let (best, ok) = argmin_inner_fallback(
+                &obj,
+                &partial,
+                &cold,
+                n_eta,
+                max_iter,
+                tol,
+                ode_nm_fallback_multiplier(model),
+            );
             eta = best;
             (ok, true)
         } else {
@@ -1034,10 +1072,16 @@ fn find_ebe_iov(
         let partial = x.clone();
         let mut cold = vec![0.0; n_flat];
         cold[..n_eta].copy_from_slice(&mu);
-        if skip_ode_iov_nm_fallback(model) {
-            (false, false)
-        } else if enable_stall {
-            let (best, ok) = argmin_inner_fallback(&obj, &partial, &cold, n_flat, max_iter, tol);
+        if enable_stall {
+            let (best, ok) = argmin_inner_fallback(
+                &obj,
+                &partial,
+                &cold,
+                n_flat,
+                max_iter,
+                tol,
+                ode_nm_fallback_multiplier(model),
+            );
             x = best;
             (ok, true)
         } else {
@@ -4591,18 +4635,18 @@ mod iov_tests {
         // Partial in the deep (global) well, cold NM seed in the shallow well: the fallback
         // keeps the lower-objective partial rather than overwriting with the shallow NM
         // result (the old behaviour, which on this multimodal objective inflated the OFV).
-        let (eta, _) = argmin_inner_fallback(&obj, &[-2.0], &[2.0], 1, 200, 1e-8);
+        let (eta, _) = argmin_inner_fallback(&obj, &[-2.0], &[2.0], 1, 200, 1e-8, 5);
         assert!((eta[0] + 2.0).abs() < 1e-2, "kept deep well, got {eta:?}");
 
         // Partial in the shallow well, cold NM seed reaches the deep well: NM wins.
-        let (eta2, _) = argmin_inner_fallback(&obj, &[2.0], &[-2.0], 1, 200, 1e-8);
+        let (eta2, _) = argmin_inner_fallback(&obj, &[2.0], &[-2.0], 1, 200, 1e-8, 5);
         assert!(
             (eta2[0] + 2.0).abs() < 1e-2,
             "NM found deeper well, got {eta2:?}"
         );
 
         // Non-finite partial objective → unusable → NM result is taken.
-        let (eta3, _) = argmin_inner_fallback(&obj, &[f64::NAN], &[-2.0], 1, 200, 1e-8);
+        let (eta3, _) = argmin_inner_fallback(&obj, &[f64::NAN], &[-2.0], 1, 200, 1e-8, 5);
         assert!(
             eta3[0].is_finite(),
             "NaN partial must be discarded, got {eta3:?}"
@@ -4611,7 +4655,7 @@ mod iov_tests {
         // `ebe_warm_start` seeds the single NM from the partial (covers the warm branch):
         // from the deep well it stays there even though the cold seed is far away.
         set_ebe_warm_start(true);
-        let (eta4, _) = argmin_inner_fallback(&obj, &[-2.0], &[5.0], 1, 200, 1e-8);
+        let (eta4, _) = argmin_inner_fallback(&obj, &[-2.0], &[5.0], 1, 200, 1e-8, 5);
         assert!(
             (eta4[0] + 2.0).abs() < 1e-2,
             "warm seed held the deep well, got {eta4:?}"
@@ -4626,10 +4670,48 @@ mod iov_tests {
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
         .expect("parse ODE IOV");
-        assert!(skip_ode_iov_nm_fallback(&ode_iov));
+        assert_eq!(ode_nm_fallback_multiplier(&ode_iov), 0);
 
         let closed_form_iov = make_iov_model();
-        assert!(!skip_ode_iov_nm_fallback(&closed_form_iov));
+        assert_eq!(ode_nm_fallback_multiplier(&closed_form_iov), 5);
+    }
+
+    /// #708: profiling a real reproduction (pembrolizumab model066) showed multiple plain
+    /// (non-IOV) ODE subjects simultaneously stuck in `find_ebe -> argmin_inner_fallback ->
+    /// nelder_mead_minimize`, each burning the historical `max_iter * 5` budget, at a bad
+    /// L-BFGS line-search trial point. A full skip (mirroring ODE+IOV) was tried and
+    /// regressed badly (the outer optimizer never took a step, see
+    /// `ode_nm_fallback_multiplier`'s doc) — the fix is a bounded, not zero, multiplier.
+    #[test]
+    fn ode_non_iov_bounds_nelder_mead_inner_fallback() {
+        use crate::parser::model_parser::parse_model_string;
+        let plain_ode = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse plain ODE");
+        assert_eq!(ode_nm_fallback_multiplier(&plain_ode), 1);
+
+        let closed_form = parse_model_string(
+            "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n",
+        )
+        .expect("parse closed-form model");
+        assert_eq!(ode_nm_fallback_multiplier(&closed_form), 5);
+    }
+
+    /// `nm_iter_multiplier = 0` returns the BFGS partial unconditionally, with no NM restart
+    /// (only the single `obj(partial)` call every path takes to check finiteness).
+    #[test]
+    fn argmin_inner_fallback_zero_multiplier_skips_nm_entirely() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let obj = |x: &[f64]| -> f64 {
+            calls.set(calls.get() + 1);
+            x[0] * x[0]
+        };
+        let (eta, nm_converged) = argmin_inner_fallback(&obj, &[3.0], &[0.0], 1, 200, 1e-8, 0);
+        assert_eq!(eta, vec![3.0], "multiplier=0 must return the partial as-is");
+        assert!(!nm_converged);
+        assert_eq!(calls.get(), 1, "multiplier=0 must not run any NM restart");
     }
 
     #[test]
