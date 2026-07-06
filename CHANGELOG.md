@@ -42,6 +42,13 @@ section of the SDLC for the versioning policy).
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
 ### Fixed
+- **A pathological (stiff/time-varying) ODE subject no longer stalls a FOCEI fit for an
+  extended period on one core** (#708). The inner-loop start-rejection guard that hard-rejects
+  a subject with a catastrophically bad warm-started NLL before running BFGS/Nelder-Mead
+  fallback was previously ODE+IOV-only; it now applies to any ODE model, so a plain (non-IOV)
+  ODE subject stuck in a pathological region (e.g. a stiff time-varying-clearance term) is
+  caught immediately instead of repeatedly re-solving the same expensive ODE via the BFGS +
+  Nelder-Mead fallback on every outer iteration.
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point
