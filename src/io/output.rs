@@ -1183,13 +1183,19 @@ fn fmt_cov_entry(v: f64) -> String {
     s
 }
 
-/// Quote and escape a free-form string for embedding as a YAML scalar value
-/// (backslash and double-quote are the two characters significant inside a
-/// double-quoted YAML string). Used for values sourced from the OS/environment
-/// (e.g. `environment.username`) that aren't under ferx's control and may
-/// contain YAML-significant characters like `:`.
+/// Quote and escape a free-form string for embedding as a YAML double-quoted
+/// scalar. Used for values sourced from the OS/environment (e.g.
+/// `environment.username`) that aren't under ferx's control and may contain
+/// YAML-significant characters — `:`/`#` are harmless once quoted, but a
+/// literal newline or backslash/quote would otherwise corrupt the line or
+/// (for a raw newline) get silently folded away by YAML's line-folding rules.
 fn yaml_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    format!("\"{escaped}\"")
 }
 
 /// Build the ordered parameter name list that matches `pack_params` layout:
@@ -3044,6 +3050,17 @@ mod tests {
             yaml.contains("  username: \"DOMAIN\\\\svc: build \\\"prod\\\"\""),
             "username not properly quoted/escaped:\n{yaml}"
         );
+    }
+
+    #[test]
+    fn yaml_quote_escapes_newline_and_carriage_return() {
+        // Copilot review on #706: a raw embedded newline would otherwise get
+        // silently folded away by YAML's line-folding rules (or break the
+        // single-line assumption the rest of this writer relies on).
+        assert_eq!(yaml_quote("a\nb"), "\"a\\nb\"");
+        assert_eq!(yaml_quote("a\r\nb"), "\"a\\r\\nb\"");
+        // `#`/`:` need no extra handling once the value is quoted.
+        assert_eq!(yaml_quote("a#b: c"), "\"a#b: c\"");
     }
 
     #[test]
