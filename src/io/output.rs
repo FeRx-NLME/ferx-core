@@ -1736,6 +1736,19 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    // Run timing + thread count (#704 — replaces the separate `-timing.txt` file).
+    writeln!(f, "\nestimation:").map_err(|e| e.to_string())?;
+    writeln!(f, "  wall_time_secs: {:.6}", result.wall_time_secs).map_err(|e| e.to_string())?;
+    writeln!(f, "  n_threads: {}", result.n_threads_used).map_err(|e| e.to_string())?;
+
+    // System/account info the fit ran under, for troubleshooting (#704).
+    writeln!(f, "\nenvironment:").map_err(|e| e.to_string())?;
+    writeln!(f, "  os: {}", result.environment.os).map_err(|e| e.to_string())?;
+    writeln!(f, "  arch: {}", result.environment.arch).map_err(|e| e.to_string())?;
+    writeln!(f, "  docker: {}", result.environment.in_docker).map_err(|e| e.to_string())?;
+    writeln!(f, "  username: {}", result.environment.username).map_err(|e| e.to_string())?;
+    writeln!(f, "  ferx_version: {}", result.ferx_version).map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
@@ -1871,6 +1884,7 @@ mod tests {
             wall_time_secs: 0.0,
             model_name: "test".to_string(),
             ferx_version: env!("CARGO_PKG_VERSION").to_string(),
+            environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             sigma_types,
@@ -2436,6 +2450,7 @@ mod tests {
             wall_time_secs: 0.0,
             model_name: "test".to_string(),
             ferx_version: env!("CARGO_PKG_VERSION").to_string(),
+            environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             sigma_types,
@@ -2981,6 +2996,16 @@ mod tests {
         );
         // Warnings.
         assert!(yaml.contains("\nwarnings:") && yaml.contains("- \"example warning\""));
+        // #704: estimation timing/threads + environment snapshot.
+        assert!(yaml.contains("\nestimation:"));
+        assert!(yaml.contains("  wall_time_secs:"));
+        assert!(yaml.contains("  n_threads:"));
+        assert!(yaml.contains("\nenvironment:"));
+        assert!(yaml.contains(&format!("  os: {}", r.environment.os)));
+        assert!(yaml.contains(&format!("  arch: {}", r.environment.arch)));
+        assert!(yaml.contains(&format!("  docker: {}", r.environment.in_docker)));
+        assert!(yaml.contains(&format!("  username: {}", r.environment.username)));
+        assert!(yaml.contains(&format!("  ferx_version: {}", r.ferx_version)));
     }
 
     #[test]

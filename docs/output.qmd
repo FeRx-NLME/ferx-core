@@ -1,6 +1,6 @@
 # Output Files
 
-Each model run produces three output files (plus a fourth, `{model}-covtab.csv`,
+Each model run produces two output files (plus a third, `{model}-covtab.csv`,
 when the model declares a [`[covariates]`](model-file/covariates.qmd) block).
 
 ## Quick reference: where to find what
@@ -143,6 +143,15 @@ covariance_matrix:
     log_chol_ETA_CL: [0.000000e+0, 0.000000e+0, 5.678901e-5, 0.000000e+0, 0.000000e+0]
     log_chol_ETA_V:  [0.000000e+0, 0.000000e+0, 0.000000e+0, 2.345678e-6, 0.000000e+0]
     sigma_1:         [0.000000e+0, 0.000000e+0, 0.000000e+0, 0.000000e+0, 7.890123e-7]
+estimation:
+  wall_time_secs: 12.345678
+  n_threads: 8
+environment:
+  os: linux
+  arch: x86_64
+  docker: true
+  username: ron
+  ferx_version: 0.2.0
 ```
 
 The `covariance_matrix:` block is only present when the covariance step ran
@@ -163,6 +172,14 @@ not log-transformed).
 - **se**: Standard error from the covariance step
 - **rse_pct**: Relative standard error as percentage (SE/estimate * 100)
 - **cv_pct**: Coefficient of variation for omega (sqrt(variance) * 100)
+
+The `estimation:` block replaces the standalone `{model}-timing.txt` file
+(removed in #704): `wall_time_secs` measures only the estimation step (not
+parsing or data reading), and `n_threads` is the Rayon worker count used.
+The `environment:` block is a snapshot of the machine and account the fit
+ran under — `os`/`arch` from the running binary's target, `docker` (whether
+`/.dockerenv` or `/proc/1/cgroup` indicate a container), `username`
+(`$USER`/`%USERNAME%`), and `ferx_version`.
 
 ## FitResult Fields (Rust API / console)
 
@@ -250,6 +267,21 @@ When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption 
 | `n_threads_used` | Number of Rayon threads used during estimation |
 | `nlopt_missing_algorithms` | NLopt algorithms that were requested but unavailable in this build (empty when all available) |
 | `covariance_n_evals_estimated` | Estimated number of OFV evaluations the covariance step will run, populated only when `run_covariance_step = true` and `n_parameters > 30` |
+| `environment` | [`EnvironmentInfo`](#environment-info) — OS, CPU architecture, whether running in a container, and OS username |
+
+### Environment Info
+
+`FitResult.environment: EnvironmentInfo` is detected once per fit:
+
+| Field | Description |
+|-------|-------------|
+| `os` | Target OS family (`std::env::consts::OS`), e.g. `"linux"`, `"macos"`, `"windows"` |
+| `arch` | Target CPU architecture (`std::env::consts::ARCH`), e.g. `"x86_64"`, `"aarch64"` |
+| `in_docker` | `true` when `/.dockerenv` exists or `/proc/1/cgroup` names a container runtime |
+| `username` | OS username the fit ran under (`$USER`/`%USERNAME%`), `"unknown"` if neither is set |
+
+`.fitrx` bundles saved before this field existed load with an `"unknown"`
+placeholder rather than the *loading* machine's environment.
 
 ### EBE Convergence Diagnostics
 
@@ -260,16 +292,6 @@ Counters from the inner-loop (EBE) optimizer, useful for diagnosing problematic 
 | `ebe_convergence_warnings` | Number of outer iterations in which at least one subject had an unconverged EBE |
 | `max_unconverged_subjects` | Worst-case unconverged-subject count seen in a single outer iteration |
 | `total_ebe_fallbacks` | Total number of times the Nelder-Mead fallback was invoked across all subjects and outer iterations |
-
-## Timing File (`{model}-timing.txt`)
-
-A single-line text file with the wall-clock estimation time:
-
-```
-elapsed_seconds=0.496000
-```
-
-This measures only the estimation step (not parsing or data reading).
 
 ## Optimizer Trace CSV
 

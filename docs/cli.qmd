@@ -106,13 +106,12 @@ a usage error (missing path).
 
 ## Output Files
 
-Three files are always generated, named after the model file:
+Two files are always generated, named after the model file:
 
 | File | Contents |
 |------|----------|
 | `{model}-sdtab.csv` | Per-observation diagnostics |
-| `{model}-fit.yaml` | Parameter estimates, standard errors, and (when the covariance step ran) a `covariance_matrix:` block containing the full optimizer-space parameter covariance matrix |
-| `{model}-timing.txt` | Wall-clock estimation time |
+| `{model}-fit.yaml` | Parameter estimates, standard errors, an `estimation:` block (wall time, thread count), an `environment:` block (OS, arch, Docker, username, ferx version), and (when the covariance step ran) a `covariance_matrix:` block containing the full optimizer-space parameter covariance matrix |
 
 See [Output Files](output.qmd) for detailed format descriptions.
 

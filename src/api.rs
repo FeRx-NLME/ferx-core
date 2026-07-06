@@ -4530,6 +4530,7 @@ fn fit_inner(
         wall_time_secs,
         model_name: model.name.clone(),
         ferx_version: env!("CARGO_PKG_VERSION").to_string(),
+        environment: crate::environment::detect(),
         eta_param_info: model.eta_param_info.clone(),
         theta_transform: model.theta_transform.clone(),
         sigma_types: model
@@ -9890,6 +9891,7 @@ mod simulate_with_uncertainty_tests {
             wall_time_secs: 0.0,
             model_name: String::new(),
             ferx_version: String::new(),
+            environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: vec![],
             theta_transform: vec![],
             sigma_types: vec![],

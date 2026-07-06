@@ -227,6 +227,10 @@ struct FitWire {
     eta_param_info: Vec<EtaParamInfoWire>,
     model_name: String,
     ferx_version: String,
+    // Absent on bundles saved before #704 added this field; loaders default
+    // to `EnvironmentInfo::default()`'s "unknown" placeholder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment: Option<crate::environment::EnvironmentInfo>,
     // Source-file provenance. All four are optional and default to absent on
     // older bundles (produced before these fields existed) so they keep loading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -756,6 +760,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
             .collect(),
         model_name: r.model_name.clone(),
         ferx_version: r.ferx_version.clone(),
+        environment: Some(r.environment.clone()),
         model_path: r.model_path.clone(),
         data_path: r.data_path.clone(),
         model_hash: r.model_hash.clone(),
@@ -1810,6 +1815,7 @@ fn wire_to_fit_result(
         wall_time_secs: w.wall_time_secs,
         model_name: w.model_name,
         ferx_version: w.ferx_version,
+        environment: w.environment.unwrap_or_default(),
         eta_param_info,
         theta_transform,
         sigma_types,
@@ -2011,6 +2017,7 @@ mod tests {
             wall_time_secs: 1.234,
             model_name: "test_model".into(),
             ferx_version: "0.1.0".into(),
+            environment: crate::environment::detect(),
             eta_param_info: vec![
                 EtaParamInfo {
                     eta_name: "eta_CL".into(),
@@ -2091,6 +2098,7 @@ mod tests {
         assert_eq!(l.theta_fixed, r.theta_fixed);
         assert_eq!(l.warnings, r.warnings);
         assert_eq!(l.covariance_status, r.covariance_status);
+        assert_eq!(l.environment, r.environment);
         assert_eq!(l.subjects.len(), r.subjects.len());
         for (a, b) in l.subjects.iter().zip(r.subjects.iter()) {
             assert_eq!(a.id, b.id);
@@ -2166,6 +2174,18 @@ mod tests {
         let r0 = minimal_fit_result(); // npde_seed defaults to None
         save_fit(&r0, &p, "src\n", &none, SaveFitOptions::default()).unwrap();
         assert_eq!(load_fit(&none).unwrap().fit.npde_seed, None);
+    }
+
+    #[test]
+    fn fit_wire_missing_environment_defaults_to_none() {
+        // Simulates a `.fitrx` bundle saved before #704 added `environment` to
+        // `FitWire`: the key is simply absent from `fit.json`.
+        let r = minimal_fit_result();
+        let wire = build_fit_wire(&r);
+        let mut value = serde_json::to_value(&wire).unwrap();
+        value.as_object_mut().unwrap().remove("environment");
+        let reloaded: FitWire = serde_json::from_value(value).unwrap();
+        assert!(reloaded.environment.is_none());
     }
 
     #[test]

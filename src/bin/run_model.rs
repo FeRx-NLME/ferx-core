@@ -218,15 +218,6 @@ fn main() {
             let elapsed_secs = elapsed.as_secs_f64();
             eprintln!("Elapsed fit time: {:.3}s", elapsed_secs);
 
-            // Write timing file alongside outputs
-            let timing_path = format!("{}-timing.txt", model_name);
-            if let Ok(()) = std::fs::write(
-                &timing_path,
-                format!("elapsed_seconds={:.6}\n", elapsed_secs),
-            ) {
-                eprintln!("Timing written to {}", timing_path);
-            }
-
             println!("\nFit completed!");
             println!("OFV: {:.4}", fit_result.ofv);
             println!("Elapsed: {:.3}s", elapsed_secs);
