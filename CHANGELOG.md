@@ -33,6 +33,12 @@ section of the SDLC for the versioning policy).
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
 ### Fixed
+- **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
+  SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
+  reduction whose grouping depended on the number of rayon threads; because floating-point
+  addition is not associative, the objective (and, in non-converged runs, the final OFV and
+  estimates) differed between e.g. 4 and 15 threads. The per-subject contributions are now summed
+  in a fixed subject order, so a given fit returns bit-identical results at any thread count.
 - **CLI flags in `--flag=value` form are no longer silently ignored** (#693):
   `--data`, `--output`, `--threads` (and any other value-taking flag) now accept
   `=` the same as a space, e.g. `ferx model.ferx --data=d.csv --threads=4`.

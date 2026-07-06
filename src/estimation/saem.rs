@@ -729,15 +729,19 @@ fn theta_sigma_mstep_light(
                             scratch,
                         )
                     })
-                    .reduce(
-                        || (0.0, vec![0.0f64; n]),
-                        |(nll_a, mut ga), (nll_b, gb)| {
-                            for (a, b) in ga.iter_mut().zip(gb.iter()) {
-                                *a += b;
-                            }
-                            (nll_a + nll_b, ga)
-                        },
-                    )
+                    // Collect in subject order, then fold serially: rayon's
+                    // parallel `reduce` combines partial (nll, grad) pairs along
+                    // thread-count-dependent boundaries and f64 addition is
+                    // non-associative, so the objective and gradient would
+                    // otherwise depend on the worker count (#703).
+                    .collect::<Vec<(f64, Vec<f64>)>>()
+                    .into_iter()
+                    .fold((0.0, vec![0.0f64; n]), |(nll_a, mut ga), (nll_b, gb)| {
+                        for (a, b) in ga.iter_mut().zip(gb.iter()) {
+                            *a += b;
+                        }
+                        (nll_a + nll_b, ga)
+                    })
             } else {
                 population
                     .subjects
@@ -758,15 +762,17 @@ fn theta_sigma_mstep_light(
                             scratch,
                         )
                     })
-                    .reduce(
-                        || (0.0, vec![0.0f64; n]),
-                        |(nll_a, mut ga), (nll_b, gb)| {
-                            for (a, b) in ga.iter_mut().zip(gb.iter()) {
-                                *a += b;
-                            }
-                            (nll_a + nll_b, ga)
-                        },
-                    )
+                    // Deterministic reduction (collect in subject order, fold
+                    // serially) — a parallel `reduce` would make the objective
+                    // and gradient depend on the rayon worker count (#703).
+                    .collect::<Vec<(f64, Vec<f64>)>>()
+                    .into_iter()
+                    .fold((0.0, vec![0.0f64; n]), |(nll_a, mut ga), (nll_b, gb)| {
+                        for (a, b) in ga.iter_mut().zip(gb.iter()) {
+                            *a += b;
+                        }
+                        (nll_a + nll_b, ga)
+                    })
             };
             for (gi, &gv) in g.iter_mut().zip(grad_vec.iter()) {
                 *gi = if gv.is_finite() { gv } else { 0.0 };
@@ -1045,14 +1051,18 @@ fn obs_nll_sum(
     etas: &[Vec<f64>],
 ) -> f64 {
     use rayon::prelude::*;
-    population
+    // Collect in subject order and sum serially so the objective does not
+    // depend on the rayon worker count (f64 addition is non-associative and a
+    // parallel `.sum()` splits by thread count) — #703.
+    let per_subj: Vec<f64> = population
         .subjects
         .par_iter()
         .enumerate()
         .map_init(EventPkParams::default, |scratch, (i, subject)| {
             obs_nll_subject_into(model, subject, theta, sigma_values, &etas[i], scratch)
         })
-        .sum()
+        .collect();
+    per_subj.iter().sum()
 }
 
 /// IOV variant of `obs_nll_sum`: per-occasion predictions using `[eta, kappa_k]`.
@@ -1065,7 +1075,10 @@ fn obs_nll_sum_iov(
     kappas: &[Vec<Vec<f64>>],
 ) -> f64 {
     use rayon::prelude::*;
-    population
+    // Deterministic reduction (collect in subject order, fold serially): a
+    // parallel `.sum()` would make the objective depend on the rayon worker
+    // count — #703.
+    let per_subj: Vec<f64> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -1080,7 +1093,8 @@ fn obs_nll_sum_iov(
                 scratch,
             )
         })
-        .sum()
+        .collect();
+    per_subj.iter().sum()
 }
 
 /// True when a free (non-`FIX`) additive component of a `Combined` endpoint has

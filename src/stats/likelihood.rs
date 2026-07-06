@@ -2000,7 +2000,14 @@ pub fn foce_population_nll_iov(
     sigma_values: &[f64],
     interaction: bool,
 ) -> f64 {
-    population
+    // Compute each subject's NLL in parallel, then reduce in a fixed subject
+    // order. rayon's `ParallelIterator::sum` folds partial sums along split
+    // boundaries that depend on the worker-thread count, and f64 addition is
+    // not associative — so a bare `.sum()` yields a thread-count-dependent OFV
+    // (e.g. 4 vs 15 threads). Collecting into an ordered `Vec` and summing
+    // serially makes the objective bit-reproducible regardless of thread count
+    // while keeping the expensive per-subject work parallel (#703).
+    let per_subj: Vec<f64> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -2023,7 +2030,8 @@ pub fn foce_population_nll_iov(
                 omega_iov,
             )
         })
-        .sum::<f64>()
+        .collect();
+    per_subj.iter().sum()
 }
 
 /// Population FOCE objective: sum over all subjects
@@ -2037,7 +2045,11 @@ pub fn foce_population_nll(
     sigma_values: &[f64],
     interaction: bool,
 ) -> f64 {
-    population
+    // Deterministic reduction: collect per-subject NLLs in subject order, then
+    // sum serially. A parallel `.sum()` would make the OFV depend on the
+    // thread count (f64 addition is non-associative; rayon splits by worker
+    // count). See `foce_population_nll_iov` and #703.
+    let per_subj: Vec<f64> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -2053,7 +2065,8 @@ pub fn foce_population_nll(
                 interaction,
             )
         })
-        .sum::<f64>()
+        .collect();
+    per_subj.iter().sum()
 }
 
 /// Compute CWRES (Conditional Weighted Residuals) for a subject.
