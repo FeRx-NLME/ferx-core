@@ -19,6 +19,11 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **`-h`/`--help` flag for the `ferx` CLI** (#688): `ferx --help`, `ferx check --help`,
+  and `ferx summary --help` now print usage to stdout and exit 0, matching standard
+  CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
+
 ## [0.2.0] - 2026-07-03
 
 ### Added

@@ -2,8 +2,43 @@ use ferx_core::NcaInit;
 use std::env;
 use std::time::Instant;
 
+/// Top-level usage/help text, shared by the no-args error path (stderr, exit 1)
+/// and `ferx -h`/`--help` (stdout, exit 0) so the two can't drift apart.
+const MAIN_USAGE: &str = "\
+Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]]
+       ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
+       ferx check <model.ferx> [--data <data.csv>] [--json]
+       ferx summary <run.fitrx>
+
+Fits a NLME model and writes sdtab.csv with residuals.
+Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
+
+--threads N    use N rayon workers (N > 0)
+--threads 0    use rayon default (one worker per logical CPU)
+--threads auto alias for --threads 0
+
+--output PATH  also write a portable .fitrx fit bundle (zip of JSON+CSV)
+--include-data embed the input --data CSV inside the .fitrx (off by default)
+
+--inits-from-nca[=METHOD]  derive NCA-based starting values before fitting,
+               overriding the model file. METHOD is nca, nca_sweep (default),
+               or nca_ebe; a bare --inits-from-nca means nca_sweep.
+
+-h, --help     print this help and exit
+";
+
+/// True for either spelling of the help flag.
+fn is_help_flag(arg: Option<&String>) -> bool {
+    matches!(arg.map(String::as_str), Some("-h") | Some("--help"))
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    if is_help_flag(args.get(1)) {
+        print!("{MAIN_USAGE}");
+        std::process::exit(0);
+    }
 
     // `ferx check ...` is a separate, non-fitting subcommand: parse + validate a
     // model (optionally against data) and report structured diagnostics. Dispatch
@@ -20,24 +55,7 @@ fn main() {
     }
 
     if args.len() < 2 {
-        eprintln!("Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]]");
-        eprintln!("       ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]");
-        eprintln!("       ferx check <model.ferx> [--data <data.csv>] [--json]");
-        eprintln!("       ferx summary <run.fitrx>");
-        eprintln!();
-        eprintln!("Fits a NLME model and writes sdtab.csv with residuals.");
-        eprintln!("Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)");
-        eprintln!();
-        eprintln!("--threads N    use N rayon workers (N > 0)");
-        eprintln!("--threads 0    use rayon default (one worker per logical CPU)");
-        eprintln!("--threads auto alias for --threads 0");
-        eprintln!();
-        eprintln!("--output PATH  also write a portable .fitrx fit bundle (zip of JSON+CSV)");
-        eprintln!("--include-data embed the input --data CSV inside the .fitrx (off by default)");
-        eprintln!();
-        eprintln!("--inits-from-nca[=METHOD]  derive NCA-based starting values before fitting,");
-        eprintln!("               overriding the model file. METHOD is nca, nca_sweep (default),");
-        eprintln!("               or nca_ebe; a bare --inits-from-nca means nca_sweep.");
+        eprint!("{MAIN_USAGE}");
         std::process::exit(1);
     }
 
@@ -181,18 +199,26 @@ fn main() {
     }
 }
 
+const SUMMARY_USAGE: &str = "\
+Usage: ferx summary <run.fitrx>
+
+Prints a psn::sumo-style summary — parameter estimates with %RSE
+plus basic run info — from a saved .fitrx fit bundle.
+";
+
 /// Run the `summary` subcommand: load a `.fitrx` bundle and print a
 /// `psn::sumo`-style summary (parameter estimates + basic run info) to stdout.
-/// Returns the process exit code: `0` = printed, `1` = load failed,
-/// `2` = usage (missing/flag-looking path).
+/// Returns the process exit code: `0` = printed (incl. `--help`), `1` = load
+/// failed, `2` = usage (missing/flag-looking path).
 fn run_summary(args: &[String]) -> i32 {
+    if is_help_flag(args.get(2)) {
+        print!("{SUMMARY_USAGE}");
+        return 0;
+    }
     let path = match args.get(2) {
         Some(p) if !p.starts_with("--") => p.as_str(),
         _ => {
-            eprintln!("Usage: ferx summary <run.fitrx>");
-            eprintln!();
-            eprintln!("Prints a psn::sumo-style summary — parameter estimates with %RSE");
-            eprintln!("plus basic run info — from a saved .fitrx fit bundle.");
+            eprint!("{SUMMARY_USAGE}");
             return 2;
         }
     };
@@ -247,9 +273,23 @@ fn parse_check_args(args: &[String]) -> Result<CheckArgs<'_>, CheckArgsError> {
     Ok(CheckArgs { model, data, json })
 }
 
+const CHECK_USAGE: &str = "\
+Usage: ferx check <model.ferx> [--data <data.csv>] [--json]
+
+Validates a model file without fitting and reports structured
+diagnostics. With --data, also runs data-dependent checks
+(covariates present, per-CMT coverage, steady-state, lag time).
+--json   emit the report as JSON to stdout
+";
+
 /// Run the `check` subcommand. Returns the process exit code:
-/// `0` = valid (no errors), `1` = errors found, `2` = usage / serialization error.
+/// `0` = valid (no errors) or `--help`, `1` = errors found, `2` = usage /
+/// serialization error.
 fn run_check(args: &[String]) -> i32 {
+    if is_help_flag(args.get(2)) {
+        print!("{CHECK_USAGE}");
+        return 0;
+    }
     let parsed = match parse_check_args(args) {
         Ok(p) => p,
         Err(CheckArgsError::MissingDataValue) => {
@@ -257,12 +297,7 @@ fn run_check(args: &[String]) -> i32 {
             return 2;
         }
         Err(CheckArgsError::Usage) => {
-            eprintln!("Usage: ferx check <model.ferx> [--data <data.csv>] [--json]");
-            eprintln!();
-            eprintln!("Validates a model file without fitting and reports structured");
-            eprintln!("diagnostics. With --data, also runs data-dependent checks");
-            eprintln!("(covariates present, per-CMT coverage, steady-state, lag time).");
-            eprintln!("--json   emit the report as JSON to stdout");
+            eprint!("{CHECK_USAGE}");
             return 2;
         }
     };
@@ -393,8 +428,8 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_check_args, parse_inits_from_nca_flag, parse_output_flag, parse_threads_flag,
-        print_check_human, run_check, run_summary, CheckArgsError,
+        is_help_flag, parse_check_args, parse_inits_from_nca_flag, parse_output_flag,
+        parse_threads_flag, print_check_human, run_check, run_summary, CheckArgsError,
     };
     use ferx_core::NcaInit;
 
@@ -535,6 +570,26 @@ mod tests {
         // No model path, and a flag where the model should be — both usage (2).
         assert_eq!(run_check(&args(&["check"])), 2);
         assert_eq!(run_check(&args(&["check", "--json"])), 2);
+    }
+
+    #[test]
+    fn run_check_help_returns_0() {
+        assert_eq!(run_check(&args(&["check", "-h"])), 0);
+        assert_eq!(run_check(&args(&["check", "--help"])), 0);
+    }
+
+    #[test]
+    fn run_summary_help_returns_0() {
+        assert_eq!(run_summary(&args(&["summary", "-h"])), 0);
+        assert_eq!(run_summary(&args(&["summary", "--help"])), 0);
+    }
+
+    #[test]
+    fn is_help_flag_recognizes_both_spellings_only() {
+        assert!(is_help_flag(Some(&"-h".to_string())));
+        assert!(is_help_flag(Some(&"--help".to_string())));
+        assert!(!is_help_flag(Some(&"--json".to_string())));
+        assert!(!is_help_flag(None));
     }
 
     #[test]
