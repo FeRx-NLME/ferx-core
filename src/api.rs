@@ -612,6 +612,68 @@ fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Result<(), Strin
     Ok(())
 }
 
+/// Reject the model / data combinations the reactive driver cannot yet simulate
+/// *faithfully*. The adaptive path integrates each subject from a single baseline
+/// (t=0) PK snapshot with between-subject variability only (kappas held at zero),
+/// and never re-derives PK, applies a reset, or carries process noise. So an IOV
+/// model, a time-varying covariate, a system reset (EVID=3/4), or an SDE
+/// `[diffusion]` model would each be **silently** wrong — a violation of the
+/// "never a silent wrong answer" contract this module promises. Until each is
+/// properly supported (#391 follow-ups), reject it with a typed error. This
+/// mirrors the `n_kappa > 0` guards `fit()` already applies (IMPMAP,
+/// trust-region). Both public entry points funnel through `run_adaptive_population`,
+/// so guarding there covers `simulate_adaptive` and `simulate_adaptive_from_spec`.
+///
+/// The covariate check is conservative: it rejects any subject that carries
+/// per-event covariate snapshots, even when the varying column is one the model
+/// never references. Pruning irrelevant time-varying columns first (as the fit
+/// path does via `Population::prune_irrelevant_tv_covariates`) is a follow-up;
+/// over-rejecting here stays on the safe side of the contract.
+fn reject_unsupported_adaptive(
+    model: &CompiledModel,
+    population: &Population,
+) -> Result<(), String> {
+    if model.n_kappa > 0 {
+        return Err(
+            "adaptive-dosing simulation does not yet support inter-occasion variability \
+             (IOV / `kappa`): the reactive driver integrates from a single baseline PK \
+             snapshot and would silently hold every kappa at zero, biasing the predictions, \
+             the reactive decisions, and the dose ledger. Simulate without IOV, or track \
+             #391 for occasion-aware adaptive support."
+                .to_string(),
+        );
+    }
+    if model.is_sde() {
+        return Err(
+            "adaptive-dosing simulation does not support stochastic (`[diffusion]` / SDE) \
+             models: the reactive integrator is deterministic and would silently drop the \
+             process-noise term. Use the deterministic ODE model for adaptive dosing."
+                .to_string(),
+        );
+    }
+    for subject in &population.subjects {
+        if subject.has_tv_covariates() {
+            return Err(format!(
+                "adaptive-dosing simulation does not yet support time-varying covariates \
+                 (subject '{}'): the reactive driver resolves each subject's PK once from the \
+                 baseline covariate snapshot, so a covariate that changes over the horizon would \
+                 silently drive CL/V/KA off its t=0 value. Use time-constant covariates, or track \
+                 #391 for per-event PK under adaptive dosing.",
+                subject.id
+            ));
+        }
+        if subject.has_resets() {
+            return Err(format!(
+                "adaptive-dosing simulation does not support system-reset events (EVID=3/4) \
+                 (subject '{}'): the reactive driver never applies the reset, so the compartment \
+                 state would silently fail to zero. Remove reset rows for adaptive runs.",
+                subject.id
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Covariates referenced by the model but missing from the `[covariates]`
 /// declaration. These are still read (leniently) so the model works; the parser
 /// has already warned that they ought to be declared.
@@ -5332,6 +5394,183 @@ mod tests {
         assert!(reject_selected_error_for_adaptive(&single).is_ok());
     }
 
+    // --- Adaptive-dosing "no silent wrong answer" guards (#391) --------------
+    // The reactive driver integrates from a single baseline PK snapshot (BSV
+    // only, kappas zeroed), so IOV / time-varying covariates / resets / SDE
+    // would each be silently wrong. Each must be a typed error, not a silent
+    // number. See `reject_unsupported_adaptive`.
+
+    const PLAIN_ADAPTIVE_MODEL: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+
+    // A dose-free base subject with one observation and no per-event covariate
+    // snapshots — the shape the reactive driver accepts. Tests mutate one field
+    // to trip a specific guard.
+    fn adaptive_base_subject() -> crate::types::Subject {
+        crate::types::Subject {
+            id: "1".into(),
+            doses: Vec::new(),
+            obs_times: vec![24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0],
+            obs_cmts: vec![1],
+            covariates: std::collections::HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    fn adaptive_pop(subject: crate::types::Subject) -> Population {
+        Population {
+            subjects: vec![subject],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn adaptive_rejects_iov_model() {
+        use crate::parser::model_parser::parse_model_string;
+        let iov = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let model = parse_model_string(iov).expect("IOV model parses");
+        assert!(model.n_kappa > 0, "test model must declare a kappa");
+        let err = reject_unsupported_adaptive(&model, &adaptive_pop(adaptive_base_subject()))
+            .expect_err("IOV model must be rejected for adaptive dosing");
+        assert!(
+            err.to_lowercase().contains("inter-occasion") || err.to_lowercase().contains("iov"),
+            "error should cite IOV: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_rejects_sde_model() {
+        use crate::parser::model_parser::parse_model_string;
+        let sde = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -CL/V * central
+
+[diffusion]
+  central ~ 0.01
+
+[error_model]
+  DV ~ proportional(PROP)
+";
+        let model = parse_model_string(sde).expect("SDE model parses");
+        assert!(model.is_sde(), "test model must be an SDE model");
+        let err = reject_unsupported_adaptive(&model, &adaptive_pop(adaptive_base_subject()))
+            .expect_err("SDE model must be rejected for adaptive dosing");
+        assert!(
+            err.to_lowercase().contains("diffusion")
+                || err.to_lowercase().contains("sde")
+                || err.to_lowercase().contains("stochastic"),
+            "error should cite the SDE/diffusion restriction: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_rejects_time_varying_covariate_subject() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(PLAIN_ADAPTIVE_MODEL).expect("plain model parses");
+        let mut subject = adaptive_base_subject();
+        subject.obs_covariates = vec![std::collections::HashMap::from([("WT".to_string(), 70.0)])];
+        assert!(subject.has_tv_covariates());
+        let err = reject_unsupported_adaptive(&model, &adaptive_pop(subject))
+            .expect_err("a subject with time-varying covariates must be rejected");
+        assert!(
+            err.to_lowercase().contains("time-varying") && err.to_lowercase().contains("covariate"),
+            "error should cite time-varying covariates: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_rejects_reset_subject() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(PLAIN_ADAPTIVE_MODEL).expect("plain model parses");
+        let mut subject = adaptive_base_subject();
+        subject.reset_times = vec![48.0];
+        assert!(subject.has_resets());
+        let err = reject_unsupported_adaptive(&model, &adaptive_pop(subject))
+            .expect_err("a subject with system resets must be rejected");
+        assert!(
+            err.to_lowercase().contains("reset"),
+            "error should cite system resets: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_accepts_plain_bsv_model() {
+        use crate::parser::model_parser::parse_model_string;
+        let model = parse_model_string(PLAIN_ADAPTIVE_MODEL).expect("plain model parses");
+        // A BSV-only model with a dose-free, time-constant-covariate, reset-free
+        // subject is exactly the supported cut — no guard should fire.
+        assert!(
+            reject_unsupported_adaptive(&model, &adaptive_pop(adaptive_base_subject())).is_ok()
+        );
+    }
+
     fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         let n = iwres.len();
         SubjectResult {
@@ -6464,9 +6703,10 @@ pub struct AdaptiveSimulateOptions {
     /// Must be non-empty: an empty schedule never consults the controller and is
     /// rejected (it would otherwise be a silent dose-free run).
     pub decision_times: Vec<f64>,
-    /// Signals the controller may read at each decision. **Ipred only** here — a
-    /// [`crate::sim::adaptive::ObserveMode::Dv`] monitor is rejected (it needs
-    /// the per-subject RNG substreams of S1.5).
+    /// Signals the controller may read at each decision. Each monitor resolves on
+    /// its own [`crate::sim::adaptive::ObserveMode`]: `Ipred` reads the latent
+    /// prediction; `Dv` adds the endpoint's assay-noise draw (`IPRED + ε·√σ²`) on
+    /// the monitor's per-subject RNG substream (#391 S1.5).
     pub monitors: Vec<MonitorSpec>,
     /// Run the frozen-schedule replay verifier after each (subject, replicate)
     /// (default `true`). A divergence is a typed `Err` that taints the whole
@@ -6499,9 +6739,9 @@ impl Default for AdaptiveSimulateOptions {
 #[non_exhaustive]
 pub struct AdaptiveSimulationResult {
     /// Per-observation predictions: one row per (replicate, subject, obs time).
-    /// **Ipred only** in this slice — `ipred` and the `Continuous` value are both
-    /// the individual prediction; residual / assay error (the realized DV) and
-    /// its per-subject RNG substream arrive in S1.5.
+    /// `ipred` and the `Continuous` value are the individual prediction. Assay-
+    /// noised DV monitoring (used for the controller's decisions) is applied inside
+    /// the run via each `Dv` monitor's RNG substream, not emitted as a separate row.
     pub trajectories: Vec<SimulationResult>,
     /// Every dose the controllers actually issued, tagged by `(draw, sim)`.
     pub ledger: Vec<DoseLedgerEntry>,
@@ -6518,7 +6758,7 @@ pub struct AdaptiveSimulationResult {
 }
 
 /// Simulate state-reactive ("adaptive" / feedback) dosing over a population
-/// (epic #391, **experimental**).
+/// (epic #391, **beta**).
 ///
 /// For each subject and each of `n_sim` replicates: draw η ~ N(0, Ω), then run
 /// one integration driven by a **fresh** controller minted from
@@ -6666,6 +6906,11 @@ where
     F: Fn() -> C,
     C: FnMut(&ControllerCtx) -> crate::sim::adaptive::ControllerDecision,
 {
+    // Reject model/data the reactive driver cannot faithfully simulate (IOV,
+    // time-varying covariates, resets, SDE) with a typed error — never a silent
+    // wrong answer (#391). Both public entry points funnel through here.
+    reject_unsupported_adaptive(model, population)?;
+
     use rand::SeedableRng;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {

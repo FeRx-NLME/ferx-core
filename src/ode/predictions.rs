@@ -5456,6 +5456,57 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_bolus_f_scaling_matches_static() {
+        // Coverage for the bolus emit-path multiply `u[cmt-1] += F*amt` under
+        // F != 1. The infusion-F seam is covered above, but no test drove the
+        // *bolus* F multiply with F != 1 (it shares the static engine's structure,
+        // but was unexercised). A bare-slot F = 0.5 halves every controller-issued
+        // bolus; the degenerate oracle (re-issue the same bolus at each decision)
+        // must reproduce the equivalent static bolus schedule (carrying the same F)
+        // bit-exact.
+        let ode = one_cpt_ode_spec();
+        let mut pk = pk_one(1.0, 10.0); // ke = 0.1
+        pk.values[crate::types::PK_IDX_F] = 0.5; // bare-slot F on all compartments
+        let decisions = [0.0, 24.0, 48.0];
+        // A dose is realized at every decision and the last observation (60) is the
+        // global maximum, so neither engine breaks at an interior observation — the
+        // condition under which the degenerate oracle is bit-exact.
+        let obs = vec![1.0, 12.0, 25.0, 36.0, 49.0, 60.0];
+        let mut controller = |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let base = make_subject(vec![], obs.clone());
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut controller,
+            100,
+            None,
+        )
+        .expect("driver runs");
+
+        let static_doses: Vec<DoseEvent> = decisions
+            .iter()
+            .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        let static_subject = make_subject(static_doses, obs);
+        let static_preds = ode_predictions(&ode, &pk.values, &[], &[], &static_subject);
+
+        assert_eq!(run.predictions.len(), static_preds.len());
+        for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+            assert_relative_eq!(*got, *want, max_relative = 1e-9);
+        }
+        // F is actually applied to the bolus (u += F*amt), recorded per row.
+        assert_eq!(run.ledger.len(), 3);
+        for entry in &run.ledger {
+            assert_eq!(entry.f_applied, 0.5);
+        }
+    }
+
+    #[test]
     fn adaptive_reactive_infusion_titrates_against_closed_form() {
         // Genuine state-reactive infusion: infuse 100 mg @ 25 (4 h) only when the
         // monitored amount is below 50, else hold. Checked against the exact 1-cpt
