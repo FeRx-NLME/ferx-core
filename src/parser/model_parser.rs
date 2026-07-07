@@ -16749,8 +16749,9 @@ mod tests {
 
     #[test]
     fn test_parse_threads_zero_means_auto() {
-        // `threads = 0` is treated as "leave rayon default alone",
-        // matching the R binding's `threads <= 0` sentinel.
+        // `threads = 0` is treated as "use the engine's default thread count"
+        // (available cores - 1, capped at 8 — #707), matching the R binding's
+        // `threads <= 0` sentinel.
         let opts = parse_fit_options(&["threads = 0".to_string()]).unwrap();
         assert_eq!(opts.threads, None);
     }
@@ -16766,7 +16767,7 @@ mod tests {
 
     #[test]
     fn test_parse_threads_default_is_none() {
-        // No `threads` line → None (rayon global pool, one worker per logical CPU).
+        // No `threads` line → None (engine picks its own default thread count: #707).
         let opts = parse_fit_options(&["method = focei".to_string()]).unwrap();
         assert_eq!(opts.threads, None);
     }
