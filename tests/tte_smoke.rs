@@ -476,9 +476,13 @@ mod survival_smoke {
         let opts = FitOptions::default();
         let result = fit(&model, &pop, &model.default_params, &opts)
             .expect("clock=reset RTTE fit must not error");
+        // Assert a real objective, not just `is_finite`: a sentinel-poisoned fit sums the
+        // per-subject `1e20` sentinel to ~n·1e20, which is still finite. A genuine
+        // clock-reset OFV on this small population is O(10²–10³), so `< 1e6` cleanly
+        // separates a real fit from one silently folded to the sentinel.
         assert!(
-            result.ofv.is_finite(),
-            "clock-reset RTTE OFV must be finite; got {}",
+            result.ofv.is_finite() && result.ofv < 1e6,
+            "clock-reset RTTE OFV must be a real objective (finite, < 1e6, not sentinel-poisoned); got {}",
             result.ofv
         );
     }
@@ -543,6 +547,38 @@ mod survival_smoke {
         assert!(
             err.contains("non-finite TIME") && err.contains("CMT=2"),
             "error should flag the non-finite time, got: {err}"
+        );
+    }
+
+    /// A record whose left-truncation entry_time is after its own TIME yields a negative
+    /// first gap (clock-reset) / decreasing cumulative hazard (clock-forward), both of which
+    /// fold to the silent 1e20 sentinel. The datareader skips such rows on load; a hand-built
+    /// `Population` bypasses that, so the fit boundary must reject it with a clear error.
+    #[test]
+    fn rtte_entry_time_after_time_is_rejected() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        // First record's entry (12.0) is after its event TIME (5.0).
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 12.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("entry_time after TIME must be rejected");
+        assert!(
+            err.contains("entry_time") && err.contains("CMT=2"),
+            "error should flag the entry-after-time record, got: {err}"
         );
     }
 

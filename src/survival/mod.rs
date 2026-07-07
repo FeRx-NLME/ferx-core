@@ -1609,6 +1609,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rtte_reset_folds_unsupported_inputs_to_sentinel() {
+        // Every ill-posed input to the gap-time renewal likelihood must fold into the
+        // 1e20 sentinel (a finite-but-poison objective the optimizer steers away from),
+        // never a finite silently-wrong contribution — matching the forward and
+        // single-event paths. This is the reset counterpart to the forward slice's
+        // `rtte_forward_rejects_non_monotone_hazard`, exercising each guard return in
+        // `rtte_reset_nll_from_curves` (Δ<0, h≤0, non-monotone H on either arm, interval).
+        let exact = |t: f64| ObsRecord::Event {
+            time: t,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        };
+        let censor = |t: f64| ObsRecord::Event {
+            time: t,
+            event_type: EventType::RightCensored,
+            entry_time: 0.0,
+            cmt: 2,
+        };
+        let tol = MonoTol::analytic();
+        let lin = |t: f64| 0.1 * t; // proper increasing H(Δ)
+        let good_h = |_t: f64| 0.1_f64;
+        // Decreasing after t = 3, so H(Δ) < 0 on a gap of 5 (non-monotone / negative hazard).
+        let dec = |t: f64| if t < 3.0 { t } else { 1.0 - t };
+
+        // Non-positive hazard at an Exact event → sentinel (Exact arm, h ≤ 0).
+        assert_eq!(
+            rtte_reset_nll_from_curves(&[exact(5.0)], lin, |_t| 0.0, tol),
+            1e20
+        );
+        // Non-monotone cumulative hazard on an Exact gap → sentinel (Exact arm).
+        assert_eq!(
+            rtte_reset_nll_from_curves(&[exact(5.0)], dec, good_h, tol),
+            1e20
+        );
+        // Non-monotone cumulative hazard on a censored gap → sentinel (RightCensored arm).
+        assert_eq!(
+            rtte_reset_nll_from_curves(&[censor(5.0)], dec, good_h, tol),
+            1e20
+        );
+        // Out-of-order records → negative gap → sentinel (Δ < 0 guard).
+        assert_eq!(
+            rtte_reset_nll_from_curves(&[exact(10.0), exact(4.0)], lin, good_h, tol),
+            1e20
+        );
+        // Interval-censored record is unsupported for RTTE → sentinel.
+        let interval = ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::IntervalCensored {
+                left: 3.0,
+                right: 5.0,
+            },
+            entry_time: 0.0,
+            cmt: 2,
+        };
+        assert_eq!(
+            rtte_reset_nll_from_curves(&[interval], lin, good_h, tol),
+            1e20
+        );
+    }
+
     // ── draw_tte_outcome: administrative censoring at the observation window ──
 
     #[test]

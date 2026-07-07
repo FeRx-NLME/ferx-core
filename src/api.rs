@@ -1368,6 +1368,7 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                     time,
                     cmt: c,
                     event_type,
+                    entry_time,
                     ..
                 } = r;
                 if *c != cmt {
@@ -1385,6 +1386,20 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                     return Some(format!(
                         "Subject '{}': RTTE endpoint CMT={cmt} has a non-finite TIME ({time}). \
                          Repeated-event rows require finite, time-sorted TIME values.",
+                        subject.id
+                    ));
+                }
+                // A left-truncation entry after the record's own event/censoring time gives a
+                // negative first gap (Δ = time − entry < 0 under clock-reset) or a decreasing
+                // cumulative-hazard increment (H(entry) > H(time) under clock-forward), both of
+                // which fold to the silent 1e20 sentinel. The datareader skips such rows on
+                // load; a hand-built `Population` bypasses that, so reject it here — the same
+                // up-front guarantee this function gives for interval/non-finite/out-of-order.
+                if *entry_time > *time {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has entry_time={entry_time} after \
+                         TIME={time}. The left-truncation entry must not exceed the record's \
+                         event/censoring time.",
                         subject.id
                     ));
                 }
