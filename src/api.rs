@@ -976,25 +976,16 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
     // subject, so a covariate relationship that pushes a subject's typical
     // parameter out of range is caught too. Reported once — a single fatal
     // error already halts the fit.
-    // Pathway-fraction **value** checks (below) read a per-compartment term/fraction
-    // tally: `frac_count` maps each input-rate compartment to `(total terms,
-    // fractioned terms)`, and the Σ ≈ 1 gate uses it to run only on a genuine
-    // ≥2-pathway split. The companion **structural** rules — every term on a
-    // ≥2-pathway compartment must carry a fraction, and a *lone* fractioned term is
-    // rejected — are enforced earlier, in the parser's `build_ode_spec` (alongside
-    // the at-most-one-zero-order rule, #505), so they also guard the `simulate()` /
-    // `predict()` paths that never reach this data-level check (#388, #588). By the
-    // time a model reaches here its fractions are therefore structurally well-formed;
-    // only the value ranges remain.
+    // Pathway-fraction **value** checks (below): each fraction in (0, 1], and the
+    // fractions on a compartment sum to ≈ 1. The companion **structural** rules —
+    // every term on a ≥2-pathway compartment must carry a fraction, and a *lone*
+    // fractioned term is rejected — are enforced earlier, in the parser's
+    // `build_ode_spec` (alongside the at-most-one-zero-order rule, #505), so they
+    // also guard the `simulate()` / `predict()` paths that never reach this
+    // data-level check (#388, #588). By the time a model reaches here every
+    // *fractioned* compartment therefore has ≥2 partitioning terms, so the Σ ≈ 1
+    // check below runs unconditionally on any compartment that carries a fraction.
     use std::collections::BTreeMap;
-    let mut frac_count: BTreeMap<usize, (usize, usize)> = BTreeMap::new(); // cmt -> (total, fractioned)
-    for f in &ode.input_rate {
-        let e = frac_count.entry(f.cmt).or_insert((0, 0));
-        e.0 += 1;
-        if f.frac_slot.is_some() {
-            e.1 += 1;
-        }
-    }
 
     let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     'subjects: for subject in &population.subjects {
@@ -1053,11 +1044,11 @@ fn check_absorption_dosing(model: &CompiledModel, population: &Population) -> Ve
             *frac_sum.entry(forcing.cmt).or_insert(0.0) += fr;
         }
         for (&cmt, &sum) in &frac_sum {
-            // Only a genuine ≥2-pathway split is checked for Σ ≈ 1; a lone fractioned
-            // term is already rejected structurally above, so don't double-report it
-            // with the misleading "sum to <FR>, not 1" here (review #1).
-            let multi = frac_count.get(&cmt).is_some_and(|&(total, _)| total >= 2);
-            if multi && (sum - 1.0).abs() > 1e-4 {
+            // A lone fractioned term is rejected at parse (`build_ode_spec`), so every
+            // compartment reaching `frac_sum` has ≥2 partitioning terms — the Σ ≈ 1
+            // check needs no ≥2-pathway gate here (avoids the misleading "sum to <FR>,
+            // not 1" a lone term would otherwise trigger; #388 review #1, #588).
+            if (sum - 1.0).abs() > 1e-4 {
                 diags.push(
                     Diagnostic::error(
                         "E_ABSORPTION_FRACTION",
@@ -6010,8 +6001,13 @@ pub fn simulate_with_options(
     // release) or `resolve_rate`'s opaque `.expect` *before* the chokepoint
     // guard. Asserting here makes both branches fail with the same actionable
     // diagnostic; it is a no-op O(doses) scan on the common all-`Fixed` dataset.
+    // The built-in absorption input-rate guard (#588) is hoisted for the same
+    // reason: otherwise a malformed multi-pathway / SS / infusion absorption model
+    // integrates the whole warm-EBE pass first and fails only at the chokepoint,
+    // with a confusable "EBE did not converge" instead of the real cause.
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
+    assert_absorption_dosing_supported(model, population);
 
     let method = match opts.match_method {
         Some(m) => m,
