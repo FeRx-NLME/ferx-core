@@ -1215,6 +1215,7 @@ fn run_mcem(
 
     // ---- Covariance step ----
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
+    let cov_timer = std::time::Instant::now();
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             let packed = pack_params(&final_params);
@@ -1248,6 +1249,7 @@ fn run_mcem(
         } else {
             None
         };
+    let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
 
     // ---- Finalize trace ----
     let impmap_trace = if collect_trace {
@@ -1335,6 +1337,7 @@ fn run_mcem(
         h_matrices,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,

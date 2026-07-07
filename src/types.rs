@@ -4070,6 +4070,15 @@ pub struct FitResult {
     pub dw_statistic: f64,
     /// Wall-clock time for the complete fit in seconds.
     pub wall_time_secs: f64,
+    /// Wall-clock time spent converging each stage of `method_chain`, parallel
+    /// to it, in seconds. Excludes the covariance step (see
+    /// `covariance_wall_time_secs`), which only ever runs on the last
+    /// estimating stage (#615).
+    pub method_wall_times_secs: Vec<f64>,
+    /// Wall-clock time spent on the post-estimation covariance step (FD
+    /// Hessian / SIR-fallback proposal construction), in seconds. `0.0` when
+    /// the covariance step was not run (#713).
+    pub covariance_wall_time_secs: f64,
     /// Model name (from the `.ferx` file or "Unnamed").
     pub model_name: String,
     /// ferx-core library version (from Cargo.toml at compile time).

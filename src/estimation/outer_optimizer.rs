@@ -19,6 +19,10 @@ pub struct OuterResult {
     /// Per-occasion kappa EBEs for each subject. Empty vecs when `n_kappa == 0`.
     pub kappas: Vec<Vec<DVector<f64>>>,
     pub covariance_matrix: Option<DMatrix<f64>>,
+    /// Wall-clock time spent inside this stage's covariance-step block
+    /// (`compute_covariance` / SIR-fallback construction), in seconds.
+    /// `0.0` when `run_covariance_step` was false for this stage.
+    pub covariance_wall_time_secs: f64,
     pub warnings: Vec<String>,
     /// Estimated OFV evaluations saved by the SAEM mu-ref gradient step M-step.
     /// Non-None only when method=saem and mu_referencing=true.
@@ -163,6 +167,7 @@ fn evaluate_at_initial_params(
 
     let mut warnings = Vec::new();
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
+    let cov_timer = std::time::Instant::now();
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
@@ -198,6 +203,7 @@ fn evaluate_at_initial_params(
         } else {
             None
         };
+    let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
 
     OuterResult {
         params,
@@ -208,6 +214,7 @@ fn evaluate_at_initial_params(
         h_matrices,
         kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
@@ -1307,6 +1314,7 @@ fn optimize_nlopt(
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
+    let cov_timer = std::time::Instant::now();
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
@@ -1342,6 +1350,7 @@ fn optimize_nlopt(
         } else {
             None
         };
+    let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
 
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());
@@ -1364,6 +1373,7 @@ fn optimize_nlopt(
         h_matrices: final_hms,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
@@ -1734,6 +1744,7 @@ fn optimize_bfgs(
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
+    let cov_timer = std::time::Instant::now();
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
@@ -1769,6 +1780,7 @@ fn optimize_bfgs(
         } else {
             None
         };
+    let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
 
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());
@@ -1783,6 +1795,7 @@ fn optimize_bfgs(
         h_matrices: final_hms,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,

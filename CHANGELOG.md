@@ -29,6 +29,12 @@ section of the SDLC for the versioning policy).
   `FitResult.environment` and round-trip through `.fitrx` bundles.
 
 ### Added
+- **`estimation:` block in `{model}-fit.yaml` now splits wall time by stage** (#713):
+  a `{method}_wall_time_secs` entry (e.g. `focei_wall_time_secs`, `imp_wall_time_secs`)
+  is reported for each stage of `method`/`methods`, plus a `covariance_wall_time_secs`
+  for the post-estimation FD-Hessian / SIR-fallback step, alongside the existing
+  `wall_time_secs` total. Also carried on `FitResult.method_wall_times_secs` /
+  `FitResult.covariance_wall_time_secs` and round-trips through `.fitrx` bundles.
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
   model.ferx`, `ferx check model.ferx`, and the public `fit_from_files()`

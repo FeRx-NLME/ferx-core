@@ -3804,11 +3804,17 @@ fn fit_inner(
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
+    // Per-stage convergence wall time, parallel to `chain`/`method_chain`
+    // (#713). Excludes the covariance step, which is timed separately below
+    // and only ever runs on the last estimating stage.
+    let mut method_wall_times_secs: Vec<f64> = Vec::with_capacity(n_stages);
+    let mut covariance_wall_time_secs: f64 = 0.0;
 
     for (stage_idx, &method) in chain.iter().enumerate() {
         if crate::cancel::is_cancelled(&options.cancel) {
             return Err("cancelled by user".to_string());
         }
+        let stage_start = std::time::Instant::now();
         let is_last = stage_idx + 1 == n_stages;
         let mut stage_opts = options.clone();
         stage_opts.method = method;
@@ -3890,6 +3896,7 @@ fn fit_inner(
                     h_matrices,
                     kappas,
                     covariance_matrix: None,
+                    covariance_wall_time_secs: 0.0,
                     warnings: Vec::new(),
                     saem_mu_ref_m_step_evals_saved: None,
                     saem_n_subjects_hmc: None,
@@ -3960,6 +3967,7 @@ fn fit_inner(
                     });
                 }
             }
+            method_wall_times_secs.push(stage_start.elapsed().as_secs_f64());
             continue;
         }
 
@@ -4006,6 +4014,11 @@ fn fit_inner(
             }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
+
+        let stage_cov_secs = stage_result.covariance_wall_time_secs;
+        method_wall_times_secs
+            .push((stage_start.elapsed().as_secs_f64() - stage_cov_secs).max(0.0));
+        covariance_wall_time_secs += stage_cov_secs;
 
         stage_params = stage_result.params.clone();
         total_iterations += stage_result.n_iterations;
@@ -4486,6 +4499,8 @@ fn fit_inner(
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
+        method_wall_times_secs,
+        covariance_wall_time_secs,
         converged: result.converged,
         ofv,
         aic,
@@ -10083,6 +10098,8 @@ mod simulate_with_uncertainty_tests {
         FitResult {
             method: EstimationMethod::FoceI,
             method_chain: vec![EstimationMethod::FoceI],
+            method_wall_times_secs: vec![0.0],
+            covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
             aic: 0.0,

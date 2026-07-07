@@ -2204,6 +2204,7 @@ pub fn run_saem(
 
     // ---- Covariance step ----
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
+    let cov_timer = std::time::Instant::now();
     let covariance_matrix =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
@@ -2240,6 +2241,7 @@ pub fn run_saem(
         } else {
             None
         };
+    let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
 
     if verbose {
         eprintln!("SAEM completed. Final OFV = {:.4}", ofv);
@@ -2293,6 +2295,7 @@ pub fn run_saem(
         h_matrices,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc,
