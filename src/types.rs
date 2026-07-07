@@ -4074,6 +4074,8 @@ pub struct FitResult {
     pub model_name: String,
     /// ferx-core library version (from Cargo.toml at compile time).
     pub ferx_version: String,
+    /// OS/arch/Docker/username snapshot of the machine the fit ran on (#704).
+    pub environment: crate::environment::EnvironmentInfo,
     /// Per-ETA transformation metadata (see `EtaParamInfo`). Used by the R
     /// layer to pick the correct CI / CV% formula for each random effect.
     pub eta_param_info: Vec<EtaParamInfo>,

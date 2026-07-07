@@ -2,6 +2,7 @@ pub mod api;
 pub mod build_info;
 pub mod cancel;
 pub mod diagnostics;
+pub mod environment;
 pub mod estimation;
 pub mod frem;
 pub mod io;
@@ -29,6 +30,7 @@ pub use api::{
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, Severity};
+pub use environment::EnvironmentInfo;
 pub use estimation::run_sir::run_sir;
 pub use estimation::uncertainty_samples::UncertaintyMethod;
 pub use frem::{prepare_frem, FremDataInfo, FremFitInit, FremPrepareResult};

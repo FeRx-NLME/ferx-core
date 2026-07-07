@@ -28,6 +28,56 @@ use crate::types::{
 //  TTE data term
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Round-off tolerance for the cumulative-hazard monotonicity guard in
+/// [`tte_nll_from_curves`]. A cumulative hazard is non-decreasing, so a negative
+/// increment `H(b) - H(a) < 0` is ill-posed - but each `H` read carries solver
+/// round-off, so an increment counts as a genuine violation only past
+/// `abstol + reltol * |H|`. This mirrors the ODE integrator's own per-step
+/// monotonicity tolerance (`mono_tol` in `src/ode/solver.rs`).
+///
+/// ODE-accumulated callers pass the *configured* solver tolerances
+/// ([`MonoTol::from_solver`]) so a user-tightened `ode_reltol` tightens the guard in
+/// lockstep; the analytic closed-form path passes a tight fixed floor
+/// ([`MonoTol::analytic`]) since it carries only f64 round-off, not solver error.
+#[derive(Clone, Copy, Debug)]
+pub struct MonoTol {
+    pub reltol: f64,
+    pub abstol: f64,
+}
+
+impl MonoTol {
+    /// Tight floor for closed-form hazard families. Their `H(t)` is evaluated in closed
+    /// form (no ODE solve), so the only round-off is f64 arithmetic - a few ULPs, i.e.
+    /// ~1e-15 relative. Valid families are monotone by construction, so this floor mainly
+    /// guards against sign-flipped parameters. `1e-9` is used for *both* terms, giving a
+    /// floor `1e-9 + 1e-9*|H|` that scales with `H` (so it does not over-reject a large
+    /// closed-form `H`) yet sits ~6 orders above the true round-off - tight enough to
+    /// still catch any genuine negative increment, loose enough never to fire on a
+    /// legitimate fit.
+    pub fn analytic() -> Self {
+        Self {
+            reltol: 1e-9,
+            abstol: 1e-9,
+        }
+    }
+
+    /// Floor tied to the ODE solver's effective tolerances.
+    pub fn from_solver(opts: &crate::ode::OdeSolverOptions) -> Self {
+        Self {
+            reltol: opts.reltol,
+            abstol: opts.abstol,
+        }
+    }
+}
+
+impl Default for MonoTol {
+    /// The standard floor at the solver's default tolerances (reltol 1e-4, abstol 1e-6),
+    /// delegating to [`crate::ode::OdeSolverOptions::default`] so the two stay in sync.
+    fn default() -> Self {
+        Self::from_solver(&crate::ode::OdeSolverOptions::default())
+    }
+}
+
 /// Negative log-likelihood contribution of a TTE endpoint for one subject.
 ///
 /// Handles all three EventType variants and left truncation (entry_time > 0).
@@ -53,6 +103,7 @@ pub fn tte_data_term(
                 records,
                 |t| cum_hazard(*family, t, &params),
                 |t| hazard_and_cum_hazard(*family, t, &params).0,
+                MonoTol::analytic(),
             )
         }
         // ODE-accumulated hazards are routed through `tte_endpoint_nll` → `tte_ode_nll`
@@ -83,20 +134,23 @@ pub fn tte_nll_from_curves(
     records: &[ObsRecord],
     cumhaz_at: impl Fn(f64) -> f64,
     hazard_at: impl Fn(f64) -> f64,
+    tol: MonoTol,
 ) -> f64 {
     let mut nll = 0.0_f64;
 
     // A cumulative hazard is non-decreasing: `H(b) ≥ H(a)` for `b ≥ a`. A drug-driven
     // `[odes]` hazard is a free user expression with no `h ≥ 0` constraint, so a
     // sign-flipped / non-monotone hazard can make an increment negative — `S = exp(−ΔH)
-    // > 1`, ill-posed. Flag any such increment past a relative round-off floor (the ODE
-    // `reltol` defaults to 1e-4) so a near-zero hazard's quadrature noise on a flat `H`
-    // is tolerated. The simulation path hard-errors on the same non-monotone CHZ; here,
-    // with an optimizer to steer, it folds into the shared 1e20 sentinel.
-    // NOTE(#618): the relative term scales with the accumulated `|H|`, so for a large `H`
-    // a genuine negative increment up to ~0.1%·H can slip past as round-off. Decouple the
-    // floor from the cumulative magnitude (tie to `reltol` / a local increment scale).
-    let monotone_violation = |hi: f64, lo: f64| hi - lo < -(1e-6 + 1e-3 * hi.abs().max(lo.abs()));
+    // > 1`, ill-posed. Treat an increment as a genuine violation only past the solver's
+    // own round-off band `abstol + reltol·|H|` (see `MonoTol`), so a near-zero hazard's
+    // quadrature noise on a flat `H` is tolerated while a larger negative step is not.
+    // The simulation path hard-errors on the same non-monotone CHZ; here, with an
+    // optimizer to steer, it folds into the shared 1e20 sentinel.
+    // #618: the previous fixed `1e-3·|H|` term was 10× looser than the default `reltol`
+    // and ignored a user-tightened `ode_reltol`, so a genuine negative step up to ~0.1%·H
+    // slipped past as round-off; tying the floor to `tol` closes that gap.
+    let monotone_violation =
+        |hi: f64, lo: f64| hi - lo < -crate::ode::scale_tol(tol.abstol, tol.reltol, hi, lo);
 
     for record in records {
         let ObsRecord::Event {
@@ -831,7 +885,7 @@ mod tests {
             cmt: 3,
         }];
         // CHZ is negative by t=5 (entry H=0): a clear monotonicity violation.
-        let nll = tte_nll_from_curves(&records, |_t| -0.5, |_t| 0.1);
+        let nll = tte_nll_from_curves(&records, |_t| -0.5, |_t| 0.1, MonoTol::default());
         assert_eq!(
             nll, 1e20,
             "non-monotone CHZ on a censor must be sentinel-guarded"
@@ -849,7 +903,7 @@ mod tests {
             entry_time: 0.0,
             cmt: 3,
         }];
-        let nll = tte_nll_from_curves(&records, |_t| -0.5, |_t| 0.1);
+        let nll = tte_nll_from_curves(&records, |_t| -0.5, |_t| 0.1, MonoTol::default());
         assert_eq!(
             nll, 1e20,
             "non-monotone CHZ on an exact event must be sentinel-guarded"
@@ -869,7 +923,7 @@ mod tests {
             cmt: 3,
         }];
         // H(5) = −1e−9, below the 1e−6 absolute floor ⇒ accepted, not sentinel.
-        let nll = tte_nll_from_curves(&records, |_t| -1e-9, |_t| 0.0);
+        let nll = tte_nll_from_curves(&records, |_t| -1e-9, |_t| 0.0, MonoTol::default());
         assert!(
             nll.abs() < 1e-6,
             "round-off dip must stay finite, got {nll}"
@@ -892,10 +946,100 @@ mod tests {
             cmt: 3,
         }];
         // H(entry=2) = 1.0 but H(left=5) = 0.2 < H(entry): non-monotone ⇒ sentinel.
-        let nll = tte_nll_from_curves(&records, |t| if t < 3.0 { 1.0 } else { 0.2 }, |_t| 0.1);
+        let nll = tte_nll_from_curves(
+            &records,
+            |t| if t < 3.0 { 1.0 } else { 0.2 },
+            |_t| 0.1,
+            MonoTol::default(),
+        );
         assert_eq!(
             nll, 1e20,
             "non-monotone CHZ before an interval must be sentinel-guarded"
+        );
+    }
+
+    /// #618: with a large accumulated `H`, a *genuine* negative increment (here 0.05% of
+    /// `H` - between the solver `reltol` and the old `1e-3` term) must hit the sentinel.
+    /// The previous magnitude-relative `1e-3·|H|` floor accepted it as round-off and let
+    /// the optimizer see a spurious finite (negative) NLL.
+    #[test]
+    fn tte_nll_from_curves_rejects_genuine_negative_increment_large_h() {
+        let records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::RightCensored,
+            entry_time: 2.0,
+            cmt: 3,
+        }];
+        // H(entry=2) = 100, H(5) = 99.95 ⇒ ΔH = −0.05 = −0.05% of H. Old floor
+        // 1e-3·100 = 0.1 accepted it; new floor reltol·100 = 0.01 rejects it.
+        let cumhaz = |t: f64| if t <= 2.0 { 100.0 } else { 99.95 };
+        let nll = tte_nll_from_curves(&records, cumhaz, |_t| 0.1, MonoTol::default());
+        assert_eq!(
+            nll, 1e20,
+            "genuine negative increment on a large H must be sentinel-guarded"
+        );
+    }
+
+    /// And the exact-event arm: a positive instantaneous `h(T)` does not excuse a
+    /// genuinely negative accumulated increment on a large `H` (#618).
+    #[test]
+    fn tte_nll_from_curves_exact_rejects_genuine_negative_increment_large_h() {
+        let records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 2.0,
+            cmt: 3,
+        }];
+        let cumhaz = |t: f64| if t <= 2.0 { 100.0 } else { 99.95 };
+        let nll = tte_nll_from_curves(&records, cumhaz, |_t| 0.1, MonoTol::default());
+        assert_eq!(
+            nll, 1e20,
+            "exact-event genuine negative increment must be sentinel-guarded"
+        );
+    }
+
+    /// The tightened floor must NOT over-reject: a dip *within* the solver's round-off
+    /// band (ΔH = −0.005 on H = 100, i.e. 0.005% - below the reltol·100 = 0.01 floor)
+    /// stays finite, so a legitimate fit is not derailed by quadrature noise.
+    #[test]
+    fn tte_nll_from_curves_tolerates_solver_band_dip_large_h() {
+        let records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::RightCensored,
+            entry_time: 2.0,
+            cmt: 3,
+        }];
+        let cumhaz = |t: f64| if t <= 2.0 { 100.0 } else { 99.995 };
+        let nll = tte_nll_from_curves(&records, cumhaz, |_t| 0.1, MonoTol::default());
+        assert!(
+            nll.is_finite() && nll < 1e20,
+            "within-band round-off dip must stay finite, got {nll}"
+        );
+    }
+
+    /// The analytic path uses a tight fixed floor ([`MonoTol::analytic`]): a small
+    /// negative increment that the ODE-sized default floor would swallow is still
+    /// rejected, so a sign-flipped closed-form hazard cannot sneak `S > 1` through.
+    #[test]
+    fn tte_nll_from_curves_analytic_floor_rejects_small_dip() {
+        let records = vec![ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::RightCensored,
+            entry_time: 2.0,
+            cmt: 3,
+        }];
+        // ΔH = −1e−5 on H ≈ 1: above the analytic ~1e−9 floor (rejected) but below the
+        // default ODE floor 1e−6 + reltol·1 ≈ 1e−4 (which tolerates it as round-off).
+        let cumhaz = |t: f64| if t <= 2.0 { 1.0 } else { 1.0 - 1e-5 };
+        let nll = tte_nll_from_curves(&records, cumhaz, |_t| 0.1, MonoTol::analytic());
+        assert_eq!(
+            nll, 1e20,
+            "analytic floor must reject a small genuine negative dip"
+        );
+        let nll_default = tte_nll_from_curves(&records, cumhaz, |_t| 0.1, MonoTol::default());
+        assert!(
+            nll_default.is_finite() && nll_default < 1e20,
+            "same dip is within the ODE-sized default floor, got {nll_default}"
         );
     }
 

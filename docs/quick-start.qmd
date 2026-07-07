@@ -98,13 +98,12 @@ TVKA                 0.757498     0.034986        4.6
 
 ## 5. Output files
 
-Three files are generated:
+Two files are generated:
 
 | File | Contents |
 |------|----------|
 | `warfarin-sdtab.csv` | Per-observation diagnostics (PRED, IPRED, CWRES, IWRES, ETAs) |
-| `warfarin-fit.yaml` | Parameter estimates with standard errors in YAML format |
-| `warfarin-timing.txt` | Wall-clock estimation time |
+| `warfarin-fit.yaml` | Parameter estimates with standard errors, plus `estimation:`/`environment:` info, in YAML format |
 
 ## Next Steps
 

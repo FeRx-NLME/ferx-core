@@ -82,6 +82,15 @@ impl Default for OdeSolverOptions {
     }
 }
 
+/// Scale-aware tolerance band `abstol + reltol * max(|a|, |b|)`. Shared by the RK45
+/// step-error control, the per-step monotonicity guard (`mono_tol`), and the TTE
+/// cumulative-hazard monotonicity floor (`survival::MonoTol`), so the integrator and the
+/// survival guard use one definition and cannot silently diverge (see #618).
+#[inline]
+pub(crate) fn scale_tol(abstol: f64, reltol: f64, a: f64, b: f64) -> f64 {
+    abstol + reltol * a.abs().max(b.abs())
+}
+
 /// Solution point: (time, state vector)
 #[derive(Debug, Clone)]
 pub struct SolPoint {
@@ -305,7 +314,7 @@ pub(crate) fn solve_ode_dense(
         for i in 0..n {
             let err_i = dt_eff
                 * (E1 * k1[i] + E3 * k3[i] + E4 * k4[i] + E5 * k5[i] + E6 * k6[i] + E7 * k7[i]);
-            let scale = opts.abstol + opts.reltol * u5[i].abs().max(u[i].abs());
+            let scale = scale_tol(opts.abstol, opts.reltol, u5[i], u[i]);
             err_norm += (err_i / scale) * (err_i / scale);
         }
         err_norm = (err_norm / n as f64).sqrt();
@@ -544,7 +553,7 @@ pub fn solve_ode_until_threshold(
         for i in 0..n {
             let err_i = dt_eff
                 * (E1 * k1[i] + E3 * k3[i] + E4 * k4[i] + E5 * k5[i] + E6 * k6[i] + E7 * k7[i]);
-            let scale = opts.abstol + opts.reltol * u5[i].abs().max(u[i].abs());
+            let scale = scale_tol(opts.abstol, opts.reltol, u5[i], u[i]);
             err_norm += (err_i / scale) * (err_i / scale);
         }
         err_norm = (err_norm / n as f64).sqrt();
@@ -566,7 +575,7 @@ pub fn solve_ode_until_threshold(
             }
             // Scale-aware monotonicity floor: a real negative rate produces a
             // decrease ≫ this; only round-off sits below it.
-            let mono_tol = opts.abstol + opts.reltol * y0.abs().max(y1.abs());
+            let mono_tol = scale_tol(opts.abstol, opts.reltol, y0, y1);
             if y1 < y0 - mono_tol {
                 return ThresholdCrossing::Failed(format!(
                     "monitored state {monitor} decreased ({y0:.6} → {y1:.6}) over \
@@ -782,7 +791,7 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
                     + E5 * k5[i].val()
                     + E6 * k6[i].val()
                     + E7 * k7[i].val());
-            let scale = opts.abstol + opts.reltol * u5[i].val().abs().max(u[i].val().abs());
+            let scale = scale_tol(opts.abstol, opts.reltol, u5[i].val(), u[i].val());
             err_norm += (err_i / scale) * (err_i / scale);
         }
         err_norm = (err_norm / n as f64).sqrt();

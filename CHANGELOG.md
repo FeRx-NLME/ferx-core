@@ -19,6 +19,15 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Changed
+- **CLI default output no longer writes a separate `{model}-timing.txt` file** (#704):
+  the estimation step's wall-clock time and thread count now live under a new
+  `estimation:` section in `{model}-fit.yaml` (narrower in scope than the old
+  file, which also covered model parsing and data loading), alongside a new
+  `environment:` section (OS, CPU architecture, whether running in Docker, OS
+  username, ferx version) for troubleshooting and reproducibility. Both are also carried on
+  `FitResult.environment` and round-trip through `.fitrx` bundles.
+
 ### Added
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
@@ -33,9 +42,26 @@ section of the SDLC for the versioning policy).
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
 ### Fixed
+- **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
+  SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
+  reduction whose grouping depended on the number of rayon threads; because floating-point
+  addition is not associative, the objective (and, in non-converged runs, the final OFV and
+  estimates) differed between e.g. 4 and 15 threads. The per-subject contributions are now summed
+  in a fixed subject order, so a given fit returns bit-identical results at any thread count.
 - **CLI flags in `--flag=value` form are no longer silently ignored** (#693):
   `--data`, `--output`, `--threads` (and any other value-taking flag) now accept
   `=` the same as a space, e.g. `ferx model.ferx --data=d.csv --threads=4`.
+- **TTE non-monotone-hazard guard now tracks the ODE solver tolerance** (#618). For a
+  drug-driven `[odes]` `hazard =` expression (no `h >= 0` constraint), the cumulative-
+  hazard monotonicity check rejected a negative increment `H(b) < H(a)` only past a fixed
+  `1e-3*|H|` round-off floor - 10x looser than the solver's default `reltol` (1e-4) and
+  growing without bound as `H` accumulates, so a genuinely negative step up to ~0.1% of a
+  large accumulated `H` slipped through as round-off (admitting `S = exp(-ΔH) > 1` and
+  biasing the optimizer toward the negative-hazard region). The floor is now tied to the
+  model's *configured* `ode_reltol`/`ode_abstol` (`abstol + reltol*|H|`, mirroring the
+  integrator's own per-step monotonicity tolerance), and the analytic closed-form path
+  uses a tight fixed floor. Such a step now correctly folds into the `1e20` sentinel,
+  while legitimate solver round-off on a flat/slow `H` stays finite.
 - **Built-in absorption pathway-fraction validation now covers `simulate()` and
   `predict()`** (#588): a multi-pathway model with malformed fractions — a bare term
   alongside a fractioned one, a lone `FR*fn(...)`, a fraction outside `(0, 1]`, or

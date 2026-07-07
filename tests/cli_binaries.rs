@@ -123,7 +123,7 @@ fn no_arguments_prints_usage_and_exits_one() {
     assert_eq!(out.status.code(), Some(1), "no args → usage exit 1");
 }
 
-// ── ferx fit: full success path (writes sdtab/yaml/timing + .fitrx bundle) ────
+// ── ferx fit: full success path (writes sdtab/yaml + .fitrx bundle) ──────────
 
 /// Drives the fit half of `main`: a small 10-subject 1-cpt IV FOCEI fit with
 /// `--threads` and `--output` (so the thread-pool and .fitrx-bundle branches
@@ -161,6 +161,25 @@ fn fit_with_data_writes_outputs_and_bundle() {
         let p = tmp.path().join(name);
         assert!(p.exists(), "expected output {} to be written", p.display());
     }
+    // #704: the standalone timing file is gone — timing now lives in the yaml.
+    assert!(!tmp.path().join("one_cpt_iv-timing.txt").exists());
+
+    let yaml = std::fs::read_to_string(tmp.path().join("one_cpt_iv-fit.yaml")).unwrap();
+    assert!(
+        yaml.contains("\nestimation:"),
+        "yaml missing estimation: {yaml}"
+    );
+    assert!(yaml.contains("  wall_time_secs:"));
+    assert!(yaml.contains("  n_threads_used:"));
+    assert!(
+        yaml.contains("\nenvironment:"),
+        "yaml missing environment: {yaml}"
+    );
+    assert!(yaml.contains("  os:"));
+    assert!(yaml.contains("  arch:"));
+    assert!(yaml.contains("  in_docker:"));
+    assert!(yaml.contains("  username:"));
+    assert!(yaml.contains("  ferx_version:"));
 }
 
 /// Drives the `--simulate` half of `main` (no data file). Uses a tiny inline
