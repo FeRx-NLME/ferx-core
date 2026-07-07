@@ -248,7 +248,8 @@ fn try_joint_pktte_shared_solve(
         matches!(
             e,
             EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. }
+                hazard: HazardSpec::OdeAccumulated { .. },
+                ..
             }
         )
     };
@@ -348,14 +349,22 @@ fn tte_endpoint_nll(
     model: &CompiledModel,
     subject: &Subject,
     hazard: &HazardSpec,
+    recurrence: crate::types::TteRecurrence,
     records: &[ObsRecord],
     theta: &[f64],
     eta: &[f64],
 ) -> f64 {
     match hazard {
-        HazardSpec::Analytic { .. } => {
-            crate::survival::tte_data_term(records, hazard, theta, eta, &subject.covariates)
-        }
+        HazardSpec::Analytic { .. } => crate::survival::tte_data_term(
+            records,
+            hazard,
+            recurrence,
+            theta,
+            eta,
+            &subject.covariates,
+        ),
+        // Recurrence is orthogonal to the ODE-accumulated path, which is Single-only
+        // for now (RTTE + drug-driven hazard is rejected at parse — a later slice).
         HazardSpec::OdeAccumulated { chz_state } => {
             tte_ode_nll(model, subject, *chz_state, records, theta, eta)
         }
@@ -485,7 +494,7 @@ pub fn individual_nll_into_with_schedule(
         // Iterate model.endpoints (typically 1–3 entries) rather than scanning
         // obs_records for unique CMTs — avoids the HashSet and one pass over records.
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard } = endpoint {
+            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()
@@ -509,7 +518,15 @@ pub fn individual_nll_into_with_schedule(
                         *chz_state,
                         &records_for_cmt,
                     ),
-                    _ => tte_endpoint_nll(model, subject, hazard, &records_for_cmt, theta, eta),
+                    _ => tte_endpoint_nll(
+                        model,
+                        subject,
+                        hazard,
+                        *recurrence,
+                        &records_for_cmt,
+                        theta,
+                        eta,
+                    ),
                 };
                 data_ll += 2.0 * raw;
             }
@@ -695,7 +712,7 @@ pub(crate) fn obs_nll_subject_from_preds(
     if !subject.obs_records.is_empty() {
         use crate::types::EndpointLikelihood;
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard } = endpoint {
+            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
                 // ObsRecord::Event is the only variant (DiscreteState/Count deferred);
                 // the `..` pattern captures all EventType variants (Exact, RightCensored,
                 // IntervalCensored), so this filter correctly passes every TTE record type.
@@ -710,7 +727,15 @@ pub(crate) fn obs_nll_subject_from_preds(
                 if records_for_cmt.is_empty() {
                     continue;
                 }
-                nll += tte_endpoint_nll(model, subject, hazard, &records_for_cmt, theta, eta);
+                nll += tte_endpoint_nll(
+                    model,
+                    subject,
+                    hazard,
+                    *recurrence,
+                    &records_for_cmt,
+                    theta,
+                    eta,
+                );
             }
         }
     }
@@ -879,7 +904,7 @@ pub fn foce_subject_nll(
         let mut tte_h = DMatrix::<f64>::zeros(n_eta, n_eta);
 
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard } = endpoint {
+            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()
@@ -894,7 +919,15 @@ pub fn foce_subject_nll(
                 // Closure that evaluates the TTE NLL at a given eta vector — re-solving
                 // the ODE per perturbed η for the ODE-accumulated (joint PK-TTE) case.
                 let tte_fn = |eta_eval: &[f64]| -> f64 {
-                    tte_endpoint_nll(model, subject, hazard, &records_for_cmt, theta, eta_eval)
+                    tte_endpoint_nll(
+                        model,
+                        subject,
+                        hazard,
+                        *recurrence,
+                        &records_for_cmt,
+                        theta,
+                        eta_eval,
+                    )
                 };
                 // #570: at the mode, read H/h off the shared solve when available; the
                 // FD-Hessian below still calls `tte_fn` at perturbed η (intrinsic to FD).
@@ -2363,7 +2396,7 @@ pub fn individual_nll_iov(
         use crate::survival::tte_data_term;
         use crate::types::EndpointLikelihood;
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard } = endpoint {
+            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()
@@ -2375,8 +2408,15 @@ pub fn individual_nll_iov(
                 if records_for_cmt.is_empty() {
                     continue;
                 }
-                data_ll +=
-                    2.0 * tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+                data_ll += 2.0
+                    * tte_data_term(
+                        &records_for_cmt,
+                        hazard,
+                        *recurrence,
+                        theta,
+                        eta,
+                        &subject.covariates,
+                    );
             }
         }
     }
@@ -3598,6 +3638,7 @@ mod tests {
         let (chz_state, hazard) = match model.endpoints.get(&2) {
             Some(EndpointLikelihood::Tte {
                 hazard: h @ HazardSpec::OdeAccumulated { chz_state },
+                ..
             }) => (*chz_state, h),
             _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
         };
@@ -3611,6 +3652,7 @@ mod tests {
             &model,
             &subject,
             hazard,
+            crate::types::TteRecurrence::Single,
             &subject.obs_records,
             &p.theta,
             &eta_nz,

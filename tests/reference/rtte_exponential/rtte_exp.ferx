@@ -1,0 +1,24 @@
+# Constant-hazard repeated time-to-event (RTTE) with a shared subject frailty.
+# Phase 3 Slice 3.1 anchor (clock-forward / Andersen-Gill).
+#
+# Data: rtte_exp.csv — 100 subjects, ~3 events/subject, administrative censoring
+# at t = 20. Data-generating TVLAMBDA = 0.15, omega^2(log rate) = 0.09.
+#
+# RTTE default method is SAEM: Laplace/FOCEI underestimates the frailty omega^2
+# for recurrent events at low event rates (Karlsson et al. 2009).
+
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+
+[fit_options]
+  method        = saem
+  n_exploration = 400
+  n_convergence = 200
+  saem_seed     = 31

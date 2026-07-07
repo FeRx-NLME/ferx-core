@@ -1,0 +1,37 @@
+# Repeated time-to-event (RTTE) with a constant hazard and a shared subject frailty.
+# Phase 3 Slice 3.1 — clock-forward (Andersen-Gill).
+#
+# Each subject can have MULTIPLE events on the TTE CMT (type = rtte). The hazard is a
+# constant rate with between-subject variability:
+#   lambda = TVLAMBDA * exp(ETA_LAMBDA)
+# Clock-forward means the cumulative hazard accumulates over the whole window and is not
+# reset at events; the per-subject likelihood is  Sum_k log h(t_k) - H(T).
+#
+# Data format (TTE rows, EVID=0), in time order per subject, ending in a censor row:
+#   DV=1  exact event   (several per subject)
+#   DV=0  right-censored (administrative, at the end of observation)
+#
+# Reference (simulated): TVLAMBDA = 0.15, omega(ETA_LAMBDA) = 0.09, censoring at t = 20;
+# ~3 events/subject. Simulated dataset: data/rtte_exponential.csv.
+#
+# This example sets method = saem: a Laplace/FOCEI fit can underestimate the frailty
+# omega^2 at low event rates (Karlsson et al. 2009). The engine default stays FOCEI, but
+# an RTTE-with-frailty fit under FOCE/FOCEI warns and recommends method = saem/imp.
+#
+# Run:  cargo run --release -- examples/rtte_exponential.ferx --data data/rtte_exponential.csv
+
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+
+[fit_options]
+  method        = saem
+  n_exploration = 400
+  n_convergence = 200
+  saem_seed     = 31

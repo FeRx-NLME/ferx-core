@@ -373,6 +373,65 @@ right-censored TTE row per cause compartment (CMT 2 and CMT 3) per synthetic
 subject and overwrites each with the drawn outcome. A TTE `[simulation]` block
 **requires `horizon`** (there are no continuous `times` to schedule).
 
+## Repeated events (RTTE) {#rtte}
+
+A **repeated** TTE model (`type = rtte` in `[event_model]`) lets one subject
+experience the same event several times. Add `type = rtte` and give each subject
+multiple `DV = 1` rows in time order, ending in a `DV = 0` administrative-censoring
+row:
+
+```
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)   # frailty shared across a subject's events
+
+[fit_options]
+  method = saem
+```
+
+`clock = forward` (the default, Andersen–Gill total time) integrates the cumulative
+hazard once across the whole window (`Σ_k log h(t_k) − H(T)`); `clock = reset`
+(gap time) is a later slice. See
+[Repeated events](../model-file/event-model.qmd#rtte) for the DSL details.
+
+::: {.callout-warning}
+## Prefer SAEM/IMP for RTTE
+
+A Laplace-based fit (`focei`/`foce`) can **underestimate the frailty ω²** for RTTE at
+low event rates (Karlsson et al. 2009: −91 % to −96 % below a 43 % event rate). ferx
+warns and recommends `method = saem` or `method = imp`. For an *event-rich* design the
+methods coincide (see the anchor below).
+:::
+
+### Validation — constant-hazard RTTE
+
+Dataset `tests/reference/rtte_exponential/rtte_exp.csv` (100 subjects; data-generating
+`TVLAMBDA = 0.15`, `ω² = 0.09`; censored at t = 20 → **305 events, 3.05/subject**). Two
+of the anchors are **exact and license-free** — for a constant hazard the RTTE
+likelihood factorises, so the per-subject event *counts* are `Poisson(λᵢ·T)` and a
+Poisson-lognormal GLMM on the counts is the exact MLE (`count_equivalence.R`).
+
+| Method | TVLAMBDA | ω²(log rate) | OFV |
+|--------|---------:|-------------:|----:|
+| Analytic MLE `D/Σt` (fixed) | **0.15250** | — | 1757.16 |
+| ferx fixed-effects | 0.15250 | — | 1757.16 |
+| Poisson-LN GLMM (exact mixed MLE) | 0.14062 | 0.16455 | — |
+| **NONMEM** LAPLACE | 0.14062 | 0.16450 | 1748.49 |
+| **ferx** FOCEI | 0.14060 | 0.16448 | 1748.49 |
+| ferx SAEM (seed 31) | 0.14033 | 0.16993 | 1748.50 |
+
+ferx FOCEI reproduces NONMEM LAPLACE to 4–5 significant figures and the OFV to the
+decimal (1748.49), and both land on the exact Poisson-LN GLMM MLE. The frailty ω² is
+well-identified here because the design is event-rich, so FOCEI, SAEM, NONMEM and the
+GLMM coincide — the Karlsson Laplace bias is a *low-event-rate* effect. Full write-up
+in `tests/reference/rtte_exponential/expected.md`.
+
 ## Comparison with reference software
 
 The exponential validation dataset is `tests/reference/tte_exponential/tte_exp.csv`

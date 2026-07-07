@@ -189,6 +189,12 @@ struct FitWire {
     n_iterations: usize,
     interaction: bool,
     wall_time_secs: f64,
+    // Absent on bundles saved before #713 split out per-method / covariance
+    // timing; loaders default to an empty Vec / 0.0.
+    #[serde(default)]
+    method_wall_times_secs: Vec<f64>,
+    #[serde(default)]
+    covariance_wall_time_secs: f64,
     n_threads_used: usize,
     uses_ode_solver: bool,
     uses_sde: bool,
@@ -671,6 +677,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         n_iterations: r.n_iterations,
         interaction: r.interaction,
         wall_time_secs: r.wall_time_secs,
+        method_wall_times_secs: r.method_wall_times_secs.clone(),
+        covariance_wall_time_secs: r.covariance_wall_time_secs,
         n_threads_used: r.n_threads_used,
         uses_ode_solver: r.uses_ode_solver,
         uses_sde: r.uses_sde,
@@ -1741,6 +1749,8 @@ fn wire_to_fit_result(
     Ok(FitResult {
         method,
         method_chain,
+        method_wall_times_secs: w.method_wall_times_secs,
+        covariance_wall_time_secs: w.covariance_wall_time_secs,
         converged: w.converged,
         ofv: w.ofv,
         aic: w.aic,
@@ -1951,6 +1961,8 @@ mod tests {
         FitResult {
             method: EstimationMethod::FoceI,
             method_chain: vec![EstimationMethod::FoceI],
+            method_wall_times_secs: vec![1.234],
+            covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 100.0,
             aic: 110.0,

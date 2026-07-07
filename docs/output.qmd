@@ -144,6 +144,8 @@ covariance_matrix:
     log_chol_ETA_V:  [0.000000e+0, 0.000000e+0, 0.000000e+0, 2.345678e-6, 0.000000e+0]
     sigma_1:         [0.000000e+0, 0.000000e+0, 0.000000e+0, 0.000000e+0, 7.890123e-7]
 estimation:
+  focei_wall_time_secs: 11.845678
+  covariance_wall_time_secs: 0.500000
   wall_time_secs: 12.345678
   n_threads_used: 8
 environment:
@@ -178,7 +180,13 @@ The `estimation:` block replaces the standalone `{model}-timing.txt` file
 (not model parsing or data reading — the old timing file's `elapsed_seconds`
 covered the whole CLI run, so the two are not a like-for-like replacement,
 just the closest equivalent), and `n_threads_used` is the Rayon worker count
-used. The `environment:` block is a snapshot of the machine and account the
+used. `wall_time_secs` is further broken down (#713) into a `{method}_wall_time_secs`
+entry for each stage of `method = ...`/`methods = [...]` (e.g. `focei_wall_time_secs`,
+`imp_wall_time_secs` for a `[focei, imp]` chain) plus `covariance_wall_time_secs`
+for the post-estimation FD-Hessian / SIR-fallback step, which only ever runs
+once, on the last estimating stage (#615). The per-stage keys measure
+convergence only and exclude the covariance step. The `environment:` block is
+a snapshot of the machine and account the
 fit ran under — `os`/`arch` from the running binary's target, `in_docker`
 (whether `/.dockerenv`, `KUBERNETES_SERVICE_HOST`, or `/proc/1/cgroup`
 indicate a container), `username` (`$USER`/`%USERNAME%`, quoted/escaped since
@@ -186,7 +194,7 @@ it's free-form text), and `ferx_version`.
 
 ## FitResult Fields (Rust API / console)
 
-The following fields are populated on the `FitResult` struct returned by `fit()` and printed by `print_results()`. Except for `wall_time_secs`, `n_threads_used`, and `environment` (written to the `estimation:`/`environment:` blocks above), they are **not** currently written to the fit YAML — read them programmatically or from the console summary.
+The following fields are populated on the `FitResult` struct returned by `fit()` and printed by `print_results()`. Except for `wall_time_secs`, `method_wall_times_secs`, `covariance_wall_time_secs`, `n_threads_used`, and `environment` (written to the `estimation:`/`environment:` blocks above), they are **not** currently written to the fit YAML — read them programmatically or from the console summary.
 
 ### Shrinkage
 
@@ -264,6 +272,8 @@ When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption 
 | `model_name` | Name from the `.ferx` file (or `"Unnamed"`) |
 | `ferx_version` | Version of ferx-core that produced the result |
 | `wall_time_secs` | Wall-clock time for the complete fit (seconds) |
+| `method_wall_times_secs` | Wall-clock convergence time per stage, parallel to `method_chain` (seconds); excludes the covariance step |
+| `covariance_wall_time_secs` | Wall-clock time spent on the post-estimation covariance step; `0.0` when not run |
 | `gradient_method_inner` | Gradient method used in the inner (EBE) loop, e.g. `analytic (Dual2)` or `finite differences` |
 | `gradient_method_outer` | Gradient method used in the outer loop, e.g. `finite differences` |
 | `uses_ode_solver` | `true` if the model uses the ODE solver, `false` for analytical PK |

@@ -169,6 +169,10 @@ fn fit_with_data_writes_outputs_and_bundle() {
         yaml.contains("\nestimation:"),
         "yaml missing estimation: {yaml}"
     );
+    // #713: convergence time is broken out per method-chain stage (this fit
+    // is a single-stage FOCEI run), plus the covariance step separately.
+    assert!(yaml.contains("  focei_wall_time_secs:"));
+    assert!(yaml.contains("  covariance_wall_time_secs:"));
     assert!(yaml.contains("  wall_time_secs:"));
     assert!(yaml.contains("  n_threads_used:"));
     assert!(

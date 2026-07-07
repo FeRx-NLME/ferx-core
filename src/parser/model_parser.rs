@@ -5,6 +5,7 @@ use crate::sim::adaptive::{
 use crate::types::*;
 use regex::Regex;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -1203,6 +1204,28 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         ParseCtx::new(&theta_names, &eta_names, &all_assigned).with_nn_specs(&nn_specs_for_ctx);
     let mut indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
 
+    // Reject a forward reference — a name read before it is assigned in file
+    // order — rather than let it silently resolve to 0.0 at eval time (#710).
+    let in_block: HashSet<String> = all_assigned.iter().cloned().collect();
+    let forward_refs = collect_forward_refs(&indiv_stmts, &in_block);
+    if !forward_refs.is_empty() {
+        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut msgs: Vec<String> = Vec::new();
+        for (used, defining) in &forward_refs {
+            if seen.insert((used.clone(), defining.clone())) {
+                msgs.push(format!("`{used}` (used in `{defining}`)"));
+            }
+        }
+        return Err(format!(
+            "[individual_parameters]: forward reference(s) to name(s) declared later \
+             in the block: {}. Statements are evaluated in file order, so a name must \
+             be assigned before it is used; a forward reference would otherwise \
+             silently read 0.0. Reorder the block so each name is declared before it \
+             is referenced.",
+            msgs.join(", "),
+        ));
+    }
+
     // Detect ODE vs analytical model
     let is_ode = struct_lines
         .iter()
@@ -2200,6 +2223,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .map(|s| s.state_names.clone())
             .unwrap_or_default();
         let is_ode_model = model.ode_spec.is_some();
+        // Individual-parameter name bound to this `pk <model>(...)` block's `v`/`v1` role
+        // (`None` for `ode(...)`/`ode_template(...)`) — see `build_obs_scale_spec`'s doc (#712).
+        let volume_indiv_name_for_scaling: Option<String> = if is_ode_model {
+            None
+        } else {
+            pk_param_map
+                .get("v")
+                .or_else(|| pk_param_map.get("v1"))
+                .cloned()
+        };
+        let mut scaling_parse_warnings: Vec<String> = Vec::new();
 
         let (scaling, output_fn, output_program, scaling_covariates) = parse_scaling_block(
             scaling_lines,
@@ -2212,7 +2246,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             model.pk_model,
             &model.kappa_names,
             &readout_synth_params,
+            volume_indiv_name_for_scaling.as_deref(),
+            &mut scaling_parse_warnings,
         )?;
+        model.parse_warnings.extend(scaling_parse_warnings);
 
         // AD compatibility check (Phase 2.5):
         //
@@ -3582,6 +3619,8 @@ fn eval_indiv_param_vars(
 /// - `alpha`  — required for Gompertz (baseline hazard at t=0)
 /// - `gamma`  — required for Gompertz (hazard growth rate)
 /// - `loghr`  — optional (all families); log-hazard-ratio covariate term Σ(β·x)
+/// - `type`   — optional; `tte` (default, single event) | `rtte` (repeated events)
+/// - `clock`  — optional (RTTE only); `forward` (Andersen–Gill total time, default) or `reset` (gap time — Slice 3.2, rejected until then)
 #[cfg(feature = "survival")]
 fn parse_event_model_block(
     lines: &[String],
@@ -3631,6 +3670,11 @@ fn parse_event_model_block(
     // cumulative-hazard ODE derivative before the ODE spec is built; here we only
     // record its presence and route to the OdeAccumulated endpoint below.
     let mut hazard_present = false;
+    // Recurrence (RTTE): `type = tte | rtte` (default tte) and, for RTTE,
+    // `clock = forward | reset` (default forward). Resolved into `TteRecurrence`
+    // after the key loop. §3.3 of `plans/tte-survival-markov.md`.
+    let mut type_opt: Option<String> = None;
+    let mut clock_opt: Option<String> = None;
 
     for line in lines {
         let trimmed = line.trim();
@@ -3684,10 +3728,16 @@ fn parse_event_model_block(
                 // derivative by the parser pre-scan, so it is not compiled here.
                 hazard_present = true;
             }
+            "type" => {
+                type_opt = Some(value.to_string());
+            }
+            "clock" => {
+                clock_opt = Some(value.to_string());
+            }
             other => {
                 return Err(format!(
-                    "[event_model]: unknown key `{other}` \
-                     — valid keys: cmt, family, scale, rate, shape, alpha, gamma, loghr, hazard"
+                    "[event_model]: unknown key `{other}` — valid keys: cmt, family, scale, \
+                     rate, shape, alpha, gamma, loghr, hazard, type, clock"
                 ));
             }
         }
@@ -3726,11 +3776,65 @@ fn parse_event_model_block(
         }
     }
 
+    // Resolve the recurrence: standard single-event TTE (default) vs. repeated TTE
+    // (RTTE). For RTTE, `clock = forward` (Andersen–Gill total time, the default) is
+    // the only mode supported in Slice 3.1; `clock = reset` (gap time, §8.8.6) is a
+    // later slice. `clock` is meaningless without `type = rtte`.
+    let recurrence = {
+        use crate::types::{RtteClock, TteRecurrence};
+        match type_opt.as_deref().unwrap_or("tte") {
+            "tte" | "single" => {
+                if let Some(c) = clock_opt.as_deref() {
+                    return Err(format!(
+                        "[event_model]: CMT={cmt} sets `clock = {c}` on a single-event TTE \
+                         endpoint. `clock` selects how time is measured between repeated events, \
+                         so it is only valid with `type = rtte`."
+                    ));
+                }
+                TteRecurrence::Single
+            }
+            "rtte" => {
+                let clock = match clock_opt.as_deref().unwrap_or("forward") {
+                    "forward" => RtteClock::Forward,
+                    "reset" => {
+                        return Err(format!(
+                            "[event_model]: CMT={cmt} sets `clock = reset` (gap-time RTTE), which \
+                             is not yet supported (Slice 3.2). Use `clock = forward` (the default \
+                             Andersen–Gill total-time hazard)."
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "[event_model]: CMT={cmt} unknown clock `{other}` — valid: forward, reset"
+                        ));
+                    }
+                };
+                TteRecurrence::Repeated { clock }
+            }
+            other => {
+                return Err(format!(
+                    "[event_model]: CMT={cmt} unknown type `{other}` — valid: tte, rtte"
+                ));
+            }
+        }
+    };
+
     // ODE-accumulated hazard path (joint PK-TTE, Slice 2.1): `hazard = <expr>` was
     // injected as a cumulative-hazard ODE derivative (`d/dt(__chz_<cmt>)`); the
     // endpoint only records that accumulator's state index. Mutually exclusive with
     // the analytic closed-form `family` keys.
     if hazard_present {
+        // RTTE with a drug-driven ODE hazard (joint PK-RTTE) needs the repeated-event
+        // root-finder loop AND, for clock-reset, the selective CHZ reset — a later
+        // slice. Reject rather than silently fitting a single-event likelihood.
+        if matches!(recurrence, crate::types::TteRecurrence::Repeated { .. }) {
+            return Err(format!(
+                "[event_model]: CMT={cmt} combines `type = rtte` with an ODE-accumulated \
+                 `hazard = ...` (drug-driven joint PK-RTTE), which is not yet supported. Use an \
+                 analytic `family` hazard for repeated events, or `type = tte` for a single-event \
+                 drug-driven hazard."
+            ));
+        }
         if family_opt.is_some()
             || scale_expr.is_some()
             || shape_expr.is_some()
@@ -3768,6 +3872,7 @@ fn parse_event_model_block(
             cmt,
             EndpointLikelihood::Tte {
                 hazard: HazardSpec::OdeAccumulated { chz_state },
+                recurrence,
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -4005,6 +4110,7 @@ fn parse_event_model_block(
         cmt,
         EndpointLikelihood::Tte {
             hazard: HazardSpec::Analytic { family, param_fn },
+            recurrence,
         },
         event_model_covariates,
         event_model_thetas,
@@ -5304,12 +5410,27 @@ fn compile_scale_deriv_program(
 
 /// Build a `ScalingSpec` (None / ScalarScale / ExpressionScale) from one
 /// `obs_scale[…] = value` line. Shared between the uniform and per-CMT paths.
+///
+/// `volume_indiv_name` is the individual-parameter name bound to the built-in
+/// `pk <model>(...)` structural block's `v`/`v1` role (`None` for `ode(...)`/
+/// `ode_template(...)`, where there's no such built-in concentration divisor to
+/// collide with). Referencing that exact name in a Form B expression is a real,
+/// supported feature (an intentional additional transform on top of the
+/// built-in concentration output — see `docs/model-file/scaling.qmd` and
+/// `examples/scaling_expression.ferx`), not rejected. But it is *also* the
+/// signature of a common mistake: copying `obs_scale = V` from an `ode(...)`
+/// translation of the same model, where it's required (raw output there is
+/// amount, not concentration) — on a `pk` block it silently divides by `v` a
+/// second time. Since ferx can't tell intent from mistake here, it warns
+/// (`parse_warnings`) rather than erroring (#712).
 fn build_obs_scale_spec(
     value: &str,
     theta_names: &[String],
     eta_names: &[String],
     indiv_var_names: &[String],
     pk_indices: &[usize],
+    volume_indiv_name: Option<&str>,
+    parse_warnings: &mut Vec<String>,
 ) -> Result<ScalingSpec, String> {
     // Try scalar first (Form A). Otherwise parse as expression (Form B).
     if let Ok(k) = value.parse::<f64>() {
@@ -5326,6 +5447,29 @@ fn build_obs_scale_spec(
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     let expr =
         parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] obs_scale: {}", e))?;
+    if let Some(vname) = volume_indiv_name {
+        let mut references_volume = false;
+        visit_expr_nodes(&expr, &mut |e| {
+            if let Expression::Variable(name) = e {
+                if name == vname {
+                    references_volume = true;
+                }
+            }
+        });
+        if references_volume {
+            parse_warnings.push(format!(
+                "[scaling]: obs_scale = `{value}` references `{vname}`, which is also this \
+                 model's `pk` structural block volume parameter. A built-in analytical `pk` \
+                 block already outputs concentration (divides by `{vname}` internally) — this \
+                 `obs_scale` divides by `{vname}` again on top. If that's intentional (a \
+                 deliberate additional transform), ignore this warning. If `obs_scale = {vname}` \
+                 was copied from an `ode(...)` translation of this model (where it converts raw \
+                 compartment amount to concentration and is required), remove `[scaling]` here — \
+                 the `pk` block's built-in concentration output is already what that conversion \
+                 was for."
+            ));
+        }
+    }
     // Pre-resolve indiv param name → PK slot so the closure can look up
     // `pk.values[slot]` for each `Expression::Variable(name)`. Mirrors
     // the analytical Form B path from Phase 1.5.
@@ -5818,6 +5962,11 @@ pub(crate) fn build_y_output_fn(
 /// - Mixing uniform (`obs_scale = K`) with per-CMT (`obs_scale[CMT=N] = K`)
 ///   within the same group → error.
 /// - Duplicate `[CMT=N]` keys → error.
+/// - `obs_scale` referencing the same individual parameter bound to a built-in
+///   `pk <model>(...)` block's `v`/`v1` role → **warning** (`parse_warnings`),
+///   not an error: it's a supported feature, but also the signature of a
+///   common mistake (a leftover `obs_scale = V` from an `ode(...)`
+///   translation) — see [`build_obs_scale_spec`] (#712).
 #[allow(clippy::too_many_arguments)]
 fn parse_scaling_block(
     lines: &[String],
@@ -5830,6 +5979,8 @@ fn parse_scaling_block(
     pk_model: PkModel,
     kappa_names: &[String],
     readout_synth: &[ReadoutSynthParam],
+    volume_indiv_name: Option<&str>,
+    parse_warnings: &mut Vec<String>,
 ) -> Result<
     (
         ScalingSpec,
@@ -5872,6 +6023,8 @@ fn parse_scaling_block(
                     eta_names,
                     indiv_var_names,
                     pk_indices,
+                    volume_indiv_name,
+                    parse_warnings,
                 )?;
                 match cmt_opt {
                     None => {
@@ -10326,6 +10479,90 @@ fn collect_undefined_vars_in_stmts(
             }
         }
     });
+}
+
+/// Detect a `[individual_parameters]` expression that reads an in-block name
+/// *before* that name is assigned in file order (issue #710). Because the block
+/// registers every assigned name as a defined variable — so a forward reference
+/// parses as `Variable(name)` rather than `Covariate(name)` (see the two-pass
+/// parse in `compile_model`) — such a reference would otherwise resolve to the
+/// running var map's default `0.0` at eval time, silently collapsing the formula
+/// (e.g. `exp(IMAX*…)` → `exp(0)`) with no diagnostic. This mirrors the `[odes]`
+/// undefined-reference guard (#314, `collect_undefined_vars`) but keys on
+/// declaration *order*, not *presence*: the name IS declared, just too late.
+///
+/// `in_block` is every name assigned anywhere in the block
+/// (`assigned_vars_in_order`); only reads of those names are order-checked. A
+/// `Variable(name)` whose name is outside `in_block` cannot occur in this parse
+/// context, and covariate / theta / eta references are distinct node kinds that
+/// are never flagged. Returns each `(used_name, defining_name)` violation in
+/// encounter order (a read of a not-yet-assigned name inside the RHS of
+/// `defining_name = …`). Statements execute top-to-bottom; each `if` arm is
+/// checked against the names assigned before the `if`, and a name assigned in
+/// any arm is treated as available afterwards (conservative — avoids
+/// false-positive order errors on a name defined across branches).
+fn collect_forward_refs(stmts: &[Statement], in_block: &HashSet<String>) -> Vec<(String, String)> {
+    fn check_reads(
+        assigned: &HashSet<String>,
+        in_block: &HashSet<String>,
+        defining: &str,
+        out: &mut Vec<(String, String)>,
+        visit: impl FnOnce(&mut dyn FnMut(&Expression)),
+    ) {
+        visit(&mut |e: &Expression| {
+            if let Expression::Variable(name) = e {
+                if in_block.contains(name) && !assigned.contains(name) {
+                    out.push((name.clone(), defining.to_string()));
+                }
+            }
+        });
+    }
+    fn walk(
+        stmts: &[Statement],
+        assigned: &mut HashSet<String>,
+        in_block: &HashSet<String>,
+        out: &mut Vec<(String, String)>,
+    ) {
+        for s in stmts {
+            match s {
+                Statement::Assign(name, expr) => {
+                    check_reads(assigned, in_block, name, out, |f| visit_expr_nodes(expr, f));
+                    assigned.insert(name.clone());
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // Each arm sees only names assigned before the `if`.
+                    for (cond, body) in branches {
+                        check_reads(assigned, in_block, "if-condition", out, |f| {
+                            visit_condition_nodes(cond, f)
+                        });
+                        let mut branch_assigned = assigned.clone();
+                        walk(body, &mut branch_assigned, in_block, out);
+                    }
+                    if let Some(eb) = else_body {
+                        let mut branch_assigned = assigned.clone();
+                        walk(eb, &mut branch_assigned, in_block, out);
+                    }
+                    // A name assigned in any arm is available afterwards.
+                    let mut branch_names: Vec<String> = Vec::new();
+                    for (_, body) in branches {
+                        branch_names.extend(assigned_vars_in_order(body));
+                    }
+                    if let Some(eb) = else_body {
+                        branch_names.extend(assigned_vars_in_order(eb));
+                    }
+                    assigned.extend(branch_names);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut assigned: HashSet<String> = HashSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    walk(stmts, &mut assigned, in_block, &mut out);
+    out
 }
 
 /// Accumulate the theta and eta indices referenced in an expression. Only the
@@ -18617,6 +18854,119 @@ mod tests {
         assert!((m_late[1] - 1.0).abs() < 1e-12);
     }
 
+    /// #710: an `[individual_parameters]` expression that references a name
+    /// declared *later* in the same block must be a hard parse error, not a
+    /// silent `0.0` substitution (the pre-fix behaviour collapsed the formula).
+    #[test]
+    fn indiv_params_forward_reference_is_error() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta TVIMAX(-0.3)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 1.0
+[individual_parameters]
+  CL   = TVCL * exp(IMAX) * exp(ETA_CL)
+  V    = TVV
+  IMAX = TVIMAX
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+        let err = parse_err(content);
+        assert!(
+            err.contains("forward reference") && err.contains("IMAX"),
+            "expected forward-reference error naming IMAX, got: {err}"
+        );
+    }
+
+    /// #710: reordering so the referenced name is declared first parses cleanly —
+    /// the guard keys on declaration *order*, not mere presence.
+    #[test]
+    fn indiv_params_declaration_before_use_parses() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta TVIMAX(-0.3)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 1.0
+[individual_parameters]
+  IMAX = TVIMAX
+  CL   = TVCL * exp(IMAX) * exp(ETA_CL)
+  V    = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+        parse_model_string(content).expect("declaration-before-use must parse");
+    }
+
+    /// #710: the order guard must not false-positive on a name assigned in an
+    /// earlier statement and read later — the normal backward-reference case.
+    #[test]
+    fn indiv_params_backward_reference_parses() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 1.0
+[individual_parameters]
+  KE = TVCL / TVV
+  CL = TVCL * KE * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+        parse_model_string(content).expect("backward reference must parse");
+    }
+
+    /// #710 (unit): `collect_forward_refs` walks statement order and flags only a
+    /// read of a not-yet-assigned in-block name. A name assigned across both arms
+    /// of an `if` is available afterwards (no false positive).
+    #[test]
+    fn collect_forward_refs_detects_order_and_respects_branches() {
+        use BinOp::Mul;
+        let in_block: HashSet<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
+
+        // B = A * 2 (A not yet assigned) — forward reference.
+        let bad = vec![
+            Statement::Assign(
+                "B".to_string(),
+                Expression::BinOp(
+                    Box::new(Expression::Variable("A".to_string())),
+                    Mul,
+                    Box::new(Expression::Literal(2.0)),
+                ),
+            ),
+            Statement::Assign("A".to_string(), Expression::Literal(1.0)),
+        ];
+        let refs = collect_forward_refs(&bad, &in_block);
+        assert_eq!(refs, vec![("A".to_string(), "B".to_string())]);
+
+        // A assigned on both arms of an if, then read — no violation.
+        let ok = vec![
+            Statement::If {
+                branches: vec![(
+                    Condition::Compare(Expression::Time, CmpOp::Gt, Expression::Literal(0.0)),
+                    vec![Statement::Assign("A".to_string(), Expression::Literal(1.0))],
+                )],
+                else_body: Some(vec![Statement::Assign(
+                    "A".to_string(),
+                    Expression::Literal(2.0),
+                )]),
+            },
+            Statement::Assign("C".to_string(), Expression::Variable("A".to_string())),
+        ];
+        assert!(collect_forward_refs(&ok, &in_block).is_empty());
+    }
+
     /// A theta referenced only from an `[error_model]` magnitude expression
     /// (e.g. `RUV_LATE`, never used in `[individual_parameters]`) must not trip
     /// the "declared but not referenced" warning — it *is* meaningfully
@@ -23260,6 +23610,79 @@ if (WT > 70) {
         }
     }
 
+    /// #712: `obs_scale` referencing the same individual parameter bound to the
+    /// `pk <model>(...)` block's `v` role is a supported feature (see the test
+    /// above) but also the signature of a common mistake (a leftover `obs_scale
+    /// = V` copied from an `ode(...)` translation, where it's required but on a
+    /// `pk` block double-divides). It must still parse — warn, not error.
+    #[test]
+    fn test_obs_scale_referencing_pk_volume_warns_not_errors() {
+        let src = analytical_model_with_scaling(Some("  obs_scale = V\n"));
+        let model = parse_model_string(&src).expect("must still parse (warning, not error)");
+        assert!(
+            model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("obs_scale") && w.contains("volume parameter")),
+            "expected a volume-collision warning, got {:?}",
+            model.parse_warnings
+        );
+    }
+
+    /// A pure unit-conversion constant (Form A) never references any individual
+    /// parameter, so it must never trigger the #712 volume-collision warning.
+    #[test]
+    fn test_obs_scale_scalar_constant_on_pk_block_does_not_warn() {
+        let src = analytical_model_with_scaling(Some("  obs_scale = 1000\n"));
+        let model = parse_model_string(&src).expect("scalar obs_scale parses");
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("volume parameter")),
+            "scalar obs_scale must not warn, got {:?}",
+            model.parse_warnings
+        );
+    }
+
+    /// An expression referencing an individual parameter that is *not* the
+    /// `pk` block's volume role (here `CL`, not `V`) is not the double-scaling
+    /// pattern #712 targets — no warning.
+    #[test]
+    fn test_obs_scale_referencing_non_volume_indiv_param_does_not_warn() {
+        let src = analytical_model_with_scaling(Some("  obs_scale = CL / 10\n"));
+        let model = parse_model_string(&src).expect("CL-referencing obs_scale parses");
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("volume parameter")),
+            "obs_scale referencing a non-volume indiv param must not warn, got {:?}",
+            model.parse_warnings
+        );
+    }
+
+    /// On an `ode(...)` model there's no built-in concentration divisor to
+    /// collide with — `obs_scale = V` is the documented, required way to
+    /// convert raw compartment amount to concentration, not a mistake pattern.
+    /// Must never warn.
+    #[test]
+    fn test_obs_scale_referencing_volume_on_ode_model_does_not_warn() {
+        let src = ode_model_with_scaling(
+            "ode(obs_cmt=central, states=[depot, central])",
+            Some("  obs_scale = V\n"),
+        );
+        let model = parse_model_string(&src).expect("ODE obs_scale = V parses");
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("volume parameter")),
+            "ODE obs_scale = V must not warn, got {:?}",
+            model.parse_warnings
+        );
+    }
+
     #[test]
     fn test_parse_scaling_y_form_c_on_analytical_accepted() {
         // #650: a full Form C output readout is now accepted on analytical PK
@@ -23501,18 +23924,19 @@ if (WT > 70) {
     /// drift from it.
     #[test]
     fn ode_free_slot_count_reports_headroom() {
-        // 16 slots − 2 reserved (F, lagtime) = 14 usable.
-        assert_eq!(ode_free_slot_count(&[]), 14);
-        // CL→0, V→1 are non-reserved canonical slots, leaving 12.
+        // MAX_PK_PARAMS slots minus the reserved ones (F, lagtime) are usable.
+        let usable = MAX_PK_PARAMS - RESERVED_PK_SLOTS.len();
+        assert_eq!(ode_free_slot_count(&[]), usable);
+        // CL→0, V→1 are non-reserved canonical slots, leaving `usable - 2`.
         assert_eq!(
             ode_free_slot_count(&["CL".to_string(), "V".to_string()]),
-            12
+            usable - 2
         );
-        // 14 non-canonical params exactly fill the layout → 0 free; one more still 0
-        // (`ode_param_slots` errors, and the headroom is reported as full).
-        let full: Vec<String> = (0..14).map(|i| format!("EXTRA{i}")).collect();
+        // `usable` non-canonical params exactly fill the layout → 0 free; one more
+        // still 0 (`ode_param_slots` errors, and the headroom is reported as full).
+        let full: Vec<String> = (0..usable).map(|i| format!("EXTRA{i}")).collect();
         assert_eq!(ode_free_slot_count(&full), 0);
-        let over: Vec<String> = (0..15).map(|i| format!("EXTRA{i}")).collect();
+        let over: Vec<String> = (0..usable + 1).map(|i| format!("EXTRA{i}")).collect();
         assert_eq!(ode_free_slot_count(&over), 0);
     }
 
@@ -23533,14 +23957,19 @@ if (WT > 70) {
     }
 
     /// #486 regression: a model that previously parsed (direct-θ readout served by the
-    /// FD fallback) must not start failing the 16-slot PK layout once desugaring is
+    /// FD fallback) must not start failing the PK-slot layout once desugaring is
     /// available. When the synthetic param has no free slot, the readout falls back to
     /// FD (its prior behaviour) with a warning, instead of erroring.
     #[test]
     fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
-        // CL, V, KA take 3 of the 14 usable slots; 11 extra top-level params fill the
-        // remaining 11 → zero headroom. A direct-θ readout would need one more.
-        let extras: String = (0..11).map(|i| format!("  EXTRA{i} = TVV\n")).collect();
+        // CL, V, KA take 3 of the (MAX_PK_PARAMS − reserved) usable slots; the
+        // remaining are filled by EXTRA params → zero headroom. A direct-θ readout
+        // would need one more.
+        let usable = MAX_PK_PARAMS - RESERVED_PK_SLOTS.len();
+        let n_extras = usable - 3;
+        let extras: String = (0..n_extras)
+            .map(|i| format!("  EXTRA{i} = TVV\n"))
+            .collect();
         let src = format!(
             "\
 [parameters]

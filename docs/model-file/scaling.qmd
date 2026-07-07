@@ -13,6 +13,22 @@ The convention is **divisive**: `pred_scaled = pred_raw / scale`. This
 matches the natural reading of `obs_scale = V/1000` as *"divide amount by
 V/1000 to get concentration in the user's units."*
 
+**What "raw output" is depends on the structural model.** For `ode(...)`/
+`ode_template(...)`, the raw output is the compartment amount — `obs_scale
+= V` is the required, standard way to convert it to concentration. For a
+**built-in `pk <model>(...)` block** (`pk one_cpt_iv(...)`, `pk
+two_cpt_oral(...)`, etc.), the raw output is **already concentration** —
+the closed-form kernel divides by the volume parameter (`v`/`v1`)
+internally, matching NONMEM's implicit `S1=V1`. Adding `obs_scale = V` (or
+whatever individual parameter is bound to that `pk` block's `v`/`v1` role)
+on top of a `pk` block therefore divides by the volume parameter a
+*second* time — a common mistake when translating an `ode(...)` model
+(where that division is needed) to an equivalent closed-form `pk` block
+(where it already happens). `ferx check` warns on this pattern, but does
+not reject it, since `obs_scale` referencing an individual parameter is
+also a real, supported feature (see Form B) for an intentional additional
+transform on top of the built-in concentration output.
+
 Three forms are supported. Each is optional; omitting `[scaling]` keeps
 the historical "raw prediction equals DV" behaviour.
 
@@ -45,7 +61,10 @@ Expressions may reference:
 - individual parameters declared in `[individual_parameters]` (e.g.
   `V`, `CL`) — these are resolved from a subject-static evaluation of
   `pk_param_fn` at scale-evaluation time, so `obs_scale = 1000 / V`
-  uses the per-subject V (typical value times the EBE eta).
+  uses the per-subject V (typical value times the EBE eta). On a
+  built-in `pk <model>(...)` block, referencing the same name bound to
+  its `v`/`v1` role divides by that volume a second time — see the note
+  above.
 
 The scale is evaluated **once per subject** with subject-level
 covariates (matching the no-TV path). Time-varying covariate support for

@@ -1,0 +1,21 @@
+# Fixed-effects (n_eta = 0) constant-hazard RTTE — the license-free anchor.
+#
+# Without frailty the clock-forward RTTE log-likelihood is
+#   log L = D * log(lambda) - lambda * sum_i T_i
+# (D = total events, T_i = subject observation window), whose maximiser is the
+# pooled Poisson-process rate  lambda_hat = D / sum_i T_i  = 305 / 2000 = 0.15250
+# on rtte_exp.csv. A ferx fixed-effects fit must recover it (the RTTE analogue of
+# the survreg exponential anchor).
+
+[parameters]
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+
+[fit_options]
+  method  = focei
+  maxiter = 200

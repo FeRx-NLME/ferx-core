@@ -40,6 +40,28 @@ section of the SDLC for the versioning policy).
   also silently frozen at `TIME=0`). The `auc_target_attainment` metric is not yet
   available for time-varying-covariate subjects and is rejected with a typed error
   rather than reported from a frozen snapshot.
+- **`estimation:` block in `{model}-fit.yaml` now splits wall time by stage** (#713):
+  a `{method}_wall_time_secs` entry (e.g. `focei_wall_time_secs`, `imp_wall_time_secs`)
+  is reported for each stage of `method`/`methods`, plus a `covariance_wall_time_secs`
+  for the post-estimation FD-Hessian / SIR-fallback step, alongside the existing
+  `wall_time_secs` total. Also carried on `FitResult.method_wall_times_secs` /
+  `FitResult.covariance_wall_time_secs` and round-trips through `.fitrx` bundles.
+- **Repeated time-to-event (RTTE) models** (Phase 3 Slice 3.1): `[event_model]`
+  accepts `type = rtte` for endpoints with multiple events per subject, with
+  `clock = forward` (Andersen–Gill total time, the default; `clock = reset`
+  gap-time is a later slice). The clock-forward likelihood integrates the
+  cumulative hazard once across each subject's records (`Σ_k log h(t_k) − H(T)`)
+  rather than summing independent single-event terms. Because Laplace/FOCEI
+  severely underestimates the frailty variance ω² for RTTE at low event rates
+  (Karlsson et al. 2009), fitting RTTE under a Laplace-based method now emits a
+  warning recommending `method = saem` or `method = imp` (fired only for a
+  frailty model — `n_eta > 0` — whose chain's final estimating stage is
+  Laplace-based, so a warm-start like `[focei, saem]` does not false-warn).
+  RTTE is a **fit-only** feature in this slice: `simulate()` and unsupported
+  configurations (`clock = reset`, interval-censored or out-of-order or non-finite
+  repeated-event rows) are rejected with a clear error rather than silently
+  producing a wrong answer; `predict_survival()` reports first-event survival for
+  RTTE (use its `cum_hazard` field for the recurrent `E[N(t)]`).
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
   model.ferx`, `ferx check model.ferx`, and the public `fit_from_files()`
@@ -51,8 +73,26 @@ section of the SDLC for the versioning policy).
 - **`-h`/`--help` flag for the `ferx` CLI** (#688): `ferx --help`, `ferx check --help`,
   and `ferx summary --help` now print usage to stdout and exit 0, matching standard
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
+- **`ferx check` warns when `[scaling] obs_scale` references the same individual
+  parameter bound to a built-in `pk <model>(...)` block's `v`/`v1` role** (#712):
+  the closed-form kernel already divides by that volume internally to produce
+  concentration, so an `obs_scale` referencing it divides by it a second
+  time — a common mistake when translating an `ode(...)` model (where that
+  division is required) to an equivalent closed-form `pk` block (where it
+  already happens). Not rejected — `obs_scale` referencing an individual
+  parameter is also a supported feature for an intentional additional
+  transform — just flagged, since ferx can't tell intent from mistake.
+  `docs/model-file/scaling.qmd` now documents the raw-output convention per
+  structural-model type.
 
 ### Fixed
+- **A forward reference in `[individual_parameters]` is now a parse error instead of a
+  silent zero** (#710). A statement that referenced a name declared *later* in the same
+  block (e.g. `CL = ... * exp(IMAX*...)` with `IMAX` defined below it) previously resolved
+  the not-yet-defined name to `0.0` — collapsing the formula (`exp(0)=1`) with no diagnostic
+  from `ferx check` or at fit time. Such an out-of-order reference is now rejected loudly,
+  naming the offending variable; reorder the block so each name is declared before it is
+  used. This mirrors the existing `[odes]` undefined-reference guard (#314).
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point
@@ -158,6 +198,15 @@ section of the SDLC for the versioning policy).
   [Scaling → Form C](https://ferx-nlme.github.io/ferx-core/model-file/scaling.html).
 
 ### Changed
+- **Bumped `MAX_PK_PARAMS` from 16 to 128**, raising the ceiling on ODE structural
+  parameters (rate constants, Emax/EC50, baselines, …) that an ODE model may declare
+  in `[individual_parameters]` from 7 to 119 (slots 0–8 remain reserved for the named
+  PK params CL, V, Q, V2, KA, F, Q3, V3, LAGTIME). Complex multi-analyte models —
+  e.g. simultaneous parent/metabolite systems with ~20+ structural parameters — that
+  previously failed the parser's "too many individual parameters" check now compile.
+  The ceiling is a compile-time constant because the Enzyme autodiff backend requires
+  stack-allocated arrays of statically-known size; the cost of the higher ceiling is
+  purely stack (`MAX_PK_PARAMS * 8` bytes per `PkParams`, ~1 KB at 128).
 - **M3 BLOQ censored rows now enter the FOCEI Laplace determinant `log|H̃|`** for a
   consistent likelihood (#486). Previously censored rows contributed to the data term and
   the true inner Hessian but were dropped from the outer `log|H̃|` — an internal

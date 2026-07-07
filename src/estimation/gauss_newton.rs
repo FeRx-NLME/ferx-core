@@ -364,12 +364,13 @@ pub fn run_foce_gn(
     if !do_polish {
         // Pure GN — skip FOCEI polish, go directly to covariance step
         let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-        let covariance_matrix =
+        let (covariance_matrix, covariance_wall_time_secs) =
             if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
                 if verbose {
                     eprintln!("Running covariance step...");
                 }
-                match compute_covariance(
+                let cov_timer = std::time::Instant::now();
+                let cm = match compute_covariance(
                     &x,
                     &gn_params,
                     model,
@@ -395,9 +396,10 @@ pub fn run_foce_gn(
                         sir_fallback_proposal = Some(fallback_proposal);
                         None
                     }
-                }
+                };
+                (cm, cov_timer.elapsed().as_secs_f64())
             } else {
-                None
+                (None, 0.0)
             };
 
         if verbose {
@@ -413,6 +415,7 @@ pub fn run_foce_gn(
             h_matrices,
             kappas,
             covariance_matrix,
+            covariance_wall_time_secs,
             warnings,
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
@@ -480,13 +483,14 @@ pub fn run_foce_gn(
 
     // ---- Covariance step ----
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
                 eprintln!("Running covariance step...");
             }
+            let cov_timer = std::time::Instant::now();
             let packed = pack_params(&final_params);
-            match compute_covariance(
+            let cm = match compute_covariance(
                 &packed,
                 &final_params,
                 model,
@@ -512,9 +516,10 @@ pub fn run_foce_gn(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
 
     if verbose {
@@ -530,6 +535,7 @@ pub fn run_foce_gn(
         h_matrices: final_h_mats,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,

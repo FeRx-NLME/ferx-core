@@ -1754,7 +1754,24 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     // Run timing + thread count (#704 — replaces the separate `-timing.txt` file).
     // Key names match `FitResult`/`.fitrx` field names (`n_threads_used`,
     // `in_docker`) so the same data isn't spelled two different ways across formats.
+    // Per-method convergence time and the covariance step are broken out
+    // separately (#713) so a chain like `[focei, imp]` reports where the wall
+    // time actually went instead of one opaque total.
     writeln!(f, "\nestimation:").map_err(|e| e.to_string())?;
+    // Index explicitly rather than `.zip()`: a length mismatch (only expected
+    // for a pre-#713 `.fitrx` bundle, where `method_wall_times_secs` defaults
+    // to empty) must not silently drop trailing `method_chain` keys.
+    for (i, m) in result.method_chain.iter().enumerate() {
+        let secs = result.method_wall_times_secs.get(i).copied().unwrap_or(0.0);
+        let key = m.label().to_lowercase().replace('-', "_");
+        writeln!(f, "  {}_wall_time_secs: {:.6}", key, secs).map_err(|e| e.to_string())?;
+    }
+    writeln!(
+        f,
+        "  covariance_wall_time_secs: {:.6}",
+        result.covariance_wall_time_secs
+    )
+    .map_err(|e| e.to_string())?;
     writeln!(f, "  wall_time_secs: {:.6}", result.wall_time_secs).map_err(|e| e.to_string())?;
     writeln!(f, "  n_threads_used: {}", result.n_threads_used).map_err(|e| e.to_string())?;
 
@@ -1842,6 +1859,8 @@ mod tests {
         FitResult {
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
+            method_wall_times_secs: vec![0.0],
+            covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
             aic: 0.0,
@@ -2408,6 +2427,8 @@ mod tests {
         FitResult {
             method: EstimationMethod::Foce,
             method_chain: vec![EstimationMethod::Foce],
+            method_wall_times_secs: vec![0.0],
+            covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
             aic: 0.0,
@@ -3021,7 +3042,10 @@ mod tests {
         // Warnings.
         assert!(yaml.contains("\nwarnings:") && yaml.contains("- \"example warning\""));
         // #704: estimation timing/threads + environment snapshot.
+        // #713: per-method convergence time + covariance step broken out.
         assert!(yaml.contains("\nestimation:"));
+        assert!(yaml.contains("  foce_wall_time_secs:"));
+        assert!(yaml.contains("  covariance_wall_time_secs:"));
         assert!(yaml.contains("  wall_time_secs:"));
         assert!(yaml.contains("  n_threads_used:"));
         assert!(yaml.contains("\nenvironment:"));
@@ -3033,6 +3057,45 @@ mod tests {
             yaml_quote(&r.environment.username)
         )));
         assert!(yaml.contains(&format!("  ferx_version: {}", r.ferx_version)));
+    }
+
+    #[test]
+    fn write_yaml_splits_timing_per_method_chain_stage() {
+        // #713: a chained fit (e.g. `[focei, imp]`) should report each stage's
+        // convergence time under its own key, plus the covariance step
+        // separately, instead of one opaque `wall_time_secs` total.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.method_chain = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
+        r.method_wall_times_secs = vec![32.5, 15.3];
+        r.covariance_wall_time_secs = 8.3;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(yaml.contains("  focei_wall_time_secs: 32.500000"), "{yaml}");
+        assert!(yaml.contains("  imp_wall_time_secs: 15.300000"), "{yaml}");
+        assert!(
+            yaml.contains("  covariance_wall_time_secs: 8.300000"),
+            "{yaml}"
+        );
+    }
+
+    #[test]
+    fn write_yaml_timing_survives_short_method_wall_times_secs() {
+        // #713 review: a `.fitrx` bundle saved before this field existed
+        // deserializes `method_wall_times_secs` to an empty Vec (`#[serde(default)]`)
+        // while `method_chain` is unaffected. Indexing with `.get(i)` must still
+        // emit every `{method}_wall_time_secs` key (at 0.0) rather than silently
+        // truncating via `.zip()`.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.method_chain = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
+        r.method_wall_times_secs = vec![];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(yaml.contains("  focei_wall_time_secs: 0.000000"), "{yaml}");
+        assert!(yaml.contains("  imp_wall_time_secs: 0.000000"), "{yaml}");
     }
 
     #[test]

@@ -19,6 +19,10 @@ pub struct OuterResult {
     /// Per-occasion kappa EBEs for each subject. Empty vecs when `n_kappa == 0`.
     pub kappas: Vec<Vec<DVector<f64>>>,
     pub covariance_matrix: Option<DMatrix<f64>>,
+    /// Wall-clock time spent inside this stage's covariance-step block
+    /// (`compute_covariance` / SIR-fallback construction), in seconds.
+    /// `0.0` when `run_covariance_step` was false for this stage.
+    pub covariance_wall_time_secs: f64,
     pub warnings: Vec<String>,
     /// Estimated OFV evaluations saved by the SAEM mu-ref gradient step M-step.
     /// Non-None only when method=saem and mu_referencing=true.
@@ -163,12 +167,13 @@ fn evaluate_at_initial_params(
 
     let mut warnings = Vec::new();
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            match compute_covariance(
+            let cov_timer = std::time::Instant::now();
+            let cm = match compute_covariance(
                 &x,
                 init_params,
                 model,
@@ -194,9 +199,10 @@ fn evaluate_at_initial_params(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
 
     OuterResult {
@@ -208,6 +214,7 @@ fn evaluate_at_initial_params(
         h_matrices,
         kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
@@ -1307,12 +1314,13 @@ fn optimize_nlopt(
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            match compute_covariance(
+            let cov_timer = std::time::Instant::now();
+            let cm = match compute_covariance(
                 &x0,
                 init_params,
                 model,
@@ -1338,9 +1346,10 @@ fn optimize_nlopt(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
 
     if !converged {
@@ -1364,6 +1373,7 @@ fn optimize_nlopt(
         h_matrices: final_hms,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
@@ -1734,12 +1744,13 @@ fn optimize_bfgs(
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            match compute_covariance(
+            let cov_timer = std::time::Instant::now();
+            let cm = match compute_covariance(
                 &x_final,
                 init_params,
                 model,
@@ -1765,9 +1776,10 @@ fn optimize_bfgs(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
 
     if !converged {
@@ -1783,6 +1795,7 @@ fn optimize_bfgs(
         h_matrices: final_hms,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
@@ -5541,6 +5554,10 @@ mod tests {
             result.ofv.is_finite(),
             "presearch run produced non-finite OFV"
         );
+        // #713: with `run_covariance_step = false` the covariance block never
+        // runs, so its timer must report exactly 0.0, not a stray near-zero
+        // `Instant::now()` reading.
+        assert_eq!(result.covariance_wall_time_secs, 0.0);
     }
 
     // ── Covariance Hessian throughput benchmark (issue #209) ─────────────────
