@@ -29,6 +29,13 @@ section of the SDLC for the versioning policy).
   [Data → Column mapping](https://ferx-nlme.github.io/ferx-core/model-file/data.html).
 
 ### Changed
+- **Default thread count capped at 8** (#707): when `threads` is unset (or
+  `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R
+  binding — the engine now defaults to `available cores - 1` (floored at 1),
+  capped at 8, instead of one worker per logical core. Most fits gain little from
+  scaling past a handful of cores, and not all cores are equal on
+  asymmetric platforms (e.g. Apple Silicon's E-cores). An explicit
+  `threads = N` / `--threads N` still pins the exact count requested.
 - **CLI default output no longer writes a separate `{model}-timing.txt` file** (#704):
   the estimation step's wall-clock time and thread count now live under a new
   `estimation:` section in `{model}-fit.yaml` (narrower in scope than the old
@@ -44,6 +51,22 @@ section of the SDLC for the versioning policy).
   for the post-estimation FD-Hessian / SIR-fallback step, alongside the existing
   `wall_time_secs` total. Also carried on `FitResult.method_wall_times_secs` /
   `FitResult.covariance_wall_time_secs` and round-trips through `.fitrx` bundles.
+- **Repeated time-to-event (RTTE) models** (Phase 3 Slice 3.1): `[event_model]`
+  accepts `type = rtte` for endpoints with multiple events per subject, with
+  `clock = forward` (Andersen–Gill total time, the default; `clock = reset`
+  gap-time is a later slice). The clock-forward likelihood integrates the
+  cumulative hazard once across each subject's records (`Σ_k log h(t_k) − H(T)`)
+  rather than summing independent single-event terms. Because Laplace/FOCEI
+  severely underestimates the frailty variance ω² for RTTE at low event rates
+  (Karlsson et al. 2009), fitting RTTE under a Laplace-based method now emits a
+  warning recommending `method = saem` or `method = imp` (fired only for a
+  frailty model — `n_eta > 0` — whose chain's final estimating stage is
+  Laplace-based, so a warm-start like `[focei, saem]` does not false-warn).
+  RTTE is a **fit-only** feature in this slice: `simulate()` and unsupported
+  configurations (`clock = reset`, interval-censored or out-of-order or non-finite
+  repeated-event rows) are rejected with a clear error rather than silently
+  producing a wrong answer; `predict_survival()` reports first-event survival for
+  RTTE (use its `cum_hazard` field for the recurrent `E[N(t)]`).
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
   model.ferx`, `ferx check model.ferx`, and the public `fit_from_files()`

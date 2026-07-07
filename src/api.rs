@@ -61,6 +61,57 @@ pub(crate) fn fit_thread_pool_builder() -> rayon::ThreadPoolBuilder {
     rayon::ThreadPoolBuilder::new().stack_size(FIT_RAYON_STACK_SIZE)
 }
 
+/// Ceiling applied to the unpinned default thread count (#707).
+const DEFAULT_THREADS_CAP: usize = 8;
+
+/// Core cap arithmetic for the unpinned default thread count, split out from
+/// [`default_thread_count`] so it is testable without depending on the host's actual
+/// core count: leave one core free for the OS/other work, and don't scale past
+/// [`DEFAULT_THREADS_CAP`] even on much larger machines, since most fits see no benefit
+/// from spreading across every core and (notably on Apple Silicon) not all cores are equal.
+fn cap_default_threads(available: usize) -> usize {
+    available.saturating_sub(1).clamp(1, DEFAULT_THREADS_CAP)
+}
+
+/// Default worker-thread count used when nothing pins an explicit count (`threads` unset
+/// or `auto`/`0`, and no explicit `--threads`/[`configure_global_thread_pool`] call). See
+/// [`cap_default_threads`] for the cap logic (#707).
+pub(crate) fn default_thread_count() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cap_default_threads(available)
+}
+
+/// Set when a caller has explicitly sized the process-wide Rayon pool (currently: the CLI's
+/// `--threads N` via [`configure_global_thread_pool`]), so [`default_fit_pool`] knows to
+/// honor that explicit choice rather than applying the [`default_thread_count`] cap (#707).
+static GLOBAL_THREADS_EXPLICIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Explicitly size the process-wide Rayon pool and mark it as user-chosen. Intended for a
+/// CLI binary sizing its one process-wide pool from `--threads N` before the first fit;
+/// library callers that want a pinned thread count for a single fit should use
+/// `FitOptions::threads` instead, which scopes a fit-local pool via [`build_fit_pool`].
+///
+/// `n_threads` must be positive — a caller wanting the engine's own default should simply
+/// not call this at all, rather than pass `0` (which Rayon would otherwise silently treat
+/// as "pick automatically", masking the caller's intent). The explicit-override flag is
+/// only set once `build_global` actually succeeds, so a failed call (e.g. the global pool
+/// was already initialized elsewhere) leaves [`default_fit_pool`] applying the #707 cap
+/// rather than incorrectly deferring to whatever the ambient pool happens to be.
+pub fn configure_global_thread_pool(n_threads: usize) -> Result<(), String> {
+    if n_threads == 0 {
+        return Err("thread count must be positive".to_string());
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build_global()
+        .map_err(|e| format!("failed to configure thread pool with {n_threads} threads: {e}"))?;
+    GLOBAL_THREADS_EXPLICIT.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
 /// Build a fit-scoped Rayon pool with the ferx worker stack and an explicit thread
 /// count. Used only when the caller pins `options.threads` to a positive value; the
 /// common (unpinned) path reuses the shared [`default_fit_pool`] instead.
@@ -75,20 +126,26 @@ pub(crate) fn build_fit_pool(n_threads: usize) -> Result<rayon::ThreadPool, Stri
 /// ODE+IOV analytic gradients do not overflow the platform-default worker stack. Shared
 /// across every default-threads `fit()` call so batch / concurrent callers do not each
 /// spawn-and-tear-down a fresh `N × 32 MiB` pool (which oversubscribes CPUs and can
-/// exhaust address space). Sized to `rayon::current_num_threads()` at first use, so a
-/// CLI `--threads N` (which sets the global pool count before the first fit) is honored.
+/// exhaust address space).
+///
+/// Sized by [`default_thread_count`] (available cores minus one, capped at 8 — #707): most
+/// fits gain little from spreading across every core, and not all cores are equal on
+/// asymmetric platforms (e.g. Apple Silicon E-cores). A caller that explicitly sized the
+/// global pool via [`configure_global_thread_pool`] (the CLI's `--threads N`) is honored
+/// instead — that call marks [`GLOBAL_THREADS_EXPLICIT`] before this pool is built.
 ///
 /// Returns `None` only if the one-time build fails (e.g. resource limits); callers then
 /// run on the ambient pool rather than aborting the fit.
 pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        // Pin to the ambient worker count (the global pool size, which a CLI `--threads N`
-        // sets via `build_global` before the first fit). A bare `build()` would instead
-        // default to *all* logical CPUs and ignore `--threads`. Evaluated outside any fit
-        // pool, so it reads the global pool's configured size.
+        let n_threads = if GLOBAL_THREADS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire) {
+            rayon::current_num_threads()
+        } else {
+            default_thread_count()
+        };
         fit_thread_pool_builder()
-            .num_threads(rayon::current_num_threads())
+            .num_threads(n_threads)
             .build()
             .ok()
     })
@@ -1341,6 +1398,91 @@ pub(crate) fn check_transit_support(
     None
 }
 
+/// Fit-boundary validation for RTTE (repeated-event) endpoints. The parser enforces
+/// these for `.ferx` models, but a Rust caller can hand-build a `CompiledModel` /
+/// `Population` that bypasses it, so `fit()` re-checks up front — otherwise each of
+/// these would fold into the clock-forward NLL's `1e20` sentinel and produce a silent
+/// garbage fit instead of a clear error. Rejects, per RTTE cmt:
+///
+///   * **`clock = reset`** — gap-time RTTE is Slice 3.2; the clock-forward NLL folds
+///     `Repeated { Reset }` into `1e20` for every subject (a flat objective the
+///     optimizer "converges" on). Only the parser guards this for `.ferx`.
+///   * **interval-censored records** — unsupported for RTTE and folded into `1e20` by
+///     [`crate::survival::rtte_forward_nll_from_curves`]. Interval censoring is a *data*
+///     property (a DV=0→DV=2 pair), so the parser cannot see it — it must be caught here.
+///   * **non-finite `TIME`** — a `NaN`/`inf` time slips past the `time < prev` order
+///     check (every NaN comparison is false) and poisons `prev`, so reject it explicitly.
+///   * **out-of-order rows** — the clock-forward likelihood integrates the cumulative
+///     hazard **once** across a subject's records, using each record's time as the lower
+///     limit for the next; the telescoping sum is only correct when the rows are
+///     time-sorted, so unsorted rows would give a finite-but-wrong NLL.
+///
+/// Returns `None` when there is no RTTE endpoint or every subject's rows are valid.
+#[cfg(feature = "survival")]
+fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<String> {
+    use crate::types::{EndpointLikelihood, EventType, ObsRecord, RtteClock, TteRecurrence};
+    let mut rtte_cmts: Vec<usize> = Vec::new();
+    for (cmt, ep) in &model.endpoints {
+        if let EndpointLikelihood::Tte {
+            recurrence: TteRecurrence::Repeated { clock },
+            ..
+        } = ep
+        {
+            if matches!(clock, RtteClock::Reset) {
+                return Some(format!(
+                    "RTTE endpoint CMT={cmt} uses `clock = reset` (gap-time), which is not yet \
+                     supported (Slice 3.2). Use `clock = forward` (Andersen–Gill total time)."
+                ));
+            }
+            rtte_cmts.push(*cmt);
+        }
+    }
+    if rtte_cmts.is_empty() {
+        return None;
+    }
+    for subject in &population.subjects {
+        for &cmt in &rtte_cmts {
+            let mut prev = f64::NEG_INFINITY;
+            for r in &subject.obs_records {
+                let ObsRecord::Event {
+                    time,
+                    cmt: c,
+                    event_type,
+                    ..
+                } = r;
+                if *c != cmt {
+                    continue;
+                }
+                if matches!(event_type, EventType::IntervalCensored { .. }) {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has an interval-censored record, \
+                         which is not supported for repeated events. Use exact (DV=1) event rows \
+                         and a right-censoring (DV=0) row.",
+                        subject.id
+                    ));
+                }
+                if !time.is_finite() {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has a non-finite TIME ({time}). \
+                         Repeated-event rows require finite, time-sorted TIME values.",
+                        subject.id
+                    ));
+                }
+                if *time < prev {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has records out of time order \
+                         (t={time} follows t={prev}). Repeated-event rows must be sorted by TIME \
+                         per subject so the cumulative hazard accumulates correctly.",
+                        subject.id
+                    ));
+                }
+                prev = *time;
+            }
+        }
+    }
+    None
+}
+
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
 /// the oral **depot** amount on a subject carrying an EVID=3/4 reset.
 ///
@@ -2320,6 +2462,14 @@ pub fn fit(
     // the depot amount can't be superposed across an EVID=3/4 reset, so predicting
     // would silently read a zero depot. Fail loudly instead.
     if let Some(e) = check_analytic_readout_support(model, population) {
+        return Err(e);
+    }
+    // RTTE (repeated-event) clock-forward likelihood telescopes the cumulative hazard
+    // across a subject's records in time order and does not support clock=reset /
+    // interval-censored / non-finite times, all of which would otherwise fold into a
+    // silent 1e20 sentinel. Reject a hand-built model/dataset up front.
+    #[cfg(feature = "survival")]
+    if let Some(e) = check_rtte_records(model, population) {
         return Err(e);
     }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
@@ -3572,6 +3722,40 @@ fn fit_inner(
                 format!("SAEM: {w}")
             });
         }
+    }
+
+    // RTTE (repeated time-to-event) fit under a Laplace-based method (FOCE/FOCEI/GN)
+    // severely underestimates the frailty variance ω² at low event rates (Karlsson et
+    // al. 2009: −91% to −96% bias below a 43% event rate). SAEM and IMP are unbiased.
+    // Warn but keep Laplace available — it is fast and fine for fixed-effects or
+    // high-event-rate RTTE. §3.3 of `plans/tte-survival-markov.md`. Two gates: (1) the
+    // model carries a frailty (`n_eta > 0`); a fixed-effects RTTE fit has no ω² to
+    // underestimate, so the warning would be spurious. (2) The **final/estimating** stage
+    // must be Laplace-based — a warm-start chain like `[focei, imp]` or `[saem, focei]`
+    // whose terminal estimator is SAEM/IMP is already unbiased and must not warn.
+    // (`n_eta > 0` can over-fire on a joint model whose PK — not hazard — carries the
+    // etas; that spurious *advisory* is preferable to probing the hazard, which silently
+    // misses a covariate-gated frailty like `exp(ETA·WT)` and drops the warning entirely.)
+    #[cfg(feature = "survival")]
+    if model.has_rtte()
+        && model.n_eta > 0
+        && matches!(
+            chain.last(),
+            Some(
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::FoceGn
+                    | EstimationMethod::FoceGnHybrid
+            )
+        )
+    {
+        pre_run_warnings.push(
+            "RTTE fit under a Laplace-based method (FOCE/FOCEI/GN) can severely \
+             underestimate the frailty variance ω² at low event rates (Karlsson et al. \
+             2009). Prefer `method = saem` or `method = imp`; Laplace remains available \
+             for fixed-effects or high-event-rate RTTE."
+                .to_string(),
+        );
     }
 
     // Capture thread count before chain runs (current_num_threads() reports
@@ -5277,6 +5461,47 @@ mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
 
+    // ── default thread count cap (#707) ─────────────────────────────────────
+
+    #[test]
+    fn cap_default_threads_leaves_one_core_free() {
+        assert_eq!(cap_default_threads(2), 1);
+        assert_eq!(cap_default_threads(4), 3);
+        assert_eq!(cap_default_threads(8), 7);
+    }
+
+    #[test]
+    fn cap_default_threads_caps_at_eight() {
+        assert_eq!(cap_default_threads(9), 8);
+        assert_eq!(cap_default_threads(16), 8);
+        assert_eq!(cap_default_threads(128), 8);
+    }
+
+    #[test]
+    fn cap_default_threads_never_zero() {
+        // A single-core report (or an `available_parallelism()` failure mapped to 1)
+        // must still leave at least one worker thread.
+        assert_eq!(cap_default_threads(1), 1);
+        assert_eq!(cap_default_threads(0), 1);
+    }
+
+    #[test]
+    fn configure_global_thread_pool_rejects_zero() {
+        // `0` must be rejected rather than silently forwarded to Rayon, which would
+        // otherwise interpret it as "pick automatically" and mask the caller's intent
+        // (and would incorrectly mark GLOBAL_THREADS_EXPLICIT). Returns before touching
+        // the process-wide pool, so this is safe to run alongside other tests.
+        assert!(configure_global_thread_pool(0).is_err());
+    }
+
+    #[test]
+    fn default_thread_count_matches_cap_of_available_parallelism() {
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(default_thread_count(), cap_default_threads(available));
+    }
+
     // ── resolve_data_path (#690) ────────────────────────────────────────────
 
     #[test]
@@ -6146,9 +6371,16 @@ pub struct SimulateOptions {
     pub horizon: Option<f64>,
 }
 
-/// Validate the preventable preconditions of **ODE-accumulated (joint PK-TTE)**
-/// event-time simulation, returning a clear `Err` for a caller to act on. A model
-/// with no ODE-accumulated TTE endpoint is unaffected (returns `Ok`).
+/// Validate the preventable preconditions of TTE event-time simulation, returning a
+/// clear `Err` for a caller to act on.
+///
+/// **Repeated events (RTTE, `type = rtte`) are rejected outright**: `simulate_tte`
+/// draws a single latent per cause, so an RTTE subject's records would be simulated as
+/// competing single events (earliest wins), not a recurrent stream. RTTE simulation is
+/// a later slice (3.3); fail loud rather than emit silently-wrong single-event data.
+///
+/// For **ODE-accumulated (joint PK-TTE)** endpoints, a model with no such endpoint is
+/// otherwise unaffected (returns `Ok`).
 ///
 /// Drug-driven event times are sampled by integrating the augmented ODE until the
 /// cumulative hazard reaches `−log u` (Slice 2.2). Two conditions cannot be sampled
@@ -6163,17 +6395,38 @@ pub struct SimulateOptions {
 /// A genuinely divergent hazard (negative / non-finite) is *not* preventable here —
 /// it surfaces loudly during integration (never as a silent censor).
 #[cfg(feature = "survival")]
-fn validate_ode_tte_simulatable(
+fn validate_tte_simulatable(
     model: &CompiledModel,
     population: &Population,
     horizon: Option<f64>,
 ) -> Result<(), String> {
-    use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord};
+    use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord, TteRecurrence};
+    // RTTE (repeated-event) simulation is a later slice (3.3): the single-latent draw in
+    // `simulate_tte` would turn a subject's K event rows into K competing single events
+    // (earliest wins, the rest censored) — a silent wrong answer. Reject it here so every
+    // simulate entry point (`simulate*`, uncertainty) fails loudly instead.
+    if model.endpoints.values().any(|e| {
+        matches!(
+            e,
+            EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Repeated { .. },
+                ..
+            }
+        )
+    }) {
+        return Err(
+            "Repeated time-to-event (RTTE, `type = rtte`) simulation is not yet supported \
+             (Slice 3.3): `simulate()` would draw a single event per subject rather than a \
+             recurrent stream. Fitting RTTE is supported; simulation is a later slice."
+                .to_string(),
+        );
+    }
     let is_ode_tte = |cmt: &usize| {
         matches!(
             model.endpoints.get(cmt),
             Some(EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. }
+                hazard: HazardSpec::OdeAccumulated { .. },
+                ..
             })
         )
     };
@@ -6181,7 +6434,8 @@ fn validate_ode_tte_simulatable(
         matches!(
             e,
             EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. }
+                hazard: HazardSpec::OdeAccumulated { .. },
+                ..
             }
         )
     }) {
@@ -6257,7 +6511,7 @@ pub fn simulate_with_options(
     // deep in sampling (a finite horizon is required; resets and left truncation are
     // not yet supported for an ODE hazard).
     #[cfg(feature = "survival")]
-    validate_ode_tte_simulatable(model, population, opts.horizon)?;
+    validate_tte_simulatable(model, population, opts.horizon)?;
 
     // Parity with `fit()`: a referenced covariate absent from the data would
     // silently read 0.0 (e.g. a `Selected` error model's `if (FREE==0)` selector
@@ -6646,7 +6900,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // the uncertainty path) funnel through here and cannot signal an error, so
     // enforce the identical contract as a panic rather than emitting wrong rows.
     #[cfg(feature = "survival")]
-    if let Err(e) = validate_ode_tte_simulatable(model, population, horizon) {
+    if let Err(e) = validate_tte_simulatable(model, population, horizon) {
         panic!("{e}");
     }
 
@@ -7322,7 +7576,7 @@ pub fn simulate_with_uncertainty(
     // uncertainty path does not yet expose — validate for a clean Err here (the
     // inner chokepoint would otherwise enforce the same contract as a panic).
     #[cfg(feature = "survival")]
-    validate_ode_tte_simulatable(model, population, None)?;
+    validate_tte_simulatable(model, population, None)?;
 
     // Parity with `fit()`: reject a referenced covariate absent from the data
     // rather than silently reading it as 0.0 (a `Selected` error-model selector
@@ -7510,6 +7764,14 @@ fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64 {
 /// `S_all(t) = exp(−Σ_j H_j(t))`, computed together so that
 /// `Σ_k F_k(t) + S_all(t) = 1` holds at every grid point (see [`cif_curves`]).
 ///
+/// **RTTE (`type = rtte`) semantics.** This computes single-event quantities from the
+/// hazard curve, so for a repeated-event endpoint `survival`, `median_survival`,
+/// `mean_survival` and `cif` describe **time to the *first* event**, not the recurrent
+/// process. The recurrent quantity — the expected event count `E[N(t)] = H(t)` — is the
+/// `cum_hazard` field (with `hazard` its rate `h(t)`). A recurrence-aware predictor is a
+/// later slice (3.3); until then read `cum_hazard`/`hazard` for RTTE, not the survival
+/// summaries.
+///
 /// Returns an empty Vec when the model has no TTE endpoints.
 #[cfg(feature = "survival")]
 pub fn predict_survival(
@@ -7542,7 +7804,7 @@ pub fn predict_survival(
         #[allow(clippy::type_complexity)]
         let mut rows: Vec<(usize, Vec<f64>, Vec<f64>, f64, f64)> = Vec::new();
         for (&cmt, endpoint) in &model.endpoints {
-            let crate::types::EndpointLikelihood::Tte { hazard } = endpoint else {
+            let crate::types::EndpointLikelihood::Tte { hazard, .. } = endpoint else {
                 continue;
             };
             match hazard {
@@ -8347,6 +8609,7 @@ mod iov_integration {
                     family: crate::types::HazardFamily::Exponential,
                     param_fn: Box::new(|_theta, _eta, _cov| vec![0.1]),
                 },
+                recurrence: crate::types::TteRecurrence::Single,
             },
         );
 

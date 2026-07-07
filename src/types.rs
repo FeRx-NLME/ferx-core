@@ -2597,10 +2597,46 @@ impl std::fmt::Debug for HazardSpec {
 }
 
 #[cfg(feature = "survival")]
+/// Hazard clock for a **repeated** TTE (RTTE) endpoint — how time is measured
+/// between successive events (§3.3 of `plans/tte-survival-markov.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtteClock {
+    /// Clock-forward / total time (Andersen–Gill), the default. The hazard is a
+    /// function of *absolute* time; the cumulative hazard accumulates continuously
+    /// over `[0, T]` and is **not** reset at events. NLL `Σ_k log h(t_k) − H(T)`.
+    Forward,
+    /// Clock-reset / gap time (renewal). The hazard depends on time *since the
+    /// previous event*; the accumulator resets to 0 at each event. NLL
+    /// `Σ_k log h(Δ_k) − Σ_k H(Δ_k)`. Requires the selective per-state reset
+    /// (§8.8.6) — **Slice 3.2**, rejected at parse until then.
+    Reset,
+}
+
+#[cfg(feature = "survival")]
+/// Whether a TTE endpoint observes a single event per subject (standard TTE /
+/// competing risks) or repeated events (RTTE). Orthogonal to [`HazardSpec`]'s
+/// analytic-vs-ODE axis: a recurrent endpoint can carry either hazard shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TteRecurrence {
+    /// Standard TTE: at most one event (plus optional censoring) per subject.
+    /// The per-record likelihood terms are independent (Phase 1 / 1b / 2).
+    Single,
+    /// Repeated TTE (RTTE): multiple events per subject on one endpoint. The
+    /// cumulative-hazard terms couple across a subject's records — see
+    /// [`crate::survival::rtte_forward_nll_from_curves`].
+    Repeated { clock: RtteClock },
+}
+
+#[cfg(feature = "survival")]
 /// Per-CMT endpoint likelihood specification.
 pub enum EndpointLikelihood {
     Gaussian(EndpointError),
-    Tte { hazard: HazardSpec },
+    Tte {
+        hazard: HazardSpec,
+        /// Single event (standard TTE) vs. repeated events (RTTE). Defaults to
+        /// `Single`; set to `Repeated` only when the model declares `type = rtte`.
+        recurrence: TteRecurrence,
+    },
     // Binary, Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
 }
 
@@ -2609,7 +2645,9 @@ impl std::fmt::Debug for EndpointLikelihood {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EndpointLikelihood::Gaussian(e) => write!(f, "Gaussian({e:?})"),
-            EndpointLikelihood::Tte { hazard } => write!(f, "Tte({hazard:?})"),
+            EndpointLikelihood::Tte { hazard, recurrence } => {
+                write!(f, "Tte({hazard:?}, {recurrence:?})")
+            }
         }
     }
 }
@@ -3104,6 +3142,24 @@ impl CompiledModel {
             .collect();
         c.sort_unstable();
         c
+    }
+
+    /// True if any endpoint is a **repeated** TTE (RTTE) endpoint. Drives the
+    /// Laplace-bias warning in `fit()`: RTTE ω² is severely underestimated under
+    /// FOCE/FOCEI (Karlsson et al. 2009), so an RTTE fit whose final stage is
+    /// Laplace-based warns and recommends `method = saem`/`imp`. It does **not**
+    /// change the method — the default estimator stays `FoceI`.
+    #[cfg(feature = "survival")]
+    pub fn has_rtte(&self) -> bool {
+        self.endpoints.values().any(|e| {
+            matches!(
+                e,
+                EndpointLikelihood::Tte {
+                    recurrence: TteRecurrence::Repeated { .. },
+                    ..
+                }
+            )
+        })
     }
 
     /// Always false without the `survival` feature - TTE endpoints can't be

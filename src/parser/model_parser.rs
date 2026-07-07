@@ -3623,6 +3623,8 @@ fn eval_indiv_param_vars(
 /// - `alpha`  — required for Gompertz (baseline hazard at t=0)
 /// - `gamma`  — required for Gompertz (hazard growth rate)
 /// - `loghr`  — optional (all families); log-hazard-ratio covariate term Σ(β·x)
+/// - `type`   — optional; `tte` (default, single event) | `rtte` (repeated events)
+/// - `clock`  — optional (RTTE only); `forward` (Andersen–Gill total time, default) or `reset` (gap time — Slice 3.2, rejected until then)
 #[cfg(feature = "survival")]
 fn parse_event_model_block(
     lines: &[String],
@@ -3672,6 +3674,11 @@ fn parse_event_model_block(
     // cumulative-hazard ODE derivative before the ODE spec is built; here we only
     // record its presence and route to the OdeAccumulated endpoint below.
     let mut hazard_present = false;
+    // Recurrence (RTTE): `type = tte | rtte` (default tte) and, for RTTE,
+    // `clock = forward | reset` (default forward). Resolved into `TteRecurrence`
+    // after the key loop. §3.3 of `plans/tte-survival-markov.md`.
+    let mut type_opt: Option<String> = None;
+    let mut clock_opt: Option<String> = None;
 
     for line in lines {
         let trimmed = line.trim();
@@ -3725,10 +3732,16 @@ fn parse_event_model_block(
                 // derivative by the parser pre-scan, so it is not compiled here.
                 hazard_present = true;
             }
+            "type" => {
+                type_opt = Some(value.to_string());
+            }
+            "clock" => {
+                clock_opt = Some(value.to_string());
+            }
             other => {
                 return Err(format!(
-                    "[event_model]: unknown key `{other}` \
-                     — valid keys: cmt, family, scale, rate, shape, alpha, gamma, loghr, hazard"
+                    "[event_model]: unknown key `{other}` — valid keys: cmt, family, scale, \
+                     rate, shape, alpha, gamma, loghr, hazard, type, clock"
                 ));
             }
         }
@@ -3767,11 +3780,65 @@ fn parse_event_model_block(
         }
     }
 
+    // Resolve the recurrence: standard single-event TTE (default) vs. repeated TTE
+    // (RTTE). For RTTE, `clock = forward` (Andersen–Gill total time, the default) is
+    // the only mode supported in Slice 3.1; `clock = reset` (gap time, §8.8.6) is a
+    // later slice. `clock` is meaningless without `type = rtte`.
+    let recurrence = {
+        use crate::types::{RtteClock, TteRecurrence};
+        match type_opt.as_deref().unwrap_or("tte") {
+            "tte" | "single" => {
+                if let Some(c) = clock_opt.as_deref() {
+                    return Err(format!(
+                        "[event_model]: CMT={cmt} sets `clock = {c}` on a single-event TTE \
+                         endpoint. `clock` selects how time is measured between repeated events, \
+                         so it is only valid with `type = rtte`."
+                    ));
+                }
+                TteRecurrence::Single
+            }
+            "rtte" => {
+                let clock = match clock_opt.as_deref().unwrap_or("forward") {
+                    "forward" => RtteClock::Forward,
+                    "reset" => {
+                        return Err(format!(
+                            "[event_model]: CMT={cmt} sets `clock = reset` (gap-time RTTE), which \
+                             is not yet supported (Slice 3.2). Use `clock = forward` (the default \
+                             Andersen–Gill total-time hazard)."
+                        ));
+                    }
+                    other => {
+                        return Err(format!(
+                            "[event_model]: CMT={cmt} unknown clock `{other}` — valid: forward, reset"
+                        ));
+                    }
+                };
+                TteRecurrence::Repeated { clock }
+            }
+            other => {
+                return Err(format!(
+                    "[event_model]: CMT={cmt} unknown type `{other}` — valid: tte, rtte"
+                ));
+            }
+        }
+    };
+
     // ODE-accumulated hazard path (joint PK-TTE, Slice 2.1): `hazard = <expr>` was
     // injected as a cumulative-hazard ODE derivative (`d/dt(__chz_<cmt>)`); the
     // endpoint only records that accumulator's state index. Mutually exclusive with
     // the analytic closed-form `family` keys.
     if hazard_present {
+        // RTTE with a drug-driven ODE hazard (joint PK-RTTE) needs the repeated-event
+        // root-finder loop AND, for clock-reset, the selective CHZ reset — a later
+        // slice. Reject rather than silently fitting a single-event likelihood.
+        if matches!(recurrence, crate::types::TteRecurrence::Repeated { .. }) {
+            return Err(format!(
+                "[event_model]: CMT={cmt} combines `type = rtte` with an ODE-accumulated \
+                 `hazard = ...` (drug-driven joint PK-RTTE), which is not yet supported. Use an \
+                 analytic `family` hazard for repeated events, or `type = tte` for a single-event \
+                 drug-driven hazard."
+            ));
+        }
         if family_opt.is_some()
             || scale_expr.is_some()
             || shape_expr.is_some()
@@ -3809,6 +3876,7 @@ fn parse_event_model_block(
             cmt,
             EndpointLikelihood::Tte {
                 hazard: HazardSpec::OdeAccumulated { chz_state },
+                recurrence,
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -4046,6 +4114,7 @@ fn parse_event_model_block(
         cmt,
         EndpointLikelihood::Tte {
             hazard: HazardSpec::Analytic { family, param_fn },
+            recurrence,
         },
         event_model_covariates,
         event_model_thetas,
@@ -16793,8 +16862,9 @@ mod tests {
 
     #[test]
     fn test_parse_threads_zero_means_auto() {
-        // `threads = 0` is treated as "leave rayon default alone",
-        // matching the R binding's `threads <= 0` sentinel.
+        // `threads = 0` is treated as "use the engine's default thread count"
+        // (available cores - 1, floored at 1, capped at 8 — #707), matching the
+        // R binding's `threads <= 0` sentinel.
         let opts = parse_fit_options(&["threads = 0".to_string()]).unwrap();
         assert_eq!(opts.threads, None);
     }
@@ -16810,7 +16880,7 @@ mod tests {
 
     #[test]
     fn test_parse_threads_default_is_none() {
-        // No `threads` line → None (rayon global pool, one worker per logical CPU).
+        // No `threads` line → None (engine picks its own default thread count: #707).
         let opts = parse_fit_options(&["method = focei".to_string()]).unwrap();
         assert_eq!(opts.threads, None);
     }

@@ -433,7 +433,7 @@ fn obs_nll_subject_into_iov(
         use crate::survival::tte_data_term;
         use crate::types::EndpointLikelihood;
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard } = endpoint {
+            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()
@@ -445,8 +445,14 @@ fn obs_nll_subject_into_iov(
                 if records_for_cmt.is_empty() {
                     continue;
                 }
-                total_nll +=
-                    tte_data_term(&records_for_cmt, hazard, theta, eta, &subject.covariates);
+                total_nll += tte_data_term(
+                    &records_for_cmt,
+                    hazard,
+                    *recurrence,
+                    theta,
+                    eta,
+                    &subject.covariates,
+                );
             }
         }
     }
