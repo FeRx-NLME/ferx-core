@@ -42,6 +42,13 @@ section of the SDLC for the versioning policy).
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
 ### Fixed
+- **A forward reference in `[individual_parameters]` is now a parse error instead of a
+  silent zero** (#710). A statement that referenced a name declared *later* in the same
+  block (e.g. `CL = ... * exp(IMAX*...)` with `IMAX` defined below it) previously resolved
+  the not-yet-defined name to `0.0` — collapsing the formula (`exp(0)=1`) with no diagnostic
+  from `ferx check` or at fit time. Such an out-of-order reference is now rejected loudly,
+  naming the offending variable; reorder the block so each name is declared before it is
+  used. This mirrors the existing `[odes]` undefined-reference guard (#314).
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point

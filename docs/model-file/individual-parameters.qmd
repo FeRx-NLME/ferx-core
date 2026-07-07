@@ -18,6 +18,23 @@ Each line assigns a PK parameter using an arithmetic expression that can referen
 - **Event time** -- the built-ins `TIME` and `time`
 - **Constants** -- numeric literals (e.g., `70`, `0.75`)
 
+## Evaluation Order
+
+Statements are evaluated top to bottom, so a name must be **declared before it is
+used**. A line may reference any parameter assigned on an earlier line, but a
+reference to a name defined *later* in the block is a parse error (caught by
+`ferx check` too), not a silent `0.0`:
+
+```
+[individual_parameters]
+  CL   = TVCL * exp(IMAX) * exp(ETA_CL)   # ERROR: IMAX declared below
+  IMAX = TVIMAX
+```
+
+Reorder so each name is defined before it is referenced (`IMAX` above `CL`). This
+matches NONMEM's `$PK`-block convention and prevents a mistyped or out-of-order
+name from quietly reading as zero and collapsing the formula.
+
 ## Supported Operators and Functions
 
 | Operator/Function | Example |

@@ -5,6 +5,7 @@ use crate::sim::adaptive::{
 use crate::types::*;
 use regex::Regex;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -1202,6 +1203,28 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let indiv_ctx =
         ParseCtx::new(&theta_names, &eta_names, &all_assigned).with_nn_specs(&nn_specs_for_ctx);
     let mut indiv_stmts = parse_block_statements(&indiv_text, indiv_ctx, StatementMode::Plain)?;
+
+    // Reject a forward reference — a name read before it is assigned in file
+    // order — rather than let it silently resolve to 0.0 at eval time (#710).
+    let in_block: HashSet<String> = all_assigned.iter().cloned().collect();
+    let forward_refs = collect_forward_refs(&indiv_stmts, &in_block);
+    if !forward_refs.is_empty() {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut msgs: Vec<String> = Vec::new();
+        for (used, defining) in &forward_refs {
+            if seen.insert(format!("{used}\u{0}{defining}")) {
+                msgs.push(format!("`{used}` (used in `{defining}`)"));
+            }
+        }
+        return Err(format!(
+            "[individual_parameters]: forward reference(s) to name(s) declared later \
+             in the block: {}. Statements are evaluated in file order, so a name must \
+             be assigned before it is used; a forward reference would otherwise \
+             silently read 0.0. Reorder the block so each name is declared before it \
+             is referenced.",
+            msgs.join(", "),
+        ));
+    }
 
     // Detect ODE vs analytical model
     let is_ode = struct_lines
@@ -10282,6 +10305,90 @@ fn collect_undefined_vars_in_stmts(
     });
 }
 
+/// Detect a `[individual_parameters]` expression that reads an in-block name
+/// *before* that name is assigned in file order (issue #710). Because the block
+/// registers every assigned name as a defined variable — so a forward reference
+/// parses as `Variable(name)` rather than `Covariate(name)` (see the two-pass
+/// parse in `compile_model`) — such a reference would otherwise resolve to the
+/// running var map's default `0.0` at eval time, silently collapsing the formula
+/// (e.g. `exp(IMAX*…)` → `exp(0)`) with no diagnostic. This mirrors the `[odes]`
+/// undefined-reference guard (#314, `collect_undefined_vars`) but keys on
+/// declaration *order*, not *presence*: the name IS declared, just too late.
+///
+/// `in_block` is every name assigned anywhere in the block
+/// (`assigned_vars_in_order`); only reads of those names are order-checked. A
+/// `Variable(name)` whose name is outside `in_block` cannot occur in this parse
+/// context, and covariate / theta / eta references are distinct node kinds that
+/// are never flagged. Returns each `(used_name, defining_name)` violation in
+/// encounter order (a read of a not-yet-assigned name inside the RHS of
+/// `defining_name = …`). Statements execute top-to-bottom; each `if` arm is
+/// checked against the names assigned before the `if`, and a name assigned in
+/// any arm is treated as available afterwards (conservative — avoids
+/// false-positive order errors on a name defined across branches).
+fn collect_forward_refs(stmts: &[Statement], in_block: &HashSet<String>) -> Vec<(String, String)> {
+    fn check_reads(
+        assigned: &HashSet<String>,
+        in_block: &HashSet<String>,
+        defining: &str,
+        out: &mut Vec<(String, String)>,
+        visit: impl FnOnce(&mut dyn FnMut(&Expression)),
+    ) {
+        visit(&mut |e: &Expression| {
+            if let Expression::Variable(name) = e {
+                if in_block.contains(name) && !assigned.contains(name) {
+                    out.push((name.clone(), defining.to_string()));
+                }
+            }
+        });
+    }
+    fn walk(
+        stmts: &[Statement],
+        assigned: &mut HashSet<String>,
+        in_block: &HashSet<String>,
+        out: &mut Vec<(String, String)>,
+    ) {
+        for s in stmts {
+            match s {
+                Statement::Assign(name, expr) => {
+                    check_reads(assigned, in_block, name, out, |f| visit_expr_nodes(expr, f));
+                    assigned.insert(name.clone());
+                }
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    // Each arm sees only names assigned before the `if`.
+                    for (cond, body) in branches {
+                        check_reads(assigned, in_block, "if-condition", out, |f| {
+                            visit_condition_nodes(cond, f)
+                        });
+                        let mut branch_assigned = assigned.clone();
+                        walk(body, &mut branch_assigned, in_block, out);
+                    }
+                    if let Some(eb) = else_body {
+                        let mut branch_assigned = assigned.clone();
+                        walk(eb, &mut branch_assigned, in_block, out);
+                    }
+                    // A name assigned in any arm is available afterwards.
+                    let mut branch_names: Vec<String> = Vec::new();
+                    for (_, body) in branches {
+                        branch_names.extend(assigned_vars_in_order(body));
+                    }
+                    if let Some(eb) = else_body {
+                        branch_names.extend(assigned_vars_in_order(eb));
+                    }
+                    assigned.extend(branch_names);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut assigned: HashSet<String> = HashSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    walk(stmts, &mut assigned, in_block, &mut out);
+    out
+}
+
 /// Accumulate the theta and eta indices referenced in an expression. Only the
 /// statement-level variant is used outside the `survival` feature, so this
 /// expression-level entry is gated to its sole caller (`parse_event_model_block`).
@@ -18569,6 +18676,119 @@ mod tests {
         assert!((m_early[1] - 1.0).abs() < 1e-12);
         assert!((m_late[0] - 1.5).abs() < 1e-12);
         assert!((m_late[1] - 1.0).abs() < 1e-12);
+    }
+
+    /// #710: an `[individual_parameters]` expression that references a name
+    /// declared *later* in the same block must be a hard parse error, not a
+    /// silent `0.0` substitution (the pre-fix behaviour collapsed the formula).
+    #[test]
+    fn indiv_params_forward_reference_is_error() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta TVIMAX(-0.3)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 1.0
+[individual_parameters]
+  CL   = TVCL * exp(IMAX) * exp(ETA_CL)
+  V    = TVV
+  IMAX = TVIMAX
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+        let err = parse_err(content);
+        assert!(
+            err.contains("forward reference") && err.contains("IMAX"),
+            "expected forward-reference error naming IMAX, got: {err}"
+        );
+    }
+
+    /// #710: reordering so the referenced name is declared first parses cleanly —
+    /// the guard keys on declaration *order*, not mere presence.
+    #[test]
+    fn indiv_params_declaration_before_use_parses() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta TVIMAX(-0.3)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 1.0
+[individual_parameters]
+  IMAX = TVIMAX
+  CL   = TVCL * exp(IMAX) * exp(ETA_CL)
+  V    = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+        parse_model_string(content).expect("declaration-before-use must parse");
+    }
+
+    /// #710: the order guard must not false-positive on a name assigned in an
+    /// earlier statement and read later — the normal backward-reference case.
+    #[test]
+    fn indiv_params_backward_reference_parses() {
+        let content = r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 1.0
+[individual_parameters]
+  KE = TVCL / TVV
+  CL = TVCL * KE * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR)
+"#;
+        parse_model_string(content).expect("backward reference must parse");
+    }
+
+    /// #710 (unit): `collect_forward_refs` walks statement order and flags only a
+    /// read of a not-yet-assigned in-block name. A name assigned across both arms
+    /// of an `if` is available afterwards (no false positive).
+    #[test]
+    fn collect_forward_refs_detects_order_and_respects_branches() {
+        use BinOp::Mul;
+        let in_block: HashSet<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
+
+        // B = A * 2 (A not yet assigned) — forward reference.
+        let bad = vec![
+            Statement::Assign(
+                "B".to_string(),
+                Expression::BinOp(
+                    Box::new(Expression::Variable("A".to_string())),
+                    Mul,
+                    Box::new(Expression::Literal(2.0)),
+                ),
+            ),
+            Statement::Assign("A".to_string(), Expression::Literal(1.0)),
+        ];
+        let refs = collect_forward_refs(&bad, &in_block);
+        assert_eq!(refs, vec![("A".to_string(), "B".to_string())]);
+
+        // A assigned on both arms of an if, then read — no violation.
+        let ok = vec![
+            Statement::If {
+                branches: vec![(
+                    Condition::Compare(Expression::Time, CmpOp::Gt, Expression::Literal(0.0)),
+                    vec![Statement::Assign("A".to_string(), Expression::Literal(1.0))],
+                )],
+                else_body: Some(vec![Statement::Assign(
+                    "A".to_string(),
+                    Expression::Literal(2.0),
+                )]),
+            },
+            Statement::Assign("C".to_string(), Expression::Variable("A".to_string())),
+        ];
+        assert!(collect_forward_refs(&ok, &in_block).is_empty());
     }
 
     /// A theta referenced only from an `[error_model]` magnitude expression
