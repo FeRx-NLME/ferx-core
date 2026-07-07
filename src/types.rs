@@ -3144,9 +3144,11 @@ impl CompiledModel {
         c
     }
 
-    /// True if any endpoint is a **repeated** TTE (RTTE) endpoint. Used to steer
-    /// the optimizer default (RTTE is severely biased under Laplace/FOCEI — see
-    /// Karlsson et al. 2009 — so `auto` warns and prefers SAEM/IMP).
+    /// True if any endpoint is a **repeated** TTE (RTTE) endpoint. Drives the
+    /// Laplace-bias warning in `fit()`: RTTE ω² is severely underestimated under
+    /// FOCE/FOCEI (Karlsson et al. 2009), so an RTTE fit whose final stage is
+    /// Laplace-based warns and recommends `method = saem`/`imp`. It does **not**
+    /// change the method — the default estimator stays `FoceI`.
     #[cfg(feature = "survival")]
     pub fn has_rtte(&self) -> bool {
         self.endpoints.values().any(|e| {

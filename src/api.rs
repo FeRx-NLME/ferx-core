@@ -1324,33 +1324,45 @@ pub(crate) fn check_transit_support(
     None
 }
 
-/// Reject an RTTE (repeated-event) endpoint whose per-subject records are not in
-/// nondecreasing time order.
+/// Fit-boundary validation for RTTE (repeated-event) endpoints. The parser enforces
+/// these for `.ferx` models, but a Rust caller can hand-build a `CompiledModel` /
+/// `Population` that bypasses it, so `fit()` re-checks up front — otherwise each of
+/// these would fold into the clock-forward NLL's `1e20` sentinel and produce a silent
+/// garbage fit instead of a clear error. Rejects, per RTTE cmt:
 ///
-/// The clock-forward RTTE likelihood ([`crate::survival::rtte_forward_nll_from_curves`])
-/// integrates the cumulative hazard **once** across a subject's records, using each
-/// record's time as the lower limit for the next — a telescoping sum that is only
-/// correct when the records are time-sorted. Out-of-order rows would produce a finite
-/// but wrong NLL (a silent-wrong-answer). The data reader appends TTE rows in file
-/// order, so this catches an unsorted dataset (or a hand-built `Population`) up front.
-/// Returns `None` when there is no RTTE endpoint or every subject's rows are ordered.
+///   * **`clock = reset`** — gap-time RTTE is Slice 3.2; the clock-forward NLL folds
+///     `Repeated { Reset }` into `1e20` for every subject (a flat objective the
+///     optimizer "converges" on). Only the parser guards this for `.ferx`.
+///   * **interval-censored records** — unsupported for RTTE and folded into `1e20` by
+///     [`crate::survival::rtte_forward_nll_from_curves`]. Interval censoring is a *data*
+///     property (a DV=0→DV=2 pair), so the parser cannot see it — it must be caught here.
+///   * **non-finite `TIME`** — a `NaN`/`inf` time slips past the `time < prev` order
+///     check (every NaN comparison is false) and poisons `prev`, so reject it explicitly.
+///   * **out-of-order rows** — the clock-forward likelihood integrates the cumulative
+///     hazard **once** across a subject's records, using each record's time as the lower
+///     limit for the next; the telescoping sum is only correct when the rows are
+///     time-sorted, so unsorted rows would give a finite-but-wrong NLL.
+///
+/// Returns `None` when there is no RTTE endpoint or every subject's rows are valid.
 #[cfg(feature = "survival")]
-fn check_rtte_record_ordering(model: &CompiledModel, population: &Population) -> Option<String> {
-    use crate::types::{EndpointLikelihood, ObsRecord, TteRecurrence};
-    let rtte_cmts: Vec<usize> = model
-        .endpoints
-        .iter()
-        .filter_map(|(cmt, ep)| {
-            matches!(
-                ep,
-                EndpointLikelihood::Tte {
-                    recurrence: TteRecurrence::Repeated { .. },
-                    ..
-                }
-            )
-            .then_some(*cmt)
-        })
-        .collect();
+fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<String> {
+    use crate::types::{EndpointLikelihood, EventType, ObsRecord, RtteClock, TteRecurrence};
+    let mut rtte_cmts: Vec<usize> = Vec::new();
+    for (cmt, ep) in &model.endpoints {
+        if let EndpointLikelihood::Tte {
+            recurrence: TteRecurrence::Repeated { clock },
+            ..
+        } = ep
+        {
+            if matches!(clock, RtteClock::Reset) {
+                return Some(format!(
+                    "RTTE endpoint CMT={cmt} uses `clock = reset` (gap-time), which is not yet \
+                     supported (Slice 3.2). Use `clock = forward` (Andersen–Gill total time)."
+                ));
+            }
+            rtte_cmts.push(*cmt);
+        }
+    }
     if rtte_cmts.is_empty() {
         return None;
     }
@@ -1358,9 +1370,29 @@ fn check_rtte_record_ordering(model: &CompiledModel, population: &Population) ->
         for &cmt in &rtte_cmts {
             let mut prev = f64::NEG_INFINITY;
             for r in &subject.obs_records {
-                let ObsRecord::Event { time, cmt: c, .. } = r;
+                let ObsRecord::Event {
+                    time,
+                    cmt: c,
+                    event_type,
+                    ..
+                } = r;
                 if *c != cmt {
                     continue;
+                }
+                if matches!(event_type, EventType::IntervalCensored { .. }) {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has an interval-censored record, \
+                         which is not supported for repeated events. Use exact (DV=1) event rows \
+                         and a right-censoring (DV=0) row.",
+                        subject.id
+                    ));
+                }
+                if !time.is_finite() {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has a non-finite TIME ({time}). \
+                         Repeated-event rows require finite, time-sorted TIME values.",
+                        subject.id
+                    ));
                 }
                 if *time < prev {
                     return Some(format!(
@@ -2357,10 +2389,11 @@ pub fn fit(
         return Err(e);
     }
     // RTTE (repeated-event) clock-forward likelihood telescopes the cumulative hazard
-    // across a subject's records in time order, so out-of-order rows would silently
-    // corrupt the NLL. Reject them up front.
+    // across a subject's records in time order and does not support clock=reset /
+    // interval-censored / non-finite times, all of which would otherwise fold into a
+    // silent 1e20 sentinel. Reject a hand-built model/dataset up front.
     #[cfg(feature = "survival")]
-    if let Some(e) = check_rtte_record_ordering(model, population) {
+    if let Some(e) = check_rtte_records(model, population) {
         return Err(e);
     }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
@@ -3619,21 +3652,26 @@ fn fit_inner(
     // severely underestimates the frailty variance ω² at low event rates (Karlsson et
     // al. 2009: −91% to −96% bias below a 43% event rate). SAEM and IMP are unbiased.
     // Warn but keep Laplace available — it is fast and fine for fixed-effects or
-    // high-event-rate RTTE. §3.3 of `plans/tte-survival-markov.md`. Only fire when the
-    // model actually carries a frailty (`n_eta > 0`); a fixed-effects RTTE fit has no
-    // ω² to underestimate, so the warning would be spurious.
+    // high-event-rate RTTE. §3.3 of `plans/tte-survival-markov.md`. Two gates: (1) the
+    // model carries a frailty (`n_eta > 0`); a fixed-effects RTTE fit has no ω² to
+    // underestimate, so the warning would be spurious. (2) The **final/estimating** stage
+    // must be Laplace-based — a warm-start chain like `[focei, imp]` or `[saem, focei]`
+    // whose terminal estimator is SAEM/IMP is already unbiased and must not warn.
+    // (`n_eta > 0` can over-fire on a joint model whose PK — not hazard — carries the
+    // etas; that spurious *advisory* is preferable to probing the hazard, which silently
+    // misses a covariate-gated frailty like `exp(ETA·WT)` and drops the warning entirely.)
     #[cfg(feature = "survival")]
     if model.has_rtte()
         && model.n_eta > 0
-        && chain.iter().any(|&m| {
-            matches!(
-                m,
+        && matches!(
+            chain.last(),
+            Some(
                 EstimationMethod::Foce
                     | EstimationMethod::FoceI
                     | EstimationMethod::FoceGn
                     | EstimationMethod::FoceGnHybrid
             )
-        })
+        )
     {
         pre_run_warnings.push(
             "RTTE fit under a Laplace-based method (FOCE/FOCEI/GN) can severely \
@@ -6216,9 +6254,16 @@ pub struct SimulateOptions {
     pub horizon: Option<f64>,
 }
 
-/// Validate the preventable preconditions of **ODE-accumulated (joint PK-TTE)**
-/// event-time simulation, returning a clear `Err` for a caller to act on. A model
-/// with no ODE-accumulated TTE endpoint is unaffected (returns `Ok`).
+/// Validate the preventable preconditions of TTE event-time simulation, returning a
+/// clear `Err` for a caller to act on.
+///
+/// **Repeated events (RTTE, `type = rtte`) are rejected outright**: `simulate_tte`
+/// draws a single latent per cause, so an RTTE subject's records would be simulated as
+/// competing single events (earliest wins), not a recurrent stream. RTTE simulation is
+/// a later slice (3.3); fail loud rather than emit silently-wrong single-event data.
+///
+/// For **ODE-accumulated (joint PK-TTE)** endpoints, a model with no such endpoint is
+/// otherwise unaffected (returns `Ok`).
 ///
 /// Drug-driven event times are sampled by integrating the augmented ODE until the
 /// cumulative hazard reaches `−log u` (Slice 2.2). Two conditions cannot be sampled
@@ -6233,12 +6278,32 @@ pub struct SimulateOptions {
 /// A genuinely divergent hazard (negative / non-finite) is *not* preventable here —
 /// it surfaces loudly during integration (never as a silent censor).
 #[cfg(feature = "survival")]
-fn validate_ode_tte_simulatable(
+fn validate_tte_simulatable(
     model: &CompiledModel,
     population: &Population,
     horizon: Option<f64>,
 ) -> Result<(), String> {
-    use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord};
+    use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord, TteRecurrence};
+    // RTTE (repeated-event) simulation is a later slice (3.3): the single-latent draw in
+    // `simulate_tte` would turn a subject's K event rows into K competing single events
+    // (earliest wins, the rest censored) — a silent wrong answer. Reject it here so every
+    // simulate entry point (`simulate*`, uncertainty) fails loudly instead.
+    if model.endpoints.values().any(|e| {
+        matches!(
+            e,
+            EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Repeated { .. },
+                ..
+            }
+        )
+    }) {
+        return Err(
+            "Repeated time-to-event (RTTE, `type = rtte`) simulation is not yet supported \
+             (Slice 3.3): `simulate()` would draw a single event per subject rather than a \
+             recurrent stream. Fitting RTTE is supported; simulation is a later slice."
+                .to_string(),
+        );
+    }
     let is_ode_tte = |cmt: &usize| {
         matches!(
             model.endpoints.get(cmt),
@@ -6329,7 +6394,7 @@ pub fn simulate_with_options(
     // deep in sampling (a finite horizon is required; resets and left truncation are
     // not yet supported for an ODE hazard).
     #[cfg(feature = "survival")]
-    validate_ode_tte_simulatable(model, population, opts.horizon)?;
+    validate_tte_simulatable(model, population, opts.horizon)?;
 
     // Parity with `fit()`: a referenced covariate absent from the data would
     // silently read 0.0 (e.g. a `Selected` error model's `if (FREE==0)` selector
@@ -6718,7 +6783,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // the uncertainty path) funnel through here and cannot signal an error, so
     // enforce the identical contract as a panic rather than emitting wrong rows.
     #[cfg(feature = "survival")]
-    if let Err(e) = validate_ode_tte_simulatable(model, population, horizon) {
+    if let Err(e) = validate_tte_simulatable(model, population, horizon) {
         panic!("{e}");
     }
 
@@ -7394,7 +7459,7 @@ pub fn simulate_with_uncertainty(
     // uncertainty path does not yet expose — validate for a clean Err here (the
     // inner chokepoint would otherwise enforce the same contract as a panic).
     #[cfg(feature = "survival")]
-    validate_ode_tte_simulatable(model, population, None)?;
+    validate_tte_simulatable(model, population, None)?;
 
     // Parity with `fit()`: reject a referenced covariate absent from the data
     // rather than silently reading it as 0.0 (a `Selected` error-model selector
@@ -7581,6 +7646,14 @@ fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64 {
 /// cause-specific cumulative incidence `F(t)` and the all-cause survival
 /// `S_all(t) = exp(−Σ_j H_j(t))`, computed together so that
 /// `Σ_k F_k(t) + S_all(t) = 1` holds at every grid point (see [`cif_curves`]).
+///
+/// **RTTE (`type = rtte`) semantics.** This computes single-event quantities from the
+/// hazard curve, so for a repeated-event endpoint `survival`, `median_survival`,
+/// `mean_survival` and `cif` describe **time to the *first* event**, not the recurrent
+/// process. The recurrent quantity — the expected event count `E[N(t)] = H(t)` — is the
+/// `cum_hazard` field (with `hazard` its rate `h(t)`). A recurrence-aware predictor is a
+/// later slice (3.3); until then read `cum_hazard`/`hazard` for RTTE, not the survival
+/// summaries.
 ///
 /// Returns an empty Vec when the model has no TTE endpoints.
 #[cfg(feature = "survival")]

@@ -442,6 +442,147 @@ mod survival_smoke {
         );
     }
 
+    /// A hand-built `Repeated { clock = Reset }` model — which the parser rejects for a
+    /// `.ferx` file, but a Rust caller can construct — must be rejected at the fit
+    /// boundary, not silently folded into the clock-forward `1e20` sentinel (which would
+    /// give a flat objective and a garbage "converged" fit).
+    #[test]
+    fn rtte_clock_reset_hand_built_is_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        // Swap the parsed Repeated{Forward} endpoint on CMT 2 for a Repeated{Reset} one.
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let pop = rtte_pop();
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("clock=reset must be rejected at the fit boundary");
+        assert!(
+            err.contains("reset") && err.contains("CMT=2"),
+            "error should flag clock=reset as unsupported, got: {err}"
+        );
+    }
+
+    /// An interval-censored record on an RTTE endpoint (a DV=0→DV=2 data pattern the
+    /// parser cannot see, since censoring is data-driven) must be rejected at the fit
+    /// boundary rather than folding into the `1e20` sentinel.
+    #[test]
+    fn rtte_interval_censored_record_is_rejected() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::IntervalCensored {
+                    left: 3.0,
+                    right: 5.0,
+                },
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("interval-censored RTTE record must be rejected");
+        assert!(
+            err.contains("interval-censored") && err.contains("CMT=2"),
+            "error should flag interval censoring as unsupported for RTTE, got: {err}"
+        );
+    }
+
+    /// A non-finite TIME on an RTTE endpoint slips past the `time < prev` order check
+    /// (every NaN comparison is false) and would poison the accumulator; the fit
+    /// boundary must reject it with a clear error rather than a confusing flat 1e20.
+    #[test]
+    fn rtte_non_finite_time_is_rejected() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: f64::NAN,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("non-finite RTTE TIME must be rejected");
+        assert!(
+            err.contains("non-finite TIME") && err.contains("CMT=2"),
+            "error should flag the non-finite time, got: {err}"
+        );
+    }
+
+    /// RTTE simulation is a later slice (3.3); `simulate*` must reject an RTTE model
+    /// loudly rather than draw a single event per subject (`simulate_tte` would collapse
+    /// a subject's repeated events into one competing-risks draw — a silent wrong answer).
+    #[test]
+    fn rtte_simulate_is_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let pop = rtte_pop();
+        let opts = SimulateOptions::default();
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE simulation must be rejected");
+        assert!(
+            err.contains("RTTE") && err.contains("not yet supported"),
+            "error should flag RTTE simulation as unsupported, got: {err}"
+        );
+    }
+
+    /// A warm-start chain whose FINAL (estimating) stage is SAEM/IMP must NOT emit the
+    /// Laplace ω² warning, even though an earlier FOCEI warm-start stage is Laplace-based.
+    /// Regression for keying the warning off the terminal stage (`chain.last()`) rather
+    /// than `any` — `[focei, saem]` is a documented warm-start chain that de-biases ω².
+    #[test]
+    fn rtte_warm_start_terminal_saem_does_not_warn() {
+        use ferx_core::types::EstimationMethod;
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let pop = rtte_pop();
+        let opts = FitOptions {
+            methods: vec![EstimationMethod::FoceI, EstimationMethod::Saem],
+            outer_maxiter: 3,
+            saem_n_exploration: 2,
+            saem_n_convergence: 2,
+            saem_seed: Some(1),
+            ..FitOptions::default()
+        };
+        let result =
+            fit(&model, &pop, &model.default_params, &opts).expect("warm-start RTTE fit must run");
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("RTTE") && w.contains("ω²")),
+            "a terminal-SAEM chain must not emit the ω² warning; got: {:?}",
+            result.warnings
+        );
+    }
+
     /// Parser must recognise [event_model] with family=weibull (scale + shape).
     #[test]
     fn tte_weibull_model_parses() {

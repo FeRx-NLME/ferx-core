@@ -3620,8 +3620,7 @@ fn eval_indiv_param_vars(
 /// - `gamma`  — required for Gompertz (hazard growth rate)
 /// - `loghr`  — optional (all families); log-hazard-ratio covariate term Σ(β·x)
 /// - `type`   — optional; `tte` (default, single event) | `rtte` (repeated events)
-/// - `clock`  — optional, RTTE only; `forward` (default, Andersen–Gill total time) |
-///              `reset` (gap time — Slice 3.2, rejected until then)
+/// - `clock`  — optional (RTTE only); `forward` (Andersen–Gill total time, default) or `reset` (gap time — Slice 3.2, rejected until then)
 #[cfg(feature = "survival")]
 fn parse_event_model_block(
     lines: &[String],

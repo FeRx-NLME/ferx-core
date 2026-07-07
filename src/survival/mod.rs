@@ -114,11 +114,14 @@ pub fn tte_data_term(
                 // once across the subject's whole risk window (§3.3), so the records couple.
                 TteRecurrence::Repeated {
                     clock: RtteClock::Forward,
-                } => rtte_forward_nll_from_curves(records, cumhaz_at, hazard_at, MonoTol::analytic()),
-                // Clock-reset (gap-time) RTTE is Slice 3.2; the parser rejects `clock =
-                // reset` until then, so this arm is unreachable in a compiled model. Kept
-                // as an explicit sentinel (not `unreachable!`) so the dispatch is total and
-                // behaves identically in debug and ci-test builds.
+                } => {
+                    rtte_forward_nll_from_curves(records, cumhaz_at, hazard_at, MonoTol::analytic())
+                }
+                // Clock-reset (gap-time) RTTE is Slice 3.2. It is rejected up front — by
+                // the parser for `.ferx` models and by `api::check_rtte_records` for a
+                // hand-built `CompiledModel` — so this arm is unreachable via `fit()`. Kept
+                // as an explicit sentinel (not `unreachable!`) so the dispatch stays total
+                // and `tte_data_term` never panics if called directly with `Reset`.
                 TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 } => 1e20,
@@ -264,14 +267,15 @@ fn cumhaz_monotone_violation(hi: f64, lo: f64, tol: MonoTol) -> bool {
 /// terms instead would over-count the cumulative hazard by `Σ_k H(t_k)` — the classic
 /// "treat recurrent events as independent observations" error.
 ///
-/// Preconditions (enforced upstream — see the data-load RTTE validation):
-///   * `records` are in **nondecreasing `time`** order (the last is typically the
-///     administrative right-censor at the horizon `T ≥ t_K`);
+/// Preconditions (enforced upstream by `api::check_rtte_records` at the fit boundary):
+///   * `records` are in **nondecreasing, finite `time`** order (the last is typically
+///     the administrative right-censor at the horizon `T ≥ t_K`);
 ///   * left truncation uses the **first** record's `entry_time` as the initial lower
 ///     limit; per-record `entry_time` on later records is ignored (the previous event
 ///     is the lower limit);
-///   * `IntervalCensored` is not supported for RTTE (rejected at parse) — it folds
-///     into the `1e20` sentinel here as defense-in-depth.
+///   * `IntervalCensored` is not supported for RTTE. Interval censoring is a *data*
+///     property (a DV=0→DV=2 pair) the parser cannot see, so it is rejected at the fit
+///     boundary; the `1e20` sentinel here is defense-in-depth for a direct caller.
 ///
 /// Returns the `1e20` sentinel on a non-positive hazard at an event, a non-monotone
 /// cumulative hazard, or a non-finite total — matching [`tte_nll_from_curves`].
@@ -326,7 +330,9 @@ pub fn rtte_forward_nll_from_curves(
                 nll += (h_t - h_lo) - h_val.ln();
                 h_lo = h_t;
             }
-            // RTTE + interval censoring is unsupported (rejected at parse); sentinel.
+            // RTTE + interval censoring is unsupported (rejected at the fit boundary by
+            // `api::check_rtte_records`, since DV-driven censoring is invisible to the
+            // parser); this sentinel is defense-in-depth for a direct caller.
             EventType::IntervalCensored { .. } => return 1e20,
         }
     }
@@ -1341,7 +1347,8 @@ mod tests {
         let cumhaz_at = |t: f64| lambda * t;
         let hazard_at = |_t: f64| lambda;
 
-        let rtte = rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        let rtte =
+            rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
         let expected_rtte = 30.0 * lambda - 2.0 * lambda.ln(); // H(T) − Σ log h
         assert_abs_diff_eq!(rtte, expected_rtte, epsilon = 1e-12);
 
@@ -1368,7 +1375,8 @@ mod tests {
         }];
         let cumhaz_at = |t: f64| lambda * t;
         let hazard_at = |_t: f64| lambda;
-        let rtte = rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        let rtte =
+            rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
         let single = tte_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
         assert_abs_diff_eq!(rtte, single, epsilon = 1e-12);
     }
@@ -1402,7 +1410,8 @@ mod tests {
         ];
         let cumhaz_at = |t: f64| lambda * t;
         let hazard_at = |_t: f64| lambda;
-        let rtte = rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
+        let rtte =
+            rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
         let expected = (30.0 - 2.0) * lambda - 2.0 * lambda.ln();
         assert_abs_diff_eq!(rtte, expected, epsilon = 1e-12);
     }
@@ -1446,6 +1455,35 @@ mod tests {
         );
         let expected = 30.0 * lambda - 2.0 * lambda.ln();
         assert_abs_diff_eq!(via_dispatch, expected, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn tte_data_term_clock_reset_returns_sentinel() {
+        use crate::types::{HazardFamily, RtteClock, TteRecurrence};
+        // `clock = reset` is Slice 3.2; `fit()` rejects it at the boundary
+        // (`api::check_rtte_records`), so this dispatch arm is only reachable by a direct
+        // caller. It must return the `1e20` sentinel — never panic — keeping the match total.
+        let records = rtte_constant_hazard_records();
+        let param_fn: crate::types::HazardParamFn =
+            Box::new(|theta: &[f64], _: &[f64], _: &HashMap<String, f64>| vec![theta[0]]);
+        let hazard = HazardSpec::Analytic {
+            family: HazardFamily::Exponential,
+            param_fn,
+        };
+        let nll = tte_data_term(
+            &records,
+            &hazard,
+            TteRecurrence::Repeated {
+                clock: RtteClock::Reset,
+            },
+            &[0.05],
+            &[0.0],
+            &HashMap::new(),
+        );
+        assert_eq!(
+            nll, 1e20,
+            "clock=reset dispatch must fold into the sentinel"
+        );
     }
 
     // ── draw_tte_outcome: administrative censoring at the observation window ──

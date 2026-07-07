@@ -43,8 +43,14 @@ section of the SDLC for the versioning policy).
   rather than summing independent single-event terms. Because Laplace/FOCEI
   severely underestimates the frailty variance ω² for RTTE at low event rates
   (Karlsson et al. 2009), fitting RTTE under a Laplace-based method now emits a
-  warning recommending `method = saem` or `method = imp`. Out-of-order
-  repeated-event rows are rejected at the fit boundary.
+  warning recommending `method = saem` or `method = imp` (fired only for a
+  frailty model — `n_eta > 0` — whose chain's final estimating stage is
+  Laplace-based, so a warm-start like `[focei, saem]` does not false-warn).
+  RTTE is a **fit-only** feature in this slice: `simulate()` and unsupported
+  configurations (`clock = reset`, interval-censored or out-of-order or non-finite
+  repeated-event rows) are rejected with a clear error rather than silently
+  producing a wrong answer; `predict_survival()` reports first-event survival for
+  RTTE (use its `cum_hazard` field for the recurrent `E[N(t)]`).
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
   model.ferx`, `ferx check model.ferx`, and the public `fit_from_files()`
