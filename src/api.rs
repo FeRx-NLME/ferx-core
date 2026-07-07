@@ -13412,6 +13412,42 @@ mod adaptive_sim_tests {
     }
 
     #[test]
+    fn from_spec_supports_time_varying_covariate_with_infusion() {
+        // #700 infusion coverage: an infusion route under a declining covariate
+        // exercises the injected-infusion F (captured at injection) and the
+        // infusion-end break in BOTH the reactive driver and the frozen-replay
+        // engine (`adaptive_frozen_replay_tv`). The default-on verifier passing
+        // confirms the per-event bookkeeping for infusions, not just boluses.
+        let mut parsed = parse_full_model(SPEC_TV_COV).expect("model + block parse");
+        parsed
+            .adaptive_dosing
+            .as_mut()
+            .expect("[adaptive_dosing]")
+            .route = AdaptiveRoute::Infuse { cmt: 1, over: 2.0 };
+        let spec = parsed.adaptive_dosing.as_ref().unwrap();
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let pop = tv_cov_pop(&[100.0, 80.0, 60.0, 45.0, 35.0], &obs);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        let res = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect("TV infusion adaptive sim runs + verifies");
+        assert!(!res.ledger.is_empty());
+        assert!(
+            res.ledger.iter().all(|e| e.rate > 0.0),
+            "infusion route must record a positive rate on every realized dose"
+        );
+    }
+
+    #[test]
     fn adaptive_auc_target_rejects_time_varying_covariate() {
         // #700: the exposure metric (`auc_target_attainment`) can't yet be computed
         // per-event, so declaring `auc_target` on a time-varying-covariate subject is
