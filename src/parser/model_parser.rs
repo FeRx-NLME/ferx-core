@@ -1541,12 +1541,32 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                 continue;
             };
             // NONMEM-faithful display of the attribute for diagnostics: the DSL
-            // parameter prefix, the RATE code that drives it, and the noun. `F`/
-            // `Lag` are not modeled-dose attributes on the analytical engine.
+            // parameter prefix, the RATE code that drives it, and the noun.
+            // Per-compartment `F{cmt}`/`ALAG{cmt}` are ODE-only (they route through
+            // the ODE `dose_attr_map`); the analytical engine has a single dose
+            // route reached via the bare `f=`/`lagtime=` mapping. Such a name used
+            // to hit `continue` here and land in an unused spare slot, so effective
+            // bioavailability stayed 1 / lag stayed 0 with no error (only a
+            // `W_UNUSED_PARAM` if the name was otherwise unreferenced). Reject it
+            // with an actionable message instead of silently no-op'ing.
             let (param_prefix, rate_code, kind) = match attr {
                 crate::types::DoseAttr::Duration => ("D", "-2", "duration"),
                 crate::types::DoseAttr::Rate => ("R", "-1", "rate"),
-                crate::types::DoseAttr::F | crate::types::DoseAttr::Lag => continue,
+                crate::types::DoseAttr::F | crate::types::DoseAttr::Lag => {
+                    let (indexed, noun, bare) = if matches!(attr, crate::types::DoseAttr::F) {
+                        ("F", "bioavailability", "f")
+                    } else {
+                        ("ALAG", "lag time", "lagtime")
+                    };
+                    return Err(format!(
+                        "[individual_parameters]: `{name}` reads as a per-compartment {noun} \
+                         (`{indexed}{cmt}`), which only an ODE disposition applies. The analytical \
+                         `{}` model has a single dose route, so set {noun} with the bare `{bare}=` \
+                         argument in the `pk(...)` call (renaming `{name}` to a plain parameter), \
+                         or use an `ode(...)` model for a compartment-specific value.",
+                        pk_model.canonical_name(),
+                    ));
+                }
             };
             // Reject a `D{cmt}`/`R{cmt}` whose compartment the analytical engine
             // cannot infuse into — the central compartment for every model, plus
@@ -26745,6 +26765,75 @@ CL V KA WT
         assert!(
             err.contains("compartment 3") && err.contains("D3") && err.contains("ode("),
             "error must name the compartment, the param, and point to ode(...): {err}"
+        );
+    }
+
+    #[test]
+    fn analytical_indexed_f_and_alag_are_rejected() {
+        // Per-compartment `F{cmt}` / `ALAG{cmt}` are ODE-only. On an analytical
+        // `pk ...` model they used to be silently dropped into an unused slot
+        // (effective F = 1 / lag = 0, no error). They must now be a loud parse
+        // error pointing at the bare `f=` / `lagtime=` mapping.
+        let f_src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVF1(0.7, 0.01, 1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F1 = TVF1
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(f_src)
+            .err()
+            .expect("F1 on an analytical oral model must error, not be silently ignored");
+        assert!(
+            err.contains("F1")
+                && err.contains("bioavailability")
+                && err.contains("f=")
+                && err.contains("ode("),
+            "F error must name the param, the noun, the bare `f=` mapping, and ode(...): {err}"
+        );
+
+        // Same for a per-compartment lag `ALAG1`.
+        let lag_src = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVLAG1(1.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  ALAG1 = TVLAG1
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let err = parse_full_model(lag_src)
+            .err()
+            .expect("ALAG1 on an analytical oral model must error");
+        assert!(
+            err.contains("ALAG1") && err.contains("lag time") && err.contains("lagtime="),
+            "lag error must name the param, the noun, and the bare `lagtime=` mapping: {err}"
         );
     }
 
