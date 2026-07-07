@@ -671,32 +671,23 @@ fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Result<(), Strin
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
-/// *faithfully*. The adaptive path carries between-subject variability only (kappas
-/// held at zero) and never applies a reset or carries process noise. So an IOV
-/// model, a system reset (EVID=3/4), or an SDE `[diffusion]` model would each be
+/// *faithfully*. The adaptive path never applies a reset or carries process noise,
+/// so a system reset (EVID=3/4) or an SDE `[diffusion]` model would each be
 /// **silently** wrong — a violation of the "never a silent wrong answer" contract
 /// this module promises. Until each is properly supported (#391 follow-ups), reject
-/// it with a typed error. This mirrors the `n_kappa > 0` guards `fit()` already
-/// applies (IMPMAP, trust-region). Both public entry points funnel through
+/// it with a typed error. Both public entry points funnel through
 /// `run_adaptive_population`, so guarding there covers `simulate_adaptive` and
 /// `simulate_adaptive_from_spec`.
 ///
 /// Time-varying covariates (and a `TIME`-in-PK model) are **no longer** rejected:
-/// the driver now recomputes PK per event/segment from the covariate active in that
-/// segment (#700), the same way the static `predict()` / `simulate()` path does.
+/// the driver recomputes PK per event/segment from the covariate active in that
+/// segment (#700). Inter-occasion variability (IOV / `kappa`) is **no longer**
+/// rejected either: a fresh κ is drawn per decision window and threaded through the
+/// per-segment eta (#701), with occasion = decision index.
 fn reject_unsupported_adaptive(
     model: &CompiledModel,
     population: &Population,
 ) -> Result<(), String> {
-    if model.n_kappa > 0 {
-        return Err(
-            "adaptive-dosing simulation does not yet support inter-occasion variability \
-             (IOV / `kappa`): the reactive driver would silently hold every kappa at zero, \
-             biasing the predictions, the reactive decisions, and the dose ledger. Simulate \
-             without IOV, or track #391 for occasion-aware adaptive support."
-                .to_string(),
-        );
-    }
     if model.is_sde() {
         return Err(
             "adaptive-dosing simulation does not support stochastic (`[diffusion]` / SDE) \
@@ -5770,7 +5761,9 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_rejects_iov_model() {
+    fn adaptive_accepts_iov_model() {
+        // IOV is now supported (#701): a fresh κ is drawn per decision window and
+        // threaded through the per-segment eta, so the guard no longer rejects it.
         use crate::parser::model_parser::parse_model_string;
         let iov = r"
 [parameters]
@@ -5795,11 +5788,9 @@ mod tests {
 ";
         let model = parse_model_string(iov).expect("IOV model parses");
         assert!(model.n_kappa > 0, "test model must declare a kappa");
-        let err = reject_unsupported_adaptive(&model, &adaptive_pop(adaptive_base_subject()))
-            .expect_err("IOV model must be rejected for adaptive dosing");
         assert!(
-            err.to_lowercase().contains("inter-occasion") || err.to_lowercase().contains("iov"),
-            "error should cite IOV: {err}"
+            reject_unsupported_adaptive(&model, &adaptive_pop(adaptive_base_subject())).is_ok(),
+            "IOV model is now supported for adaptive dosing (#701)"
         );
     }
 
@@ -7322,17 +7313,19 @@ where
     // adaptive output — predictions, decisions, the dose ledger, `target_window` — is
     // fully per-event covariate-aware; only this one exposure metric is deferred.
     if auc_target.is_some()
-        && population
-            .subjects
-            .iter()
-            .any(|s| crate::pk::subject_needs_per_event_pk(model, s))
+        && (model.n_kappa > 0
+            || population
+                .subjects
+                .iter()
+                .any(|s| crate::pk::subject_needs_per_event_pk(model, s)))
     {
         return Err(
-            "adaptive-dosing `auc_target` is not yet supported for time-varying-covariate \
-             (or TIME-in-PK) subjects: its exposure metric integrates a dense grid from a \
-             single frozen PK snapshot, which would be silently wrong under a changing \
-             covariate. Drop `auc_target` (all other outputs remain per-event \
-             covariate-aware), or track #700 for a per-event AUC."
+            "adaptive-dosing `auc_target` is not yet supported for time-varying-covariate, \
+             TIME-in-PK, or IOV (`kappa`) subjects: its exposure metric integrates a dense grid \
+             from a single frozen PK snapshot, which would be silently wrong when the PK changes \
+             across the horizon (a drifting covariate or a per-occasion κ). Drop `auc_target` (all \
+             other outputs remain per-event / per-occasion aware), or track #700/#701 for a \
+             per-event AUC."
                 .to_string(),
         );
     }
@@ -7347,21 +7340,91 @@ where
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         for subject in &population.subjects {
-            // Draw η ~ N(0, Ω); append zero kappas for IOV models (the reactive
-            // driver is BSV-only in this slice).
+            // Draw η ~ N(0, Ω). `eta_slice` (η with κ appended as zeros) is the
+            // **baseline** window — the parameters before the first decision, and
+            // the reactive driver's fixed eta on a non-IOV run.
             let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
             let eta = &params.omega.chol * DVector::from_column_slice(&z);
             let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
-            // Per-event PK when the subject's covariates (dose / obs / pk-only rows)
-            // or a `TIME` built-in vary PK across the horizon (#700); the reactive
-            // driver then resolves PK per segment from these snapshots. `None` ⇒
-            // constant PK, driven from the frozen `pk` snapshot below. One shared
-            // predicate (`subject_needs_per_event_pk`) gates the materialiser, this
-            // gate, and the `auc_target` guard so they cannot drift apart.
+            // Inter-occasion variability (#701): draw a fresh κ per decision window
+            // and build the per-window eta `[η_bsv | κ_g]` the driver threads through
+            // each segment, plus `decision_pk[g]` = the PK at decision g under
+            // occasion g's κ. Occasion = decision index (per-decision-window). κ is
+            // drawn on a dedicated substream keyed by (subject, replicate), disjoint
+            // from the η and assay streams, so a non-IOV model (`n_kappa == 0`) draws
+            // nothing and this whole block is skipped — the path stays byte-identical.
+            let (eta_occ, decision_pk): (
+                Option<Vec<Vec<f64>>>,
+                Option<Vec<crate::types::PkParams>>,
+            ) = if model.n_kappa > 0 {
+                let omega_iov = params
+                    .omega_iov
+                    .as_ref()
+                    .expect("omega_iov present when n_kappa > 0");
+                let kappa_base =
+                    crate::sim::adaptive::subject_kappa_base_seed(assay_root, &subject.id, sim);
+                let n_occ = decision_times.len();
+                let mut eta_occ = Vec::with_capacity(n_occ);
+                let mut decision_pk = Vec::with_capacity(n_occ);
+                for g in 0..n_occ {
+                    let zk: Vec<f64> = (0..model.n_kappa)
+                        .map(|k| crate::sim::adaptive::kappa_standard_normal(kappa_base, g, k))
+                        .collect();
+                    let kappa_g = &omega_iov.chol * DVector::from_column_slice(&zk);
+                    let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
+                    e.extend(kappa_g.iter().copied());
+                    // PK at decision g under occasion g's κ, at the covariate the
+                    // driver sees at that decision (its `decision_cov`: the
+                    // obs-coincident snapshot if the decision lands on an
+                    // observation row, else the subject-static covariates). Gives
+                    // occasion g's parameters to the pre-dose readout and the
+                    // injected dose's F even when the decision is not a record
+                    // (where LOCF would carry the previous occasion's PK).
+                    let dcov = subject
+                        .obs_times
+                        .iter()
+                        .position(|&ot| ot.to_bits() == decision_times[g].to_bits())
+                        .map(|i| subject.obs_cov(i))
+                        .unwrap_or(&subject.covariates);
+                    decision_pk.push((model.pk_param_fn)(
+                        &params.theta,
+                        &e,
+                        dcov,
+                        decision_times[g],
+                    ));
+                    eta_occ.push(e);
+                }
+                (Some(eta_occ), Some(decision_pk))
+            } else {
+                (None, None)
+            };
+
+            // Per-event PK when PK varies across the horizon: an IOV κ that switches
+            // per occasion (#701), or a time-varying covariate / pk-only row / `TIME`
+            // built-in (#700). The reactive driver then resolves PK per segment from
+            // these snapshots. `None` ⇒ constant PK, driven from the frozen `pk`
+            // snapshot below. The IOV snapshot is owned (recomputed per replicate as κ
+            // is redrawn); the #700-only path reuses `event_pk_buf`. One shared
+            // predicate (`subject_needs_per_event_pk`) gates the #700 branch, the
+            // materialiser, and the `auc_target` guard so they cannot drift apart.
+            let event_pk_iov: Option<crate::pk::EventPkParams> = eta_occ.as_ref().map(|eo| {
+                // IOV: each obs / pk-only record carries its occasion's κ (and any
+                // #700 covariate); records before the first decision use the baseline.
+                crate::pk::compute_event_pk_params_iov(
+                    model,
+                    subject,
+                    &params.theta,
+                    &eta_slice,
+                    eo,
+                    decision_times,
+                )
+            });
             let event_pk: Option<&crate::pk::EventPkParams> =
-                if crate::pk::subject_needs_per_event_pk(model, subject) {
+                if let Some(ev) = event_pk_iov.as_ref() {
+                    Some(ev)
+                } else if crate::pk::subject_needs_per_event_pk(model, subject) {
                     crate::pk::compute_event_pk_params_into(
                         model,
                         subject,
@@ -7405,6 +7468,8 @@ where
                 ode,
                 &pk.values,
                 event_pk,
+                decision_pk.as_deref(),
+                eta_occ.as_deref(),
                 &params.theta,
                 &eta_slice,
                 subject,
@@ -7421,6 +7486,8 @@ where
                     ode,
                     &pk.values,
                     event_pk,
+                    decision_pk.as_deref(),
+                    eta_occ.as_deref(),
                     &params.theta,
                     &eta_slice,
                     subject,
@@ -12871,6 +12938,27 @@ mod adaptive_sim_tests {
   DV ~ proportional(PROP)
 "#;
 
+    // IOV ODE model (#701): a per-occasion κ on CL over a near-degenerate BSV η
+    // (the parser requires an omega). A seeded run's η and per-occasion κ are both
+    // reconstructed exactly and checked against `predict_iov`.
+    const ODE_IOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
     // Analytical (non-ODE) twin — used to assert simulate_adaptive rejects it.
     const ANALYTICAL: &str = r#"
 [parameters]
@@ -12965,6 +13053,102 @@ mod adaptive_sim_tests {
                 "adaptive IPRED {} != static predict {} at t={}",
                 traj.ipred,
                 pred.pred,
+                traj.time
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_iov_matches_predict_iov_with_reconstructed_kappa() {
+        // Full-stack IOV oracle (#701): run the reactive driver on a real IOV model
+        // (κ drawn per decision window from the seeded substream), then reconstruct the
+        // exact per-occasion κ and confirm the trajectory equals `predict_iov` on the
+        // realized doses with occasions = decision windows. Obs coincide with decisions,
+        // so every dosing occasion appears in predict_iov's obs-derived groups. The
+        // default-on frozen-replay verifier also runs (bit-exact); its Ok is part of the
+        // assertion. This is the api-level counterpart of the driver-level degenerate
+        // oracle, exercising the real `pk_param_fn` → κ path end to end.
+        let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+        assert!(model.n_kappa == 1 && model.n_eta == 1);
+        let decisions = vec![0.0, 24.0, 48.0, 72.0];
+        let obs = decisions.clone();
+        let seed = 20260708u64;
+        let pop = population(vec![subj("1", obs.clone(), vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(seed),
+            decision_times: decisions.clone(),
+            ..Default::default() // verify = true
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect("adaptive IOV sim runs and passes the default verifier");
+        assert_eq!(res.ledger.len(), 4, "a dose at every decision");
+
+        // Reconstruct the BSV η exactly as `run_adaptive_population` drew it: the same
+        // seeded `StdRng`, one N(0,1) per η for this single (sim 1, subject "1"), then
+        // Ω's Cholesky. (With `seed` set, the assay/κ streams don't touch this rng, so
+        // the η draw is the only consumer — reproducible here.)
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+        let z_eta: Vec<f64> = (0..model.n_eta).map(|_| rng.sample(normal)).collect();
+        let eta_bsv: Vec<f64> = (&model.default_params.omega.chol
+            * nalgebra::DVector::from_column_slice(&z_eta))
+        .iter()
+        .copied()
+        .collect();
+
+        // Reconstruct the exact per-occasion κ from the seeded substream (the same
+        // derivation `run_adaptive_population` uses: κ_g = chol(Ω_IOV) · z, z keyed by
+        // (occasion, component); root = the run seed; replicate = 1).
+        let omega_iov = model.default_params.omega_iov.as_ref().expect("omega_iov");
+        let base = crate::sim::adaptive::subject_kappa_base_seed(seed, "1", 1);
+        let kappas: Vec<Vec<f64>> = (0..decisions.len())
+            .map(|g| {
+                let z: Vec<f64> = (0..model.n_kappa)
+                    .map(|k| crate::sim::adaptive::kappa_standard_normal(base, g, k))
+                    .collect();
+                (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z))
+                    .iter()
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        assert!(
+            kappas.iter().any(|k| k[0].abs() > 1e-6),
+            "the reconstructed κ must be genuinely nonzero, else the oracle is vacuous"
+        );
+
+        // Static reference: predict_iov on the realized doses with occasion = window.
+        let static_doses: Vec<DoseEvent> = res
+            .ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+            .collect();
+        let mut static_subject = subj("1", obs.clone(), static_doses);
+        static_subject.occasions = obs
+            .iter()
+            .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
+            .collect();
+        static_subject.dose_occasions = res
+            .ledger
+            .iter()
+            .map(|e| crate::pk::occasion_of(&decisions, e.time).expect("dose in a window") as u32)
+            .collect();
+        let preds = crate::pk::predict_iov(
+            &model,
+            &static_subject,
+            &model.default_params.theta,
+            &eta_bsv,
+            &kappas,
+        );
+
+        assert_eq!(res.trajectories.len(), preds.len());
+        for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+            assert!(
+                (traj.ipred - pred).abs() <= 1e-9 + 1e-9 * pred.abs(),
+                "adaptive IOV IPRED {} != predict_iov {} at t={}",
+                traj.ipred,
+                pred,
                 traj.time
             );
         }
@@ -13576,6 +13760,64 @@ mod adaptive_sim_tests {
         pop
     }
 
+    // IOV declarative spec (#701): a per-occasion κ on CL, no covariate (the parser
+    // requires an omega, so a near-degenerate BSV η rides along).
+    const SPEC_IOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 96
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 8 : increase 25%
+"#;
+
+    // #700 × #701 co-occurrence: CL depends on BOTH a time-varying covariate (CRCL)
+    // and a per-occasion κ.
+    const SPEC_TV_IOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * (CRCL / 100.0) * exp(KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 96
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 8 : increase 25%
+"#;
+
     #[test]
     fn from_spec_supports_time_varying_covariate() {
         // End-to-end #700: a covariate-dependent CL (CRCL declining — e.g. renal
@@ -13695,6 +13937,82 @@ mod adaptive_sim_tests {
             err.to_lowercase().contains("auc_target")
                 && err.to_lowercase().contains("time-varying"),
             "error should cite auc_target + time-varying: {err}"
+        );
+    }
+
+    #[test]
+    fn from_spec_supports_time_varying_covariate_with_iov() {
+        // #700 × #701 co-occurrence: CL depends on BOTH a declining covariate (CRCL,
+        // #700 LOCF) and a per-occasion κ (#701 decision window). Both fold into the
+        // per-event PK in the reactive driver AND the frozen-replay engine, so the
+        // default-on verifier passing is the bit-exact proof they compose. The run is
+        // reproducible for a fixed seed and κ-sensitive across seeds.
+        let parsed = parse_full_model(SPEC_TV_IOV).expect("model + block parse");
+        assert!(parsed.model.n_kappa == 1);
+        let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing]");
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let pop = tv_cov_pop(&[100.0, 80.0, 60.0, 45.0, 35.0], &obs);
+        let run = |seed: u64| {
+            let opts = AdaptiveSimulateOptions {
+                seed: Some(seed),
+                ..Default::default()
+            };
+            simulate_adaptive_from_spec(
+                &parsed.model,
+                &pop,
+                &parsed.model.default_params,
+                1,
+                spec,
+                &opts,
+            )
+            .expect("TV+IOV adaptive sim runs + verifies")
+        };
+        let a = run(1);
+        assert!(!a.ledger.is_empty());
+        let a_last = a.trajectories.last().unwrap().ipred;
+        // Reproducible for a fixed seed (κ + η both seeded).
+        assert_eq!(
+            a_last,
+            run(1).trajectories.last().unwrap().ipred,
+            "same seed ⇒ identical trajectory"
+        );
+        // κ genuinely perturbs the trajectory across seeds.
+        assert!(
+            (a_last - run(999).trajectories.last().unwrap().ipred).abs() > 1e-9,
+            "different seed ⇒ different κ ⇒ different trajectory"
+        );
+    }
+
+    #[test]
+    fn adaptive_auc_target_rejects_iov() {
+        // #701: like the TV-covariate case, the exposure metric can't yet be computed
+        // per-occasion, so declaring `auc_target` on an IOV model is a typed error
+        // rather than a silently κ-frozen AUC.
+        let mut parsed = parse_full_model(SPEC_IOV).expect("model + block parse");
+        parsed
+            .adaptive_dosing
+            .as_mut()
+            .expect("[adaptive_dosing]")
+            .auc_target = Some((400.0, 600.0));
+        let spec = parsed.adaptive_dosing.as_ref().unwrap();
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let pop = population(vec![subj("1", obs, vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        let err = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect_err("auc_target on an IOV model must be rejected");
+        assert!(
+            err.to_lowercase().contains("auc_target") && err.to_lowercase().contains("iov"),
+            "error should cite auc_target + IOV: {err}"
         );
     }
 

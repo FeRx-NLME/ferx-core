@@ -579,6 +579,76 @@ pub fn compute_event_pk_params_into(
     }
 }
 
+/// The decision window (occasion) active at time `t` under the per-decision-window
+/// IOV convention for adaptive dosing (#701): the index of the latest decision at
+/// or before `t`, or `None` before the first decision (the baseline window, whose
+/// κ is zero). `decision_times` is the ascending reactive schedule. A record that
+/// coincides with a decision (within a tiny tolerance) belongs to that decision's
+/// window — matching the driver, which opens window `g` at the decision break and
+/// records the coincident observation post-open.
+pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
+    let mut occ = None;
+    for (g, &d) in decision_times.iter().enumerate() {
+        if d <= t + 1e-9 {
+            occ = Some(g);
+        } else {
+            break;
+        }
+    }
+    occ
+}
+
+/// Occasion-aware per-event PK for the adaptive IOV path (#701).
+///
+/// Like [`compute_event_pk_params`] but each observation / pk-only record is
+/// evaluated with the eta of the **occasion (decision window)** active at its time
+/// ([`occasion_of`]): `eta_occ[g]` for the window `g` containing the record, or
+/// `eta_baseline` (BSV η with κ = 0) before the first decision. This is the IOV
+/// analogue of [`predict_iov`]'s per-event occasion-κ selection, with occasion =
+/// decision window instead of the OCC column. Doses stay empty — the adaptive base
+/// subject is dose-free; controller-injected doses take their PK from the driver's
+/// per-decision snapshot. It composes with #700's time-varying covariates: each
+/// record's *covariate* snapshot (`obs_cov` / `pk_only_cov`) is used alongside its
+/// occasion eta, so a model with both a TV covariate and IOV κ is per-event correct
+/// in both.
+pub(crate) fn compute_event_pk_params_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_baseline: &[f64],
+    eta_occ: &[Vec<f64>],
+    decision_times: &[f64],
+) -> EventPkParams {
+    let mut out = EventPkParams::with_capacity_for(subject);
+    let eta_at = |t: f64| -> &[f64] {
+        match occasion_of(decision_times, t) {
+            Some(g) => eta_occ[g].as_slice(),
+            None => eta_baseline,
+        }
+    };
+    for j in 0..subject.obs_times.len() {
+        let t = subject.obs_times[j];
+        out.obs.push(pk_params_at_time(
+            model,
+            theta,
+            eta_at(t),
+            subject.obs_cov(j),
+            t,
+        ));
+    }
+    for m in 0..subject.pk_only_times.len() {
+        let t = subject.pk_only_times[m];
+        out.pk_only.push(pk_params_at_time(
+            model,
+            theta,
+            eta_at(t),
+            subject.pk_only_cov(m),
+            t,
+        ));
+    }
+    out
+}
+
 /// IOV predictions with proper per-dose occasion accounting (issue #104).
 ///
 /// Builds per-event PK parameters carrying **each event's occasion kappa** and

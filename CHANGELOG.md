@@ -59,6 +59,17 @@ section of the SDLC for the versioning policy).
   also silently frozen at `TIME=0`). The `auc_target_attainment` metric is not yet
   available for time-varying-covariate subjects and is rejected with a typed error
   rather than reported from a frozen snapshot.
+- **Adaptive (feedback) dosing now supports inter-occasion variability (IOV)** (#701):
+  the reactive driver draws a fresh occasion `kappa` per **decision window** (occasion =
+  decision index) and threads it through the per-event PK — instead of silently holding
+  every kappa at zero — so occasion-to-occasion shifts in CL/V correctly drive the
+  predictions, the monitored signal, and every reactive dose decision, and the
+  frozen-replay verifier validates the per-occasion bookkeeping. Composes with the #700
+  time-varying-covariate path (a model with both is per-event correct in each). `kappa`
+  is drawn on a dedicated per-(subject, replicate) substream, so a non-IOV run is
+  byte-identical to before and enabling a `Dv` monitor never shifts the draws. The
+  `auc_target_attainment` metric is not yet available for IOV subjects and is rejected
+  with a typed error rather than reported from a κ-frozen snapshot.
 - **`estimation:` block in `{model}-fit.yaml` now splits wall time by stage** (#713):
   a `{method}_wall_time_secs` entry (e.g. `focei_wall_time_secs`, `imp_wall_time_secs`)
   is reported for each stage of `method`/`methods`, plus a `covariance_wall_time_secs`
