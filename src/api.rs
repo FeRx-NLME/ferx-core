@@ -2029,7 +2029,11 @@ pub fn check_model_data_warnings(
     // hits this readily (a slow-absorption depot drug with large MTT easily has
     // `α ≥ KTR`). Evaluated on typical values (η = 0) per subject so a covariate on
     // MTT/CL that pushes the typical profile into the flip-flop regime is caught.
-    // Reported once, naming the first affected subject.
+    // Reported once, naming the first affected subject. A model carrying an ODE
+    // twin is auto-rerouted to it per evaluation (`pk::effective_model_for_eval`),
+    // so the closed form's zero never reaches the objective — there the warning is
+    // an informational heads-up; a twin-less model (lagtime / `f` / user `[odes]`)
+    // still degenerates and the warning stays actionable (message branches on it).
     if matches!(
         model.pk_model,
         PkModel::OneCptTransit | PkModel::TwoCptTransit
@@ -2048,21 +2052,42 @@ pub fn check_model_data_warnings(
                 _ => cl / v1,
             };
             if disp_rate >= ktr {
-                diags.push(Diagnostic::warning(
-                    "W_TRANSIT_FLIP_FLOP",
+                let msg = if model.transit_ode_equivalent.is_some() {
+                    // Auto-handled: the flip-flop reroute (`pk::effective_model_for_eval`)
+                    // evaluates the ODE `transit()` twin for these parameters, so the
+                    // profile is correct — this is an informational heads-up, not an error.
+                    format!(
+                        "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
+                         typical values (subject {}): the flip-flop regime, outside the analytic \
+                         transit closed form's convergence domain. ferx automatically evaluates \
+                         the equivalent ODE transit model for such parameters (correct, but slower \
+                         than the closed form) — check the MTT / CL starting estimates if the \
+                         flip-flop is unexpected.",
+                        model.pk_model.canonical_name(),
+                        disp_rate,
+                        ktr,
+                        subject.id
+                    )
+                } else {
+                    // No ODE twin to route to (a lagtime, bioavailability `f`, or user
+                    // `[odes]` block declines the desugar), so the closed form still
+                    // returns an identically-zero profile and degenerates the objective.
                     format!(
                         "{} disposition rate ({:.4}) ≥ transit rate KTR = (n+1)/mtt ({:.4}) at \
                          typical values (subject {}): the analytic transit closed form is outside \
                          its convergence domain and returns an identically-zero concentration \
                          profile, which silently degenerates the objective (a proportional error \
-                         model collapses `(σ·pred)²` to 0). This is the flip-flop regime — check \
-                         the MTT / CL starting estimates, or use an ODE transit model.",
+                         model collapses `(σ·pred)²` to 0). This model has no ODE twin to fall back \
+                         on (a lagtime, bioavailability `f`, or user `[odes]` block declines it) — \
+                         rewrite it as an explicit ODE transit model, or check the MTT / CL \
+                         starting estimates.",
                         model.pk_model.canonical_name(),
                         disp_rate,
                         ktr,
                         subject.id
-                    ),
-                ));
+                    )
+                };
+                diags.push(Diagnostic::warning("W_TRANSIT_FLIP_FLOP", msg));
                 break;
             }
         }

@@ -154,8 +154,9 @@ absorption *shape* is estimable), and `F` / `lagtime` map exactly as for
 absorption with `ka = 1/MTT`.
 
 **Domain.** The closed form converges for `ke = CL/V` below the transit rate
-`KTR = (N+1)/MTT` (the absorption-rate-limited regime — the usual case); the
-optimiser is kept inside this region automatically.
+`KTR = (N+1)/MTT` (the absorption-rate-limited regime — the usual case). At or above
+it (the flip-flop regime) ferx routes the model to its ODE twin automatically — see
+the flip-flop note below.
 
 **Scope (first version).** This analytic model supports single and multiple
 **bolus** doses, bioavailability, lag time, and a `central` initial amount.
@@ -165,11 +166,17 @@ optimiser is kept inside this region automatically.
 tolerance (`tests/transit_analytic_equivalence.rs`), so the forcing model is the
 drop-in choice when you need a feature the closed form does not yet cover.
 
-The closed form converges only when the disposition rate is below the transit rate
-`KTR = (n+1)/mtt`. Outside that domain (the **flip-flop** regime) it returns an
-identically-zero profile; a `W_TRANSIT_FLIP_FLOP` warning is emitted at the
-typical-value estimates so this fails loud rather than silently degenerating the
-objective — check the MTT / CL starting estimates, or use an ODE transit model.
+When the disposition rate reaches or exceeds the transit rate `KTR = (n+1)/mtt`
+(the **flip-flop** regime — a slow-absorption depot whose absorption rate-limits a
+faster disposition), the closed form is outside its convergence domain. ferx detects
+this *per evaluation* and routes the model to its exact ODE `transit()` twin, which
+is valid in both regimes (matched to a NONMEM ADVAN13 transit simulation to ~1e-4),
+so a flip-flop model fits and predicts correctly instead of returning a zero
+profile. A `W_TRANSIT_FLIP_FLOP` note still flags the regime at the typical-value
+estimates. The reroute needs an ODE twin: a closed-form transit model that also
+carries a `lagtime`, bioavailability `f`, or user `[odes]` block cannot be desugared,
+so it keeps the zero profile — there the warning stays actionable ("rewrite it as an
+explicit ODE transit model").
 
 [`examples/one_cpt_transit.ferx`](https://github.com/FeRx-NLME/ferx-core/blob/main/examples/one_cpt_transit.ferx)
 is a complete self-contained analytic transit model:
