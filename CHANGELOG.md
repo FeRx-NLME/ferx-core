@@ -41,6 +41,19 @@ section of the SDLC for the versioning policy).
   and `ferx summary --help` now print usage to stdout and exit 0, matching standard
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
 
+### Added
+- **`ferx check` warns when `[scaling] obs_scale` references the same individual
+  parameter bound to a built-in `pk <model>(...)` block's `v`/`v1` role** (#712):
+  the closed-form kernel already divides by that volume internally to produce
+  concentration, so an `obs_scale` referencing it divides by it a second
+  time — a common mistake when translating an `ode(...)` model (where that
+  division is required) to an equivalent closed-form `pk` block (where it
+  already happens). Not rejected — `obs_scale` referencing an individual
+  parameter is also a supported feature for an intentional additional
+  transform — just flagged, since ferx can't tell intent from mistake.
+  `docs/model-file/scaling.qmd` now documents the raw-output convention per
+  structural-model type.
+
 ### Fixed
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel

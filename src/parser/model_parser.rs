@@ -2200,6 +2200,17 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             .map(|s| s.state_names.clone())
             .unwrap_or_default();
         let is_ode_model = model.ode_spec.is_some();
+        // Individual-parameter name bound to this `pk <model>(...)` block's `v`/`v1` role
+        // (`None` for `ode(...)`/`ode_template(...)`) — see `build_obs_scale_spec`'s doc (#712).
+        let volume_indiv_name_for_scaling: Option<String> = if is_ode_model {
+            None
+        } else {
+            pk_param_map
+                .get("v")
+                .or_else(|| pk_param_map.get("v1"))
+                .cloned()
+        };
+        let mut scaling_parse_warnings: Vec<String> = Vec::new();
 
         let (scaling, output_fn, output_program, scaling_covariates) = parse_scaling_block(
             scaling_lines,
@@ -2212,7 +2223,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             model.pk_model,
             &model.kappa_names,
             &readout_synth_params,
+            volume_indiv_name_for_scaling.as_deref(),
+            &mut scaling_parse_warnings,
         )?;
+        model.parse_warnings.extend(scaling_parse_warnings);
 
         // AD compatibility check (Phase 2.5):
         //
@@ -5304,12 +5318,27 @@ fn compile_scale_deriv_program(
 
 /// Build a `ScalingSpec` (None / ScalarScale / ExpressionScale) from one
 /// `obs_scale[…] = value` line. Shared between the uniform and per-CMT paths.
+///
+/// `volume_indiv_name` is the individual-parameter name bound to the built-in
+/// `pk <model>(...)` structural block's `v`/`v1` role (`None` for `ode(...)`/
+/// `ode_template(...)`, where there's no such built-in concentration divisor to
+/// collide with). Referencing that exact name in a Form B expression is a real,
+/// supported feature (an intentional additional transform on top of the
+/// built-in concentration output — see `docs/model-file/scaling.qmd` and
+/// `examples/scaling_expression.ferx`), not rejected. But it is *also* the
+/// signature of a common mistake: copying `obs_scale = V` from an `ode(...)`
+/// translation of the same model, where it's required (raw output there is
+/// amount, not concentration) — on a `pk` block it silently divides by `v` a
+/// second time. Since ferx can't tell intent from mistake here, it warns
+/// (`parse_warnings`) rather than erroring (#712).
 fn build_obs_scale_spec(
     value: &str,
     theta_names: &[String],
     eta_names: &[String],
     indiv_var_names: &[String],
     pk_indices: &[usize],
+    volume_indiv_name: Option<&str>,
+    parse_warnings: &mut Vec<String>,
 ) -> Result<ScalingSpec, String> {
     // Try scalar first (Form A). Otherwise parse as expression (Form B).
     if let Ok(k) = value.parse::<f64>() {
@@ -5326,6 +5355,29 @@ fn build_obs_scale_spec(
     let ctx = ParseCtx::new(theta_names, eta_names, indiv_var_names);
     let expr =
         parse_scalar_expression(value, ctx).map_err(|e| format!("[scaling] obs_scale: {}", e))?;
+    if let Some(vname) = volume_indiv_name {
+        let mut references_volume = false;
+        visit_expr_nodes(&expr, &mut |e| {
+            if let Expression::Variable(name) = e {
+                if name == vname {
+                    references_volume = true;
+                }
+            }
+        });
+        if references_volume {
+            parse_warnings.push(format!(
+                "[scaling]: obs_scale = `{value}` references `{vname}`, which is also this \
+                 model's `pk` structural block volume parameter. A built-in analytical `pk` \
+                 block already outputs concentration (divides by `{vname}` internally) — this \
+                 `obs_scale` divides by `{vname}` again on top. If that's intentional (a \
+                 deliberate additional transform), ignore this warning. If `obs_scale = {vname}` \
+                 was copied from an `ode(...)` translation of this model (where it converts raw \
+                 compartment amount to concentration and is required), remove `[scaling]` here — \
+                 the `pk` block's built-in concentration output is already what that conversion \
+                 was for."
+            ));
+        }
+    }
     // Pre-resolve indiv param name → PK slot so the closure can look up
     // `pk.values[slot]` for each `Expression::Variable(name)`. Mirrors
     // the analytical Form B path from Phase 1.5.
@@ -5818,6 +5870,11 @@ pub(crate) fn build_y_output_fn(
 /// - Mixing uniform (`obs_scale = K`) with per-CMT (`obs_scale[CMT=N] = K`)
 ///   within the same group → error.
 /// - Duplicate `[CMT=N]` keys → error.
+/// - `obs_scale` referencing the same individual parameter bound to a built-in
+///   `pk <model>(...)` block's `v`/`v1` role → **warning** (`parse_warnings`),
+///   not an error: it's a supported feature, but also the signature of a
+///   common mistake (a leftover `obs_scale = V` from an `ode(...)`
+///   translation) — see [`build_obs_scale_spec`] (#712).
 #[allow(clippy::too_many_arguments)]
 fn parse_scaling_block(
     lines: &[String],
@@ -5830,6 +5887,8 @@ fn parse_scaling_block(
     pk_model: PkModel,
     kappa_names: &[String],
     readout_synth: &[ReadoutSynthParam],
+    volume_indiv_name: Option<&str>,
+    parse_warnings: &mut Vec<String>,
 ) -> Result<
     (
         ScalingSpec,
@@ -5872,6 +5931,8 @@ fn parse_scaling_block(
                     eta_names,
                     indiv_var_names,
                     pk_indices,
+                    volume_indiv_name,
+                    parse_warnings,
                 )?;
                 match cmt_opt {
                     None => {
@@ -23212,6 +23273,79 @@ if (WT > 70) {
             }
             other => panic!("expected ExpressionScale, got {:?}", other),
         }
+    }
+
+    /// #712: `obs_scale` referencing the same individual parameter bound to the
+    /// `pk <model>(...)` block's `v` role is a supported feature (see the test
+    /// above) but also the signature of a common mistake (a leftover `obs_scale
+    /// = V` copied from an `ode(...)` translation, where it's required but on a
+    /// `pk` block double-divides). It must still parse — warn, not error.
+    #[test]
+    fn test_obs_scale_referencing_pk_volume_warns_not_errors() {
+        let src = analytical_model_with_scaling(Some("  obs_scale = V\n"));
+        let model = parse_model_string(&src).expect("must still parse (warning, not error)");
+        assert!(
+            model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("obs_scale") && w.contains("volume parameter")),
+            "expected a volume-collision warning, got {:?}",
+            model.parse_warnings
+        );
+    }
+
+    /// A pure unit-conversion constant (Form A) never references any individual
+    /// parameter, so it must never trigger the #712 volume-collision warning.
+    #[test]
+    fn test_obs_scale_scalar_constant_on_pk_block_does_not_warn() {
+        let src = analytical_model_with_scaling(Some("  obs_scale = 1000\n"));
+        let model = parse_model_string(&src).expect("scalar obs_scale parses");
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("volume parameter")),
+            "scalar obs_scale must not warn, got {:?}",
+            model.parse_warnings
+        );
+    }
+
+    /// An expression referencing an individual parameter that is *not* the
+    /// `pk` block's volume role (here `CL`, not `V`) is not the double-scaling
+    /// pattern #712 targets — no warning.
+    #[test]
+    fn test_obs_scale_referencing_non_volume_indiv_param_does_not_warn() {
+        let src = analytical_model_with_scaling(Some("  obs_scale = CL / 10\n"));
+        let model = parse_model_string(&src).expect("CL-referencing obs_scale parses");
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("volume parameter")),
+            "obs_scale referencing a non-volume indiv param must not warn, got {:?}",
+            model.parse_warnings
+        );
+    }
+
+    /// On an `ode(...)` model there's no built-in concentration divisor to
+    /// collide with — `obs_scale = V` is the documented, required way to
+    /// convert raw compartment amount to concentration, not a mistake pattern.
+    /// Must never warn.
+    #[test]
+    fn test_obs_scale_referencing_volume_on_ode_model_does_not_warn() {
+        let src = ode_model_with_scaling(
+            "ode(obs_cmt=central, states=[depot, central])",
+            Some("  obs_scale = V\n"),
+        );
+        let model = parse_model_string(&src).expect("ODE obs_scale = V parses");
+        assert!(
+            !model
+                .parse_warnings
+                .iter()
+                .any(|w| w.contains("volume parameter")),
+            "ODE obs_scale = V must not warn, got {:?}",
+            model.parse_warnings
+        );
     }
 
     #[test]
