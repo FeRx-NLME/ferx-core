@@ -187,6 +187,15 @@ fn final_ofv_no_worse_than_best_seen_during_trace() {
     opts.outer_maxiter = 1000;
     opts.optimizer_trace = true;
     opts.run_covariance_step = false;
+    // Pin to a single worker. The optimizer trace keeps its `TraceWriter` in a
+    // thread-local (`estimation::trace`), so init/write/finish must all land on
+    // the same thread. `fit_inner` runs inside a shared rayon pool, and after a
+    // per-subject `par_iter` rayon may resume the outer-loop continuation on a
+    // *different* worker — stranding the writer (empty trace, `trace_path` None).
+    // That migration is near-certain when the whole test binary runs concurrent
+    // fits on the shared pool. One worker => no migration => deterministic trace.
+    // (The regression under test — #59 best-seen restoration — is thread-agnostic.)
+    opts.threads = Some(1);
 
     let result =
         fit(&model, &population, &model.default_params, &opts).expect("slsqp fit must succeed");
