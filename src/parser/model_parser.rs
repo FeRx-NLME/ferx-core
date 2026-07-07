@@ -16750,8 +16750,8 @@ mod tests {
     #[test]
     fn test_parse_threads_zero_means_auto() {
         // `threads = 0` is treated as "use the engine's default thread count"
-        // (available cores - 1, capped at 8 — #707), matching the R binding's
-        // `threads <= 0` sentinel.
+        // (available cores - 1, floored at 1, capped at 8 — #707), matching the
+        // R binding's `threads <= 0` sentinel.
         let opts = parse_fit_options(&["threads = 0".to_string()]).unwrap();
         assert_eq!(opts.threads, None);
     }

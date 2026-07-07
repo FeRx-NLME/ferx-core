@@ -93,12 +93,23 @@ static GLOBAL_THREADS_EXPLICIT: std::sync::atomic::AtomicBool =
 /// CLI binary sizing its one process-wide pool from `--threads N` before the first fit;
 /// library callers that want a pinned thread count for a single fit should use
 /// `FitOptions::threads` instead, which scopes a fit-local pool via [`build_fit_pool`].
+///
+/// `n_threads` must be positive — a caller wanting the engine's own default should simply
+/// not call this at all, rather than pass `0` (which Rayon would otherwise silently treat
+/// as "pick automatically", masking the caller's intent). The explicit-override flag is
+/// only set once `build_global` actually succeeds, so a failed call (e.g. the global pool
+/// was already initialized elsewhere) leaves [`default_fit_pool`] applying the #707 cap
+/// rather than incorrectly deferring to whatever the ambient pool happens to be.
 pub fn configure_global_thread_pool(n_threads: usize) -> Result<(), String> {
-    GLOBAL_THREADS_EXPLICIT.store(true, std::sync::atomic::Ordering::Relaxed);
+    if n_threads == 0 {
+        return Err("thread count must be positive".to_string());
+    }
     rayon::ThreadPoolBuilder::new()
         .num_threads(n_threads)
         .build_global()
-        .map_err(|e| format!("failed to configure thread pool with {n_threads} threads: {e}"))
+        .map_err(|e| format!("failed to configure thread pool with {n_threads} threads: {e}"))?;
+    GLOBAL_THREADS_EXPLICIT.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
 }
 
 /// Build a fit-scoped Rayon pool with the ferx worker stack and an explicit thread
@@ -128,7 +139,7 @@ pub(crate) fn build_fit_pool(n_threads: usize) -> Result<rayon::ThreadPool, Stri
 pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        let n_threads = if GLOBAL_THREADS_EXPLICIT.load(std::sync::atomic::Ordering::Relaxed) {
+        let n_threads = if GLOBAL_THREADS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire) {
             rayon::current_num_threads()
         } else {
             default_thread_count()
@@ -5311,6 +5322,15 @@ mod tests {
         // must still leave at least one worker thread.
         assert_eq!(cap_default_threads(1), 1);
         assert_eq!(cap_default_threads(0), 1);
+    }
+
+    #[test]
+    fn configure_global_thread_pool_rejects_zero() {
+        // `0` must be rejected rather than silently forwarded to Rayon, which would
+        // otherwise interpret it as "pick automatically" and mask the caller's intent
+        // (and would incorrectly mark GLOBAL_THREADS_EXPLICIT). Returns before touching
+        // the process-wide pool, so this is safe to run alongside other tests.
+        assert!(configure_global_thread_pool(0).is_err());
     }
 
     #[test]

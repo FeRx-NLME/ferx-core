@@ -17,7 +17,7 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
        an explicit --data overrides it, with a warning if they differ.
 
 --threads N    use N rayon workers (N > 0)
---threads 0    use the default worker count (available cores - 1, capped at 8)
+--threads 0    use the default worker count (available cores - 1, floored at 1, capped at 8)
 --threads auto alias for --threads 0
 
 --output PATH  also write a portable .fitrx fit bundle (zip of JSON+CSV)
@@ -112,7 +112,7 @@ fn main() {
     // need is applied by fit()'s own fit-scoped pool (api::default_fit_pool), so the
     // global pool keeps the platform-default stack here rather than reserving a second
     // 32 MiB × N. Without --threads, fit() applies its own default (available cores - 1,
-    // capped at 8 — #707).
+    // floored at 1, capped at 8 — #707).
     if let Some(n) = threads {
         if let Err(e) = ferx_core::configure_global_thread_pool(n) {
             eprintln!("Warning: {e}");

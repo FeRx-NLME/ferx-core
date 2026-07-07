@@ -22,8 +22,8 @@ section of the SDLC for the versioning policy).
 ### Changed
 - **Default thread count capped at 8** (#707): when `threads` is unset (or
   `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R
-  binding — the engine now defaults to `available cores - 1`, capped at 8,
-  instead of one worker per logical core. Most fits gain little from
+  binding — the engine now defaults to `available cores - 1` (floored at 1),
+  capped at 8, instead of one worker per logical core. Most fits gain little from
   scaling past a handful of cores, and not all cores are equal on
   asymmetric platforms (e.g. Apple Silicon's E-cores). An explicit
   `threads = N` / `--threads N` still pins the exact count requested.
