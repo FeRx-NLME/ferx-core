@@ -23,14 +23,16 @@
 //! **non-zero `init(...)` initial conditions**; static covariates; a constant
 //! `obs_scale` divisor, an **η-dependent expression `obs_scale`** divisor (`obs_scale =
 //! expr(θ,η)`, applied as the subject-static quotient on the static walk, #486), and
-//! **LTBS** (`log(DV) ~ …`) output transforms; the built-in igd/transit input-rate
-//! forcings (#430/#468); up to [`MAX_ODE_SENS_DIM`] individual parameters. Both the full
+//! **LTBS** (`log(DV) ~ …`) output transforms; all five built-in input-rate
+//! forcings (igd/transit/weibull/first_order/zero_order, #430/#468/#530);
+//! **estimated lagtime** (incl. compartment-indexed `ALAG{cmt}`) for every forcing
+//! except `weibull()`; up to [`MAX_ODE_SENS_DIM`] individual parameters. Both the full
 //! `Dual2` **outer** gradient and a light `Dual1` **inner** η-gradient
 //! ([`ode_subject_eta_grad`]) are served (#410).
 //!
 //! **Not yet supported** (falls back to the gradient-free / FD path): steady-state
-//! dosing, lagtime (incl. compartment-indexed `ALAG{cmt}`), `weibull()` and other
-//! input-rate forcings beyond igd/transit, IOV, SDE/diffusion, expression `obs_scale`
+//! dosing, `weibull()` **combined with an estimated lagtime** (its `β < 1` onset has
+//! no closed-form rate-on saltation), IOV, SDE/diffusion, expression `obs_scale`
 //! **combined with LTBS or time-varying covariates**, time-varying covariates, and
 //! **θ/η referenced *directly* in a Form C readout** (these need extra direct
 //! readout-gradient terms beyond the individual-parameter chain; reference them via

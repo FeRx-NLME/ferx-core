@@ -164,8 +164,11 @@ pub fn validate_weibull(td: f64, beta: f64) -> Result<(), String> {
 ///
 /// Domain: `dur > 0` (enforce upstream with [`validate_zero_order`]). Unlike the
 /// smooth densities, the rate has a **hard cutoff at `tad = dur`**: callers on the
-/// ODE path must break the integration timeline there, and the `∂R_in/∂dur`
-/// boundary impulse is FD-only until #530 (see [`InputRateKind::supported_over_dual`]).
+/// ODE path must break the integration timeline there. The `∂R_in/∂dur` splits
+/// into a smooth magnitude term (carried by the pointwise `dur` dual) and a
+/// moving-boundary impulse at the cutoff, which the analytic ODE provider now
+/// injects as a rate-off saltation (#530) — so this kind is lifted to `Dual2`
+/// ([`InputRateKind::supported_over_dual`] = `true`), not FD-only.
 ///
 /// This is the readable reference form (used by tests and one-shot callers); the
 /// ODE hot path goes through [`InputRateForcing::prepare`] +
@@ -236,10 +239,12 @@ pub enum InputRateKind {
     /// Zero-order (constant-rate) absorption over a modeled duration —
     /// `zero_order(dur)`. `R_in = dose/dur` on `(0, dur]`, else 0 (#504). Unlike
     /// the smooth densities above, this has a **hard cutoff at `tad = dur`**: the
-    /// ODE timeline must place a break there (see `predictions.rs`), and its
-    /// `∂R_in/∂dur` is a moving boundary that the pointwise `Dual2` walk cannot
-    /// express, so it stays on the FD fallback ([`Self::supported_over_dual`])
-    /// until the boundary-impulse mechanism lands (#530).
+    /// ODE timeline must place a break there (see `predictions.rs`). Its
+    /// `∂R_in/∂dur` has a smooth magnitude term plus a moving-boundary impulse at
+    /// the cutoff; the analytic ODE provider delivers the window as a per-segment
+    /// constant and injects the rate-off saltation for that boundary term (#530),
+    /// so this kind is now lifted to `Dual2` ([`Self::supported_over_dual`] =
+    /// `true`) rather than FD-only.
     ZeroOrder,
     /// First-order (Bateman) absorption — `first_order(ka)`. `R_in = dose·ka·
     /// e^{−ka·tad}` (#505). The existing first-order absorption exposed as an
