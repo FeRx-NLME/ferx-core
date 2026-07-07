@@ -1209,10 +1209,10 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let in_block: HashSet<String> = all_assigned.iter().cloned().collect();
     let forward_refs = collect_forward_refs(&indiv_stmts, &in_block);
     if !forward_refs.is_empty() {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen: HashSet<(String, String)> = HashSet::new();
         let mut msgs: Vec<String> = Vec::new();
         for (used, defining) in &forward_refs {
-            if seen.insert(format!("{used}\u{0}{defining}")) {
+            if seen.insert((used.clone(), defining.clone())) {
                 msgs.push(format!("`{used}` (used in `{defining}`)"));
             }
         }
