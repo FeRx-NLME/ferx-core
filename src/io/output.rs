@@ -1758,11 +1758,11 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     // separately (#713) so a chain like `[focei, imp]` reports where the wall
     // time actually went instead of one opaque total.
     writeln!(f, "\nestimation:").map_err(|e| e.to_string())?;
-    for (m, secs) in result
-        .method_chain
-        .iter()
-        .zip(result.method_wall_times_secs.iter())
-    {
+    // Index explicitly rather than `.zip()`: a length mismatch (only expected
+    // for a pre-#713 `.fitrx` bundle, where `method_wall_times_secs` defaults
+    // to empty) must not silently drop trailing `method_chain` keys.
+    for (i, m) in result.method_chain.iter().enumerate() {
+        let secs = result.method_wall_times_secs.get(i).copied().unwrap_or(0.0);
         let key = m.label().to_lowercase().replace('-', "_");
         writeln!(f, "  {}_wall_time_secs: {:.6}", key, secs).map_err(|e| e.to_string())?;
     }
@@ -3078,6 +3078,24 @@ mod tests {
             yaml.contains("  covariance_wall_time_secs: 8.300000"),
             "{yaml}"
         );
+    }
+
+    #[test]
+    fn write_yaml_timing_survives_short_method_wall_times_secs() {
+        // #713 review: a `.fitrx` bundle saved before this field existed
+        // deserializes `method_wall_times_secs` to an empty Vec (`#[serde(default)]`)
+        // while `method_chain` is unaffected. Indexing with `.get(i)` must still
+        // emit every `{method}_wall_time_secs` key (at 0.0) rather than silently
+        // truncating via `.zip()`.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.method_chain = vec![EstimationMethod::FoceI, EstimationMethod::Imp];
+        r.method_wall_times_secs = vec![];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(yaml.contains("  focei_wall_time_secs: 0.000000"), "{yaml}");
+        assert!(yaml.contains("  imp_wall_time_secs: 0.000000"), "{yaml}");
     }
 
     #[test]

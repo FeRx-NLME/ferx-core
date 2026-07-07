@@ -167,13 +167,13 @@ fn evaluate_at_initial_params(
 
     let mut warnings = Vec::new();
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let cov_timer = std::time::Instant::now();
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            match compute_covariance(
+            let cov_timer = std::time::Instant::now();
+            let cm = match compute_covariance(
                 &x,
                 init_params,
                 model,
@@ -199,11 +199,11 @@ fn evaluate_at_initial_params(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
-    let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
 
     OuterResult {
         params,
@@ -1314,13 +1314,13 @@ fn optimize_nlopt(
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let cov_timer = std::time::Instant::now();
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            match compute_covariance(
+            let cov_timer = std::time::Instant::now();
+            let cm = match compute_covariance(
                 &x0,
                 init_params,
                 model,
@@ -1346,11 +1346,11 @@ fn optimize_nlopt(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
-    let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
 
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());
@@ -1744,13 +1744,13 @@ fn optimize_bfgs(
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let cov_timer = std::time::Instant::now();
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            match compute_covariance(
+            let cov_timer = std::time::Instant::now();
+            let cm = match compute_covariance(
                 &x_final,
                 init_params,
                 model,
@@ -1776,11 +1776,11 @@ fn optimize_bfgs(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
-    let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
 
     if !converged {
         warnings.push("Outer optimization did not converge".to_string());
@@ -5554,6 +5554,10 @@ mod tests {
             result.ofv.is_finite(),
             "presearch run produced non-finite OFV"
         );
+        // #713: with `run_covariance_step = false` the covariance block never
+        // runs, so its timer must report exactly 0.0, not a stray near-zero
+        // `Instant::now()` reading.
+        assert_eq!(result.covariance_wall_time_secs, 0.0);
     }
 
     // ── Covariance Hessian throughput benchmark (issue #209) ─────────────────

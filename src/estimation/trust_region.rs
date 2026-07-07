@@ -398,13 +398,13 @@ pub fn optimize_trust_region(
     }
 
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let cov_timer = std::time::Instant::now();
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            match compute_covariance(
+            let cov_timer = std::time::Instant::now();
+            let cm = match compute_covariance(
                 &best_x,
                 init_params,
                 model,
@@ -430,11 +430,11 @@ pub fn optimize_trust_region(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
-    let covariance_wall_time_secs = cov_timer.elapsed().as_secs_f64();
 
     OuterResult {
         params: final_params,
