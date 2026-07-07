@@ -1025,6 +1025,59 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String
     ))
 }
 
+/// Validate a `SS` (steady-state) dataset cell.
+///
+/// NONMEM overloads `SS`: `0` = not steady state, `1` = reset the dose
+/// compartment to zero and initialise it at the steady state of the given
+/// regimen, `2` = *superimpose* that steady state on top of the compartment's
+/// pre-existing amounts (no reset). ferx implements `SS=1` only.
+///
+/// The engine carries steady state as a single `DoseEvent.ss: bool`, so once a
+/// cell is reduced to that flag the `1`-vs-`2` distinction is gone. Previously
+/// any `SS >= 0.5` — including `SS=2` — was collapsed to `ss = true` and run
+/// with `SS=1` (reset) semantics, so an `SS=2` record produced a wrong (reset)
+/// profile with no error. `0` maps to `false`, `1` to `true`; every other value
+/// (including `SS=2`) is rejected here. Full `SS=2` support is tracked in #694.
+///
+/// A missing / blank / non-numeric cell arrives as `0.0` (via [`parse_f64`]) and
+/// is treated as "not steady state", matching the NONMEM default. `time` is the
+/// user-written (`raw_time`) value so the message names the row's own time.
+fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
+    if !ss.is_finite() {
+        return Err(format!(
+            "subject {id}, time {time}: SS={ss} is not finite; expected 0 (not \
+             steady state) or 1 (reset then dose to steady state)."
+        ));
+    }
+    // `SS` is a NONMEM integer code. Match on the integer form (mirrors
+    // `validate_dose_rate`); a non-integer `SS` is not a code. `ss as i64`
+    // saturates, so an out-of-range integer can't alias 0/1. Comparison against
+    // `0.0` is exempt from clippy::float_cmp.
+    let code = if ss.fract() == 0.0 {
+        Some(ss as i64)
+    } else {
+        None
+    };
+    match code {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => {
+            let hint = if code == Some(2) {
+                " SS=2 (superimpose the steady state without resetting the \
+                 compartment) is not yet supported — only SS=1 (reset then dose \
+                 to steady state) is implemented; see issue #694."
+            } else {
+                ""
+            };
+            Err(format!(
+                "subject {id}, time {time}: SS={ss} is not a supported \
+                 steady-state code; expected 0 (not steady state) or 1 (reset \
+                 then dose to steady state).{hint}"
+            ))
+        }
+    }
+}
+
 /// Compute a record's effective EVID.
 ///
 /// When an `EVID` column is present its value governs (a blank / `.` /
@@ -1424,10 +1477,19 @@ fn parse_subject(
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64(s))
                 .unwrap_or(0.0);
-            let ss = ss_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s.trim()) >= 0.5)
-                .unwrap_or(false);
+            // Validate the `SS` cell: only `SS=0`/`SS=1` are supported. A missing
+            // or blank cell parses to `0.0` (not steady state). `SS=2` and other
+            // codes are rejected here (via `validate_ss`) rather than silently
+            // collapsed into the single `ss = true` flag and run with `SS=1`
+            // (reset) semantics. `raw_time` names the value the user wrote.
+            let ss = validate_ss(
+                ss_col
+                    .and_then(|c| row.get(c))
+                    .map(|s| parse_f64(s.trim()))
+                    .unwrap_or(0.0),
+                id,
+                raw_time,
+            )?;
 
             doses.push(match rate_mode {
                 RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
@@ -1882,6 +1944,28 @@ mod tests {
     }
 
     #[test]
+    fn ss2_dose_row_is_rejected() {
+        // An `SS=2` dose (superimpose steady state without reset) must not load
+        // silently as `SS=1` (reset) — reading the dataset fails end-to-end with a
+        // message that identifies the row and points at the tracking issue. This
+        // is the wiring test for `validate_ss` on the real parse path.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+                   1,0,.,1,100,1,0,1,2,24\n\
+                   1,1,5.0,0,.,1,0,0,0,0\n";
+        let f = write_csv(csv);
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("SS=2") && err.contains("#694"), "{err}");
+
+        // SS=1 on the same layout still loads (the regimen ferx does support).
+        let ok = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+                  1,0,.,1,100,1,0,1,1,24\n\
+                  1,1,5.0,0,.,1,0,0,0,0\n";
+        let f = write_csv(ok);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.subjects[0].doses[0].ss);
+    }
+
+    #[test]
     fn unknown_iov_column_is_rejected() {
         // A requested IOV column that isn't in the header is a hard error, not a
         // silent "no occasions" — otherwise an IOV model would quietly collapse.
@@ -2225,6 +2309,44 @@ mod tests {
         // Ordinary data-driven rates classify as Fixed.
         assert_eq!(validate_dose_rate(0.0, "1", 0.0).unwrap(), RateMode::Fixed);
         assert_eq!(validate_dose_rate(50.0, "1", 0.0).unwrap(), RateMode::Fixed);
+    }
+
+    // ── NONMEM SS codes: only 0/1 supported ──────────────────────────────────
+    // The engine stores steady state as a single `DoseEvent.ss: bool`. `SS=1`
+    // (reset then equilibrate) and `SS=2` (superimpose without reset) are
+    // *different* regimens, but both used to collapse to `ss = true` (`SS >= 0.5`)
+    // and run with SS=1 semantics — so an SS=2 record silently produced a wrong
+    // (reset) profile. `validate_ss` is the unit under test: 0/1 pass, everything
+    // else (SS=2, other codes, non-integers, non-finite) is rejected loudly.
+    #[test]
+    fn validate_ss_accepts_0_and_1_rejects_others() {
+        // The only supported codes: 0 = not steady state, 1 = reset then dose to
+        // steady state.
+        assert!(!validate_ss(0.0, "1", 0.0).unwrap());
+        assert!(validate_ss(1.0, "1", 0.0).unwrap());
+
+        // SS=2 (superimpose without reset) is not supported — rejected loudly,
+        // not silently collapsed to SS=1. The message names the value, the row,
+        // and the tracking issue so the offending record is identifiable.
+        let e = validate_ss(2.0, "7", 12.0).unwrap_err();
+        assert!(
+            e.contains("SS=2") && e.contains("#694") && e.contains("subject 7"),
+            "{e}"
+        );
+
+        // Other codes and non-integers are not rounded into 0/1 — a stray SS is
+        // malformed, not a silent steady-state regimen.
+        for s in [3.0, -1.0, 0.5, 1.5] {
+            let e = validate_ss(s, "1", 0.0).unwrap_err();
+            assert!(e.contains(&format!("SS={s}")), "s={s}: {e}");
+        }
+
+        // Non-finite SS on a dose row is malformed (old code: `inf >= 0.5` was a
+        // silent steady-state dose).
+        for s in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let e = validate_ss(s, "1", 0.0).unwrap_err();
+            assert!(e.contains("not finite"), "s={s}: {e}");
+        }
     }
 
     #[test]

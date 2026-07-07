@@ -182,6 +182,14 @@ section of the SDLC for the versioning policy).
   from `ferx check` or at fit time. Such an out-of-order reference is now rejected loudly,
   naming the offending variable; reorder the block so each name is declared before it is
   used. This mirrors the existing `[odes]` undefined-reference guard (#314).
+- **`SS=2` steady-state dose records are now rejected instead of silently run as
+  `SS=1`** (#729): NONMEM `SS=2` (superimpose the steady state of a regimen on top
+  of the compartment's existing amounts, without resetting) was collapsed to the
+  same internal `ss = true` flag as `SS=1` (reset then equilibrate) — every
+  `SS >= 0.5` cell became `SS=1` — so an `SS=2` dataset fitted, predicted, and
+  simulated with the wrong (reset) initial conditions and no warning. The data
+  reader now accepts only `SS=0`/`SS=1` and rejects `SS=2` (and any other code)
+  with a clear message. Full `SS=2` support is tracked in #694.
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point
