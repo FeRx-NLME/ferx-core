@@ -6381,43 +6381,54 @@ fn apply_ode_template(extracted: &mut ExtractedBlocks) -> Result<(), String> {
 /// The equivalent shares the model's `[parameters]`/`[individual_parameters]`/… blocks
 /// verbatim and swaps only the disposition, so its θ/η layout matches the closed-form model
 /// exactly (the dispatch can hand it the same parameter vector). Scoped to the plain
-/// `cl/v/n/mtt` form with no `lagtime=`/`f=` mapping and no user `[odes]`/`[scaling]` block;
-/// anything else returns `None` (and stays closed-form, still rejected up front for the
-/// features it cannot serve) — extending it is a follow-up.
+/// `one_cpt_transit(cl,v,n,mtt)` and `two_cpt_transit(cl,v1,q,v2,n,mtt)` forms with no
+/// `lagtime=`/`f=` mapping and no user `[odes]`/`[scaling]` block; anything else returns
+/// `None` (and stays closed-form, still rejected up front for the features it cannot serve).
 fn transit_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> {
-    let transit_re = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
-    let args_str = extracted
-        .unnamed
-        .get("structural_model")?
-        .iter()
-        .find_map(|l| transit_re.captures(l.trim()))?
-        .get(1)?
-        .as_str()
-        .to_string();
+    // Match the plain closed-form transit disposition — 1-cpt `cl/v/n/mtt` or
+    // 2-cpt `cl/v1/q/v2/n/mtt`. Any other structural form stays closed-form.
+    let structural = extracted.unnamed.get("structural_model")?;
+    let one_re = Regex::new(r"^pk\s+one_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
+    let two_re = Regex::new(r"^pk\s+two_cpt_transit\s*\(([^)]*)\)\s*$").unwrap();
+    let (args_str, is_two_cpt, pk_label) =
+        if let Some(caps) = structural.iter().find_map(|l| one_re.captures(l.trim())) {
+            (
+                caps.get(1)?.as_str().to_string(),
+                false,
+                "pk one_cpt_transit",
+            )
+        } else if let Some(caps) = structural.iter().find_map(|l| two_re.captures(l.trim())) {
+            (
+                caps.get(1)?.as_str().to_string(),
+                true,
+                "pk two_cpt_transit",
+            )
+        } else {
+            return None;
+        };
     // A user-written [odes]/[scaling] block is outside the plain-form scope. An
-    // [initial_conditions] block is too: the equivalent's single `central` state cannot carry
-    // a transit `depot` seed, and transit-init has its own parse-time validation on the
-    // primary model — building the equivalent would pre-empt that with a confusing error.
+    // [initial_conditions] block is too: the equivalent's disposition states (central,
+    // and periph for 2-cpt) cannot carry a transit `depot` seed, and transit-init has its
+    // own parse-time validation on the primary model — building the equivalent would
+    // pre-empt that with a confusing error.
     if extracted.unnamed.contains_key("odes")
         || extracted.unnamed.contains_key("scaling")
         || extracted.unnamed.contains_key("initial_conditions")
     {
         return None;
     }
-    let roles = parse_role_pairs(&args_str, "pk one_cpt_transit").ok()?;
-    let allowed = ["cl", "v", "n", "mtt"];
+    let roles = parse_role_pairs(&args_str, pk_label).ok()?;
+    let allowed: &[&str] = if is_two_cpt {
+        &["cl", "v1", "q", "v2", "n", "mtt"]
+    } else {
+        &["cl", "v", "n", "mtt"]
+    };
     if roles.keys().any(|k| !allowed.contains(&k.as_str())) {
         return None; // a lagtime=/f= (or other) mapping — outside the scope.
     }
-    let (cl, v, n, mtt) = (
-        roles.get("cl")?,
-        roles.get("v")?,
-        roles.get("n")?,
-        roles.get("mtt")?,
-    );
     // Re-emit every block verbatim except the disposition (deterministic order), then append
     // the ODE twin. Parsing this source yields a normal ODE model — it contains no
-    // `pk one_cpt_transit`, so it does not recurse into this desugar.
+    // `pk one_cpt_transit`/`pk two_cpt_transit`, so it does not recurse into this desugar.
     let mut src = String::new();
     let mut names: Vec<&String> = extracted.unnamed.keys().collect();
     names.sort();
@@ -6446,11 +6457,38 @@ fn transit_ode_equivalent_source(extracted: &ExtractedBlocks) -> Option<String> 
         }
         src.push('\n');
     }
-    src.push_str("[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n");
-    src.push_str(&format!(
-        "[odes]\n  d/dt(central) = transit(n={n}, mtt={mtt}) - ({cl}/{v}) * central\n\n"
-    ));
-    src.push_str(&format!("[scaling]\n  obs_scale = {v}\n\n"));
+    // Disposition twin. The micro-constant flux mirrors `ode_template::generate`'s
+    // matching case exactly — 1-cpt: `ke = cl/v`; 2-cpt: `k10 = cl/v1`, `k12 = q/v1`,
+    // `k21 = q/v2`, observed on `central` — so the ODE twin describes the same linear
+    // system as the exponential-tilting closed form (pinned by the closed-form↔ODE
+    // equivalence test, `tests/transit_analytic_equivalence.rs`).
+    if is_two_cpt {
+        let (cl, v1, q, v2, n, mtt) = (
+            roles.get("cl")?,
+            roles.get("v1")?,
+            roles.get("q")?,
+            roles.get("v2")?,
+            roles.get("n")?,
+            roles.get("mtt")?,
+        );
+        src.push_str("[structural_model]\n  ode(obs_cmt=central, states=[central, periph])\n\n");
+        src.push_str(&format!(
+            "[odes]\n  d/dt(central) = transit(n={n}, mtt={mtt}) - ({cl}/{v1} + {q}/{v1}) * central + ({q}/{v2}) * periph\n  d/dt(periph) = ({q}/{v1}) * central - ({q}/{v2}) * periph\n\n"
+        ));
+        src.push_str(&format!("[scaling]\n  obs_scale = {v1}\n\n"));
+    } else {
+        let (cl, v, n, mtt) = (
+            roles.get("cl")?,
+            roles.get("v")?,
+            roles.get("n")?,
+            roles.get("mtt")?,
+        );
+        src.push_str("[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n");
+        src.push_str(&format!(
+            "[odes]\n  d/dt(central) = transit(n={n}, mtt={mtt}) - ({cl}/{v}) * central\n\n"
+        ));
+        src.push_str(&format!("[scaling]\n  obs_scale = {v}\n\n"));
+    }
     Some(src)
 }
 

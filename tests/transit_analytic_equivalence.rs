@@ -725,6 +725,83 @@ fn two_cpt_transit_with_bioavailability_matches_ode() {
 /// Fixed-parameter population OFV at several eta values — drives the analytic
 /// **sensitivity** path (`run_obs` two_cpt_transit branch, the exact
 /// `∂f/∂{cl,v1,q,v2,n,mtt,η}` jets), the 2-cpt counterpart of `transit_ofv_matches_ode`.
+/// Regression (2-cpt asymmetry): a `two_cpt_transit` model with a mid-profile `TIME`
+/// switch used to be **rejected** — the ODE-equivalent desugar was 1-cpt only — while
+/// the identical 1-cpt model transparently rerouted (cf.
+/// `transit_time_desugar_matches_hand_written_ode`). It now carries a 2-cpt ODE twin
+/// (`central` + `periph`) that predict() / the gradient route TIME/TV-cov subjects to,
+/// matching a hand-written 2-cpt transit ODE.
+#[test]
+fn two_cpt_transit_time_desugar_matches_hand_written_ode() {
+    let header = "\
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVCL_LATE(0.30, 0.001, 10.0)
+  theta TVV1(8.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(1.5, 0.05, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  if (TIME > 6.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  NTR = TVNTR
+  MTT = TVMTT
+";
+    let shorthand = format!(
+        "{header}\n[structural_model]\n  pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=V2, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let hand_ode = format!(
+        "{header}\n[structural_model]\n  ode(obs_cmt=central, states=[central, periph])\n\n\
+         [odes]\n  \
+         d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V1 + Q/V1) * central + (Q/V2) * periph\n  \
+         d/dt(periph)  = (Q/V1) * central - (Q/V2) * periph\n\n\
+         [scaling]\n  obs_scale = V1\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let sh = parse_full_model(&shorthand)
+        .expect("2-cpt transit + TIME parses (was rejected before the twin existed)")
+        .model;
+    let hd = parse_full_model(&hand_ode)
+        .expect("hand 2-cpt ODE parses")
+        .model;
+    assert!(
+        sh.ode_spec.is_none() && sh.transit_ode_equivalent.is_some(),
+        "2-cpt transit + TIME shorthand must carry an ODE equivalent (primary stays closed-form)"
+    );
+    let pop = population(
+        vec![bolus(0.0, 100.0)],
+        vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0],
+    );
+    let ps = predict(&sh, &pop, &sh.default_params);
+    let ph = predict(&hd, &pop, &hd.default_params);
+    assert_eq!(ps.len(), ph.len());
+    assert!(!ps.is_empty());
+    for (x, y) in ps.iter().zip(ph.iter()) {
+        assert!(
+            (x.pred - y.pred).abs() <= 1e-9 + 1e-9 * x.pred.abs(),
+            "t={:.3}: desugared {:.6} vs hand ODE {:.6}",
+            x.time,
+            x.pred,
+            y.pred
+        );
+    }
+    assert!(
+        ps.iter().any(|p| p.time > 6.0) && ps.iter().any(|p| p.time < 6.0),
+        "observations must straddle the TIME switch"
+    );
+}
+
 #[test]
 fn two_cpt_transit_ofv_matches_ode() {
     use ferx_core::stats::likelihood::individual_nll;

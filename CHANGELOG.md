@@ -51,6 +51,11 @@ section of the SDLC for the versioning policy).
   repeated-event rows) are rejected with a clear error rather than silently
   producing a wrong answer; `predict_survival()` reports first-event survival for
   RTTE (use its `cum_hazard` field for the recurrent `E[N(t)]`).
+- **`two_cpt_transit` now supports time-varying covariates and `TIME`-dependent parameters** (#724):
+  a 2-cpt transit model whose disposition switches mid-profile is transparently routed to an exact
+  ODE `transit()` twin (`central` + `periph`), exactly as `one_cpt_transit` already was — instead
+  of being rejected. This removes the 1-cpt/2-cpt asymmetry. IOV, steady-state, infusion, and reset
+  doses on a transit closed form remain rejected (use an explicit ODE `transit()` model for those).
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
   model.ferx`, `ferx check model.ferx`, and the public `fit_from_files()`
