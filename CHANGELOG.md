@@ -250,6 +250,19 @@ section of the SDLC for the versioning policy).
   that silent no-op, pointing at the bare `f=`/`lagtime=` mapping (e.g. `f=F1`) or an `ode(...)`
   model. A parameter that *is* correctly mapped (`pk(..., f=F1)`) is unaffected — its value was, and
   remains, applied as bioavailability/lag.
+- **Flip-flop transit models now evaluate correctly instead of returning a zero
+  profile** (#733): when a `pk one_cpt_transit(...)` / `two_cpt_transit(...)` model's
+  individual parameters put the disposition rate at or above the transit rate
+  (`ke ≥ KTR`, or `α ≥ KTR` for 2-cpt — the flip-flop regime of a slow-absorption
+  depot), the exponential-tilting closed form is outside its convergence domain and
+  clamped the prediction *and its gradient* to `0`, silently degenerating a
+  proportional-error objective. `predict()`, `simulate()`, `fit()` and the
+  diagnostics now route such a model — per evaluation — to its exact ODE `transit()`
+  twin, which is valid in that regime (matched to a NONMEM ADVAN13 transit
+  simulation to ~1e-4). A flip-flop model that carries a `lagtime`, bioavailability
+  `f`, or user `[odes]` block has no twin to route to; it keeps the closed form's
+  zero, and the `W_TRANSIT_FLIP_FLOP` warning stays actionable rather than becoming
+  the informational auto-routed note.
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point
