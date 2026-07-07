@@ -868,6 +868,106 @@ fn tte_convergence_exponential_fixed_matches_survreg() {
     );
 }
 
+// ── RTTE (repeated TTE, clock-forward) — tests/reference/rtte_exponential ──────
+
+const RTTE_REF_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/reference/rtte_exponential/rtte_exp.csv"
+);
+
+const RTTE_FIT_FIXED: &str = r"
+[parameters]
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+";
+
+const RTTE_FIT_MIXED: &str = r"
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+";
+
+/// Cross-tool, exact: a fixed-effects (n_eta=0) constant-hazard RTTE fit must recover the
+/// analytic pooled Poisson-process MLE `lambda = D / Σ_i T_i = 305 / 2000 = 0.15250` on
+/// the committed dataset (the RTTE analogue of the survreg exponential anchor), and the
+/// OFV must equal the closed-form `-2 logL`. Both are exact and license-free. Critically,
+/// this fails on the pre-RTTE per-record accumulation: summing independent single-event
+/// terms over-counts the cumulative hazard by `Σ_k H(t_k)`, so both `lambda` and the OFV
+/// would be wrong.
+#[test]
+fn rtte_convergence_fixed_matches_mle() {
+    let model = parse_model_string(RTTE_FIT_FIXED).expect("fixed RTTE model must parse");
+    assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_REF_CSV, None, None, None)
+        .expect("reference CSV reads");
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+
+    // rtte_exp.csv: D = 305 events; 100 subjects each observed over [0, 20] ⇒ exposure 2000.
+    let lambda_mle: f64 = 305.0 / 2000.0; // 0.15250
+    let m2ll_mle: f64 = -2.0 * (305.0 * lambda_mle.ln() - lambda_mle * 2000.0);
+    let lambda = r.theta[0];
+    eprintln!(
+        "[rtte fixed] lambda = {lambda:.6} (MLE {lambda_mle:.6}), OFV = {:.4} (analytic {m2ll_mle:.4})",
+        r.ofv
+    );
+
+    assert!(
+        (lambda - lambda_mle).abs() / lambda_mle < 1e-3,
+        "fixed RTTE rate {lambda:.6} must match analytic MLE {lambda_mle:.6}"
+    );
+    assert!(
+        (r.ofv - m2ll_mle).abs() < 1e-2,
+        "fixed RTTE OFV {:.4} must match analytic -2logL {m2ll_mle:.4}",
+        r.ofv
+    );
+}
+
+/// Cross-tool: a mixed-effects (frailty) RTTE FOCEI fit must reproduce NONMEM LAPLACE and
+/// the exact Poisson-lognormal GLMM MLE on the committed dataset — TVLAMBDA ≈ 0.1406,
+/// omega^2 ≈ 0.1645, OFV ≈ 1748.49 (see `tests/reference/rtte_exponential/expected.md`).
+/// FOCEI is deterministic, so the bands are tight. The frailty omega^2 is well-identified
+/// here because the data is event-rich; the Karlsson Laplace bias is a low-event-rate
+/// effect, so FOCEI, SAEM, NONMEM and the GLMM all coincide on this design.
+#[test]
+fn rtte_convergence_mixed_matches_nonmem() {
+    let model = parse_model_string(RTTE_FIT_MIXED).expect("mixed RTTE model must parse");
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_REF_CSV, None, None, None)
+        .expect("reference CSV reads");
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+    let lambda = r.theta[0];
+    let omega2 = r.omega[(0, 0)];
+    eprintln!(
+        "[rtte mixed] TVLAMBDA = {lambda:.5} omega^2 = {omega2:.5} OFV = {:.4}  (NONMEM 0.14062 / 0.16450 / 1748.49)",
+        r.ofv
+    );
+
+    // NONMEM LAPLACE: 0.140618 / 0.164496 / 1748.493. Poisson-LN GLMM MLE: 0.14062 / 0.16455.
+    assert!(
+        (0.132..0.150).contains(&lambda),
+        "TVLAMBDA {lambda:.5} off the NONMEM/GLMM value ~0.1406"
+    );
+    assert!(
+        (0.140..0.190).contains(&omega2),
+        "omega^2 {omega2:.5} off the NONMEM/GLMM value ~0.1645"
+    );
+    assert!(
+        (r.ofv - 1748.493).abs() < 0.2,
+        "OFV {:.4} must match NONMEM LAPLACE 1748.493",
+        r.ofv
+    );
+}
+
 /// Cross-tool, exact: a FIXED-EFFECTS (n_eta=0) competing-risks exponential fit
 /// must recover each cause's closed-form MLE `λ̂_k = d_k / Σ_i t_i` — identical to
 /// base-R `survreg(dist="exponential")` fitted per cause (other-cause events as

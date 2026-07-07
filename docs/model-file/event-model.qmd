@@ -22,6 +22,8 @@ including data format, hazard families, and comparison with nlmixr2 / NONMEM.
   gamma  = <expression> # Gompertz only: hazard growth rate
   loghr  = <expression> # optional (all families): proportional-hazards covariate term;
                         #   multiplies the full hazard by exp(loghr)
+  type   = tte          # tte (default, single event) | rtte (repeated events)
+  clock  = forward      # RTTE only: forward (default, total time) | reset (gap time)
 ```
 
 > **Expression namespace:** expressions are evaluated in the theta / eta / covariate
@@ -78,6 +80,51 @@ PK and the event model share the same random effects (a common frailty). Notes:
   clear error rather than silently emitting no event rows).
 
 See [Joint PK-TTE](../estimation/tte.qmd#joint-pk-tte) for a worked example.
+
+## Repeated events (RTTE) {#rtte}
+
+Set `type = rtte` when a subject can experience the **same event more than once**
+(recurrent seizures, hypoglycaemic episodes, exacerbations). The data then carries
+several `DV = 1` rows per subject on the TTE CMT, in time order, typically ending in a
+`DV = 0` administrative-censoring row at the end of observation:
+
+```
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)   # frailty shared across a subject's events
+```
+
+The `clock` key selects how the hazard measures time between events:
+
+| `clock`     | Model | Likelihood | Status |
+|-------------|-------|-----------|--------|
+| `forward` (default) | Andersen–Gill / total time — hazard is a function of *absolute* time; the cumulative hazard is **not** reset at events | `Σ_k log h(t_k) − H(T)` | supported |
+| `reset`     | Renewal / gap time — hazard depends on time *since the previous event*; the accumulator resets at each event | `Σ_k log h(Δ_k) − Σ_k H(Δ_k)` | later slice (rejected for now) |
+
+For a time-homogeneous hazard (e.g. exponential) the two clocks coincide; they differ
+only when the hazard varies with time (Weibull, Gompertz, or a covariate-on-time term).
+
+::: {.callout-warning}
+## Estimation method for RTTE
+
+Laplace-based methods (`focei`, `foce`, the Gauss–Newton variants) can **severely
+underestimate the frailty variance ω²** for RTTE at low event rates (Karlsson et al.
+2009 report −91 % to −96 % bias below a 43 % event rate). ferx emits a warning and
+recommends **`method = saem`** or **`method = imp`**, which are unbiased. Laplace remains
+available and is fine for fixed-effects or high-event-rate RTTE.
+:::
+
+Notes:
+
+- Repeated-event rows must be **sorted by TIME** within each subject; out-of-order rows
+  are rejected at the fit boundary (the clock-forward likelihood telescopes the
+  cumulative hazard across a subject's records).
+- `clock` is only valid with `type = rtte`.
+- A **drug-driven ODE hazard** (`hazard =`) with `type = rtte` is a later slice and is
+  rejected for now — use an analytic `family` for repeated events.
+- Left truncation (`TENTRY`) applies to the subject's first record.
 
 ## TTE-only models
 

@@ -1324,6 +1324,59 @@ pub(crate) fn check_transit_support(
     None
 }
 
+/// Reject an RTTE (repeated-event) endpoint whose per-subject records are not in
+/// nondecreasing time order.
+///
+/// The clock-forward RTTE likelihood ([`crate::survival::rtte_forward_nll_from_curves`])
+/// integrates the cumulative hazard **once** across a subject's records, using each
+/// record's time as the lower limit for the next — a telescoping sum that is only
+/// correct when the records are time-sorted. Out-of-order rows would produce a finite
+/// but wrong NLL (a silent-wrong-answer). The data reader appends TTE rows in file
+/// order, so this catches an unsorted dataset (or a hand-built `Population`) up front.
+/// Returns `None` when there is no RTTE endpoint or every subject's rows are ordered.
+#[cfg(feature = "survival")]
+fn check_rtte_record_ordering(model: &CompiledModel, population: &Population) -> Option<String> {
+    use crate::types::{EndpointLikelihood, ObsRecord, TteRecurrence};
+    let rtte_cmts: Vec<usize> = model
+        .endpoints
+        .iter()
+        .filter_map(|(cmt, ep)| {
+            matches!(
+                ep,
+                EndpointLikelihood::Tte {
+                    recurrence: TteRecurrence::Repeated { .. },
+                    ..
+                }
+            )
+            .then_some(*cmt)
+        })
+        .collect();
+    if rtte_cmts.is_empty() {
+        return None;
+    }
+    for subject in &population.subjects {
+        for &cmt in &rtte_cmts {
+            let mut prev = f64::NEG_INFINITY;
+            for r in &subject.obs_records {
+                let ObsRecord::Event { time, cmt: c, .. } = r;
+                if *c != cmt {
+                    continue;
+                }
+                if *time < prev {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has records out of time order \
+                         (t={time} follows t={prev}). Repeated-event rows must be sorted by TIME \
+                         per subject so the cumulative hazard accumulates correctly.",
+                        subject.id
+                    ));
+                }
+                prev = *time;
+            }
+        }
+    }
+    None
+}
+
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
 /// the oral **depot** amount on a subject carrying an EVID=3/4 reset.
 ///
@@ -2301,6 +2354,13 @@ pub fn fit(
     // the depot amount can't be superposed across an EVID=3/4 reset, so predicting
     // would silently read a zero depot. Fail loudly instead.
     if let Some(e) = check_analytic_readout_support(model, population) {
+        return Err(e);
+    }
+    // RTTE (repeated-event) clock-forward likelihood telescopes the cumulative hazard
+    // across a subject's records in time order, so out-of-order rows would silently
+    // corrupt the NLL. Reject them up front.
+    #[cfg(feature = "survival")]
+    if let Some(e) = check_rtte_record_ordering(model, population) {
         return Err(e);
     }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
@@ -3553,6 +3613,35 @@ fn fit_inner(
                 format!("SAEM: {w}")
             });
         }
+    }
+
+    // RTTE (repeated time-to-event) fit under a Laplace-based method (FOCE/FOCEI/GN)
+    // severely underestimates the frailty variance ω² at low event rates (Karlsson et
+    // al. 2009: −91% to −96% bias below a 43% event rate). SAEM and IMP are unbiased.
+    // Warn but keep Laplace available — it is fast and fine for fixed-effects or
+    // high-event-rate RTTE. §3.3 of `plans/tte-survival-markov.md`. Only fire when the
+    // model actually carries a frailty (`n_eta > 0`); a fixed-effects RTTE fit has no
+    // ω² to underestimate, so the warning would be spurious.
+    #[cfg(feature = "survival")]
+    if model.has_rtte()
+        && model.n_eta > 0
+        && chain.iter().any(|&m| {
+            matches!(
+                m,
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::FoceGn
+                    | EstimationMethod::FoceGnHybrid
+            )
+        })
+    {
+        pre_run_warnings.push(
+            "RTTE fit under a Laplace-based method (FOCE/FOCEI/GN) can severely \
+             underestimate the frailty variance ω² at low event rates (Karlsson et al. \
+             2009). Prefer `method = saem` or `method = imp`; Laplace remains available \
+             for fixed-effects or high-event-rate RTTE."
+                .to_string(),
+        );
     }
 
     // Capture thread count before chain runs (current_num_threads() reports
@@ -6154,7 +6243,8 @@ fn validate_ode_tte_simulatable(
         matches!(
             model.endpoints.get(cmt),
             Some(EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. }
+                hazard: HazardSpec::OdeAccumulated { .. },
+                ..
             })
         )
     };
@@ -6162,7 +6252,8 @@ fn validate_ode_tte_simulatable(
         matches!(
             e,
             EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. }
+                hazard: HazardSpec::OdeAccumulated { .. },
+                ..
             }
         )
     }) {
@@ -7523,7 +7614,7 @@ pub fn predict_survival(
         #[allow(clippy::type_complexity)]
         let mut rows: Vec<(usize, Vec<f64>, Vec<f64>, f64, f64)> = Vec::new();
         for (&cmt, endpoint) in &model.endpoints {
-            let crate::types::EndpointLikelihood::Tte { hazard } = endpoint else {
+            let crate::types::EndpointLikelihood::Tte { hazard, .. } = endpoint else {
                 continue;
             };
             match hazard {
@@ -8328,6 +8419,7 @@ mod iov_integration {
                     family: crate::types::HazardFamily::Exponential,
                     param_fn: Box::new(|_theta, _eta, _cov| vec![0.1]),
                 },
+                recurrence: crate::types::TteRecurrence::Single,
             },
         );
 
