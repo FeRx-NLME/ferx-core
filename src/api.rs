@@ -652,7 +652,11 @@ fn reject_unsupported_adaptive(
         );
     }
     for subject in &population.subjects {
-        if subject.has_tv_covariates() {
+        // `has_tv_covariates()` only inspects the dose/obs snapshot vectors; a
+        // subject whose covariate varies solely on EVID=2 rows carries it in
+        // `pk_only_covariates`, which that predicate misses. Test it explicitly so
+        // a dose-free, zero-observation EVID=2 subject can't slip past frozen at t=0.
+        if subject.has_tv_covariates() || !subject.pk_only_covariates.is_empty() {
             return Err(format!(
                 "adaptive-dosing simulation does not yet support time-varying covariates \
                  (subject '{}'): the reactive driver resolves each subject's PK once from the \
@@ -5539,6 +5543,36 @@ mod tests {
         assert!(subject.has_tv_covariates());
         let err = reject_unsupported_adaptive(&model, &adaptive_pop(subject))
             .expect_err("a subject with time-varying covariates must be rejected");
+        assert!(
+            err.to_lowercase().contains("time-varying") && err.to_lowercase().contains("covariate"),
+            "error should cite time-varying covariates: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_rejects_pk_only_covariate_subject() {
+        use crate::parser::model_parser::parse_model_string;
+        // A covariate that varies only on EVID=2 rows lands in `pk_only_covariates`,
+        // which `has_tv_covariates()` does NOT inspect — so a dose-free, zero-obs
+        // subject built from such rows would slip past the guard and be silently
+        // simulated with PK frozen at t=0. The guard tests `pk_only_covariates`
+        // directly; this pins that (the `has_tv_covariates()` assert proves the
+        // check is load-bearing — without it this subject is wrongly accepted).
+        let model = parse_model_string(PLAIN_ADAPTIVE_MODEL).expect("plain model parses");
+        let mut subject = adaptive_base_subject();
+        subject.obs_times = Vec::new();
+        subject.observations = Vec::new();
+        subject.obs_cmts = Vec::new();
+        subject.cens = Vec::new();
+        subject.pk_only_times = vec![24.0];
+        subject.pk_only_covariates =
+            vec![std::collections::HashMap::from([("WT".to_string(), 90.0)])];
+        assert!(
+            !subject.has_tv_covariates(),
+            "pk_only snapshots must be invisible to has_tv_covariates() for this test to bite"
+        );
+        let err = reject_unsupported_adaptive(&model, &adaptive_pop(subject))
+            .expect_err("a subject with EVID=2 time-varying covariates must be rejected");
         assert!(
             err.to_lowercase().contains("time-varying") && err.to_lowercase().contains("covariate"),
             "error should cite time-varying covariates: {err}"
