@@ -582,6 +582,118 @@ mod survival_smoke {
         );
     }
 
+    /// Clock-reset gap-time RTTE supports a right-censored row only as the subject's final
+    /// record: a mid-stream censor would restart the renewal clock (censoring does not reset
+    /// it), so the next gap would be measured from the censor instead of the last event —
+    /// diverging from the gap-time NONMEM anchor. Reachable via ordinary data (the datareader
+    /// flushes a mid-stream DV=0 as a RightCensored before the next event), so it must be
+    /// rejected at the fit boundary rather than silently mis-measured.
+    #[test]
+    fn rtte_reset_mid_stream_censor_is_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let mut pop = rtte_pop();
+        // Right-censored row at t=8 sits BEFORE a later event at t=12 (mid-stream censor).
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 8.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 12.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("mid-stream censor under clock=reset must be rejected");
+        assert!(
+            err.contains("right-censored") && err.contains("CMT=2"),
+            "error should flag the mid-stream censor, got: {err}"
+        );
+    }
+
+    /// Two clock-reset events at the same TIME give a zero inter-event gap, which the gap-time
+    /// hazard cannot represent (h(0) folds to the sentinel). The order guard uses strict `<`,
+    /// so equal times pass it — the fit boundary must reject the tie rather than silently
+    /// poison the subject's likelihood.
+    #[test]
+    fn rtte_reset_tied_event_times_are_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let mut pop = rtte_pop();
+        // Two events at the identical TIME=5 (zero inter-event gap).
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("tied event times under clock=reset must be rejected");
+        assert!(
+            err.contains("same TIME") && err.contains("CMT=2"),
+            "error should flag the zero-gap tied events, got: {err}"
+        );
+    }
+
     /// RTTE simulation is a later slice (3.3); `simulate*` must reject an RTTE model
     /// loudly rather than draw a single event per subject (`simulate_tte` would collapse
     /// a subject's repeated events into one competing-risks draw — a silent wrong answer).

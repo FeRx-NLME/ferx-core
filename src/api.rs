@@ -1342,19 +1342,40 @@ pub(crate) fn check_transit_support(
 ///     the lower limit for the next), and clock-reset measures each inter-event gap
 ///     `Δ = t − t_prev`; unsorted rows give a finite-but-wrong NLL (forward) or a negative
 ///     gap that folds to `1e20` (reset).
+///   * **`entry_time > TIME`** — a left-truncation entry after the record's own time gives
+///     a negative first gap (reset) or `H(entry) > H(TIME)` (forward), both folded to the
+///     sentinel. The datareader skips such rows on load; a hand-built caller bypasses that.
+///
+/// And, for **`clock = reset`** endpoints only (clock-forward telescopes absolute `H` and
+/// is unaffected):
+///
+///   * **mid-stream right-censoring** — a censoring does not reset the renewal clock, so a
+///     `RightCensored` row before a later record would measure the next gap from the censor
+///     rather than the last event (and diverge from the gap-time NONMEM anchor). Gap-time
+///     RTTE supports a censor only as the subject's final record; interrupted-observation
+///     renewal is a later slice.
+///   * **tied event times** — two events at the same `TIME` give a zero gap `Δ = 0`, which
+///     the gap-time hazard cannot represent (`h(0)` folds to the sentinel).
 ///
 /// Returns `None` when there is no RTTE endpoint or every subject's rows are valid.
 #[cfg(feature = "survival")]
 fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<String> {
-    use crate::types::{EndpointLikelihood, EventType, ObsRecord, TteRecurrence};
+    use crate::types::{EndpointLikelihood, EventType, ObsRecord, RtteClock, TteRecurrence};
     let mut rtte_cmts: Vec<usize> = Vec::new();
+    // Clock-reset endpoints carry an extra data-shape contract (a censor may only be the
+    // final record, gaps must be strictly positive); track them so those checks stay
+    // scoped to reset and don't reject clock-forward data that telescopes fine.
+    let mut reset_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (cmt, ep) in &model.endpoints {
         if let EndpointLikelihood::Tte {
-            recurrence: TteRecurrence::Repeated { .. },
+            recurrence: TteRecurrence::Repeated { clock },
             ..
         } = ep
         {
             rtte_cmts.push(*cmt);
+            if matches!(clock, RtteClock::Reset) {
+                reset_cmts.insert(*cmt);
+            }
         }
     }
     if rtte_cmts.is_empty() {
@@ -1363,6 +1384,9 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
     for subject in &population.subjects {
         for &cmt in &rtte_cmts {
             let mut prev = f64::NEG_INFINITY;
+            // Reset only: whether a right-censored row has already been seen for this
+            // subject+cmt — any record after it is a mid-stream censor (rejected below).
+            let mut seen_censor = false;
             for r in &subject.obs_records {
                 let ObsRecord::Event {
                     time,
@@ -1410,6 +1434,42 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                          per subject so the cumulative hazard accumulates correctly.",
                         subject.id
                     ));
+                }
+                // Clock-reset (gap-time) data-shape contract. The renewal clock resets only
+                // at EVENTS and each gap is measured from the previous event, so two shapes
+                // that pass every generic check above are still ill-posed under reset and
+                // would silently fold to the 1e20 sentinel or diverge from the gap-time
+                // definition. Reject them for reset endpoints only — clock-forward telescopes
+                // absolute H across a subject's records and is unaffected by either.
+                if reset_cmts.contains(&cmt) {
+                    // A right-censored row before a later record is a mid-stream censor: a
+                    // censoring does NOT reset the renewal clock, so the following gap would
+                    // be measured from the censor instead of the last event (also diverging
+                    // from the NONMEM gap-time anchor, which advances the clock only on
+                    // events). Interrupted-observation renewal is a later slice; fail loud.
+                    if seen_censor {
+                        return Some(format!(
+                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has a \
+                             right-censored (DV=0) row before a later record. Gap-time RTTE \
+                             supports right-censoring only as the final record per subject; a \
+                             mid-stream censor would restart the renewal clock. Use \
+                             clock=forward for interrupted-observation data.",
+                            subject.id
+                        ));
+                    }
+                    // Two events at the same TIME give a zero inter-event gap (Δ = 0), which
+                    // the gap-time hazard cannot represent — h(0) folds to the sentinel.
+                    if matches!(event_type, EventType::Exact) && *time == prev {
+                        return Some(format!(
+                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has two events \
+                             at the same TIME={time} (zero inter-event gap). Repeated events \
+                             must have strictly increasing times so each gap Δ > 0.",
+                            subject.id
+                        ));
+                    }
+                    if matches!(event_type, EventType::RightCensored) {
+                        seen_censor = true;
+                    }
                 }
                 prev = *time;
             }
@@ -7659,10 +7719,13 @@ fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64 {
 /// **RTTE (`type = rtte`) semantics.** This computes single-event quantities from the
 /// hazard curve, so for a repeated-event endpoint `survival`, `median_survival`,
 /// `mean_survival` and `cif` describe **time to the *first* event**, not the recurrent
-/// process. The recurrent quantity — the expected event count `E[N(t)] = H(t)` — is the
-/// `cum_hazard` field (with `hazard` its rate `h(t)`). A recurrence-aware predictor is a
-/// later slice (3.3); until then read `cum_hazard`/`hazard` for RTTE, not the survival
-/// summaries.
+/// process. For `clock = forward` (Andersen–Gill), the recurrent quantity — the expected
+/// event count `E[N(t)] = H(t)` — is the `cum_hazard` field (with `hazard` its rate
+/// `h(t)`). For `clock = reset` (gap-time / renewal), `cum_hazard` is the cumulative
+/// hazard of a single gap evaluated at *absolute* time and is **not** the renewal mean
+/// `E[N(t)]`, so it is not a meaningful recurrent quantity here. A recurrence-aware
+/// predictor is a later slice (3.3); until then read `cum_hazard`/`hazard` only for
+/// clock-forward RTTE, not the survival summaries and not for clock-reset.
 ///
 /// Returns an empty Vec when the model has no TTE endpoints.
 #[cfg(feature = "survival")]
