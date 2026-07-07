@@ -6400,9 +6400,44 @@ fn emit_subject_rows<R: rand::Rng>(
     #[cfg(not(feature = "survival"))]
     let _ = horizon;
 
-    // Use the same TV-covariate-aware dispatcher as estimation and post-fit
-    // diagnostics. For no-TV subjects this stays on the one-pk-param fast path.
-    let ipreds = pk::compute_predictions_with_tv(model, subject, &params.theta, eta_slice);
+    // Predict IPRED. For IOV models (`n_kappa > 0`) route through the
+    // occasion-aware `predict_iov`, drawing one independent κ ~ N(0, Ω_IOV) per
+    // occasion — otherwise every occasion would share the same (κ = 0) parameters
+    // and the simulated data would carry NO inter-occasion variability, silently
+    // under-dispersing a VPC relative to the fitted model / NONMEM `$SIM`. The
+    // caller zeroes the κ tail of `eta_slice`; only the BSV head (`..n_eta`) is
+    // used here, and the κ draws happen on this occasion-aware branch instead.
+    // Non-IOV models keep the TV-covariate-aware fast-path dispatcher unchanged
+    // and draw no extra randoms, so their output is byte-identical.
+    let ipreds = if model.n_kappa > 0 {
+        let omega_iov = params
+            .omega_iov
+            .as_ref()
+            .expect("omega_iov is present whenever the model declares kappa (n_kappa > 0)");
+        // One κ vector per occasion group, in `iov_occasion_groups` order — the
+        // exact order `predict_iov` indexes its `kappas` argument by. Empty when
+        // the subject carries no occasion labels, in which case `predict_iov`
+        // falls back to κ = 0 (matching the fit-time no-occasion diagnostic).
+        let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
+        let kappas: Vec<Vec<f64>> = (0..occ_groups.len())
+            .map(|_| {
+                let z: Vec<f64> = (0..model.n_kappa).map(|_| rng.sample(normal)).collect();
+                (&omega_iov.chol * DVector::from_column_slice(&z))
+                    .iter()
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        pk::predict_iov(
+            model,
+            subject,
+            &params.theta,
+            &eta_slice[..model.n_eta],
+            &kappas,
+        )
+    } else {
+        pk::compute_predictions_with_tv(model, subject, &params.theta, eta_slice)
+    };
 
     // Add residual error (Gaussian path). IIV on residual error (#409): the
     // drawn `eta_slice` includes η_ruv, so scale the residual variance by

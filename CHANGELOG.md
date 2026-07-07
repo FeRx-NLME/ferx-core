@@ -27,6 +27,12 @@ section of the SDLC for the versioning policy).
   `environment:` section (OS, CPU architecture, whether running in Docker, OS
   username, ferx version) for troubleshooting and reproducibility. Both are also carried on
   `FitResult.environment` and round-trip through `.fitrx` bundles.
+- **`simulate()` now samples inter-occasion variability (kappa)** (#723): simulating
+  an IOV model draws an independent `kappa ~ N(0, Omega_IOV)` for each occasion
+  (matching NONMEM `$SIM`), instead of holding every kappa at zero. Simulated /
+  VPC datasets from IOV models now carry the between-occasion spread the model
+  parameterizes; previously they silently under-dispersed relative to the fitted
+  model. Non-IOV models are unaffected (bit-identical output).
 
 ### Added
 - **Optional `[data]` model-file block** (#690): a model can now declare

@@ -148,8 +148,10 @@ any censored row, since the within-subject decorrelation would otherwise mix the
 LLOQ into the uncensored rows. NPDE also requires more replicates than a subject
 has observations (`npde_nsim > n_obs`) for a full-rank simulated covariance;
 otherwise that subject's NPDE is `NaN` (NPD is still computed). For IOV (`kappa`)
-models the simulation holds kappas at zero (the existing `simulate()` convention),
-so NPDE/NPD omit the inter-occasion component of the predictive variance.
+models the NPDE/NPD simulation currently holds kappas at zero, so NPDE/NPD omit
+the inter-occasion component of the predictive variance. (This is specific to the
+NPDE path; `simulate()` itself samples per-occasion kappas — see
+[Simulation](simulation.qmd#simulation-process). Aligning NPDE is a follow-up.)
 
 ## Estimation Methods
 
