@@ -308,14 +308,17 @@ impl DoseEvent {
 /// The headroom here therefore bounds how many structural parameters an ODE
 /// model can declare.
 ///
-/// This must be a compile-time constant because the Enzyme autodiff backend
-/// requires stack-allocated arrays of statically-known size along the AD path
-/// (a `Vec` would break differentiation). The cost of a larger ceiling is
-/// purely stack: each `PkParams` holds `MAX_PK_PARAMS * 8` bytes, and a few
-/// scratch buffers in `ode/predictions.rs` size themselves the same way. At
-/// 128 that is ~1 KB per instance — negligible — while leaving room for
-/// complex multi-analyte models (e.g. simultaneous parent/metabolite systems
-/// with ~20+ structural parameters).
+/// This must be a compile-time constant because the hand-rolled `Dual2`
+/// analytic sensitivities (`src/sens/provider.rs`) build stack arrays
+/// `[Dual2<M>; MAX_PK_PARAMS]` inside the per-observation loop, and Rust
+/// array lengths must be known at compile time (a `Vec` there would mean a
+/// heap allocation per observation on the FOCE/FOCEI hot path). The cost of
+/// a larger ceiling is stack, on two fronts: `PkParams` holds
+/// `MAX_PK_PARAMS * 8` bytes (~1 KB at 128, negligible), but the `Dual2`
+/// arrays scale with both the slot count and the dual width `M` (capped at
+/// `MAX_SCALE_AXES = 16`) — up to ~279 KB per array at the current ceiling,
+/// constructed per observation on rayon worker threads (~2 MB stacks). See
+/// `tests/large_ode_slot_headroom.rs` for the stack-safety smoke tests.
 pub const MAX_PK_PARAMS: usize = 128;
 
 pub const PK_IDX_CL: usize = 0;
