@@ -1037,8 +1037,16 @@ pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
         let data_csv_bytes = read_bytes(&mut archive, "data.csv")?;
         let tmp = tempfile::NamedTempFile::new()?;
         std::fs::write(tmp.path(), &data_csv_bytes)?;
+        // data.csv is bundled with its original headers, so honour the model's
+        // `[data]` column mapping (#730) when re-reading — otherwise a fit that
+        // mapped e.g. `DV = CONC` cannot round-trip through load_fit. Parse the
+        // bundled model source for the map; fall back to no mapping if it can't
+        // be parsed (leave the read to fail with its own diagnostic).
+        let column_map = crate::parser::model_parser::parse_full_model(&model_source)
+            .map(|m| m.column_map)
+            .unwrap_or_default();
         Some(
-            crate::io::datareader::read_nonmem_csv(tmp.path(), None, None)
+            crate::io::datareader::read_nonmem_csv_mapped(tmp.path(), None, None, &column_map)
                 .map_err(FitrxError::Corrupt)?,
         )
     } else {
@@ -2125,6 +2133,68 @@ mod tests {
         assert_eq!(loaded.model_source, "model source\n");
         assert!(loaded.population.is_none());
         assert_eq!(loaded.manifest.format_version, FORMAT_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_bundled_data_honours_column_mapping() {
+        // #730 regression: data.csv is bundled with its original headers, so
+        // load_fit must read it through the model's `[data]` column mapping.
+        // Before the fix the loader used the unmapped reader and failed with
+        // `Missing TIME column` on a TAFD/CONC dataset.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mapped.fitrx");
+
+        // A dataset whose time/response columns are named TAFD/CONC.
+        let data_csv = dir.path().join("input.csv");
+        std::fs::write(
+            &data_csv,
+            "ID,TAFD,CONC,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n1,2,3.0,0,.\n",
+        )
+        .unwrap();
+
+        // Valid model that maps TAFD→TIME and CONC→DV in its `[data]` block.
+        let model_source = "\
+[parameters]
+  theta TVCL(1.0)
+  theta TVV(1.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[data]
+  path = input.csv
+  TIME = TAFD
+  DV   = CONC
+";
+
+        // `p` must line up with `minimal_fit_result`'s subjects for the bundle's
+        // predictions.csv join; the mapped read under test is of the separate
+        // `include_data` file, not `p`.
+        let r = minimal_fit_result();
+        let p = dummy_population(&["S1", "S2"], 3);
+        save_fit(
+            &r,
+            &p,
+            model_source,
+            &path,
+            SaveFitOptions {
+                include_data: Some(data_csv.clone()),
+            },
+        )
+        .unwrap();
+
+        let loaded = load_fit(&path).expect("load_fit reads the mapped TAFD/CONC data.csv");
+        let pop = loaded.population.expect("data.csv was bundled");
+        // The mapping fed CONC into DV: real observations were parsed.
+        let n_obs: usize = pop.subjects.iter().map(|s| s.observations.len()).sum();
+        assert_eq!(n_obs, 2, "mapped observations should be read");
+        assert!(!pop.covariate_names.contains(&"TAFD".to_string()));
+        assert!(!pop.covariate_names.contains(&"CONC".to_string()));
     }
 
     #[test]
