@@ -40,8 +40,6 @@ section of the SDLC for the versioning policy).
 - **`-h`/`--help` flag for the `ferx` CLI** (#688): `ferx --help`, `ferx check --help`,
   and `ferx summary --help` now print usage to stdout and exit 0, matching standard
   CLI convention (previously only printed on no-args/bad-args, to stderr, exit 1).
-
-### Added
 - **`ferx check` warns when `[scaling] obs_scale` references the same individual
   parameter bound to a built-in `pk <model>(...)` block's `v`/`v1` role** (#712):
   the closed-form kernel already divides by that volume internally to produce
