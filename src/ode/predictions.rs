@@ -1735,6 +1735,30 @@ fn reject_unsupported_dose_compartment(
     Ok(ode.dose_attr_map.f_bio(cmt, pk_params_flat))
 }
 
+/// PK snapshot governing a segment boundary at time `t`, for the per-event
+/// (time-varying-covariate / `TIME`-built-in) adaptive path (#700). Mirrors the
+/// NONMEM end-of-interval convention of [`ode_predictions_event_driven`]: a real
+/// record — an observation or EVID=2 (pk-only) row — at `t` contributes its own
+/// per-event snapshot; any other break (a decision-only time or an infusion end,
+/// neither a data record) carries the previous record's PK forward (LOCF). Shared
+/// by the reactive driver and its frozen-replay static engine so the two resolve
+/// PK identically and stay bit-aligned.
+fn segment_pk_at(
+    t: f64,
+    obs_map: &HashMap<u64, Vec<usize>>,
+    pk_only_map: &HashMap<u64, usize>,
+    event_pk: &crate::pk::EventPkParams,
+    last_pk: PkParams,
+) -> PkParams {
+    if let Some(&j) = obs_map.get(&t.to_bits()).and_then(|idxs| idxs.first()) {
+        return event_pk.obs[j];
+    }
+    if let Some(&m) = pk_only_map.get(&t.to_bits()) {
+        return event_pk.pk_only[m];
+    }
+    last_pk
+}
+
 /// Reactive ("adaptive" / feedback) ODE prediction over a single subject (#391
 /// S1.3). Walks a fixed `decision_times` schedule, and at each decision lets
 /// `controller` read the current state (through the declared `monitors`) and
@@ -1824,6 +1848,7 @@ pub(crate) fn ode_predictions_adaptive(
     ode_predictions_adaptive_impl(
         ode,
         pk_params_flat,
+        None,
         theta,
         eta,
         subject,
@@ -1848,6 +1873,15 @@ pub(crate) fn ode_predictions_adaptive(
 pub(crate) fn ode_predictions_adaptive_impl(
     ode: &OdeSpec,
     pk_params_flat: &[f64],
+    // Per-event PK for the base subject (#700). `Some` ⇒ time-varying-covariate /
+    // `TIME`-built-in path: PK is resolved per segment from these snapshots
+    // (`event_pk.obs[j]` / `event_pk.pk_only[m]`) instead of the frozen
+    // `pk_params_flat`, and observation / pk-only times become segment breaks.
+    // `None` ⇒ the constant-covariate path, byte-identical to before (`pk_params_flat`
+    // threads through every segment). The base subject is dose-free, so `event_pk.dose`
+    // is unused; controller-injected doses take their PK from the carried-forward
+    // (LOCF) snapshot at injection time.
+    event_pk: Option<&crate::pk::EventPkParams>,
     theta: &[f64],
     eta: &[f64],
     subject: &Subject,
@@ -1858,6 +1892,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     assay: Option<&AssayNoise>,
 ) -> Result<AdaptiveRun, String> {
     let n = ode.n_states;
+    let tv = event_pk.is_some();
 
     // --- Preconditions (typed errors, never silent) ----------------------
     if !subject.doses.is_empty() {
@@ -1887,7 +1922,37 @@ pub(crate) fn ode_predictions_adaptive_impl(
 
     // --- Running state ---------------------------------------------------
     let n_obs = subject.obs_times.len();
-    let mut u = ode.initial_state(pk_params_flat);
+
+    // Per-event PK seed for the TV path (#700): the snapshot at the subject's
+    // earliest record (obs or pk-only), mirroring `ode_predictions_event_driven`'s
+    // init so a covariate-dependent `init(state)=expr` is seeded correctly. Only
+    // read when `tv`; the constant path seeds `u` from `pk_params_flat` as before.
+    let init_pk: PkParams = match event_pk {
+        Some(ev) => {
+            let mut best: Option<(f64, PkParams)> = None;
+            for (j, &t) in subject.obs_times.iter().enumerate() {
+                if best.map_or(true, |(bt, _)| t < bt) {
+                    best = Some((t, ev.obs[j]));
+                }
+            }
+            for (m, &t) in subject.pk_only_times.iter().enumerate() {
+                if best.map_or(true, |(bt, _)| t < bt) {
+                    best = Some((t, ev.pk_only[m]));
+                }
+            }
+            best.map(|(_, p)| p).unwrap_or_default()
+        }
+        None => PkParams::default(),
+    };
+    // Most-recent real record's PK, carried forward (LOCF) across non-record
+    // breaks and updated as the loop crosses obs / pk-only records. Unused (`!tv`).
+    let mut last_pk: PkParams = init_pk;
+
+    let mut u = if tv {
+        ode.initial_state(&init_pk.values)
+    } else {
+        ode.initial_state(pk_params_flat)
+    };
     let mut predictions = vec![f64::NAN; n_obs];
     let mut ledger: Vec<DoseLedgerEntry> = Vec::new();
     let mut decisions: Vec<DecisionLogEntry> = Vec::new();
@@ -1895,6 +1960,13 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // Shadow subject accumulates the controller's realized doses (the #324
     // pattern); `integrate_segment` reads `shadow.doses` for the TAD anchor.
     let mut shadow = subject.clone();
+    // Bioavailability `F` captured at each injected dose's injection time (from the
+    // LOCF PK there), parallel to `shadow.doses`. A delivered dose's F is fixed when
+    // it is given — later covariate drift must not retroactively rescale it — so
+    // segments read F from here rather than re-resolving from the segment PK. On the
+    // constant path this equals `f_bio(cmt, pk_params_flat)` for every dose, so the
+    // per-segment infusion window is byte-identical to before.
+    let mut injected_f: Vec<f64> = Vec::new();
 
     // Extended params: PK params + TAFD/TAD anchors. TAFD (slot MAX_PK_PARAMS)
     // stays NaN until the first dose arrives; TAD is set per segment inside
@@ -1907,6 +1979,14 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
     for (i, &t) in shadow.obs_times.iter().enumerate() {
         obs_map.entry(t.to_bits()).or_default().push(i);
+    }
+    // Time -> pk-only (EVID=2) event index, for the per-event PK resolver; empty
+    // on the constant path.
+    let mut pk_only_map: HashMap<u64, usize> = HashMap::new();
+    if tv {
+        for (m, &t) in subject.pk_only_times.iter().enumerate() {
+            pk_only_map.entry(t.to_bits()).or_insert(m);
+        }
     }
 
     // Decision time -> 0-based index, for the in-loop hook.
@@ -1921,12 +2001,18 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // (sorted) list dynamically inside the loop (see `insert_break`), which is why
     // the walk below is a `while` over a growing `Vec` rather than a fixed range.
     // With no infusions issued the timeline never grows, so the bolus-only path is
-    // byte-identical to before. Observations are deliberately NOT break points —
-    // they are recorded via `saveat` *inside* a segment, exactly as
-    // `ode_predictions` does. Breaking at observations too would reinitialize the
-    // adaptive integrator at each one and perturb the step sequence, so the segment
-    // structure (and the result) would no longer match the static engine on the
-    // same realized doses.
+    // byte-identical to before.
+    //
+    // On the constant-covariate path observations are deliberately NOT break points
+    // — they are recorded via `saveat` *inside* a segment, exactly as
+    // `ode_predictions` does; breaking at each one would reinitialize the integrator
+    // and perturb the step sequence, so the segment structure (and the bit-exact
+    // match to the static engine on the same realized doses) is preserved. On the
+    // time-varying path (#700) the covariate — hence CL/V/KA — changes only at
+    // obs / pk-only records, so those times MUST become segment boundaries for the
+    // per-event PK to stay piecewise-constant; the frozen-replay static engine adds
+    // the identical breaks, so the two still share `integrate_segment` over
+    // identical segments and stay bit-aligned.
     let t_last = shadow
         .obs_times
         .iter()
@@ -1935,6 +2021,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
         .fold(0.0_f64, f64::max);
     let mut break_times: Vec<f64> = vec![0.0, t_last];
     break_times.extend(decision_times.iter().cloned());
+    if tv {
+        break_times.extend(shadow.obs_times.iter().cloned());
+        break_times.extend(shadow.pk_only_times.iter().cloned());
+    }
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
@@ -1943,6 +2033,21 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let mut k = 0;
     while k < break_times.len() {
         let t_start = break_times[k];
+
+        // PK snapshot in effect at this break's left boundary `t_start`: the record
+        // there (obs / pk-only) or the LOCF carry-forward (`last_pk`) on the TV path
+        // (#700), the frozen `pk_params_flat` on the constant path. Drives the
+        // decision-time readouts and the bioavailability of any dose injected here —
+        // a dose's F is fixed at injection (LOCF of the covariate to the decision).
+        let readout_pk = match event_pk {
+            Some(ev) => segment_pk_at(t_start, &obs_map, &pk_only_map, ev, last_pk),
+            None => PkParams::default(),
+        };
+        let pk_readout: &[f64] = if tv {
+            &readout_pk.values
+        } else {
+            pk_params_flat
+        };
 
         // --- Decision hook: observe (pre-dose trough) -> decide -> dose. ---
         if !stopped {
@@ -1966,16 +2071,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
                     // compiled `observe` expression for the latent value; absent
                     // one (the programmatic path), read the model's cmt readout.
                     let latent = match am.observe {
-                        Some(f) => f(&u, pk_params_flat, theta, eta, decision_cov),
-                        None => read_observable(
-                            ode,
-                            &u,
-                            pk_params_flat,
-                            theta,
-                            eta,
-                            decision_cov,
-                            m.cmt,
-                        ),
+                        Some(f) => f(&u, pk_readout, theta, eta, decision_cov),
+                        None => {
+                            read_observable(ode, &u, pk_readout, theta, eta, decision_cov, m.cmt)
+                        }
                     };
                     // Resolve the monitored signal on its own mode: Ipred is the
                     // latent readout; Dv adds the endpoint's assay residual draw on
@@ -2080,7 +2179,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                                 ode,
                                 cmt,
                                 n,
-                                pk_params_flat,
+                                pk_readout,
                                 decision_index,
                             )?;
                             u[cmt - 1] += f * amt;
@@ -2090,6 +2189,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                             shadow
                                 .doses
                                 .push(DoseEvent::new(t_start, amt, cmt, 0.0, false, 0.0));
+                            injected_f.push(f);
                             ledger.push(DoseLedgerEntry {
                                 subject: shadow.id.clone(),
                                 draw: 0,
@@ -2122,7 +2222,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                                 ode,
                                 cmt,
                                 n,
-                                pk_params_flat,
+                                pk_readout,
                                 decision_index,
                             )?;
                             // Unlike a bolus, an infusion adds nothing to `u` here: it is injected
@@ -2141,6 +2241,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                                 ext_params[crate::types::MAX_PK_PARAMS] = t_start;
                             }
                             shadow.doses.push(dose);
+                            injected_f.push(f);
                             ledger.push(DoseLedgerEntry {
                                 subject: shadow.id.clone(),
                                 draw: 0,
@@ -2197,15 +2298,16 @@ pub(crate) fn ode_predictions_adaptive_impl(
         if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
             for &obs_idx in obs_idxs {
                 let cmt = shadow.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                predictions[obs_idx] = read_observable(
-                    ode,
-                    &u,
-                    pk_params_flat,
-                    theta,
-                    eta,
-                    shadow.obs_cov(obs_idx),
-                    cmt,
-                );
+                // On the TV path each observation reads with its own per-event PK
+                // snapshot (`event_pk.obs[obs_idx]`), consistent with the record-at-
+                // `t_start` PK that propagated the state into this boundary; the
+                // frozen snapshot on the constant path.
+                let obs_pk: &[f64] = match event_pk {
+                    Some(ev) => &ev.obs[obs_idx].values,
+                    None => pk_params_flat,
+                };
+                predictions[obs_idx] =
+                    read_observable(ode, &u, obs_pk, theta, eta, shadow.obs_cov(obs_idx), cmt);
             }
         }
 
@@ -2219,21 +2321,30 @@ pub(crate) fn ode_predictions_adaptive_impl(
         if k + 1 < break_times.len() {
             let t_end = break_times[k + 1];
 
-            // Per-segment lag/F for the realized doses (boluses and infusions):
-            // lag 0 — a nonzero lag is rejected at the decision hook for either
-            // — and F per cmt. Infusions are delivered by `integrate_segment`'s
-            // `active_infusions` over any segment they fully span, which the
-            // dynamic infusion-end breaks guarantee.
-            let dose_lagtimes: Vec<f64> = shadow
-                .doses
-                .iter()
-                .map(|d| ode.dose_attr_map.lagtime(d.cmt, pk_params_flat))
-                .collect();
-            let dose_f_bio: Vec<f64> = shadow
-                .doses
-                .iter()
-                .map(|d| ode.dose_attr_map.f_bio(d.cmt, pk_params_flat))
-                .collect();
+            // PK governing the segment `(t_start, t_end]`: the record at `t_end`
+            // (NONMEM end-of-interval convention) or the LOCF carry-forward on the TV
+            // path (#700), the frozen snapshot otherwise. On the TV path it is written
+            // into `ext_params`'s PK slots (leaving the TAFD/TAD anchors intact) for
+            // the ODE RHS and passed through as the readout PK for any observation
+            // `integrate_segment` records internally.
+            let seg_pk = match event_pk {
+                Some(ev) => segment_pk_at(t_end, &obs_map, &pk_only_map, ev, last_pk),
+                None => PkParams::default(),
+            };
+            let seg_pk_values: &[f64] = if tv { &seg_pk.values } else { pk_params_flat };
+            if tv {
+                ext_params[..crate::types::MAX_PK_PARAMS]
+                    .copy_from_slice(&seg_pk.values[..crate::types::MAX_PK_PARAMS]);
+            }
+
+            // Realized doses are all controller-injected: lag is 0 (a nonzero lag is
+            // rejected at injection) and F was captured at injection time in
+            // `injected_f` (LOCF PK), so a later covariate change can't retroactively
+            // rescale a delivered dose. Infusions are delivered by `integrate_segment`'s
+            // `active_infusions` over any segment they fully span (the dynamic
+            // infusion-end breaks guarantee full containment). On the constant path
+            // `injected_f == f_bio(cmt, pk_params_flat)` for every dose, byte-identical.
+            let dose_lagtimes: Vec<f64> = vec![0.0; shadow.doses.len()];
 
             integrate_segment(
                 ode,
@@ -2242,9 +2353,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 t_end,
                 &shadow,
                 &dose_lagtimes,
-                &dose_f_bio,
+                &injected_f,
                 &mut ext_params,
-                pk_params_flat,
+                seg_pk_values,
                 theta,
                 eta,
                 &obs_map,
@@ -2252,6 +2363,13 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 None,
                 &[],
             );
+
+            // Advance the LOCF carry: after integrating into `t_end`, the record
+            // there (if any) is the most-recent PK. `segment_pk_at` returns `last_pk`
+            // unchanged for a non-record break, so this is a no-op in that case.
+            if tv {
+                last_pk = seg_pk;
+            }
         }
 
         k += 1;
@@ -2309,9 +2427,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
 /// with the realized ledger. The ledger stores nominal `amt`/`rate`
 /// (pre-bioavailability), exactly as a `subject.doses` entry, so `F`/lag re-apply
 /// downstream identically.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_adaptive_frozen_replay(
     ode: &OdeSpec,
     pk_params_flat: &[f64],
+    event_pk: Option<&crate::pk::EventPkParams>,
     theta: &[f64],
     eta: &[f64],
     base_subject: &Subject,
@@ -2325,14 +2445,36 @@ pub(crate) fn verify_adaptive_frozen_replay(
         .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
         .collect();
 
-    let static_preds = ode_predictions_with_extra_breaks(
-        ode,
-        pk_params_flat,
-        theta,
-        eta,
-        &static_subject,
-        decision_times,
-    );
+    // On the time-varying path (#700) the static replay must resolve PK per event
+    // exactly as the reactive driver did — a single frozen snapshot would diverge.
+    // The driver's `event_pk` is reused directly: its obs / pk-only snapshots depend
+    // only on the (unchanged) observation grid and covariates, not on the doses, so
+    // they are identical for the ledger-rebuilt static subject; each dose's realized
+    // F is taken from the ledger. `adaptive_frozen_replay_tv` shares `segment_pk_at`
+    // + `integrate_segment` with the driver, so the two stay bit-aligned. The
+    // constant path keeps the general single-snapshot engine.
+    let static_preds = match event_pk {
+        Some(ev) => {
+            let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
+            adaptive_frozen_replay_tv(
+                ode,
+                ev,
+                theta,
+                eta,
+                &static_subject,
+                &dose_f,
+                decision_times,
+            )
+        }
+        None => ode_predictions_with_extra_breaks(
+            ode,
+            pk_params_flat,
+            theta,
+            eta,
+            &static_subject,
+            decision_times,
+        ),
+    };
 
     if static_preds.len() != run.predictions.len() {
         return Err(format!(
@@ -2365,6 +2507,185 @@ pub(crate) fn verify_adaptive_frozen_replay(
         }
     }
     Ok(())
+}
+
+/// Static, up-front frozen-replay engine for the time-varying-covariate adaptive
+/// path (#700). Rebuilds the trajectory from the realized ledger the way the
+/// reactive driver did, but plans the entire break timeline **up front** from the
+/// frozen ledger (rather than discovering it reactively) — so agreement with the
+/// reactive run still proves the driver's dose bookkeeping. It shares
+/// [`segment_pk_at`] and [`integrate_segment`] with the driver and adds the same
+/// obs / pk-only breaks, so the two walk identical segments with identical
+/// per-event PK and stay **bit-aligned**. Verifier-only; the constant-covariate
+/// path keeps the general single-snapshot [`ode_predictions_with_extra_breaks`].
+///
+/// `dose_f[i]` is the realized bioavailability of ledger dose `i` (the driver's
+/// `f_applied`), so a delivered dose's F is taken as given rather than re-derived —
+/// F correctness is pinned separately by the degenerate oracle against
+/// `ode_predictions_event_driven`.
+#[allow(clippy::too_many_arguments)]
+fn adaptive_frozen_replay_tv(
+    ode: &OdeSpec,
+    event_pk: &crate::pk::EventPkParams,
+    theta: &[f64],
+    eta: &[f64],
+    subject: &Subject,
+    dose_f: &[f64],
+    extra_breaks: &[f64],
+) -> Vec<f64> {
+    let n = ode.n_states;
+    let n_obs = subject.obs_times.len();
+
+    let mut obs_map: HashMap<u64, Vec<usize>> = HashMap::new();
+    for (i, &t) in subject.obs_times.iter().enumerate() {
+        obs_map.entry(t.to_bits()).or_default().push(i);
+    }
+    let mut pk_only_map: HashMap<u64, usize> = HashMap::new();
+    for (m, &t) in subject.pk_only_times.iter().enumerate() {
+        pk_only_map.entry(t.to_bits()).or_insert(m);
+    }
+
+    // Seed PK / state from the earliest record, mirroring the driver's init.
+    let init_pk: PkParams = {
+        let mut best: Option<(f64, PkParams)> = None;
+        for (j, &t) in subject.obs_times.iter().enumerate() {
+            if best.map_or(true, |(bt, _)| t < bt) {
+                best = Some((t, event_pk.obs[j]));
+            }
+        }
+        for (m, &t) in subject.pk_only_times.iter().enumerate() {
+            if best.map_or(true, |(bt, _)| t < bt) {
+                best = Some((t, event_pk.pk_only[m]));
+            }
+        }
+        best.map(|(_, p)| p).unwrap_or_default()
+    };
+    let mut last_pk = init_pk;
+    let mut u = ode.initial_state(&init_pk.values);
+    let mut predictions = vec![f64::NAN; n_obs];
+
+    // Injected doses carry no lag (a nonzero lag is rejected at injection).
+    let dose_lagtimes = vec![0.0; subject.doses.len()];
+
+    let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+    let first_dose_time = subject
+        .doses
+        .iter()
+        .map(|d| d.time)
+        .fold(f64::INFINITY, f64::min);
+    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
+        first_dose_time
+    } else {
+        f64::NAN
+    };
+
+    // The same break set the reactive driver visited: 0, the last time, every dose
+    // time, F-scaled infusion ends, obs / pk-only records, and the decision breaks.
+    let t_last = subject
+        .obs_times
+        .iter()
+        .chain(extra_breaks.iter())
+        .cloned()
+        .fold(0.0_f64, f64::max);
+    let mut break_times: Vec<f64> = vec![0.0, t_last];
+    for (i, d) in subject.doses.iter().enumerate() {
+        break_times.push(d.time);
+        if is_real_infusion(d) {
+            let (_, dur_eff) = d.bioavailable_infusion(dose_f[i]);
+            break_times.push(d.time + dur_eff);
+        }
+    }
+    break_times.extend(subject.obs_times.iter().cloned());
+    break_times.extend(subject.pk_only_times.iter().cloned());
+    break_times.extend(
+        extra_breaks
+            .iter()
+            .copied()
+            .filter(|b| b.is_finite() && *b > 0.0),
+    );
+    break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    if break_times.len() < 2 {
+        break_times.push(break_times[0]);
+    }
+
+    for k in 0..break_times.len() {
+        let t_start = break_times[k];
+
+        // Apply boluses landing at t_start (lag 0) with their realized F — at EVERY
+        // break, including the last. The driver's while-loop processes the final
+        // break too (so a decision at the maximum time still doses and its coincident
+        // observation is read post-dose); the replay must match, or a dose landing at
+        // the last time is silently dropped here (the frozen-replay verifier caught
+        // exactly this). Infusions add nothing here — `integrate_segment`'s
+        // `active_infusions` delivers them over every segment they span.
+        for (i, d) in subject.doses.iter().enumerate() {
+            if (d.time - t_start).abs() >= 1e-12 {
+                continue;
+            }
+            if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt) {
+                let cmt_idx = d.cmt.saturating_sub(1);
+                if cmt_idx < n {
+                    u[cmt_idx] += dose_f[i] * d.amt;
+                }
+            }
+        }
+
+        // Record obs at the left boundary (post-dose) with each observation's own
+        // per-event PK (consistent with the state propagated into this boundary).
+        if let Some(obs_idxs) = obs_map.get(&t_start.to_bits()) {
+            for &obs_idx in obs_idxs {
+                let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
+                predictions[obs_idx] = read_observable(
+                    ode,
+                    &u,
+                    &event_pk.obs[obs_idx].values,
+                    theta,
+                    eta,
+                    subject.obs_cov(obs_idx),
+                    cmt,
+                );
+            }
+        }
+
+        // Integrate `(t_start, t_end]` to the next break, if any. The final break has
+        // no successor — its dose + observation were applied above.
+        if k + 1 < break_times.len() {
+            let t_end = break_times[k + 1];
+            // Segment PK = record at t_end (NONMEM end-of-interval) or LOCF carry —
+            // the identical `segment_pk_at` the driver used.
+            let seg_pk = segment_pk_at(t_end, &obs_map, &pk_only_map, event_pk, last_pk);
+            ext_params[..crate::types::MAX_PK_PARAMS]
+                .copy_from_slice(&seg_pk.values[..crate::types::MAX_PK_PARAMS]);
+
+            integrate_segment(
+                ode,
+                &mut u,
+                t_start,
+                t_end,
+                subject,
+                &dose_lagtimes,
+                dose_f,
+                &mut ext_params,
+                &seg_pk.values,
+                theta,
+                eta,
+                &obs_map,
+                &mut predictions,
+                None,
+                &[],
+            );
+
+            last_pk = seg_pk;
+        }
+    }
+
+    for p in &mut predictions {
+        if *p < 0.0 {
+            *p = 0.0;
+        }
+    }
+    predictions
 }
 
 /// Number of trapezoid panels per inter-decision window for the metrics-only
@@ -2422,8 +2743,10 @@ const ADAPTIVE_AUC_PANELS: usize = 128;
 /// latent — the AUC is always over the un-noised signal, never the assay draw).
 ///
 /// `base_subject` is the dose-free subject the run was driven from; only its doses
-/// are replaced (its covariates carry over — the reactive driver is BSV-only in
-/// this slice, so a single static covariate snapshot is exact).
+/// are replaced (its covariates carry over). This pass uses a **single** PK snapshot
+/// (`pk_params_flat`), exact only for constant-covariate subjects — a time-varying
+/// (or TIME-in-PK) subject with an `auc_target` is rejected upstream in
+/// `run_adaptive_population` (#700), so it never reaches here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn adaptive_window_signal_aucs(
     ode: &OdeSpec,
@@ -4349,6 +4672,202 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_tv_covariate_controller_matches_static_event_driven() {
+        // Degenerate oracle on the time-varying-covariate path (#700): a controller
+        // that ignores state and gives a fixed bolus at every decision must
+        // reproduce the trusted static event-driven engine on the same realized
+        // doses, when the per-event PK drifts across the horizon. CL declines here
+        // (e.g. renal-function decline), so a frozen t=0 snapshot gives a visibly
+        // wrong answer — the whole point of #700.
+        let ode = one_cpt_ode_spec();
+        let v = 10.0;
+        // Decisions coincide with observation rows; CL declines across the horizon.
+        let times = [0.0, 24.0, 48.0, 72.0];
+        let cls = [1.0, 0.7, 0.5, 0.3];
+        let obs_pk: Vec<PkParams> = cls.iter().map(|&cl| pk_one(cl, v)).collect();
+        let event_pk = crate::pk::EventPkParams {
+            dose: Vec::new(),
+            obs: obs_pk.clone(),
+            pk_only: Vec::new(),
+        };
+
+        let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+            actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+            rule: None,
+        };
+        let base = make_subject(vec![], times.to_vec());
+        let run = ode_predictions_adaptive_impl(
+            &ode,
+            &obs_pk[0].values, // t=0 baseline — unused on the TV path
+            Some(&event_pk),
+            &[],
+            &[],
+            &base,
+            &times,
+            &[],
+            &mut decide,
+            100,
+            None,
+        )
+        .expect("driver runs");
+
+        // Trusted static engine: same realized doses, same drifting per-event PK.
+        // Each dose coincides with an obs row, so its LOCF snapshot is that row's PK.
+        let static_doses: Vec<DoseEvent> = times
+            .iter()
+            .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        let static_subject = make_subject(static_doses, times.to_vec());
+        let static_preds = ode_predictions_event_driven(
+            &ode,
+            &static_subject,
+            &[],
+            &[],
+            &obs_pk, // pk_at_dose: dose k coincides with obs k
+            &obs_pk, // pk_at_obs
+            &[],     // pk_at_pk_only
+        );
+
+        assert_eq!(run.predictions.len(), static_preds.len());
+        // Cross-integrator (dense driver vs `solve_ode` static) → solver-tolerance.
+        for (got, want) in run.predictions.iter().zip(static_preds.iter()) {
+            assert_relative_eq!(*got, *want, max_relative = 1e-9);
+        }
+        assert_eq!(run.ledger.len(), 4);
+
+        // Guard against a silent regression to the frozen-t0 path: the same run with
+        // PK frozen at CL=1.0 for the whole horizon must give a materially different
+        // (lower — faster clearance) final prediction.
+        let mut frozen = |_ctx: &ControllerCtx| ControllerDecision {
+            actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+            rule: None,
+        };
+        let frozen_run = ode_predictions_adaptive_impl(
+            &ode,
+            &obs_pk[0].values,
+            None,
+            &[],
+            &[],
+            &base,
+            &times,
+            &[],
+            &mut frozen,
+            100,
+            None,
+        )
+        .expect("frozen driver runs");
+        let tv_last = *run.predictions.last().unwrap();
+        let frozen_last = *frozen_run.predictions.last().unwrap();
+        assert!(
+            (tv_last - frozen_last).abs() > 1e-6 * tv_last.abs().max(1.0),
+            "TV path must differ from the frozen-t0 path: tv={tv_last}, frozen={frozen_last}"
+        );
+    }
+
+    #[test]
+    fn adaptive_tv_frozen_replay_is_bit_exact() {
+        // The TV frozen-replay engine must be BIT-aligned with the reactive driver
+        // (not merely tolerance-close) — the same invariant the constant path pins.
+        // Both share `segment_pk_at` + `integrate_segment` over identical segments.
+        // A hold-mix controller and a decision that falls *between* obs rows (t=12,
+        // exercising the LOCF carry and a decision-only break) make it a real test.
+        let ode = one_cpt_ode_spec();
+        let v = 10.0;
+        let obs_times = [0.0, 24.0, 48.0, 72.0];
+        let cls = [1.0, 0.7, 0.5, 0.3];
+        let obs_pk: Vec<PkParams> = cls.iter().map(|&cl| pk_one(cl, v)).collect();
+        let event_pk = crate::pk::EventPkParams {
+            dose: Vec::new(),
+            obs: obs_pk.clone(),
+            pk_only: Vec::new(),
+        };
+        let decisions = [0.0, 12.0, 24.0, 48.0, 72.0];
+        let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
+        let mut decide = |ctx: &ControllerCtx| ControllerDecision {
+            actions: if ctx.signal("A").expect("monitor A declared") < 50.0 {
+                vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }]
+            } else {
+                vec![DoseAction::Hold]
+            },
+            rule: None,
+        };
+        let mons: Vec<AdaptiveMonitor> = monitors
+            .iter()
+            .map(|s| AdaptiveMonitor {
+                spec: s,
+                observe: None,
+            })
+            .collect();
+        let base = make_subject(vec![], obs_times.to_vec());
+        let run = ode_predictions_adaptive_impl(
+            &ode,
+            &obs_pk[0].values,
+            Some(&event_pk),
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &mons,
+            &mut decide,
+            100,
+            None,
+        )
+        .expect("driver runs");
+
+        // The default-tolerance verifier accepts it.
+        verify_adaptive_frozen_replay(
+            &ode,
+            &obs_pk[0].values,
+            Some(&event_pk),
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &run,
+        )
+        .expect("TV run matches the static replay");
+
+        // And the agreement is bit-exact, not merely within the verifier's slack.
+        let mut static_subject = base.clone();
+        static_subject.doses = run
+            .ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+            .collect();
+        let dose_f: Vec<f64> = run.ledger.iter().map(|e| e.f_applied).collect();
+        let replay = adaptive_frozen_replay_tv(
+            &ode,
+            &event_pk,
+            &[],
+            &[],
+            &static_subject,
+            &dose_f,
+            &decisions,
+        );
+        let mut max_rel = 0.0_f64;
+        for (got, want) in run.predictions.iter().zip(replay.iter()) {
+            if got.is_nan() && want.is_nan() {
+                continue;
+            }
+            let d = (got - want).abs();
+            let r = if want.abs() > 0.0 { d / want.abs() } else { d };
+            max_rel = max_rel.max(r);
+        }
+        assert!(
+            max_rel <= 1e-12,
+            "TV frozen replay not bit-aligned: max_rel={max_rel}"
+        );
+        // The controller must actually hold at least once, so a decision-only break
+        // (LOCF carry) is genuinely exercised.
+        assert!(
+            run.decisions
+                .iter()
+                .any(|d| matches!(d.outcome, DecisionOutcome::Hold)),
+            "expected at least one hold to exercise a decision-only break"
+        );
+    }
+
+    #[test]
     fn frozen_replay_verifier_accepts_aligned_run_and_rejects_corruption() {
         // The verifier's Err branches aren't reachable from a faithful run (the
         // bookkeeping is correct), so exercise them directly: a faithful run
@@ -4375,7 +4894,7 @@ mod tests {
         .expect("driver runs");
 
         // A dose at every decision aligns the segment structure → exact match.
-        verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &decisions, &run)
+        verify_adaptive_frozen_replay(&ode, &pk.values, None, &[], &[], &base, &decisions, &run)
             .expect("aligned run matches the static replay");
 
         let mut perturbed = run.clone();
@@ -4383,6 +4902,7 @@ mod tests {
         let err = verify_adaptive_frozen_replay(
             &ode,
             &pk.values,
+            None,
             &[],
             &[],
             &base,
@@ -4394,9 +4914,17 @@ mod tests {
 
         let mut short = run.clone();
         short.predictions.pop();
-        let err =
-            verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &decisions, &short)
-                .expect_err("a length mismatch must fail verification");
+        let err = verify_adaptive_frozen_replay(
+            &ode,
+            &pk.values,
+            None,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &short,
+        )
+        .expect_err("a length mismatch must fail verification");
         assert!(err.contains("prediction"), "got: {err}");
     }
 
@@ -4440,7 +4968,7 @@ mod tests {
         assert_eq!(run.ledger.len(), 1, "only the t=0 decision should dose");
 
         // Passes the tight (aligned) verifier — the whole point of the fix.
-        verify_adaptive_frozen_replay(&ode, &pk.values, &[], &[], &base, &decisions, &run)
+        verify_adaptive_frozen_replay(&ode, &pk.values, None, &[], &[], &base, &decisions, &run)
             .expect("held-decision run matches the aligned static replay");
     }
 
@@ -8144,6 +8672,7 @@ mod tests {
         let run = ode_predictions_adaptive_impl(
             model.ode_spec.as_ref().unwrap(),
             &pk.values,
+            None,
             &theta,
             &eta,
             &subject,

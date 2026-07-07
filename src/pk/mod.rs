@@ -13,7 +13,7 @@ pub use three_compartment::*;
 pub use two_compartment::*;
 
 #[inline]
-fn model_uses_time_builtin(model: &CompiledModel) -> bool {
+pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
     crate::parser::model_parser::compiled_model_uses_time_builtin(model)
 }
 
@@ -520,7 +520,10 @@ pub fn compute_event_pk_params_into(
     out.obs.clear();
     out.pk_only.clear();
 
-    if subject.has_tv_covariates() || model_uses_time_builtin(model) {
+    if subject.has_tv_covariates()
+        || !subject.pk_only_covariates.is_empty()
+        || model_uses_time_builtin(model)
+    {
         for k in 0..subject.doses.len() {
             out.dose.push(pk_params_at_time(
                 model,
@@ -549,8 +552,9 @@ pub fn compute_event_pk_params_into(
             ));
         }
     } else {
-        // Reached only when the model uses neither TV covariates nor the `TIME`
-        // built-in, so a single snapshot (t=0) is exact for every event.
+        // Reached only when the subject carries no time-varying covariates (on
+        // dose/obs *or* pk-only rows) and the model uses no `TIME` built-in, so a
+        // single snapshot (t=0) is exact for every event.
         let p = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
         // pk_only stays empty — see EventPkParams docstring.
         for _ in 0..subject.doses.len() {

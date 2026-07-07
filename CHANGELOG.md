@@ -29,6 +29,17 @@ section of the SDLC for the versioning policy).
   `FitResult.environment` and round-trip through `.fitrx` bundles.
 
 ### Added
+- **Adaptive (feedback) dosing now supports time-varying covariates** (#700): the
+  reactive driver recomputes each subject's PK per event/segment from the covariate
+  active in that segment (the same NONMEM end-of-interval convention `predict()` /
+  `simulate()` use), instead of freezing it at the `t=0` snapshot. A covariate that
+  changes over the horizon — e.g. declining renal function driving clearance under
+  TDM titration — now correctly drives the predictions, the monitored signal, and
+  every dose decision, and the frozen-replay verifier validates the per-event
+  bookkeeping. Models whose PK reads the `TIME` built-in are covered too (previously
+  also silently frozen at `TIME=0`). The `auc_target_attainment` metric is not yet
+  available for time-varying-covariate subjects and is rejected with a typed error
+  rather than reported from a frozen snapshot.
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
   model.ferx`, `ferx check model.ferx`, and the public `fit_from_files()`
