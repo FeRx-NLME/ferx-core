@@ -2607,8 +2607,10 @@ pub enum RtteClock {
     Forward,
     /// Clock-reset / gap time (renewal). The hazard depends on time *since the
     /// previous event*; the accumulator resets to 0 at each event. NLL
-    /// `Σ_k log h(Δ_k) − Σ_k H(Δ_k)`. Requires the selective per-state reset
-    /// (§8.8.6) — **Slice 3.2**, rejected at parse until then.
+    /// `Σ_k log h(Δ_k) − Σ_k H(Δ_k)`. For an analytic hazard family this is exact with
+    /// no ODE — the closed form is evaluated on each gap `Δ_k`
+    /// ([`crate::survival::rtte_reset_nll_from_curves`]). A drug-driven ODE hazard would
+    /// need the selective per-state reset (§8.8.6) and is still rejected at parse.
     Reset,
 }
 

@@ -1,0 +1,34 @@
+# Clock-reset (gap-time / renewal) repeated time-to-event with a Weibull inter-event
+# gap distribution and a shared subject frailty. Phase 3 Slice 3.2.
+#
+# clock = reset: the hazard clock restarts at each event, so a subject's inter-event
+# gaps Δ_k are independent Weibull draws and the likelihood is
+#   Sum_k [ H(Δ_k) − log h(Δ_k) ]   (final gap censored).
+# With a Weibull shape != 1 the within-gap hazard varies with time, so clock-reset
+# differs from clock-forward (they coincide only for the memoryless exponential).
+#
+# Data format (TTE rows, EVID=0), time-ordered per subject, ending in a censor row:
+#   DV=1  exact event   (several per subject)
+#   DV=0  right-censored (administrative)
+#
+# Reference (simulated): TVSCALE = 5, TVSHAPE = 1.5, omega(ETA_SCALE) = 0.09,
+# censoring at t = 30; ~6.6 events/subject. Dataset: data/rtte_weibull_reset.csv.
+#
+# Run:  cargo run --release -- examples/rtte_weibull_reset.ferx --data data/rtte_weibull_reset.csv
+
+[parameters]
+  theta TVSCALE(5.0, 0.1, 100.0)
+  theta TVSHAPE(1.5, 0.1, 10.0)
+  omega ETA_SCALE ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  clock  = reset
+  family = weibull
+  scale  = TVSCALE * exp(ETA_SCALE)
+  shape  = TVSHAPE
+
+[fit_options]
+  method  = focei
+  maxiter = 300

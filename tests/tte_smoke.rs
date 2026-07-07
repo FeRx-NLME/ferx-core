@@ -261,15 +261,21 @@ mod survival_smoke {
         ));
     }
 
-    /// `clock = reset` (gap time) is Slice 3.2 — rejected with an actionable error.
+    /// `clock = reset` (gap time) parses to a clock-reset RTTE endpoint.
     #[test]
-    fn rtte_clock_reset_is_rejected() {
+    fn rtte_clock_reset_parses() {
+        use ferx_core::types::{RtteClock, TteRecurrence};
         let src = RTTE_EXP_MODEL.replace("type   = rtte", "type   = rtte\n  clock  = reset");
-        let err = parse_model_string(&src).expect_err("clock=reset must be rejected");
-        assert!(
-            err.contains("reset") && err.contains("Slice 3.2"),
-            "error should explain clock=reset is deferred, got: {err}"
-        );
+        let model = parse_model_string(&src).expect("clock=reset must parse");
+        assert!(matches!(
+            model.endpoints.get(&2),
+            Some(EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset
+                },
+                ..
+            })
+        ));
     }
 
     /// `clock` without `type = rtte` is meaningless and rejected.
@@ -442,12 +448,14 @@ mod survival_smoke {
         );
     }
 
-    /// A hand-built `Repeated { clock = Reset }` model — which the parser rejects for a
-    /// `.ferx` file, but a Rust caller can construct — must be rejected at the fit
-    /// boundary, not silently folded into the clock-forward `1e20` sentinel (which would
-    /// give a flat objective and a garbage "converged" fit).
+    /// A hand-built `Repeated { clock = Reset }` model fits end-to-end through the
+    /// gap-time renewal likelihood (finite OFV). A `.ferx` file reaches this via
+    /// `clock = reset`; a Rust caller can also construct the endpoint directly. This is
+    /// the fit-boundary counterpart to the clock-forward `rtte_fit_completes_*` test and
+    /// exercises the `check_rtte_records` fall-through for reset endpoints. Tier-2:
+    /// capped at 3 outer iterations, no convergence.
     #[test]
-    fn rtte_clock_reset_hand_built_is_rejected() {
+    fn rtte_clock_reset_hand_built_fits() {
         use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
         let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         // Swap the parsed Repeated{Forward} endpoint on CMT 2 for a Repeated{Reset} one.
@@ -466,11 +474,12 @@ mod survival_smoke {
         );
         let pop = rtte_pop();
         let opts = FitOptions::default();
-        let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("clock=reset must be rejected at the fit boundary");
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .expect("clock=reset RTTE fit must not error");
         assert!(
-            err.contains("reset") && err.contains("CMT=2"),
-            "error should flag clock=reset as unsupported, got: {err}"
+            result.ofv.is_finite(),
+            "clock-reset RTTE OFV must be finite; got {}",
+            result.ofv
         );
     }
 

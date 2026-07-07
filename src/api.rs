@@ -1324,42 +1324,36 @@ pub(crate) fn check_transit_support(
     None
 }
 
-/// Fit-boundary validation for RTTE (repeated-event) endpoints. The parser enforces
-/// these for `.ferx` models, but a Rust caller can hand-build a `CompiledModel` /
-/// `Population` that bypasses it, so `fit()` re-checks up front — otherwise each of
-/// these would fold into the clock-forward NLL's `1e20` sentinel and produce a silent
-/// garbage fit instead of a clear error. Rejects, per RTTE cmt:
+/// Fit-boundary validation for RTTE (repeated-event) endpoints, both `clock = forward`
+/// (Andersen–Gill total time) and `clock = reset` (gap time). The parser enforces these
+/// for `.ferx` models, but a Rust caller can hand-build a `CompiledModel` / `Population`
+/// that bypasses it, so `fit()` re-checks up front — otherwise each of these would fold
+/// into the RTTE NLL's `1e20` sentinel and produce a silent garbage fit instead of a
+/// clear error. Rejects, per RTTE cmt:
 ///
-///   * **`clock = reset`** — gap-time RTTE is Slice 3.2; the clock-forward NLL folds
-///     `Repeated { Reset }` into `1e20` for every subject (a flat objective the
-///     optimizer "converges" on). Only the parser guards this for `.ferx`.
 ///   * **interval-censored records** — unsupported for RTTE and folded into `1e20` by
-///     [`crate::survival::rtte_forward_nll_from_curves`]. Interval censoring is a *data*
+///     both [`crate::survival::rtte_forward_nll_from_curves`] and
+///     [`crate::survival::rtte_reset_nll_from_curves`]. Interval censoring is a *data*
 ///     property (a DV=0→DV=2 pair), so the parser cannot see it — it must be caught here.
 ///   * **non-finite `TIME`** — a `NaN`/`inf` time slips past the `time < prev` order
 ///     check (every NaN comparison is false) and poisons `prev`, so reject it explicitly.
-///   * **out-of-order rows** — the clock-forward likelihood integrates the cumulative
-///     hazard **once** across a subject's records, using each record's time as the lower
-///     limit for the next; the telescoping sum is only correct when the rows are
-///     time-sorted, so unsorted rows would give a finite-but-wrong NLL.
+///   * **out-of-order rows** — both RTTE clocks require time-sorted rows: clock-forward
+///     telescopes the cumulative hazard across a subject's records (each record's time is
+///     the lower limit for the next), and clock-reset measures each inter-event gap
+///     `Δ = t − t_prev`; unsorted rows give a finite-but-wrong NLL (forward) or a negative
+///     gap that folds to `1e20` (reset).
 ///
 /// Returns `None` when there is no RTTE endpoint or every subject's rows are valid.
 #[cfg(feature = "survival")]
 fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<String> {
-    use crate::types::{EndpointLikelihood, EventType, ObsRecord, RtteClock, TteRecurrence};
+    use crate::types::{EndpointLikelihood, EventType, ObsRecord, TteRecurrence};
     let mut rtte_cmts: Vec<usize> = Vec::new();
     for (cmt, ep) in &model.endpoints {
         if let EndpointLikelihood::Tte {
-            recurrence: TteRecurrence::Repeated { clock },
+            recurrence: TteRecurrence::Repeated { .. },
             ..
         } = ep
         {
-            if matches!(clock, RtteClock::Reset) {
-                return Some(format!(
-                    "RTTE endpoint CMT={cmt} uses `clock = reset` (gap-time), which is not yet \
-                     supported (Slice 3.2). Use `clock = forward` (Andersen–Gill total time)."
-                ));
-            }
             rtte_cmts.push(*cmt);
         }
     }
@@ -2388,10 +2382,10 @@ pub fn fit(
     if let Some(e) = check_analytic_readout_support(model, population) {
         return Err(e);
     }
-    // RTTE (repeated-event) clock-forward likelihood telescopes the cumulative hazard
-    // across a subject's records in time order and does not support clock=reset /
-    // interval-censored / non-finite times, all of which would otherwise fold into a
-    // silent 1e20 sentinel. Reject a hand-built model/dataset up front.
+    // RTTE (repeated-event) likelihoods — clock-forward telescoping and clock-reset
+    // gap-time — require time-sorted records and do not support interval-censored /
+    // non-finite times, all of which would otherwise fold into a silent 1e20 sentinel.
+    // Reject a hand-built model/dataset up front.
     #[cfg(feature = "survival")]
     if let Some(e) = check_rtte_records(model, population) {
         return Err(e);

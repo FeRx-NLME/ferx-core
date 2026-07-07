@@ -968,6 +968,112 @@ fn rtte_convergence_mixed_matches_nonmem() {
     );
 }
 
+// ── RTTE clock-reset (gap time) — tests/reference/rtte_weibull_reset ───────────
+
+const RTTE_RESET_REF_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/reference/rtte_weibull_reset/rtte_weibull_reset.csv"
+);
+
+const RTTE_RESET_FIT_FIXED: &str = r"
+[parameters]
+  theta TVSCALE(3.0, 0.1, 100.0)
+  theta TVSHAPE(1.0, 0.1, 10.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  clock  = reset
+  family = weibull
+  scale  = TVSCALE
+  shape  = TVSHAPE
+";
+
+const RTTE_RESET_FIT_MIXED: &str = r"
+[parameters]
+  theta TVSCALE(5.0, 0.1, 100.0)
+  theta TVSHAPE(1.5, 0.1, 10.0)
+  omega ETA_SCALE ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  clock  = reset
+  family = weibull
+  scale  = TVSCALE * exp(ETA_SCALE)
+  shape  = TVSHAPE
+";
+
+/// Cross-tool, exact: a fixed-effects (n_eta=0) clock-reset Weibull RTTE fit must match
+/// `survreg(Surv(gap, event) ~ 1, dist="weibull")` on the inter-event gap durations —
+/// under clock-reset the gaps are independent Weibull observations, so the reset RTTE
+/// likelihood reduces exactly to that regression (see `survreg.R`). This also pins that
+/// the gap bookkeeping is right: a clock-forward accumulation on the same data would give
+/// a different scale/shape/OFV.
+#[test]
+fn rtte_reset_convergence_fixed_matches_survreg() {
+    let model = parse_model_string(RTTE_RESET_FIT_FIXED).expect("fixed reset model must parse");
+    assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_RESET_REF_CSV, None, None, None)
+        .expect("reference CSV reads");
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+    let (scale, shape) = (r.theta[0], r.theta[1]);
+    eprintln!(
+        "[rtte reset fixed] scale = {scale:.5} shape = {shape:.5} OFV = {:.4}  (survreg 4.78920 / 1.32415 / 3243.856)",
+        r.ofv
+    );
+
+    // survreg on the gap durations: scale 4.78920, shape 1.32415, -2logL 3243.856.
+    assert!(
+        (scale - 4.78920).abs() / 4.78920 < 2e-3,
+        "reset scale {scale:.5} must match survreg 4.78920"
+    );
+    assert!(
+        (shape - 1.32415).abs() / 1.32415 < 2e-3,
+        "reset shape {shape:.5} must match survreg 1.32415"
+    );
+    assert!(
+        (r.ofv - 3243.856).abs() < 1e-2,
+        "reset OFV {:.4} must match survreg -2logL 3243.856",
+        r.ofv
+    );
+}
+
+/// Cross-tool: a mixed-effects (frailty) clock-reset Weibull RTTE FOCEI fit must
+/// reproduce NONMEM LAPLACE on the committed dataset — TVSCALE ~ 5.16, TVSHAPE ~ 1.53,
+/// omega^2 ~ 0.132, OFV ~ 3175.86 (see `tests/reference/rtte_weibull_reset/expected.md`).
+#[test]
+fn rtte_reset_convergence_mixed_matches_nonmem() {
+    let model = parse_model_string(RTTE_RESET_FIT_MIXED).expect("mixed reset model must parse");
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_RESET_REF_CSV, None, None, None)
+        .expect("reference CSV reads");
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+    let (scale, shape, omega2) = (r.theta[0], r.theta[1], r.omega[(0, 0)]);
+    eprintln!(
+        "[rtte reset mixed] scale = {scale:.5} shape = {shape:.5} omega^2 = {omega2:.5} OFV = {:.4}  (NONMEM 5.1594 / 1.5299 / 0.1322 / 3175.86)",
+        r.ofv
+    );
+
+    // NONMEM LAPLACE: 5.15939 / 1.52987 / 0.13225 / 3175.863.
+    assert!(
+        (5.0..5.35).contains(&scale),
+        "scale {scale:.5} off the NONMEM value ~5.16"
+    );
+    assert!(
+        (1.45..1.60).contains(&shape),
+        "shape {shape:.5} off the NONMEM value ~1.53"
+    );
+    assert!(
+        (0.10..0.17).contains(&omega2),
+        "omega^2 {omega2:.5} off the NONMEM value ~0.132"
+    );
+    assert!(
+        (r.ofv - 3175.863).abs() < 0.3,
+        "OFV {:.4} must match NONMEM LAPLACE 3175.863",
+        r.ofv
+    );
+}
+
 /// Cross-tool, exact: a FIXED-EFFECTS (n_eta=0) competing-risks exponential fit
 /// must recover each cause's closed-form MLE `λ̂_k = d_k / Σ_i t_i` — identical to
 /// base-R `survreg(dist="exponential")` fitted per cause (other-cause events as

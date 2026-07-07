@@ -3620,7 +3620,7 @@ fn eval_indiv_param_vars(
 /// - `gamma`  — required for Gompertz (hazard growth rate)
 /// - `loghr`  — optional (all families); log-hazard-ratio covariate term Σ(β·x)
 /// - `type`   — optional; `tte` (default, single event) | `rtte` (repeated events)
-/// - `clock`  — optional (RTTE only); `forward` (Andersen–Gill total time, default) or `reset` (gap time — Slice 3.2, rejected until then)
+/// - `clock`  — optional (RTTE only); `forward` (default, Andersen–Gill total time) | `reset` (gap time / renewal — hazard clock resets at each event)
 #[cfg(feature = "survival")]
 fn parse_event_model_block(
     lines: &[String],
@@ -3777,9 +3777,9 @@ fn parse_event_model_block(
     }
 
     // Resolve the recurrence: standard single-event TTE (default) vs. repeated TTE
-    // (RTTE). For RTTE, `clock = forward` (Andersen–Gill total time, the default) is
-    // the only mode supported in Slice 3.1; `clock = reset` (gap time, §8.8.6) is a
-    // later slice. `clock` is meaningless without `type = rtte`.
+    // (RTTE). For RTTE, `clock = forward` (Andersen–Gill total time, the default)
+    // accumulates the hazard continuously; `clock = reset` (gap time, §3.3) restarts the
+    // hazard clock at each event. `clock` is meaningless without `type = rtte`.
     let recurrence = {
         use crate::types::{RtteClock, TteRecurrence};
         match type_opt.as_deref().unwrap_or("tte") {
@@ -3796,13 +3796,7 @@ fn parse_event_model_block(
             "rtte" => {
                 let clock = match clock_opt.as_deref().unwrap_or("forward") {
                     "forward" => RtteClock::Forward,
-                    "reset" => {
-                        return Err(format!(
-                            "[event_model]: CMT={cmt} sets `clock = reset` (gap-time RTTE), which \
-                             is not yet supported (Slice 3.2). Use `clock = forward` (the default \
-                             Andersen–Gill total-time hazard)."
-                        ));
-                    }
+                    "reset" => RtteClock::Reset,
                     other => {
                         return Err(format!(
                             "[event_model]: CMT={cmt} unknown clock `{other}` — valid: forward, reset"

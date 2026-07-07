@@ -101,10 +101,13 @@ The `clock` key selects how the hazard measures time between events:
 | `clock`     | Model | Likelihood | Status |
 |-------------|-------|-----------|--------|
 | `forward` (default) | Andersen–Gill / total time — hazard is a function of *absolute* time; the cumulative hazard is **not** reset at events | `Σ_k log h(t_k) − H(T)` | supported |
-| `reset`     | Renewal / gap time — hazard depends on time *since the previous event*; the accumulator resets at each event | `Σ_k log h(Δ_k) − Σ_k H(Δ_k)` | later slice (rejected for now) |
+| `reset`     | Renewal / gap time — hazard depends on time *since the previous event*; the clock resets at each event | `Σ_k log h(Δ_k) − Σ_k H(Δ_k)` | supported (analytic families) |
 
 For a time-homogeneous hazard (e.g. exponential) the two clocks coincide; they differ
 only when the hazard varies with time (Weibull, Gompertz, or a covariate-on-time term).
+Under `clock = reset` a subject's inter-event gaps are independent draws from the hazard
+family, so a fixed-effects reset fit reduces to an ordinary survival regression on the
+gap durations.
 
 ::: {.callout-warning}
 ## Estimation method for RTTE

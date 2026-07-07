@@ -396,8 +396,9 @@ row:
 ```
 
 `clock = forward` (the default, Andersen–Gill total time) integrates the cumulative
-hazard once across the whole window (`Σ_k log h(t_k) − H(T)`); `clock = reset`
-(gap time) is a later slice. See
+hazard once across the whole window (`Σ_k log h(t_k) − H(T)`); `clock = reset` (gap
+time) restarts the hazard clock at each event (`Σ_k log h(Δ_k) − Σ_k H(Δ_k)` over
+inter-event gaps). For a time-homogeneous hazard the two coincide. See
 [Repeated events](../model-file/event-model.qmd#rtte) for the DSL details.
 
 ::: {.callout-warning}
