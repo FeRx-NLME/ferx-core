@@ -198,6 +198,12 @@ the model has fewer than two valid residuals, and `cov_condition_number` is
   ],
   "model_name": "warfarin",
   "ferx_version": "0.1.0",
+  "environment": {
+    "os": "linux",
+    "arch": "x86_64",
+    "in_docker": true,
+    "username": "ron"
+  },
 
   "model_path": "examples/warfarin.ferx",
   "data_path":  "data/warfarin.csv",
@@ -208,6 +214,10 @@ the model has fewer than two valid residuals, and `cov_condition_number` is
 
 `sir` is non-null only when `[fit_options].sir = true`; `iov` is non-null only
 when the model uses kappa (block IOV).
+
+`environment` is absent (the key is omitted) on bundles saved before #704
+added this field; loaders default it to an `"unknown"` placeholder rather
+than re-detecting the *loading* machine's environment.
 
 `model_path` / `data_path` / `model_hash` / `data_hash` are populated when the
 fit was produced via `fit_from_files` (or `run_model_with_data`); they are

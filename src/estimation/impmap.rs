@@ -1417,7 +1417,11 @@ fn theta_sigma_weighted_mstep(
     let obj = |xv: &[f64], _: Option<&mut [f64]>, _: &mut ()| -> f64 {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
-        let val: f64 = population
+        // Reduce in subject order (collect then serial sum) so the objective is
+        // reproducible regardless of rayon worker count — a parallel `.sum()`
+        // folds along thread-count-dependent split points and f64 addition is
+        // non-associative (#703).
+        let per_subj: Vec<f64> = population
             .subjects
             .par_iter()
             .zip(draws.par_iter())
@@ -1431,7 +1435,8 @@ fn theta_sigma_weighted_mstep(
                 }
                 s
             })
-            .sum();
+            .collect();
+        let val: f64 = per_subj.iter().sum();
         if val.is_finite() {
             val
         } else {

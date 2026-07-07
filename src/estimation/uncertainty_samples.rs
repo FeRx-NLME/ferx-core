@@ -396,6 +396,7 @@ mod tests {
             wall_time_secs: 0.0,
             model_name: String::new(),
             ferx_version: String::new(),
+            environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: vec![],
             theta_transform: vec![],
             sigma_types: vec![],

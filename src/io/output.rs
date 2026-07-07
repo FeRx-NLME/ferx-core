@@ -1183,6 +1183,21 @@ fn fmt_cov_entry(v: f64) -> String {
     s
 }
 
+/// Quote and escape a free-form string for embedding as a YAML double-quoted
+/// scalar. Used for values sourced from the OS/environment (e.g.
+/// `environment.username`) that aren't under ferx's control and may contain
+/// YAML-significant characters — `:`/`#` are harmless once quoted, but a
+/// literal newline or backslash/quote would otherwise corrupt the line or
+/// (for a raw newline) get silently folded away by YAML's line-folding rules.
+fn yaml_quote(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    format!("\"{escaped}\"")
+}
+
 /// Build the ordered parameter name list that matches `pack_params` layout:
 /// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
 ///
@@ -1736,6 +1751,28 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    // Run timing + thread count (#704 — replaces the separate `-timing.txt` file).
+    // Key names match `FitResult`/`.fitrx` field names (`n_threads_used`,
+    // `in_docker`) so the same data isn't spelled two different ways across formats.
+    writeln!(f, "\nestimation:").map_err(|e| e.to_string())?;
+    writeln!(f, "  wall_time_secs: {:.6}", result.wall_time_secs).map_err(|e| e.to_string())?;
+    writeln!(f, "  n_threads_used: {}", result.n_threads_used).map_err(|e| e.to_string())?;
+
+    // System/account info the fit ran under, for troubleshooting (#704).
+    writeln!(f, "\nenvironment:").map_err(|e| e.to_string())?;
+    writeln!(f, "  os: {}", result.environment.os).map_err(|e| e.to_string())?;
+    writeln!(f, "  arch: {}", result.environment.arch).map_err(|e| e.to_string())?;
+    writeln!(f, "  in_docker: {}", result.environment.in_docker).map_err(|e| e.to_string())?;
+    // Quoted/escaped: an OS username is free-form text and may contain YAML-
+    // significant characters (e.g. a colon in a Windows domain account).
+    writeln!(
+        f,
+        "  username: {}",
+        yaml_quote(&result.environment.username)
+    )
+    .map_err(|e| e.to_string())?;
+    writeln!(f, "  ferx_version: {}", result.ferx_version).map_err(|e| e.to_string())?;
+
     Ok(())
 }
 
@@ -1871,6 +1908,7 @@ mod tests {
             wall_time_secs: 0.0,
             model_name: "test".to_string(),
             ferx_version: env!("CARGO_PKG_VERSION").to_string(),
+            environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             sigma_types,
@@ -2436,6 +2474,7 @@ mod tests {
             wall_time_secs: 0.0,
             model_name: "test".to_string(),
             ferx_version: env!("CARGO_PKG_VERSION").to_string(),
+            environment: crate::environment::EnvironmentInfo::default(),
             eta_param_info: Vec::new(),
             theta_transform: Vec::new(),
             sigma_types,
@@ -2981,6 +3020,47 @@ mod tests {
         );
         // Warnings.
         assert!(yaml.contains("\nwarnings:") && yaml.contains("- \"example warning\""));
+        // #704: estimation timing/threads + environment snapshot.
+        assert!(yaml.contains("\nestimation:"));
+        assert!(yaml.contains("  wall_time_secs:"));
+        assert!(yaml.contains("  n_threads_used:"));
+        assert!(yaml.contains("\nenvironment:"));
+        assert!(yaml.contains(&format!("  os: {}", r.environment.os)));
+        assert!(yaml.contains(&format!("  arch: {}", r.environment.arch)));
+        assert!(yaml.contains(&format!("  in_docker: {}", r.environment.in_docker)));
+        assert!(yaml.contains(&format!(
+            "  username: {}",
+            yaml_quote(&r.environment.username)
+        )));
+        assert!(yaml.contains(&format!("  ferx_version: {}", r.ferx_version)));
+    }
+
+    #[test]
+    fn write_yaml_escapes_username_with_yaml_significant_characters() {
+        // #704 review: an OS username is free-form text (e.g. a Windows domain
+        // account) and may contain a colon or quote, which would otherwise
+        // corrupt the YAML document.
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1]);
+        r.environment.username = "DOMAIN\\svc: build \"prod\"".to_string();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        assert!(
+            yaml.contains("  username: \"DOMAIN\\\\svc: build \\\"prod\\\"\""),
+            "username not properly quoted/escaped:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn yaml_quote_escapes_newline_and_carriage_return() {
+        // Copilot review on #706: a raw embedded newline would otherwise get
+        // silently folded away by YAML's line-folding rules (or break the
+        // single-line assumption the rest of this writer relies on).
+        assert_eq!(yaml_quote("a\nb"), "\"a\\nb\"");
+        assert_eq!(yaml_quote("a\r\nb"), "\"a\\r\\nb\"");
+        // `#`/`:` need no extra handling once the value is quoted.
+        assert_eq!(yaml_quote("a#b: c"), "\"a#b: c\"");
     }
 
     #[test]

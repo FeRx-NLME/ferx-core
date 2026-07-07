@@ -160,7 +160,15 @@ fn tte_ode_nll(
     // NaN curves, which `tte_nll_from_curves` maps to the 1e20 sentinel).
     let (cum, haz) =
         crate::survival::ode_cumhaz_hazard(model, subject, chz_state, theta, eta, &times);
-    tte_ode_nll_from_curves(records, &times, &cum, &haz)
+    // Tie the CHZ monotonicity floor to this model's *configured* solver tolerances
+    // (#618). A missing ODE yields NaN curves -> sentinel regardless, so the default is
+    // immaterial there.
+    let tol = model
+        .ode_spec
+        .as_ref()
+        .map(|o| crate::survival::MonoTol::from_solver(&o.solver_opts))
+        .unwrap_or_default();
+    tte_ode_nll_from_curves(records, &times, &cum, &haz, tol)
 }
 
 /// Per-record TTE NLL from cumulative-hazard / hazard curves already sampled at
@@ -169,7 +177,13 @@ fn tte_ode_nll(
 /// build `cum`/`haz`) and the #570 joint-PK-TTE inner-NLL share (which reads `H`/`h`
 /// off the Gaussian solve), so the per-record likelihood logic lives in one place.
 #[cfg(feature = "survival")]
-fn tte_ode_nll_from_curves(records: &[ObsRecord], times: &[f64], cum: &[f64], haz: &[f64]) -> f64 {
+fn tte_ode_nll_from_curves(
+    records: &[ObsRecord],
+    times: &[f64],
+    cum: &[f64],
+    haz: &[f64],
+    tol: crate::survival::MonoTol,
+) -> f64 {
     let cumhaz_at = |t: f64| -> f64 {
         times
             .binary_search_by(|x| x.partial_cmp(&t).unwrap())
@@ -180,7 +194,7 @@ fn tte_ode_nll_from_curves(records: &[ObsRecord], times: &[f64], cum: &[f64], ha
             .binary_search_by(|x| x.partial_cmp(&t).unwrap())
             .map_or(f64::NAN, |i| haz[i])
     };
-    crate::survival::tte_nll_from_curves(records, cumhaz_at, hazard_at)
+    crate::survival::tte_nll_from_curves(records, cumhaz_at, hazard_at, tol)
 }
 
 /// #570: a single augmented PK+CHZ integration reused for both endpoints of a joint
@@ -322,7 +336,8 @@ fn tte_ode_nll_from_shared(
         (ode.rhs)(st, &share.pk_values, t, &mut du);
         haz[i] = du[chz_state];
     }
-    tte_ode_nll_from_curves(records, &share.times, &cum, &haz)
+    let tol = crate::survival::MonoTol::from_solver(&ode.solver_opts);
+    tte_ode_nll_from_curves(records, &share.times, &cum, &haz, tol)
 }
 
 /// Dispatch a TTE endpoint's per-subject NLL on its hazard representation: the
@@ -1985,7 +2000,14 @@ pub fn foce_population_nll_iov(
     sigma_values: &[f64],
     interaction: bool,
 ) -> f64 {
-    population
+    // Compute each subject's NLL in parallel, then reduce in a fixed subject
+    // order. rayon's `ParallelIterator::sum` folds partial sums along split
+    // boundaries that depend on the worker-thread count, and f64 addition is
+    // not associative — so a bare `.sum()` yields a thread-count-dependent OFV
+    // (e.g. 4 vs 15 threads). Collecting into an ordered `Vec` and summing
+    // serially makes the objective bit-reproducible regardless of thread count
+    // while keeping the expensive per-subject work parallel (#703).
+    let per_subj: Vec<f64> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -2008,7 +2030,8 @@ pub fn foce_population_nll_iov(
                 omega_iov,
             )
         })
-        .sum::<f64>()
+        .collect();
+    per_subj.iter().sum()
 }
 
 /// Population FOCE objective: sum over all subjects
@@ -2022,7 +2045,11 @@ pub fn foce_population_nll(
     sigma_values: &[f64],
     interaction: bool,
 ) -> f64 {
-    population
+    // Deterministic reduction: collect per-subject NLLs in subject order, then
+    // sum serially. A parallel `.sum()` would make the OFV depend on the
+    // thread count (f64 addition is non-associative; rayon splits by worker
+    // count). See `foce_population_nll_iov` and #703.
+    let per_subj: Vec<f64> = population
         .subjects
         .par_iter()
         .enumerate()
@@ -2038,7 +2065,8 @@ pub fn foce_population_nll(
                 interaction,
             )
         })
-        .sum::<f64>()
+        .collect();
+    per_subj.iter().sum()
 }
 
 /// Compute CWRES (Conditional Weighted Residuals) for a subject.
