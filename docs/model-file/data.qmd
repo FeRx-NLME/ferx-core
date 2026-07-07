@@ -12,16 +12,54 @@ fit against, so `ferx model.ferx` (no `--data`) and `ferx check model.ferx`
 ```
 [data]
   path = <path-to-csv>
+  <canonical-role> = <actual-header>   # optional column mappings
 ```
 
-`path` is the only key. A relative path is resolved **relative to the model
-file's own directory** — not the current working directory of the process
+`path` is the only required key. A relative path is resolved **relative to the
+model file's own directory** — not the current working directory of the process
 running `ferx` — so a model and its dataset can be moved together as a pair.
 
 ```
 [data]
   path = warfarin.csv
 ```
+
+---
+
+## Column mapping
+
+By default ferx recognises the canonical NONMEM columns (`ID`, `TIME`, `DV`,
+`EVID`, `AMT`, `CMT`, `RATE`, `MDV`, `II`, `SS`, `CENS`, `ADDL`) by name,
+case-insensitively. When a dataset stores a role under a different header —
+e.g. `TAFD` for time or `CONC` for the response — you can map it in the `[data]`
+block instead of pre-editing the CSV. The direction is
+`canonical = actual-header`, the ferx equivalent of NONMEM's
+`$INPUT TIME=TAFD`:
+
+```
+[data]
+  path = mydata.csv
+  TIME = TAFD
+  DV   = CONC
+```
+
+- The **actual header** is matched case-insensitively (`TIME = tafd` finds a
+  `TAFD` column).
+- A mapped header is treated **only** as its canonical role — it is never also
+  picked up as a covariate by auto-detection.
+- Mappable roles are the canonical columns above plus `TENTRY` and `FREMTYPE`.
+
+Validation is strict, so a typo fails loudly rather than silently reading the
+wrong column:
+
+- a mapped header that is **absent** from the dataset is an error;
+- mapping the **same role twice**, or mapping **two roles to the same header**,
+  is an error.
+
+The IOV occasion column is *not* set here — keep using
+[`iov_column`](iov.qmd) in `[fit_options]`, and covariate columns
+keep their dataset names (declare them in [`[covariates]`](covariates.qmd) if
+needed).
 
 ---
 
@@ -70,7 +108,7 @@ data-dependent checks" (not an error) — the same as it always has when
 
 - One dataset per model — there is no support for multiple `[data]` blocks or
   multiple datasets.
-- `[data]` only carries `path`; row-level filtering stays in
+- `[data]` carries `path` and column mappings only; row-level filtering stays in
   [`[data_selection]`](data-selection.qmd) (the NONMEM `IGNORE=`/`ACCEPT=`
   analogue).
 
@@ -81,6 +119,7 @@ data-dependent checks" (not an error) — the same as it always has when
 | NONMEM | ferx |
 |--------|------|
 | `$DATA warfarin.csv` | `[data]  path = warfarin.csv` |
+| `$INPUT ID TIME=TAFD DV=CONC ...` | `[data]  TIME = TAFD` / `DV = CONC` |
 
 NONMEM has no override-with-warning concept — a `$DATA` record is the only
 source of the dataset path. ferx's CLI `--data`/R `data =` argument taking

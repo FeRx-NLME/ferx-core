@@ -3,8 +3,8 @@ use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv, read_nonmem_csv_filtered, read_nonmem_csv_filtered_tte,
-    read_nonmem_csv_with_covariates, read_nonmem_csv_with_covariates_filtered,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
     read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
     ERR_COV_NON_NUMERIC,
 };
@@ -246,6 +246,7 @@ pub fn run_model_with_data_inits(
         None,
         iov_col,
         sel_filter.as_ref(),
+        &parsed.column_map,
     )?;
     eprintln!(
         "Data:  {} subjects, {} observations from {}",
@@ -772,6 +773,7 @@ pub fn read_population_for(
     fallback_columns: Option<&[&str]>,
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     // Extract TTE CMTs from model endpoints so the reader can route TTE rows
     // to obs_records instead of the Gaussian parallel Vecs.
@@ -795,31 +797,44 @@ pub fn read_population_for(
         match (covariate_decls, filter) {
             (Some(decls), Some(sel)) => {
                 let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates_filtered(
+                let (pop, table) = read_nonmem_csv_with_covariates_filtered_mapped(
                     Path::new(data_path),
                     decls,
                     &extra,
                     iov_column,
                     sel,
+                    column_map,
                 )?;
                 Ok((pop, Some(table)))
             }
             (Some(decls), None) => {
                 let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates(
+                let (pop, table) = read_nonmem_csv_with_covariates_mapped(
                     Path::new(data_path),
                     decls,
                     &extra,
                     iov_column,
+                    column_map,
                 )?;
                 Ok((pop, Some(table)))
             }
             (None, Some(sel)) => Ok((
-                read_nonmem_csv_filtered(Path::new(data_path), fallback_columns, iov_column, sel)?,
+                read_nonmem_csv_filtered_mapped(
+                    Path::new(data_path),
+                    fallback_columns,
+                    iov_column,
+                    sel,
+                    column_map,
+                )?,
                 None,
             )),
             (None, None) => Ok((
-                read_nonmem_csv(Path::new(data_path), fallback_columns, iov_column)?,
+                read_nonmem_csv_mapped(
+                    Path::new(data_path),
+                    fallback_columns,
+                    iov_column,
+                    column_map,
+                )?,
                 None,
             )),
         }
@@ -835,6 +850,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
+                    column_map,
                 )?;
                 Ok((pop, Some(table)))
             }
@@ -845,6 +861,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
+                    column_map,
                 )?;
                 Ok((pop, None))
             }
@@ -2135,6 +2152,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
             None,
             iov_col,
             None,
+            &parsed.column_map,
         ) {
             Ok((population, _table)) => {
                 // Surface datareader warnings (ADDL missing II, IOV OCC missing)
@@ -2207,6 +2225,7 @@ pub fn fit_from_files(
         covariate_columns,
         None,
         sel_filter_fit.as_ref(),
+        &parsed.column_map,
     )?;
     model.bloq_method = opts.bloq_method;
     // SDE models have no analytic-sensitivity path — force FD.

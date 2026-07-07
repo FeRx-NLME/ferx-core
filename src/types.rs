@@ -5495,6 +5495,13 @@ pub struct ParsedModel {
     /// path (CLI `--data`, R) always overrides this — see
     /// [`crate::api::resolve_data_path`].
     pub data_path: Option<String>,
+    /// Canonical-role → actual-header column remappings from the optional
+    /// `[data]` block (#730, NONMEM `$INPUT TIME=TAFD` analogue). Each entry is
+    /// `(canonical_role_lowercase, actual_csv_header)` — e.g. `("time",
+    /// "TAFD")` for `TIME = TAFD`. Empty when the block declares no mappings.
+    /// The reader renames each mapped header to its canonical role, so the
+    /// column serves that role and is excluded from covariate auto-detection.
+    pub column_map: Vec<(String, String)>,
     /// 1-based source line of each unnamed `[block]` header, keyed by the
     /// lowercased block type (e.g. `"individual_parameters" -> 7`). Used by
     /// `ferx check` to attach a block-level location to diagnostics. Empty when

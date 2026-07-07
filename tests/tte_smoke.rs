@@ -1816,7 +1816,7 @@ mod survival_smoke {
         let model = parse_model_string(include_str!("../examples/pktte_joint.ferx"))
             .expect("pktte_joint.ferx must parse");
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/pktte_joint.csv");
-        let (pop, _) = read_population_for(&model, &None, path, None, None, None)
+        let (pop, _) = read_population_for(&model, &None, path, None, None, None, &[])
             .expect("pktte_joint.csv must load");
         assert_eq!(pop.subjects.len(), 6, "6 subjects");
         for s in &pop.subjects {

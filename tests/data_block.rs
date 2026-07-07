@@ -114,6 +114,74 @@ fn fit_explicit_data_path_overrides_model_declared_path_with_warning() {
     );
 }
 
+/// Rewrites `data/one_cpt_iv.csv` with the TIME and DV headers renamed to TAFD
+/// and CONC, so a `[data]` column mapping is required to read it. Returns the
+/// path to the rewritten CSV.
+fn write_renamed_headers_csv(dir: &Path) -> std::path::PathBuf {
+    let src = std::fs::read_to_string("data/one_cpt_iv.csv").expect("read one_cpt_iv.csv");
+    let mut lines = src.lines();
+    let header = lines.next().expect("header line");
+    // Only the header line changes; body rows are positional.
+    let renamed_header = header.replace("TIME", "TAFD").replace("DV", "CONC");
+    let body: Vec<&str> = lines.collect();
+    let out = std::iter::once(renamed_header.as_str())
+        .chain(body.iter().copied())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let path = dir.join("renamed.csv");
+    std::fs::write(&path, out).expect("write renamed csv");
+    path
+}
+
+#[test]
+fn fit_reads_dataset_through_data_block_column_mapping() {
+    // #730: a dataset whose time/response columns are named TAFD/CONC fits
+    // correctly once the `[data]` block maps them to the canonical roles.
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_renamed_headers_csv(dir.path());
+
+    let data_block = "[data]\n  path = renamed.csv\n  TIME = TAFD\n  DV = CONC\n";
+    let model_src = MODEL_TEMPLATE.replace("{data}", data_block);
+    let model_path = dir.path().join("m.ferx");
+    std::fs::write(&model_path, model_src).expect("write model file");
+
+    let (result, population) = run_model_with_data_inits(model_path.to_str().unwrap(), None, None)
+        .expect("fit should succeed using the mapped TAFD/CONC columns");
+
+    // The mapping fed the response into DV: a non-trivial objective was formed
+    // over real observations (would be empty/NaN if CONC never became DV).
+    let n_obs: usize = population
+        .subjects
+        .iter()
+        .map(|s| s.observations.len())
+        .sum();
+    assert!(n_obs > 0, "mapped dataset should yield observations");
+    assert!(result.ofv.is_finite());
+    // The renamed headers must not have leaked in as covariates.
+    assert!(!population.covariate_names.contains(&"TAFD".to_string()));
+    assert!(!population.covariate_names.contains(&"CONC".to_string()));
+}
+
+#[test]
+fn fit_errors_when_mapped_column_absent_from_dataset() {
+    // Mapping to a header the dataset lacks is a hard, clear error.
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::copy("data/one_cpt_iv.csv", dir.path().join("data.csv")).expect("copy csv");
+
+    // Dataset has a real TIME column, but we map TIME to a non-existent header.
+    let data_block = "[data]\n  path = data.csv\n  TIME = NOPE\n";
+    let model_src = MODEL_TEMPLATE.replace("{data}", data_block);
+    let model_path = dir.path().join("m.ferx");
+    std::fs::write(&model_path, model_src).expect("write model file");
+
+    let err = run_model_with_data_inits(model_path.to_str().unwrap(), None, None)
+        .expect_err("mapping to an absent column must error");
+    assert!(
+        err.contains("mapped column `NOPE`"),
+        "unexpected error: {err}"
+    );
+}
+
 #[test]
 fn check_uses_model_declared_data_path_when_no_data_flag_given() {
     let dir = tempfile::tempdir().expect("tempdir");

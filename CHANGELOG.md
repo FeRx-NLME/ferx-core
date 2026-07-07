@@ -19,6 +19,15 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **`[data]` block column mapping** (#730): map a canonical column role to a
+  differently-named dataset header with `canonical = actual` entries (e.g.
+  `TIME = TAFD`, `DV = CONC`), the ferx equivalent of NONMEM's
+  `$INPUT TIME=TAFD`. Header matching is case-insensitive, mapped headers are
+  excluded from covariate auto-detection, and typos (absent header, duplicate
+  role, duplicate target) fail loudly. See
+  [Data → Column mapping](https://ferx-nlme.github.io/ferx-core/model-file/data.html).
+
 ### Changed
 - **CLI default output no longer writes a separate `{model}-timing.txt` file** (#704):
   the estimation step's wall-clock time and thread count now live under a new
