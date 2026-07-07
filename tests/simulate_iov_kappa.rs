@@ -97,7 +97,8 @@ fn simulate_samples_inter_occasion_kappa() {
 /// against NONMEM.
 ///
 /// Design (`tests/fixtures/iov_anchor.{ferx,csv}`, shared bit-for-bit with the
-/// NONMEM `iov_anchor.ctl`): a 1-cpt IV-bolus model with IOV on `V`, `EVID=4`
+/// NONMEM kit `nonmem_anchor/iov_anchor.{ctl,csv}`): a 1-cpt IV-bolus model with
+/// IOV on `V`, `EVID=4`
 /// (reset + bolus) at the start of each of 3 occasions, and one observation at
 /// `t=0`. Because the compartment is reset and no time elapses,
 /// `IPRED = AMT / V` exactly, so
