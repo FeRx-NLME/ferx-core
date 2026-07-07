@@ -1317,11 +1317,23 @@ fn parse_subject(
                 } else {
                     for k in 1..=(addl as u32) {
                         let addl_time = time + (k as f64) * ii;
-                        doses.push(DoseEvent::new(
-                            addl_time, amt, cmt, rate,
-                            false, // expanded doses are never SS themselves
-                            ii,
-                        ));
+                        // Preserve the parent row's RATE classification for every
+                        // expanded dose: a coded `RATE=-1`/`-2` (modeled rate/
+                        // duration) row must yield modeled additional doses, not
+                        // `Fixed` ones. Passing the raw `-1`/`-2` sentinel through
+                        // `DoseEvent::new` would set `rate_mode = Fixed` with
+                        // `duration = 0` (since `rate <= 0`), so `is_infusion()`
+                        // returns false and the dose silently collapses to an
+                        // instantaneous bolus — and `check_modeled_dose_rates`
+                        // skips `Fixed` doses, so the missing `R{cmt}`/`D{cmt}`
+                        // slot is never caught. Mirror the primary-dose match
+                        // above (expanded doses are never SS themselves).
+                        doses.push(match rate_mode {
+                            RateMode::Fixed => DoseEvent::new(addl_time, amt, cmt, rate, false, ii),
+                            RateMode::ModeledDuration | RateMode::ModeledRate => {
+                                DoseEvent::modeled(addl_time, amt, cmt, false, ii, rate_mode)
+                            }
+                        });
                         dose_rec.push(row_seq);
                         if occ_col.is_some() {
                             dose_occasions.push(occ);
@@ -2041,6 +2053,42 @@ mod tests {
             dose.is_infusion() && !dose.is_fixed(),
             "modeled, not a bolus"
         );
+    }
+
+    #[test]
+    fn addl_expansion_preserves_coded_rate_mode() {
+        // Regression (ADDL + coded RATE): every ADDL-expanded dose of a coded
+        // `RATE=-2` (modeled-duration) row must stay modeled, not collapse to a
+        // `Fixed` bolus. The additional doses used to be built via
+        // `DoseEvent::new` with the raw `-2` sentinel → `rate_mode = Fixed`,
+        // `duration = 0` (since `rate <= 0`), so `is_infusion()` was false and
+        // each additional dose silently became an instantaneous bolus (and
+        // `check_modeled_dose_rates` skips `Fixed` doses, so the missing
+        // `D{cmt}` slot was never caught). One modeled infusion followed by N
+        // boluses is a silently-wrong regimen on fit/predict/simulate.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,ADDL\n\
+                   1,0,.,1,100,1,-2,1,24,2\n\
+                   1,1,5.0,0,.,.,.,0,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let doses = &pop.subjects[0].doses;
+        assert_eq!(doses.len(), 3, "primary + 2 ADDL doses");
+        for (k, d) in doses.iter().enumerate() {
+            assert_eq!(
+                d.rate_mode,
+                RateMode::ModeledDuration,
+                "dose {k} must stay modeled-duration, not Fixed"
+            );
+            assert!(
+                d.is_infusion() && !d.is_fixed(),
+                "dose {k} modeled, not a bolus"
+            );
+            assert_eq!(d.amt, 100.0);
+            assert_eq!(d.cmt, 1);
+        }
+        // Additional doses land at time + k*II.
+        assert_eq!(doses[1].time, 24.0);
+        assert_eq!(doses[2].time, 48.0);
     }
 
     #[test]
