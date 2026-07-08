@@ -28,11 +28,14 @@ use std::path::Path;
 /// `covariance_status`, `cov_eigenvalues`, `cov_condition_number`, and
 /// `covariance_wall_time_secs`.
 ///
-/// The numerics are identical to the inline covariance step in `fit()` — this
-/// wrapper reconstructs the same inputs (`compute_covariance`) rather than
-/// duplicating the FD-Hessian logic. A fit produced with `covariance = false`
+/// The numerics reuse the inline covariance step in `fit()` — this wrapper
+/// calls the same `compute_covariance` at the same converged point rather than
+/// duplicating the FD-Hessian logic, so a fit produced with `covariance = false`
 /// followed by `run_covariance` yields the same covariance matrix and SEs as a
-/// single fit produced with `covariance = true`.
+/// single fit produced with `covariance = true`, up to finite-difference noise
+/// (~1e-5, platform dependent): the inline path passes the optimizer's exact
+/// Cholesky factor, while this wrapper reconstructs it from `fit.omega` via a
+/// re-decomposition, which the FD Hessian amplifies.
 ///
 /// # Failure semantics
 ///
