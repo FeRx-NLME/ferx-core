@@ -250,16 +250,23 @@ estimates) side by side.
 /// Returns the process exit code: `0` = printed (incl. `--help`), `1` = a load
 /// failed, `2` = usage (missing/flag-looking path).
 fn run_summary(args: &[String]) -> i32 {
-    if is_help_flag(args.get(2)) {
-        print!("{SUMMARY_USAGE}");
-        return 0;
+    // `summary` takes only bundle paths plus `-h`/`--help`. Scan every argument:
+    // help anywhere prints usage (exit 0); any other flag-looking argument is a
+    // usage error (exit 2) rather than being silently ignored or mistaken for a
+    // file path. Everything else is a bundle path.
+    let mut paths: Vec<&str> = Vec::new();
+    for arg in &args[2..] {
+        if is_help_flag(Some(arg)) {
+            print!("{SUMMARY_USAGE}");
+            return 0;
+        }
+        if arg.starts_with('-') {
+            eprintln!("Error: unknown option {}", arg);
+            eprint!("{SUMMARY_USAGE}");
+            return 2;
+        }
+        paths.push(arg.as_str());
     }
-    // Collect every positional (non-flag) argument after `summary`.
-    let paths: Vec<&str> = args[2..]
-        .iter()
-        .take_while(|a| !a.starts_with("--"))
-        .map(String::as_str)
-        .collect();
     if paths.is_empty() {
         eprint!("{SUMMARY_USAGE}");
         return 2;
@@ -763,6 +770,26 @@ mod tests {
         // No path, and a flag where the path should be — both usage (2).
         assert_eq!(run_summary(&args(&["summary"])), 2);
         assert_eq!(run_summary(&args(&["summary", "--json"])), 2);
+        // An unknown flag *after* a path is rejected, not silently ignored.
+        assert_eq!(
+            run_summary(&args(&["summary", "/no/such/file.fitrx", "--bogus"])),
+            2
+        );
+        // A short unknown flag (single dash) is rejected too.
+        assert_eq!(run_summary(&args(&["summary", "-x"])), 2);
+    }
+
+    #[test]
+    fn run_summary_help_anywhere_returns_0() {
+        // Help is recognized even when it follows a path (before any load).
+        assert_eq!(
+            run_summary(&args(&["summary", "/no/such/file.fitrx", "-h"])),
+            0
+        );
+        assert_eq!(
+            run_summary(&args(&["summary", "/no/such/file.fitrx", "--help"])),
+            0
+        );
     }
 
     #[test]
@@ -770,23 +797,45 @@ mod tests {
         assert_eq!(run_summary(&args(&["summary", "/no/such/file.fitrx"])), 1);
     }
 
-    #[test]
-    fn run_summary_valid_fitrx_returns_0() {
-        // Produce a real .fitrx via simulate (fast — no optimization loop), then
-        // load and summarize it in-process so the success arm is covered.
+    /// Simulate the warfarin model and write it to a `.fitrx` at `path` (fast —
+    /// no optimization loop), so `run_summary`'s success arms can be covered.
+    fn write_warfarin_fitrx(path: &std::path::Path) {
         let (fit, pop) = ferx_core::run_model_simulate(WARFARIN_MODEL).expect("simulate warfarin");
         let src = std::fs::read_to_string(WARFARIN_MODEL).expect("read model");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("run.fitrx");
         ferx_core::io::fitrx::save_fit(
             &fit,
             &pop,
             &src,
-            &path,
+            path,
             ferx_core::io::fitrx::SaveFitOptions::default(),
         )
         .expect("save fitrx");
+    }
+
+    #[test]
+    fn run_summary_valid_fitrx_returns_0() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.fitrx");
+        write_warfarin_fitrx(&path);
         assert_eq!(run_summary(&args(&["summary", path.to_str().unwrap()])), 0);
+    }
+
+    #[test]
+    fn run_summary_multiple_fitrx_returns_0() {
+        // Two bundles → the comparison-table arm.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p1 = dir.path().join("run1.fitrx");
+        let p2 = dir.path().join("run2.fitrx");
+        write_warfarin_fitrx(&p1);
+        write_warfarin_fitrx(&p2);
+        assert_eq!(
+            run_summary(&args(&[
+                "summary",
+                p1.to_str().unwrap(),
+                p2.to_str().unwrap()
+            ])),
+            0
+        );
     }
 
     #[test]
