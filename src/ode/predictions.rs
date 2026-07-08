@@ -1796,7 +1796,12 @@ fn earliest_record_pk(
 /// record wins a tie with a pk-only record at the same time (matching
 /// [`segment_pk_at`]). Falls back to `baseline` only for a decision that precedes
 /// the first record. The constant-covariate path never calls this.
-fn locf_decision_cov<'a>(
+///
+/// Also called by `run_adaptive_population` to resolve the covariate for each IOV
+/// `decision_pk[g]` snapshot (#701), so the precomputed decision PK and this driver's
+/// live `decision_cov` share **one** covariate rule and cannot silently diverge — the
+/// reason this is `pub(crate)` rather than private.
+pub(crate) fn locf_decision_cov<'a>(
     t: f64,
     subject: &'a Subject,
     baseline: &'a HashMap<String, f64>,
@@ -5644,6 +5649,80 @@ mod tests {
             max_rel <= 1e-12,
             "IOV frozen replay not bit-aligned: max_rel={max_rel}"
         );
+    }
+
+    #[test]
+    fn adaptive_iov_threads_occasion_eta_into_readout() {
+        // #701 review (coverage): in every other IOV test the per-occasion κ reaches
+        // the trajectory only through the precomputed PK array (event_pk / decision_pk),
+        // so the *separate* `eta_for` threading of the occasion eta into
+        // `read_observable` / `integrate_segment` — load-bearing only when an expression
+        // references κ or η *directly* — was never exercised end to end. Here the
+        // monitored `observe` returns the κ component (eta[1]) it is handed, so the
+        // recorded decision signal must equal that occasion's κ. If `eta_for` /
+        // `segment_occ_at` threaded the wrong occasion (e.g. the fixed baseline eta),
+        // the signals would be the baseline value, not the per-occasion κ.
+        let ode = one_cpt_ode_spec();
+        let v = 10.0;
+        let times = [0.0, 24.0, 48.0]; // 3 decisions = 3 occasions; obs coincide.
+        let occ_pk: Vec<PkParams> = vec![pk_one(1.0, v); times.len()];
+        let event_pk = crate::pk::EventPkParams {
+            dose: Vec::new(),
+            obs: occ_pk.clone(),
+            pk_only: Vec::new(),
+        };
+        let decision_pk = occ_pk.clone();
+        // Distinct κ per occasion in eta[1]; eta[0] is a dummy η_bsv.
+        let eta_occ: Vec<Vec<f64>> = vec![vec![0.0, 10.0], vec![0.0, 20.0], vec![0.0, 30.0]];
+        // A non-empty *baseline* eta with a sentinel κ=999: a wrong occasion (falling
+        // back to baseline) would surface 999, not the per-occasion κ — a clean miss
+        // rather than an index panic.
+        let baseline_eta = [0.0, 999.0];
+
+        // `observe` returns the κ component (eta[1]) it is handed — the occasion's κ.
+        let obs_fn: OdeOutputFn = Box::new(
+            |_u: &[f64], _pk: &[f64], _th: &[f64], eta: &[f64], _cov: &HashMap<String, f64>| eta[1],
+        );
+        let spec = MonitorSpec::new("K", 1, ObserveMode::Ipred);
+        let mons = vec![AdaptiveMonitor {
+            spec: &spec,
+            observe: Some(&obs_fn),
+        }];
+        let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+            actions: vec![DoseAction::Hold],
+            rule: None,
+        };
+        let base = make_subject(vec![], times.to_vec());
+        let run = ode_predictions_adaptive_impl(
+            &ode,
+            &occ_pk[0].values,
+            Some(&event_pk),
+            Some(&decision_pk),
+            Some(&eta_occ),
+            &[],
+            &baseline_eta,
+            &base,
+            &times,
+            &mons,
+            &mut decide,
+            100,
+            None,
+        )
+        .expect("driver runs");
+
+        let sig_at = |t: f64| {
+            run.decisions
+                .iter()
+                .find(|d| d.time == t)
+                .and_then(|d| d.observed_signals.first())
+                .map(|s| s.value)
+                .unwrap_or(f64::NAN)
+        };
+        // Each decision's readout must carry its own occasion's κ (eta[1]), threaded by
+        // `eta_for(segment_occ_at(...))` — not the baseline sentinel 999.
+        assert_eq!(sig_at(0.0), 10.0, "occasion 0 κ");
+        assert_eq!(sig_at(24.0), 20.0, "occasion 1 κ");
+        assert_eq!(sig_at(48.0), 30.0, "occasion 2 κ");
     }
 
     #[test]

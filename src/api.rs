@@ -7277,6 +7277,19 @@ where
     // wrong answer (#391). Both public entry points funnel through here.
     reject_unsupported_adaptive(model, population)?;
 
+    // The occasion bookkeeping assumes a strictly-increasing decision schedule:
+    // `occasion_of` (per-decision-window κ selection) scans ascending and stops at the
+    // first later time, and `decision_index_of` keys windows by exact time bits. An
+    // unsorted schedule would mis-map a record to the wrong occasion's κ, and a
+    // duplicated time would split the window-open index from the materialiser's
+    // occasion — both silently, since the frozen-replay verifier reuses the same
+    // occasion arrays and cannot catch a shared-wrong-input (#701 review). The
+    // declarative `[adaptive_dosing]` path already enforces this on its `at` list via
+    // `validate_increasing_finite`; guard the programmatic `simulate_adaptive` path
+    // here too, at the shared funnel, with the *same* validator (finite + strictly
+    // ascending ⇒ no duplicates) so the two paths cannot drift.
+    crate::sim::adaptive::validate_increasing_finite(decision_times, "`decision_times`")?;
+
     use rand::SeedableRng;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
@@ -7376,18 +7389,22 @@ where
                     let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
                     e.extend(kappa_g.iter().copied());
                     // PK at decision g under occasion g's κ, at the covariate the
-                    // driver sees at that decision (its `decision_cov`: the
-                    // obs-coincident snapshot if the decision lands on an
-                    // observation row, else the subject-static covariates). Gives
-                    // occasion g's parameters to the pre-dose readout and the
-                    // injected dose's F even when the decision is not a record
-                    // (where LOCF would carry the previous occasion's PK).
-                    let dcov = subject
-                        .obs_times
-                        .iter()
-                        .position(|&ot| ot.to_bits() == decision_times[g].to_bits())
-                        .map(|i| subject.obs_cov(i))
-                        .unwrap_or(&subject.covariates);
+                    // driver actually sees at that decision. This MUST match the
+                    // driver's live `decision_cov` (predictions.rs) exactly: the
+                    // obs-coincident snapshot on a record, else the LOCF covariate of
+                    // the most-recent record carried forward — NOT the frozen t=0
+                    // baseline. On a time-varying-covariate + IOV model whose decision
+                    // lands between records, a baseline fallback here would freeze the
+                    // decision's covariate at t=0 (the exact #700 defect) while the
+                    // driver's readout uses LOCF — and the frozen-replay verifier,
+                    // which reuses this same `decision_pk`, could not catch it. Sharing
+                    // the one `locf_decision_cov` helper the driver uses makes the two
+                    // covariate resolutions a single source of truth (#701 review).
+                    let dcov = crate::ode::predictions::locf_decision_cov(
+                        decision_times[g],
+                        subject,
+                        &subject.covariates,
+                    );
                     decision_pk.push((model.pk_param_fn)(
                         &params.theta,
                         &e,
@@ -14013,6 +14030,126 @@ mod adaptive_sim_tests {
         assert!(
             err.to_lowercase().contains("auc_target") && err.to_lowercase().contains("iov"),
             "error should cite auc_target + IOV: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_iov_decision_pk_uses_locf_covariate_off_grid() {
+        // #701 review regression (verifier-blind): on a TV-covariate + IOV model, an
+        // off-record decision must resolve its PK snapshot (`decision_pk[g]`) at the
+        // LOCF covariate — the most-recent record carried forward — exactly as the
+        // driver's live `decision_cov` does, NOT the frozen t=0 baseline. Before the
+        // fix, `run_adaptive_population` fell back to `subject.covariates` (t=0) for a
+        // decision off the obs grid, re-introducing the #700 "decision covariate frozen
+        // at t=0" defect on the IOV decision-PK path — and the frozen-replay verifier,
+        // which reuses the same `decision_pk`, could not catch it.
+        //
+        // F (bioavailability) depends on CRCL and never enters the ODE, so each injected
+        // dose's realized `f_applied` is an *unconfounded* readout of the covariate the
+        // decision saw: F = CRCL/200 ⇒ 0.5 at CRCL=100, 1.0 at CRCL=200.
+        let iov_tvf = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+  f  = CRCL / 200.0
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let model = parse_model_string(iov_tvf).expect("parse TV-F + IOV model");
+        assert!(model.n_kappa == 1, "must be an IOV model");
+
+        // obs at 0 (CRCL 100) and 24 (CRCL 200): the covariate jumps at t=24.
+        let mut s = subj("1", vec![0.0, 24.0], vec![]);
+        s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+        s.obs_covariates = vec![
+            HashMap::from([("CRCL".to_string(), 100.0)]),
+            HashMap::from([("CRCL".to_string(), 200.0)]),
+        ];
+        let mut pop = population(vec![s]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+
+        // Decisions at 0, 12, 24, 36. t=12 is off-record but *before* the jump
+        // (LOCF == baseline == 100, a control); t=36 is off-record and *after* the jump
+        // (LOCF = 200, baseline = 100) — the discriminator. A fixed bolus doses at each.
+        let decisions = vec![0.0, 12.0, 24.0, 36.0];
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            decision_times: decisions.clone(),
+            ..Default::default()
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect("adaptive TV-F + IOV sim runs and passes the default verifier");
+        assert_eq!(res.ledger.len(), 4, "a dose at every decision");
+
+        let f_at = |t: f64| {
+            res.ledger
+                .iter()
+                .find(|e| e.time == t)
+                .map(|e| e.f_applied)
+                .unwrap_or_else(|| panic!("no dose at t={t}"))
+        };
+        // t=0 coincides with obs CRCL=100 → F=0.5; t=24 coincides with obs CRCL=200 → F=1.0.
+        assert!((f_at(0.0) - 0.5).abs() < 1e-9, "t=0 F={}", f_at(0.0));
+        assert!((f_at(24.0) - 1.0).abs() < 1e-9, "t=24 F={}", f_at(24.0));
+        // t=12 off-record but before the jump → LOCF == baseline == 100 → F=0.5 (the
+        // buggy and fixed code agree here; the control).
+        assert!((f_at(12.0) - 0.5).abs() < 1e-9, "t=12 F={}", f_at(12.0));
+        // t=36 off-record and AFTER the jump → LOCF CRCL=200 → F=1.0. The bug froze it
+        // at the t=0 baseline CRCL=100 → F=0.5. This assertion fails without the fix.
+        assert!(
+            (f_at(36.0) - 1.0).abs() < 1e-9,
+            "off-record decision at t=36 must use the LOCF covariate (CRCL=200 ⇒ F=1.0), \
+             not the frozen t=0 baseline (CRCL=100 ⇒ F=0.5); got F={}",
+            f_at(36.0)
+        );
+    }
+
+    #[test]
+    fn adaptive_rejects_non_ascending_or_duplicate_decision_times() {
+        // #701 review: the occasion bookkeeping (`occasion_of`, `decision_index_of`)
+        // assumes a strictly-increasing decision schedule. An unsorted or duplicated
+        // `decision_times` would silently mis-map a record's occasion κ — and the
+        // frozen-replay verifier, reusing the same occasion arrays, could not catch it.
+        // The programmatic `simulate_adaptive` path must reject it loudly at the shared
+        // funnel, matching the declarative path's `validate_increasing_finite`.
+        let model = parse_model_string(ODE_IOV).expect("parse IOV model");
+        let pop = population(vec![subj("1", vec![0.0, 24.0, 48.0], vec![])]);
+        let run = |dts: Vec<f64>| {
+            let opts = AdaptiveSimulateOptions {
+                seed: Some(1),
+                decision_times: dts,
+                ..Default::default()
+            };
+            simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        };
+        // Out of order.
+        let err = run(vec![0.0, 48.0, 24.0]).expect_err("unsorted schedule must be rejected");
+        assert!(
+            err.to_lowercase().contains("increasing"),
+            "error should cite the ordering: {err}"
+        );
+        // Duplicate time (strictly-increasing rejects equality).
+        let err = run(vec![0.0, 24.0, 24.0, 48.0]).expect_err("duplicate time must be rejected");
+        assert!(
+            err.to_lowercase().contains("increasing"),
+            "error should cite the ordering: {err}"
+        );
+        // The ascending control still runs.
+        assert!(
+            run(vec![0.0, 24.0, 48.0]).is_ok(),
+            "ascending schedule runs"
         );
     }
 

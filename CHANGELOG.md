@@ -69,7 +69,10 @@ section of the SDLC for the versioning policy).
   is drawn on a dedicated per-(subject, replicate) substream, so a non-IOV run is
   byte-identical to before and enabling a `Dv` monitor never shifts the draws. The
   `auc_target_attainment` metric is not yet available for IOV subjects and is rejected
-  with a typed error rather than reported from a κ-frozen snapshot.
+  with a typed error rather than reported from a κ-frozen snapshot. A non-ascending or
+  duplicated adaptive `decision_times` schedule (programmatic `simulate_adaptive`) is now
+  rejected with a typed error, matching the declarative `[adaptive_dosing]` path — an
+  out-of-order schedule would otherwise mis-map a record to the wrong occasion.
 - **`estimation:` block in `{model}-fit.yaml` now splits wall time by stage** (#713):
   a `{method}_wall_time_secs` entry (e.g. `focei_wall_time_secs`, `imp_wall_time_secs`)
   is reported for each stage of `method`/`methods`, plus a `covariance_wall_time_secs`
