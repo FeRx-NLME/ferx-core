@@ -1194,6 +1194,11 @@ fn parse_subjects(
     let npde_i = col.get("NPDE").copied();
     let npd_i = col.get("NPD").copied();
     let cens_i = col.get("CENS").copied();
+    // N_OBS is always written by `write_predictions_csv`, but treat it as
+    // optional so a hand-built bundle without it still loads. When present, it
+    // is validated per row against the subject we're filling — the ID order
+    // check alone can't catch two same-ID blocks written in the wrong order.
+    let n_obs_i = col.get("N_OBS").copied();
 
     // Rows are written one contiguous block per subject, in the same order as
     // ebes.csv (see `write_predictions_csv`), with exactly `n_obs` rows each.
@@ -1235,7 +1240,7 @@ fn parse_subjects(
             )));
         }
         let idx = cur;
-        if *id != subjects[idx].id {
+        if id != &subjects[idx].id {
             return Err(FitrxError::Corrupt(format!(
                 "predictions.csv row {}: ID {:?} out of order; expected subject {:?} \
                  (predictions must follow ebes.csv subject order)",
@@ -1243,6 +1248,24 @@ fn parse_subjects(
                 id,
                 subjects[idx].id
             )));
+        }
+        // Row-level N_OBS guard: catches two same-ID blocks written out of
+        // order, where the ID check above passes but the block sizes differ.
+        if let Some(j) = n_obs_i {
+            if let Some(raw) = fields.get(j) {
+                if let Ok(row_n_obs) = raw.parse::<usize>() {
+                    if row_n_obs != subjects[idx].n_obs {
+                        return Err(FitrxError::Corrupt(format!(
+                            "predictions.csv row {}: N_OBS {} disagrees with ebes.csv \
+                             n_obs {} for subject {:?}",
+                            i + 1,
+                            row_n_obs,
+                            subjects[idx].n_obs,
+                            subjects[idx].id
+                        )));
+                    }
+                }
+            }
         }
         subjects[idx].pred.push(parse_opt(&fields[pred_i]));
         subjects[idx].ipred.push(parse_opt(&fields[ipred_i]));
@@ -2572,6 +2595,59 @@ mod tests {
             "no bleed into block A"
         );
         assert!(s[1].ipred.iter().all(|&v| v > 100.0), "block B rows intact");
+    }
+
+    #[test]
+    fn load_rejects_misordered_duplicate_id_blocks() {
+        // Two same-ID blocks written in the wrong order: the ID order check
+        // passes (both are "12"), so the per-row N_OBS guard is what catches it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup-swapped.fitrx");
+        let mut r = minimal_fit_result();
+        let n_eta = 2;
+        r.subjects = vec![dummy_subject("12", n_eta, 3), dummy_subject("12", n_eta, 5)];
+        r.n_obs = 8;
+        r.n_subjects = 2;
+        let p = dummy_population(&["12", "12"], 5);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        // Reorder predictions.csv so the 5-row block precedes the 3-row block.
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().to_string();
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf).unwrap();
+            if name == "predictions.csv" {
+                let csv = String::from_utf8(buf).unwrap();
+                let lines: Vec<&str> = csv.lines().collect();
+                // header, then 3 rows (block A), then 5 rows (block B).
+                let header = lines[0];
+                let block_a = &lines[1..4];
+                let block_b = &lines[4..9];
+                let mut reordered = vec![header];
+                reordered.extend_from_slice(block_b);
+                reordered.extend_from_slice(block_a);
+                buf = reordered.join("\n").into_bytes();
+                buf.push(b'\n');
+            }
+            entries.push((name, buf));
+        }
+        let bad = dir.path().join("dup-swapped-rewritten.fitrx");
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&bad).unwrap());
+        for (name, body) in entries {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&body).unwrap();
+        }
+        zw.finish().unwrap();
+
+        let err = load_fit(&bad).unwrap_err();
+        match err {
+            FitrxError::Corrupt(msg) => assert!(msg.contains("N_OBS"), "msg = {}", msg),
+            other => panic!("expected Corrupt, got {:?}", other),
+        }
     }
 
     #[test]
