@@ -20,7 +20,6 @@ use crate::estimation::parameterization::{compute_mu_k, pack_params};
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
 use crate::io::hash::sha256_file;
 use crate::types::*;
-use nalgebra::DVector;
 use std::path::Path;
 
 /// Run the covariance step against an existing fit. Returns a new `FitResult`
@@ -170,13 +169,19 @@ pub fn run_covariance(
     // `compute_covariance` reconverges the EBEs (and recomputes H) at every
     // perturbed point, so the passed `eta_hats` are only a warm-start and
     // `h_matrices` is unused. The score-cross-product path (covariance_method
-    // = s / rsr) does read `kappas`, so we rebuild all three consistently by
-    // re-running the inner loop at the fitted parameters, warm-started from the
-    // fit's stored EBEs. This is exactly what a fresh `fit()` hands to
-    // `compute_covariance`.
+    // = s / rsr) does read `kappas`, so we rebuild all three by re-running the
+    // final inner loop at the fitted parameters.
+    //
+    // We **cold-start** (`warm_etas = None`) rather than seeding from the fit's
+    // stored EBEs, because that is exactly what the inline covariance path in
+    // `outer_optimizer` does (its "final inner loop at converged parameters"
+    // passes `None`). Warm-starting from the stored EBEs would run the inner
+    // BFGS from a slightly different point and, at a loose `inner_tol`, land a
+    // slightly different EBE than the cold path — enough to make the covariance
+    // matrix diverge from the inline result by ~1e-4 on some platforms. Matching
+    // the inline start point keeps the two numerics bit-for-bit comparable.
     let params = fitted_params_from_result(fit, model_ref);
     let x_hat = pack_params(&params);
-    let warm_etas: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
     let mu_k = compute_mu_k(model_ref, &params.theta, options.mu_referencing);
     let (eta_hats, h_matrices, _stats, kappas) =
         crate::estimation::inner_optimizer::run_inner_loop_warm(
@@ -185,7 +190,7 @@ pub fn run_covariance(
             &params,
             options.inner_maxiter,
             options.inner_tol,
-            Some(&warm_etas),
+            None,
             Some(&mu_k),
             options.min_obs_for_convergence_check as usize,
         );
