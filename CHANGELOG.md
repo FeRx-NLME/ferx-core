@@ -20,6 +20,11 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`ferx summary` compares multiple runs** (#749): pass two or more `.fitrx`
+  bundles (`ferx summary run1.fitrx run2.fitrx run3.fitrx`) to print a Markdown
+  table comparing them side by side — method, convergence, OFV/AIC/BIC, ΔOFV,
+  runtime, subject/observation/parameter counts, and THETA/OMEGA/SIGMA
+  estimates. A single bundle still prints the detailed `psn::sumo`-style report.
 - **`[data]` block column renaming** (#730, #742): rename any dataset header to
   any new name with `new-name = actual` entries (e.g. `TIME = TAFD`,
   `DV = CONC`), the ferx equivalent of NONMEM's `$INPUT TIME=TAFD`. Targets are

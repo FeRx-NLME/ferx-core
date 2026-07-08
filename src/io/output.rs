@@ -771,6 +771,261 @@ pub fn format_summary(result: &FitResult) -> String {
     out
 }
 
+/// Render a Markdown table comparing several runs side by side.
+///
+/// Each element of `runs` is `(label, fit)`, where `label` names the run
+/// (typically the `.fitrx` file stem) and becomes a column header. Backs
+/// `ferx summary` when given two or more bundles: one run-info table (method,
+/// convergence, OFV/AIC/BIC, ΔOFV vs the first run, runtime, sizes) followed
+/// by THETA / OMEGA / SIGMA estimate tables whose rows are the union of
+/// parameter names across all runs (a `—` marks a parameter absent from a run).
+pub fn format_comparison(runs: &[(String, &FitResult)]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if runs.is_empty() {
+        return out;
+    }
+
+    // Emit one Markdown table row: `| head | c0 | c1 | ... |`.
+    fn row(out: &mut String, head: &str, cells: &[String]) {
+        let mut line = format!("| {} |", head);
+        for c in cells {
+            let _ = write!(line, " {} |", c);
+        }
+        let _ = writeln!(out, "{}", line);
+    }
+
+    let labels: Vec<&str> = runs.iter().map(|(l, _)| l.as_str()).collect();
+    let n = runs.len();
+
+    // --- Header + run-info block ---
+    row(
+        &mut out,
+        "Run",
+        &labels.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+    );
+    // Separator: one `---` per column, including the leading metric column.
+    {
+        let seps: Vec<String> = std::iter::repeat("---".to_string()).take(n).collect();
+        row(&mut out, "---", &seps);
+    }
+
+    let method_label = |r: &FitResult| -> String {
+        if r.method_chain.len() > 1 {
+            r.method_chain
+                .iter()
+                .map(|m| m.label())
+                .collect::<Vec<_>>()
+                .join(" → ")
+        } else {
+            r.method.label().to_string()
+        }
+    };
+
+    row(
+        &mut out,
+        "Model",
+        &runs
+            .iter()
+            .map(|(_, r)| r.model_name.clone())
+            .collect::<Vec<_>>(),
+    );
+    row(
+        &mut out,
+        "Method",
+        &runs
+            .iter()
+            .map(|(_, r)| method_label(r))
+            .collect::<Vec<_>>(),
+    );
+    row(
+        &mut out,
+        "Converged",
+        &runs
+            .iter()
+            .map(|(_, r)| {
+                if r.converged {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                }
+            })
+            .collect::<Vec<_>>(),
+    );
+    row(
+        &mut out,
+        "OFV",
+        &runs
+            .iter()
+            .map(|(_, r)| format!("{:.4}", r.ofv))
+            .collect::<Vec<_>>(),
+    );
+    // ΔOFV relative to the first run (0 for the reference column).
+    let ref_ofv = runs[0].1.ofv;
+    row(
+        &mut out,
+        "ΔOFV",
+        &runs
+            .iter()
+            .map(|(_, r)| format!("{:+.4}", r.ofv - ref_ofv))
+            .collect::<Vec<_>>(),
+    );
+    row(
+        &mut out,
+        "AIC",
+        &runs
+            .iter()
+            .map(|(_, r)| format!("{:.4}", r.aic))
+            .collect::<Vec<_>>(),
+    );
+    row(
+        &mut out,
+        "BIC",
+        &runs
+            .iter()
+            .map(|(_, r)| format!("{:.4}", r.bic))
+            .collect::<Vec<_>>(),
+    );
+    row(
+        &mut out,
+        "Runtime (s)",
+        &runs
+            .iter()
+            .map(|(_, r)| format!("{:.1}", r.wall_time_secs))
+            .collect::<Vec<_>>(),
+    );
+    row(
+        &mut out,
+        "Iterations",
+        &runs
+            .iter()
+            .map(|(_, r)| r.n_iterations.to_string())
+            .collect::<Vec<_>>(),
+    );
+    row(
+        &mut out,
+        "Subjects",
+        &runs
+            .iter()
+            .map(|(_, r)| r.n_subjects.to_string())
+            .collect::<Vec<_>>(),
+    );
+    row(
+        &mut out,
+        "Observations",
+        &runs
+            .iter()
+            .map(|(_, r)| r.n_obs.to_string())
+            .collect::<Vec<_>>(),
+    );
+    row(
+        &mut out,
+        "Parameters",
+        &runs
+            .iter()
+            .map(|(_, r)| r.n_parameters.to_string())
+            .collect::<Vec<_>>(),
+    );
+
+    // --- Parameter estimate tables ---
+    // Build the union of parameter names in first-seen order across runs.
+    let union_names = |get: &dyn Fn(&FitResult) -> Vec<String>| -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        for (_, r) in runs {
+            for name in get(r) {
+                if seen.insert(name.clone()) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    };
+
+    // Estimate cell for parameter `name` in run `r`, `—` if the run lacks it.
+    // `%RSE` is appended in parens when a standard error is available.
+    let theta_cell = |r: &FitResult, name: &str| -> String {
+        match r.theta_names.iter().position(|n| n == name) {
+            None => "—".to_string(),
+            Some(i) => {
+                let est = r.theta[i];
+                match r.se_theta.as_ref().and_then(|se| se.get(i)) {
+                    Some(&se) if est.abs() > 1e-12 => {
+                        format!("{:.4} ({:.1}%)", est, (se / est.abs()) * 100.0)
+                    }
+                    _ => format!("{:.4}", est),
+                }
+            }
+        }
+    };
+
+    let theta_names = union_names(&|r| r.theta_names.clone());
+    if !theta_names.is_empty() {
+        let _ = writeln!(out, "\n**THETA**\n");
+        row(
+            &mut out,
+            "Parameter",
+            &labels.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        );
+        let seps: Vec<String> = std::iter::repeat("---".to_string()).take(n).collect();
+        row(&mut out, "---", &seps);
+        for name in &theta_names {
+            let cells: Vec<String> = runs.iter().map(|(_, r)| theta_cell(r, name)).collect();
+            row(&mut out, name, &cells);
+        }
+    }
+
+    let omega_names = union_names(&|r| r.eta_names.clone());
+    if !omega_names.is_empty() {
+        let _ = writeln!(out, "\n**OMEGA** (variances)\n");
+        row(
+            &mut out,
+            "Parameter",
+            &labels.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        );
+        let seps: Vec<String> = std::iter::repeat("---".to_string()).take(n).collect();
+        row(&mut out, "---", &seps);
+        for name in &omega_names {
+            let cells: Vec<String> = runs
+                .iter()
+                .map(
+                    |(_, r)| match r.eta_names.iter().position(|nm| nm == name) {
+                        Some(i) => format!("{:.4}", r.omega[(i, i)]),
+                        None => "—".to_string(),
+                    },
+                )
+                .collect();
+            row(&mut out, name, &cells);
+        }
+    }
+
+    let sigma_names = union_names(&|r| r.sigma_names.clone());
+    if !sigma_names.is_empty() {
+        let _ = writeln!(out, "\n**SIGMA**\n");
+        row(
+            &mut out,
+            "Parameter",
+            &labels.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        );
+        let seps: Vec<String> = std::iter::repeat("---".to_string()).take(n).collect();
+        row(&mut out, "---", &seps);
+        for name in &sigma_names {
+            let cells: Vec<String> = runs
+                .iter()
+                .map(
+                    |(_, r)| match r.sigma_names.iter().position(|nm| nm == name) {
+                        Some(i) => format!("{:.4}", r.sigma[i]),
+                        None => "—".to_string(),
+                    },
+                )
+                .collect();
+            row(&mut out, name, &cells);
+        }
+    }
+
+    out
+}
+
 /// Generate SDTAB-like output as vectors of (header, values) pairs
 pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f64>)> {
     let n_total: usize = result.subjects.iter().map(|s| s.ipred.len()).sum();
@@ -2897,6 +3152,59 @@ mod tests {
         let cl = table.lines().find(|l| l.starts_with("CL")).expect("CL row");
         // No covariance run → SE/%RSE rendered as "---".
         assert!(cl.contains("---"), "{cl}");
+    }
+
+    // ── format_comparison: multi-run Markdown table ──────────────────────────
+
+    #[test]
+    fn format_comparison_tabulates_runs_side_by_side() {
+        let mut a = full_param_result(Some(vec![0.2, 0.0]));
+        a.model_name = "run_a".into();
+        a.ofv = 100.0;
+        a.wall_time_secs = 12.5;
+        let mut b = full_param_result(Some(vec![0.3, 0.0]));
+        b.model_name = "run_b".into();
+        b.ofv = 90.0;
+        b.wall_time_secs = 8.0;
+
+        let md = format_comparison(&[("run_a".into(), &a), ("run_b".into(), &b)]);
+
+        // Header row carries both run labels.
+        assert!(md.contains("| Run | run_a | run_b |"), "{md}");
+        // Markdown separator row present.
+        assert!(md.contains("| --- | --- | --- |"), "{md}");
+        // Run-info rows.
+        assert!(md.contains("| OFV | 100.0000 | 90.0000 |"), "{md}");
+        // ΔOFV is relative to the first run (0 for the reference column).
+        assert!(md.contains("| ΔOFV | +0.0000 | -10.0000 |"), "{md}");
+        assert!(md.contains("| Runtime (s) | 12.5 | 8.0 |"), "{md}");
+        // Section headers + a THETA estimate with %RSE (SE 0.2 / est 2.0 = 10%).
+        assert!(md.contains("**THETA**"), "{md}");
+        assert!(md.contains("| CL | 2.0000 (10.0%)"), "{md}");
+        assert!(md.contains("**OMEGA**"), "{md}");
+        assert!(md.contains("**SIGMA**"), "{md}");
+    }
+
+    #[test]
+    fn format_comparison_marks_missing_parameters() {
+        let a = full_param_result(None); // thetas: CL, ZERO
+        let mut b = full_param_result(None);
+        b.theta = vec![2.0];
+        b.theta_names = vec!["CL".into()]; // no ZERO
+        b.theta_fixed = vec![false];
+
+        let md = format_comparison(&[("a".into(), &a), ("b".into(), &b)]);
+        // ZERO exists only in run `a`; run `b`'s cell is an em dash.
+        let zero_row = md
+            .lines()
+            .find(|l| l.starts_with("| ZERO |"))
+            .expect("ZERO row");
+        assert!(zero_row.contains("—"), "{zero_row}");
+    }
+
+    #[test]
+    fn format_comparison_empty_is_empty() {
+        assert!(format_comparison(&[]).is_empty());
     }
 
     // ── print_results: stderr smoke test (exercises both header branches) ────

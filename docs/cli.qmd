@@ -8,7 +8,7 @@ The `ferx` command-line tool runs population PK estimation from model files and 
 ferx <model.ferx> --data <data.csv> [--output <run.fitrx>] [--include-data] [--inits-from-nca[=METHOD]]
 ferx <model.ferx> --simulate          [--output <run.fitrx>]
 ferx check <model.ferx> [--data <data.csv>] [--json]
-ferx summary <run.fitrx>
+ferx summary <run.fitrx> [<run2.fitrx> ...]
 ferx --help                    # or -h; also: ferx check --help, ferx summary --help
 ```
 
@@ -103,6 +103,37 @@ Subjects: 32   Observations: 251   Parameters: 7
 
 The exit code is `0` on success, `1` if the bundle cannot be loaded, and `2` on
 a usage error (missing path).
+
+#### Compare Multiple Runs
+
+Pass two or more bundles to compare them side by side. Instead of the single-run
+report above, `summary` prints a **Markdown table** — method, convergence,
+OFV / AIC / BIC, ΔOFV (relative to the first run), runtime, and the subject /
+observation / parameter counts, followed by THETA (with %RSE), OMEGA, and SIGMA
+estimate tables. Each column is labelled with the bundle's file stem, and a `—`
+marks a parameter absent from a run. Handy for pasting into a report or a PR.
+
+```bash
+ferx summary run1.fitrx run2.fitrx run3.fitrx
+```
+
+```markdown
+| Run | run1 | run2 | run3 |
+| --- | --- | --- | --- |
+| Model | warfarin | warfarin | warfarin |
+| Method | FOCE | FOCEI | SAEM → IMP |
+| Converged | yes | yes | yes |
+| OFV | -280.3639 | -281.0102 | -280.9998 |
+| ΔOFV | +0.0000 | -0.6463 | -0.6359 |
+| ... | ... | ... | ... |
+
+**THETA**
+
+| Parameter | run1 | run2 | run3 |
+| --- | --- | --- | --- |
+| TVCL | 0.1330 (5.0%) | 0.1332 (4.9%) | 0.1331 (5.1%) |
+| ... | ... | ... | ... |
+```
 
 ## Output Files
 

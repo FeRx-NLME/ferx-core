@@ -8,7 +8,7 @@ const MAIN_USAGE: &str = "\
 Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]]
        ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
        ferx check <model.ferx> [--data <data.csv>] [--json]
-       ferx summary <run.fitrx>
+       ferx summary <run.fitrx> [<run2.fitrx> ...]
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -231,38 +231,73 @@ fn main() {
 }
 
 const SUMMARY_USAGE: &str = "\
-Usage: ferx summary <run.fitrx>
+Usage: ferx summary <run.fitrx> [<run2.fitrx> ...]
 
-Prints a psn::sumo-style summary — parameter estimates with %RSE
-plus basic run info — from a saved .fitrx fit bundle.
+With one bundle: prints a psn::sumo-style summary — parameter estimates
+with %RSE plus basic run info.
+
+With two or more bundles: prints a Markdown table comparing the runs
+(method, convergence, OFV/AIC/BIC, ΔOFV, runtime, sizes, and parameter
+estimates) side by side.
 ";
 
-/// Run the `summary` subcommand: load a `.fitrx` bundle and print a
-/// `psn::sumo`-style summary (parameter estimates + basic run info) to stdout.
-/// Returns the process exit code: `0` = printed (incl. `--help`), `1` = load
+/// Run the `summary` subcommand: load one or more `.fitrx` bundles.
+///
+/// A single bundle prints a `psn::sumo`-style summary (parameter estimates +
+/// basic run info). Two or more bundles print a Markdown comparison table.
+/// The column label for each run is the bundle's file stem.
+///
+/// Returns the process exit code: `0` = printed (incl. `--help`), `1` = a load
 /// failed, `2` = usage (missing/flag-looking path).
 fn run_summary(args: &[String]) -> i32 {
     if is_help_flag(args.get(2)) {
         print!("{SUMMARY_USAGE}");
         return 0;
     }
-    let path = match args.get(2) {
-        Some(p) if !p.starts_with("--") => p.as_str(),
-        _ => {
-            eprint!("{SUMMARY_USAGE}");
-            return 2;
-        }
-    };
-    match ferx_core::io::fitrx::load_fit(std::path::Path::new(path)) {
-        Ok(loaded) => {
-            print!("{}", ferx_core::io::output::format_summary(&loaded.fit));
-            0
-        }
-        Err(e) => {
-            eprintln!("Error: failed to load {}: {}", path, e);
-            1
+    // Collect every positional (non-flag) argument after `summary`.
+    let paths: Vec<&str> = args[2..]
+        .iter()
+        .take_while(|a| !a.starts_with("--"))
+        .map(String::as_str)
+        .collect();
+    if paths.is_empty() {
+        eprint!("{SUMMARY_USAGE}");
+        return 2;
+    }
+
+    // Load all bundles up front so a bad path fails before any output.
+    let mut loaded = Vec::with_capacity(paths.len());
+    for path in &paths {
+        match ferx_core::io::fitrx::load_fit(std::path::Path::new(path)) {
+            Ok(l) => loaded.push((*path, l)),
+            Err(e) => {
+                eprintln!("Error: failed to load {}: {}", path, e);
+                return 1;
+            }
         }
     }
+
+    if loaded.len() == 1 {
+        print!(
+            "{}",
+            ferx_core::io::output::format_summary(&loaded[0].1.fit)
+        );
+    } else {
+        // Column label = file stem (e.g. `run1.fitrx` → `run1`).
+        let runs: Vec<(String, &ferx_core::FitResult)> = loaded
+            .iter()
+            .map(|(path, l)| {
+                let label = std::path::Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(path)
+                    .to_string();
+                (label, &l.fit)
+            })
+            .collect();
+        print!("{}", ferx_core::io::output::format_comparison(&runs));
+    }
+    0
 }
 
 /// Parsed `ferx check` arguments.
