@@ -4874,6 +4874,69 @@ fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
 ///
 /// Does NOT handle `method` (which has list-chain syntax) — that stays in
 /// the block parser.
+/// Parse the `iov_occasion` fit-option value into an [`IovOccasionRule`].
+///
+/// Accepts:
+///   - `column` (or empty/none/null/na) → [`IovOccasionRule::Column`]
+///   - `dose`                           → [`IovOccasionRule::PerDose`]
+///   - `time(24, 48)`                   → [`IovOccasionRule::TimeWindows`]
+///
+/// Breakpoints must be finite and strictly increasing.
+fn parse_iov_occasion(value: &str) -> Result<IovOccasionRule, String> {
+    let v = value.trim();
+    let lower = v.to_ascii_lowercase();
+    if lower.is_empty() || lower == "column" || lower == "none" || lower == "null" || lower == "na"
+    {
+        return Ok(IovOccasionRule::Column);
+    }
+    if lower == "dose" {
+        return Ok(IovOccasionRule::PerDose);
+    }
+    if let Some(rest) = lower.strip_prefix("time") {
+        let inner = rest.trim();
+        let inner = inner
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .ok_or_else(|| {
+                format!(
+                    "fit option `iov_occasion`: expected `time(edge1, edge2, ...)`, got `{value}`"
+                )
+            })?;
+        let mut edges = Vec::new();
+        for tok in inner.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            let x = tok.parse::<f64>().map_err(|_| {
+                format!("fit option `iov_occasion`: breakpoint `{tok}` is not a number")
+            })?;
+            if !x.is_finite() {
+                return Err(format!(
+                    "fit option `iov_occasion`: breakpoint `{tok}` must be finite"
+                ));
+            }
+            edges.push(x);
+        }
+        if edges.is_empty() {
+            return Err(
+                "fit option `iov_occasion`: `time(...)` needs at least one breakpoint".to_string(),
+            );
+        }
+        if edges.windows(2).any(|w| w[1] <= w[0]) {
+            return Err(format!(
+                "fit option `iov_occasion`: `time(...)` breakpoints must be strictly increasing, \
+                 got `{value}`"
+            ));
+        }
+        return Ok(IovOccasionRule::TimeWindows(edges));
+    }
+    Err(format!(
+        "fit option `iov_occasion`: unknown value `{value}` — expected `column`, `dose`, or \
+         `time(edge1, edge2, ...)`"
+    ))
+}
+
 pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result<bool, String> {
     let value = value.trim();
 
@@ -5250,6 +5313,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             } else {
                 Some(value.to_string())
             };
+        }
+        "iov_occasion" => {
+            opts.iov_occasion = parse_iov_occasion(value)?;
         }
         "optimizer_trace" => opts.optimizer_trace = parse_bool("optimizer_trace")?,
         "reconverge_gradient_interval" => {
@@ -20197,6 +20263,53 @@ mod tests {
         let content = minimal_model_with_fit_options("  iov_column = PERIOD");
         let parsed = parse_full_model(&content).unwrap();
         assert_eq!(parsed.fit_options.iov_column, Some("PERIOD".to_string()));
+    }
+
+    #[test]
+    fn test_iov_occasion_dose_and_column() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(&mut opts, "iov_occasion", "dose"),
+            Ok(true)
+        );
+        assert_eq!(opts.iov_occasion, IovOccasionRule::PerDose);
+        apply_fit_option(&mut opts, "iov_occasion", "column").unwrap();
+        assert_eq!(opts.iov_occasion, IovOccasionRule::Column);
+    }
+
+    #[test]
+    fn test_iov_occasion_time_windows() {
+        let mut opts = FitOptions::default();
+        apply_fit_option(&mut opts, "iov_occasion", "time(24, 48)").unwrap();
+        assert_eq!(
+            opts.iov_occasion,
+            IovOccasionRule::TimeWindows(vec![24.0, 48.0])
+        );
+    }
+
+    #[test]
+    fn test_iov_occasion_rejects_bad_values() {
+        let mut opts = FitOptions::default();
+        // non-increasing breakpoints
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time(48, 24)").is_err());
+        // empty breakpoint list
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time()").is_err());
+        // unparseable breakpoint
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time(a)").is_err());
+        // unknown mode
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "weekly").is_err());
+        // malformed time() (missing parens)
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time 24").is_err());
+    }
+
+    #[test]
+    fn test_iov_occasion_parsed_from_fit_options_block() {
+        let content = minimal_model_with_fit_options("  iov_occasion = time(24)");
+        let parsed = parse_full_model(&content).unwrap();
+        assert_eq!(
+            parsed.fit_options.iov_occasion,
+            IovOccasionRule::TimeWindows(vec![24.0])
+        );
     }
 
     // ── block_kappa (Option B) ─────────────────────────────────────────────

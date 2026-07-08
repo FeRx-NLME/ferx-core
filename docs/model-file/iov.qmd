@@ -8,7 +8,10 @@ Inter-Occasion Variability (IOV) models the fact that a subject's PK parameters 
 
 ### Occasions
 
-An **occasion** is a distinct time window during which the same kappa value applies. Occasions are identified by an integer column in the dataset (e.g. `OCC`). All rows — dose records and observation records — that share the same occasion index belong to one occasion.
+An **occasion** is a distinct time window during which the same kappa value applies. All rows — dose records and observation records — that share the same occasion index belong to one occasion. Occasions can be supplied two ways:
+
+- **From the data** — an integer column (e.g. `OCC`) named via `iov_column` in `[fit_options]`.
+- **From the model** — a rule (`iov_occasion = dose` or `iov_occasion = time(...)`) that derives the occasion of each row from its timeline, so you do not have to precompute an occasion column. See [Declaring occasions in the model](#declaring-occasions-in-the-model).
 
 ### Kappa parameters
 
@@ -104,6 +107,28 @@ A name may not appear in both a `kappa` and a `block_kappa` line.
 ```
 
 See `examples/warfarin_iov.ferx` for a complete runnable example.
+
+## Declaring occasions in the model
+
+Instead of carrying an occasion column in the data, you can have ferx derive the occasion partition from each subject's timeline with the `iov_occasion` key in `[fit_options]`. The kappa declarations are unchanged — only where the occasion *labels* come from differs.
+
+| `iov_occasion` value | Meaning |
+|---|---|
+| `column` (default) | Occasions come from the `iov_column` dataset column. |
+| `dose` | Each administration begins a new occasion. An observation takes the occasion of the most recent dose at or before its time (dose-before-observation at equal `TIME`). ADDL-expanded doses each start their own occasion. |
+| `time(t₁, t₂, …)` | Time-window breakpoints. The strictly-increasing edges define bins: `time(24, 48)` → occasion 0 for `TIME < 24`, occasion 1 for `24 ≤ TIME < 48`, occasion 2 for `TIME ≥ 48`. |
+
+For example, a two-period crossover with a washout at 24 h needs no `OCC` column:
+
+```
+[fit_options]
+  method       = foce
+  iov_occasion = time(24)
+```
+
+**Precedence.** If both `iov_occasion` (set to `dose`/`time(...)`) and `iov_column` are given, the model-side rule **wins** and a warning notes that the column was ignored.
+
+**Note.** For `time(...)`, observations are bucketed by the data-file `TIME` (the raw, user-clock time); doses use their event time. This is the common case; for reset-stacked subjects whose `TIME` restarts, prefer an explicit `iov_column`.
 
 ## Algorithm Details
 
@@ -203,5 +228,6 @@ When the dataset has occasion labels the sdtab CSV gains an `OCC` column (one ro
 |---------|--------|------|
 | Diagonal IOV | `OMEGA BLOCK(n) SAME` with one kappa per block | `kappa NAME ~ variance` (Option A) |
 | Correlated IOV | `OMEGA BLOCK(n)` shared across occasions | `block_kappa (N1, N2) = [...]` (Option B) |
-| Occasion column | `OCC` in `$INPUT`; referenced in `$PK` | `iov_column = OCC` in `[fit_options]` |
+| Occasion from data | `OCC` in `$INPUT`; referenced in `$PK` | `iov_column = OCC` in `[fit_options]` |
+| Occasion from model | `IF(TIME.LT.24) OCC=1` logic in `$PK` | `iov_occasion = dose` or `time(...)` in `[fit_options]` |
 | Kappa in PK | `ETA(n)` with `SAME` block | `KAPPA_xxx` in `[individual_parameters]` |

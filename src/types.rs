@@ -4347,6 +4347,30 @@ pub struct NeuralNetworkInfo {
     pub output_names: Vec<String>,
 }
 
+/// How the IOV occasion partition — which data rows belong to which occasion —
+/// is determined. IOV *random effects* (`kappa`) are always declared in the
+/// model DSL; this only controls where the occasion **labels** come from.
+///
+/// The chosen rule populates `Subject::occasions` / `Subject::dose_occasions`,
+/// the same vectors the dataset-column path fills, so everything downstream
+/// (`split_obs_by_occasion`, the inner-loop kappa expansion) is unchanged.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum IovOccasionRule {
+    /// Default: occasion labels come from the dataset column named by
+    /// [`FitOptions::iov_column`] (or none, if that is unset).
+    #[default]
+    Column,
+    /// Dose-triggered: each administration begins a new occasion. An
+    /// observation takes the occasion of the most recent dose at or before its
+    /// time (dose-before-observation tie-break at equal TIME). ADDL-expanded
+    /// doses each start their own occasion.
+    PerDose,
+    /// Time-window breakpoints. The (strictly increasing) edges define bins:
+    /// `time(24, 48)` → occasions `[-inf,24) = 0`, `[24,48) = 1`, `[48,inf) = 2`.
+    /// A row's occasion is the number of breakpoints at or before its time.
+    TimeWindows(Vec<f64>),
+}
+
 /// Options for fit()
 #[derive(Debug, Clone)]
 pub struct FitOptions {
@@ -4696,6 +4720,12 @@ pub struct FitOptions {
     /// and the inner loop estimates per-occasion kappas alongside the BSV etas.
     /// Requires at least one `kappa` declaration in the model's `[parameters]` block.
     pub iov_column: Option<String>,
+    /// Model-side rule for deriving the IOV occasion partition. Default
+    /// [`IovOccasionRule::Column`] reproduces the historical behaviour (occasions
+    /// come from `iov_column`). When set to `PerDose` or `TimeWindows`, `fit()`
+    /// derives `Subject::occasions` / `dose_occasions` from each subject's timeline
+    /// and — if `iov_column` is also set — overrides the column, emitting a warning.
+    pub iov_occasion: IovOccasionRule,
     /// Optional cooperative cancellation token. When present and flipped by
     /// another thread, the outer/inner/SAEM/GN loops exit at the next safe
     /// point and `fit()` returns `Err("cancelled by user")`. Default `None`.
@@ -4941,6 +4971,7 @@ impl Default for FitOptions {
             start_sigma: 0.3,
             multi_start_seed: None,
             iov_column: None,
+            iov_occasion: IovOccasionRule::Column,
             cancel: None,
             user_set_keys: Vec::new(),
             gradient_method: GradientMethod::default(),
@@ -5375,6 +5406,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "gradient",
         "gradient_method",
         "iov_column",
+        "iov_occasion",
         "optimizer_trace",
         "scale_params",
         "parameter_scaling",
