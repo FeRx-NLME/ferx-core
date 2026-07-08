@@ -1356,6 +1356,10 @@ pub(crate) fn check_transit_support(
 ///     renewal is a later slice.
 ///   * **tied event times** — two events at the same `TIME` give a zero gap `Δ = 0`, which
 ///     the gap-time hazard cannot represent (`h(0)` folds to the sentinel).
+///   * **left truncation (`entry_time > 0`)** — delayed entry is not yet supported for
+///     gap-time RTTE: the first-gap conditioning convention (renewal clock from entry vs.
+///     clock from 0 conditioned on survival to entry) is unratified and unanchored, and the
+///     two differ for a time-varying hazard. Clock-forward supports it via `H(entry)`.
 ///
 /// Returns `None` when there is no RTTE endpoint or every subject's rows are valid.
 #[cfg(feature = "survival")]
@@ -1464,6 +1468,24 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                             "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has two events \
                              at the same TIME={time} (zero inter-event gap). Repeated events \
                              must have strictly increasing times so each gap Δ > 0.",
+                            subject.id
+                        ));
+                    }
+                    // Left truncation (delayed entry, entry_time > 0) is not yet supported for
+                    // gap-time RTTE. The first gap's convention is unratified — renewal clock
+                    // restarts at entry (`Δ = time − entry`, H from 0) vs. clock from 0
+                    // conditioned on survival to entry (`H(t) − H(entry)`) — and the two differ
+                    // for a time-varying hazard (they coincide only for the memoryless
+                    // exponential). There is no NONMEM/survreg anchor for either, so fail loud
+                    // rather than silently pick one. Clock-forward *does* support left truncation
+                    // (it conditions via `H(entry)`), so route such data there or set TENTRY=0.
+                    if *entry_time > 0.0 {
+                        return Some(format!(
+                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has a \
+                             left-truncation entry_time={entry_time} > 0. Delayed entry is not \
+                             yet supported for gap-time RTTE (the first-gap conditioning \
+                             convention is unratified). Use clock=forward, which supports left \
+                             truncation, or set the entry time to 0.",
                             subject.id
                         ));
                     }

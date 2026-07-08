@@ -694,6 +694,53 @@ mod survival_smoke {
         );
     }
 
+    /// Left truncation (delayed entry, entry_time > 0) is not yet supported for clock-reset
+    /// RTTE: the first-gap conditioning convention (renewal clock from entry vs. clock from 0
+    /// conditioned on survival to entry) is unratified and unanchored, and the two differ for
+    /// a time-varying hazard. Fail loud rather than silently pick one; clock-forward supports
+    /// left truncation and is the documented route for such data.
+    #[test]
+    fn rtte_reset_left_truncation_is_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let mut pop = rtte_pop();
+        // Subject enters the risk set at t=4 (delayed entry, entry_time > 0) on both rows.
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 6.0,
+                event_type: EventType::Exact,
+                entry_time: 4.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 4.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("left-truncated clock=reset must be rejected");
+        assert!(
+            err.contains("left-truncation") && err.contains("CMT=2"),
+            "error should flag the delayed entry, got: {err}"
+        );
+    }
+
     /// RTTE simulation is a later slice (3.3); `simulate*` must reject an RTTE model
     /// loudly rather than draw a single event per subject (`simulate_tte` would collapse
     /// a subject's repeated events into one competing-risks draw — a silent wrong answer).
