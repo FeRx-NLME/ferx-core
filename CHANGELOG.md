@@ -19,7 +19,23 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **`[data]` block column mapping** (#730): map a canonical column role to a
+  differently-named dataset header with `canonical = actual` entries (e.g.
+  `TIME = TAFD`, `DV = CONC`), the ferx equivalent of NONMEM's
+  `$INPUT TIME=TAFD`. Header matching is case-insensitive, mapped headers are
+  excluded from covariate auto-detection, and typos (absent header, duplicate
+  role, duplicate target) fail loudly. See
+  [Data → Column mapping](https://ferx-nlme.github.io/ferx-core/model-file/data.html).
+
 ### Changed
+- **Default thread count capped at 8** (#707): when `threads` is unset (or
+  `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R
+  binding — the engine now defaults to `available cores - 1` (floored at 1),
+  capped at 8, instead of one worker per logical core. Most fits gain little from
+  scaling past a handful of cores, and not all cores are equal on
+  asymmetric platforms (e.g. Apple Silicon's E-cores). An explicit
+  `threads = N` / `--threads N` still pins the exact count requested.
 - **CLI default output no longer writes a separate `{model}-timing.txt` file** (#704):
   the estimation step's wall-clock time and thread count now live under a new
   `estimation:` section in `{model}-fit.yaml` (narrower in scope than the old

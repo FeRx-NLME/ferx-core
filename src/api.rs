@@ -3,8 +3,8 @@ use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv, read_nonmem_csv_filtered, read_nonmem_csv_filtered_tte,
-    read_nonmem_csv_with_covariates, read_nonmem_csv_with_covariates_filtered,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
     read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
     ERR_COV_NON_NUMERIC,
 };
@@ -61,6 +61,57 @@ pub(crate) fn fit_thread_pool_builder() -> rayon::ThreadPoolBuilder {
     rayon::ThreadPoolBuilder::new().stack_size(FIT_RAYON_STACK_SIZE)
 }
 
+/// Ceiling applied to the unpinned default thread count (#707).
+const DEFAULT_THREADS_CAP: usize = 8;
+
+/// Core cap arithmetic for the unpinned default thread count, split out from
+/// [`default_thread_count`] so it is testable without depending on the host's actual
+/// core count: leave one core free for the OS/other work, and don't scale past
+/// [`DEFAULT_THREADS_CAP`] even on much larger machines, since most fits see no benefit
+/// from spreading across every core and (notably on Apple Silicon) not all cores are equal.
+fn cap_default_threads(available: usize) -> usize {
+    available.saturating_sub(1).clamp(1, DEFAULT_THREADS_CAP)
+}
+
+/// Default worker-thread count used when nothing pins an explicit count (`threads` unset
+/// or `auto`/`0`, and no explicit `--threads`/[`configure_global_thread_pool`] call). See
+/// [`cap_default_threads`] for the cap logic (#707).
+pub(crate) fn default_thread_count() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cap_default_threads(available)
+}
+
+/// Set when a caller has explicitly sized the process-wide Rayon pool (currently: the CLI's
+/// `--threads N` via [`configure_global_thread_pool`]), so [`default_fit_pool`] knows to
+/// honor that explicit choice rather than applying the [`default_thread_count`] cap (#707).
+static GLOBAL_THREADS_EXPLICIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Explicitly size the process-wide Rayon pool and mark it as user-chosen. Intended for a
+/// CLI binary sizing its one process-wide pool from `--threads N` before the first fit;
+/// library callers that want a pinned thread count for a single fit should use
+/// `FitOptions::threads` instead, which scopes a fit-local pool via [`build_fit_pool`].
+///
+/// `n_threads` must be positive — a caller wanting the engine's own default should simply
+/// not call this at all, rather than pass `0` (which Rayon would otherwise silently treat
+/// as "pick automatically", masking the caller's intent). The explicit-override flag is
+/// only set once `build_global` actually succeeds, so a failed call (e.g. the global pool
+/// was already initialized elsewhere) leaves [`default_fit_pool`] applying the #707 cap
+/// rather than incorrectly deferring to whatever the ambient pool happens to be.
+pub fn configure_global_thread_pool(n_threads: usize) -> Result<(), String> {
+    if n_threads == 0 {
+        return Err("thread count must be positive".to_string());
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build_global()
+        .map_err(|e| format!("failed to configure thread pool with {n_threads} threads: {e}"))?;
+    GLOBAL_THREADS_EXPLICIT.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
 /// Build a fit-scoped Rayon pool with the ferx worker stack and an explicit thread
 /// count. Used only when the caller pins `options.threads` to a positive value; the
 /// common (unpinned) path reuses the shared [`default_fit_pool`] instead.
@@ -75,20 +126,26 @@ pub(crate) fn build_fit_pool(n_threads: usize) -> Result<rayon::ThreadPool, Stri
 /// ODE+IOV analytic gradients do not overflow the platform-default worker stack. Shared
 /// across every default-threads `fit()` call so batch / concurrent callers do not each
 /// spawn-and-tear-down a fresh `N × 32 MiB` pool (which oversubscribes CPUs and can
-/// exhaust address space). Sized to `rayon::current_num_threads()` at first use, so a
-/// CLI `--threads N` (which sets the global pool count before the first fit) is honored.
+/// exhaust address space).
+///
+/// Sized by [`default_thread_count`] (available cores minus one, capped at 8 — #707): most
+/// fits gain little from spreading across every core, and not all cores are equal on
+/// asymmetric platforms (e.g. Apple Silicon E-cores). A caller that explicitly sized the
+/// global pool via [`configure_global_thread_pool`] (the CLI's `--threads N`) is honored
+/// instead — that call marks [`GLOBAL_THREADS_EXPLICIT`] before this pool is built.
 ///
 /// Returns `None` only if the one-time build fails (e.g. resource limits); callers then
 /// run on the ambient pool rather than aborting the fit.
 pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        // Pin to the ambient worker count (the global pool size, which a CLI `--threads N`
-        // sets via `build_global` before the first fit). A bare `build()` would instead
-        // default to *all* logical CPUs and ignore `--threads`. Evaluated outside any fit
-        // pool, so it reads the global pool's configured size.
+        let n_threads = if GLOBAL_THREADS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire) {
+            rayon::current_num_threads()
+        } else {
+            default_thread_count()
+        };
         fit_thread_pool_builder()
-            .num_threads(rayon::current_num_threads())
+            .num_threads(n_threads)
             .build()
             .ok()
     })
@@ -246,6 +303,7 @@ pub fn run_model_with_data_inits(
         None,
         iov_col,
         sel_filter.as_ref(),
+        &parsed.column_map,
     )?;
     eprintln!(
         "Data:  {} subjects, {} observations from {}",
@@ -772,6 +830,7 @@ pub fn read_population_for(
     fallback_columns: Option<&[&str]>,
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     // Extract TTE CMTs from model endpoints so the reader can route TTE rows
     // to obs_records instead of the Gaussian parallel Vecs.
@@ -795,31 +854,44 @@ pub fn read_population_for(
         match (covariate_decls, filter) {
             (Some(decls), Some(sel)) => {
                 let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates_filtered(
+                let (pop, table) = read_nonmem_csv_with_covariates_filtered_mapped(
                     Path::new(data_path),
                     decls,
                     &extra,
                     iov_column,
                     sel,
+                    column_map,
                 )?;
                 Ok((pop, Some(table)))
             }
             (Some(decls), None) => {
                 let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates(
+                let (pop, table) = read_nonmem_csv_with_covariates_mapped(
                     Path::new(data_path),
                     decls,
                     &extra,
                     iov_column,
+                    column_map,
                 )?;
                 Ok((pop, Some(table)))
             }
             (None, Some(sel)) => Ok((
-                read_nonmem_csv_filtered(Path::new(data_path), fallback_columns, iov_column, sel)?,
+                read_nonmem_csv_filtered_mapped(
+                    Path::new(data_path),
+                    fallback_columns,
+                    iov_column,
+                    sel,
+                    column_map,
+                )?,
                 None,
             )),
             (None, None) => Ok((
-                read_nonmem_csv(Path::new(data_path), fallback_columns, iov_column)?,
+                read_nonmem_csv_mapped(
+                    Path::new(data_path),
+                    fallback_columns,
+                    iov_column,
+                    column_map,
+                )?,
                 None,
             )),
         }
@@ -835,6 +907,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
+                    column_map,
                 )?;
                 Ok((pop, Some(table)))
             }
@@ -845,6 +918,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
+                    column_map,
                 )?;
                 Ok((pop, None))
             }
@@ -2311,6 +2385,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
             None,
             iov_col,
             None,
+            &parsed.column_map,
         ) {
             Ok((population, _table)) => {
                 // Surface datareader warnings (ADDL missing II, IOV OCC missing)
@@ -2383,6 +2458,7 @@ pub fn fit_from_files(
         covariate_columns,
         None,
         sel_filter_fit.as_ref(),
+        &parsed.column_map,
     )?;
     model.bloq_method = opts.bloq_method;
     // SDE models have no analytic-sensitivity path — force FD.
@@ -5475,6 +5551,47 @@ pub(crate) fn eps_shrinkage_warning(shrinkage_eps: f64) -> Option<String> {
 mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
+
+    // ── default thread count cap (#707) ─────────────────────────────────────
+
+    #[test]
+    fn cap_default_threads_leaves_one_core_free() {
+        assert_eq!(cap_default_threads(2), 1);
+        assert_eq!(cap_default_threads(4), 3);
+        assert_eq!(cap_default_threads(8), 7);
+    }
+
+    #[test]
+    fn cap_default_threads_caps_at_eight() {
+        assert_eq!(cap_default_threads(9), 8);
+        assert_eq!(cap_default_threads(16), 8);
+        assert_eq!(cap_default_threads(128), 8);
+    }
+
+    #[test]
+    fn cap_default_threads_never_zero() {
+        // A single-core report (or an `available_parallelism()` failure mapped to 1)
+        // must still leave at least one worker thread.
+        assert_eq!(cap_default_threads(1), 1);
+        assert_eq!(cap_default_threads(0), 1);
+    }
+
+    #[test]
+    fn configure_global_thread_pool_rejects_zero() {
+        // `0` must be rejected rather than silently forwarded to Rayon, which would
+        // otherwise interpret it as "pick automatically" and mask the caller's intent
+        // (and would incorrectly mark GLOBAL_THREADS_EXPLICIT). Returns before touching
+        // the process-wide pool, so this is safe to run alongside other tests.
+        assert!(configure_global_thread_pool(0).is_err());
+    }
+
+    #[test]
+    fn default_thread_count_matches_cap_of_available_parallelism() {
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(default_thread_count(), cap_default_threads(available));
+    }
 
     // ── resolve_data_path (#690) ────────────────────────────────────────────
 

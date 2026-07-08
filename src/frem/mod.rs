@@ -870,13 +870,16 @@ pub fn prepare_frem(
     missing_value: Option<f64>,
     fit_init: Option<&FremFitInit>,
 ) -> Result<FremPrepareResult, String> {
-    use crate::io::datareader::read_nonmem_csv;
+    use crate::io::datareader::read_nonmem_csv_mapped;
     use crate::parser::model_parser::parse_full_model_file;
 
     // Full parse so the optional `[covariates]` block is available for fallback.
     let parsed = parse_full_model_file(model_path)?;
     let base_model = &parsed.model;
-    let population = read_nonmem_csv(data_path, None, None)?;
+    // Honour the model's `[data]` column mapping (#730) so FREM prep reads the
+    // same columns as `fit()`/`check` do — otherwise a mapped TIME/DV header is
+    // missed here even though it works everywhere else.
+    let population = read_nonmem_csv_mapped(data_path, None, None, &parsed.column_map)?;
 
     // Resolve the covariate list (explicit args, else the model's [covariates]
     // block) — see `resolve_frem_covariates`.

@@ -2090,10 +2090,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // value is resolved here; `parse_full_model_file` resolves it relative to
     // the model file's directory afterwards (this function only sees the
     // model's text, not its path on disk).
-    let data_path = blocks
-        .get("data")
-        .map(|lines| parse_data_block(lines))
-        .transpose()?;
+    let (data_path, data_column_map) = match blocks.get("data") {
+        Some(lines) => {
+            let (p, m) = parse_data_block(lines)?;
+            (Some(p), m)
+        }
+        None => (None, Vec::new()),
+    };
 
     // ── [data_selection] block ────────────────────────────────────────────────
     // Parsed after [fit_options] and merged into the same FitOptions so the
@@ -2818,6 +2821,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         adaptive_dosing,
         fit_options,
         data_path,
+        column_map: data_column_map,
         covariate_decls,
         block_lines: extracted.block_lines.clone(),
     })
@@ -4714,27 +4718,67 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     }
 }
 
+/// Canonical column roles that a `[data]` block may remap to an actual CSV
+/// header (#730, NONMEM `$INPUT TIME=TAFD` analogue). Kept in sync with the
+/// standard columns recognised by [`crate::io::datareader`].
+const DATA_BLOCK_ROLES: &[&str] = &[
+    "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl", "tentry",
+    "fremtype",
+];
+
 /// Parse a `[data]` block (#690, NONMEM `$DATA` analogue). Returns the raw
-/// `path` value as written; `parse_full_model_file` resolves it relative to
-/// the model file's directory.
-fn parse_data_block(lines: &[String]) -> Result<String, String> {
+/// `path` value as written (resolved relative to the model file's directory by
+/// `parse_full_model_file`) plus any `canonical = actual` column remappings
+/// (#730). Each map entry is `(canonical_role_lowercase, actual_header)`.
+///
+/// Validated here: unknown keys, empty target names, a role mapped twice, and
+/// two roles mapped to the same actual header (duplicate targets). Whether a
+/// mapped header actually exists in the dataset can only be checked when the
+/// CSV is read, so that lives in the datareader.
+fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>), String> {
     let mut path: Option<String> = None;
+    let mut column_map: Vec<(String, String)> = Vec::new();
     for line in lines {
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
         if parts.len() != 2 {
             continue;
         }
         let (key, value) = (parts[0], parts[1].trim_matches(|c| c == '"' || c == '\''));
-        match key {
-            "path" => path = Some(value.to_string()),
-            _ => {
+        let key_lc = key.to_ascii_lowercase();
+        if key_lc == "path" {
+            path = Some(value.to_string());
+        } else if DATA_BLOCK_ROLES.contains(&key_lc.as_str()) {
+            if value.is_empty() {
                 return Err(format!(
-                    "[data]: unknown key `{key}` — valid keys are: path"
-                ))
+                    "[data]: empty column name for role `{key_lc}` — write `{key_lc} = <header>`"
+                ));
+            }
+            if column_map.iter().any(|(role, _)| role == &key_lc) {
+                return Err(format!("[data]: role `{key_lc}` mapped more than once"));
+            }
+            column_map.push((key_lc, value.to_string()));
+        } else {
+            return Err(format!(
+                "[data]: unknown key `{key}` — valid keys are: path, or a canonical column role \
+                 ({})",
+                DATA_BLOCK_ROLES.join(", ")
+            ));
+        }
+    }
+    // Reject two roles pointing at the same actual header (case-insensitive):
+    // the reader would rename one header to two roles, silently dropping one.
+    for i in 0..column_map.len() {
+        for j in (i + 1)..column_map.len() {
+            if column_map[i].1.eq_ignore_ascii_case(&column_map[j].1) {
+                return Err(format!(
+                    "[data]: roles `{}` and `{}` both map to column `{}`",
+                    column_map[i].0, column_map[j].0, column_map[i].1
+                ));
             }
         }
     }
-    path.ok_or_else(|| "[data]: missing required key `path`".to_string())
+    let path = path.ok_or_else(|| "[data]: missing required key `path`".to_string())?;
+    Ok((path, column_map))
 }
 
 fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
@@ -16812,8 +16856,9 @@ mod tests {
 
     #[test]
     fn test_parse_threads_zero_means_auto() {
-        // `threads = 0` is treated as "leave rayon default alone",
-        // matching the R binding's `threads <= 0` sentinel.
+        // `threads = 0` is treated as "use the engine's default thread count"
+        // (available cores - 1, floored at 1, capped at 8 — #707), matching the
+        // R binding's `threads <= 0` sentinel.
         let opts = parse_fit_options(&["threads = 0".to_string()]).unwrap();
         assert_eq!(opts.threads, None);
     }
@@ -16829,7 +16874,7 @@ mod tests {
 
     #[test]
     fn test_parse_threads_default_is_none() {
-        // No `threads` line → None (rayon global pool, one worker per logical CPU).
+        // No `threads` line → None (engine picks its own default thread count: #707).
         let opts = parse_fit_options(&["method = focei".to_string()]).unwrap();
         assert_eq!(opts.threads, None);
     }
@@ -17694,15 +17739,12 @@ mod tests {
 
     #[test]
     fn test_parse_data_block_path() {
-        assert_eq!(
-            parse_data_block(&["path = warfarin.csv".to_string()]).unwrap(),
-            "warfarin.csv"
-        );
+        let (path, map) = parse_data_block(&["path = warfarin.csv".to_string()]).unwrap();
+        assert_eq!(path, "warfarin.csv");
+        assert!(map.is_empty());
         // Quoted paths (e.g. containing spaces) are accepted, quotes stripped.
-        assert_eq!(
-            parse_data_block(&["path = \"my data.csv\"".to_string()]).unwrap(),
-            "my data.csv"
-        );
+        let (path, _) = parse_data_block(&["path = \"my data.csv\"".to_string()]).unwrap();
+        assert_eq!(path, "my data.csv");
     }
 
     #[test]
@@ -17715,6 +17757,79 @@ mod tests {
     fn test_parse_data_block_unknown_key_is_error() {
         let err = parse_data_block(&["bogus = 1".to_string()]).unwrap_err();
         assert!(err.contains("unknown key `bogus`"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_data_block_column_mapping() {
+        // `canonical = actual` remappings (#730). Roles are lowercased; the
+        // actual header is preserved verbatim. `path` still parses alongside.
+        let (path, map) = parse_data_block(&[
+            "path = mydata.csv".to_string(),
+            "TIME = TAFD".to_string(),
+            "DV = CONC".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(path, "mydata.csv");
+        assert_eq!(
+            map,
+            vec![
+                ("time".to_string(), "TAFD".to_string()),
+                ("dv".to_string(), "CONC".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_data_block_empty_target_is_error() {
+        let err =
+            parse_data_block(&["path = d.csv".to_string(), "time =".to_string()]).unwrap_err();
+        assert!(err.contains("empty column name for role `time`"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_data_block_role_mapped_twice_is_error() {
+        let err = parse_data_block(&[
+            "path = d.csv".to_string(),
+            "TIME = TAFD".to_string(),
+            "time = T2".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("role `time` mapped more than once"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_data_block_duplicate_target_is_error() {
+        // Two roles pointing at the same actual header (case-insensitive) is
+        // rejected: the reader would rename one header to two roles.
+        let err = parse_data_block(&[
+            "path = d.csv".to_string(),
+            "TIME = X".to_string(),
+            "DV = x".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("both map to column `X`"), "{err}");
+    }
+
+    #[test]
+    fn test_data_block_populates_parsed_model_column_map() {
+        let content =
+            format!("{MINIMAL_MODEL}[data]\n  path = warfarin.csv\n  TIME = TAFD\n  DV = CONC\n");
+        let parsed = parse_full_model(&content).unwrap();
+        assert_eq!(parsed.data_path.as_deref(), Some("warfarin.csv"));
+        assert_eq!(
+            parsed.column_map,
+            vec![
+                ("time".to_string(), "TAFD".to_string()),
+                ("dv".to_string(), "CONC".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_model_without_data_mappings_has_empty_column_map() {
+        let content = format!("{MINIMAL_MODEL}[data]\n  path = warfarin.csv\n");
+        let parsed = parse_full_model(&content).unwrap();
+        assert!(parsed.column_map.is_empty());
     }
 
     /// Minimal valid one-compartment IV model, used as a base by the `[data]`

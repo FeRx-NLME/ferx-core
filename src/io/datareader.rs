@@ -152,6 +152,18 @@ pub fn read_nonmem_csv(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
 ) -> Result<Population, String> {
+    read_nonmem_csv_mapped(path, covariate_columns, iov_column, &[])
+}
+
+/// Like [`read_nonmem_csv`] but with a `[data]` canonical-role → header
+/// remapping (#730). `column_map` entries are `(canonical_role, actual_header)`;
+/// an empty slice is the no-remap identity used by the public wrapper.
+pub(crate) fn read_nonmem_csv_mapped(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    column_map: &[(String, String)],
+) -> Result<Population, String> {
     read_nonmem_csv_impl(
         path,
         covariate_columns,
@@ -159,6 +171,7 @@ pub fn read_nonmem_csv(
         None,
         None,
         &HashSet::new(),
+        column_map,
     )
     .map(|(pop, _)| pop)
 }
@@ -182,6 +195,18 @@ pub fn read_nonmem_csv_with_covariates(
     extra_columns: &[String],
     iov_column: Option<&str>,
 ) -> Result<(Population, CovariateTable), String> {
+    read_nonmem_csv_with_covariates_mapped(path, decls, extra_columns, iov_column, &[])
+}
+
+/// Like [`read_nonmem_csv_with_covariates`] but with a `[data]` column
+/// remapping (#730). See [`read_nonmem_csv_mapped`].
+pub(crate) fn read_nonmem_csv_with_covariates_mapped(
+    path: &Path,
+    decls: &[CovariateDecl],
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    column_map: &[(String, String)],
+) -> Result<(Population, CovariateTable), String> {
     // Population reads the union of declared + referenced-but-undeclared columns,
     // declared first so the table's column order matches the declaration.
     let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
@@ -198,6 +223,7 @@ pub fn read_nonmem_csv_with_covariates(
         Some(decls),
         None,
         &HashSet::new(),
+        column_map,
     )?;
     Ok((
         pop,
@@ -212,6 +238,18 @@ pub fn read_nonmem_csv_filtered(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
     filter: &SelectionFilter,
+) -> Result<Population, String> {
+    read_nonmem_csv_filtered_mapped(path, covariate_columns, iov_column, filter, &[])
+}
+
+/// Like [`read_nonmem_csv_filtered`] but with a `[data]` column remapping
+/// (#730). See [`read_nonmem_csv_mapped`].
+pub(crate) fn read_nonmem_csv_filtered_mapped(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: &SelectionFilter,
+    column_map: &[(String, String)],
 ) -> Result<Population, String> {
     // When an explicit covariate list is supplied, make sure every covariate the
     // filter references is in it — otherwise a filtered column outside the list
@@ -237,6 +275,7 @@ pub fn read_nonmem_csv_filtered(
         None,
         Some(filter),
         &HashSet::new(),
+        column_map,
     )
     .map(|(pop, _)| pop)
 }
@@ -248,6 +287,26 @@ pub fn read_nonmem_csv_with_covariates_filtered(
     extra_columns: &[String],
     iov_column: Option<&str>,
     filter: &SelectionFilter,
+) -> Result<(Population, CovariateTable), String> {
+    read_nonmem_csv_with_covariates_filtered_mapped(
+        path,
+        decls,
+        extra_columns,
+        iov_column,
+        filter,
+        &[],
+    )
+}
+
+/// Like [`read_nonmem_csv_with_covariates_filtered`] but with a `[data]` column
+/// remapping (#730). See [`read_nonmem_csv_mapped`].
+pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
+    path: &Path,
+    decls: &[CovariateDecl],
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    filter: &SelectionFilter,
+    column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
     let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
     for c in extra_columns {
@@ -274,6 +333,7 @@ pub fn read_nonmem_csv_with_covariates_filtered(
         Some(decls),
         Some(filter),
         &HashSet::new(),
+        column_map,
     )?;
     Ok((
         pop,
@@ -293,6 +353,7 @@ pub(crate) fn read_nonmem_csv_filtered_tte(
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
     tte_cmts: &HashSet<usize>,
+    column_map: &[(String, String)],
 ) -> Result<Population, String> {
     let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
         let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
@@ -315,6 +376,7 @@ pub(crate) fn read_nonmem_csv_filtered_tte(
         None,
         filter,
         tte_cmts,
+        column_map,
     )
     .map(|(pop, _)| pop)
 }
@@ -328,6 +390,7 @@ pub(crate) fn read_nonmem_csv_with_covariates_tte(
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
     tte_cmts: &HashSet<usize>,
+    column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
     let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
     for c in extra_columns {
@@ -350,6 +413,7 @@ pub(crate) fn read_nonmem_csv_with_covariates_tte(
         Some(decls),
         filter,
         tte_cmts,
+        column_map,
     )?;
     Ok((
         pop,
@@ -373,6 +437,7 @@ fn read_nonmem_csv_impl(
     table_decls: Option<&[CovariateDecl]>,
     filter: Option<&SelectionFilter>,
     tte_cmts: &HashSet<usize>,
+    column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
@@ -383,12 +448,65 @@ fn read_nonmem_csv_impl(
     // Preserve original header casing for covariate names. Standard NONMEM
     // columns are matched case-insensitively so that legacy CSVs (e.g. `Id`,
     // `TIME`) keep working; covariate lookups remain case-sensitive.
-    let headers: Vec<String> = rdr
+    let mut headers: Vec<String> = rdr
         .headers()
         .map_err(|e| format!("Failed to read headers: {}", e))?
         .iter()
         .map(|h| h.trim().to_string())
         .collect();
+
+    // Apply `[data]` column remapping (#730): rename each mapped actual header
+    // to its canonical role (case-insensitive match). Downstream canonical
+    // lookups (`col_idx_ci("time")`) and covariate auto-detection (`is_standard`)
+    // then treat the column as that role with no further special-casing, and the
+    // original header no longer leaks in as a covariate. Resolve every target
+    // against the *original* headers first, then apply the renames, so one
+    // mapping can never shadow another's lookup.
+    if !column_map.is_empty() {
+        let mut planned: Vec<(usize, String)> = Vec::with_capacity(column_map.len());
+        for (canonical, actual) in column_map {
+            // A mapped header that is absent is a hard error — the mapping would
+            // silently do nothing (e.g. TIME would still be reported missing).
+            let idx = headers
+                .iter()
+                .position(|h| h.eq_ignore_ascii_case(actual))
+                .ok_or_else(|| {
+                    format!(
+                        "[data]: mapped column `{actual}` (for role `{canonical}`) not found in \
+                         dataset headers: {}",
+                        headers.join(", ")
+                    )
+                })?;
+            // Reject when the dataset already carries this canonical role under a
+            // *different* header — the role would be ambiguous after renaming.
+            if let Some(other) = headers
+                .iter()
+                .position(|h| h.eq_ignore_ascii_case(canonical))
+            {
+                if other != idx {
+                    return Err(format!(
+                        "[data]: role `{canonical}` maps to `{actual}`, but the dataset already \
+                         has a `{}` column",
+                        headers[other]
+                    ));
+                }
+            }
+            // Reject clobbering the IOV occasion column: renaming it would make
+            // the later `iov_column` lookup fail with a misleading "not found".
+            if let Some(iov) = iov_column {
+                if actual.eq_ignore_ascii_case(iov) {
+                    return Err(format!(
+                        "[data]: mapped column `{actual}` (for role `{canonical}`) is also the \
+                         iov_column `{iov}`"
+                    ));
+                }
+            }
+            planned.push((idx, canonical.to_ascii_uppercase()));
+        }
+        for (idx, name) in planned {
+            headers[idx] = name;
+        }
+    }
 
     let col_idx_ci =
         |name: &str| -> Option<usize> { headers.iter().position(|h| h.eq_ignore_ascii_case(name)) };
@@ -2336,7 +2454,7 @@ mod tests {
         let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n\
                    1,100,1,0,0,.,1,90\n";
         let f = write_csv(csv);
-        let pop = read_nonmem_csv_filtered_tte(f.path(), None, None, None, &tte_cmts).unwrap();
+        let pop = read_nonmem_csv_filtered_tte(f.path(), None, None, None, &tte_cmts, &[]).unwrap();
         let recs = &pop.subjects[0].obs_records;
         assert_eq!(recs.len(), 1);
         let ObsRecord::Event {
@@ -2937,6 +3055,83 @@ mod tests {
     }
 
     #[test]
+    fn test_column_map_renames_canonical_roles() {
+        // `[data]` remapping (#730): a dataset using TAFD/CONC headers is read
+        // by mapping them to TIME/DV. Values land on the right roles and the
+        // mapped headers do NOT leak into covariate auto-detection.
+        let csv = "ID,TAFD,CONC,EVID,AMT,WT\n\
+                   1,0,.,1,100,70\n\
+                   1,1,5.0,0,.,70\n\
+                   1,2,3.0,0,.,70\n";
+        let f = write_csv(csv);
+        let map = vec![
+            ("time".to_string(), "TAFD".to_string()),
+            ("dv".to_string(), "CONC".to_string()),
+        ];
+        let pop = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.obs_times, vec![1.0, 2.0]);
+        assert_eq!(subj.observations, vec![5.0, 3.0]);
+        // WT is still a covariate; the mapped headers are not.
+        assert!(pop.covariate_names.contains(&"WT".to_string()));
+        assert!(!pop.covariate_names.contains(&"TAFD".to_string()));
+        assert!(!pop.covariate_names.contains(&"CONC".to_string()));
+    }
+
+    #[test]
+    fn test_column_map_is_case_insensitive_on_header() {
+        // The actual header is matched case-insensitively: `time = tafd` finds a
+        // `TAFD` header.
+        let csv = "ID,TAFD,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,7,2.0,0,.\n";
+        let f = write_csv(csv);
+        let map = vec![("time".to_string(), "tafd".to_string())];
+        let pop = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap();
+        assert_eq!(pop.subjects[0].obs_times, vec![7.0]);
+    }
+
+    #[test]
+    fn test_column_map_missing_header_errors() {
+        // Mapping a role to a header the dataset lacks is a hard error, not a
+        // silent no-op (TIME would otherwise still be reported missing).
+        let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,1,5.0,0,.\n";
+        let f = write_csv(csv);
+        let map = vec![("dv".to_string(), "CONC".to_string())];
+        let err = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap_err();
+        assert!(err.contains("mapped column `CONC`"), "{err}");
+        assert!(err.contains("role `dv`"), "{err}");
+    }
+
+    #[test]
+    fn test_column_map_conflicts_with_existing_canonical_column_errors() {
+        // Dataset has BOTH a real TIME and a TAFD column; mapping TIME=TAFD is
+        // ambiguous and must error rather than silently pick one.
+        let csv = "ID,TIME,TAFD,DV,EVID,AMT\n\
+                   1,0,0,.,1,100\n\
+                   1,1,2,5.0,0,.\n";
+        let f = write_csv(csv);
+        let map = vec![("time".to_string(), "TAFD".to_string())];
+        let err = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap_err();
+        assert!(err.contains("already has a `TIME` column"), "{err}");
+    }
+
+    #[test]
+    fn test_column_map_conflicts_with_iov_column_errors() {
+        // Mapping a role onto the header used as the IOV occasion column is a
+        // clear error (renaming it would break the occasion lookup).
+        let csv = "ID,TIME,DV,EVID,AMT,OCC\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,.,1\n";
+        let f = write_csv(csv);
+        let map = vec![("tentry".to_string(), "OCC".to_string())];
+        let err = read_nonmem_csv_mapped(f.path(), None, Some("OCC"), &map).unwrap_err();
+        assert!(err.contains("iov_column `OCC`"), "{err}");
+    }
+
+    #[test]
     fn test_legacy_read_still_succeeds_with_non_numeric_covariate() {
         // The legacy auto-detect path must remain unchanged (no strict numeric
         // check): a non-numeric covariate column loads without erroring.
@@ -3007,8 +3202,9 @@ mod tests {
         // branch; the filter then drops STUDY==2 (subject 2).
         let cols: &[&str] = &["WT"];
         let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
-        let pop = read_nonmem_csv_filtered_tte(f.path(), Some(cols), None, Some(&filter), &no_tte)
-            .unwrap();
+        let pop =
+            read_nonmem_csv_filtered_tte(f.path(), Some(cols), None, Some(&filter), &no_tte, &[])
+                .unwrap();
         assert_eq!(
             pop.subjects
                 .iter()
@@ -3037,6 +3233,7 @@ mod tests {
             None,
             Some(&drop_age40),
             &no_tte,
+            &[],
         )
         .unwrap();
         // Subject 2 (AGE=40) is dropped via the merged AGE column; subject 1 remains.

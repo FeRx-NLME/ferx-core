@@ -807,8 +807,8 @@ fn tte_sse_competing_risks_recovers_truth() {
 #[test]
 fn tte_convergence_exponential_mixed() {
     let model = parse_model_string(EXP_FIT).expect("fit model must parse");
-    let (pop, _cov) =
-        read_population_for(&model, &None, REF_CSV, None, None, None).expect("reference CSV reads");
+    let (pop, _cov) = read_population_for(&model, &None, REF_CSV, None, None, None, &[])
+        .expect("reference CSV reads");
     assert_eq!(pop.subjects.len(), 100, "reference dataset is 100 subjects");
 
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
@@ -844,8 +844,8 @@ fn tte_convergence_exponential_fixed_matches_survreg() {
     let model = parse_model_string(EXP_FIT_FIXED).expect("fixed-effects model must parse");
     assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
 
-    let (pop, _cov) =
-        read_population_for(&model, &None, REF_CSV, None, None, None).expect("reference CSV reads");
+    let (pop, _cov) = read_population_for(&model, &None, REF_CSV, None, None, None, &[])
+        .expect("reference CSV reads");
 
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
     let lambda = r.theta[0];
@@ -909,7 +909,7 @@ const RTTE_FIT_MIXED: &str = r"
 fn rtte_convergence_fixed_matches_mle() {
     let model = parse_model_string(RTTE_FIT_FIXED).expect("fixed RTTE model must parse");
     assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
-    let (pop, _cov) = read_population_for(&model, &None, RTTE_REF_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_REF_CSV, None, None, None, &[])
         .expect("reference CSV reads");
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
 
@@ -942,7 +942,7 @@ fn rtte_convergence_fixed_matches_mle() {
 #[test]
 fn rtte_convergence_mixed_matches_nonmem() {
     let model = parse_model_string(RTTE_FIT_MIXED).expect("mixed RTTE model must parse");
-    let (pop, _cov) = read_population_for(&model, &None, RTTE_REF_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_REF_CSV, None, None, None, &[])
         .expect("reference CSV reads");
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
     let lambda = r.theta[0];
@@ -1014,7 +1014,7 @@ const RTTE_RESET_FIT_MIXED: &str = r"
 fn rtte_reset_convergence_fixed_matches_survreg() {
     let model = parse_model_string(RTTE_RESET_FIT_FIXED).expect("fixed reset model must parse");
     assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
-    let (pop, _cov) = read_population_for(&model, &None, RTTE_RESET_REF_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_RESET_REF_CSV, None, None, None, &[])
         .expect("reference CSV reads");
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
     let (scale, shape) = (r.theta[0], r.theta[1]);
@@ -1045,7 +1045,7 @@ fn rtte_reset_convergence_fixed_matches_survreg() {
 #[test]
 fn rtte_reset_convergence_mixed_matches_nonmem() {
     let model = parse_model_string(RTTE_RESET_FIT_MIXED).expect("mixed reset model must parse");
-    let (pop, _cov) = read_population_for(&model, &None, RTTE_RESET_REF_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_RESET_REF_CSV, None, None, None, &[])
         .expect("reference CSV reads");
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
     let (scale, shape, omega2) = (r.theta[0], r.theta[1], r.omega[(0, 0)]);
@@ -1094,7 +1094,7 @@ fn tte_competing_fixed_matches_per_cause_mle() {
     let model = parse_model_string(COMPETING_FIXED).expect("fixed competing model must parse");
     assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
 
-    let (pop, _cov) = read_population_for(&model, &None, COMPETING_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, COMPETING_CSV, None, None, None, &[])
         .expect("competing CSV reads");
 
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fixed competing fit");
@@ -1248,7 +1248,7 @@ fn tte_convergence_weibull_fixed_matches_survreg() {
     let model = parse_model_string(WEIBULL_FIT_FIXED).expect("fixed-effects model must parse");
     assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
 
-    let (pop, _cov) = read_population_for(&model, &None, WEIBULL_REF_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, WEIBULL_REF_CSV, None, None, None, &[])
         .expect("reference CSV reads");
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
 
@@ -1283,7 +1283,7 @@ fn tte_convergence_weibull_fixed_matches_survreg() {
 #[test]
 fn tte_convergence_weibull_mixed() {
     let model = parse_model_string(WEIBULL_FIT).expect("fit model must parse");
-    let (pop, _cov) = read_population_for(&model, &None, WEIBULL_REF_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, WEIBULL_REF_CSV, None, None, None, &[])
         .expect("reference CSV reads");
     assert_eq!(pop.subjects.len(), 100, "reference dataset is 100 subjects");
 
@@ -1390,7 +1390,7 @@ fn tte_convergence_gompertz_rct_recovers() {
         "TRT must be picked up from the loghr expression"
     );
 
-    let (pop, _cov) = read_population_for(&model, &None, GOMPERTZ_REF_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, GOMPERTZ_REF_CSV, None, None, None, &[])
         .expect("reference CSV reads");
     assert_eq!(pop.subjects.len(), 300, "reference dataset is 300 subjects");
 
