@@ -32,6 +32,7 @@ pub use api::{
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, Severity};
 pub use environment::EnvironmentInfo;
+pub use estimation::run_covariance::run_covariance;
 pub use estimation::run_sir::run_sir;
 pub use estimation::uncertainty_samples::UncertaintyMethod;
 pub use frem::{prepare_frem, FremDataInfo, FremFitInit, FremPrepareResult};

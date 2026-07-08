@@ -5081,7 +5081,7 @@ fn is_last_estimating_stage(
 /// sir`) produced a result. Pulled out of `fit()` so the precedence — a real
 /// covariance always wins over a fallback, which wins over a plain failure — is
 /// unit-testable without driving a full fit to a non-PD Hessian.
-fn resolve_covariance_status(
+pub(crate) fn resolve_covariance_status(
     run_covariance_step: bool,
     has_covariance_matrix: bool,
     has_sir_fallback: bool,
@@ -5162,7 +5162,7 @@ fn resolve_sir_fallback(
     }
 }
 
-fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
+pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
     let cov = match cov {
         Some(m) => m,
         None => return (None, None),
@@ -6226,7 +6226,7 @@ fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
 
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
-fn extract_standard_errors(
+pub(crate) fn extract_standard_errors(
     cov: &Option<DMatrix<f64>>,
     template: &ModelParameters,
 ) -> (

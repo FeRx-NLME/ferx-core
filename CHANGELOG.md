@@ -25,6 +25,17 @@ section of the SDLC for the versioning policy).
   table comparing them side by side — method, convergence, OFV/AIC/BIC, ΔOFV,
   runtime, subject/observation/parameter counts, and THETA/OMEGA/SIGMA
   estimates. A single bundle still prints the detailed `psn::sumo`-style report.
+- **Standalone covariance step** (#738): `run_covariance()` runs the FD-Hessian
+  covariance step against an existing fit without re-fitting, mirroring
+  `run_sir()`. It re-reads the model/data from the fit's recorded paths (with
+  SHA-256 integrity checks, refusing stale inputs) or accepts caller-supplied
+  `model`/`population`, then returns a fit with `covariance_matrix`, standard
+  errors, `covariance_status`, and condition-number diagnostics refreshed. It
+  reuses `fit()`'s inline covariance step at the converged point, so the result
+  matches an inline `covariance = true` fit up to finite-difference noise. A
+  covariance step that runs but fails (non-PD / unusable FD Hessian) is non-fatal
+  — the returned fit reports `covariance_status = Failed` with a diagnostic
+  warning.
 - **Per-parameter estimates + gradients in the optimizer trace** (#640): when
   `optimizer_trace = true`, each CSV row now also records the full parameter
   vector (`val:<name>` columns, natural/reporting scale) for every method and
