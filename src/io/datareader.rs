@@ -855,7 +855,7 @@ fn read_nonmem_csv_impl(
 
     // All-zero-dose warning (#753): an `AMT` column exists (so E_DOSE_NO_AMT did not
     // fire) but every parsed dose amount is exactly zero — e.g. a placebo-only typo
-    // or a mis-scaled amount column. Like the all-zero-AMT error, this yields a flat
+    // or a mis-scaled amount column. Like the `E_DOSE_NO_AMT` error above, this yields a flat
     // objective; here we warn rather than error because the column is present and a
     // genuinely dose-free-but-AMT-columned dataset is conceivable. Only fires when at
     // least one dose event exists (else W_NO_DOSES already covered it).
