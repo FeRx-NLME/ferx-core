@@ -346,7 +346,10 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   drawn per **decision window** (occasion = decision index) and threaded through the
   per-event PK, so occasion-to-occasion shifts in CL/V drive the trajectory, the
   monitored signal, and every reactive dose; the frozen-replay verifier validates the
-  per-occasion bookkeeping, and it composes with time-varying covariates. `kappa` is
+  per-occasion bookkeeping, and it composes with time-varying covariates — the
+  composition (`CL = TVCL·(CRCL/100)·exp(η + κ)` under a declining covariate *and* a
+  per-occasion κ) is cross-validated dose-for-dose against an independent **mrgsolve**
+  run (`tests/reference/vanco_renal_iov_mrgsolve/`). `kappa` is
   drawn on a dedicated per-(subject, replicate) substream (disjoint from the η and
   assay streams), so a non-IOV run is unchanged and enabling a `Dv` monitor never
   shifts the draws. *Caveat:* as with time-varying covariates, `auc_target` on an IOV

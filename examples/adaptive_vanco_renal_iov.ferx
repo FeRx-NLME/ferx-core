@@ -1,0 +1,85 @@
+# Adaptive (feedback) dosing — vancomycin trough-TDM titration under BOTH a
+# time-varying renal covariate AND inter-occasion variability on clearance
+# (epic #391 / #700 x #701)
+#
+# This is the COMPOSITION of the two adaptive anchors:
+#   - adaptive_vanco_renal.ferx (#700): a declining CRCL covariate drives CL, and
+#     the reactive driver recomputes PK per event/segment from the covariate active
+#     in that segment (NONMEM end-of-interval convention).
+#   - adaptive_vanco_iov.ferx  (#701): a fresh per-occasion KAPPA_CL is drawn per
+#     decision window (occasion = decision index) and threaded through the segments.
+#
+# Here clearance depends on BOTH at once:
+#
+#   CL = TVCL * (CRCL / 100) * exp(ETA_CL + KAPPA_CL)
+#
+# so each day CL is set by (a) the renal function active in that segment (a smooth
+# decline from ~120 to ~40 mL/min over the horizon) and (b) that window's occasion
+# kappa. The controller titrates the once-daily 1-h infusion +/-25% to hold the
+# pre-dose trough (CENT/V) in a target band. Both effects move CL, so the realized
+# dose ladder reflects the two composed — the #700 per-event PK path and the #701
+# per-occasion kappa are each per-event correct, and correct TOGETHER.
+#
+# `auc_target` is deliberately absent: its exposure metric integrates a dense grid
+# from a single frozen PK snapshot, which is silently wrong when CL changes across
+# the horizon (a drifting covariate OR a per-occasion kappa), so it is a typed error
+# for a time-varying-covariate / IOV subject (#700/#701). `target_window` (the
+# pct-in-band trough metric) is per-event / per-occasion aware and retained.
+#
+# Run with `simulate_adaptive_from_spec()` (not the plain forward `simulate()`).
+# Validated dose-for-dose against an independent mrgsolve run (mrgsolve, not NONMEM,
+# is the feedback-dosing comparator): ferx's realized doses + reconstructed
+# per-occasion kappa + the CRCL trajectory are injected into an mrgsolve model whose
+# per-segment CL is TVCL*(CRCL/100)*exp(kappa), and the trough trajectory is compared
+# dose-for-dose. See tests/reference/vanco_renal_iov_mrgsolve/.
+#
+# Negligible BSV: ETA_CL carries a vanishing variance (SD ~ 1e-5) so the two
+# INTENDED sources of PK variation — the CRCL decline and the per-occasion kappa —
+# are what drive every decision. KAPPA_CL carries SD ~ 0.3 (variance 0.09), genuinely
+# nonzero, so CL really switches per window on top of the covariate trend.
+#
+# See docs/model-file/adaptive-dosing.qmd for the block reference.
+
+[parameters]
+  theta TVCL(4.0,  0.1,  50.0)   # vancomycin clearance at CRCL = 100 mL/min (L/h)
+  theta TVV(80.0,  5.0, 300.0)   # central volume (L); CENT/V is the concentration
+
+  # Negligible between-subject variability: the engine requires at least one omega,
+  # so CL's BSV carries a vanishing variance (SD ~ 1e-5). The CRCL covariate and the
+  # IOV kappa below are the intended sources of PK variation.
+  omega ETA_CL ~ 1e-10
+
+  # Inter-occasion variability on CL (#701): a fresh KAPPA_CL is drawn per decision
+  # window (occasion = decision index) from N(0, 0.09) — SD ~ 0.3. This is what the
+  # mrgsolve anchor injects, composed with the CRCL covariate below.
+  kappa KAPPA_CL ~ 0.09
+
+  sigma ADD ~ 1.0                # nominal additive error (concentration); the latent
+                                 # `observe` signal is un-noised, so it never enters
+                                 # the dose decisions.
+
+[individual_parameters]
+  CL = TVCL * (CRCL / 100.0) * exp(ETA_CL + KAPPA_CL)  # renal covariate x IOV kappa
+  V  = TVV                       # (CRCL is the time-varying covariate that declines)
+
+[structural_model]
+  ode(states=[CENT])
+
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT  # 1-cpt IV; infusions enter CENT via the route
+
+[scaling]
+  y = CENT / V                   # observed/predicted endpoint: concentration (mg/L)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[adaptive_dosing]
+  observe       = CENT / V               # titrate on the latent trough concentration
+  at            = every 24 from 0 to 312 # a decision at the start of each day
+  start_dose    = 500                    # empiric start (mg/day): subtherapeutic -> climbs
+  route         = infuse(cmt=1, over=1)  # 1-h IV infusion into the drug compartment
+  dose_bounds   = [250, 4000]            # mg/day
+  target_window = [10, 15]               # report % of days with trough in [10, 15] mg/L
+  when signal < 10 : increase 25%        # subtherapeutic trough -> raise the dose
+  when signal > 15 : decrease 25%        # supratherapeutic trough -> lower the dose
