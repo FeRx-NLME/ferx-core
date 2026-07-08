@@ -2069,15 +2069,19 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // per-event PK to stay piecewise-constant; the frozen-replay static engine adds
     // the identical breaks, so the two still share `integrate_segment` over
     // identical segments and stay bit-aligned.
-    let t_last = shadow
+    let mut t_last = shadow
         .obs_times
         .iter()
         .chain(decision_times.iter())
-        // A trailing pk-only (EVID=2) record can be the latest event on the TV path,
-        // so the horizon must reach it too (it also becomes a break below).
-        .chain(shadow.pk_only_times.iter())
         .cloned()
         .fold(0.0_f64, f64::max);
+    // On the TV path a trailing pk-only (EVID=2) record can be the latest event and
+    // becomes a break below, so the horizon must reach it too. Gated by `tv` so the
+    // constant path — where pk-only rows are neither breaks nor PK-changing — keeps
+    // its exact prior horizon (byte-identical, the shipped canary).
+    if tv {
+        t_last = shadow.pk_only_times.iter().cloned().fold(t_last, f64::max);
+    }
     let mut break_times: Vec<f64> = vec![0.0, t_last];
     break_times.extend(decision_times.iter().cloned());
     if tv {
