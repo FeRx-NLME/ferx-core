@@ -158,6 +158,11 @@ pub fn run_foce_gn(
         // With identity scale (scale_params=false) this is a no-op.
         let grad_s: DVector<f64> =
             DVector::from_iterator(n_packed, (0..n_packed).map(|i| grad[i] * gn_scale[i]));
+        // Per-coordinate scaled gradient for the trace's `grad:*` columns (#640),
+        // in the same space as the FOCE `grad_norm`. Snapshot at the iteration's
+        // evaluation point; accepted-step rows log the current estimate with this
+        // pre-step gradient (a one-iter lag, mirroring the FOCE trace).
+        let grad_s_trace: Vec<f64> = grad_s.iter().copied().collect();
         let mut h_s = DMatrix::zeros(n_packed, n_packed);
         for i in 0..n_packed {
             for j in 0..n_packed {
@@ -259,6 +264,11 @@ pub fn run_foce_gn(
             // with accepted-step rows (which also log the post-accept radius).
             if crate::estimation::trace::is_active() {
                 let (gn_method, gn_phase) = gn_trace_method_phase(options.method);
+                // Rejected step: `x` is unchanged, so the estimate and the
+                // gradient share the same point.
+                let values = crate::estimation::parameterization::coordinate_values(
+                    &unpack_params(&x, init_params),
+                );
                 crate::estimation::trace::write_gn(
                     iter,
                     gn_method,
@@ -269,6 +279,8 @@ pub fn run_foce_gn(
                     false,
                     None,
                     None,
+                    &values,
+                    Some(&grad_s_trace),
                 );
             }
 
@@ -302,6 +314,12 @@ pub fn run_foce_gn(
         // Trace: accepted step (lm_lambda column carries trust_radius for GN-TR)
         if crate::estimation::trace::is_active() {
             let (gn_method, gn_phase) = gn_trace_method_phase(options.method);
+            // Accepted step: `x` now holds the new point (`x_try`); its estimate
+            // is logged with this iteration's (pre-step) scaled gradient.
+            let values = crate::estimation::parameterization::coordinate_values(&unpack_params(
+                &x,
+                init_params,
+            ));
             crate::estimation::trace::write_gn(
                 iter,
                 gn_method,
@@ -312,6 +330,8 @@ pub fn run_foce_gn(
                 true,
                 None,
                 None,
+                &values,
+                Some(&grad_s_trace),
             );
         }
 

@@ -434,6 +434,114 @@ pub fn compute_bounds(template: &ModelParameters) -> PackedBounds {
     PackedBounds { lower, upper }
 }
 
+/// Per-coordinate **display names** for the optimizer trace, in the same order
+/// as [`pack_params`]: `[theta…, Ω (lower-tri col-major)…, sigma…, Ω_IOV…]`.
+///
+/// Declared names are preferred (`TVCL`, `ETA_CL`, `EPS_PROP`); an Ω
+/// off-diagonal couples two etas as `ETA_i~ETA_j` (row eta ~ column eta). When a
+/// name is missing the NONMEM-style fallback is used: `THETA1`, `OMEGA(2,1)`,
+/// `SIGMA(1)`.
+pub fn coordinate_names(params: &ModelParameters) -> Vec<String> {
+    let mut names = Vec::with_capacity(packed_len(params));
+    for i in 0..params.theta.len() {
+        names.push(named_or(&params.theta_names, i, || {
+            format!("THETA{}", i + 1)
+        }));
+    }
+    push_omega_names(&mut names, &params.omega);
+    for i in 0..params.sigma.values.len() {
+        names.push(named_or(&params.sigma.names, i, || {
+            format!("SIGMA({})", i + 1)
+        }));
+    }
+    if let Some(ref iov) = params.omega_iov {
+        push_omega_names(&mut names, iov);
+    }
+    names
+}
+
+fn named_or(v: &[String], i: usize, fallback: impl FnOnce() -> String) -> String {
+    match v.get(i) {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => fallback(),
+    }
+}
+
+fn push_omega_names(names: &mut Vec<String>, om: &OmegaMatrix) {
+    let n = om.dim();
+    let diag_name = |i: usize| named_or(&om.eta_names, i, || format!("OMEGA({},{})", i + 1, i + 1));
+    if om.diagonal {
+        for i in 0..n {
+            names.push(diag_name(i));
+        }
+    } else {
+        // Column-major lower triangle — mirrors `pack_params`.
+        for j in 0..n {
+            for i in j..n {
+                if i == j {
+                    names.push(diag_name(i));
+                } else {
+                    let ni = om.eta_names.get(i).filter(|s| !s.is_empty());
+                    let nj = om.eta_names.get(j).filter(|s| !s.is_empty());
+                    match (ni, nj) {
+                        (Some(a), Some(b)) => names.push(format!("{}~{}", a, b)),
+                        _ => names.push(format!("OMEGA({},{})", i + 1, j + 1)),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Per-coordinate **natural / reporting-scale** values, ordered like
+/// [`pack_params`]. Theta are natural values, Ω entries are variances
+/// (diagonal) / covariances (off-diagonal), sigma are variances. This is the
+/// back-transformed space the trace's `val:*` columns report.
+pub fn coordinate_values(params: &ModelParameters) -> Vec<f64> {
+    coordinate_values_raw(
+        &params.theta,
+        &params.omega.matrix,
+        params.omega.diagonal,
+        &params.sigma.values,
+        params.omega_iov.as_ref().map(|m| (&m.matrix, m.diagonal)),
+    )
+}
+
+/// Assemble the natural-scale coordinate vector directly from raw pieces, for
+/// callers (e.g. SAEM) that hold parameters as loose matrices/vectors rather
+/// than a `ModelParameters`. Order matches [`pack_params`].
+pub fn coordinate_values_raw(
+    theta: &[f64],
+    omega_mat: &DMatrix<f64>,
+    omega_diagonal: bool,
+    sigma: &[f64],
+    iov: Option<(&DMatrix<f64>, bool)>,
+) -> Vec<f64> {
+    let mut v = Vec::new();
+    v.extend_from_slice(theta);
+    push_omega_vals(&mut v, omega_mat, omega_diagonal);
+    v.extend_from_slice(sigma);
+    if let Some((m, diag)) = iov {
+        push_omega_vals(&mut v, m, diag);
+    }
+    v
+}
+
+fn push_omega_vals(v: &mut Vec<f64>, m: &DMatrix<f64>, diagonal: bool) {
+    let n = m.nrows();
+    if diagonal {
+        for i in 0..n {
+            v.push(m[(i, i)]);
+        }
+    } else {
+        for j in 0..n {
+            for i in j..n {
+                v.push(m[(i, j)]);
+            }
+        }
+    }
+}
+
 /// Return initial ETA vector: warm-start if available, else mu_refs, else zeros.
 pub fn get_eta_init(n_eta: usize, warm_start: Option<&[f64]>, mu_refs: Option<&[f64]>) -> Vec<f64> {
     if let Some(ws) = warm_start {
@@ -862,6 +970,109 @@ mod tests {
             .zip(recovered.sigma.values.iter())
         {
             assert_relative_eq!(orig, rec, epsilon = 1e-8);
+        }
+    }
+
+    // ── coordinate names / values (trace #640) ──────────────────────────────
+
+    #[test]
+    fn test_coordinate_names_diagonal() {
+        // Layout: theta(cl,v), diagonal Ω(eta_cl,eta_v), sigma(sigma_prop).
+        let t = make_template();
+        let names = coordinate_names(&t);
+        assert_eq!(names, vec!["cl", "v", "eta_cl", "eta_v", "sigma_prop"]);
+        assert_eq!(names.len(), packed_len(&t));
+    }
+
+    #[test]
+    fn test_coordinate_values_diagonal_are_natural_scale() {
+        // Values: theta as-is, Ω diagonal as variances, sigma as variance.
+        let t = make_template();
+        let v = coordinate_values(&t);
+        assert_eq!(v.len(), packed_len(&t));
+        assert_relative_eq!(v[0], 10.0, epsilon = 1e-12); // cl
+        assert_relative_eq!(v[1], 100.0, epsilon = 1e-12); // v
+        assert_relative_eq!(v[2], 0.09, epsilon = 1e-12); // var(eta_cl)
+        assert_relative_eq!(v[3], 0.04, epsilon = 1e-12); // var(eta_v)
+        assert_relative_eq!(v[4], 0.3, epsilon = 1e-12); // sigma
+    }
+
+    #[test]
+    fn test_coordinate_names_block_off_diagonal() {
+        // Block Ω off-diagonal couples row~col eta in packed (col-major) order:
+        // (0,0)=eta_cl, (1,0)=eta_v~eta_cl, (1,1)=eta_v.
+        let t = make_block_template();
+        let names = coordinate_names(&t);
+        assert_eq!(
+            names,
+            vec!["cl", "v", "eta_cl", "eta_v~eta_cl", "eta_v", "sigma_prop"]
+        );
+    }
+
+    #[test]
+    fn test_coordinate_values_block_off_diagonal_is_covariance() {
+        let t = make_block_template();
+        let v = coordinate_values(&t);
+        // Packed omega order: var(cl)=0.09, cov=0.02, var(v)=0.04.
+        assert_relative_eq!(v[2], 0.09, epsilon = 1e-12);
+        assert_relative_eq!(v[3], 0.02, epsilon = 1e-12);
+        assert_relative_eq!(v[4], 0.04, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_coordinate_names_fallbacks_when_unnamed() {
+        // Empty declared names → NONMEM-style THETA1 / OMEGA(2,1) / SIGMA(1).
+        let mut m = DMatrix::zeros(2, 2);
+        m[(0, 0)] = 0.09;
+        m[(1, 1)] = 0.04;
+        m[(0, 1)] = 0.02;
+        m[(1, 0)] = 0.02;
+        let omega = OmegaMatrix::from_matrix(m, vec![String::new(), String::new()], false);
+        let t = ModelParameters {
+            theta: vec![1.0],
+            theta_names: vec![String::new()],
+            theta_lower: vec![0.0],
+            theta_upper: vec![10.0],
+            theta_fixed: vec![false],
+            omega,
+            omega_fixed: vec![false, false],
+            sigma: SigmaVector {
+                values: vec![0.3],
+                names: vec![String::new()],
+            },
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: Vec::new(),
+        };
+        let names = coordinate_names(&t);
+        assert_eq!(
+            names,
+            vec![
+                "THETA1",
+                "OMEGA(1,1)",
+                "OMEGA(2,1)",
+                "OMEGA(2,2)",
+                "SIGMA(1)"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_coordinate_names_values_include_iov() {
+        // IOV coordinates append after sigma, mirroring pack_params.
+        let t = make_iov_template();
+        let names = coordinate_names(&t);
+        assert_eq!(names, vec!["TVCL", "ETA_CL", "PROP_ERR", "KAPPA_CL"]);
+        let v = coordinate_values(&t);
+        assert_eq!(v.len(), packed_len(&t));
+        assert_relative_eq!(v[3], 0.01, epsilon = 1e-12); // var(kappa_cl)
+    }
+
+    #[test]
+    fn test_coordinate_values_matches_packed_len_for_all_shapes() {
+        for t in [make_template(), make_block_template(), make_iov_template()] {
+            assert_eq!(coordinate_values(&t).len(), packed_len(&t));
+            assert_eq!(coordinate_names(&t).len(), packed_len(&t));
         }
     }
 

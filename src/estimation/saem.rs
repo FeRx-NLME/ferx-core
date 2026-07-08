@@ -2120,7 +2120,27 @@ pub fn run_saem(
                 );
             }
 
-            crate::estimation::trace::write_saem(k, phase, cond_nll, gamma, mh_accept_rate);
+            // Per-coordinate estimates (natural scale) for the trace's `val:*`
+            // columns (#640). SAEM has no OFV gradient, so `grad:*` are NA.
+            let iov = init_params
+                .omega_iov
+                .as_ref()
+                .map(|m| (&state.omega_iov_mat, m.diagonal));
+            let values = crate::estimation::parameterization::coordinate_values_raw(
+                &state.theta,
+                &state.omega_mat,
+                init_params.omega.diagonal,
+                &state.sigma_vals,
+                iov,
+            );
+            crate::estimation::trace::write_saem(
+                k,
+                phase,
+                cond_nll,
+                gamma,
+                mh_accept_rate,
+                &values,
+            );
         }
     }
 

@@ -3861,7 +3861,11 @@ fn fit_inner(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let path = format!("/tmp/ferx_trace_{}_{}.csv", pid, ts);
-        if let Err(e) = crate::estimation::trace::init(path.clone()) {
+        // Header carries one `val:<name>`/`grad:<name>` column per optimized
+        // coordinate. The coordinate structure (and hence the names) is fixed
+        // across a method chain, so the template's names serve every stage.
+        let coord_names = crate::estimation::parameterization::coordinate_names(init_params);
+        if let Err(e) = crate::estimation::trace::init(path.clone(), &coord_names) {
             eprintln!("[ferx] warning: could not open trace file {}: {}", path, e);
         } else {
             eprintln!("[ferx] optimizer trace → {}", path);

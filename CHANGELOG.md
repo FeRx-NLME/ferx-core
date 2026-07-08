@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Per-parameter estimates + gradients in the optimizer trace** (#640): when
+  `optimizer_trace = true`, each CSV row now also records the full parameter
+  vector (`val:<name>` columns, natural/reporting scale) for every method and
+  the full gradient vector (`grad:<name>` columns, optimizer-scaled space) for
+  the gradient methods (FOCE/FOCEI/GN; `NA` for SAEM). Columns are named after
+  the declared parameters (`TVCL`, `ETA_CL`, `ETA_V~ETA_CL`, `PROP_ERR`) with
+  `THETA1` / `OMEGA(2,1)` / `SIGMA(1)` fallbacks, and reconstruct `grad_norm`
+  as `sqrt(sum(grad:<name>^2))`. This powers a per-parameter convergence view
+  in the ferx-r trace UI.
 - **`[data]` block column renaming** (#730, #742): rename any dataset header to
   any new name with `new-name = actual` entries (e.g. `TIME = TAFD`,
   `DV = CONC`), the ferx equivalent of NONMEM's `$INPUT TIME=TAFD`. Targets are
