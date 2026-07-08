@@ -163,6 +163,9 @@ pub fn run_foce_gn(
         // evaluation point; accepted-step rows log the current estimate with this
         // pre-step gradient (a one-iter lag, mirroring the FOCE trace).
         let grad_s_trace: Vec<f64> = grad_s.iter().copied().collect();
+        // Scalar norm of the same scaled gradient, for the `grad_norm` column —
+        // so `sqrt(sum(grad:*^2)) == grad_norm` holds for GN rows.
+        let grad_norm_trace = grad_s.norm();
         let mut h_s = DMatrix::zeros(n_packed, n_packed);
         for i in 0..n_packed {
             for j in 0..n_packed {
@@ -274,6 +277,7 @@ pub fn run_foce_gn(
                     gn_method,
                     gn_phase,
                     ofv,
+                    Some(grad_norm_trace),
                     radius_before,
                     0.0,
                     false,
@@ -325,6 +329,7 @@ pub fn run_foce_gn(
                 gn_method,
                 gn_phase,
                 ofv,
+                Some(grad_norm_trace),
                 trust_radius,
                 ofv - prev_ofv,
                 true,
@@ -3506,5 +3511,70 @@ mod tests {
                  off={g_off:.17e} on={g_on:.17e} (mu-ref shortcut not fully removed)"
             );
         }
+    }
+
+    /// GN with the optimizer trace active must emit the per-parameter `val:*` /
+    /// `grad:*` columns (#640) via the two `write_gn` call sites, and — after the
+    /// review fix — populate the `grad_norm` column so it reconstructs from the
+    /// `grad:*` block. This is the fast test that registers PR coverage for the
+    /// GN trace lines (the site is otherwise reached only by slow fits).
+    #[test]
+    fn gn_trace_emits_per_param_columns_and_grad_norm() {
+        use crate::types::{EstimationMethod, Optimizer};
+        let model = make_model();
+        let population = make_population();
+        let coord_names =
+            crate::estimation::parameterization::coordinate_names(&model.default_params);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = format!(
+            "/tmp/ferx_trace_gn_param_{}_{}.csv",
+            std::process::id(),
+            nanos
+        );
+        crate::estimation::trace::init(path.clone(), &coord_names).unwrap();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceGn,
+            optimizer: Optimizer::Bfgs,
+            outer_maxiter: 4,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let _ = run_foce_gn(&model, &population, &model.default_params, &opts);
+        crate::estimation::trace::finish();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines = contents.lines();
+        let header: Vec<String> = lines.next().unwrap().split(',').map(String::from).collect();
+        assert!(header.iter().any(|c| c.starts_with("val:")));
+        assert!(header.iter().any(|c| c.starts_with("grad:")));
+        let n_coords = coord_names.len();
+        let fixed = 17;
+        let gn_idx = header.iter().position(|c| c == "grad_norm").unwrap();
+        let mut checked = false;
+        for row in lines {
+            let c: Vec<String> = row.split(',').map(String::from).collect();
+            assert_eq!(c.len(), fixed + 2 * n_coords, "GN row column count");
+            // GN rows must now carry a finite grad_norm (the review fix).
+            let gn: f64 = c[gn_idx]
+                .parse()
+                .expect("GN grad_norm must be finite, not NA");
+            let mut sq = 0.0;
+            for i in (fixed + n_coords)..(fixed + 2 * n_coords) {
+                sq += c[i].parse::<f64>().unwrap().powi(2);
+            }
+            assert!(
+                (sq.sqrt() - gn).abs() <= 1e-6 * gn.abs().max(1.0),
+                "GN grad:* must reconstruct grad_norm: recon={} grad_norm={}",
+                sq.sqrt(),
+                gn
+            );
+            checked = true;
+        }
+        assert!(checked, "expected at least one GN trace row");
+        std::fs::remove_file(&path).ok();
     }
 }

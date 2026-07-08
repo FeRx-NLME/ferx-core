@@ -1063,7 +1063,14 @@ fn optimize_nlopt(
                     sq += gi * gi;
                 }
                 grad_norm_for_trace = Some(sq.sqrt());
-                grad_vec_for_trace = Some(g.to_vec());
+                // Clone the scaled gradient for the trace only when a trace is
+                // open — this runs on every gradient eval (the hot path), so an
+                // unconditional `to_vec` would waste an allocation per eval on
+                // the default trace-off path (#640 review). Snapshot before the
+                // SLSQP cap below so it matches `grad_norm_for_trace`.
+                if crate::estimation::trace::is_active() {
+                    grad_vec_for_trace = Some(g.to_vec());
+                }
                 if matches!(algo, nlopt::Algorithm::Slsqp) {
                     cap_slsqp_gradient(g, &lower_s, &upper_s);
                 }
@@ -5610,8 +5617,78 @@ mod tests {
                 }
             }
             assert!(
-                (sq.sqrt() - gn).abs() < 1e-4,
-                "grad cols must reconstruct grad_norm"
+                (sq.sqrt() - gn).abs() <= 1e-6 * gn.abs().max(1.0),
+                "grad cols must reconstruct grad_norm: recon={} grad_norm={}",
+                sq.sqrt(),
+                gn
+            );
+            checked = true;
+            break;
+        }
+        assert!(checked, "expected at least one row with a finite grad_norm");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Gradient-mode NLopt (SLSQP) with the trace active must emit the
+    /// per-parameter columns via the *nlopt* `write_foce` call site — the branch
+    /// that snapshots `grad_vec_for_trace` (now guarded by `is_active`). The
+    /// built-in-BFGS test above covers a different site; SLSQP is otherwise only
+    /// reached by slow fits, so this registers PR coverage for the nlopt path.
+    #[test]
+    fn nlopt_gradient_trace_emits_per_param_columns() {
+        use crate::types::{EstimationMethod, FitOptions, Optimizer};
+        let model = make_model();
+        let population = make_population(4);
+        let coord_names =
+            crate::estimation::parameterization::coordinate_names(&model.default_params);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = format!(
+            "/tmp/ferx_trace_slsqp_param_{}_{}.csv",
+            std::process::id(),
+            nanos
+        );
+        crate::estimation::trace::init(path.clone(), &coord_names).unwrap();
+        let opts = FitOptions {
+            method: EstimationMethod::Foce,
+            optimizer: Optimizer::Slsqp,
+            outer_maxiter: 3,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let _ = optimize_population(&model, &population, &model.default_params, &opts);
+        crate::estimation::trace::finish();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines = contents.lines();
+        let header: Vec<String> = lines.next().unwrap().split(',').map(String::from).collect();
+        assert!(header.iter().any(|c| c.starts_with("val:")));
+        assert!(header.iter().any(|c| c.starts_with("grad:")));
+        let n_coords = coord_names.len();
+        let fixed = 17;
+        let gn_idx = header.iter().position(|c| c == "grad_norm").unwrap();
+        let mut checked = false;
+        for row in lines {
+            let c: Vec<String> = row.split(',').map(String::from).collect();
+            assert_eq!(c.len(), fixed + 2 * n_coords, "row column count");
+            if c[gn_idx] == "NA" {
+                continue;
+            }
+            let gn: f64 = c[gn_idx].parse().unwrap();
+            let mut sq = 0.0;
+            for i in (fixed + n_coords)..(fixed + 2 * n_coords) {
+                if let Ok(v) = c[i].parse::<f64>() {
+                    sq += v * v;
+                }
+            }
+            assert!(
+                (sq.sqrt() - gn).abs() <= 1e-6 * gn.abs().max(1.0),
+                "grad cols must reconstruct grad_norm: recon={} grad_norm={}",
+                sq.sqrt(),
+                gn
             );
             checked = true;
             break;

@@ -452,7 +452,7 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | `phase` | gn_hybrid, saem | `focei` (polish) or `explore`/`converge` |
 | `ofv` | all | Objective function value |
 | `wall_ms` | all | Wall time for this iteration (ms) |
-| `grad_norm` | BFGS, NLopt gradient-mode | Gradient norm |
+| `grad_norm` | BFGS, NLopt gradient-mode, GN | Gradient norm |
 | `step_norm` | BFGS | Step size |
 | `inner_iter_count` | (reserved) | Reserved for future per-iteration inner-loop count; currently `NA` |
 | `optimizer` | FOCE/FOCEI | Active NLopt algorithm |
@@ -476,7 +476,10 @@ per optimized coordinate (thetas, Ω diagonals **and** off-diagonal covariances,
 containing a comma is CSV-quoted). The column set is fixed across a method chain
 (e.g. `saem -> focei`), so one header serves the whole run. `grad:*` columns are
 `NA` on any iteration without an OFV gradient (SAEM, and derivative-free BOBYQA
-evals). This powers the per-parameter convergence view in ferx-r's trace UI
+evals). The `val:*`/`grad:*` cells are written in scientific notation
+(`{:.6e}`) — unlike the fixed-decimal scalar columns — so small variances and
+near-converged gradient coordinates keep their precision instead of rounding to
+`0`. This powers the per-parameter convergence view in ferx-r's trace UI
 (#640).
 
 Unused columns contain `NA`. The trace is buffered and flushed when the fit ends; if a run is killed mid-iteration the buffered tail may be lost.

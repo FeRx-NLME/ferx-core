@@ -61,15 +61,21 @@ impl TraceWriter {
     /// Append the per-parameter `val:*` and `grad:*` columns (no leading/trailing
     /// newline). `grads = None` (SAEM, or a derivative-free eval) writes `NA` for
     /// every gradient column. Missing/non-finite entries serialise as `NA`.
+    ///
+    /// These use a scientific format (`fmt_opt_sci`), not the fixed `{:.6}` of
+    /// the scalar columns: per-parameter estimates (variances down to ~1e-8) and
+    /// near-converged gradient coordinates span many orders of magnitude, and a
+    /// fixed six-decimal format would round them to `0.000000`, erasing exactly
+    /// the signal the per-parameter view exists to show (#640 review).
     fn write_param_cols(&mut self, values: &[f64], grads: Option<&[f64]>) {
         for i in 0..self.n_coords {
-            let _ = write!(self.writer, ",{}", fmt_opt(values.get(i).copied()));
+            let _ = write!(self.writer, ",{}", fmt_opt_sci(values.get(i).copied()));
         }
         for i in 0..self.n_coords {
             let _ = write!(
                 self.writer,
                 ",{}",
-                fmt_opt(grads.and_then(|g| g.get(i).copied()))
+                fmt_opt_sci(grads.and_then(|g| g.get(i).copied()))
             );
         }
     }
@@ -119,6 +125,7 @@ impl TraceWriter {
         method: &str,
         phase: &str,
         ofv: f64,
+        grad_norm: Option<f64>,
         lm_lambda: f64,
         ofv_delta: f64,
         step_accepted: bool,
@@ -128,14 +135,18 @@ impl TraceWriter {
         grads: Option<&[f64]>,
     ) {
         let wall_ms = self.elapsed_ms();
+        // grad_norm (position 6) is now populated for GN: the scaled BHHH
+        // gradient is available, so `sqrt(sum(grad:*^2)) == grad_norm` holds for
+        // GN rows too, matching the FOCE writers (#640 review).
         let _ = write!(
             self.writer,
-            "{},{},{},{:.6},{},NA,NA,NA,NA,{:.6},{:.6},{},NA,NA,NA,{},{}",
+            "{},{},{},{:.6},{},{},NA,NA,NA,{:.6},{:.6},{},NA,NA,NA,{},{}",
             iter,
             method,
             phase,
             ofv,
             wall_ms,
+            fmt_opt(grad_norm),
             lm_lambda,
             ofv_delta,
             i32::from(step_accepted),
@@ -178,6 +189,18 @@ impl TraceWriter {
 fn fmt_opt(v: Option<f64>) -> String {
     match v {
         Some(f) if f.is_finite() => format!("{:.6}", f),
+        _ => "NA".to_string(),
+    }
+}
+
+/// Scientific-notation variant of [`fmt_opt`] for the per-parameter `val:*` /
+/// `grad:*` columns, which span many orders of magnitude. `1.5e-8` survives
+/// where `{:.6}` would print `0.000000`. Ten significant figures keep large
+/// gradient components (O(1e6)) precise enough that `sqrt(sum(grad:*^2))`
+/// reconstructs `grad_norm`. Non-finite → `NA`.
+fn fmt_opt_sci(v: Option<f64>) -> String {
+    match v {
+        Some(f) if f.is_finite() => format!("{:.9e}", f),
         _ => "NA".to_string(),
     }
 }
@@ -322,6 +345,7 @@ pub fn write_gn(
     method: &str,
     phase: &str,
     ofv: f64,
+    grad_norm: Option<f64>,
     lm_lambda: f64,
     ofv_delta: f64,
     step_accepted: bool,
@@ -341,6 +365,7 @@ pub fn write_gn(
                 method,
                 phase,
                 ofv,
+                grad_norm,
                 lm_lambda,
                 ofv_delta,
                 step_accepted,
@@ -452,12 +477,26 @@ mod tests {
     fn test_gn_row_format() {
         let path = format!("/tmp/ferx_trace_gn_{}.csv", std::process::id());
         let mut w = TraceWriter::new(path.clone(), &[]).unwrap();
-        w.write_gn_row(3, "gn", "", 200.0, 0.01, -5.0, true, None, None, &[], None);
+        w.write_gn_row(
+            3,
+            "gn",
+            "",
+            200.0,
+            Some(0.5),
+            0.01,
+            -5.0,
+            true,
+            None,
+            None,
+            &[],
+            None,
+        );
         w.flush();
         let contents = read_file(&path);
         let row = contents.lines().nth(1).unwrap();
         assert!(row.starts_with("3,gn,,200."));
-        assert!(row.contains(",0.010000,-5.000000,1,"));
+        // grad_norm now populated for GN (position 6), then lm_lambda, ofv_delta.
+        assert!(row.contains(",0.500000,NA,NA,NA,0.010000,-5.000000,1,"));
         std::fs::remove_file(&path).ok();
     }
 
@@ -555,7 +594,20 @@ mod tests {
         // can call trace::write_* unconditionally.
         assert!(!is_active());
         write_foce(1, "foce", 1.0, None, None, "slsqp", None, None, &[], None);
-        write_gn(1, "gn", "", 1.0, 0.0, 0.0, true, None, None, &[], None);
+        write_gn(
+            1,
+            "gn",
+            "",
+            1.0,
+            None,
+            0.0,
+            0.0,
+            true,
+            None,
+            None,
+            &[],
+            None,
+        );
         write_saem(1, "explore", 1.0, 1.0, 0.5, &[]);
         // No assertion on files — the assertion is "didn't panic".
     }
@@ -718,7 +770,12 @@ mod tests {
         assert_eq!(cols.len(), 21);
         assert_eq!(
             &cols[17..],
-            &["2.500000", "0.090000", "0.400000", "-0.300000"]
+            &[
+                "2.500000000e0",
+                "9.000000000e-2",
+                "4.000000000e-1",
+                "-3.000000000e-1"
+            ]
         );
         std::fs::remove_file(&path).ok();
     }
@@ -750,7 +807,10 @@ mod tests {
             .split(',')
             .map(String::from)
             .collect();
-        assert_eq!(&cols[17..], &["2.500000", "0.090000", "NA", "NA"]);
+        assert_eq!(
+            &cols[17..],
+            &["2.500000000e0", "9.000000000e-2", "NA", "NA"]
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -768,7 +828,10 @@ mod tests {
             .split(',')
             .map(String::from)
             .collect();
-        assert_eq!(&cols[17..], &["2.500000", "0.090000", "NA", "NA"]);
+        assert_eq!(
+            &cols[17..],
+            &["2.500000000e0", "9.000000000e-2", "NA", "NA"]
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -826,7 +889,7 @@ mod tests {
             .collect();
         // 17 fixed + 3 val + 3 grad = 23.
         assert_eq!(cols.len(), 23);
-        assert_eq!(&cols[17..20], &["1.000000", "NA", "NA"]);
+        assert_eq!(&cols[17..20], &["1.000000000e0", "NA", "NA"]);
         std::fs::remove_file(&path).ok();
     }
 
@@ -834,7 +897,20 @@ mod tests {
     fn test_gn_step_rejected_serialised_as_zero() {
         let path = unique_path("gn_reject");
         let mut w = TraceWriter::new(path.clone(), &[]).unwrap();
-        w.write_gn_row(5, "gn", "", 100.0, 1.0, 2.0, false, None, None, &[], None);
+        w.write_gn_row(
+            5,
+            "gn",
+            "",
+            100.0,
+            None,
+            1.0,
+            2.0,
+            false,
+            None,
+            None,
+            &[],
+            None,
+        );
         w.flush();
         let row = read_file(&path).lines().nth(1).unwrap().to_string();
         // step_accepted is the column right before cond_nll's NA stretch.
