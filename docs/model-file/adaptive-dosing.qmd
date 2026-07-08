@@ -236,6 +236,15 @@ compartment, double-applied bioavailability — moves a prediction by orders of
 magnitude more, so the tight check still catches it without ever false-positiving
 on a legitimate run.
 
+On the time-varying-covariate and IOV paths the driver and the replay share
+precomputed per-event / per-occasion PK snapshots, so replay agreement alone would
+only prove the two *consumed* them identically — not that the snapshots were built
+correctly. The verifier therefore also **independently re-derives** each snapshot
+(the per-occasion `kappa`, the per-decision PK at its LOCF covariate, the per-record
+PK) from the run's primitives and bit-checks it against what the driver used, so a
+mis-resolved covariate or occasion fails loudly rather than being applied by both
+sides and slipping through unnoticed (#748).
+
 ## Validation
 
 NONMEM has **no native feedback dosing**, so there is no equivalent NONMEM run to

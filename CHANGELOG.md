@@ -77,6 +77,15 @@ section of the SDLC for the versioning policy).
   VPC datasets from IOV models now carry the between-occasion spread the model
   parameterizes; previously they silently under-dispersed relative to the fitted
   model. Non-IOV models are unaffected (bit-identical output).
+- **The adaptive frozen-replay verifier now independently validates its snapshots** (#748):
+  the default-on safety net for `simulate_adaptive` / `simulate_adaptive_from_spec` reused the
+  same precomputed per-occasion / per-event PK snapshots the reactive driver did, so it checked
+  that the two *consumed* them identically but never that they were *correct* — a mis-built
+  snapshot (a wrong covariate, occasion, or `kappa` fed to a parameter) was applied by both sides
+  and passed the replay bit-exact. The verifier now re-derives each snapshot from the run's
+  primitives via the canonical helpers and bit-asserts it against what the driver was handed, so a
+  build that mis-resolves a covariate or occasion (the class fixed in #732 / #739) fails loudly for
+  every model instead of slipping past the replay. No effect on correct models.
 
 ### Added
 - **Adaptive (feedback) dosing now supports time-varying covariates** (#700): the

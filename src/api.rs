@@ -7538,6 +7538,33 @@ where
             .map_err(|e| format!("subject '{}' (sim {sim}): {e}", subject.id))?;
 
             if opts.verify {
+                // #748: the frozen-replay verifier below reuses the *same* precomputed
+                // snapshots (`event_pk`, `decision_pk`, `eta_occ`) the driver did, so it
+                // validates that the two *consume* them identically — never that they are
+                // *correct*. A build-loop that fed a leaf the wrong covariate / occasion /
+                // κ (the #732 & #739 "decision covariate frozen at t=0" class) is applied
+                // by both sides and passes the replay bit-exact. Close that blind spot by
+                // independently re-deriving each snapshot from primitives and bit-asserting
+                // it against what the driver was handed — default-on, before the replay.
+                verify_adaptive_snapshots(
+                    model,
+                    params,
+                    subject,
+                    &eta_slice,
+                    decision_times,
+                    assay_root,
+                    sim,
+                    eta_occ.as_deref(),
+                    decision_pk.as_deref(),
+                    event_pk,
+                )
+                .map_err(|e| {
+                    format!(
+                        "adaptive snapshot verification failed for subject '{}' (sim {sim}): {e}",
+                        subject.id
+                    )
+                })?;
+
                 crate::ode::verify_adaptive_frozen_replay(
                     ode,
                     &pk.values,
@@ -7667,6 +7694,260 @@ where
         decisions,
         metrics,
     })
+}
+
+/// Validate that the per-(subject, replicate) PK snapshots the reactive driver was
+/// handed — and which the frozen-schedule replay verifier reuses **verbatim** — are
+/// *correct*, not merely *consumed identically* by both engines (#748).
+///
+/// `run_adaptive_population` precomputes, once, the PK snapshots it feeds to both the
+/// driver and `verify_adaptive_frozen_replay`: the baseline `pk` (t=0), `eta_occ[g]`
+/// (the per-decision-window `[η_bsv | κ_g]`), `decision_pk[g]` (the PK at decision
+/// `g`), and `event_pk` (the per-record obs / pk-only PK). Because the replay consumes
+/// the identical arrays, a **build-loop** error — a wrong covariate, occasion, or κ
+/// fed to a leaf — is applied by both sides and passes the replay bit-exact. That is
+/// exactly how the "decision covariate frozen at t=0" defect reached production twice
+/// (#732, #739): each time only a hand-written regression test using an off-record
+/// `f_applied` readout could catch it, because the default-on verifier could not.
+///
+/// This check closes that blind spot for the three per-occasion / per-event snapshots
+/// #748 names. It **independently re-derives** `eta_occ`, `decision_pk`, and `event_pk`
+/// from the run's *primitive* inputs — θ, the drawn BSV η (`eta_slice`), the subject's
+/// covariates, the decision schedule, and (re-drawn here) the per-occasion κ substream
+/// — by calling the **leaf** rules directly (`pk_param_fn`, `locf_decision_cov`,
+/// `occasion_of`, `subject_kappa_base_seed` / `kappa_standard_normal`), NOT by
+/// re-invoking the build loop's composite assembler. In particular `event_pk` is
+/// rebuilt record-by-record inline (occasion via `occasion_of`, PK via `pk_param_fn`
+/// at the record's own covariate) rather than through `compute_event_pk_params_iov`,
+/// so a wrong occasion or covariate the *composite* would introduce is caught too —
+/// not only a wrong array argument. It then bit-asserts (`to_bits`) each re-derivation
+/// against what the driver received; `pk_param_fn` and the seeded κ substream are pure,
+/// so a correct build agrees to the bit and a divergent one fails loudly, default-on,
+/// for **every** model.
+///
+/// The teeth come from this being a **second orchestration over the same leaves**: it
+/// **must not** be refactored to call the build loop's composite assembler, or a defect
+/// edited into that assembler would be mirrored on both sides and slip through again.
+/// The leaf rules themselves (the covariate LOCF rule, the occasion map, the κ draw)
+/// are the single source of truth and are unit-tested in isolation; θ and `eta_slice`
+/// are trusted primitive draws (not "built" snapshots) so — like the seed and Ω — they
+/// are consumed, not re-derived.
+///
+/// Scope: the constant-path baseline `pk` (a single t=0 evaluation at the subject-static
+/// covariate) is a shared snapshot too, but a trivial one — it is left to the degenerate
+/// oracle rather than re-derived per run here; extending the check to it is a possible
+/// follow-up. On the constant-covariate / non-IOV path (no `eta_occ`, no `event_pk`)
+/// this function is therefore a no-op.
+#[allow(clippy::too_many_arguments)]
+fn verify_adaptive_snapshots(
+    model: &CompiledModel,
+    params: &ModelParameters,
+    subject: &Subject,
+    eta_slice: &[f64],
+    decision_times: &[f64],
+    assay_root: u64,
+    sim: usize,
+    eta_occ: Option<&[Vec<f64>]>,
+    decision_pk: Option<&[PkParams]>,
+    event_pk: Option<&crate::pk::EventPkParams>,
+) -> Result<(), String> {
+    let n_eta = model.n_eta;
+
+    // ── IOV path: re-derive eta_occ + decision_pk, then event_pk inline ─────────
+    if let (Some(eta_occ), Some(decision_pk)) = (eta_occ, decision_pk) {
+        let omega_iov = params.omega_iov.as_ref().ok_or_else(|| {
+            "an IOV run (eta_occ / decision_pk present) carries no omega_iov — a build-loop \
+             invariant violation (#748)"
+                .to_string()
+        })?;
+        let kappa_base =
+            crate::sim::adaptive::subject_kappa_base_seed(assay_root, &subject.id, sim);
+        let n_occ = decision_times.len();
+
+        if eta_occ.len() != n_occ || decision_pk.len() != n_occ {
+            return Err(format!(
+                "occasion snapshot arrays are mis-sized: expected {n_occ} (one per decision), \
+                 got eta_occ.len()={}, decision_pk.len()={} (#748)",
+                eta_occ.len(),
+                decision_pk.len()
+            ));
+        }
+
+        let mut eta_occ_check: Vec<Vec<f64>> = Vec::with_capacity(n_occ);
+        for g in 0..n_occ {
+            // Re-draw occasion g's κ on the dedicated substream and assemble the
+            // per-window eta [η_bsv | κ_g] — an independent copy of the build loop.
+            let zk: Vec<f64> = (0..model.n_kappa)
+                .map(|k| crate::sim::adaptive::kappa_standard_normal(kappa_base, g, k))
+                .collect();
+            let kappa_g = &omega_iov.chol * DVector::from_column_slice(&zk);
+            let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
+            e.extend(kappa_g.iter().copied());
+
+            if !slice_bits_eq(&e, &eta_occ[g]) {
+                return Err(format!(
+                    "eta_occ[{g}] (occasion κ for the decision at t={}) diverges from an \
+                     independent re-draw — a wrong occasion→κ keying or [η | κ] assembly in the \
+                     build loop. The frozen-replay verifier reuses this array and cannot catch \
+                     it (#748).",
+                    decision_times[g]
+                ));
+            }
+
+            // decision_pk[g] must equal pk_param_fn at the covariate the driver's live
+            // `decision_cov` uses — LOCF of the most-recent record, NOT the frozen t=0
+            // baseline (the twice-fixed #732 / #739 defect).
+            let dcov = crate::ode::predictions::locf_decision_cov(
+                decision_times[g],
+                subject,
+                &subject.covariates,
+            );
+            let dpk = (model.pk_param_fn)(&params.theta, &e, dcov, decision_times[g]);
+            if !pk_bits_eq(&dpk, &decision_pk[g]) {
+                return Err(format!(
+                    "decision_pk[{g}] (decision at t={}) diverges from an independent \
+                     re-derivation at the LOCF decision covariate — the 'decision covariate \
+                     frozen at t=0' class fixed in #732 / #739. Both the driver and the \
+                     frozen-replay verifier consume this snapshot, so the replay cannot catch \
+                     it (#748).",
+                    decision_times[g]
+                ));
+            }
+            eta_occ_check.push(e);
+        }
+
+        // event_pk (per-record obs / pk-only PK) re-derived from the *check's* occasion
+        // eta, so a corrupt build eta_occ cannot launder itself into event_pk.
+        let ev = event_pk.ok_or_else(|| {
+            "an IOV run carries no event_pk — κ makes PK per-occasion, so obs / pk-only records \
+             must each carry a per-event snapshot (#748)"
+                .to_string()
+        })?;
+        return check_event_pk_records(
+            model,
+            &params.theta,
+            eta_slice,
+            subject,
+            decision_times,
+            Some(&eta_occ_check),
+            ev,
+        );
+    }
+
+    // ── TV-covariate / TIME-in-PK path without IOV ──────────────────────────────
+    // Every record uses the baseline η; re-derive per record and compare.
+    if let Some(ev) = event_pk {
+        return check_event_pk_records(
+            model,
+            &params.theta,
+            eta_slice,
+            subject,
+            decision_times,
+            None,
+            ev,
+        );
+    }
+
+    // ── Constant-covariate path: only the baseline `pk` (checked above) applies. ─
+    Ok(())
+}
+
+/// Two `f64`s are the same to the bit (so two runs of the *same* deterministic
+/// computation agree, and a NaN equals itself). Used by the #748 snapshot check,
+/// where any difference is a real build divergence, not solver slack.
+#[inline]
+fn f64_bits_eq(a: f64, b: f64) -> bool {
+    a.to_bits() == b.to_bits()
+}
+
+/// Bit-equality of two PK parameter snapshots (#748).
+fn pk_bits_eq(a: &PkParams, b: &PkParams) -> bool {
+    a.values
+        .iter()
+        .zip(b.values.iter())
+        .all(|(x, y)| f64_bits_eq(*x, *y))
+}
+
+/// Bit-equality of two eta slices (#748).
+fn slice_bits_eq(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| f64_bits_eq(*x, *y))
+}
+
+/// Re-derive each per-record (obs / EVID=2 pk-only) PK snapshot **inline** — occasion
+/// via [`occasion_of`](crate::pk::occasion_of), PK via `pk_param_fn` at the record's
+/// own covariate — and bit-check it against the `event_pk` the driver used (#748).
+///
+/// This is an *independent second derivation*, NOT a re-call of
+/// `compute_event_pk_params_iov`: a wrong occasion grouping or per-record covariate the
+/// composite builder would introduce is caught here, not only a wrong array argument.
+/// `eta_occ_check` is the independently re-derived per-window eta (IOV); `None` ⇒ the
+/// non-IOV path, where every record uses the baseline `eta_slice`. The dose-free
+/// adaptive base subject carries no dose events, so `event_pk.dose` must stay empty.
+fn check_event_pk_records(
+    model: &CompiledModel,
+    theta: &[f64],
+    eta_slice: &[f64],
+    subject: &Subject,
+    decision_times: &[f64],
+    eta_occ_check: Option<&[Vec<f64>]>,
+    got: &crate::pk::EventPkParams,
+) -> Result<(), String> {
+    // Eta in effect at a record time `t`: occasion `g`'s per-window eta when IOV is
+    // active and a window is open, else the baseline (matches the driver's `eta_for`
+    // over the same `occasion_of`).
+    let eta_at = |t: f64| -> &[f64] {
+        match eta_occ_check {
+            Some(eo) => match crate::pk::occasion_of(decision_times, t) {
+                Some(g) => eo[g].as_slice(),
+                None => eta_slice,
+            },
+            None => eta_slice,
+        }
+    };
+
+    if got.dose.len() != subject.doses.len() {
+        return Err(format!(
+            "event_pk.dose has {} entr(ies) but the subject has {} dose record(s) (#748)",
+            got.dose.len(),
+            subject.doses.len()
+        ));
+    }
+    if got.obs.len() != subject.obs_times.len() {
+        return Err(format!(
+            "event_pk.obs has {} entr(ies) but the subject has {} observation record(s) (#748)",
+            got.obs.len(),
+            subject.obs_times.len()
+        ));
+    }
+    for j in 0..subject.obs_times.len() {
+        let t = subject.obs_times[j];
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.obs_cov(j), t);
+        if !pk_bits_eq(&want, &got.obs[j]) {
+            return Err(format!(
+                "event_pk.obs[{j}] (record at t={t}) diverges from an independent re-derivation \
+                 — a wrong per-event covariate or occasion κ in the per-event PK builder, reused \
+                 verbatim by the frozen-replay verifier, which cannot catch it (#748)"
+            ));
+        }
+    }
+    if got.pk_only.len() != subject.pk_only_times.len() {
+        return Err(format!(
+            "event_pk.pk_only has {} entr(ies) but the subject has {} EVID=2 record(s) (#748)",
+            got.pk_only.len(),
+            subject.pk_only_times.len()
+        ));
+    }
+    for m in 0..subject.pk_only_times.len() {
+        let t = subject.pk_only_times[m];
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.pk_only_cov(m), t);
+        if !pk_bits_eq(&want, &got.pk_only[m]) {
+            return Err(format!(
+                "event_pk.pk_only[{m}] (EVID=2 record at t={t}) diverges from an independent \
+                 re-derivation — a wrong per-event covariate or occasion κ (#748)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Simulate a declarative `[adaptive_dosing]` block over a population — the
@@ -14890,5 +15171,536 @@ mod adaptive_sim_tests {
             res.ledger.iter().all(|e| e.amt >= 250.0 && e.amt <= 2000.0),
             "every realized dose must respect dose_bounds [250, 2000]"
         );
+    }
+}
+
+// ── Tests: #748 independent adaptive-snapshot correctness check ──────────────
+//
+// The frozen-replay verifier reuses the precomputed snapshots (`eta_occ`,
+// `decision_pk`, `event_pk`) the driver was handed, so it validates their
+// *consumption*, not their *correctness* — a build-loop that feeds a leaf the
+// wrong covariate / occasion / κ passes it bit-exact. These tests pin the teeth of
+// `verify_adaptive_snapshots`, the independent re-derivation that closes that gap:
+// a canonical build is accepted, and each deliberately-corrupted snapshot class
+// (the twice-fixed #732 / #739 "decision covariate frozen at t=0" defect included)
+// is rejected. Every corruption is constructed to differ from the canonical build,
+// so the tests fail if the check ever regresses to a no-op.
+#[cfg(test)]
+mod adaptive_snapshot_verify_tests {
+    use super::*;
+    use crate::parser::model_parser::parse_model_string;
+    use crate::sim::adaptive::{
+        kappa_standard_normal, subject_kappa_base_seed, ControllerCtx, DoseAction,
+    };
+    use std::collections::HashMap;
+
+    // IOV (per-occasion κ on CL) × a time-varying covariate (CRCL) on CL — the exact
+    // composition the "decision covariate frozen at t=0" bug lived in (#732 / #739).
+    // CL depends on CRCL, so resolving a decision's covariate at the wrong time gives
+    // a different `decision_pk`, which is what the check must catch.
+    const IOV_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * (CRCL / 100.0) * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    // Same structural model without IOV — exercises the TV-only branch (event_pk
+    // present, eta_occ / decision_pk absent).
+    const TVCOV_NO_IOV: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * (CRCL / 100.0) * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    const SEED: u64 = 20_260_708;
+    const SIM: usize = 1;
+
+    // A dose-free base subject whose covariate (CRCL) drops from the t=0 baseline
+    // (100) to 50 at the first record (t=6). An off-grid decision at t=12 then has a
+    // LOCF covariate (50, from the t=6 record) that differs from the frozen t=0
+    // baseline (100) — the setup that makes the historical decision_pk bug observable.
+    fn tv_subject() -> Subject {
+        let base = HashMap::from([("CRCL".to_string(), 100.0)]);
+        let lo = HashMap::from([("CRCL".to_string(), 50.0)]);
+        Subject {
+            id: "S1".into(),
+            doses: Vec::new(),
+            obs_times: vec![6.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0, 0.0],
+            obs_cmts: vec![1, 1],
+            covariates: base,
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![lo.clone(), lo],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 1],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    // `tv_subject` plus an EVID=2 (pk-only) record at t=12 (CRCL=75) — so `event_pk`
+    // carries a `pk_only` snapshot and the inline pk-only re-derivation branch is
+    // exercised.
+    fn tv_subject_with_pk_only() -> Subject {
+        let mut s = tv_subject();
+        s.pk_only_times = vec![12.0];
+        s.pk_only_covariates = vec![HashMap::from([("CRCL".to_string(), 75.0)])];
+        s
+    }
+
+    /// Build the canonical IOV snapshots exactly as `run_adaptive_population` does —
+    /// a third, independent orchestration used only to hand the check a *correct*
+    /// build (accepted) and known-corrupt copies (rejected).
+    fn canonical_iov(
+        model: &CompiledModel,
+        params: &ModelParameters,
+        subject: &Subject,
+        eta_slice: &[f64],
+        decision_times: &[f64],
+    ) -> (Vec<Vec<f64>>, Vec<PkParams>, crate::pk::EventPkParams) {
+        let n_eta = model.n_eta;
+        let omega_iov = params.omega_iov.as_ref().unwrap();
+        let kappa_base = subject_kappa_base_seed(SEED, &subject.id, SIM);
+        let n_occ = decision_times.len();
+        let mut eta_occ = Vec::with_capacity(n_occ);
+        let mut decision_pk = Vec::with_capacity(n_occ);
+        for g in 0..n_occ {
+            let zk: Vec<f64> = (0..model.n_kappa)
+                .map(|k| kappa_standard_normal(kappa_base, g, k))
+                .collect();
+            let kappa_g = &omega_iov.chol * DVector::from_column_slice(&zk);
+            let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
+            e.extend(kappa_g.iter().copied());
+            let dcov = crate::ode::predictions::locf_decision_cov(
+                decision_times[g],
+                subject,
+                &subject.covariates,
+            );
+            decision_pk.push((model.pk_param_fn)(
+                &params.theta,
+                &e,
+                dcov,
+                decision_times[g],
+            ));
+            eta_occ.push(e);
+        }
+        let event_pk = crate::pk::compute_event_pk_params_iov(
+            model,
+            subject,
+            &params.theta,
+            eta_slice,
+            &eta_occ,
+            decision_times,
+        );
+        (eta_occ, decision_pk, event_pk)
+    }
+
+    #[test]
+    fn accepts_a_canonical_iov_build() {
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, decision_pk, event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect("a canonical build must pass the snapshot check");
+    }
+
+    #[test]
+    fn catches_decision_pk_frozen_at_t0_covariate() {
+        // The #732 / #739 defect: build decision_pk[1] (off-grid decision at t=12)
+        // with the frozen t=0 covariate instead of LOCF. The check must reject it —
+        // the frozen-replay verifier reuses the same array and cannot.
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, mut decision_pk, event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+
+        // Off-grid decision g=1 (t=12): LOCF covariate is the t=6 record (CRCL=50);
+        // the frozen baseline is CRCL=100 → a genuinely different snapshot.
+        let frozen = (model.pk_param_fn)(&params.theta, &eta_occ[1], &subject.covariates, 12.0);
+        assert!(
+            !pk_bits_eq(&frozen, &decision_pk[1]),
+            "test setup must make the frozen-t0 snapshot differ from the LOCF one, \
+             else the corruption is vacuous"
+        );
+        decision_pk[1] = frozen;
+
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("a frozen-t0 decision_pk must be rejected");
+        assert!(err.contains("decision_pk[1]"), "names the slot: {err}");
+        assert!(err.contains("#748"), "references the issue: {err}");
+    }
+
+    #[test]
+    fn catches_corrupted_occasion_kappa() {
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (mut eta_occ, decision_pk, event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        // Perturb window 1's κ by a clearly-nonzero amount (independent of its draw).
+        eta_occ[1][model.n_eta] += 1.0;
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("a corrupted occasion κ must be rejected");
+        assert!(err.contains("eta_occ[1]"), "names the slot: {err}");
+    }
+
+    #[test]
+    fn catches_corrupted_event_pk_snapshot() {
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, decision_pk, mut event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        // Corrupt the first observation's CL snapshot.
+        event_pk.obs[0].values[0] += 1.0;
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("a corrupted event_pk snapshot must be rejected");
+        assert!(err.contains("event_pk.obs[0]"), "names the slot: {err}");
+    }
+
+    #[test]
+    fn catches_corrupted_pk_only_snapshot() {
+        // A subject with an EVID=2 (pk-only) record exercises the inline pk-only
+        // re-derivation branch; a mis-built pk_only snapshot must be rejected.
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject_with_pk_only();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, decision_pk, mut event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        assert_eq!(
+            event_pk.pk_only.len(),
+            1,
+            "the EVID=2 record must yield a pk_only snapshot"
+        );
+        event_pk.pk_only[0].values[0] += 1.0; // corrupt CL at the pk-only record
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("a corrupted pk_only snapshot must be rejected");
+        assert!(err.contains("event_pk.pk_only[0]"), "names the slot: {err}");
+    }
+
+    #[test]
+    fn catches_missized_occasion_arrays() {
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (mut eta_occ, decision_pk, event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        eta_occ.pop(); // length 2, not 3
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("a mis-sized occasion array must be rejected");
+        assert!(
+            err.contains("mis-sized"),
+            "explains the size mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_and_checks_tv_only_path() {
+        // Non-IOV TV-covariate path: event_pk present, eta_occ / decision_pk absent.
+        let model = parse_model_string(TVCOV_NO_IOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa]; // n_kappa == 0
+        let decisions = vec![0.0, 12.0, 24.0];
+        let mut event_pk =
+            crate::pk::compute_event_pk_params(&model, &subject, &params.theta, &eta_slice);
+        verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            None,
+            None,
+            Some(&event_pk),
+        )
+        .expect("a canonical TV-only build must pass");
+
+        event_pk.obs[1].values[1] += 1.0;
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            None,
+            None,
+            Some(&event_pk),
+        )
+        .expect_err("a corrupted TV-only event_pk must be rejected");
+        assert!(err.contains("event_pk.obs[1]"), "names the slot: {err}");
+    }
+
+    #[test]
+    fn constant_path_is_a_noop() {
+        // No precomputed snapshots (constant-covariate / non-IOV): nothing to check.
+        let model = parse_model_string(TVCOV_NO_IOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        verify_adaptive_snapshots(
+            &model, &params, &subject, &eta_slice, &decisions, SEED, SIM, None, None, None,
+        )
+        .expect("the constant path performs no snapshot checks");
+    }
+
+    #[test]
+    fn wired_into_a_real_reactive_tvcov_iov_run() {
+        // End-to-end: a genuine reactive IOV × declining-covariate run with the
+        // default-on verifier must pass — the snapshot check is wired at the
+        // chokepoint and does not false-positive on a correct production build.
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let base = HashMap::from([("CRCL".to_string(), 100.0)]);
+        let decisions = vec![0.0, 24.0, 48.0, 72.0];
+        // Obs coincide with decisions; CRCL declines across the horizon.
+        let crcls = [100.0, 80.0, 60.0, 40.0];
+        let obs_covariates: Vec<HashMap<String, f64>> = crcls
+            .iter()
+            .map(|&c| HashMap::from([("CRCL".to_string(), c)]))
+            .collect();
+        let subject = Subject {
+            id: "S1".into(),
+            doses: Vec::new(),
+            obs_times: decisions.clone(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; decisions.len()],
+            obs_cmts: vec![1; decisions.len()],
+            covariates: base,
+            dose_covariates: Vec::new(),
+            obs_covariates,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; decisions.len()],
+            occasions: vec![1; decisions.len()],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let pop = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["CRCL".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(SEED),
+            decision_times: decisions,
+            ..Default::default() // verify = true
+        };
+        let controller = || |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, controller, &opts)
+            .expect(
+                "a correct reactive IOV × TV-cov run passes the wired snapshot + replay checks",
+            );
+        assert_eq!(res.ledger.len(), 4, "a dose at every decision");
+    }
+
+    #[test]
+    fn rejects_iov_arrays_without_omega_iov() {
+        // eta_occ / decision_pk present (the IOV path) but the params carry no
+        // omega_iov — a build-loop invariant violation the check must flag with a
+        // typed error rather than unwrap-panic.
+        let model = parse_model_string(TVCOV_NO_IOV).expect("parse"); // omega_iov = None
+        let params = model.default_params.clone();
+        assert!(
+            params.omega_iov.is_none(),
+            "TVCOV_NO_IOV must have no omega_iov"
+        );
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let eta_occ = vec![vec![0.0; model.n_eta]; decisions.len()];
+        let decision_pk = vec![PkParams::default(); decisions.len()];
+        let event_pk =
+            crate::pk::compute_event_pk_params(&model, &subject, &params.theta, &eta_slice);
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("IOV arrays without omega_iov must be rejected");
+        assert!(err.contains("omega_iov"), "names the missing matrix: {err}");
+    }
+
+    #[test]
+    fn rejects_iov_run_missing_event_pk() {
+        // On the IOV path event_pk must be present (κ makes PK per-occasion, so obs /
+        // pk-only records each carry a snapshot). A None here is a build invariant
+        // violation, caught after the per-occasion checks pass.
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, decision_pk, _event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            None,
+        )
+        .expect_err("an IOV run without event_pk must be rejected");
+        assert!(err.contains("event_pk"), "names the missing array: {err}");
+    }
+
+    #[test]
+    fn catches_event_pk_length_mismatch() {
+        // An event_pk array longer than the subject's record grid (a mis-built array
+        // the frozen-replay verifier would reuse) must be rejected on length alone.
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, decision_pk, mut event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        event_pk.obs.push(PkParams::default()); // one more obs snapshot than records
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("an over-long event_pk array must be rejected");
+        assert!(err.contains("entr"), "explains the length mismatch: {err}");
     }
 }
