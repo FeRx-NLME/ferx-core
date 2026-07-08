@@ -671,22 +671,19 @@ fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Result<(), Strin
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
-/// *faithfully*. The adaptive path integrates each subject from a single baseline
-/// (t=0) PK snapshot with between-subject variability only (kappas held at zero),
-/// and never re-derives PK, applies a reset, or carries process noise. So an IOV
-/// model, a time-varying covariate, a system reset (EVID=3/4), or an SDE
-/// `[diffusion]` model would each be **silently** wrong — a violation of the
-/// "never a silent wrong answer" contract this module promises. Until each is
-/// properly supported (#391 follow-ups), reject it with a typed error. This
-/// mirrors the `n_kappa > 0` guards `fit()` already applies (IMPMAP,
-/// trust-region). Both public entry points funnel through `run_adaptive_population`,
-/// so guarding there covers `simulate_adaptive` and `simulate_adaptive_from_spec`.
+/// *faithfully*. The adaptive path carries between-subject variability only (kappas
+/// held at zero) and never applies a reset or carries process noise. So an IOV
+/// model, a system reset (EVID=3/4), or an SDE `[diffusion]` model would each be
+/// **silently** wrong — a violation of the "never a silent wrong answer" contract
+/// this module promises. Until each is properly supported (#391 follow-ups), reject
+/// it with a typed error. This mirrors the `n_kappa > 0` guards `fit()` already
+/// applies (IMPMAP, trust-region). Both public entry points funnel through
+/// `run_adaptive_population`, so guarding there covers `simulate_adaptive` and
+/// `simulate_adaptive_from_spec`.
 ///
-/// The covariate check is conservative: it rejects any subject that carries
-/// per-event covariate snapshots, even when the varying column is one the model
-/// never references. Pruning irrelevant time-varying columns first (as the fit
-/// path does via `Population::prune_irrelevant_tv_covariates`) is a follow-up;
-/// over-rejecting here stays on the safe side of the contract.
+/// Time-varying covariates (and a `TIME`-in-PK model) are **no longer** rejected:
+/// the driver now recomputes PK per event/segment from the covariate active in that
+/// segment (#700), the same way the static `predict()` / `simulate()` path does.
 fn reject_unsupported_adaptive(
     model: &CompiledModel,
     population: &Population,
@@ -694,10 +691,9 @@ fn reject_unsupported_adaptive(
     if model.n_kappa > 0 {
         return Err(
             "adaptive-dosing simulation does not yet support inter-occasion variability \
-             (IOV / `kappa`): the reactive driver integrates from a single baseline PK \
-             snapshot and would silently hold every kappa at zero, biasing the predictions, \
-             the reactive decisions, and the dose ledger. Simulate without IOV, or track \
-             #391 for occasion-aware adaptive support."
+             (IOV / `kappa`): the reactive driver would silently hold every kappa at zero, \
+             biasing the predictions, the reactive decisions, and the dose ledger. Simulate \
+             without IOV, or track #391 for occasion-aware adaptive support."
                 .to_string(),
         );
     }
@@ -709,21 +705,9 @@ fn reject_unsupported_adaptive(
                 .to_string(),
         );
     }
+    // Time-varying covariates (and `TIME`-in-PK) are now supported via per-event PK
+    // recomputation in the reactive driver (#700); they are no longer rejected here.
     for subject in &population.subjects {
-        // `has_tv_covariates()` only inspects the dose/obs snapshot vectors; a
-        // subject whose covariate varies solely on EVID=2 rows carries it in
-        // `pk_only_covariates`, which that predicate misses. Test it explicitly so
-        // a dose-free, zero-observation EVID=2 subject can't slip past frozen at t=0.
-        if subject.has_tv_covariates() || !subject.pk_only_covariates.is_empty() {
-            return Err(format!(
-                "adaptive-dosing simulation does not yet support time-varying covariates \
-                 (subject '{}'): the reactive driver resolves each subject's PK once from the \
-                 baseline covariate snapshot, so a covariate that changes over the horizon would \
-                 silently drive CL/V/KA off its t=0 value. Use time-constant covariates, or track \
-                 #391 for per-event PK under adaptive dosing.",
-                subject.id
-            ));
-        }
         if subject.has_resets() {
             return Err(format!(
                 "adaptive-dosing simulation does not support system-reset events (EVID=3/4) \
@@ -3861,7 +3845,11 @@ fn fit_inner(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let path = format!("/tmp/ferx_trace_{}_{}.csv", pid, ts);
-        if let Err(e) = crate::estimation::trace::init(path.clone()) {
+        // Header carries one `val:<name>`/`grad:<name>` column per optimized
+        // coordinate. The coordinate structure (and hence the names) is fixed
+        // across a method chain, so the template's names serve every stage.
+        let coord_names = crate::estimation::parameterization::coordinate_names(init_params);
+        if let Err(e) = crate::estimation::trace::init(path.clone(), &coord_names) {
             eprintln!("[ferx] warning: could not open trace file {}: {}", path, e);
         } else {
             eprintln!("[ferx] optimizer trace → {}", path);
@@ -5858,29 +5846,30 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_rejects_time_varying_covariate_subject() {
+    fn adaptive_accepts_time_varying_covariate_subject() {
         use crate::parser::model_parser::parse_model_string;
+        // Time-varying covariates are now supported via per-event PK (#700); the
+        // guard no longer rejects them. Correctness of the per-event PK itself is
+        // pinned by the driver-level oracle
+        // `adaptive_tv_covariate_controller_matches_static_event_driven`.
         let model = parse_model_string(PLAIN_ADAPTIVE_MODEL).expect("plain model parses");
         let mut subject = adaptive_base_subject();
         subject.obs_covariates = vec![std::collections::HashMap::from([("WT".to_string(), 70.0)])];
         assert!(subject.has_tv_covariates());
-        let err = reject_unsupported_adaptive(&model, &adaptive_pop(subject))
-            .expect_err("a subject with time-varying covariates must be rejected");
         assert!(
-            err.to_lowercase().contains("time-varying") && err.to_lowercase().contains("covariate"),
-            "error should cite time-varying covariates: {err}"
+            reject_unsupported_adaptive(&model, &adaptive_pop(subject)).is_ok(),
+            "a subject with time-varying covariates must now be accepted"
         );
     }
 
     #[test]
-    fn adaptive_rejects_pk_only_covariate_subject() {
+    fn adaptive_accepts_pk_only_covariate_subject() {
         use crate::parser::model_parser::parse_model_string;
         // A covariate that varies only on EVID=2 rows lands in `pk_only_covariates`,
-        // which `has_tv_covariates()` does NOT inspect — so a dose-free, zero-obs
-        // subject built from such rows would slip past the guard and be silently
-        // simulated with PK frozen at t=0. The guard tests `pk_only_covariates`
-        // directly; this pins that (the `has_tv_covariates()` assert proves the
-        // check is load-bearing — without it this subject is wrongly accepted).
+        // which `has_tv_covariates()` does NOT inspect. It is now supported via
+        // per-event PK (#700) and no longer rejected; the `has_tv_covariates()`
+        // assert proves this pk-only case is a distinct path from the obs/dose one
+        // (`compute_event_pk_params` was broadened to materialise it too).
         let model = parse_model_string(PLAIN_ADAPTIVE_MODEL).expect("plain model parses");
         let mut subject = adaptive_base_subject();
         subject.obs_times = Vec::new();
@@ -5892,13 +5881,11 @@ mod tests {
             vec![std::collections::HashMap::from([("WT".to_string(), 90.0)])];
         assert!(
             !subject.has_tv_covariates(),
-            "pk_only snapshots must be invisible to has_tv_covariates() for this test to bite"
+            "pk_only snapshots are invisible to has_tv_covariates() — a distinct path"
         );
-        let err = reject_unsupported_adaptive(&model, &adaptive_pop(subject))
-            .expect_err("a subject with EVID=2 time-varying covariates must be rejected");
         assert!(
-            err.to_lowercase().contains("time-varying") && err.to_lowercase().contains("covariate"),
-            "error should cite time-varying covariates: {err}"
+            reject_unsupported_adaptive(&model, &adaptive_pop(subject)).is_ok(),
+            "a subject with EVID=2 time-varying covariates must now be accepted"
         );
     }
 
@@ -7330,6 +7317,37 @@ where
     let mut decisions: Vec<DecisionLogEntry> = Vec::new();
     let mut metrics: Vec<AdaptiveSubjectMetrics> = Vec::new();
 
+    // `auc_target_attainment` (#391 S2.5b) integrates a dense grid with a single PK
+    // snapshot — exact only for constant-covariate subjects. A time-varying (or
+    // TIME-in-PK) subject would silently get a frozen-PK AUC (there is no exact
+    // per-event dense-grid solver — even the fit path approximates TV states with a
+    // warning, and the adaptive result has no warnings channel). So reject the
+    // combination loudly (#700) rather than report a wrong metric. Every other
+    // adaptive output — predictions, decisions, the dose ledger, `target_window` — is
+    // fully per-event covariate-aware; only this one exposure metric is deferred.
+    if auc_target.is_some()
+        && population
+            .subjects
+            .iter()
+            .any(|s| crate::pk::subject_needs_per_event_pk(model, s))
+    {
+        return Err(
+            "adaptive-dosing `auc_target` is not yet supported for time-varying-covariate \
+             (or TIME-in-PK) subjects: its exposure metric integrates a dense grid from a \
+             single frozen PK snapshot, which would be silently wrong under a changing \
+             covariate. Drop `auc_target` (all other outputs remain per-event \
+             covariate-aware), or track #700 for a per-event AUC."
+                .to_string(),
+        );
+    }
+
+    // Reused per-event PK buffer (#700): filled in place per (sim, subject) on the
+    // time-varying path via `compute_event_pk_params_into`, so the hot loop keeps
+    // its backing `Vec`s instead of allocating three fresh ones per replicate. The
+    // values are recomputed every iteration (η is redrawn); only the allocation is
+    // reused. Unused on the constant path (`event_pk` stays `None`).
+    let mut event_pk_buf = crate::pk::EventPkParams::default();
+
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         for subject in &population.subjects {
@@ -7339,6 +7357,26 @@ where
             let eta = &params.omega.chol * DVector::from_column_slice(&z);
             let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
+
+            // Per-event PK when the subject's covariates (dose / obs / pk-only rows)
+            // or a `TIME` built-in vary PK across the horizon (#700); the reactive
+            // driver then resolves PK per segment from these snapshots. `None` ⇒
+            // constant PK, driven from the frozen `pk` snapshot below. One shared
+            // predicate (`subject_needs_per_event_pk`) gates the materialiser, this
+            // gate, and the `auc_target` guard so they cannot drift apart.
+            let event_pk: Option<&crate::pk::EventPkParams> =
+                if crate::pk::subject_needs_per_event_pk(model, subject) {
+                    crate::pk::compute_event_pk_params_into(
+                        model,
+                        subject,
+                        &params.theta,
+                        &eta_slice,
+                        &mut event_pk_buf,
+                    );
+                    Some(&event_pk_buf)
+                } else {
+                    None
+                };
 
             // Baseline PK snapshot at the start of the simulation horizon (t=0).
             let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates, 0.0);
@@ -7370,6 +7408,7 @@ where
             let run: AdaptiveRun = crate::ode::ode_predictions_adaptive_impl(
                 ode,
                 &pk.values,
+                event_pk,
                 &params.theta,
                 &eta_slice,
                 subject,
@@ -7385,6 +7424,7 @@ where
                 crate::ode::verify_adaptive_frozen_replay(
                     ode,
                     &pk.values,
+                    event_pk,
                     &params.theta,
                     &eta_slice,
                     subject,
@@ -13497,6 +13537,273 @@ mod adaptive_sim_tests {
                 traj.time
             );
         }
+    }
+
+    // A covariate-dependent 1-cpt model (CL scales with CRCL) used by the #700
+    // time-varying-covariate end-to-end tests. No BSV in effect (ETA_CL declared
+    // but unreferenced), so the covariate is the only source of PK variation.
+    const SPEC_TV_COV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * CRCL / 100.0
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 96
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 8 : increase 25%
+"#;
+
+    fn tv_cov_pop(crcls: &[f64], obs: &[f64]) -> Population {
+        let mut s = subj("1", obs.to_vec(), vec![]);
+        s.covariates = HashMap::from([("CRCL".to_string(), crcls[0])]);
+        s.obs_covariates = crcls
+            .iter()
+            .map(|&c| HashMap::from([("CRCL".to_string(), c)]))
+            .collect();
+        let mut pop = population(vec![s]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+        pop
+    }
+
+    #[test]
+    fn from_spec_supports_time_varying_covariate() {
+        // End-to-end #700: a covariate-dependent CL (CRCL declining — e.g. renal
+        // decline) drives per-event PK through the declarative path, and the
+        // default-on frozen-replay verifier validates the whole run. A constant-CRCL
+        // subject yields a different trajectory, proving the covariate is consumed.
+        let parsed = parse_full_model(SPEC_TV_COV).expect("model + block parse");
+        let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing]");
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+
+        // TV run: the verifier (on by default) passing is itself the bookkeeping
+        // check for the per-event path.
+        let tv_pop = tv_cov_pop(&[100.0, 80.0, 60.0, 45.0, 35.0], &obs);
+        let tv = simulate_adaptive_from_spec(
+            &parsed.model,
+            &tv_pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect("TV adaptive sim runs + verifies");
+
+        let const_pop = tv_cov_pop(&[100.0, 100.0, 100.0, 100.0, 100.0], &obs);
+        let cst = simulate_adaptive_from_spec(
+            &parsed.model,
+            &const_pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect("constant adaptive sim runs");
+
+        assert!(!tv.ledger.is_empty());
+        // Declining CRCL lowers CL late ⇒ slower clearance ⇒ a materially different
+        // late trajectory than the constant-CRCL subject.
+        let tv_last = tv.trajectories.last().unwrap().ipred;
+        let cst_last = cst.trajectories.last().unwrap().ipred;
+        assert!(
+            (tv_last - cst_last).abs() > 1e-6 * tv_last.abs().max(1.0),
+            "time-varying covariate must change the trajectory: tv={tv_last}, const={cst_last}"
+        );
+    }
+
+    #[test]
+    fn from_spec_supports_time_varying_covariate_with_infusion() {
+        // #700 infusion coverage: an infusion route under a declining covariate
+        // exercises the injected-infusion F (captured at injection) and the
+        // infusion-end break in BOTH the reactive driver and the frozen-replay
+        // engine (`adaptive_frozen_replay_tv`). The default-on verifier passing
+        // confirms the per-event bookkeeping for infusions, not just boluses.
+        let mut parsed = parse_full_model(SPEC_TV_COV).expect("model + block parse");
+        parsed
+            .adaptive_dosing
+            .as_mut()
+            .expect("[adaptive_dosing]")
+            .route = AdaptiveRoute::Infuse { cmt: 1, over: 2.0 };
+        let spec = parsed.adaptive_dosing.as_ref().unwrap();
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let pop = tv_cov_pop(&[100.0, 80.0, 60.0, 45.0, 35.0], &obs);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        let res = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect("TV infusion adaptive sim runs + verifies");
+        assert!(!res.ledger.is_empty());
+        assert!(
+            res.ledger.iter().all(|e| e.rate > 0.0),
+            "infusion route must record a positive rate on every realized dose"
+        );
+    }
+
+    #[test]
+    fn adaptive_auc_target_rejects_time_varying_covariate() {
+        // #700: the exposure metric (`auc_target_attainment`) can't yet be computed
+        // per-event, so declaring `auc_target` on a time-varying-covariate subject is
+        // a typed error rather than a silently frozen-PK AUC.
+        let mut parsed = parse_full_model(SPEC_TV_COV).expect("model + block parse");
+        // Attach an `auc_target` to the parsed spec (the model string above omits it
+        // so the support test above stays clean).
+        parsed
+            .adaptive_dosing
+            .as_mut()
+            .expect("[adaptive_dosing]")
+            .auc_target = Some((400.0, 600.0));
+        let spec = parsed.adaptive_dosing.as_ref().unwrap();
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let pop = tv_cov_pop(&[100.0, 80.0, 60.0, 45.0, 35.0], &obs);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+
+        let err = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect_err("auc_target on a TV subject must be rejected");
+        assert!(
+            err.to_lowercase().contains("auc_target")
+                && err.to_lowercase().contains("time-varying"),
+            "error should cite auc_target + time-varying: {err}"
+        );
+    }
+
+    #[test]
+    fn from_spec_supports_time_dependent_pk() {
+        // #700 also fixes a latent bug: a `TIME`-dependent PK parameter (no
+        // covariate) was silently frozen at TIME=0 on the adaptive path. Now
+        // `model_uses_time_builtin` routes it through per-event PK, so it verifies
+        // and differs from a constant (TIME=0) baseline model. Same structural core;
+        // only CL's TIME dependence differs.
+        const TIME_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(0.01 * TIME)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 96
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 8 : increase 25%
+"#;
+        const CONST_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 96
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 8 : increase 25%
+"#;
+        // Observations offset from the decision grid (0,24,…,96): the constant
+        // baseline below runs on the shipped single-snapshot verifier, which has a
+        // pre-existing gap when a dose lands exactly at the last break *and* an obs
+        // coincides with it (tracked separately). Offsetting keeps this test about
+        // TIME, not that edge; the TV support test above pins the last-break edge on
+        // the per-event path.
+        let obs = vec![6.0, 30.0, 54.0, 78.0, 90.0];
+        let pop = population(vec![subj("1", obs, vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+
+        let tp = parse_full_model(TIME_MODEL).expect("TIME model parses");
+        assert!(
+            crate::pk::model_uses_time_builtin(&tp.model),
+            "the TIME model must be detected as time-dependent"
+        );
+        let time_res = simulate_adaptive_from_spec(
+            &tp.model,
+            &pop,
+            &tp.model.default_params,
+            1,
+            tp.adaptive_dosing.as_ref().unwrap(),
+            &opts,
+        )
+        .expect("TIME-in-PK sim runs + verifies");
+
+        let cp = parse_full_model(CONST_MODEL).expect("const model parses");
+        let const_res = simulate_adaptive_from_spec(
+            &cp.model,
+            &pop,
+            &cp.model.default_params,
+            1,
+            cp.adaptive_dosing.as_ref().unwrap(),
+            &opts,
+        )
+        .expect("constant sim runs");
+
+        let t_last = time_res.trajectories.last().unwrap().ipred;
+        let c_last = const_res.trajectories.last().unwrap().ipred;
+        assert!(
+            (t_last - c_last).abs() > 1e-6 * t_last.abs().max(1.0),
+            "TIME-dependent PK must differ from the TIME=0 baseline: time={t_last}, const={c_last}"
+        );
     }
 
     #[test]

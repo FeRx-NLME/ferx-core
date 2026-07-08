@@ -331,10 +331,15 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
 - **Dose-free base subjects** — the regimen is fully controller-driven; a subject
   that already carries doses (including steady-state or loading regimens) is
   rejected.
-- **Time-constant covariates only** — a subject carrying a *time-varying* covariate
-  is rejected: the driver resolves each subject's PK once from the baseline
-  snapshot, so a covariate that changes over the horizon would otherwise silently
-  drive CL/V/KA off its t=0 value. Per-event PK under adaptive dosing is a follow-up.
+- **Time-varying covariates are supported** — the driver recomputes PK per
+  event/segment from the covariate active in that segment (the NONMEM
+  end-of-interval convention that `predict()` / `simulate()` use), so a covariate
+  that changes over the horizon (e.g. declining renal function driving clearance)
+  correctly drives CL/V/KA, the monitored signal, and every dose decision; the
+  frozen-replay verifier validates the per-event bookkeeping. A model whose PK reads
+  the `TIME` built-in is covered the same way. *Caveat:* the `auc_target_attainment`
+  metric is not yet computed per-event, so declaring `auc_target` on a
+  time-varying-covariate subject is a typed error rather than a frozen-snapshot AUC.
 - **No system resets** — a subject with an EVID=3/4 reset event is rejected (the
   reactive driver does not apply resets).
 - **Between-subject variability only** — η is drawn per subject/replicate. A model

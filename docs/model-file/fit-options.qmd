@@ -452,7 +452,7 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | `phase` | gn_hybrid, saem | `focei` (polish) or `explore`/`converge` |
 | `ofv` | all | Objective function value |
 | `wall_ms` | all | Wall time for this iteration (ms) |
-| `grad_norm` | BFGS, NLopt gradient-mode | Gradient norm |
+| `grad_norm` | BFGS, NLopt gradient-mode, GN | Gradient norm |
 | `step_norm` | BFGS | Step size |
 | `inner_iter_count` | (reserved) | Reserved for future per-iteration inner-loop count; currently `NA` |
 | `optimizer` | FOCE/FOCEI | Active NLopt algorithm |
@@ -464,5 +464,22 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | `mh_accept_rate` | SAEM | Mean acceptance rate across all subjects (MH or HMC). In mixed HMC/MH runs (`n_leapfrog > 0` with some MH-fallback subjects) this is an aggregate across both samplers. |
 | `n_ebe_unconverged` | FOCE/FOCEI | Subjects whose inner optimizer did not converge |
 | `n_ebe_fallback` | FOCE/FOCEI | Subjects that fell back to Nelder-Mead |
+| `val:<name>` | all | Per-parameter estimate, one column per optimized coordinate, in **natural / reporting scale** (θ as values, Ω as variances/covariances, Σ as variances) |
+| `grad:<name>` | FOCE/FOCEI/GN | Per-parameter gradient, in the optimizer's **transformed/scaled** space (`NA` for SAEM); `sqrt(sum(grad:<name>^2)) == grad_norm` |
+
+After the fixed columns above, the trace appends two blocks of per-parameter
+columns — all `val:<name>` columns, then all `grad:<name>` columns — one pair
+per optimized coordinate (thetas, Ω diagonals **and** off-diagonal covariances,
+Σ, plus any IOV Ω). Headers use the declared parameter names where available
+(`val:TVCL`, `val:ETA_CL`, an Ω off-diagonal as `val:ETA_V~ETA_CL`,
+`val:PROP_ERR`), with `THETA1` / `OMEGA(2,1)` / `SIGMA(1)` fallbacks (a name
+containing a comma is CSV-quoted). The column set is fixed across a method chain
+(e.g. `saem -> focei`), so one header serves the whole run. `grad:*` columns are
+`NA` on any iteration without an OFV gradient (SAEM, and derivative-free BOBYQA
+evals). The `val:*`/`grad:*` cells are written in scientific notation
+(`{:.6e}`) — unlike the fixed-decimal scalar columns — so small variances and
+near-converged gradient coordinates keep their precision instead of rounding to
+`0`. This powers the per-parameter convergence view in ferx-r's trace UI
+(#640).
 
 Unused columns contain `NA`. The trace is buffered and flushed when the fit ends; if a run is killed mid-iteration the buffered tail may be lost.
