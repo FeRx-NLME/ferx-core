@@ -20,6 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Standalone covariance step** (#738): `run_covariance()` runs the FD-Hessian
+  covariance step against an existing fit without re-fitting, mirroring
+  `run_sir()`. It re-reads the model/data from the fit's recorded paths (with
+  SHA-256 integrity checks, refusing stale inputs) or accepts caller-supplied
+  `model`/`population`, then returns a fit with `covariance_matrix`, standard
+  errors, `covariance_status`, and condition-number diagnostics refreshed. The
+  numerics are identical to `fit()`'s inline covariance step. A covariance step
+  that runs but fails (non-PD / unusable FD Hessian) is non-fatal — the returned
+  fit reports `covariance_status = Failed` with a diagnostic warning.
 - **`[data]` block column renaming** (#730, #742): rename any dataset header to
   any new name with `new-name = actual` entries (e.g. `TIME = TAFD`,
   `DV = CONC`), the ferx equivalent of NONMEM's `$INPUT TIME=TAFD`. Targets are
