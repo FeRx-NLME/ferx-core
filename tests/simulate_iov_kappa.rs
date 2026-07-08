@@ -171,3 +171,70 @@ fn simulate_iov_recovers_omega_iov_variance() {
          NONMEM $SIM on the same design gives 0.0415"
     );
 }
+
+/// Regression (#723 review): `simulate()` must apply `[scaling]` to an IOV model
+/// even when the data carries no occasion labels.
+///
+/// `predict_iov` applied the divisive `[scaling]` block inside a
+/// `for .. in &occ_groups` loop. On occasion-less data (`simulate()` reading a
+/// dataset without an `iov_column`) `occ_groups` is empty, so the loop ran zero
+/// times and IPRED was returned **unscaled** — off by the full `obs_scale`
+/// (a silent ~1000× error here). `simulate()` runs no IOV-occasion data-check, so
+/// unlike `fit()` it does not reject the missing-occasion case, making the wrong
+/// scaling silently reachable.
+///
+/// The fixture is a single subject so the (single) BSV η draw stays aligned between
+/// the two reads below; the tiny `Ω_IOV` makes the per-occasion κ negligible, so
+/// any per-row IPRED difference is purely whether `[scaling]` was applied. With the
+/// fix both reads are scaled (ratio ≈ 1); before it, the occasion-less read is
+/// `obs_scale` × larger.
+#[test]
+fn simulate_iov_applies_scaling_without_occasion_labels() {
+    let model = parse_model_file(Path::new("tests/fixtures/iov_scaling.ferx"))
+        .expect("iov_scaling model parses");
+    assert!(model.n_kappa > 0, "fixture must declare IOV (kappa)");
+    let csv = Path::new("tests/fixtures/iov_scaling.csv");
+
+    // Same rows, same seed; the only difference is whether occasions are labelled.
+    let with_occ = simulate_with_seed(
+        &model,
+        &read_nonmem_csv(csv, None, Some("OCC")).expect("iov_scaling data loads (OCC)"),
+        &model.default_params,
+        1,
+        7,
+    );
+    let no_occ = simulate_with_seed(
+        &model,
+        &read_nonmem_csv(csv, None, None).expect("iov_scaling data loads (no OCC)"),
+        &model.default_params,
+        1,
+        7,
+    );
+
+    assert_eq!(with_occ.len(), no_occ.len(), "same rows ⇒ same row count");
+    assert!(
+        !with_occ.is_empty(),
+        "fixture must produce observation rows"
+    );
+    for (a, b) in with_occ.iter().zip(no_occ.iter()) {
+        assert!(
+            a.ipred.is_finite() && a.ipred > 0.0 && b.ipred.is_finite() && b.ipred > 0.0,
+            "ipreds must be finite and positive"
+        );
+        // obs_scale = 1000, AMT/V ~ 10 ⇒ a correctly scaled IPRED is ~0.01. An
+        // unscaled (bug) occasion-less IPRED would be ~10.
+        assert!(
+            b.ipred < 0.1,
+            "occasion-less IOV simulate returned an unscaled IPRED ({}); [scaling] was dropped",
+            b.ipred
+        );
+        let ratio = b.ipred / a.ipred;
+        assert!(
+            (ratio - 1.0).abs() < 0.02,
+            "occasion-less IOV simulate dropped [scaling]: ipred {} (no OCC) vs {} (OCC), \
+             ratio {ratio:.3} (≈ obs_scale means scaling was skipped)",
+            b.ipred,
+            a.ipred
+        );
+    }
+}

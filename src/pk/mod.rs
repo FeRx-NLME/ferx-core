@@ -765,6 +765,17 @@ pub fn predict_iov(
     // not here; see the note below for the κ=0 limitation there.)
     if !matches!(model.scaling, ScalingSpec::None) {
         let raw = preds.clone();
+        // Base pass with the BSV+κ=0 vector (`[η_bsv, 0…0]`, the same combination
+        // the non-IOV `compute_predictions_with_tv` path scales with). This scales
+        // every observation, including any not owned by an occasion group — most
+        // importantly an occasion-less subject (`simulate()` on data read without an
+        // `iov_column`), where the per-occasion loop below is empty and would
+        // otherwise leave `preds` UNSCALED and off by the full scale factor (#723
+        // review). When occasions are present every obs is owned by a group, so the
+        // loop overwrites this base pass entirely and the result is unchanged.
+        apply_scaling(model, subject, theta, &pk_only_combined, &mut preds);
+        // Per-occasion override: an observation carrying an occasion label is
+        // re-scaled with that occasion's κ, overwriting the base pass.
         for (occ_id, obs_indices) in &occ_groups {
             let combined = combined_for(*occ_id);
             let mut scaled = raw.clone();

@@ -93,12 +93,14 @@ of $\Omega_{\text{IOV}}$:
 
 | Source | between-occasion Var(log IPRED) |
 |--------|--------------------------------:|
-| Truth ($\Omega_{\text{IOV}}$)   | 0.04000 |
-| NONMEM 7.6.0 `$SIMULATION`      | 0.04151 |
-| ferx `simulate()` (high-N)      | 0.03988 |
+| Truth ($\Omega_{\text{IOV}}$)      | 0.04000 |
+| NONMEM 7.6.0 `$SIMULATION`         | 0.04151 |
+| ferx `simulate()` (df 12000)       | 0.03939 |
 
 All three agree within Monte-Carlo error; the previous behaviour (kappa held at
-zero) collapsed the ferx figure to ~0. The comparison is pinned by
+zero) collapsed the ferx figure to ~0. A higher-resolution 100-replicate run
+(df 60000) tightens the ferx estimate to 0.03988 (0.5 SE from truth), ruling out
+systematic under-dispersion. The 0.03939 figure in the table is pinned by
 `tests/simulate_iov_kappa.rs::simulate_iov_recovers_omega_iov_variance`.
 
 ## TTE simulation {#tte-simulation}
