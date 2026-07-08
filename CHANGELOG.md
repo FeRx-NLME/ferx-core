@@ -25,6 +25,15 @@ section of the SDLC for the versioning policy).
   table comparing them side by side — method, convergence, OFV/AIC/BIC, ΔOFV,
   runtime, subject/observation/parameter counts, and THETA/OMEGA/SIGMA
   estimates. A single bundle still prints the detailed `psn::sumo`-style report.
+- **Per-parameter estimates + gradients in the optimizer trace** (#640): when
+  `optimizer_trace = true`, each CSV row now also records the full parameter
+  vector (`val:<name>` columns, natural/reporting scale) for every method and
+  the full gradient vector (`grad:<name>` columns, optimizer-scaled space) for
+  the gradient methods (FOCE/FOCEI/GN; `NA` for SAEM). Columns are named after
+  the declared parameters (`TVCL`, `ETA_CL`, `ETA_V~ETA_CL`, `PROP_ERR`) with
+  `THETA1` / `OMEGA(2,1)` / `SIGMA(1)` fallbacks, and reconstruct `grad_norm`
+  as `sqrt(sum(grad:<name>^2))`. This powers a per-parameter convergence view
+  in the ferx-r trace UI.
 - **`[data]` block column renaming** (#730, #742): rename any dataset header to
   any new name with `new-name = actual` entries (e.g. `TIME = TAFD`,
   `DV = CONC`), the ferx equivalent of NONMEM's `$INPUT TIME=TAFD`. Targets are
@@ -64,6 +73,20 @@ section of the SDLC for the versioning policy).
   also silently frozen at `TIME=0`). The `auc_target_attainment` metric is not yet
   available for time-varying-covariate subjects and is rejected with a typed error
   rather than reported from a frozen snapshot.
+- **Adaptive (feedback) dosing now supports inter-occasion variability (IOV)** (#701):
+  the reactive driver draws a fresh occasion `kappa` per **decision window** (occasion =
+  decision index) and threads it through the per-event PK — instead of silently holding
+  every kappa at zero — so occasion-to-occasion shifts in CL/V correctly drive the
+  predictions, the monitored signal, and every reactive dose decision, and the
+  frozen-replay verifier validates the per-occasion bookkeeping. Composes with the #700
+  time-varying-covariate path (a model with both is per-event correct in each). `kappa`
+  is drawn on a dedicated per-(subject, replicate) substream, so a non-IOV run is
+  byte-identical to before and enabling a `Dv` monitor never shifts the draws. The
+  `auc_target_attainment` metric is not yet available for IOV subjects and is rejected
+  with a typed error rather than reported from a κ-frozen snapshot. A non-ascending or
+  duplicated adaptive `decision_times` schedule (programmatic `simulate_adaptive`) is now
+  rejected with a typed error, matching the declarative `[adaptive_dosing]` path — an
+  out-of-order schedule would otherwise mis-map a record to the wrong occasion.
 - **`estimation:` block in `{model}-fit.yaml` now splits wall time by stage** (#713):
   a `{method}_wall_time_secs` entry (e.g. `focei_wall_time_secs`, `imp_wall_time_secs`)
   is reported for each stage of `method`/`methods`, plus a `covariance_wall_time_secs`

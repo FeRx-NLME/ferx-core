@@ -2120,7 +2120,32 @@ pub fn run_saem(
                 );
             }
 
-            crate::estimation::trace::write_saem(k, phase, cond_nll, gamma, mh_accept_rate);
+            // Per-coordinate estimates (natural scale) for the trace's `val:*`
+            // columns (#640). SAEM has no OFV gradient, so `grad:*` are NA.
+            // Guard the per-iteration Vec build on `is_active` so it costs
+            // nothing on the default (trace-off) path across the many SAEM
+            // iterations (#640 review).
+            if crate::estimation::trace::is_active() {
+                let iov = init_params
+                    .omega_iov
+                    .as_ref()
+                    .map(|m| (&state.omega_iov_mat, m.diagonal));
+                let values = crate::estimation::parameterization::coordinate_values_raw(
+                    &state.theta,
+                    &state.omega_mat,
+                    init_params.omega.diagonal,
+                    &state.sigma_vals,
+                    iov,
+                );
+                crate::estimation::trace::write_saem(
+                    k,
+                    phase,
+                    cond_nll,
+                    gamma,
+                    mh_accept_rate,
+                    &values,
+                );
+            }
         }
     }
 
@@ -3514,5 +3539,90 @@ mod tests {
             kappa_outer[(0, 0)],
             expected
         );
+    }
+
+    /// SAEM with the optimizer trace active must emit the per-parameter `val:*`
+    /// columns and write `NA` for every `grad:*` column (SAEM has no OFV
+    /// gradient). This is the fast test that registers PR coverage for the SAEM
+    /// trace call site (#640), which is otherwise reached only by slow fits.
+    #[test]
+    fn saem_trace_emits_value_columns_with_na_grads() {
+        use crate::types::{DoseEvent, FitOptions, Population};
+        use std::collections::HashMap;
+
+        let model = analytical_model(GradientMethod::Auto);
+        let subj = Subject {
+            id: "1".into(),
+            doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            obs_times: vec![1.0, 2.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![1.0, 0.5],
+            obs_cmts: vec![1, 1],
+            covariates: HashMap::new(),
+            dose_covariates: Vec::new(),
+            obs_covariates: Vec::new(),
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![],
+            dose_occasions: vec![],
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let population = Population {
+            subjects: vec![subj],
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+
+        let coord_names =
+            crate::estimation::parameterization::coordinate_names(&model.default_params);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = format!(
+            "/tmp/ferx_trace_saem_param_{}_{}.csv",
+            std::process::id(),
+            nanos
+        );
+        crate::estimation::trace::init(path.clone(), &coord_names).unwrap();
+
+        let opts = FitOptions {
+            saem_n_exploration: 2,
+            saem_n_convergence: 0,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let _ = run_saem(&model, &population, &model.default_params, &opts);
+        crate::estimation::trace::finish();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines = contents.lines();
+        let header: Vec<String> = lines.next().unwrap().split(',').map(String::from).collect();
+        assert!(header.iter().any(|c| c.starts_with("val:")));
+        let n_coords = coord_names.len();
+        let fixed = 17;
+        let mut rows = 0;
+        for row in lines {
+            let c: Vec<String> = row.split(',').map(String::from).collect();
+            assert_eq!(c.len(), fixed + 2 * n_coords, "SAEM row column count");
+            // Every value column finite; every gradient column NA.
+            for i in fixed..(fixed + n_coords) {
+                assert!(c[i].parse::<f64>().is_ok(), "val column must be finite");
+            }
+            for i in (fixed + n_coords)..(fixed + 2 * n_coords) {
+                assert_eq!(c[i], "NA", "SAEM grad column must be NA");
+            }
+            rows += 1;
+        }
+        assert!(rows >= 1, "expected at least one SAEM trace row");
+        std::fs::remove_file(&path).ok();
     }
 }

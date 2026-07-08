@@ -575,6 +575,12 @@ pub(crate) fn compute_subject_metrics(
 /// disjoint from any other stream derived from the same run seed (η, output).
 const ASSAY_PURPOSE_SALT: u64 = 0xA55A_E155_0DE0_0001;
 
+/// Purpose tag folded into the IOV-kappa seed so the per-occasion κ draw stream
+/// is disjoint from the assay stream, the η stream, and the output stream derived
+/// from the same run seed (#701). A distinct salt is what guarantees enabling a
+/// `Dv` monitor never shifts the κ draws, and vice versa.
+const KAPPA_PURPOSE_SALT: u64 = 0xCA99_0CCA_5104_0001;
+
 /// 64-bit golden-ratio odd constant for seed mixing (same family as the
 /// per-chain seeding in `estimation/bayes.rs`).
 const GOLDEN64: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -620,6 +626,32 @@ pub(crate) fn assay_standard_normal(base_seed: u64, decision_index: usize, analy
         combine_seed(base_seed, decision_index as u64),
         stable_hash_str(analyte),
     );
+    let mut rng = rand::rngs::StdRng::seed_from_u64(key);
+    Normal::new(0.0, 1.0).unwrap().sample(&mut rng)
+}
+
+/// Per-(subject, replicate) base seed for the IOV-kappa substream (#701), rooted
+/// at the run-level `root` seed and keyed by the subject *id* (permutation-
+/// invariant, like the assay stream). The [`KAPPA_PURPOSE_SALT`] keeps it disjoint
+/// from the assay substream that shares this root, so enabling a `Dv` monitor never
+/// perturbs the κ draws (and the reverse). A model with no IOV never calls this, so
+/// the η stream stays byte-identical whether or not κ is present.
+pub(crate) fn subject_kappa_base_seed(root: u64, subject_id: &str, replicate: usize) -> u64 {
+    let s = combine_seed(root ^ KAPPA_PURPOSE_SALT, stable_hash_str(subject_id));
+    combine_seed(s, replicate as u64)
+}
+
+/// One standard-normal draw for kappa `component` on `occasion`, on the substream
+/// rooted at `base_seed` ([`subject_kappa_base_seed`]). A fresh RNG is seeded per
+/// draw from the full `(occasion, component)` key, so — exactly like
+/// [`assay_standard_normal`] — the draw depends on nothing else in the run: adding
+/// an occasion, a monitor, or another κ component never shifts any other draw. The
+/// caller assembles `n_kappa` such draws into a z-vector and applies the IOV
+/// Cholesky factor to obtain the correlated κ for that occasion.
+pub(crate) fn kappa_standard_normal(base_seed: u64, occasion: usize, component: usize) -> f64 {
+    use rand::SeedableRng;
+    use rand_distr::{Distribution, Normal};
+    let key = combine_seed(combine_seed(base_seed, occasion as u64), component as u64);
     let mut rng = rand::rngs::StdRng::seed_from_u64(key);
     Normal::new(0.0, 1.0).unwrap().sample(&mut rng)
 }
@@ -1442,6 +1474,53 @@ mod tests {
         assert_ne!(
             x,
             assay_standard_normal(101, 0, "A"),
+            "base seed keys the draw"
+        );
+    }
+
+    // ----- #701: IOV-kappa substream seed helpers -----------------------
+
+    #[test]
+    fn subject_kappa_base_seed_separates_and_is_disjoint_from_assay() {
+        let a = subject_kappa_base_seed(42, "subj-1", 1);
+        assert_eq!(a, subject_kappa_base_seed(42, "subj-1", 1), "deterministic");
+        assert_ne!(
+            a,
+            subject_kappa_base_seed(42, "subj-2", 1),
+            "subject id keys"
+        );
+        assert_ne!(
+            a,
+            subject_kappa_base_seed(42, "subj-1", 2),
+            "replicate keys"
+        );
+        assert_ne!(a, subject_kappa_base_seed(7, "subj-1", 1), "root seed keys");
+        // Disjoint from the assay stream that shares the same run root: the
+        // purpose salt is what keeps enabling a `Dv` monitor from perturbing κ.
+        assert_ne!(
+            a,
+            subject_assay_base_seed(42, "subj-1", 1),
+            "kappa and assay substreams are disjoint under the same root"
+        );
+    }
+
+    #[test]
+    fn kappa_standard_normal_is_deterministic_and_key_separated() {
+        let x = kappa_standard_normal(100, 0, 0);
+        assert_eq!(x, kappa_standard_normal(100, 0, 0), "deterministic");
+        assert_ne!(
+            x,
+            kappa_standard_normal(100, 1, 0),
+            "occasion keys the draw"
+        );
+        assert_ne!(
+            x,
+            kappa_standard_normal(100, 0, 1),
+            "component keys the draw"
+        );
+        assert_ne!(
+            x,
+            kappa_standard_normal(101, 0, 0),
             "base seed keys the draw"
         );
     }

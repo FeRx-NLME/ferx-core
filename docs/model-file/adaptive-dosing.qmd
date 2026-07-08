@@ -342,10 +342,20 @@ slow-gated `tests/adaptive_vanco_anchor.rs` (nightly + on push to `main`).
   time-varying-covariate subject is a typed error rather than a frozen-snapshot AUC.
 - **No system resets** — a subject with an EVID=3/4 reset event is rejected (the
   reactive driver does not apply resets).
-- **Between-subject variability only** — η is drawn per subject/replicate. A model
-  declaring **inter-occasion variability** (`kappa` / IOV) is rejected rather than
-  silently run with its kappas held at zero; parameter-uncertainty propagation and
-  IOV are later layers.
+- **Inter-occasion variability (IOV) is supported** — a fresh occasion `kappa` is
+  drawn per **decision window** (occasion = decision index) and threaded through the
+  per-event PK, so occasion-to-occasion shifts in CL/V drive the trajectory, the
+  monitored signal, and every reactive dose; the frozen-replay verifier validates the
+  per-occasion bookkeeping, and it composes with time-varying covariates — the
+  composition (`CL = TVCL·(CRCL/100)·exp(η + κ)` under a declining covariate *and* a
+  per-occasion κ) is cross-validated dose-for-dose against an independent **mrgsolve**
+  run (`tests/reference/vanco_renal_iov_mrgsolve/`). `kappa` is
+  drawn on a dedicated per-(subject, replicate) substream (disjoint from the η and
+  assay streams), so a non-IOV run is unchanged and enabling a `Dv` monitor never
+  shifts the draws. *Caveat:* as with time-varying covariates, `auc_target` on an IOV
+  model is a typed error (the exposure metric is not yet computed per-occasion).
+  Between-subject η is still drawn per subject/replicate; parameter-uncertainty
+  propagation is a later layer.
 - **Deterministic ODE only** — a stochastic (`[diffusion]` / SDE) model is rejected
   (the reactive integrator carries no process noise).
 - **Diagonal assay noise** — each `Dv` monitor draws independently; correlated
