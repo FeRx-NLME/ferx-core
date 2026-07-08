@@ -1170,8 +1170,7 @@ fn parse_subjects(
         });
     }
 
-    // predictions.csv → fill ipred/pred/iwres/cwres/cens grouped by ID,
-    // assuming subject rows are contiguous (which save_fit guarantees).
+    // predictions.csv → fill ipred/pred/iwres/cwres/cens positionally.
     let mut plines = preds_csv.lines();
     let pheader = plines
         .next()
@@ -1196,11 +1195,24 @@ fn parse_subjects(
     let npd_i = col.get("NPD").copied();
     let cens_i = col.get("CENS").copied();
 
-    let mut by_id: HashMap<String, usize> = HashMap::new();
-    for (idx, s) in subjects.iter().enumerate() {
-        by_id.insert(s.id.clone(), idx);
-    }
+    // Rows are written one contiguous block per subject, in the same order as
+    // ebes.csv (see `write_predictions_csv`), with exactly `n_obs` rows each.
+    // Consume `subjects[i].n_obs` rows for subject i before advancing, using
+    // the row ID only as a consistency check. Keying on ID instead (as this
+    // once did) collapses distinct subjects that share a textual ID — e.g. an
+    // ID reused across studies or a reset-split subject — routing every
+    // duplicate's rows to one subject and leaving the other with zero, which
+    // then trips the n_obs cross-validation below.
+    let parse_opt = |s: &str| -> f64 {
+        if s.is_empty() {
+            f64::NAN
+        } else {
+            s.parse().unwrap_or(f64::NAN)
+        }
+    };
 
+    let mut cur = 0usize;
+    let mut filled = 0usize;
     for (i, line) in plines.enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -1208,18 +1220,30 @@ fn parse_subjects(
         let fields = parse_csv_row(line);
         let id = fields
             .get(id_i)
-            .ok_or_else(|| FitrxError::Corrupt(format!("predictions.csv row {}: short", i + 1)))?
-            .clone();
-        let idx = *by_id
-            .get(&id)
-            .ok_or_else(|| FitrxError::Corrupt(format!("predictions.csv: unknown ID {:?}", id)))?;
-        let parse_opt = |s: &str| -> f64 {
-            if s.is_empty() {
-                f64::NAN
-            } else {
-                s.parse().unwrap_or(f64::NAN)
-            }
-        };
+            .ok_or_else(|| FitrxError::Corrupt(format!("predictions.csv row {}: short", i + 1)))?;
+        // Advance past subjects whose observation block is complete (including
+        // zero-observation subjects, which consume no prediction rows).
+        while cur < subjects.len() && filled == subjects[cur].n_obs {
+            cur += 1;
+            filled = 0;
+        }
+        if cur >= subjects.len() {
+            return Err(FitrxError::Corrupt(format!(
+                "predictions.csv row {}: more rows than ebes.csv accounts for (id {:?})",
+                i + 1,
+                id
+            )));
+        }
+        let idx = cur;
+        if *id != subjects[idx].id {
+            return Err(FitrxError::Corrupt(format!(
+                "predictions.csv row {}: ID {:?} out of order; expected subject {:?} \
+                 (predictions must follow ebes.csv subject order)",
+                i + 1,
+                id,
+                subjects[idx].id
+            )));
+        }
         subjects[idx].pred.push(parse_opt(&fields[pred_i]));
         subjects[idx].ipred.push(parse_opt(&fields[ipred_i]));
         subjects[idx].cwres.push(parse_opt(&fields[cwres_i]));
@@ -1242,6 +1266,7 @@ fn parse_subjects(
             None => 0,
         };
         subjects[idx].cens.push(c);
+        filled += 1;
     }
 
     // Cross-validate every subject's per-observation vector length against
@@ -2486,9 +2511,12 @@ mod tests {
             if name == "predictions.csv" {
                 let csv = String::from_utf8(buf).unwrap();
                 let mut lines: Vec<&str> = csv.lines().collect();
-                // Drop the second data row (first S1 observation) to simulate
-                // a writer that miscounted.
-                lines.remove(2);
+                // Drop the last data row (last S2 observation) so the final
+                // subject comes up one short. Positional parsing fills S2 with
+                // the rows it has, then the n_obs cross-validation catches the
+                // shortfall at the tail. (Dropping a middle row instead would
+                // trip the earlier ID-order check, a different code path.)
+                lines.pop();
                 buf = lines.join("\n").into_bytes();
                 buf.push(b'\n');
             }
@@ -2508,6 +2536,42 @@ mod tests {
             FitrxError::Corrupt(msg) => assert!(msg.contains("n_obs"), "msg = {}", msg),
             other => panic!("expected Corrupt, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn load_handles_duplicate_subject_ids() {
+        // Two distinct subjects can share a textual ID (an ID reused across
+        // studies, or a reset-split subject). ebes.csv / predictions.csv are
+        // written one contiguous block per subject in subject order, so the
+        // loader must assign prediction rows positionally. Keying on ID (as it
+        // once did) collapses the two "12" subjects — routing every row to one
+        // and leaving the other with zero, which then trips the n_obs check.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dup-ids.fitrx");
+        let mut r = minimal_fit_result();
+        let n_eta = 2;
+        let a = dummy_subject("12", n_eta, 3);
+        let mut b = dummy_subject("12", n_eta, 5);
+        // Offset the second block so we can prove the two never cross-mix.
+        b.ipred = b.ipred.iter().map(|v| v + 100.0).collect();
+        r.subjects = vec![a, b];
+        r.n_obs = 8;
+        r.n_subjects = 2;
+        let p = dummy_population(&["12", "12"], 5);
+        save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
+
+        let loaded = load_fit(&path).unwrap();
+        let s = &loaded.fit.subjects;
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].id, "12");
+        assert_eq!(s[1].id, "12");
+        assert_eq!(s[0].ipred.len(), 3, "first block keeps its own n_obs");
+        assert_eq!(s[1].ipred.len(), 5, "second block keeps its own n_obs");
+        assert!(
+            s[0].ipred.iter().all(|&v| v < 100.0),
+            "no bleed into block A"
+        );
+        assert!(s[1].ipred.iter().all(|&v| v > 100.0), "block B rows intact");
     }
 
     #[test]

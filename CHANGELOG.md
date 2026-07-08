@@ -59,6 +59,14 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **Loading a `.fitrx` bundle whose data has two subjects sharing an ID no longer
+  fails with a spurious `corrupt or missing entry` error.** `load_fit` (and thus
+  `ferx summary`) matched `predictions.csv` rows to subjects by ID, so when a
+  dataset reuses an ID across subjects (e.g. an ID repeated across studies or a
+  reset-split subject), every duplicate's rows were routed to one subject and the
+  other was left with zero rows — tripping the `n_obs` consistency check. Rows are
+  now assigned positionally in `ebes.csv` subject order (which the writer already
+  guarantees), with the row ID kept as an ordering cross-check.
 - **A forward reference in `[individual_parameters]` is now a parse error instead of a
   silent zero** (#710). A statement that referenced a name declared *later* in the same
   block (e.g. `CL = ... * exp(IMAX*...)` with `IMAX` defined below it) previously resolved
