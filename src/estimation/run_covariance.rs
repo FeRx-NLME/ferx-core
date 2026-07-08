@@ -360,8 +360,9 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         // `run_covariance` reconstructs the packed parameter vector via a
-        // Cholesky round-trip (fit.omega → Chol(omega) → L), which introduces
-        // O(ε_machine · cond(L)) error relative to the inline path's exact L.
+        // Cholesky round-trip (FitResult.omega → Chol(FitResult.omega) → L),
+        // which introduces O(ε_machine · cond(L)) error relative to the inline
+        // path's exact L (stored from the optimizer, never re-decomposed).
         // The resulting FD-Hessian perturbations differ by the same amount,
         // so strict sub-1e-6 parity is not achievable through this path.
         // 1e-4 is tight enough to catch any real regression while being
