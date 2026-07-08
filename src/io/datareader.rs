@@ -455,16 +455,17 @@ fn read_nonmem_csv_impl(
         .map(|h| h.trim().to_string())
         .collect();
 
-    // Apply `[data]` column remapping (#730): rename each mapped actual header
-    // to its canonical role (case-insensitive match). Downstream canonical
-    // lookups (`col_idx_ci("time")`) and covariate auto-detection (`is_standard`)
-    // then treat the column as that role with no further special-casing, and the
-    // original header no longer leaks in as a covariate. Resolve every target
-    // against the *original* headers first, then apply the renames, so one
-    // mapping can never shadow another's lookup.
+    // Apply `[data]` column remapping (#730, #742): rename each mapped actual
+    // header to its target name (case-insensitive match on the actual header).
+    // Downstream canonical lookups (`col_idx_ci("time")`) and covariate
+    // auto-detection (`is_standard`) then treat a renamed column as that role /
+    // covariate with no further special-casing, and the original header no
+    // longer leaks in under its old name. Resolve every actual header against
+    // the *original* headers first, then apply the renames, so one mapping can
+    // never shadow another's lookup.
     if !column_map.is_empty() {
         let mut planned: Vec<(usize, String)> = Vec::with_capacity(column_map.len());
-        for (canonical, actual) in column_map {
+        for (target, actual) in column_map {
             // A mapped header that is absent is a hard error — the mapping would
             // silently do nothing (e.g. TIME would still be reported missing).
             let idx = headers
@@ -472,36 +473,37 @@ fn read_nonmem_csv_impl(
                 .position(|h| h.eq_ignore_ascii_case(actual))
                 .ok_or_else(|| {
                     format!(
-                        "[data]: mapped column `{actual}` (for role `{canonical}`) not found in \
+                        "[data]: mapped column `{actual}` (for role `{target}`) not found in \
                          dataset headers: {}",
                         headers.join(", ")
                     )
                 })?;
-            // Reject when the dataset already carries this canonical role under a
-            // *different* header — the role would be ambiguous after renaming.
-            if let Some(other) = headers
-                .iter()
-                .position(|h| h.eq_ignore_ascii_case(canonical))
-            {
-                if other != idx {
-                    return Err(format!(
-                        "[data]: role `{canonical}` maps to `{actual}`, but the dataset already \
-                         has a `{}` column",
-                        headers[other]
-                    ));
-                }
-            }
             // Reject clobbering the IOV occasion column: renaming it would make
             // the later `iov_column` lookup fail with a misleading "not found".
             if let Some(iov) = iov_column {
                 if actual.eq_ignore_ascii_case(iov) {
                     return Err(format!(
-                        "[data]: mapped column `{actual}` (for role `{canonical}`) is also the \
+                        "[data]: mapped column `{actual}` (for role `{target}`) is also the \
                          iov_column `{iov}`"
                     ));
                 }
             }
-            planned.push((idx, canonical.to_ascii_uppercase()));
+            planned.push((idx, target.clone()));
+        }
+        // A column being renamed *away* frees its old name — the raw `dv` column
+        // renamed to `ODV` no longer collides with a `DV = lndv` mapping (#742).
+        // So a target may collide only with a *surviving* (non-source) header.
+        let sources: std::collections::HashSet<usize> = planned.iter().map(|(i, _)| *i).collect();
+        for (idx, target) in &planned {
+            if let Some(other) = headers.iter().position(|h| h.eq_ignore_ascii_case(target)) {
+                if other != *idx && !sources.contains(&other) {
+                    return Err(format!(
+                        "[data]: renaming to `{target}` collides — the dataset already has a `{}` \
+                         column",
+                        headers[other]
+                    ));
+                }
+            }
         }
         for (idx, name) in planned {
             headers[idx] = name;
@@ -3113,9 +3115,61 @@ mod tests {
                    1,0,0,.,1,100\n\
                    1,1,2,5.0,0,.\n";
         let f = write_csv(csv);
-        let map = vec![("time".to_string(), "TAFD".to_string())];
+        let map = vec![("TIME".to_string(), "TAFD".to_string())];
         let err = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap_err();
         assert!(err.contains("already has a `TIME` column"), "{err}");
+    }
+
+    #[test]
+    fn test_column_map_renames_arbitrary_column() {
+        // #742: a `[data]` target need not be a canonical role — an arbitrary
+        // column can be renamed (e.g. a covariate). `weight` → `WT` and the new
+        // name is the one that surfaces as a covariate.
+        let csv = "ID,TIME,DV,EVID,AMT,weight\n\
+                   1,0,.,1,100,70\n\
+                   1,1,5.0,0,.,70\n";
+        let f = write_csv(csv);
+        let map = vec![("WT".to_string(), "weight".to_string())];
+        let pop = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap();
+        assert!(pop.covariate_names.contains(&"WT".to_string()));
+        assert!(!pop.covariate_names.contains(&"weight".to_string()));
+        assert_eq!(pop.subjects[0].covariates["WT"], 70.0);
+    }
+
+    #[test]
+    fn test_column_map_frees_renamed_away_column_for_role() {
+        // #742: the dataset's raw `dv` is renamed aside to `ODV`, freeing the DV
+        // role for the log-DV column `lndv`. Both renames must succeed — the old
+        // `dv` no longer collides with the `DV` target because it is being
+        // renamed away in the same block.
+        let csv = "ID,TIME,dv,lndv,EVID,AMT\n\
+                   1,0,.,.,1,100\n\
+                   1,1,5.0,1.609,0,.\n";
+        let f = write_csv(csv);
+        let map = vec![
+            ("ODV".to_string(), "dv".to_string()),
+            ("DV".to_string(), "lndv".to_string()),
+        ];
+        let pop = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap();
+        let subj = &pop.subjects[0];
+        // DV now carries the log-DV values.
+        assert_eq!(subj.observations, vec![1.609]);
+        // The raw DV survives as the `ODV` covariate.
+        assert!(pop.covariate_names.contains(&"ODV".to_string()));
+        assert_eq!(subj.covariates["ODV"], 5.0);
+    }
+
+    #[test]
+    fn test_column_map_target_collides_with_surviving_column_errors() {
+        // #742 boundary: promoting `lndv` to DV without renaming the existing
+        // `dv` away leaves two DV columns — ambiguous, so it must error.
+        let csv = "ID,TIME,dv,lndv,EVID,AMT\n\
+                   1,0,.,.,1,100\n\
+                   1,1,5.0,1.609,0,.\n";
+        let f = write_csv(csv);
+        let map = vec![("DV".to_string(), "lndv".to_string())];
+        let err = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap_err();
+        assert!(err.contains("already has a `dv` column"), "{err}");
     }
 
     #[test]

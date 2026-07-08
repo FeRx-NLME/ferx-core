@@ -163,6 +163,34 @@ fn fit_reads_dataset_through_data_block_column_mapping() {
 }
 
 #[test]
+fn fit_renames_arbitrary_covariate_column_through_data_block() {
+    // #742: a `[data]` target need not be a canonical role. A dataset carrying a
+    // lowercase `wgt` covariate is renamed to `WT`, and the new name is what
+    // surfaces in the fitted population — the original `wgt` no longer leaks.
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Append a constant `wgt` covariate column to every row of the base CSV.
+    let src = std::fs::read_to_string("data/one_cpt_iv.csv").expect("read one_cpt_iv.csv");
+    let mut lines = src.lines();
+    let header = format!("{},wgt", lines.next().expect("header"));
+    let body: Vec<String> = lines.map(|l| format!("{l},70")).collect();
+    let out = std::iter::once(header)
+        .chain(body)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dir.path().join("cov.csv"), out).expect("write cov csv");
+
+    let data_block = "[data]\n  path = cov.csv\n  WT = wgt\n";
+    let model_src = MODEL_TEMPLATE.replace("{data}", data_block);
+    let model_path = dir.path().join("m.ferx");
+    std::fs::write(&model_path, model_src).expect("write model file");
+
+    let (_result, population) = run_model_with_data_inits(model_path.to_str().unwrap(), None, None)
+        .expect("fit should succeed with the renamed WT covariate");
+    assert!(population.covariate_names.contains(&"WT".to_string()));
+    assert!(!population.covariate_names.contains(&"wgt".to_string()));
+}
+
+#[test]
 fn fit_errors_when_mapped_column_absent_from_dataset() {
     // Mapping to a header the dataset lacks is a hard, clear error.
     let dir = tempfile::tempdir().expect("tempdir");

@@ -4724,9 +4724,11 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     }
 }
 
-/// Canonical column roles that a `[data]` block may remap to an actual CSV
-/// header (#730, NONMEM `$INPUT TIME=TAFD` analogue). Kept in sync with the
-/// standard columns recognised by [`crate::io::datareader`].
+/// Canonical column roles a `[data]` block may remap (#730, NONMEM
+/// `$INPUT TIME=TAFD` analogue). A target naming one of these is upper-cased to
+/// the standard header spelling; any other target is an arbitrary column rename
+/// (#742) kept in its written case. Stays in sync with the standard columns
+/// recognised by [`crate::io::datareader`].
 const DATA_BLOCK_ROLES: &[&str] = &[
     "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl", "tentry",
     "fremtype",
@@ -4734,13 +4736,27 @@ const DATA_BLOCK_ROLES: &[&str] = &[
 
 /// Parse a `[data]` block (#690, NONMEM `$DATA` analogue). Returns the raw
 /// `path` value as written (resolved relative to the model file's directory by
-/// `parse_full_model_file`) plus any `canonical = actual` column remappings
-/// (#730). Each map entry is `(canonical_role_lowercase, actual_header)`.
+/// `parse_full_model_file`) plus any `target = actual` column remappings.
+/// Each map entry is `(target_header, actual_header)`: the dataset's
+/// `actual_header` column is renamed to `target_header` when the CSV is read.
 ///
-/// Validated here: unknown keys, empty target names, a role mapped twice, and
-/// two roles mapped to the same actual header (duplicate targets). Whether a
-/// mapped header actually exists in the dataset can only be checked when the
-/// CSV is read, so that lives in the datareader.
+/// A `target` that names a canonical role (#730, DATA_BLOCK_ROLES) is upper-cased
+/// to the standard header spelling; any other target (#742 — arbitrary column /
+/// covariate rename) keeps the exact case written, since covariate lookups are
+/// case-sensitive. This lets a dataset's own `dv` column be renamed aside so a
+/// different column can take the `DV` role, e.g.
+///
+/// ```text
+/// [data]
+///   ODV = dv       # keep the raw DV under a new name
+///   DV  = lndv     # promote the log-DV column to the DV role
+///   WT  = weight   # rename an arbitrary covariate
+/// ```
+///
+/// Validated here: empty target names, a target mapped twice, and two targets
+/// mapped to the same actual header. Whether a mapped header actually exists in
+/// the dataset — and whether a rename collides with a surviving column — can
+/// only be checked when the CSV is read, so that lives in the datareader.
 fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>), String> {
     let mut path: Option<String> = None;
     let mut column_map: Vec<(String, String)> = Vec::new();
@@ -4753,31 +4769,36 @@ fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>),
         let key_lc = key.to_ascii_lowercase();
         if key_lc == "path" {
             path = Some(value.to_string());
-        } else if DATA_BLOCK_ROLES.contains(&key_lc.as_str()) {
-            if value.is_empty() {
-                return Err(format!(
-                    "[data]: empty column name for role `{key_lc}` — write `{key_lc} = <header>`"
-                ));
-            }
-            if column_map.iter().any(|(role, _)| role == &key_lc) {
-                return Err(format!("[data]: role `{key_lc}` mapped more than once"));
-            }
-            column_map.push((key_lc, value.to_string()));
-        } else {
+            continue;
+        }
+        if value.is_empty() {
             return Err(format!(
-                "[data]: unknown key `{key}` — valid keys are: path, or a canonical column role \
-                 ({})",
-                DATA_BLOCK_ROLES.join(", ")
+                "[data]: empty column name for `{key}` — write `{key} = <header>`"
             ));
         }
+        // Canonical roles use the standard upper-case spelling; arbitrary
+        // targets (#742) keep their exact case for case-sensitive covariate
+        // lookups.
+        let target = if DATA_BLOCK_ROLES.contains(&key_lc.as_str()) {
+            key_lc.to_ascii_uppercase()
+        } else {
+            key.to_string()
+        };
+        if column_map
+            .iter()
+            .any(|(t, _)| t.eq_ignore_ascii_case(&target))
+        {
+            return Err(format!("[data]: target `{target}` mapped more than once"));
+        }
+        column_map.push((target, value.to_string()));
     }
-    // Reject two roles pointing at the same actual header (case-insensitive):
-    // the reader would rename one header to two roles, silently dropping one.
+    // Reject two targets pointing at the same actual header (case-insensitive):
+    // the reader would rename one header to two targets, silently dropping one.
     for i in 0..column_map.len() {
         for j in (i + 1)..column_map.len() {
             if column_map[i].1.eq_ignore_ascii_case(&column_map[j].1) {
                 return Err(format!(
-                    "[data]: roles `{}` and `{}` both map to column `{}`",
+                    "[data]: targets `{}` and `{}` both map to column `{}`",
                     column_map[i].0, column_map[j].0, column_map[i].1
                 ));
             }
@@ -17760,18 +17781,27 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_data_block_unknown_key_is_error() {
-        let err = parse_data_block(&["bogus = 1".to_string()]).unwrap_err();
-        assert!(err.contains("unknown key `bogus`"), "{err}");
+    fn test_parse_data_block_arbitrary_target_is_accepted() {
+        // #742: a non-canonical target renames an arbitrary column. Its case is
+        // preserved (covariate lookups are case-sensitive), unlike canonical
+        // roles which are upper-cased.
+        let (_, map) =
+            parse_data_block(&["path = d.csv".to_string(), "WT = weight".to_string()]).unwrap();
+        assert_eq!(map, vec![("WT".to_string(), "weight".to_string())]);
+        // Mixed-case arbitrary target kept verbatim.
+        let (_, map) =
+            parse_data_block(&["path = d.csv".to_string(), "MyCov = raw".to_string()]).unwrap();
+        assert_eq!(map, vec![("MyCov".to_string(), "raw".to_string())]);
     }
 
     #[test]
     fn test_parse_data_block_column_mapping() {
-        // `canonical = actual` remappings (#730). Roles are lowercased; the
-        // actual header is preserved verbatim. `path` still parses alongside.
+        // `target = actual` remappings. Canonical roles are upper-cased to the
+        // standard spelling; the actual header is preserved verbatim. `path`
+        // still parses alongside.
         let (path, map) = parse_data_block(&[
             "path = mydata.csv".to_string(),
-            "TIME = TAFD".to_string(),
+            "time = TAFD".to_string(),
             "DV = CONC".to_string(),
         ])
         .unwrap();
@@ -17779,8 +17809,8 @@ mod tests {
         assert_eq!(
             map,
             vec![
-                ("time".to_string(), "TAFD".to_string()),
-                ("dv".to_string(), "CONC".to_string()),
+                ("TIME".to_string(), "TAFD".to_string()),
+                ("DV".to_string(), "CONC".to_string()),
             ]
         );
     }
@@ -17789,24 +17819,24 @@ mod tests {
     fn test_parse_data_block_empty_target_is_error() {
         let err =
             parse_data_block(&["path = d.csv".to_string(), "time =".to_string()]).unwrap_err();
-        assert!(err.contains("empty column name for role `time`"), "{err}");
+        assert!(err.contains("empty column name for `time`"), "{err}");
     }
 
     #[test]
-    fn test_parse_data_block_role_mapped_twice_is_error() {
+    fn test_parse_data_block_target_mapped_twice_is_error() {
         let err = parse_data_block(&[
             "path = d.csv".to_string(),
             "TIME = TAFD".to_string(),
             "time = T2".to_string(),
         ])
         .unwrap_err();
-        assert!(err.contains("role `time` mapped more than once"), "{err}");
+        assert!(err.contains("target `TIME` mapped more than once"), "{err}");
     }
 
     #[test]
     fn test_parse_data_block_duplicate_target_is_error() {
-        // Two roles pointing at the same actual header (case-insensitive) is
-        // rejected: the reader would rename one header to two roles.
+        // Two targets pointing at the same actual header (case-insensitive) is
+        // rejected: the reader would rename one header to two targets.
         let err = parse_data_block(&[
             "path = d.csv".to_string(),
             "TIME = X".to_string(),
@@ -17825,8 +17855,8 @@ mod tests {
         assert_eq!(
             parsed.column_map,
             vec![
-                ("time".to_string(), "TAFD".to_string()),
-                ("dv".to_string(), "CONC".to_string()),
+                ("TIME".to_string(), "TAFD".to_string()),
+                ("DV".to_string(), "CONC".to_string()),
             ]
         );
     }

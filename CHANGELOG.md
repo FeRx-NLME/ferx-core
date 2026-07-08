@@ -20,12 +20,15 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
-- **`[data]` block column mapping** (#730): map a canonical column role to a
-  differently-named dataset header with `canonical = actual` entries (e.g.
-  `TIME = TAFD`, `DV = CONC`), the ferx equivalent of NONMEM's
-  `$INPUT TIME=TAFD`. Header matching is case-insensitive, mapped headers are
-  excluded from covariate auto-detection, and typos (absent header, duplicate
-  role, duplicate target) fail loudly. See
+- **`[data]` block column renaming** (#730, #742): rename any dataset header to
+  any new name with `new-name = actual` entries (e.g. `TIME = TAFD`,
+  `DV = CONC`), the ferx equivalent of NONMEM's `$INPUT TIME=TAFD`. Targets are
+  not limited to canonical roles — arbitrary columns and covariates can be
+  renamed too, and a column can be renamed *aside* to free its name for another
+  (e.g. `ODV = dv` then `DV = lndv`). Header matching is case-insensitive,
+  renamed headers are excluded from covariate auto-detection under their old
+  name, and typos (absent header, duplicate target, or a target colliding with a
+  surviving column) fail loudly. See
   [Data → Column mapping](https://ferx-nlme.github.io/ferx-core/model-file/data.html).
 
 ### Changed

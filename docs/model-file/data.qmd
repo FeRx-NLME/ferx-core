@@ -12,7 +12,7 @@ fit against, so `ferx model.ferx` (no `--data`) and `ferx check model.ferx`
 ```
 [data]
   path = <path-to-csv>
-  <canonical-role> = <actual-header>   # optional column mappings
+  <new-name> = <actual-header>   # optional column renames
 ```
 
 `path` is the only required key. A relative path is resolved **relative to the
@@ -31,9 +31,9 @@ running `ferx` — so a model and its dataset can be moved together as a pair.
 By default ferx recognises the canonical NONMEM columns (`ID`, `TIME`, `DV`,
 `EVID`, `AMT`, `CMT`, `RATE`, `MDV`, `II`, `SS`, `CENS`, `ADDL`) by name,
 case-insensitively. When a dataset stores a role under a different header —
-e.g. `TAFD` for time or `CONC` for the response — you can map it in the `[data]`
-block instead of pre-editing the CSV. The direction is
-`canonical = actual-header`, the ferx equivalent of NONMEM's
+e.g. `TAFD` for time or `CONC` for the response — you can rename it in the
+`[data]` block instead of pre-editing the CSV. The direction is
+`new-name = actual-header`, the ferx equivalent of NONMEM's
 `$INPUT TIME=TAFD`:
 
 ```
@@ -43,18 +43,38 @@ block instead of pre-editing the CSV. The direction is
   DV   = CONC
 ```
 
+The target need not be a canonical role: **any** column can be renamed to **any**
+new name, including covariates. Because renames are resolved against the
+original headers all at once, a column can be renamed *aside* to free its name
+for another — e.g. keep the raw `dv` under a new name while promoting a log-DV
+column into the `DV` role:
+
+```
+[data]
+  path = mydata.csv
+  ODV = dv         # keep the original DV under a new name
+  DV  = lndv       # promote the log-DV column into the DV role
+  WT  = weight     # rename an arbitrary covariate
+```
+
 - The **actual header** is matched case-insensitively (`TIME = tafd` finds a
   `TAFD` column).
-- A mapped header is treated **only** as its canonical role — it is never also
-  picked up as a covariate by auto-detection.
-- Mappable roles are the canonical columns above plus `TENTRY` and `FREMTYPE`.
+- A target naming a canonical role is upper-cased to the standard spelling
+  (`time = TAFD` → `TIME`); any other target keeps its exact case, since
+  covariate lookups are case-sensitive.
+- A renamed header is treated **only** under its new name — the original header
+  no longer leaks in under its old name (so `TIME = TAFD` stops `TAFD` from being
+  auto-detected as a covariate).
 
 Validation is strict, so a typo fails loudly rather than silently reading the
 wrong column:
 
 - a mapped header that is **absent** from the dataset is an error;
-- mapping the **same role twice**, or mapping **two roles to the same header**,
-  is an error.
+- renaming to the **same target twice**, or mapping **two targets to the same
+  header**, is an error;
+- a rename whose target collides with a **surviving** (non-renamed) column is an
+  error — e.g. `DV = lndv` while the dataset still has its own `dv` column is
+  ambiguous and rejected (rename the old `dv` aside, as above).
 
 The IOV occasion column is *not* set here — keep using
 [`iov_column`](iov.qmd) in `[fit_options]`, and covariate columns
