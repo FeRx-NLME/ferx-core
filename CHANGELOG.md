@@ -144,6 +144,14 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **A dataset with dose rows but no `AMT` column is now a hard error instead of a
+  silent bad fit** (#753). When the amount column is named something other than
+  `AMT` (e.g. a NONMEM export using `DOSE`), every dose parsed with amount 0, so no
+  drug entered the system, the objective was flat, and the fit "converged" with
+  every parameter pinned at its initial estimate. The reader now rejects such data
+  with `E_DOSE_NO_AMT`, naming the fix (rename the column to `AMT`). A companion
+  warning `W_ALL_DOSES_ZERO` fires when an `AMT` column *is* present but every dose
+  amount is 0 (e.g. a mis-scaled column).
 - **Loading a `.fitrx` bundle whose data has two subjects sharing an ID no longer
   fails with a spurious `corrupt or missing entry` error.** `load_fit` (and thus
   `ferx summary`) matched `predictions.csv` rows to subjects by ID, so when a

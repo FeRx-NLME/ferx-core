@@ -778,6 +778,25 @@ fn read_nonmem_csv_impl(
         subjects.push(subject);
     }
 
+    // Hard error (#753): dose rows are present (EVID=1/4 classified as doses) but
+    // the dataset has no `AMT` column, so every dose was created with `amt = 0`.
+    // The fit would run silently with no drug in the system — a flat objective
+    // that pins every parameter at its initial estimate. This most often means the
+    // amount column is named something other than `AMT` (e.g. a NONMEM export using
+    // `DOSE`); rename it in the [data] block or the CSV header. Scoped to dose rows
+    // present + no AMT column: dose-free models (#262) and TTE/survival have no dose
+    // events, and the EVID-absent path infers no doses without an AMT column, so
+    // none of them trip this.
+    if amt_col.is_none() && subjects.iter().any(|s| !s.doses.is_empty()) {
+        return Err(
+            "E_DOSE_NO_AMT: the dataset has dose records (EVID=1/4) but no `AMT` column, so \
+             every dose amount is zero and the fit would run with no drug in the system. If the \
+             amount column has a different name (e.g. `DOSE`), rename it to `AMT` in the CSV \
+             header or via a rename in the [data] block."
+                .to_string(),
+        );
+    }
+
     // Accumulate OCC warning into population_warnings (surfaced via FitResult.warnings).
     if let Some(name) = iov_column {
         if total_occ_failures > 0 {
@@ -831,6 +850,27 @@ fn read_nonmem_csv_impl(
                  AMT column with EVID=1/4 dose rows (or a nonzero AMT when EVID is absent).",
                 subjects.len()
             ));
+        }
+    }
+
+    // All-zero-dose warning (#753): an `AMT` column exists (so E_DOSE_NO_AMT did not
+    // fire) but every parsed dose amount is exactly zero — e.g. a placebo-only typo
+    // or a mis-scaled amount column. Like the all-zero-AMT error, this yields a flat
+    // objective; here we warn rather than error because the column is present and a
+    // genuinely dose-free-but-AMT-columned dataset is conceivable. Only fires when at
+    // least one dose event exists (else W_NO_DOSES already covered it).
+    if amt_col.is_some() {
+        let any_dose = subjects.iter().any(|s| !s.doses.is_empty());
+        let all_zero = subjects
+            .iter()
+            .all(|s| s.doses.iter().all(|d| d.amt == 0.0));
+        if any_dose && all_zero {
+            population_warnings.push(
+                "W_ALL_DOSES_ZERO: every dose record has AMT = 0, so no drug enters the system \
+                 and the objective is flat (parameters will not move from their initial values). \
+                 Check the `AMT` column values and scaling."
+                    .to_string(),
+            );
         }
     }
 
@@ -1794,6 +1834,51 @@ mod tests {
         let f = write_csv("ID,TIME,EVID,AMT\n1,0,1,100\n");
         let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
         assert!(err.contains("Missing DV column"), "{err}");
+    }
+
+    #[test]
+    fn dose_rows_without_amt_column_are_rejected() {
+        // #753: EVID=1 dose rows but the amount column is named `DOSE`, not `AMT`.
+        // Every dose parses to amt=0 → flat objective → fit pinned at init. This is
+        // a hard error naming the fix, not a silent bad fit.
+        let f = write_csv("ID,TIME,DV,EVID,DOSE\n1,0,.,1,100\n1,1,5.0,0,.\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("E_DOSE_NO_AMT"), "{err}");
+    }
+
+    #[test]
+    fn dose_free_dataset_without_amt_column_is_ok() {
+        // The E_DOSE_NO_AMT guard must be scoped to *dose rows present*: a dataset
+        // with only observations (EVID=0) and no AMT column is a legitimate
+        // dose-free fit (#262) and must not error.
+        let f = write_csv("ID,TIME,DV,EVID\n1,0,1.0,0\n1,1,2.0,0\n");
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.subjects.iter().all(|s| s.doses.is_empty()));
+    }
+
+    #[test]
+    fn all_zero_amt_doses_warn() {
+        // #753: an `AMT` column exists (so E_DOSE_NO_AMT does not fire) but every
+        // dose amount is 0 → flat objective. Warn rather than error.
+        let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,0\n1,1,5.0,0,.\n");
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(
+            pop.warnings.iter().any(|w| w.contains("W_ALL_DOSES_ZERO")),
+            "{:?}",
+            pop.warnings
+        );
+    }
+
+    #[test]
+    fn nonzero_amt_doses_do_not_warn_all_zero() {
+        // Guard against a false-positive W_ALL_DOSES_ZERO on a normal dataset.
+        let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(
+            !pop.warnings.iter().any(|w| w.contains("W_ALL_DOSES_ZERO")),
+            "{:?}",
+            pop.warnings
+        );
     }
 
     #[test]
