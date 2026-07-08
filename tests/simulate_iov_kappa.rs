@@ -238,3 +238,72 @@ fn simulate_iov_applies_scaling_without_occasion_labels() {
         );
     }
 }
+
+/// NONMEM `$SIM` anchor for `[scaling]` on the occasion-less IOV path (#723 review).
+///
+/// Cross-tool complement to the internal regression above: `predict_iov` applied
+/// `[scaling]` inside the per-occasion loop, so an IOV model simulated on data with no
+/// occasion labels returned UNSCALED IPRED. On a shared 300-subject occasion-less design
+/// (`tests/fixtures/iov_scaling_anchor.{ferx,csv}`, mirrored bit-for-bit by the NONMEM kit
+/// `nonmem_anchor/iov_scaling_anchor.{ctl,csv}`): 1-cpt IV bolus, IOV on `V`,
+/// `obs_scale = 1000`, one obs at `t=0` after an `EVID=4` reset+bolus so raw IPRED = AMT/V.
+/// Read WITHOUT an `iov_column` the occasion kappa collapses to 0, so
+///   `log IPRED = log(AMT) − log(TVV) − ETA_V − log(1000)`,
+/// giving `mean(log IPRED) = log(AMT/TVV/1000) = log(0.01) = −4.60517` and
+/// `Var(log IPRED) = ω²_V = 0.04` (BSV only — the occasion component is absent).
+///
+/// NONMEM 7.6.0 `$SIMULATION` on the identical design (`IPRED = F/1000`, `OCC=0` so
+/// `KAPPA=0`): mean(log IPRED) = −4.60873, Var(log IPRED) = 0.03965, geo-mean IPRED =
+/// 0.009964. Old code (scaling dropped on the empty-occasion path) collapses the mean to
+/// `log(AMT/TVV) = +2.30259` — a factor `obs_scale = 1000` too large.
+#[test]
+fn simulate_iov_scaling_matches_nonmem_occasionless() {
+    let model = parse_model_file(Path::new("tests/fixtures/iov_scaling_anchor.ferx"))
+        .expect("iov_scaling_anchor model parses");
+    assert!(model.n_kappa > 0, "anchor must declare IOV (kappa)");
+    // Read WITHOUT the occasion column: subjects carry no occasions ⇒ kappa = 0, which
+    // exercises the fixed occasion-less scaling path.
+    let pop = read_nonmem_csv(
+        Path::new("tests/fixtures/iov_scaling_anchor.csv"),
+        None,
+        None,
+    )
+    .expect("iov_scaling_anchor data loads");
+    assert!(
+        pop.subjects.iter().all(|s| s.occasions.is_empty()),
+        "anchor must be read occasion-less (no iov_column)"
+    );
+
+    // 20 replicates × 300 subjects ⇒ 6000 IPREDs; SE(mean log) ~ 0.2/sqrt(6000) ~ 0.003.
+    let rows = simulate_with_seed(&model, &pop, &model.default_params, 20, 20_260_708);
+    let logs: Vec<f64> = rows
+        .iter()
+        .map(|r| {
+            assert!(
+                r.ipred.is_finite() && r.ipred > 0.0,
+                "ipred must be positive"
+            );
+            r.ipred.ln()
+        })
+        .collect();
+    let n = logs.len() as f64;
+    let mean = logs.iter().sum::<f64>() / n;
+    let var = logs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    eprintln!(
+        "ferx occasion-less IOV+[scaling]: mean(log IPRED)={mean:.5}, Var={var:.5}; \
+         NONMEM -4.60873 / 0.03965"
+    );
+
+    // (1) SCALING applied: mean(log IPRED) ~ log(AMT/TVV/obs_scale) = -4.60517 (NONMEM -4.609).
+    //     Old code (scaling dropped) ⇒ +2.30259, off by log(1000)=6.9 — caught with huge margin.
+    assert!(
+        (mean - (-4.60517)).abs() < 0.05,
+        "occasion-less IOV [scaling] not applied: mean(log IPRED)={mean:.5}, expected ~-4.605 \
+         (NONMEM -4.609); a value near +2.303 means obs_scale was dropped"
+    );
+    // (2) kappa = 0 on the occasion-less path: Var(log IPRED) ~ omega^2_V = 0.04 (not ~0.08).
+    assert!(
+        (var - 0.04).abs() < 0.008,
+        "occasion-less Var(log IPRED)={var:.5}, expected ~0.04 (BSV only; NONMEM 0.03965)"
+    );
+}

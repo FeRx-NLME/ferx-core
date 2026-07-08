@@ -103,6 +103,23 @@ zero) collapsed the ferx figure to ~0. A higher-resolution 100-replicate run
 systematic under-dispersion. The 0.03939 figure in the table is pinned by
 `tests/simulate_iov_kappa.rs::simulate_iov_recovers_omega_iov_variance`.
 
+A second anchor pins that `[scaling]` is applied on the **occasion-less** IOV path —
+an IOV model simulated on data read without an `iov_column`, where the occasion
+`kappa` collapses to zero. On the same 1-cpt IV design with `obs_scale = 1000`,
+$IPRED = (AMT/V)/1000$, so $\text{mean}(\log IPRED) = \log(AMT/TVV/1000) = -4.60517$
+and $\text{Var}(\log IPRED) = \omega^2_V = 0.04$ (BSV only — no occasion component):
+
+| Source | mean(log IPRED) | Var(log IPRED) |
+|--------|----------------:|---------------:|
+| Analytic (scaling applied)  | −4.60517 | 0.04000 |
+| NONMEM 7.6.0 `$SIMULATION`  | −4.60873 | 0.03965 |
+| ferx `simulate()`           | −4.60378 | 0.04138 |
+
+ferx and NONMEM agree to ~0.005 on the scaled level. Before the fix, `simulate()`
+dropped the scale factor on the empty-occasion path, inflating the mean by
+$\log(1000) \approx 6.9$. Pinned by
+`tests/simulate_iov_kappa.rs::simulate_iov_scaling_matches_nonmem_occasionless`.
+
 ## TTE simulation {#tte-simulation}
 
 For a [time-to-event model](../estimation/tte.qmd) there are no continuous
