@@ -500,6 +500,22 @@ pub fn compute_event_pk_params(
     out
 }
 
+/// Whether a subject needs **per-event** PK (a snapshot resolved separately at
+/// each dose / observation / EVID=2 record) rather than a single frozen t=0
+/// snapshot: its PK varies across the horizon because a covariate changes on a
+/// dose/obs row (`has_tv_covariates`), a covariate changes only on an EVID=2
+/// (pk-only) row (`pk_only_covariates`, which `has_tv_covariates` does not
+/// inspect), or the model reads the `TIME` built-in. Single source of truth for
+/// this decision (#700): the per-event PK materializer
+/// ([`compute_event_pk_params_into`]) and the adaptive driver's `event_pk` gate /
+/// `auc_target` guard (`api::run_adaptive_population`) all consult it, so they
+/// cannot drift apart and silently freeze PK on one path but not another.
+pub(crate) fn subject_needs_per_event_pk(model: &CompiledModel, subject: &Subject) -> bool {
+    subject.has_tv_covariates()
+        || !subject.pk_only_covariates.is_empty()
+        || model_uses_time_builtin(model)
+}
+
 /// Same as [`compute_event_pk_params`] but writes into a caller-owned
 /// buffer. Used by SAEM's MH loop and the FOCE objective closure where
 /// the buffer is allocated once per subject and reused across many
@@ -520,10 +536,7 @@ pub fn compute_event_pk_params_into(
     out.obs.clear();
     out.pk_only.clear();
 
-    if subject.has_tv_covariates()
-        || !subject.pk_only_covariates.is_empty()
-        || model_uses_time_builtin(model)
-    {
+    if subject_needs_per_event_pk(model, subject) {
         for k in 0..subject.doses.len() {
             out.dose.push(pk_params_at_time(
                 model,

@@ -1759,6 +1759,67 @@ fn segment_pk_at(
     last_pk
 }
 
+/// PK snapshot to seed the per-event (time-varying) adaptive walk from: the
+/// earliest obs / pk-only record's snapshot, mirroring
+/// [`ode_predictions_event_driven`]'s init so a covariate-dependent
+/// `init(state)=expr` is seeded correctly (#700). Falls back to `fallback` when
+/// the subject carries **no** record (e.g. a `TIME`-in-PK subject driven purely by
+/// decision times) — the caller passes the t=0 baseline PK there, never a
+/// zero-PK default. Shared by the driver and `adaptive_frozen_replay_tv` so the two
+/// seed identically and stay bit-aligned; when at least one record exists the
+/// fallback is unused, so a differing fallback between the two is harmless.
+fn earliest_record_pk(
+    subject: &Subject,
+    event_pk: &crate::pk::EventPkParams,
+    fallback: PkParams,
+) -> PkParams {
+    let mut best: Option<(f64, PkParams)> = None;
+    for (j, &t) in subject.obs_times.iter().enumerate() {
+        if best.map_or(true, |(bt, _)| t < bt) {
+            best = Some((t, event_pk.obs[j]));
+        }
+    }
+    for (m, &t) in subject.pk_only_times.iter().enumerate() {
+        if best.map_or(true, |(bt, _)| t < bt) {
+            best = Some((t, event_pk.pk_only[m]));
+        }
+    }
+    best.map(|(_, p)| p).unwrap_or(fallback)
+}
+
+/// LOCF covariate map governing a **decision** at time `t` on the per-event
+/// (time-varying) adaptive path (#700). The covariate of the most-recent obs /
+/// pk-only record at or before `t`, mirroring the LOCF PK carry (`pk_readout`), so
+/// a monitored signal (or a `[scaling]` / `observe` expression) that references a
+/// time-varying covariate *directly* — not only through a resolved PK parameter —
+/// sees the covariate active at the decision, not the frozen t=0 baseline. An obs
+/// record wins a tie with a pk-only record at the same time (matching
+/// [`segment_pk_at`]). Falls back to `baseline` only for a decision that precedes
+/// the first record. The constant-covariate path never calls this.
+fn locf_decision_cov<'a>(
+    t: f64,
+    subject: &'a Subject,
+    baseline: &'a HashMap<String, f64>,
+) -> &'a HashMap<String, f64> {
+    let mut best: Option<(f64, &'a HashMap<String, f64>)> = None;
+    for (j, &rt) in subject.obs_times.iter().enumerate() {
+        if rt <= t + 1e-12 && best.map_or(true, |(bt, _)| rt >= bt) {
+            if let Some(cov) = subject.obs_covariates.get(j) {
+                best = Some((rt, cov));
+            }
+        }
+    }
+    for (m, &rt) in subject.pk_only_times.iter().enumerate() {
+        // Strict `>` so an obs record at the same time keeps priority.
+        if rt <= t + 1e-12 && best.map_or(true, |(bt, _)| rt > bt) {
+            if let Some(cov) = subject.pk_only_covariates.get(m) {
+                best = Some((rt, cov));
+            }
+        }
+    }
+    best.map(|(_, c)| c).unwrap_or(baseline)
+}
+
 /// Reactive ("adaptive" / feedback) ODE prediction over a single subject (#391
 /// S1.3). Walks a fixed `decision_times` schedule, and at each decision lets
 /// `controller` read the current state (through the declared `monitors`) and
@@ -1925,22 +1986,17 @@ pub(crate) fn ode_predictions_adaptive_impl(
 
     // Per-event PK seed for the TV path (#700): the snapshot at the subject's
     // earliest record (obs or pk-only), mirroring `ode_predictions_event_driven`'s
-    // init so a covariate-dependent `init(state)=expr` is seeded correctly. Only
-    // read when `tv`; the constant path seeds `u` from `pk_params_flat` as before.
+    // init so a covariate-dependent `init(state)=expr` is seeded correctly. A
+    // record-free subject (e.g. a `TIME`-in-PK subject driven purely by decision
+    // times) falls back to the t=0 baseline `pk_params_flat`, never a zero-PK
+    // default (which would integrate CL=V=0 → NaN). Only read when `tv`; the
+    // constant path seeds `u` from `pk_params_flat` as before.
     let init_pk: PkParams = match event_pk {
         Some(ev) => {
-            let mut best: Option<(f64, PkParams)> = None;
-            for (j, &t) in subject.obs_times.iter().enumerate() {
-                if best.map_or(true, |(bt, _)| t < bt) {
-                    best = Some((t, ev.obs[j]));
-                }
-            }
-            for (m, &t) in subject.pk_only_times.iter().enumerate() {
-                if best.map_or(true, |(bt, _)| t < bt) {
-                    best = Some((t, ev.pk_only[m]));
-                }
-            }
-            best.map(|(_, p)| p).unwrap_or_default()
+            let mut base = PkParams::default();
+            let m = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
+            base.values[..m].copy_from_slice(&pk_params_flat[..m]);
+            earliest_record_pk(subject, ev, base)
         }
         None => PkParams::default(),
     };
@@ -2017,6 +2073,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
         .obs_times
         .iter()
         .chain(decision_times.iter())
+        // A trailing pk-only (EVID=2) record can be the latest event on the TV path,
+        // so the horizon must reach it too (it also becomes a break below).
+        .chain(shadow.pk_only_times.iter())
         .cloned()
         .fold(0.0_f64, f64::max);
     let mut break_times: Vec<f64> = vec![0.0, t_last];
@@ -2027,6 +2086,33 @@ pub(crate) fn ode_predictions_adaptive_impl(
     }
     break_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+
+    // #700 review guard: the tolerance dedup above can merge two break times within
+    // 1e-15 that are not bit-identical, but `segment_pk_at` / `decision_index_of` /
+    // `obs_map` resolve records by *exact* bits. If a decision, observation, or
+    // pk-only time were merged into a different representative, its exact-bit lookup
+    // would silently miss — dropping a per-event PK snapshot or a dose decision, and
+    // the frozen-replay verifier (which shares this dedup) could not catch it. Fail
+    // loudly instead, honoring this module's "never a silent wrong answer" contract.
+    // Integer-hour grids (every test / example) are bit-exact and never trip this.
+    if tv {
+        let surviving: std::collections::HashSet<u64> =
+            break_times.iter().map(|t| t.to_bits()).collect();
+        if let Some(t) = decision_times
+            .iter()
+            .chain(shadow.obs_times.iter())
+            .chain(shadow.pk_only_times.iter())
+            .copied()
+            .find(|t| !surviving.contains(&t.to_bits()))
+        {
+            return Err(format!(
+                "adaptive-dosing (time-varying) event time {t} lies within 1e-15 of another \
+                 break time but is not bit-identical, so its per-event PK / decision lookup \
+                 would be silently dropped. Align decision, observation, and EVID=2 times to \
+                 identical values (integer-valued time grids are unaffected)."
+            ));
+        }
+    }
 
     let mut stopped = false;
 
@@ -2054,14 +2140,21 @@ pub(crate) fn ode_predictions_adaptive_impl(
             if let Some(&decision_index) = decision_index_of.get(&t_start.to_bits()) {
                 // Covariate snapshot in effect at the decision time. When the
                 // decision coincides with an observation row, use that row's
-                // per-observation snapshot (so time-varying covariates drive the
-                // monitored readouts and the controller's view); otherwise fall
-                // back to the subject-static map.
-                let decision_cov = obs_map
+                // per-observation snapshot. Otherwise, on the TV path (#700), carry
+                // the covariate of the most-recent record forward (LOCF) so it stays
+                // consistent with `pk_readout` (also LOCF) — a decision that lands
+                // between records must NOT read the frozen t=0 covariate, or an
+                // `observe` / `[scaling]` expression that references a time-varying
+                // covariate directly would drive the controller off a stale value.
+                // The constant path keeps the subject-static map (byte-identical).
+                let decision_cov = match obs_map
                     .get(&t_start.to_bits())
                     .and_then(|idxs| idxs.first())
-                    .map(|&i| shadow.obs_cov(i))
-                    .unwrap_or(&shadow.covariates);
+                {
+                    Some(&i) => shadow.obs_cov(i),
+                    None if tv => locf_decision_cov(t_start, subject, &shadow.covariates),
+                    None => &shadow.covariates,
+                };
                 // Resolve each monitored signal at the current (pre-dose) state.
                 let mut signals: HashMap<String, f64> = HashMap::new();
                 let mut observed: Vec<ObservedSignal> = Vec::with_capacity(monitors.len());
@@ -2545,21 +2638,11 @@ fn adaptive_frozen_replay_tv(
         pk_only_map.entry(t.to_bits()).or_insert(m);
     }
 
-    // Seed PK / state from the earliest record, mirroring the driver's init.
-    let init_pk: PkParams = {
-        let mut best: Option<(f64, PkParams)> = None;
-        for (j, &t) in subject.obs_times.iter().enumerate() {
-            if best.map_or(true, |(bt, _)| t < bt) {
-                best = Some((t, event_pk.obs[j]));
-            }
-        }
-        for (m, &t) in subject.pk_only_times.iter().enumerate() {
-            if best.map_or(true, |(bt, _)| t < bt) {
-                best = Some((t, event_pk.pk_only[m]));
-            }
-        }
-        best.map(|(_, p)| p).unwrap_or_default()
-    };
+    // Seed PK / state from the earliest record, mirroring the driver's init via the
+    // shared `earliest_record_pk` so the two seed identically. A record-free subject
+    // yields empty `predictions` here (nothing to verify), so the `default()`
+    // fallback — which the driver seeds from the t=0 baseline instead — is moot.
+    let init_pk: PkParams = earliest_record_pk(subject, event_pk, PkParams::default());
     let mut last_pk = init_pk;
     let mut u = ode.initial_state(&init_pk.values);
     let mut predictions = vec![f64::NAN; n_obs];
@@ -2585,6 +2668,8 @@ fn adaptive_frozen_replay_tv(
         .obs_times
         .iter()
         .chain(extra_breaks.iter())
+        // Match the driver: a trailing pk-only record extends the horizon too.
+        .chain(subject.pk_only_times.iter())
         .cloned()
         .fold(0.0_f64, f64::max);
     let mut break_times: Vec<f64> = vec![0.0, t_last];
@@ -4867,6 +4952,250 @@ mod tests {
                 .iter()
                 .any(|d| matches!(d.outcome, DecisionOutcome::Hold)),
             "expected at least one hold to exercise a decision-only break"
+        );
+    }
+
+    #[test]
+    fn earliest_record_pk_seeds_earliest_else_fallback() {
+        // #700 seed helper: with records present, seed from the earliest record's
+        // per-event PK (obs vs pk-only, whichever is earlier). With NO record, fall
+        // back to the supplied baseline — never a zero-PK default (which would
+        // integrate CL=V=0 → NaN for a record-free TIME-in-PK subject).
+        let event_pk = crate::pk::EventPkParams {
+            dose: Vec::new(),
+            obs: vec![pk_one(1.0, 10.0), pk_one(2.0, 10.0)],
+            pk_only: vec![pk_one(9.0, 10.0)],
+        };
+        // obs at 24 & 48, pk-only at 6 (earliest) → seed = pk_only[0] (CL=9).
+        let mut s = make_subject(vec![], vec![24.0, 48.0]);
+        s.pk_only_times = vec![6.0];
+        let seeded = earliest_record_pk(&s, &event_pk, pk_one(5.0, 5.0));
+        assert_eq!(
+            seeded.cl(),
+            9.0,
+            "earliest record is the pk-only row at t=6"
+        );
+
+        // No records at all → the baseline fallback, not PkParams::default().
+        let empty = crate::pk::EventPkParams::default();
+        let recordless = make_subject(vec![], vec![]);
+        let fallback = pk_one(5.0, 5.0);
+        let seeded = earliest_record_pk(&recordless, &empty, fallback);
+        assert_eq!(
+            seeded.cl(),
+            5.0,
+            "record-free subject seeds from the baseline"
+        );
+        assert_ne!(
+            seeded.cl(),
+            PkParams::default().cl(),
+            "must NOT be the zero-PK default"
+        );
+    }
+
+    #[test]
+    fn locf_decision_cov_carries_forward_prefers_obs_and_falls_back() {
+        // #700: at a decision that lands between records, the covariate must be the
+        // most-recent record's (LOCF), not the frozen t=0 baseline; an obs record
+        // wins a tie with a pk-only record; before the first record, the baseline.
+        let baseline = HashMap::from([("WT".to_string(), 70.0)]);
+        let mut s = make_subject(vec![], vec![0.0, 24.0, 48.0]);
+        s.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 50.0)]),
+            HashMap::from([("WT".to_string(), 30.0)]),
+        ];
+        // A pk-only row at t=24 with a *different* WT proves obs wins the tie.
+        s.pk_only_times = vec![24.0];
+        s.pk_only_covariates = vec![HashMap::from([("WT".to_string(), 999.0)])];
+
+        // Decision at t=36 → LOCF is the obs at t=24 (WT=50), not baseline 70.
+        assert_eq!(locf_decision_cov(36.0, &s, &baseline)["WT"], 50.0);
+        // At t=24 exactly, the obs record wins over the coincident pk-only row.
+        assert_eq!(locf_decision_cov(24.0, &s, &baseline)["WT"], 50.0);
+        // Before the first record (t=-1) → baseline.
+        assert_eq!(locf_decision_cov(-1.0, &s, &baseline)["WT"], 70.0);
+    }
+
+    #[test]
+    fn adaptive_tv_decision_between_records_reads_locf_covariate() {
+        // #700 regression: a decision that does NOT coincide with an observation
+        // must read the LOCF covariate (the most-recent record), not the frozen t=0
+        // baseline. Before the fix, `decision_cov` fell back to `shadow.covariates`
+        // (t=0) while `pk_readout` used the LOCF PK — so an `observe` expression that
+        // references a time-varying covariate directly saw a stale value and the
+        // controller titrated off the wrong signal. The frozen-replay verifier is
+        // blind to this (it never re-runs decisions), so it needs its own test.
+        let ode = one_cpt_ode_spec();
+        let mut base = make_subject(vec![], vec![0.0, 24.0, 48.0]);
+        base.covariates = HashMap::from([("WT".to_string(), 70.0)]);
+        base.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 50.0)]),
+            HashMap::from([("WT".to_string(), 30.0)]),
+        ];
+        let event_pk = crate::pk::EventPkParams {
+            dose: Vec::new(),
+            obs: vec![pk_one(1.0, 10.0); 3],
+            pk_only: Vec::new(),
+        };
+        // `observe` reads the covariate WT directly (the case that regresses).
+        let obs_fn: OdeOutputFn = Box::new(
+            |_u: &[f64], _pk: &[f64], _th: &[f64], _eta: &[f64], cov: &HashMap<String, f64>| {
+                *cov.get("WT").unwrap_or(&f64::NAN)
+            },
+        );
+        let spec = MonitorSpec::new("A", 1, ObserveMode::Ipred);
+        let mons = vec![AdaptiveMonitor {
+            spec: &spec,
+            observe: Some(&obs_fn),
+        }];
+        // Hold every decision — we only care about the monitored signal it recorded.
+        let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+            actions: vec![DoseAction::Hold],
+            rule: None,
+        };
+        // Decisions at 12 and 36 fall *between* obs rows.
+        let decisions = [0.0, 12.0, 36.0];
+        let run = ode_predictions_adaptive_impl(
+            &ode,
+            &event_pk.obs[0].values,
+            Some(&event_pk),
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &mons,
+            &mut decide,
+            100,
+            None,
+        )
+        .expect("driver runs");
+
+        let sig_at = |t: f64| {
+            run.decisions
+                .iter()
+                .find(|d| d.time == t)
+                .and_then(|d| d.observed_signals.first())
+                .map(|s| s.value)
+                .unwrap_or(f64::NAN)
+        };
+        // t=36 is after the t=24 obs (WT=50) → LOCF WT=50, NOT the t=0 baseline 70.
+        assert_eq!(sig_at(36.0), 50.0, "decision at t=36 must read LOCF WT=50");
+        // t=12 is after only the t=0 obs → WT=70 (which equals the baseline here).
+        assert_eq!(
+            sig_at(12.0),
+            70.0,
+            "decision at t=12 reads the t=0 record WT=70"
+        );
+    }
+
+    #[test]
+    fn adaptive_tv_break_collision_within_tolerance_is_rejected() {
+        // #700 guard: the 1e-15 `dedup_by` on `break_times` can merge a decision and
+        // an observation that are within tolerance but not bit-identical, after which
+        // the exact-`to_bits()` lookups in `segment_pk_at` / `decision_index_of` miss
+        // the dropped one — silently losing a per-event PK snapshot or a dose. Rather
+        // than a silent wrong answer, the driver rejects it loudly.
+        let ode = one_cpt_ode_spec();
+        // 0.1 + 0.2 == 0.30000000000000004 ≠ 0.3 (0.29999999999999998), |Δ| ≈ 5.5e-17.
+        let drifted = 0.1_f64 + 0.2_f64;
+        let base = make_subject(vec![], vec![0.0, 0.3]);
+        let event_pk = crate::pk::EventPkParams {
+            dose: Vec::new(),
+            obs: vec![pk_one(1.0, 10.0); 2],
+            pk_only: Vec::new(),
+        };
+        let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+            actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+            rule: None,
+        };
+        let err = ode_predictions_adaptive_impl(
+            &ode,
+            &event_pk.obs[0].values,
+            Some(&event_pk),
+            &[],
+            &[],
+            &base,
+            &[0.0, drifted],
+            &[],
+            &mut decide,
+            100,
+            None,
+        )
+        .expect_err("a sub-tolerance decision/obs collision must be rejected");
+        assert!(
+            err.contains("bit-identical"),
+            "error should cite the collision: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_tv_pk_only_records_drive_per_event_pk() {
+        // #700: an EVID=2 (pk-only) record carries a per-event PK snapshot that
+        // `has_tv_covariates()` never inspects. The driver must resolve the segment
+        // ending at the pk-only row from `event_pk.pk_only`, and the frozen-replay
+        // engine must agree bit-for-bit. Every prior test used `pk_only: Vec::new()`,
+        // so this pins the pk-only branch of `segment_pk_at` + the pk-only seed/break
+        // loops in both engines.
+        let ode = one_cpt_ode_spec();
+        let v = 10.0;
+        // obs at 0 & 48; a pk-only record at 24 governs the (0, 24] decay.
+        let mut base = make_subject(vec![], vec![0.0, 48.0]);
+        base.pk_only_times = vec![24.0];
+        base.pk_only_covariates = vec![HashMap::from([("CRCL".to_string(), 40.0)])];
+        base.obs_covariates = vec![
+            HashMap::from([("CRCL".to_string(), 100.0)]),
+            HashMap::from([("CRCL".to_string(), 100.0)]),
+        ];
+
+        let run_for = |pk_only_cl: f64| {
+            let event_pk = crate::pk::EventPkParams {
+                dose: Vec::new(),
+                obs: vec![pk_one(1.0, v), pk_one(1.0, v)],
+                pk_only: vec![pk_one(pk_only_cl, v)],
+            };
+            let mut decide = |_ctx: &ControllerCtx| ControllerDecision {
+                actions: vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }],
+                rule: None,
+            };
+            let run = ode_predictions_adaptive_impl(
+                &ode,
+                &event_pk.obs[0].values,
+                Some(&event_pk),
+                &[],
+                &[],
+                &base,
+                &[0.0, 24.0, 48.0],
+                &[],
+                &mut decide,
+                100,
+                None,
+            )
+            .expect("driver runs");
+            // The frozen-replay verifier exercises the pk-only branch of the static
+            // replay engine and pins bit-alignment with the driver.
+            verify_adaptive_frozen_replay(
+                &ode,
+                &event_pk.obs[0].values,
+                Some(&event_pk),
+                &[],
+                &[],
+                &base,
+                &[0.0, 24.0, 48.0],
+                &run,
+            )
+            .expect("pk-only TV run matches the static replay");
+            *run.predictions.last().unwrap()
+        };
+
+        // A faster pk-only CL clears more drug over (0, 24], so the t=48 prediction
+        // is materially lower — proving the pk-only snapshot is actually consumed.
+        let slow = run_for(0.2);
+        let fast = run_for(3.0);
+        assert!(
+            fast < slow - 1e-6,
+            "pk-only per-event CL must drive the trajectory: slow={slow}, fast={fast}"
         );
     }
 

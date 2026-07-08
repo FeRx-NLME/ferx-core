@@ -7105,11 +7105,6 @@ where
     let mut decisions: Vec<DecisionLogEntry> = Vec::new();
     let mut metrics: Vec<AdaptiveSubjectMetrics> = Vec::new();
 
-    // Whether the model reads the `TIME` built-in in its individual parameters
-    // (#700). Model-constant, so resolved once; forces the per-event PK path even
-    // for a subject that carries no time-varying covariates.
-    let uses_time = crate::pk::model_uses_time_builtin(model);
-
     // `auc_target_attainment` (#391 S2.5b) integrates a dense grid with a single PK
     // snapshot — exact only for constant-covariate subjects. A time-varying (or
     // TIME-in-PK) subject would silently get a frozen-PK AUC (there is no exact
@@ -7119,11 +7114,10 @@ where
     // adaptive output — predictions, decisions, the dose ledger, `target_window` — is
     // fully per-event covariate-aware; only this one exposure metric is deferred.
     if auc_target.is_some()
-        && (uses_time
-            || population
-                .subjects
-                .iter()
-                .any(|s| s.has_tv_covariates() || !s.pk_only_covariates.is_empty()))
+        && population
+            .subjects
+            .iter()
+            .any(|s| crate::pk::subject_needs_per_event_pk(model, s))
     {
         return Err(
             "adaptive-dosing `auc_target` is not yet supported for time-varying-covariate \
@@ -7134,6 +7128,13 @@ where
                 .to_string(),
         );
     }
+
+    // Reused per-event PK buffer (#700): filled in place per (sim, subject) on the
+    // time-varying path via `compute_event_pk_params_into`, so the hot loop keeps
+    // its backing `Vec`s instead of allocating three fresh ones per replicate. The
+    // values are recomputed every iteration (η is redrawn); only the allocation is
+    // reused. Unused on the constant path (`event_pk` stays `None`).
+    let mut event_pk_buf = crate::pk::EventPkParams::default();
 
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
@@ -7148,20 +7149,22 @@ where
             // Per-event PK when the subject's covariates (dose / obs / pk-only rows)
             // or a `TIME` built-in vary PK across the horizon (#700); the reactive
             // driver then resolves PK per segment from these snapshots. `None` ⇒
-            // constant PK, driven from the frozen `pk` snapshot below.
-            let event_pk = if subject.has_tv_covariates()
-                || !subject.pk_only_covariates.is_empty()
-                || uses_time
-            {
-                Some(crate::pk::compute_event_pk_params(
-                    model,
-                    subject,
-                    &params.theta,
-                    &eta_slice,
-                ))
-            } else {
-                None
-            };
+            // constant PK, driven from the frozen `pk` snapshot below. One shared
+            // predicate (`subject_needs_per_event_pk`) gates the materialiser, this
+            // gate, and the `auc_target` guard so they cannot drift apart.
+            let event_pk: Option<&crate::pk::EventPkParams> =
+                if crate::pk::subject_needs_per_event_pk(model, subject) {
+                    crate::pk::compute_event_pk_params_into(
+                        model,
+                        subject,
+                        &params.theta,
+                        &eta_slice,
+                        &mut event_pk_buf,
+                    );
+                    Some(&event_pk_buf)
+                } else {
+                    None
+                };
 
             // Baseline PK snapshot at the start of the simulation horizon (t=0).
             let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates, 0.0);
@@ -7193,7 +7196,7 @@ where
             let run: AdaptiveRun = crate::ode::ode_predictions_adaptive_impl(
                 ode,
                 &pk.values,
-                event_pk.as_ref(),
+                event_pk,
                 &params.theta,
                 &eta_slice,
                 subject,
@@ -7209,7 +7212,7 @@ where
                 crate::ode::verify_adaptive_frozen_replay(
                     ode,
                     &pk.values,
-                    event_pk.as_ref(),
+                    event_pk,
                     &params.theta,
                     &eta_slice,
                     subject,
