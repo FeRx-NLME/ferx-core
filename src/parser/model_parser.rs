@@ -4753,10 +4753,11 @@ const DATA_BLOCK_ROLES: &[&str] = &[
 ///   WT  = weight   # rename an arbitrary covariate
 /// ```
 ///
-/// Validated here: empty target names, a target mapped twice, and two targets
-/// mapped to the same actual header. Whether a mapped header actually exists in
-/// the dataset — and whether a rename collides with a surviving column — can
-/// only be checked when the CSV is read, so that lives in the datareader.
+/// Validated here: an empty `path`, empty target names, a target mapped twice,
+/// and two targets mapped to the same actual header. Whether a mapped header
+/// actually exists in the dataset — and whether a rename collides with a
+/// surviving column — can only be checked when the CSV is read, so that lives in
+/// the datareader.
 fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>), String> {
     let mut path: Option<String> = None;
     let mut column_map: Vec<(String, String)> = Vec::new();
@@ -4768,6 +4769,9 @@ fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>),
         let (key, value) = (parts[0], parts[1].trim_matches(|c| c == '"' || c == '\''));
         let key_lc = key.to_ascii_lowercase();
         if key_lc == "path" {
+            if value.is_empty() {
+                return Err("[data]: empty `path` — write `path = <path-to-csv>`".to_string());
+            }
             path = Some(value.to_string());
             continue;
         }
@@ -17813,6 +17817,14 @@ mod tests {
                 ("DV".to_string(), "CONC".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_data_block_empty_path_is_error() {
+        // A bare `path =` fails loudly here rather than surfacing later as an
+        // opaque CSV-open error.
+        let err = parse_data_block(&["path =".to_string()]).unwrap_err();
+        assert!(err.contains("empty `path`"), "{err}");
     }
 
     #[test]

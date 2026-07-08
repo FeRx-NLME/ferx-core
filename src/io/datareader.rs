@@ -473,7 +473,7 @@ fn read_nonmem_csv_impl(
                 .position(|h| h.eq_ignore_ascii_case(actual))
                 .ok_or_else(|| {
                     format!(
-                        "[data]: mapped column `{actual}` (for role `{target}`) not found in \
+                        "[data]: mapped column `{actual}` (renamed to `{target}`) not found in \
                          dataset headers: {}",
                         headers.join(", ")
                     )
@@ -483,7 +483,7 @@ fn read_nonmem_csv_impl(
             if let Some(iov) = iov_column {
                 if actual.eq_ignore_ascii_case(iov) {
                     return Err(format!(
-                        "[data]: mapped column `{actual}` (for role `{target}`) is also the \
+                        "[data]: mapped column `{actual}` (renamed to `{target}`) is also the \
                          iov_column `{iov}`"
                     ));
                 }
@@ -3104,7 +3104,7 @@ mod tests {
         let map = vec![("dv".to_string(), "CONC".to_string())];
         let err = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap_err();
         assert!(err.contains("mapped column `CONC`"), "{err}");
-        assert!(err.contains("role `dv`"), "{err}");
+        assert!(err.contains("renamed to `dv`"), "{err}");
     }
 
     #[test]
