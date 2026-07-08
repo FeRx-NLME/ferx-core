@@ -78,6 +78,12 @@ pub fn run_covariance(
     // --- Resolve model -----------------------------------------------------
     let model_owned: Option<CompiledModel>;
     let mut iov_column_from_parse: Option<String> = None;
+    // `[data]` canonical-role → header remapping (#730). Captured from the parse
+    // so a re-read from disk honours renames like `TIME = TAFD` — otherwise the
+    // CSV reader looks for the canonical headers and mis-parses / hard-errors on
+    // a dataset the original fit read fine. Only meaningful on the re-parse path
+    // (model == None); a caller-supplied model+population never re-reads.
+    let mut column_map_from_parse: Vec<(String, String)> = Vec::new();
     let model_ref: &CompiledModel = match model {
         Some(m) => m,
         None => {
@@ -100,6 +106,7 @@ pub fn run_covariance(
             }
             let parsed = crate::parser::model_parser::parse_full_model_file(Path::new(path))?;
             iov_column_from_parse = parsed.fit_options.iov_column.clone();
+            column_map_from_parse = parsed.column_map.clone();
             model_owned = Some(parsed.model);
             model_owned.as_ref().unwrap()
         }
@@ -135,10 +142,11 @@ pub fn run_covariance(
                     ));
                 }
             }
-            let p = crate::io::datareader::read_nonmem_csv(
+            let p = crate::io::datareader::read_nonmem_csv_mapped(
                 Path::new(path),
                 None,
                 iov_column_from_parse.as_deref(),
+                &column_map_from_parse,
             )?;
             pop_owned = Some(p);
             pop_owned.as_ref().unwrap()
@@ -369,6 +377,54 @@ mod tests {
         assert_eq!(out.theta, fit_b.theta);
         assert_eq!(out.omega, fit_b.omega);
         assert_eq!(out.ofv, fit_b.ofv);
+    }
+
+    /// Regression (#730 interaction): when `run_covariance` re-reads the dataset
+    /// from disk (`model = None`, `population = None`), it must honour the
+    /// model's `[data]` header renaming. Otherwise the CSV reader looks for the
+    /// canonical headers and hard-errors on a dataset the original fit read fine.
+    #[test]
+    fn run_covariance_honours_data_column_map_on_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let (model_path, data_path) = copy_example_to_tempdir(dir.path());
+
+        // Rename the TIME header to a non-canonical name in the data, and add a
+        // `[data]` block that maps it back. `read_nonmem_csv` (no map) would fail
+        // to find TIME; `read_nonmem_csv_mapped` resolves TIME = TAFD.
+        let raw = std::fs::read_to_string(&data_path).unwrap();
+        let (header, rest) = raw.split_once('\n').unwrap();
+        let renamed_header = header.replacen("TIME", "TAFD", 1);
+        std::fs::write(&data_path, format!("{renamed_header}\n{rest}")).unwrap();
+
+        let model_src = std::fs::read_to_string(&model_path).unwrap();
+        let data_str = data_path.to_str().unwrap();
+        std::fs::write(
+            &model_path,
+            format!("{model_src}\n[data]\npath = {data_str}\nTIME = TAFD\n"),
+        )
+        .unwrap();
+
+        // Fit without cov (fit_from_files applies the [data] map), then run the
+        // standalone step forcing a disk re-read.
+        let fit = fit_from_files(
+            model_path.to_str().unwrap(),
+            Some(data_path.to_str().unwrap()),
+            None,
+            Some(FitOptions {
+                run_covariance_step: false,
+                ..quick_opts()
+            }),
+        )
+        .expect("fit must converge on the renamed dataset");
+
+        let out = run_covariance(&fit, None, None, &quick_opts())
+            .expect("run_covariance must re-read the renamed dataset via the column map");
+        // The re-read succeeded and produced a real covariance step — proving the
+        // map was applied (an unmapped read would have errored above).
+        assert!(matches!(
+            out.covariance_status,
+            CovarianceStatus::Computed | CovarianceStatus::Failed
+        ));
     }
 
     #[test]
