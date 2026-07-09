@@ -296,7 +296,7 @@ pub fn run_model_with_data_inits(
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
     let sel_filter = build_selection_filter(&parsed.fit_options)?;
-    let (population, covariate_table) = read_population_for(
+    let (mut population, covariate_table) = read_population_for(
         &parsed.model,
         &parsed.covariate_decls,
         data_path,
@@ -343,7 +343,29 @@ pub fn run_model_with_data_inits(
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
     result.model_text = std::fs::read_to_string(model_path).ok();
+    derive_output_occasions(&parsed.model, &parsed.fit_options, &mut population);
     Ok((result, population))
+}
+
+/// Mirror [`fit`]'s model-side IOV occasion derivation onto a caller-owned
+/// population so downstream output — sdtab's `OCC` column and any per-occasion
+/// diagnostic keyed on [`Subject::occasions`] — reflects the derived labels.
+/// `fit()` derives occasions only on its internal population clone, so without
+/// this the returned population still has empty `occasions` under a
+/// `dose`/`time(...)` rule and the OCC column silently vanishes versus an
+/// equivalent `iov_column` run (#757). No-op unless the model declares kappa and
+/// a derived rule is active; `had_column = false` + a throwaway sink because the
+/// override warning already fired inside `fit()`.
+fn derive_output_occasions(
+    model: &CompiledModel,
+    options: &FitOptions,
+    population: &mut Population,
+) {
+    if model.n_kappa == 0 || options.iov_occasion == IovOccasionRule::Column {
+        return;
+    }
+    let mut sink = Vec::new();
+    apply_iov_occasion_rule(population, &options.iov_occasion, false, &mut sink);
 }
 
 /// Run a model file with simulated data (from [simulation] block).
@@ -1062,36 +1084,60 @@ fn apply_iov_occasion_rule(
         match rule {
             IovOccasionRule::Column => unreachable!("handled by the early return above"),
             IovOccasionRule::TimeWindows(edges) => {
-                // Observations use the raw (user-clock) time when available so the
-                // breakpoints match the data file's TIME even for reset-stacked
-                // subjects; doses fall back to the internal event time.
-                let use_raw = s.obs_raw_times.len() == s.obs_times.len();
-                s.occasions = (0..s.obs_times.len())
-                    .map(|i| {
-                        let t = if use_raw {
-                            s.obs_raw_times[i]
-                        } else {
-                            s.obs_times[i]
-                        };
-                        window_occ(edges, t)
-                    })
-                    .collect();
+                // Bucket observations and doses on the *same* internal event clock.
+                // For reset-stacked subjects (EVID 3/4) that clock is monotonic and
+                // already shifted so each reset segment sits past the previous one,
+                // so the breakpoints separate periods correctly. Using the raw user
+                // TIME for observations (as an earlier version did) is wrong on two
+                // counts: it restarts each period — folding period 2 back into
+                // occasion 0 — and it puts observations on a different clock than the
+                // doses (whose only stored time is the internal one), so a dose could
+                // land in a different occasion than its co-timed samples (#757).
+                s.occasions = s.obs_times.iter().map(|&t| window_occ(edges, t)).collect();
                 s.dose_occasions = s.doses.iter().map(|d| window_occ(edges, d.time)).collect();
             }
             IovOccasionRule::PerDose => {
-                // Each dose (in time order) opens a new occasion. Doses are stored
-                // time-sorted at load, so the vector index is the occasion label.
-                s.dose_occasions = (0..s.doses.len() as u32).collect();
-                let dose_times: Vec<f64> = s.doses.iter().map(|d| d.time).collect();
+                // Each distinct administration *time* opens a new occasion. Doses
+                // that share a time (e.g. a simultaneous depot + central bolus, or a
+                // split dual-route dose) share one occasion rather than each spawning
+                // its own — indexing by dose position would leave the earlier
+                // co-timed dose stranded in an empty occasion, since observations can
+                // only map to one of them (#757). Doses are stored time-sorted, so a
+                // running counter that ticks on each time change is the label.
+                let mut dose_occ = Vec::with_capacity(s.doses.len());
+                let mut occ = 0u32;
+                let mut prev: Option<f64> = None;
+                for d in &s.doses {
+                    if let Some(p) = prev {
+                        if d.time != p {
+                            occ += 1;
+                        }
+                    }
+                    dose_occ.push(occ);
+                    prev = Some(d.time);
+                }
+                s.dose_occasions = dose_occ;
+                // Distinct dose times, ascending (one per occasion label above).
+                let mut dose_times: Vec<f64> = Vec::new();
+                for d in &s.doses {
+                    if dose_times.last() != Some(&d.time) {
+                        dose_times.push(d.time);
+                    }
+                }
+                // Observation occasion = most recent dose at or before its time
+                // (dose-before-obs tie-break at equal TIME); pre-first-dose rows fold
+                // into occasion 0. obs_times are ascending, so a single forward walk
+                // over the distinct dose times is linear rather than O(obs*doses)
+                // (#757 cleanup).
+                let mut j = 0usize;
                 s.occasions = s
                     .obs_times
                     .iter()
                     .map(|&t| {
-                        // Count doses at or before this observation (dose-before-obs
-                        // tie-break at equal TIME); pre-first-dose rows fold into
-                        // occasion 0.
-                        let n = dose_times.iter().filter(|&&dt| dt <= t).count();
-                        n.saturating_sub(1) as u32
+                        while j < dose_times.len() && dose_times[j] <= t {
+                            j += 1;
+                        }
+                        j.saturating_sub(1) as u32
                     })
                     .collect();
             }
@@ -2732,7 +2778,18 @@ pub fn fit(
     let mut ltbs_warnings: Vec<String> = Vec::new();
     // A model-side IOV occasion rule (`iov_occasion = dose | time(...)`) derives
     // the occasion labels from each subject's timeline instead of a data column.
-    let derive_occ = options.iov_occasion != IovOccasionRule::Column;
+    // Only meaningful when the model actually declares kappa: without it the
+    // derived labels feed nothing, so skip the clone + derivation entirely and
+    // tell the user the option is a no-op rather than silently paying for it.
+    let iov_rule_set = options.iov_occasion != IovOccasionRule::Column;
+    if iov_rule_set && model.n_kappa == 0 {
+        ltbs_warnings.push(
+            "iov_occasion is set in [fit_options] but the model declares no kappa (IOV) \
+             random effects, so it has no effect and no occasions were derived."
+                .to_string(),
+        );
+    }
+    let derive_occ = iov_rule_set && model.n_kappa > 0;
     let pop_pruned: std::borrow::Cow<Population> = {
         let needs_prune = population.subjects.iter().any(|s| {
             !s.dose_covariates.is_empty()
@@ -2770,6 +2827,51 @@ pub fn fit(
         }
     };
     let pop_ref: &Population = &*pop_pruned;
+
+    // A model-side occasion rule must actually partition the timeline. The
+    // dataset-column path is guarded by `E_IOV_MISSING_OCC`; the derived path
+    // suppresses that check (labels arrive at fit time), so re-establish the same
+    // invariant on the *derived* labels here (#757):
+    //   - if every subject collapses to a single occasion, the per-occasion kappa
+    //     is added once per subject exactly like an eta — confounded with
+    //     between-subject variability and unidentifiable — so error, as the
+    //     column path would have;
+    //   - if the count explodes (e.g. `iov_occasion = dose` on an ADDL train,
+    //     where each expanded dose opens an occasion), the inner per-subject
+    //     problem balloons; warn so the multiplication isn't silent.
+    if derive_occ {
+        // Distinct occasion labels seen across observations and doses, per subject.
+        let distinct_occ = |s: &Subject| -> usize {
+            let mut occs: Vec<u32> = s.occasions.clone();
+            occs.extend_from_slice(&s.dose_occasions);
+            occs.sort_unstable();
+            occs.dedup();
+            occs.len()
+        };
+        let max_occ = pop_ref.subjects.iter().map(distinct_occ).max().unwrap_or(0);
+        if max_occ <= 1 {
+            return Err(
+                "The `iov_occasion` rule produced only a single occasion for every subject, \
+                 so the per-occasion kappa (IOV) cannot be separated from between-subject \
+                 variability (it is unidentifiable). Use `iov_occasion = time(...)` with \
+                 breakpoints inside the sampling window, `iov_occasion = dose` on a \
+                 multiple-dose design, or supply an `iov_column`."
+                    .to_string(),
+            );
+        }
+        // Above this many occasions per subject the derivation has almost
+        // certainly over-partitioned (e.g. a long ADDL dose train); the fit still
+        // runs but the inner kappa dimensionality is n_iov * max_occ per subject.
+        const IOV_OCCASION_WARN_LIMIT: usize = 20;
+        if max_occ > IOV_OCCASION_WARN_LIMIT {
+            ltbs_warnings.push(format!(
+                "iov_occasion derived {max_occ} occasions for at least one subject — the \
+                 inner per-subject problem grows with the occasion count. If this came from \
+                 an ADDL/steady-state dose train, prefer `iov_occasion = time(...)` windows \
+                 or an `iov_column` that groups administrations into fewer occasions."
+            ));
+        }
+    }
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {
@@ -8960,6 +9062,136 @@ mod iov_integration {
         for (a, b) in r_col.ebe_kappas.iter().zip(&r_dsl.ebe_kappas) {
             assert_eq!(a.len(), b.len(), "same number of occasions per subject");
         }
+    }
+
+    // #757: TimeWindows must bucket observations on the internal (monotonic)
+    // event clock, not the raw user clock. A reset-stacked crossover restarts
+    // the user TIME each period; if the derivation read `obs_raw_times` the
+    // second period's early samples would fold back into occasion 0 and split
+    // from their (internal-clock) doses.
+    #[test]
+    fn test_apply_iov_occasion_time_windows_uses_internal_clock() {
+        let mut pop = make_iov_population();
+        // Raw times that restart mid-series, as a period-2 reset would; the
+        // internal obs_times stay [1..6]. The rule must ignore these.
+        for s in &mut pop.subjects {
+            s.obs_raw_times = vec![1.0, 2.0, 3.0, 0.5, 1.5, 2.5];
+        }
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(
+            &mut pop,
+            &IovOccasionRule::TimeWindows(vec![3.5]),
+            false,
+            &mut warnings,
+        );
+        for s in &pop.subjects {
+            // Internal clock [1..6] with break at 3.5 → [0,0,0,1,1,1]. Had the raw
+            // times been used, the last three (all < 3.5) would be occasion 0.
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+        }
+    }
+
+    // #757: two doses administered at the same time (e.g. a simultaneous
+    // depot + central bolus) must share one occasion — the earlier one must not
+    // be stranded in an empty, observation-less occasion.
+    #[test]
+    fn test_apply_iov_occasion_per_dose_cotimed_doses_share_occasion() {
+        let mut pop = make_iov_population();
+        for s in &mut pop.subjects {
+            s.doses = vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(0.0, 50.0, 2, 0.0, false, 0.0), // co-timed
+                DoseEvent::new(3.5, 100.0, 1, 0.0, false, 0.0),
+            ];
+        }
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(&mut pop, &IovOccasionRule::PerDose, false, &mut warnings);
+        for s in &pop.subjects {
+            // Two co-timed doses at t=0 → occasion 0; dose at 3.5 → occasion 1.
+            assert_eq!(s.dose_occasions, vec![0u32, 0, 1]);
+            // Observation partition unchanged: 1..3 → occ 0, 4..6 → occ 1.
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+        }
+    }
+
+    // #757: a derived rule that collapses every subject to a single occasion
+    // leaves kappa confounded with BSV — the same unidentifiability the column
+    // path guards with E_IOV_MISSING_OCC. fit() must error rather than run.
+    #[test]
+    fn test_iov_occasion_degenerate_single_occasion_errors() {
+        let model = make_iov_model();
+        let pop = make_iov_population();
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        // Breakpoint past the last observation (max 6.0) → one occasion for all.
+        opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
+        let res = fit(&model, &pop, &model.default_params, &opts);
+        let msg = res.expect_err("single-occasion derivation must error");
+        assert!(
+            msg.contains("single occasion") || msg.contains("unidentifiable"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // #757: `iov_occasion` with no kappa in the model is a no-op — it must warn
+    // (so the user knows it had no effect) and skip the derivation entirely.
+    #[test]
+    fn test_iov_occasion_without_kappa_warns() {
+        let mut model = make_iov_model();
+        // Strip IOV so the rule has nothing to feed.
+        model.n_kappa = 0;
+        model.kappa_names.clear();
+        model.default_params.omega_iov = None;
+        model.default_params.kappa_fixed.clear();
+        let pop = make_iov_population();
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        opts.iov_occasion = IovOccasionRule::PerDose;
+        let res = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("iov_occasion") && w.contains("no effect")),
+            "expected a no-op warning, got: {:?}",
+            res.warnings
+        );
+    }
+
+    // #757: `run_model_*` mirrors the model-side occasion derivation onto the
+    // returned population so sdtab keeps its OCC column. Exercises the helper the
+    // CLI wrapper calls without a full fit.
+    #[test]
+    fn test_derive_output_occasions_matches_rule() {
+        let model = make_iov_model();
+        let empty = |p: &mut Population| {
+            for s in &mut p.subjects {
+                s.occasions.clear();
+                s.dose_occasions.clear();
+            }
+        };
+
+        // Derived rule → occasions written for output.
+        let mut pop = make_iov_population();
+        empty(&mut pop);
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        opts.iov_occasion = IovOccasionRule::PerDose;
+        super::derive_output_occasions(&model, &opts, &mut pop);
+        for s in &pop.subjects {
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+        }
+
+        // Column rule (default) → no-op, occasions stay empty.
+        let mut pop_col = make_iov_population();
+        empty(&mut pop_col);
+        let opts_col = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        super::derive_output_occasions(&model, &opts_col, &mut pop_col);
+        assert!(pop_col.subjects.iter().all(|s| s.occasions.is_empty()));
+
+        // Rule set but no kappa → no-op.
+        let mut model0 = make_iov_model();
+        model0.n_kappa = 0;
+        let mut pop0 = make_iov_population();
+        empty(&mut pop0);
+        super::derive_output_occasions(&model0, &opts, &mut pop0);
+        assert!(pop0.subjects.iter().all(|s| s.occasions.is_empty()));
     }
 
     // `ferx check` must surface the same trust_region+IOV incompatibility that

@@ -25,7 +25,12 @@ section of the SDLC for the versioning policy).
   instead of requiring a precomputed dataset column. `iov_occasion = dose`
   starts a new occasion at each administration; `iov_occasion = time(24, 48)`
   splits by time-window breakpoints. When both `iov_occasion` and `iov_column`
-  are set, the model-side rule wins (with a warning). See the
+  are set, the model-side rule wins (with a warning). Both rules bucket
+  observations and doses on the same internal event clock (correct for
+  reset-stacked crossover subjects), co-timed doses share one occasion, a
+  degenerate single-occasion partition errors instead of silently
+  under-identifying kappa, and the derived `OCC` column is written to `sdtab`
+  (#757). See the
   [IOV documentation](https://ferx-nlme.github.io/ferx-core/model-file/iov.html).
 - **`ferx summary` compares multiple runs** (#749): pass two or more `.fitrx`
   bundles (`ferx summary run1.fitrx run2.fitrx run3.fitrx`) to print a Markdown
