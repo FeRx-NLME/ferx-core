@@ -400,11 +400,11 @@ impl InputRateForcing {
     /// individual-parameter vector `params` — laid out identically to the `f64`
     /// [`Self::prepare`] input, so `arg_slots` index the same way (and the
     /// per-kind argument defaults match `prepare`, so the lifted constants
-    /// reproduce the scalar ones for `T = f64`). The smooth kinds
-    /// (inverse-Gaussian, transit, Weibull) are lifted and return `Some`;
-    /// [`InputRateKind::ZeroOrder`] returns `None` (its moving-boundary `∂/∂dur`
-    /// is not a pointwise `Dual2` expression — see #530), keeping that model on
-    /// the FD fallback. [`InputRateKind::supported_over_dual`] gates which kinds
+    /// reproduce the scalar ones for `T = f64`). All five kinds are lifted and
+    /// return `Some`: the smooth densities (inverse-Gaussian, transit, Weibull,
+    /// first-order) pointwise, and [`InputRateKind::ZeroOrder`] via its `dur` jet —
+    /// its moving-boundary `∂/∂dur` is delivered as a rate-off saltation by the
+    /// analytic provider (#530), not FD. [`InputRateKind::supported_over_dual`] gates which kinds
     /// reach here and is pinned consistent with this `match` by
     /// `supported_over_dual_agrees_with_prepare_dual`.
     pub fn prepare_dual<T: PkNum>(&self, params: &[T]) -> Option<PreparedInputRate<T>> {
