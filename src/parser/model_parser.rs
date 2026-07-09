@@ -4881,7 +4881,9 @@ fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
 ///   - `dose`                           → [`IovOccasionRule::PerDose`]
 ///   - `time(24, 48)`                   → [`IovOccasionRule::TimeWindows`]
 ///
-/// Breakpoints must be finite and strictly increasing.
+/// Breakpoints must be finite, strictly increasing, and must not include `0`
+/// (the first occasion already spans everything before the first breakpoint, so
+/// a leading `0` is implied and would only carve out an empty leading occasion).
 fn parse_iov_occasion(value: &str) -> Result<IovOccasionRule, String> {
     let v = value.trim();
     let lower = v.to_ascii_lowercase();
@@ -4922,6 +4924,21 @@ fn parse_iov_occasion(value: &str) -> Result<IovOccasionRule, String> {
             return Err(
                 "fit option `iov_occasion`: `time(...)` needs at least one breakpoint".to_string(),
             );
+        }
+        // A `0` breakpoint is redundant and wrong: the first occasion already
+        // spans everything before the first breakpoint — `[-inf, edge1)` — so a
+        // leading `0` only carves out an empty occasion for `t < 0` and shifts
+        // every real occasion up by one. Reject it with a message that names the
+        // fix (a common `c(0, 24, 48)`-style mistake).
+        if edges.iter().any(|&e| e == 0.0) {
+            return Err(format!(
+                "fit option `iov_occasion`: `time(...)` breakpoints must not include `0`. The \
+                 first occasion already covers everything before the first breakpoint (`[-inf, \
+                 edge1)`), and the last covers everything at or after the last breakpoint (to \
+                 `+inf`), so `0` is implied and does not need to be specified — a leading `0` \
+                 would create an empty leading occasion. Write `time(24, 48)`, not \
+                 `time(0, 24, 48)` (got `{value}`)."
+            ));
         }
         if edges.windows(2).any(|w| w[1] <= w[0]) {
             return Err(format!(
@@ -20300,6 +20317,24 @@ mod tests {
         assert!(apply_fit_option(&mut opts, "iov_occasion", "weekly").is_err());
         // malformed time() (missing parens)
         assert!(apply_fit_option(&mut opts, "iov_occasion", "time 24").is_err());
+    }
+
+    // A leading `0` breakpoint (the `c(0, 24, 48)` habit) is redundant — the
+    // first occasion already spans `[-inf, edge1)` — and shifts every occasion
+    // up by one, so it is rejected with a message that names the fix.
+    #[test]
+    fn test_iov_occasion_rejects_zero_breakpoint() {
+        let mut opts = FitOptions::default();
+        let err = apply_fit_option(&mut opts, "iov_occasion", "time(0, 24, 48)")
+            .expect_err("a 0 breakpoint must be rejected");
+        assert!(
+            err.contains("must not include `0`") && err.contains("implied"),
+            "got: {err}"
+        );
+        // Also rejected as the sole breakpoint.
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time(0)").is_err());
+        // The non-zero form is still accepted.
+        apply_fit_option(&mut opts, "iov_occasion", "time(24, 48)").unwrap();
     }
 
     #[test]

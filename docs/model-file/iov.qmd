@@ -116,7 +116,7 @@ Instead of carrying an occasion column in the data, you can have ferx derive the
 |---|---|
 | `column` (default) | Occasions come from the `iov_column` dataset column. |
 | `dose` | Each administration *time* begins a new occasion. An observation takes the occasion of the most recent dose at or before its time (dose-before-observation at equal `TIME`). Doses that share a time (e.g. a simultaneous depot + central bolus) share one occasion. ADDL-expanded doses each start their own occasion. |
-| `time(t₁, t₂, …)` | Time-window breakpoints. The strictly-increasing edges define bins: `time(24, 48)` → occasion 0 for `TIME < 24`, occasion 1 for `24 ≤ TIME < 48`, occasion 2 for `TIME ≥ 48`. |
+| `time(t₁, t₂, …)` | Time-window breakpoints. The strictly-increasing edges define bins: `time(24, 48)` → occasion 0 for `TIME < 24`, occasion 1 for `24 ≤ TIME < 48`, occasion 2 for `TIME ≥ 48`. The first occasion runs from `-∞` to the first breakpoint and the last runs from the last breakpoint to `+∞`, so you specify only the *interior* boundaries. |
 
 For example, a two-period crossover with a washout at 24 h needs no `OCC` column:
 
@@ -125,6 +125,8 @@ For example, a two-period crossover with a washout at 24 h needs no `OCC` column
   method       = foce
   iov_occasion = time(24)
 ```
+
+This single breakpoint defines **two** occasions: `TIME < 24` (occasion 0) and `TIME ≥ 24` (occasion 1). You give only the interior boundaries — the breakpoint list is *not* a list of occasion start times. In particular, **do not add a leading `0`**: occasion 0 already starts at `-∞`, so `time(0, 24, 48)` is a mistake (it would carve out an empty occasion for `TIME < 0` and shift every real occasion up by one). ferx rejects a `0` breakpoint with an error pointing you at the correct `time(24, 48)` form. Likewise there is no trailing edge for the last occasion — it runs to `+∞`.
 
 **Precedence.** If both `iov_occasion` (set to `dose`/`time(...)`) and `iov_column` are given, the model-side rule **wins** and a warning notes that the column was ignored.
 

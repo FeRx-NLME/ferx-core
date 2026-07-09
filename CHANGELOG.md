@@ -30,7 +30,10 @@ section of the SDLC for the versioning policy).
   reset-stacked crossover subjects), co-timed doses share one occasion, a
   degenerate single-occasion partition errors instead of silently
   under-identifying kappa, and the derived `OCC` column is written to `sdtab`
-  (#757). See the
+  (#757). A `time(...)` breakpoint list must contain only interior boundaries
+  (the first occasion starts at `-∞`, the last runs to `+∞`); a leading `0`
+  (the `c(0, 24, 48)` habit) is rejected with a message pointing at the correct
+  `time(24, 48)` form. See the
   [IOV documentation](https://ferx-nlme.github.io/ferx-core/model-file/iov.html).
 - **`ferx summary` compares multiple runs** (#749): pass two or more `.fitrx`
   bundles (`ferx summary run1.fitrx run2.fitrx run3.fitrx`) to print a Markdown
