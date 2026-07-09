@@ -188,7 +188,7 @@ mod survival_smoke {
             model.endpoints.keys().collect::<Vec<_>>()
         );
         match model.endpoints.get(&2) {
-            Some(EndpointLikelihood::Tte { hazard: _ }) => {}
+            Some(EndpointLikelihood::Tte { .. }) => {}
             other => panic!("expected Tte endpoint for CMT=2, got: {other:?}"),
         }
 
@@ -196,6 +196,796 @@ mod survival_smoke {
         assert_eq!(model.n_theta, 3, "n_theta should be 3");
         // n_eta = ETA_LAMBDA = 1
         assert_eq!(model.n_eta, 1, "n_eta should be 1");
+    }
+
+    // ── RTTE (repeated TTE) parsing (Slice 3.1) ──
+
+    /// A compact exponential RTTE model: `type = rtte` (default `clock = forward`).
+    const RTTE_EXP_MODEL: &str = r"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+";
+
+    /// A standard (non-RTTE) TTE endpoint must default to `Single` recurrence.
+    #[test]
+    fn tte_default_recurrence_is_single() {
+        use ferx_core::types::TteRecurrence;
+        let model = parse_model_string(EXP_TTE_ONLY).expect("EXP_TTE_ONLY must parse");
+        match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte { recurrence, .. }) => {
+                assert_eq!(*recurrence, TteRecurrence::Single);
+            }
+            other => panic!("expected a Single Tte endpoint, got: {other:?}"),
+        }
+    }
+
+    /// `type = rtte` with no explicit clock parses to clock-forward RTTE.
+    #[test]
+    fn rtte_type_parses_as_forward_clock() {
+        use ferx_core::types::{RtteClock, TteRecurrence};
+        let model = parse_model_string(RTTE_EXP_MODEL).expect("RTTE_EXP_MODEL must parse");
+        match model.endpoints.get(&2) {
+            Some(EndpointLikelihood::Tte { recurrence, .. }) => {
+                assert_eq!(
+                    *recurrence,
+                    TteRecurrence::Repeated {
+                        clock: RtteClock::Forward
+                    }
+                );
+            }
+            other => panic!("expected a Repeated(Forward) Tte endpoint, got: {other:?}"),
+        }
+    }
+
+    /// `clock = forward` explicit is accepted and equivalent to the default.
+    #[test]
+    fn rtte_explicit_forward_clock_parses() {
+        use ferx_core::types::{RtteClock, TteRecurrence};
+        let src = RTTE_EXP_MODEL.replace("type   = rtte", "type   = rtte\n  clock  = forward");
+        let model = parse_model_string(&src).expect("explicit clock=forward must parse");
+        assert!(matches!(
+            model.endpoints.get(&2),
+            Some(EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Forward
+                },
+                ..
+            })
+        ));
+    }
+
+    /// `clock = reset` (gap time) parses to a clock-reset RTTE endpoint.
+    #[test]
+    fn rtte_clock_reset_parses() {
+        use ferx_core::types::{RtteClock, TteRecurrence};
+        let src = RTTE_EXP_MODEL.replace("type   = rtte", "type   = rtte\n  clock  = reset");
+        let model = parse_model_string(&src).expect("clock=reset must parse");
+        assert!(matches!(
+            model.endpoints.get(&2),
+            Some(EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset
+                },
+                ..
+            })
+        ));
+    }
+
+    /// `clock` without `type = rtte` is meaningless and rejected.
+    #[test]
+    fn rtte_clock_without_type_is_rejected() {
+        let src = EXP_TTE_ONLY.replace("cmt    = 2", "cmt    = 2\n  clock  = forward");
+        let err = parse_model_string(&src).expect_err("clock without type=rtte must be rejected");
+        assert!(
+            err.contains("clock") && err.contains("rtte"),
+            "error should explain clock needs type=rtte, got: {err}"
+        );
+    }
+
+    /// An unknown `type` value is rejected (not silently treated as single-event).
+    #[test]
+    fn rtte_unknown_type_is_rejected() {
+        let src = RTTE_EXP_MODEL.replace("type   = rtte", "type   = frailty");
+        let err = parse_model_string(&src).expect_err("unknown type must be rejected");
+        assert!(
+            err.contains("type") && err.contains("frailty"),
+            "error should name the bad type, got: {err}"
+        );
+    }
+
+    /// RTTE with a drug-driven ODE hazard (joint PK-RTTE) is a later slice — reject
+    /// rather than silently fitting a single-event likelihood.
+    #[test]
+    fn rtte_with_ode_hazard_is_rejected() {
+        let src = ODE_TTE_MODEL.replace("cmt    = 3", "cmt    = 3\n  type   = rtte");
+        let err = parse_model_string(&src).expect_err("rtte + ODE hazard must be rejected");
+        assert!(
+            err.contains("rtte") && err.contains("hazard"),
+            "error should explain RTTE + ODE hazard is unsupported, got: {err}"
+        );
+    }
+
+    /// Compact RTTE model with a capped iteration count for a fast fit-path smoke.
+    const RTTE_EXP_FIT_MODEL: &str = r"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+
+    /// Repeated-event data: each inner slice is one subject's `(time, dv)` rows in
+    /// nondecreasing time order, ending in a censor (`dv = 0`) at the horizon t = 30.
+    /// ~2–4 events/subject — enough to exercise the clock-forward telescoping fit path.
+    const RTTE_SUBJECTS: &[&[(f64, u8)]] = &[
+        &[(4.2, 1), (11.8, 1), (23.1, 1), (30.0, 0)],
+        &[(6.7, 1), (19.4, 1), (30.0, 0)],
+        &[(2.9, 1), (9.3, 1), (15.0, 1), (27.6, 1), (30.0, 0)],
+        &[(13.1, 1), (30.0, 0)],
+        &[(5.5, 1), (12.2, 1), (21.9, 1), (30.0, 0)],
+        &[(8.1, 1), (17.7, 1), (28.4, 1), (30.0, 0)],
+        &[(3.3, 1), (10.0, 1), (30.0, 0)],
+        &[(7.0, 1), (14.9, 1), (25.2, 1), (30.0, 0)],
+    ];
+
+    fn rtte_pop() -> Population {
+        let seed = vec![(30.0_f64, 0_u8); RTTE_SUBJECTS.len()];
+        let mut pop = common::tte_pop_from_pairs(&seed);
+        for (s, rows) in pop.subjects.iter_mut().zip(RTTE_SUBJECTS) {
+            s.obs_records = rows
+                .iter()
+                .map(|&(t, dv)| ObsRecord::Event {
+                    time: t,
+                    event_type: if dv == 1 {
+                        EventType::Exact
+                    } else {
+                        EventType::RightCensored
+                    },
+                    entry_time: 0.0,
+                    cmt: 2,
+                })
+                .collect();
+        }
+        pop
+    }
+
+    /// A clock-forward RTTE model fits end-to-end (finite OFV) through the telescoping
+    /// likelihood, and — under the Laplace-based default method — surfaces the ω²
+    /// underestimation warning. Tier-2: capped at 3 outer iterations, no convergence.
+    #[test]
+    fn rtte_fit_completes_and_warns_under_focei() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let pop = rtte_pop();
+        let opts = FitOptions::default();
+        let result =
+            fit(&model, &pop, &model.default_params, &opts).expect("RTTE fit must not error");
+        assert!(
+            result.ofv.is_finite(),
+            "RTTE OFV must be finite; got {}",
+            result.ofv
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("RTTE") && w.contains("ω²")),
+            "expected an RTTE-under-Laplace ω² warning; got: {:?}",
+            result.warnings
+        );
+    }
+
+    /// A fixed-effects (n_eta = 0) RTTE fit must NOT emit the ω² warning — there is no
+    /// frailty to underestimate, so the Karlsson caution would be spurious.
+    #[test]
+    fn rtte_fixed_effects_does_not_warn() {
+        // RTTE model with no omega (n_eta = 0), FOCEI.
+        let src = "\n[parameters]\n  theta TVLAMBDA(0.15, 0.001, 10.0)\n\n[event_model]\n  cmt    = 2\n  type   = rtte\n  family = exponential\n  scale  = TVLAMBDA\n\n[fit_options]\n  method  = focei\n  maxiter = 3\n";
+        let model = parse_model_string(src).expect("fixed-effects RTTE model must parse");
+        assert_eq!(model.n_eta, 0, "model must have no etas");
+        let pop = rtte_pop();
+        let opts = FitOptions::default();
+        let result =
+            fit(&model, &pop, &model.default_params, &opts).expect("fixed RTTE fit must not error");
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("RTTE") && w.contains("ω²")),
+            "fixed-effects RTTE must not emit the ω² warning; got: {:?}",
+            result.warnings
+        );
+    }
+
+    /// Out-of-order RTTE records are rejected at the fit boundary — the telescoping
+    /// likelihood assumes time-sorted rows, so unsorted input must error, not silently
+    /// corrupt the NLL.
+    #[test]
+    fn rtte_out_of_order_records_are_rejected() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        // Subject 0's first two event times go backwards (11.8 then 4.2).
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 11.8,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 4.2,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("out-of-order RTTE records must be rejected");
+        assert!(
+            err.contains("out of time order") && err.contains("CMT=2"),
+            "error should flag the unsorted RTTE rows, got: {err}"
+        );
+    }
+
+    /// A hand-built `Repeated { clock = Reset }` model fits end-to-end through the
+    /// gap-time renewal likelihood (finite OFV). A `.ferx` file reaches this via
+    /// `clock = reset`; a Rust caller can also construct the endpoint directly. This is
+    /// the fit-boundary counterpart to the clock-forward `rtte_fit_completes_*` test and
+    /// exercises the `check_rtte_records` fall-through for reset endpoints. Tier-2:
+    /// capped at 3 outer iterations, no convergence.
+    #[test]
+    fn rtte_clock_reset_hand_built_fits() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        // Swap the parsed Repeated{Forward} endpoint on CMT 2 for a Repeated{Reset} one.
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let pop = rtte_pop();
+        let opts = FitOptions::default();
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .expect("clock=reset RTTE fit must not error");
+        // Assert a real objective, not just `is_finite`: a sentinel-poisoned fit sums the
+        // per-subject `1e20` sentinel to ~n·1e20, which is still finite. A genuine
+        // clock-reset OFV on this small population is O(10²–10³), so `< 1e6` cleanly
+        // separates a real fit from one silently folded to the sentinel.
+        assert!(
+            result.ofv.is_finite() && result.ofv < 1e6,
+            "clock-reset RTTE OFV must be a real objective (finite, < 1e6, not sentinel-poisoned); got {}",
+            result.ofv
+        );
+    }
+
+    /// An interval-censored record on an RTTE endpoint (a DV=0→DV=2 data pattern the
+    /// parser cannot see, since censoring is data-driven) must be rejected at the fit
+    /// boundary rather than folding into the `1e20` sentinel.
+    #[test]
+    fn rtte_interval_censored_record_is_rejected() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::IntervalCensored {
+                    left: 3.0,
+                    right: 5.0,
+                },
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("interval-censored RTTE record must be rejected");
+        assert!(
+            err.contains("interval-censored") && err.contains("CMT=2"),
+            "error should flag interval censoring as unsupported for RTTE, got: {err}"
+        );
+    }
+
+    /// A non-finite TIME on an RTTE endpoint slips past the `time < prev` order check
+    /// (every NaN comparison is false) and would poison the accumulator; the fit
+    /// boundary must reject it with a clear error rather than a confusing flat 1e20.
+    #[test]
+    fn rtte_non_finite_time_is_rejected() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: f64::NAN,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("non-finite RTTE TIME must be rejected");
+        assert!(
+            err.contains("non-finite TIME") && err.contains("CMT=2"),
+            "error should flag the non-finite time, got: {err}"
+        );
+    }
+
+    /// A record whose left-truncation entry_time is after its own TIME yields a negative
+    /// first gap (clock-reset) / decreasing cumulative hazard (clock-forward), both of which
+    /// fold to the silent 1e20 sentinel. The datareader skips such rows on load; a hand-built
+    /// `Population` bypasses that, so the fit boundary must reject it with a clear error.
+    #[test]
+    fn rtte_entry_time_after_time_is_rejected() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        // First record's entry (12.0) is after its event TIME (5.0).
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 12.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("entry_time after TIME must be rejected");
+        assert!(
+            err.contains("entry_time") && err.contains("CMT=2"),
+            "error should flag the entry-after-time record, got: {err}"
+        );
+    }
+
+    /// Clock-reset gap-time RTTE supports a right-censored row only as the subject's final
+    /// record: a mid-stream censor would restart the renewal clock (censoring does not reset
+    /// it), so the next gap would be measured from the censor instead of the last event —
+    /// diverging from the gap-time NONMEM anchor. Reachable via ordinary data (the datareader
+    /// flushes a mid-stream DV=0 as a RightCensored before the next event), so it must be
+    /// rejected at the fit boundary rather than silently mis-measured.
+    #[test]
+    fn rtte_reset_mid_stream_censor_is_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let mut pop = rtte_pop();
+        // Right-censored row at t=8 sits BEFORE a later event at t=12 (mid-stream censor).
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 8.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 12.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("mid-stream censor under clock=reset must be rejected");
+        assert!(
+            err.contains("right-censored") && err.contains("CMT=2"),
+            "error should flag the mid-stream censor, got: {err}"
+        );
+    }
+
+    /// Two clock-reset events at the same TIME give a zero inter-event gap, which the gap-time
+    /// hazard cannot represent (h(0) folds to the sentinel). The order guard uses strict `<`,
+    /// so equal times pass it — the fit boundary must reject the tie rather than silently
+    /// poison the subject's likelihood.
+    #[test]
+    fn rtte_reset_tied_event_times_are_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let mut pop = rtte_pop();
+        // Two events at the identical TIME=5 (zero inter-event gap).
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("tied event times under clock=reset must be rejected");
+        assert!(
+            err.contains("same TIME") && err.contains("CMT=2"),
+            "error should flag the zero-gap tied events, got: {err}"
+        );
+    }
+
+    /// Left truncation (delayed entry, entry_time > 0) is not yet supported for clock-reset
+    /// RTTE: the first-gap conditioning convention (renewal clock from entry vs. clock from 0
+    /// conditioned on survival to entry) is unratified and unanchored, and the two differ for
+    /// a time-varying hazard. Fail loud rather than silently pick one; clock-forward supports
+    /// left truncation and is the documented route for such data.
+    #[test]
+    fn rtte_reset_left_truncation_is_rejected() {
+        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
+        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
+        model.endpoints.insert(
+            2,
+            EndpointLikelihood::Tte {
+                hazard: HazardSpec::Analytic {
+                    family: HazardFamily::Exponential,
+                    param_fn,
+                },
+                recurrence: TteRecurrence::Repeated {
+                    clock: RtteClock::Reset,
+                },
+            },
+        );
+        let mut pop = rtte_pop();
+        // Subject enters the risk set at t=4 (delayed entry, entry_time > 0) on both rows.
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 6.0,
+                event_type: EventType::Exact,
+                entry_time: 4.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 4.0,
+                cmt: 2,
+            },
+        ];
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("left-truncated clock=reset must be rejected");
+        assert!(
+            err.contains("left-truncation") && err.contains("CMT=2"),
+            "error should flag the delayed entry, got: {err}"
+        );
+    }
+
+    /// RTTE simulation (Slice 3.3) regenerates a *recurrent* stream per subject: each
+    /// subject's rows are one event process to the horizon, not a single competing-risks
+    /// draw. With a horizon set, `simulate*` succeeds, at least one subject fires more
+    /// than one event, and every subject ends with an administrative censor at the
+    /// horizon — the round-trip layout the data reader reads back.
+    #[test]
+    fn rtte_simulate_produces_recurrent_stream() {
+        use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
+        use std::collections::BTreeMap;
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let pop = rtte_pop();
+        let opts = SimulateOptions {
+            seed: Some(7),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect("RTTE simulation with a horizon must succeed");
+
+        let mut by_id: BTreeMap<String, Vec<(f64, bool)>> = BTreeMap::new();
+        for r in &sims {
+            match r.outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert_eq!(r.cmt, 2, "RTTE rows stay on the endpoint CMT");
+                    by_id
+                        .entry(r.id.clone())
+                        .or_default()
+                        .push((time, observed));
+                }
+                ref o => panic!("expected an Event outcome, got {o:?}"),
+            }
+        }
+        assert_eq!(by_id.len(), pop.subjects.len(), "one group per subject");
+
+        let mut max_events = 0usize;
+        for (id, rows) in &by_id {
+            let (t_last, obs_last) = *rows.last().unwrap();
+            assert!(
+                !obs_last && t_last == 30.0,
+                "subject {id} must end with a censor at the horizon, got ({t_last}, {obs_last})"
+            );
+            let mut prev = 0.0_f64;
+            for &(t, obs) in &rows[..rows.len() - 1] {
+                assert!(
+                    obs && t > prev && t < 30.0,
+                    "subject {id} pre-censor rows are sorted events before the horizon: {t}"
+                );
+                prev = t;
+            }
+            max_events = max_events.max(rows.len() - 1);
+        }
+        assert!(
+            max_events > 1,
+            "at least one subject must fire multiple events (recurrent stream, not a single \
+             competing-risks draw); max events = {max_events}"
+        );
+    }
+
+    /// RTTE simulation needs a finite administrative horizon (the stream runs up to it);
+    /// without one, `simulate*` must fail loud rather than run unbounded.
+    #[test]
+    fn rtte_simulate_without_horizon_is_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let pop = rtte_pop();
+        let opts = SimulateOptions::default(); // horizon: None
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE simulation without a horizon must be rejected");
+        assert!(
+            err.contains("RTTE") && err.contains("horizon"),
+            "error should require a horizon, got: {err}"
+        );
+    }
+
+    /// Left truncation (`entry_time > 0`) on an RTTE record is a deferred follow-up
+    /// (conditional first-gap sampling); simulation must reject it, not silently sample
+    /// the first gap from 0.
+    #[test]
+    fn rtte_simulate_left_truncation_is_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        let ObsRecord::Event { entry_time, .. } = &mut pop.subjects[0].obs_records[0];
+        *entry_time = 2.0;
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE simulation with left truncation must be rejected");
+        assert!(
+            err.contains("left truncation"),
+            "error should flag left truncation, got: {err}"
+        );
+    }
+
+    /// EVID=3/4 resets on an RTTE subject would disturb the hazard clock mid-stream
+    /// (selective per-state reset is a later slice); simulation must reject them.
+    #[test]
+    fn rtte_simulate_resets_are_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        pop.subjects[0].reset_times = vec![10.0];
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE simulation with resets must be rejected");
+        assert!(
+            err.contains("resets"),
+            "error should flag EVID=3/4 resets, got: {err}"
+        );
+    }
+
+    /// A single recurrent stream per subject only: multiple RTTE CMTs are a later slice
+    /// (they need a shared-horizon multi-stream draw). Simulation must reject them
+    /// rather than regenerate only the first CMT's stream.
+    #[test]
+    fn rtte_simulate_multiple_rtte_cmts_are_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        const TWO_RTTE: &str = r"
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+
+[event_model a]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+
+[event_model b]
+  cmt    = 3
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+";
+        let model = parse_model_string(TWO_RTTE).expect("two-RTTE model must parse");
+        let mut pop = common::tte_pop_from_pairs(&[(30.0, 0)]);
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 3,
+            },
+        ];
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("multi-CMT RTTE simulation must be rejected");
+        assert!(
+            err.contains("multiple CMTs"),
+            "error should flag multiple RTTE CMTs, got: {err}"
+        );
+    }
+
+    /// An RTTE cause combined with a competing single-event TTE cause is a later slice;
+    /// simulation must reject it rather than mix a recurrent stream with a one-shot draw.
+    #[test]
+    fn rtte_simulate_competing_single_tte_sibling_is_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        const RTTE_PLUS_TTE: &str = r"
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+
+[event_model recurrent]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+
+[event_model single]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA
+";
+        let model = parse_model_string(RTTE_PLUS_TTE).expect("RTTE + TTE model must parse");
+        let mut pop = common::tte_pop_from_pairs(&[(30.0, 0)]);
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 3,
+            },
+        ];
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE + competing single-TTE simulation must be rejected");
+        assert!(
+            err.contains("competing single-event TTE"),
+            "error should flag the competing single-event TTE sibling, got: {err}"
+        );
+    }
+
+    /// A warm-start chain whose FINAL (estimating) stage is SAEM/IMP must NOT emit the
+    /// Laplace ω² warning, even though an earlier FOCEI warm-start stage is Laplace-based.
+    /// Regression for keying the warning off the terminal stage (`chain.last()`) rather
+    /// than `any` — `[focei, saem]` is a documented warm-start chain that de-biases ω².
+    #[test]
+    fn rtte_warm_start_terminal_saem_does_not_warn() {
+        use ferx_core::types::EstimationMethod;
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let pop = rtte_pop();
+        let opts = FitOptions {
+            methods: vec![EstimationMethod::FoceI, EstimationMethod::Saem],
+            outer_maxiter: 3,
+            saem_n_exploration: 2,
+            saem_n_convergence: 2,
+            saem_seed: Some(1),
+            ..FitOptions::default()
+        };
+        let result =
+            fit(&model, &pop, &model.default_params, &opts).expect("warm-start RTTE fit must run");
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| w.contains("RTTE") && w.contains("ω²")),
+            "a terminal-SAEM chain must not emit the ω² warning; got: {:?}",
+            result.warnings
+        );
     }
 
     /// Parser must recognise [event_model] with family=weibull (scale + shape).
@@ -233,7 +1023,7 @@ mod survival_smoke {
             "endpoints must contain CMT=2 for Weibull model"
         );
         match model.endpoints.get(&2) {
-            Some(EndpointLikelihood::Tte { hazard: _ }) => {}
+            Some(EndpointLikelihood::Tte { .. }) => {}
             other => panic!("expected Tte endpoint for CMT=2 (Weibull), got: {other:?}"),
         }
         assert_eq!(
@@ -277,7 +1067,7 @@ mod survival_smoke {
             "endpoints must contain CMT=2 for Gompertz model"
         );
         match model.endpoints.get(&2) {
-            Some(EndpointLikelihood::Tte { hazard: _ }) => {}
+            Some(EndpointLikelihood::Tte { .. }) => {}
             other => panic!("expected Tte endpoint for CMT=2 (Gompertz), got: {other:?}"),
         }
         assert_eq!(
@@ -1506,7 +2296,7 @@ mod survival_smoke {
             .endpoints
             .get(&2)
             .expect("CMT=2 must be a TTE endpoint");
-        let EndpointLikelihood::Tte { hazard } = ep else {
+        let EndpointLikelihood::Tte { hazard, .. } = ep else {
             panic!("expected Tte endpoint");
         };
         let param_fn = match hazard {
@@ -1619,7 +2409,7 @@ mod survival_smoke {
             .endpoints
             .get(&2)
             .expect("CMT=2 must be a TTE endpoint");
-        let EndpointLikelihood::Tte { hazard } = ep else {
+        let EndpointLikelihood::Tte { hazard, .. } = ep else {
             panic!("expected Tte endpoint");
         };
         let param_fn = match hazard {
@@ -1758,7 +2548,7 @@ mod survival_smoke {
             "CMT=2 must be registered as a TTE endpoint"
         );
         match model.endpoints.get(&2) {
-            Some(EndpointLikelihood::Tte { hazard: _ }) => {}
+            Some(EndpointLikelihood::Tte { .. }) => {}
             other => panic!("expected Tte endpoint for CMT=2 (Weibull), got: {other:?}"),
         }
         assert_eq!(model.n_theta, 2, "n_theta should be 2 (TVSCALE, TVSHAPE)");
@@ -1775,7 +2565,7 @@ mod survival_smoke {
             "CMT=2 must be registered as a TTE endpoint"
         );
         match model.endpoints.get(&2) {
-            Some(EndpointLikelihood::Tte { hazard: _ }) => {}
+            Some(EndpointLikelihood::Tte { .. }) => {}
             other => panic!("expected Tte endpoint for CMT=2 (Gompertz), got: {other:?}"),
         }
         assert_eq!(model.n_theta, 2, "n_theta should be 2 (TVALPHA, TVGAMMA)");
@@ -1791,6 +2581,7 @@ mod survival_smoke {
         match model.endpoints.get(&3) {
             Some(EndpointLikelihood::Tte {
                 hazard: ferx_core::HazardSpec::OdeAccumulated { chz_state },
+                ..
             }) => {
                 // depot(0), central(1), __chz(2)
                 assert_eq!(*chz_state, 2, "accumulator appended after depot, central");
@@ -1816,7 +2607,7 @@ mod survival_smoke {
         let model = parse_model_string(include_str!("../examples/pktte_joint.ferx"))
             .expect("pktte_joint.ferx must parse");
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/data/pktte_joint.csv");
-        let (pop, _) = read_population_for(&model, &None, path, None, None, None)
+        let (pop, _) = read_population_for(&model, &None, path, None, None, None, &[])
             .expect("pktte_joint.csv must load");
         assert_eq!(pop.subjects.len(), 6, "6 subjects");
         for s in &pop.subjects {
@@ -2200,7 +2991,7 @@ mod survival_smoke {
             .endpoints
             .get(&2)
             .expect("CMT=2 must be a TTE endpoint");
-        let EndpointLikelihood::Tte { hazard } = ep else {
+        let EndpointLikelihood::Tte { hazard, .. } = ep else {
             panic!("expected Tte endpoint, got {ep:?}");
         };
         match hazard {

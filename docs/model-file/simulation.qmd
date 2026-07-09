@@ -71,11 +71,54 @@ This will:
 
 ## Simulation Process
 
-1. For each subject, random effects are sampled from $\eta_i \sim N(0, \Omega)$
+1. For each subject, random effects are sampled from $\eta_i \sim N(0, \Omega)$.
+   For IOV (`kappa`) models an independent occasion random effect
+   $\kappa_{i,o} \sim N(0, \Omega_{\text{IOV}})$ is **also** drawn for each
+   occasion $o$ (grouped by the `iov_column`), so the simulated data reproduces
+   the between-occasion variability the model parameterizes — matching NONMEM
+   `$SIM`. (The post-fit NPDE/NPD diagnostics are a separate path that still
+   holds kappas at zero; see [fit options](fit-options.qmd#simulation-based-diagnostics-npde--npd).)
 2. Individual parameters are computed using the `[individual_parameters]` equations
 3. Predictions are generated using the structural model
 4. Residual error is added: $DV = IPRED + \epsilon$, where $\epsilon \sim N(0, V)$
 5. Observations below 0.001 are clipped to 0.001
+
+### IOV validation against NONMEM `$SIM` {#iov-validation}
+
+The occasion-`kappa` draw is anchored to NONMEM `$SIMULATION`. On a shared
+300-subject × 3-occasion design (1-cpt IV bolus, IOV on `V`, `EVID=4` reset + bolus
+at the start of each occasion, one observation at `t=0` so `IPRED = AMT/V` exactly),
+the within-subject between-occasion variance of `log(IPRED)` is an unbiased estimate
+of $\Omega_{\text{IOV}}$:
+
+| Source | between-occasion Var(log IPRED) |
+|--------|--------------------------------:|
+| Truth ($\Omega_{\text{IOV}}$)      | 0.04000 |
+| NONMEM 7.6.0 `$SIMULATION`         | 0.04151 |
+| ferx `simulate()` (df 12000)       | 0.03939 |
+
+All three agree within Monte-Carlo error; the previous behaviour (kappa held at
+zero) collapsed the ferx figure to ~0. A higher-resolution 100-replicate run
+(df 60000) tightens the ferx estimate to 0.03988 (0.5 SE from truth), ruling out
+systematic under-dispersion. The 0.03939 figure in the table is pinned by
+`tests/simulate_iov_kappa.rs::simulate_iov_recovers_omega_iov_variance`.
+
+A second anchor pins that `[scaling]` is applied on the **occasion-less** IOV path —
+an IOV model simulated on data read without an `iov_column`, where the occasion
+`kappa` collapses to zero. On the same 1-cpt IV design with `obs_scale = 1000`,
+$IPRED = (AMT/V)/1000$, so $\text{mean}(\log IPRED) = \log(AMT/TVV/1000) = -4.60517$
+and $\text{Var}(\log IPRED) = \omega^2_V = 0.04$ (BSV only — no occasion component):
+
+| Source | mean(log IPRED) | Var(log IPRED) |
+|--------|----------------:|---------------:|
+| Analytic (scaling applied)  | −4.60517 | 0.04000 |
+| NONMEM 7.6.0 `$SIMULATION`  | −4.60873 | 0.03965 |
+| ferx `simulate()`           | −4.60378 | 0.04138 |
+
+ferx and NONMEM agree to ~0.005 on the scaled level. Before the fix, `simulate()`
+dropped the scale factor on the empty-occasion path, inflating the mean by
+$\log(1000) \approx 6.9$. Pinned by
+`tests/simulate_iov_kappa.rs::simulate_iov_scaling_matches_nonmem_occasionless`.
 
 ## TTE simulation {#tte-simulation}
 

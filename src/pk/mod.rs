@@ -13,7 +13,7 @@ pub use three_compartment::*;
 pub use two_compartment::*;
 
 #[inline]
-fn model_uses_time_builtin(model: &CompiledModel) -> bool {
+pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
     crate::parser::model_parser::compiled_model_uses_time_builtin(model)
 }
 
@@ -500,6 +500,22 @@ pub fn compute_event_pk_params(
     out
 }
 
+/// Whether a subject needs **per-event** PK (a snapshot resolved separately at
+/// each dose / observation / EVID=2 record) rather than a single frozen t=0
+/// snapshot: its PK varies across the horizon because a covariate changes on a
+/// dose/obs row (`has_tv_covariates`), a covariate changes only on an EVID=2
+/// (pk-only) row (`pk_only_covariates`, which `has_tv_covariates` does not
+/// inspect), or the model reads the `TIME` built-in. Single source of truth for
+/// this decision (#700): the per-event PK materializer
+/// ([`compute_event_pk_params_into`]) and the adaptive driver's `event_pk` gate /
+/// `auc_target` guard (`api::run_adaptive_population`) all consult it, so they
+/// cannot drift apart and silently freeze PK on one path but not another.
+pub(crate) fn subject_needs_per_event_pk(model: &CompiledModel, subject: &Subject) -> bool {
+    subject.has_tv_covariates()
+        || !subject.pk_only_covariates.is_empty()
+        || model_uses_time_builtin(model)
+}
+
 /// Same as [`compute_event_pk_params`] but writes into a caller-owned
 /// buffer. Used by SAEM's MH loop and the FOCE objective closure where
 /// the buffer is allocated once per subject and reused across many
@@ -520,7 +536,7 @@ pub fn compute_event_pk_params_into(
     out.obs.clear();
     out.pk_only.clear();
 
-    if subject.has_tv_covariates() || model_uses_time_builtin(model) {
+    if subject_needs_per_event_pk(model, subject) {
         for k in 0..subject.doses.len() {
             out.dose.push(pk_params_at_time(
                 model,
@@ -549,8 +565,9 @@ pub fn compute_event_pk_params_into(
             ));
         }
     } else {
-        // Reached only when the model uses neither TV covariates nor the `TIME`
-        // built-in, so a single snapshot (t=0) is exact for every event.
+        // Reached only when the subject carries no time-varying covariates (on
+        // dose/obs *or* pk-only rows) and the model uses no `TIME` built-in, so a
+        // single snapshot (t=0) is exact for every event.
         let p = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
         // pk_only stays empty — see EventPkParams docstring.
         for _ in 0..subject.doses.len() {
@@ -560,6 +577,97 @@ pub fn compute_event_pk_params_into(
             out.obs.push(p);
         }
     }
+}
+
+/// The decision window (occasion) active at time `t` under the per-decision-window
+/// IOV convention for adaptive dosing (#701): the index of the latest decision at
+/// or before `t`, or `None` before the first decision (the baseline window, whose
+/// κ is zero). `decision_times` is the ascending reactive schedule. A record that
+/// coincides with a decision (within a tiny tolerance) belongs to that decision's
+/// window — matching the driver, which opens window `g` at the decision break and
+/// records the coincident observation post-open. Requires `decision_times` strictly
+/// ascending (enforced at the funnel by `validate_increasing_finite`); the scan stops
+/// at the first later time, so an unsorted schedule would return a wrong index.
+///
+/// The 1e-9 tolerance is deliberately looser than the exact-`to_bits` decision/record
+/// lookups (`decision_index_of`, `segment_pk_at`) and the #700 break-collision guard
+/// (1e-15). On a non-integer grid, a record within (1e-15, 1e-9) of a decision is
+/// grouped into that decision's window here. That never breaks bit-alignment: the
+/// driver, the frozen-replay verifier, and the `compute_event_pk_params_iov`
+/// materialiser all resolve a record's occasion through *this one function*, so they
+/// cannot disagree with each other — and integer-valued time grids (every test and
+/// example) never land in that window at all.
+pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
+    let mut occ = None;
+    for (g, &d) in decision_times.iter().enumerate() {
+        if d <= t + 1e-9 {
+            occ = Some(g);
+        } else {
+            break;
+        }
+    }
+    occ
+}
+
+/// Occasion-aware per-event PK for the adaptive IOV path (#701).
+///
+/// Like [`compute_event_pk_params`] but each observation / pk-only record is
+/// evaluated with the eta of the **occasion (decision window)** active at its time
+/// ([`occasion_of`]): `eta_occ[g]` for the window `g` containing the record, or
+/// `eta_baseline` (BSV η with κ = 0) before the first decision. This is the IOV
+/// analogue of [`predict_iov`]'s per-event occasion-κ selection, with occasion =
+/// decision window instead of the OCC column. Doses stay empty — the adaptive base
+/// subject is dose-free; controller-injected doses take their PK from the driver's
+/// per-decision snapshot. It composes with #700's time-varying covariates: each
+/// record's *covariate* snapshot (`obs_cov` / `pk_only_cov`) is used alongside its
+/// occasion eta, so a model with both a TV covariate and IOV κ is per-event correct
+/// in both.
+///
+/// **pk-only (EVID=2) convention — deliberately different from [`predict_iov`].** Here
+/// a pk-only record takes the κ of the decision window containing its time (like any
+/// obs record), because in the reactive setting that observation genuinely occurs
+/// *during* that occasion. The static [`predict_iov`] instead maps pk-only rows to no
+/// occasion (`u32::MAX` ⇒ κ = 0, BSV-only), following the OCC-column semantics of #104.
+/// The two are consistent *within* their own path (the adaptive driver's
+/// `segment_occ_at` also uses [`occasion_of`], so materialiser and driver agree), but a
+/// future oracle that validates an adaptive IOV run *with EVID=2 rows* against
+/// `predict_iov` must account for this — they will disagree on the pk-only κ by design.
+pub(crate) fn compute_event_pk_params_iov(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_baseline: &[f64],
+    eta_occ: &[Vec<f64>],
+    decision_times: &[f64],
+) -> EventPkParams {
+    let mut out = EventPkParams::with_capacity_for(subject);
+    let eta_at = |t: f64| -> &[f64] {
+        match occasion_of(decision_times, t) {
+            Some(g) => eta_occ[g].as_slice(),
+            None => eta_baseline,
+        }
+    };
+    for j in 0..subject.obs_times.len() {
+        let t = subject.obs_times[j];
+        out.obs.push(pk_params_at_time(
+            model,
+            theta,
+            eta_at(t),
+            subject.obs_cov(j),
+            t,
+        ));
+    }
+    for m in 0..subject.pk_only_times.len() {
+        let t = subject.pk_only_times[m];
+        out.pk_only.push(pk_params_at_time(
+            model,
+            theta,
+            eta_at(t),
+            subject.pk_only_cov(m),
+            t,
+        ));
+    }
+    out
 }
 
 /// IOV predictions with proper per-dose occasion accounting (issue #104).
@@ -765,6 +873,17 @@ pub fn predict_iov(
     // not here; see the note below for the κ=0 limitation there.)
     if !matches!(model.scaling, ScalingSpec::None) {
         let raw = preds.clone();
+        // Base pass with the BSV+κ=0 vector (`[η_bsv, 0…0]`, the same combination
+        // the non-IOV `compute_predictions_with_tv` path scales with). This scales
+        // every observation, including any not owned by an occasion group — most
+        // importantly an occasion-less subject (`simulate()` on data read without an
+        // `iov_column`), where the per-occasion loop below is empty and would
+        // otherwise leave `preds` UNSCALED and off by the full scale factor (#723
+        // review). When occasions are present every obs is owned by a group, so the
+        // loop overwrites this base pass entirely and the result is unchanged.
+        apply_scaling(model, subject, theta, &pk_only_combined, &mut preds);
+        // Per-occasion override: an observation carrying an occasion label is
+        // re-scaled with that occasion's κ, overwriting the base pass.
         for (occ_id, obs_indices) in &occ_groups {
             let combined = combined_for(*occ_id);
             let mut scaled = raw.clone();

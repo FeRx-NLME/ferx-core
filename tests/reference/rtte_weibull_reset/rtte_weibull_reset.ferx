@@ -1,0 +1,25 @@
+# Clock-reset (gap-time) Weibull RTTE with a shared subject frailty on the scale.
+# Phase 3 Slice 3.2 anchor.
+#
+# Data: rtte_weibull_reset.csv — 100 subjects, ~6.6 events/subject, censored at t = 30.
+# Data-generating TVSCALE = 5, TVSHAPE = 1.5, omega^2(log scale) = 0.09.
+#
+# clock = reset: the hazard clock restarts at each event, so the per-subject NLL is
+# Sum_k [H(Δ_k) − log h(Δ_k)] over inter-event gaps Δ_k (final gap censored).
+
+[parameters]
+  theta TVSCALE(5.0, 0.1, 100.0)
+  theta TVSHAPE(1.5, 0.1, 10.0)
+  omega ETA_SCALE ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  clock  = reset
+  family = weibull
+  scale  = TVSCALE * exp(ETA_SCALE)
+  shape  = TVSHAPE
+
+[fit_options]
+  method  = focei
+  maxiter = 300

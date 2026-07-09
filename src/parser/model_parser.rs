@@ -2131,10 +2131,13 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     // value is resolved here; `parse_full_model_file` resolves it relative to
     // the model file's directory afterwards (this function only sees the
     // model's text, not its path on disk).
-    let data_path = blocks
-        .get("data")
-        .map(|lines| parse_data_block(lines))
-        .transpose()?;
+    let (data_path, data_column_map) = match blocks.get("data") {
+        Some(lines) => {
+            let (p, m) = parse_data_block(lines)?;
+            (Some(p), m)
+        }
+        None => (None, Vec::new()),
+    };
 
     // ── [data_selection] block ────────────────────────────────────────────────
     // Parsed after [fit_options] and merged into the same FitOptions so the
@@ -2859,6 +2862,7 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         adaptive_dosing,
         fit_options,
         data_path,
+        column_map: data_column_map,
         covariate_decls,
         block_lines: extracted.block_lines.clone(),
     })
@@ -3660,6 +3664,8 @@ fn eval_indiv_param_vars(
 /// - `alpha`  — required for Gompertz (baseline hazard at t=0)
 /// - `gamma`  — required for Gompertz (hazard growth rate)
 /// - `loghr`  — optional (all families); log-hazard-ratio covariate term Σ(β·x)
+/// - `type`   — optional; `tte` (default, single event) | `rtte` (repeated events)
+/// - `clock`  — optional (RTTE only); `forward` (default, Andersen–Gill total time) | `reset` (gap time / renewal — hazard clock resets at each event)
 #[cfg(feature = "survival")]
 fn parse_event_model_block(
     lines: &[String],
@@ -3709,6 +3715,11 @@ fn parse_event_model_block(
     // cumulative-hazard ODE derivative before the ODE spec is built; here we only
     // record its presence and route to the OdeAccumulated endpoint below.
     let mut hazard_present = false;
+    // Recurrence (RTTE): `type = tte | rtte` (default tte) and, for RTTE,
+    // `clock = forward | reset` (default forward). Resolved into `TteRecurrence`
+    // after the key loop. §3.3 of `plans/tte-survival-markov.md`.
+    let mut type_opt: Option<String> = None;
+    let mut clock_opt: Option<String> = None;
 
     for line in lines {
         let trimmed = line.trim();
@@ -3762,10 +3773,16 @@ fn parse_event_model_block(
                 // derivative by the parser pre-scan, so it is not compiled here.
                 hazard_present = true;
             }
+            "type" => {
+                type_opt = Some(value.to_string());
+            }
+            "clock" => {
+                clock_opt = Some(value.to_string());
+            }
             other => {
                 return Err(format!(
-                    "[event_model]: unknown key `{other}` \
-                     — valid keys: cmt, family, scale, rate, shape, alpha, gamma, loghr, hazard"
+                    "[event_model]: unknown key `{other}` — valid keys: cmt, family, scale, \
+                     rate, shape, alpha, gamma, loghr, hazard, type, clock"
                 ));
             }
         }
@@ -3804,11 +3821,59 @@ fn parse_event_model_block(
         }
     }
 
+    // Resolve the recurrence: standard single-event TTE (default) vs. repeated TTE
+    // (RTTE). For RTTE, `clock = forward` (Andersen–Gill total time, the default)
+    // accumulates the hazard continuously; `clock = reset` (gap time, §3.3) restarts the
+    // hazard clock at each event. `clock` is meaningless without `type = rtte`.
+    let recurrence = {
+        use crate::types::{RtteClock, TteRecurrence};
+        match type_opt.as_deref().unwrap_or("tte") {
+            "tte" | "single" => {
+                if let Some(c) = clock_opt.as_deref() {
+                    return Err(format!(
+                        "[event_model]: CMT={cmt} sets `clock = {c}` on a single-event TTE \
+                         endpoint. `clock` selects how time is measured between repeated events, \
+                         so it is only valid with `type = rtte`."
+                    ));
+                }
+                TteRecurrence::Single
+            }
+            "rtte" => {
+                let clock = match clock_opt.as_deref().unwrap_or("forward") {
+                    "forward" => RtteClock::Forward,
+                    "reset" => RtteClock::Reset,
+                    other => {
+                        return Err(format!(
+                            "[event_model]: CMT={cmt} unknown clock `{other}` — valid: forward, reset"
+                        ));
+                    }
+                };
+                TteRecurrence::Repeated { clock }
+            }
+            other => {
+                return Err(format!(
+                    "[event_model]: CMT={cmt} unknown type `{other}` — valid: tte, rtte"
+                ));
+            }
+        }
+    };
+
     // ODE-accumulated hazard path (joint PK-TTE, Slice 2.1): `hazard = <expr>` was
     // injected as a cumulative-hazard ODE derivative (`d/dt(__chz_<cmt>)`); the
     // endpoint only records that accumulator's state index. Mutually exclusive with
     // the analytic closed-form `family` keys.
     if hazard_present {
+        // RTTE with a drug-driven ODE hazard (joint PK-RTTE) needs the repeated-event
+        // root-finder loop AND, for clock-reset, the selective CHZ reset — a later
+        // slice. Reject rather than silently fitting a single-event likelihood.
+        if matches!(recurrence, crate::types::TteRecurrence::Repeated { .. }) {
+            return Err(format!(
+                "[event_model]: CMT={cmt} combines `type = rtte` with an ODE-accumulated \
+                 `hazard = ...` (drug-driven joint PK-RTTE), which is not yet supported. Use an \
+                 analytic `family` hazard for repeated events, or `type = tte` for a single-event \
+                 drug-driven hazard."
+            ));
+        }
         if family_opt.is_some()
             || scale_expr.is_some()
             || shape_expr.is_some()
@@ -3846,6 +3911,7 @@ fn parse_event_model_block(
             cmt,
             EndpointLikelihood::Tte {
                 hazard: HazardSpec::OdeAccumulated { chz_state },
+                recurrence,
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -4083,6 +4149,7 @@ fn parse_event_model_block(
         cmt,
         EndpointLikelihood::Tte {
             hazard: HazardSpec::Analytic { family, param_fn },
+            recurrence,
         },
         event_model_covariates,
         event_model_thetas,
@@ -4692,27 +4759,92 @@ fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     }
 }
 
+/// Canonical column roles a `[data]` block may remap (#730, NONMEM
+/// `$INPUT TIME=TAFD` analogue). A target naming one of these is upper-cased to
+/// the standard header spelling; any other target is an arbitrary column rename
+/// (#742) kept in its written case. Stays in sync with the standard columns
+/// recognised by [`crate::io::datareader`].
+const DATA_BLOCK_ROLES: &[&str] = &[
+    "id", "time", "dv", "evid", "amt", "cmt", "rate", "mdv", "ii", "ss", "cens", "addl", "tentry",
+    "fremtype",
+];
+
 /// Parse a `[data]` block (#690, NONMEM `$DATA` analogue). Returns the raw
-/// `path` value as written; `parse_full_model_file` resolves it relative to
-/// the model file's directory.
-fn parse_data_block(lines: &[String]) -> Result<String, String> {
+/// `path` value as written (resolved relative to the model file's directory by
+/// `parse_full_model_file`) plus any `target = actual` column remappings.
+/// Each map entry is `(target_header, actual_header)`: the dataset's
+/// `actual_header` column is renamed to `target_header` when the CSV is read.
+///
+/// A `target` that names a canonical role (#730, DATA_BLOCK_ROLES) is upper-cased
+/// to the standard header spelling; any other target (#742 — arbitrary column /
+/// covariate rename) keeps the exact case written, since covariate lookups are
+/// case-sensitive. This lets a dataset's own `dv` column be renamed aside so a
+/// different column can take the `DV` role, e.g.
+///
+/// ```text
+/// [data]
+///   ODV = dv       # keep the raw DV under a new name
+///   DV  = lndv     # promote the log-DV column to the DV role
+///   WT  = weight   # rename an arbitrary covariate
+/// ```
+///
+/// Validated here: an empty `path`, empty target names, a target mapped twice,
+/// and two targets mapped to the same actual header. Whether a mapped header
+/// actually exists in the dataset — and whether a rename collides with a
+/// surviving column — can only be checked when the CSV is read, so that lives in
+/// the datareader.
+fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>), String> {
     let mut path: Option<String> = None;
+    let mut column_map: Vec<(String, String)> = Vec::new();
     for line in lines {
         let parts: Vec<&str> = line.splitn(2, '=').map(|s| s.trim()).collect();
         if parts.len() != 2 {
             continue;
         }
         let (key, value) = (parts[0], parts[1].trim_matches(|c| c == '"' || c == '\''));
-        match key {
-            "path" => path = Some(value.to_string()),
-            _ => {
+        let key_lc = key.to_ascii_lowercase();
+        if key_lc == "path" {
+            if value.is_empty() {
+                return Err("[data]: empty `path` — write `path = <path-to-csv>`".to_string());
+            }
+            path = Some(value.to_string());
+            continue;
+        }
+        if value.is_empty() {
+            return Err(format!(
+                "[data]: empty column name for `{key}` — write `{key} = <header>`"
+            ));
+        }
+        // Canonical roles use the standard upper-case spelling; arbitrary
+        // targets (#742) keep their exact case for case-sensitive covariate
+        // lookups.
+        let target = if DATA_BLOCK_ROLES.contains(&key_lc.as_str()) {
+            key_lc.to_ascii_uppercase()
+        } else {
+            key.to_string()
+        };
+        if column_map
+            .iter()
+            .any(|(t, _)| t.eq_ignore_ascii_case(&target))
+        {
+            return Err(format!("[data]: target `{target}` mapped more than once"));
+        }
+        column_map.push((target, value.to_string()));
+    }
+    // Reject two targets pointing at the same actual header (case-insensitive):
+    // the reader would rename one header to two targets, silently dropping one.
+    for i in 0..column_map.len() {
+        for j in (i + 1)..column_map.len() {
+            if column_map[i].1.eq_ignore_ascii_case(&column_map[j].1) {
                 return Err(format!(
-                    "[data]: unknown key `{key}` — valid keys are: path"
-                ))
+                    "[data]: targets `{}` and `{}` both map to column `{}`",
+                    column_map[i].0, column_map[j].0, column_map[i].1
+                ));
             }
         }
     }
-    path.ok_or_else(|| "[data]: missing required key `path`".to_string())
+    let path = path.ok_or_else(|| "[data]: missing required key `path`".to_string())?;
+    Ok((path, column_map))
 }
 
 fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
@@ -4783,6 +4915,86 @@ fn parse_fit_options(lines: &[String]) -> Result<FitOptions, String> {
 ///
 /// Does NOT handle `method` (which has list-chain syntax) — that stays in
 /// the block parser.
+/// Parse the `iov_occasion` fit-option value into an [`IovOccasionRule`].
+///
+/// Accepts:
+///   - `column` (or empty/none/null/na) → [`IovOccasionRule::Column`]
+///   - `dose`                           → [`IovOccasionRule::PerDose`]
+///   - `time(24, 48)`                   → [`IovOccasionRule::TimeWindows`]
+///
+/// Breakpoints must be finite, strictly increasing, and must not include `0`
+/// (the first occasion already spans everything before the first breakpoint, so
+/// a leading `0` is implied and would only carve out an empty leading occasion).
+fn parse_iov_occasion(value: &str) -> Result<IovOccasionRule, String> {
+    let v = value.trim();
+    let lower = v.to_ascii_lowercase();
+    if lower.is_empty() || lower == "column" || lower == "none" || lower == "null" || lower == "na"
+    {
+        return Ok(IovOccasionRule::Column);
+    }
+    if lower == "dose" {
+        return Ok(IovOccasionRule::PerDose);
+    }
+    if let Some(rest) = lower.strip_prefix("time") {
+        let inner = rest.trim();
+        let inner = inner
+            .strip_prefix('(')
+            .and_then(|s| s.strip_suffix(')'))
+            .ok_or_else(|| {
+                format!(
+                    "fit option `iov_occasion`: expected `time(edge1, edge2, ...)`, got `{value}`"
+                )
+            })?;
+        let mut edges = Vec::new();
+        for tok in inner.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() {
+                continue;
+            }
+            let x = tok.parse::<f64>().map_err(|_| {
+                format!("fit option `iov_occasion`: breakpoint `{tok}` is not a number")
+            })?;
+            if !x.is_finite() {
+                return Err(format!(
+                    "fit option `iov_occasion`: breakpoint `{tok}` must be finite"
+                ));
+            }
+            edges.push(x);
+        }
+        if edges.is_empty() {
+            return Err(
+                "fit option `iov_occasion`: `time(...)` needs at least one breakpoint".to_string(),
+            );
+        }
+        // A `0` breakpoint is redundant and wrong: the first occasion already
+        // spans everything before the first breakpoint — `[-inf, edge1)` — so a
+        // leading `0` only carves out an empty occasion for `t < 0` and shifts
+        // every real occasion up by one. Reject it with a message that names the
+        // fix (a common `c(0, 24, 48)`-style mistake).
+        if edges.iter().any(|&e| e == 0.0) {
+            return Err(format!(
+                "fit option `iov_occasion`: `time(...)` breakpoints must not include `0`. The \
+                 first occasion already covers everything before the first breakpoint (`[-inf, \
+                 edge1)`), and the last covers everything at or after the last breakpoint (to \
+                 `+inf`), so `0` is implied and does not need to be specified — a leading `0` \
+                 would create an empty leading occasion. Write `time(24, 48)`, not \
+                 `time(0, 24, 48)` (got `{value}`)."
+            ));
+        }
+        if edges.windows(2).any(|w| w[1] <= w[0]) {
+            return Err(format!(
+                "fit option `iov_occasion`: `time(...)` breakpoints must be strictly increasing, \
+                 got `{value}`"
+            ));
+        }
+        return Ok(IovOccasionRule::TimeWindows(edges));
+    }
+    Err(format!(
+        "fit option `iov_occasion`: unknown value `{value}` — expected `column`, `dose`, or \
+         `time(edge1, edge2, ...)`"
+    ))
+}
+
 pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result<bool, String> {
     let value = value.trim();
 
@@ -5159,6 +5371,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             } else {
                 Some(value.to_string())
             };
+        }
+        "iov_occasion" => {
+            opts.iov_occasion = parse_iov_occasion(value)?;
         }
         "optimizer_trace" => opts.optimizer_trace = parse_bool("optimizer_trace")?,
         "reconverge_gradient_interval" => {
@@ -16790,8 +17005,9 @@ mod tests {
 
     #[test]
     fn test_parse_threads_zero_means_auto() {
-        // `threads = 0` is treated as "leave rayon default alone",
-        // matching the R binding's `threads <= 0` sentinel.
+        // `threads = 0` is treated as "use the engine's default thread count"
+        // (available cores - 1, floored at 1, capped at 8 — #707), matching the
+        // R binding's `threads <= 0` sentinel.
         let opts = parse_fit_options(&["threads = 0".to_string()]).unwrap();
         assert_eq!(opts.threads, None);
     }
@@ -16807,7 +17023,7 @@ mod tests {
 
     #[test]
     fn test_parse_threads_default_is_none() {
-        // No `threads` line → None (rayon global pool, one worker per logical CPU).
+        // No `threads` line → None (engine picks its own default thread count: #707).
         let opts = parse_fit_options(&["method = focei".to_string()]).unwrap();
         assert_eq!(opts.threads, None);
     }
@@ -17672,15 +17888,12 @@ mod tests {
 
     #[test]
     fn test_parse_data_block_path() {
-        assert_eq!(
-            parse_data_block(&["path = warfarin.csv".to_string()]).unwrap(),
-            "warfarin.csv"
-        );
+        let (path, map) = parse_data_block(&["path = warfarin.csv".to_string()]).unwrap();
+        assert_eq!(path, "warfarin.csv");
+        assert!(map.is_empty());
         // Quoted paths (e.g. containing spaces) are accepted, quotes stripped.
-        assert_eq!(
-            parse_data_block(&["path = \"my data.csv\"".to_string()]).unwrap(),
-            "my data.csv"
-        );
+        let (path, _) = parse_data_block(&["path = \"my data.csv\"".to_string()]).unwrap();
+        assert_eq!(path, "my data.csv");
     }
 
     #[test]
@@ -17690,9 +17903,99 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_data_block_unknown_key_is_error() {
-        let err = parse_data_block(&["bogus = 1".to_string()]).unwrap_err();
-        assert!(err.contains("unknown key `bogus`"), "{err}");
+    fn test_parse_data_block_arbitrary_target_is_accepted() {
+        // #742: a non-canonical target renames an arbitrary column. Its case is
+        // preserved (covariate lookups are case-sensitive), unlike canonical
+        // roles which are upper-cased.
+        let (_, map) =
+            parse_data_block(&["path = d.csv".to_string(), "WT = weight".to_string()]).unwrap();
+        assert_eq!(map, vec![("WT".to_string(), "weight".to_string())]);
+        // Mixed-case arbitrary target kept verbatim.
+        let (_, map) =
+            parse_data_block(&["path = d.csv".to_string(), "MyCov = raw".to_string()]).unwrap();
+        assert_eq!(map, vec![("MyCov".to_string(), "raw".to_string())]);
+    }
+
+    #[test]
+    fn test_parse_data_block_column_mapping() {
+        // `target = actual` remappings. Canonical roles are upper-cased to the
+        // standard spelling; the actual header is preserved verbatim. `path`
+        // still parses alongside.
+        let (path, map) = parse_data_block(&[
+            "path = mydata.csv".to_string(),
+            "time = TAFD".to_string(),
+            "DV = CONC".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(path, "mydata.csv");
+        assert_eq!(
+            map,
+            vec![
+                ("TIME".to_string(), "TAFD".to_string()),
+                ("DV".to_string(), "CONC".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_data_block_empty_path_is_error() {
+        // A bare `path =` fails loudly here rather than surfacing later as an
+        // opaque CSV-open error.
+        let err = parse_data_block(&["path =".to_string()]).unwrap_err();
+        assert!(err.contains("empty `path`"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_data_block_empty_target_is_error() {
+        let err =
+            parse_data_block(&["path = d.csv".to_string(), "time =".to_string()]).unwrap_err();
+        assert!(err.contains("empty column name for `time`"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_data_block_target_mapped_twice_is_error() {
+        let err = parse_data_block(&[
+            "path = d.csv".to_string(),
+            "TIME = TAFD".to_string(),
+            "time = T2".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("target `TIME` mapped more than once"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_data_block_duplicate_target_is_error() {
+        // Two targets pointing at the same actual header (case-insensitive) is
+        // rejected: the reader would rename one header to two targets.
+        let err = parse_data_block(&[
+            "path = d.csv".to_string(),
+            "TIME = X".to_string(),
+            "DV = x".to_string(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("both map to column `X`"), "{err}");
+    }
+
+    #[test]
+    fn test_data_block_populates_parsed_model_column_map() {
+        let content =
+            format!("{MINIMAL_MODEL}[data]\n  path = warfarin.csv\n  TIME = TAFD\n  DV = CONC\n");
+        let parsed = parse_full_model(&content).unwrap();
+        assert_eq!(parsed.data_path.as_deref(), Some("warfarin.csv"));
+        assert_eq!(
+            parsed.column_map,
+            vec![
+                ("TIME".to_string(), "TAFD".to_string()),
+                ("DV".to_string(), "CONC".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_model_without_data_mappings_has_empty_column_map() {
+        let content = format!("{MINIMAL_MODEL}[data]\n  path = warfarin.csv\n");
+        let parsed = parse_full_model(&content).unwrap();
+        assert!(parsed.column_map.is_empty());
     }
 
     /// Minimal valid one-compartment IV model, used as a base by the `[data]`
@@ -20018,6 +20321,71 @@ mod tests {
         let content = minimal_model_with_fit_options("  iov_column = PERIOD");
         let parsed = parse_full_model(&content).unwrap();
         assert_eq!(parsed.fit_options.iov_column, Some("PERIOD".to_string()));
+    }
+
+    #[test]
+    fn test_iov_occasion_dose_and_column() {
+        let mut opts = FitOptions::default();
+        assert_eq!(
+            apply_fit_option(&mut opts, "iov_occasion", "dose"),
+            Ok(true)
+        );
+        assert_eq!(opts.iov_occasion, IovOccasionRule::PerDose);
+        apply_fit_option(&mut opts, "iov_occasion", "column").unwrap();
+        assert_eq!(opts.iov_occasion, IovOccasionRule::Column);
+    }
+
+    #[test]
+    fn test_iov_occasion_time_windows() {
+        let mut opts = FitOptions::default();
+        apply_fit_option(&mut opts, "iov_occasion", "time(24, 48)").unwrap();
+        assert_eq!(
+            opts.iov_occasion,
+            IovOccasionRule::TimeWindows(vec![24.0, 48.0])
+        );
+    }
+
+    #[test]
+    fn test_iov_occasion_rejects_bad_values() {
+        let mut opts = FitOptions::default();
+        // non-increasing breakpoints
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time(48, 24)").is_err());
+        // empty breakpoint list
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time()").is_err());
+        // unparseable breakpoint
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time(a)").is_err());
+        // unknown mode
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "weekly").is_err());
+        // malformed time() (missing parens)
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time 24").is_err());
+    }
+
+    // A leading `0` breakpoint (the `c(0, 24, 48)` habit) is redundant — the
+    // first occasion already spans `[-inf, edge1)` — and shifts every occasion
+    // up by one, so it is rejected with a message that names the fix.
+    #[test]
+    fn test_iov_occasion_rejects_zero_breakpoint() {
+        let mut opts = FitOptions::default();
+        let err = apply_fit_option(&mut opts, "iov_occasion", "time(0, 24, 48)")
+            .expect_err("a 0 breakpoint must be rejected");
+        assert!(
+            err.contains("must not include `0`") && err.contains("implied"),
+            "got: {err}"
+        );
+        // Also rejected as the sole breakpoint.
+        assert!(apply_fit_option(&mut opts, "iov_occasion", "time(0)").is_err());
+        // The non-zero form is still accepted.
+        apply_fit_option(&mut opts, "iov_occasion", "time(24, 48)").unwrap();
+    }
+
+    #[test]
+    fn test_iov_occasion_parsed_from_fit_options_block() {
+        let content = minimal_model_with_fit_options("  iov_occasion = time(24)");
+        let parsed = parse_full_model(&content).unwrap();
+        assert_eq!(
+            parsed.fit_options.iov_occasion,
+            IovOccasionRule::TimeWindows(vec![24.0])
+        );
     }
 
     // ── block_kappa (Option B) ─────────────────────────────────────────────

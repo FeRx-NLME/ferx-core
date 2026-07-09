@@ -14,6 +14,7 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `method` | `foce`, `focei`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](#chained-fits). When neither this key nor a wrapper's `method` argument is set, the engine falls back to `focei` and emits a warning so the implicit choice is visible — set `method` here to silence it. |
+| `threads` | positive integer, `0`, `auto` | `auto` | Number of Rayon worker threads for per-subject parallelism. A positive integer pins the count. `0`/`auto` (or omitting the key) uses the engine's default: available cores − 1 (floored at 1), capped at 8 — most fits gain little from spreading across every core, and not all cores are equal on asymmetric platforms (e.g. Apple Silicon E-cores). The CLI's `--threads` flag mirrors this key (see `ferx --help`). |
 | `maxiter` | integer | `500` | Maximum outer loop iterations. `maxiter = 0` is *evaluation only* (NONMEM `MAXEVAL=0`): the engine runs one inner EBE solve at the initial parameters and reports the objective there with no outer optimisation — useful for scoring a fixed parameter set or computing standard errors at known estimates (with `covariance = true`). The reported fit is marked not-converged, and the parameters are returned unchanged. |
 | `covariance` | `true`, `false` | `true` | Compute covariance matrix and standard errors |
 | `covariance_method` | `r`, `s`, `rsr` | `r` | Which covariance estimator to assemble, mirroring NONMEM `$COVARIANCE MATRIX=`. `r` = inverse Hessian `R⁻¹` (model-based; the default). `s` = inverse score cross-product `S⁻¹` (empirical information). `rsr` = the Huber–White sandwich `R⁻¹SR⁻¹` (robust to model mis-specification; NONMEM's default). **ferx defaults to `r`, but NONMEM's `$COVARIANCE` default is `rsr`** — set `covariance_method = rsr` when reconciling SEs against a NONMEM run that used the default `$COV`. `s`/`rsr` are supported for FOCEI, FOCE, and IOV fits; all three anchored against NONMEM `$COV MATRIX=S`/`RSR` within ~10%. All methods require a positive-definite FD Hessian (a non-PD Hessian is not yet routed to the `s` cross-product). Requires `covariance = true`. |
@@ -36,7 +37,8 @@ The optional `[fit_options]` block configures the estimation method and optimize
 | `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde--npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. A typical value is `1000`. Cost scales linearly with the count. |
 | `npde_seed` | integer | — | RNG seed for the NPDE/NPD simulation, for reproducible diagnostics. Unset falls back to a fixed default. Only used when `npde_nsim > 0`. |
 | `mu_referencing` | `true`, `false` | `true` | Re-centre inner-loop ETA estimates on the current population mean (auto-detected from `[individual_parameters]`). See the [FAQ entry](../faq.qmd#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem--nlmixr2) for details. Set `false` to reproduce pre-automatic-mu behaviour. |
-| `iov_column` | string | — | Name of the occasion column in the dataset (e.g. `OCC`). Required when the model uses `kappa` or `block_kappa` declarations. The column must contain integer occasion indices. Case-insensitive. Only supported with `foce` / `focei` — not `saem`. See [IOV documentation](iov.qmd). |
+| `iov_column` | string | — | Name of the occasion column in the dataset (e.g. `OCC`). Supplies occasions when the model uses `kappa` or `block_kappa` declarations. The column must contain integer occasion indices. Case-insensitive. Supported with `foce`, `focei`, and `saem` (not `imp` / `impmap`, which do not support IOV). See [IOV documentation](iov.qmd). |
+| `iov_occasion` | `column`, `dose`, `time(t₁, …)` | `column` | Derive the IOV occasion partition from the model instead of a data column. `dose`: each administration starts a new occasion. `time(24, 48)`: time-window breakpoints. When set to `dose`/`time(...)`, this overrides `iov_column` (with a warning). See [Declaring occasions in the model](iov.qmd#declaring-occasions-in-the-model). |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
 | `reconverge_gradient_interval` | integer ≥ 0 | `0` | How often to re-solve each subject's inner EBE loop during the population gradient instead of holding the EBEs (η̂) and FOCE Hessian fixed. `0` (default) never reconverges — the cheap fixed-EBE gradient is used. `1` reconverges on every gradient evaluation; `N` reconverges on evaluations `0, N, 2N, …` and uses the cheap gradient in between (amortizing the cost by ~`N`× while still periodically correcting the search direction). The fixed-EBE gradient omits the inner solution's response to θ/Ω, so on ill-conditioned fits a gradient optimizer (e.g. `slsqp`) can stall well above the derivative-free (`bobyqa`) optimum; reconverging recovers the full surface at roughly **5–6× the per-gradient cost** at interval `1`. IOV models (`kappa`/`block_kappa`) always reconverge and ignore this setting. See the [FOCE/FOCEI page](../estimation/foce.qmd#gradient-accuracy-vs-cost). |
 | `inits_from_nca` | `true`, `false`, `nca`, `nca_sweep`, `nca_ebe` | `false` | Derive NCA-based starting values from the data before the optimizer loop. `true` (alias for `nca_sweep`) and `false`/`off` toggle the default strategy; the three named values pick a strategy explicitly (see [NCA-based starting values](#nca-based-starting-values)). Fixed thetas are never overwritten; covariate-effect thetas (no mu-referencing link) keep the model default. Most useful with `method = trust_region` or `method = gn` / `method = gn_hybrid`, where bad starting values can cause early stalling. The same estimation is available without running a fit via the CLI flag `--inits-from-nca[=METHOD]` and (in ferx-r) the `ferx_inits_from_nca()` function. |
@@ -148,8 +150,10 @@ any censored row, since the within-subject decorrelation would otherwise mix the
 LLOQ into the uncensored rows. NPDE also requires more replicates than a subject
 has observations (`npde_nsim > n_obs`) for a full-rank simulated covariance;
 otherwise that subject's NPDE is `NaN` (NPD is still computed). For IOV (`kappa`)
-models the simulation holds kappas at zero (the existing `simulate()` convention),
-so NPDE/NPD omit the inter-occasion component of the predictive variance.
+models the NPDE/NPD simulation currently holds kappas at zero, so NPDE/NPD omit
+the inter-occasion component of the predictive variance. (This is specific to the
+NPDE path; `simulate()` itself samples per-occasion kappas — see
+[Simulation](simulation.qmd#simulation-process). Aligning NPDE is a follow-up.)
 
 ## Estimation Methods
 
@@ -451,7 +455,7 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | `phase` | gn_hybrid, saem | `focei` (polish) or `explore`/`converge` |
 | `ofv` | all | Objective function value |
 | `wall_ms` | all | Wall time for this iteration (ms) |
-| `grad_norm` | BFGS, NLopt gradient-mode | Gradient norm |
+| `grad_norm` | BFGS, NLopt gradient-mode, GN | Gradient norm |
 | `step_norm` | BFGS | Step size |
 | `inner_iter_count` | (reserved) | Reserved for future per-iteration inner-loop count; currently `NA` |
 | `optimizer` | FOCE/FOCEI | Active NLopt algorithm |
@@ -463,5 +467,22 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | `mh_accept_rate` | SAEM | Mean acceptance rate across all subjects (MH or HMC). In mixed HMC/MH runs (`n_leapfrog > 0` with some MH-fallback subjects) this is an aggregate across both samplers. |
 | `n_ebe_unconverged` | FOCE/FOCEI | Subjects whose inner optimizer did not converge |
 | `n_ebe_fallback` | FOCE/FOCEI | Subjects that fell back to Nelder-Mead |
+| `val:<name>` | all | Per-parameter estimate, one column per optimized coordinate, in **natural / reporting scale** (θ as values, Ω as variances/covariances, Σ as variances) |
+| `grad:<name>` | FOCE/FOCEI/GN | Per-parameter gradient, in the optimizer's **transformed/scaled** space (`NA` for SAEM); `sqrt(sum(grad:<name>^2)) == grad_norm` |
+
+After the fixed columns above, the trace appends two blocks of per-parameter
+columns — all `val:<name>` columns, then all `grad:<name>` columns — one pair
+per optimized coordinate (thetas, Ω diagonals **and** off-diagonal covariances,
+Σ, plus any IOV Ω). Headers use the declared parameter names where available
+(`val:TVCL`, `val:ETA_CL`, an Ω off-diagonal as `val:ETA_V~ETA_CL`,
+`val:PROP_ERR`), with `THETA1` / `OMEGA(2,1)` / `SIGMA(1)` fallbacks (a name
+containing a comma is CSV-quoted). The column set is fixed across a method chain
+(e.g. `saem -> focei`), so one header serves the whole run. `grad:*` columns are
+`NA` on any iteration without an OFV gradient (SAEM, and derivative-free BOBYQA
+evals). The `val:*`/`grad:*` cells are written in scientific notation
+(`{:.6e}`) — unlike the fixed-decimal scalar columns — so small variances and
+near-converged gradient coordinates keep their precision instead of rounding to
+`0`. This powers the per-parameter convergence view in ferx-r's trace UI
+(#640).
 
 Unused columns contain `NA`. The trace is buffered and flushed when the fit ends; if a run is killed mid-iteration the buffered tail may be lost.

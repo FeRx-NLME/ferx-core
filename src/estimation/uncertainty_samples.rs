@@ -330,6 +330,8 @@ mod tests {
         FitResult {
             method: crate::types::EstimationMethod::FoceI,
             method_chain: vec![],
+            method_wall_times_secs: vec![],
+            covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
             aic: 0.0,

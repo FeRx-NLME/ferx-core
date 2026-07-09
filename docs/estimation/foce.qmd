@@ -235,6 +235,27 @@ Same warfarin model, `$EST METHOD=1` (no `INTER`), `$COVARIANCE MATRIX=S` and `M
 
 Note that ferx defaults to `covariance_method = r` whereas NONMEM's `$COVARIANCE` default is the `rsr` sandwich; set `covariance_method = rsr` when reconciling SEs against a default NONMEM run.
 
+### Running the covariance step after a fit (`run_covariance`)
+
+The covariance step can also be run as a standalone step against a `FitResult` produced earlier — the covariance-step analogue of [`run_sir`](sir.qmd#running-sir-after-a-fit-run_sir). This is useful when the original fit was expensive and you want to add (or re-run, e.g. with a different `covariance_method`) the covariance step without re-estimating, or when working with a fit loaded from a `.fitrx` bundle.
+
+```rust
+use ferx_core::{fit_from_files, run_covariance, FitOptions};
+
+let mut opts = FitOptions::default();
+opts.run_covariance_step = false;               // skip cov during the fit…
+let fit = fit_from_files("model.ferx", Some("data.csv"), None, Some(opts.clone()))?;
+
+opts.covariance_method = ferx_core::CovarianceMethod::Sandwich;   // …run it now, as RSR
+let fit_with_cov = run_covariance(&fit, None, None, &opts)?;
+```
+
+`run_covariance` reconstructs the fitted parameters from the `FitResult`, re-runs the final inner loop (cold-started, exactly as the inline covariance path in `fit()` does) to rebuild the covariance-step inputs, and calls the same FD-Hessian covariance step `fit()` runs inline — so the result matches fitting with `covariance = true` up to finite-difference noise (the inline path passes the optimizer's exact Cholesky factor; this wrapper re-decomposes `fit.omega`). The returned `FitResult` is a clone of `fit` with `covariance_matrix`, `se_theta` / `se_omega` / `se_sigma` / `se_kappa`, `covariance_status`, and the condition-number diagnostics refreshed. `run_covariance_step` on the passed options is ignored — calling the function is itself the request.
+
+A covariance step that runs but cannot produce a usable matrix (a non-positive-definite or structurally-unusable FD Hessian) is **not** an error: the returned fit reports `covariance_status = Failed` with a diagnostic in `warnings`, mirroring the inline `fit()` behaviour. `Err` is reserved for input problems — a missing or hash-mismatched model/dataset, a dimension mismatch, or an IOV model supplied without its population.
+
+The second and third arguments (`Option<&CompiledModel>` / `Option<&Population>`) behave exactly as for `run_sir`: `Some(...)` is used as-is (caller owns verification), `None` re-reads from `fit.model_path` / `fit.data_path` with SHA-256 integrity checks that refuse stale source. See [Caller-supplied vs. re-read inputs](sir.qmd#caller-supplied-vs-re-read-inputs).
+
 ### Hessian regularization
 
 Because the EBEs reconverge, the Hessian is positive-definite on well-conditioned surfaces and no regularization is needed. As a safety net for genuinely ill-conditioned or near-singular problems, ferx-core still inverts via a symmetric eigendecomposition and clips eigenvalues below `max(λ_max · 1e-10, 1e-12)` to that floor before reconstructing `H⁻¹`, adding a warning to `FitResult.warnings`:

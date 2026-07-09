@@ -19,6 +19,10 @@ pub struct OuterResult {
     /// Per-occasion kappa EBEs for each subject. Empty vecs when `n_kappa == 0`.
     pub kappas: Vec<Vec<DVector<f64>>>,
     pub covariance_matrix: Option<DMatrix<f64>>,
+    /// Wall-clock time spent inside this stage's covariance-step block
+    /// (`compute_covariance` / SIR-fallback construction), in seconds.
+    /// `0.0` when `run_covariance_step` was false for this stage.
+    pub covariance_wall_time_secs: f64,
     pub warnings: Vec<String>,
     /// Estimated OFV evaluations saved by the SAEM mu-ref gradient step M-step.
     /// Non-None only when method=saem and mu_referencing=true.
@@ -163,12 +167,13 @@ fn evaluate_at_initial_params(
 
     let mut warnings = Vec::new();
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            match compute_covariance(
+            let cov_timer = std::time::Instant::now();
+            let cm = match compute_covariance(
                 &x,
                 init_params,
                 model,
@@ -194,9 +199,10 @@ fn evaluate_at_initial_params(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
 
     OuterResult {
@@ -208,6 +214,7 @@ fn evaluate_at_initial_params(
         h_matrices,
         kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
@@ -1016,6 +1023,10 @@ fn optimize_nlopt(
 
         // Compute gradient if requested (central FD with fixed EBEs)
         let mut grad_norm_for_trace: Option<f64> = None;
+        // Per-coordinate scaled gradient for the trace (#640); only populated
+        // for a genuine OFV gradient (not the guard-penalty push), so it is
+        // present exactly when `grad_norm_for_trace` is.
+        let mut grad_vec_for_trace: Option<Vec<f64>> = None;
         if let Some(g) = grad {
             // A rejected or non-finite point has no useful population gradient: steepest
             // ascent toward bounds center nudges the optimizer back. Fall through (no early
@@ -1052,6 +1063,14 @@ fn optimize_nlopt(
                     sq += gi * gi;
                 }
                 grad_norm_for_trace = Some(sq.sqrt());
+                // Clone the scaled gradient for the trace only when a trace is
+                // open — this runs on every gradient eval (the hot path), so an
+                // unconditional `to_vec` would waste an allocation per eval on
+                // the default trace-off path (#640 review). Snapshot before the
+                // SLSQP cap below so it matches `grad_norm_for_trace`.
+                if crate::estimation::trace::is_active() {
+                    grad_vec_for_trace = Some(g.to_vec());
+                }
                 if matches!(algo, nlopt::Algorithm::Slsqp) {
                     cap_slsqp_gradient(g, &lower_s, &upper_s);
                 }
@@ -1129,6 +1148,7 @@ fn optimize_nlopt(
                 nlopt::Algorithm::Lbfgs => "nlopt_lbfgs",
                 _ => "slsqp",
             };
+            let values = crate::estimation::parameterization::coordinate_values(&params);
             crate::estimation::trace::write_foce(
                 state.n_evals,
                 method_str,
@@ -1138,6 +1158,8 @@ fn optimize_nlopt(
                 optimizer_str,
                 Some(ebe_stats.n_unconverged),
                 Some(ebe_stats.n_fallback),
+                &values,
+                grad_vec_for_trace.as_deref(),
             );
         }
         state.prev_x = xs.to_vec();
@@ -1307,12 +1329,13 @@ fn optimize_nlopt(
     // Covariance step (skip if user cancelled — it's expensive and the result
     // will be discarded by the top-level fit() anyway).
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            match compute_covariance(
+            let cov_timer = std::time::Instant::now();
+            let cm = match compute_covariance(
                 &x0,
                 init_params,
                 model,
@@ -1338,9 +1361,10 @@ fn optimize_nlopt(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
 
     if !converged {
@@ -1364,6 +1388,7 @@ fn optimize_nlopt(
         h_matrices: final_hms,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
@@ -1576,6 +1601,11 @@ fn optimize_bfgs(
         }
 
         let g_norm: f64 = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+        // Snapshot the scaled gradient that `g_norm` is taken from, before the
+        // step overwrites `g` with `g_new`. The trace's `grad:*` columns log
+        // this vector so `sqrt(Σ gᵢ²) == grad_norm` holds (#640). Like the
+        // existing `grad_norm` column, it reflects the pre-step point.
+        let g_for_trace: Vec<f64> = g.to_vec();
         if g_norm < options.outer_gtol {
             if options.verbose {
                 eprintln!("Converged at iteration {} (|g| = {:.2e})", iter, g_norm);
@@ -1691,6 +1721,14 @@ fn optimize_bfgs(
                 Optimizer::Lbfgs => "lbfgs",
                 _ => "bfgs",
             };
+            // Recompute the real (unscaled) point rather than reuse
+            // `x_new_real`, which may already have been moved into the
+            // predictor's anchor above.
+            let x_real: Vec<f64> = (0..n).map(|i| xs[i] * scale[i]).collect();
+            let values = crate::estimation::parameterization::coordinate_values(&unpack_params(
+                &x_real,
+                init_params,
+            ));
             crate::estimation::trace::write_foce(
                 iter,
                 method_str,
@@ -1700,6 +1738,8 @@ fn optimize_bfgs(
                 optimizer_str,
                 None,
                 None,
+                &values,
+                Some(&g_for_trace),
             );
         }
 
@@ -1734,12 +1774,13 @@ fn optimize_bfgs(
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
     let mut sir_fallback_proposal: Option<DMatrix<f64>> = None;
-    let covariance_matrix =
+    let (covariance_matrix, covariance_wall_time_secs) =
         if options.run_covariance_step && !crate::cancel::is_cancelled(&options.cancel) {
             if options.verbose {
                 eprintln!("Computing covariance matrix...");
             }
-            match compute_covariance(
+            let cov_timer = std::time::Instant::now();
+            let cm = match compute_covariance(
                 &x_final,
                 init_params,
                 model,
@@ -1765,9 +1806,10 @@ fn optimize_bfgs(
                     sir_fallback_proposal = Some(fallback_proposal);
                     None
                 }
-            }
+            };
+            (cm, cov_timer.elapsed().as_secs_f64())
         } else {
-            None
+            (None, 0.0)
         };
 
     if !converged {
@@ -1783,6 +1825,7 @@ fn optimize_bfgs(
         h_matrices: final_hms,
         kappas: final_kappas,
         covariance_matrix,
+        covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
@@ -5514,6 +5557,146 @@ mod tests {
         );
     }
 
+    /// Built-in BFGS with the optimizer trace active must emit the per-parameter
+    /// `val:*` / `grad:*` columns (#640) via the second `write_foce` call site,
+    /// and the gradient columns must reconstruct the `grad_norm` column.
+    #[test]
+    fn bfgs_trace_emits_per_param_columns() {
+        use crate::types::{EstimationMethod, FitOptions, Optimizer};
+        let model = make_model();
+        let population = make_population(4);
+        let coord_names =
+            crate::estimation::parameterization::coordinate_names(&model.default_params);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = format!(
+            "/tmp/ferx_trace_bfgs_param_{}_{}.csv",
+            std::process::id(),
+            nanos
+        );
+        crate::estimation::trace::init(path.clone(), &coord_names).unwrap();
+        let opts = FitOptions {
+            method: EstimationMethod::Foce,
+            optimizer: Optimizer::Bfgs,
+            outer_maxiter: 3,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let _ = optimize_population(&model, &population, &model.default_params, &opts);
+        crate::estimation::trace::finish();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines = contents.lines();
+        let header = lines.next().unwrap();
+        assert!(
+            header.contains("val:"),
+            "header missing val columns: {header}"
+        );
+        assert!(header.contains("grad:"), "header missing grad columns");
+        let n_coords = coord_names.len();
+        let fixed = 17;
+        // Find a data row with a finite grad_norm and check the invariant.
+        let cols_of = |l: &str| l.split(',').map(String::from).collect::<Vec<_>>();
+        let hdr = cols_of(header);
+        let gn_idx = hdr.iter().position(|c| c == "grad_norm").unwrap();
+        let mut checked = false;
+        for row in lines {
+            let c = cols_of(row);
+            assert_eq!(c.len(), fixed + 2 * n_coords, "row column count");
+            if c[gn_idx] == "NA" {
+                continue;
+            }
+            let gn: f64 = c[gn_idx].parse().unwrap();
+            let mut sq = 0.0;
+            for i in (fixed + n_coords)..(fixed + 2 * n_coords) {
+                if let Ok(v) = c[i].parse::<f64>() {
+                    sq += v * v;
+                }
+            }
+            assert!(
+                (sq.sqrt() - gn).abs() <= 1e-6 * gn.abs().max(1.0),
+                "grad cols must reconstruct grad_norm: recon={} grad_norm={}",
+                sq.sqrt(),
+                gn
+            );
+            checked = true;
+            break;
+        }
+        assert!(checked, "expected at least one row with a finite grad_norm");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Gradient-mode NLopt (SLSQP) with the trace active must emit the
+    /// per-parameter columns via the *nlopt* `write_foce` call site — the branch
+    /// that snapshots `grad_vec_for_trace` (now guarded by `is_active`). The
+    /// built-in-BFGS test above covers a different site; SLSQP is otherwise only
+    /// reached by slow fits, so this registers PR coverage for the nlopt path.
+    #[test]
+    fn nlopt_gradient_trace_emits_per_param_columns() {
+        use crate::types::{EstimationMethod, FitOptions, Optimizer};
+        let model = make_model();
+        let population = make_population(4);
+        let coord_names =
+            crate::estimation::parameterization::coordinate_names(&model.default_params);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = format!(
+            "/tmp/ferx_trace_slsqp_param_{}_{}.csv",
+            std::process::id(),
+            nanos
+        );
+        crate::estimation::trace::init(path.clone(), &coord_names).unwrap();
+        let opts = FitOptions {
+            method: EstimationMethod::Foce,
+            optimizer: Optimizer::Slsqp,
+            outer_maxiter: 3,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let _ = optimize_population(&model, &population, &model.default_params, &opts);
+        crate::estimation::trace::finish();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines = contents.lines();
+        let header: Vec<String> = lines.next().unwrap().split(',').map(String::from).collect();
+        assert!(header.iter().any(|c| c.starts_with("val:")));
+        assert!(header.iter().any(|c| c.starts_with("grad:")));
+        let n_coords = coord_names.len();
+        let fixed = 17;
+        let gn_idx = header.iter().position(|c| c == "grad_norm").unwrap();
+        let mut checked = false;
+        for row in lines {
+            let c: Vec<String> = row.split(',').map(String::from).collect();
+            assert_eq!(c.len(), fixed + 2 * n_coords, "row column count");
+            if c[gn_idx] == "NA" {
+                continue;
+            }
+            let gn: f64 = c[gn_idx].parse().unwrap();
+            let mut sq = 0.0;
+            for i in (fixed + n_coords)..(fixed + 2 * n_coords) {
+                if let Ok(v) = c[i].parse::<f64>() {
+                    sq += v * v;
+                }
+            }
+            assert!(
+                (sq.sqrt() - gn).abs() <= 1e-6 * gn.abs().max(1.0),
+                "grad cols must reconstruct grad_norm: recon={} grad_norm={}",
+                sq.sqrt(),
+                gn
+            );
+            checked = true;
+            break;
+        }
+        assert!(checked, "expected at least one row with a finite grad_norm");
+        std::fs::remove_file(&path).ok();
+    }
+
     // ── global pre-search (CRS2-LM) ──────────────────────────────────────────
 
     /// Exercises the `run_global_presearch` branch. CRS2-LM may be absent from
@@ -5541,6 +5724,10 @@ mod tests {
             result.ofv.is_finite(),
             "presearch run produced non-finite OFV"
         );
+        // #713: with `run_covariance_step = false` the covariance block never
+        // runs, so its timer must report exactly 0.0, not a stray near-zero
+        // `Instant::now()` reading.
+        assert_eq!(result.covariance_wall_time_secs, 0.0);
     }
 
     // ── Covariance Hessian throughput benchmark (issue #209) ─────────────────

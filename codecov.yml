@@ -115,3 +115,4 @@ ignore:
   - "**/build.rs"
   - "src/bin/generate_data.rs"
   - "src/bin/pktte_sim_anchor.rs"
+  - "src/bin/rtte_sim_anchor.rs"

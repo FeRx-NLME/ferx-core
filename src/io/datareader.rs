@@ -152,6 +152,18 @@ pub fn read_nonmem_csv(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
 ) -> Result<Population, String> {
+    read_nonmem_csv_mapped(path, covariate_columns, iov_column, &[])
+}
+
+/// Like [`read_nonmem_csv`] but with a `[data]` canonical-role → header
+/// remapping (#730). `column_map` entries are `(canonical_role, actual_header)`;
+/// an empty slice is the no-remap identity used by the public wrapper.
+pub(crate) fn read_nonmem_csv_mapped(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    column_map: &[(String, String)],
+) -> Result<Population, String> {
     read_nonmem_csv_impl(
         path,
         covariate_columns,
@@ -159,6 +171,7 @@ pub fn read_nonmem_csv(
         None,
         None,
         &HashSet::new(),
+        column_map,
     )
     .map(|(pop, _)| pop)
 }
@@ -182,6 +195,18 @@ pub fn read_nonmem_csv_with_covariates(
     extra_columns: &[String],
     iov_column: Option<&str>,
 ) -> Result<(Population, CovariateTable), String> {
+    read_nonmem_csv_with_covariates_mapped(path, decls, extra_columns, iov_column, &[])
+}
+
+/// Like [`read_nonmem_csv_with_covariates`] but with a `[data]` column
+/// remapping (#730). See [`read_nonmem_csv_mapped`].
+pub(crate) fn read_nonmem_csv_with_covariates_mapped(
+    path: &Path,
+    decls: &[CovariateDecl],
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    column_map: &[(String, String)],
+) -> Result<(Population, CovariateTable), String> {
     // Population reads the union of declared + referenced-but-undeclared columns,
     // declared first so the table's column order matches the declaration.
     let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
@@ -198,6 +223,7 @@ pub fn read_nonmem_csv_with_covariates(
         Some(decls),
         None,
         &HashSet::new(),
+        column_map,
     )?;
     Ok((
         pop,
@@ -212,6 +238,18 @@ pub fn read_nonmem_csv_filtered(
     covariate_columns: Option<&[&str]>,
     iov_column: Option<&str>,
     filter: &SelectionFilter,
+) -> Result<Population, String> {
+    read_nonmem_csv_filtered_mapped(path, covariate_columns, iov_column, filter, &[])
+}
+
+/// Like [`read_nonmem_csv_filtered`] but with a `[data]` column remapping
+/// (#730). See [`read_nonmem_csv_mapped`].
+pub(crate) fn read_nonmem_csv_filtered_mapped(
+    path: &Path,
+    covariate_columns: Option<&[&str]>,
+    iov_column: Option<&str>,
+    filter: &SelectionFilter,
+    column_map: &[(String, String)],
 ) -> Result<Population, String> {
     // When an explicit covariate list is supplied, make sure every covariate the
     // filter references is in it — otherwise a filtered column outside the list
@@ -237,6 +275,7 @@ pub fn read_nonmem_csv_filtered(
         None,
         Some(filter),
         &HashSet::new(),
+        column_map,
     )
     .map(|(pop, _)| pop)
 }
@@ -248,6 +287,26 @@ pub fn read_nonmem_csv_with_covariates_filtered(
     extra_columns: &[String],
     iov_column: Option<&str>,
     filter: &SelectionFilter,
+) -> Result<(Population, CovariateTable), String> {
+    read_nonmem_csv_with_covariates_filtered_mapped(
+        path,
+        decls,
+        extra_columns,
+        iov_column,
+        filter,
+        &[],
+    )
+}
+
+/// Like [`read_nonmem_csv_with_covariates_filtered`] but with a `[data]` column
+/// remapping (#730). See [`read_nonmem_csv_mapped`].
+pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
+    path: &Path,
+    decls: &[CovariateDecl],
+    extra_columns: &[String],
+    iov_column: Option<&str>,
+    filter: &SelectionFilter,
+    column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
     let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
     for c in extra_columns {
@@ -274,6 +333,7 @@ pub fn read_nonmem_csv_with_covariates_filtered(
         Some(decls),
         Some(filter),
         &HashSet::new(),
+        column_map,
     )?;
     Ok((
         pop,
@@ -293,6 +353,7 @@ pub(crate) fn read_nonmem_csv_filtered_tte(
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
     tte_cmts: &HashSet<usize>,
+    column_map: &[(String, String)],
 ) -> Result<Population, String> {
     let augmented: Option<Vec<String>> = covariate_columns.map(|cols| {
         let mut v: Vec<String> = cols.iter().map(|s| s.to_string()).collect();
@@ -315,6 +376,7 @@ pub(crate) fn read_nonmem_csv_filtered_tte(
         None,
         filter,
         tte_cmts,
+        column_map,
     )
     .map(|(pop, _)| pop)
 }
@@ -328,6 +390,7 @@ pub(crate) fn read_nonmem_csv_with_covariates_tte(
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
     tte_cmts: &HashSet<usize>,
+    column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
     let mut union: Vec<String> = decls.iter().map(|d| d.name.clone()).collect();
     for c in extra_columns {
@@ -350,6 +413,7 @@ pub(crate) fn read_nonmem_csv_with_covariates_tte(
         Some(decls),
         filter,
         tte_cmts,
+        column_map,
     )?;
     Ok((
         pop,
@@ -373,6 +437,7 @@ fn read_nonmem_csv_impl(
     table_decls: Option<&[CovariateDecl]>,
     filter: Option<&SelectionFilter>,
     tte_cmts: &HashSet<usize>,
+    column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     let mut rdr = csv::ReaderBuilder::new()
         .flexible(true)
@@ -383,12 +448,67 @@ fn read_nonmem_csv_impl(
     // Preserve original header casing for covariate names. Standard NONMEM
     // columns are matched case-insensitively so that legacy CSVs (e.g. `Id`,
     // `TIME`) keep working; covariate lookups remain case-sensitive.
-    let headers: Vec<String> = rdr
+    let mut headers: Vec<String> = rdr
         .headers()
         .map_err(|e| format!("Failed to read headers: {}", e))?
         .iter()
         .map(|h| h.trim().to_string())
         .collect();
+
+    // Apply `[data]` column remapping (#730, #742): rename each mapped actual
+    // header to its target name (case-insensitive match on the actual header).
+    // Downstream canonical lookups (`col_idx_ci("time")`) and covariate
+    // auto-detection (`is_standard`) then treat a renamed column as that role /
+    // covariate with no further special-casing, and the original header no
+    // longer leaks in under its old name. Resolve every actual header against
+    // the *original* headers first, then apply the renames, so one mapping can
+    // never shadow another's lookup.
+    if !column_map.is_empty() {
+        let mut planned: Vec<(usize, String)> = Vec::with_capacity(column_map.len());
+        for (target, actual) in column_map {
+            // A mapped header that is absent is a hard error — the mapping would
+            // silently do nothing (e.g. TIME would still be reported missing).
+            let idx = headers
+                .iter()
+                .position(|h| h.eq_ignore_ascii_case(actual))
+                .ok_or_else(|| {
+                    format!(
+                        "[data]: mapped column `{actual}` (renamed to `{target}`) not found in \
+                         dataset headers: {}",
+                        headers.join(", ")
+                    )
+                })?;
+            // Reject clobbering the IOV occasion column: renaming it would make
+            // the later `iov_column` lookup fail with a misleading "not found".
+            if let Some(iov) = iov_column {
+                if actual.eq_ignore_ascii_case(iov) {
+                    return Err(format!(
+                        "[data]: mapped column `{actual}` (renamed to `{target}`) is also the \
+                         iov_column `{iov}`"
+                    ));
+                }
+            }
+            planned.push((idx, target.clone()));
+        }
+        // A column being renamed *away* frees its old name — the raw `dv` column
+        // renamed to `ODV` no longer collides with a `DV = lndv` mapping (#742).
+        // So a target may collide only with a *surviving* (non-source) header.
+        let sources: std::collections::HashSet<usize> = planned.iter().map(|(i, _)| *i).collect();
+        for (idx, target) in &planned {
+            if let Some(other) = headers.iter().position(|h| h.eq_ignore_ascii_case(target)) {
+                if other != *idx && !sources.contains(&other) {
+                    return Err(format!(
+                        "[data]: renaming to `{target}` collides — the dataset already has a `{}` \
+                         column",
+                        headers[other]
+                    ));
+                }
+            }
+        }
+        for (idx, name) in planned {
+            headers[idx] = name;
+        }
+    }
 
     let col_idx_ci =
         |name: &str| -> Option<usize> { headers.iter().position(|h| h.eq_ignore_ascii_case(name)) };
@@ -658,6 +778,25 @@ fn read_nonmem_csv_impl(
         subjects.push(subject);
     }
 
+    // Hard error (#753): dose rows are present (EVID=1/4 classified as doses) but
+    // the dataset has no `AMT` column, so every dose was created with `amt = 0`.
+    // The fit would run silently with no drug in the system — a flat objective
+    // that pins every parameter at its initial estimate. This most often means the
+    // amount column is named something other than `AMT` (e.g. a NONMEM export using
+    // `DOSE`); rename it in the [data] block or the CSV header. Scoped to dose rows
+    // present + no AMT column: dose-free models (#262) and TTE/survival have no dose
+    // events, and the EVID-absent path infers no doses without an AMT column, so
+    // none of them trip this.
+    if amt_col.is_none() && subjects.iter().any(|s| !s.doses.is_empty()) {
+        return Err(
+            "E_DOSE_NO_AMT: the dataset has dose records (EVID=1/4) but no `AMT` column, so \
+             every dose amount is zero and the fit would run with no drug in the system. If the \
+             amount column has a different name (e.g. `DOSE`), rename it to `AMT` in the CSV \
+             header or via a rename in the [data] block."
+                .to_string(),
+        );
+    }
+
     // Accumulate OCC warning into population_warnings (surfaced via FitResult.warnings).
     if let Some(name) = iov_column {
         if total_occ_failures > 0 {
@@ -711,6 +850,27 @@ fn read_nonmem_csv_impl(
                  AMT column with EVID=1/4 dose rows (or a nonzero AMT when EVID is absent).",
                 subjects.len()
             ));
+        }
+    }
+
+    // All-zero-dose warning (#753): an `AMT` column exists (so E_DOSE_NO_AMT did not
+    // fire) but every parsed dose amount is exactly zero — e.g. a placebo-only typo
+    // or a mis-scaled amount column. Like the `E_DOSE_NO_AMT` error above, this yields a flat
+    // objective; here we warn rather than error because the column is present and a
+    // genuinely dose-free-but-AMT-columned dataset is conceivable. Only fires when at
+    // least one dose event exists (else W_NO_DOSES already covered it).
+    if amt_col.is_some() {
+        let any_dose = subjects.iter().any(|s| !s.doses.is_empty());
+        let all_zero = subjects
+            .iter()
+            .all(|s| s.doses.iter().all(|d| d.amt == 0.0));
+        if any_dose && all_zero {
+            population_warnings.push(
+                "W_ALL_DOSES_ZERO: every dose record has AMT = 0, so no drug enters the system \
+                 and the objective is flat (parameters will not move from their initial values). \
+                 Check the `AMT` column values and scaling."
+                    .to_string(),
+            );
         }
     }
 
@@ -863,6 +1023,91 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String
          (bolus), >0 (infusion rate), -1 (modeled infusion rate), and -2 \
          (modeled infusion duration)."
     ))
+}
+
+/// Validate a `SS` (steady-state) dataset cell.
+///
+/// NONMEM overloads `SS`: `0` = not steady state, `1` = reset the dose
+/// compartment to zero and initialise it at the steady state of the given
+/// regimen, `2` = *superimpose* that steady state on top of the compartment's
+/// pre-existing amounts (no reset). ferx implements `SS=1` only.
+///
+/// The engine carries steady state as a single `DoseEvent.ss: bool`, so once a
+/// cell is reduced to that flag the `1`-vs-`2` distinction is gone. Previously
+/// any `SS >= 0.5` — including `SS=2` — was collapsed to `ss = true` and run
+/// with `SS=1` (reset) semantics, so an `SS=2` record produced a wrong (reset)
+/// profile with no error. `0` maps to `false`, `1` to `true`; every other value
+/// (including `SS=2`) is rejected here. Full `SS=2` support is tracked in #694.
+///
+/// A missing / blank / non-numeric cell arrives as `0.0` (via [`parse_f64`]) and
+/// is treated as "not steady state", matching the NONMEM default. `time` is the
+/// user-written (`raw_time`) value so the message names the row's own time.
+fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
+    if !ss.is_finite() {
+        return Err(format!(
+            "subject {id}, time {time}: SS={ss} is not finite; expected 0 (not \
+             steady state) or 1 (reset then dose to steady state)."
+        ));
+    }
+    // `SS` is a NONMEM integer code. Match on the integer form (mirrors
+    // `validate_dose_rate`); a non-integer `SS` is not a code. `ss as i64`
+    // saturates, so an out-of-range integer can't alias 0/1. Comparison against
+    // `0.0` is exempt from clippy::float_cmp.
+    let code = if ss.fract() == 0.0 {
+        Some(ss as i64)
+    } else {
+        None
+    };
+    match code {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => {
+            let hint = if code == Some(2) {
+                " SS=2 (superimpose the steady state without resetting the \
+                 compartment) is not yet supported — only SS=1 (reset then dose \
+                 to steady state) is implemented; see issue #694."
+            } else {
+                ""
+            };
+            Err(format!(
+                "subject {id}, time {time}: SS={ss} is not a supported \
+                 steady-state code; expected 0 (not steady state) or 1 (reset \
+                 then dose to steady state).{hint}"
+            ))
+        }
+    }
+}
+
+/// Build a dose that honors the row's `RATE` classification (#324/#722).
+///
+/// A coded `RATE=-1`/`-2` row yields a *modeled* infusion ([`DoseEvent::modeled`],
+/// whose concrete rate/duration are resolved per iteration from `R{cmt}`/`D{cmt}`);
+/// an ordinary row yields a [`RateMode::Fixed`] dose. Passing the raw `-1`/`-2`
+/// sentinel to [`DoseEvent::new`] instead would set `rate_mode = Fixed` with
+/// `duration = 0` (since `rate <= 0`), so `is_infusion()` is false and the dose
+/// silently collapses to an instantaneous bolus — and `check_modeled_dose_rates`
+/// skips `Fixed` doses, so the missing slot is never caught.
+///
+/// **Single construction site** for the primary dose *and* its `ADDL`-expanded
+/// copies, so the two cannot diverge — that divergence is exactly what silently
+/// collapsed `ADDL` modeled infusions to boluses (#722). `ADDL` doses pass
+/// `ss = false` (an expanded dose is never steady-state itself); everything else
+/// is identical to the primary row.
+fn dose_for_rate_mode(
+    time: f64,
+    amt: f64,
+    cmt: usize,
+    rate: f64,
+    ss: bool,
+    ii: f64,
+    rate_mode: RateMode,
+) -> DoseEvent {
+    match rate_mode {
+        RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
+        RateMode::ModeledDuration | RateMode::ModeledRate => {
+            DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode)
+        }
+    }
 }
 
 /// Compute a record's effective EVID.
@@ -1264,17 +1509,21 @@ fn parse_subject(
                 .and_then(|c| row.get(c))
                 .map(|s| parse_f64(s))
                 .unwrap_or(0.0);
-            let ss = ss_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s.trim()) >= 0.5)
-                .unwrap_or(false);
+            // Validate the `SS` cell: only `SS=0`/`SS=1` are supported. A missing
+            // or blank cell parses to `0.0` (not steady state). `SS=2` and other
+            // codes are rejected here (via `validate_ss`) rather than silently
+            // collapsed into the single `ss = true` flag and run with `SS=1`
+            // (reset) semantics. `raw_time` names the value the user wrote.
+            let ss = validate_ss(
+                ss_col
+                    .and_then(|c| row.get(c))
+                    .map(|s| parse_f64(s.trim()))
+                    .unwrap_or(0.0),
+                id,
+                raw_time,
+            )?;
 
-            doses.push(match rate_mode {
-                RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
-                RateMode::ModeledDuration | RateMode::ModeledRate => {
-                    DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode)
-                }
-            });
+            doses.push(dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode));
             dose_rec.push(row_seq);
             if occ_col.is_some() {
                 dose_occasions.push(occ);
@@ -1317,10 +1566,13 @@ fn parse_subject(
                 } else {
                     for k in 1..=(addl as u32) {
                         let addl_time = time + (k as f64) * ii;
-                        doses.push(DoseEvent::new(
-                            addl_time, amt, cmt, rate,
-                            false, // expanded doses are never SS themselves
-                            ii,
+                        // Same construction as the primary dose (see
+                        // `dose_for_rate_mode`): an expanded dose of a coded
+                        // `RATE=-1`/`-2` row stays a modeled infusion rather than
+                        // collapsing to a `Fixed` bolus, and is never steady-state
+                        // itself (`ss = false`).
+                        doses.push(dose_for_rate_mode(
+                            addl_time, amt, cmt, rate, false, ii, rate_mode,
                         ));
                         dose_rec.push(row_seq);
                         if occ_col.is_some() {
@@ -1677,6 +1929,73 @@ mod tests {
     }
 
     #[test]
+    fn dose_rows_without_amt_column_are_rejected() {
+        // #753: EVID=1 dose rows but the amount column is named `DOSE`, not `AMT`.
+        // Every dose parses to amt=0 → flat objective → fit pinned at init. This is
+        // a hard error naming the fix, not a silent bad fit.
+        let f = write_csv("ID,TIME,DV,EVID,DOSE\n1,0,.,1,100\n1,1,5.0,0,.\n");
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("E_DOSE_NO_AMT"), "{err}");
+    }
+
+    #[test]
+    fn dose_free_dataset_without_amt_column_is_ok() {
+        // The E_DOSE_NO_AMT guard must be scoped to *dose rows present*: a dataset
+        // with only observations (EVID=0) and no AMT column is a legitimate
+        // dose-free fit (#262) and must not error.
+        let f = write_csv("ID,TIME,DV,EVID\n1,0,1.0,0\n1,1,2.0,0\n");
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.subjects.iter().all(|s| s.doses.is_empty()));
+    }
+
+    #[test]
+    fn all_zero_amt_doses_warn() {
+        // #753: an `AMT` column exists (so E_DOSE_NO_AMT does not fire) but every
+        // dose amount is 0 → flat objective. Warn rather than error.
+        let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,0\n1,1,5.0,0,.\n");
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(
+            pop.warnings.iter().any(|w| w.contains("W_ALL_DOSES_ZERO")),
+            "{:?}",
+            pop.warnings
+        );
+    }
+
+    #[test]
+    fn nonzero_amt_doses_do_not_warn_all_zero() {
+        // Guard against a false-positive W_ALL_DOSES_ZERO on a normal dataset.
+        let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(
+            !pop.warnings.iter().any(|w| w.contains("W_ALL_DOSES_ZERO")),
+            "{:?}",
+            pop.warnings
+        );
+    }
+
+    #[test]
+    fn ss2_dose_row_is_rejected() {
+        // An `SS=2` dose (superimpose steady state without reset) must not load
+        // silently as `SS=1` (reset) — reading the dataset fails end-to-end with a
+        // message that identifies the row and points at the tracking issue. This
+        // is the wiring test for `validate_ss` on the real parse path.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+                   1,0,.,1,100,1,0,1,2,24\n\
+                   1,1,5.0,0,.,1,0,0,0,0\n";
+        let f = write_csv(csv);
+        let err = read_nonmem_csv(f.path(), None, None).unwrap_err();
+        assert!(err.contains("SS=2") && err.contains("#694"), "{err}");
+
+        // SS=1 on the same layout still loads (the regimen ferx does support).
+        let ok = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+                  1,0,.,1,100,1,0,1,1,24\n\
+                  1,1,5.0,0,.,1,0,0,0,0\n";
+        let f = write_csv(ok);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        assert!(pop.subjects[0].doses[0].ss);
+    }
+
+    #[test]
     fn unknown_iov_column_is_rejected() {
         // A requested IOV column that isn't in the header is a hard error, not a
         // silent "no occasions" — otherwise an IOV model would quietly collapse.
@@ -2022,6 +2341,44 @@ mod tests {
         assert_eq!(validate_dose_rate(50.0, "1", 0.0).unwrap(), RateMode::Fixed);
     }
 
+    // ── NONMEM SS codes: only 0/1 supported ──────────────────────────────────
+    // The engine stores steady state as a single `DoseEvent.ss: bool`. `SS=1`
+    // (reset then equilibrate) and `SS=2` (superimpose without reset) are
+    // *different* regimens, but both used to collapse to `ss = true` (`SS >= 0.5`)
+    // and run with SS=1 semantics — so an SS=2 record silently produced a wrong
+    // (reset) profile. `validate_ss` is the unit under test: 0/1 pass, everything
+    // else (SS=2, other codes, non-integers, non-finite) is rejected loudly.
+    #[test]
+    fn validate_ss_accepts_0_and_1_rejects_others() {
+        // The only supported codes: 0 = not steady state, 1 = reset then dose to
+        // steady state.
+        assert!(!validate_ss(0.0, "1", 0.0).unwrap());
+        assert!(validate_ss(1.0, "1", 0.0).unwrap());
+
+        // SS=2 (superimpose without reset) is not supported — rejected loudly,
+        // not silently collapsed to SS=1. The message names the value, the row,
+        // and the tracking issue so the offending record is identifiable.
+        let e = validate_ss(2.0, "7", 12.0).unwrap_err();
+        assert!(
+            e.contains("SS=2") && e.contains("#694") && e.contains("subject 7"),
+            "{e}"
+        );
+
+        // Other codes and non-integers are not rounded into 0/1 — a stray SS is
+        // malformed, not a silent steady-state regimen.
+        for s in [3.0, -1.0, 0.5, 1.5] {
+            let e = validate_ss(s, "1", 0.0).unwrap_err();
+            assert!(e.contains(&format!("SS={s}")), "s={s}: {e}");
+        }
+
+        // Non-finite SS on a dose row is malformed (old code: `inf >= 0.5` was a
+        // silent steady-state dose).
+        for s in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let e = validate_ss(s, "1", 0.0).unwrap_err();
+            assert!(e.contains("not finite"), "s={s}: {e}");
+        }
+    }
+
     #[test]
     fn coded_rate_minus_one_on_dose_row_loads_as_modeled_rate() {
         // A RATE=-1 dose loads as a modeled-rate dose (the R{cmt} existence +
@@ -2041,6 +2398,75 @@ mod tests {
             dose.is_infusion() && !dose.is_fixed(),
             "modeled, not a bolus"
         );
+    }
+
+    #[test]
+    fn addl_expansion_preserves_coded_rate_mode() {
+        // Regression (ADDL + coded RATE): every ADDL-expanded dose of a coded
+        // `RATE=-2` (modeled-duration) row must stay modeled, not collapse to a
+        // `Fixed` bolus. The additional doses used to be built via
+        // `DoseEvent::new` with the raw `-2` sentinel → `rate_mode = Fixed`,
+        // `duration = 0` (since `rate <= 0`), so `is_infusion()` was false and
+        // each additional dose silently became an instantaneous bolus (and
+        // `check_modeled_dose_rates` skips `Fixed` doses, so the missing
+        // `D{cmt}` slot was never caught). One modeled infusion followed by N
+        // boluses is a silently-wrong regimen on fit/predict/simulate.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,ADDL\n\
+                   1,0,.,1,100,1,-2,1,24,2\n\
+                   1,1,5.0,0,.,.,.,0,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let doses = &pop.subjects[0].doses;
+        assert_eq!(doses.len(), 3, "primary + 2 ADDL doses");
+        for (k, d) in doses.iter().enumerate() {
+            assert_eq!(
+                d.rate_mode,
+                RateMode::ModeledDuration,
+                "dose {k} must stay modeled-duration, not Fixed"
+            );
+            assert!(
+                d.is_infusion() && !d.is_fixed(),
+                "dose {k} modeled, not a bolus"
+            );
+            assert_eq!(d.amt, 100.0);
+            assert_eq!(d.cmt, 1);
+        }
+        // Additional doses land at time + k*II.
+        assert_eq!(doses[1].time, 24.0);
+        assert_eq!(doses[2].time, 48.0);
+    }
+
+    #[test]
+    fn addl_expansion_preserves_modeled_rate() {
+        // Mirror of `addl_expansion_preserves_coded_rate_mode` for the OTHER
+        // coded mode, `RATE=-1` (modeled rate → `R{cmt}`). Both modes share the
+        // single `DoseEvent::modeled(...)` ADDL arm, so this locks in that the
+        // `ModeledRate` branch (which `modeled()` tags `InfusionDef::RateDefined`,
+        // vs `DurationDefined` for `RATE=-2`) is preserved across ADDL expansion,
+        // not just `ModeledDuration`. Without the fix these collapsed to `Fixed`
+        // boluses via `DoseEvent::new` with the raw `-1` sentinel.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,ADDL\n\
+                   1,0,.,1,100,1,-1,1,24,2\n\
+                   1,1,5.0,0,.,.,.,0,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let doses = &pop.subjects[0].doses;
+        assert_eq!(doses.len(), 3, "primary + 2 ADDL doses");
+        for (k, d) in doses.iter().enumerate() {
+            assert_eq!(
+                d.rate_mode,
+                RateMode::ModeledRate,
+                "dose {k} must stay modeled-rate, not Fixed"
+            );
+            assert!(
+                d.is_infusion() && !d.is_fixed(),
+                "dose {k} modeled, not a bolus"
+            );
+            assert_eq!(d.amt, 100.0);
+            assert_eq!(d.cmt, 1);
+        }
+        assert_eq!(doses[1].time, 24.0);
+        assert_eq!(doses[2].time, 48.0);
     }
 
     #[test]
@@ -2336,7 +2762,7 @@ mod tests {
         let csv = "ID,TIME,DV,EVID,MDV,AMT,CMT,TENTRY\n\
                    1,100,1,0,0,.,1,90\n";
         let f = write_csv(csv);
-        let pop = read_nonmem_csv_filtered_tte(f.path(), None, None, None, &tte_cmts).unwrap();
+        let pop = read_nonmem_csv_filtered_tte(f.path(), None, None, None, &tte_cmts, &[]).unwrap();
         let recs = &pop.subjects[0].obs_records;
         assert_eq!(recs.len(), 1);
         let ObsRecord::Event {
@@ -2937,6 +3363,135 @@ mod tests {
     }
 
     #[test]
+    fn test_column_map_renames_canonical_roles() {
+        // `[data]` remapping (#730): a dataset using TAFD/CONC headers is read
+        // by mapping them to TIME/DV. Values land on the right roles and the
+        // mapped headers do NOT leak into covariate auto-detection.
+        let csv = "ID,TAFD,CONC,EVID,AMT,WT\n\
+                   1,0,.,1,100,70\n\
+                   1,1,5.0,0,.,70\n\
+                   1,2,3.0,0,.,70\n";
+        let f = write_csv(csv);
+        let map = vec![
+            ("time".to_string(), "TAFD".to_string()),
+            ("dv".to_string(), "CONC".to_string()),
+        ];
+        let pop = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap();
+        let subj = &pop.subjects[0];
+        assert_eq!(subj.obs_times, vec![1.0, 2.0]);
+        assert_eq!(subj.observations, vec![5.0, 3.0]);
+        // WT is still a covariate; the mapped headers are not.
+        assert!(pop.covariate_names.contains(&"WT".to_string()));
+        assert!(!pop.covariate_names.contains(&"TAFD".to_string()));
+        assert!(!pop.covariate_names.contains(&"CONC".to_string()));
+    }
+
+    #[test]
+    fn test_column_map_is_case_insensitive_on_header() {
+        // The actual header is matched case-insensitively: `time = tafd` finds a
+        // `TAFD` header.
+        let csv = "ID,TAFD,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,7,2.0,0,.\n";
+        let f = write_csv(csv);
+        let map = vec![("time".to_string(), "tafd".to_string())];
+        let pop = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap();
+        assert_eq!(pop.subjects[0].obs_times, vec![7.0]);
+    }
+
+    #[test]
+    fn test_column_map_missing_header_errors() {
+        // Mapping a role to a header the dataset lacks is a hard error, not a
+        // silent no-op (TIME would otherwise still be reported missing).
+        let csv = "ID,TIME,DV,EVID,AMT\n\
+                   1,0,.,1,100\n\
+                   1,1,5.0,0,.\n";
+        let f = write_csv(csv);
+        let map = vec![("dv".to_string(), "CONC".to_string())];
+        let err = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap_err();
+        assert!(err.contains("mapped column `CONC`"), "{err}");
+        assert!(err.contains("renamed to `dv`"), "{err}");
+    }
+
+    #[test]
+    fn test_column_map_conflicts_with_existing_canonical_column_errors() {
+        // Dataset has BOTH a real TIME and a TAFD column; mapping TIME=TAFD is
+        // ambiguous and must error rather than silently pick one.
+        let csv = "ID,TIME,TAFD,DV,EVID,AMT\n\
+                   1,0,0,.,1,100\n\
+                   1,1,2,5.0,0,.\n";
+        let f = write_csv(csv);
+        let map = vec![("TIME".to_string(), "TAFD".to_string())];
+        let err = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap_err();
+        assert!(err.contains("already has a `TIME` column"), "{err}");
+    }
+
+    #[test]
+    fn test_column_map_renames_arbitrary_column() {
+        // #742: a `[data]` target need not be a canonical role — an arbitrary
+        // column can be renamed (e.g. a covariate). `weight` → `WT` and the new
+        // name is the one that surfaces as a covariate.
+        let csv = "ID,TIME,DV,EVID,AMT,weight\n\
+                   1,0,.,1,100,70\n\
+                   1,1,5.0,0,.,70\n";
+        let f = write_csv(csv);
+        let map = vec![("WT".to_string(), "weight".to_string())];
+        let pop = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap();
+        assert!(pop.covariate_names.contains(&"WT".to_string()));
+        assert!(!pop.covariate_names.contains(&"weight".to_string()));
+        assert_eq!(pop.subjects[0].covariates["WT"], 70.0);
+    }
+
+    #[test]
+    fn test_column_map_frees_renamed_away_column_for_role() {
+        // #742: the dataset's raw `dv` is renamed aside to `ODV`, freeing the DV
+        // role for the log-DV column `lndv`. Both renames must succeed — the old
+        // `dv` no longer collides with the `DV` target because it is being
+        // renamed away in the same block.
+        let csv = "ID,TIME,dv,lndv,EVID,AMT\n\
+                   1,0,.,.,1,100\n\
+                   1,1,5.0,1.609,0,.\n";
+        let f = write_csv(csv);
+        let map = vec![
+            ("ODV".to_string(), "dv".to_string()),
+            ("DV".to_string(), "lndv".to_string()),
+        ];
+        let pop = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap();
+        let subj = &pop.subjects[0];
+        // DV now carries the log-DV values.
+        assert_eq!(subj.observations, vec![1.609]);
+        // The raw DV survives as the `ODV` covariate.
+        assert!(pop.covariate_names.contains(&"ODV".to_string()));
+        assert_eq!(subj.covariates["ODV"], 5.0);
+    }
+
+    #[test]
+    fn test_column_map_target_collides_with_surviving_column_errors() {
+        // #742 boundary: promoting `lndv` to DV without renaming the existing
+        // `dv` away leaves two DV columns — ambiguous, so it must error.
+        let csv = "ID,TIME,dv,lndv,EVID,AMT\n\
+                   1,0,.,.,1,100\n\
+                   1,1,5.0,1.609,0,.\n";
+        let f = write_csv(csv);
+        let map = vec![("DV".to_string(), "lndv".to_string())];
+        let err = read_nonmem_csv_mapped(f.path(), None, None, &map).unwrap_err();
+        assert!(err.contains("already has a `dv` column"), "{err}");
+    }
+
+    #[test]
+    fn test_column_map_conflicts_with_iov_column_errors() {
+        // Mapping a role onto the header used as the IOV occasion column is a
+        // clear error (renaming it would break the occasion lookup).
+        let csv = "ID,TIME,DV,EVID,AMT,OCC\n\
+                   1,0,.,1,100,1\n\
+                   1,1,5.0,0,.,1\n";
+        let f = write_csv(csv);
+        let map = vec![("tentry".to_string(), "OCC".to_string())];
+        let err = read_nonmem_csv_mapped(f.path(), None, Some("OCC"), &map).unwrap_err();
+        assert!(err.contains("iov_column `OCC`"), "{err}");
+    }
+
+    #[test]
     fn test_legacy_read_still_succeeds_with_non_numeric_covariate() {
         // The legacy auto-detect path must remain unchanged (no strict numeric
         // check): a non-numeric covariate column loads without erroring.
@@ -3007,8 +3562,9 @@ mod tests {
         // branch; the filter then drops STUDY==2 (subject 2).
         let cols: &[&str] = &["WT"];
         let filter = SelectionFilter::from_opts(&["STUDY == 2".to_string()], &[], &[]).unwrap();
-        let pop = read_nonmem_csv_filtered_tte(f.path(), Some(cols), None, Some(&filter), &no_tte)
-            .unwrap();
+        let pop =
+            read_nonmem_csv_filtered_tte(f.path(), Some(cols), None, Some(&filter), &no_tte, &[])
+                .unwrap();
         assert_eq!(
             pop.subjects
                 .iter()
@@ -3037,6 +3593,7 @@ mod tests {
             None,
             Some(&drop_age40),
             &no_tte,
+            &[],
         )
         .unwrap();
         // Subject 2 (AGE=40) is dropped via the merged AGE column; subject 1 remains.

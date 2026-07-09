@@ -3,8 +3,8 @@ use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::io::datareader::{
-    read_nonmem_csv, read_nonmem_csv_filtered, read_nonmem_csv_filtered_tte,
-    read_nonmem_csv_with_covariates, read_nonmem_csv_with_covariates_filtered,
+    read_nonmem_csv_filtered_mapped, read_nonmem_csv_filtered_tte, read_nonmem_csv_mapped,
+    read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
     read_nonmem_csv_with_covariates_tte, SelectionFilter, ERR_COV_MISSING_COLUMNS,
     ERR_COV_NON_NUMERIC,
 };
@@ -61,6 +61,57 @@ pub(crate) fn fit_thread_pool_builder() -> rayon::ThreadPoolBuilder {
     rayon::ThreadPoolBuilder::new().stack_size(FIT_RAYON_STACK_SIZE)
 }
 
+/// Ceiling applied to the unpinned default thread count (#707).
+const DEFAULT_THREADS_CAP: usize = 8;
+
+/// Core cap arithmetic for the unpinned default thread count, split out from
+/// [`default_thread_count`] so it is testable without depending on the host's actual
+/// core count: leave one core free for the OS/other work, and don't scale past
+/// [`DEFAULT_THREADS_CAP`] even on much larger machines, since most fits see no benefit
+/// from spreading across every core and (notably on Apple Silicon) not all cores are equal.
+fn cap_default_threads(available: usize) -> usize {
+    available.saturating_sub(1).clamp(1, DEFAULT_THREADS_CAP)
+}
+
+/// Default worker-thread count used when nothing pins an explicit count (`threads` unset
+/// or `auto`/`0`, and no explicit `--threads`/[`configure_global_thread_pool`] call). See
+/// [`cap_default_threads`] for the cap logic (#707).
+pub(crate) fn default_thread_count() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    cap_default_threads(available)
+}
+
+/// Set when a caller has explicitly sized the process-wide Rayon pool (currently: the CLI's
+/// `--threads N` via [`configure_global_thread_pool`]), so [`default_fit_pool`] knows to
+/// honor that explicit choice rather than applying the [`default_thread_count`] cap (#707).
+static GLOBAL_THREADS_EXPLICIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Explicitly size the process-wide Rayon pool and mark it as user-chosen. Intended for a
+/// CLI binary sizing its one process-wide pool from `--threads N` before the first fit;
+/// library callers that want a pinned thread count for a single fit should use
+/// `FitOptions::threads` instead, which scopes a fit-local pool via [`build_fit_pool`].
+///
+/// `n_threads` must be positive — a caller wanting the engine's own default should simply
+/// not call this at all, rather than pass `0` (which Rayon would otherwise silently treat
+/// as "pick automatically", masking the caller's intent). The explicit-override flag is
+/// only set once `build_global` actually succeeds, so a failed call (e.g. the global pool
+/// was already initialized elsewhere) leaves [`default_fit_pool`] applying the #707 cap
+/// rather than incorrectly deferring to whatever the ambient pool happens to be.
+pub fn configure_global_thread_pool(n_threads: usize) -> Result<(), String> {
+    if n_threads == 0 {
+        return Err("thread count must be positive".to_string());
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n_threads)
+        .build_global()
+        .map_err(|e| format!("failed to configure thread pool with {n_threads} threads: {e}"))?;
+    GLOBAL_THREADS_EXPLICIT.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
 /// Build a fit-scoped Rayon pool with the ferx worker stack and an explicit thread
 /// count. Used only when the caller pins `options.threads` to a positive value; the
 /// common (unpinned) path reuses the shared [`default_fit_pool`] instead.
@@ -75,20 +126,26 @@ pub(crate) fn build_fit_pool(n_threads: usize) -> Result<rayon::ThreadPool, Stri
 /// ODE+IOV analytic gradients do not overflow the platform-default worker stack. Shared
 /// across every default-threads `fit()` call so batch / concurrent callers do not each
 /// spawn-and-tear-down a fresh `N × 32 MiB` pool (which oversubscribes CPUs and can
-/// exhaust address space). Sized to `rayon::current_num_threads()` at first use, so a
-/// CLI `--threads N` (which sets the global pool count before the first fit) is honored.
+/// exhaust address space).
+///
+/// Sized by [`default_thread_count`] (available cores minus one, capped at 8 — #707): most
+/// fits gain little from spreading across every core, and not all cores are equal on
+/// asymmetric platforms (e.g. Apple Silicon E-cores). A caller that explicitly sized the
+/// global pool via [`configure_global_thread_pool`] (the CLI's `--threads N`) is honored
+/// instead — that call marks [`GLOBAL_THREADS_EXPLICIT`] before this pool is built.
 ///
 /// Returns `None` only if the one-time build fails (e.g. resource limits); callers then
 /// run on the ambient pool rather than aborting the fit.
 pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        // Pin to the ambient worker count (the global pool size, which a CLI `--threads N`
-        // sets via `build_global` before the first fit). A bare `build()` would instead
-        // default to *all* logical CPUs and ignore `--threads`. Evaluated outside any fit
-        // pool, so it reads the global pool's configured size.
+        let n_threads = if GLOBAL_THREADS_EXPLICIT.load(std::sync::atomic::Ordering::Acquire) {
+            rayon::current_num_threads()
+        } else {
+            default_thread_count()
+        };
         fit_thread_pool_builder()
-            .num_threads(rayon::current_num_threads())
+            .num_threads(n_threads)
             .build()
             .ok()
     })
@@ -239,13 +296,14 @@ pub fn run_model_with_data_inits(
 
     let iov_col = parsed.fit_options.iov_column.as_deref();
     let sel_filter = build_selection_filter(&parsed.fit_options)?;
-    let (population, covariate_table) = read_population_for(
+    let (mut population, covariate_table) = read_population_for(
         &parsed.model,
         &parsed.covariate_decls,
         data_path,
         None,
         iov_col,
         sel_filter.as_ref(),
+        &parsed.column_map,
     )?;
     eprintln!(
         "Data:  {} subjects, {} observations from {}",
@@ -285,7 +343,29 @@ pub fn run_model_with_data_inits(
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.data_hash = crate::io::hash::sha256_file(Path::new(data_path)).ok();
     result.model_text = std::fs::read_to_string(model_path).ok();
+    derive_output_occasions(&parsed.model, &parsed.fit_options, &mut population);
     Ok((result, population))
+}
+
+/// Mirror [`fit`]'s model-side IOV occasion derivation onto a caller-owned
+/// population so downstream output — sdtab's `OCC` column and any per-occasion
+/// diagnostic keyed on [`Subject::occasions`] — reflects the derived labels.
+/// `fit()` derives occasions only on its internal population clone, so without
+/// this the returned population still has empty `occasions` under a
+/// `dose`/`time(...)` rule and the OCC column silently vanishes versus an
+/// equivalent `iov_column` run (#757). No-op unless the model declares kappa and
+/// a derived rule is active; `had_column = false` + a throwaway sink because the
+/// override warning already fired inside `fit()`.
+fn derive_output_occasions(
+    model: &CompiledModel,
+    options: &FitOptions,
+    population: &mut Population,
+) {
+    if model.n_kappa == 0 || options.iov_occasion == IovOccasionRule::Column {
+        return;
+    }
+    let mut sink = Vec::new();
+    apply_iov_occasion_rule(population, &options.iov_occasion, false, &mut sink);
 }
 
 /// Run a model file with simulated data (from [simulation] block).
@@ -613,36 +693,23 @@ fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Result<(), Strin
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
-/// *faithfully*. The adaptive path integrates each subject from a single baseline
-/// (t=0) PK snapshot with between-subject variability only (kappas held at zero),
-/// and never re-derives PK, applies a reset, or carries process noise. So an IOV
-/// model, a time-varying covariate, a system reset (EVID=3/4), or an SDE
-/// `[diffusion]` model would each be **silently** wrong — a violation of the
-/// "never a silent wrong answer" contract this module promises. Until each is
-/// properly supported (#391 follow-ups), reject it with a typed error. This
-/// mirrors the `n_kappa > 0` guards `fit()` already applies (IMPMAP,
-/// trust-region). Both public entry points funnel through `run_adaptive_population`,
-/// so guarding there covers `simulate_adaptive` and `simulate_adaptive_from_spec`.
+/// *faithfully*. The adaptive path never applies a reset or carries process noise,
+/// so a system reset (EVID=3/4) or an SDE `[diffusion]` model would each be
+/// **silently** wrong — a violation of the "never a silent wrong answer" contract
+/// this module promises. Until each is properly supported (#391 follow-ups), reject
+/// it with a typed error. Both public entry points funnel through
+/// `run_adaptive_population`, so guarding there covers `simulate_adaptive` and
+/// `simulate_adaptive_from_spec`.
 ///
-/// The covariate check is conservative: it rejects any subject that carries
-/// per-event covariate snapshots, even when the varying column is one the model
-/// never references. Pruning irrelevant time-varying columns first (as the fit
-/// path does via `Population::prune_irrelevant_tv_covariates`) is a follow-up;
-/// over-rejecting here stays on the safe side of the contract.
+/// Time-varying covariates (and a `TIME`-in-PK model) are **no longer** rejected:
+/// the driver recomputes PK per event/segment from the covariate active in that
+/// segment (#700). Inter-occasion variability (IOV / `kappa`) is **no longer**
+/// rejected either: a fresh κ is drawn per decision window and threaded through the
+/// per-segment eta (#701), with occasion = decision index.
 fn reject_unsupported_adaptive(
     model: &CompiledModel,
     population: &Population,
 ) -> Result<(), String> {
-    if model.n_kappa > 0 {
-        return Err(
-            "adaptive-dosing simulation does not yet support inter-occasion variability \
-             (IOV / `kappa`): the reactive driver integrates from a single baseline PK \
-             snapshot and would silently hold every kappa at zero, biasing the predictions, \
-             the reactive decisions, and the dose ledger. Simulate without IOV, or track \
-             #391 for occasion-aware adaptive support."
-                .to_string(),
-        );
-    }
     if model.is_sde() {
         return Err(
             "adaptive-dosing simulation does not support stochastic (`[diffusion]` / SDE) \
@@ -651,21 +718,9 @@ fn reject_unsupported_adaptive(
                 .to_string(),
         );
     }
+    // Time-varying covariates (and `TIME`-in-PK) are now supported via per-event PK
+    // recomputation in the reactive driver (#700); they are no longer rejected here.
     for subject in &population.subjects {
-        // `has_tv_covariates()` only inspects the dose/obs snapshot vectors; a
-        // subject whose covariate varies solely on EVID=2 rows carries it in
-        // `pk_only_covariates`, which that predicate misses. Test it explicitly so
-        // a dose-free, zero-observation EVID=2 subject can't slip past frozen at t=0.
-        if subject.has_tv_covariates() || !subject.pk_only_covariates.is_empty() {
-            return Err(format!(
-                "adaptive-dosing simulation does not yet support time-varying covariates \
-                 (subject '{}'): the reactive driver resolves each subject's PK once from the \
-                 baseline covariate snapshot, so a covariate that changes over the horizon would \
-                 silently drive CL/V/KA off its t=0 value. Use time-constant covariates, or track \
-                 #391 for per-event PK under adaptive dosing.",
-                subject.id
-            ));
-        }
         if subject.has_resets() {
             return Err(format!(
                 "adaptive-dosing simulation does not support system-reset events (EVID=3/4) \
@@ -772,6 +827,7 @@ pub fn read_population_for(
     fallback_columns: Option<&[&str]>,
     iov_column: Option<&str>,
     filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     // Extract TTE CMTs from model endpoints so the reader can route TTE rows
     // to obs_records instead of the Gaussian parallel Vecs.
@@ -795,31 +851,44 @@ pub fn read_population_for(
         match (covariate_decls, filter) {
             (Some(decls), Some(sel)) => {
                 let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates_filtered(
+                let (pop, table) = read_nonmem_csv_with_covariates_filtered_mapped(
                     Path::new(data_path),
                     decls,
                     &extra,
                     iov_column,
                     sel,
+                    column_map,
                 )?;
                 Ok((pop, Some(table)))
             }
             (Some(decls), None) => {
                 let extra = undeclared_referenced(model, decls);
-                let (pop, table) = read_nonmem_csv_with_covariates(
+                let (pop, table) = read_nonmem_csv_with_covariates_mapped(
                     Path::new(data_path),
                     decls,
                     &extra,
                     iov_column,
+                    column_map,
                 )?;
                 Ok((pop, Some(table)))
             }
             (None, Some(sel)) => Ok((
-                read_nonmem_csv_filtered(Path::new(data_path), fallback_columns, iov_column, sel)?,
+                read_nonmem_csv_filtered_mapped(
+                    Path::new(data_path),
+                    fallback_columns,
+                    iov_column,
+                    sel,
+                    column_map,
+                )?,
                 None,
             )),
             (None, None) => Ok((
-                read_nonmem_csv(Path::new(data_path), fallback_columns, iov_column)?,
+                read_nonmem_csv_mapped(
+                    Path::new(data_path),
+                    fallback_columns,
+                    iov_column,
+                    column_map,
+                )?,
                 None,
             )),
         }
@@ -835,6 +904,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
+                    column_map,
                 )?;
                 Ok((pop, Some(table)))
             }
@@ -845,6 +915,7 @@ pub fn read_population_for(
                     iov_column,
                     filter,
                     &tte_cmts,
+                    column_map,
                 )?;
                 Ok((pop, None))
             }
@@ -922,10 +993,22 @@ fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> 
 /// `fit()` so the first error is unchanged: covariates, scaling, error model,
 /// iov occasions.
 pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    // Default (no model-side occasion rule): occasions, if any, come from the data.
+    check_model_data_rule(model, population, &IovOccasionRule::Column)
+}
+
+/// [`check_model_data`] variant aware of the model-side IOV occasion rule, so the
+/// `E_IOV_MISSING_OCC` check can be skipped when `iov_occasion` will derive the
+/// labels at fit time. Used by `fit()` and the `ferx check` path.
+pub fn check_model_data_rule(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
     let mut diags = check_covariates(model, population);
     diags.extend(check_per_cmt_scaling(model, population));
     diags.extend(check_per_cmt_error_model(model, population));
-    diags.extend(check_iov_occasions(model, population));
+    diags.extend(check_iov_occasions(model, population, iov_rule));
     diags.extend(check_absorption_dosing(model, population));
     diags.extend(check_modeled_dose_rates(model, population));
     diags.extend(validate_output_columns(model, population));
@@ -935,8 +1018,18 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
 /// IOV models require occasion labels in the dataset. When `n_kappa > 0` but
 /// every subject has an empty `occasions` vector the kappa random effects are
 /// silently ignored — catch this early instead.
-fn check_iov_occasions(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+fn check_iov_occasions(
+    model: &CompiledModel,
+    population: &Population,
+    iov_rule: &IovOccasionRule,
+) -> Vec<Diagnostic> {
     if model.n_kappa == 0 {
+        return Vec::new();
+    }
+    // A model-side occasion rule (`iov_occasion = dose | time(...)`) populates the
+    // occasion labels at fit time from each subject's timeline, so the dataset need
+    // not carry them — the empty-occasions check does not apply.
+    if *iov_rule != IovOccasionRule::Column {
         return Vec::new();
     }
     // `all()` on an empty iterator is vacuously true; an empty population is not
@@ -948,11 +1041,108 @@ fn check_iov_occasions(model: &CompiledModel, population: &Population) -> Vec<Di
     }
     vec![Diagnostic::error(
         "E_IOV_MISSING_OCC",
-        "Model declares kappa (IOV) parameters but no occasion labels were found in the \
-         dataset. Set `iov_column = \"OCC\"` (or the relevant column name) in \
-         [fit_options] so that per-occasion kappas can be estimated.",
+        "Model declares kappa (IOV) parameters but no occasion labels were found. Either set \
+         `iov_column = \"OCC\"` (or the relevant column name) to read occasions from the dataset, \
+         or set `iov_occasion = dose` / `iov_occasion = time(...)` to derive them in the model — \
+         both in [fit_options] — so that per-occasion kappas can be estimated.",
     )
     .with_block("fit_options")]
+}
+
+/// Derive each subject's IOV occasion labels from a model-side rule
+/// ([`IovOccasionRule::PerDose`] or [`IovOccasionRule::TimeWindows`]), writing
+/// `Subject::occasions` (parallel to `obs_times`) and `Subject::dose_occasions`
+/// (parallel to `doses`). This is the DSL alternative to a dataset occasion
+/// column; downstream grouping (`split_obs_by_occasion`) is identical either way.
+///
+/// When `had_column` is true the model *also* set `iov_column`; the DSL rule wins
+/// and a one-time override warning is pushed. A `Column` rule must never reach
+/// here (the caller only clones the population when a derived rule is active).
+fn apply_iov_occasion_rule(
+    population: &mut Population,
+    rule: &IovOccasionRule,
+    had_column: bool,
+    warnings: &mut Vec<String>,
+) {
+    if had_column {
+        warnings.push(
+            "iov_occasion is set in [fit_options], so the model-side occasion rule is used and \
+             the iov_column dataset column is ignored."
+                .to_string(),
+        );
+    }
+    // `Column` supplies no derived labels — nothing to do (the caller only clones
+    // the population for a derived rule, so this is a defensive no-op).
+    if *rule == IovOccasionRule::Column {
+        return;
+    }
+    // Occasion of a scalar time under a set of strictly-increasing breakpoints:
+    // the number of edges at or before `t` (so `time(24,48)` → 0 | 1 | 2).
+    let window_occ =
+        |edges: &[f64], t: f64| -> u32 { edges.iter().filter(|&&e| e <= t).count() as u32 };
+    for s in population.subjects.iter_mut() {
+        match rule {
+            IovOccasionRule::Column => unreachable!("handled by the early return above"),
+            IovOccasionRule::TimeWindows(edges) => {
+                // Bucket observations and doses on the *same* internal event clock.
+                // For reset-stacked subjects (EVID 3/4) that clock is monotonic and
+                // already shifted so each reset segment sits past the previous one,
+                // so the breakpoints separate periods correctly. Using the raw user
+                // TIME for observations (as an earlier version did) is wrong on two
+                // counts: it restarts each period — folding period 2 back into
+                // occasion 0 — and it puts observations on a different clock than the
+                // doses (whose only stored time is the internal one), so a dose could
+                // land in a different occasion than its co-timed samples (#757).
+                s.occasions = s.obs_times.iter().map(|&t| window_occ(edges, t)).collect();
+                s.dose_occasions = s.doses.iter().map(|d| window_occ(edges, d.time)).collect();
+            }
+            IovOccasionRule::PerDose => {
+                // Each distinct administration *time* opens a new occasion. Doses
+                // that share a time (e.g. a simultaneous depot + central bolus, or a
+                // split dual-route dose) share one occasion rather than each spawning
+                // its own — indexing by dose position would leave the earlier
+                // co-timed dose stranded in an empty occasion, since observations can
+                // only map to one of them (#757). Doses are stored time-sorted, so a
+                // running counter that ticks on each time change is the label.
+                let mut dose_occ = Vec::with_capacity(s.doses.len());
+                let mut occ = 0u32;
+                let mut prev: Option<f64> = None;
+                for d in &s.doses {
+                    if let Some(p) = prev {
+                        if d.time != p {
+                            occ += 1;
+                        }
+                    }
+                    dose_occ.push(occ);
+                    prev = Some(d.time);
+                }
+                s.dose_occasions = dose_occ;
+                // Distinct dose times, ascending (one per occasion label above).
+                let mut dose_times: Vec<f64> = Vec::new();
+                for d in &s.doses {
+                    if dose_times.last() != Some(&d.time) {
+                        dose_times.push(d.time);
+                    }
+                }
+                // Observation occasion = most recent dose at or before its time
+                // (dose-before-obs tie-break at equal TIME); pre-first-dose rows fold
+                // into occasion 0. obs_times are ascending, so a single forward walk
+                // over the distinct dose times is linear rather than O(obs*doses)
+                // (#757 cleanup).
+                let mut j = 0usize;
+                s.occasions = s
+                    .obs_times
+                    .iter()
+                    .map(|&t| {
+                        while j < dose_times.len() && dose_times[j] <= t {
+                            j += 1;
+                        }
+                        j.saturating_sub(1) as u32
+                    })
+                    .collect();
+            }
+        }
+    }
 }
 
 /// Built-in absorption input-rate models (e.g. `transit()`) are integrated
@@ -1318,6 +1508,182 @@ pub(crate) fn check_transit_support(
                      an ODE transit model for a zero-order input.",
                     subject.id
                 ));
+            }
+        }
+    }
+    None
+}
+
+/// Fit-boundary validation for RTTE (repeated-event) endpoints, both `clock = forward`
+/// (Andersen–Gill total time) and `clock = reset` (gap time). The parser enforces these
+/// for `.ferx` models, but a Rust caller can hand-build a `CompiledModel` / `Population`
+/// that bypasses it, so `fit()` re-checks up front — otherwise each of these would fold
+/// into the RTTE NLL's `1e20` sentinel and produce a silent garbage fit instead of a
+/// clear error. Rejects, per RTTE cmt:
+///
+///   * **interval-censored records** — unsupported for RTTE and folded into `1e20` by
+///     both [`crate::survival::rtte_forward_nll_from_curves`] and
+///     [`crate::survival::rtte_reset_nll_from_curves`]. Interval censoring is a *data*
+///     property (a DV=0→DV=2 pair), so the parser cannot see it — it must be caught here.
+///   * **non-finite `TIME`** — a `NaN`/`inf` time slips past the `time < prev` order
+///     check (every NaN comparison is false) and poisons `prev`, so reject it explicitly.
+///   * **out-of-order rows** — both RTTE clocks require time-sorted rows: clock-forward
+///     telescopes the cumulative hazard across a subject's records (each record's time is
+///     the lower limit for the next), and clock-reset measures each inter-event gap
+///     `Δ = t − t_prev`; unsorted rows give a finite-but-wrong NLL (forward) or a negative
+///     gap that folds to `1e20` (reset).
+///   * **`entry_time > TIME`** — a left-truncation entry after the record's own time gives
+///     a negative first gap (reset) or `H(entry) > H(TIME)` (forward), both folded to the
+///     sentinel. The datareader skips such rows on load; a hand-built caller bypasses that.
+///
+/// And, for **`clock = reset`** endpoints only (clock-forward telescopes absolute `H` and
+/// is unaffected):
+///
+///   * **mid-stream right-censoring** — a censoring does not reset the renewal clock, so a
+///     `RightCensored` row before a later record would measure the next gap from the censor
+///     rather than the last event (and diverge from the gap-time NONMEM anchor). Gap-time
+///     RTTE supports a censor only as the subject's final record; interrupted-observation
+///     renewal is a later slice.
+///   * **tied event times** — two events at the same `TIME` give a zero gap `Δ = 0`, which
+///     the gap-time hazard cannot represent (`h(0)` folds to the sentinel).
+///   * **left truncation (`entry_time > 0`)** — delayed entry is not yet supported for
+///     gap-time RTTE: the first-gap conditioning convention (renewal clock from entry vs.
+///     clock from 0 conditioned on survival to entry) is unratified and unanchored, and the
+///     two differ for a time-varying hazard. Clock-forward supports it via `H(entry)`.
+///
+/// Returns `None` when there is no RTTE endpoint or every subject's rows are valid.
+#[cfg(feature = "survival")]
+fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<String> {
+    use crate::types::{EndpointLikelihood, EventType, ObsRecord, RtteClock, TteRecurrence};
+    let mut rtte_cmts: Vec<usize> = Vec::new();
+    // Clock-reset endpoints carry an extra data-shape contract (a censor may only be the
+    // final record, gaps must be strictly positive); track them so those checks stay
+    // scoped to reset and don't reject clock-forward data that telescopes fine.
+    let mut reset_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (cmt, ep) in &model.endpoints {
+        if let EndpointLikelihood::Tte {
+            recurrence: TteRecurrence::Repeated { clock },
+            ..
+        } = ep
+        {
+            rtte_cmts.push(*cmt);
+            if matches!(clock, RtteClock::Reset) {
+                reset_cmts.insert(*cmt);
+            }
+        }
+    }
+    if rtte_cmts.is_empty() {
+        return None;
+    }
+    for subject in &population.subjects {
+        for &cmt in &rtte_cmts {
+            let mut prev = f64::NEG_INFINITY;
+            // Reset only: whether a right-censored row has already been seen for this
+            // subject+cmt — any record after it is a mid-stream censor (rejected below).
+            let mut seen_censor = false;
+            for r in &subject.obs_records {
+                let ObsRecord::Event {
+                    time,
+                    cmt: c,
+                    event_type,
+                    entry_time,
+                    ..
+                } = r;
+                if *c != cmt {
+                    continue;
+                }
+                if matches!(event_type, EventType::IntervalCensored { .. }) {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has an interval-censored record, \
+                         which is not supported for repeated events. Use exact (DV=1) event rows \
+                         and a right-censoring (DV=0) row.",
+                        subject.id
+                    ));
+                }
+                if !time.is_finite() {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has a non-finite TIME ({time}). \
+                         Repeated-event rows require finite, time-sorted TIME values.",
+                        subject.id
+                    ));
+                }
+                // A left-truncation entry after the record's own event/censoring time gives a
+                // negative first gap (Δ = time − entry < 0 under clock-reset) or a decreasing
+                // cumulative-hazard increment (H(entry) > H(time) under clock-forward), both of
+                // which fold to the silent 1e20 sentinel. The datareader skips such rows on
+                // load; a hand-built `Population` bypasses that, so reject it here — the same
+                // up-front guarantee this function gives for interval/non-finite/out-of-order.
+                if *entry_time > *time {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has entry_time={entry_time} after \
+                         TIME={time}. The left-truncation entry must not exceed the record's \
+                         event/censoring time.",
+                        subject.id
+                    ));
+                }
+                if *time < prev {
+                    return Some(format!(
+                        "Subject '{}': RTTE endpoint CMT={cmt} has records out of time order \
+                         (t={time} follows t={prev}). Repeated-event rows must be sorted by TIME \
+                         per subject so the cumulative hazard accumulates correctly.",
+                        subject.id
+                    ));
+                }
+                // Clock-reset (gap-time) data-shape contract. The renewal clock resets only
+                // at EVENTS and each gap is measured from the previous event, so two shapes
+                // that pass every generic check above are still ill-posed under reset and
+                // would silently fold to the 1e20 sentinel or diverge from the gap-time
+                // definition. Reject them for reset endpoints only — clock-forward telescopes
+                // absolute H across a subject's records and is unaffected by either.
+                if reset_cmts.contains(&cmt) {
+                    // A right-censored row before a later record is a mid-stream censor: a
+                    // censoring does NOT reset the renewal clock, so the following gap would
+                    // be measured from the censor instead of the last event (also diverging
+                    // from the NONMEM gap-time anchor, which advances the clock only on
+                    // events). Interrupted-observation renewal is a later slice; fail loud.
+                    if seen_censor {
+                        return Some(format!(
+                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has a \
+                             right-censored (DV=0) row before a later record. Gap-time RTTE \
+                             supports right-censoring only as the final record per subject; a \
+                             mid-stream censor would restart the renewal clock. Use \
+                             clock=forward for interrupted-observation data.",
+                            subject.id
+                        ));
+                    }
+                    // Two events at the same TIME give a zero inter-event gap (Δ = 0), which
+                    // the gap-time hazard cannot represent — h(0) folds to the sentinel.
+                    if matches!(event_type, EventType::Exact) && *time == prev {
+                        return Some(format!(
+                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has two events \
+                             at the same TIME={time} (zero inter-event gap). Repeated events \
+                             must have strictly increasing times so each gap Δ > 0.",
+                            subject.id
+                        ));
+                    }
+                    // Left truncation (delayed entry, entry_time > 0) is not yet supported for
+                    // gap-time RTTE. The first gap's convention is unratified — renewal clock
+                    // restarts at entry (`Δ = time − entry`, H from 0) vs. clock from 0
+                    // conditioned on survival to entry (`H(t) − H(entry)`) — and the two differ
+                    // for a time-varying hazard (they coincide only for the memoryless
+                    // exponential). There is no NONMEM/survreg anchor for either, so fail loud
+                    // rather than silently pick one. Clock-forward *does* support left truncation
+                    // (it conditions via `H(entry)`), so route such data there or set TENTRY=0.
+                    if *entry_time > 0.0 {
+                        return Some(format!(
+                            "Subject '{}': RTTE endpoint CMT={cmt} (clock=reset) has a \
+                             left-truncation entry_time={entry_time} > 0. Delayed entry is not \
+                             yet supported for gap-time RTTE (the first-gap conditioning \
+                             convention is unratified). Use clock=forward, which supports left \
+                             truncation, or set the entry time to 0.",
+                            subject.id
+                        ));
+                    }
+                    if matches!(event_type, EventType::RightCensored) {
+                        seen_censor = true;
+                    }
+                }
+                prev = *time;
             }
         }
     }
@@ -2135,6 +2501,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
             None,
             iov_col,
             None,
+            &parsed.column_map,
         ) {
             Ok((population, _table)) => {
                 // Surface datareader warnings (ADDL missing II, IOV OCC missing)
@@ -2149,7 +2516,11 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
                     };
                     diags.push(Diagnostic::warning(code, w.clone()));
                 }
-                diags.extend(check_model_data(&parsed.model, &population));
+                diags.extend(check_model_data_rule(
+                    &parsed.model,
+                    &population,
+                    &parsed.fit_options.iov_occasion,
+                ));
                 let init_params = parsed.model.default_params.clone();
                 diags.extend(check_model_data_warnings(
                     &parsed.model,
@@ -2207,6 +2578,7 @@ pub fn fit_from_files(
         covariate_columns,
         None,
         sel_filter_fit.as_ref(),
+        &parsed.column_map,
     )?;
     model.bloq_method = opts.bloq_method;
     // SDE models have no analytic-sensitivity path — force FD.
@@ -2303,6 +2675,14 @@ pub fn fit(
     if let Some(e) = check_analytic_readout_support(model, population) {
         return Err(e);
     }
+    // RTTE (repeated-event) likelihoods — clock-forward telescoping and clock-reset
+    // gap-time — require time-sorted records and do not support interval-censored /
+    // non-finite times, all of which would otherwise fold into a silent 1e20 sentinel.
+    // Reject a hand-built model/dataset up front.
+    #[cfg(feature = "survival")]
+    if let Some(e) = check_rtte_records(model, population) {
+        return Err(e);
+    }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
     // enforces these for `.ferx` models, but a Rust caller could otherwise set
     // `log_transform = true` together with a proportional/combined error or a
@@ -2376,7 +2756,11 @@ pub fn fit(
     // see the data. `ferx check` runs the same `check_model_data` to report
     // every finding; here we stop at the first error to preserve fit()'s
     // historical fail-fast behavior and exact error strings.
-    first_error(&check_model_data(model, population))?;
+    first_error(&check_model_data_rule(
+        model,
+        population,
+        &options.iov_occasion,
+    ))?;
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
     // DAY / STIME columns in NONMEM-format datasets), clear those
@@ -2392,16 +2776,38 @@ pub fn fit(
     // it) unmodified, and avoids double-logging on repeated `fit()` calls.
     let needs_dv_log = model.log_transform && !model.dv_pre_logged;
     let mut ltbs_warnings: Vec<String> = Vec::new();
+    // A model-side IOV occasion rule (`iov_occasion = dose | time(...)`) derives
+    // the occasion labels from each subject's timeline instead of a data column.
+    // Only meaningful when the model actually declares kappa: without it the
+    // derived labels feed nothing, so skip the clone + derivation entirely and
+    // tell the user the option is a no-op rather than silently paying for it.
+    let iov_rule_set = options.iov_occasion != IovOccasionRule::Column;
+    if iov_rule_set && model.n_kappa == 0 {
+        ltbs_warnings.push(
+            "iov_occasion is set in [fit_options] but the model declares no kappa (IOV) \
+             random effects, so it has no effect and no occasions were derived."
+                .to_string(),
+        );
+    }
+    let derive_occ = iov_rule_set && model.n_kappa > 0;
     let pop_pruned: std::borrow::Cow<Population> = {
         let needs_prune = population.subjects.iter().any(|s| {
             !s.dose_covariates.is_empty()
                 || !s.obs_covariates.is_empty()
                 || !s.pk_only_covariates.is_empty()
         });
-        if needs_prune || needs_dv_log {
+        if needs_prune || needs_dv_log || derive_occ {
             let mut p = population.clone();
             if needs_prune {
                 p.prune_irrelevant_tv_covariates(&model.referenced_covariates);
+            }
+            if derive_occ {
+                apply_iov_occasion_rule(
+                    &mut p,
+                    &options.iov_occasion,
+                    options.iov_column.is_some(),
+                    &mut ltbs_warnings,
+                );
             }
             if needs_dv_log {
                 let n_nonpos = log_transform_observations(&mut p);
@@ -2421,6 +2827,51 @@ pub fn fit(
         }
     };
     let pop_ref: &Population = &*pop_pruned;
+
+    // A model-side occasion rule must actually partition the timeline. The
+    // dataset-column path is guarded by `E_IOV_MISSING_OCC`; the derived path
+    // suppresses that check (labels arrive at fit time), so re-establish the same
+    // invariant on the *derived* labels here (#757):
+    //   - if every subject collapses to a single occasion, the per-occasion kappa
+    //     is added once per subject exactly like an eta — confounded with
+    //     between-subject variability and unidentifiable — so error, as the
+    //     column path would have;
+    //   - if the count explodes (e.g. `iov_occasion = dose` on an ADDL train,
+    //     where each expanded dose opens an occasion), the inner per-subject
+    //     problem balloons; warn so the multiplication isn't silent.
+    if derive_occ {
+        // Distinct occasion labels seen across observations and doses, per subject.
+        let distinct_occ = |s: &Subject| -> usize {
+            let mut occs: Vec<u32> = s.occasions.clone();
+            occs.extend_from_slice(&s.dose_occasions);
+            occs.sort_unstable();
+            occs.dedup();
+            occs.len()
+        };
+        let max_occ = pop_ref.subjects.iter().map(distinct_occ).max().unwrap_or(0);
+        if max_occ <= 1 {
+            return Err(
+                "The `iov_occasion` rule produced only a single occasion for every subject, \
+                 so the per-occasion kappa (IOV) cannot be separated from between-subject \
+                 variability (it is unidentifiable). Use `iov_occasion = time(...)` with \
+                 breakpoints inside the sampling window, `iov_occasion = dose` on a \
+                 multiple-dose design, or supply an `iov_column`."
+                    .to_string(),
+            );
+        }
+        // Above this many occasions per subject the derivation has almost
+        // certainly over-partitioned (e.g. a long ADDL dose train); the fit still
+        // runs but the inner kappa dimensionality is n_iov * max_occ per subject.
+        const IOV_OCCASION_WARN_LIMIT: usize = 20;
+        if max_occ > IOV_OCCASION_WARN_LIMIT {
+            ltbs_warnings.push(format!(
+                "iov_occasion derived {max_occ} occasions for at least one subject — the \
+                 inner per-subject problem grows with the occasion count. If this came from \
+                 an ADDL/steady-state dose train, prefer `iov_occasion = time(...)` windows \
+                 or an `iov_column` that groups administrations into fewer occasions."
+            ));
+        }
+    }
 
     // Single-start fast path (default)
     if options.n_starts <= 1 {
@@ -3555,6 +4006,40 @@ fn fit_inner(
         }
     }
 
+    // RTTE (repeated time-to-event) fit under a Laplace-based method (FOCE/FOCEI/GN)
+    // severely underestimates the frailty variance ω² at low event rates (Karlsson et
+    // al. 2009: −91% to −96% bias below a 43% event rate). SAEM and IMP are unbiased.
+    // Warn but keep Laplace available — it is fast and fine for fixed-effects or
+    // high-event-rate RTTE. §3.3 of `plans/tte-survival-markov.md`. Two gates: (1) the
+    // model carries a frailty (`n_eta > 0`); a fixed-effects RTTE fit has no ω² to
+    // underestimate, so the warning would be spurious. (2) The **final/estimating** stage
+    // must be Laplace-based — a warm-start chain like `[focei, imp]` or `[saem, focei]`
+    // whose terminal estimator is SAEM/IMP is already unbiased and must not warn.
+    // (`n_eta > 0` can over-fire on a joint model whose PK — not hazard — carries the
+    // etas; that spurious *advisory* is preferable to probing the hazard, which silently
+    // misses a covariate-gated frailty like `exp(ETA·WT)` and drops the warning entirely.)
+    #[cfg(feature = "survival")]
+    if model.has_rtte()
+        && model.n_eta > 0
+        && matches!(
+            chain.last(),
+            Some(
+                EstimationMethod::Foce
+                    | EstimationMethod::FoceI
+                    | EstimationMethod::FoceGn
+                    | EstimationMethod::FoceGnHybrid
+            )
+        )
+    {
+        pre_run_warnings.push(
+            "RTTE fit under a Laplace-based method (FOCE/FOCEI/GN) can severely \
+             underestimate the frailty variance ω² at low event rates (Karlsson et al. \
+             2009). Prefer `method = saem` or `method = imp`; Laplace remains available \
+             for fixed-effects or high-event-rate RTTE."
+                .to_string(),
+        );
+    }
+
     // Capture thread count before chain runs (current_num_threads() reports
     // whichever Rayon pool is active — scoped pool when threads=Some, else global).
     let n_threads_used = rayon::current_num_threads();
@@ -3567,7 +4052,11 @@ fn fit_inner(
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let path = format!("/tmp/ferx_trace_{}_{}.csv", pid, ts);
-        if let Err(e) = crate::estimation::trace::init(path.clone()) {
+        // Header carries one `val:<name>`/`grad:<name>` column per optimized
+        // coordinate. The coordinate structure (and hence the names) is fixed
+        // across a method chain, so the template's names serve every stage.
+        let coord_names = crate::estimation::parameterization::coordinate_names(init_params);
+        if let Err(e) = crate::estimation::trace::init(path.clone(), &coord_names) {
             eprintln!("[ferx] warning: could not open trace file {}: {}", path, e);
         } else {
             eprintln!("[ferx] optimizer trace → {}", path);
@@ -3804,11 +4293,17 @@ fn fit_inner(
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
+    // Per-stage convergence wall time, parallel to `chain`/`method_chain`
+    // (#713). Excludes the covariance step, which is timed separately below
+    // and only ever runs on the last estimating stage.
+    let mut method_wall_times_secs: Vec<f64> = Vec::with_capacity(n_stages);
+    let mut covariance_wall_time_secs: f64 = 0.0;
 
     for (stage_idx, &method) in chain.iter().enumerate() {
         if crate::cancel::is_cancelled(&options.cancel) {
             return Err("cancelled by user".to_string());
         }
+        let stage_start = std::time::Instant::now();
         let is_last = stage_idx + 1 == n_stages;
         let mut stage_opts = options.clone();
         stage_opts.method = method;
@@ -3890,6 +4385,7 @@ fn fit_inner(
                     h_matrices,
                     kappas,
                     covariance_matrix: None,
+                    covariance_wall_time_secs: 0.0,
                     warnings: Vec::new(),
                     saem_mu_ref_m_step_evals_saved: None,
                     saem_n_subjects_hmc: None,
@@ -3960,6 +4456,7 @@ fn fit_inner(
                     });
                 }
             }
+            method_wall_times_secs.push(stage_start.elapsed().as_secs_f64());
             continue;
         }
 
@@ -4006,6 +4503,11 @@ fn fit_inner(
             }
             _ => optimize_population(model, population, &stage_params, &stage_opts),
         };
+
+        let stage_cov_secs = stage_result.covariance_wall_time_secs;
+        method_wall_times_secs
+            .push((stage_start.elapsed().as_secs_f64() - stage_cov_secs).max(0.0));
+        covariance_wall_time_secs += stage_cov_secs;
 
         stage_params = stage_result.params.clone();
         total_iterations += stage_result.n_iterations;
@@ -4486,6 +4988,8 @@ fn fit_inner(
     let fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
+        method_wall_times_secs,
+        covariance_wall_time_secs,
         converged: result.converged,
         ofv,
         aic,
@@ -4793,7 +5297,7 @@ fn is_last_estimating_stage(
 /// sir`) produced a result. Pulled out of `fit()` so the precedence — a real
 /// covariance always wins over a fallback, which wins over a plain failure — is
 /// unit-testable without driving a full fit to a non-PD Hessian.
-fn resolve_covariance_status(
+pub(crate) fn resolve_covariance_status(
     run_covariance_step: bool,
     has_covariance_matrix: bool,
     has_sir_fallback: bool,
@@ -4874,7 +5378,7 @@ fn resolve_sir_fallback(
     }
 }
 
-fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
+pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, Option<f64>) {
     let cov = match cov {
         Some(m) => m,
         None => return (None, None),
@@ -5243,6 +5747,47 @@ mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector};
 
+    // ── default thread count cap (#707) ─────────────────────────────────────
+
+    #[test]
+    fn cap_default_threads_leaves_one_core_free() {
+        assert_eq!(cap_default_threads(2), 1);
+        assert_eq!(cap_default_threads(4), 3);
+        assert_eq!(cap_default_threads(8), 7);
+    }
+
+    #[test]
+    fn cap_default_threads_caps_at_eight() {
+        assert_eq!(cap_default_threads(9), 8);
+        assert_eq!(cap_default_threads(16), 8);
+        assert_eq!(cap_default_threads(128), 8);
+    }
+
+    #[test]
+    fn cap_default_threads_never_zero() {
+        // A single-core report (or an `available_parallelism()` failure mapped to 1)
+        // must still leave at least one worker thread.
+        assert_eq!(cap_default_threads(1), 1);
+        assert_eq!(cap_default_threads(0), 1);
+    }
+
+    #[test]
+    fn configure_global_thread_pool_rejects_zero() {
+        // `0` must be rejected rather than silently forwarded to Rayon, which would
+        // otherwise interpret it as "pick automatically" and mask the caller's intent
+        // (and would incorrectly mark GLOBAL_THREADS_EXPLICIT). Returns before touching
+        // the process-wide pool, so this is safe to run alongside other tests.
+        assert!(configure_global_thread_pool(0).is_err());
+    }
+
+    #[test]
+    fn default_thread_count_matches_cap_of_available_parallelism() {
+        let available = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(default_thread_count(), cap_default_threads(available));
+    }
+
     // ── resolve_data_path (#690) ────────────────────────────────────────────
 
     #[test]
@@ -5436,7 +5981,9 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_rejects_iov_model() {
+    fn adaptive_accepts_iov_model() {
+        // IOV is now supported (#701): a fresh κ is drawn per decision window and
+        // threaded through the per-segment eta, so the guard no longer rejects it.
         use crate::parser::model_parser::parse_model_string;
         let iov = r"
 [parameters]
@@ -5461,11 +6008,9 @@ mod tests {
 ";
         let model = parse_model_string(iov).expect("IOV model parses");
         assert!(model.n_kappa > 0, "test model must declare a kappa");
-        let err = reject_unsupported_adaptive(&model, &adaptive_pop(adaptive_base_subject()))
-            .expect_err("IOV model must be rejected for adaptive dosing");
         assert!(
-            err.to_lowercase().contains("inter-occasion") || err.to_lowercase().contains("iov"),
-            "error should cite IOV: {err}"
+            reject_unsupported_adaptive(&model, &adaptive_pop(adaptive_base_subject())).is_ok(),
+            "IOV model is now supported for adaptive dosing (#701)"
         );
     }
 
@@ -5508,29 +6053,30 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_rejects_time_varying_covariate_subject() {
+    fn adaptive_accepts_time_varying_covariate_subject() {
         use crate::parser::model_parser::parse_model_string;
+        // Time-varying covariates are now supported via per-event PK (#700); the
+        // guard no longer rejects them. Correctness of the per-event PK itself is
+        // pinned by the driver-level oracle
+        // `adaptive_tv_covariate_controller_matches_static_event_driven`.
         let model = parse_model_string(PLAIN_ADAPTIVE_MODEL).expect("plain model parses");
         let mut subject = adaptive_base_subject();
         subject.obs_covariates = vec![std::collections::HashMap::from([("WT".to_string(), 70.0)])];
         assert!(subject.has_tv_covariates());
-        let err = reject_unsupported_adaptive(&model, &adaptive_pop(subject))
-            .expect_err("a subject with time-varying covariates must be rejected");
         assert!(
-            err.to_lowercase().contains("time-varying") && err.to_lowercase().contains("covariate"),
-            "error should cite time-varying covariates: {err}"
+            reject_unsupported_adaptive(&model, &adaptive_pop(subject)).is_ok(),
+            "a subject with time-varying covariates must now be accepted"
         );
     }
 
     #[test]
-    fn adaptive_rejects_pk_only_covariate_subject() {
+    fn adaptive_accepts_pk_only_covariate_subject() {
         use crate::parser::model_parser::parse_model_string;
         // A covariate that varies only on EVID=2 rows lands in `pk_only_covariates`,
-        // which `has_tv_covariates()` does NOT inspect — so a dose-free, zero-obs
-        // subject built from such rows would slip past the guard and be silently
-        // simulated with PK frozen at t=0. The guard tests `pk_only_covariates`
-        // directly; this pins that (the `has_tv_covariates()` assert proves the
-        // check is load-bearing — without it this subject is wrongly accepted).
+        // which `has_tv_covariates()` does NOT inspect. It is now supported via
+        // per-event PK (#700) and no longer rejected; the `has_tv_covariates()`
+        // assert proves this pk-only case is a distinct path from the obs/dose one
+        // (`compute_event_pk_params` was broadened to materialise it too).
         let model = parse_model_string(PLAIN_ADAPTIVE_MODEL).expect("plain model parses");
         let mut subject = adaptive_base_subject();
         subject.obs_times = Vec::new();
@@ -5542,13 +6088,11 @@ mod tests {
             vec![std::collections::HashMap::from([("WT".to_string(), 90.0)])];
         assert!(
             !subject.has_tv_covariates(),
-            "pk_only snapshots must be invisible to has_tv_covariates() for this test to bite"
+            "pk_only snapshots are invisible to has_tv_covariates() — a distinct path"
         );
-        let err = reject_unsupported_adaptive(&model, &adaptive_pop(subject))
-            .expect_err("a subject with EVID=2 time-varying covariates must be rejected");
         assert!(
-            err.to_lowercase().contains("time-varying") && err.to_lowercase().contains("covariate"),
-            "error should cite time-varying covariates: {err}"
+            reject_unsupported_adaptive(&model, &adaptive_pop(subject)).is_ok(),
+            "a subject with EVID=2 time-varying covariates must now be accepted"
         );
     }
 
@@ -5898,7 +6442,7 @@ fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
 
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
-fn extract_standard_errors(
+pub(crate) fn extract_standard_errors(
     cov: &Option<DMatrix<f64>>,
     template: &ModelParameters,
 ) -> (
@@ -6112,9 +6656,26 @@ pub struct SimulateOptions {
     pub horizon: Option<f64>,
 }
 
-/// Validate the preventable preconditions of **ODE-accumulated (joint PK-TTE)**
-/// event-time simulation, returning a clear `Err` for a caller to act on. A model
-/// with no ODE-accumulated TTE endpoint is unaffected (returns `Ok`).
+/// Validate the preventable preconditions of TTE event-time simulation, returning a
+/// clear `Err` for a caller to act on.
+///
+/// **Repeated events (RTTE, `type = rtte`, Slice 3.3)** are simulated as a recurrent
+/// stream by `simulate_rtte_stream` (analytic hazards only). Several preconditions are
+/// *user-fixable* and would otherwise corrupt the stream silently, so they are rejected
+/// here (a clean `Err` from `simulate_with_options`; the `Vec`-returning entry points
+/// re-raise the same message as a panic):
+/// - a **finite, positive horizon** is required — the recurrent stream is generated up
+///   to that administrative window; there is no implicit one;
+/// - **left truncation** (`entry_time > 0`) is a deferred follow-up (conditional
+///   first-gap sampling past entry), so `entry_time == 0` is required;
+/// - exactly **one recurrent stream per subject** — multiple RTTE CMTs, or an RTTE
+///   cause mixed with a competing single-event TTE cause, are a later slice (they need
+///   a shared-horizon multi-stream draw);
+/// - **EVID-3/4 resets** are rejected — a reset would disturb the hazard clock
+///   mid-stream (selective per-state reset is a later slice).
+///
+/// For **ODE-accumulated (joint PK-TTE)** endpoints, a model with no such endpoint is
+/// otherwise unaffected (returns `Ok`).
 ///
 /// Drug-driven event times are sampled by integrating the augmented ODE until the
 /// cumulative hazard reaches `−log u` (Slice 2.2). Two conditions cannot be sampled
@@ -6129,17 +6690,116 @@ pub struct SimulateOptions {
 /// A genuinely divergent hazard (negative / non-finite) is *not* preventable here —
 /// it surfaces loudly during integration (never as a silent censor).
 #[cfg(feature = "survival")]
-fn validate_ode_tte_simulatable(
+fn validate_tte_simulatable(
     model: &CompiledModel,
     population: &Population,
     horizon: Option<f64>,
 ) -> Result<(), String> {
-    use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord};
+    use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord, TteRecurrence};
+
+    // RTTE (repeated-event, Slice 3.3) preconditions. The stream generator
+    // (`survival::simulate_rtte_stream`) handles a single analytic recurrent cause
+    // per subject; the cases below are user-fixable and would otherwise corrupt the
+    // draw silently, so reject them at every simulate entry point (`simulate*`,
+    // uncertainty).
+    let is_rtte = |cmt: &usize| {
+        matches!(
+            model.endpoints.get(cmt),
+            Some(EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Repeated { .. },
+                ..
+            })
+        )
+    };
+    let is_single_tte = |cmt: &usize| {
+        matches!(
+            model.endpoints.get(cmt),
+            Some(EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Single,
+                ..
+            })
+        )
+    };
+    let has_rtte = model.endpoints.values().any(|e| {
+        matches!(
+            e,
+            EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Repeated { .. },
+                ..
+            }
+        )
+    });
+    if has_rtte {
+        // A finite, positive administrative horizon bounds the recurrent stream.
+        match horizon {
+            Some(h) if h.is_finite() && h > 0.0 => {}
+            _ => {
+                return Err(
+                    "Repeated time-to-event (RTTE, `type = rtte`) simulation requires a finite, \
+                     positive administrative horizon: set `[simulation] horizon` (or \
+                     `SimulateOptions.horizon`). The recurrent event stream is generated up to \
+                     that horizon."
+                        .to_string(),
+                );
+            }
+        }
+        for subject in &population.subjects {
+            // Distinct RTTE CMTs on this subject, plus whether it also carries a
+            // competing single-event TTE cause (a non-recurrent `Tte` sibling).
+            let mut rtte_cmts = std::collections::BTreeSet::new();
+            let mut has_single_tte_sibling = false;
+            for r in &subject.obs_records {
+                let ObsRecord::Event {
+                    cmt, entry_time, ..
+                } = r;
+                if is_rtte(cmt) {
+                    rtte_cmts.insert(*cmt);
+                    if *entry_time > 0.0 {
+                        return Err(format!(
+                            "RTTE (`type = rtte`) simulation does not support left truncation \
+                             (entry_time={entry_time} for subject '{}' on CMT={cmt}); conditional \
+                             first-gap sampling past entry is a deferred follow-up",
+                            subject.id
+                        ));
+                    }
+                } else if is_single_tte(cmt) {
+                    has_single_tte_sibling = true;
+                }
+            }
+            if rtte_cmts.is_empty() {
+                continue;
+            }
+            if rtte_cmts.len() > 1 {
+                return Err(format!(
+                    "RTTE simulation supports one recurrent stream per subject, but subject '{}' \
+                     has RTTE endpoints on multiple CMTs ({:?}); multi-cause RTTE simulation is a \
+                     later slice",
+                    subject.id, rtte_cmts
+                ));
+            }
+            if has_single_tte_sibling {
+                return Err(format!(
+                    "RTTE simulation does not support an RTTE cause combined with a competing \
+                     single-event TTE cause on subject '{}'; simulate them separately",
+                    subject.id
+                ));
+            }
+            if !subject.reset_times.is_empty() {
+                return Err(format!(
+                    "RTTE simulation does not support EVID=3/4 resets (a reset would disturb the \
+                     hazard clock mid-stream; selective per-state reset is a later slice); subject \
+                     '{}' has resets",
+                    subject.id
+                ));
+            }
+        }
+    }
     let is_ode_tte = |cmt: &usize| {
         matches!(
             model.endpoints.get(cmt),
             Some(EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. }
+                hazard: HazardSpec::OdeAccumulated { .. },
+                ..
             })
         )
     };
@@ -6147,7 +6807,8 @@ fn validate_ode_tte_simulatable(
         matches!(
             e,
             EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. }
+                hazard: HazardSpec::OdeAccumulated { .. },
+                ..
             }
         )
     }) {
@@ -6223,7 +6884,7 @@ pub fn simulate_with_options(
     // deep in sampling (a finite horizon is required; resets and left truncation are
     // not yet supported for an ODE hazard).
     #[cfg(feature = "survival")]
-    validate_ode_tte_simulatable(model, population, opts.horizon)?;
+    validate_tte_simulatable(model, population, opts.horizon)?;
 
     // Parity with `fit()`: a referenced covariate absent from the data would
     // silently read 0.0 (e.g. a `Selected` error model's `if (FREE==0)` selector
@@ -6400,9 +7061,44 @@ fn emit_subject_rows<R: rand::Rng>(
     #[cfg(not(feature = "survival"))]
     let _ = horizon;
 
-    // Use the same TV-covariate-aware dispatcher as estimation and post-fit
-    // diagnostics. For no-TV subjects this stays on the one-pk-param fast path.
-    let ipreds = pk::compute_predictions_with_tv(model, subject, &params.theta, eta_slice);
+    // Predict IPRED. For IOV models (`n_kappa > 0`) route through the
+    // occasion-aware `predict_iov`, drawing one independent κ ~ N(0, Ω_IOV) per
+    // occasion — otherwise every occasion would share the same (κ = 0) parameters
+    // and the simulated data would carry NO inter-occasion variability, silently
+    // under-dispersing a VPC relative to the fitted model / NONMEM `$SIM`. The
+    // caller zeroes the κ tail of `eta_slice`; only the BSV head (`..n_eta`) is
+    // used here, and the κ draws happen on this occasion-aware branch instead.
+    // Non-IOV models keep the TV-covariate-aware fast-path dispatcher unchanged
+    // and draw no extra randoms, so their output is byte-identical.
+    let ipreds = if model.n_kappa > 0 {
+        let omega_iov = params
+            .omega_iov
+            .as_ref()
+            .expect("omega_iov is present whenever the model declares kappa (n_kappa > 0)");
+        // One κ vector per occasion group, in `iov_occasion_groups` order — the
+        // exact order `predict_iov` indexes its `kappas` argument by. Empty when
+        // the subject carries no occasion labels, in which case `predict_iov`
+        // falls back to κ = 0 (matching the fit-time no-occasion diagnostic).
+        let occ_groups = crate::stats::likelihood::iov_occasion_groups(subject);
+        let kappas: Vec<Vec<f64>> = (0..occ_groups.len())
+            .map(|_| {
+                let z: Vec<f64> = (0..model.n_kappa).map(|_| rng.sample(normal)).collect();
+                (&omega_iov.chol * DVector::from_column_slice(&z))
+                    .iter()
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        pk::predict_iov(
+            model,
+            subject,
+            &params.theta,
+            &eta_slice[..model.n_eta],
+            &kappas,
+        )
+    } else {
+        pk::compute_predictions_with_tv(model, subject, &params.theta, eta_slice)
+    };
 
     // Add residual error (Gaussian path). IIV on residual error (#409): the
     // drawn `eta_slice` includes η_ruv, so scale the residual variance by
@@ -6612,7 +7308,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // the uncertainty path) funnel through here and cannot signal an error, so
     // enforce the identical contract as a panic rather than emitting wrong rows.
     #[cfg(feature = "survival")]
-    if let Err(e) = validate_ode_tte_simulatable(model, population, horizon) {
+    if let Err(e) = validate_tte_simulatable(model, population, horizon) {
         panic!("{e}");
     }
 
@@ -6924,6 +7620,19 @@ where
     // wrong answer (#391). Both public entry points funnel through here.
     reject_unsupported_adaptive(model, population)?;
 
+    // The occasion bookkeeping assumes a strictly-increasing decision schedule:
+    // `occasion_of` (per-decision-window κ selection) scans ascending and stops at the
+    // first later time, and `decision_index_of` keys windows by exact time bits. An
+    // unsorted schedule would mis-map a record to the wrong occasion's κ, and a
+    // duplicated time would split the window-open index from the materialiser's
+    // occasion — both silently, since the frozen-replay verifier reuses the same
+    // occasion arrays and cannot catch a shared-wrong-input (#701 review). The
+    // declarative `[adaptive_dosing]` path already enforces this on its `at` list via
+    // `validate_increasing_finite`; guard the programmatic `simulate_adaptive` path
+    // here too, at the shared funnel, with the *same* validator (finite + strictly
+    // ascending ⇒ no duplicates) so the two paths cannot drift.
+    crate::sim::adaptive::validate_increasing_finite(decision_times, "`decision_times`")?;
+
     use rand::SeedableRng;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
@@ -6951,15 +7660,142 @@ where
     let mut decisions: Vec<DecisionLogEntry> = Vec::new();
     let mut metrics: Vec<AdaptiveSubjectMetrics> = Vec::new();
 
+    // `auc_target_attainment` (#391 S2.5b) integrates a dense grid with a single PK
+    // snapshot — exact only for constant-covariate subjects. A time-varying (or
+    // TIME-in-PK) subject would silently get a frozen-PK AUC (there is no exact
+    // per-event dense-grid solver — even the fit path approximates TV states with a
+    // warning, and the adaptive result has no warnings channel). So reject the
+    // combination loudly (#700) rather than report a wrong metric. Every other
+    // adaptive output — predictions, decisions, the dose ledger, `target_window` — is
+    // fully per-event covariate-aware; only this one exposure metric is deferred.
+    if auc_target.is_some()
+        && (model.n_kappa > 0
+            || population
+                .subjects
+                .iter()
+                .any(|s| crate::pk::subject_needs_per_event_pk(model, s)))
+    {
+        return Err(
+            "adaptive-dosing `auc_target` is not yet supported for time-varying-covariate, \
+             TIME-in-PK, or IOV (`kappa`) subjects: its exposure metric integrates a dense grid \
+             from a single frozen PK snapshot, which would be silently wrong when the PK changes \
+             across the horizon (a drifting covariate or a per-occasion κ). Drop `auc_target` (all \
+             other outputs remain per-event / per-occasion aware), or track #700/#701 for a \
+             per-event AUC."
+                .to_string(),
+        );
+    }
+
+    // Reused per-event PK buffer (#700): filled in place per (sim, subject) on the
+    // time-varying path via `compute_event_pk_params_into`, so the hot loop keeps
+    // its backing `Vec`s instead of allocating three fresh ones per replicate. The
+    // values are recomputed every iteration (η is redrawn); only the allocation is
+    // reused. Unused on the constant path (`event_pk` stays `None`).
+    let mut event_pk_buf = crate::pk::EventPkParams::default();
+
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         for subject in &population.subjects {
-            // Draw η ~ N(0, Ω); append zero kappas for IOV models (the reactive
-            // driver is BSV-only in this slice).
+            // Draw η ~ N(0, Ω). `eta_slice` (η with κ appended as zeros) is the
+            // **baseline** window — the parameters before the first decision, and
+            // the reactive driver's fixed eta on a non-IOV run.
             let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(normal)).collect();
             let eta = &params.omega.chol * DVector::from_column_slice(&z);
             let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
+
+            // Inter-occasion variability (#701): draw a fresh κ per decision window
+            // and build the per-window eta `[η_bsv | κ_g]` the driver threads through
+            // each segment, plus `decision_pk[g]` = the PK at decision g under
+            // occasion g's κ. Occasion = decision index (per-decision-window). κ is
+            // drawn on a dedicated substream keyed by (subject, replicate), disjoint
+            // from the η and assay streams, so a non-IOV model (`n_kappa == 0`) draws
+            // nothing and this whole block is skipped — the path stays byte-identical.
+            let (eta_occ, decision_pk): (
+                Option<Vec<Vec<f64>>>,
+                Option<Vec<crate::types::PkParams>>,
+            ) = if model.n_kappa > 0 {
+                let omega_iov = params
+                    .omega_iov
+                    .as_ref()
+                    .expect("omega_iov present when n_kappa > 0");
+                let kappa_base =
+                    crate::sim::adaptive::subject_kappa_base_seed(assay_root, &subject.id, sim);
+                let n_occ = decision_times.len();
+                let mut eta_occ = Vec::with_capacity(n_occ);
+                let mut decision_pk = Vec::with_capacity(n_occ);
+                for g in 0..n_occ {
+                    let zk: Vec<f64> = (0..model.n_kappa)
+                        .map(|k| crate::sim::adaptive::kappa_standard_normal(kappa_base, g, k))
+                        .collect();
+                    let kappa_g = &omega_iov.chol * DVector::from_column_slice(&zk);
+                    let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
+                    e.extend(kappa_g.iter().copied());
+                    // PK at decision g under occasion g's κ, at the covariate the
+                    // driver actually sees at that decision. This MUST match the
+                    // driver's live `decision_cov` (predictions.rs) exactly: the
+                    // obs-coincident snapshot on a record, else the LOCF covariate of
+                    // the most-recent record carried forward — NOT the frozen t=0
+                    // baseline. On a time-varying-covariate + IOV model whose decision
+                    // lands between records, a baseline fallback here would freeze the
+                    // decision's covariate at t=0 (the exact #700 defect) while the
+                    // driver's readout uses LOCF — and the frozen-replay verifier,
+                    // which reuses this same `decision_pk`, could not catch it. Sharing
+                    // the one `locf_decision_cov` helper the driver uses makes the two
+                    // covariate resolutions a single source of truth (#701 review).
+                    let dcov = crate::ode::predictions::locf_decision_cov(
+                        decision_times[g],
+                        subject,
+                        &subject.covariates,
+                    );
+                    decision_pk.push((model.pk_param_fn)(
+                        &params.theta,
+                        &e,
+                        dcov,
+                        decision_times[g],
+                    ));
+                    eta_occ.push(e);
+                }
+                (Some(eta_occ), Some(decision_pk))
+            } else {
+                (None, None)
+            };
+
+            // Per-event PK when PK varies across the horizon: an IOV κ that switches
+            // per occasion (#701), or a time-varying covariate / pk-only row / `TIME`
+            // built-in (#700). The reactive driver then resolves PK per segment from
+            // these snapshots. `None` ⇒ constant PK, driven from the frozen `pk`
+            // snapshot below. The IOV snapshot is owned (recomputed per replicate as κ
+            // is redrawn); the #700-only path reuses `event_pk_buf`. One shared
+            // predicate (`subject_needs_per_event_pk`) gates the #700 branch, the
+            // materialiser, and the `auc_target` guard so they cannot drift apart.
+            let event_pk_iov: Option<crate::pk::EventPkParams> = eta_occ.as_ref().map(|eo| {
+                // IOV: each obs / pk-only record carries its occasion's κ (and any
+                // #700 covariate); records before the first decision use the baseline.
+                crate::pk::compute_event_pk_params_iov(
+                    model,
+                    subject,
+                    &params.theta,
+                    &eta_slice,
+                    eo,
+                    decision_times,
+                )
+            });
+            let event_pk: Option<&crate::pk::EventPkParams> =
+                if let Some(ev) = event_pk_iov.as_ref() {
+                    Some(ev)
+                } else if crate::pk::subject_needs_per_event_pk(model, subject) {
+                    crate::pk::compute_event_pk_params_into(
+                        model,
+                        subject,
+                        &params.theta,
+                        &eta_slice,
+                        &mut event_pk_buf,
+                    );
+                    Some(&event_pk_buf)
+                } else {
+                    None
+                };
 
             // Baseline PK snapshot at the start of the simulation horizon (t=0).
             let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates, 0.0);
@@ -6991,6 +7827,9 @@ where
             let run: AdaptiveRun = crate::ode::ode_predictions_adaptive_impl(
                 ode,
                 &pk.values,
+                event_pk,
+                decision_pk.as_deref(),
+                eta_occ.as_deref(),
                 &params.theta,
                 &eta_slice,
                 subject,
@@ -7003,9 +7842,39 @@ where
             .map_err(|e| format!("subject '{}' (sim {sim}): {e}", subject.id))?;
 
             if opts.verify {
+                // #748: the frozen-replay verifier below reuses the *same* precomputed
+                // snapshots (`event_pk`, `decision_pk`, `eta_occ`) the driver did, so it
+                // validates that the two *consume* them identically — never that they are
+                // *correct*. A build-loop that fed a leaf the wrong covariate / occasion /
+                // κ (the #732 & #739 "decision covariate frozen at t=0" class) is applied
+                // by both sides and passes the replay bit-exact. Close that blind spot by
+                // independently re-deriving each snapshot from primitives and bit-asserting
+                // it against what the driver was handed — default-on, before the replay.
+                verify_adaptive_snapshots(
+                    model,
+                    params,
+                    subject,
+                    &eta_slice,
+                    decision_times,
+                    assay_root,
+                    sim,
+                    eta_occ.as_deref(),
+                    decision_pk.as_deref(),
+                    event_pk,
+                )
+                .map_err(|e| {
+                    format!(
+                        "adaptive snapshot verification failed for subject '{}' (sim {sim}): {e}",
+                        subject.id
+                    )
+                })?;
+
                 crate::ode::verify_adaptive_frozen_replay(
                     ode,
                     &pk.values,
+                    event_pk,
+                    decision_pk.as_deref(),
+                    eta_occ.as_deref(),
                     &params.theta,
                     &eta_slice,
                     subject,
@@ -7129,6 +7998,260 @@ where
         decisions,
         metrics,
     })
+}
+
+/// Validate that the per-(subject, replicate) PK snapshots the reactive driver was
+/// handed — and which the frozen-schedule replay verifier reuses **verbatim** — are
+/// *correct*, not merely *consumed identically* by both engines (#748).
+///
+/// `run_adaptive_population` precomputes, once, the PK snapshots it feeds to both the
+/// driver and `verify_adaptive_frozen_replay`: the baseline `pk` (t=0), `eta_occ[g]`
+/// (the per-decision-window `[η_bsv | κ_g]`), `decision_pk[g]` (the PK at decision
+/// `g`), and `event_pk` (the per-record obs / pk-only PK). Because the replay consumes
+/// the identical arrays, a **build-loop** error — a wrong covariate, occasion, or κ
+/// fed to a leaf — is applied by both sides and passes the replay bit-exact. That is
+/// exactly how the "decision covariate frozen at t=0" defect reached production twice
+/// (#732, #739): each time only a hand-written regression test using an off-record
+/// `f_applied` readout could catch it, because the default-on verifier could not.
+///
+/// This check closes that blind spot for the three per-occasion / per-event snapshots
+/// #748 names. It **independently re-derives** `eta_occ`, `decision_pk`, and `event_pk`
+/// from the run's *primitive* inputs — θ, the drawn BSV η (`eta_slice`), the subject's
+/// covariates, the decision schedule, and (re-drawn here) the per-occasion κ substream
+/// — by calling the **leaf** rules directly (`pk_param_fn`, `locf_decision_cov`,
+/// `occasion_of`, `subject_kappa_base_seed` / `kappa_standard_normal`), NOT by
+/// re-invoking the build loop's composite assembler. In particular `event_pk` is
+/// rebuilt record-by-record inline (occasion via `occasion_of`, PK via `pk_param_fn`
+/// at the record's own covariate) rather than through `compute_event_pk_params_iov`,
+/// so a wrong occasion or covariate the *composite* would introduce is caught too —
+/// not only a wrong array argument. It then bit-asserts (`to_bits`) each re-derivation
+/// against what the driver received; `pk_param_fn` and the seeded κ substream are pure,
+/// so a correct build agrees to the bit and a divergent one fails loudly, default-on,
+/// for **every** model.
+///
+/// The teeth come from this being a **second orchestration over the same leaves**: it
+/// **must not** be refactored to call the build loop's composite assembler, or a defect
+/// edited into that assembler would be mirrored on both sides and slip through again.
+/// The leaf rules themselves (the covariate LOCF rule, the occasion map, the κ draw)
+/// are the single source of truth and are unit-tested in isolation; θ and `eta_slice`
+/// are trusted primitive draws (not "built" snapshots) so — like the seed and Ω — they
+/// are consumed, not re-derived.
+///
+/// Scope: the constant-path baseline `pk` (a single t=0 evaluation at the subject-static
+/// covariate) is a shared snapshot too, but a trivial one — it is left to the degenerate
+/// oracle rather than re-derived per run here; extending the check to it is a possible
+/// follow-up. On the constant-covariate / non-IOV path (no `eta_occ`, no `event_pk`)
+/// this function is therefore a no-op.
+#[allow(clippy::too_many_arguments)]
+fn verify_adaptive_snapshots(
+    model: &CompiledModel,
+    params: &ModelParameters,
+    subject: &Subject,
+    eta_slice: &[f64],
+    decision_times: &[f64],
+    assay_root: u64,
+    sim: usize,
+    eta_occ: Option<&[Vec<f64>]>,
+    decision_pk: Option<&[PkParams]>,
+    event_pk: Option<&crate::pk::EventPkParams>,
+) -> Result<(), String> {
+    let n_eta = model.n_eta;
+
+    // ── IOV path: re-derive eta_occ + decision_pk, then event_pk inline ─────────
+    if let (Some(eta_occ), Some(decision_pk)) = (eta_occ, decision_pk) {
+        let omega_iov = params.omega_iov.as_ref().ok_or_else(|| {
+            "an IOV run (eta_occ / decision_pk present) carries no omega_iov — a build-loop \
+             invariant violation (#748)"
+                .to_string()
+        })?;
+        let kappa_base =
+            crate::sim::adaptive::subject_kappa_base_seed(assay_root, &subject.id, sim);
+        let n_occ = decision_times.len();
+
+        if eta_occ.len() != n_occ || decision_pk.len() != n_occ {
+            return Err(format!(
+                "occasion snapshot arrays are mis-sized: expected {n_occ} (one per decision), \
+                 got eta_occ.len()={}, decision_pk.len()={} (#748)",
+                eta_occ.len(),
+                decision_pk.len()
+            ));
+        }
+
+        let mut eta_occ_check: Vec<Vec<f64>> = Vec::with_capacity(n_occ);
+        for g in 0..n_occ {
+            // Re-draw occasion g's κ on the dedicated substream and assemble the
+            // per-window eta [η_bsv | κ_g] — an independent copy of the build loop.
+            let zk: Vec<f64> = (0..model.n_kappa)
+                .map(|k| crate::sim::adaptive::kappa_standard_normal(kappa_base, g, k))
+                .collect();
+            let kappa_g = &omega_iov.chol * DVector::from_column_slice(&zk);
+            let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
+            e.extend(kappa_g.iter().copied());
+
+            if !slice_bits_eq(&e, &eta_occ[g]) {
+                return Err(format!(
+                    "eta_occ[{g}] (occasion κ for the decision at t={}) diverges from an \
+                     independent re-draw — a wrong occasion→κ keying or [η | κ] assembly in the \
+                     build loop. The frozen-replay verifier reuses this array and cannot catch \
+                     it (#748).",
+                    decision_times[g]
+                ));
+            }
+
+            // decision_pk[g] must equal pk_param_fn at the covariate the driver's live
+            // `decision_cov` uses — LOCF of the most-recent record, NOT the frozen t=0
+            // baseline (the twice-fixed #732 / #739 defect).
+            let dcov = crate::ode::predictions::locf_decision_cov(
+                decision_times[g],
+                subject,
+                &subject.covariates,
+            );
+            let dpk = (model.pk_param_fn)(&params.theta, &e, dcov, decision_times[g]);
+            if !pk_bits_eq(&dpk, &decision_pk[g]) {
+                return Err(format!(
+                    "decision_pk[{g}] (decision at t={}) diverges from an independent \
+                     re-derivation at the LOCF decision covariate — the 'decision covariate \
+                     frozen at t=0' class fixed in #732 / #739. Both the driver and the \
+                     frozen-replay verifier consume this snapshot, so the replay cannot catch \
+                     it (#748).",
+                    decision_times[g]
+                ));
+            }
+            eta_occ_check.push(e);
+        }
+
+        // event_pk (per-record obs / pk-only PK) re-derived from the *check's* occasion
+        // eta, so a corrupt build eta_occ cannot launder itself into event_pk.
+        let ev = event_pk.ok_or_else(|| {
+            "an IOV run carries no event_pk — κ makes PK per-occasion, so obs / pk-only records \
+             must each carry a per-event snapshot (#748)"
+                .to_string()
+        })?;
+        return check_event_pk_records(
+            model,
+            &params.theta,
+            eta_slice,
+            subject,
+            decision_times,
+            Some(&eta_occ_check),
+            ev,
+        );
+    }
+
+    // ── TV-covariate / TIME-in-PK path without IOV ──────────────────────────────
+    // Every record uses the baseline η; re-derive per record and compare.
+    if let Some(ev) = event_pk {
+        return check_event_pk_records(
+            model,
+            &params.theta,
+            eta_slice,
+            subject,
+            decision_times,
+            None,
+            ev,
+        );
+    }
+
+    // ── Constant-covariate path: only the baseline `pk` (checked above) applies. ─
+    Ok(())
+}
+
+/// Two `f64`s are the same to the bit (so two runs of the *same* deterministic
+/// computation agree, and a NaN equals itself). Used by the #748 snapshot check,
+/// where any difference is a real build divergence, not solver slack.
+#[inline]
+fn f64_bits_eq(a: f64, b: f64) -> bool {
+    a.to_bits() == b.to_bits()
+}
+
+/// Bit-equality of two PK parameter snapshots (#748).
+fn pk_bits_eq(a: &PkParams, b: &PkParams) -> bool {
+    a.values
+        .iter()
+        .zip(b.values.iter())
+        .all(|(x, y)| f64_bits_eq(*x, *y))
+}
+
+/// Bit-equality of two eta slices (#748).
+fn slice_bits_eq(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| f64_bits_eq(*x, *y))
+}
+
+/// Re-derive each per-record (obs / EVID=2 pk-only) PK snapshot **inline** — occasion
+/// via [`occasion_of`](crate::pk::occasion_of), PK via `pk_param_fn` at the record's
+/// own covariate — and bit-check it against the `event_pk` the driver used (#748).
+///
+/// This is an *independent second derivation*, NOT a re-call of
+/// `compute_event_pk_params_iov`: a wrong occasion grouping or per-record covariate the
+/// composite builder would introduce is caught here, not only a wrong array argument.
+/// `eta_occ_check` is the independently re-derived per-window eta (IOV); `None` ⇒ the
+/// non-IOV path, where every record uses the baseline `eta_slice`. The dose-free
+/// adaptive base subject carries no dose events, so `event_pk.dose` must stay empty.
+fn check_event_pk_records(
+    model: &CompiledModel,
+    theta: &[f64],
+    eta_slice: &[f64],
+    subject: &Subject,
+    decision_times: &[f64],
+    eta_occ_check: Option<&[Vec<f64>]>,
+    got: &crate::pk::EventPkParams,
+) -> Result<(), String> {
+    // Eta in effect at a record time `t`: occasion `g`'s per-window eta when IOV is
+    // active and a window is open, else the baseline (matches the driver's `eta_for`
+    // over the same `occasion_of`).
+    let eta_at = |t: f64| -> &[f64] {
+        match eta_occ_check {
+            Some(eo) => match crate::pk::occasion_of(decision_times, t) {
+                Some(g) => eo[g].as_slice(),
+                None => eta_slice,
+            },
+            None => eta_slice,
+        }
+    };
+
+    if got.dose.len() != subject.doses.len() {
+        return Err(format!(
+            "event_pk.dose has {} entr(ies) but the subject has {} dose record(s) (#748)",
+            got.dose.len(),
+            subject.doses.len()
+        ));
+    }
+    if got.obs.len() != subject.obs_times.len() {
+        return Err(format!(
+            "event_pk.obs has {} entr(ies) but the subject has {} observation record(s) (#748)",
+            got.obs.len(),
+            subject.obs_times.len()
+        ));
+    }
+    for j in 0..subject.obs_times.len() {
+        let t = subject.obs_times[j];
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.obs_cov(j), t);
+        if !pk_bits_eq(&want, &got.obs[j]) {
+            return Err(format!(
+                "event_pk.obs[{j}] (record at t={t}) diverges from an independent re-derivation \
+                 — a wrong per-event covariate or occasion κ in the per-event PK builder, reused \
+                 verbatim by the frozen-replay verifier, which cannot catch it (#748)"
+            ));
+        }
+    }
+    if got.pk_only.len() != subject.pk_only_times.len() {
+        return Err(format!(
+            "event_pk.pk_only has {} entr(ies) but the subject has {} EVID=2 record(s) (#748)",
+            got.pk_only.len(),
+            subject.pk_only_times.len()
+        ));
+    }
+    for m in 0..subject.pk_only_times.len() {
+        let t = subject.pk_only_times[m];
+        let want = (model.pk_param_fn)(theta, eta_at(t), subject.pk_only_cov(m), t);
+        if !pk_bits_eq(&want, &got.pk_only[m]) {
+            return Err(format!(
+                "event_pk.pk_only[{m}] (EVID=2 record at t={t}) diverges from an independent \
+                 re-derivation — a wrong per-event covariate or occasion κ (#748)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Simulate a declarative `[adaptive_dosing]` block over a population — the
@@ -7288,7 +8411,7 @@ pub fn simulate_with_uncertainty(
     // uncertainty path does not yet expose — validate for a clean Err here (the
     // inner chokepoint would otherwise enforce the same contract as a panic).
     #[cfg(feature = "survival")]
-    validate_ode_tte_simulatable(model, population, None)?;
+    validate_tte_simulatable(model, population, None)?;
 
     // Parity with `fit()`: reject a referenced covariate absent from the data
     // rather than silently reading it as 0.0 (a `Selected` error-model selector
@@ -7476,6 +8599,17 @@ fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64 {
 /// `S_all(t) = exp(−Σ_j H_j(t))`, computed together so that
 /// `Σ_k F_k(t) + S_all(t) = 1` holds at every grid point (see [`cif_curves`]).
 ///
+/// **RTTE (`type = rtte`) semantics.** This computes single-event quantities from the
+/// hazard curve, so for a repeated-event endpoint `survival`, `median_survival`,
+/// `mean_survival` and `cif` describe **time to the *first* event**, not the recurrent
+/// process. For `clock = forward` (Andersen–Gill), the recurrent quantity — the expected
+/// event count `E[N(t)] = H(t)` — is the `cum_hazard` field (with `hazard` its rate
+/// `h(t)`). For `clock = reset` (gap-time / renewal), `cum_hazard` is the cumulative
+/// hazard of a single gap evaluated at *absolute* time and is **not** the renewal mean
+/// `E[N(t)]`, so it is not a meaningful recurrent quantity here. A recurrence-aware
+/// predictor is a later slice (3.3); until then read `cum_hazard`/`hazard` only for
+/// clock-forward RTTE, not the survival summaries and not for clock-reset.
+///
 /// Returns an empty Vec when the model has no TTE endpoints.
 #[cfg(feature = "survival")]
 pub fn predict_survival(
@@ -7508,7 +8642,7 @@ pub fn predict_survival(
         #[allow(clippy::type_complexity)]
         let mut rows: Vec<(usize, Vec<f64>, Vec<f64>, f64, f64)> = Vec::new();
         for (&cmt, endpoint) in &model.endpoints {
-            let crate::types::EndpointLikelihood::Tte { hazard } = endpoint else {
+            let crate::types::EndpointLikelihood::Tte { hazard, .. } = endpoint else {
                 continue;
             };
             match hazard {
@@ -8194,6 +9328,241 @@ mod iov_integration {
         assert_eq!(d.block.as_deref(), Some("fit_options"));
     }
 
+    // A model-side occasion rule (`iov_occasion`) supplies the labels at fit time,
+    // so the E_IOV_MISSING_OCC data check must NOT fire even with empty occasions.
+    #[test]
+    fn test_iov_occasion_rule_suppresses_missing_occ_check() {
+        let model = make_iov_model();
+        let mut pop = make_iov_population();
+        for subj in &mut pop.subjects {
+            subj.occasions.clear();
+            subj.dose_occasions.clear();
+        }
+        let rule = IovOccasionRule::TimeWindows(vec![3.5]);
+        let diags = super::check_model_data_rule(&model, &pop, &rule);
+        assert!(
+            !diags.iter().any(|d| d.code == "E_IOV_MISSING_OCC"),
+            "iov_occasion rule should suppress the missing-occasion error"
+        );
+        // Column rule (default) still flags the empty occasions.
+        let diags = super::check_model_data_rule(&model, &pop, &IovOccasionRule::Column);
+        assert!(diags.iter().any(|d| d.code == "E_IOV_MISSING_OCC"));
+    }
+
+    // TimeWindows breakpoints bucket obs and doses by (raw) time: `time(3.5)`
+    // splits the make_iov_population timeline (obs 1..6, doses at 0.0 and 3.5)
+    // into occasion 0 (t < 3.5) and occasion 1 (t ≥ 3.5).
+    #[test]
+    fn test_apply_iov_occasion_time_windows() {
+        let mut pop = make_iov_population();
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(
+            &mut pop,
+            &IovOccasionRule::TimeWindows(vec![3.5]),
+            false,
+            &mut warnings,
+        );
+        assert!(warnings.is_empty(), "no column set → no override warning");
+        for s in &pop.subjects {
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+            assert_eq!(s.dose_occasions, vec![0u32, 1]);
+        }
+    }
+
+    // PerDose opens a new occasion at each administration; an observation takes
+    // the occasion of the most recent dose (dose-before-obs at equal TIME). For
+    // make_iov_population (doses at 0.0 and 3.5) this yields the same partition
+    // as time(3.5): obs 1..3 → occasion 0, obs 4..6 → occasion 1.
+    #[test]
+    fn test_apply_iov_occasion_per_dose() {
+        let mut pop = make_iov_population();
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(&mut pop, &IovOccasionRule::PerDose, false, &mut warnings);
+        for s in &pop.subjects {
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+            assert_eq!(s.dose_occasions, vec![0u32, 1]);
+        }
+    }
+
+    // When both iov_column and a DSL rule are set, the DSL rule wins and a single
+    // override warning is emitted.
+    #[test]
+    fn test_apply_iov_occasion_coexistence_warns() {
+        let mut pop = make_iov_population();
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(
+            &mut pop,
+            &IovOccasionRule::PerDose,
+            /* had_column = */ true,
+            &mut warnings,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("iov_column"));
+    }
+
+    // NONMEM-equivalence by proxy: the column path is already NONMEM-validated
+    // (tests/warfarin_iov_nonmem.rs). A DSL `time(3.5)` rule that reproduces the
+    // same occasion partition must produce a bit-identical fit (same OFV, same
+    // per-occasion kappa structure) as reading the occasions from the column.
+    #[test]
+    fn test_iov_occasion_dsl_matches_column_fit() {
+        let model = make_iov_model();
+        let pop = make_iov_population(); // occasions [1,1,1,2,2,2] from the column
+
+        let opts_col = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        let r_col =
+            fit(&model, &pop, &model.default_params, &opts_col).expect("column fit should succeed");
+
+        // Same population, but derive occasions from the model instead. time(3.5)
+        // reproduces the column partition (relabeled 0/1 vs 1/2 — grouping is by
+        // label identity, so the estimation is identical).
+        let mut opts_dsl = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        opts_dsl.iov_occasion = IovOccasionRule::TimeWindows(vec![3.5]);
+        let r_dsl = fit(&model, &pop, &model.default_params, &opts_dsl)
+            .expect("DSL-occasion fit should succeed");
+
+        assert!(
+            (r_col.ofv - r_dsl.ofv).abs() < 1e-6,
+            "DSL occasion rule OFV {} must match column OFV {}",
+            r_dsl.ofv,
+            r_col.ofv
+        );
+        assert_eq!(r_col.ebe_kappas.len(), r_dsl.ebe_kappas.len());
+        for (a, b) in r_col.ebe_kappas.iter().zip(&r_dsl.ebe_kappas) {
+            assert_eq!(a.len(), b.len(), "same number of occasions per subject");
+        }
+    }
+
+    // #757: TimeWindows must bucket observations on the internal (monotonic)
+    // event clock, not the raw user clock. A reset-stacked crossover restarts
+    // the user TIME each period; if the derivation read `obs_raw_times` the
+    // second period's early samples would fold back into occasion 0 and split
+    // from their (internal-clock) doses.
+    #[test]
+    fn test_apply_iov_occasion_time_windows_uses_internal_clock() {
+        let mut pop = make_iov_population();
+        // Raw times that restart mid-series, as a period-2 reset would; the
+        // internal obs_times stay [1..6]. The rule must ignore these.
+        for s in &mut pop.subjects {
+            s.obs_raw_times = vec![1.0, 2.0, 3.0, 0.5, 1.5, 2.5];
+        }
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(
+            &mut pop,
+            &IovOccasionRule::TimeWindows(vec![3.5]),
+            false,
+            &mut warnings,
+        );
+        for s in &pop.subjects {
+            // Internal clock [1..6] with break at 3.5 → [0,0,0,1,1,1]. Had the raw
+            // times been used, the last three (all < 3.5) would be occasion 0.
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+        }
+    }
+
+    // #757: two doses administered at the same time (e.g. a simultaneous
+    // depot + central bolus) must share one occasion — the earlier one must not
+    // be stranded in an empty, observation-less occasion.
+    #[test]
+    fn test_apply_iov_occasion_per_dose_cotimed_doses_share_occasion() {
+        let mut pop = make_iov_population();
+        for s in &mut pop.subjects {
+            s.doses = vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(0.0, 50.0, 2, 0.0, false, 0.0), // co-timed
+                DoseEvent::new(3.5, 100.0, 1, 0.0, false, 0.0),
+            ];
+        }
+        let mut warnings = Vec::new();
+        super::apply_iov_occasion_rule(&mut pop, &IovOccasionRule::PerDose, false, &mut warnings);
+        for s in &pop.subjects {
+            // Two co-timed doses at t=0 → occasion 0; dose at 3.5 → occasion 1.
+            assert_eq!(s.dose_occasions, vec![0u32, 0, 1]);
+            // Observation partition unchanged: 1..3 → occ 0, 4..6 → occ 1.
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+        }
+    }
+
+    // #757: a derived rule that collapses every subject to a single occasion
+    // leaves kappa confounded with BSV — the same unidentifiability the column
+    // path guards with E_IOV_MISSING_OCC. fit() must error rather than run.
+    #[test]
+    fn test_iov_occasion_degenerate_single_occasion_errors() {
+        let model = make_iov_model();
+        let pop = make_iov_population();
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        // Breakpoint past the last observation (max 6.0) → one occasion for all.
+        opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
+        let res = fit(&model, &pop, &model.default_params, &opts);
+        let msg = res.expect_err("single-occasion derivation must error");
+        assert!(
+            msg.contains("single occasion") || msg.contains("unidentifiable"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // #757: `iov_occasion` with no kappa in the model is a no-op — it must warn
+    // (so the user knows it had no effect) and skip the derivation entirely.
+    #[test]
+    fn test_iov_occasion_without_kappa_warns() {
+        let mut model = make_iov_model();
+        // Strip IOV so the rule has nothing to feed.
+        model.n_kappa = 0;
+        model.kappa_names.clear();
+        model.default_params.omega_iov = None;
+        model.default_params.kappa_fixed.clear();
+        let pop = make_iov_population();
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        opts.iov_occasion = IovOccasionRule::PerDose;
+        let res = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
+        assert!(
+            res.warnings
+                .iter()
+                .any(|w| w.contains("iov_occasion") && w.contains("no effect")),
+            "expected a no-op warning, got: {:?}",
+            res.warnings
+        );
+    }
+
+    // #757: `run_model_*` mirrors the model-side occasion derivation onto the
+    // returned population so sdtab keeps its OCC column. Exercises the helper the
+    // CLI wrapper calls without a full fit.
+    #[test]
+    fn test_derive_output_occasions_matches_rule() {
+        let model = make_iov_model();
+        let empty = |p: &mut Population| {
+            for s in &mut p.subjects {
+                s.occasions.clear();
+                s.dose_occasions.clear();
+            }
+        };
+
+        // Derived rule → occasions written for output.
+        let mut pop = make_iov_population();
+        empty(&mut pop);
+        let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        opts.iov_occasion = IovOccasionRule::PerDose;
+        super::derive_output_occasions(&model, &opts, &mut pop);
+        for s in &pop.subjects {
+            assert_eq!(s.occasions, vec![0u32, 0, 0, 1, 1, 1]);
+        }
+
+        // Column rule (default) → no-op, occasions stay empty.
+        let mut pop_col = make_iov_population();
+        empty(&mut pop_col);
+        let opts_col = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
+        super::derive_output_occasions(&model, &opts_col, &mut pop_col);
+        assert!(pop_col.subjects.iter().all(|s| s.occasions.is_empty()));
+
+        // Rule set but no kappa → no-op.
+        let mut model0 = make_iov_model();
+        model0.n_kappa = 0;
+        let mut pop0 = make_iov_population();
+        empty(&mut pop0);
+        super::derive_output_occasions(&model0, &opts, &mut pop0);
+        assert!(pop0.subjects.iter().all(|s| s.occasions.is_empty()));
+    }
+
     // `ferx check` must surface the same trust_region+IOV incompatibility that
     // `fit()` rejects — without it, a model could report `valid: true` and then
     // fail at fit time. `check_model_options` is the shared source of truth.
@@ -8313,6 +9682,7 @@ mod iov_integration {
                     family: crate::types::HazardFamily::Exponential,
                     param_fn: Box::new(|_theta, _eta, _cov| vec![0.1]),
                 },
+                recurrence: crate::types::TteRecurrence::Single,
             },
         );
 
@@ -10083,6 +11453,8 @@ mod simulate_with_uncertainty_tests {
         FitResult {
             method: EstimationMethod::FoceI,
             method_chain: vec![EstimationMethod::FoceI],
+            method_wall_times_secs: vec![0.0],
+            covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
             aic: 0.0,
@@ -12442,6 +13814,27 @@ mod adaptive_sim_tests {
   DV ~ proportional(PROP)
 "#;
 
+    // IOV ODE model (#701): a per-occasion κ on CL over a near-degenerate BSV η
+    // (the parser requires an omega). A seeded run's η and per-occasion κ are both
+    // reconstructed exactly and checked against `predict_iov`.
+    const ODE_IOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
     // Analytical (non-ODE) twin — used to assert simulate_adaptive rejects it.
     const ANALYTICAL: &str = r#"
 [parameters]
@@ -12536,6 +13929,102 @@ mod adaptive_sim_tests {
                 "adaptive IPRED {} != static predict {} at t={}",
                 traj.ipred,
                 pred.pred,
+                traj.time
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_iov_matches_predict_iov_with_reconstructed_kappa() {
+        // Full-stack IOV oracle (#701): run the reactive driver on a real IOV model
+        // (κ drawn per decision window from the seeded substream), then reconstruct the
+        // exact per-occasion κ and confirm the trajectory equals `predict_iov` on the
+        // realized doses with occasions = decision windows. Obs coincide with decisions,
+        // so every dosing occasion appears in predict_iov's obs-derived groups. The
+        // default-on frozen-replay verifier also runs (bit-exact); its Ok is part of the
+        // assertion. This is the api-level counterpart of the driver-level degenerate
+        // oracle, exercising the real `pk_param_fn` → κ path end to end.
+        let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+        assert!(model.n_kappa == 1 && model.n_eta == 1);
+        let decisions = vec![0.0, 24.0, 48.0, 72.0];
+        let obs = decisions.clone();
+        let seed = 20260708u64;
+        let pop = population(vec![subj("1", obs.clone(), vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(seed),
+            decision_times: decisions.clone(),
+            ..Default::default() // verify = true
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect("adaptive IOV sim runs and passes the default verifier");
+        assert_eq!(res.ledger.len(), 4, "a dose at every decision");
+
+        // Reconstruct the BSV η exactly as `run_adaptive_population` drew it: the same
+        // seeded `StdRng`, one N(0,1) per η for this single (sim 1, subject "1"), then
+        // Ω's Cholesky. (With `seed` set, the assay/κ streams don't touch this rng, so
+        // the η draw is the only consumer — reproducible here.)
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+        let z_eta: Vec<f64> = (0..model.n_eta).map(|_| rng.sample(normal)).collect();
+        let eta_bsv: Vec<f64> = (&model.default_params.omega.chol
+            * nalgebra::DVector::from_column_slice(&z_eta))
+        .iter()
+        .copied()
+        .collect();
+
+        // Reconstruct the exact per-occasion κ from the seeded substream (the same
+        // derivation `run_adaptive_population` uses: κ_g = chol(Ω_IOV) · z, z keyed by
+        // (occasion, component); root = the run seed; replicate = 1).
+        let omega_iov = model.default_params.omega_iov.as_ref().expect("omega_iov");
+        let base = crate::sim::adaptive::subject_kappa_base_seed(seed, "1", 1);
+        let kappas: Vec<Vec<f64>> = (0..decisions.len())
+            .map(|g| {
+                let z: Vec<f64> = (0..model.n_kappa)
+                    .map(|k| crate::sim::adaptive::kappa_standard_normal(base, g, k))
+                    .collect();
+                (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z))
+                    .iter()
+                    .copied()
+                    .collect()
+            })
+            .collect();
+        assert!(
+            kappas.iter().any(|k| k[0].abs() > 1e-6),
+            "the reconstructed κ must be genuinely nonzero, else the oracle is vacuous"
+        );
+
+        // Static reference: predict_iov on the realized doses with occasion = window.
+        let static_doses: Vec<DoseEvent> = res
+            .ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+            .collect();
+        let mut static_subject = subj("1", obs.clone(), static_doses);
+        static_subject.occasions = obs
+            .iter()
+            .map(|&t| crate::pk::occasion_of(&decisions, t).expect("obs in a window") as u32)
+            .collect();
+        static_subject.dose_occasions = res
+            .ledger
+            .iter()
+            .map(|e| crate::pk::occasion_of(&decisions, e.time).expect("dose in a window") as u32)
+            .collect();
+        let preds = crate::pk::predict_iov(
+            &model,
+            &static_subject,
+            &model.default_params.theta,
+            &eta_bsv,
+            &kappas,
+        );
+
+        assert_eq!(res.trajectories.len(), preds.len());
+        for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+            assert!(
+                (traj.ipred - pred).abs() <= 1e-9 + 1e-9 * pred.abs(),
+                "adaptive IOV IPRED {} != predict_iov {} at t={}",
+                traj.ipred,
+                pred,
                 traj.time
             );
         }
@@ -13104,6 +14593,527 @@ mod adaptive_sim_tests {
                 traj.time
             );
         }
+    }
+
+    // A covariate-dependent 1-cpt model (CL scales with CRCL) used by the #700
+    // time-varying-covariate end-to-end tests. No BSV in effect (ETA_CL declared
+    // but unreferenced), so the covariate is the only source of PK variation.
+    const SPEC_TV_COV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * CRCL / 100.0
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 96
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 8 : increase 25%
+"#;
+
+    fn tv_cov_pop(crcls: &[f64], obs: &[f64]) -> Population {
+        let mut s = subj("1", obs.to_vec(), vec![]);
+        s.covariates = HashMap::from([("CRCL".to_string(), crcls[0])]);
+        s.obs_covariates = crcls
+            .iter()
+            .map(|&c| HashMap::from([("CRCL".to_string(), c)]))
+            .collect();
+        let mut pop = population(vec![s]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+        pop
+    }
+
+    // IOV declarative spec (#701): a per-occasion κ on CL, no covariate (the parser
+    // requires an omega, so a near-degenerate BSV η rides along).
+    const SPEC_IOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 96
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 8 : increase 25%
+"#;
+
+    // #700 × #701 co-occurrence: CL depends on BOTH a time-varying covariate (CRCL)
+    // and a per-occasion κ.
+    const SPEC_TV_IOV: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * (CRCL / 100.0) * exp(KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 96
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 8 : increase 25%
+"#;
+
+    #[test]
+    fn from_spec_supports_time_varying_covariate() {
+        // End-to-end #700: a covariate-dependent CL (CRCL declining — e.g. renal
+        // decline) drives per-event PK through the declarative path, and the
+        // default-on frozen-replay verifier validates the whole run. A constant-CRCL
+        // subject yields a different trajectory, proving the covariate is consumed.
+        let parsed = parse_full_model(SPEC_TV_COV).expect("model + block parse");
+        let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing]");
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+
+        // TV run: the verifier (on by default) passing is itself the bookkeeping
+        // check for the per-event path.
+        let tv_pop = tv_cov_pop(&[100.0, 80.0, 60.0, 45.0, 35.0], &obs);
+        let tv = simulate_adaptive_from_spec(
+            &parsed.model,
+            &tv_pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect("TV adaptive sim runs + verifies");
+
+        let const_pop = tv_cov_pop(&[100.0, 100.0, 100.0, 100.0, 100.0], &obs);
+        let cst = simulate_adaptive_from_spec(
+            &parsed.model,
+            &const_pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect("constant adaptive sim runs");
+
+        assert!(!tv.ledger.is_empty());
+        // Declining CRCL lowers CL late ⇒ slower clearance ⇒ a materially different
+        // late trajectory than the constant-CRCL subject.
+        let tv_last = tv.trajectories.last().unwrap().ipred;
+        let cst_last = cst.trajectories.last().unwrap().ipred;
+        assert!(
+            (tv_last - cst_last).abs() > 1e-6 * tv_last.abs().max(1.0),
+            "time-varying covariate must change the trajectory: tv={tv_last}, const={cst_last}"
+        );
+    }
+
+    #[test]
+    fn from_spec_supports_time_varying_covariate_with_infusion() {
+        // #700 infusion coverage: an infusion route under a declining covariate
+        // exercises the injected-infusion F (captured at injection) and the
+        // infusion-end break in BOTH the reactive driver and the frozen-replay
+        // engine (`adaptive_frozen_replay_tv`). The default-on verifier passing
+        // confirms the per-event bookkeeping for infusions, not just boluses.
+        let mut parsed = parse_full_model(SPEC_TV_COV).expect("model + block parse");
+        parsed
+            .adaptive_dosing
+            .as_mut()
+            .expect("[adaptive_dosing]")
+            .route = AdaptiveRoute::Infuse { cmt: 1, over: 2.0 };
+        let spec = parsed.adaptive_dosing.as_ref().unwrap();
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let pop = tv_cov_pop(&[100.0, 80.0, 60.0, 45.0, 35.0], &obs);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        let res = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect("TV infusion adaptive sim runs + verifies");
+        assert!(!res.ledger.is_empty());
+        assert!(
+            res.ledger.iter().all(|e| e.rate > 0.0),
+            "infusion route must record a positive rate on every realized dose"
+        );
+    }
+
+    #[test]
+    fn adaptive_auc_target_rejects_time_varying_covariate() {
+        // #700: the exposure metric (`auc_target_attainment`) can't yet be computed
+        // per-event, so declaring `auc_target` on a time-varying-covariate subject is
+        // a typed error rather than a silently frozen-PK AUC.
+        let mut parsed = parse_full_model(SPEC_TV_COV).expect("model + block parse");
+        // Attach an `auc_target` to the parsed spec (the model string above omits it
+        // so the support test above stays clean).
+        parsed
+            .adaptive_dosing
+            .as_mut()
+            .expect("[adaptive_dosing]")
+            .auc_target = Some((400.0, 600.0));
+        let spec = parsed.adaptive_dosing.as_ref().unwrap();
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let pop = tv_cov_pop(&[100.0, 80.0, 60.0, 45.0, 35.0], &obs);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+
+        let err = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect_err("auc_target on a TV subject must be rejected");
+        assert!(
+            err.to_lowercase().contains("auc_target")
+                && err.to_lowercase().contains("time-varying"),
+            "error should cite auc_target + time-varying: {err}"
+        );
+    }
+
+    #[test]
+    fn from_spec_supports_time_varying_covariate_with_iov() {
+        // #700 × #701 co-occurrence: CL depends on BOTH a declining covariate (CRCL,
+        // #700 LOCF) and a per-occasion κ (#701 decision window). Both fold into the
+        // per-event PK in the reactive driver AND the frozen-replay engine, so the
+        // default-on verifier passing is the bit-exact proof they compose. The run is
+        // reproducible for a fixed seed and κ-sensitive across seeds.
+        let parsed = parse_full_model(SPEC_TV_IOV).expect("model + block parse");
+        assert!(parsed.model.n_kappa == 1);
+        let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing]");
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let pop = tv_cov_pop(&[100.0, 80.0, 60.0, 45.0, 35.0], &obs);
+        let run = |seed: u64| {
+            let opts = AdaptiveSimulateOptions {
+                seed: Some(seed),
+                ..Default::default()
+            };
+            simulate_adaptive_from_spec(
+                &parsed.model,
+                &pop,
+                &parsed.model.default_params,
+                1,
+                spec,
+                &opts,
+            )
+            .expect("TV+IOV adaptive sim runs + verifies")
+        };
+        let a = run(1);
+        assert!(!a.ledger.is_empty());
+        let a_last = a.trajectories.last().unwrap().ipred;
+        // Reproducible for a fixed seed (κ + η both seeded).
+        assert_eq!(
+            a_last,
+            run(1).trajectories.last().unwrap().ipred,
+            "same seed ⇒ identical trajectory"
+        );
+        // κ genuinely perturbs the trajectory across seeds.
+        assert!(
+            (a_last - run(999).trajectories.last().unwrap().ipred).abs() > 1e-9,
+            "different seed ⇒ different κ ⇒ different trajectory"
+        );
+    }
+
+    #[test]
+    fn adaptive_auc_target_rejects_iov() {
+        // #701: like the TV-covariate case, the exposure metric can't yet be computed
+        // per-occasion, so declaring `auc_target` on an IOV model is a typed error
+        // rather than a silently κ-frozen AUC.
+        let mut parsed = parse_full_model(SPEC_IOV).expect("model + block parse");
+        parsed
+            .adaptive_dosing
+            .as_mut()
+            .expect("[adaptive_dosing]")
+            .auc_target = Some((400.0, 600.0));
+        let spec = parsed.adaptive_dosing.as_ref().unwrap();
+        let obs = vec![0.0, 24.0, 48.0, 72.0, 96.0];
+        let pop = population(vec![subj("1", obs, vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+        let err = simulate_adaptive_from_spec(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            1,
+            spec,
+            &opts,
+        )
+        .expect_err("auc_target on an IOV model must be rejected");
+        assert!(
+            err.to_lowercase().contains("auc_target") && err.to_lowercase().contains("iov"),
+            "error should cite auc_target + IOV: {err}"
+        );
+    }
+
+    #[test]
+    fn adaptive_iov_decision_pk_uses_locf_covariate_off_grid() {
+        // #701 review regression (verifier-blind): on a TV-covariate + IOV model, an
+        // off-record decision must resolve its PK snapshot (`decision_pk[g]`) at the
+        // LOCF covariate — the most-recent record carried forward — exactly as the
+        // driver's live `decision_cov` does, NOT the frozen t=0 baseline. Before the
+        // fix, `run_adaptive_population` fell back to `subject.covariates` (t=0) for a
+        // decision off the obs grid, re-introducing the #700 "decision covariate frozen
+        // at t=0" defect on the IOV decision-PK path — and the frozen-replay verifier,
+        // which reuses the same `decision_pk`, could not catch it.
+        //
+        // F (bioavailability) depends on CRCL and never enters the ODE, so each injected
+        // dose's realized `f_applied` is an *unconfounded* readout of the covariate the
+        // decision saw: F = CRCL/200 ⇒ 0.5 at CRCL=100, 1.0 at CRCL=200.
+        let iov_tvf = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+  f  = CRCL / 200.0
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+        let model = parse_model_string(iov_tvf).expect("parse TV-F + IOV model");
+        assert!(model.n_kappa == 1, "must be an IOV model");
+
+        // obs at 0 (CRCL 100) and 24 (CRCL 200): the covariate jumps at t=24.
+        let mut s = subj("1", vec![0.0, 24.0], vec![]);
+        s.covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+        s.obs_covariates = vec![
+            HashMap::from([("CRCL".to_string(), 100.0)]),
+            HashMap::from([("CRCL".to_string(), 200.0)]),
+        ];
+        let mut pop = population(vec![s]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+
+        // Decisions at 0, 12, 24, 36. t=12 is off-record but *before* the jump
+        // (LOCF == baseline == 100, a control); t=36 is off-record and *after* the jump
+        // (LOCF = 200, baseline = 100) — the discriminator. A fixed bolus doses at each.
+        let decisions = vec![0.0, 12.0, 24.0, 36.0];
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            decision_times: decisions.clone(),
+            ..Default::default()
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect("adaptive TV-F + IOV sim runs and passes the default verifier");
+        assert_eq!(res.ledger.len(), 4, "a dose at every decision");
+
+        let f_at = |t: f64| {
+            res.ledger
+                .iter()
+                .find(|e| e.time == t)
+                .map(|e| e.f_applied)
+                .unwrap_or_else(|| panic!("no dose at t={t}"))
+        };
+        // t=0 coincides with obs CRCL=100 → F=0.5; t=24 coincides with obs CRCL=200 → F=1.0.
+        assert!((f_at(0.0) - 0.5).abs() < 1e-9, "t=0 F={}", f_at(0.0));
+        assert!((f_at(24.0) - 1.0).abs() < 1e-9, "t=24 F={}", f_at(24.0));
+        // t=12 off-record but before the jump → LOCF == baseline == 100 → F=0.5 (the
+        // buggy and fixed code agree here; the control).
+        assert!((f_at(12.0) - 0.5).abs() < 1e-9, "t=12 F={}", f_at(12.0));
+        // t=36 off-record and AFTER the jump → LOCF CRCL=200 → F=1.0. The bug froze it
+        // at the t=0 baseline CRCL=100 → F=0.5. This assertion fails without the fix.
+        assert!(
+            (f_at(36.0) - 1.0).abs() < 1e-9,
+            "off-record decision at t=36 must use the LOCF covariate (CRCL=200 ⇒ F=1.0), \
+             not the frozen t=0 baseline (CRCL=100 ⇒ F=0.5); got F={}",
+            f_at(36.0)
+        );
+    }
+
+    #[test]
+    fn adaptive_rejects_non_ascending_or_duplicate_decision_times() {
+        // #701 review: the occasion bookkeeping (`occasion_of`, `decision_index_of`)
+        // assumes a strictly-increasing decision schedule. An unsorted or duplicated
+        // `decision_times` would silently mis-map a record's occasion κ — and the
+        // frozen-replay verifier, reusing the same occasion arrays, could not catch it.
+        // The programmatic `simulate_adaptive` path must reject it loudly at the shared
+        // funnel, matching the declarative path's `validate_increasing_finite`.
+        let model = parse_model_string(ODE_IOV).expect("parse IOV model");
+        let pop = population(vec![subj("1", vec![0.0, 24.0, 48.0], vec![])]);
+        let run = |dts: Vec<f64>| {
+            let opts = AdaptiveSimulateOptions {
+                seed: Some(1),
+                decision_times: dts,
+                ..Default::default()
+            };
+            simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+        };
+        // Out of order.
+        let err = run(vec![0.0, 48.0, 24.0]).expect_err("unsorted schedule must be rejected");
+        assert!(
+            err.to_lowercase().contains("increasing"),
+            "error should cite the ordering: {err}"
+        );
+        // Duplicate time (strictly-increasing rejects equality).
+        let err = run(vec![0.0, 24.0, 24.0, 48.0]).expect_err("duplicate time must be rejected");
+        assert!(
+            err.to_lowercase().contains("increasing"),
+            "error should cite the ordering: {err}"
+        );
+        // The ascending control still runs.
+        assert!(
+            run(vec![0.0, 24.0, 48.0]).is_ok(),
+            "ascending schedule runs"
+        );
+    }
+
+    #[test]
+    fn from_spec_supports_time_dependent_pk() {
+        // #700 also fixes a latent bug: a `TIME`-dependent PK parameter (no
+        // covariate) was silently frozen at TIME=0 on the adaptive path. Now
+        // `model_uses_time_builtin` routes it through per-event PK, so it verifies
+        // and differs from a constant (TIME=0) baseline model. Same structural core;
+        // only CL's TIME dependence differs.
+        const TIME_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(0.01 * TIME)
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 96
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 8 : increase 25%
+"#;
+        const CONST_MODEL: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL
+  V  = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[scaling]
+  y = central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central
+  at = every 24 from 0 to 96
+  start_dose = 100
+  route = bolus(cmt=1)
+  dose_bounds = [0, 1000]
+  when signal < 8 : increase 25%
+"#;
+        // Observations offset from the decision grid (0,24,…,96): the constant
+        // baseline below runs on the shipped single-snapshot verifier, which has a
+        // pre-existing gap when a dose lands exactly at the last break *and* an obs
+        // coincides with it (tracked separately). Offsetting keeps this test about
+        // TIME, not that edge; the TV support test above pins the last-break edge on
+        // the per-event path.
+        let obs = vec![6.0, 30.0, 54.0, 78.0, 90.0];
+        let pop = population(vec![subj("1", obs, vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(1),
+            ..Default::default()
+        };
+
+        let tp = parse_full_model(TIME_MODEL).expect("TIME model parses");
+        assert!(
+            crate::pk::model_uses_time_builtin(&tp.model),
+            "the TIME model must be detected as time-dependent"
+        );
+        let time_res = simulate_adaptive_from_spec(
+            &tp.model,
+            &pop,
+            &tp.model.default_params,
+            1,
+            tp.adaptive_dosing.as_ref().unwrap(),
+            &opts,
+        )
+        .expect("TIME-in-PK sim runs + verifies");
+
+        let cp = parse_full_model(CONST_MODEL).expect("const model parses");
+        let const_res = simulate_adaptive_from_spec(
+            &cp.model,
+            &pop,
+            &cp.model.default_params,
+            1,
+            cp.adaptive_dosing.as_ref().unwrap(),
+            &opts,
+        )
+        .expect("constant sim runs");
+
+        let t_last = time_res.trajectories.last().unwrap().ipred;
+        let c_last = const_res.trajectories.last().unwrap().ipred;
+        assert!(
+            (t_last - c_last).abs() > 1e-6 * t_last.abs().max(1.0),
+            "TIME-dependent PK must differ from the TIME=0 baseline: time={t_last}, const={c_last}"
+        );
     }
 
     #[test]
@@ -13700,5 +15710,536 @@ mod adaptive_sim_tests {
             res.ledger.iter().all(|e| e.amt >= 250.0 && e.amt <= 2000.0),
             "every realized dose must respect dose_bounds [250, 2000]"
         );
+    }
+}
+
+// ── Tests: #748 independent adaptive-snapshot correctness check ──────────────
+//
+// The frozen-replay verifier reuses the precomputed snapshots (`eta_occ`,
+// `decision_pk`, `event_pk`) the driver was handed, so it validates their
+// *consumption*, not their *correctness* — a build-loop that feeds a leaf the
+// wrong covariate / occasion / κ passes it bit-exact. These tests pin the teeth of
+// `verify_adaptive_snapshots`, the independent re-derivation that closes that gap:
+// a canonical build is accepted, and each deliberately-corrupted snapshot class
+// (the twice-fixed #732 / #739 "decision covariate frozen at t=0" defect included)
+// is rejected. Every corruption is constructed to differ from the canonical build,
+// so the tests fail if the check ever regresses to a no-op.
+#[cfg(test)]
+mod adaptive_snapshot_verify_tests {
+    use super::*;
+    use crate::parser::model_parser::parse_model_string;
+    use crate::sim::adaptive::{
+        kappa_standard_normal, subject_kappa_base_seed, ControllerCtx, DoseAction,
+    };
+    use std::collections::HashMap;
+
+    // IOV (per-occasion κ on CL) × a time-varying covariate (CRCL) on CL — the exact
+    // composition the "decision covariate frozen at t=0" bug lived in (#732 / #739).
+    // CL depends on CRCL, so resolving a decision's covariate at the wrong time gives
+    // a different `decision_pk`, which is what the check must catch.
+    const IOV_TVCOV: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * (CRCL / 100.0) * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    // Same structural model without IOV — exercises the TV-only branch (event_pk
+    // present, eta_occ / decision_pk absent).
+    const TVCOV_NO_IOV: &str = r#"
+[parameters]
+  theta TVCL(1.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * (CRCL / 100.0) * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+    const SEED: u64 = 20_260_708;
+    const SIM: usize = 1;
+
+    // A dose-free base subject whose covariate (CRCL) drops from the t=0 baseline
+    // (100) to 50 at the first record (t=6). An off-grid decision at t=12 then has a
+    // LOCF covariate (50, from the t=6 record) that differs from the frozen t=0
+    // baseline (100) — the setup that makes the historical decision_pk bug observable.
+    fn tv_subject() -> Subject {
+        let base = HashMap::from([("CRCL".to_string(), 100.0)]);
+        let lo = HashMap::from([("CRCL".to_string(), 50.0)]);
+        Subject {
+            id: "S1".into(),
+            doses: Vec::new(),
+            obs_times: vec![6.0, 24.0],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0, 0.0],
+            obs_cmts: vec![1, 1],
+            covariates: base,
+            dose_covariates: Vec::new(),
+            obs_covariates: vec![lo.clone(), lo],
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0, 0],
+            occasions: vec![1, 1],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        }
+    }
+
+    // `tv_subject` plus an EVID=2 (pk-only) record at t=12 (CRCL=75) — so `event_pk`
+    // carries a `pk_only` snapshot and the inline pk-only re-derivation branch is
+    // exercised.
+    fn tv_subject_with_pk_only() -> Subject {
+        let mut s = tv_subject();
+        s.pk_only_times = vec![12.0];
+        s.pk_only_covariates = vec![HashMap::from([("CRCL".to_string(), 75.0)])];
+        s
+    }
+
+    /// Build the canonical IOV snapshots exactly as `run_adaptive_population` does —
+    /// a third, independent orchestration used only to hand the check a *correct*
+    /// build (accepted) and known-corrupt copies (rejected).
+    fn canonical_iov(
+        model: &CompiledModel,
+        params: &ModelParameters,
+        subject: &Subject,
+        eta_slice: &[f64],
+        decision_times: &[f64],
+    ) -> (Vec<Vec<f64>>, Vec<PkParams>, crate::pk::EventPkParams) {
+        let n_eta = model.n_eta;
+        let omega_iov = params.omega_iov.as_ref().unwrap();
+        let kappa_base = subject_kappa_base_seed(SEED, &subject.id, SIM);
+        let n_occ = decision_times.len();
+        let mut eta_occ = Vec::with_capacity(n_occ);
+        let mut decision_pk = Vec::with_capacity(n_occ);
+        for g in 0..n_occ {
+            let zk: Vec<f64> = (0..model.n_kappa)
+                .map(|k| kappa_standard_normal(kappa_base, g, k))
+                .collect();
+            let kappa_g = &omega_iov.chol * DVector::from_column_slice(&zk);
+            let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
+            e.extend(kappa_g.iter().copied());
+            let dcov = crate::ode::predictions::locf_decision_cov(
+                decision_times[g],
+                subject,
+                &subject.covariates,
+            );
+            decision_pk.push((model.pk_param_fn)(
+                &params.theta,
+                &e,
+                dcov,
+                decision_times[g],
+            ));
+            eta_occ.push(e);
+        }
+        let event_pk = crate::pk::compute_event_pk_params_iov(
+            model,
+            subject,
+            &params.theta,
+            eta_slice,
+            &eta_occ,
+            decision_times,
+        );
+        (eta_occ, decision_pk, event_pk)
+    }
+
+    #[test]
+    fn accepts_a_canonical_iov_build() {
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, decision_pk, event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect("a canonical build must pass the snapshot check");
+    }
+
+    #[test]
+    fn catches_decision_pk_frozen_at_t0_covariate() {
+        // The #732 / #739 defect: build decision_pk[1] (off-grid decision at t=12)
+        // with the frozen t=0 covariate instead of LOCF. The check must reject it —
+        // the frozen-replay verifier reuses the same array and cannot.
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, mut decision_pk, event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+
+        // Off-grid decision g=1 (t=12): LOCF covariate is the t=6 record (CRCL=50);
+        // the frozen baseline is CRCL=100 → a genuinely different snapshot.
+        let frozen = (model.pk_param_fn)(&params.theta, &eta_occ[1], &subject.covariates, 12.0);
+        assert!(
+            !pk_bits_eq(&frozen, &decision_pk[1]),
+            "test setup must make the frozen-t0 snapshot differ from the LOCF one, \
+             else the corruption is vacuous"
+        );
+        decision_pk[1] = frozen;
+
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("a frozen-t0 decision_pk must be rejected");
+        assert!(err.contains("decision_pk[1]"), "names the slot: {err}");
+        assert!(err.contains("#748"), "references the issue: {err}");
+    }
+
+    #[test]
+    fn catches_corrupted_occasion_kappa() {
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (mut eta_occ, decision_pk, event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        // Perturb window 1's κ by a clearly-nonzero amount (independent of its draw).
+        eta_occ[1][model.n_eta] += 1.0;
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("a corrupted occasion κ must be rejected");
+        assert!(err.contains("eta_occ[1]"), "names the slot: {err}");
+    }
+
+    #[test]
+    fn catches_corrupted_event_pk_snapshot() {
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, decision_pk, mut event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        // Corrupt the first observation's CL snapshot.
+        event_pk.obs[0].values[0] += 1.0;
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("a corrupted event_pk snapshot must be rejected");
+        assert!(err.contains("event_pk.obs[0]"), "names the slot: {err}");
+    }
+
+    #[test]
+    fn catches_corrupted_pk_only_snapshot() {
+        // A subject with an EVID=2 (pk-only) record exercises the inline pk-only
+        // re-derivation branch; a mis-built pk_only snapshot must be rejected.
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject_with_pk_only();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, decision_pk, mut event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        assert_eq!(
+            event_pk.pk_only.len(),
+            1,
+            "the EVID=2 record must yield a pk_only snapshot"
+        );
+        event_pk.pk_only[0].values[0] += 1.0; // corrupt CL at the pk-only record
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("a corrupted pk_only snapshot must be rejected");
+        assert!(err.contains("event_pk.pk_only[0]"), "names the slot: {err}");
+    }
+
+    #[test]
+    fn catches_missized_occasion_arrays() {
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (mut eta_occ, decision_pk, event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        eta_occ.pop(); // length 2, not 3
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("a mis-sized occasion array must be rejected");
+        assert!(
+            err.contains("mis-sized"),
+            "explains the size mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_and_checks_tv_only_path() {
+        // Non-IOV TV-covariate path: event_pk present, eta_occ / decision_pk absent.
+        let model = parse_model_string(TVCOV_NO_IOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa]; // n_kappa == 0
+        let decisions = vec![0.0, 12.0, 24.0];
+        let mut event_pk =
+            crate::pk::compute_event_pk_params(&model, &subject, &params.theta, &eta_slice);
+        verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            None,
+            None,
+            Some(&event_pk),
+        )
+        .expect("a canonical TV-only build must pass");
+
+        event_pk.obs[1].values[1] += 1.0;
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            None,
+            None,
+            Some(&event_pk),
+        )
+        .expect_err("a corrupted TV-only event_pk must be rejected");
+        assert!(err.contains("event_pk.obs[1]"), "names the slot: {err}");
+    }
+
+    #[test]
+    fn constant_path_is_a_noop() {
+        // No precomputed snapshots (constant-covariate / non-IOV): nothing to check.
+        let model = parse_model_string(TVCOV_NO_IOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        verify_adaptive_snapshots(
+            &model, &params, &subject, &eta_slice, &decisions, SEED, SIM, None, None, None,
+        )
+        .expect("the constant path performs no snapshot checks");
+    }
+
+    #[test]
+    fn wired_into_a_real_reactive_tvcov_iov_run() {
+        // End-to-end: a genuine reactive IOV × declining-covariate run with the
+        // default-on verifier must pass — the snapshot check is wired at the
+        // chokepoint and does not false-positive on a correct production build.
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let base = HashMap::from([("CRCL".to_string(), 100.0)]);
+        let decisions = vec![0.0, 24.0, 48.0, 72.0];
+        // Obs coincide with decisions; CRCL declines across the horizon.
+        let crcls = [100.0, 80.0, 60.0, 40.0];
+        let obs_covariates: Vec<HashMap<String, f64>> = crcls
+            .iter()
+            .map(|&c| HashMap::from([("CRCL".to_string(), c)]))
+            .collect();
+        let subject = Subject {
+            id: "S1".into(),
+            doses: Vec::new(),
+            obs_times: decisions.clone(),
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; decisions.len()],
+            obs_cmts: vec![1; decisions.len()],
+            covariates: base,
+            dose_covariates: Vec::new(),
+            obs_covariates,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; decisions.len()],
+            occasions: vec![1; decisions.len()],
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            #[cfg(feature = "survival")]
+            obs_records: vec![],
+        };
+        let pop = Population {
+            subjects: vec![subject],
+            covariate_names: vec!["CRCL".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        };
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(SEED),
+            decision_times: decisions,
+            ..Default::default() // verify = true
+        };
+        let controller = || |_ctx: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, controller, &opts)
+            .expect(
+                "a correct reactive IOV × TV-cov run passes the wired snapshot + replay checks",
+            );
+        assert_eq!(res.ledger.len(), 4, "a dose at every decision");
+    }
+
+    #[test]
+    fn rejects_iov_arrays_without_omega_iov() {
+        // eta_occ / decision_pk present (the IOV path) but the params carry no
+        // omega_iov — a build-loop invariant violation the check must flag with a
+        // typed error rather than unwrap-panic.
+        let model = parse_model_string(TVCOV_NO_IOV).expect("parse"); // omega_iov = None
+        let params = model.default_params.clone();
+        assert!(
+            params.omega_iov.is_none(),
+            "TVCOV_NO_IOV must have no omega_iov"
+        );
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let eta_occ = vec![vec![0.0; model.n_eta]; decisions.len()];
+        let decision_pk = vec![PkParams::default(); decisions.len()];
+        let event_pk =
+            crate::pk::compute_event_pk_params(&model, &subject, &params.theta, &eta_slice);
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("IOV arrays without omega_iov must be rejected");
+        assert!(err.contains("omega_iov"), "names the missing matrix: {err}");
+    }
+
+    #[test]
+    fn rejects_iov_run_missing_event_pk() {
+        // On the IOV path event_pk must be present (κ makes PK per-occasion, so obs /
+        // pk-only records each carry a snapshot). A None here is a build invariant
+        // violation, caught after the per-occasion checks pass.
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, decision_pk, _event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            None,
+        )
+        .expect_err("an IOV run without event_pk must be rejected");
+        assert!(err.contains("event_pk"), "names the missing array: {err}");
+    }
+
+    #[test]
+    fn catches_event_pk_length_mismatch() {
+        // An event_pk array longer than the subject's record grid (a mis-built array
+        // the frozen-replay verifier would reuse) must be rejected on length alone.
+        let model = parse_model_string(IOV_TVCOV).expect("parse");
+        let params = model.default_params.clone();
+        let subject = tv_subject();
+        let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
+        let decisions = vec![0.0, 12.0, 24.0];
+        let (eta_occ, decision_pk, mut event_pk) =
+            canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
+        event_pk.obs.push(PkParams::default()); // one more obs snapshot than records
+        let err = verify_adaptive_snapshots(
+            &model,
+            &params,
+            &subject,
+            &eta_slice,
+            &decisions,
+            SEED,
+            SIM,
+            Some(&eta_occ),
+            Some(&decision_pk),
+            Some(&event_pk),
+        )
+        .expect_err("an over-long event_pk array must be rejected");
+        assert!(err.contains("entr"), "explains the length mismatch: {err}");
     }
 }

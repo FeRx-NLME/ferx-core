@@ -1,0 +1,78 @@
+# Adaptive (feedback) dosing — vancomycin trough-TDM titration under a
+# time-varying renal covariate (epic #391 / #700)
+#
+# The time-varying-covariate counterpart of adaptive_vanco_auc.ferx. A 1-cpt IV
+# vancomycin model is dosed once daily by a 1-h infusion, and the pre-dose trough
+# (CENT/V) is titrated +/-25% to hold it in a target band — the same trough
+# control law as the constant-covariate example. What differs here is that the
+# patient's renal function **declines over the horizon**: a CRCL covariate falls
+# from ~120 to ~40 mL/min (a realistic AKI / renal-decline trajectory), and CL is
+# a linear function of CRCL. As CL falls, drug accumulates, so the controller must
+# back the dose *down* to keep the trough in band — the covariate genuinely drives
+# every decision.
+#
+# This is the #700 analogue of the constant-covariate anchor: it exercises the
+# reactive driver's per-event PK recomputation (the NONMEM end-of-interval
+# convention that predict()/simulate() use) rather than a single t=0 PK snapshot.
+# CL is resolved for each integration segment from the CRCL value active in that
+# segment, so a covariate that changes over the horizon correctly drives the
+# predictions, the monitored trough, and the dose ladder.
+#
+# `auc_target` is deliberately absent: the exposure metric integrates a dense grid
+# from a single frozen PK snapshot, which would be silently wrong under a changing
+# covariate, so `auc_target` is a typed error for a time-varying-covariate subject
+# (#700). `target_window` (the pct-in-band trough metric) stays — it is a decision-
+# grid summary and is fully per-event covariate-aware.
+#
+# Run with `simulate_adaptive_from_spec()` (not the plain forward `simulate()`).
+# Validated dose-for-dose against an independent mrgsolve run (mrgsolve, not
+# NONMEM, is the feedback-dosing comparator); see
+# tests/reference/vanco_renal_mrgsolve/.
+#
+# Negligible IIV: ETA_CL carries a vanishing variance so the patient is
+# effectively typical-value and the realized ladder is reproducible / comparable
+# to the typical-value mrgsolve run — the CRCL trajectory is the only source of
+# PK variation.
+#
+# See docs/model-file/adaptive-dosing.qmd for the block reference.
+
+[parameters]
+  theta TVCL(4.0,  0.1,  50.0)   # vancomycin clearance at CRCL = 100 mL/min (L/h)
+  theta TVV(80.0,  5.0, 300.0)   # central volume (L); CENT/V is the concentration
+
+  # Negligible IIV: the engine requires at least one omega, so CL carries a
+  # vanishing variance (SD ~ 1e-5). The patient is effectively typical-value, the
+  # controller titrates on the latent trough, and the ladder is reproducible /
+  # comparable to the typical-value mrgsolve run. The CRCL covariate is the sole
+  # driver of the (changing) clearance.
+  omega ETA_CL ~ 1e-10
+
+  sigma ADD ~ 1.0                # nominal additive error (concentration); the latent
+                                 # `observe` signal is un-noised, so it never enters
+                                 # the dose decisions.
+
+[individual_parameters]
+  CL = TVCL * CRCL / 100.0       # clearance scales linearly with renal function
+  V  = TVV                       # (CRCL is the time-varying covariate that declines)
+
+[structural_model]
+  ode(states=[CENT])
+
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT  # 1-cpt IV; infusions enter CENT via the route
+
+[scaling]
+  y = CENT / V                   # observed/predicted endpoint: concentration (mg/L)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[adaptive_dosing]
+  observe       = CENT / V               # titrate on the latent trough concentration
+  at            = every 24 from 0 to 312 # a decision at the start of each day
+  start_dose    = 500                    # empiric start (mg/day): subtherapeutic -> climbs
+  route         = infuse(cmt=1, over=1)  # 1-h IV infusion into the drug compartment
+  dose_bounds   = [250, 4000]            # mg/day
+  target_window = [10, 15]               # report % of days with trough in [10, 15] mg/L
+  when signal < 10 : increase 25%        # subtherapeutic trough -> raise the dose
+  when signal > 15 : decrease 25%        # supratherapeutic trough -> lower the dose

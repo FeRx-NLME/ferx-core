@@ -2597,10 +2597,48 @@ impl std::fmt::Debug for HazardSpec {
 }
 
 #[cfg(feature = "survival")]
+/// Hazard clock for a **repeated** TTE (RTTE) endpoint — how time is measured
+/// between successive events (§3.3 of `plans/tte-survival-markov.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtteClock {
+    /// Clock-forward / total time (Andersen–Gill), the default. The hazard is a
+    /// function of *absolute* time; the cumulative hazard accumulates continuously
+    /// over `[0, T]` and is **not** reset at events. NLL `Σ_k log h(t_k) − H(T)`.
+    Forward,
+    /// Clock-reset / gap time (renewal). The hazard depends on time *since the
+    /// previous event*; the accumulator resets to 0 at each event. NLL
+    /// `Σ_k log h(Δ_k) − Σ_k H(Δ_k)`. For an analytic hazard family this is exact with
+    /// no ODE — the closed form is evaluated on each gap `Δ_k`
+    /// ([`crate::survival::rtte_reset_nll_from_curves`]). A drug-driven ODE hazard would
+    /// need the selective per-state reset (§8.8.6) and is still rejected at parse.
+    Reset,
+}
+
+#[cfg(feature = "survival")]
+/// Whether a TTE endpoint observes a single event per subject (standard TTE /
+/// competing risks) or repeated events (RTTE). Orthogonal to [`HazardSpec`]'s
+/// analytic-vs-ODE axis: a recurrent endpoint can carry either hazard shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TteRecurrence {
+    /// Standard TTE: at most one event (plus optional censoring) per subject.
+    /// The per-record likelihood terms are independent (Phase 1 / 1b / 2).
+    Single,
+    /// Repeated TTE (RTTE): multiple events per subject on one endpoint. The
+    /// cumulative-hazard terms couple across a subject's records — see
+    /// [`crate::survival::rtte_forward_nll_from_curves`].
+    Repeated { clock: RtteClock },
+}
+
+#[cfg(feature = "survival")]
 /// Per-CMT endpoint likelihood specification.
 pub enum EndpointLikelihood {
     Gaussian(EndpointError),
-    Tte { hazard: HazardSpec },
+    Tte {
+        hazard: HazardSpec,
+        /// Single event (standard TTE) vs. repeated events (RTTE). Defaults to
+        /// `Single`; set to `Repeated` only when the model declares `type = rtte`.
+        recurrence: TteRecurrence,
+    },
     // Binary, Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
 }
 
@@ -2609,7 +2647,9 @@ impl std::fmt::Debug for EndpointLikelihood {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EndpointLikelihood::Gaussian(e) => write!(f, "Gaussian({e:?})"),
-            EndpointLikelihood::Tte { hazard } => write!(f, "Tte({hazard:?})"),
+            EndpointLikelihood::Tte { hazard, recurrence } => {
+                write!(f, "Tte({hazard:?}, {recurrence:?})")
+            }
         }
     }
 }
@@ -3104,6 +3144,24 @@ impl CompiledModel {
             .collect();
         c.sort_unstable();
         c
+    }
+
+    /// True if any endpoint is a **repeated** TTE (RTTE) endpoint. Drives the
+    /// Laplace-bias warning in `fit()`: RTTE ω² is severely underestimated under
+    /// FOCE/FOCEI (Karlsson et al. 2009), so an RTTE fit whose final stage is
+    /// Laplace-based warns and recommends `method = saem`/`imp`. It does **not**
+    /// change the method — the default estimator stays `FoceI`.
+    #[cfg(feature = "survival")]
+    pub fn has_rtte(&self) -> bool {
+        self.endpoints.values().any(|e| {
+            matches!(
+                e,
+                EndpointLikelihood::Tte {
+                    recurrence: TteRecurrence::Repeated { .. },
+                    ..
+                }
+            )
+        })
     }
 
     /// Always false without the `survival` feature - TTE endpoints can't be
@@ -4082,6 +4140,15 @@ pub struct FitResult {
     pub dw_statistic: f64,
     /// Wall-clock time for the complete fit in seconds.
     pub wall_time_secs: f64,
+    /// Wall-clock time spent converging each stage of `method_chain`, parallel
+    /// to it, in seconds. Excludes the covariance step (see
+    /// `covariance_wall_time_secs`), which only ever runs on the last
+    /// estimating stage (#615).
+    pub method_wall_times_secs: Vec<f64>,
+    /// Wall-clock time spent on the post-estimation covariance step (FD
+    /// Hessian / SIR-fallback proposal construction), in seconds. `0.0` when
+    /// the covariance step was not run (#713).
+    pub covariance_wall_time_secs: f64,
     /// Model name (from the `.ferx` file or "Unnamed").
     pub model_name: String,
     /// ferx-core library version (from Cargo.toml at compile time).
@@ -4278,6 +4345,30 @@ pub struct NeuralNetworkInfo {
     pub input_names: Vec<String>,
     /// PK output names in declaration order.
     pub output_names: Vec<String>,
+}
+
+/// How the IOV occasion partition — which data rows belong to which occasion —
+/// is determined. IOV *random effects* (`kappa`) are always declared in the
+/// model DSL; this only controls where the occasion **labels** come from.
+///
+/// The chosen rule populates `Subject::occasions` / `Subject::dose_occasions`,
+/// the same vectors the dataset-column path fills, so everything downstream
+/// (`split_obs_by_occasion`, the inner-loop kappa expansion) is unchanged.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum IovOccasionRule {
+    /// Default: occasion labels come from the dataset column named by
+    /// [`FitOptions::iov_column`] (or none, if that is unset).
+    #[default]
+    Column,
+    /// Dose-triggered: each administration begins a new occasion. An
+    /// observation takes the occasion of the most recent dose at or before its
+    /// time (dose-before-observation tie-break at equal TIME). ADDL-expanded
+    /// doses each start their own occasion.
+    PerDose,
+    /// Time-window breakpoints. The (strictly increasing) edges define bins:
+    /// `time(24, 48)` → occasions `[-inf,24) = 0`, `[24,48) = 1`, `[48,inf) = 2`.
+    /// A row's occasion is the number of breakpoints at or before its time.
+    TimeWindows(Vec<f64>),
 }
 
 /// Options for fit()
@@ -4629,6 +4720,12 @@ pub struct FitOptions {
     /// and the inner loop estimates per-occasion kappas alongside the BSV etas.
     /// Requires at least one `kappa` declaration in the model's `[parameters]` block.
     pub iov_column: Option<String>,
+    /// Model-side rule for deriving the IOV occasion partition. Default
+    /// [`IovOccasionRule::Column`] reproduces the historical behaviour (occasions
+    /// come from `iov_column`). When set to `PerDose` or `TimeWindows`, `fit()`
+    /// derives `Subject::occasions` / `dose_occasions` from each subject's timeline
+    /// and — if `iov_column` is also set — overrides the column, emitting a warning.
+    pub iov_occasion: IovOccasionRule,
     /// Optional cooperative cancellation token. When present and flipped by
     /// another thread, the outer/inner/SAEM/GN loops exit at the next safe
     /// point and `fit()` returns `Err("cancelled by user")`. Default `None`.
@@ -4874,6 +4971,7 @@ impl Default for FitOptions {
             start_sigma: 0.3,
             multi_start_seed: None,
             iov_column: None,
+            iov_occasion: IovOccasionRule::Column,
             cancel: None,
             user_set_keys: Vec::new(),
             gradient_method: GradientMethod::default(),
@@ -5308,6 +5406,7 @@ pub fn framework_keys() -> &'static [&'static str] {
         "gradient",
         "gradient_method",
         "iov_column",
+        "iov_occasion",
         "optimizer_trace",
         "scale_params",
         "parameter_scaling",
@@ -5486,6 +5585,13 @@ pub struct ParsedModel {
     /// path (CLI `--data`, R) always overrides this — see
     /// [`crate::api::resolve_data_path`].
     pub data_path: Option<String>,
+    /// Canonical-role → actual-header column remappings from the optional
+    /// `[data]` block (#730, NONMEM `$INPUT TIME=TAFD` analogue). Each entry is
+    /// `(canonical_role_lowercase, actual_csv_header)` — e.g. `("time",
+    /// "TAFD")` for `TIME = TAFD`. Empty when the block declares no mappings.
+    /// The reader renames each mapped header to its canonical role, so the
+    /// column serves that role and is excluded from covariate auto-detection.
+    pub column_map: Vec<(String, String)>,
     /// 1-based source line of each unnamed `[block]` header, keyed by the
     /// lowercased block type (e.g. `"individual_parameters" -> 7`). Used by
     /// `ferx check` to attach a block-level location to diagnostics. Empty when
