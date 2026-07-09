@@ -2092,6 +2092,39 @@ mod tests {
     }
 
     #[test]
+    fn addl_expansion_preserves_modeled_rate() {
+        // Mirror of `addl_expansion_preserves_coded_rate_mode` for the OTHER
+        // coded mode, `RATE=-1` (modeled rate → `R{cmt}`). Both modes share the
+        // single `DoseEvent::modeled(...)` ADDL arm, so this locks in that the
+        // `ModeledRate` branch (which `modeled()` tags `InfusionDef::RateDefined`,
+        // vs `DurationDefined` for `RATE=-2`) is preserved across ADDL expansion,
+        // not just `ModeledDuration`. Without the fix these collapsed to `Fixed`
+        // boluses via `DoseEvent::new` with the raw `-1` sentinel.
+        let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,ADDL\n\
+                   1,0,.,1,100,1,-1,1,24,2\n\
+                   1,1,5.0,0,.,.,.,0,.,.\n";
+        let f = write_csv(csv);
+        let pop = read_nonmem_csv(f.path(), None, None).unwrap();
+        let doses = &pop.subjects[0].doses;
+        assert_eq!(doses.len(), 3, "primary + 2 ADDL doses");
+        for (k, d) in doses.iter().enumerate() {
+            assert_eq!(
+                d.rate_mode,
+                RateMode::ModeledRate,
+                "dose {k} must stay modeled-rate, not Fixed"
+            );
+            assert!(
+                d.is_infusion() && !d.is_fixed(),
+                "dose {k} modeled, not a bolus"
+            );
+            assert_eq!(d.amt, 100.0);
+            assert_eq!(d.cmt, 1);
+        }
+        assert_eq!(doses[1].time, 24.0);
+        assert_eq!(doses[2].time, 48.0);
+    }
+
+    #[test]
     fn positive_and_zero_rate_doses_still_parse() {
         // Don't break normal infusions/boluses: RATE=50 → duration = amt/rate,
         // RATE=0 → bolus (duration 0).
