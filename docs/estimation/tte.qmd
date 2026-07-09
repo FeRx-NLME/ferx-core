@@ -464,6 +464,20 @@ input-shape checks (out-of-order, interval-censored, or non-finite event times; 
 [Repeated events](../model-file/event-model.qmd#rtte)) therefore do **not** apply to
 simulation: such rows are simply not consulted, not rejected.
 
+::: {.callout-note}
+## Per-subject simulation diagnostics
+
+A degenerate draw is handled *per subject*, not by aborting the run: a non-positive /
+non-finite analytic hazard rate produces no event (the subject is censored), and an RTTE
+hazard so extreme it would fire more than a million times over the window has its stream
+skipped (also censored). Rather than let these look like ordinary censoring, the
+`simulate_with_options_diag` API returns a `SimulationOutput { results, warnings }` naming
+the affected subjects (`W_TTE_DEGENERATE_HAZARD` / `W_RTTE_DEGENERATE`); `ferx … --simulate`
+echoes them alongside the fit warnings. The plain `simulate()` / `simulate_with_seed()` /
+`simulate_with_options()` entry points apply the same per-subject handling but return only
+the rows.
+:::
+
 ```
 [simulation]
   n_subjects = 200

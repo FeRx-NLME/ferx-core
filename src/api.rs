@@ -497,7 +497,10 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // planned study end (#522). `match_method = None` makes this identical to
     // `simulate_with_seed` for the Gaussian path (same seeded RNG, no matching),
     // and the `None`-matching branch cannot error.
-    let sim_results = simulate_with_options(
+    let SimulationOutput {
+        results: sim_results,
+        warnings: sim_warnings,
+    } = simulate_with_options_diag(
         &parsed.model,
         &template,
         &parsed.model.default_params,
@@ -614,6 +617,9 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     result.model_path = Some(model_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.model_text = std::fs::read_to_string(model_path).ok();
+    // Surface any per-subject simulation diagnostics (#762/#763) alongside the fit
+    // warnings so the CLI reports a degenerate simulated subject rather than dropping it.
+    result.warnings.extend(sim_warnings);
     Ok((result, population))
 }
 
@@ -6962,6 +6968,21 @@ fn validate_tte_simulatable(
     Ok(())
 }
 
+/// Simulate observations under `opts`, returning only the observation rows.
+///
+/// Thin wrapper over [`simulate_with_options_diag`] that discards the per-subject
+/// simulation diagnostics ([`SimulationOutput::warnings`]). Use the `_diag` form when a
+/// degenerate-subject warning (#762 / #763) must be surfaced (e.g. a population VPC).
+pub fn simulate_with_options(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+) -> Result<Vec<SimulationResult>, String> {
+    simulate_with_options_diag(model, population, params, n_sim, opts).map(|o| o.results)
+}
+
 /// Simulate observations, optionally with propensity-score matching.
 ///
 /// With `opts.match_method == None` this is identical to
@@ -6974,13 +6995,18 @@ fn validate_tte_simulatable(
 ///
 /// Returns `Err` if matching is requested but the population is empty or any
 /// subject has no observations.
-pub fn simulate_with_options(
+///
+/// This is the diagnostics-returning form: the [`SimulationOutput`] carries both the
+/// rows and any non-fatal per-subject warnings (a degenerate hazard draw, #763; a
+/// degenerate recurrent stream skipped, #762). [`simulate_with_options`] is the thin
+/// wrapper that returns only the rows.
+pub fn simulate_with_options_diag(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
     opts: &SimulateOptions,
-) -> Result<Vec<SimulationResult>, String> {
+) -> Result<SimulationOutput, String> {
     use rand::SeedableRng;
 
     // ODE-accumulated (joint PK-TTE) TTE simulation samples drug-driven event times
@@ -7056,7 +7082,8 @@ pub fn simulate_with_options(
     let method = match opts.match_method {
         Some(m) => m,
         None => {
-            return Ok(simulate_inner_with_draw(
+            let mut warnings = Vec::new();
+            let results = simulate_inner_with_draw(
                 model,
                 population,
                 params,
@@ -7065,7 +7092,9 @@ pub fn simulate_with_options(
                 None,
                 opts.horizon,
                 &mut rng,
-            ));
+                &mut warnings,
+            );
+            return Ok(SimulationOutput { results, warnings });
         }
     };
 
@@ -7113,7 +7142,8 @@ pub fn simulate_with_options(
     }
 
     let omega_inv = &params.omega.inv;
-    Ok(simulate_inner_with_draw(
+    let mut warnings = Vec::new();
+    let results = simulate_inner_with_draw(
         model,
         population,
         params,
@@ -7122,7 +7152,9 @@ pub fn simulate_with_options(
         Some((&eta_hats, omega_inv, method)),
         opts.horizon,
         &mut rng,
-    ))
+        &mut warnings,
+    );
+    Ok(SimulationOutput { results, warnings })
 }
 
 fn simulate_inner<R: rand::Rng>(
@@ -7134,7 +7166,21 @@ fn simulate_inner<R: rand::Rng>(
 ) -> Vec<SimulationResult> {
     // `simulate` / `simulate_with_seed` carry no horizon; the per-record window
     // applies. An explicit `[simulation] horizon` enters via `simulate_with_options`.
-    simulate_inner_with_draw(model, population, params, n_sim, 1, None, None, rng)
+    // These entry points return only the rows; per-subject simulation diagnostics
+    // (#762 degenerate RTTE, #763 degenerate hazard draw) are collected but surfaced
+    // only on the `simulate_with_options` path (`SimulationOutput.warnings`).
+    let mut warnings = Vec::new();
+    simulate_inner_with_draw(
+        model,
+        population,
+        params,
+        n_sim,
+        1,
+        None,
+        None,
+        rng,
+        &mut warnings,
+    )
 }
 
 /// Emit all observation rows for one subject given a fully-formed `eta_slice`
@@ -7164,11 +7210,12 @@ fn emit_subject_rows<R: rand::Rng>(
     horizon: Option<f64>,
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
+    warnings: &mut Vec<String>,
 ) {
-    // `horizon` is consumed only by the TTE path below; without the `survival`
-    // feature there are no TTE endpoints, so discard it to avoid an unused-arg warn.
+    // `horizon` and `warnings` are consumed only by the TTE path below; without the
+    // `survival` feature there are no TTE endpoints, so discard them to avoid unused-arg warns.
     #[cfg(not(feature = "survival"))]
-    let _ = horizon;
+    let _ = (horizon, &mut *warnings);
 
     // Predict IPRED. For IOV models (`n_kappa > 0`) route through the
     // occasion-aware `predict_iov`, drawing one independent κ ~ N(0, Ω_IOV) per
@@ -7286,6 +7333,7 @@ fn emit_subject_rows<R: rand::Rng>(
         horizon,
         rng,
         results,
+        warnings,
     );
 }
 
@@ -7400,6 +7448,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
     horizon: Option<f64>,
     rng: &mut R,
+    warnings: &mut Vec<String>,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
 
@@ -7461,6 +7510,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         horizon,
                         rng,
                         &mut results,
+                        &mut *warnings,
                     );
                 }
             }
@@ -7483,6 +7533,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         horizon,
                         rng,
                         &mut results,
+                        &mut *warnings,
                     );
                 }
             }
@@ -8553,6 +8604,11 @@ pub fn simulate_with_uncertainty(
     let total_obs: usize = population.subjects.iter().map(|s| s.obs_times.len()).sum();
     let mut results =
         Vec::with_capacity(opts.n_uncertainty_draws * opts.n_sim_per_draw * total_obs);
+    // Per-subject simulation diagnostics (#762/#763) are collected but not surfaced on
+    // this uncertainty-aggregation path (its return is the flat row vec); the underlying
+    // per-subject handling — no whole-run panic, degenerate subjects censored — still
+    // applies. Use `simulate_with_options` when the warnings matter.
+    let mut sim_warnings: Vec<String> = Vec::new();
     for (k, params) in draws.iter().enumerate() {
         let mut rows = simulate_inner_with_draw(
             model,
@@ -8563,6 +8619,7 @@ pub fn simulate_with_uncertainty(
             None,
             None,
             &mut rng,
+            &mut sim_warnings,
         );
         results.append(&mut rows);
     }
@@ -8593,6 +8650,24 @@ pub struct SimulationResult {
     /// Simulated observation outcome.  For Gaussian: `SimOutcome::Continuous { value }`.
     /// For TTE (requires `survival` feature): `SimOutcome::Event { time, observed }`.
     pub outcome: SimOutcome,
+}
+
+/// The result of [`simulate_with_options`]: the simulated rows plus any non-fatal
+/// per-subject diagnostics collected during the run.
+///
+/// `warnings` is the simulation analogue of [`FitResult::warnings`]: a subject whose
+/// draw degenerates — a non-positive / non-finite analytic hazard rate that produces
+/// no event (#763), or a hazard so extreme its recurrent stream is skipped rather than
+/// materialised (#762) — is handled *per subject* (censored / skipped, the run
+/// continues) and named here, instead of silently vanishing into the censored rows or
+/// aborting the whole run. Empty for a clean simulation. The simpler `simulate()` /
+/// `simulate_with_seed()` entry points apply the same per-subject handling but return
+/// only the rows (no diagnostics channel) — use `simulate_with_options` when the
+/// warnings matter (e.g. a population VPC).
+#[derive(Debug, Clone, Default)]
+pub struct SimulationOutput {
+    pub results: Vec<SimulationResult>,
+    pub warnings: Vec<String>,
 }
 
 /// Predict concentrations for a population using given parameters (no random effects).

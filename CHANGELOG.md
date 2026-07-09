@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **`simulate_with_options_diag` surfaces per-subject simulation diagnostics** (#762,
+  #763): a new entry point returning `SimulationOutput { results, warnings }` — the
+  simulation analogue of `FitResult.warnings`. It reports subjects handled specially
+  during a run (a degenerate hazard draw, an over-large recurrent stream) instead of
+  letting them look like ordinary censoring. `simulate_with_options` is unchanged (a
+  thin wrapper returning just the rows), and `ferx <model> --simulate` now echoes these
+  warnings alongside the fit warnings.
 - **Declare IOV occasions in the model** (#756): a new `iov_occasion` key in
   `[fit_options]` derives the occasion partition from each subject's timeline
   instead of requiring a precomputed dataset column. `iov_occasion = dose`
@@ -179,6 +186,16 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **A degenerate hazard draw in simulation no longer vanishes silently, and a pathological
+  RTTE hazard no longer aborts the whole run** (#762, #763). When an analytic hazard's
+  effective rate degenerates (non-positive / non-finite), the affected subject is censored
+  with no event — previously indistinguishable from ordinary administrative censoring; the
+  `simulate_with_options_diag` path now names it in a `W_TTE_DEGENERATE_HAZARD` warning. An
+  RTTE hazard so extreme it would fire more than a million times over the window is now
+  skipped (censored) with a `W_RTTE_DEGENERATE` warning and the run continues for the rest
+  of the population, instead of panicking the entire `simulate()` call — and without first
+  materialising ~1e6 rows. The `simulate()` / `simulate_with_seed()` entry points apply the
+  same per-subject handling (no panic) but return only the rows.
 - **A time-varying covariate on a survival hazard is now a hard error instead of a
   silently frozen baseline value** (#741). A `[event_model]` hazard that references a
   covariate whose value changes within a subject was evaluated at the covariate's

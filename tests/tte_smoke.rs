@@ -435,6 +435,90 @@ mod survival_smoke {
         let _ = ferx_core::predict_survival(&model, &pop, &model.default_params, &[1.0, 5.0, 10.0]);
     }
 
+    /// A zero-rate hazard (`λ = 0`): every draw hits the degenerate sentinel, so each
+    /// subject is censored with no event — surfaced as a per-subject warning on the
+    /// `_diag` path rather than silently vanishing into the censored rows (#763).
+    #[test]
+    fn degenerate_hazard_simulation_warns_not_silent() {
+        use ferx_core::{simulate_with_options_diag, SimOutcome, SimulateOptions};
+        const M: &str = "
+[parameters]
+  theta TVLAMBDA(1.0, 0.0, 10.0)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * 0
+
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(M).expect("zero-rate model parses");
+        let pop = common::tte_pop_from_pairs(&[(20.0, 0), (20.0, 0)]);
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(20.0),
+        };
+        let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &opts)
+            .expect("a degenerate hazard still simulates (censored); it does not error");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("W_TTE_DEGENERATE_HAZARD") && w.contains("#763")),
+            "a degenerate hazard draw must be surfaced as a warning: {:?}",
+            out.warnings
+        );
+        assert!(
+            out.results
+                .iter()
+                .all(|r| matches!(r.outcome, SimOutcome::Event { observed, .. } if !observed)),
+            "every subject is censored (no event)"
+        );
+    }
+
+    /// An RTTE hazard so extreme it would fire ≫ MAX_EVENTS times: the degenerate
+    /// subject's stream is skipped (censored) with a warning and the run completes for the
+    /// whole population — no whole-run panic, no ~1e6 materialised rows (#762).
+    #[test]
+    fn degenerate_rtte_simulation_warns_and_continues() {
+        use ferx_core::{simulate_with_options_diag, SimulateOptions};
+        const M: &str = "
+[parameters]
+  theta TVLAMBDA(1000000.0, 0.001, 100000000.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+
+[fit_options]
+  method = focei
+";
+        let model = parse_model_string(M).expect("high-rate RTTE model parses");
+        let pop = common::tte_pop_from_pairs(&[(30.0, 0), (30.0, 0)]);
+        let opts = SimulateOptions {
+            seed: Some(2),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let out = simulate_with_options_diag(&model, &pop, &model.default_params, 1, &opts)
+            .expect("a degenerate RTTE stream must not abort the whole run");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("W_RTTE_DEGENERATE") && w.contains("#762")),
+            "a degenerate RTTE stream must warn: {:?}",
+            out.warnings
+        );
+        assert_eq!(
+            out.results.len(),
+            pop.subjects.len(),
+            "one administrative censor row per subject; the degenerate stream is not materialised"
+        );
+    }
+
     /// A clock-forward RTTE model fits end-to-end (finite OFV) through the telescoping
     /// likelihood, and — under the Laplace-based default method — surfaces the ω²
     /// underestimation warning. Tier-2: capped at 3 outer iterations, no convergence.
