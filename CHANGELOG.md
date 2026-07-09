@@ -179,6 +179,16 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **An `[initial_conditions]` covariate that matches no data column now fails the
+  fit loudly instead of silently dropping the baseline** (#765). A covariate named
+  only inside an init expression (e.g. `init(central) = CONC0 * V`) was never
+  registered as a required data column, so with a `[covariates]` block it was never
+  read, and under auto-detect a case mismatch (`CONC0` vs a `conc0` header) resolved
+  to `0` — zeroing the initial amount with no diagnostic (identical OFV with and
+  without the block). Init-expression covariates are now registered like every other
+  model covariate, so a missing or miscased name raises `E_MISSING_COVARIATE` listing
+  the available columns. Rename the column in `[data]` (`CONC0 = conc0`) or match the
+  header's case in the expression.
 - **A dataset with dose rows but no `AMT` column is now a hard error instead of a
   silent bad fit** (#753). When the amount column is named something other than
   `AMT` (e.g. a NONMEM export using `DOSE`), every dose parsed with amount 0, so no
