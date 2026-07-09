@@ -245,9 +245,13 @@ absorption lag can differ by route. Mirroring NONMEM's `F1`/`F2` and
 > give such a quantity a different (un-indexed-looking) name.
 
 This is an **ODE-engine** feature: the analytical PK functions have a single
-fixed dose route, so they take only the bare `f=`/`lagtime=` mapping. (The
-EKF/`[diffusion]` path applies per-compartment `F` but, as elsewhere, does not
-apply absorption lag.)
+fixed dose route, so they take only the bare `f=`/`lagtime=` mapping. You may
+still *name* an analytical parameter `F{n}`/`ALAG{n}` and bind it through that
+mapping (`pk(..., f=F1)` routes `F1` into the single `F` slot and applies it
+exactly like `f=F`), but an `F{n}`/`ALAG{n}`/`LAGTIME{n}` parameter left
+*unmapped* on an analytical model is a parse error rather than a silently-ignored
+no-op (#725). (The EKF/`[diffusion]` path applies per-compartment `F` but, as
+elsewhere, does not apply absorption lag.)
 
 > Per-compartment **observation scaling** (NONMEM's `Sn`, e.g. `S2 = V`) is a
 > separate, readout-side concept — it divides a compartment's amount to give the

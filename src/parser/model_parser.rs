@@ -1544,15 +1544,35 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             // parameter prefix, the RATE code that drives it, and the noun.
             // Per-compartment `F{cmt}`/`ALAG{cmt}` are ODE-only (they route through
             // the ODE `dose_attr_map`); the analytical engine has a single dose
-            // route reached via the bare `f=`/`lagtime=` mapping. Such a name used
-            // to hit `continue` here and land in an unused spare slot, so effective
-            // bioavailability stayed 1 / lag stayed 0 with no error (only a
-            // `W_UNUSED_PARAM` if the name was otherwise unreferenced). Reject it
-            // with an actionable message instead of silently no-op'ing.
+            // route reached via the bare `f=`/`lagtime=` mapping.
             let (param_prefix, rate_code, kind) = match attr {
                 crate::types::DoseAttr::Duration => ("D", "-2", "duration"),
                 crate::types::DoseAttr::Rate => ("R", "-1", "rate"),
                 crate::types::DoseAttr::F | crate::types::DoseAttr::Lag => {
+                    // A user may legitimately NAME their bioavailability / lag
+                    // parameter `F1`/`ALAG1` (a natural NONMEM-porting choice) and
+                    // bind it to the single analytical dose route via the bare
+                    // `f=`/`lagtime=` mapping — `pk(..., f=F1)` routes `F1` into
+                    // `PK_IDX_F` and applies it correctly. Accept that case (it is
+                    // bit-identical to the canonical `f=F` idiom). Reject only an
+                    // *unmapped* `F{cmt}`/`ALAG{cmt}`: with nothing binding it to the
+                    // dose route, its value lands in an unused spare slot and is
+                    // silently discarded — effective bioavailability stays 1 / lag
+                    // stays 0 with no effect — the porting footgun this guard exists
+                    // to catch. `alag`/`lagtime` both resolve to `PK_IDX_LAGTIME`
+                    // via `name_to_index`, so either spelling of the mapping counts.
+                    let target_slot = if matches!(attr, crate::types::DoseAttr::F) {
+                        crate::types::PK_IDX_F
+                    } else {
+                        crate::types::PK_IDX_LAGTIME
+                    };
+                    let bound_to_dose_route = pk_param_map.iter().any(|(key, value)| {
+                        value == name
+                            && crate::types::PkParams::name_to_index(key) == Some(target_slot)
+                    });
+                    if bound_to_dose_route {
+                        continue;
+                    }
                     let (indexed, noun, bare) = if matches!(attr, crate::types::DoseAttr::F) {
                         ("F", "bioavailability", "f")
                     } else {
@@ -1560,10 +1580,11 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
                     };
                     return Err(format!(
                         "[individual_parameters]: `{name}` reads as a per-compartment {noun} \
-                         (`{indexed}{cmt}`), which only an ODE disposition applies. The analytical \
-                         `{}` model has a single dose route, so set {noun} with the bare `{bare}=` \
-                         argument in the `pk(...)` call (renaming `{name}` to a plain parameter), \
-                         or use an `ode(...)` model for a compartment-specific value.",
+                         (`{indexed}{cmt}`), an ODE-only dose attribute, but nothing binds it to \
+                         the analytical `{}` model's single dose route — so its value would be \
+                         silently discarded (effective {noun} unchanged). Bind it via the bare \
+                         `{bare}=` argument in the `pk(...)` call (e.g. `{bare}={name}`), or use an \
+                         `ode(...)` model for a genuinely compartment-specific value.",
                         pk_model.canonical_name(),
                     ));
                 }
@@ -26768,73 +26789,137 @@ CL V KA WT
         );
     }
 
+    /// Assemble a minimal analytical one-cpt oral model from its
+    /// `[individual_parameters]` dose-attribute line and its `pk(...)` structural
+    /// line, so the `F{cmt}`/`ALAG{cmt}` tests below vary only the two lines that
+    /// matter. `TVATTR` (0.7) is a valid typical value for either bioavailability
+    /// or lag.
+    fn indexed_attr_model(indiv_attr_line: &str, pk_line: &str) -> String {
+        format!(
+            "[parameters]\n\
+             theta TVCL(5.0, 0.1, 100.0)\n\
+             theta TVV(50.0, 1.0, 500.0)\n\
+             theta TVKA(1.0, 0.01, 10.0)\n\
+             theta TVATTR(0.7, 0.01, 10.0)\n\
+             omega ETA_CL ~ 0.09\n\
+             sigma PROP ~ 0.04 (sd)\n\
+             \n\
+             [individual_parameters]\n\
+             CL = TVCL * exp(ETA_CL)\n\
+             V  = TVV\n\
+             KA = TVKA\n\
+             {indiv_attr_line}\n\
+             \n\
+             [structural_model]\n\
+             {pk_line}\n\
+             \n\
+             [error_model]\n\
+             DV ~ proportional(PROP)\n"
+        )
+    }
+
     #[test]
-    fn analytical_indexed_f_and_alag_are_rejected() {
+    fn analytical_indexed_f_and_alag_unmapped_are_rejected() {
         // Per-compartment `F{cmt}` / `ALAG{cmt}` are ODE-only. On an analytical
-        // `pk ...` model they used to be silently dropped into an unused slot
-        // (effective F = 1 / lag = 0, no error). They must now be a loud parse
-        // error pointing at the bare `f=` / `lagtime=` mapping.
-        let f_src = r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 100.0)
-  theta TVV(50.0, 1.0, 500.0)
-  theta TVKA(1.0, 0.01, 10.0)
-  theta TVF1(0.7, 0.01, 1.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04 (sd)
+        // `pk ...` model, a name of that form that is NOT bound to the single dose
+        // route used to be silently dropped into an unused slot (effective F = 1 /
+        // lag = 0, no effect). That silent no-op must now be a loud, reason-specific
+        // parse error that names the param, says the value would be discarded, and
+        // points at the bare `f=` / `lagtime=` mapping. (The correctly-*mapped*
+        // case is accepted — see `analytical_indexed_f_and_alag_mapped_are_accepted`.)
 
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-  KA = TVKA
-  F1 = TVF1
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP)
-"#;
-        let err = parse_full_model(f_src)
-            .err()
-            .expect("F1 on an analytical oral model must error, not be silently ignored");
+        // Unmapped `F1`.
+        let err = parse_full_model(&indexed_attr_model(
+            "F1 = TVATTR",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        ))
+        .err()
+        .expect("unmapped F1 on an analytical oral model must error, not be silently ignored");
         assert!(
             err.contains("F1")
+                && err.contains("reads as a per-compartment")
                 && err.contains("bioavailability")
+                && err.contains("silently discarded")
                 && err.contains("f=")
                 && err.contains("ode("),
-            "F error must name the param, the noun, the bare `f=` mapping, and ode(...): {err}"
+            "F error must be reason-specific: name the param, the noun, that it is discarded, \
+             the bare `f=` mapping, and ode(...): {err}"
         );
 
-        // Same for a per-compartment lag `ALAG1`.
-        let lag_src = r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 100.0)
-  theta TVV(50.0, 1.0, 500.0)
-  theta TVKA(1.0, 0.01, 10.0)
-  theta TVLAG1(1.0, 0.01, 10.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04 (sd)
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-  KA = TVKA
-  ALAG1 = TVLAG1
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP)
-"#;
-        let err = parse_full_model(lag_src)
-            .err()
-            .expect("ALAG1 on an analytical oral model must error");
+        // Unmapped per-compartment lag `ALAG1`.
+        let err = parse_full_model(&indexed_attr_model(
+            "ALAG1 = TVATTR",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        ))
+        .err()
+        .expect("unmapped ALAG1 on an analytical oral model must error");
         assert!(
-            err.contains("ALAG1") && err.contains("lag time") && err.contains("lagtime="),
-            "lag error must name the param, the noun, and the bare `lagtime=` mapping: {err}"
+            err.contains("ALAG1")
+                && err.contains("reads as a per-compartment")
+                && err.contains("lag time")
+                && err.contains("silently discarded")
+                && err.contains("lagtime="),
+            "lag error must be reason-specific and name the bare `lagtime=` mapping: {err}"
         );
+
+        // The `LAGTIME{n}` alias hits the same guard as `ALAG{n}`.
+        let err = parse_full_model(&indexed_attr_model(
+            "LAGTIME1 = TVATTR",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        ))
+        .err()
+        .expect("unmapped LAGTIME1 (ALAG alias) on an analytical oral model must error");
+        assert!(
+            err.contains("LAGTIME1") && err.contains("lag time") && err.contains("lagtime="),
+            "LAGTIME1 alias must be rejected like ALAG1, naming the actual param: {err}"
+        );
+
+        // A higher index (`F2` — a compartment the 1-cpt model doesn't even have)
+        // is rejected the same way: an unmapped per-compartment F with no effect.
+        let err = parse_full_model(&indexed_attr_model(
+            "F2 = TVATTR",
+            "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+        ))
+        .err()
+        .expect("unmapped F2 on an analytical oral model must error");
+        assert!(
+            err.contains("F2") && err.contains("bioavailability"),
+            "F2 must be rejected and named: {err}"
+        );
+    }
+
+    #[test]
+    fn analytical_indexed_f_and_alag_mapped_are_accepted() {
+        // Regression guard (PR #725 review): a user may NAME their bioavailability
+        // / lag parameter `F1` / `ALAG1` / `LAGTIME1` and bind it to the single
+        // analytical dose route via the bare `f=` / `lagtime=` / `alag=` mapping.
+        // The value IS applied (routed to `PK_IDX_F` / `PK_IDX_LAGTIME`),
+        // bit-identical to the canonical `f=F` idiom, so the guard must NOT reject
+        // it. Before the narrowing fix these all errored — a breaking regression on
+        // previously-working, numerically-correct models.
+        for (indiv, pk) in [
+            ("F1 = TVATTR", "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F1)"),
+            (
+                "ALAG1 = TVATTR",
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG1)",
+            ),
+            // `alag=` alias for the mapping key, and the `LAGTIME{n}` param spelling.
+            (
+                "ALAG1 = TVATTR",
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, alag=ALAG1)",
+            ),
+            (
+                "LAGTIME1 = TVATTR",
+                "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=LAGTIME1)",
+            ),
+        ] {
+            let res = parse_full_model(&indexed_attr_model(indiv, pk));
+            assert!(
+                res.is_ok(),
+                "correctly-mapped `{pk}` (with `{indiv}`) must be accepted, got: {:?}",
+                res.err()
+            );
+        }
     }
 
     #[test]

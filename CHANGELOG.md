@@ -60,12 +60,14 @@ section of the SDLC for the versioning policy).
   from `ferx check` or at fit time. Such an out-of-order reference is now rejected loudly,
   naming the offending variable; reorder the block so each name is declared before it is
   used. This mirrors the existing `[odes]` undefined-reference guard (#314).
-- **Per-compartment `F{cmt}`/`ALAG{cmt}` on an analytical `pk` model is now a clear error** (#725):
-  these are ODE-only dose attributes, but on an analytical model they were silently dropped into an
-  unused parameter slot — so effective bioavailability stayed 1 and lag stayed 0 with no error (a
-  footgun when porting a NONMEM `$PK` that sets `F1`/`ALAG1`). The parser now rejects them with a
-  message pointing to the bare `f=`/`lagtime=` mapping in `pk(...)`, or an `ode(...)` model for a
-  compartment-specific value.
+- **An *unmapped* per-compartment `F{cmt}`/`ALAG{cmt}` on an analytical `pk` model is now a clear
+  error** (#725): these are ODE-only dose attributes. Naming an analytical individual parameter
+  `F1`/`ALAG1` (or the `LAGTIME1` alias) *without* binding it to the model's single dose route used
+  to drop its value into an unused slot — so effective bioavailability stayed 1 / lag stayed 0 with
+  no effect (a footgun when porting a NONMEM `$PK` that sets `F1`/`ALAG1`). The parser now rejects
+  that silent no-op, pointing at the bare `f=`/`lagtime=` mapping (e.g. `f=F1`) or an `ode(...)`
+  model. A parameter that *is* correctly mapped (`pk(..., f=F1)`) is unaffected — its value was, and
+  remains, applied as bioavailability/lag.
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point
