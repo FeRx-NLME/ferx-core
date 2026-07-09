@@ -433,6 +433,56 @@ well-identified here because the design is event-rich, so FOCEI, SAEM, NONMEM an
 GLMM coincide — the Karlsson Laplace bias is a *low-event-rate* effect. Full write-up
 in `tests/reference/rtte_exponential/expected.md`.
 
+### Simulating repeated events
+
+`simulate()` draws a **recurrent event stream** per subject up to the administrative
+`[simulation] horizon` (analytic hazard families; RTTE with a drug-driven ODE hazard is
+a later slice). Under `clock = forward` each next event is drawn *conditional on
+survival past the previous one* — the closed-form inverse of `H(t) − H(t_{k−1}) = −log u`
+— so a time-varying hazard keeps accumulating across the window; under `clock = reset`
+each inter-event gap is a fresh draw from zero. Every subject emits its events (`DV = 1`)
+followed by one administrative censor (`DV = 0`) at the horizon, so simulated data
+round-trips straight back through the data reader. A finite horizon is required (the
+stream has no implicit end); left truncation, multiple RTTE causes, an RTTE cause mixed
+with a competing single-event cause, and EVID=3/4 resets are rejected with a clear error
+rather than silently mis-sampled.
+
+```
+[simulation]
+  n_subjects = 200
+  horizon    = 20
+  seed       = 33
+```
+
+The sampler is validated four ways (all in `tests/tte_convergence.rs` except the last):
+
+- *Analytic count law (Tier-1, exact).* For a constant hazard the stream is a
+  homogeneous Poisson process, so `N(T) ~ Poisson(λT)`; for clock-forward Weibull it is
+  non-homogeneous with `N(T) ~ Poisson(H(T))`. The simulated counts match these exact
+  laws.
+- *Goodness-of-fit (PIT/KS, estimation-free).* By the time-rescaling theorem the
+  rescaled inter-event increments `H(t_k) − H(t_{k−1})` are iid `Exp(1)` under correct
+  sampling; a Kolmogorov–Smirnov test of `V_k = exp(−ΔH_k)` against Uniform(0,1) passes
+  (D ≈ 0.018), confirming the conditional forward draws reproduce `H(t)`.
+- *Frailty variance (method of moments, estimation-free).* The simulated event counts
+  imply `Var(log λ_i) = ω²`; at a well-identified design (≈31 events/subject) the read
+  is `ω² = 0.092` against the injected `0.09`.
+- *Cross-tool anchor (NONMEM, external).* ferx *simulated*
+  `tests/reference/rtte_exponential_sim/rtte_sim.csv` (300 subjects; truth
+  `TVLAMBDA = 0.15`, `ω² = 0.09`); ferx **and NONMEM** then both *fit* it:
+
+  | Engine | Method | TVLAMBDA | ω²(log rate) | OFV |
+  |--------|--------|---------:|-------------:|----:|
+  | NONMEM | LAPLACE | 0.15617 | 0.12801 | 5557.266 |
+  | ferx   | FOCEI   | 0.15619 | 0.12794 | 5557.266 |
+
+  An independent engine recovering the same parameters from ferx-simulated data is the
+  external corroboration that the simulator is correct. Both land at ω² ≈ 0.128 (above
+  the data-generating 0.09) because this single 300-subject realization is
+  over-dispersed — a Monte-Carlo property of the drawn dataset, not the sampler, whose
+  true injected variance the method-of-moments check pins at 0.09. Full write-up in
+  `tests/reference/rtte_exponential_sim/expected.md`.
+
 ## Comparison with reference software
 
 The exponential validation dataset is `tests/reference/tte_exponential/tte_exp.csv`

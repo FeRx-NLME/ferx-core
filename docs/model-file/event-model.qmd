@@ -128,6 +128,12 @@ Notes:
 - A **drug-driven ODE hazard** (`hazard =`) with `type = rtte` is a later slice and is
   rejected for now — use an analytic `family` for repeated events.
 - Left truncation (`TENTRY`) applies to the subject's first record.
+- **`simulate()` draws a recurrent stream** per subject to the administrative
+  `[simulation] horizon` (both clocks; analytic families). See
+  [Simulating repeated events](../estimation/tte.qmd#simulating-repeated-events) for the
+  method and validation. A finite horizon is required; left truncation, multiple RTTE
+  causes, an RTTE cause mixed with a competing single-event cause, and EVID=3/4 resets
+  are rejected rather than silently mis-sampled.
 
 ## TTE-only models
 

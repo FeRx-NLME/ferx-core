@@ -19,6 +19,11 @@
 # an RTTE-with-frailty fit under FOCE/FOCEI warns and recommends method = saem/imp.
 #
 # Run:  cargo run --release -- examples/rtte_exponential.ferx --data data/rtte_exponential.csv
+#
+# Or SIMULATE a fresh recurrent-event dataset to the [simulation] horizon (Slice 3.3):
+#   cargo run --release -- examples/rtte_exponential.ferx --simulate
+# Each subject draws a stream of events up to horizon = 20 (clock-forward: each event
+# conditioned on survival past the previous), then the fit runs on the simulated data.
 
 [parameters]
   theta TVLAMBDA(0.15, 0.001, 10.0)
@@ -35,3 +40,8 @@
   n_exploration = 400
   n_convergence = 200
   saem_seed     = 31
+
+[simulation]
+  n_subjects = 200
+  horizon    = 20
+  seed       = 33

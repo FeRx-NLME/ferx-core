@@ -130,11 +130,16 @@ section of the SDLC for the versioning policy).
   al. 2009), fitting RTTE under a Laplace-based method with a frailty now emits a
   warning recommending `method = saem` or `method = imp` (fired only for a frailty
   model — `n_eta > 0` — whose chain's final estimating stage is Laplace-based, so a
-  warm-start like `[focei, saem]` does not false-warn). RTTE is **fit-only** for now:
-  `simulate()` and unsupported configurations (interval-censored or out-of-order or
-  non-finite repeated-event rows) are rejected with a clear error rather than
-  silently producing a wrong answer; `predict_survival()` reports first-event
-  survival for RTTE (use its `cum_hazard` field for the recurrent `E[N(t)]`).
+  warm-start like `[focei, saem]` does not false-warn). **`simulate()` draws a
+  recurrent event stream** per subject up to the administrative `[simulation]
+  horizon` — clock-forward via conditional inverse-CDF draws (each event conditioned
+  on survival past the previous), clock-reset via fresh gap draws — for the analytic
+  hazard families. Unsupported configurations (interval-censored, out-of-order,
+  non-finite, or — for simulation — left-truncated, multiple RTTE causes, an RTTE
+  cause mixed with a competing single-event cause, or EVID=3/4 resets) are rejected
+  with a clear error rather than silently producing a wrong answer;
+  `predict_survival()` reports first-event survival for RTTE (use its `cum_hazard`
+  field for the recurrent `E[N(t)]`).
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
   model.ferx`, `ferx check model.ferx`, and the public `fit_from_files()`

@@ -72,6 +72,56 @@ const EXP_FIT_FIXED: &str = r"
   scale  = TVLAMBDA
 ";
 
+/// RTTE (Slice 3.3) **data-generating ("truth")** model for the SSE round-trip:
+/// clock-forward exponential recurrent events, `lambda_pop = 0.15`, `omega^2 = 0.09`
+/// on log(lambda). Event-rich (~3 events/subject at horizon 20) ⇒ FOCEI-Laplace ω²
+/// bias is mild (plan §3.3; matches the `tests/reference/rtte_exponential` anchor).
+const RTTE_EXP_TRUTH: &str = r"
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+";
+
+/// RTTE SSE **fit** model, initialised away from the truth (rate ~half, variance
+/// ~third) so recovery is a real test.
+const RTTE_EXP_FIT: &str = r"
+[parameters]
+  theta TVLAMBDA(0.08, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.03
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+";
+
+/// RTTE **sampler goodness-of-fit** truth: fixed-effects clock-forward Weibull
+/// (no frailty, no residual error). A single shared intensity `h(t)` means the
+/// closed-form cumulative hazard `H(t) = (t/scale)^shape` is one curve, so the
+/// probability-integral transform of the rescaled inter-event increments needs no
+/// per-subject random effect. Shape > 1 ⇒ the hazard genuinely varies with
+/// absolute time, so the test exercises *conditional* (not memoryless) sampling.
+const RTTE_WEIBULL_FWD_PIT_TRUTH: &str = r"
+[parameters]
+  theta TVSCALE(8.0, 0.1, 1000.0)
+  theta TVSHAPE(1.5, 0.1, 10.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  clock  = forward
+  family = weibull
+  scale  = TVSCALE
+  shape  = TVSHAPE
+";
+
 /// Competing-risks "truth" model: two exponential causes (CMT 2, CMT 3) linked
 /// by a shared log-frailty `ETA_F` (ω²=0.25). The cause-specific *rates* are
 /// well-identified and recover tightly; the shared frailty ω² is weakly
@@ -635,6 +685,357 @@ fn joint_pktte_sse_recovers_pk_and_omega() {
         "hazard params must stay feasible"
     );
     assert!(r.ofv.is_finite(), "joint PK-TTE SSE OFV must be finite");
+}
+
+// ── RTTE simulation (Slice 3.3) ──────────────────────────────────────────────
+
+/// Rebuild an RTTE fit population from `simulate()` outcomes: group each subject's
+/// rows (K observed events + 1 administrative censor) into `ObsRecord::Event`s on
+/// the endpoint CMT — `Exact` for an observed event, `RightCensored` for the
+/// trailing censor. This is exactly the layout the data reader produces from RTTE
+/// rows (`DV = 1` events then a `DV = 0` censor), so the round-trip refit sees the
+/// same records the sampler emitted.
+fn rtte_pop_from_sims(sims: &[SimulationResult]) -> Population {
+    use ferx_core::types::{EventType, ObsRecord};
+    use std::collections::BTreeMap;
+
+    let mut by_id: BTreeMap<String, Vec<(usize, f64, bool)>> = BTreeMap::new();
+    for r in sims {
+        match r.outcome {
+            SimOutcome::Event { time, observed } => {
+                by_id
+                    .entry(r.id.clone())
+                    .or_default()
+                    .push((r.cmt, time, observed));
+            }
+            ref o => panic!("expected an Event outcome for an RTTE simulation, got {o:?}"),
+        }
+    }
+
+    let subjects = by_id
+        .into_iter()
+        .map(|(id, recs)| {
+            let mut s = common::subject(&id, vec![], vec![], vec![], vec![]);
+            s.obs_records = recs
+                .into_iter()
+                .map(|(cmt, time, observed)| ObsRecord::Event {
+                    time,
+                    event_type: if observed {
+                        EventType::Exact
+                    } else {
+                        EventType::RightCensored
+                    },
+                    entry_time: 0.0,
+                    cmt,
+                })
+                .collect();
+            s
+        })
+        .collect();
+
+    Population {
+        subjects,
+        covariate_names: vec![],
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    }
+}
+
+/// **Slice 3.3 sampler goodness-of-fit** — the decisive, estimation-free validator
+/// for the clock-forward RTTE stream. For a fixed-effects Weibull truth (one shared
+/// intensity), the **time-rescaling theorem** says the inter-event increments
+/// `ΔH_k = H(t_k) − H(t_{k−1})`, with `H(t) = (t/scale)^shape` (an inline closed
+/// form, no shared code with the sampler), are iid `Exp(1)` under correct sampling,
+/// so `V_k = exp(−ΔH_k) ~ Uniform(0,1)`; a Kolmogorov–Smirnov test against Uniform
+/// must pass at 5%.
+///
+/// **Why only the first `K` gaps, with the horizon set far away.** Pooling *every*
+/// completed gap from a fixed-horizon renewal process is biased: a gap is kept only
+/// if its event lands before the horizon (`u > exp(−(H(horizon) − H(t_{k−1})))`), so
+/// gaps adjacent to the boundary are selected toward small values — a property of the
+/// truncated data, not the sampler. Taking the first `K` gaps per subject with
+/// `horizon ≫ K·E[gap]` makes that keep-threshold `≈ exp(−H(horizon)) ≈ 0`, so those
+/// `K` gaps are *unconditioned* draws and the KS reference is the exact Uniform(0,1).
+///
+/// What this pins that the SSE below cannot: the *loop* itself — conditioning each
+/// draw on survival past the previous event (subtracting `H(t_{k−1})`), the forward
+/// clock (a reset bug leaves the `V_k` non-uniform), and no RNG reordering. It is
+/// immune to any estimator bias (no fit). Shape > 1 makes the hazard time-varying, so
+/// a memoryless short-cut fails here (gaps 2..K are genuine conditional draws).
+#[test]
+fn rtte_forward_event_times_match_model_survival() {
+    use ferx_core::{simulate_with_options, SimulateOptions};
+    use std::collections::BTreeMap;
+    const N: usize = 600;
+    // horizon ≫ K·E[gap] (E[gap] = scale·Γ(1+1/shape) ≈ 7.2, K·E[gap] ≈ 43 ≪ 120)
+    // ⇒ H(120) ≈ 58 expected events/subject, so every subject reaches ≥ K and the
+    // first K gaps are unconditioned.
+    const HORIZON: f64 = 120.0;
+    const K: usize = 6;
+    const SEED: u64 = 20260709;
+    // Must match RTTE_WEIBULL_FWD_PIT_TRUTH (the oracle re-derives the same H).
+    const SCALE: f64 = 8.0;
+    const SHAPE: f64 = 1.5;
+
+    let truth = parse_model_string(RTTE_WEIBULL_FWD_PIT_TRUTH).expect("PIT truth model must parse");
+    // One right-censored template row per subject on CMT 2; `simulate_rtte_stream`
+    // regenerates each subject's stream to the horizon.
+    let template = common::tte_pop_from_pairs(&vec![(HORIZON, 0u8); N]);
+    let opts = SimulateOptions {
+        seed: Some(SEED),
+        match_method: None,
+        horizon: Some(HORIZON),
+    };
+    let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
+        .expect("RTTE PIT simulation must succeed");
+
+    // Independent closed-form cumulative hazard (no shared code with the conditional
+    // sampler): H(t) = (t/scale)^shape.
+    let cumhaz = |t: f64| (t / SCALE).powf(SHAPE);
+    let mut by_id: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for r in &sims {
+        if let SimOutcome::Event {
+            time,
+            observed: true,
+        } = r.outcome
+        {
+            by_id.entry(r.id.clone()).or_default().push(time);
+        }
+    }
+    // Rescaled increments for the first K events per subject (unconditioned; see the
+    // doc comment). Assert every subject reached ≥ K events so no subject is dropped —
+    // a dropped subject would reintroduce selection.
+    let mut v: Vec<f64> = Vec::new();
+    let mut min_events = usize::MAX;
+    for times in by_id.values() {
+        min_events = min_events.min(times.len());
+        let mut h_prev = 0.0_f64;
+        for &t in times.iter().take(K) {
+            let h = cumhaz(t);
+            v.push((-(h - h_prev)).exp());
+            h_prev = h;
+        }
+    }
+    assert_eq!(by_id.len(), N, "every subject must appear");
+    assert!(
+        min_events >= K,
+        "every subject must reach ≥ K={K} events so the first-K gaps are unconditioned; \
+         min was {min_events} — raise the horizon"
+    );
+    assert_eq!(v.len(), N * K, "N·K unconditioned increments");
+    v.sort_by(|a, b| a.partial_cmp(b).expect("increments are finite"));
+
+    // Kolmogorov–Smirnov against the FULLY-SPECIFIED Uniform(0,1) (truth parameters,
+    // not estimated ⇒ the standard 1.36/√N critical is exact).
+    let n = v.len() as f64;
+    let mut d = 0.0_f64;
+    for (i, &vi) in v.iter().enumerate() {
+        d = d.max((i as f64 + 1.0) / n - vi).max(vi - i as f64 / n);
+    }
+    let crit = 1.36 / n.sqrt();
+    eprintln!(
+        "[PIT-RTTE] increments={} KS D={d:.4} vs 5% critical {crit:.4}",
+        v.len()
+    );
+    assert!(
+        d < crit,
+        "RTTE forward sampler fails the KS goodness-of-fit against the model survival: \
+         D={d:.4} ≥ {crit:.4} — the recurrent sampler does not reproduce H(t)"
+    );
+}
+
+/// Per-subject observed-event counts from an RTTE `simulate()`, INCLUDING zero-event
+/// subjects — every subject emits at least its censor row, so grouping on all rows and
+/// counting the observed ones yields a 0 for the event-free subjects (dropping them
+/// would bias the variance). Panics unless every one of `n` subjects appears.
+fn rtte_event_counts(sims: &[SimulationResult], n: usize) -> Vec<f64> {
+    let mut by_id = std::collections::BTreeMap::<String, usize>::new();
+    for r in sims {
+        let c = by_id.entry(r.id.clone()).or_default();
+        if matches!(r.outcome, SimOutcome::Event { observed: true, .. }) {
+            *c += 1;
+        }
+    }
+    assert_eq!(
+        by_id.len(),
+        n,
+        "every subject must appear (via its censor row)"
+    );
+    by_id.values().map(|&c| c as f64).collect()
+}
+
+/// **Slice 3.3 — the sampler injects the correct frailty variance.** For exponential
+/// RTTE the per-subject count is `N_i ~ Poisson(λ_i·T)`, `λ_i = λ·exp(η_i)`, so
+/// `E[N] = μ = λT·e^{ω²/2}` and `Var[N] = μ + μ²(e^{ω²} − 1)`, giving the
+/// method-of-moments estimate `ω² = ln(1 + (Var − μ)/μ²)` straight from the simulated
+/// counts — **no estimator (no fit) in the loop**.
+///
+/// The catch is that MoM is noisy when events/subject is small (~3): the count
+/// over-dispersion is then a poor read on the frailty, and a single realization can sit
+/// ±0.03 off (that noise, not a bias, is why the SSE below does not assert `ω²` at the
+/// truth). Here the horizon is large (≈31 events/subject), so each subject's rate is
+/// pinned precisely and the MoM read is tight — a clean, estimator-free confirmation
+/// that `simulate()` injects `Var(log λ_i) = ω² = 0.09`. A sampler that over- or
+/// under-dispersed the frailty would miss this band regardless of any fit.
+#[test]
+fn rtte_sampler_injects_correct_frailty_variance() {
+    use ferx_core::{simulate_with_options, SimulateOptions};
+    const N: usize = 4000;
+    const HORIZON: f64 = 200.0; // ≈ λT = 30 events/subject ⇒ the frailty is well-identified
+    const SEED: u64 = 3;
+
+    let truth = parse_model_string(RTTE_EXP_TRUTH).expect("RTTE truth model must parse");
+    let template = common::tte_pop_from_pairs(&vec![(HORIZON, 0u8); N]);
+    let opts = SimulateOptions {
+        seed: Some(SEED),
+        match_method: None,
+        horizon: Some(HORIZON),
+    };
+    let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
+        .expect("RTTE simulation must succeed");
+
+    let counts = rtte_event_counts(&sims, N);
+    let mean_c = counts.iter().sum::<f64>() / N as f64;
+    let var_c = counts.iter().map(|c| (c - mean_c).powi(2)).sum::<f64>() / (N as f64 - 1.0);
+    let w2_mom = (1.0 + (var_c - mean_c) / (mean_c * mean_c)).ln();
+    eprintln!("[FRAILTY-RTTE] mean={mean_c:.2} var={var_c:.2} → MoM ω²={w2_mom:.4} (truth 0.09)");
+    // mean = λT·e^{ω²/2} = 0.15·200·e^0.045 ≈ 31.4.
+    assert!(
+        (30.0..33.0).contains(&mean_c),
+        "mean events/subject {mean_c:.2} off λT·e^(ω²/2) ≈ 31.4"
+    );
+    assert!(
+        (0.082..0.098).contains(&w2_mom),
+        "method-of-moments ω² {w2_mom:.4} off truth 0.09 — the sampler injects the wrong \
+         between-subject variance (no estimator here, so this isolates a sampler bug)"
+    );
+}
+
+/// **Slice 3.3 SSE** — license-free round-trip validator for the RTTE generative path.
+/// Simulate a clock-forward exponential RTTE dataset from known (θ, Ω) with ferx's own
+/// `simulate()`, rebuild a fit population, and refit from a perturbed start. A wrong
+/// event-time sampler, a dropped/duplicated event, or a broken sim→Population→fit
+/// round-trip (wrong DV/censor layout) shows up here as non-recovery of the sharply
+/// identified population rate `λ`.
+///
+/// **Scope.** `λ` is pinned by the total event count and recovers tightly. The frailty
+/// `ω²` is only weakly identified at this realistic sparse design (~3 events/subject):
+/// a single realization's empirical over-dispersion fluctuates around 0.09 by ±0.03, so
+/// FOCEI lands high here (~0.13) simply because this seed's data happens to be
+/// over-dispersed (its own MoM reads ~0.125). That is Monte-Carlo noise, **not** a
+/// sampler or estimator bias — `rtte_sampler_injects_correct_frailty_variance` confirms
+/// the true injected variance is 0.09 at high events/subject. So `ω²` is bracketed
+/// around the seed-fixed estimate (guarding a gross fit regression), not asserted at the
+/// truth — the same policy the joint PK-TTE SSE uses for its weakly-identified params.
+#[test]
+fn rtte_sse_forward_exponential_recovers_rate() {
+    use ferx_core::{simulate_with_options, SimulateOptions};
+    const N: usize = 1500;
+    const HORIZON: f64 = 20.0;
+    const SEED: u64 = 20260709;
+
+    let truth = parse_model_string(RTTE_EXP_TRUTH).expect("RTTE truth model must parse");
+    let template = common::tte_pop_from_pairs(&vec![(HORIZON, 0u8); N]);
+    let opts = SimulateOptions {
+        seed: Some(SEED),
+        match_method: None,
+        horizon: Some(HORIZON),
+    };
+    let sims = simulate_with_options(&truth, &template, &truth.default_params, 1, &opts)
+        .expect("RTTE simulation must succeed");
+
+    let counts = rtte_event_counts(&sims, N);
+    let mean_c = counts.iter().sum::<f64>() / N as f64;
+    let max_events = counts.iter().cloned().fold(0.0_f64, f64::max);
+    eprintln!("[SSE-RTTE] mean events/subject={mean_c:.3} (~3.14) max={max_events}");
+    assert!(
+        (2.9..3.4).contains(&mean_c),
+        "mean events/subject {mean_c:.3} off λT·e^(ω²/2) ≈ 3.14 — a 2x sampler rate error is out of band"
+    );
+    assert!(
+        max_events >= 5.0,
+        "a recurrent stream should reach ≥5 events for some subject; got {max_events}"
+    );
+
+    let fit_pop = rtte_pop_from_sims(&sims);
+    let model = parse_model_string(RTTE_EXP_FIT).expect("RTTE fit model must parse");
+    let r = fit(&model, &fit_pop, &model.default_params, &fit_opts())
+        .expect("RTTE SSE fit must succeed");
+
+    let lambda = r.theta[0];
+    let omega2 = r.omega[(0, 0)];
+    eprintln!(
+        "[SSE-RTTE] FOCEI λ={lambda:.5} (truth 0.15) ω²={omega2:.5} (weakly identified, see doc) OFV={:.4}",
+        r.ofv
+    );
+    // λ is sharply identified ⇒ tight truth recovery (a factor-of-2 sampler error breaks it).
+    assert!(
+        (0.140..0.160).contains(&lambda),
+        "lambda_pop not recovered: got {lambda:.5}, expected ~0.15"
+    );
+    // ω² brackets the seed-fixed FOCEI estimate (~0.129) — see the doc comment: this
+    // realization is over-dispersed, and the truth-level variance check lives in
+    // `rtte_sampler_injects_correct_frailty_variance`.
+    assert!(
+        (0.10..0.16).contains(&omega2),
+        "FOCEI ω² {omega2:.5} outside the expected bracket for this realization"
+    );
+    assert!(r.ofv.is_finite(), "RTTE SSE OFV must be finite");
+}
+
+const RTTE_SIM_ANCHOR_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/reference/rtte_exponential_sim/rtte_sim.csv"
+);
+
+/// **Slice 3.3 cross-tool simulation anchor** (the external, CLAUDE.md-required leg).
+/// ferx *simulated* `tests/reference/rtte_exponential_sim/rtte_sim.csv` (300 subjects,
+/// truth TVLAMBDA = 0.15, ω² = 0.09, horizon = 20; via `cargo run --bin rtte_sim_anchor
+/// --features survival`). Here ferx **and NONMEM** both *fit* that ferx-simulated file:
+/// an INDEPENDENT engine recovering the parameters from ferx-simulated data is the
+/// external corroboration that the RTTE **simulator** is correct — a biased sampler
+/// would move both engines off the data-generating values.
+///
+/// NONMEM LAPLACE (`nonmem.lst`, telescoping-AG `$PRED`): TVLAMBDA = 0.15617,
+/// ω² = 0.12801, OFV = 5557.266. ferx FOCEI fits the identical file through the real
+/// datareader and must reproduce them to a few significant figures (this reuses the
+/// Slice 3.1 finding that ferx FOCEI ≡ NONMEM LAPLACE for constant-hazard RTTE). The ω²
+/// sits above the data-generating 0.09 for *both* engines — this N = 300 realization is
+/// over-dispersed; the sampler's true injected variance is pinned at 0.09, estimator-free,
+/// by `rtte_sampler_injects_correct_frailty_variance`.
+#[test]
+fn rtte_sim_anchor_ferx_matches_nonmem() {
+    // NONMEM LAPLACE on the same ferx-simulated file (see nonmem.lst / nonmem.ext).
+    const NM_LAMBDA: f64 = 0.15617;
+    const NM_OMEGA2: f64 = 0.12801;
+    const NM_OFV: f64 = 5557.266;
+
+    let model = parse_model_string(RTTE_EXP_FIT).expect("RTTE fit model must parse");
+    let (pop, _cov) =
+        read_population_for(&model, &None, RTTE_SIM_ANCHOR_CSV, None, None, None, &[])
+            .expect("read ferx-simulated RTTE anchor CSV");
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("ferx anchor fit");
+
+    let (lambda, omega2) = (r.theta[0], r.omega[(0, 0)]);
+    eprintln!(
+        "[SIM-ANCHOR] ferx λ={lambda:.5} ω²={omega2:.5} OFV={:.3}  (NONMEM {NM_LAMBDA} / {NM_OMEGA2} / {NM_OFV})",
+        r.ofv
+    );
+    assert!(
+        (lambda - NM_LAMBDA).abs() < 0.002,
+        "ferx λ={lambda:.5} should reproduce NONMEM {NM_LAMBDA} on the same ferx-simulated data"
+    );
+    assert!(
+        (omega2 - NM_OMEGA2).abs() < 0.004,
+        "ferx ω²={omega2:.5} should reproduce NONMEM {NM_OMEGA2} on the same ferx-simulated data"
+    );
+    assert!(
+        (r.ofv - NM_OFV).abs() < 1.0,
+        "ferx OFV={:.3} should reproduce NONMEM {NM_OFV} (same likelihood objective)",
+        r.ofv
+    );
 }
 
 const REF_CSV: &str = concat!(

@@ -1,0 +1,404 @@
+Thu Jul  9 08:29:40 AM UTC 2026
+$PROBLEM RTTE simulate cross-tool anchor (Phase 3 Slice 3.3) — NONMEM fits ferx-simulated data
+; Clock-forward (Andersen-Gill) constant-hazard RTTE with a shared log-rate frailty.
+; The dataset rtte_sim.csv was produced by ferx's OWN simulator
+; (`cargo run --bin rtte_sim_anchor --features survival`), from the truth
+; TVLAMBDA = 0.15, omega^2(log rate) = 0.09, horizon = 20. Fitting it with an
+; INDEPENDENT engine (NONMEM) must recover that truth — the external corroboration
+; that the ferx RTTE *simulator* is correct (a biased sampler would shift the
+; recovered parameters away from the truth here).
+;
+; Same telescoping-AG $PRED as tests/reference/rtte_exponential/nonmem.ctl: track the
+; previous event time TLAST and contribute the survival over each inter-event gap
+; times the hazard at an event, which telescopes to L = prod_k h * exp(-H(T)).
+;
+; Data: rtte_sim.csv (ID,TIME,DV,EVID,CMT,MDV). DV=1 event, DV=0 admin censor at t=20.
+$INPUT ID TIME DV EVID CMT MDV
+$DATA rtte_sim.csv IGNORE=@
+
+$PRED
+  IF (NEWIND.NE.2) TLAST = 0        ; reset the gap clock at each new subject
+  LAMBDA = THETA(1)*EXP(ETA(1))     ; individual constant hazard (frailty on log rate)
+  CUMHAZ = LAMBDA*(TIME - TLAST)    ; H over the gap since the previous event
+  SURV   = EXP(-CUMHAZ)
+  Y = SURV                          ; default (DV=0 censor): survival over the final gap
+  IF (DV.EQ.1) Y = SURV*LAMBDA      ; event: density over the gap
+  IF (DV.EQ.1) TLAST = TIME         ; advance the clock AFTER using the old TLAST
+
+$THETA (0, 0.15)                    ; TVLAMBDA (population rate)
+$OMEGA 0.09                         ; frailty variance (var of log rate)
+
+; LAPLACE likelihood (exact 2nd-order eta-Hessian) — the NONMEM analogue of ferx FOCEI.
+$ESTIMATION METHOD=COND LAPLACE LIKELIHOOD NUMERICAL SLOW NOABORT PRINT=5 MAXEVAL=9999
+$COVARIANCE UNCONDITIONAL SLOW
+$TABLE ID TIME DV LAMBDA NOPRINT ONEHEADER FILE=rtte_sim_sdtab
+
+NM-TRAN MESSAGES
+  
+ WARNINGS AND ERRORS (IF ANY) FOR PROBLEM    1
+             
+ (WARNING  2) NM-TRAN INFERS THAT THE DATA ARE POPULATION.
+  
+Note: Analytical 2nd Derivatives are constructed in FSUBS but are never used.
+      You may insert $ABBR DERIV2=NO after the first $PROB to save FSUBS construction and compilation time
+  
+
+License Registered to: InsightRX
+Expiration Date:    14 AUG 2026
+Current Date:        9 JUL 2026
+Days until program expires :  35
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.6.0 (nm760)
+ ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
+ CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
+ AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
+ PERFORMED BY NOUS INFOSYSTEMS.
+
+ PROBLEM NO.:         1
+ RTTE simulate cross-tool anchor (Phase 3 Slice 3.3) — NONMEM fits ferx
+0DATA CHECKOUT RUN:              NO
+ DATA SET LOCATED ON UNIT NO.:    2
+ THIS UNIT TO BE REWOUND:        NO
+ CREATE/ADD TO FDATA.csv:        YES
+ NO. OF DATA RECS IN DATA SET:     1299
+ NO. OF DATA ITEMS IN DATA SET:   6
+ ID DATA ITEM IS DATA ITEM NO.:   1
+ DEP VARIABLE IS DATA ITEM NO.:   3
+ MDV DATA ITEM IS DATA ITEM NO.:  6
+0LABELS FOR DATA ITEMS:
+ ID TIME DV EVID CMT MDV
+0(NONBLANK) LABELS FOR PRED-DEFINED ITEMS:
+ LAMBDA
+0FORMAT FOR DATA:
+ (6E8.0)
+
+ TOT. NO. OF OBS RECS:     1299
+ TOT. NO. OF INDIVIDUALS:      300
+0LENGTH OF THETA:   1
+0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
+0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT OMEGA BOUNDARY TEST OMITTED:    NO
+0INITIAL ESTIMATE OF THETA:
+ LOWER BOUND    INITIAL EST    UPPER BOUND
+  0.0000E+00     0.1500E+00     0.1000E+07
+0INITIAL ESTIMATE OF OMEGA:
+ 0.9000E-01
+0COVARIANCE STEP OMITTED:        NO
+ EIGENVLS. PRINTED:              NO
+ SPECIAL COMPUTATION:            NO
+ COMPRESSED FORMAT:              NO
+ GRADIENT METHOD USED:       SLOW
+ SIGDIGITS ETAHAT (SIGLO):                  -1
+ SIGDIGITS GRADIENTS (SIGL):                -1
+ EXCLUDE COV FOR FOCE (NOFCOV):              NO
+ Cholesky Transposition of R Matrix (CHOLROFF):0
+ KNUTHSUMOFF:                                -1
+ RESUME COV ANALYSIS (RESUME):               NO
+ SIR SAMPLE SIZE (SIRSAMPLE):
+ NON-LINEARLY TRANSFORM THETAS DURING COV (THBND): 1
+ PRECONDTIONING CYCLES (PRECOND):        0
+ PRECONDTIONING TYPES (PRECONDS):        TOS
+ FORCED PRECONDTIONING CYCLES (PFCOND):0
+ PRECONDTIONING TYPE (PRETYPE):        0
+ FORCED POS. DEFINITE SETTING DURING PRECONDITIONING: (FPOSDEF):0
+ SIMPLE POS. DEFINITE SETTING: (POSDEF):-1
+0TABLES STEP OMITTED:    NO
+ NO. OF TABLES:           1
+ SEED NUMBER (SEED):    11456
+ NPDTYPE:    0
+ INTERPTYPE:    0
+ RANMETHOD:             3U
+ MC SAMPLES (ESAMPLE):    300
+ WRES SQUARE ROOT TYPE (WRESCHOL): EIGENVALUE
+0-- TABLE   1 --
+0RECORDS ONLY:    ALL
+04 COLUMNS APPENDED:    YES
+ PRINTED:                NO
+ HEADERS:               ONE
+ FILE TO BE FORWARDED:   NO
+ FORMAT:                S1PE11.4
+ IDFORMAT:
+ LFORMAT:
+ RFORMAT:
+ FIXED_EFFECT_ETAS:
+0USER-CHOSEN ITEMS:
+ ID TIME DV LAMBDA
+1
+
+
+ #TBLN:      1
+ #METH: Laplacian Conditional Estimation
+
+ ESTIMATION STEP OMITTED:                 NO
+ SHRINK INFO WITH EVALUATION (EVALSHRINK) NO
+ ANALYSIS TYPE:                           POPULATION
+ NUMBER OF SADDLE POINT RESET ITERATIONS:      0
+ GRADIENT METHOD USED:               SLOW
+ CONDITIONAL ESTIMATES USED:              YES
+ CENTERED ETA:                            NO
+ EPS-ETA INTERACTION:                     NO
+ LAPLACIAN OBJ. FUNC.:                    YES
+ NUMERICAL 2ND DERIVATIVES:               YES
+ PRED F SET TO A LIKELIHOOD:              YES
+ NO. OF FUNCT. EVALS. ALLOWED:            9999
+ NO. OF SIG. FIGURES REQUIRED:            3
+ INTERMEDIATE PRINTOUT:                   YES
+ ESTIMATE OUTPUT TO MSF:                  NO
+ ABORT WITH PRED EXIT CODE 1:             NO
+ IND. OBJ. FUNC. VALUES SORTED:           NO
+ NUMERICAL DERIVATIVE
+       FILE REQUEST (NUMDER):               NONE
+ MAP (ETAHAT) ESTIMATION METHOD (OPTMAP):   0
+ ETA HESSIAN EVALUATION METHOD (ETADER):    0
+ INITIAL ETA FOR MAP ESTIMATION (MCETA):    0
+ SIGDIGITS FOR MAP ESTIMATION (SIGLO):      100
+ GRADIENT SIGDIGITS OF
+       FIXED EFFECTS PARAMETERS (SIGL):     100
+ NOPRIOR SETTING (NOPRIOR):                 0
+ NOCOV SETTING (NOCOV):                     OFF
+ DERCONT SETTING (DERCONT):                 OFF
+ FINAL ETA RE-EVALUATION (FNLETA):          1
+ EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
+       IN SHRINKAGE (ETASTYPE):             NO
+ NON-INFL. ETA CORRECTION (NONINFETA):      0
+ RAW OUTPUT FILE (FILE): nonmem.ext
+ EXCLUDE TITLE (NOTITLE):                   NO
+ EXCLUDE COLUMN LABELS (NOLABEL):           NO
+ FORMAT FOR ADDITIONAL FILES (FORMAT):      S1PE12.5
+ PARAMETER ORDER FOR OUTPUTS (ORDER):       TSOL
+ KNUTHSUMOFF:                               0
+ INCLUDE LNTWOPI:                           NO
+ INCLUDE CONSTANT TERM TO PRIOR (PRIORC):   NO
+ INCLUDE CONSTANT TERM TO OMEGA (ETA) (OLNTWOPI):NO
+ ADDITIONAL CONVERGENCE TEST (CTYPE=4)?:    NO
+ EM OR BAYESIAN METHOD USED:                 NONE
+
+
+ THE FOLLOWING LABELS ARE EQUIVALENT
+ PRED=NPRED
+ RES=NRES
+ WRES=NWRES
+ IWRS=NIWRES
+ IPRD=NIPRED
+ IRS=NIRES
+
+ MONITORING OF SEARCH:
+
+
+0ITERATION NO.:    0    OBJECTIVE VALUE:   5561.22890474014        NO. OF FUNC. EVALS.:   3
+ CUMULATIVE NO. OF FUNC. EVALS.:        3
+ NPARAMETR:  1.5000E-01  9.0000E-02
+ PARAMETER:  1.0000E-01  1.0000E-01
+ GRADIENT:  -8.7186E+01 -2.3167E+01
+
+0ITERATION NO.:    5    OBJECTIVE VALUE:   5557.26616242123        NO. OF FUNC. EVALS.:  21
+ CUMULATIVE NO. OF FUNC. EVALS.:       24
+ NPARAMETR:  1.5617E-01  1.2801E-01
+ PARAMETER:  1.4034E-01  2.7614E-01
+ GRADIENT:  -8.5475E-02 -2.8679E-02
+
+0ITERATION NO.:    6    OBJECTIVE VALUE:   5557.26616242123        NO. OF FUNC. EVALS.:   0
+ CUMULATIVE NO. OF FUNC. EVALS.:       24
+ NPARAMETR:  1.5617E-01  1.2801E-01
+ PARAMETER:  1.4034E-01  2.7614E-01
+ GRADIENT:  -8.5475E-02 -2.8679E-02
+
+ #TERM:
+0MINIMIZATION SUCCESSFUL
+ NO. OF FUNCTION EVALUATIONS USED:       24
+ NO. OF SIG. DIGITS IN FINAL EST.:  3.2
+
+ ETABAR IS THE ARITHMETIC MEAN OF THE ETA-ESTIMATES,
+ AND THE P-VALUE IS GIVEN FOR THE NULL HYPOTHESIS THAT THE TRUE MEAN IS 0.
+
+ ETABAR:         1.3087E-02
+ SE:             1.1206E-02
+ N:                     300
+
+ P VAL.:         2.4286E-01
+
+ ETASHRINKSD(%)  4.5628E+01
+ ETASHRINKVR(%)  7.0437E+01
+ EBVSHRINKSD(%)  4.6160E+01
+ EBVSHRINKVR(%)  7.1013E+01
+ RELATIVEINF(%)  2.8987E+01
+ EPSSHRINKSD(%)  1.0000E+02
+ EPSSHRINKVR(%)  1.0000E+02
+
+  
+ TOTAL DATA POINTS NORMALLY DISTRIBUTED (N):            0
+ N*LOG(2PI) CONSTANT TO OBJECTIVE FUNCTION:    0.0000000000000000     
+ OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT:    5557.2661624212296     
+ OBJECTIVE FUNCTION VALUE WITH CONSTANT:       5557.2661624212296     
+ REPORTED OBJECTIVE FUNCTION DOES NOT CONTAIN CONSTANT
+  
+ TOTAL EFFECTIVE ETAS (NIND*NETA):                           300
+  
+ #TERE:
+ Elapsed estimation  time in seconds:     0.16
+ Elapsed covariance  time in seconds:     0.08
+ Elapsed postprocess time in seconds:     0.03
+1
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                         LAPLACIAN CONDITIONAL ESTIMATION                       ********************
+ #OBJT:**************                       MINIMUM VALUE OF OBJECTIVE FUNCTION                      ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+
+
+
+ #OBJV:********************************************          5557.266       *********************************************
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                         LAPLACIAN CONDITIONAL ESTIMATION                       ********************
+ ********************                             FINAL PARAMETER ESTIMATE                           ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+ THETA - VECTOR OF FIXED EFFECTS PARAMETERS   *********
+
+
+         TH 1     
+ 
+         1.56E-01
+ 
+
+
+ OMEGA - COV MATRIX FOR RANDOM EFFECTS - ETAS  ********
+
+
+         ETA1     
+ 
+ ETA1
++        1.28E-01
+ 
+1
+
+
+ OMEGA - CORR MATRIX FOR RANDOM EFFECTS - ETAS  *******
+
+
+         ETA1     
+ 
+ ETA1
++        3.58E-01
+ 
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                         LAPLACIAN CONDITIONAL ESTIMATION                       ********************
+ ********************                            STANDARD ERROR OF ESTIMATE                          ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+ THETA - VECTOR OF FIXED EFFECTS PARAMETERS   *********
+
+
+         TH 1     
+ 
+         6.59E-03
+ 
+
+
+ OMEGA - COV MATRIX FOR RANDOM EFFECTS - ETAS  ********
+
+
+         ETA1     
+ 
+ ETA1
++        3.71E-02
+ 
+1
+
+
+ OMEGA - CORR MATRIX FOR RANDOM EFFECTS - ETAS  *******
+
+
+         ETA1     
+ 
+ ETA1
++        5.18E-02
+ 
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                         LAPLACIAN CONDITIONAL ESTIMATION                       ********************
+ ********************                          COVARIANCE MATRIX OF ESTIMATE                         ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+            TH 1      OM11  
+ 
+ TH 1
++        4.34E-05
+ 
+ OM11
++       -1.06E-04  1.38E-03
+ 
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                         LAPLACIAN CONDITIONAL ESTIMATION                       ********************
+ ********************                          CORRELATION MATRIX OF ESTIMATE                        ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+            TH 1      OM11  
+ 
+ TH 1
++        6.59E-03
+ 
+ OM11
++       -4.33E-01  3.71E-02
+ 
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                         LAPLACIAN CONDITIONAL ESTIMATION                       ********************
+ ********************                      INVERSE COVARIANCE MATRIX OF ESTIMATE                     ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+            TH 1      OM11  
+ 
+ TH 1
++        2.83E+04
+ 
+ OM11
++        2.18E+03  8.94E+02
+ 
+ Elapsed finaloutput time in seconds:     0.03
+ #CPUT: Total CPU Time in Seconds,        0.323
+Stop Time:
+Thu Jul  9 08:29:43 AM UTC 2026

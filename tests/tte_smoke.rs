@@ -741,20 +741,221 @@ mod survival_smoke {
         );
     }
 
-    /// RTTE simulation is a later slice (3.3); `simulate*` must reject an RTTE model
-    /// loudly rather than draw a single event per subject (`simulate_tte` would collapse
-    /// a subject's repeated events into one competing-risks draw — a silent wrong answer).
+    /// RTTE simulation (Slice 3.3) regenerates a *recurrent* stream per subject: each
+    /// subject's rows are one event process to the horizon, not a single competing-risks
+    /// draw. With a horizon set, `simulate*` succeeds, at least one subject fires more
+    /// than one event, and every subject ends with an administrative censor at the
+    /// horizon — the round-trip layout the data reader reads back.
     #[test]
-    fn rtte_simulate_is_rejected() {
+    fn rtte_simulate_produces_recurrent_stream() {
+        use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
+        use std::collections::BTreeMap;
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let pop = rtte_pop();
+        let opts = SimulateOptions {
+            seed: Some(7),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let sims = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect("RTTE simulation with a horizon must succeed");
+
+        let mut by_id: BTreeMap<String, Vec<(f64, bool)>> = BTreeMap::new();
+        for r in &sims {
+            match r.outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert_eq!(r.cmt, 2, "RTTE rows stay on the endpoint CMT");
+                    by_id
+                        .entry(r.id.clone())
+                        .or_default()
+                        .push((time, observed));
+                }
+                ref o => panic!("expected an Event outcome, got {o:?}"),
+            }
+        }
+        assert_eq!(by_id.len(), pop.subjects.len(), "one group per subject");
+
+        let mut max_events = 0usize;
+        for (id, rows) in &by_id {
+            let (t_last, obs_last) = *rows.last().unwrap();
+            assert!(
+                !obs_last && t_last == 30.0,
+                "subject {id} must end with a censor at the horizon, got ({t_last}, {obs_last})"
+            );
+            let mut prev = 0.0_f64;
+            for &(t, obs) in &rows[..rows.len() - 1] {
+                assert!(
+                    obs && t > prev && t < 30.0,
+                    "subject {id} pre-censor rows are sorted events before the horizon: {t}"
+                );
+                prev = t;
+            }
+            max_events = max_events.max(rows.len() - 1);
+        }
+        assert!(
+            max_events > 1,
+            "at least one subject must fire multiple events (recurrent stream, not a single \
+             competing-risks draw); max events = {max_events}"
+        );
+    }
+
+    /// RTTE simulation needs a finite administrative horizon (the stream runs up to it);
+    /// without one, `simulate*` must fail loud rather than run unbounded.
+    #[test]
+    fn rtte_simulate_without_horizon_is_rejected() {
         use ferx_core::{simulate_with_options, SimulateOptions};
         let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         let pop = rtte_pop();
-        let opts = SimulateOptions::default();
+        let opts = SimulateOptions::default(); // horizon: None
         let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
-            .expect_err("RTTE simulation must be rejected");
+            .expect_err("RTTE simulation without a horizon must be rejected");
         assert!(
-            err.contains("RTTE") && err.contains("not yet supported"),
-            "error should flag RTTE simulation as unsupported, got: {err}"
+            err.contains("RTTE") && err.contains("horizon"),
+            "error should require a horizon, got: {err}"
+        );
+    }
+
+    /// Left truncation (`entry_time > 0`) on an RTTE record is a deferred follow-up
+    /// (conditional first-gap sampling); simulation must reject it, not silently sample
+    /// the first gap from 0.
+    #[test]
+    fn rtte_simulate_left_truncation_is_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        let ObsRecord::Event { entry_time, .. } = &mut pop.subjects[0].obs_records[0];
+        *entry_time = 2.0;
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE simulation with left truncation must be rejected");
+        assert!(
+            err.contains("left truncation"),
+            "error should flag left truncation, got: {err}"
+        );
+    }
+
+    /// EVID=3/4 resets on an RTTE subject would disturb the hazard clock mid-stream
+    /// (selective per-state reset is a later slice); simulation must reject them.
+    #[test]
+    fn rtte_simulate_resets_are_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let mut pop = rtte_pop();
+        pop.subjects[0].reset_times = vec![10.0];
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE simulation with resets must be rejected");
+        assert!(
+            err.contains("resets"),
+            "error should flag EVID=3/4 resets, got: {err}"
+        );
+    }
+
+    /// A single recurrent stream per subject only: multiple RTTE CMTs are a later slice
+    /// (they need a shared-horizon multi-stream draw). Simulation must reject them
+    /// rather than regenerate only the first CMT's stream.
+    #[test]
+    fn rtte_simulate_multiple_rtte_cmts_are_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        const TWO_RTTE: &str = r"
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+
+[event_model a]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+
+[event_model b]
+  cmt    = 3
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+";
+        let model = parse_model_string(TWO_RTTE).expect("two-RTTE model must parse");
+        let mut pop = common::tte_pop_from_pairs(&[(30.0, 0)]);
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 3,
+            },
+        ];
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("multi-CMT RTTE simulation must be rejected");
+        assert!(
+            err.contains("multiple CMTs"),
+            "error should flag multiple RTTE CMTs, got: {err}"
+        );
+    }
+
+    /// An RTTE cause combined with a competing single-event TTE cause is a later slice;
+    /// simulation must reject it rather than mix a recurrent stream with a one-shot draw.
+    #[test]
+    fn rtte_simulate_competing_single_tte_sibling_is_rejected() {
+        use ferx_core::{simulate_with_options, SimulateOptions};
+        const RTTE_PLUS_TTE: &str = r"
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+
+[event_model recurrent]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+
+[event_model single]
+  cmt    = 3
+  family = exponential
+  scale  = TVLAMBDA
+";
+        let model = parse_model_string(RTTE_PLUS_TTE).expect("RTTE + TTE model must parse");
+        let mut pop = common::tte_pop_from_pairs(&[(30.0, 0)]);
+        pop.subjects[0].obs_records = vec![
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 30.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 3,
+            },
+        ];
+        let opts = SimulateOptions {
+            seed: Some(1),
+            match_method: None,
+            horizon: Some(30.0),
+        };
+        let err = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect_err("RTTE + competing single-TTE simulation must be rejected");
+        assert!(
+            err.contains("competing single-event TTE"),
+            "error should flag the competing single-event TTE sibling, got: {err}"
         );
     }
 

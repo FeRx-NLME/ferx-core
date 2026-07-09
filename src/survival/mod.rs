@@ -716,6 +716,165 @@ fn draw_ode_tte_latent<R: rand::Rng>(
     }
 }
 
+/// Identify a subject's single **RTTE** (repeated-event) cause: its CMT, clock,
+/// hazard family, and the analytic hazard parameters at `(theta, eta,
+/// covariates)`. Returns `None` for a non-RTTE subject — the common single /
+/// competing single-TTE path in [`simulate_tte`].
+///
+/// An RTTE endpoint is a *recurrent* process: all of a subject's rows at that CMT
+/// belong to **one** stream, not a set of competing single events, so it must be
+/// detected and routed away from the competing-risks branch. Tight scope (Slice
+/// 3.3): a model reaching simulation has at most one RTTE CMT and no competing
+/// single-event TTE sibling — [`crate::api::validate_tte_simulatable`] rejects
+/// both up front. This re-establishes the load-bearing invariants rather than
+/// trust the caller: a non-analytic hazard (parser rejects `rtte` + ODE hazard)
+/// or a second distinct RTTE CMT slipping past the guard is a **bug**, so it
+/// panics rather than silently dropping a recurrent stream.
+#[cfg(feature = "survival")]
+fn rtte_cause(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(usize, RtteClock, HazardFamily, Vec<f64>)> {
+    let mut found: Option<(usize, RtteClock, HazardFamily, Vec<f64>)> = None;
+    for record in &subject.obs_records {
+        let ObsRecord::Event { cmt, .. } = record;
+        let Some(EndpointLikelihood::Tte {
+            hazard,
+            recurrence: TteRecurrence::Repeated { clock },
+        }) = model.endpoints.get(cmt)
+        else {
+            continue;
+        };
+        // The parser rejects `type = rtte` with an ODE-accumulated hazard, so only
+        // the analytic closed form reaches simulation.
+        let HazardSpec::Analytic { family, param_fn } = hazard else {
+            panic!(
+                "RTTE endpoint on CMT={cmt} carries a non-analytic hazard; the parser rejects \
+                 `type = rtte` with an ODE-accumulated `hazard = ...`, so this is unreachable"
+            );
+        };
+        match &found {
+            None => {
+                found = Some((
+                    *cmt,
+                    *clock,
+                    *family,
+                    param_fn(theta, eta, &subject.covariates),
+                ));
+            }
+            // Additional rows on the same CMT belong to the same recurrent stream;
+            // one call to `simulate_rtte_stream` regenerates all of them.
+            Some((c0, ..)) if *c0 == *cmt => {}
+            Some((c0, ..)) => panic!(
+                "subject '{}' has RTTE causes on multiple CMTs ({c0} and {cmt}); \
+                 api::validate_tte_simulatable must reject multi-cause RTTE simulation",
+                subject.id
+            ),
+        }
+    }
+    found
+}
+
+/// Generate one subject's **RTTE** (repeated-event) stream to the administrative
+/// `horizon` and append the rows. Analytic hazard only (the parser rejects `rtte`
+/// + ODE hazard).
+///
+/// - **clock-forward** (Andersen–Gill, absolute time): each next event is drawn
+///   *conditional on survival past the previous event* via the closed-form
+///   [`sample_conditional_event_time`] (which solves `H(T) − H(t_prev) = −log U`).
+///   The hazard clock never resets, so a time-varying hazard (e.g. Weibull) keeps
+///   accumulating over `[0, horizon]`.
+/// - **clock-reset** (renewal, gap time): each inter-event gap is a fresh draw
+///   from `t = 0` via [`sample_event_time`]; event times accumulate the gaps. The
+///   hazard clock restarts at every event.
+///
+/// Emits one `Event { observed = true }` row per event strictly before `horizon`,
+/// then one `Event { observed = false }` administrative-censoring row **at**
+/// `horizon`. A subject with no event before the horizon yields just the censor
+/// row. This is exactly the reference RTTE layout (`DV = 1` event rows followed by
+/// a trailing `DV = 0` at the horizon), so simulated data round-trips through the
+/// data reader back to the same records.
+///
+/// **Termination.** Each event strictly advances time by a positive amount (the
+/// samplers return `t > t_prev` or the degenerate `f64::MAX` sentinel, which is
+/// `≥ horizon` and stops the loop), and the horizon is finite, so the loop
+/// terminates. A pathological parameterization (vanishing inter-event gaps) is
+/// caught by a hard event cap that **panics** rather than hanging or silently
+/// truncating the stream (which would fabricate a censored subject).
+#[cfg(feature = "survival")]
+#[allow(clippy::too_many_arguments)]
+fn simulate_rtte_stream<R: rand::Rng>(
+    family: HazardFamily,
+    params: &[f64],
+    clock: RtteClock,
+    horizon: f64,
+    cmt: usize,
+    id: &str,
+    draw: usize,
+    sim: usize,
+    rng: &mut R,
+    results: &mut Vec<crate::api::SimulationResult>,
+) {
+    let push = |time: f64, observed: bool, results: &mut Vec<crate::api::SimulationResult>| {
+        results.push(crate::api::SimulationResult {
+            draw,
+            sim,
+            id: id.to_string(),
+            time,
+            cmt,
+            ipred: f64::NAN,
+            outcome: SimOutcome::Event { time, observed },
+        });
+    };
+
+    // Backstop against a degenerate hazard whose inter-event gaps vanish: fail
+    // loud instead of hanging or silently capping the stream.
+    const MAX_EVENTS: usize = 1_000_000;
+    let mut t_prev = 0.0_f64;
+    let mut n_events = 0usize;
+    loop {
+        let u: f64 = rng.sample(rand::distr::Open01);
+        let t_next = match clock {
+            // Absolute-time hazard: condition the next event on survival past the
+            // previous one. From `t_prev = 0` this equals a fresh draw, and for a
+            // memoryless (Exponential) hazard it equals the reset draw below.
+            RtteClock::Forward => sample_conditional_event_time(family, params, t_prev, u),
+            // Renewal: a fresh gap from 0, accumulated onto the previous event. A
+            // degenerate `f64::MAX` gap must stay `≥ horizon` (not overflow to a
+            // finite value), so guard the addition.
+            RtteClock::Reset => {
+                let gap = sample_event_time(family, params, u);
+                if gap >= f64::MAX - t_prev {
+                    f64::MAX
+                } else {
+                    t_prev + gap
+                }
+            }
+        };
+        // Record the event only while the draw lands strictly before the horizon. A
+        // draw that reaches the horizon, the degenerate `f64::MAX` sentinel, or a NaN
+        // all fail this test (`NaN < horizon` is false), ending the stream: the subject
+        // is administratively right-censored at the horizon.
+        if t_next < horizon {
+            push(t_next, true, results);
+            t_prev = t_next;
+            n_events += 1;
+            assert!(
+                n_events < MAX_EVENTS,
+                "RTTE simulation for subject '{id}' (CMT={cmt}) produced over {MAX_EVENTS} \
+                 events before horizon {horizon} — the hazard parameters are degenerate \
+                 (vanishing inter-event gaps)"
+            );
+        } else {
+            break;
+        }
+    }
+    // Trailing administrative right-censoring row at the horizon.
+    push(horizon, false, results);
+}
+
 /// Draw TTE event/censoring outcomes for a subject and append them to `results`.
 ///
 /// Called from `api::simulate_inner_with_draw` after the Gaussian path. Each
@@ -759,6 +918,32 @@ pub fn simulate_tte<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<crate::api::SimulationResult>,
 ) {
+    // Repeated events (RTTE, Slice 3.3) are a *recurrent* process, not competing
+    // single events: a subject's rows at the RTTE CMT are one stream to be
+    // regenerated to the horizon. Detect and route it first, so the single /
+    // competing path below stays byte-identical for non-RTTE models. The tight-scope
+    // invariants (single RTTE CMT, no competing single-TTE sibling, finite horizon,
+    // entry_time == 0) are enforced fail-loud in `api::validate_tte_simulatable`.
+    if let Some((cmt, clock, family, params)) = rtte_cause(model, subject, theta, eta) {
+        let horizon = horizon.expect(
+            "RTTE simulation requires a finite horizon; the simulate entry points validate this \
+             before sampling",
+        );
+        simulate_rtte_stream(
+            family,
+            &params,
+            clock,
+            horizon,
+            cmt,
+            &subject.id,
+            draw,
+            sim,
+            rng,
+            results,
+        );
+        return;
+    }
+
     // Each TTE cause (a record routed to a `Tte` endpoint) carries its observation
     // window and the kind of hazard that draws its latent event time. A subject may
     // also carry non-TTE records; those are skipped here.
@@ -1789,6 +1974,283 @@ mod tests {
                 "a degenerate (no-event) draw must never be reported as an observed event"
             );
             assert_eq!(t, f64::INFINITY, "censored at the (unbounded) window");
+        }
+    }
+
+    // ── simulate_rtte_stream: repeated-event streams to the horizon (Slice 3.3) ──
+
+    /// Run one RTTE stream and return its observed event times, asserting the
+    /// structural invariants every stream must satisfy: it always ends with an
+    /// unobserved administrative-censoring row at exactly the horizon, and every
+    /// preceding row is an observed event strictly inside `(0, horizon)` in
+    /// increasing order (on the given CMT, with a NaN ipred).
+    fn rtte_stream_events<R: rand::Rng>(
+        family: HazardFamily,
+        params: &[f64],
+        clock: RtteClock,
+        horizon: f64,
+        rng: &mut R,
+    ) -> Vec<f64> {
+        let mut results = Vec::new();
+        simulate_rtte_stream(
+            family,
+            params,
+            clock,
+            horizon,
+            2,
+            "1",
+            0,
+            1,
+            rng,
+            &mut results,
+        );
+        assert!(!results.is_empty(), "a stream always emits the censor row");
+        let last = results.last().unwrap();
+        match last.outcome {
+            SimOutcome::Event { time, observed } => {
+                assert!(!observed, "the final row is the administrative censor");
+                assert_eq!(time, horizon, "the censor row sits at the horizon");
+            }
+            _ => panic!("RTTE stream must emit Event outcomes"),
+        }
+        let mut prev = 0.0_f64;
+        let mut events = Vec::new();
+        for r in &results[..results.len() - 1] {
+            match r.outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert!(observed, "non-final rows are observed events");
+                    assert!(
+                        time > prev && time < horizon,
+                        "events strictly sorted inside (0, horizon): {time} after {prev}"
+                    );
+                    prev = time;
+                    events.push(time);
+                }
+                _ => panic!("RTTE stream must emit Event outcomes"),
+            }
+        }
+        assert!(
+            results
+                .iter()
+                .all(|r| r.cmt == 2 && r.id == "1" && r.ipred.is_nan()),
+            "cmt / id / NaN-ipred echoed on every row"
+        );
+        events
+    }
+
+    #[test]
+    fn rtte_forward_exponential_count_is_poisson() {
+        use rand::SeedableRng;
+        // A constant hazard is a homogeneous Poisson process: N(T) ~ Poisson(λT).
+        // λ=0.15, T=20 ⇒ mean = var = 3.0. N=4000 ⇒ SE(mean) = √(3/4000) ≈ 0.027,
+        // so |mean − 3| < 0.15 is ~5σ; the dispersion var/mean must be ≈ 1 (a
+        // gamma/NB counting process would inflate it).
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_0001);
+        let (lambda, horizon, n) = (0.15_f64, 20.0_f64, 4000usize);
+        let counts: Vec<f64> = (0..n)
+            .map(|_| {
+                rtte_stream_events(
+                    HazardFamily::Exponential,
+                    &[lambda],
+                    RtteClock::Forward,
+                    horizon,
+                    &mut rng,
+                )
+                .len() as f64
+            })
+            .collect();
+        let mean = counts.iter().sum::<f64>() / n as f64;
+        let var = counts.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / n as f64;
+        let expected = lambda * horizon;
+        assert!(
+            (mean - expected).abs() < 0.15,
+            "mean events {mean} should track λT = {expected}"
+        );
+        assert!(
+            (var / mean - 1.0).abs() < 0.15,
+            "count dispersion var/mean = {} should be ≈ 1 (Poisson)",
+            var / mean
+        );
+    }
+
+    #[test]
+    fn rtte_forward_weibull_count_is_poisson() {
+        use rand::SeedableRng;
+        // Clock-forward with a time-varying hazard is a non-homogeneous Poisson
+        // process: N(T) ~ Poisson(H(T)) with H(T) = (T/scale)^shape. scale=10,
+        // shape=1.5, T=20 ⇒ H = 2^1.5 ≈ 2.828. This exercises the *conditional*
+        // sampling (each event drawn given survival past the previous) against the
+        // exact mean — a clock bug (e.g. resetting) would shift it.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_0002);
+        let (scale, shape, horizon, n) = (10.0_f64, 1.5_f64, 20.0_f64, 5000usize);
+        let mean = (0..n)
+            .map(|_| {
+                rtte_stream_events(
+                    HazardFamily::Weibull,
+                    &[scale, shape],
+                    RtteClock::Forward,
+                    horizon,
+                    &mut rng,
+                )
+                .len() as f64
+            })
+            .sum::<f64>()
+            / n as f64;
+        let expected = (horizon / scale).powf(shape);
+        assert!(
+            (mean - expected).abs() < 0.15,
+            "mean events {mean} should track H(T) = (T/scale)^shape = {expected}"
+        );
+    }
+
+    #[test]
+    fn rtte_forward_equals_reset_for_exponential() {
+        use rand::SeedableRng;
+        // Exponential is memoryless ⇒ clock-forward (condition on survival past the
+        // previous event) and clock-reset (fresh gap from 0) draw a *bit-identical*
+        // stream from the same seed.
+        let (lambda, horizon) = (0.3_f64, 25.0_f64);
+        let mut r_fwd = rand::rngs::StdRng::seed_from_u64(0xABCD_1234);
+        let mut r_rst = rand::rngs::StdRng::seed_from_u64(0xABCD_1234);
+        let fwd = rtte_stream_events(
+            HazardFamily::Exponential,
+            &[lambda],
+            RtteClock::Forward,
+            horizon,
+            &mut r_fwd,
+        );
+        let rst = rtte_stream_events(
+            HazardFamily::Exponential,
+            &[lambda],
+            RtteClock::Reset,
+            horizon,
+            &mut r_rst,
+        );
+        assert_eq!(fwd, rst, "exponential forward == reset (memoryless)");
+        assert!(
+            !fwd.is_empty(),
+            "expected events for λT = {}",
+            lambda * horizon
+        );
+    }
+
+    #[test]
+    fn rtte_forward_differs_from_reset_for_weibull() {
+        use rand::SeedableRng;
+        // Weibull is not memoryless ⇒ absolute-time (forward) and gap-time (reset)
+        // streams share only their first event and then diverge from the same seed.
+        let (scale, shape, horizon) = (4.0_f64, 2.0_f64, 40.0_f64);
+        let mut r_fwd = rand::rngs::StdRng::seed_from_u64(0x0011_2233);
+        let mut r_rst = rand::rngs::StdRng::seed_from_u64(0x0011_2233);
+        let fwd = rtte_stream_events(
+            HazardFamily::Weibull,
+            &[scale, shape],
+            RtteClock::Forward,
+            horizon,
+            &mut r_fwd,
+        );
+        let rst = rtte_stream_events(
+            HazardFamily::Weibull,
+            &[scale, shape],
+            RtteClock::Reset,
+            horizon,
+            &mut r_rst,
+        );
+        assert!(
+            fwd.len() >= 2 && rst.len() >= 2,
+            "need multiple events to compare clocks (fwd={}, rst={})",
+            fwd.len(),
+            rst.len()
+        );
+        assert!(
+            (fwd[0] - rst[0]).abs() < 1e-12,
+            "the first event is a fresh draw from 0 either way"
+        );
+        assert_ne!(
+            fwd, rst,
+            "Weibull forward and reset must diverge after the first event"
+        );
+    }
+
+    #[test]
+    fn rtte_reset_weibull_gaps_match_family_mean() {
+        use rand::SeedableRng;
+        // Renewal (reset): inter-event gaps are iid Weibull(scale, shape) ⇒ mean gap
+        // = scale·Γ(1 + 1/shape). For shape=2, Γ(1.5) = √π/2, so the mean is
+        // scale·√π/2 with no hard-coded gamma. Horizon ≫ mean gap keeps the
+        // (censored final gap excluded) bias negligible.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xFACE_0FF0);
+        let (scale, shape, horizon) = (3.0_f64, 2.0_f64, 80.0_f64);
+        let mut gaps = Vec::new();
+        for _ in 0..3000 {
+            let ev = rtte_stream_events(
+                HazardFamily::Weibull,
+                &[scale, shape],
+                RtteClock::Reset,
+                horizon,
+                &mut rng,
+            );
+            let mut prev = 0.0_f64;
+            for &t in &ev {
+                gaps.push(t - prev);
+                prev = t;
+            }
+        }
+        let mean_gap = gaps.iter().sum::<f64>() / gaps.len() as f64;
+        let expected = scale * std::f64::consts::PI.sqrt() / 2.0; // scale·Γ(1.5)
+        assert!(
+            (mean_gap - expected).abs() < 0.08,
+            "mean reset gap {mean_gap} should track scale·Γ(1+1/shape) = {expected} \
+             (n = {} gaps)",
+            gaps.len()
+        );
+    }
+
+    #[test]
+    fn rtte_stream_is_deterministic_for_seed() {
+        use rand::SeedableRng;
+        let run = || {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+            rtte_stream_events(
+                HazardFamily::Weibull,
+                &[5.0, 1.3],
+                RtteClock::Forward,
+                50.0,
+                &mut rng,
+            )
+        };
+        assert_eq!(run(), run(), "same seed ⇒ identical stream");
+    }
+
+    #[test]
+    fn rtte_stream_zero_hazard_emits_only_censor_row() {
+        use rand::SeedableRng;
+        // λ=0 ⇒ every draw is the degenerate f64::MAX sentinel ⇒ no events, just the
+        // trailing censor at the horizon. Must not hang or panic, on either clock.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        let horizon = 15.0_f64;
+        for clock in [RtteClock::Forward, RtteClock::Reset] {
+            let mut results = Vec::new();
+            simulate_rtte_stream(
+                HazardFamily::Exponential,
+                &[0.0],
+                clock,
+                horizon,
+                2,
+                "s",
+                0,
+                1,
+                &mut rng,
+                &mut results,
+            );
+            assert_eq!(results.len(), 1, "{clock:?}: only the censor row");
+            match results[0].outcome {
+                SimOutcome::Event { time, observed } => {
+                    assert_eq!(time, horizon);
+                    assert!(!observed);
+                }
+                _ => panic!("expected an Event outcome"),
+            }
         }
     }
 

@@ -6443,10 +6443,20 @@ pub struct SimulateOptions {
 /// Validate the preventable preconditions of TTE event-time simulation, returning a
 /// clear `Err` for a caller to act on.
 ///
-/// **Repeated events (RTTE, `type = rtte`) are rejected outright**: `simulate_tte`
-/// draws a single latent per cause, so an RTTE subject's records would be simulated as
-/// competing single events (earliest wins), not a recurrent stream. RTTE simulation is
-/// a later slice (3.3); fail loud rather than emit silently-wrong single-event data.
+/// **Repeated events (RTTE, `type = rtte`, Slice 3.3)** are simulated as a recurrent
+/// stream by `simulate_rtte_stream` (analytic hazards only). Several preconditions are
+/// *user-fixable* and would otherwise corrupt the stream silently, so they are rejected
+/// here (a clean `Err` from `simulate_with_options`; the `Vec`-returning entry points
+/// re-raise the same message as a panic):
+/// - a **finite, positive horizon** is required — the recurrent stream is generated up
+///   to that administrative window; there is no implicit one;
+/// - **left truncation** (`entry_time > 0`) is a deferred follow-up (conditional
+///   first-gap sampling past entry), so `entry_time == 0` is required;
+/// - exactly **one recurrent stream per subject** — multiple RTTE CMTs, or an RTTE
+///   cause mixed with a competing single-event TTE cause, are a later slice (they need
+///   a shared-horizon multi-stream draw);
+/// - **EVID-3/4 resets** are rejected — a reset would disturb the hazard clock
+///   mid-stream (selective per-state reset is a later slice).
 ///
 /// For **ODE-accumulated (joint PK-TTE)** endpoints, a model with no such endpoint is
 /// otherwise unaffected (returns `Ok`).
@@ -6470,11 +6480,31 @@ fn validate_tte_simulatable(
     horizon: Option<f64>,
 ) -> Result<(), String> {
     use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord, TteRecurrence};
-    // RTTE (repeated-event) simulation is a later slice (3.3): the single-latent draw in
-    // `simulate_tte` would turn a subject's K event rows into K competing single events
-    // (earliest wins, the rest censored) — a silent wrong answer. Reject it here so every
-    // simulate entry point (`simulate*`, uncertainty) fails loudly instead.
-    if model.endpoints.values().any(|e| {
+
+    // RTTE (repeated-event, Slice 3.3) preconditions. The stream generator
+    // (`survival::simulate_rtte_stream`) handles a single analytic recurrent cause
+    // per subject; the cases below are user-fixable and would otherwise corrupt the
+    // draw silently, so reject them at every simulate entry point (`simulate*`,
+    // uncertainty).
+    let is_rtte = |cmt: &usize| {
+        matches!(
+            model.endpoints.get(cmt),
+            Some(EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Repeated { .. },
+                ..
+            })
+        )
+    };
+    let is_single_tte = |cmt: &usize| {
+        matches!(
+            model.endpoints.get(cmt),
+            Some(EndpointLikelihood::Tte {
+                recurrence: TteRecurrence::Single,
+                ..
+            })
+        )
+    };
+    let has_rtte = model.endpoints.values().any(|e| {
         matches!(
             e,
             EndpointLikelihood::Tte {
@@ -6482,13 +6512,71 @@ fn validate_tte_simulatable(
                 ..
             }
         )
-    }) {
-        return Err(
-            "Repeated time-to-event (RTTE, `type = rtte`) simulation is not yet supported \
-             (Slice 3.3): `simulate()` would draw a single event per subject rather than a \
-             recurrent stream. Fitting RTTE is supported; simulation is a later slice."
-                .to_string(),
-        );
+    });
+    if has_rtte {
+        // A finite, positive administrative horizon bounds the recurrent stream.
+        match horizon {
+            Some(h) if h.is_finite() && h > 0.0 => {}
+            _ => {
+                return Err(
+                    "Repeated time-to-event (RTTE, `type = rtte`) simulation requires a finite, \
+                     positive administrative horizon: set `[simulation] horizon` (or \
+                     `SimulateOptions.horizon`). The recurrent event stream is generated up to \
+                     that horizon."
+                        .to_string(),
+                );
+            }
+        }
+        for subject in &population.subjects {
+            // Distinct RTTE CMTs on this subject, plus whether it also carries a
+            // competing single-event TTE cause (a non-recurrent `Tte` sibling).
+            let mut rtte_cmts = std::collections::BTreeSet::new();
+            let mut has_single_tte_sibling = false;
+            for r in &subject.obs_records {
+                let ObsRecord::Event {
+                    cmt, entry_time, ..
+                } = r;
+                if is_rtte(cmt) {
+                    rtte_cmts.insert(*cmt);
+                    if *entry_time > 0.0 {
+                        return Err(format!(
+                            "RTTE (`type = rtte`) simulation does not support left truncation \
+                             (entry_time={entry_time} for subject '{}' on CMT={cmt}); conditional \
+                             first-gap sampling past entry is a deferred follow-up",
+                            subject.id
+                        ));
+                    }
+                } else if is_single_tte(cmt) {
+                    has_single_tte_sibling = true;
+                }
+            }
+            if rtte_cmts.is_empty() {
+                continue;
+            }
+            if rtte_cmts.len() > 1 {
+                return Err(format!(
+                    "RTTE simulation supports one recurrent stream per subject, but subject '{}' \
+                     has RTTE endpoints on multiple CMTs ({:?}); multi-cause RTTE simulation is a \
+                     later slice",
+                    subject.id, rtte_cmts
+                ));
+            }
+            if has_single_tte_sibling {
+                return Err(format!(
+                    "RTTE simulation does not support an RTTE cause combined with a competing \
+                     single-event TTE cause on subject '{}'; simulate them separately",
+                    subject.id
+                ));
+            }
+            if !subject.reset_times.is_empty() {
+                return Err(format!(
+                    "RTTE simulation does not support EVID=3/4 resets (a reset would disturb the \
+                     hazard clock mid-stream; selective per-state reset is a later slice); subject \
+                     '{}' has resets",
+                    subject.id
+                ));
+            }
+        }
     }
     let is_ode_tte = |cmt: &usize| {
         matches!(
