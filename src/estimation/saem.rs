@@ -433,7 +433,10 @@ fn obs_nll_subject_into_iov(
         use crate::survival::tte_data_term;
         use crate::types::EndpointLikelihood;
         for (cmt, endpoint) in &model.endpoints {
-            if let EndpointLikelihood::Tte { hazard, recurrence } = endpoint {
+            if let EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } = endpoint
+            {
                 let records_for_cmt: Vec<crate::types::ObsRecord> = subject
                     .obs_records
                     .iter()

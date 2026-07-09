@@ -825,6 +825,48 @@ impl Subject {
     pub fn pk_only_cov(&self, m: usize) -> &HashMap<String, f64> {
         self.pk_only_covariates.get(m).unwrap_or(&self.covariates)
     }
+
+    /// Names of covariates whose value **varies within this subject**, i.e. is
+    /// not constant across the per-observation / per-dose / per-EVID2 LOCF
+    /// snapshots. Returns an empty vector when the subject has no time-varying
+    /// covariates (the common case — snapshots are empty or all equal).
+    ///
+    /// This is the *which-covariate* companion to the boolean
+    /// [`has_tv_covariates`](Self::has_tv_covariates): guards that only care
+    /// whether a *specific* referenced covariate varies (e.g. survival hazards,
+    /// #741) intersect this set with their reference list, rather than rejecting
+    /// on the mere presence of any time-varying covariate. Unlike
+    /// `has_tv_covariates`, it also inspects `pk_only_covariates` (EVID=2 rows),
+    /// so a covariate that changes only on an "other event" row is detected.
+    /// Names are returned sorted for a deterministic diagnostic.
+    pub fn time_varying_covariate_names(&self) -> Vec<String> {
+        // First value seen per covariate; a later differing value marks it varying.
+        let mut first_seen: HashMap<&str, f64> = HashMap::new();
+        let mut varying: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let snapshots = self
+            .obs_covariates
+            .iter()
+            .chain(self.dose_covariates.iter())
+            .chain(self.pk_only_covariates.iter());
+        for snap in snapshots {
+            for (name, &val) in snap {
+                match first_seen.get(name.as_str()) {
+                    // Exact inequality is correct: values are LOCF copies of the
+                    // parsed CSV f64, so a genuine change differs bit-for-bit and a
+                    // carried-forward value is identical. A NaN covariate (which
+                    // should not occur) compares unequal and is conservatively flagged.
+                    Some(&prev) if prev != val => {
+                        varying.insert(name.clone());
+                    }
+                    Some(_) => {}
+                    None => {
+                        first_seen.insert(name.as_str(), val);
+                    }
+                }
+            }
+        }
+        varying.into_iter().collect()
+    }
 }
 
 /// Summary of records excluded by `[data_selection]` `ignore`/`accept` rules.
@@ -2638,6 +2680,15 @@ pub enum EndpointLikelihood {
         /// Single event (standard TTE) vs. repeated events (RTTE). Defaults to
         /// `Single`; set to `Repeated` only when the model declares `type = rtte`.
         recurrence: TteRecurrence,
+        /// Covariate names referenced by this hazard's **closed-form parameters**
+        /// (analytic families — scale/shape/alpha/gamma/loghr). The analytic hazard
+        /// is evaluated once per record with a *baseline* covariate snapshot (the
+        /// [`HazardParamFn`] takes no time argument), so a time-varying covariate
+        /// here would be silently frozen; [`crate::api::check_survival_tv_covariates`]
+        /// rejects that up front (#741). Empty for [`HazardSpec::OdeAccumulated`],
+        /// whose covariate dependencies flow through the ODE system and are guarded
+        /// by the whole-subject time-varying-covariate check instead.
+        hazard_covariates: Vec<String>,
     },
     // Binary, Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
 }
@@ -2647,7 +2698,9 @@ impl std::fmt::Debug for EndpointLikelihood {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EndpointLikelihood::Gaussian(e) => write!(f, "Gaussian({e:?})"),
-            EndpointLikelihood::Tte { hazard, recurrence } => {
+            EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } => {
                 write!(f, "Tte({hazard:?}, {recurrence:?})")
             }
         }
@@ -7126,6 +7179,48 @@ mod tests {
         assert!(s.has_censored_observation());
         s.cens = vec![-1, 0];
         assert!(s.has_censored_observation());
+    }
+
+    #[test]
+    fn time_varying_covariate_names_detects_only_varying_covariates() {
+        let mut s = bare_subject("1");
+        // WT varies across obs snapshots; SEX is constant → only WT is reported.
+        s.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0), ("SEX".to_string(), 1.0)]),
+            HashMap::from([("WT".to_string(), 80.0), ("SEX".to_string(), 1.0)]),
+        ];
+        assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
+    }
+
+    #[test]
+    fn time_varying_covariate_names_empty_when_constant_or_absent() {
+        // No snapshots at all → empty.
+        let s = bare_subject("1");
+        assert!(s.time_varying_covariate_names().is_empty());
+        // Present but constant across snapshots → empty.
+        let mut s2 = bare_subject("2");
+        s2.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 70.0)]),
+        ];
+        assert!(s2.time_varying_covariate_names().is_empty());
+    }
+
+    #[test]
+    fn time_varying_covariate_names_inspects_pk_only_rows() {
+        // A covariate that changes only across EVID=2 (pk-only) rows is time-varying —
+        // this is the case `has_tv_covariates()` misses (it inspects only obs/dose
+        // snapshots), so with obs/dose empty it reports no TV covariates at all.
+        let mut s = bare_subject("1");
+        s.pk_only_covariates = vec![
+            HashMap::from([("CRCL".to_string(), 100.0)]),
+            HashMap::from([("CRCL".to_string(), 60.0)]),
+        ];
+        assert!(
+            !s.has_tv_covariates(),
+            "has_tv_covariates inspects only obs/dose rows, so it is blind to pk_only variation"
+        );
+        assert_eq!(s.time_varying_covariate_names(), vec!["CRCL".to_string()]);
     }
 
     #[test]

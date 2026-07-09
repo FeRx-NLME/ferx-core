@@ -364,6 +364,77 @@ mod survival_smoke {
         pop
     }
 
+    /// A single-TTE exponential model whose hazard carries a PH covariate (`CRCL`
+    /// via `loghr`), paired with one subject whose `CRCL` is time-varying. This is
+    /// the #741 fixture: the hazard would otherwise be silently evaluated at the
+    /// baseline `CRCL`.
+    fn tv_cov_hazard_model_and_pop() -> (ferx_core::types::CompiledModel, Population) {
+        use std::collections::HashMap;
+        const M: &str = r"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta TVBETA(0.1, -5.0, 5.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+  loghr  = TVBETA * CRCL
+
+[fit_options]
+  method  = focei
+  maxiter = 3
+";
+        let model = parse_model_string(M).expect("TV-cov hazard model must parse");
+        let mut pop = common::tte_pop_from_pairs(&[(30.0, 0)]);
+        pop.covariate_names = vec!["CRCL".to_string()];
+        pop.subjects[0].covariates = HashMap::from([("CRCL".to_string(), 100.0)]);
+        pop.subjects[0].obs_covariates = vec![
+            HashMap::from([("CRCL".to_string(), 100.0)]),
+            HashMap::from([("CRCL".to_string(), 60.0)]),
+        ];
+        (model, pop)
+    }
+
+    /// `fit()` rejects a time-varying covariate on a survival hazard rather than
+    /// silently freezing it at baseline (#741). Regression for the analytic path.
+    #[test]
+    fn tv_cov_hazard_fit_is_rejected() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let opts = FitOptions::default();
+        let err = fit(&model, &pop, &model.default_params, &opts)
+            .expect_err("a time-varying covariate on the hazard must be rejected by fit()");
+        assert!(err.contains("#741"), "error must cite the issue: {err}");
+        assert!(err.contains("CRCL"), "error must name the covariate: {err}");
+    }
+
+    /// `predict()` panics on the same combination — the non-`fit` entry points cannot
+    /// honour a silently-frozen hazard either (#741).
+    #[test]
+    #[should_panic(expected = "#741")]
+    fn tv_cov_hazard_predict_panics() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let _ = ferx_core::predict(&model, &pop, &model.default_params);
+    }
+
+    /// `simulate()` panics on the same combination for the same reason (#741).
+    #[test]
+    #[should_panic(expected = "#741")]
+    fn tv_cov_hazard_simulate_panics() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 0);
+    }
+
+    /// `predict_survival()` panics too — the survival curves read the hazard at the
+    /// frozen baseline covariate, so a time-varying covariate must fail loudly (#741).
+    #[test]
+    #[should_panic(expected = "#741")]
+    fn tv_cov_hazard_predict_survival_panics() {
+        let (model, pop) = tv_cov_hazard_model_and_pop();
+        let _ = ferx_core::predict_survival(&model, &pop, &model.default_params, &[1.0, 5.0, 10.0]);
+    }
+
     /// A clock-forward RTTE model fits end-to-end (finite OFV) through the telescoping
     /// likelihood, and — under the Laplace-based default method — surfaces the ω²
     /// underestimation warning. Tier-2: capped at 3 outer iterations, no convergence.
@@ -470,6 +541,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let pop = rtte_pop();
@@ -603,6 +675,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let mut pop = rtte_pop();
@@ -661,6 +734,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let mut pop = rtte_pop();
@@ -714,6 +788,7 @@ mod survival_smoke {
                 recurrence: TteRecurrence::Repeated {
                     clock: RtteClock::Reset,
                 },
+                hazard_covariates: Vec::new(),
             },
         );
         let mut pop = rtte_pop();

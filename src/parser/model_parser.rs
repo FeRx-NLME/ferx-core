@@ -3912,6 +3912,10 @@ fn parse_event_model_block(
             EndpointLikelihood::Tte {
                 hazard: HazardSpec::OdeAccumulated { chz_state },
                 recurrence,
+                // The ODE-accumulated hazard's covariate dependencies flow through the
+                // injected `d/dt(__chz)` derivative; the whole-subject time-varying check
+                // (the ODE solve freezes PK params at t=0) guards them, not this list.
+                hazard_covariates: Vec::new(),
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -4150,6 +4154,7 @@ fn parse_event_model_block(
         EndpointLikelihood::Tte {
             hazard: HazardSpec::Analytic { family, param_fn },
             recurrence,
+            hazard_covariates: event_model_covariates.clone(),
         },
         event_model_covariates,
         event_model_thetas,

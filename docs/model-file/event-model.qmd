@@ -133,7 +133,10 @@ Notes:
   [Simulating repeated events](../estimation/tte.qmd#simulating-repeated-events) for the
   method and validation. A finite horizon is required; left truncation, multiple RTTE
   causes, an RTTE cause mixed with a competing single-event cause, and EVID=3/4 resets
-  are rejected rather than silently mis-sampled.
+  are rejected rather than silently mis-sampled. The stream is **regenerated from
+  `t = 0`**, so — unlike fitting — `simulate()` does not read the input event rows: the
+  fit-boundary input-shape checks above (sort order, interval censoring, finite times) do
+  not apply to it.
 
 ## TTE-only models
 

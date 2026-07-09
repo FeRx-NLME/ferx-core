@@ -743,6 +743,7 @@ fn rtte_cause(
         let Some(EndpointLikelihood::Tte {
             hazard,
             recurrence: TteRecurrence::Repeated { clock },
+            ..
         }) = model.endpoints.get(cmt)
         else {
             continue;
@@ -1192,6 +1193,7 @@ mod tests {
                 param_fn,
             },
             recurrence: TteRecurrence::Single,
+            hazard_covariates: Vec::new(),
         };
         let (family, params) =
             tte_cause_params(&tte, &theta, &eta, &cov).expect("Tte endpoint must yield Some");
@@ -1211,6 +1213,7 @@ mod tests {
         let ode = EndpointLikelihood::Tte {
             hazard: HazardSpec::OdeAccumulated { chz_state: 2 },
             recurrence: TteRecurrence::Single,
+            hazard_covariates: Vec::new(),
         };
         assert!(tte_cause_params(&ode, &theta, &eta, &cov).is_none());
     }

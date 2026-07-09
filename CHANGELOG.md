@@ -179,6 +179,16 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **A time-varying covariate on a survival hazard is now a hard error instead of a
+  silently frozen baseline value** (#741). A `[event_model]` hazard that references a
+  covariate whose value changes within a subject was evaluated at the covariate's
+  baseline — the analytic hazard families take no time argument, and the joint PK-TTE
+  ODE hazard integrates with the PK parameters frozen at `t=0` — so the fit or
+  simulation silently used the wrong hazard across every TTE / RTTE / competing-risks /
+  joint-PK-TTE endpoint. `fit()` now rejects it (and `predict()` / `simulate()` panic),
+  naming the covariate and the subject. A time-varying covariate the hazard does *not*
+  reference — e.g. one used only by a shared PK model in a frailty-only joint fit — is
+  unaffected. Hold the covariate constant within each subject for now.
 - **A dataset with dose rows but no `AMT` column is now a hard error instead of a
   silent bad fit** (#753). When the amount column is named something other than
   `AMT` (e.g. a NONMEM export using `DOSE`), every dose parsed with amount 0, so no
