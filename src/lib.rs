@@ -6,6 +6,8 @@ pub mod environment;
 pub mod estimation;
 pub mod frem;
 pub mod io;
+#[cfg(feature = "markov")]
+pub mod markov;
 #[cfg(feature = "nn")]
 pub mod nn;
 pub mod ode;

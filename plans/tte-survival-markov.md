@@ -358,16 +358,20 @@ log L_i(η) = Σ_{m=0}^{n_i−1} log [P(Δt_m)]_{s_m, s_{m+1}}
 
 Dataset: `(ID, TIME, STATE)` pairs — **no EVID=3 rows**. DV carries integer state index.
 
-For **gradients of P w.r.t. Q entries**, the Van Loan (1978) block-matrix Padé identity
-(this is **exact**, not an approximation):
+For **gradients of P w.r.t. the rate parameters**, the Van Loan (1978)
+block-matrix Padé identity gives the Fréchet derivative in a direction `E` (this
+is **exact**, not an approximation):
 
 ```
-∂/∂λ_jk expm(Q) = [expm([[Q, E_jk], [0, Q]])]_{1:S, S+1:2S}
+L(Q, E) = ∂/∂t expm(Q + tE)|₀ = [expm([[Q, E], [0, Q]])]_{1:S, S+1:2S}
 ```
 
-where `E_jk` is the matrix with 1 in position (j,k) and 0 elsewhere. One 2S×2S matrix
-exponential per parameter gives the exact derivative without finite differences.
-For S=3 states: a 6×6 matrix exponential per parameter (fast).
+One 2S×2S matrix exponential per direction gives the exact derivative without
+finite differences (for S=3, a 6×6 exp per parameter — fast). **The direction is
+constrained:** a generator's diagonal is fixed by its off-diagonals
+(`q_jj = −Σ_{k≠j} q_jk`), so the derivative w.r.t. rate `q_jk` uses
+`E = (E_jk − E_jj)·Δt`, not a bare single-entry `E_jk` — see §9.7. (Details and
+the implemented `matrix_exp_frechet` primitive: §8.7.)
 
 #### mCTMM (minimal CTMM) — highly recommended as stepping stone
 
@@ -1439,36 +1443,57 @@ fn laplace_objective_nongaussian(
 
 ### 8.7 CTMM matrix exponential module
 
-New file `src/markov/mod.rs`:
+`src/markov/mod.rs` — gated behind the `markov` cargo feature. **The matrix
+exponential is not hand-rolled:** nalgebra 0.35 already ships the Higham (2005)
+scaling-and-squaring Padé as `DMatrix::exp()` (see D4), so `matrix_exp` is a thin
+wrapper and the module adds **zero dependencies**. Public API as built (leaf PR,
+#759):
 
 ```rust
-/// 13th-order scaling-and-squaring Padé approximant (Higham 2005).
-/// Stable for any Q with ‖Q‖ reasonable; rescale if ‖Q‖₁ > 1.
+/// P(Δt) = expm(A) for A = Q·Δt. Thin wrapper over nalgebra's `DMatrix::exp()`
+/// (Higham 2005 scaling-and-squaring Padé). Round-off is NOT clamped here — the
+/// likelihood inspects only the one selected entry.
 pub fn matrix_exp(a: &DMatrix<f64>) -> DMatrix<f64>;
 
-/// Gradient of matrix_exp(Q) w.r.t. Q[j,k] using the Van Loan (1978) block trick:
-///   ∂ expm(Q) / ∂ Q[j,k] = [expm([[Q, E_jk],[0,Q]])]_{1:S, S+1:2S}
-/// Returns a slice of S×S gradient matrices, one per non-zero Q entry.
-pub fn matrix_exp_grad(q: &DMatrix<f64>, entries: &[(usize,usize)]) -> Vec<DMatrix<f64>>;
+/// Exact Fréchet derivative L(A,E) = d/dt expm(A + tE)|₀ via the Van Loan (1978)
+/// block trick: [ expm([[A,E],[0,A]]) ]_{upper-right}. DIRECTIONAL — the caller
+/// supplies the perturbation E — because a generator's rate parameters are
+/// CONSTRAINED (rows sum to 0), so ∂/∂q_jk is the derivative in the direction
+/// (E_jk − E_jj)·Δt, NOT the derivative w.r.t. a single free matrix entry. (An
+/// earlier draft of this section returned "one gradient per Q entry", which
+/// silently ignores the row-sum-zero constraint — the corrected primitive is
+/// directional.)
+pub fn matrix_exp_frechet(a: &DMatrix<f64>, e: &DMatrix<f64>) -> DMatrix<f64>;
 
-/// CTMM individual data term: -Σ log P[s_{k+1} | s_k, Δt_k, Q(η,θ)]
-pub fn ctmm_data_term(q: &DMatrix<f64>, records: &[(f64, usize)]) -> f64;
+/// The constrained direction (E_jk − E_jj)·dt for rate parameter q_jk of an
+/// s-state generator. Feed with A = Q·dt to `matrix_exp_frechet` for ∂P(dt)/∂q_jk.
+pub fn generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> DMatrix<f64>;
 
-/// Time-inhomogeneous transition: solve dP/dt = Q(C(t))·P, P(0)=I using RK45.
-/// Returns P(Δt) as S×S matrix.
-pub fn ctmm_inhomogeneous_transition(
-    q_at_c: impl Fn(f64) -> DMatrix<f64>,
-    delta_t: f64,
-    n_states: usize,
-) -> DMatrix<f64>;
-
-/// Forward algorithm for HMM (future phase): O(T×S²), log-sum-exp stable.
-pub fn hmm_log_likelihood(
-    transitions: &DMatrix<f64>,     // P(s'|s) row-stochastic
-    emissions:   &[Vec<f64>],       // p(y_t | s) for each time
-    init_dist:   &[f64],
-) -> f64;
+/// Individual CTMM NLL = −Σ log P(Δtₘ)[sₘ, sₘ₊₁] for a PREBUILT generator.
+/// Fail-loud guard layer (never a silent −inf, never a panic on bad input):
+///   • structural/data errors → Err(MarkovError): non-square/too-small Q, state
+///     index out of range, non-finite time, decreasing time, two distinct states
+///     at Δt=0;
+///   • parameter-driven degeneracy (an observed transition whose probability
+///     underflowed to non-positive) → Ok(1e20) sentinel, matching the `survival`
+///     module's convention (repels the optimizer, keeps the fit alive).
+pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovError>;
 ```
+
+**Deferred to later phases — NOT in the leaf** (shipping their signatures now
+would be dead code and a coverage hole behind the same flag):
+
+```rust
+/// Phase 6 — time-inhomogeneous transition: solve dP/dt = Q(C(t))·P, P(0)=I (RK45).
+pub fn ctmm_inhomogeneous_transition(q_at_c: impl Fn(f64) -> DMatrix<f64>, delta_t: f64, n_states: usize) -> DMatrix<f64>;
+
+/// Phase 7 — HMM forward algorithm: O(T×S²), log-sum-exp stable.
+pub fn hmm_log_likelihood(transitions: &DMatrix<f64>, emissions: &[Vec<f64>], init_dist: &[f64]) -> f64;
+```
+
+The leaf ships `matrix_exp` + `matrix_exp_frechet` + `generator_rate_direction`
++ `ctmm_data_term` + a Tier-1 test battery (§14.10). Building `Q(η,θ)` from the
+model, the FOCEI/SAEM wiring, and the `Population → StateObs` reader are Phase 5.
 
 ### 8.8 Simulation, Prediction & Diagnostics
 
@@ -1844,22 +1869,34 @@ significant. Expose as `[fit_options] cila_samples = 50`.
 
 ### 9.7 Van Loan block trick for CTMM gradients
 
-For computing `∂ expm(Q) / ∂ Q[j,k]` without finite differences:
+The primitive computes the Fréchet derivative in an **arbitrary direction** `E`
+(not w.r.t. a single entry) — `L(A,E) = d/dt expm(A + tE)|₀` — because a
+generator's rate parameters are constrained (see below):
 
 ```rust
-fn matrix_exp_param_grad(q: &DMatrix<f64>, j: usize, k: usize) -> DMatrix<f64> {
-    let s = q.nrows();
+fn matrix_exp_frechet(a: &DMatrix<f64>, e: &DMatrix<f64>) -> DMatrix<f64> {
+    let s = a.nrows();
     let mut c = DMatrix::zeros(2*s, 2*s);
-    c.view_mut((0,0), (s,s)).copy_from(q);
-    c.view_mut((s,s), (s,s)).copy_from(q);
-    c[(j, s + k)] = 1.0;   // E_jk in the upper-right block
+    c.view_mut((0,0), (s,s)).copy_from(a);
+    c.view_mut((s,s), (s,s)).copy_from(a);
+    c.view_mut((0,s), (s,s)).copy_from(e);   // E in the upper-right block
     let ec = matrix_exp(&c);
-    ec.view((0,s), (s,s)).into_owned()  // upper-right block = the gradient
+    ec.view((0,s), (s,s)).into_owned()        // upper-right block = L(A,E)
 }
 ```
 
-One 2S×2S matrix exponential per parameter gives the exact gradient. For S=3 and
-5 free parameters: 5 matrix exponentials of a 6×6 matrix — negligible cost.
+**The row-sum-zero constraint matters.** A generator's diagonal is fixed by its
+off-diagonals (`q_jj = −Σ_{k≠j} q_jk`), so raising the *rate parameter* `q_jk`
+also lowers `q_jj`. The derivative of `expm(Q·Δt)` w.r.t. that rate is therefore
+`L(Q·Δt, (E_jk − E_jj)·Δt)`, **not** the single-entry `L(Q·Δt, E_jk)`. A
+per-entry API (an earlier draft) silently computes the wrong thing; the directional
+form above takes the constrained direction explicitly (built by
+`generator_rate_direction`). One 2S×2S matrix exponential per parameter gives the
+exact gradient — for S=3 and 5 rate parameters, five 6×6 exponentials, negligible.
+*(A complex-step alternative `L(A,E) = Im(expm(A + i·h·E))/h` needs one complex
+S×S exp per direction — ~2× cheaper — but it's an unvalidated Phase-5
+optimization; the leaf uses real Van Loan, validated to 1e-13 against
+Daleckii–Krein.)*
 
 ---
 
@@ -2762,12 +2799,36 @@ Simulated 3-state mCTMM; single τ parameter; vs. R `msm` restricted model.
 CAV (cardiac allograft vasculopathy); 3 states. Available in R `msm`.
 Reference: `msm::msm()`. Accept: Q entries ±15%; OFV ±1.0.
 
-### 14.10 Matrix exponential unit test (Tier 1, fast)
+### 14.10 Matrix exponential unit test (Tier 1, fast) — **built (leaf PR #759)**
 
-Verify `matrix_exp(A)` matches `Σ Aᵏ/k!` (k=0..20) to 1e-10 for:
-- 2×2 diagonal Q (analytic solution available)
-- 3×3 dense Q
-Verify `matrix_exp_param_grad` matches FD gradient to 1e-8.
+The `src/markov` leaf ships this battery as inline `#[cfg(test)]` tests. Value:
+- `matrix_exp(A)` vs `Σ Aᵏ/k!` for a 2×2 generator and a 3×3 dense generator
+  (to 1e-12), and vs the **closed-form 2-state** transition matrix (to 1e-13).
+- `expm(0) = I` exactly.
+
+Generator invariants (a floating `expm` is not guaranteed stochastic):
+- rows sum to 1 and entries ∈ [0,1] for a generator;
+- semigroup/inverse `expm(A)·expm(−A) = I`;
+- `det(expm A) = exp(tr A)`;
+- large-norm stress (‖Q·Δt‖ ~ 1e4, near-absorbing): rows still sum to 1 even
+  where individual entries underflow to exactly 0 — the log(0) hazard the
+  `ctmm_data_term` guard handles.
+
+Gradient — **exact**, not just vs FD:
+- `matrix_exp_frechet` vs the **Daleckii–Krein** divided-difference reference in
+  the eigenbasis of a symmetric `A` (to 1e-13) — independent of both FD and the
+  `expm` internals;
+- Fréchet linearity `L(A,αE) = α·L(A,E)`;
+- the constrained rate direction `(E_jk − E_jj)·Δt` vs central FD of the full
+  `expm(Q(a)·Δt)` (to 1e-8).
+
+Guard layer (fail-loud, no silent −inf):
+- each structural error returns its typed `MarkovError` **and the message is
+  asserted** (non-square/too-small Q, out-of-range state, non-finite time —
+  matched via `is_nan()` since `NaN != NaN` — decreasing time, Δt=0 with a state
+  change);
+- an underflowed observed transition returns the `1e20` sentinel;
+- Δt=0 with the same state, and <2 observations, contribute 0.
 
 ### 14.11 Simulation-estimation (SSE) — every endpoint (license-free)
 
@@ -2870,8 +2931,21 @@ these have no residual variance).
 
 ### D4: Matrix exponential crate vs. in-house
 
-Implement inline using nalgebra — ~150 lines, no new dependency, full control,
-testable against series definition. The `expm` crate on crates.io is unmaintained (2019).
+**nalgebra already ships it — no hand-rolled Padé.** `nalgebra 0.35`'s
+`Matrix::exp()` (`src/linalg/exp.rs`) *is* the Higham (2005) scaling-and-squaring
+Padé approximant this design needs, and it works on `DMatrix`. So there is **no
+~150-line inline Padé** and no new dependency: `src/markov::matrix_exp` is a
+thin, documented wrapper over `DMatrix::exp()`, and the parameter gradient
+(`matrix_exp_frechet`, §8.7/§9.7) is the Van Loan block trick built on the same
+call. Validated in-repo against the Taylor series, the closed-form 2-state
+transition matrix, and the exact Daleckii–Krein Fréchet reference (§14.10) — the
+unmaintained `expm` crate (2019) is moot.
+
+*(This note originally called for a hand-rolled inline Padé; that predated the
+discovery that nalgebra's built-in `.exp()` is exactly the required algorithm. An
+empirical probe confirmed it reproduces the closed-form 2-state solution to
+1e-16, satisfies the stochasticity / semigroup / `det = exp(tr)` identities, and
+supports an exact Van Loan Fréchet to machine precision.)*
 
 ### D5: Feature flag for markov module
 

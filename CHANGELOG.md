@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Experimental `markov` feature — CTMM matrix-exponential foundation**
+  (#759): a new default-off `markov` cargo feature adds the numerical core for
+  continuous-time Markov models — transition probabilities
+  `P(Δt) = expm(Q·Δt)` (nalgebra's scaling-and-squaring Padé) with exact
+  Van Loan (1978) parameter gradients, plus a guarded individual CTMM
+  likelihood term. This is a library-internal primitive with **no model-file
+  syntax yet**; wiring it into estimation is a later phase (see
+  `plans/tte-survival-markov.md`).
 - **Declare IOV occasions in the model** (#756): a new `iov_occasion` key in
   `[fit_options]` derives the occasion partition from each subject's timeline
   instead of requiring a precomputed dataset column. `iov_occasion = dose`
