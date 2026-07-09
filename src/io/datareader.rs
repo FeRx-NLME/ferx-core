@@ -1078,6 +1078,38 @@ fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
     }
 }
 
+/// Build a dose that honors the row's `RATE` classification (#324/#722).
+///
+/// A coded `RATE=-1`/`-2` row yields a *modeled* infusion ([`DoseEvent::modeled`],
+/// whose concrete rate/duration are resolved per iteration from `R{cmt}`/`D{cmt}`);
+/// an ordinary row yields a [`RateMode::Fixed`] dose. Passing the raw `-1`/`-2`
+/// sentinel to [`DoseEvent::new`] instead would set `rate_mode = Fixed` with
+/// `duration = 0` (since `rate <= 0`), so `is_infusion()` is false and the dose
+/// silently collapses to an instantaneous bolus — and `check_modeled_dose_rates`
+/// skips `Fixed` doses, so the missing slot is never caught.
+///
+/// **Single construction site** for the primary dose *and* its `ADDL`-expanded
+/// copies, so the two cannot diverge — that divergence is exactly what silently
+/// collapsed `ADDL` modeled infusions to boluses (#722). `ADDL` doses pass
+/// `ss = false` (an expanded dose is never steady-state itself); everything else
+/// is identical to the primary row.
+fn dose_for_rate_mode(
+    time: f64,
+    amt: f64,
+    cmt: usize,
+    rate: f64,
+    ss: bool,
+    ii: f64,
+    rate_mode: RateMode,
+) -> DoseEvent {
+    match rate_mode {
+        RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
+        RateMode::ModeledDuration | RateMode::ModeledRate => {
+            DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode)
+        }
+    }
+}
+
 /// Compute a record's effective EVID.
 ///
 /// When an `EVID` column is present its value governs (a blank / `.` /
@@ -1491,12 +1523,7 @@ fn parse_subject(
                 raw_time,
             )?;
 
-            doses.push(match rate_mode {
-                RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
-                RateMode::ModeledDuration | RateMode::ModeledRate => {
-                    DoseEvent::modeled(time, amt, cmt, ss, ii, rate_mode)
-                }
-            });
+            doses.push(dose_for_rate_mode(time, amt, cmt, rate, ss, ii, rate_mode));
             dose_rec.push(row_seq);
             if occ_col.is_some() {
                 dose_occasions.push(occ);
@@ -1539,23 +1566,14 @@ fn parse_subject(
                 } else {
                     for k in 1..=(addl as u32) {
                         let addl_time = time + (k as f64) * ii;
-                        // Preserve the parent row's RATE classification for every
-                        // expanded dose: a coded `RATE=-1`/`-2` (modeled rate/
-                        // duration) row must yield modeled additional doses, not
-                        // `Fixed` ones. Passing the raw `-1`/`-2` sentinel through
-                        // `DoseEvent::new` would set `rate_mode = Fixed` with
-                        // `duration = 0` (since `rate <= 0`), so `is_infusion()`
-                        // returns false and the dose silently collapses to an
-                        // instantaneous bolus — and `check_modeled_dose_rates`
-                        // skips `Fixed` doses, so the missing `R{cmt}`/`D{cmt}`
-                        // slot is never caught. Mirror the primary-dose match
-                        // above (expanded doses are never SS themselves).
-                        doses.push(match rate_mode {
-                            RateMode::Fixed => DoseEvent::new(addl_time, amt, cmt, rate, false, ii),
-                            RateMode::ModeledDuration | RateMode::ModeledRate => {
-                                DoseEvent::modeled(addl_time, amt, cmt, false, ii, rate_mode)
-                            }
-                        });
+                        // Same construction as the primary dose (see
+                        // `dose_for_rate_mode`): an expanded dose of a coded
+                        // `RATE=-1`/`-2` row stays a modeled infusion rather than
+                        // collapsing to a `Fixed` bolus, and is never steady-state
+                        // itself (`ss = false`).
+                        doses.push(dose_for_rate_mode(
+                            addl_time, amt, cmt, rate, false, ii, rate_mode,
+                        ));
                         dose_rec.push(row_seq);
                         if occ_col.is_some() {
                             dose_occasions.push(occ);
