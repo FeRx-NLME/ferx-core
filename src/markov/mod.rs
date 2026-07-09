@@ -57,6 +57,22 @@ use nalgebra::DMatrix;
 /// [`MarkovError`] instead.
 const SENTINEL_NLL: f64 = 1e20;
 
+/// Upper bound on the magnitude of any entry of the scaled generator `Q·Δt`
+/// before it is handed to `expm`.
+///
+/// nalgebra's `DMatrix::exp` forms internal matrix powers of its argument (up to
+/// `A^8`/`A^10`) to choose a scaling factor. For an argument whose entries exceed
+/// roughly `1e38`, those powers overflow to `+∞` **even though the argument
+/// itself is finite**; the overflow drives nalgebra's internal squaring count to
+/// `u64::MAX`, so `expm` then spins forever in a `for _ in 0..s` loop that never
+/// returns — a **hang**, not a catchable panic, and not something the post-`expm`
+/// finiteness check can rescue. A `Q·Δt` this large is a diverged parameter,
+/// never a real CTMM regime (it is orders of magnitude beyond any physical
+/// rate×time), so it is treated as the degenerate case and repels the optimizer.
+/// The bound sits far below the overflow point (`1e18^10 = 1e180 ≪ f64::MAX`) and
+/// far above any legitimate argument.
+const MAX_EXP_ARG_ABS: f64 = 1e18;
+
 /// A single continuous-time Markov state observation: the process was seen in
 /// integer `state` at `time`. The CTMM likelihood consumes *consecutive* pairs
 /// of these within a subject (`(ID, TIME, STATE)` data, no `EVID=3` rows —
@@ -284,14 +300,21 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
             continue;
         }
 
-        // Guard the exponential's argument for finiteness. A generator entry
-        // that diverged during optimization (e.g. an infinite rate from a bad η
-        // guess), or a finite-but-huge rate whose `q·dt` overflows to ∞, would
-        // otherwise reach nalgebra's `expm` — whose internal LU solve `.unwrap()`
-        // can *panic* on a non-finite input, aborting the whole fit. Treat it as
-        // the degenerate case (repel the optimizer) instead of crashing.
+        // Guard the exponential's argument before it reaches nalgebra's `expm`.
+        // Two failure modes, both from a rate that diverged during optimization:
+        //   • a non-finite entry (∞/NaN, e.g. an infinite rate from a bad η) —
+        //     `expm`'s internal LU solve `.unwrap()` can *panic* on it; and
+        //   • a finite-but-enormous entry (|q·dt| ≳ 1e38) — `expm` forms internal
+        //     matrix powers that overflow to ∞, driving its scaling count to
+        //     `u64::MAX` so it *hangs* in an unbounded squaring loop.
+        // A hang survives neither the post-`expm` finiteness check nor
+        // `catch_unwind`, so both are rejected here up front. Either is the
+        // degenerate case (repel the optimizer), not a crash or a frozen fit.
         let arg = q * dt;
-        if arg.iter().any(|x| !x.is_finite()) {
+        if arg
+            .iter()
+            .any(|x| !x.is_finite() || x.abs() > MAX_EXP_ARG_ABS)
+        {
             return Ok(SENTINEL_NLL);
         }
         let p_mat = matrix_exp(&arg);
@@ -301,7 +324,12 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
         if !p.is_finite() || p <= 0.0 {
             return Ok(SENTINEL_NLL);
         }
-        nll -= p.ln();
+        // A valid generator gives P ∈ [0, 1]; clamp to 1 so floating round-off on
+        // a near-certain transition (p = 1 + ε) contributes ~0 rather than a
+        // spurious *negative* NLL, and a malformed generator (a P entry > 1)
+        // cannot be *rewarded* with a negative term. Entry-level generator
+        // validity stays the builder's responsibility (not re-checked here).
+        nll -= p.min(1.0).ln();
     }
     Ok(nll)
 }
@@ -655,6 +683,53 @@ mod tests {
             },
         ];
         assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SENTINEL_NLL);
+    }
+
+    #[test]
+    fn data_term_finite_huge_generator_returns_sentinel() {
+        // Regression: a FINITE but enormous rate (|q·dt| ≳ 1e38) must not reach
+        // nalgebra's `expm`. Its argument is all-finite (so the is_finite() check
+        // alone lets it through), but `expm` overflows an internal matrix power to
+        // ∞, sets its scaling count to u64::MAX, and HANGS forever in
+        // `for _ in 0..s`. The magnitude guard treats it as the degenerate case so
+        // the call returns promptly — this test would never terminate without it.
+        let q = DMatrix::from_row_slice(2, 2, &[-1e40, 1e40, 0.0, 0.0]);
+        // Precondition: the argument really is finite, so finiteness alone is not
+        // enough to catch it — the magnitude bound is what does.
+        assert!((&q * 1.0).iter().all(|x: &f64| x.is_finite()));
+        let obs = [
+            StateObs {
+                time: 0.0,
+                state: 0,
+            },
+            StateObs {
+                time: 1.0,
+                state: 1,
+            },
+        ];
+        assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SENTINEL_NLL);
+    }
+
+    #[test]
+    fn data_term_superstochastic_entry_never_negative() {
+        // Regression: an invalid generator (positive diagonal ⇒ a P entry > 1)
+        // must not produce a NEGATIVE nll via log(p) > 0, which would *reward* the
+        // optimizer toward the malformed input. The `p.min(1.0)` clamp makes the
+        // contribution exactly 0, never negative.
+        let q = DMatrix::from_row_slice(2, 2, &[5.0, 0.0, 0.0, 5.0]); // P[0,0] = e^5 > 1
+        let obs = [
+            StateObs {
+                time: 0.0,
+                state: 0,
+            },
+            StateObs {
+                time: 1.0,
+                state: 0,
+            },
+        ];
+        let nll = ctmm_data_term(&q, &obs).unwrap();
+        assert!(nll >= 0.0, "nll must never be negative, got {nll}");
+        assert_eq!(nll, 0.0, "clamped p = 1 ⇒ −log 1 = 0");
     }
 
     // ---- ctmm_data_term: structural errors are loud (check messages) ------
