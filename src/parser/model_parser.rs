@@ -979,6 +979,23 @@ pub fn parse_model_string(content: &str) -> Result<CompiledModel, String> {
     Ok(parsed.model)
 }
 
+/// Register covariate names as required data columns: push each name not
+/// already present, then re-sort. Shared by the `[scaling]`, error-model
+/// selector, and `[initial_conditions]` blocks so all three declare their
+/// covariates identically — the divergence that let an unregistered init
+/// covariate silently evaluate to 0 (issue #765).
+fn register_referenced_covariates(
+    referenced: &mut Vec<String>,
+    covs: impl IntoIterator<Item = String>,
+) {
+    for cov in covs {
+        if !referenced.contains(&cov) {
+            referenced.push(cov);
+        }
+    }
+    referenced.sort();
+}
+
 /// Parse a full model string including all optional blocks.
 pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
     let mut extracted = extract_blocks(content)?;
@@ -2307,24 +2324,14 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
             }
         }
 
-        for cov in scaling_covariates {
-            if !model.referenced_covariates.contains(&cov) {
-                model.referenced_covariates.push(cov);
-            }
-        }
-        model.referenced_covariates.sort();
+        register_referenced_covariates(&mut model.referenced_covariates, scaling_covariates);
         model.scaling = scaling;
     }
 
     // Covariate-selected [error_model] (issue #658): the selector's covariates
     // are required data columns, so register them like scaling covariates.
     if !selector_covariates.is_empty() {
-        for cov in &selector_covariates {
-            if !model.referenced_covariates.contains(cov) {
-                model.referenced_covariates.push(cov.clone());
-            }
-        }
-        model.referenced_covariates.sort();
+        register_referenced_covariates(&mut model.referenced_covariates, selector_covariates);
     }
 
     // ── [initial_conditions] block (issue #521) ──
@@ -2347,13 +2354,8 @@ pub fn parse_full_model(content: &str) -> Result<ParsedModel, String> {
         // Register init-expression covariates as required data columns, mirroring
         // the scaling (`scaling_covariates`) and error-selector blocks above. Without
         // this, a `[covariates]`-declared model never reads the column, and a miscased
-        // /absent init covariate silently evaluates to 0 (issue #765).
-        for cov in init_covariates {
-            if !model.referenced_covariates.contains(&cov) {
-                model.referenced_covariates.push(cov);
-            }
-        }
-        model.referenced_covariates.sort();
+        // or absent init covariate silently evaluates to 0 (issue #765).
+        register_referenced_covariates(&mut model.referenced_covariates, init_covariates);
     }
 
     // ODE validation: the `NEEDS_FORM_C = usize::MAX` sentinel from
@@ -5811,8 +5813,9 @@ fn build_init_amount_fn(
     // must become required data columns — see the fn doc (issue #765).
     let mut cov_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     collect_covariates(&expr, &mut cov_set);
-    let mut covariates_ref: Vec<String> = cov_set.into_iter().collect();
-    covariates_ref.sort();
+    // Order is irrelevant: the caller pools these into a HashSet and the final
+    // `register_referenced_covariates` re-sorts, so don't sort here.
+    let covariates_ref: Vec<String> = cov_set.into_iter().collect();
     let indiv_to_pk_slot: HashMap<String, usize> = indiv_var_names
         .iter()
         .enumerate()
@@ -5892,9 +5895,9 @@ fn parse_initial_conditions_block(
             amount_deriv,
         });
     }
-    let mut cov_refs: Vec<String> = cov_refs.into_iter().collect();
-    cov_refs.sort();
-    Ok((out, cov_refs))
+    // Return unsorted: the caller re-sorts via `register_referenced_covariates`.
+    let init_covariates: Vec<String> = cov_refs.into_iter().collect();
+    Ok((out, init_covariates))
 }
 
 /// Build an `OdeOutputFn` from one `y[…] = value` line. Shared between
