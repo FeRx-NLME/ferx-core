@@ -1285,6 +1285,7 @@ pub fn run_bayes(
         h_matrices,
         kappas,
         covariance_matrix: None,
+        covariance_wall_time_secs: 0.0,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,

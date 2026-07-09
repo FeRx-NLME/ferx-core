@@ -19,7 +19,51 @@ section of the SDLC for the versioning policy).
 
 ## [Unreleased]
 
+### Added
+- **`ferx summary` compares multiple runs** (#749): pass two or more `.fitrx`
+  bundles (`ferx summary run1.fitrx run2.fitrx run3.fitrx`) to print a Markdown
+  table comparing them side by side — method, convergence, OFV/AIC/BIC, ΔOFV,
+  runtime, subject/observation/parameter counts, and THETA/OMEGA/SIGMA
+  estimates. A single bundle still prints the detailed `psn::sumo`-style report.
+- **Standalone covariance step** (#738): `run_covariance()` runs the FD-Hessian
+  covariance step against an existing fit without re-fitting, mirroring
+  `run_sir()`. It re-reads the model/data from the fit's recorded paths (with
+  SHA-256 integrity checks, refusing stale inputs) or accepts caller-supplied
+  `model`/`population`, then returns a fit with `covariance_matrix`, standard
+  errors, `covariance_status`, and condition-number diagnostics refreshed. It
+  reuses `fit()`'s inline covariance step at the converged point, so the result
+  matches an inline `covariance = true` fit up to finite-difference noise. A
+  covariance step that runs but fails (non-PD / unusable FD Hessian) is non-fatal
+  — the returned fit reports `covariance_status = Failed` with a diagnostic
+  warning.
+- **Per-parameter estimates + gradients in the optimizer trace** (#640): when
+  `optimizer_trace = true`, each CSV row now also records the full parameter
+  vector (`val:<name>` columns, natural/reporting scale) for every method and
+  the full gradient vector (`grad:<name>` columns, optimizer-scaled space) for
+  the gradient methods (FOCE/FOCEI/GN; `NA` for SAEM). Columns are named after
+  the declared parameters (`TVCL`, `ETA_CL`, `ETA_V~ETA_CL`, `PROP_ERR`) with
+  `THETA1` / `OMEGA(2,1)` / `SIGMA(1)` fallbacks, and reconstruct `grad_norm`
+  as `sqrt(sum(grad:<name>^2))`. This powers a per-parameter convergence view
+  in the ferx-r trace UI.
+- **`[data]` block column renaming** (#730, #742): rename any dataset header to
+  any new name with `new-name = actual` entries (e.g. `TIME = TAFD`,
+  `DV = CONC`), the ferx equivalent of NONMEM's `$INPUT TIME=TAFD`. Targets are
+  not limited to canonical roles — arbitrary columns and covariates can be
+  renamed too, and a column can be renamed *aside* to free its name for another
+  (e.g. `ODV = dv` then `DV = lndv`). Header matching is case-insensitive,
+  renamed headers are excluded from covariate auto-detection under their old
+  name, and typos (absent header, duplicate target, or a target colliding with a
+  surviving column) fail loudly. See
+  [Data → Column mapping](https://ferx-nlme.github.io/ferx-core/model-file/data.html).
+
 ### Changed
+- **Default thread count capped at 8** (#707): when `threads` is unset (or
+  `0`/`auto`) — via `[fit_options] threads`, the CLI `--threads` flag, or the R
+  binding — the engine now defaults to `available cores - 1` (floored at 1),
+  capped at 8, instead of one worker per logical core. Most fits gain little from
+  scaling past a handful of cores, and not all cores are equal on
+  asymmetric platforms (e.g. Apple Silicon's E-cores). An explicit
+  `threads = N` / `--threads N` still pins the exact count requested.
 - **CLI default output no longer writes a separate `{model}-timing.txt` file** (#704):
   the estimation step's wall-clock time and thread count now live under a new
   `estimation:` section in `{model}-fit.yaml` (narrower in scope than the old
@@ -27,8 +71,70 @@ section of the SDLC for the versioning policy).
   `environment:` section (OS, CPU architecture, whether running in Docker, OS
   username, ferx version) for troubleshooting and reproducibility. Both are also carried on
   `FitResult.environment` and round-trip through `.fitrx` bundles.
+- **`simulate()` now samples inter-occasion variability (kappa)** (#723): simulating
+  an IOV model draws an independent `kappa ~ N(0, Omega_IOV)` for each occasion
+  (matching NONMEM `$SIM`), instead of holding every kappa at zero. Simulated /
+  VPC datasets from IOV models now carry the between-occasion spread the model
+  parameterizes; previously they silently under-dispersed relative to the fitted
+  model. Non-IOV models are unaffected (bit-identical output).
+- **The adaptive frozen-replay verifier now independently validates its snapshots** (#748):
+  the default-on safety net for `simulate_adaptive` / `simulate_adaptive_from_spec` reused the
+  same precomputed per-occasion / per-event PK snapshots the reactive driver did, so it checked
+  that the two *consumed* them identically but never that they were *correct* — a mis-built
+  snapshot (a wrong covariate, occasion, or `kappa` fed to a parameter) was applied by both sides
+  and passed the replay bit-exact. The verifier now re-derives each snapshot from the run's
+  primitives via the canonical helpers and bit-asserts it against what the driver was handed, so a
+  build that mis-resolves a covariate or occasion (the class fixed in #732 / #739) fails loudly for
+  every model instead of slipping past the replay. No effect on correct models.
 
 ### Added
+- **Adaptive (feedback) dosing now supports time-varying covariates** (#700): the
+  reactive driver recomputes each subject's PK per event/segment from the covariate
+  active in that segment (the same NONMEM end-of-interval convention `predict()` /
+  `simulate()` use), instead of freezing it at the `t=0` snapshot. A covariate that
+  changes over the horizon — e.g. declining renal function driving clearance under
+  TDM titration — now correctly drives the predictions, the monitored signal, and
+  every dose decision, and the frozen-replay verifier validates the per-event
+  bookkeeping. Models whose PK reads the `TIME` built-in are covered too (previously
+  also silently frozen at `TIME=0`). The `auc_target_attainment` metric is not yet
+  available for time-varying-covariate subjects and is rejected with a typed error
+  rather than reported from a frozen snapshot.
+- **Adaptive (feedback) dosing now supports inter-occasion variability (IOV)** (#701):
+  the reactive driver draws a fresh occasion `kappa` per **decision window** (occasion =
+  decision index) and threads it through the per-event PK — instead of silently holding
+  every kappa at zero — so occasion-to-occasion shifts in CL/V correctly drive the
+  predictions, the monitored signal, and every reactive dose decision, and the
+  frozen-replay verifier validates the per-occasion bookkeeping. Composes with the #700
+  time-varying-covariate path (a model with both is per-event correct in each). `kappa`
+  is drawn on a dedicated per-(subject, replicate) substream, so a non-IOV run is
+  byte-identical to before and enabling a `Dv` monitor never shifts the draws. The
+  `auc_target_attainment` metric is not yet available for IOV subjects and is rejected
+  with a typed error rather than reported from a κ-frozen snapshot. A non-ascending or
+  duplicated adaptive `decision_times` schedule (programmatic `simulate_adaptive`) is now
+  rejected with a typed error, matching the declarative `[adaptive_dosing]` path — an
+  out-of-order schedule would otherwise mis-map a record to the wrong occasion.
+- **`estimation:` block in `{model}-fit.yaml` now splits wall time by stage** (#713):
+  a `{method}_wall_time_secs` entry (e.g. `focei_wall_time_secs`, `imp_wall_time_secs`)
+  is reported for each stage of `method`/`methods`, plus a `covariance_wall_time_secs`
+  for the post-estimation FD-Hessian / SIR-fallback step, alongside the existing
+  `wall_time_secs` total. Also carried on `FitResult.method_wall_times_secs` /
+  `FitResult.covariance_wall_time_secs` and round-trips through `.fitrx` bundles.
+- **Repeated time-to-event (RTTE) models** (Phase 3): `[event_model]` accepts
+  `type = rtte` for endpoints with multiple events per subject, with
+  `clock = forward` (Andersen–Gill total time, the default) or `clock = reset`
+  (gap time / renewal). Clock-forward integrates the cumulative hazard once across
+  each subject's records (`Σ_k log h(t_k) − H(T)`); clock-reset restarts the hazard
+  clock at each event (`Σ_k log h(Δ_k) − Σ_k H(Δ_k)` over inter-event gaps). Both
+  use the analytic hazard families. Because Laplace/FOCEI can severely
+  underestimate the frailty variance ω² for RTTE at low event rates (Karlsson et
+  al. 2009), fitting RTTE under a Laplace-based method with a frailty now emits a
+  warning recommending `method = saem` or `method = imp` (fired only for a frailty
+  model — `n_eta > 0` — whose chain's final estimating stage is Laplace-based, so a
+  warm-start like `[focei, saem]` does not false-warn). RTTE is **fit-only** for now:
+  `simulate()` and unsupported configurations (interval-censored or out-of-order or
+  non-finite repeated-event rows) are rejected with a clear error rather than
+  silently producing a wrong answer; `predict_survival()` reports first-event
+  survival for RTTE (use its `cum_hazard` field for the recurrent `E[N(t)]`).
 - **Optional `[data]` model-file block** (#690): a model can now declare
   `path = ...` to point at its own dataset (`$DATA` equivalent), so `ferx
   model.ferx`, `ferx check model.ferx`, and the public `fit_from_files()`
@@ -53,6 +159,22 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **A dataset with dose rows but no `AMT` column is now a hard error instead of a
+  silent bad fit** (#753). When the amount column is named something other than
+  `AMT` (e.g. a NONMEM export using `DOSE`), every dose parsed with amount 0, so no
+  drug entered the system, the objective was flat, and the fit "converged" with
+  every parameter pinned at its initial estimate. The reader now rejects such data
+  with `E_DOSE_NO_AMT`, naming the fix (rename the column to `AMT`). A companion
+  warning `W_ALL_DOSES_ZERO` fires when an `AMT` column *is* present but every dose
+  amount is 0 (e.g. a mis-scaled column).
+- **Loading a `.fitrx` bundle whose data has two subjects sharing an ID no longer
+  fails with a spurious `corrupt or missing entry` error.** `load_fit` (and thus
+  `ferx summary`) matched `predictions.csv` rows to subjects by ID, so when a
+  dataset reuses an ID across subjects (e.g. an ID repeated across studies or a
+  reset-split subject), every duplicate's rows were routed to one subject and the
+  other was left with zero rows — tripping the `n_obs` consistency check. Rows are
+  now assigned positionally in `ebes.csv` subject order (which the writer already
+  guarantees), with the row ID kept as an ordering cross-check.
 - **A forward reference in `[individual_parameters]` is now a parse error instead of a
   silent zero** (#710). A statement that referenced a name declared *later* in the same
   block (e.g. `CL = ... * exp(IMAX*...)` with `IMAX` defined below it) previously resolved
@@ -66,6 +188,14 @@ section of the SDLC for the versioning policy).
   the first dose, instead of silently becoming instantaneous boluses. Previously
   a regimen such as `AMT=100, RATE=-2, D1=2, ADDL=5, II=24` fitted (and predicted/
   simulated) as one modeled infusion followed by five boluses, with no warning.
+- **`SS=2` steady-state dose records are now rejected instead of silently run as
+  `SS=1`** (#729): NONMEM `SS=2` (superimpose the steady state of a regimen on top
+  of the compartment's existing amounts, without resetting) was collapsed to the
+  same internal `ss = true` flag as `SS=1` (reset then equilibrate) — every
+  `SS >= 0.5` cell became `SS=1` — so an `SS=2` dataset fitted, predicted, and
+  simulated with the wrong (reset) initial conditions and no warning. The data
+  reader now accepts only `SS=0`/`SS=1` and rejects `SS=2` (and any other code)
+  with a clear message. Full `SS=2` support is tracked in #694.
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point

@@ -807,8 +807,8 @@ fn tte_sse_competing_risks_recovers_truth() {
 #[test]
 fn tte_convergence_exponential_mixed() {
     let model = parse_model_string(EXP_FIT).expect("fit model must parse");
-    let (pop, _cov) =
-        read_population_for(&model, &None, REF_CSV, None, None, None).expect("reference CSV reads");
+    let (pop, _cov) = read_population_for(&model, &None, REF_CSV, None, None, None, &[])
+        .expect("reference CSV reads");
     assert_eq!(pop.subjects.len(), 100, "reference dataset is 100 subjects");
 
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
@@ -844,8 +844,8 @@ fn tte_convergence_exponential_fixed_matches_survreg() {
     let model = parse_model_string(EXP_FIT_FIXED).expect("fixed-effects model must parse");
     assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
 
-    let (pop, _cov) =
-        read_population_for(&model, &None, REF_CSV, None, None, None).expect("reference CSV reads");
+    let (pop, _cov) = read_population_for(&model, &None, REF_CSV, None, None, None, &[])
+        .expect("reference CSV reads");
 
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
     let lambda = r.theta[0];
@@ -864,6 +864,212 @@ fn tte_convergence_exponential_fixed_matches_survreg() {
     assert!(
         (r.ofv - SURVREG_LAMBDA_M2LL).abs() < 1e-3,
         "fixed-effects OFV {:.4} must match survreg -2logLik {SURVREG_LAMBDA_M2LL} within 1e-3",
+        r.ofv
+    );
+}
+
+// ── RTTE (repeated TTE, clock-forward) — tests/reference/rtte_exponential ──────
+
+const RTTE_REF_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/reference/rtte_exponential/rtte_exp.csv"
+);
+
+const RTTE_FIT_FIXED: &str = r"
+[parameters]
+  theta TVLAMBDA(0.10, 0.001, 10.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA
+";
+
+const RTTE_FIT_MIXED: &str = r"
+[parameters]
+  theta TVLAMBDA(0.15, 0.001, 10.0)
+  omega ETA_LAMBDA ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+";
+
+/// Cross-tool, exact: a fixed-effects (n_eta=0) constant-hazard RTTE fit must recover the
+/// analytic pooled Poisson-process MLE `lambda = D / Σ_i T_i = 305 / 2000 = 0.15250` on
+/// the committed dataset (the RTTE analogue of the survreg exponential anchor), and the
+/// OFV must equal the closed-form `-2 logL`. Both are exact and license-free. Critically,
+/// this fails on the pre-RTTE per-record accumulation: summing independent single-event
+/// terms over-counts the cumulative hazard by `Σ_k H(t_k)`, so both `lambda` and the OFV
+/// would be wrong.
+#[test]
+fn rtte_convergence_fixed_matches_mle() {
+    let model = parse_model_string(RTTE_FIT_FIXED).expect("fixed RTTE model must parse");
+    assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_REF_CSV, None, None, None, &[])
+        .expect("reference CSV reads");
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+
+    // rtte_exp.csv: D = 305 events; 100 subjects each observed over [0, 20] ⇒ exposure 2000.
+    let lambda_mle: f64 = 305.0 / 2000.0; // 0.15250
+    let m2ll_mle: f64 = -2.0 * (305.0 * lambda_mle.ln() - lambda_mle * 2000.0);
+    let lambda = r.theta[0];
+    eprintln!(
+        "[rtte fixed] lambda = {lambda:.6} (MLE {lambda_mle:.6}), OFV = {:.4} (analytic {m2ll_mle:.4})",
+        r.ofv
+    );
+
+    assert!(
+        (lambda - lambda_mle).abs() / lambda_mle < 1e-3,
+        "fixed RTTE rate {lambda:.6} must match analytic MLE {lambda_mle:.6}"
+    );
+    assert!(
+        (r.ofv - m2ll_mle).abs() < 1e-2,
+        "fixed RTTE OFV {:.4} must match analytic -2logL {m2ll_mle:.4}",
+        r.ofv
+    );
+}
+
+/// Cross-tool: a mixed-effects (frailty) RTTE FOCEI fit must reproduce NONMEM LAPLACE and
+/// the exact Poisson-lognormal GLMM MLE on the committed dataset — TVLAMBDA ≈ 0.1406,
+/// omega^2 ≈ 0.1645, OFV ≈ 1748.49 (see `tests/reference/rtte_exponential/expected.md`).
+/// FOCEI is deterministic, so the bands are tight. The frailty omega^2 is well-identified
+/// here because the data is event-rich; the Karlsson Laplace bias is a low-event-rate
+/// effect, so FOCEI, SAEM, NONMEM and the GLMM all coincide on this design.
+#[test]
+fn rtte_convergence_mixed_matches_nonmem() {
+    let model = parse_model_string(RTTE_FIT_MIXED).expect("mixed RTTE model must parse");
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_REF_CSV, None, None, None, &[])
+        .expect("reference CSV reads");
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+    let lambda = r.theta[0];
+    let omega2 = r.omega[(0, 0)];
+    eprintln!(
+        "[rtte mixed] TVLAMBDA = {lambda:.5} omega^2 = {omega2:.5} OFV = {:.4}  (NONMEM 0.14062 / 0.16450 / 1748.49)",
+        r.ofv
+    );
+
+    // NONMEM LAPLACE: 0.140618 / 0.164496 / 1748.493. Poisson-LN GLMM MLE: 0.14062 / 0.16455.
+    assert!(
+        (0.132..0.150).contains(&lambda),
+        "TVLAMBDA {lambda:.5} off the NONMEM/GLMM value ~0.1406"
+    );
+    assert!(
+        (0.140..0.190).contains(&omega2),
+        "omega^2 {omega2:.5} off the NONMEM/GLMM value ~0.1645"
+    );
+    assert!(
+        (r.ofv - 1748.493).abs() < 0.2,
+        "OFV {:.4} must match NONMEM LAPLACE 1748.493",
+        r.ofv
+    );
+}
+
+// ── RTTE clock-reset (gap time) — tests/reference/rtte_weibull_reset ───────────
+
+const RTTE_RESET_REF_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/reference/rtte_weibull_reset/rtte_weibull_reset.csv"
+);
+
+const RTTE_RESET_FIT_FIXED: &str = r"
+[parameters]
+  theta TVSCALE(3.0, 0.1, 100.0)
+  theta TVSHAPE(1.0, 0.1, 10.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  clock  = reset
+  family = weibull
+  scale  = TVSCALE
+  shape  = TVSHAPE
+";
+
+const RTTE_RESET_FIT_MIXED: &str = r"
+[parameters]
+  theta TVSCALE(5.0, 0.1, 100.0)
+  theta TVSHAPE(1.5, 0.1, 10.0)
+  omega ETA_SCALE ~ 0.09
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  clock  = reset
+  family = weibull
+  scale  = TVSCALE * exp(ETA_SCALE)
+  shape  = TVSHAPE
+";
+
+/// Cross-tool, exact: a fixed-effects (n_eta=0) clock-reset Weibull RTTE fit must match
+/// `survreg(Surv(gap, event) ~ 1, dist="weibull")` on the inter-event gap durations —
+/// under clock-reset the gaps are independent Weibull observations, so the reset RTTE
+/// likelihood reduces exactly to that regression (see `survreg.R`). This also pins that
+/// the gap bookkeeping is right: a clock-forward accumulation on the same data would give
+/// a different scale/shape/OFV.
+#[test]
+fn rtte_reset_convergence_fixed_matches_survreg() {
+    let model = parse_model_string(RTTE_RESET_FIT_FIXED).expect("fixed reset model must parse");
+    assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_RESET_REF_CSV, None, None, None, &[])
+        .expect("reference CSV reads");
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+    let (scale, shape) = (r.theta[0], r.theta[1]);
+    eprintln!(
+        "[rtte reset fixed] scale = {scale:.5} shape = {shape:.5} OFV = {:.4}  (survreg 4.78920 / 1.32415 / 3243.856)",
+        r.ofv
+    );
+
+    // survreg on the gap durations: scale 4.78920, shape 1.32415, -2logL 3243.856.
+    assert!(
+        (scale - 4.78920).abs() / 4.78920 < 2e-3,
+        "reset scale {scale:.5} must match survreg 4.78920"
+    );
+    assert!(
+        (shape - 1.32415).abs() / 1.32415 < 2e-3,
+        "reset shape {shape:.5} must match survreg 1.32415"
+    );
+    assert!(
+        (r.ofv - 3243.856).abs() < 1e-2,
+        "reset OFV {:.4} must match survreg -2logL 3243.856",
+        r.ofv
+    );
+}
+
+/// Cross-tool: a mixed-effects (frailty) clock-reset Weibull RTTE FOCEI fit must
+/// reproduce NONMEM LAPLACE on the committed dataset — TVSCALE ~ 5.16, TVSHAPE ~ 1.53,
+/// omega^2 ~ 0.132, OFV ~ 3175.86 (see `tests/reference/rtte_weibull_reset/expected.md`).
+#[test]
+fn rtte_reset_convergence_mixed_matches_nonmem() {
+    let model = parse_model_string(RTTE_RESET_FIT_MIXED).expect("mixed reset model must parse");
+    let (pop, _cov) = read_population_for(&model, &None, RTTE_RESET_REF_CSV, None, None, None, &[])
+        .expect("reference CSV reads");
+    let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
+    let (scale, shape, omega2) = (r.theta[0], r.theta[1], r.omega[(0, 0)]);
+    eprintln!(
+        "[rtte reset mixed] scale = {scale:.5} shape = {shape:.5} omega^2 = {omega2:.5} OFV = {:.4}  (NONMEM 5.1594 / 1.5299 / 0.1322 / 3175.86)",
+        r.ofv
+    );
+
+    // NONMEM LAPLACE: 5.15939 / 1.52987 / 0.13225 / 3175.863.
+    assert!(
+        (5.0..5.35).contains(&scale),
+        "scale {scale:.5} off the NONMEM value ~5.16"
+    );
+    assert!(
+        (1.45..1.60).contains(&shape),
+        "shape {shape:.5} off the NONMEM value ~1.53"
+    );
+    assert!(
+        (0.10..0.17).contains(&omega2),
+        "omega^2 {omega2:.5} off the NONMEM value ~0.132"
+    );
+    assert!(
+        (r.ofv - 3175.863).abs() < 0.3,
+        "OFV {:.4} must match NONMEM LAPLACE 3175.863",
         r.ofv
     );
 }
@@ -888,7 +1094,7 @@ fn tte_competing_fixed_matches_per_cause_mle() {
     let model = parse_model_string(COMPETING_FIXED).expect("fixed competing model must parse");
     assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
 
-    let (pop, _cov) = read_population_for(&model, &None, COMPETING_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, COMPETING_CSV, None, None, None, &[])
         .expect("competing CSV reads");
 
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fixed competing fit");
@@ -1042,7 +1248,7 @@ fn tte_convergence_weibull_fixed_matches_survreg() {
     let model = parse_model_string(WEIBULL_FIT_FIXED).expect("fixed-effects model must parse");
     assert_eq!(model.n_eta, 0, "fixed-effects model must have no etas");
 
-    let (pop, _cov) = read_population_for(&model, &None, WEIBULL_REF_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, WEIBULL_REF_CSV, None, None, None, &[])
         .expect("reference CSV reads");
     let r = fit(&model, &pop, &model.default_params, &fit_opts()).expect("fit must succeed");
 
@@ -1077,7 +1283,7 @@ fn tte_convergence_weibull_fixed_matches_survreg() {
 #[test]
 fn tte_convergence_weibull_mixed() {
     let model = parse_model_string(WEIBULL_FIT).expect("fit model must parse");
-    let (pop, _cov) = read_population_for(&model, &None, WEIBULL_REF_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, WEIBULL_REF_CSV, None, None, None, &[])
         .expect("reference CSV reads");
     assert_eq!(pop.subjects.len(), 100, "reference dataset is 100 subjects");
 
@@ -1184,7 +1390,7 @@ fn tte_convergence_gompertz_rct_recovers() {
         "TRT must be picked up from the loghr expression"
     );
 
-    let (pop, _cov) = read_population_for(&model, &None, GOMPERTZ_REF_CSV, None, None, None)
+    let (pop, _cov) = read_population_for(&model, &None, GOMPERTZ_REF_CSV, None, None, None, &[])
         .expect("reference CSV reads");
     assert_eq!(pop.subjects.len(), 300, "reference dataset is 300 subjects");
 

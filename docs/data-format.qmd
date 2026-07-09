@@ -62,9 +62,19 @@ observations. Inference keys on `AMT` only — a dose always carries a nonzero
 amount (for infusions, `AMT` is the amount and `RATE` the rate). When an `EVID`
 column **is** present, its values govern and nothing is inferred.
 
-Two non-fatal warnings (collected into the fit's warnings) guard against a
-silently dose-free fit:
+One hard error and three warnings guard against a silently dose-free (or
+zero-dose) fit:
 
+- **`E_DOSE_NO_AMT`** *(error)* — the dataset has dose rows (`EVID=1`/`4`) but
+  **no `AMT` column**, so every dose amount is zero and the fit would run with no
+  drug in the system (a flat objective that pins every parameter at its initial
+  estimate). This usually means the amount column is named something other than
+  `AMT` (e.g. a NONMEM export using `DOSE`); rename it to `AMT` in the CSV header
+  or via a rename in the `[data]` block.
+- **`W_ALL_DOSES_ZERO`** — an `AMT` column **is** present but every parsed dose
+  has `AMT = 0` (e.g. a placebo-only typo or a mis-scaled amount column). Same
+  flat-objective symptom as the error above, but the column exists so it is a
+  warning rather than a hard stop.
 - **`W_AMT_NOT_DOSED`** — one or more **non-observation** rows carry `AMT != 0`
   but were not treated as doses: an `EVID` column is present and codes a dose row
   as something other than `1`/`4` (e.g. a dose row mistyped `EVID=0` with

@@ -8,7 +8,7 @@ const MAIN_USAGE: &str = "\
 Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]]
        ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
        ferx check <model.ferx> [--data <data.csv>] [--json]
-       ferx summary <run.fitrx>
+       ferx summary <run.fitrx> [<run2.fitrx> ...]
 
 Fits a NLME model and writes sdtab.csv with residuals.
 Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
@@ -17,7 +17,7 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
        an explicit --data overrides it, with a warning if they differ.
 
 --threads N    use N rayon workers (N > 0)
---threads 0    use rayon default (one worker per logical CPU)
+--threads 0    use the default worker count (available cores - 1, floored at 1, capped at 8)
 --threads auto alias for --threads 0
 
 --output PATH  also write a portable .fitrx fit bundle (zip of JSON+CSV)
@@ -111,13 +111,11 @@ fn main() {
     // — inherits the count. The 32 MiB worker stack that wide ODE+IOV analytic gradients
     // need is applied by fit()'s own fit-scoped pool (api::default_fit_pool), so the
     // global pool keeps the platform-default stack here rather than reserving a second
-    // 32 MiB × N. Without --threads, fit() sizes its pool to all cores.
+    // 32 MiB × N. Without --threads, fit() applies its own default (available cores - 1,
+    // floored at 1, capped at 8 — #707).
     if let Some(n) = threads {
-        if let Err(e) = rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-        {
-            eprintln!("Warning: failed to configure thread pool with {n} threads: {e}");
+        if let Err(e) = ferx_core::configure_global_thread_pool(n) {
+            eprintln!("Warning: {e}");
         }
     }
 
@@ -233,38 +231,80 @@ fn main() {
 }
 
 const SUMMARY_USAGE: &str = "\
-Usage: ferx summary <run.fitrx>
+Usage: ferx summary <run.fitrx> [<run2.fitrx> ...]
 
-Prints a psn::sumo-style summary — parameter estimates with %RSE
-plus basic run info — from a saved .fitrx fit bundle.
+With one bundle: prints a psn::sumo-style summary — parameter estimates
+with %RSE plus basic run info.
+
+With two or more bundles: prints a Markdown table comparing the runs
+(method, convergence, OFV/AIC/BIC, ΔOFV, runtime, sizes, and parameter
+estimates) side by side.
 ";
 
-/// Run the `summary` subcommand: load a `.fitrx` bundle and print a
-/// `psn::sumo`-style summary (parameter estimates + basic run info) to stdout.
-/// Returns the process exit code: `0` = printed (incl. `--help`), `1` = load
+/// Run the `summary` subcommand: load one or more `.fitrx` bundles.
+///
+/// A single bundle prints a `psn::sumo`-style summary (parameter estimates +
+/// basic run info). Two or more bundles print a Markdown comparison table.
+/// The column label for each run is the bundle's file stem.
+///
+/// Returns the process exit code: `0` = printed (incl. `--help`), `1` = a load
 /// failed, `2` = usage (missing/flag-looking path).
 fn run_summary(args: &[String]) -> i32 {
-    if is_help_flag(args.get(2)) {
-        print!("{SUMMARY_USAGE}");
-        return 0;
-    }
-    let path = match args.get(2) {
-        Some(p) if !p.starts_with("--") => p.as_str(),
-        _ => {
+    // `summary` takes only bundle paths plus `-h`/`--help`. Scan every argument:
+    // help anywhere prints usage (exit 0); any other flag-looking argument is a
+    // usage error (exit 2) rather than being silently ignored or mistaken for a
+    // file path. Everything else is a bundle path.
+    let mut paths: Vec<&str> = Vec::new();
+    for arg in &args[2..] {
+        if is_help_flag(Some(arg)) {
+            print!("{SUMMARY_USAGE}");
+            return 0;
+        }
+        if arg.starts_with('-') {
+            eprintln!("Error: unknown option {}", arg);
             eprint!("{SUMMARY_USAGE}");
             return 2;
         }
-    };
-    match ferx_core::io::fitrx::load_fit(std::path::Path::new(path)) {
-        Ok(loaded) => {
-            print!("{}", ferx_core::io::output::format_summary(&loaded.fit));
-            0
-        }
-        Err(e) => {
-            eprintln!("Error: failed to load {}: {}", path, e);
-            1
+        paths.push(arg.as_str());
+    }
+    if paths.is_empty() {
+        eprint!("{SUMMARY_USAGE}");
+        return 2;
+    }
+
+    // Load all bundles up front so a bad path fails before any output.
+    let mut loaded = Vec::with_capacity(paths.len());
+    for path in &paths {
+        match ferx_core::io::fitrx::load_fit(std::path::Path::new(path)) {
+            Ok(l) => loaded.push((*path, l)),
+            Err(e) => {
+                eprintln!("Error: failed to load {}: {}", path, e);
+                return 1;
+            }
         }
     }
+
+    if loaded.len() == 1 {
+        print!(
+            "{}",
+            ferx_core::io::output::format_summary(&loaded[0].1.fit)
+        );
+    } else {
+        // Column label = file stem (e.g. `run1.fitrx` → `run1`).
+        let runs: Vec<(String, &ferx_core::FitResult)> = loaded
+            .iter()
+            .map(|(path, l)| {
+                let label = std::path::Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(path)
+                    .to_string();
+                (label, &l.fit)
+            })
+            .collect();
+        print!("{}", ferx_core::io::output::format_comparison(&runs));
+    }
+    0
 }
 
 /// Parsed `ferx check` arguments.
@@ -730,6 +770,26 @@ mod tests {
         // No path, and a flag where the path should be — both usage (2).
         assert_eq!(run_summary(&args(&["summary"])), 2);
         assert_eq!(run_summary(&args(&["summary", "--json"])), 2);
+        // An unknown flag *after* a path is rejected, not silently ignored.
+        assert_eq!(
+            run_summary(&args(&["summary", "/no/such/file.fitrx", "--bogus"])),
+            2
+        );
+        // A short unknown flag (single dash) is rejected too.
+        assert_eq!(run_summary(&args(&["summary", "-x"])), 2);
+    }
+
+    #[test]
+    fn run_summary_help_anywhere_returns_0() {
+        // Help is recognized even when it follows a path (before any load).
+        assert_eq!(
+            run_summary(&args(&["summary", "/no/such/file.fitrx", "-h"])),
+            0
+        );
+        assert_eq!(
+            run_summary(&args(&["summary", "/no/such/file.fitrx", "--help"])),
+            0
+        );
     }
 
     #[test]
@@ -737,23 +797,45 @@ mod tests {
         assert_eq!(run_summary(&args(&["summary", "/no/such/file.fitrx"])), 1);
     }
 
-    #[test]
-    fn run_summary_valid_fitrx_returns_0() {
-        // Produce a real .fitrx via simulate (fast — no optimization loop), then
-        // load and summarize it in-process so the success arm is covered.
+    /// Simulate the warfarin model and write it to a `.fitrx` at `path` (fast —
+    /// no optimization loop), so `run_summary`'s success arms can be covered.
+    fn write_warfarin_fitrx(path: &std::path::Path) {
         let (fit, pop) = ferx_core::run_model_simulate(WARFARIN_MODEL).expect("simulate warfarin");
         let src = std::fs::read_to_string(WARFARIN_MODEL).expect("read model");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("run.fitrx");
         ferx_core::io::fitrx::save_fit(
             &fit,
             &pop,
             &src,
-            &path,
+            path,
             ferx_core::io::fitrx::SaveFitOptions::default(),
         )
         .expect("save fitrx");
+    }
+
+    #[test]
+    fn run_summary_valid_fitrx_returns_0() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("run.fitrx");
+        write_warfarin_fitrx(&path);
         assert_eq!(run_summary(&args(&["summary", path.to_str().unwrap()])), 0);
+    }
+
+    #[test]
+    fn run_summary_multiple_fitrx_returns_0() {
+        // Two bundles → the comparison-table arm.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p1 = dir.path().join("run1.fitrx");
+        let p2 = dir.path().join("run2.fitrx");
+        write_warfarin_fitrx(&p1);
+        write_warfarin_fitrx(&p2);
+        assert_eq!(
+            run_summary(&args(&[
+                "summary",
+                p1.to_str().unwrap(),
+                p2.to_str().unwrap()
+            ])),
+            0
+        );
     }
 
     #[test]

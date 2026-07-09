@@ -142,6 +142,8 @@ the model has fewer than two valid residuals, and `cov_condition_number` is
   "n_iterations": 42,
   "interaction": true,
   "wall_time_secs": 1.234,
+  "method_wall_times_secs": [1.134],
+  "covariance_wall_time_secs": 0.1,
   "n_threads_used": 4,
   "uses_ode_solver": false,
   "gradient_method_inner": "analytic (Dual2)",

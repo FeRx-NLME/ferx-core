@@ -6,6 +6,7 @@ pub mod importance_sampling;
 pub mod inner_optimizer;
 pub mod outer_optimizer;
 pub mod parameterization;
+pub mod run_covariance;
 pub mod run_sir;
 pub mod saem;
 pub mod saem_conddist;

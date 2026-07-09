@@ -101,7 +101,67 @@ fn setup_frem(dir: &Path) -> FremPrepareResult {
     .expect("prepare_frem should succeed")
 }
 
+/// Rewrite a CSV's header line, renaming TIME→TAFD and DV→CONC so a `[data]`
+/// column mapping is required to read it. Body rows are positional, unchanged.
+fn rename_time_dv_headers(src: &Path, dst: &Path) {
+    let text = std::fs::read_to_string(src).unwrap();
+    let mut lines = text.lines();
+    let header = lines
+        .next()
+        .unwrap()
+        .replace("TIME", "TAFD")
+        .replace("DV", "CONC");
+    let body: Vec<&str> = lines.collect();
+    let out = std::iter::once(header.as_str())
+        .chain(body.iter().copied())
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(dst, out).unwrap();
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
+
+/// #730 regression: FREM prep must honour the model's `[data]` column mapping.
+/// A dataset with TAFD/CONC headers is only readable once TIME/DV are mapped;
+/// before the fix `prepare_frem` read via the unmapped reader and failed with
+/// `Missing TIME column`.
+#[test]
+fn frem_prepare_honours_data_block_column_mapping() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+
+    // Dataset with WT/AGE covariates, then TIME→TAFD / DV→CONC in the header.
+    let cov_csv = write_warfarin_with_covariates(dir);
+    let data_path = dir.join("warfarin_frem_tafd.csv");
+    rename_time_dv_headers(&cov_csv, &data_path);
+
+    // Model carries the mapping in its `[data]` block. `path` is required by the
+    // parser but ignored here (the explicit data_path argument overrides it).
+    let model_src =
+        format!("{BASE_MODEL}\n[data]\n  path = ignored.csv\n  TIME = TAFD\n  DV = CONC\n");
+    let model_path = dir.join("warfarin_base_mapped.ferx");
+    std::fs::write(&model_path, model_src).unwrap();
+
+    let result = prepare_frem(
+        &model_path,
+        &data_path,
+        &["WT".to_string(), "AGE".to_string()],
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("prepare_frem should read the mapped TAFD/CONC dataset");
+
+    // Mapping fed real observations through: covariate metadata is well-formed
+    // and the renamed roles did not leak in as covariates.
+    assert_eq!(result.n_total_etas, 5);
+    assert_eq!(result.fremtype_map.len(), 2);
+    assert!(result.covariate_means.iter().any(|(n, _)| n == "WT"));
+    assert!(!result.covariate_means.iter().any(|(n, _)| n == "TAFD"));
+    assert!(!result.covariate_means.iter().any(|(n, _)| n == "CONC"));
+}
 
 /// FREM preparation produces correct omega dimensions and covariate metadata.
 #[test]

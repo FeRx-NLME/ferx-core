@@ -2,7 +2,12 @@
 
 **Status:** Phase 1, Phase 1b, **and Phase 2 complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 (Joint PK-TTE, ODE hazard accumulator) COMPLETE — Slice 2.1 fit path via PR #567 (squash `657800ee`) merged 2026-06-28, plus Slice 2.2 drug-driven event-time simulation + Slice 2.3 docs via PR #595 (squash `3f58c7d3`) merged 2026-06-29; both closing #564. ferx-r pin bump PR #208 merged.** Open follow-ups: **ferx-r#210** (bundled `pktte_joint` example + ODE-TTE simulation exposure — now sample-able after #595); **#570** (joint-fit double-solve perf) **SHIPPED via PR #613** — inner-NLL EBE + FOCEI at-mode now share one augmented solve (`solve_ode_dense` Hermite read-back, predictions bit-identical); the FD-Hessian's analytic CHZ η-sensitivities are split out as #626; #469 (FOCEI nonlinear-frailty ω²) **CLOSED via #571**. **NEXT: Phase 3 — RTTE (repeated TTE; `clock = forward | reset`; SAEM primary; selective per-state ODE reset §8.8.6), optionally alongside Phase 3b (SAEM Laplace proposal).**  
 **Scope:** Phase 2 complete; next active phase = Phase 3 (RTTE)  
-**Revised:** 2026-06-29 (**Phase 2 complete** — PR #595 (`3f58c7d3`) merged Slice 2.2 drug-driven
+**Revised:** 2026-07-09 (Markov track cross-referenced — #759 tracks the Markov phases (4b DTMM /
+4c mCTMM / 5–6 CTMM), companion **#760** filed for Phase 4 (categorical / discrete-state
+likelihood); §8.4 gains #759's ergonomic Option-A `[markov_model]` DSL + a design note (homogeneous
+CTMM = matrix-exp + Van Loan, not the `dP/dt=QᵀP` probability ODE, which is Phase 6 only; `msm` not
+NONMEM for CTMM). Phase 4/4b–6 headers now name their tracking issues. Earlier 2026-06-29: **Phase 2
+complete** — PR #595 (`3f58c7d3`) merged Slice 2.2 drug-driven
 event-time simulation + Slice 2.3 docs; status markers flipped to done across the header, §5.5, and
 §12/§18, #469 marked closed via #571, NEXT advanced to Phase 3. Earlier 2026-06-29: Slice 2.2 scope
 hardened — adversarial/"no-happy-path" pass: typed
@@ -1310,22 +1315,57 @@ r      = R_OVERDISPERSION
 ```
 
 **CTMM / mCTMM / DTMM:**
+
+Two equivalent spellings. **Option A (recommended, per #759)** — declare states bound to their
+DV integer code and list each allowed transition by label; ferx builds the generator `Q`, fills
+the row-sum-zero diagonal automatically, and (for `type=ctmm`) forms `P(Δt)` via the §8.7 matrix
+exponential (drug-driven `Q(t)` → §3.4 matrix ODE, Phase 6):
+
 ```
 [markov_model]
+type   = ctmm                     ; ctmm | mctmm | dtmm
+cmt    = 5
+states = [awake=0, asleep=1]      ; label = DV integer code (explicit; never positional)
+transition awake  -> asleep = LAMBDA_AS * exp(ETA_AS)   ; intensity q_ij >= 0, any DSL expr
+transition asleep -> awake  = LAMBDA_SA
+init   = [1, 0]                   ; optional starting occupancy (default: observed first state)
+```
+
+- Diagonal `q_ii = −Σ_{j≠i} q_ij` is filled by ferx; the user never writes it.
+- Intensities reuse the individual-parameter grammar (θ, η, covariates, time, PK states), so a
+  time-varying `Q(t)` is free (routes to the Phase 6 matrix-ODE path).
+- Labels are for readability + output tables only; the DV column stays numeric (§8.1). The reader
+  matches DV to the declared code and adds `log P_{that state}(Δt)`. Validate/error on: a DV value
+  with no matching state code, and duplicate codes.
+- `mctmm`: replace the transition list with a single `tau = TAU_EQUIL` (mean equilibration time
+  `1/q`; §3.4). `dtmm`: give transition probabilities directly, e.g.
+  `transition awake -> asleep = logistic(ALPHA_AS + BETA * Cc)` (no generator, no diagonal).
+
+**Option B (matrix spelling)** — for dense/fully-connected chains, name each non-zero rate by
+state index (diagonal still auto-filled). Terser for small `K` but silently order-sensitive for
+sparse chains, so Option A is preferred:
+
+```
+[markov_model]
+type     = ctmm
 cmt      = 5
-type     = ctmm       ; ctmm, mctmm, dtmm
 n_states = 3
-; For ctmm — specify each non-zero rate:
 q12 = LAMBDA12 * exp(ETA_12)
 q21 = LAMBDA21
-q13 = 0
 q23 = LAMBDA23
 q32 = LAMBDA32
-; For mctmm — single parameter:
-; tau = TAU_EQUIL    ; mean equilibration time = 1/q
-; For dtmm — transition probabilities:
-; p12 = logistic(ALPHA12 + BETA * Cc)
+; tau = TAU_EQUIL                        ; mctmm
+; p12 = logistic(ALPHA12 + BETA * Cc)    ; dtmm
 ```
+
+> **Design note (re: #759).** #759 frames CTMM as integrating the occupancy ODE `dP/dt = QᵀP`
+> on the existing `[odes]` engine. ferx does that **only for the time-inhomogeneous** (drug-driven
+> `Q(t)`) case — Phase 6. For the **time-homogeneous** case ferx uses the **matrix exponential**
+> `P(Δt) = expm(QΔt)` with **exact Van Loan (1978) gradients** (§3.4, §8.7), *not* the probability
+> ODE: cleaner and exactly differentiable. Comparator likewise differs — CTMM/mCTMM anchor to R
+> `msm`, not NONMEM (whose EVID=3 CTMM mechanism ferx rejects, §3.4); only DTMM anchors to NONMEM
+> (§7.8). The categorical observation likelihood these consume is Phase 4 (§2, §3.5), tracked
+> separately as #760 (the #759 companion).
 
 **Custom log-likelihood (escape hatch):**
 ```
@@ -2486,6 +2526,8 @@ not an approximation. Low regression risk: `random_walk` path is unchanged code.
 
 ### Phase 4 — Categorical and Count Models
 
+**Tracking:** #760 — the categorical / discrete-state observation likelihood (companion of #759; the shared primitive Phases 4b–6 consume).
+
 **Binary:**
 - `EndpointLikelihood::Binary`; toenail dataset vs. saemix
 - This is mixed-effects **logistic regression** (logit link; probit/cloglog are `LinkFn`
@@ -2513,6 +2555,9 @@ not an approximation. Low regression risk: `random_walk` path is unchanged code.
 `src/io/datareader.rs`, new `src/categorical/mod.rs`.
 
 ### Phase 4b — DTMM
+
+**Tracking:** #759 covers the Markov phases (4b DTMM, 4c mCTMM, 5 & 6 CTMM) — see §8.4 for the
+DSL and the matrix-exp-vs-ODE design note.
 
 Direct transition probability parameterization; no matrix exponential; vs. NONMEM
 Bergstrand 2025 supplementary code.

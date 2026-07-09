@@ -1,0 +1,23 @@
+# IOV simulate anchor (#723): IOV on V, 1-cpt IV bolus, obs at t=0 per occasion.
+# Matches iov_anchor.ctl: same theta/omega/kappa/sigma. IPRED at each occasion's
+# t=0 obs = AMT/V, so within-subject between-occasion Var(log IPRED) = omega^2_IOV.
+[parameters]
+  theta TVCL(1.0, 0.001, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  kappa KAPPA_V ~ 0.04
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V + KAPPA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  iov_column = OCC

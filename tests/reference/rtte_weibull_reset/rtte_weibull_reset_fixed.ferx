@@ -1,0 +1,21 @@
+# Fixed-effects (n_eta = 0) clock-reset Weibull RTTE — the license-free anchor.
+#
+# Under clock-reset a subject's inter-event gaps are independent Weibull observations,
+# so a fixed-effects fit reduces to survreg(Surv(gap, event) ~ 1, dist="weibull") on the
+# gap durations (see survreg.R): scale ~ 4.78920, shape ~ 1.32415, -2logL ~ 3243.856.
+
+[parameters]
+  theta TVSCALE(3.0, 0.1, 100.0)
+  theta TVSHAPE(1.0, 0.1, 10.0)
+
+[event_model]
+  cmt    = 2
+  type   = rtte
+  clock  = reset
+  family = weibull
+  scale  = TVSCALE
+  shape  = TVSHAPE
+
+[fit_options]
+  method  = focei
+  maxiter = 300
