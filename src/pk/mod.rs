@@ -964,24 +964,30 @@ pub fn predict_iov(
     // no-op. (Form C ODE output `y = <expr>` is applied inside the ODE solver,
     // not here; see the note below for the κ=0 limitation there.)
     if !matches!(model.scaling, ScalingSpec::None) {
-        let raw = preds.clone();
-        // Base pass with the BSV+κ=0 vector (`[η_bsv, 0…0]`, the same combination
-        // the non-IOV `compute_predictions_with_tv` path scales with). This scales
-        // every observation, including any not owned by an occasion group — most
-        // importantly an occasion-less subject (`simulate()` on data read without an
-        // `iov_column`), where the per-occasion loop below is empty and would
-        // otherwise leave `preds` UNSCALED and off by the full scale factor (#723
-        // review). When occasions are present every obs is owned by a group, so the
-        // loop overwrites this base pass entirely and the result is unchanged.
-        apply_scaling(model, subject, theta, &pk_only_combined, &mut preds);
-        // Per-occasion override: an observation carrying an occasion label is
-        // re-scaled with that occasion's κ, overwriting the base pass.
-        for (occ_id, obs_indices) in &occ_groups {
-            let combined = combined_for(*occ_id);
-            let mut scaled = raw.clone();
-            apply_scaling(model, subject, theta, &combined, &mut scaled);
-            for &j in obs_indices {
-                preds[j] = scaled[j];
+        if occ_groups.is_empty() {
+            // Occasion-less subject (`simulate()` on data read without an
+            // `iov_column`): there are no per-occasion groups, so scale here with the
+            // BSV+κ=0 vector `[η_bsv, 0…0]` — the same combination the non-IOV
+            // `compute_predictions_with_tv` path scales with. Without this the
+            // predictions would be returned UNSCALED, off by the full scale factor
+            // (#723 review).
+            apply_scaling(model, subject, theta, &pk_only_combined, &mut preds);
+        } else {
+            // Per-occasion scaling: every observation carries an occasion label and is
+            // owned by exactly one group (`subject.occasions` is parallel to the obs
+            // grid — either fully populated or empty), so the loop below determines
+            // *all* of `preds`. That makes a κ=0 base pass redundant here; skipping it
+            // avoids a full extra scaling evaluation on the estimation hot path
+            // (`predict_iov` runs in the IMP/SAEM/FOCEI inner loops) with a
+            // bit-identical result (#723 review / efficiency follow-up).
+            let raw = preds.clone();
+            for (occ_id, obs_indices) in &occ_groups {
+                let combined = combined_for(*occ_id);
+                let mut scaled = raw.clone();
+                apply_scaling(model, subject, theta, &combined, &mut scaled);
+                for &j in obs_indices {
+                    preds[j] = scaled[j];
+                }
             }
         }
     }
