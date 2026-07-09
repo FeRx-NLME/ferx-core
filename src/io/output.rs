@@ -2672,7 +2672,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }

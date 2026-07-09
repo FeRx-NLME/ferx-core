@@ -140,7 +140,11 @@ fn tte_ode_nll(
             event_type,
             entry_time,
             ..
-        } = r;
+        } = r
+        else {
+            // Non-TTE records don't contribute hazard times; skip them.
+            continue;
+        };
         if *entry_time > 0.0 {
             times.push(*entry_time);
         }
@@ -270,7 +274,11 @@ fn try_joint_pktte_shared_solve(
                 event_type,
                 entry_time,
                 cmt: rc,
-            } = r;
+            } = r
+            else {
+                // Non-TTE records don't contribute hazard times; skip them.
+                continue;
+            };
             if rc != cmt {
                 continue;
             }
@@ -2452,7 +2460,6 @@ mod tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -3274,7 +3281,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 100],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let ipreds = vec![10.0, 20.0];
@@ -3326,7 +3332,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 0],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let ipreds = vec![10.0, 20.0];

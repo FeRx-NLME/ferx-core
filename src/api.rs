@@ -477,6 +477,11 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
                     cmt,
                 })
                 .collect(),
+            // `obs_records` is unconditional since Phase 4.0, but the only records
+            // this synthetic TTE subject carries are `Event`s (survival-gated); with
+            // the feature off there is no TTE endpoint, so the vec is empty.
+            #[cfg(not(feature = "survival"))]
+            obs_records: Vec::new(),
         })
         .collect();
     let template = Population {
@@ -1588,7 +1593,11 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
                     event_type,
                     entry_time,
                     ..
-                } = r;
+                } = r
+                else {
+                    // Non-TTE records are handled by their own endpoint; skip them.
+                    continue;
+                };
                 if *c != cmt {
                     continue;
                 }
@@ -5964,7 +5973,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -6751,7 +6759,10 @@ fn validate_tte_simulatable(
             for r in &subject.obs_records {
                 let ObsRecord::Event {
                     cmt, entry_time, ..
-                } = r;
+                } = r
+                else {
+                    continue;
+                };
                 if is_rtte(cmt) {
                     rtte_cmts.insert(*cmt);
                     if *entry_time > 0.0 {
@@ -6910,7 +6921,9 @@ pub fn simulate_with_options(
         #[cfg(feature = "survival")]
         for subject in &population.subjects {
             for record in &subject.obs_records {
-                let crate::types::ObsRecord::Event { entry_time, .. } = record;
+                let crate::types::ObsRecord::Event { entry_time, .. } = record else {
+                    continue;
+                };
                 if *entry_time > h {
                     return Err(format!(
                         "SimulateOptions.horizon ({h}) is below subject '{}' entry_time \
@@ -8879,7 +8892,6 @@ mod iov_integration {
                 occasions: occasions.clone(),
                 dose_occasions: dose_occ.clone(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
             .collect();
@@ -9756,7 +9768,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -9845,7 +9856,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -9932,7 +9942,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -10027,7 +10036,6 @@ mod iov_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             });
         }
@@ -10123,7 +10131,6 @@ mod iov_integration {
             occasions: vec![1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -10471,7 +10478,6 @@ mod iov_integration {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pop = Population {
@@ -11429,7 +11435,6 @@ mod simulate_with_uncertainty_tests {
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
             .collect();
@@ -11809,7 +11814,6 @@ mod sde_integration {
                 occasions: vec![1u32; 3],
                 dose_occasions: vec![1u32],
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
             .collect();
@@ -11940,7 +11944,6 @@ mod sde_integration {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             };
             Population {
@@ -12263,7 +12266,6 @@ mod tests_sdtab_tv_cov {
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         // Sanity: this subject must be classified TV — that's the regime the
@@ -12433,7 +12435,6 @@ mod tests_sdtab_tv_cov {
             occasions: vec![1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let eta = DVector::from_vec(vec![0.0]);
@@ -12589,7 +12590,6 @@ mod tests_sdtab_tv_cov {
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         assert!(subject.has_tv_covariates());
@@ -12751,7 +12751,6 @@ mod tests_derived_session_clock {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -12990,7 +12989,6 @@ mod tests_derived_session_clock {
             occasions: vec![1, 1, 1],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13133,7 +13131,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
             dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -13314,7 +13311,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0, 0],
             occasions: vec![1, 2],
             dose_occasions: vec![1, 2],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13406,7 +13402,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13477,7 +13472,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13538,7 +13532,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13610,7 +13603,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0, 0],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13673,7 +13665,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13732,7 +13723,6 @@ mod tests_derived_iov_kappa {
             cens: vec![0],
             occasions: vec![1],
             dose_occasions: vec![1],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -13871,7 +13861,6 @@ mod adaptive_sim_tests {
             occasions: vec![1u32; n],
             dose_occasions: vec![1u32; n_dose],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -15801,7 +15790,6 @@ mod adaptive_snapshot_verify_tests {
             occasions: vec![1, 1],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -16129,7 +16117,6 @@ mod adaptive_snapshot_verify_tests {
             occasions: vec![1; decisions.len()],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pop = Population {

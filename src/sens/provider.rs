@@ -5984,7 +5984,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -6437,7 +6436,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -7408,7 +7406,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -8271,7 +8268,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         // θ = [TVCL, TVV, TVKA, TVLAG]; η = [ETA_CL, ETA_V, ETA_KA, ETA_LAG] (lag carries IIV).
@@ -8884,7 +8880,6 @@ mod tests {
             occasions: vec![1; n],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -9325,7 +9320,6 @@ mod tests {
             occasions,
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -10524,7 +10518,6 @@ mod tests {
             occasions,
             dose_occasions: (1..=n_occ as u32).collect(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let theta = vec![0.2, 10.0];
@@ -10602,7 +10595,6 @@ mod tests {
             occasions,
             dose_occasions: (1..=n_occ as u32).collect(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let theta = vec![0.2, 10.0];
@@ -12452,7 +12444,6 @@ mod tests {
             occasions,
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -12744,7 +12735,6 @@ mod tests {
             occasions,
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }

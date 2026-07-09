@@ -823,7 +823,9 @@ mod survival_smoke {
         use ferx_core::{simulate_with_options, SimulateOptions};
         let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
         let mut pop = rtte_pop();
-        let ObsRecord::Event { entry_time, .. } = &mut pop.subjects[0].obs_records[0];
+        let ObsRecord::Event { entry_time, .. } = &mut pop.subjects[0].obs_records[0] else {
+            panic!("expected a TTE Event record");
+        };
         *entry_time = 2.0;
         let opts = SimulateOptions {
             seed: Some(1),
@@ -1478,7 +1480,10 @@ mod survival_smoke {
                         entry_time,
                         time,
                         ..
-                    } = r;
+                    } = r
+                    else {
+                        panic!("expected a TTE Event record");
+                    };
                     assert_eq!(
                         *entry_time, 0.0,
                         "synthetic subjects have no left truncation"
@@ -1494,7 +1499,9 @@ mod survival_smoke {
                 .obs_records
                 .iter()
                 .filter(|r| {
-                    let ObsRecord::Event { event_type, .. } = r;
+                    let ObsRecord::Event { event_type, .. } = r else {
+                        return false;
+                    };
                     matches!(event_type, EventType::Exact)
                 })
                 .count();
@@ -1506,7 +1513,10 @@ mod survival_smoke {
                 for r in &subj.obs_records {
                     let ObsRecord::Event {
                         time, event_type, ..
-                    } = r;
+                    } = r
+                    else {
+                        panic!("expected a TTE Event record");
+                    };
                     assert!(matches!(event_type, EventType::RightCensored));
                     assert!(
                         (time - H).abs() < 1e-9,
@@ -1573,7 +1583,10 @@ mod survival_smoke {
                 event_type,
                 entry_time,
                 cmt,
-            } = &subj.obs_records[0];
+            } = &subj.obs_records[0]
+            else {
+                panic!("expected a TTE Event record");
+            };
             assert_eq!(*cmt, 2, "row on the cause CMT");
             assert_eq!(
                 *entry_time, 0.0,
@@ -1690,7 +1703,9 @@ mod survival_smoke {
             // One TTE row on the cause CMT, written by the TTE write-back. Reaching
             // this also drives the non-`Event` `filter_map` arm (the continuous rows).
             assert_eq!(subj.obs_records.len(), 1, "one TTE event row");
-            let ObsRecord::Event { time, cmt, .. } = &subj.obs_records[0];
+            let ObsRecord::Event { time, cmt, .. } = &subj.obs_records[0] else {
+                panic!("expected a TTE Event record");
+            };
             assert_eq!(*cmt, 2, "TTE row on the cause CMT");
             assert!(*time <= 14.0 + 1e-9, "TTE outcome within the horizon");
         }
@@ -1876,6 +1891,138 @@ mod survival_smoke {
         assert!(
             censored > 0,
             "some subjects must survive to the horizon (got {censored})"
+        );
+    }
+
+    // ── Phase 4.0 coexistence: TTE code paths skip non-Event records ─────────
+    // Once discrete/count endpoints coexist, a subject may carry non-TTE records
+    // on other CMTs. Every TTE fit/sim path iterating `obs_records` skips them
+    // (the `let ObsRecord::Event {..} = record else { continue }` guard), so
+    // adding one must not change the OFV or the simulated events. These exercise
+    // the guard end-to-end via the public `fit`/`simulate` APIs.
+
+    /// RTTE fit path (`check_rtte_records` + the telescoping NLL).
+    #[test]
+    fn rtte_fit_tolerates_interleaved_non_event_records() {
+        let model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
+        let opts = FitOptions::default();
+        let baseline = fit(&model, &rtte_pop(), &model.default_params, &opts)
+            .expect("baseline RTTE fit")
+            .ofv;
+        let mut pop = rtte_pop();
+        pop.subjects[0].obs_records.insert(
+            1,
+            ObsRecord::DiscreteState {
+                time: 7.0,
+                state: 1,
+                cmt: 3,
+            },
+        );
+        let mixed = fit(&model, &pop, &model.default_params, &opts)
+            .expect("RTTE fit must tolerate a non-TTE record")
+            .ofv;
+        assert_eq!(
+            baseline, mixed,
+            "a discrete-state record must not change the RTTE OFV"
+        );
+    }
+
+    /// ODE-accumulated-hazard fit path (`tte_ode_nll`).
+    #[test]
+    fn ode_tte_fit_tolerates_interleaved_non_event_records() {
+        let model = parse_model_string(ODE_TTE_MODEL).expect("ODE-TTE model parses");
+        let build_pop = || {
+            let mut pop = common::tte_pop_from_pairs(&vec![(15.0, 1u8); 10]);
+            for s in pop.subjects.iter_mut() {
+                s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+                s.obs_records = vec![ObsRecord::Event {
+                    time: 15.0,
+                    event_type: EventType::Exact,
+                    entry_time: 0.0,
+                    cmt: 3,
+                }];
+            }
+            pop
+        };
+        let opts = FitOptions::default();
+        let baseline = fit(&model, &build_pop(), &model.default_params, &opts)
+            .expect("baseline ODE-TTE fit")
+            .ofv;
+        let mut pop = build_pop();
+        pop.subjects[0].obs_records.insert(
+            0,
+            ObsRecord::DiscreteState {
+                time: 5.0,
+                state: 0,
+                cmt: 4,
+            },
+        );
+        let mixed = fit(&model, &pop, &model.default_params, &opts)
+            .expect("ODE-TTE fit must tolerate a non-TTE record")
+            .ofv;
+        assert_eq!(
+            baseline, mixed,
+            "a discrete-state record must not change the ODE-TTE OFV"
+        );
+    }
+
+    /// ODE-hazard simulation path (`simulate_tte`, `draw_ode_tte_latent`,
+    /// `validate_tte_simulatable`, `simulate_with_options`).
+    #[test]
+    fn simulate_ode_tte_tolerates_interleaved_non_event_records() {
+        use ferx_core::{simulate_with_options, SimOutcome, SimulateOptions};
+        const H: f64 = 30.0;
+        let model = parse_model_string(ODE_TTE_MODEL).expect("ODE-TTE model parses");
+        let build_pop = || {
+            let mut pop = common::tte_pop_from_pairs(&vec![(H, 0u8); 20]);
+            for s in pop.subjects.iter_mut() {
+                s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+                s.obs_records = vec![ObsRecord::Event {
+                    time: H,
+                    event_type: EventType::RightCensored,
+                    entry_time: 0.0,
+                    cmt: 3,
+                }];
+            }
+            pop
+        };
+        let opts = SimulateOptions {
+            seed: Some(17),
+            match_method: None,
+            horizon: Some(H),
+        };
+        let baseline = simulate_with_options(&model, &build_pop(), &model.default_params, 1, &opts)
+            .expect("baseline ODE-TTE sim");
+        let mut pop = build_pop();
+        pop.subjects[0].obs_records.insert(
+            0,
+            ObsRecord::Count {
+                time: 12.0,
+                count: 2,
+                cmt: 4,
+            },
+        );
+        let mixed = simulate_with_options(&model, &pop, &model.default_params, 1, &opts)
+            .expect("ODE-TTE sim must tolerate a non-TTE record");
+        // Same seed + same TTE design ⇒ bit-identical simulated events on CMT 3.
+        let events = |sims: &[ferx_core::api::SimulationResult]| {
+            let mut v: Vec<(String, u64, bool)> = sims
+                .iter()
+                .filter(|r| r.cmt == 3)
+                .map(|r| match r.outcome {
+                    SimOutcome::Event { time, observed } => {
+                        (r.id.clone(), time.to_bits(), observed)
+                    }
+                    ref o => panic!("expected an Event outcome, got {o:?}"),
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            events(&baseline),
+            events(&mixed),
+            "a non-TTE record must not change the simulated TTE events"
         );
     }
 
@@ -2623,7 +2770,9 @@ mod survival_smoke {
                 "subject {} has 1 TTE record (CMT 3)",
                 s.id
             );
-            let ObsRecord::Event { cmt, .. } = &s.obs_records[0];
+            let ObsRecord::Event { cmt, .. } = &s.obs_records[0] else {
+                panic!("expected a TTE Event record");
+            };
             assert_eq!(*cmt, 3, "the TTE record is routed to CMT 3");
         }
     }

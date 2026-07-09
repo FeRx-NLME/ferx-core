@@ -2075,7 +2075,6 @@ mod tests {
                 occasions: vec![1, 1, 1],
                 dose_occasions: vec![1],
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             })
             .collect();
@@ -3333,7 +3332,6 @@ mod tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         Population {

@@ -21896,7 +21896,6 @@ if (WT > 70) {
             occasions: vec![1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -21964,7 +21963,6 @@ if (WT > 70) {
             occasions: vec![1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 

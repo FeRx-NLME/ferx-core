@@ -177,7 +177,12 @@ pub fn tte_nll_from_curves(
             event_type,
             entry_time,
             ..
-        } = record;
+        } = record
+        else {
+            // Non-TTE records (discrete-state / count endpoints) don't contribute
+            // to the survival likelihood; skip them.
+            continue;
+        };
 
         let h_entry = if *entry_time > 0.0 {
             cumhaz_at(*entry_time)
@@ -297,7 +302,12 @@ pub fn rtte_forward_nll_from_curves(
             event_type,
             entry_time,
             ..
-        } = record;
+        } = record
+        else {
+            // Non-TTE records (discrete-state / count endpoints) don't contribute
+            // to the survival likelihood; skip them.
+            continue;
+        };
 
         if !seeded {
             h_lo = if *entry_time > 0.0 {
@@ -378,7 +388,12 @@ pub fn rtte_reset_nll_from_curves(
             event_type,
             entry_time,
             ..
-        } = record;
+        } = record
+        else {
+            // Non-TTE records (discrete-state / count endpoints) don't contribute
+            // to the survival likelihood; skip them.
+            continue;
+        };
 
         let gap = time - prev_time.unwrap_or(*entry_time);
         // A negative gap means out-of-order records (guarded at data load); the H(Δ) with
@@ -739,7 +754,9 @@ fn rtte_cause(
 ) -> Option<(usize, RtteClock, HazardFamily, Vec<f64>)> {
     let mut found: Option<(usize, RtteClock, HazardFamily, Vec<f64>)> = None;
     for record in &subject.obs_records {
-        let ObsRecord::Event { cmt, .. } = record;
+        let ObsRecord::Event { cmt, .. } = record else {
+            continue;
+        };
         let Some(EndpointLikelihood::Tte {
             hazard,
             recurrence: TteRecurrence::Repeated { clock },
@@ -965,7 +982,11 @@ pub fn simulate_tte<R: rand::Rng>(
             entry_time,
             time,
             event_type,
-        } = record;
+        } = record
+        else {
+            // Non-TTE records don't contribute a competing-risk cause; skip them.
+            continue;
+        };
         let Some(EndpointLikelihood::Tte { hazard, .. }) = model.endpoints.get(cmt) else {
             continue;
         };
@@ -1309,6 +1330,116 @@ mod tests {
             nll, 1e20,
             "non-monotone CHZ on an exact event must be sentinel-guarded"
         );
+    }
+
+    /// Phase 4.0 coexistence contract: a subject may carry non-TTE records
+    /// (discrete-state / count endpoints on other CMTs). The TTE NLL must skip
+    /// them — the `let ObsRecord::Event {..} = record else { continue }` guard —
+    /// so a mixed record slice yields exactly the Event-only NLL.
+    #[test]
+    fn tte_nll_from_curves_skips_non_event_records() {
+        let event = ObsRecord::Event {
+            time: 5.0,
+            event_type: EventType::Exact,
+            entry_time: 0.0,
+            cmt: 2,
+        };
+        let cumhaz = |t: f64| 0.1 * t;
+        let hazard = |_t: f64| 0.1;
+        let event_only = tte_nll_from_curves(&[event.clone()], cumhaz, hazard, MonoTol::default());
+        assert!(
+            event_only.is_finite() && event_only < 1e20,
+            "sanity: a well-posed exact event gives a finite NLL"
+        );
+        let mixed = tte_nll_from_curves(
+            &[
+                event,
+                ObsRecord::DiscreteState {
+                    time: 1.0,
+                    state: 0,
+                    cmt: 3,
+                },
+                ObsRecord::Count {
+                    time: 2.0,
+                    count: 4,
+                    cmt: 4,
+                },
+            ],
+            cumhaz,
+            hazard,
+            MonoTol::default(),
+        );
+        assert_eq!(
+            event_only, mixed,
+            "discrete-state / count records must be skipped by the TTE NLL"
+        );
+    }
+
+    /// Same coexistence contract for the RTTE clock-forward NLL: interleaved
+    /// non-TTE records are skipped, so the mixed slice equals the Event-only NLL.
+    #[test]
+    fn rtte_forward_nll_from_curves_skips_non_event_records() {
+        let events = [
+            ObsRecord::Event {
+                time: 2.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let cumhaz = |t: f64| 0.1 * t;
+        let hazard = |_t: f64| 0.1;
+        let event_only = rtte_forward_nll_from_curves(&events, cumhaz, hazard, MonoTol::default());
+        let mut mixed = events.to_vec();
+        mixed.insert(
+            1,
+            ObsRecord::DiscreteState {
+                time: 3.0,
+                state: 1,
+                cmt: 3,
+            },
+        );
+        let mixed_nll = rtte_forward_nll_from_curves(&mixed, cumhaz, hazard, MonoTol::default());
+        assert_eq!(event_only, mixed_nll, "non-TTE records must be skipped");
+    }
+
+    /// Same coexistence contract for the RTTE clock-reset (gap-time) NLL.
+    #[test]
+    fn rtte_reset_nll_from_curves_skips_non_event_records() {
+        let events = [
+            ObsRecord::Event {
+                time: 2.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+            ObsRecord::Event {
+                time: 5.0,
+                event_type: EventType::RightCensored,
+                entry_time: 0.0,
+                cmt: 2,
+            },
+        ];
+        let cumhaz = |t: f64| 0.1 * t;
+        let hazard = |_t: f64| 0.1;
+        let event_only = rtte_reset_nll_from_curves(&events, cumhaz, hazard, MonoTol::default());
+        let mut mixed = events.to_vec();
+        mixed.insert(
+            1,
+            ObsRecord::Count {
+                time: 3.0,
+                count: 2,
+                cmt: 4,
+            },
+        );
+        let mixed_nll = rtte_reset_nll_from_curves(&mixed, cumhaz, hazard, MonoTol::default());
+        assert_eq!(event_only, mixed_nll, "non-TTE records must be skipped");
     }
 
     /// The monotonicity guard tolerates ODE quadrature round-off on a (near-)flat
