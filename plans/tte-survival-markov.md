@@ -910,8 +910,8 @@ survival data.
 `CompiledModel.endpoints: HashMap<usize, EndpointLikelihood>` populated by `[event_model]` parser
 (PR #192). **#773 (Phase 4.0)** added the `ObsRecord::{DiscreteState, Count}` observation variants and
 ungated `ObsRecord`/`obs_records` to **default-on** (only the `Event` variant stays `survival`-gated).
-The *endpoint-likelihood* variants that consume them (Binary/Ordinal/Poisson/NegBin/Ctmm/Dtmm) are
-still deferred to Track C/D.
+The *endpoint-likelihood* variants that consume them (Binary/Ordinal/Poisson/NegBin → **Track C,
+#760**; Ctmm/Dtmm → **Track D, #759**) are still to build (dispatch spec in §8.5).
 
 ### 5.2 Individual NLL dispatch ✅ *Resolved — PRs #192, #206*
 
@@ -931,7 +931,9 @@ FD Hessian + `½ log|det H_total|` for TTE CMTs; combined with Gaussian Almquist
 `[event_model]` parser landed in PR #192 (Exponential, Weibull, Gompertz; named blocks
 for competing risks; `loghr` PH term). PR #206: `[structural_model]`, `[error_model]`,
 `[individual_parameters]` all optional when `[event_model]` is the sole endpoint.
-Binary/ordinal/count/Markov rate-matrix blocks deferred to Phase 4+.
+Binary/ordinal/count DSL blocks (`[ordinal_model]`/`[count_model]`, §8.4) → **Phase 4 · Track C
+(#760)**; the `[markov_model]` rate-matrix block → **Phases 4b/4c/5/6 · Track D (#759)**. Grammar +
+dispatch are already spec'd (§8.4/§8.5); the remaining work is wiring, not design.
 
 ### 5.5 Cumulative hazard integration ✅ *Resolved — PRs #567, #595*
 
@@ -946,7 +948,8 @@ augmented state on both the fit path (#567, Slice 2.1) and the simulation path (
 `matrix_exp_frechet` + `generator_rate_direction` (exact directional Van Loan / Fréchet gradients),
 and a guarded `ctmm_data_term`; closed-form 3-state chain test anchor in #774. **Primitive only** —
 not yet wired to an endpoint (no `[markov_model]` DSL, no `EndpointLikelihood::Ctmm`); that wiring
-is the remaining Phase 5 work (§12) — its Phase 4.0 data-plumbing prerequisite is now merged (#773).
+is the remaining **Phase 5 · Track D (#759)** work (§12) — its Phase 4.0 data-plumbing prerequisite
+is now merged (#773).
 
 ### 5.7 Data reader extensions ✅ *Resolved — PRs #192, #773*
 
@@ -965,7 +968,7 @@ SAEM M-step now adds the TTE data term for TTE subjects. Sigma update is Gaussia
 
 Current SAEM uses a random-walk MH proposal. Replacing it with a Laplace-based independent
 proposal (f-SAEM) would accelerate convergence for all non-Gaussian models (§9.1); this is
-Phase 3b and remains **open**. A related but distinct increment has landed: PR #265 ("SAEM
+**Phase 3b · Track B** and remains **open** (no tracking issue filed yet). A related but distinct increment has landed: PR #265 ("SAEM
 conditional-distribution pass", merged 2026-06-21) characterises each subject's post-fit
 `p(η|y)` — conditional mean/SD/draws, the saemix `conddist` / Monolix analog — by
 *accumulating* the existing random-walk MH draws after the fit. It does **not** change the
@@ -3133,8 +3136,8 @@ on the whole categorical phase.
 |---|---|---|---|---|
 | **Trunk** (built) | §2 dispatch, FD-Hessian + log-det, `SimOutcome` | — | ✅ done | `survival` → default |
 | **A · Survival hardening** | #741, #763, #762, #740, #626, #764, Phase 3.4 docs; Phase 2 deferred (IntervalCensored+ODE, left-trunc+ODE); ferx-r `predict_survival` + e2e + ferx-r#210 | trunk | ✅ yes | `survival` |
-| **B · SAEM engine** | Phase 3b `saem_proposal = auto` | trunk | ✅ yes | none |
-| **E · Custom likelihood** | Phase 8 `[ll_model]` | trunk | ✅ yes | none |
+| **B · SAEM engine** | Phase 3b `saem_proposal = auto` *(no issue filed)* | trunk | ✅ yes | none |
+| **E · Custom likelihood** | Phase 8 `[ll_model]` *(no issue filed)* | trunk | ✅ yes | none |
 | **4.0 · Discrete-state slice** | Phase 4.0 (front of #760) | trunk | ✅ **merged #773** | (part of Phase 4) |
 | **matrix-exp module** | `src/markov`: `matrix_exp` + Van Loan + `ctmm_data_term` (§8.7) | none | ✅ **merged #771/#774** | `markov` |
 | **C · Categorical & count** | Phase 4 / #760 (binary·ordinal·Poisson·NB) | 4.0 ✅ (#773) | **ready now** | none |
