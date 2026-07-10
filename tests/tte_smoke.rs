@@ -2728,6 +2728,48 @@ mod survival_smoke {
         );
     }
 
+    /// Issue #770: a hazard that references an IOV **kappa by name directly**
+    /// (not through an [individual_parameters] value) must also be rejected at
+    /// parse. The hazard parse scope is BSV-only, so `KAPPA_CL` here would
+    /// otherwise fall back to a leniently-read 0.0 covariate — silently dropping
+    /// the IOV term instead of failing loud. Sibling to
+    /// `event_model_referencing_kappa_indiv_param_is_rejected`, which covers the
+    /// *indirect* case (`scale = CL` with `CL = TVCL * exp(ETA_CL + KAPPA_CL)`).
+    #[test]
+    fn event_model_referencing_kappa_by_name_is_rejected() {
+        let src = r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta TVLAMBDA(0.05, 0.001, 5.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma SIGMA_ADD ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ additive(SIGMA_ADD)
+
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(KAPPA_CL)
+";
+        let err = parse_model_string(src).expect_err(
+            "a hazard referencing an IOV kappa by name must be rejected, not read as 0.0",
+        );
+        assert!(
+            err.contains("inter-occasion") && err.contains("KAPPA_CL"),
+            "the error should name the offending IOV random effect; got: {err}"
+        );
+    }
+
     /// Issue #442 (review #2): a hazard may reference an `[individual_parameters]`
     /// value defined by a NONMEM-style `if (...) { ... } else { ... }` block. Before
     /// the fix, such a name was classified as a covariate and silently resolved to

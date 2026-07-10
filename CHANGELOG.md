@@ -266,6 +266,15 @@ section of the SDLC for the versioning policy).
   structural-model type.
 
 ### Fixed
+- **A time-to-event hazard that references an inter-occasion (IOV) `kappa` by name
+  is now rejected at parse instead of silently using zero** (#770). A hazard is
+  evaluated once per subject with no occasion context, so an IOV `kappa` has no
+  well-defined value there. Referencing one *through* an `[individual_parameters]`
+  value was already rejected (#442); a hazard expression that names a `kappa`
+  **directly** (e.g. `scale = TVLAMBDA * exp(KAPPA_CL)`) previously fell back to a
+  leniently-read `0.0` covariate, silently dropping the IOV term. It now fails
+  loud, naming the offending random effect — write the hazard in terms of θ/η, or
+  reference an IOV-free parameter.
 - **A degenerate hazard draw in simulation no longer vanishes silently, and a pathological
   RTTE hazard no longer aborts the whole run** (#762, #763). When an analytic hazard's
   effective rate degenerates (non-positive / non-finite), the affected subject is censored
