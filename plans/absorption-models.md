@@ -2,9 +2,11 @@
 
 **Tracking issue:** [#322](https://github.com/FeRx-NLME/ferx-core/issues/322)
 **Scope:** ferx-core (primary) + ferx-r (follow-up PR once `pub` API lands)
-**Status:** approved roadmap, in progress (updated 2026-06-29). **The full model
-catalogue is merged** (Phases −1/0a/0b/1/2). The only remaining roadmap phase is
-**Phase 3 (#386, analytical closed forms)**; see "Route to close #322" below.
+**Status:** ✅ **COMPLETE** (updated 2026-07-10). Epic **#322 CLOSED 2026-06-29** (model
+catalogue, Phases −1/0a/0b/1/2); the speed-only follow-on **Phase 3 (#386, analytical
+closed forms) CLOSED 2026-07-06**. Every roadmap phase shipped with NONMEM anchors and
+ferx-r exposure — **no work remaining**. The "How #322 closed" section below is kept as a
+retrospective of how it landed.
 - **Prerequisite #324:** safety net (PR #326), **modeled infusion duration `Dn` /
   `RATE=-2`** (PR #384), and **modeled rate `Rn` / `RATE=-1` on both engines**
   (PR #418) **merged**; see #383 for any residual analytical-engine items.
@@ -57,66 +59,78 @@ catalogue is merged** (Phases −1/0a/0b/1/2). The only remaining roadmap phase 
     (`build_ode_spec`). **ferx-r follow-up ✅ done — PR [#209](https://github.com/FeRx-NLME/ferx-r/pull/209)
     merged 2026-06-28 (`5b3937e5`): pin bump + parallel/mixed examples + validate tests.** Spun off
     **#588** (fraction value-checks still skipped on the `simulate()`/`predict()` paths).
-- **Phase 3 — #386 — analytical incomplete-gamma / exponential tilting** for
-  transit + IG. Now *speed-only* (#430 already gave transit/IG exact gradients on
-  the ODE path), so this only removes the ODE solve. Lowest urgency. Weibull never
-  reaches Phase 3 (no closed form) — its only exact-gradient route is the #430
+- **Phase 3 — #386 — analytical incomplete-gamma / exponential tilting — ✅ MERGED,
+  CLOSED 2026-07-06.** `regularized_gamma_p(a,x)` over `PkNum` (PR #604), the
+  `TiltedAbsorption` trait + `convolve_1cpt` (PR #606), and closed-form dispatch for 1-cpt
+  (PR #611) and 2-cpt (PR #634) transit — speed-only as planned (#430 already gave exact
+  ODE-path gradients), dropping the ODE solve (~28–31× faster, same fit). **IG's closed
+  form was deferred** (Stage-3 do-or-drop → deferred; now tracked in **#790**): only
+  `TransitAbsorption` implements `TiltedAbsorption` today, so IG still runs on the #430
+  ODE-forcing path with exact `Dual2` gradients meanwhile. The
+  closed form's flip-flop regime (`ke ≥ KTR` / `α ≥ KTR`, where it clamps to 0) reroutes to
+  the ODE twin — **#724** (2-cpt twin) + **#776** (flip-flop reroute + twin-less hard error).
+  Weibull never reaches Phase 3 (no closed form) — its only exact-gradient route is the #430
   generic forcing.
 
-Recommended sequence: Weibull (#498), zero-order (#504), the shared **fraction
-multiplier #388** (biphasic IG), and **`parallel`/`mixed` #505** are all **✅ merged**
-(ferx-core + ferx-r). The model catalogue is therefore complete. **NEXT = #386**
-(Phase 3 closed forms — the last roadmap phase). The moving-boundary sensitivity
-**#530** (`zero_order` `dur` + `Dn` off FD) and the **#588** fraction-validation hole
-are parallel, off-roadmap tracks — independent of Phase 3, not gating it.
+Sequence (all ✅ merged, ferx-core + ferx-r): Weibull (#498), zero-order (#504), the
+shared **fraction multiplier #388** (biphasic IG), **`parallel`/`mixed` #505**, and
+**Phase 3 closed forms #386** (2026-07-06). The two off-roadmap tracks also landed: the
+moving-boundary sensitivity **#530** (`zero_order` `dur` + `Dn`/`Rn` off FD, CLOSED
+2026-06-30) and the **#588** fraction-validation hole on the simulate/predict paths (CLOSED
+2026-07-07). **Nothing remains — the epic is closed.**
 
 Multi-PR / phased.
 
-## Route to close #322 (remaining work)
+## How #322 closed — ✅ retrospective (all stages done)
 
-Phases −1/0a/0b/1/2 are merged — the entire model catalogue (`transit`, `igd` +
-biphasic, `weibull`, `zero_order`, `sequential`, `parallel`, `mixed`, `first_order`)
-ships with NONMEM anchors and ferx-r exposure. **The only remaining roadmap phase is
-Phase 3 (#386).** Two nuances:
+Phases −1/0a/0b/1/2 (the entire model catalogue: `transit`, `igd` + biphasic, `weibull`,
+`zero_order`, `sequential`, `parallel`, `mixed`, `first_order`) shipped with NONMEM anchors
+and ferx-r exposure, and **#322 closed 2026-06-29** on catalogue completion. Phase 3 (#386,
+analytical closed forms) was a **speed-only follow-on** — not a blocker for #322 — and
+closed **2026-07-06**. Two nuances, both now resolved:
 
-- **#386 as filed is transit-only** (its scope note: "Covers transit → standard 1-/2-cpt
-  disposition only"). The plan's Phase 3 *also* describes an **IG closed form**, but that
-  half is **unfiled** — it needs a conscious **do-or-drop** decision (Stage 3 below).
+- **#386 as filed was transit-only** ("Covers transit → standard 1-/2-cpt disposition
+  only"). The plan's Phase 3 also described an **IG closed form**; that was the Stage-3
+  do-or-drop, resolved as **deferred** (now tracked in **#790**) — only `TransitAbsorption`
+  implements `TiltedAbsorption` today, and IG runs on the #430 ODE-forcing path with exact
+  `Dual2` gradients meanwhile.
 - **Weibull stays numerical forever** (no elementary closed form); it already has exact
-  gradients via #430, so it never reaches Phase 3 and does **not** block closing #322.
+  gradients via #430, so it never reached Phase 3 and did **not** block #322.
 
-The critical path to close #322 is **Stage 2 + Stage 4**. Stages 1, 3-IG, and 5 are
-quality — fold them in for a clean finish, or defer.
+The original critical path was **Stage 2 + Stage 4**; every stage below is now ✅ done.
 
-| Stage | Work | Issue | Size | Risk | Critical path? |
-|---|---|---|---|---|---|
-| **0** | Make this plan truthful (#505 merged; #386 = sole remaining phase) | — | XS | none | enables the rest |
-| **1** | Hoist `E_ABSORPTION_FRACTION` value-checks to the parse/sim path | **#588** | S | low | no (debt) |
-| **2a** | `regularized_gamma_p(a,x)`: f64 + `Dual2` 1st/2nd-order rules, mutation-verified | **#386** | M | **HIGH** | **yes** |
-| **2b** | 1-cpt transit closed form (`TiltedAbsorption` + `convolve_1cpt`); relax error rule for transit; equivalence test (n=0 ≡ Bateman) | **#386** | M | med | **yes** |
-| **2c** | 2-cpt transit closed form | **#386** | L | med | **yes** |
-| **3** | **Decide IG**: file + build IG closed form (`normal_cdf` on `PkNum`), *or* consciously drop (IG already has exact gradients and isn't stiff) | new / note | M or 0 | med | judgment |
-| **4** | Re-anchor transit vs the #385 NONMEM dataset, record new runtime; CHANGELOG/docs; **close #322** | **#386** | S | low | **yes** |
-| **5** | Get `zero_order`/`mixed`/`Dn` off FD via one boundary-impulse mechanism | **#530** | M | med-high | no (parallel) |
+| Stage | Work | Issue | ✅ Resolved by |
+|---|---|---|---|
+| **0** | Make this plan truthful | — | this PR (#602) |
+| **1** | Hoist `E_ABSORPTION_FRACTION` value-checks to the parse/sim path | **#588** | ✅ CLOSED 2026-07-07 (via #696) |
+| **2a** | `regularized_gamma_p(a,x)`: f64 + `Dual2` 1st/2nd-order rules, mutation-verified | **#386** | ✅ PR #604 |
+| **2b** | 1-cpt transit closed form (`TiltedAbsorption` + `convolve_1cpt`); relax error rule; n=0 ≡ Bateman | **#386** | ✅ PR #606 / #611 |
+| **2c** | 2-cpt transit closed form | **#386** | ✅ PR #634 |
+| **3** | **Decide IG**: build closed form *or* defer | note | ✅ decided → **DEFERRED**, tracked in **#790** (IG keeps #430 ODE-path gradients meanwhile) |
+| **4** | Re-anchor transit vs #385, record runtime; docs; **close #322** | **#386** | ✅ #386 CLOSED 2026-07-06; #322 CLOSED 2026-06-29 |
+| **5** | Get `zero_order`/`mixed`/`Dn` off FD via one boundary-impulse mechanism | **#530** | ✅ CLOSED 2026-06-30 |
+| **+** | Closed-form flip-flop → ODE-twin reroute + twin-less hard error | — | ✅ PR #724 / #776 |
 
-**Why this order.**
-- **2a is the linchpin and highest risk.** `∂P/∂x` is clean (`x^{a-1}e^{-x}/Γ(a)`), but
+**How it played out** (the original staging rationale, kept for the record).
+- **2a was the linchpin and highest risk.** `∂P/∂x` is clean (`x^{a-1}e^{-x}/Γ(a)`), but
   transit's shape is `a = N+1` and **N carries IIV**, so `∂P/∂a` is required — and that
-  partial is not elementary. Landing `regularized_gamma_p` + its dual rules *first*, behind
-  mutation-verified tests, mirrors how `ln_gamma` (#340 → #458) was retired before transit
-  wiring, and lets the Phase-3 *speed* justification (it is explicitly **lowest urgency**) be
-  re-weighed cheaply if 2a proves hard.
-- **IG is a deliberate fork.** Phase 3's *motivation* (the #385 anchor: ~89 s release at
-  `ode_*tol=1e-9` vs NONMEM's ~16 s) is specifically transit's stiffness. IG isn't stiff and
-  already has exact `Dual2` gradients (#430/#433), so its closed form is marginal speed polish.
-  Lean: **drop IG from the closure scope** unless there's a transit-scale IG perf complaint.
-- **#530 is genuinely parallel.** #386 moves *transit/IG* off the ODE path, but
-  `zero_order`/`mixed` get no closed form — #530 is the only route to make the *whole*
-  absorption family analytic-gradient. It doesn't block #322 and can run independently.
+  partial is not elementary. `regularized_gamma_p` + its dual rules landed *first* (#604),
+  behind mutation-verified tests, mirroring how `ln_gamma` (#340 → #458) was retired before
+  transit wiring; the closed forms (#606/#611/#634) then built on it.
+- **IG was a deliberate fork — and was deferred.** Phase 3's *motivation* (the #385 anchor:
+  ~89 s release at `ode_*tol=1e-9` vs NONMEM's ~16 s) is specifically transit's stiffness. IG
+  isn't stiff and already had exact `Dual2` gradients (#430/#433), so its closed form was
+  marginal speed polish and was **left on the ODE-forcing path** for the initial close. The
+  closed form itself is now tracked in **#790**.
+- **#530 was genuinely parallel — and also landed.** #386 moved *transit* off the ODE path,
+  but `zero_order`/`mixed` got no closed form; #530 (CLOSED 2026-06-30) took them off FD via
+  the boundary-impulse (`dur` jet) mechanism, so the whole absorption family now has exact
+  analytic gradients.
 
-**Definition of done for #322:** transit closed form merged + equivalence-tested (≡ Phase-0
-ODE) + re-anchored with recorded runtime; error rule relaxed for transit and documented; IG
-do-or-drop recorded; plan + CHANGELOG + docs updated. (#588/#530 optional for a clean finish.)
+**Done for #322** (achieved): transit closed form merged + equivalence-tested (≡ Phase-0 ODE)
++ re-anchored; error rule relaxed for transit and documented; IG do-or-drop recorded (deferred → #790);
+plan + CHANGELOG + docs updated. #588 and #530 also closed. **#322 CLOSED 2026-06-29; Phase 3
+#386 CLOSED 2026-07-06.**
 
 > **Autodiff landscape (2026-06):** the Enzyme autodiff path (`src/ad/`, the `autodiff`
 > Cargo feature) was **retired** (#367/#381) in favour of hand-rolled forward sensitivities in
@@ -440,15 +454,16 @@ Decouple **input function** from **disposition**, reusing existing machinery:
      `ln_gamma` transit calls) evaluate over `Dual2`, so `transit()`/`igd()`/`weibull()` get
      **exact analytic** ODE forcing sensitivities (#468/#430/#498), gated by
      `InputRateKind::supported_over_dual()`.
-   - **Phase 0a finding (resolved, with one designed exception):** transit originally shipped
+   - **Phase 0a finding (fully resolved):** transit originally shipped
      `f64`-only and differentiated via **finite differences**; #430 (`igd`) / #468 (`transit`) /
      #498 (`weibull`) lifted all three onto the analytic `Dual2` path (`src/sens/ode_provider.rs`:
      state integrated as `Dual2<N>` through the generic RK45), so they are no longer FD holdouts.
-     The remaining FD case is **by design**: `zero_order` (#504) has a *moving boundary* (`R_in`
-     cuts off at `tad=dur`), whose `∂/∂dur` is not a `PkNum`-generic expression but a dual-channel
-     impulse at `tad=dur` (a Leibniz boundary term). It ships with `dur` on FD
-     (`supported_over_dual()=false`) until that impulse is built — the same gap that keeps #384's
-     modeled-duration `Dn` infusion on FD; see "Analytic sensitivities for the ODE forcing".
+     The last FD case — `zero_order` (#504), whose *moving boundary* (`R_in` cuts off at `tad=dur`)
+     makes `∂/∂dur` a dual-channel impulse at `tad=dur` (a Leibniz boundary term), not a
+     `PkNum`-generic expression — was closed by **#530 (CLOSED 2026-06-30)**: the boundary "`dur`
+     jet" was built, so `InputRateKind::ZeroOrder.supported_over_dual()` is now `true`, and the
+     same mechanism also lifted #384's modeled-duration `Dn`/`Rn` infusion off FD. **The entire
+     absorption family now has exact analytic (`Dual2`) gradients.**
 2. **Forcing into the user's ODE.** `R_in(tad)` is added into the dosing compartment of the
    disposition the user supplied (`ode(...)` or the `ode_template`-generated states) via the
    **same RHS-wrapper mechanism that already injects `+rate` for infusions**
@@ -626,8 +641,10 @@ Each item needs a negative/edge test so it registers Codecov patch coverage:
     **Closed-form** (superpose `*_oral` solvers by `frac`). NONMEM `$DES` anchors ran
     (`tests/parallel_mixed_nonmem_anchor.rs`). **ferx-r follow-up done — PR #209 (`5b3937e5`,
     merged 2026-06-28).** Spun off **#588** (fraction value-checks skip the simulate/predict paths).
-- **Phase 3 — analytical closed forms for transit and IG** (1/2-cpt). Both are implemented
-  via the **`TiltedAbsorption` trait** in a new `src/pk/analytical_absorption.rs`:
+- **Phase 3 — analytical closed forms for transit and IG** (1/2-cpt). **✅ Transit shipped**
+  (#604/#606/#611/#634); **IG's closed form is deferred — tracked in #790** (Stage 3 above).
+  Only `TransitAbsorption` implements the trait today, so the IG spec below is the reference
+  design for #790. The design is the **`TiltedAbsorption` trait** in `src/pk/analytical_absorption.rs`:
 
   ```rust
   pub trait TiltedAbsorption {
