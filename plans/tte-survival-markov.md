@@ -904,12 +904,14 @@ survival data.
 
 ## 5. Gap Analysis — What ferx-core Currently Lacks
 
-### 5.1 Observation type system ✅ *Resolved — PRs #190, #192*
+### 5.1 Observation type system ✅ *Resolved — PRs #190, #192, #773*
 
-`ObsRecord::Event`, `EventType`, and `Subject.obs_records` added (behind
-`#[cfg(feature = "survival")]`). `CompiledModel.endpoints: HashMap<usize,
-EndpointLikelihood>` populated by `[event_model]` parser (PR #192). Binary/ordinal/count
-variants deferred to Phase 4.
+`ObsRecord::Event`, `EventType`, and `Subject.obs_records` added (PRs #190/#192).
+`CompiledModel.endpoints: HashMap<usize, EndpointLikelihood>` populated by `[event_model]` parser
+(PR #192). **#773 (Phase 4.0)** added the `ObsRecord::{DiscreteState, Count}` observation variants and
+ungated `ObsRecord`/`obs_records` to **default-on** (only the `Event` variant stays `survival`-gated).
+The *endpoint-likelihood* variants that consume them (Binary/Ordinal/Poisson/NegBin/Ctmm/Dtmm) are
+still deferred to Track C/D.
 
 ### 5.2 Individual NLL dispatch ✅ *Resolved — PRs #192, #206*
 
@@ -946,11 +948,13 @@ and a guarded `ctmm_data_term`; closed-form 3-state chain test anchor in #774. *
 not yet wired to an endpoint (no `[markov_model]` DSL, no `EndpointLikelihood::Ctmm`); that wiring
 is the remaining Phase 5 work (§12) — its Phase 4.0 data-plumbing prerequisite is now merged (#773).
 
-### 5.7 Data reader extensions ✅ *Resolved — PR #192*
+### 5.7 Data reader extensions ✅ *Resolved — PRs #192, #773*
 
 DV=0/1/2 routed to `subject.obs_records` for TTE CMTs; `TENTRY` column auto-detected
-for left truncation; non-integer DV on TTE CMT → hard error. State-index and count
-routing deferred to Phase 4.
+for left truncation; non-integer DV on TTE CMT → hard error. **State-index and count routing landed
+via #773 (Phase 4.0):** an `ObsRouting { tte, discrete, count }` 3-target dispatch with a disjointness
+guard and a shared `checked_integer_dv` (missing DV skipped as MDV=1 per #258; non-integer, negative,
+non-finite, and out-of-range DVs rejected) — covered by 13 reader tests.
 
 ### 5.8 SAEM sigma update for non-Gaussian ✅ *Resolved — PR #206*
 
@@ -1572,9 +1576,9 @@ pub struct SimulationResult {
 **Breaking change:** `dv_sim: f64` field removed; callers must use
 `row.outcome.continuous_value()`. Version bumped 0.1.5 → 0.1.6.
 
-**Future variants** (`Category`, `Count`) will be added to `SimOutcome` unconditionally
-(no feature flag) once Phase 4 lands. The `Event` variant will likewise be promoted
-to default-on after Phase 1 validation.
+**`SimOutcome::Category` and `Count`** landed via #773 (Phase 4.0), unconditional (no feature flag) —
+but only the output *shape*; the sampler/producer that emits them is Track C/D (still open). The
+`Event` variant remains `survival`-gated.
 
 The target `Prediction` enum and `SurvivalPredictionResult` remain as planned:
 
@@ -2588,28 +2592,30 @@ DSL parsers are the next step.
 **Tracking:** front slice of #760. **The pivot that lets the categorical track (C) and the Markov
 track (D) proceed in parallel** — see the track map (§19).
 
-Today `types.rs` carries only `ObsRecord::Event`, `EndpointLikelihood::{Gaussian,Tte}`, and
-`SimOutcome::{Continuous,Event}` (the discrete/count variants are commented out, "deferred to
-Phase 4/5"). The Markov phases are nominally blocked on *all* of Phase 4, but they consume only the
-discrete-state *plumbing*, not the ordinal/Poisson/NB *distributions*. Carve that plumbing out as
-its own small slice:
+Rationale for carving this thin slice off the front of Phase 4: the Markov phases were nominally
+blocked on *all* of Phase 4, but they consume only the discrete-state *plumbing*, not the
+ordinal/Poisson/NB *distributions*. #773 shipped exactly that plumbing (record types, reader routing,
+sim-output shapes — no likelihood/DSL/producer), all **default-on**:
 
-- `ObsRecord::DiscreteState { time, state, cmt }` and `ObsRecord::Count { time, count, cmt }` (the
-  §8.1 variants). The datareader routes integer-DV rows on a declared discrete/count CMT into them
-  (two-pass read: parse the `[..._model]` blocks first, then dispatch each row by its CMT, §8.1). A
-  non-integer DV on such a CMT is a hard error (mirror the TTE rule from #192).
-- `SimOutcome::Category { state }` and `SimOutcome::Count { count }` (added unconditionally, §8.8.1)
-  plus the `Prediction::CatProbs { probs }` output shape.
-- **No likelihood math here** — only the record types, the reader routing, and the output shapes.
+- ✅ `ObsRecord::DiscreteState { time, state, cmt }` and `Count { time, count, cmt }` (default-on;
+  only `Event` stays `survival`-gated). The datareader's `ObsRouting { tte, discrete, count }` routes
+  integer-DV rows on a declared discrete/count CMT into them, with a disjointness guard and
+  `checked_integer_dv` validation (missing DV skipped as MDV=1 per #258; non-integer / negative /
+  non-finite / out-of-range DV rejected).
+- ✅ `SimOutcome::Category { state }` and `Count { count }` (unconditional).
+- ⬜ **Not** in #773 (these belong with the endpoint / prediction, Track C/D): `Prediction::CatProbs`
+  (there is no `Prediction` enum yet), the `EndpointLikelihood` variants, the `[..._model]` DSL blocks,
+  and any sampler/producer — i.e. no likelihood math and nothing that *emits* a category/count.
 
 **What consumes it.** Track C (binary/ordinal/Poisson/NB data terms, §3.5) and Track D
 (DTMM/mCTMM/CTMM state observations, §3.4). CTMM (4c/5/6) needs *only* this slice plus its own
 matrix-exp NLL — it does **not** need the categorical distributions; only DTMM (4b) additionally
 reuses Track C's categorical-logit primitive.
 
-**Deliverables:** the `types.rs` variants above; `io/datareader.rs` integer-DV state/count routing
-+ non-integer guard; a Tier-2 test that a `DiscreteState`-CMT dataset reads into `obs_records`; no
-estimator change (no endpoint math yet). **Files:** `src/types.rs`, `src/io/datareader.rs`.
+**Delivered (#773):** the `types.rs` variants above (+ ungate of `ObsRecord`/`obs_records` to
+default-on, a mechanical cascade across ~14 files); the `io/datareader.rs` `ObsRouting` 3-target
+routing + DV validation; 13 reader tests. No estimator change (no endpoint math).
+**Files:** `src/types.rs`, `src/io/datareader.rs`.
 
 ### Phase 4 — Categorical and Count Models · Track C
 
@@ -2758,7 +2764,7 @@ are out of scope for v1. **No `simulate()`** by default (an arbitrary `ll` has n
 fit/predict only; document the limitation.
 
 **Validation:** Tier-1 — a custom-Poisson `[ll_model]` reproduces the analytic Poisson data term to
-1e-10; Tier-2 — parse + `fit()` in ≤3 iters; once Phase 4 lands, cross-check vs. the built-in
+1e-10; Tier-2 — parse + `fit()` in ≤3 iters; once the Track-C Poisson endpoint lands, cross-check vs. the built-in
 Poisson. **Files:** the four above + new `docs/model-file/ll-model.qmd`.
 
 ---
@@ -3131,8 +3137,8 @@ on the whole categorical phase.
 | **E · Custom likelihood** | Phase 8 `[ll_model]` | trunk | ✅ yes | none |
 | **4.0 · Discrete-state slice** | Phase 4.0 (front of #760) | trunk | ✅ **merged #773** | (part of Phase 4) |
 | **matrix-exp module** | `src/markov`: `matrix_exp` + Van Loan + `ctmm_data_term` (§8.7) | none | ✅ **merged #771/#774** | `markov` |
-| **C · Categorical & count** | Phase 4 / #760 (binary·ordinal·Poisson·NB) | 4.0 | after 4.0 | none |
-| **D · Markov / CTMM** | Phases 4b/4c/5/6 / #759 — **matrix-exp core merged #771/#774** | 4.0 (+ matrix-exp; 4b also on C's logit) | core in · endpoint after 4.0 | `markov` |
+| **C · Categorical & count** | Phase 4 / #760 (binary·ordinal·Poisson·NB) | 4.0 ✅ (#773) | **ready now** | none |
+| **D · Markov / CTMM** | Phases 4b/4c/5/6 / #759 — **matrix-exp core merged #771/#774** | 4.0 ✅ (#773) + matrix-exp ✅ | **endpoint ready** (both prereqs in) | `markov` |
 | **Phase 7 · HMM** | Phase 7 (Track D tail) | D (Phase 5) + inner-EM spike | tail | `markov` |
 
 **Sequencing.** Start in parallel with zero coordination: **A, B, E, and the 4.0 slice** — plus the
