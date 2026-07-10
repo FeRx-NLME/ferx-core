@@ -3865,8 +3865,14 @@ pub enum WarningSeverity {
 pub enum WarningCode {
     /// Optimizer did not reach the convergence criterion.
     Convergence,
-    /// Covariance step failed, was regularized, or is informational (see message).
+    /// Informational note about the covariance step (e.g. its evaluation cost).
     CovarianceStep,
+    /// The covariance step failed — no standard errors are available.
+    CovarianceFailed,
+    /// The covariance step succeeded but was regularized / degraded (eigenvalue
+    /// floor applied, or a non-finite off-diagonal stencil); SEs may be
+    /// over-optimistic.
+    CovarianceRegularized,
     /// Correlation / condition-number problem in the covariance.
     ConditionNumber,
     /// Optimizer-health issue (trust-radius collapse, degeneracy).
@@ -3915,6 +3921,8 @@ impl WarningCode {
         match self {
             WarningCode::Convergence => "convergence",
             WarningCode::CovarianceStep => "covariance_step",
+            WarningCode::CovarianceFailed => "covariance_failed",
+            WarningCode::CovarianceRegularized => "covariance_regularized",
             WarningCode::ConditionNumber => "condition_number",
             WarningCode::OptimizerHealth => "optimizer_health",
             WarningCode::DwAutocorrelation => "dw_autocorrelation",
@@ -4012,15 +4020,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // Hessian is not positive definite") whose prefix differs from "failed:"
         // messages. It must be compound so that "SIR failed: covariance not
         // positive definite" (no "covariance step" token) still routes to "sir".
-        (WarningSeverity::Critical, WarningCode::CovarianceStep)
+        (WarningSeverity::Critical, WarningCode::CovarianceFailed)
     } else if lower.contains("covariance step regularized")
         || lower.contains("off-diagonal fd stencil")
     {
         // Regularisation warning and off-diagonal NaN soft warning both indicate a
         // degraded-but-present covariance step result. Severity within the message
-        // (minor/moderate/severe, or "over-optimistic") informs guidance; the
-        // category is always covariance_step.
-        (WarningSeverity::Warning, WarningCode::CovarianceStep)
+        // (minor/moderate/severe, or "over-optimistic") informs guidance.
+        (WarningSeverity::Warning, WarningCode::CovarianceRegularized)
     } else if lower.contains("ill-conditioned") || lower.contains("condition number") {
         // Note: "covariance step failed: Hessian has ill-conditioned entries" contains
         // "ill-conditioned" but is caught by "covariance step failed" above (else-if chain).
@@ -6449,7 +6456,7 @@ mod tests {
     fn classify_warning_covariance_is_critical() {
         let w = classify_warning("Covariance step failed");
         assert_eq!(w.severity, WarningSeverity::Critical);
-        assert_eq!(w.category.as_str(), "covariance_step");
+        assert_eq!(w.category.as_str(), "covariance_failed");
     }
 
     #[test]
@@ -6482,7 +6489,7 @@ mod tests {
         assert_eq!(w.source_method.as_deref(), Some("FOCEI"));
         assert_eq!(w.message, "Covariance step failed");
         assert_eq!(w.severity, WarningSeverity::Critical);
-        assert_eq!(w.category.as_str(), "covariance_step");
+        assert_eq!(w.category.as_str(), "covariance_failed");
     }
 
     #[test]
@@ -6519,6 +6526,8 @@ mod tests {
         let expected: &[(WarningCode, &str)] = &[
             (Convergence, "convergence"),
             (CovarianceStep, "covariance_step"),
+            (CovarianceFailed, "covariance_failed"),
+            (CovarianceRegularized, "covariance_regularized"),
             (ConditionNumber, "condition_number"),
             (OptimizerHealth, "optimizer_health"),
             (DwAutocorrelation, "dw_autocorrelation"),
@@ -6600,7 +6609,7 @@ mod tests {
                 Critical,
                 "convergence",
             ),
-            ("Covariance step failed", Critical, "covariance_step"),
+            ("Covariance step failed", Critical, "covariance_failed"),
             // global_search has two arms: explicit "disabled" is a runtime
             // failure (Warning); a bare mention without "disabled" is
             // informational.
@@ -6631,7 +6640,7 @@ mod tests {
             (
                 "Covariance step failed \u{2014} SEs not available",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             (
                 "saem_n_leapfrog > 0 but HMC is unavailable (requires an analytical PK model \
@@ -6742,7 +6751,7 @@ mod tests {
                 "Covariance step: Hessian is not positive definite. \
                  Eigenvalues: [8.4000, 2.1000, -0.0100]. SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             // Covariance step regularised — present in all three severity tiers.
             (
@@ -6750,7 +6759,7 @@ mod tests {
                  (1 of 3 free-block eigenvalues clipped; min eig = 1.2e-6, floor = 8.4e-14; \
                  severity: minor). Standard errors are likely reliable.",
                 Warning,
-                "covariance_step",
+                "covariance_regularized",
             ),
             (
                 "Covariance step regularized: eigenvalue floor applied to FD Hessian \
@@ -6758,7 +6767,7 @@ mod tests {
                  severity: severe). Standard errors are likely unreliable; \
                  SIR-based confidence intervals are recommended.",
                 Warning,
-                "covariance_step",
+                "covariance_regularized",
             ),
             // Off-diagonal NaN soft warning — Success result, but correlation missing.
             (
@@ -6766,7 +6775,7 @@ mod tests {
                  Cross-partial correlation set to 0; SE for these parameter(s) \
                  may be over-optimistic. Try tuning fd_hessian_step.",
                 Warning,
-                "covariance_step",
+                "covariance_regularized",
             ),
             // Chain-prefixed off-diagonal warning.
             (
@@ -6774,7 +6783,7 @@ mod tests {
                  Cross-partial correlation set to 0; SE for these parameter(s) \
                  may be over-optimistic. Try tuning fd_hessian_step.",
                 Warning,
-                "covariance_step",
+                "covariance_regularized",
             ),
             // Unusable messages introduced in commit 2.
             (
@@ -6782,14 +6791,14 @@ mod tests {
                  (likely numerical overflow or underflow in model evaluation). \
                  SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             (
                 "Covariance step failed: Hessian has ill-conditioned entries for the \
                  following parameter(s) — theta[CL] (non-finite diagonal); \
                  sigma[1] (non-finite off-diagonal). SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             // Omega near-singular (tiny positive eigenvalue) — "near-singular" descriptor.
             (
@@ -6797,7 +6806,7 @@ mod tests {
                  convergence (min eigenvalue = 1.2e-10; eigenvalues: [0.5000, 1.2e-10]). \
                  SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             // Omega truly non-PD (negative eigenvalue) — "not positive definite" descriptor.
             (
@@ -6805,7 +6814,7 @@ mod tests {
                  convergence (min eigenvalue = -1.0e-3; eigenvalues: [0.5000, -1.0e-3]). \
                  SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             // SIR message that also contains "not positive definite" — must
             // still route to "sir", NOT to covariance_step.
@@ -6818,13 +6827,13 @@ mod tests {
             (
                 "[FOCEI] Covariance step failed",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             (
                 "[FOCEI] Covariance step: Hessian is not positive definite. \
                  Eigenvalues: [2.1000, -0.0100]. SE estimates not available.",
                 Critical,
-                "covariance_step",
+                "covariance_failed",
             ),
             (
                 "[SAEM] individual parameter(s) not mu-referenced: V",

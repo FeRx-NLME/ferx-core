@@ -20,6 +20,14 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Finer covariance-step warning codes** (#781): the overloaded
+  `covariance_step` warning code is split by severity into `covariance_failed`
+  (Critical — no standard errors), `covariance_regularized` (Warning — SEs
+  degraded but present), and `covariance_step` (Info — cost notes), so an agent
+  can branch on the outcome. The failure/regularized codes carry `details` with
+  `condition_number`, `min_eigenvalue`, and `n_negative_eigenvalues` when those
+  were computed. See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
 - **High ETA-shrinkage warning** (#781): a fit now emits an `eta_shrinkage`
   warning when any random-effect (ETA) shrinkage exceeds ~30% (the Savic &
   Karlsson rule of thumb) — the data poorly inform that IIV, so EBE-based

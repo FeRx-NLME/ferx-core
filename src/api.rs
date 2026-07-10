@@ -3163,18 +3163,33 @@ fn rebuild_warnings_structured(result: &mut FitResult) {
         .iter()
         .map(|w| crate::types::classify_warning(w))
         .collect();
+    let stats = DiagStats {
+        dw_statistic: result.dw_statistic,
+        iwres_lag1_r: result.iwres_lag1_r,
+        shrinkage_eps: result.shrinkage_eps,
+        cov_condition_number: result.cov_condition_number,
+        cov_eigenvalues: result.cov_eigenvalues.as_deref(),
+        shrinkage_eta: &result.shrinkage_eta,
+        eta_names: &result.eta_names,
+    };
     for e in &mut entries {
-        e.details = diagnostic_details(
-            &e.category,
-            result.dw_statistic,
-            result.iwres_lag1_r,
-            result.shrinkage_eps,
-            result.cov_condition_number,
-            &result.shrinkage_eta,
-            &result.eta_names,
-        );
+        e.details = diagnostic_details(&e.category, &stats);
     }
     result.warnings_structured = entries;
+}
+
+/// Typed inputs for [`diagnostic_details`], sourced from `FitResult`'s fields.
+/// `Default` gives finite-zero scalars, `None` options, and empty slices, so a
+/// test can set only the fields a case needs via struct-update syntax.
+#[derive(Default)]
+struct DiagStats<'a> {
+    dw_statistic: f64,
+    iwres_lag1_r: f64,
+    shrinkage_eps: f64,
+    cov_condition_number: Option<f64>,
+    cov_eigenvalues: Option<&'a [f64]>,
+    shrinkage_eta: &'a [f64],
+    eta_names: &'a [String],
 }
 
 /// Machine-readable `details` payload for the numeric diagnostic warning codes,
@@ -3184,37 +3199,33 @@ fn rebuild_warnings_structured(result: &mut FitResult) {
 /// `details` key is then omitted from the JSON entirely, rather than emitting a
 /// `null` value (`serde_json` maps non-finite floats to `null`). `cov_condition_number`
 /// in particular is documented as `+Inf` for a near-singular parameter space.
-#[allow(clippy::too_many_arguments)]
 fn diagnostic_details(
     code: &crate::types::WarningCode,
-    dw_statistic: f64,
-    iwres_lag1_r: f64,
-    shrinkage_eps: f64,
-    cov_condition_number: Option<f64>,
-    shrinkage_eta: &[f64],
-    eta_names: &[String],
+    s: &DiagStats,
 ) -> Option<serde_json::Value> {
     use crate::types::WarningCode;
     match code {
-        WarningCode::DwAutocorrelation if dw_statistic.is_finite() && iwres_lag1_r.is_finite() => {
+        WarningCode::DwAutocorrelation
+            if s.dw_statistic.is_finite() && s.iwres_lag1_r.is_finite() =>
+        {
             Some(serde_json::json!({
-                "durbin_watson": dw_statistic,
-                "iwres_lag1_autocorr": iwres_lag1_r,
+                "durbin_watson": s.dw_statistic,
+                "iwres_lag1_autocorr": s.iwres_lag1_r,
             }))
         }
-        WarningCode::EpsShrinkage if shrinkage_eps.is_finite() => Some(serde_json::json!({
-            "eps_shrinkage": shrinkage_eps,
-            "eps_shrinkage_pct": 100.0 * shrinkage_eps,
+        WarningCode::EpsShrinkage if s.shrinkage_eps.is_finite() => Some(serde_json::json!({
+            "eps_shrinkage": s.shrinkage_eps,
+            "eps_shrinkage_pct": 100.0 * s.shrinkage_eps,
         })),
         WarningCode::EtaShrinkage => {
             // The high-shrinkage ETAs behind the message, with each shrinkage
             // as a percent — sourced from the typed `shrinkage_eta` field.
-            let high: Vec<serde_json::Value> = high_shrinkage_eta_indices(shrinkage_eta)
+            let high: Vec<serde_json::Value> = high_shrinkage_eta_indices(s.shrinkage_eta)
                 .into_iter()
                 .map(|i| {
                     serde_json::json!({
-                        "eta": eta_label(eta_names, i),
-                        "shrinkage_pct": 100.0 * shrinkage_eta[i],
+                        "eta": eta_label(s.eta_names, i),
+                        "shrinkage_pct": 100.0 * s.shrinkage_eta[i],
                     })
                 })
                 .collect();
@@ -3227,11 +3238,48 @@ fn diagnostic_details(
                 }))
             }
         }
-        WarningCode::ConditionNumber => match cov_condition_number {
+        WarningCode::ConditionNumber => match s.cov_condition_number {
             Some(c) if c.is_finite() => Some(serde_json::json!({ "condition_number": c })),
             _ => None,
         },
+        WarningCode::CovarianceFailed | WarningCode::CovarianceRegularized => {
+            covariance_details(s.cov_condition_number, s.cov_eigenvalues)
+        }
         _ => None,
+    }
+}
+
+/// `details` for the covariance-step warning codes: the condition number and,
+/// when the covariance matrix was produced (so eigenvalues exist — typically
+/// the regularized case, not a hard failure), the smallest eigenvalue and the
+/// count of negative ones (which diagnose a non-PD Hessian). Non-finite values
+/// are skipped; returns `None` if nothing usable is available.
+fn covariance_details(
+    cov_condition_number: Option<f64>,
+    cov_eigenvalues: Option<&[f64]>,
+) -> Option<serde_json::Value> {
+    let mut obj = serde_json::Map::new();
+    if let Some(c) = cov_condition_number {
+        if c.is_finite() {
+            obj.insert("condition_number".to_string(), serde_json::json!(c));
+        }
+    }
+    if let Some(eigs) = cov_eigenvalues {
+        let finite: Vec<f64> = eigs.iter().copied().filter(|v| v.is_finite()).collect();
+        if !finite.is_empty() {
+            let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
+            let n_neg = finite.iter().filter(|&&v| v < 0.0).count();
+            obj.insert("min_eigenvalue".to_string(), serde_json::json!(min));
+            obj.insert(
+                "n_negative_eigenvalues".to_string(),
+                serde_json::json!(n_neg),
+            );
+        }
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(obj))
     }
 }
 
@@ -11928,7 +11976,7 @@ mod simulate_with_uncertainty_tests {
     #[test]
     fn diagnostic_details_covers_numeric_codes() {
         use crate::types::WarningCode;
-        // Shim for the non-ETA codes (empty ETA inputs).
+        // Shim for the scalar codes (no ETA/eigenvalue inputs).
         fn dd(
             code: &crate::types::WarningCode,
             dw: f64,
@@ -11936,7 +11984,16 @@ mod simulate_with_uncertainty_tests {
             eps: f64,
             cond: Option<f64>,
         ) -> Option<serde_json::Value> {
-            super::diagnostic_details(code, dw, lag1, eps, cond, &[], &[])
+            super::diagnostic_details(
+                code,
+                &super::DiagStats {
+                    dw_statistic: dw,
+                    iwres_lag1_r: lag1,
+                    shrinkage_eps: eps,
+                    cov_condition_number: cond,
+                    ..Default::default()
+                },
+            )
         }
         // Durbin–Watson: both stored stats surface.
         let d = dd(&WarningCode::DwAutocorrelation, 1.2, 0.4, f64::NAN, None).expect("DW details");
@@ -12012,46 +12069,62 @@ mod simulate_with_uncertainty_tests {
     #[test]
     fn eta_shrinkage_details_lists_high_etas() {
         use crate::types::WarningCode;
+        let ed = |shrink: &[f64], names: &[String]| {
+            super::diagnostic_details(
+                &WarningCode::EtaShrinkage,
+                &super::DiagStats {
+                    shrinkage_eta: shrink,
+                    eta_names: names,
+                    ..Default::default()
+                },
+            )
+        };
         let names = vec!["eta_CL".to_string(), "eta_V".to_string()];
-        let d = super::diagnostic_details(
-            &WarningCode::EtaShrinkage,
-            f64::NAN,
-            0.0,
-            f64::NAN,
-            None,
-            &[0.05, 0.42],
-            &names,
-        )
-        .expect("eta details");
+        let d = ed(&[0.05, 0.42], &names).expect("eta details");
         assert_eq!(d["threshold_pct"], 30.0);
         let high = d["high_shrinkage_etas"].as_array().unwrap();
         assert_eq!(high.len(), 1);
         assert_eq!(high[0]["eta"], "eta_V");
         assert!((high[0]["shrinkage_pct"].as_f64().unwrap() - 42.0).abs() < 1e-9);
         // No high eta → no details payload.
-        assert!(super::diagnostic_details(
-            &WarningCode::EtaShrinkage,
-            f64::NAN,
-            0.0,
-            f64::NAN,
-            None,
-            &[0.05, 0.10],
-            &names,
-        )
-        .is_none());
-
+        assert!(ed(&[0.05, 0.10], &names).is_none());
         // Missing name → non-empty `eta_{i}` placeholder, not "".
-        let d = super::diagnostic_details(
-            &WarningCode::EtaShrinkage,
-            f64::NAN,
-            0.0,
-            f64::NAN,
-            None,
-            &[0.42],
-            &[], // no names
-        )
-        .expect("details");
+        let d = ed(&[0.42], &[]).expect("details");
         assert_eq!(d["high_shrinkage_etas"][0]["eta"], "eta_0");
+    }
+
+    #[test]
+    fn covariance_details_reports_eigenvalues_and_condition() {
+        use crate::types::WarningCode;
+        let cd = |cond: Option<f64>, eigs: Option<&[f64]>| {
+            super::diagnostic_details(
+                &WarningCode::CovarianceRegularized,
+                &super::DiagStats {
+                    cov_condition_number: cond,
+                    cov_eigenvalues: eigs,
+                    ..Default::default()
+                },
+            )
+        };
+        // Regularized (or failed) with eigenvalues present: min + negative count.
+        let d = cd(Some(1.4e6), Some(&[0.5, -1.0e-3, 2.1])).expect("cov details");
+        assert_eq!(d["condition_number"], 1.4e6);
+        assert!((d["min_eigenvalue"].as_f64().unwrap() + 1.0e-3).abs() < 1e-12);
+        assert_eq!(d["n_negative_eigenvalues"], 1);
+        // CovarianceFailed shares the same payload builder.
+        assert!(super::diagnostic_details(
+            &WarningCode::CovarianceFailed,
+            &super::DiagStats {
+                cov_condition_number: Some(9.9),
+                ..Default::default()
+            },
+        )
+        .is_some());
+        // Nothing available (hard failure: no matrix → no eigenvalues, no cond)
+        // → details omitted.
+        assert!(cd(None, None).is_none());
+        // Non-finite condition number is skipped.
+        assert!(cd(Some(f64::INFINITY), None).is_none());
     }
 
     #[test]
