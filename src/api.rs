@@ -5420,7 +5420,7 @@ fn fit_inner(
         }
     };
 
-    let fit_result = FitResult {
+    let mut fit_result = FitResult {
         method: final_method,
         method_chain: chain.clone(),
         method_wall_times_secs,
@@ -5603,6 +5603,15 @@ fn fit_inner(
             ms(jac_fd_n),
             avg_us(jac_fd_n, jac_fd_c)
         );
+    }
+
+    // Highly correlated parameter pairs — emitted typed at source with a
+    // `details` payload (#781). Appended post-construction because it needs the
+    // packed parameter names, which are derived from the assembled `FitResult`;
+    // `rebuild_warnings_structured` preserves this native entry by message.
+    if let Some((msg, entry)) = high_correlation_warning(&fit_result) {
+        fit_result.warnings.push(msg);
+        fit_result.warnings_structured.push(entry);
     }
 
     Ok(fit_result)
@@ -6406,6 +6415,88 @@ fn inflated_rse_warning(
         details: Some(serde_json::json!({
             "threshold_pct": RSE_WARN_THRESHOLD_PCT,
             "parameters": params_json,
+        })),
+    };
+    Some((msg, entry))
+}
+
+/// Absolute correlation above which a parameter pair is flagged as
+/// collinear/non-identified. `0.95` is a common rule of thumb.
+const CORRELATION_WARN_THRESHOLD: f64 = 0.95;
+
+/// Parameter pairs whose estimate correlation exceeds the threshold, as
+/// `(name_a, name_b, correlation)`. The correlation is computed over the free
+/// (positive-variance) entries of the parameter covariance matrix, in the
+/// optimizer's packed space. Empty when there is no covariance matrix or fewer
+/// than two free parameters.
+fn high_correlation_pairs(
+    cov: Option<&DMatrix<f64>>,
+    names: &[String],
+) -> Vec<(String, String, f64)> {
+    let Some(cov) = cov else {
+        return Vec::new();
+    };
+    let n = cov.nrows();
+    let free: Vec<usize> = (0..n).filter(|&i| cov[(i, i)] > 0.0).collect();
+    if free.len() < 2 {
+        return Vec::new();
+    }
+    let label = |i: usize| {
+        names
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("P{}", i + 1))
+    };
+    let mut pairs = Vec::new();
+    for a in 0..free.len() {
+        for b in (a + 1)..free.len() {
+            let (ia, ib) = (free[a], free[b]);
+            let denom = (cov[(ia, ia)] * cov[(ib, ib)]).sqrt();
+            if denom <= 0.0 || !denom.is_finite() {
+                continue;
+            }
+            let r = cov[(ia, ib)] / denom;
+            if r.is_finite() && r.abs() >= CORRELATION_WARN_THRESHOLD {
+                pairs.push((label(ia), label(ib), r));
+            }
+        }
+    }
+    pairs
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// highly correlated parameter pairs in the fit's covariance matrix, or `None`.
+fn high_correlation_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
+    let cov = result.covariance_matrix.as_ref()?;
+    let names = crate::io::output::packed_param_names(result, cov.nrows());
+    let pairs = high_correlation_pairs(Some(cov), &names);
+    if pairs.is_empty() {
+        return None;
+    }
+    let list = pairs
+        .iter()
+        .map(|(a, b, r)| format!("{a} ~ {b} ({r:.2})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!(
+        "Highly correlated parameter pair(s) (|r| >= {CORRELATION_WARN_THRESHOLD:.2}): \
+         {list}. Highly correlated estimates indicate over-parameterization or \
+         non-identifiability; consider fixing or removing one of each pair."
+    );
+    let pairs_json: Vec<serde_json::Value> = pairs
+        .iter()
+        .map(
+            |(a, b, r)| serde_json::json!({ "parameter_a": a, "parameter_b": b, "correlation": r }),
+        )
+        .collect();
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::HighCorrelation,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({
+            "threshold": CORRELATION_WARN_THRESHOLD,
+            "pairs": pairs_json,
         })),
     };
     Some((msg, entry))
@@ -12729,6 +12820,50 @@ mod simulate_with_uncertainty_tests {
         let (s, bound) = super::theta_boundary_side(1e-10, 0.0, 100.0).unwrap();
         assert_eq!(s, "lower");
         assert_eq!(bound, 1e-10);
+    }
+
+    #[test]
+    fn high_correlation_pairs_flags_collinear_estimates() {
+        let names = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        // 3x3 covariance: A~B correlation 0.99 (0.0099/0.01), A~C and B~C ~0.
+        let mut cov = DMatrix::identity(3, 3) * 0.01;
+        cov[(0, 1)] = 0.0099;
+        cov[(1, 0)] = 0.0099;
+        let pairs = super::high_correlation_pairs(Some(&cov), &names);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!((pairs[0].0.as_str(), pairs[0].1.as_str()), ("A", "B"));
+        assert!((pairs[0].2 - 0.99).abs() < 1e-9);
+        // A fixed / zero-variance parameter (diag == 0) is excluded.
+        let mut cov2 = DMatrix::identity(2, 2) * 0.01;
+        cov2[(1, 1)] = 0.0;
+        assert!(super::high_correlation_pairs(Some(&cov2), &names).is_empty());
+        // No covariance matrix → nothing.
+        assert!(super::high_correlation_pairs(None, &names).is_empty());
+    }
+
+    #[test]
+    fn high_correlation_warning_emits_typed_entry_with_details() {
+        use crate::types::WarningCode;
+        let model = tiny_model();
+        let mut fit = synthetic_fit(&model.default_params);
+        // synthetic_fit's covariance is a scaled identity (no correlation) →
+        // no warning.
+        assert!(super::high_correlation_warning(&fit).is_none());
+        // Inject a strong theta0~theta1 correlation into the packed covariance.
+        let n = fit.covariance_matrix.as_ref().unwrap().nrows();
+        assert!(n >= 2);
+        let mut cov = DMatrix::identity(n, n) * 0.01;
+        cov[(0, 1)] = 0.0098; // r = 0.98
+        cov[(1, 0)] = 0.0098;
+        fit.covariance_matrix = Some(cov);
+        let (msg, entry) = super::high_correlation_warning(&fit).expect("expected a pair");
+        assert!(msg.contains("highly correlated") || msg.contains("Highly correlated"));
+        assert_eq!(entry.category, WarningCode::HighCorrelation);
+        let d = entry.details.as_ref().expect("details");
+        assert_eq!(d["threshold"], 0.95);
+        assert!((d["pairs"][0]["correlation"].as_f64().unwrap() - 0.98).abs() < 1e-9);
+        // The labels are the packed parameter names (first two thetas here).
+        assert_eq!(d["pairs"][0]["parameter_a"], fit.theta_names[0].as_str());
     }
 
     #[test]

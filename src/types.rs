@@ -3953,6 +3953,9 @@ pub enum WarningCode {
     /// One or more THETA estimates have a large relative standard error — poorly
     /// estimated / imprecise parameters.
     InflatedRse,
+    /// One or more parameter pairs are highly correlated in the covariance —
+    /// over-parameterization / non-identifiability.
+    HighCorrelation,
     /// Dataset-quality issue (missing DV, ADDL/II, non-positive DV, …).
     DataQuality,
     /// Omega structure caveat (mixed lognormal / additive block).
@@ -4000,6 +4003,7 @@ impl WarningCode {
             WarningCode::EtaShrinkage => "eta_shrinkage",
             WarningCode::BoundaryEstimate => "boundary_estimate",
             WarningCode::InflatedRse => "inflated_rse",
+            WarningCode::HighCorrelation => "high_correlation",
             WarningCode::DataQuality => "data_quality",
             WarningCode::OmegaStructure => "omega_structure",
             WarningCode::GradientFallback => "gradient_fallback",
@@ -4139,6 +4143,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, WarningCode::BoundaryEstimate)
     } else if lower.contains("relative standard error") {
         (WarningSeverity::Warning, WarningCode::InflatedRse)
+    } else if lower.contains("highly correlated") {
+        (WarningSeverity::Warning, WarningCode::HighCorrelation)
     } else if lower.starts_with("w_addl_missing_ii") || lower.contains("addl > 0 but ii") {
         (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_iov_occ_missing")
@@ -6638,6 +6644,7 @@ mod tests {
             (EtaShrinkage, "eta_shrinkage"),
             (BoundaryEstimate, "boundary_estimate"),
             (InflatedRse, "inflated_rse"),
+            (HighCorrelation, "high_correlation"),
             (DataQuality, "data_quality"),
             (OmegaStructure, "omega_structure"),
             (GradientFallback, "gradient_fallback"),
@@ -6801,6 +6808,11 @@ mod tests {
                 "High relative standard error (RSE > 50%): TVCL (72%).",
                 Warning,
                 "inflated_rse",
+            ),
+            (
+                "Highly correlated parameter pair(s) (|r| >= 0.95): TVCL ~ TVV (0.98).",
+                Warning,
+                "high_correlation",
             ),
             (
                 "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
