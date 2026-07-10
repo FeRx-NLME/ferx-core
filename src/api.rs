@@ -3170,6 +3170,8 @@ fn rebuild_warnings_structured(result: &mut FitResult) {
             result.iwres_lag1_r,
             result.shrinkage_eps,
             result.cov_condition_number,
+            &result.shrinkage_eta,
+            &result.eta_names,
         );
     }
     result.warnings_structured = entries;
@@ -3182,12 +3184,15 @@ fn rebuild_warnings_structured(result: &mut FitResult) {
 /// `details` key is then omitted from the JSON entirely, rather than emitting a
 /// `null` value (`serde_json` maps non-finite floats to `null`). `cov_condition_number`
 /// in particular is documented as `+Inf` for a near-singular parameter space.
+#[allow(clippy::too_many_arguments)]
 fn diagnostic_details(
     code: &crate::types::WarningCode,
     dw_statistic: f64,
     iwres_lag1_r: f64,
     shrinkage_eps: f64,
     cov_condition_number: Option<f64>,
+    shrinkage_eta: &[f64],
+    eta_names: &[String],
 ) -> Option<serde_json::Value> {
     use crate::types::WarningCode;
     match code {
@@ -3201,6 +3206,27 @@ fn diagnostic_details(
             "eps_shrinkage": shrinkage_eps,
             "eps_shrinkage_pct": 100.0 * shrinkage_eps,
         })),
+        WarningCode::EtaShrinkage => {
+            // The high-shrinkage ETAs behind the message, with each shrinkage
+            // as a percent — sourced from the typed `shrinkage_eta` field.
+            let high: Vec<serde_json::Value> = high_shrinkage_eta_indices(shrinkage_eta)
+                .into_iter()
+                .map(|i| {
+                    serde_json::json!({
+                        "eta": eta_label(eta_names, i),
+                        "shrinkage_pct": 100.0 * shrinkage_eta[i],
+                    })
+                })
+                .collect();
+            if high.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({
+                    "threshold_pct": 100.0 * ETA_SHRINKAGE_WARN_THRESHOLD,
+                    "high_shrinkage_etas": high,
+                }))
+            }
+        }
         WarningCode::ConditionNumber => match cov_condition_number {
             Some(c) if c.is_finite() => Some(serde_json::json!({ "condition_number": c })),
             _ => None,
@@ -5066,6 +5092,9 @@ fn fit_inner(
     if let Some(w) = eps_shrinkage_warning(shrinkage_eps) {
         warnings.push(w);
     }
+    if let Some(w) = eta_shrinkage_warning(&shrinkage_eta, &result.params.omega.eta_names) {
+        warnings.push(w);
+    }
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
@@ -5932,6 +5961,57 @@ pub(crate) fn eps_shrinkage_warning(shrinkage_eps: f64) -> Option<String> {
          of subjects; sigma at a bound. Inspect the IWRES distribution in the \
          sdtab.",
         100.0 * shrinkage_eps
+    ))
+}
+
+/// ETA-shrinkage warning threshold (fraction). 0.30 is the classic
+/// Savic & Karlsson (2009) 30% rule of thumb: above it, an EBE-based
+/// diagnostic — and the individual estimates of that random effect — are
+/// poorly informed by the data (η shrinks toward 0).
+const ETA_SHRINKAGE_WARN_THRESHOLD: f64 = 0.30;
+
+/// Indices of the ETAs whose shrinkage meets/exceeds the warning threshold.
+/// `shrinkage` is per-ETA shrinkage as a fraction (0..1); non-finite entries
+/// are ignored.
+pub(crate) fn high_shrinkage_eta_indices(shrinkage: &[f64]) -> Vec<usize> {
+    shrinkage
+        .iter()
+        .enumerate()
+        .filter(|(_, &s)| s.is_finite() && s >= ETA_SHRINKAGE_WARN_THRESHOLD)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Label for the `i`-th ETA, falling back to a non-empty `eta_{i}` placeholder
+/// when the name is missing — so both the message and the `details` payload
+/// stay unambiguous.
+fn eta_label(eta_names: &[String], i: usize) -> String {
+    eta_names
+        .get(i)
+        .cloned()
+        .unwrap_or_else(|| format!("eta_{i}"))
+}
+
+/// Build the user-facing warning for high ETA shrinkage, or `None` when no ETA
+/// exceeds the threshold. `shrinkage` is per-ETA shrinkage as a fraction;
+/// `eta_names` labels them in the same order.
+pub(crate) fn eta_shrinkage_warning(shrinkage: &[f64], eta_names: &[String]) -> Option<String> {
+    let high = high_shrinkage_eta_indices(shrinkage);
+    if high.is_empty() {
+        return None;
+    }
+    let list = high
+        .iter()
+        .map(|&i| format!("{} ({:.0}%)", eta_label(eta_names, i), 100.0 * shrinkage[i]))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "High ETA shrinkage (\u{2265} {:.0}%): {}. EBE-based diagnostics for these \
+         random effects are unreliable and the data poorly inform their individual \
+         estimates; consider removing the IIV on the affected parameter(s) or \
+         collecting more informative data.",
+        100.0 * ETA_SHRINKAGE_WARN_THRESHOLD,
+        list
     ))
 }
 
@@ -11848,19 +11928,26 @@ mod simulate_with_uncertainty_tests {
     #[test]
     fn diagnostic_details_covers_numeric_codes() {
         use crate::types::WarningCode;
+        // Shim for the non-ETA codes (empty ETA inputs).
+        fn dd(
+            code: &crate::types::WarningCode,
+            dw: f64,
+            lag1: f64,
+            eps: f64,
+            cond: Option<f64>,
+        ) -> Option<serde_json::Value> {
+            super::diagnostic_details(code, dw, lag1, eps, cond, &[], &[])
+        }
         // Durbin–Watson: both stored stats surface.
-        let d =
-            super::diagnostic_details(&WarningCode::DwAutocorrelation, 1.2, 0.4, f64::NAN, None)
-                .expect("DW details");
+        let d = dd(&WarningCode::DwAutocorrelation, 1.2, 0.4, f64::NAN, None).expect("DW details");
         assert_eq!(d["durbin_watson"], 1.2);
         assert_eq!(d["iwres_lag1_autocorr"], 0.4);
         // EPS shrinkage: fraction + percent.
-        let d = super::diagnostic_details(&WarningCode::EpsShrinkage, f64::NAN, 0.0, -0.083, None)
-            .expect("eps details");
+        let d = dd(&WarningCode::EpsShrinkage, f64::NAN, 0.0, -0.083, None).expect("eps details");
         assert_eq!(d["eps_shrinkage"], -0.083);
         assert!((d["eps_shrinkage_pct"].as_f64().unwrap() + 8.3).abs() < 1e-9);
         // Condition number: from the Option.
-        let d = super::diagnostic_details(
+        let d = dd(
             &WarningCode::ConditionNumber,
             f64::NAN,
             0.0,
@@ -11870,10 +11957,8 @@ mod simulate_with_uncertainty_tests {
         .expect("cond details");
         assert_eq!(d["condition_number"], 1.4e6);
         // None cases: missing stat, non-finite stat, and non-numeric code.
-        assert!(
-            super::diagnostic_details(&WarningCode::ConditionNumber, 0.0, 0.0, 0.0, None).is_none()
-        );
-        assert!(super::diagnostic_details(
+        assert!(dd(&WarningCode::ConditionNumber, 0.0, 0.0, 0.0, None).is_none());
+        assert!(dd(
             &WarningCode::DwAutocorrelation,
             f64::INFINITY,
             0.0,
@@ -11881,15 +11966,12 @@ mod simulate_with_uncertainty_tests {
             None
         )
         .is_none());
-        assert!(
-            super::diagnostic_details(&WarningCode::Convergence, 1.0, 0.0, 0.0, Some(1.0))
-                .is_none()
-        );
+        assert!(dd(&WarningCode::Convergence, 1.0, 0.0, 0.0, Some(1.0)).is_none());
 
         // Non-finite *contributing* stats omit details rather than emit a
         // null-valued payload (serde_json maps non-finite floats to null).
         // cov_condition_number = +Inf (documented for near-singular spaces):
-        assert!(super::diagnostic_details(
+        assert!(dd(
             &WarningCode::ConditionNumber,
             f64::NAN,
             0.0,
@@ -11898,7 +11980,7 @@ mod simulate_with_uncertainty_tests {
         )
         .is_none());
         // finite Durbin-Watson but non-finite lag-1 autocorrelation:
-        assert!(super::diagnostic_details(
+        assert!(dd(
             &WarningCode::DwAutocorrelation,
             1.20,
             f64::NAN,
@@ -11909,15 +11991,84 @@ mod simulate_with_uncertainty_tests {
     }
 
     #[test]
+    fn eta_shrinkage_warning_fires_above_threshold_only() {
+        let names = vec![
+            "eta_CL".to_string(),
+            "eta_V".to_string(),
+            "eta_KA".to_string(),
+        ];
+        // All low → no warning.
+        assert!(super::eta_shrinkage_warning(&[0.01, 0.05, 0.10], &names).is_none());
+        // NaN is ignored (not treated as high).
+        assert!(super::eta_shrinkage_warning(&[0.01, f64::NAN, 0.20], &names).is_none());
+        // One above the 30% threshold → warning names it with its percent.
+        let w = super::eta_shrinkage_warning(&[0.02, 0.42, 0.10], &names).expect("warning");
+        assert!(w.contains("eta_V (42%)"), "got: {w}");
+        assert!(w.to_lowercase().contains("eta shrinkage"));
+        // Boundary: exactly at threshold counts.
+        assert!(super::eta_shrinkage_warning(&[0.30], &["eta_CL".into()]).is_some());
+    }
+
+    #[test]
+    fn eta_shrinkage_details_lists_high_etas() {
+        use crate::types::WarningCode;
+        let names = vec!["eta_CL".to_string(), "eta_V".to_string()];
+        let d = super::diagnostic_details(
+            &WarningCode::EtaShrinkage,
+            f64::NAN,
+            0.0,
+            f64::NAN,
+            None,
+            &[0.05, 0.42],
+            &names,
+        )
+        .expect("eta details");
+        assert_eq!(d["threshold_pct"], 30.0);
+        let high = d["high_shrinkage_etas"].as_array().unwrap();
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0]["eta"], "eta_V");
+        assert!((high[0]["shrinkage_pct"].as_f64().unwrap() - 42.0).abs() < 1e-9);
+        // No high eta → no details payload.
+        assert!(super::diagnostic_details(
+            &WarningCode::EtaShrinkage,
+            f64::NAN,
+            0.0,
+            f64::NAN,
+            None,
+            &[0.05, 0.10],
+            &names,
+        )
+        .is_none());
+
+        // Missing name → non-empty `eta_{i}` placeholder, not "".
+        let d = super::diagnostic_details(
+            &WarningCode::EtaShrinkage,
+            f64::NAN,
+            0.0,
+            f64::NAN,
+            None,
+            &[0.42],
+            &[], // no names
+        )
+        .expect("details");
+        assert_eq!(d["high_shrinkage_etas"][0]["eta"], "eta_0");
+    }
+
+    #[test]
     fn rebuild_attaches_details_from_typed_fields() {
         let model = tiny_model();
         let mut fit = synthetic_fit(&model.default_params);
         fit.warnings = vec![
             "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).".to_string(),
             "Outer optimization did not converge".to_string(),
+            "High ETA shrinkage (\u{2265} 30%): eta_V (42%). EBE-based diagnostics \
+             for these random effects are unreliable."
+                .to_string(),
         ];
         fit.dw_statistic = 1.20;
         fit.iwres_lag1_r = 0.4;
+        fit.shrinkage_eta = vec![0.05, 0.42];
+        fit.eta_names = vec!["eta_CL".to_string(), "eta_V".to_string()];
         super::rebuild_warnings_structured(&mut fit);
 
         let dw = &fit.warnings_structured[0];
@@ -11927,6 +12078,11 @@ mod simulate_with_uncertainty_tests {
         assert_eq!(details["iwres_lag1_autocorr"], 0.4);
         // A non-numeric code keeps details omitted.
         assert!(fit.warnings_structured[1].details.is_none());
+        // ETA shrinkage classifies + attaches its high-eta details.
+        let eta = &fit.warnings_structured[2];
+        assert_eq!(eta.category, crate::types::WarningCode::EtaShrinkage);
+        let ed = eta.details.as_ref().expect("ETA shrinkage details");
+        assert_eq!(ed["high_shrinkage_etas"][0]["eta"], "eta_V");
     }
 
     #[test]

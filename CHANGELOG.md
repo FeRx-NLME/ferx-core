@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **High ETA-shrinkage warning** (#781): a fit now emits an `eta_shrinkage`
+  warning when any random-effect (ETA) shrinkage exceeds ~30% (the Savic &
+  Karlsson rule of thumb) — the data poorly inform that IIV, so EBE-based
+  diagnostics for it are unreliable and removing the IIV is often warranted.
+  The structured warning carries `details` listing the affected ETAs and their
+  shrinkage percent. See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
 - **Warning `details` payloads for numeric diagnostics** (#781): structured
   warnings for `dw_autocorrelation`, `eps_shrinkage`, and `condition_number` now
   carry a `details` object with the value behind the message (e.g.

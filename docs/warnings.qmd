@@ -50,6 +50,7 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `sir` | Warning | SIR failed or was requested without a covariance. | Ensure a covariance exists before requesting SIR. |
 | `importance_sampling` | Warning | ESS = 0 / proposal collapse. | Increase samples or improve the proposal. |
 | `eps_shrinkage` | Warning | Residual (EPS) shrinkage high / negative. | Sparse data for the error model — simplify it. |
+| `eta_shrinkage` | Warning | One or more ETA shrinkages exceed ~30%. | Data poorly inform that IIV — consider removing it on the affected parameter(s). |
 | `data_quality` | Warning | Dataset issue (missing DV, ADDL/II, non-positive DV, …). | Fix the dataset before trusting the fit. |
 | `omega_structure` | Warning | Mixed lognormal / additive block in omega. | Make the block's parameterization consistent. |
 | `gradient_fallback` | Info | A gradient / sampler fallback was taken. | None; note the slower path. |
@@ -71,6 +72,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 |------|----------------|
 | `dw_autocorrelation` | `durbin_watson`, `iwres_lag1_autocorr` |
 | `eps_shrinkage` | `eps_shrinkage` (fraction), `eps_shrinkage_pct` |
+| `eta_shrinkage` | `threshold_pct`, `high_shrinkage_etas` (array of `{eta, shrinkage_pct}`) |
 | `condition_number` | `condition_number` |
 
 ```json
