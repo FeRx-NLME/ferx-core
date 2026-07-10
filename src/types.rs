@@ -3852,21 +3852,104 @@ pub enum WarningSeverity {
     Info,
 }
 
-/// A structured warning with severity, category, and message.
+/// Stable, typed taxonomy for a structured warning (issue #778).
+///
+/// Each variant is the machine-branchable *code* an agent or the R wrapper keys
+/// off — a stable contract, unlike free-text message wording. Serialized (and
+/// via [`WarningCode::as_str`]) as a fixed snake_case token; those tokens are a
+/// public API surface and must not change once released. Add variants as new
+/// warning classes appear; never repurpose an existing token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WarningCode {
+    /// Optimizer did not reach the convergence criterion.
+    Convergence,
+    /// Covariance step failed, was regularized, or is informational (see message).
+    CovarianceStep,
+    /// Correlation / condition-number problem in the covariance.
+    ConditionNumber,
+    /// Optimizer-health issue (trust-radius collapse, degeneracy).
+    OptimizerHealth,
+    /// Residual (IWRES) autocorrelation — Durbin–Watson out of range.
+    DwAutocorrelation,
+    /// ETA distribution departs from normality (Shapiro–Wilk).
+    EtaNormality,
+    /// An experimental feature (SDE, neural-network components) was used.
+    Experimental,
+    /// BLOQ / M3 censoring handling caveat.
+    BloqMethod,
+    /// Sampling-importance-resampling (SIR) issue.
+    Sir,
+    /// Importance-sampling issue (ESS = 0, proposal collapse).
+    ImportanceSampling,
+    /// EPS (residual) shrinkage is notably high / negative.
+    EpsShrinkage,
+    /// Dataset-quality issue (missing DV, ADDL/II, non-positive DV, …).
+    DataQuality,
+    /// Omega structure caveat (mixed lognormal / additive block).
+    OmegaStructure,
+    /// A gradient / sampler fallback was taken (e.g. HMC → Metropolis-Hastings).
+    GradientFallback,
+    /// Mu-referencing note or missing-mu-reference caveat.
+    MuReferencing,
+    /// Optimizer-configuration note (`global_search`).
+    OptimizerConfig,
+    /// Multi-start informational note.
+    MultiStart,
+    /// The run was cancelled by the user.
+    Cancelled,
+    /// Thread-count efficiency note.
+    Threads,
+    /// Unrecognised message — fallback bucket.
+    General,
+}
+
+impl WarningCode {
+    /// The stable snake_case token (identical to the serde representation).
+    /// This is the string an agent / the R wrapper branches on.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WarningCode::Convergence => "convergence",
+            WarningCode::CovarianceStep => "covariance_step",
+            WarningCode::ConditionNumber => "condition_number",
+            WarningCode::OptimizerHealth => "optimizer_health",
+            WarningCode::DwAutocorrelation => "dw_autocorrelation",
+            WarningCode::EtaNormality => "eta_normality",
+            WarningCode::Experimental => "experimental",
+            WarningCode::BloqMethod => "bloq_method",
+            WarningCode::Sir => "sir",
+            WarningCode::ImportanceSampling => "importance_sampling",
+            WarningCode::EpsShrinkage => "eps_shrinkage",
+            WarningCode::DataQuality => "data_quality",
+            WarningCode::OmegaStructure => "omega_structure",
+            WarningCode::GradientFallback => "gradient_fallback",
+            WarningCode::MuReferencing => "mu_referencing",
+            WarningCode::OptimizerConfig => "optimizer_config",
+            WarningCode::MultiStart => "multi_start",
+            WarningCode::Cancelled => "cancelled",
+            WarningCode::Threads => "threads",
+            WarningCode::General => "general",
+        }
+    }
+}
+
+impl std::fmt::Display for WarningCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A structured warning with severity, typed code, and message.
 ///
 /// Populated in parallel with `FitResult.warnings` (which remains for
-/// backward compatibility). The `category` is a fixed lowercase vocabulary:
-/// `convergence`, `covariance_step`, `optimizer_health`, `dw_autocorrelation`,
-/// `bloq_method`, `sir`, `importance_sampling`, `data_quality`,
-/// `omega_structure`, `ebe_convergence`, `gradient_fallback`,
-/// `mu_referencing`, `optimizer_config`, `multi_start`, `cancelled`,
-/// `threads`, `condition_number`, `eta_normality`, `eps_shrinkage`,
-/// `experimental`, `general` (fallback for unrecognised messages).
+/// backward compatibility). The `category` is a typed [`WarningCode`] — the
+/// stable, machine-branchable taxonomy — replacing the former free-text
+/// category string (issue #778).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct WarningEntry {
     pub severity: WarningSeverity,
-    /// Fixed lowercase category string (see type-level docs).
-    pub category: String,
+    /// Typed warning code (stable snake_case serde token).
+    pub category: WarningCode,
     /// Human-readable message. For messages that carry a multi-stage chain
     /// prefix such as `[FOCEI] ...`, only the body after the prefix is stored
     /// here; the method tag is moved into `source_method`. For unprefixed
@@ -3875,6 +3958,13 @@ pub struct WarningEntry {
     pub message: String,
     /// For multi-stage chains, the method that produced this warning.
     pub source_method: Option<String>,
+    /// Optional structured payload with machine-readable numbers behind the
+    /// message (e.g. `{"durbin_watson": 1.2}` or `{"condition_number": 1.4e6}`),
+    /// so an agent reads the value directly instead of parsing prose. Populated
+    /// by native at-source emitters; `None` on the string-classified fallback
+    /// path ([`classify_warning`]). Omitted from JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 /// Classify a free-text warning message into a structured `WarningEntry`.
@@ -3907,7 +3997,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("without convergence")
         || lower.contains("no multi-start run converged")
     {
-        (WarningSeverity::Critical, "convergence")
+        (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("covariance step failed")
         || lower.contains("covariance failed")
         || (lower.contains("covariance step") && lower.contains("not positive definite"))
@@ -3917,7 +4007,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // Hessian is not positive definite") whose prefix differs from "failed:"
         // messages. It must be compound so that "SIR failed: covariance not
         // positive definite" (no "covariance step" token) still routes to "sir".
-        (WarningSeverity::Critical, "covariance_step")
+        (WarningSeverity::Critical, WarningCode::CovarianceStep)
     } else if lower.contains("covariance step regularized")
         || lower.contains("off-diagonal fd stencil")
     {
@@ -3925,43 +4015,43 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // degraded-but-present covariance step result. Severity within the message
         // (minor/moderate/severe, or "over-optimistic") informs guidance; the
         // category is always covariance_step.
-        (WarningSeverity::Warning, "covariance_step")
+        (WarningSeverity::Warning, WarningCode::CovarianceStep)
     } else if lower.contains("ill-conditioned") || lower.contains("condition number") {
         // Note: "covariance step failed: Hessian has ill-conditioned entries" contains
         // "ill-conditioned" but is caught by "covariance step failed" above (else-if chain).
         // Any future covariance message that contains "ill-conditioned" but NOT "failed:"
         // would land here instead — keep this ordering in mind when adding new messages.
-        (WarningSeverity::Critical, "condition_number")
+        (WarningSeverity::Critical, WarningCode::ConditionNumber)
     } else if lower.contains("trust radius") || lower.contains("degenerate") {
-        (WarningSeverity::Warning, "optimizer_health")
+        (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {
-        (WarningSeverity::Warning, "dw_autocorrelation")
+        (WarningSeverity::Warning, WarningCode::DwAutocorrelation)
     } else if lower.contains("shapiro") || lower.contains("non-normal") {
-        (WarningSeverity::Warning, "eta_normality")
+        (WarningSeverity::Warning, WarningCode::EtaNormality)
     } else if lower.contains("experimental feature") {
         // Experimental-feature notices (issue #175): SDE and neural-network
         // components emit a runtime warning so results are applied with caution.
-        (WarningSeverity::Warning, "experimental")
+        (WarningSeverity::Warning, WarningCode::Experimental)
     } else if lower.contains("m3 bloq")
         || lower.contains("bloq handling")
         || lower.contains("m3 censoring")
         || lower.contains("censoring handling")
     {
-        (WarningSeverity::Warning, "bloq_method")
+        (WarningSeverity::Warning, WarningCode::BloqMethod)
     } else if lower.contains("sir failed") || lower.contains("sir requested") {
-        (WarningSeverity::Warning, "sir")
+        (WarningSeverity::Warning, WarningCode::Sir)
     } else if lower.contains("ess = 0") || lower.contains("proposal collapse") {
-        (WarningSeverity::Warning, "importance_sampling")
+        (WarningSeverity::Warning, WarningCode::ImportanceSampling)
     } else if lower.contains("eps shrinkage") {
-        (WarningSeverity::Warning, "eps_shrinkage")
+        (WarningSeverity::Warning, WarningCode::EpsShrinkage)
     } else if lower.starts_with("w_addl_missing_ii") || lower.contains("addl > 0 but ii") {
-        (WarningSeverity::Warning, "data_quality")
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_iov_occ_missing")
         || lower.contains("missing or unparseable values in iov_column")
     {
-        (WarningSeverity::Warning, "data_quality")
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_missing_dv") {
-        (WarningSeverity::Warning, "data_quality")
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.contains("ltbs")
         || lower.contains("non-positive dv")
         || lower.contains("ss=1 dose")
@@ -3969,42 +4059,43 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         || lower.contains("evid=3/4")
         || lower.contains("lagtime evaluates")
     {
-        (WarningSeverity::Warning, "data_quality")
+        (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.contains("mixed lognormal") || lower.contains("mixed log-normal") {
-        (WarningSeverity::Warning, "omega_structure")
+        (WarningSeverity::Warning, WarningCode::OmegaStructure)
     } else if lower.contains("hmc is unavailable") {
         // "falls back to" intentionally removed: no emitted message uses that exact
         // phrase. The SAEM HMC message is fully covered by "hmc is unavailable".
-        (WarningSeverity::Info, "gradient_fallback")
+        (WarningSeverity::Info, WarningCode::GradientFallback)
     } else if lower.contains("not mu-referenced") {
-        (WarningSeverity::Warning, "mu_referencing")
+        (WarningSeverity::Warning, WarningCode::MuReferencing)
     } else if lower.contains("mu-ref") || lower.contains("mu-referencing") {
-        (WarningSeverity::Info, "mu_referencing")
+        (WarningSeverity::Info, WarningCode::MuReferencing)
     } else if lower.contains("global_search disabled") {
         // Runtime failure: CRS2-LM init failed — the optimiser ran without global search.
-        (WarningSeverity::Warning, "optimizer_config")
+        (WarningSeverity::Warning, WarningCode::OptimizerConfig)
     } else if lower.contains("global_search") {
-        (WarningSeverity::Info, "optimizer_config")
+        (WarningSeverity::Info, WarningCode::OptimizerConfig)
     } else if lower.contains("multi-start") {
-        (WarningSeverity::Info, "multi_start")
+        (WarningSeverity::Info, WarningCode::MultiStart)
     } else if lower.contains("cancelled by user") {
-        (WarningSeverity::Info, "cancelled")
+        (WarningSeverity::Info, WarningCode::Cancelled)
     } else if lower.contains("threads configured") || lower.contains("threads than subjects") {
-        (WarningSeverity::Info, "threads")
+        (WarningSeverity::Info, WarningCode::Threads)
     } else if lower.contains("n\u{00b2} ofv")
         || lower.contains("n^2 ofv")
         || (lower.contains("parameters") && lower.contains("covariance step:"))
     {
-        (WarningSeverity::Info, "covariance_step")
+        (WarningSeverity::Info, WarningCode::CovarianceStep)
     } else {
-        (WarningSeverity::Warning, "general")
+        (WarningSeverity::Warning, WarningCode::General)
     };
 
     WarningEntry {
         severity,
-        category: category.to_string(),
+        category,
         message: msg,
         source_method,
+        details: None,
     }
 }
 
@@ -6342,7 +6433,7 @@ mod tests {
     fn classify_warning_convergence_is_critical() {
         let w = classify_warning("Outer optimization did not converge");
         assert_eq!(w.severity, WarningSeverity::Critical);
-        assert_eq!(w.category, "convergence");
+        assert_eq!(w.category.as_str(), "convergence");
         assert!(w.source_method.is_none());
     }
 
@@ -6350,21 +6441,21 @@ mod tests {
     fn classify_warning_covariance_is_critical() {
         let w = classify_warning("Covariance step failed");
         assert_eq!(w.severity, WarningSeverity::Critical);
-        assert_eq!(w.category, "covariance_step");
+        assert_eq!(w.category.as_str(), "covariance_step");
     }
 
     #[test]
     fn classify_warning_dw_is_warning() {
         let w = classify_warning("Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).");
         assert_eq!(w.severity, WarningSeverity::Warning);
-        assert_eq!(w.category, "dw_autocorrelation");
+        assert_eq!(w.category.as_str(), "dw_autocorrelation");
     }
 
     #[test]
     fn classify_warning_mu_ref_is_info() {
         let w = classify_warning("mu-ref: CL, V");
         assert_eq!(w.severity, WarningSeverity::Info);
-        assert_eq!(w.category, "mu_referencing");
+        assert_eq!(w.category.as_str(), "mu_referencing");
     }
 
     #[test]
@@ -6374,7 +6465,7 @@ mod tests {
              affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
         );
         assert_eq!(w.severity, WarningSeverity::Warning);
-        assert_eq!(w.category, "mu_referencing");
+        assert_eq!(w.category.as_str(), "mu_referencing");
     }
 
     #[test]
@@ -6383,14 +6474,81 @@ mod tests {
         assert_eq!(w.source_method.as_deref(), Some("FOCEI"));
         assert_eq!(w.message, "Covariance step failed");
         assert_eq!(w.severity, WarningSeverity::Critical);
-        assert_eq!(w.category, "covariance_step");
+        assert_eq!(w.category.as_str(), "covariance_step");
     }
 
     #[test]
     fn classify_warning_unknown_falls_back_to_general() {
         let w = classify_warning("some entirely novel message");
         assert_eq!(w.severity, WarningSeverity::Warning);
-        assert_eq!(w.category, "general");
+        assert_eq!(w.category.as_str(), "general");
+    }
+
+    /// #778: the `WarningCode` serde token is a public API an agent / the R
+    /// wrapper pins against. This snapshot fails loudly if a variant's token
+    /// drifts, and asserts `as_str()` and the serde representation agree.
+    #[test]
+    fn warning_code_tokens_are_stable() {
+        use WarningCode::*;
+        let expected: &[(WarningCode, &str)] = &[
+            (Convergence, "convergence"),
+            (CovarianceStep, "covariance_step"),
+            (ConditionNumber, "condition_number"),
+            (OptimizerHealth, "optimizer_health"),
+            (DwAutocorrelation, "dw_autocorrelation"),
+            (EtaNormality, "eta_normality"),
+            (Experimental, "experimental"),
+            (BloqMethod, "bloq_method"),
+            (Sir, "sir"),
+            (ImportanceSampling, "importance_sampling"),
+            (EpsShrinkage, "eps_shrinkage"),
+            (DataQuality, "data_quality"),
+            (OmegaStructure, "omega_structure"),
+            (GradientFallback, "gradient_fallback"),
+            (MuReferencing, "mu_referencing"),
+            (OptimizerConfig, "optimizer_config"),
+            (MultiStart, "multi_start"),
+            (Cancelled, "cancelled"),
+            (Threads, "threads"),
+            (General, "general"),
+        ];
+        for (code, token) in expected {
+            assert_eq!(code.as_str(), *token, "as_str drift for {code:?}");
+            // serde token == as_str token (rename_all = "snake_case").
+            assert_eq!(
+                serde_json::to_value(code).unwrap(),
+                serde_json::json!(token),
+                "serde token drift for {code:?}"
+            );
+            // and it round-trips back to the same variant.
+            let back: WarningCode = serde_json::from_value(serde_json::json!(token)).unwrap();
+            assert_eq!(back, *code);
+        }
+    }
+
+    /// #778: the optional `details` payload serializes when present (the
+    /// at-source numeric channel) and is omitted when `None`.
+    #[test]
+    fn warning_entry_details_serialize_when_present() {
+        let with = WarningEntry {
+            severity: WarningSeverity::Warning,
+            category: WarningCode::DwAutocorrelation,
+            message: "Positive IWRES autocorrelation".to_string(),
+            source_method: None,
+            details: Some(serde_json::json!({ "durbin_watson": 1.2 })),
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["category"], "dw_autocorrelation");
+        assert_eq!(v["details"]["durbin_watson"], 1.2);
+        // round-trips
+        let back: WarningEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.details, with.details);
+        assert_eq!(back.category, WarningCode::DwAutocorrelation);
+
+        // None -> key omitted entirely.
+        let without = classify_warning("some novel message");
+        let vo = serde_json::to_value(&without).unwrap();
+        assert!(vo.get("details").is_none());
     }
 
     /// Round-trip table covering every literal warning message emitted by the
@@ -6650,7 +6808,7 @@ mod tests {
         let mut failures: Vec<String> = Vec::new();
         for (msg, want_sev, want_cat) in table {
             let got = classify_warning(msg);
-            if got.severity != *want_sev || got.category != *want_cat {
+            if got.severity != *want_sev || got.category.as_str() != *want_cat {
                 failures.push(format!(
                     "  {msg:?} -> expected ({:?}, {:?}), got ({:?}, {:?})",
                     want_sev, want_cat, got.severity, got.category

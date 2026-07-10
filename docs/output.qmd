@@ -125,7 +125,9 @@ per-subject records (`eta`, `ipred`, residuals, …), warnings, and provenance
   `{ "rows": r, "cols": c, "data": [..] }` with `data` in **row-major** order.
   Vectors (a subject's `eta`, …) serialize as flat JSON arrays.
 - Enums serialize as their variant name (e.g. `"method": "FoceI"`); structured
-  warnings carry `{severity, category, message, source_method}`.
+  warnings carry `{severity, category, message, source_method}` plus an optional
+  `details` payload, where `category` is a stable typed
+  [`WarningCode`](warnings.qmd#warning-codes) token.
 - Non-finite floats (`NaN`, `±Inf`) serialize as JSON `null`, matching the
   empty-cell convention of the YAML/CSV writers.
 

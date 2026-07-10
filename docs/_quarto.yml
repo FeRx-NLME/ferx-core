@@ -96,6 +96,8 @@ website:
         href: cli.qmd
       - text: "Output Files"
         href: output.qmd
+      - text: "Warnings"
+        href: warnings.qmd
       - text: "File Formats"
         href: file-formats/index.qmd
         contents:
