@@ -6376,7 +6376,9 @@ fn inflated_rse_warning(
     }
     let list = hits
         .iter()
-        .map(|(name, _est, _se, rse)| format!("{name} ({rse:.0}%)"))
+        // One decimal so a borderline value (e.g. 50.4%) is not displayed as
+        // "50%" — which would read as below the threshold it just tripped.
+        .map(|(name, _est, _se, rse)| format!("{name} ({rse:.1}%)"))
         .collect::<Vec<_>>()
         .join(", ");
     let msg = format!(
@@ -12807,6 +12809,16 @@ mod simulate_with_uncertainty_tests {
         assert!(
             super::inflated_rse_warning(&Some(vec![1.0; params.theta.len()]), &params).is_none()
         );
+
+        // Borderline value renders with a decimal (not rounded to the
+        // threshold): RSE = 50.4% must show "50.4%", not "50%".
+        let mut p2 = tiny_model().default_params;
+        p2.theta_fixed = vec![false; p2.theta.len()];
+        p2.theta[0] = 1.0;
+        let mut se2 = vec![0.0; p2.theta.len()];
+        se2[0] = 0.504; // RSE = 50.4%
+        let (msg2, _) = super::inflated_rse_warning(&Some(se2), &p2).expect("borderline hit");
+        assert!(msg2.contains("50.4%"), "got: {msg2}");
     }
 
     #[test]
