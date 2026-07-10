@@ -241,6 +241,188 @@ fn transit_time_desugar_matches_hand_written_ode() {
     }
 }
 
+/// Flip-flop transit: when the individual parameters put `ke = CL/V ≥ KTR`
+/// (absorption no faster than elimination), the exponential-tilting closed form is
+/// outside its convergence domain and clamps the prediction — and its gradient — to
+/// `0`. `predict()` must instead route the closed-form model to its ODE `transit()`
+/// twin (valid in that regime), so the shorthand's predictions equal the
+/// hand-written ODE's and are non-zero. Old behaviour: all-zero predictions with a
+/// `W_TRANSIT_FLIP_FLOP` warning.
+///
+/// NONMEM anchor for this exact design (CL=2, V=4, N=3, MTT=20 ⇒ ke=0.5 ≥ KTR=0.2;
+/// dose 100). A NONMEM 7.6.0 ADVAN13 transit model (`transit()` `R_in` into central,
+/// no KA — `nonmem_anchor/flip_flop_transit.ctl`) `$SIMULATION` gives the typical
+/// profile ferx reproduces here:
+///
+/// | t | ferx (ODE twin) | NONMEM IPRED |
+/// |---|-----------------|--------------|
+/// |  1 | 0.001287 | 0.0012866 |
+/// |  4 | 0.153537 | 0.15354   |
+/// |  8 | 0.912002 | 0.91199   |
+/// | 16 | 2.157863 | 2.1579    |
+/// | 24 | 1.726720 | 1.7268    |
+/// | 48 | 0.136263 | 0.13625   |
+/// | 72 | 0.004038 | 0.0040378 |
+///
+/// Agreement is at the ODE-solver tolerance (RK45 vs ADVAN13 TOL=9, ~1e-4), so the
+/// flip-flop routing is NONMEM-anchored, not just self-consistent with the twin.
+#[test]
+fn transit_flip_flop_routes_to_ode_twin() {
+    // ke = CL/V = 2/4 = 0.5; KTR = (n+1)/mtt = 4/20 = 0.2 ⇒ ke ≥ KTR (flip-flop):
+    // slow depot absorption rate-limits a faster disposition.
+    let header = "\
+[parameters]
+  theta TVCL(2.0, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+";
+    let shorthand = format!(
+        "{header}\n[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let hand_ode = format!(
+        "{header}\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let sh = parse_full_model(&shorthand)
+        .expect("flip-flop shorthand parses")
+        .model;
+    let hd = parse_full_model(&hand_ode).expect("hand ODE parses").model;
+    // Primary stays closed-form; it carries the ODE twin the flip-flop reroute uses.
+    assert!(
+        sh.ode_spec.is_none() && sh.transit_ode_equivalent.is_some(),
+        "flip-flop transit shorthand keeps a closed-form primary + an ODE twin"
+    );
+
+    let pop = population(
+        vec![bolus(0.0, 100.0)],
+        vec![1.0, 4.0, 8.0, 16.0, 24.0, 48.0, 72.0],
+    );
+    let ps = predict(&sh, &pop, &sh.default_params);
+    let ph = predict(&hd, &pop, &hd.default_params);
+    assert_eq!(ps.len(), ph.len());
+    assert!(!ps.is_empty());
+    // The reroute makes the closed-form model predict its ODE twin's profile …
+    for (x, y) in ps.iter().zip(ph.iter()) {
+        assert!(
+            (x.pred - y.pred).abs() <= ATOL + RTOL * x.pred.abs(),
+            "t={:.3}: flip-flop shorthand {:.6} vs hand ODE {:.6}",
+            x.time,
+            x.pred,
+            y.pred
+        );
+    }
+    // … and those predictions are real, not the clamped `0` the closed form returns
+    // in the flip-flop regime (guards against a vacuous 0 == 0 pass).
+    assert!(
+        ps.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.5,
+        "flip-flop predictions must be non-zero (closed form alone clamps to 0)"
+    );
+}
+
+/// Flip-flop routing on the **gradient** path, fit to convergence (slow): fitting
+/// the closed-form shorthand on flip-flop data must reach the same optimum as
+/// fitting the hand-written ODE twin. The inner (η) and outer (θ) sensitivity
+/// dispatchers route through the same reroute (`effective_model_for_eval`), so both
+/// loops evaluate the ODE twin, and at the optimum the two objectives coincide.
+/// Old behaviour: the shorthand's all-zero flip-flop predictions collapse a
+/// proportional objective, so it never tracks the ODE fit.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn transit_flip_flop_fit_matches_ode_twin() {
+    let header = "\
+[parameters]
+  theta TVCL(2.0, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.05 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+";
+    let shorthand = format!(
+        "{header}\n[structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let hand_ode = format!(
+        "{header}\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\n\
+         [odes]\n  d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V) * central\n\n\
+         [scaling]\n  obs_scale = V\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let sh = parse_full_model(&shorthand).expect("parses").model;
+    let hd = parse_full_model(&hand_ode).expect("parses").model;
+
+    // Simulate flip-flop observations from the ODE twin (truth), a small panel.
+    let obs_t = vec![2.0, 6.0, 12.0, 24.0, 48.0, 96.0];
+    let n = obs_t.len();
+    let subjects: Vec<_> = (1..=4)
+        .map(|i| {
+            common::subject(
+                &format!("{i}"),
+                vec![bolus(0.0, 100.0)],
+                obs_t.clone(),
+                vec![0.0; n],
+                vec![2; n],
+            )
+        })
+        .collect();
+    let mut pop = Population {
+        subjects,
+        ..population(vec![bolus(0.0, 100.0)], obs_t.clone())
+    };
+    let sims = ferx_core::simulate_with_seed(&hd, &pop, &hd.default_params, 1, 4321);
+    for s in pop.subjects.iter_mut() {
+        s.observations = sims
+            .iter()
+            .filter(|x| x.id == s.id)
+            .map(|x| x.outcome.continuous_value().max(1e-6))
+            .collect();
+    }
+
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceI;
+    opts.run_covariance_step = false;
+
+    // Fit both to convergence: the shorthand reroutes to an ODE textually identical
+    // to `hand_ode`, so they optimise the same objective and land on the same OFV.
+    let ra = fit(&sh, &pop, &sh.default_params, &opts).expect("flip-flop shorthand fit ok");
+    let ro = fit(&hd, &pop, &hd.default_params, &opts).expect("flip-flop ODE fit ok");
+    assert!(
+        ra.ofv.is_finite() && ro.ofv.is_finite(),
+        "OFVs must be finite: shorthand {} / ODE {}",
+        ra.ofv,
+        ro.ofv
+    );
+    let rel = (ra.ofv - ro.ofv).abs() / ro.ofv.abs().max(1.0);
+    assert!(
+        rel < 5e-3,
+        "flip-flop shorthand converged OFV {:.4} vs ODE {:.4} (rel {:.2e})",
+        ra.ofv,
+        ro.ofv,
+        rel
+    );
+}
+
 #[test]
 fn transit_with_lagtime_matches_ode() {
     let pop = population(
@@ -949,6 +1131,153 @@ fn two_cpt_transit_flip_flop_warns() {
         "in-domain params must not warn flip-flop"
     );
 }
+
+/// 2-cpt flip-flop (`α ≥ KTR`): like [`transit_flip_flop_routes_to_ode_twin`] but
+/// for the 2-cpt closed form (whose domain guard is on the fast macro-rate `α`).
+/// A huge MTT (→ tiny KTR) puts the typical profile in the flip-flop regime; the
+/// closed-form model must then predict its ODE twin's non-zero profile rather than
+/// the clamped 0.
+#[test]
+fn two_cpt_transit_flip_flop_routes_to_ode_twin() {
+    let (an_src, ode_src) = build_pair_2cpt(false, false);
+    let mut an = parse_full_model(&an_src)
+        .expect("2-cpt transit parses")
+        .model;
+    let mut ode = parse_full_model(&ode_src).expect("2-cpt ODE parses").model;
+    // MTT = 50 ⇒ KTR = (n+1)/mtt = 0.08 < α ≈ 0.19 (flip-flop), on both models.
+    for m in [&mut an, &mut ode] {
+        let i = m
+            .default_params
+            .theta_names
+            .iter()
+            .position(|n| n == "TVMTT")
+            .expect("has TVMTT");
+        m.default_params.theta[i] = 50.0;
+    }
+    assert!(
+        an.ode_spec.is_none() && an.transit_ode_equivalent.is_some(),
+        "2-cpt flip-flop shorthand keeps a closed-form primary + an ODE twin"
+    );
+
+    let pop = population(
+        vec![bolus(0.0, 100.0)],
+        vec![2.0, 8.0, 24.0, 48.0, 96.0, 168.0],
+    );
+    let pa = predict(&an, &pop, &an.default_params);
+    let po = predict(&ode, &pop, &ode.default_params);
+    assert_eq!(pa.len(), po.len());
+    for (x, y) in pa.iter().zip(po.iter()) {
+        assert!(
+            (x.pred - y.pred).abs() <= ATOL + ACCUM_RTOL * x.pred.abs(),
+            "t={:.3}: 2-cpt flip-flop shorthand {:.6} vs hand ODE {:.6}",
+            x.time,
+            x.pred,
+            y.pred
+        );
+    }
+    assert!(
+        pa.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.1,
+        "2-cpt flip-flop predictions must be non-zero (closed form clamps to 0)"
+    );
+
+    // Twin-carrying flip-flop: the warning is the *informational* auto-routed one.
+    let diags = ferx_core::api::check_model_data_warnings(&an, &pop, &an.default_params);
+    let w = diags
+        .iter()
+        .find(|d| d.code == "W_TRANSIT_FLIP_FLOP")
+        .expect("flip-flop warns");
+    assert!(
+        w.message.contains("automatically evaluates"),
+        "twin flip-flop must be informational (auto-routed), got: {}",
+        w.message
+    );
+}
+
+/// A flip-flop transit model carrying a `lagtime=` (or `f=`) mapping cannot be
+/// desugared to an ODE twin, so there is nothing to reroute to. Rather than silently
+/// returning a zero profile, it is a **hard error** at every entry point (#776):
+/// `fit()` returns `Err` and no `W_TRANSIT_FLIP_FLOP` warning fires (that
+/// informational note is reserved for the twin-carrying, auto-rerouted case).
+#[test]
+fn transit_flip_flop_without_twin_is_rejected() {
+    // ke = CL/V = 0.5 ≥ KTR = 4/20 = 0.2 (flip-flop); the lagtime declines the desugar,
+    // so there is no ODE twin to reroute to — now a hard error (#776), not a warning.
+    let src = TWIN_LESS_FLIP_FLOP_SRC;
+    let model = parse_full_model(src).expect("lagtime transit parses").model;
+    assert!(
+        model.transit_ode_equivalent.is_none(),
+        "a lagtime= transit model has no ODE twin (the desugar declines it)"
+    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
+
+    // fit() rejects it with a clear, actionable error (not a silent zero-degenerate fit).
+    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("twin-less flip-flop must be rejected");
+    assert!(
+        e.contains("flip-flop") && e.contains("no ODE twin"),
+        "expected an actionable twin-less flip-flop error, got: {e}"
+    );
+
+    // It is an error now — no longer surfaced as the informational W_TRANSIT_FLIP_FLOP
+    // warning (that warning is reserved for the twin-carrying, auto-rerouted case).
+    let diags = ferx_core::api::check_model_data_warnings(&model, &pop, &model.default_params);
+    assert!(
+        !diags.iter().any(|d| d.code == "W_TRANSIT_FLIP_FLOP"),
+        "twin-less flip-flop is a hard error, not a warning"
+    );
+}
+
+/// The twin-less flip-flop reject also fires on the `predict()` path — via a panic,
+/// mirroring the other transit-support rejects (`assert_transit_support`) (#776).
+#[test]
+#[should_panic(expected = "flip-flop regime")]
+fn transit_flip_flop_without_twin_panics_in_predict() {
+    let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
+        .expect("lagtime transit parses")
+        .model;
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
+    let _ = predict(&model, &pop, &model.default_params);
+}
+
+/// The reject also fires on the `simulate()` path — a panic through the
+/// `simulate_inner_with_draw` chokepoint, mirroring the other transit-support
+/// rejects (#776).
+#[test]
+#[should_panic(expected = "flip-flop regime")]
+fn transit_flip_flop_without_twin_panics_in_simulate() {
+    let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
+        .expect("lagtime transit parses")
+        .model;
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
+    let _ = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 42);
+}
+
+/// A twin-less `one_cpt_transit` whose typical parameters put `ke = CL/V` at or above the
+/// transit rate `KTR = (n+1)/mtt` — the flip-flop regime the closed form cannot serve, with
+/// a `lagtime=` mapping that declines the ODE-twin desugar (#776).
+const TWIN_LESS_FLIP_FLOP_SRC: &str = "\
+[parameters]
+  theta TVCL(2.0, 0.001, 50.0)
+  theta TVV(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(20.0, 0.05, 200.0)
+  theta TVLAG(0.3, 0.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  NTR = TVNTR
+  MTT = TVMTT
+  LAGTIME = TVLAG
+
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT, lagtime=LAGTIME)
+
+[error_model]
+  DV ~ proportional(PROP)
+";
 
 /// The reset guard also covers the 2-cpt model, naming it (#634 review finding 1).
 #[test]

@@ -30,6 +30,98 @@ fn pk_params_at_time(
     (model.pk_param_fn)(theta, eta, covariates, time)
 }
 
+/// Whether a transit-absorption closed form is in the **flip-flop** regime at
+/// this subject's individual parameters — the absorption rate matching or
+/// exceeding elimination, so the exponential-tilting closed form's convergence
+/// domain (`ke < KTR` for 1-cpt, `α < KTR` for 2-cpt, with `KTR = (n+1)/mtt`)
+/// is violated and [`crate::sens::one_cpt::one_cpt_transit_amt_g`] /
+/// [`crate::sens::two_cpt::transit_2cpt_domain_ok`] would clamp the prediction
+/// (and its sensitivities) to `0`.
+///
+/// Mirrors those exact guards — the 1-cpt arm inline, the 2-cpt arm by deferring
+/// to `transit_2cpt_domain_ok` itself (so both the flip-flop `!(α < KTR)` clamp
+/// *and* the confluent-eigenvalue `|α − β| < 1e-12` clamp are honoured) — so the
+/// prediction and every sensitivity path make the *same* routing decision.
+/// Returns `false` for a non-transit model, and for invalid parameters — there
+/// the closed form's `0` is a deliberate optimiser penalty, not a flip-flop to
+/// reroute to the ODE twin.
+pub(crate) fn transit_flip_flop_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> bool {
+    let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
+    let (n, mtt, cl, v1) = (pk.n_transit(), pk.mtt(), pk.cl(), pk.v());
+    if !(mtt > 0.0 && n >= 0.0 && cl > 0.0 && v1 > 0.0) {
+        return false;
+    }
+    match model.pk_model {
+        PkModel::OneCptTransit => {
+            // 1-cpt clamps inline (`one_cpt_transit_amt_g`) at `!(ke < KTR)`;
+            // mirror that single-exponential guard directly (there is no
+            // confluent-eigenvalue case for a single disposition rate).
+            let ktr = (n + 1.0) / mtt;
+            !(cl / v1 < ktr)
+        }
+        PkModel::TwoCptTransit => {
+            if !(pk.q() >= 0.0 && pk.v2() > 0.0) {
+                return false;
+            }
+            // Defer to the closed form's own domain guard rather than re-deriving
+            // it: `transit_2cpt_domain_ok` returns `None` (⇒ the closed form
+            // clamps to `0`) for *both* the flip-flop `!(α < KTR)` case and the
+            // confluent-eigenvalue `|α − β| < 1e-12` case. Rerouting exactly when
+            // it clamps keeps this predicate a faithful negation of the guard — no
+            // third copy of the rule to drift. Params are valid here, so a `None`
+            // always means "would clamp", never "invalid input".
+            crate::sens::two_cpt::transit_2cpt_domain_ok::<f64>(cl, v1, pk.q(), pk.v2(), n, mtt)
+                .is_none()
+        }
+        _ => false,
+    }
+}
+
+/// The model to evaluate this subject with at `(theta, eta)`: the structural
+/// [`CompiledModel::effective_for`] reroute (TV-covariate / `TIME` transit
+/// subjects → their ODE twin) **plus** a parameter-dependent flip-flop reroute.
+///
+/// A transit closed form clamps to `0` once `ke ≥ KTR` (absorption no faster
+/// than elimination). When the subject's parameters enter that regime and an
+/// ODE twin exists, evaluate the twin instead: it is the same model, integrated
+/// numerically, and is valid in both regimes — so the prediction and its
+/// sensitivities are correct rather than a spurious zero. Both the prediction
+/// and the sensitivity dispatchers route through here, and within an iteration
+/// they evaluate at the same `(theta, eta)`, so they agree on the decision.
+///
+/// A flip-flop transit model with no ODE twin (one carrying a lagtime, `f`, or a
+/// user `[odes]` / `[scaling]` / `[initial_conditions]` block, which the desugar
+/// declines) has nothing to reroute to, and is rejected up front at η = 0 typical
+/// values by [`crate::api::check_transit_flip_flop_no_twin`] (`fit()` → `Err`,
+/// `predict()`/`simulate()` panic) rather than silently returning the closed form's
+/// `0`. (This function still returns the closed form for it — the guard runs first.)
+pub(crate) fn effective_model_for_eval<'a>(
+    model: &'a CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> &'a CompiledModel {
+    let structural = model.effective_for(subject);
+    // No twin to route to (a non-transit model, or a lagtime / `f` / user-`[odes]`
+    // transit whose desugar declined): nothing parameter-dependent to decide.
+    let Some(twin) = &model.transit_ode_equivalent else {
+        return structural;
+    };
+    // Keep the structural (closed-form) model when it has already been rerouted to
+    // an ODE twin (TV-cov / `TIME`), or when this subject is not in the flip-flop
+    // regime. `||` short-circuits, so the predicate is evaluated only for
+    // closed-form transit subjects — the same work as before.
+    if structural.ode_spec.is_some() || !transit_flip_flop_at(model, subject, theta, eta) {
+        return structural;
+    }
+    twin.get_or_build()
+}
+
 /// Divide each prediction in-place by the scale derived from
 /// `model.scaling`. The convention is **divisive** so that
 /// `[scaling] obs_scale = 1000` maps mg/L → mg/mL (i.e. the user's number
@@ -1554,7 +1646,7 @@ pub fn compute_predictions_with_states(
     // the ODE integration (the `ode_spec` branch below) instead of the analytical
     // superposition path, which has no valid states for those subjects and would otherwise
     // return NaN. Matches the IPRED routing in `compute_predictions_with_tv` (#486).
-    let model = model.effective_for(subject);
+    let model = effective_model_for_eval(model, subject, theta, eta);
     let uses_time = model_uses_time_builtin(model);
     if let Some(ref ode) = model.ode_spec {
         // ODE path: both ipred and states come from a single ODE integration.
@@ -1852,7 +1944,7 @@ pub fn compute_predictions_with_tv_into_with_schedule(
     // covariates) routes to the exact ODE `transit()` equivalent, which takes the ODE branch
     // below (that branch ignores the cached analytical `schedule`, so a stale one is
     // harmless); every other model is unchanged (#486).
-    let model = model.effective_for(subject);
+    let model = effective_model_for_eval(model, subject, theta, eta);
     let has_tv = subject.has_tv_covariates();
     let uses_time = model_uses_time_builtin(model);
 

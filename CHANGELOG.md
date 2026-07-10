@@ -268,6 +268,24 @@ section of the SDLC for the versioning policy).
   that silent no-op, pointing at the bare `f=`/`lagtime=` mapping (e.g. `f=F1`) or an `ode(...)`
   model. A parameter that *is* correctly mapped (`pk(..., f=F1)`) is unaffected — its value was, and
   remains, applied as bioavailability/lag.
+- **Flip-flop transit models now evaluate correctly instead of returning a zero
+  profile** (#733): when a `pk one_cpt_transit(...)` / `two_cpt_transit(...)` model's
+  individual parameters put the disposition rate at or above the transit rate
+  (`ke ≥ KTR`, or `α ≥ KTR` for 2-cpt — the flip-flop regime of a slow-absorption
+  depot), the exponential-tilting closed form is outside its convergence domain and
+  clamped the prediction *and its gradient* to `0`, silently degenerating a
+  proportional-error objective. `predict()`, `simulate()`, `fit()` and the
+  diagnostics now route such a model — per evaluation — to its exact ODE `transit()`
+  twin, which is valid in that regime (matched to a NONMEM ADVAN13 transit
+  simulation to ~1e-4); a twin-carrying flip-flop model gets an informational
+  `W_TRANSIT_FLIP_FLOP` heads-up. A flip-flop model that carries a `lagtime`,
+  bioavailability `f`, or a user `[odes]` / `[scaling]` / `[initial_conditions]` block
+  has **no** ODE twin to route to, so
+  rather than silently returning a zero profile that degenerates the objective it is
+  now **rejected with a hard error** (`fit()` returns `Err`, `predict()`/`simulate()`
+  panic, `ferx check` reports `E_TRANSIT_FLIP_FLOP`) — consistent with the other
+  unsupported-transit rejects. Rewrite such a model as an explicit ODE `transit()`
+  model, or adjust the MTT / CL starting estimates.
 - **Fits are now reproducible regardless of the worker-thread count** (#703). The FOCE/FOCEI,
   SAEM, and importance-sampling objectives summed the per-subject log-likelihood with a parallel
   reduction whose grouping depended on the number of rayon threads; because floating-point
