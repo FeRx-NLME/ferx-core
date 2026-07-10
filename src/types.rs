@@ -3950,6 +3950,9 @@ pub enum WarningCode {
     /// One or more THETA estimates are pinned to an optimizer bound — a sign of
     /// non-identifiability or a too-tight bound.
     BoundaryEstimate,
+    /// One or more THETA estimates have a large relative standard error — poorly
+    /// estimated / imprecise parameters.
+    InflatedRse,
     /// Dataset-quality issue (missing DV, ADDL/II, non-positive DV, …).
     DataQuality,
     /// Omega structure caveat (mixed lognormal / additive block).
@@ -3996,6 +3999,7 @@ impl WarningCode {
             WarningCode::EpsShrinkage => "eps_shrinkage",
             WarningCode::EtaShrinkage => "eta_shrinkage",
             WarningCode::BoundaryEstimate => "boundary_estimate",
+            WarningCode::InflatedRse => "inflated_rse",
             WarningCode::DataQuality => "data_quality",
             WarningCode::OmegaStructure => "omega_structure",
             WarningCode::GradientFallback => "gradient_fallback",
@@ -4133,6 +4137,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // Distinctive phrase; the eps-shrinkage message's "sigma at a bound" is
         // matched earlier and never reaches here.
         (WarningSeverity::Warning, WarningCode::BoundaryEstimate)
+    } else if lower.contains("relative standard error") {
+        (WarningSeverity::Warning, WarningCode::InflatedRse)
     } else if lower.starts_with("w_addl_missing_ii") || lower.contains("addl > 0 but ii") {
         (WarningSeverity::Warning, WarningCode::DataQuality)
     } else if lower.starts_with("w_iov_occ_missing")
@@ -6631,6 +6637,7 @@ mod tests {
             (EpsShrinkage, "eps_shrinkage"),
             (EtaShrinkage, "eta_shrinkage"),
             (BoundaryEstimate, "boundary_estimate"),
+            (InflatedRse, "inflated_rse"),
             (DataQuality, "data_quality"),
             (OmegaStructure, "omega_structure"),
             (GradientFallback, "gradient_fallback"),
@@ -6789,6 +6796,11 @@ mod tests {
                 "Parameter estimate(s) pinned to an optimizer bound: CL (0.0010 at lower bound).",
                 Warning,
                 "boundary_estimate",
+            ),
+            (
+                "High relative standard error (RSE > 50%): TVCL (72%).",
+                Warning,
+                "inflated_rse",
             ),
             (
                 "LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV",
