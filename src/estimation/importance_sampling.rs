@@ -2186,7 +2186,6 @@ mod tests {
             dose_occasions: Vec::new(),
             // 3rd row is a FREM covariate pseudo-observation.
             fremtype: vec![0, 0, 5],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let ipreds = vec![9.0, 7.0, 99.0];
@@ -2520,7 +2519,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype,
-            #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         }
     }
@@ -2736,7 +2734,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: vec![0, 0, 100],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 

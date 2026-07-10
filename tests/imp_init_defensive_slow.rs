@@ -118,7 +118,9 @@ fn simulate_dv(
             let row = iter.next().expect("one sim row per scheduled observation");
             match row.outcome {
                 SimOutcome::Continuous { value } => *obs = value,
-                #[cfg(feature = "survival")]
+                // Non-Continuous outcomes (Event under `survival`, plus the
+                // unconditional Category/Count) never occur for this Gaussian
+                // model; ignore them.
                 _ => {}
             }
         }

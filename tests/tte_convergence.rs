@@ -435,6 +435,9 @@ fn joint_pktte_pop_from_sims(template: &Population, sims: &[SimulationResult]) -
             SimOutcome::Event { time, observed } => {
                 ev_by_id.insert(r.id.clone(), (time, observed, r.cmt));
             }
+            SimOutcome::Category { .. } | SimOutcome::Count { .. } => {
+                unreachable!("TTE simulation does not produce categorical/count outcomes")
+            }
         }
     }
     let mut pop = template.clone();

@@ -1026,7 +1026,6 @@ mod tests {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: Vec::new(),
             },
             Subject {
@@ -1051,7 +1050,6 @@ mod tests {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: Vec::new(),
             },
         ];
@@ -1906,7 +1904,6 @@ mod tests {
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: Vec::new(),
             });
         }
@@ -2069,7 +2066,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         });
         // Subject 1: RACE=1, Subject 2: RACE=-99

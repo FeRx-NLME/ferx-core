@@ -2191,7 +2191,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pk = make_pk_params(10.0, 100.0);
@@ -2246,7 +2245,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         }
     }
@@ -2436,7 +2434,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pk = make_pk_params(10.0, 100.0);
@@ -3273,7 +3270,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let pk_dose: Vec<PkParams> = vec![pk.clone(); doses.len()];

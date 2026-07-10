@@ -2636,7 +2636,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
@@ -2751,7 +2750,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -2849,7 +2847,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -3056,7 +3053,6 @@ mod tests {
             occasions: vec![1, 1, 1, 2, 2, 2],
             dose_occasions: vec![1, 2],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         };
 
@@ -3212,7 +3208,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -3354,7 +3349,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {
@@ -3454,7 +3448,6 @@ mod tests {
             occasions: vec![1u32, 1, 2, 2],
             dose_occasions: vec![1u32],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -3568,7 +3561,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let population = Population {

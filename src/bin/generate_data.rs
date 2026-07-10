@@ -107,7 +107,6 @@ fn simulate_subjects(
                 occasions: Vec::new(),
                 dose_occasions: Vec::new(),
                 fremtype: Vec::new(),
-                #[cfg(feature = "survival")]
                 obs_records: vec![],
             }
         })
@@ -553,7 +552,6 @@ fn generate_two_cpt_oral_cov() {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         })
         .collect();

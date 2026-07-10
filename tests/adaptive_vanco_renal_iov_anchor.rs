@@ -108,7 +108,6 @@ fn anchor_subject(decision_times: &[f64]) -> Subject {
         occasions: vec![1u32; n],
         dose_occasions: Vec::new(),
         fremtype: Vec::new(),
-        #[cfg(feature = "survival")]
         obs_records: vec![],
     }
 }

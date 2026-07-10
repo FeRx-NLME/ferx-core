@@ -711,7 +711,11 @@ pub struct Subject {
     /// Non-Gaussian observation records (TTE events, discrete states, counts).
     /// Empty for all-Gaussian subjects. Populated by the data reader when the
     /// model declares a non-Gaussian endpoint for the row's CMT.
-    #[cfg(feature = "survival")]
+    ///
+    /// Compiled unconditionally (Phase 4.0): the discrete-state / count plumbing
+    /// is the shared foundation for the categorical (Track C) and Markov
+    /// (Track D) endpoints, so it must be present on the default build. Only the
+    /// TTE `Event` variant it can hold stays behind the `survival` feature.
     pub obs_records: Vec<ObsRecord>,
 }
 
@@ -2529,10 +2533,17 @@ pub enum EventType {
     },
 }
 
-#[cfg(feature = "survival")]
 /// A single non-Gaussian observation record on a subject.
+///
+/// Compiled unconditionally (Phase 4.0) so the categorical/count (Track C) and
+/// Markov (Track D) endpoints share one observation stream on the default build.
+/// Only the TTE `Event` variant stays behind the `survival` feature — the same
+/// mixed-`cfg` shape `SimOutcome` already uses. The record variant is chosen by
+/// the CMT's declared endpoint, never guessed from the DV value (§8.1).
 #[derive(Debug, Clone)]
 pub enum ObsRecord {
+    /// TTE / survival event observation (gated behind the `survival` feature).
+    #[cfg(feature = "survival")]
     Event {
         time: f64,
         event_type: EventType,
@@ -2542,7 +2553,12 @@ pub enum ObsRecord {
         entry_time: f64,
         cmt: usize,
     },
-    // DiscreteState and Count variants deferred to Phase 4/5
+    /// Discrete-state observation: an integer category or Markov state index.
+    /// Serves binary/ordinal (Track C) and DTMM/CTMM state observations
+    /// (Track D); the CMT's declared endpoint disambiguates the meaning.
+    DiscreteState { time: f64, state: usize, cmt: usize },
+    /// Non-negative integer count observation (Poisson / negative-binomial, Track C).
+    Count { time: f64, count: u32, cmt: usize },
 }
 
 #[cfg(feature = "survival")]
@@ -2658,6 +2674,8 @@ impl std::fmt::Debug for EndpointLikelihood {
 ///
 /// `Continuous` preserves the existing Gaussian path unchanged.
 /// `Event` carries TTE-specific outputs (gated behind `survival` feature).
+/// `Category`/`Count` (Phase 4.0) are the shared categorical/count/Markov draw
+/// shapes; they compile unconditionally but have no producer until Track C/D.
 #[derive(Debug, Clone)]
 pub enum SimOutcome {
     /// Gaussian continuous prediction + residual noise (the only variant before Phase 1).
@@ -2665,6 +2683,10 @@ pub enum SimOutcome {
     /// TTE event: simulated event time and whether it occurred before the censoring horizon.
     #[cfg(feature = "survival")]
     Event { time: f64, observed: bool },
+    /// Categorical / discrete-state draw (binary, ordinal, DTMM/CTMM state) — Phase 4+.
+    Category { state: usize },
+    /// Count draw (Poisson / negative-binomial) — Phase 4+.
+    Count { count: u32 },
 }
 
 impl SimOutcome {
@@ -2680,6 +2702,13 @@ impl SimOutcome {
                 debug_assert!(
                     false,
                     "continuous_value() called on a TTE Event row — filter by CMT type first"
+                );
+                f64::NAN
+            }
+            SimOutcome::Category { .. } | SimOutcome::Count { .. } => {
+                debug_assert!(
+                    false,
+                    "continuous_value() called on a categorical/count row — filter by CMT type first"
                 );
                 f64::NAN
             }
@@ -5823,7 +5852,6 @@ pub(crate) mod test_helpers {
             occasions: vec![1, 1, 1],
             dose_occasions: vec![1],
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         (model, subject)
@@ -5834,6 +5862,49 @@ pub(crate) mod test_helpers {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// Phase 4.0: the `Category` / `Count` `SimOutcome` variants compile
+    /// unconditionally (shared categorical/count/Markov draw shapes) and derive
+    /// Debug/Clone. The Gaussian path is unchanged.
+    #[test]
+    fn sim_outcome_category_and_count_variants_construct() {
+        let c = SimOutcome::Category { state: 2 };
+        let n = SimOutcome::Count { count: 5 };
+        assert!(format!("{c:?}").contains("Category"));
+        assert!(format!("{n:?}").contains("Count"));
+        let _ = c.clone();
+        let _ = n.clone();
+        assert_eq!(
+            SimOutcome::Continuous { value: 4.25 }.continuous_value(),
+            4.25
+        );
+    }
+
+    /// `continuous_value()` returns NAN for the non-Gaussian outcomes. The
+    /// misuse `debug_assert` fires in debug builds, so this is asserted only when
+    /// debug-assertions are off — the profile CI and coverage use (`ci-test`,
+    /// which inherits `release`), where the NAN branch is actually taken.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn sim_outcome_category_and_count_continuous_value_is_nan() {
+        assert!(SimOutcome::Category { state: 3 }
+            .continuous_value()
+            .is_nan());
+        assert!(SimOutcome::Count { count: 9 }.continuous_value().is_nan());
+    }
+
+    /// The TTE `Event` outcome likewise has no continuous value. Same profile
+    /// caveat as above (the debug-assert fires in debug builds).
+    #[test]
+    #[cfg(all(feature = "survival", not(debug_assertions)))]
+    fn sim_outcome_event_continuous_value_is_nan() {
+        assert!(SimOutcome::Event {
+            time: 1.0,
+            observed: true,
+        }
+        .continuous_value()
+        .is_nan());
+    }
 
     /// `effective_cov_inner_tol` resolves the covariance-step reconvergence tolerance:
     /// an explicit `cov_inner_tol` wins; otherwise the fit's `inner_tol`, tightened to
@@ -5946,7 +6017,6 @@ mod tests {
             dose_occasions: vec![],
             // Row 0 = PK observation, row 1 = covariate pseudo-observation.
             fremtype: vec![0, 100],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
 
@@ -5996,7 +6066,6 @@ mod tests {
             occasions: vec![],
             dose_occasions: vec![],
             fremtype: vec![0],
-            #[cfg(feature = "survival")]
             obs_records: vec![],
         };
         let sigma = vec![0.3];
@@ -7109,7 +7178,6 @@ mod tests {
             occasions: Vec::new(),
             dose_occasions: Vec::new(),
             fremtype: Vec::new(),
-            #[cfg(feature = "survival")]
             obs_records: Vec::new(),
         }
     }
