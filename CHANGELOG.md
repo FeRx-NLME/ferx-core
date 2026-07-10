@@ -20,6 +20,13 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Inflated-RSE warning** (#781): a fit now emits an `inflated_rse` warning
+  when a free THETA's relative standard error (`100 · se / |estimate|`) exceeds
+  ~50% — an imprecisely estimated parameter, often a sign of
+  over-parameterization. Emitted typed at source with `details` listing each
+  `{parameter, estimate, se, rse_pct}`. Requires a successful covariance step
+  (no SEs → no warning). See the
+  [warnings documentation](https://ferx-nlme.github.io/ferx-core/warnings.html).
 - **`simulate_with_options_diag` surfaces per-subject simulation diagnostics** (#762,
   #763): a new entry point returning `SimulationOutput { results, warnings }` — the
   simulation analogue of `FitResult.warnings`. It reports subjects handled specially

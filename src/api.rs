@@ -5302,6 +5302,12 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
+    // Imprecisely estimated thetas (high relative standard error) — likewise
+    // emitted typed at source with `details` (#781).
+    if let Some((msg, entry)) = inflated_rse_warning(&se_theta, &result.params) {
+        warnings.push(msg);
+        native_warnings.push(entry);
+    }
 
     let (iwres_lag1_r, dw_statistic) = iwres_autocorrelation(&subjects);
 
@@ -6317,6 +6323,90 @@ fn boundary_estimate_warning(params: &ModelParameters) -> Option<(String, Warnin
         message: msg.clone(),
         source_method: None,
         details: Some(serde_json::json!({ "parameters": params_json })),
+    };
+    Some((msg, entry))
+}
+
+/// Relative-standard-error threshold (percent) above which a free THETA is
+/// flagged as imprecisely estimated. 50% is a common rule of thumb for fixed
+/// effects (well-estimated parameters typically sit well below it).
+const RSE_WARN_THRESHOLD_PCT: f64 = 50.0;
+
+/// Free (non-fixed) THETA estimates with a relative standard error above the
+/// threshold, as `(name, estimate, se, rse_pct)`. Empty when the covariance
+/// step produced no SEs, or none are imprecise. `RSE = 100 * se / |estimate|`.
+fn inflated_rse_thetas(
+    se_theta: &Option<Vec<f64>>,
+    params: &ModelParameters,
+) -> Vec<(String, f64, f64, f64)> {
+    let Some(se) = se_theta else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for i in 0..params.theta.len() {
+        if params.theta_fixed.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let (est, se_i) = (params.theta[i], se.get(i).copied().unwrap_or(f64::NAN));
+        if est.abs() <= 1e-12 || !se_i.is_finite() {
+            continue;
+        }
+        let rse = 100.0 * se_i / est.abs();
+        if rse.is_finite() && rse > RSE_WARN_THRESHOLD_PCT {
+            let name = params
+                .theta_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("THETA{}", i + 1));
+            hits.push((name, est, se_i, rse));
+        }
+    }
+    hits
+}
+
+/// Build the human message + native structured entry (with `details`) for
+/// free THETAs whose relative standard error exceeds the threshold, or `None`.
+fn inflated_rse_warning(
+    se_theta: &Option<Vec<f64>>,
+    params: &ModelParameters,
+) -> Option<(String, WarningEntry)> {
+    let hits = inflated_rse_thetas(se_theta, params);
+    if hits.is_empty() {
+        return None;
+    }
+    let list = hits
+        .iter()
+        // One decimal so a borderline value (e.g. 50.4%) is not displayed as
+        // "50%" — which would read as below the threshold it just tripped.
+        .map(|(name, _est, _se, rse)| format!("{name} ({rse:.1}%)"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let msg = format!(
+        "High relative standard error (RSE > {:.0}%): {list}. These parameter(s) \
+         are imprecisely estimated — often a sign of over-parameterization or \
+         data that do not inform them; consider simplifying the model.",
+        RSE_WARN_THRESHOLD_PCT
+    );
+    let params_json: Vec<serde_json::Value> = hits
+        .iter()
+        .map(|(name, est, se, rse)| {
+            serde_json::json!({
+                "parameter": name,
+                "estimate": est,
+                "se": se,
+                "rse_pct": rse,
+            })
+        })
+        .collect();
+    let entry = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::InflatedRse,
+        message: msg.clone(),
+        source_method: None,
+        details: Some(serde_json::json!({
+            "threshold_pct": RSE_WARN_THRESHOLD_PCT,
+            "parameters": params_json,
+        })),
     };
     Some((msg, entry))
 }
@@ -12687,6 +12777,48 @@ mod simulate_with_uncertainty_tests {
         // A fixed theta at its bound is not reported.
         params.theta_fixed[0] = true;
         assert!(super::boundary_estimate_warning(&params).is_none());
+    }
+
+    #[test]
+    fn inflated_rse_warning_emits_typed_entry_with_details() {
+        use crate::types::WarningCode;
+        let mut params = tiny_model().default_params;
+        params.theta_fixed = vec![false; params.theta.len()];
+        // No SEs (covariance step didn't run) → no warning.
+        assert!(super::inflated_rse_warning(&None, &params).is_none());
+        // theta[0] with SE = |est| → RSE 100% (> 50%); theta[1] SE tiny → fine.
+        let mut se = vec![0.0; params.theta.len()];
+        se[0] = params.theta[0].abs();
+        let (msg, entry) =
+            super::inflated_rse_warning(&Some(se.clone()), &params).expect("expected an RSE hit");
+        assert!(msg.contains("relative standard error"));
+        assert_eq!(entry.category, WarningCode::InflatedRse);
+        let d = entry.details.as_ref().expect("details");
+        assert_eq!(d["threshold_pct"], 50.0);
+        assert_eq!(
+            d["parameters"][0]["parameter"],
+            params.theta_names[0].as_str()
+        );
+        assert!((d["parameters"][0]["rse_pct"].as_f64().unwrap() - 100.0).abs() < 1e-6);
+        // A fixed theta with a huge SE is not reported.
+        params.theta_fixed[0] = true;
+        assert!(super::inflated_rse_warning(&Some(se), &params).is_none());
+        // A near-zero estimate is skipped (avoids divide-by-~0 blowups).
+        params.theta_fixed[0] = false;
+        params.theta[0] = 0.0;
+        assert!(
+            super::inflated_rse_warning(&Some(vec![1.0; params.theta.len()]), &params).is_none()
+        );
+
+        // Borderline value renders with a decimal (not rounded to the
+        // threshold): RSE = 50.4% must show "50.4%", not "50%".
+        let mut p2 = tiny_model().default_params;
+        p2.theta_fixed = vec![false; p2.theta.len()];
+        p2.theta[0] = 1.0;
+        let mut se2 = vec![0.0; p2.theta.len()];
+        se2[0] = 0.504; // RSE = 50.4%
+        let (msg2, _) = super::inflated_rse_warning(&Some(se2), &p2).expect("borderline hit");
+        assert!(msg2.contains("50.4%"), "got: {msg2}");
     }
 
     #[test]
