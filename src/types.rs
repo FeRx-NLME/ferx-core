@@ -2958,8 +2958,8 @@ pub struct CompiledModel {
     pub transit_ode_equivalent: Option<TransitOdeEquivalent>,
 }
 
-/// A lazily-built ODE representation of an analytical model that carries one (currently only
-/// `one_cpt_transit`). Holds the equivalent's reconstructed `.ferx` source and compiles the
+/// A lazily-built ODE representation of an analytical model that carries one (a plain
+/// `one_cpt_transit` or `two_cpt_transit`). Holds the equivalent's reconstructed `.ferx` source and compiles the
 /// boxed sub-model on first use, so a transit fit whose subjects never hit the fallback
 /// (constant-parameter, non-`TIME`) pays no extra parse or allocation. See
 /// [`CompiledModel::effective_for`] (#486).
@@ -2984,7 +2984,7 @@ impl TransitOdeEquivalent {
         self.built.get_or_init(|| {
             Box::new(
                 crate::parser::model_parser::parse_model_string(&self.source)
-                    .expect("internal: one_cpt_transit ODE equivalent failed to build"),
+                    .expect("internal: transit ODE equivalent failed to build"),
             )
         })
     }
@@ -3048,7 +3048,8 @@ impl CompiledModel {
 
     /// The model that should actually serve `subject`'s predictions / sensitivities.
     ///
-    /// For a `one_cpt_transit` model whose closed form cannot cope with this subject — a
+    /// For a transit closed form (`one_cpt_transit` / `two_cpt_transit`) whose closed form
+    /// cannot cope with this subject — a
     /// `TIME`-dependent structural parameter or time-varying covariates make the disposition
     /// switch mid-absorption, which the per-dose Gamma convolution assumes constant — return
     /// its exact ODE `transit()` equivalent (`transit_ode_equivalent`, built at parse time);

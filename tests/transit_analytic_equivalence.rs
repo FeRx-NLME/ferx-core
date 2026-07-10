@@ -406,6 +406,21 @@ fn transit_reset_rejected() {
     );
 }
 
+/// A non-depot (`CMT≠1`) dose is rejected on the transit closed form. The closed form
+/// folds every dose through the absorption chain into central ignoring `dose.cmt`, while
+/// the single-state ODE twin would *drop* a `CMT=2` dose (no such state) — so the two
+/// paths would silently disagree. The shared `check_transit_support` guard rejects it up
+/// front (the 2-cpt counterpart is `two_cpt_transit_non_depot_dose_rejected`).
+#[test]
+fn transit_non_depot_dose_rejected() {
+    let central_dose = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0); // CMT=2, plain bolus
+    let e = transit_fit_err(&population(vec![central_dose], vec![1.0, 4.0, 8.0]));
+    assert!(
+        e.contains("non-depot") && e.contains("CMT=2"),
+        "expected a non-depot-dose rejection message, got: {e}"
+    );
+}
+
 /// `ode_template one_cpt_transit(...)` desugars to the `transit()` forcing ODE
 /// (#386), so it must `predict()` identically to the analytic `pk` form. Covers the
 /// `ode_template` transit arm and pins the lowering to the closed form.
@@ -725,6 +740,83 @@ fn two_cpt_transit_with_bioavailability_matches_ode() {
 /// Fixed-parameter population OFV at several eta values — drives the analytic
 /// **sensitivity** path (`run_obs` two_cpt_transit branch, the exact
 /// `∂f/∂{cl,v1,q,v2,n,mtt,η}` jets), the 2-cpt counterpart of `transit_ofv_matches_ode`.
+/// Regression (2-cpt asymmetry): a `two_cpt_transit` model with a mid-profile `TIME`
+/// switch used to be **rejected** — the ODE-equivalent desugar was 1-cpt only — while
+/// the identical 1-cpt model transparently rerouted (cf.
+/// `transit_time_desugar_matches_hand_written_ode`). It now carries a 2-cpt ODE twin
+/// (`central` + `periph`) that predict() / the gradient route TIME/TV-cov subjects to,
+/// matching a hand-written 2-cpt transit ODE.
+#[test]
+fn two_cpt_transit_time_desugar_matches_hand_written_ode() {
+    let header = "\
+[parameters]
+  theta TVCL(0.13, 0.001, 10.0)
+  theta TVCL_LATE(0.30, 0.001, 10.0)
+  theta TVV1(8.0, 0.1, 500.0)
+  theta TVQ(0.5, 0.001, 50.0)
+  theta TVV2(4.0, 0.1, 500.0)
+  theta TVNTR(3.0, 0.0, 20.0)
+  theta TVMTT(1.5, 0.05, 50.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.01 (sd)
+
+[individual_parameters]
+  if (TIME > 6.0) {
+    CL = TVCL_LATE * exp(ETA_CL)
+  } else {
+    CL = TVCL * exp(ETA_CL)
+  }
+  V1 = TVV1
+  Q = TVQ
+  V2 = TVV2
+  NTR = TVNTR
+  MTT = TVMTT
+";
+    let shorthand = format!(
+        "{header}\n[structural_model]\n  pk two_cpt_transit(cl=CL, v1=V1, q=Q, v2=V2, n=NTR, mtt=MTT)\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let hand_ode = format!(
+        "{header}\n[structural_model]\n  ode(obs_cmt=central, states=[central, periph])\n\n\
+         [odes]\n  \
+         d/dt(central) = transit(n=NTR, mtt=MTT) - (CL/V1 + Q/V1) * central + (Q/V2) * periph\n  \
+         d/dt(periph)  = (Q/V1) * central - (Q/V2) * periph\n\n\
+         [scaling]\n  obs_scale = V1\n\n\
+         [error_model]\n  DV ~ proportional(PROP)\n"
+    );
+    let sh = parse_full_model(&shorthand)
+        .expect("2-cpt transit + TIME parses (was rejected before the twin existed)")
+        .model;
+    let hd = parse_full_model(&hand_ode)
+        .expect("hand 2-cpt ODE parses")
+        .model;
+    assert!(
+        sh.ode_spec.is_none() && sh.transit_ode_equivalent.is_some(),
+        "2-cpt transit + TIME shorthand must carry an ODE equivalent (primary stays closed-form)"
+    );
+    let pop = population(
+        vec![bolus(0.0, 100.0)],
+        vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0],
+    );
+    let ps = predict(&sh, &pop, &sh.default_params);
+    let ph = predict(&hd, &pop, &hd.default_params);
+    assert_eq!(ps.len(), ph.len());
+    assert!(!ps.is_empty());
+    for (x, y) in ps.iter().zip(ph.iter()) {
+        assert!(
+            (x.pred - y.pred).abs() <= 1e-9 + 1e-9 * x.pred.abs(),
+            "t={:.3}: desugared {:.6} vs hand ODE {:.6}",
+            x.time,
+            x.pred,
+            y.pred
+        );
+    }
+    assert!(
+        ps.iter().any(|p| p.time > 6.0) && ps.iter().any(|p| p.time < 6.0),
+        "observations must straddle the TIME switch"
+    );
+}
+
 #[test]
 fn two_cpt_transit_ofv_matches_ode() {
     use ferx_core::stats::likelihood::individual_nll;
@@ -871,6 +963,80 @@ fn two_cpt_transit_reset_rejected() {
         e.contains("two_cpt_transit") && e.contains("reset"),
         "expected a two_cpt_transit reset-rejection message, got: {e}"
     );
+}
+
+/// A non-depot (`CMT≠1`) dose is rejected on the 2-cpt transit closed form. The closed
+/// form transits every dose into central ignoring `dose.cmt`, while the ODE twin honours
+/// it — a `CMT=2` dose there falls to the direct-bolus branch and lands in `periph`, so the
+/// two paths would silently disagree (plausible-but-wrong, unlike the 1-cpt twin which
+/// drops it). The shared `check_transit_support` guard rejects it up front, naming the model.
+#[test]
+fn two_cpt_transit_non_depot_dose_rejected() {
+    let (an_src, _) = build_pair_2cpt(false, false);
+    let model = parse_full_model(&an_src).expect("parses").model;
+    let central_dose = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0); // CMT=2, plain bolus
+    let pop = population(vec![central_dose], vec![1.0, 4.0, 8.0]);
+    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("2cpt transit + non-depot (CMT=2) dose should be rejected");
+    assert!(
+        e.contains("two_cpt_transit") && e.contains("non-depot") && e.contains("CMT=2"),
+        "expected a two_cpt_transit non-depot-dose rejection message, got: {e}"
+    );
+}
+
+/// The IOV guard also covers the 2-cpt model, naming it (shared `check_transit_support`,
+/// the 2-cpt counterpart of `transit_iov_rejected`).
+#[test]
+fn two_cpt_transit_iov_rejected() {
+    let (an_src, _) = build_pair_2cpt(false, false);
+    let mut model = parse_full_model(&an_src).expect("parses").model;
+    model.n_kappa = 1;
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
+    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("2cpt transit + IOV should be rejected");
+    assert!(
+        e.contains("two_cpt_transit") && e.contains("IOV"),
+        "expected a two_cpt_transit IOV-rejection message, got: {e}"
+    );
+}
+
+/// The infusion guard also covers the 2-cpt model, naming it (shared `check_transit_support`,
+/// the 2-cpt counterpart of `transit_infusion_dose_rejected`).
+#[test]
+fn two_cpt_transit_infusion_dose_rejected() {
+    let (an_src, _) = build_pair_2cpt(false, false);
+    let model = parse_full_model(&an_src).expect("parses").model;
+    let inf = DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0); // rate > 0 → infusion
+    let pop = population(vec![inf], vec![1.0, 4.0, 8.0]);
+    let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect_err("2cpt transit + infusion should be rejected");
+    assert!(
+        e.contains("two_cpt_transit") && e.contains("infusion"),
+        "expected a two_cpt_transit infusion-rejection message, got: {e}"
+    );
+}
+
+/// A plain `two_cpt_transit` model with time-varying covariates now **works**: the runtime
+/// dispatch routes the TV-cov subject to the model's exact 2-cpt ODE `transit()` equivalent
+/// (the non-`TIME` reroute leg of `effective_for`, the 2-cpt counterpart of
+/// `transit_tv_covariate_now_served_by_ode_equivalent`).
+#[test]
+fn two_cpt_transit_tv_covariate_now_served_by_ode_equivalent() {
+    let (an_src, _) = build_pair_2cpt(false, false);
+    let model = parse_full_model(&an_src).expect("parses").model;
+    assert!(
+        model.transit_ode_equivalent.is_some(),
+        "plain 2-cpt transit carries an ODE equivalent"
+    );
+    let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
+    // Give the subject time-varying covariates (non-empty per-observation maps).
+    pop.subjects[0].obs_covariates = vec![
+        std::collections::HashMap::from([("WT".to_string(), 70.0)]),
+        std::collections::HashMap::from([("WT".to_string(), 72.0)]),
+    ];
+    assert!(pop.subjects[0].has_tv_covariates());
+    fit(&model, &pop, &model.default_params, &FitOptions::default())
+        .expect("2cpt transit + time-varying covariates now fits via the ODE equivalent");
 }
 
 /// Committed slow benchmark: analytic `pk two_cpt_transit` and the ODE `transit()`
