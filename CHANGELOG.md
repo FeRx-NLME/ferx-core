@@ -20,6 +20,16 @@ section of the SDLC for the versioning policy).
 ## [Unreleased]
 
 ### Added
+- **Machine-readable JSON fit output** (#777): `ferx <model> --data <csv>
+  --output-format json` (or `both`) writes `{model}-fit.json` — the *complete*
+  fit result (every estimate, standard error, diagnostic, per-subject record,
+  and provenance field), not the curated human YAML. It carries a top-level
+  `schema_version` so programmatic/agent consumers can pin, matrices serialize
+  as `{rows, cols, data}` (row-major) and vectors as flat arrays, and non-finite
+  floats become JSON `null`. `--output-format yaml` (the default) is unchanged.
+  Library callers can get the same payload in-process via
+  `FitResult::to_json_value()`. See the
+  [output documentation](https://ferx-nlme.github.io/ferx-core/output.html).
 - **Experimental `markov` feature — CTMM matrix-exponential foundation**
   (#759): a new default-off `markov` cargo feature adds the numerical core for
   continuous-time Markov models — transition probabilities

@@ -5,7 +5,7 @@ use std::time::Instant;
 /// Top-level usage/help text, shared by the no-args error path (stderr, exit 1)
 /// and `ferx -h`/`--help` (stdout, exit 0) so the two can't drift apart.
 const MAIN_USAGE: &str = "\
-Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]]
+Usage: ferx <model.ferx> --data <data.csv> [--threads N|auto] [--output <run.fitrx>] [--include-data] [--inits-from-nca[=nca|nca_sweep|nca_ebe]] [--output-format yaml|json|both]
        ferx <model.ferx> --simulate          [--threads N|auto] [--output <run.fitrx>]
        ferx check <model.ferx> [--data <data.csv>] [--json]
        ferx summary <run.fitrx> [<run2.fitrx> ...]
@@ -22,6 +22,10 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
 
 --output PATH  also write a portable .fitrx fit bundle (zip of JSON+CSV)
 --include-data embed the input --data CSV inside the .fitrx (off by default)
+
+--output-format yaml|json|both  which estimates file to write (default yaml).
+               json writes {model}-fit.json: the complete FitResult under a
+               versioned schema, for programmatic/agent consumers.
 
 --inits-from-nca[=METHOD]  derive NCA-based starting values before fitting,
                overriding the model file. METHOD is nca, nca_sweep (default),
@@ -102,6 +106,7 @@ fn main() {
         }
     };
     let output_path = parse_output_flag(&args);
+    let estimates_format = parse_output_format(&args);
     let include_data = args.iter().any(|a| a == "--include-data");
     if include_data && output_path.is_none() {
         eprintln!("Warning: --include-data has no effect without --output");
@@ -175,10 +180,19 @@ fn main() {
                 eprintln!("{}", msg);
             }
 
-            let yaml_path = format!("{}-fit.yaml", model_name);
-            match ferx_core::io::output::write_estimates_yaml(&fit_result, &yaml_path) {
-                Ok(()) => eprintln!("Estimates written to {}", yaml_path),
-                Err(e) => eprintln!("Warning: failed to write estimates: {}", e),
+            if estimates_format.wants_yaml() {
+                let yaml_path = format!("{}-fit.yaml", model_name);
+                match ferx_core::io::output::write_estimates_yaml(&fit_result, &yaml_path) {
+                    Ok(()) => eprintln!("Estimates written to {}", yaml_path),
+                    Err(e) => eprintln!("Warning: failed to write estimates: {}", e),
+                }
+            }
+            if estimates_format.wants_json() {
+                let json_path = format!("{}-fit.json", model_name);
+                match ferx_core::io::output::write_result_json(&fit_result, &json_path) {
+                    Ok(()) => eprintln!("Estimates (JSON) written to {}", json_path),
+                    Err(e) => eprintln!("Warning: failed to write JSON estimates: {}", e),
+                }
             }
 
             if let Some(out) = &output_path {
@@ -444,6 +458,41 @@ fn parse_output_flag(args: &[String]) -> Option<String> {
     }
 }
 
+/// Which estimates file(s) to write for a completed fit.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum EstimatesFormat {
+    Yaml,
+    Json,
+    Both,
+}
+
+impl EstimatesFormat {
+    fn wants_yaml(self) -> bool {
+        matches!(self, EstimatesFormat::Yaml | EstimatesFormat::Both)
+    }
+    fn wants_json(self) -> bool {
+        matches!(self, EstimatesFormat::Json | EstimatesFormat::Both)
+    }
+}
+
+/// Parse `--output-format yaml|json|both` (default `yaml`, current behaviour).
+/// Controls only the estimates file (`{model}-fit.yaml` / `-fit.json`); the
+/// sdtab/covtab/conddist CSVs are unaffected.
+fn parse_output_format(args: &[String]) -> EstimatesFormat {
+    let Some(idx) = args.iter().position(|a| a == "--output-format") else {
+        return EstimatesFormat::Yaml;
+    };
+    match args.get(idx + 1).map(String::as_str) {
+        Some("yaml") => EstimatesFormat::Yaml,
+        Some("json") => EstimatesFormat::Json,
+        Some("both") => EstimatesFormat::Both,
+        _ => {
+            eprintln!("Error: --output-format requires one of: yaml, json, both");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Parse the optional `--threads` flag. Returns `None` when the flag is
 /// absent, when its value is `0`, or when its value is `auto` — all of which
 /// mean "leave rayon's default pool alone". Exits the process on a missing
@@ -502,8 +551,8 @@ fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String>
 mod tests {
     use super::{
         is_help_flag, normalize_args, parse_check_args, parse_inits_from_nca_flag,
-        parse_output_flag, parse_threads_flag, print_check_human, run_check, run_summary,
-        CheckArgsError,
+        parse_output_flag, parse_output_format, parse_threads_flag, print_check_human, run_check,
+        run_summary, CheckArgsError, EstimatesFormat,
     };
     use ferx_core::NcaInit;
 
@@ -512,6 +561,25 @@ mod tests {
             .chain(extra.iter().copied())
             .map(String::from)
             .collect()
+    }
+
+    #[test]
+    fn parse_output_format_defaults_to_yaml() {
+        let f = parse_output_format(&args(&["model.ferx", "--data", "d.csv"]));
+        assert!(f.wants_yaml() && !f.wants_json());
+    }
+
+    #[test]
+    fn parse_output_format_reads_explicit_values() {
+        let yaml = parse_output_format(&args(&["m.ferx", "--output-format", "yaml"]));
+        assert!(yaml.wants_yaml() && !yaml.wants_json());
+
+        let json = parse_output_format(&args(&["m.ferx", "--output-format", "json"]));
+        assert!(json.wants_json() && !json.wants_yaml());
+
+        let both = parse_output_format(&args(&["m.ferx", "--output-format", "both"]));
+        assert!(both.wants_yaml() && both.wants_json());
+        assert_eq!(both, EstimatesFormat::Both);
     }
 
     #[test]

@@ -2141,6 +2141,81 @@ mod tests {
     }
 
     #[test]
+    fn json_result_has_versioned_schema_and_round_trips() {
+        // #777: the JSON output must be the *complete* FitResult under a
+        // versioned schema. Idempotent round-trip (serialize → deserialize →
+        // re-serialize equals the first serialization) proves every serialized
+        // field also deserializes back, i.e. no field is write-only / lossy.
+        let fit = minimal_fit_result();
+        let v1 = fit.to_json_value();
+
+        // Top-level schema_version is present and pinned.
+        assert_eq!(v1["schema_version"], FitResult::JSON_SCHEMA_VERSION);
+
+        // A few representative fields survive with the agent-friendly shapes.
+        assert_eq!(v1["ofv"], 100.0);
+        assert_eq!(v1["omega"]["rows"], 2);
+        assert_eq!(v1["omega"]["cols"], 2);
+        assert_eq!(v1["omega"]["data"], serde_json::json!([0.1, 0.0, 0.0, 0.2]));
+        assert_eq!(v1["subjects"][0]["eta"].as_array().unwrap().len(), 2);
+
+        // Round-trip: unknown `schema_version` is ignored on the way back in.
+        let back: FitResult = serde_json::from_value(v1.clone()).unwrap();
+        let v2 = back.to_json_value();
+        assert_eq!(v1, v2, "JSON round-trip is not idempotent (lossy field?)");
+    }
+
+    #[test]
+    fn json_result_maps_non_finite_floats_to_null() {
+        // #777 review: guarantee that non-finite floats serialize to JSON
+        // `null` and never panic `to_json_value()` / `write_result_json()`.
+        // serde_json's `Value`/string serializers map non-finite f64 to null
+        // (no `arbitrary_precision` feature here), so this holds without a
+        // sanitizing pass — this test locks that contract in.
+        let mut fit = minimal_fit_result();
+        fit.ofv = f64::INFINITY;
+        fit.shrinkage_eps = f64::NAN;
+        fit.iwres_lag1_r = f64::NEG_INFINITY;
+        // A missing covariate value is stored as NaN in the covariate table.
+        fit.covariate_table = Some(crate::types::CovariateTable {
+            names: vec!["WT".into()],
+            kinds: vec![crate::types::CovariateKind::Continuous],
+            rows: vec![crate::types::CovariateRow {
+                id: "S1".into(),
+                time: 0.0,
+                evid: 0,
+                values: vec![f64::NAN],
+            }],
+        });
+
+        let v = fit.to_json_value(); // must not panic
+        assert!(v["ofv"].is_null());
+        assert!(v["shrinkage_eps"].is_null());
+        assert!(v["iwres_lag1_r"].is_null());
+        assert!(v["covariate_table"]["rows"][0]["values"][0].is_null());
+
+        // Full write path also succeeds (pretty-printer never panics on null).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nan-fit.json");
+        crate::io::output::write_result_json(&fit, path.to_str().unwrap()).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(parsed["ofv"].is_null());
+    }
+
+    #[test]
+    fn write_result_json_writes_parseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run-fit.json");
+        let fit = minimal_fit_result();
+        crate::io::output::write_result_json(&fit, path.to_str().unwrap()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["schema_version"], FitResult::JSON_SCHEMA_VERSION);
+        assert_eq!(parsed["converged"], true);
+    }
+
+    #[test]
     fn roundtrip_minimal_fit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run1.fitrx");

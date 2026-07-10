@@ -15,6 +15,7 @@ pub mod parser;
 pub mod pk;
 pub mod propensity_match;
 pub mod sens;
+pub(crate) mod serde_nalgebra;
 pub mod sim;
 pub mod stats;
 pub mod suggest_start;
