@@ -3925,6 +3925,10 @@ fn parse_event_model_block(
             EndpointLikelihood::Tte {
                 hazard: HazardSpec::OdeAccumulated { chz_state },
                 recurrence,
+                // The ODE-accumulated hazard's covariate dependencies flow through the
+                // injected `d/dt(__chz)` derivative; the whole-subject time-varying check
+                // (the ODE solve freezes PK params at t=0) guards them, not this list.
+                hazard_covariates: Vec::new(),
             },
             Vec::new(),
             std::collections::HashSet::new(),
@@ -3976,7 +3980,7 @@ fn parse_event_model_block(
 
     // Collect covariate/theta/eta references from all expressions BEFORE they are
     // moved into the param_fn closure.
-    let event_model_covariates: Vec<String>;
+    let mut event_model_covariates: Vec<String>;
     let event_model_thetas: std::collections::HashSet<usize>;
     let event_model_etas: std::collections::HashSet<usize>;
     {
@@ -4044,6 +4048,25 @@ fn parse_event_model_block(
         keep.reverse();
         keep
     };
+
+    // A hazard sub-expression may reference an [individual_parameters] value (PR #442)
+    // whose own definition reads covariates — e.g. `scale = LAMBDA` with
+    // `LAMBDA = TVLAMBDA * exp(TVBETA * CRCL + ETA)`. The `param_fn` evaluates those kept
+    // statements, so the hazard transitively reads `CRCL` at the baseline snapshot. Union
+    // the covariates of the kept statements into the event-model covariate set so (a) they
+    // appear in the covariate table and (b) `hazard_covariates` is complete — otherwise a
+    // *time-varying* covariate reached only through an individual parameter slips past the
+    // #741 guard and is silently frozen (the exact bug #741 exists to reject).
+    {
+        let mut cov_set = std::collections::HashSet::new();
+        collect_covariates_in_stmts(&needed_indiv_stmts, &mut cov_set);
+        for c in cov_set {
+            if !event_model_covariates.contains(&c) {
+                event_model_covariates.push(c);
+            }
+        }
+        event_model_covariates.sort();
+    }
 
     // The hazard `param_fn` evaluates the kept statements with the BSV-only η it is
     // handed (kappas are PK/occasion-level, not part of a per-subject hazard), so a
@@ -4163,6 +4186,7 @@ fn parse_event_model_block(
         EndpointLikelihood::Tte {
             hazard: HazardSpec::Analytic { family, param_fn },
             recurrence,
+            hazard_covariates: event_model_covariates.clone(),
         },
         event_model_covariates,
         event_model_thetas,

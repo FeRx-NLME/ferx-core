@@ -829,6 +829,48 @@ impl Subject {
     pub fn pk_only_cov(&self, m: usize) -> &HashMap<String, f64> {
         self.pk_only_covariates.get(m).unwrap_or(&self.covariates)
     }
+
+    /// Names of covariates whose value **varies within this subject**, i.e. is
+    /// not constant across the per-observation / per-dose / per-EVID2 LOCF
+    /// snapshots. Returns an empty vector when the subject has no time-varying
+    /// covariates (the common case — snapshots are empty or all equal).
+    ///
+    /// This is the *which-covariate* companion to the boolean
+    /// [`has_tv_covariates`](Self::has_tv_covariates): guards that only care
+    /// whether a *specific* referenced covariate varies (e.g. survival hazards,
+    /// #741) intersect this set with their reference list, rather than rejecting
+    /// on the mere presence of any time-varying covariate. Unlike
+    /// `has_tv_covariates`, it also inspects `pk_only_covariates` (EVID=2 rows),
+    /// so a covariate that changes only on an "other event" row is detected.
+    /// Names are returned sorted for a deterministic diagnostic.
+    pub fn time_varying_covariate_names(&self) -> Vec<String> {
+        // First value seen per covariate; a later differing value marks it varying.
+        let mut first_seen: HashMap<&str, f64> = HashMap::new();
+        let mut varying: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let snapshots = self
+            .obs_covariates
+            .iter()
+            .chain(self.dose_covariates.iter())
+            .chain(self.pk_only_covariates.iter());
+        for snap in snapshots {
+            for (name, &val) in snap {
+                match first_seen.get(name.as_str()) {
+                    // Exact inequality is correct: values are LOCF copies of the
+                    // parsed CSV f64, so a genuine change differs bit-for-bit and a
+                    // carried-forward value is identical. A NaN covariate (which
+                    // should not occur) compares unequal and is conservatively flagged.
+                    Some(&prev) if prev != val => {
+                        varying.insert(name.clone());
+                    }
+                    Some(_) => {}
+                    None => {
+                        first_seen.insert(name.as_str(), val);
+                    }
+                }
+            }
+        }
+        varying.into_iter().collect()
+    }
 }
 
 /// Summary of records excluded by `[data_selection]` `ignore`/`accept` rules.
@@ -2654,6 +2696,15 @@ pub enum EndpointLikelihood {
         /// Single event (standard TTE) vs. repeated events (RTTE). Defaults to
         /// `Single`; set to `Repeated` only when the model declares `type = rtte`.
         recurrence: TteRecurrence,
+        /// Covariate names referenced by this hazard's **closed-form parameters**
+        /// (analytic families — scale/shape/alpha/gamma/loghr). The analytic hazard
+        /// is evaluated once per record with a *baseline* covariate snapshot (the
+        /// [`HazardParamFn`] takes no time argument), so a time-varying covariate
+        /// here would be silently frozen; [`crate::api::check_survival_tv_covariates`]
+        /// rejects that up front (#741). Empty for [`HazardSpec::OdeAccumulated`],
+        /// whose covariate dependencies flow through the ODE system and are guarded
+        /// by the whole-subject time-varying-covariate check instead.
+        hazard_covariates: Vec<String>,
     },
     // Binary, Ordinal, Poisson, NegBin, Ctmm, Dtmm deferred to Phase 4/5
 }
@@ -2663,7 +2714,9 @@ impl std::fmt::Debug for EndpointLikelihood {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EndpointLikelihood::Gaussian(e) => write!(f, "Gaussian({e:?})"),
-            EndpointLikelihood::Tte { hazard, recurrence } => {
+            EndpointLikelihood::Tte {
+                hazard, recurrence, ..
+            } => {
                 write!(f, "Tte({hazard:?}, {recurrence:?})")
             }
         }
@@ -3913,6 +3966,12 @@ pub enum WarningCode {
     Cancelled,
     /// Thread-count efficiency note.
     Threads,
+    /// A simulation-time, per-subject diagnostic — a degenerate hazard draw, or an
+    /// over-large recurrent-event stream that was skipped/censored — surfaced by
+    /// `simulate_with_options_diag` and echoed into `FitResult.warnings` on a
+    /// `--simulate` run (#762, #763). Distinct from the fit-time optimizer/data codes:
+    /// it flags a pathological simulated subject, not an estimation problem.
+    Simulation,
     /// Unrecognised message — fallback bucket.
     General,
 }
@@ -3945,6 +4004,7 @@ impl WarningCode {
             WarningCode::MultiStart => "multi_start",
             WarningCode::Cancelled => "cancelled",
             WarningCode::Threads => "threads",
+            WarningCode::Simulation => "simulation",
             WarningCode::General => "general",
         }
     }
@@ -4038,6 +4098,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // Any future covariance message that contains "ill-conditioned" but NOT "failed:"
         // would land here instead — keep this ordering in mind when adding new messages.
         (WarningSeverity::Critical, WarningCode::ConditionNumber)
+    } else if lower.starts_with("w_tte_degenerate") || lower.starts_with("w_rtte_degenerate") {
+        // Simulation-time per-subject hazard diagnostics (#762/#763). Must precede the
+        // generic "degenerate" → optimizer-health branch below, whose substring these
+        // otherwise match — these flag a pathological *simulated subject*, not an
+        // estimation/optimizer problem.
+        (WarningSeverity::Warning, WarningCode::Simulation)
     } else if lower.contains("trust radius") || lower.contains("degenerate") {
         (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {
@@ -6508,6 +6574,24 @@ mod tests {
     }
 
     #[test]
+    fn classify_warning_simulation_beats_optimizer_health_degenerate() {
+        // #762/#763 simulation diagnostics contain the word "degenerate", which the
+        // generic optimizer-health branch also keys on. The `w_tte/​w_rtte` prefix
+        // branch must precede it so a simulated-subject diagnostic is not mislabelled
+        // as an estimation/optimizer problem.
+        for msg in [
+            "W_TTE_DEGENERATE_HAZARD: subject '1' (CMT=1) drew a non-positive / \
+             non-finite effective hazard rate (#763).",
+            "W_RTTE_DEGENERATE: subject '1' (CMT=2) has a degenerate recurrent hazard (#762).",
+        ] {
+            let w = classify_warning(msg);
+            assert_eq!(w.category.as_str(), "simulation", "misclassified: {msg:?}");
+            assert_eq!(w.severity, WarningSeverity::Warning);
+            assert_ne!(w.category, WarningCode::OptimizerHealth);
+        }
+    }
+
+    #[test]
     fn classify_warning_eta_shrinkage_is_word_bounded() {
         // The real message classifies to eta_shrinkage.
         assert_eq!(
@@ -6555,6 +6639,7 @@ mod tests {
             (MultiStart, "multi_start"),
             (Cancelled, "cancelled"),
             (Threads, "threads"),
+            (Simulation, "simulation"),
             (General, "general"),
         ];
         for (code, token) in expected {
@@ -6858,6 +6943,33 @@ mod tests {
                 "[FOCEI] Outer optimization did not converge",
                 Critical,
                 "convergence",
+            ),
+            // -- survival/mod.rs simulation diagnostics (#762/#763) --------
+            // The `w_tte_degenerate` / `w_rtte_degenerate` prefixes must route to
+            // `simulation`, winning over the generic "degenerate" -> optimizer_health
+            // branch that their message body would otherwise match.
+            (
+                "W_TTE_DEGENERATE_HAZARD: subject '7' (CMT=1) drew a non-positive / \
+                 non-finite effective hazard rate; no event was generated and the \
+                 subject is censored at the observation window (#763). Check the \
+                 hazard parameters / covariate values.",
+                Warning,
+                "simulation",
+            ),
+            (
+                "W_RTTE_DEGENERATE: subject '7' (CMT=2) has a degenerate recurrent \
+                 hazard (~1.234e7 events expected before horizon 30); its event stream \
+                 was skipped and the subject censored at the horizon (#762). Check the \
+                 hazard parameters / covariate values.",
+                Warning,
+                "simulation",
+            ),
+            (
+                "W_RTTE_DEGENERATE: subject '7' (CMT=2) produced over 1000000 events \
+                 before horizon 30 (vanishing inter-event gaps); its stream was \
+                 truncated and the subject censored at the horizon (#762).",
+                Warning,
+                "simulation",
             ),
         ];
 
@@ -7444,6 +7556,48 @@ mod tests {
         assert!(s.has_censored_observation());
         s.cens = vec![-1, 0];
         assert!(s.has_censored_observation());
+    }
+
+    #[test]
+    fn time_varying_covariate_names_detects_only_varying_covariates() {
+        let mut s = bare_subject("1");
+        // WT varies across obs snapshots; SEX is constant → only WT is reported.
+        s.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0), ("SEX".to_string(), 1.0)]),
+            HashMap::from([("WT".to_string(), 80.0), ("SEX".to_string(), 1.0)]),
+        ];
+        assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
+    }
+
+    #[test]
+    fn time_varying_covariate_names_empty_when_constant_or_absent() {
+        // No snapshots at all → empty.
+        let s = bare_subject("1");
+        assert!(s.time_varying_covariate_names().is_empty());
+        // Present but constant across snapshots → empty.
+        let mut s2 = bare_subject("2");
+        s2.obs_covariates = vec![
+            HashMap::from([("WT".to_string(), 70.0)]),
+            HashMap::from([("WT".to_string(), 70.0)]),
+        ];
+        assert!(s2.time_varying_covariate_names().is_empty());
+    }
+
+    #[test]
+    fn time_varying_covariate_names_inspects_pk_only_rows() {
+        // A covariate that changes only across EVID=2 (pk-only) rows is time-varying —
+        // this is the case `has_tv_covariates()` misses (it inspects only obs/dose
+        // snapshots), so with obs/dose empty it reports no TV covariates at all.
+        let mut s = bare_subject("1");
+        s.pk_only_covariates = vec![
+            HashMap::from([("CRCL".to_string(), 100.0)]),
+            HashMap::from([("CRCL".to_string(), 60.0)]),
+        ];
+        assert!(
+            !s.has_tv_covariates(),
+            "has_tv_covariates inspects only obs/dose rows, so it is blind to pk_only variation"
+        );
+        assert_eq!(s.time_varying_covariate_names(), vec!["CRCL".to_string()]);
     }
 
     #[test]

@@ -62,6 +62,7 @@ Each `WarningCode` token, what it flags, and a typical response.
 | `multi_start` | Info | Multi-start note. | Inspect which start won. |
 | `cancelled` | Info | Run cancelled by the user. | None. |
 | `threads` | Info | Thread-count efficiency note. | Optionally tune `threads`. |
+| `simulation` | Warning | A simulated subject was handled specially — a degenerate hazard draw (censored, no event) or an over-large recurrent-event stream (skipped/truncated). Surfaced by `simulate_with_options_diag` and on `--simulate` runs (#762/#763). | Inspect the named subject's hazard parameters / covariate values; the estimated model is unaffected. |
 | `general` | Warning | Unrecognised message (fallback bucket). | Read the message text. |
 
 ## Details payloads {#details}

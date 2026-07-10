@@ -502,7 +502,10 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     // planned study end (#522). `match_method = None` makes this identical to
     // `simulate_with_seed` for the Gaussian path (same seeded RNG, no matching),
     // and the `None`-matching branch cannot error.
-    let sim_results = simulate_with_options(
+    let SimulationOutput {
+        results: sim_results,
+        warnings: sim_warnings,
+    } = simulate_with_options_diag(
         &parsed.model,
         &template,
         &parsed.model.default_params,
@@ -619,6 +622,16 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), S
     result.model_path = Some(model_path.to_string());
     result.model_hash = crate::io::hash::sha256_file(Path::new(model_path)).ok();
     result.model_text = std::fs::read_to_string(model_path).ok();
+    // Surface any per-subject simulation diagnostics (#762/#763) alongside the fit
+    // warnings so the CLI reports a degenerate simulated subject rather than dropping it.
+    // `fit()` already built `warnings_structured` from the fit warnings; rebuild it
+    // unconditionally so the appended sim warnings also reach the typed / JSON surface
+    // (#778/#779), where `classify_warning` tags them `WarningCode::Simulation`. The
+    // rebuild is idempotent — a pure function of `result.warnings` — so an empty
+    // `sim_warnings` (the common case, and every non-survival build) just reproduces the
+    // fit's structured list.
+    result.warnings.extend(sim_warnings);
+    rebuild_warnings_structured(&mut result);
     Ok((result, population))
 }
 
@@ -1722,6 +1735,104 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
     None
 }
 
+/// Reject a model / dataset where a **survival hazard references a time-varying
+/// covariate** — currently silently frozen at its baseline value (#741).
+///
+/// The analytic hazard [`crate::types::HazardParamFn`] takes no time argument and is
+/// evaluated with the subject's baseline covariate snapshot; the ODE-accumulated (joint
+/// PK-TTE) hazard is integrated with the PK-parameter vector frozen at `t=0`
+/// (`survival::ode_cumhaz_hazard`). In both cases a covariate that varies within a subject
+/// is read at one fixed value, so the fit / simulation would use the wrong hazard with no
+/// warning. Until time-varying covariates on hazards are supported, reject up front — as the
+/// PK-path TV-covariate paths already do (`check_transit_support`) — rather than silently
+/// mis-fit.
+///
+/// The scope is deliberately tight so a legitimate model is not rejected:
+///   * an **analytic** hazard rejects only when a covariate its *own* closed-form parameters
+///     reference (`hazard_covariates`) is time-varying — a covariate used solely by a shared
+///     PK model (a frailty-only joint fit) is fine, since the analytic hazard never reads it;
+///   * an **ODE-accumulated** hazard rejects on *any* time-varying covariate, because the
+///     survival ODE solve freezes the whole PK-parameter vector at `t=0`, so a covariate
+///     feeding the concentration (and hence the drug-driven hazard) is equally frozen.
+///
+/// Returns `None` when no TTE endpoint references a time-varying covariate. `fit()` surfaces
+/// the message as an `Err`; `predict()`/`simulate()` panic via [`assert_survival_tv_covariates`].
+#[cfg(feature = "survival")]
+pub(crate) fn check_survival_tv_covariates(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<String> {
+    use crate::types::{EndpointLikelihood, HazardSpec};
+    if !model.has_tte() {
+        return None;
+    }
+    for subject in &population.subjects {
+        let tv = subject.time_varying_covariate_names();
+        if tv.is_empty() {
+            continue;
+        }
+        let tv_set: std::collections::HashSet<&str> = tv.iter().map(String::as_str).collect();
+        for (cmt, endpoint) in &model.endpoints {
+            let EndpointLikelihood::Tte {
+                hazard,
+                hazard_covariates,
+                ..
+            } = endpoint
+            else {
+                continue;
+            };
+            match hazard {
+                HazardSpec::Analytic { .. } => {
+                    if let Some(name) = hazard_covariates
+                        .iter()
+                        .find(|c| tv_set.contains(c.as_str()))
+                    {
+                        return Some(format!(
+                            "[event_model] on CMT={cmt}: the survival hazard references covariate \
+                             `{name}`, which is time-varying for subject `{}`. Time-varying \
+                             covariates on a hazard are not yet supported — the analytic hazard is \
+                             evaluated at the baseline covariate value, so the fit would silently \
+                             use the wrong hazard (#741). Use a time-constant (baseline) covariate \
+                             on the hazard for now.",
+                            subject.id
+                        ));
+                    }
+                }
+                HazardSpec::OdeAccumulated { .. } => {
+                    // Any time-varying covariate is frozen by the survival ODE solve's t=0
+                    // PK-parameter snapshot; name the first one deterministically (`tv` is sorted).
+                    let name = &tv[0];
+                    return Some(format!(
+                        "[event_model] on CMT={cmt}: the ODE-accumulated (joint PK-TTE) hazard is \
+                         integrated with covariates frozen at their t=0 baseline, but covariate \
+                         `{name}` is time-varying for subject `{}`. Time-varying covariates on a \
+                         drug-driven hazard are not yet supported (#741). Hold the covariate \
+                         constant within each subject for now.",
+                        subject.id
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Panic wrapper over [`check_survival_tv_covariates`] for the non-`fit` entry points
+/// (`predict()`/`simulate()`), mirroring [`assert_transit_support`]: the same
+/// time-varying-covariate-on-hazard combination that `fit()` rejects as an `Err` cannot be
+/// honoured by prediction / simulation either (the hazard would be silently frozen), so fail
+/// loudly rather than return a subtly wrong result.
+#[cfg(feature = "survival")]
+pub(crate) fn assert_survival_tv_covariates(model: &CompiledModel, population: &Population) {
+    if let Some(msg) = check_survival_tv_covariates(model, population) {
+        panic!(
+            "predict()/simulate() received a survival model / data combination with a \
+             time-varying covariate on a hazard: {msg}\n(fit() reports this as an error rather \
+             than panicking.)"
+        );
+    }
+}
+
 /// Reject an analytic Form C readout (`[scaling] y = <expr>`, #650) that reads
 /// the oral **depot** amount on a subject carrying an EVID=3/4 reset.
 ///
@@ -2822,6 +2933,13 @@ pub fn fit(
     // Reject a hand-built model/dataset up front.
     #[cfg(feature = "survival")]
     if let Some(e) = check_rtte_records(model, population) {
+        return Err(e);
+    }
+    // A survival hazard that references a time-varying covariate would be silently
+    // evaluated at the baseline value (analytic hazard) or with PK params frozen at t=0
+    // (ODE-accumulated hazard) — reject rather than mis-fit (#741).
+    #[cfg(feature = "survival")]
+    if let Some(e) = check_survival_tv_covariates(model, population) {
         return Err(e);
     }
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already
@@ -7320,6 +7438,21 @@ fn validate_tte_simulatable(
     Ok(())
 }
 
+/// Simulate observations under `opts`, returning only the observation rows.
+///
+/// Thin wrapper over [`simulate_with_options_diag`] that discards the per-subject
+/// simulation diagnostics ([`SimulationOutput::warnings`]). Use the `_diag` form when a
+/// degenerate-subject warning (#762 / #763) must be surfaced (e.g. a population VPC).
+pub fn simulate_with_options(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+) -> Result<Vec<SimulationResult>, String> {
+    simulate_with_options_diag(model, population, params, n_sim, opts).map(|o| o.results)
+}
+
 /// Simulate observations, optionally with propensity-score matching.
 ///
 /// With `opts.match_method == None` this is identical to
@@ -7332,13 +7465,18 @@ fn validate_tte_simulatable(
 ///
 /// Returns `Err` if matching is requested but the population is empty or any
 /// subject has no observations.
-pub fn simulate_with_options(
+///
+/// This is the diagnostics-returning form: the [`SimulationOutput`] carries both the
+/// rows and any non-fatal per-subject warnings (a degenerate hazard draw, #763; a
+/// degenerate recurrent stream skipped, #762). [`simulate_with_options`] is the thin
+/// wrapper that returns only the rows.
+pub fn simulate_with_options_diag(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     n_sim: usize,
     opts: &SimulateOptions,
-) -> Result<Vec<SimulationResult>, String> {
+) -> Result<SimulationOutput, String> {
     use rand::SeedableRng;
 
     // ODE-accumulated (joint PK-TTE) TTE simulation samples drug-driven event times
@@ -7408,12 +7546,17 @@ pub fn simulate_with_options(
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
     assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    // A time-varying covariate on a survival hazard would be silently frozen — panic
+    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
+    #[cfg(feature = "survival")]
+    assert_survival_tv_covariates(model, population);
     assert_absorption_dosing_supported(model, population);
 
     let method = match opts.match_method {
         Some(m) => m,
         None => {
-            return Ok(simulate_inner_with_draw(
+            let mut warnings = Vec::new();
+            let results = simulate_inner_with_draw(
                 model,
                 population,
                 params,
@@ -7422,7 +7565,9 @@ pub fn simulate_with_options(
                 None,
                 opts.horizon,
                 &mut rng,
-            ));
+                &mut warnings,
+            );
+            return Ok(SimulationOutput { results, warnings });
         }
     };
 
@@ -7470,7 +7615,8 @@ pub fn simulate_with_options(
     }
 
     let omega_inv = &params.omega.inv;
-    Ok(simulate_inner_with_draw(
+    let mut warnings = Vec::new();
+    let results = simulate_inner_with_draw(
         model,
         population,
         params,
@@ -7479,7 +7625,9 @@ pub fn simulate_with_options(
         Some((&eta_hats, omega_inv, method)),
         opts.horizon,
         &mut rng,
-    ))
+        &mut warnings,
+    );
+    Ok(SimulationOutput { results, warnings })
 }
 
 fn simulate_inner<R: rand::Rng>(
@@ -7491,7 +7639,21 @@ fn simulate_inner<R: rand::Rng>(
 ) -> Vec<SimulationResult> {
     // `simulate` / `simulate_with_seed` carry no horizon; the per-record window
     // applies. An explicit `[simulation] horizon` enters via `simulate_with_options`.
-    simulate_inner_with_draw(model, population, params, n_sim, 1, None, None, rng)
+    // These entry points return only the rows; per-subject simulation diagnostics
+    // (#762 degenerate RTTE, #763 degenerate hazard draw) are collected but surfaced
+    // only on the `simulate_with_options` path (`SimulationOutput.warnings`).
+    let mut warnings = Vec::new();
+    simulate_inner_with_draw(
+        model,
+        population,
+        params,
+        n_sim,
+        1,
+        None,
+        None,
+        rng,
+        &mut warnings,
+    )
 }
 
 /// Emit all observation rows for one subject given a fully-formed `eta_slice`
@@ -7521,11 +7683,12 @@ fn emit_subject_rows<R: rand::Rng>(
     horizon: Option<f64>,
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
+    warnings: &mut Vec<String>,
 ) {
-    // `horizon` is consumed only by the TTE path below; without the `survival`
-    // feature there are no TTE endpoints, so discard it to avoid an unused-arg warn.
+    // `horizon` and `warnings` are consumed only by the TTE path below; without the
+    // `survival` feature there are no TTE endpoints, so discard them to avoid unused-arg warns.
     #[cfg(not(feature = "survival"))]
-    let _ = horizon;
+    let _ = (horizon, &mut *warnings);
 
     // Predict IPRED. For IOV models (`n_kappa > 0`) route through the
     // occasion-aware `predict_iov`, drawing one independent κ ~ N(0, Ω_IOV) per
@@ -7643,6 +7806,7 @@ fn emit_subject_rows<R: rand::Rng>(
         horizon,
         rng,
         results,
+        warnings,
     );
 }
 
@@ -7757,6 +7921,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
     horizon: Option<f64>,
     rng: &mut R,
+    warnings: &mut Vec<String>,
 ) -> Vec<SimulationResult> {
     use rand_distr::Normal;
 
@@ -7767,6 +7932,10 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
     assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    // A time-varying covariate on a survival hazard would be silently frozen — panic
+    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
+    #[cfg(feature = "survival")]
+    assert_survival_tv_covariates(model, population);
     assert_absorption_dosing_supported(model, population);
 
     // ODE-accumulated TTE simulation has preventable preconditions (finite horizon,
@@ -7815,6 +7984,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         horizon,
                         rng,
                         &mut results,
+                        &mut *warnings,
                     );
                 }
             }
@@ -7837,6 +8007,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         horizon,
                         rng,
                         &mut results,
+                        &mut *warnings,
                     );
                 }
             }
@@ -8907,6 +9078,11 @@ pub fn simulate_with_uncertainty(
     let total_obs: usize = population.subjects.iter().map(|s| s.obs_times.len()).sum();
     let mut results =
         Vec::with_capacity(opts.n_uncertainty_draws * opts.n_sim_per_draw * total_obs);
+    // Per-subject simulation diagnostics (#762/#763) are collected but not surfaced on
+    // this uncertainty-aggregation path (its return is the flat row vec); the underlying
+    // per-subject handling — no whole-run panic, degenerate subjects censored — still
+    // applies. Use `simulate_with_options` when the warnings matter.
+    let mut sim_warnings: Vec<String> = Vec::new();
     for (k, params) in draws.iter().enumerate() {
         let mut rows = simulate_inner_with_draw(
             model,
@@ -8917,6 +9093,7 @@ pub fn simulate_with_uncertainty(
             None,
             None,
             &mut rng,
+            &mut sim_warnings,
         );
         results.append(&mut rows);
     }
@@ -8949,6 +9126,24 @@ pub struct SimulationResult {
     pub outcome: SimOutcome,
 }
 
+/// The result of [`simulate_with_options`]: the simulated rows plus any non-fatal
+/// per-subject diagnostics collected during the run.
+///
+/// `warnings` is the simulation analogue of [`FitResult::warnings`]: a subject whose
+/// draw degenerates — a non-positive / non-finite analytic hazard rate that produces
+/// no event (#763), or a hazard so extreme its recurrent stream is skipped rather than
+/// materialised (#762) — is handled *per subject* (censored / skipped, the run
+/// continues) and named here, instead of silently vanishing into the censored rows or
+/// aborting the whole run. Empty for a clean simulation. The simpler `simulate()` /
+/// `simulate_with_seed()` entry points apply the same per-subject handling but return
+/// only the rows (no diagnostics channel) — use `simulate_with_options` when the
+/// warnings matter (e.g. a population VPC).
+#[derive(Debug, Clone, Default)]
+pub struct SimulationOutput {
+    pub results: Vec<SimulationResult>,
+    pub warnings: Vec<String>,
+}
+
 /// Predict concentrations for a population using given parameters (no random effects).
 ///
 /// Data-reader warnings (e.g. missing II for ADDL doses) are not echoed here;
@@ -8965,6 +9160,10 @@ pub fn predict(
     assert_modeled_doses_supported(model, population);
     assert_transit_support(model, population);
     assert_transit_flip_flop_no_twin(model, population, &params.theta);
+    // A time-varying covariate on a survival hazard would be silently frozen — panic
+    // rather than return a subtly wrong prediction / simulation (#741; fit() Err's).
+    #[cfg(feature = "survival")]
+    assert_survival_tv_covariates(model, population);
     assert_analytic_readout_support(model, population);
     assert_absorption_dosing_supported(model, population);
 
@@ -9095,6 +9294,11 @@ pub fn predict_survival(
     use crate::survival::{
         cif_curves, hazard_and_cum_hazard, mean_survival, median_survival, tte_cause_params,
     };
+
+    // Like predict()/simulate(), the survival curves read the hazard at a frozen
+    // baseline covariate snapshot — a time-varying covariate on the hazard would be
+    // silently applied at its baseline, so fail loudly instead (#741).
+    assert_survival_tv_covariates(model, population);
 
     // The competing-risks CIF telescopes the all-cause survival drop, which
     // requires the grid in ascending time order; sort a local copy so the
@@ -10156,6 +10360,7 @@ mod iov_integration {
                     param_fn: Box::new(|_theta, _eta, _cov| vec![0.1]),
                 },
                 recurrence: crate::types::TteRecurrence::Single,
+                hazard_covariates: Vec::new(),
             },
         );
 
@@ -11874,6 +12079,150 @@ mod simulate_with_uncertainty_tests {
             msg.contains("TIME"),
             "rejection message must name the TIME limitation: {msg}"
         );
+    }
+
+    // ---- #741: time-varying covariate on a survival hazard is rejected ----
+
+    /// A standalone TTE model with a covariate (`CRCL`) on the hazard via the PH
+    /// `loghr` term, so the parser records `CRCL` in the endpoint's
+    /// `hazard_covariates`. Used by the `check_survival_tv_covariates` tests.
+    #[cfg(feature = "survival")]
+    fn parse_tte_hazard_cov_model() -> CompiledModel {
+        use crate::parser::model_parser::parse_model_string;
+        const M: &str = r#"
+[parameters]
+  theta TVLAMBDA(0.05, 0.001, 10.0)
+  theta TVBETA(0.1, -5.0, 5.0)
+  omega ETA_LAMBDA ~ 0.09
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TVLAMBDA * exp(ETA_LAMBDA)
+  loghr  = TVBETA * CRCL
+[fit_options]
+  method = focei
+"#;
+        parse_model_string(M).expect("TTE + covariate-on-hazard model parses")
+    }
+
+    /// One-subject population whose per-observation covariate snapshots are `snaps`
+    /// (a covariate that differs across them is time-varying). `obs_records` are left
+    /// empty — `check_survival_tv_covariates` inspects only covariate snapshots and
+    /// the model endpoints.
+    #[cfg(feature = "survival")]
+    fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Population {
+        let n = snaps.len();
+        let base = snaps.first().cloned().unwrap_or_default();
+        let subject = Subject {
+            id: id.to_string(),
+            doses: Vec::new(),
+            obs_times: vec![0.0; n],
+            obs_raw_times: Vec::new(),
+            observations: vec![0.0; n],
+            obs_cmts: vec![2; n],
+            covariates: base,
+            dose_covariates: Vec::new(),
+            obs_covariates: snaps,
+            pk_only_times: Vec::new(),
+            pk_only_covariates: Vec::new(),
+            reset_times: Vec::new(),
+            cens: vec![0; n],
+            occasions: Vec::new(),
+            dose_occasions: Vec::new(),
+            fremtype: Vec::new(),
+            obs_records: Vec::new(),
+        };
+        Population {
+            subjects: vec![subject],
+            covariate_names: vec!["CRCL".to_string(), "WT".to_string()],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_hazard_time_varying_covariate_is_rejected() {
+        let model = parse_tte_hazard_cov_model();
+        let pop = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("CRCL".to_string(), 100.0)]),
+                HashMap::from([("CRCL".to_string(), 60.0)]),
+            ],
+        );
+        let msg = check_survival_tv_covariates(&model, &pop)
+            .expect("a time-varying CRCL on the hazard must be rejected up front");
+        assert!(msg.contains("CRCL"), "must name the covariate: {msg}");
+        assert!(msg.contains("S1"), "must name the subject: {msg}");
+        assert!(msg.contains("#741"), "must cite the issue: {msg}");
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_hazard_constant_covariate_is_accepted() {
+        let model = parse_tte_hazard_cov_model();
+        let pop = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("CRCL".to_string(), 100.0)]),
+                HashMap::from([("CRCL".to_string(), 100.0)]),
+            ],
+        );
+        assert!(
+            check_survival_tv_covariates(&model, &pop).is_none(),
+            "a constant hazard covariate must not be rejected"
+        );
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn analytic_hazard_ignores_tv_covariate_it_does_not_reference() {
+        // WT is time-varying but the hazard references only CRCL (held constant). A
+        // time-varying covariate used solely by an unrelated (e.g. PK) part of a joint
+        // model must not trigger a false rejection — the analytic hazard never reads it.
+        let model = parse_tte_hazard_cov_model();
+        let pop = tte_cov_snapshot_pop(
+            "S1",
+            vec![
+                HashMap::from([("CRCL".to_string(), 100.0), ("WT".to_string(), 70.0)]),
+                HashMap::from([("CRCL".to_string(), 100.0), ("WT".to_string(), 80.0)]),
+            ],
+        );
+        assert!(
+            check_survival_tv_covariates(&model, &pop).is_none(),
+            "a time-varying covariate the hazard does not reference must not be rejected"
+        );
+    }
+
+    #[cfg(feature = "survival")]
+    #[test]
+    fn ode_accumulated_hazard_rejects_any_time_varying_covariate() {
+        // The survival ODE solve freezes the whole PK-parameter vector at t=0, so ANY
+        // time-varying covariate corrupts the drug-driven hazard — even one not listed in
+        // `hazard_covariates` (empty for the ODE variant).
+        let mut model = parse_tte_hazard_cov_model();
+        model.endpoints.insert(
+            2,
+            crate::types::EndpointLikelihood::Tte {
+                hazard: crate::types::HazardSpec::OdeAccumulated { chz_state: 0 },
+                recurrence: crate::types::TteRecurrence::Single,
+                hazard_covariates: Vec::new(),
+            },
+        );
+        let pop = tte_cov_snapshot_pop(
+            "S9",
+            vec![
+                HashMap::from([("WT".to_string(), 70.0)]),
+                HashMap::from([("WT".to_string(), 90.0)]),
+            ],
+        );
+        let msg = check_survival_tv_covariates(&model, &pop)
+            .expect("ODE-accumulated hazard + any TV covariate must be rejected");
+        assert!(msg.contains("WT"), "must name the covariate: {msg}");
+        assert!(msg.contains("#741"), "must cite the issue: {msg}");
     }
 
     fn tiny_population() -> Population {
