@@ -1,5 +1,12 @@
 # Plan: Non-Gaussian NLME Models — TTE, Survival, RTTE, Markov, and Categorical
 
+**Latest (#771/#774, merged 2026-07-10):** Markov track started — the CTMM matrix-exponential
+primitive (`matrix_exp` + exact Van Loan / Fréchet gradients + `ctmm_data_term`, feature-gated
+`markov`) is on `main`. **Primitive only — not yet wired to fitting** (no `[markov_model]` DSL, no
+`EndpointLikelihood::Ctmm`; `ObsRecord::DiscreteState` still deferred). **Phase 4.0 (discrete-state
+slice) is now the critical path** — it wires the merged CTMM math into fitting and unblocks Track C.
+See §19.
+
 **Status:** Phase 1, Phase 1b, **Phase 2, and Phase 3 (RTTE) complete** — ferx-core PRs #190, #192, #206 (Phase 1), #441 (validation), #442 (name threading), #494, #501, #526 (Phase 1b competing risks), #563 (#531 cleanup) all merged; ferx-r PRs #134 & #142 merged. **Phase 2 (Joint PK-TTE, ODE hazard accumulator) COMPLETE — Slice 2.1 fit path via PR #567 (squash `657800ee`) merged 2026-06-28, plus Slice 2.2 drug-driven event-time simulation + Slice 2.3 docs via PR #595 (squash `3f58c7d3`) merged 2026-06-29; both closing #564. ferx-r pin bump PR #208 merged.** Open follow-ups: **ferx-r#210** (bundled `pktte_joint` example + ODE-TTE simulation exposure — now sample-able after #595); **#570** (joint-fit double-solve perf) **SHIPPED via PR #613** — inner-NLL EBE + FOCEI at-mode now share one augmented solve (`solve_ode_dense` Hermite read-back, predictions bit-identical); the FD-Hessian's analytic CHZ η-sensitivities are split out as #626; #469 (FOCEI nonlinear-frailty ω²) **CLOSED via #571**. **Phase 3 (RTTE) — fit + simulation COMPLETE:** Slice 3.1 clock-forward (Andersen–Gill) fit via PR #718 (squash `0caf6212`) merged 2026-07-07; Slice 3.2 clock-reset (gap-time / renewal) fit via PR #720 (squash `2c860659`) merged 2026-07-08; Slice 3.3 analytic RTTE `simulate()` (closed-form inverse-CDF recurrent stream to the `[simulation] horizon`, both clocks) via PR #761 (squash `d8d0a247`) merged 2026-07-09 — each NONMEM-anchored (ferx FOCEI ≡ NONMEM LAPLACE to the decimal), all DSL-driven (no ferx-r changes). Open follow-ups: **#740** (clock-reset left-truncation support — currently fail-loud rejected); **#741** (time-varying covariates on survival hazards are silently frozen at baseline across *all* TTE/survival endpoints — support-or-warn); **#762** (RTTE-sim `MAX_EVENTS` cap panics the whole `simulate()` run for one pathological subject; note the two `rtte_cause` panic arms are intentional fail-loud and stay); **#763** (non-positive / non-finite effective hazard rate → silent censor-only subject across TTE simulation); **#764** (RTTE-simulation docs overstate simulate-path input-row rejections — the stream is regenerated from t=0). **NEXT: Phase 3.4 (RTTE docs polish) and/or Phase 3b (SAEM Laplace proposal); then Phase 4 (categorical / discrete-state likelihood, #760) as the Markov prerequisite.**  
 **Scope:** Phase 3 (RTTE) complete; next active phase = Phase 3b (SAEM Laplace) / Phase 4 (categorical, #760)  
 **Revised:** 2026-07-09 (Markov track cross-referenced — #759 tracks the Markov phases (4b DTMM /
@@ -930,9 +937,13 @@ parser auto-appends `__chz_<cmt>' = hazard` to `OdeSpec` (init 0). The existing 
 augmented state on both the fit path (#567, Slice 2.1) and the simulation path (#595, Slice 2.2 —
 `solve_ode_until_threshold` root-finder for drug-driven event times).
 
-### 5.6 Matrix exponential *(open — Phase 5)*
+### 5.6 Matrix exponential ✅ *Resolved (primitive) — PRs #771, #774*
 
-No expm implementation. Need Padé approximant for CTMM. Van Loan trick for gradients.
+`src/markov/mod.rs` (feature `markov`): `matrix_exp` (scaling-and-squaring via nalgebra),
+`matrix_exp_frechet` + `generator_rate_direction` (exact directional Van Loan / Fréchet gradients),
+and a guarded `ctmm_data_term`; closed-form 3-state chain test anchor in #774. **Primitive only** —
+not yet wired to an endpoint (no `[markov_model]` DSL, no `EndpointLikelihood::Ctmm`); that wiring
+needs Phase 4.0 + the rest of Phase 5 (§12).
 
 ### 5.7 Data reader extensions ✅ *Resolved — PR #192*
 
@@ -2641,13 +2652,20 @@ full CTMM. Validates state-observation data reader and CTMM NLL before matrix ex
 
 **Scope:** Full Q matrix; Padé matrix exponential; Van Loan gradient.
 
+**Status: numerical core merged (#771/#774); endpoint wiring open.** The `src/markov` primitive and
+its Tier-1 test anchor are on `main`; what remains is wiring it into a fittable endpoint, which now
+depends on Phase 4.0 (discrete-state routing) landing.
+
 **Deliverables:**
-- `src/markov/mod.rs`: `matrix_exp`, `matrix_exp_param_grad`, `ctmm_data_term`
+- ✅ `src/markov/mod.rs`: `matrix_exp`, `matrix_exp_frechet` (+ `generator_rate_direction` for exact
+  generator-rate gradients), `ctmm_data_term` — merged #771 (realized as a directional Fréchet
+  derivative, not a per-entry `matrix_exp_param_grad`; same exact gradient)
+- ✅ Tier 1 unit test: `matrix_exp` + `ctmm_data_term` vs. closed-form 3-state chain — merged #774
+- **`ObsRecord::DiscreteState` routing + `EndpointLikelihood::Ctmm` dispatch — needs Phase 4.0**
 - `[markov_model]` DSL; `type = ctmm`
 - **Simulation**: Gillespie/Doob path generator (`src/markov/simulate.rs`); observe the
   simulated path on `[simulation] obs_schedule` (§8.8.2, §8.8.4)
 - **Prediction**: state-occupancy vector `π(t) = π₀·expm(Q·t)` → `Prediction::CatProbs`
-- Tier 1 unit test: `matrix_exp` vs. series expansion for 2×2 and 3×3 Q
 - Tier 3 convergence test: 3-state CTMM vs. R `msm` (CAV dataset)
 - **Tier 3 SSE**: simulate path → fit Q → recover rates
 - Docs: `docs/estimation/ctmm.qmd` with NONMEM infeasibility rationale
@@ -3088,7 +3106,7 @@ on the whole categorical phase.
   |-- A. Survival hardening ........ independent (Track A)
   |-- B. SAEM engine (Phase 3b) .... independent (Track B)
   |-- E. Custom [ll_model] (Ph 8) .. independent (Track E)
-  |-- matrix-exp module (§8.7) ..... zero-dep, start now
+  |-- matrix-exp module (§8.7) ..... ✅ MERGED (#771/#774)
   |-- Phase 4.0 discrete-state slice   <-- the pivot
         |
         |-- C. Categorical & count (Phase 4) ... Track C
@@ -3103,15 +3121,21 @@ on the whole categorical phase.
 | **A · Survival hardening** | #741, #763, #762, #740, #626, #764, Phase 3.4 docs; Phase 2 deferred (IntervalCensored+ODE, left-trunc+ODE); ferx-r `predict_survival` + e2e + ferx-r#210 | trunk | ✅ yes | `survival` |
 | **B · SAEM engine** | Phase 3b `saem_proposal = auto` | trunk | ✅ yes | none |
 | **E · Custom likelihood** | Phase 8 `[ll_model]` | trunk | ✅ yes | none |
-| **4.0 · Discrete-state slice** | Phase 4.0 (front of #760) | trunk | ✅ yes (thin) | (part of Phase 4) |
-| **matrix-exp module** | `src/markov`: `matrix_exp` + Van Loan (§8.7) | none | ✅ yes | `markov` |
+| **4.0 · Discrete-state slice** | Phase 4.0 (front of #760) | trunk | ✅ yes — **now critical path** | (part of Phase 4) |
+| **matrix-exp module** | `src/markov`: `matrix_exp` + Van Loan + `ctmm_data_term` (§8.7) | none | ✅ **merged #771/#774** | `markov` |
 | **C · Categorical & count** | Phase 4 / #760 (binary·ordinal·Poisson·NB) | 4.0 | after 4.0 | none |
-| **D · Markov / CTMM** | Phases 4b/4c/5/6 / #759 | 4.0 (+ matrix-exp; 4b also on C's logit) | after 4.0 | `markov` |
+| **D · Markov / CTMM** | Phases 4b/4c/5/6 / #759 — **matrix-exp core merged #771/#774** | 4.0 (+ matrix-exp; 4b also on C's logit) | core in · endpoint after 4.0 | `markov` |
 | **Phase 7 · HMM** | Phase 7 (Track D tail) | D (Phase 5) + inner-EM spike | tail | `markov` |
 
-**Sequencing.** Start in parallel with zero coordination: **A, B, E, the matrix-exp module, and the
-4.0 slice** — five workstreams, no shared files of consequence. Once 4.0 lands (small), **C and the
-CTMM chain (4c → 5 → 6) proceed in parallel**; only **4b DTMM** waits on C's categorical-logit
-primitive. HMM is last (needs Phase 5), but its forward primitive can be spiked at any time (Phase
-7). This is the parallel-workstream view of the linear §18 milestone order — the two are consistent:
-§18 is the safe serial order, §19 is where the parallelism is.
+**Sequencing.** Start in parallel with zero coordination: **A, B, E, and the 4.0 slice** — plus the
+**matrix-exp module, now ✅ merged (#771/#774)**. Once 4.0 lands (small), **C and the CTMM chain
+(4c → 5 → 6) proceed in parallel**; only **4b DTMM** waits on C's categorical-logit primitive. HMM is
+last (needs Phase 5), but its forward primitive can be spiked at any time (Phase 7). This is the
+parallel-workstream view of the linear §18 milestone order — the two are consistent: §18 is the safe
+serial order, §19 is where the parallelism is.
+
+**Update (2026-07-10).** The matrix-exp lane landed first (#771/#774) — validating the split — but as
+a *feature-gated, unwired* primitive: `ctmm_data_term` exists yet no model can reach it (no
+`[markov_model]` DSL, no `EndpointLikelihood::Ctmm`, `ObsRecord::DiscreteState` still deferred).
+**Phase 4.0 is therefore now the critical path**: it wires the merged CTMM math into fitting *and*
+unblocks Track C — one small slice sitting on the critical path for two tracks.
