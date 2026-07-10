@@ -8953,6 +8953,12 @@ pub fn predict_survival(
     params: &ModelParameters,
     time_grid: &[f64],
 ) -> Vec<SurvivalPredictionResult> {
+    // Deliberately no `assert_transit_flip_flop_no_twin` guard here (unlike
+    // `predict`/`simulate`): a survival prediction cannot be corrupted by a degenerate
+    // twin-less-flip-flop transit PK. A hazard that reads the PK is ODE-accumulated (the
+    // model then carries `ode_spec` and never takes the closed-form transit path), and a
+    // closed-form-family hazard does not read the PK at all — so the closed form's
+    // clamped `0` can never reach `S(t)`. See #776.
     use crate::survival::{
         cif_curves, hazard_and_cum_hazard, mean_survival, median_survival, tte_cause_params,
     };
